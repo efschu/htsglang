@@ -594,6 +594,25 @@ class _Connection:
                 {"kind": "speaker.deleted", **gone,
                  "state": self.session.state()}
             )
+        elif kind == "speaker.merge":
+            # Two roster entries turn out to be one person. The reattributed
+            # transcript lines are emitted by the session itself as updates,
+            # so the client's stream repaints without a reload; this frame
+            # only carries the roster's new shape.
+            try:
+                merged = self.session.merge_speakers(
+                    str(message.get("target_id", "")),
+                    str(message.get("source_id", "")),
+                )
+            except (KeyError, ValueError) as exc:
+                await self._send(
+                    {"kind": "error", "stage": "speaker", "message": str(exc)}
+                )
+                return
+            await self._send(
+                {"kind": "speaker.merged", **merged,
+                 "state": self.session.state()}
+            )
         elif kind == "speaker.name":
             try:
                 changed = self.session.name_speaker(
@@ -1056,6 +1075,28 @@ def build_app(service: TranslatorService) -> FastAPI:
             raise HTTPException(
                 status_code=404, detail=f"no speaker {speaker_id!r}"
             ) from exc
+
+    @app.post(
+        "/api/translator/sessions/{session_id}/speakers/{speaker_id}/merge"
+    )
+    async def merge_speakers(
+        session_id: str, speaker_id: str, body: Dict[str, Any]
+    ) -> JSONResponse:
+        """Fold ``source_id`` into ``speaker_id``: two roster entries, one
+        person. The path id is the TARGET -- the entry that survives, which is
+        the one the user dropped onto."""
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        source_id = str(body.get("source_id") or "").strip()
+        if not source_id:
+            raise HTTPException(status_code=400, detail="source_id is required")
+        try:
+            return JSONResponse(session.merge_speakers(speaker_id, source_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/translator/sessions/{session_id}/speakers")
     async def add_speaker(session_id: str, body: Dict[str, Any]) -> JSONResponse:

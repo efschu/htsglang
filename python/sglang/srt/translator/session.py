@@ -611,6 +611,14 @@ class TranslatorSession:
             "transcript_lines": len(self.transcript),
             "transcript_next_line_id": self.transcript.next_line_id,
             "transcript_floor": self.transcript.floor,
+            # What THIS server can do, for a client that is deployed
+            # independently of it. The page is served from the worktree and
+            # reloads per request, so a client-side feature goes live the
+            # moment it is merged while its server half waits for a restart --
+            # a gesture that silently does nothing in that window is worse
+            # than one that is not offered yet. An older server simply does
+            # not send the key and the client leaves the gesture off.
+            "supports": {"speaker_merge": True},
         }
 
     # -- the written record (§17.2) -----------------------------------------
@@ -956,6 +964,87 @@ class TranslatorSession:
             "speaker_id": speaker_id,
             "label": profile.label,
             "reference_seconds_released": released,
+        }
+
+    def merge_speakers(self, target_id: str, source_id: str) -> Dict[str, object]:
+        """Two roster entries are one person: fold source into target (§17.5).
+
+        The repair for the split the registry is deliberately biased towards
+        (see :meth:`SpeakerRegistry.merge`). Destructive and irreversible,
+        which is why the surface asks before sending it.
+
+        Everything in the session that names the source has to move with it,
+        or the merge leaves a half-state that is worse than the split it fixed:
+
+        * the TRANSCRIPT is reattributed retroactively, so the conversation
+          reads as one person having said all of it -- which is what the user
+          asserted by making the gesture. Nothing is deleted; the lines keep
+          their text, their translations and their uncertainty.
+        * the ARMED button, if it pointed at the source, points at the target.
+          A button that no longer exists would otherwise stay armed and the
+          next utterance would be attributed to a speaker who is gone -- the
+          same defect ``delete_speaker`` guards against, and it is reachable
+          here too because arming survives the roster changing under it.
+        * NAME SUGGESTIONS and applied names move across rather than being
+          dropped: a self-introduction heard on the source cluster was heard
+          from this person, and it is still theirs after the merge.
+        * the source's PRESET VOICE goes back to the pool. The merged speaker
+          keeps the target's, because the target is the identity that
+          survived, and a pool that never gets its voices back runs dry.
+        * ``_manual_names`` follows the label: if the user had typed a name on
+          the source and the target inherits it, that name is still one a
+          human typed and must keep its protection from the automatic path.
+        """
+        if target_id == source_id:
+            raise ValueError("a speaker cannot be merged into themselves")
+        # Read both BEFORE anything is mutated, so an unknown id fails with
+        # nothing half-done rather than a transcript already rewritten.
+        self.speakers.get(target_id)
+        source = self.speakers.get(source_id)
+        source_label = source.label
+        source_manual = source_id in self._manual_names
+
+        profile = self.speakers.merge(target_id, source_id)
+        label = profile.label or target_id
+        lines = self.transcript.reassign_all_of_speaker(
+            source_id, target_id, label
+        )
+        for line in lines:
+            self._emit_line(line, update=True)
+
+        if self._armed_speaker == source_id:
+            self._armed_speaker = target_id
+        for suggestion in self.suggestions.values():
+            if suggestion.speaker_id == source_id:
+                suggestion.speaker_id = target_id
+        for suggestion in self.applied_names.values():
+            if suggestion.speaker_id == source_id:
+                suggestion.speaker_id = target_id
+        if source_manual:
+            self._manual_names.discard(source_id)
+            if profile.label == source_label:
+                # The surviving name is the one the user typed on the source.
+                self._manual_names.add(target_id)
+        if self.voice_pool is not None:
+            release = getattr(self.voice_pool, "release", None)
+            if callable(release):
+                release(source_id)
+        self.journal.append(
+            EventKind.SESSION_STATE,
+            {
+                "speakers_merged": [source_id, target_id],
+                "label": profile.label,
+                "lines_reattributed": len(lines),
+                "reference_seconds": round(profile.reference_seconds(), 2),
+            },
+        )
+        return {
+            "target_id": target_id,
+            "source_id": source_id,
+            "label": profile.label,
+            "lines_reattributed": len(lines),
+            "observations": profile.observations,
+            "reference_seconds": round(profile.reference_seconds(), 2),
         }
 
     def clear_transcript(self) -> int:

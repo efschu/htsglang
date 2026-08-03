@@ -233,6 +233,31 @@ class TranscriptLog:
                     changed.append(line)
         return changed
 
+    def reassign_all_of_speaker(
+        self, source_id: str, speaker_id: str, speaker_label: str
+    ) -> List[TranscriptLine]:
+        """Move every line of one speaker to another, for a roster merge.
+
+        Returns only the lines that changed, for the same reason
+        :meth:`relabel_speaker` does: the caller emits exactly those.
+
+        Unlike :meth:`reassign_speaker` this does NOT clear uncertainty or
+        rewrite ``origin``/``resolved_by``. A merge says two clusters are one
+        person; it says nothing about whether the recognizer was sure of any
+        individual line at the time, and overwriting that would erase the only
+        record of how the split happened. A line that carried candidates keeps
+        them -- they name speakers, and the merged-away id among them is
+        handled where candidates are rendered.
+        """
+        changed = []
+        for line in self._lines:
+            if line.kind != KIND_UTTERANCE or line.speaker_id != source_id:
+                continue
+            line.speaker_id = speaker_id
+            line.speaker_label = speaker_label or speaker_id
+            changed.append(line)
+        return changed
+
     def reassign_speaker(
         self,
         line_id: int,

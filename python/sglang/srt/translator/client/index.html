@@ -259,12 +259,52 @@
   footer { padding:8px 10px calc(10px + env(safe-area-inset-bottom));
            border-top:1px solid var(--line); background:var(--surface);
            display:flex; flex-direction:column; gap:8px; }
-  #speakers { display:flex; gap:6px; flex-wrap:wrap; }
-  #speakers button { flex:1 1 auto; min-width:96px; min-height:46px;
-                     font-size:14.5px; gap:7px; }
-  #speakers button.add { flex:0 0 auto; min-width:52px; }
+  /* One roster entry is a CELL, not a bare button: the delete control has to
+     be a button of its own and a button inside a button is not markup. The
+     cell also gives the drop highlight something to sit on that is not the
+     tap target itself. */
+  #speakers { position:relative; display:flex; gap:6px; flex-wrap:wrap; }
+  #speakers .sp { position:relative; flex:1 1 auto; min-width:96px;
+                  display:flex; }
+  #speakers .sp > button.who, #speakers > button.add {
+    flex:1 1 auto; min-width:0; min-height:46px; font-size:14.5px; gap:7px;
+  }
+  /* Room for the delete control, so a long name never runs under it. */
+  #speakers .sp > button.who { padding-right:36px; }
+  #speakers .sp > button.who .lbl { overflow:hidden; text-overflow:ellipsis;
+                                    white-space:nowrap; }
+  #speakers > button.add { flex:0 0 auto; min-width:52px; }
   #speakers button.armed { border-color:var(--accent); color:var(--accent); }
   #speakers button .avatar { width:18px; height:18px; font-size:10px; }
+  /* Deliberately NOT a long press: the long press is the merge drag, and one
+     gesture must not mean two destructive things. 30px is under the 52px tap
+     minimum on purpose -- it is guarded by a confirmation and it must not
+     compete with the speak button it sits on. */
+  #speakers .sp > button.x {
+    position:absolute; right:3px; top:50%; transform:translateY(-50%);
+    min-height:30px; min-width:30px; padding:0; border:0; border-radius:50%;
+    background:transparent; color:var(--dim); font-size:15px; line-height:1;
+    display:flex; align-items:center; justify-content:center;
+  }
+  #speakers .sp > button.x:active { color:var(--bad); background:var(--surface2); }
+  /* The drag: every OTHER entry is a visible drop zone, and the one under the
+     finger is the one that would win. A merge is destructive, so the target
+     is never left to be guessed at. */
+  #speakers .sp.dragging { opacity:.55; }
+  #speakers .sp.dragging > button.who { border-color:var(--accent); }
+  #speakers .sp.dropzone > button.who { border-style:dashed;
+                                        border-color:var(--dim); }
+  #speakers .sp.droptarget > button.who { border-style:solid;
+    border-color:var(--ok); color:var(--ok); background:var(--surface2); }
+  #speakers.merging .sp, #speakers.merging .sp > button { touch-action:none; }
+  /* TAKES NO LAYOUT, and that is the point. As a flow row it pushed the
+     footer taller mid-gesture, which moved the drop targets out from under
+     the finger already on its way to one -- caught by `probe_roster.py`,
+     whose target coordinates are measured before the lift exactly as a user's
+     aim is. It floats above the row instead. */
+  #speakers .mergehint { position:absolute; left:0; right:0; bottom:100%;
+    margin-bottom:4px; font-size:12px; color:var(--accent);
+    text-align:center; pointer-events:none; }
   #talk { width:100%; min-height:76px; font-size:19px; font-weight:650;
           border-radius:18px; }
   #talk svg { width:26px; height:26px; }
@@ -1746,40 +1786,63 @@ function transcriptText() {
 // ---------------------------------------------------------------------------
 // Speaker row (design 17.5) and name chips (17.3).
 // ---------------------------------------------------------------------------
+/** What the CONNECTED server can do, from its own state frame.
+ *
+ * This page is served from the worktree and re-read per request, so a
+ * client-side change is live the moment it is merged, while its server half
+ * waits for a tenant restart. In that window a gesture whose control the
+ * server does not understand would look like the app ignoring the user. The
+ * capability is therefore asked for rather than assumed, and an older server
+ * that does not send the key leaves the gesture unbound until it is restarted
+ * -- with no second client deploy needed to switch it on.
+ */
+let serverSupports = {};
+
 function renderSpeakers(speakers) {
   knownSpeakers = speakers || [];
   const row = el("speakers");
   row.innerHTML = "";
   for (const speaker of knownSpeakers) {
+    const cell = document.createElement("div");
+    cell.className = "sp";
+    cell.dataset.speaker = speaker.speaker_id;
+    const shown = speaker.label || speaker.speaker_id;
+
     const button = document.createElement("button");
+    button.className = "who";
     button.dataset.speaker = speaker.speaker_id;
     const dot = document.createElement("i");
     dot.className = "avatar";
     dot.style.background = speakerColor(speaker.speaker_id);
-    dot.textContent = initials(speaker.label || speaker.speaker_id);
+    dot.textContent = initials(shown);
     const label = document.createElement("span");
     label.className = "lbl";
-    label.textContent = speaker.label || speaker.speaker_id;
+    label.textContent = shown;
     button.append(dot, label);
     bindTalkButton(button, speaker.speaker_id);
-    // Long press opens the speaker sheet -- the short press is speaking, so
-    // renaming cannot live there.
-    let hold = null;
-    button.addEventListener("pointerdown", () => {
-      hold = setTimeout(() => {
-        hold = null;
-        // Mark the press as consumed so the pointerup does not also toggle
-        // recording -- a rename must never start a turn.
-        button.dataset.renamed = "1";
-        openSpeakerSheet(speaker);
-      }, 600);
-    });
-    for (const type of ["pointerup", "pointercancel", "pointerleave"]) {
-      button.addEventListener(type, () => {
-        if (hold) { clearTimeout(hold); hold = null; }
-      });
-    }
-    row.appendChild(button);
+    bindSpeakerHold(cell, button, speaker);
+
+    // Delete, on the main page, at the entry itself (user order 2026-08-03:
+    // "man muss speaker direkt dort loeschen koennen auf der hauptseite").
+    // It was only reachable through a long press into a sheet, which is a
+    // gesture nobody finds and which now belongs to the merge drag.
+    const kill = document.createElement("button");
+    kill.className = "x";
+    kill.textContent = "×";
+    kill.title = "delete " + shown;
+    kill.setAttribute("aria-label", "delete " + shown);
+    kill.onclick = (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      confirmDeleteSpeaker(speaker);
+    };
+    // The cell is inside the talk row; a stray press on the delete control
+    // must never reach the speak button underneath it.
+    kill.addEventListener("pointerdown", (e) => e.stopPropagation());
+    kill.addEventListener("pointerup", (e) => e.stopPropagation());
+
+    cell.append(button, kill);
+    row.appendChild(cell);
   }
   const add = document.createElement("button");
   add.className = "add";
@@ -1787,6 +1850,139 @@ function renderSpeakers(speakers) {
   add.setAttribute("aria-label", "somebody new is speaking");
   add.onclick = openAddSpeakerSheet;
   row.appendChild(add);
+}
+
+/** Delete one speaker, from the roster, with a confirmation.
+ *
+ * The transcript is explicitly NOT touched: the server keeps every line this
+ * speaker said, under the name it had at the time (`speakers.remove`, whose
+ * docstring argues the case). Saying so in the confirmation matters -- "their
+ * voice is lost" reads as "the conversation is lost" if nobody says otherwise.
+ */
+async function confirmDeleteSpeaker(speaker) {
+  const shown = speaker.label || speaker.speaker_id;
+  const ok = await askConfirm(
+    "delete " + shown + "?",
+    "Their voice reference and their preset voice are released. Everything "
+    + "they said stays in the transcript.", "delete");
+  if (!ok) return;
+  connection.sendControl({
+    kind: "speaker.delete", speaker_id: speaker.speaker_id,
+  });
+}
+
+/** Long press on a roster entry: lift it, and drop it on somebody to merge.
+ *
+ * MERGE IS DESTRUCTIVE, so the gesture is deliberately the slow one and the
+ * drop is confirmed. Delete keeps the explicit control instead of sharing the
+ * press: one gesture must not mean two irreversible things.
+ *
+ * Released without having moved onto another entry, the long press still
+ * opens the speaker sheet, which is where renaming lives and where it stays.
+ * That is why the sheet is opened on RELEASE rather than when the timer
+ * fires: the same press has to be able to become a drag.
+ */
+function bindSpeakerHold(cell, button, speaker) {
+  const row = el("speakers");
+  const canMerge = !!serverSupports.speaker_merge;
+  let hold = null;
+  let dragging = false;
+  let target = null;
+
+  const cellAt = (x, y) => {
+    const node = document.elementFromPoint(x, y);
+    const found = node && node.closest ? node.closest("#speakers .sp") : null;
+    return found && found !== cell ? found : null;
+  };
+  const paint = (next) => {
+    if (target === next) return;
+    if (target) target.classList.remove("droptarget");
+    target = next;
+    if (target) target.classList.add("droptarget");
+  };
+  const lift = () => {
+    dragging = true;
+    row.classList.add("merging");
+    cell.classList.add("dragging");
+    for (const other of row.querySelectorAll(".sp")) {
+      if (other !== cell) other.classList.add("dropzone");
+    }
+    const hint = document.createElement("div");
+    hint.className = "mergehint";
+    hint.textContent = "drop on another speaker to merge them";
+    row.appendChild(hint);
+  };
+  const drop = () => {
+    row.classList.remove("merging");
+    cell.classList.remove("dragging");
+    for (const other of row.querySelectorAll(".sp")) {
+      other.classList.remove("dropzone", "droptarget");
+    }
+    for (const hint of row.querySelectorAll(".mergehint")) hint.remove();
+    const landed = target;
+    target = null;
+    dragging = false;
+    return landed;
+  };
+
+  button.addEventListener("pointerdown", (event) => {
+    if (hold) clearTimeout(hold);
+    hold = setTimeout(() => {
+      hold = null;
+      // Consume the press either way: neither the sheet nor a merge gesture
+      // may also start a turn.
+      button.dataset.renamed = "1";
+      if (!canMerge) {
+        // No server half yet: the long press keeps doing what it always did.
+        openSpeakerSheet(speaker);
+        return;
+      }
+      lift();
+      // Without capture the move events stop the moment the finger leaves
+      // this button, which is the first thing a drag does.
+      try { button.setPointerCapture(event.pointerId); } catch (err) { /* none */ }
+    }, 600);
+  });
+  button.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    event.preventDefault();
+    paint(cellAt(event.clientX, event.clientY));
+  });
+  button.addEventListener("pointerup", (event) => {
+    if (hold) { clearTimeout(hold); hold = null; return; }
+    if (!dragging) return;
+    event.preventDefault();
+    paint(cellAt(event.clientX, event.clientY));
+    const landed = drop();
+    try { button.releasePointerCapture(event.pointerId); } catch (err) { /* none */ }
+    if (!landed) { openSpeakerSheet(speaker); return; }
+    confirmMergeSpeakers(landed.dataset.speaker, speaker);
+  });
+  for (const type of ["pointercancel", "pointerleave"]) {
+    button.addEventListener(type, () => {
+      if (hold) { clearTimeout(hold); hold = null; }
+      // A cancelled drag must clear its highlights; leaving them would make
+      // the row look armed for a merge that is not happening.
+      if (dragging) drop();
+    });
+  }
+}
+
+/** Confirm and send a merge. Destructive and irreversible, so it says so. */
+async function confirmMergeSpeakers(targetId, source) {
+  const target = knownSpeakers.find((s) => s.speaker_id === targetId);
+  if (!target || targetId === source.speaker_id) return;
+  const sourceName = source.label || source.speaker_id;
+  const targetName = target.label || target.speaker_id;
+  const ok = await askConfirm(
+    "merge into " + targetName + "?",
+    sourceName + " and " + targetName + " become one speaker, called "
+    + targetName + ". Everything " + sourceName + " said is re-attributed to "
+    + targetName + ". This cannot be undone.", "merge");
+  if (!ok) return;
+  connection.sendControl({
+    kind: "speaker.merge", target_id: targetId, source_id: source.speaker_id,
+  });
 }
 
 /** Ask the session for the roster, coalescing a burst into one request.
@@ -1823,7 +2019,10 @@ function rosterLags(line) {
 }
 
 function markArmed(speakerId) {
-  for (const button of el("speakers").children) {
+  // Queried rather than walked over `children`: a roster entry is a cell that
+  // CONTAINS the speak button since the delete control arrived, so the armed
+  // class belongs on the button, one level down.
+  for (const button of el("speakers").querySelectorAll("button.who")) {
     button.classList.toggle("armed", button.dataset.speaker === speakerId);
   }
 }
@@ -1991,19 +2190,15 @@ function openSpeakerSheet(speaker) {
     });
   };
 
+  // The same delete as the "x" on the roster entry, deliberately one
+  // implementation: two copies of a destructive confirmation drift, and the
+  // one nobody reads is the one that stops warning about the right thing.
   const remove = document.createElement("button");
   remove.className = "listrow danger";
   remove.innerHTML = "<span class='name'>delete this speaker</span>";
-  remove.onclick = async () => {
+  remove.onclick = () => {
     closeSheet();
-    const ok = await askConfirm(
-      "delete " + (speaker.label || speaker.speaker_id) + "?",
-      "Their voice reference and centroid are lost. The transcript keeps "
-      + "what they said.", "delete");
-    if (!ok) return;
-    connection.sendControl({
-      kind: "speaker.delete", speaker_id: speaker.speaker_id,
-    });
+    confirmDeleteSpeaker(speaker);
   };
 
   group.append(rename, remove);
@@ -3208,6 +3403,9 @@ async function sendPairs(pairs) {
 // ---------------------------------------------------------------------------
 function applyState(state) {
   if (!state) return;
+  // Read BEFORE the roster is painted: the merge drag is only bound when the
+  // running server can carry it out (see `serverSupports`).
+  if (state.supports) serverSupports = state.supports;
   if (state.speakers) renderSpeakers(state.speakers);
   if (state.armed_speaker !== undefined) markArmed(state.armed_speaker);
   if (state.voice_mode) segSet("segvoice", state.voice_mode);
@@ -3270,6 +3468,17 @@ function onEvent(event) {
     case "speaker.deleted":
       sys("deleted " + (event.label || event.speaker_id)
           + " (" + event.reference_seconds_released + "s of voice reference)",
+          false);
+      applyState(event.state);
+      break;
+    case "speaker.merged":
+      // The reattributed lines arrive as ordinary transcript updates and have
+      // already repainted themselves; this only says what happened and takes
+      // the new roster. Said out loud because a merge is destructive and the
+      // count is the one number that tells the user it did what they meant.
+      sys("merged into " + (event.label || event.target_id) + " — "
+          + event.lines_reattributed + " line"
+          + (event.lines_reattributed === 1 ? "" : "s") + " re-attributed",
           false);
       applyState(event.state);
       break;

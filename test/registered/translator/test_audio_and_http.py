@@ -610,6 +610,71 @@ class TestTranscriptOverTheWire(unittest.TestCase):
             404,
         )
 
+    def test_the_merge_endpoint_reattributes_and_refuses_bad_input(self):
+        """The drag-and-drop gesture's server half, over the real routes."""
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1")
+            ws.receive_text()
+            self._one_turn(ws)
+        session = self.service.sessions.get("s1")
+        source = session.transcript.lines()[0].speaker_id
+        target = session.add_speaker("Matthias")
+        answer = self.client.post(
+            f"/api/translator/sessions/s1/speakers/{target}/merge",
+            json={"source_id": source},
+        )
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertEqual(answer.json()["lines_reattributed"], 1)
+        record = self.client.get("/api/translator/sessions/s1/transcript").json()
+        self.assertEqual(record["lines"][0]["speaker_id"], target)
+        self.assertEqual(record["lines"][0]["speaker_label"], "Matthias")
+        # A merge is destructive; the two ways to ask for a wrong one are
+        # refused with the status that says which mistake it was.
+        self.assertEqual(
+            self.client.post(
+                f"/api/translator/sessions/s1/speakers/{target}/merge",
+                json={"source_id": "ghost"},
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/translator/sessions/s1/speakers/{target}/merge",
+                json={"source_id": target},
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/translator/sessions/s1/speakers/{target}/merge",
+                json={},
+            ).status_code,
+            400,
+        )
+
+    def test_the_merge_socket_control_answers_with_the_new_roster(self):
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="s1")
+            ws.receive_text()
+            self._one_turn(ws)
+            session = self.service.sessions.get("s1")
+            source = session.transcript.lines()[0].speaker_id
+            target = session.add_speaker("Matthias")
+            ws.send_text(json.dumps({
+                "kind": "speaker.merge",
+                "target_id": target, "source_id": source,
+            }))
+            merged, _ = drain_until(
+                ws, lambda e: e.get("kind") == "speaker.merged", budget_s=5.0
+            )
+            self.assertIsNotNone(merged)
+            self.assertEqual(merged["target_id"], target)
+            self.assertEqual(merged["lines_reattributed"], 1)
+            # The roster the client repaints from must already be the new one.
+            roster = [s["speaker_id"] for s in merged["state"]["speakers"]]
+            self.assertIn(target, roster)
+            self.assertNotIn(source, roster)
+
 
 class TestClientAsset(unittest.TestCase):
     def test_the_pwa_is_served_and_is_self_contained(self):
@@ -693,6 +758,19 @@ class TestClientAsset(unittest.TestCase):
         # And the reader who IS scrolled up is told that something arrived,
         # instead of the app looking frozen to the one person reading it.
         self.assertIn('id="unread"', html)
+        # Roster management on the MAIN PAGE (user order 2026-08-03): a
+        # per-entry delete control, and a merge by dragging one entry onto
+        # another. Both were previously behind a long press into a sheet, or
+        # absent. `scripts/translator/probe_roster.py` is the executing arm;
+        # these are the structural pins.
+        self.assertIn("function confirmDeleteSpeaker", html)
+        self.assertIn("function confirmMergeSpeakers", html)
+        self.assertIn('kind: "speaker.merge"', html)
+        # The gesture is only offered when the CONNECTED server can carry it
+        # out -- the page deploys without a restart and its server half does
+        # not, and a drag that silently does nothing is worse than one that is
+        # not offered yet.
+        self.assertIn("serverSupports.speaker_merge", html)
         # Tap-to-toggle, not press-and-hold: on Android a long press is the
         # text-selection gesture and it cancelled the recording mid-word.
         self.assertIn("function toggleTalk", html)

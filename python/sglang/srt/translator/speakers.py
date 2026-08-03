@@ -461,6 +461,75 @@ class SpeakerRegistry:
             raise KeyError(f"unknown speaker {speaker_id!r}")
         return profile
 
+    def merge(self, target_id: str, source_id: str) -> SpeakerProfile:
+        """Fold ``source_id`` into ``target_id``: one voice, one profile.
+
+        This is the repair for the failure mode ``match_threshold`` is
+        deliberately biased towards. The bar sits at the same-speaker floor
+        (0.637) because a SPLIT degrades gracefully while a wrong MERGE
+        corrupts both voices -- so the same person occasionally arrives twice,
+        and until now nothing could put them back together. The user does the
+        discrimination the embedder could not, and this applies it.
+
+        What the union does, and why:
+
+        * the CENTROID is averaged with ``observations`` as the weight, not
+          simply overwritten. Both clusters are evidence of the same voice;
+          throwing the source's away would make the next segment match worse
+          than before the merge, which is the opposite of the point. The
+          result is renormalised by ``SpeakerEmbedding`` itself. This is the
+          one part of the union a "delete the second entry" implementation
+          cannot fake, and the arm that pins it is
+          ``test_the_centroid_inherits_the_source_cluster_not_just_its_slot``.
+        * the REFERENCE buffers are concatenated and then re-evicted through
+          the normal budget, so the merged speaker keeps the best material of
+          both instead of double the budget. Enrolled slices survive on their
+          own budget exactly as they do everywhere else.
+        * the LABEL, and with it the identity the listener sees, is the
+          TARGET's. The gesture is directional -- the user drags one entry
+          onto another -- and the one they dropped onto is the one they kept.
+          The target's label is only taken from the source when the target has
+          none at all, because a merge should not lose the only name in play.
+
+        ``enrolled`` becomes the OR of the two: the merged buffer really does
+        contain enrolled material if either side had it, and the flag governs
+        whether that material is protected from eviction.
+
+        The source id is removed and NOT recycled, so nothing new can land on
+        it. Transcript lines still pointing at it are the caller's problem and
+        not this module's -- :meth:`session.Session.merge_speakers` moves them
+        across, because the transcript is a session-level record.
+        """
+        if target_id == source_id:
+            raise ValueError(f"cannot merge speaker {target_id!r} into itself")
+        target = self.get(target_id)
+        source = self.get(source_id)
+
+        if source.centroid is not None:
+            if target.centroid is None:
+                # A speaker DECLARED with the "+" button and never heard has no
+                # centroid at all; the source's is then simply the truth.
+                target.centroid = source.centroid
+            else:
+                weight_t = max(target.observations, 1)
+                weight_s = max(source.observations, 1)
+                blended = (
+                    weight_t * target.centroid.vector
+                    + weight_s * source.centroid.vector
+                ) / float(weight_t + weight_s)
+                target.centroid = SpeakerEmbedding(blended)
+        target.observations += source.observations
+        target.references = target.references + source.references
+        self._evict(target, self._clock())
+        target.enrolled = target.enrolled or source.enrolled
+        target.last_seen = max(target.last_seen, source.last_seen)
+        if target.label is None:
+            target.label = source.label
+        if target.last_language is None:
+            target.last_language = source.last_language
+        self._profiles.pop(source_id, None)
+        return target
+
     def assign_manual(
         self,
         speaker_id: str,
