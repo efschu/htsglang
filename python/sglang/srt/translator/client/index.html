@@ -47,6 +47,8 @@
   footer { padding:12px 14px calc(12px + env(safe-area-inset-bottom));
            border-top:1px solid #24242e; display:flex; gap:10px;
            align-items:center; }
+  #diag { font:11px/1.5 ui-monospace,Menlo,Consolas,monospace; color:#7a7a8c;
+          padding:6px 10px; word-break:break-all; }
   #talk { flex:1; padding:20px; font-size:19px; border-radius:14px;
           background:#1c1c26; touch-action:none; user-select:none; }
   #talk.live { background:#2f5d7c; border-color:var(--accent); }
@@ -100,6 +102,9 @@
   <div class="note" id="routingnote"></div>
 </div>
 <div id="log"></div>
+<!-- The capture chain, on screen. The same values go to the server so a
+     log reader sees exactly what the person holding the phone sees. -->
+<div id="diag">build ? | capture not started</div>
 
 <footer>
   <div id="meter"><i></i></div>
@@ -119,6 +124,10 @@
 const BASE = location.pathname.replace(/[^/]*$/, "");
 const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://")
   + location.host + BASE + "api/translator/stream";
+// Substituted by the server when it serves this file. Without it there is no
+// way to tell a fixed client from a cached one, and every diagnosis is a
+// guess about which code the phone is actually executing.
+const CLIENT_BUILD = "__CLIENT_BUILD__";
 const PIPELINE_RATE = 16000;   // confirmed by the server on handshake
 const FRAME_MS = 20;
 
@@ -181,9 +190,25 @@ const playback = new Playback();
 // ---------------------------------------------------------------------------
 const WORKLET_SOURCE = `
 class Tap extends AudioWorkletProcessor {
+  constructor() { super(); this.calls = 0; this.empty = 0; }
   process(inputs) {
-    const ch = inputs[0][0];
-    if (ch) this.port.postMessage(new Float32Array(ch));
+    this.calls++;
+    const first = inputs[0] || [];
+    const ch = first[0];
+    if (ch) {
+      this.port.postMessage(new Float32Array(ch));
+    } else {
+      this.empty++;
+    }
+    // Liveness, not data. "process() is running but hands me nothing" and
+    // "process() is never called" look identical from the main thread, and
+    // they have completely different causes.
+    if (this.calls === 1 || this.calls === 20 || this.calls % 200 === 0) {
+      this.port.postMessage({
+        tap: true, calls: this.calls, empty: this.empty,
+        inputs: inputs.length, channels: first.length,
+      });
+    }
     return true;
   }
 }
@@ -191,14 +216,24 @@ registerProcessor("tap", Tap);
 `;
 
 class Microphone {
-  constructor(onFrame, onLevel) {
+  constructor(onFrame, onLevel, onNote) {
     this.onFrame = onFrame;
     this.onLevel = onLevel;
+    this.onNote = onNote || function () {};
     this.ctx = null;
     this.node = null;
     this.stream = null;
+    this.source = null;
+    this.script = null;
     this.carry = new Float32Array(0);
     this.open = false;
+    this.path = "worklet";
+    this.tapCalls = 0;
+    this.tapEmpty = 0;
+    this.tapChannels = 0;
+    this.chunks = 0;
+    this.frames = 0;
+    this.observedPeak = 0;
   }
 
   async start() {
@@ -229,23 +264,83 @@ class Microphone {
     const url = URL.createObjectURL(blob);
     await this.ctx.audioWorklet.addModule(url);
     URL.revokeObjectURL(url);
-    const source = this.ctx.createMediaStreamSource(this.stream);
+    this.source = this.ctx.createMediaStreamSource(this.stream);
     this.node = new AudioWorkletNode(this.ctx, "tap");
     this.node.port.onmessage = (event) => this.handle(event.data);
-    source.connect(this.node);
+    this.source.connect(this.node);
     // A zero-gain sink keeps the graph alive without echoing to the speaker.
-    const sink = this.ctx.createGain();
-    sink.gain.value = 0;
-    this.node.connect(sink).connect(this.ctx.destination);
+    this.sink = this.ctx.createGain();
+    this.sink.gain.value = 0;
+    this.node.connect(this.sink).connect(this.ctx.destination);
+    this.watchTrack();
+  }
+
+  /** Everything about the capture chain a log reader would need. */
+  diagnostics() {
+    const track = this.stream ? this.stream.getAudioTracks()[0] : null;
+    const settings = track && track.getSettings ? track.getSettings() : {};
+    return {
+      build: CLIENT_BUILD,
+      context_state: this.ctx ? this.ctx.state : "none",
+      context_rate: this.ctx ? this.ctx.sampleRate : 0,
+      track_rate: settings.sampleRate || 0,
+      track_channels: settings.channelCount || 0,
+      track_state: track ? track.readyState : "none",
+      track_muted: track ? track.muted : null,
+      track_enabled: track ? track.enabled : null,
+      track_label: track ? String(track.label).slice(0, 60) : "",
+      worklet_calls: this.tapCalls,
+      worklet_empty: this.tapEmpty,
+      worklet_channels: this.tapChannels,
+      chunks: this.chunks,
+      frames: this.frames || 0,
+      peak: Math.round(this.observedPeak * 1000) / 1000,
+      path: this.path,
+    };
+  }
+
+  watchTrack() {
+    const track = this.stream ? this.stream.getAudioTracks()[0] : null;
+    if (!track) return;
+    // Android hands the microphone to a phone call or another app by MUTING
+    // the track rather than ending it, and a muted track delivers no audio
+    // while every other indicator stays healthy.
+    track.onmute = () => this.onNote("microphone muted by the system", true);
+    track.onunmute = () => this.onNote("microphone unmuted", false);
+    track.onended = () => this.onNote("microphone track ended", true);
+  }
+
+  /** Deprecated, universally supported, and the point is that it works. */
+  startFallback() {
+    if (this.path !== "worklet" || !this.ctx || !this.source) return;
+    this.path = "scriptprocessor";
+    const size = 2048;
+    this.script = this.ctx.createScriptProcessor(size, 1, 1);
+    this.script.onaudioprocess = (event) => {
+      this.handle(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+    this.source.connect(this.script);
+    const mute = this.ctx.createGain();
+    mute.gain.value = 0;
+    this.script.connect(mute).connect(this.ctx.destination);
+    this.onNote("switched capture to the ScriptProcessor fallback", false);
   }
 
   handle(chunk) {
+    if (chunk && chunk.tap) {
+      this.tapCalls = chunk.calls;
+      this.tapEmpty = chunk.empty;
+      this.tapChannels = chunk.channels;
+      return;
+    }
+    this.chunks = (this.chunks || 0) + 1;
     let peak = 0;
     for (let i = 0; i < chunk.length; i++) {
       const v = Math.abs(chunk[i]);
       if (v > peak) peak = v;
     }
     this.onLevel(peak);
+    if (peak > (this.observedPeak || 0)) this.observedPeak = peak;
     if (!this.open) return;
 
     const ratio = this.ctx.sampleRate / PIPELINE_RATE;
@@ -472,7 +567,29 @@ const microphone = new Microphone(
   (frame) => connection.sendFrame(frame),
   (peak) => { el("meter").firstElementChild.style.width =
                 Math.min(100, peak * 260) + "%"; },
+  (text, bad) => sys(text, bad),
 );
+
+/** Show the capture chain on screen AND put it in the server log.
+ *
+ * Both, deliberately: the person holding the phone cannot read the server
+ * log, and the person reading the log cannot see the phone. A defect that
+ * lives between the microphone and the socket is invisible to each of them
+ * alone -- which is exactly how the first two phone tests were spent.
+ */
+function reportCapture(reason) {
+  const d = microphone.diagnostics();
+  d.reason = reason;
+  el("diag").textContent =
+    "build " + d.build + " | " + d.path + " | ctx " + d.context_state + " @" +
+    d.context_rate + " | track " + d.track_state +
+    (d.track_muted ? " MUTED" : "") + " @" + d.track_rate +
+    " | worklet " + d.worklet_calls + " (" + d.worklet_empty + " empty, ch " +
+    d.worklet_channels + ") | chunks " + d.chunks + " | frames " + d.frames +
+    " | peak " + d.peak;
+  connection.sendControl({ kind: "diag", capture: d });
+  return d;
+}
 
 const talk = el("talk");
 let holding = false;
@@ -501,13 +618,27 @@ async function beginTalking() {
   // recording nothing in a lit-up button. 700 ms is several worklet quanta at
   // any sample rate the browser picks.
   clearTimeout(silentCapture);
+  // Two stages. The first is early enough to still rescue the turn by
+  // switching capture paths; the second reports whatever the outcome was.
   silentCapture = setTimeout(() => {
-    if (holding && microphone.sent() === 0) {
-      sys("the microphone is open but no audio is arriving (capture context "
-          + (microphone.ctx ? microphone.ctx.state : "gone") + ")", true);
-      setStatus("no audio from the microphone", "err");
+    if (!holding) return;
+    const d = reportCapture("watchdog-400ms");
+    if (d.chunks === 0) {
+      // Nothing has reached the main thread at all. Whether the worklet is
+      // not running or is running empty, the ScriptProcessor path does not
+      // depend on either, so try it rather than losing the turn.
+      microphone.startFallback();
     }
-  }, 700);
+    silentCapture = setTimeout(() => {
+      if (holding && microphone.sent() === 0) {
+        const after = reportCapture("watchdog-1500ms");
+        sys("no audio is arriving from the microphone (path " + after.path +
+            ", worklet calls " + after.worklet_calls + ", chunks " +
+            after.chunks + ")", true);
+        setStatus("no audio from the microphone", "err");
+      }
+    }, 1100);
+  }, 400);
 }
 
 function endTalking() {
@@ -520,7 +651,10 @@ function endTalking() {
     // A release with no audio produces no segment and therefore no turn. The
     // server cannot distinguish it from a user who said nothing, so the
     // client is the only place this can be reported.
+    reportCapture("release-empty");
     sys("released without any audio -- nothing was sent for this turn", true);
+  } else {
+    reportCapture("release-ok");
   }
   connection.sendControl({ kind: "release" });
   talk.classList.remove("live");

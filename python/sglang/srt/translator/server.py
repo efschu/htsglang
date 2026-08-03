@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import json
 import logging
 import time
@@ -527,6 +528,17 @@ class _Connection:
                  "label": message.get("label"),
                  "lines_updated": len(changed)}
             )
+        elif kind == "diag":
+            # Client-side capture telemetry, logged where it can be read
+            # against the session it belongs to. This is the only channel by
+            # which a defect between the microphone and the socket becomes
+            # visible to anyone but the person holding the phone.
+            logger.info(
+                "session %s capture diagnostics: %s",
+                self._sid(),
+                json.dumps(message.get("capture") or {}, sort_keys=True),
+            )
+            await self._send({"kind": "diag.ack"})
         elif kind == "ping":
             await self._send({"kind": "pong", "at": time.time()})
         elif kind == "close":
@@ -820,7 +832,22 @@ def build_app(service: TranslatorService) -> FastAPI:
         page = CLIENT_DIR / "index.html"
         if not page.exists():
             raise HTTPException(status_code=404, detail="client not installed")
-        return HTMLResponse(page.read_text(encoding="utf-8"))
+        body = page.read_text(encoding="utf-8")
+        # Stamp the asset with its own content hash. A phone can serve a
+        # cached page for a long time, and without an identity in the page
+        # itself every diagnosis is a guess about which code is running --
+        # a fix that is deployed and a fix that is reaching the device look
+        # exactly the same from here.
+        build = hashlib.sha256(body.encode("utf-8")).hexdigest()[:10]
+        body = body.replace("__CLIENT_BUILD__", build)
+        return HTMLResponse(
+            body,
+            headers={
+                # The page carries its own identity, so it must not be served
+                # from a cache that predates it.
+                "Cache-Control": "no-cache, must-revalidate",
+            },
+        )
 
     @app.get("/manifest.webmanifest")
     async def manifest() -> JSONResponse:

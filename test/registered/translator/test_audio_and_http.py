@@ -9,6 +9,7 @@ socket is opened and no model is loaded; the backends are the fakes.
 """
 
 import json
+import re
 import math
 import unittest
 
@@ -584,6 +585,21 @@ class TestClientAsset(unittest.TestCase):
         self.assertIn("released without any audio", html,
                       "a release with no audio is indistinguishable from "
                       "silence at the server, so the client must report it")
+        # The build stamp must be substituted, not shipped as a placeholder:
+        # a page that cannot say which build it is makes every phone-side
+        # diagnosis a guess about which code is running.
+        self.assertNotIn("__CLIENT_BUILD__", html)
+        stamp = re.search(r'const CLIENT_BUILD = "([0-9a-f]{10})"', html)
+        self.assertIsNotNone(stamp, "the client must carry a build identity")
+        # Stable across requests, different when the asset differs.
+        again = client.get("/")
+        self.assertEqual(
+            re.search(r'const CLIENT_BUILD = "([0-9a-f]{10})"', again.text)
+            .group(1),
+            stamp.group(1),
+        )
+        self.assertIn("no-cache", again.headers.get("cache-control", ""))
+
         manifest = client.get("/manifest.webmanifest").json()
         self.assertEqual(manifest["display"], "standalone")
 
