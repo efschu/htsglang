@@ -226,6 +226,20 @@
   .line.uncertain[data-side="right"] { border-left-style:solid;
                                        border-right-style:dashed; }
 
+  /* --- the "you are not at the bottom" hint ---------------------------- */
+  /* A zero-height flow slot so the pill can hover over the last rows of the
+     transcript WITHOUT taking layout from it: the moment it appeared as a
+     normal block it would shorten the scroll box, which is the exact thing
+     `pinBottom()` exists to repair. Deliberately small -- it is a hint that
+     something arrived while the reader was reading further up, not an alert. */
+  #unreadwrap { position:relative; height:0; }
+  #unread { position:absolute; left:50%; bottom:8px; transform:translateX(-50%);
+            min-height:32px; padding:0 12px; font-size:12.5px; font-weight:600;
+            border-radius:16px; background:var(--accent); color:var(--accent-ink);
+            border:0; box-shadow:0 2px 10px rgba(0,0,0,.35); z-index:5;
+            white-space:nowrap; }
+  #unread[hidden] { display:none; }
+
   /* --- suggestion chips, toasts ---------------------------------------- */
   #chips, #toasts { display:flex; flex-direction:column; gap:6px; padding:0 10px; }
   #chips:not(:empty), #toasts:not(:empty) { padding-bottom:8px; }
@@ -392,6 +406,12 @@
      live turn and its durable line are THE SAME bubble, keyed by turn id, so
      nothing is said twice on screen. -->
 <main id="transcript"></main>
+
+<!-- Shown only while the reader is NOT being followed, i.e. they scrolled up
+     themselves. Without it, deliberately reading back means new speech lands
+     silently off-screen and the app looks frozen. A tap returns to the live
+     end and resumes following. -->
+<div id="unreadwrap"><button id="unread" hidden>new message &#8595;</button></div>
 
 <div id="chips"></div>
 <div id="toasts"></div>
@@ -1379,13 +1399,36 @@ function speakerLabel(speakerId) {
   return (known && known.label) || speakerId || "";
 }
 
-/** Follow new lines unless the reader has deliberately scrolled up. */
+/** Follow new lines unless the reader has deliberately scrolled up.
+ *
+ * `following` is STATE that remembers what the READER last did, and that is
+ * the whole fix for the defect the auto-scroll arm caught (newest line 95 px
+ * below the fold as soon as the transcript overflowed). The previous shape
+ * sampled `atBottom()` at APPEND time and scrolled once. But a bubble keeps
+ * GROWING after it is appended -- `turn.queued` writes a waiting notice,
+ * every `turn.translation` partial adds a clause, the final event replaces
+ * the accumulation, `turn.voice` un-hides a tag -- and none of those paths
+ * scrolls at all. The reading taken at append time is stale by the time the
+ * bubble reaches its final height.
+ *
+ * Re-measuring at growth time cannot replace the flag either: the growth is
+ * precisely what pushed the content past the fold, so a measurement taken
+ * after it always says "not at the bottom" and would latch the follow off on
+ * the first long turn. Only a flag written by the SCROLL event -- the one
+ * signal that is actually the reader's -- survives the growth.
+ */
+let following = true;
+const FOLLOW_SLACK_PX = 60;
 function atBottom() {
   const box = streamBox();
-  return box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  return box.scrollHeight - box.scrollTop - box.clientHeight < FOLLOW_SLACK_PX;
 }
-function follow(wasAtBottom) {
-  if (wasAtBottom) streamBox().scrollTop = streamBox().scrollHeight;
+function scrollToEnd() {
+  const box = streamBox();
+  box.scrollTop = box.scrollHeight;
+}
+function follow() {
+  if (following) scrollToEnd();
 }
 /** Re-pin after something OUTSIDE the stream changed its height.
  *
@@ -1395,9 +1438,58 @@ function follow(wasAtBottom) {
  * was hidden behind the suggestion chip that arrived after it.
  */
 function pinBottom() {
-  requestAnimationFrame(() => {
-    streamBox().scrollTop = streamBox().scrollHeight;
+  if (!following) return;
+  requestAnimationFrame(scrollToEnd);
+}
+
+/** The unread hint, which exists only while the reader is not being followed. */
+function paintUnread(hasNew) {
+  const pill = el("unread");
+  if (!pill) return;
+  if (following) { pill.hidden = true; return; }
+  if (hasNew) pill.hidden = false;
+}
+
+/** Follow the stream by WATCHING it, not by scrolling at the append sites.
+ *
+ * A MutationObserver over the subtree catches every way a bubble grows,
+ * including the ones added later by code that never heard of this function --
+ * which is how the original defect got in, one event handler at a time. The
+ * ResizeObserver covers the growth that leaves no mutation behind at all: a
+ * reflow from rotation, a font finishing load, the on-screen keyboard
+ * changing the viewport.
+ */
+let streamResize = null;
+function watchStream() {
+  const box = streamBox();
+  box.addEventListener("scroll", () => {
+    // The reader's own verdict, and the only writer of `following` that turns
+    // it back on. Our own scroll lands at the very bottom and therefore
+    // re-affirms `true`, so this cannot fight the observer below.
+    const now = atBottom();
+    if (now === following) return;
+    following = now;
+    paintUnread(false);
+  }, { passive: true });
+  const restick = () => {
+    if (following) scrollToEnd();
+    else paintUnread(true);
+  };
+  new MutationObserver(restick).observe(box, {
+    childList: true, subtree: true, characterData: true,
   });
+  if (window.ResizeObserver) {
+    // Observing the box measures the VIEWPORT, not the content, so each
+    // bubble is observed as it is created (see `bubbleFor`); the box entry
+    // covers the container shrinking under a banner or the keyboard.
+    streamResize = new ResizeObserver(() => { if (following) scrollToEnd(); });
+    streamResize.observe(box);
+  }
+  el("unread").onclick = () => {
+    following = true;
+    scrollToEnd();
+    paintUnread(false);
+  };
 }
 
 /** The bubble for a turn, created on whichever event mentions it first.
@@ -1409,7 +1501,6 @@ function pinBottom() {
 function bubbleFor(turnId) {
   let node = bubbles.get(turnId);
   if (node) return node;
-  const wasAtBottom = atBottom();
   node = document.createElement("article");
   node.className = "line turn";
   node.dataset.turn = turnId;
@@ -1427,7 +1518,11 @@ function bubbleFor(turnId) {
   });
   bubbles.set(turnId, node);
   streamBox().appendChild(node);
-  follow(wasAtBottom);
+  // Every LATER growth of this bubble is caught by the observers in
+  // `watchStream`; this call is only the immediate one, so the newest line is
+  // on screen within the same frame rather than one observer callback later.
+  follow();
+  if (streamResize) streamResize.observe(node);
   return node;
 }
 
@@ -1446,7 +1541,6 @@ function paintSpeaker(node, speakerId, label) {
 /** Render one durable transcript line (design 17.2/17.3/17.4). */
 function renderLine(line) {
   if (!line) return;
-  const wasAtBottom = atBottom();
   lineData.set(line.line_id, line);
 
   if (line.kind === "notice") {
@@ -1458,7 +1552,7 @@ function renderLine(line) {
       streamBox().appendChild(node);
     }
     node.textContent = line.text;
-    follow(wasAtBottom);
+    follow();
     return;
   }
 
@@ -1548,7 +1642,7 @@ function renderLine(line) {
   }
 
   renderTools(node, line);
-  follow(wasAtBottom);
+  follow();
 }
 
 /** Per-line controls: replay, fold the original away, undo a resolution. */
@@ -1606,17 +1700,31 @@ function replayTurn(turnId) {
 }
 
 function clearStream() {
+  // The nodes go with the innerHTML, and so must their resize observations --
+  // an observer holding detached elements keeps them alive for nothing.
+  if (streamResize) {
+    for (const node of bubbles.values()) streamResize.unobserve(node);
+  }
   streamBox().innerHTML = "";
   bubbles.clear();
   lineNodes.clear();
   lineData.clear();
+  // An empty stream is at its end by definition; leaving `following` off here
+  // would strand the reader off the live end of the NEXT conversation.
+  following = true;
+  paintUnread(false);
 }
 
 function applyTranscript(payload) {
   if (!payload.lines) return;
   if (payload.replace) clearStream();
   for (const line of payload.lines) renderLine(line);
-  streamBox().scrollTop = streamBox().scrollHeight;
+  // A restore lands the reader at the live end regardless of where they were
+  // before the reconnect: the scroll position they had belonged to a DOM that
+  // no longer exists.
+  following = true;
+  scrollToEnd();
+  paintUnread(false);
 }
 
 /** The transcript as text, for copy/share (design 19.6). */
@@ -3468,6 +3576,7 @@ setInterval(() => {
 }, 1000);
 
 initTheme();
+watchStream();
 setOutputMode("voice", false);
 paintActivity();
 el("gear").innerHTML = ICON.gear;

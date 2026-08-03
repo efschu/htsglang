@@ -193,6 +193,16 @@ VISIBLE_TEXT_JS = """
 #: Geometry, not scrollTop arithmetic: a line can be "scrolled to" and still
 #: sit behind a sticky control, and what the user means is that they can SEE
 #: the newest line.
+#:
+#: CORRECTED after the fix: the first version demanded the whole newest line
+#: fit inside the box, and it stayed red against a client provably pinned to
+#: the bottom (`overflow_below -4px, at bottom True`). One long turn makes a
+#: bubble TALLER than the box on a phone, and "fully inside" is then
+#: unsatisfiable at any scroll position -- the arm was asserting something no
+#: correct client can do. The bottom edge is the assertion; the top edge is
+#: only required when the line is short enough to have one on screen.
+#: `scripts/translator/probe_autoscroll.py` carries the same predicate and
+#: exercises it per mutation without a server.
 NEWEST_LINE_VISIBLE_JS = """
 () => {
   const box = document.getElementById('transcript');
@@ -200,10 +210,13 @@ NEWEST_LINE_VISIBLE_JS = """
   if (!box || !lines.length) return null;
   const last = lines[lines.length - 1].getBoundingClientRect();
   const view = box.getBoundingClientRect();
+  const taller = last.height > view.height;
   return {
     lines: lines.length,
-    // Fully inside, with a pixel of tolerance for sub-pixel layout.
-    visible: last.top >= view.top - 1 && last.bottom <= view.bottom + 1,
+    taller_than_view: taller,
+    // Inside, with a pixel of tolerance for sub-pixel layout.
+    visible: last.bottom <= view.bottom + 1
+             && (taller || last.top >= view.top - 1),
     overflow_below: Math.round(last.bottom - view.bottom),
     scrolled_to_bottom:
       box.scrollHeight - box.scrollTop - box.clientHeight < 60,
@@ -805,7 +818,9 @@ async def run_gate(args) -> tuple:
                 print(f"[gate]   scroll : {scroll['lines']} lines, newest "
                       f"visible {scroll['visible']}, overflow below "
                       f"{scroll['overflow_below']}px, at bottom "
-                      f"{scroll['scrolled_to_bottom']}")
+                      f"{scroll['scrolled_to_bottom']}"
+                      + (", taller than view"
+                         if scroll.get("taller_than_view") else ""))
                 if not scroll["visible"]:
                     failures.append(
                         f"turn {turn['turn']}: the newest transcript line is "

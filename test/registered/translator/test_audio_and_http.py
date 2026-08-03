@@ -673,12 +673,26 @@ class TestClientAsset(unittest.TestCase):
         self.assertIn('kind: "suggestion.confirm"', html)
         # Auto-scroll that yields to a reader who scrolled up.
         self.assertIn("function atBottom", html)
-        # The §19.3 rebuild renamed the transcript box and split the
-        # follow decision into a helper, but the BEHAVIOUR pinned here is
-        # unchanged and is the one that matters: auto-scroll happens only
-        # when the reader was already at the bottom, so it never yanks the
-        # page away from somebody reading back.
-        self.assertIn("if (wasAtBottom) streamBox().scrollTop", html)
+        # The BEHAVIOUR pinned here is unchanged and is the one that matters:
+        # auto-scroll happens only when the reader was already at the bottom,
+        # so it never yanks the page away from somebody reading back.
+        #
+        # Its MECHANISM changed and this pin changed with it. The old shape
+        # sampled `atBottom()` at append time and scrolled once
+        # (`if (wasAtBottom) streamBox().scrollTop = ...`), which is stale by
+        # the time the bubble finishes growing -- the queued notice, the
+        # clause partials and the final text all arrive after the append and
+        # none of them scrolled. Measured on the pre-fix client: the newest
+        # line ends up 5 px below the fold on the first growth and never
+        # recovers, because `atBottom()` then reads false for good.
+        # `scripts/translator/probe_autoscroll.py` is the executing arm; this
+        # is the structural pin that the mechanism is still the observer one.
+        self.assertIn("let following = true", html)
+        self.assertIn("new MutationObserver(restick)", html)
+        self.assertIn("if (following) scrollToEnd()", html)
+        # And the reader who IS scrolled up is told that something arrived,
+        # instead of the app looking frozen to the one person reading it.
+        self.assertIn('id="unread"', html)
         # Tap-to-toggle, not press-and-hold: on Android a long press is the
         # text-selection gesture and it cancelled the recording mid-word.
         self.assertIn("function toggleTalk", html)
