@@ -64,7 +64,50 @@ ENV_ENABLE = "SGLANG_BARLINK_BAR1_ABORT_CHECK"
 #: default: the word is 4 bytes, but reading it synchronizes the current
 #: stream, so an operator who measures a regression on an eager path has a
 #: knob instead of an all-or-nothing switch. Values <= 0 read as 1.
+#:
+#: REACH (#517). Until #517 this knob could not throttle the CUDA-graph
+#: replay boundary at all: at a boundary nothing was launched on the host
+#: path, so ``_unchecked_launches == 0`` and the gate at
+#: ``barlink_bar1.check_aborted`` was entered through ``_captured_launches``,
+#: below the interval test. It now counts boundary entries in their own
+#: counter and applies the same interval, so K > 1 throttles BOTH seams.
+#: K = 1 (the default) is unchanged in behaviour: every boundary still
+#: checks.
 ENV_EVERY = "SGLANG_BARLINK_BAR1_ABORT_CHECK_EVERY"
+
+#: Whether the status word is read ASYNCHRONOUSLY (#517). ``1`` (default)
+#: stages the word into pinned host memory with a non-blocking D2H on the
+#: current stream and reads the PREVIOUS staged value, so a check costs one
+#: copy dispatch and one ``cudaEventQuery`` instead of a stream
+#: synchronization. ``0`` restores the pre-#517 blocking ``.item()`` at every
+#: check exactly -- which is the bisect switch for the #476 measurement, and
+#: the strictest possible reporting latency (zero checks).
+#:
+#: The guard does not get weaker: ``ctlStatus`` is STICKY (written ``1u`` by a
+#: tripped kernel, never cleared -- ``barlink_bar1.py:2172`` is the only
+#: writer on the host side and it runs once at bring-up), so a value that
+#: arrives one check late is the same value. What changes is WHEN the raise
+#: happens, and that is bounded by ``ENV_MAX_LAG``.
+ENV_DEFER = "SGLANG_BARLINK_BAR1_ABORT_DEFER"
+
+#: How many consecutive checks a staged read may stay unresolved before ONE
+#: blocking wait is forced (#517). This is the bound that keeps the deferred
+#: read a guard rather than a hope: an overlap-scheduled host can run
+#: arbitrarily far ahead of the device, and without a bound the staged value
+#: could remain in flight for as long as the host keeps queueing work.
+#: Values <= 0 read as 1. ``1`` means "resolve at the very next check or
+#: block", which is still cheaper than the pre-#517 behaviour (block at EVERY
+#: check).
+#:
+#: Default 4: one NEXTN decode round on the measured recipe passes eight
+#: checks (three CUDA-graph replay boundaries plus five host-path speculative
+#: rank syncs -- see docs/dev/NOTE_517_bar1_guard_desk.md), so 4 bounds the
+#: report to well inside the round that produced the abort, while being loose
+#: enough that the copy resolves on its own in the steady state. It BINDS
+#: whenever the host is more than four checks ahead of the device; the
+#: falsifier for that is a never-ready event in
+#: ``test_barlink_bar1_abort_deferred_517.py``.
+ENV_MAX_LAG = "SGLANG_BARLINK_BAR1_ABORT_MAX_LAG"
 
 #: Whether the CUDA-graph replay boundary checks. Separate from ENV_ENABLE
 #: because it is the one check that can cost a synchronization the host would
@@ -105,6 +148,41 @@ def check_every() -> int:
     except ValueError:
         logger.warning("%s=%r is not an integer; using 1.", ENV_EVERY, raw)
         return 1
+
+
+def defer_enabled() -> bool:
+    """Whether the status read is staged asynchronously. Read per call."""
+    return _env_flag(ENV_DEFER, True)
+
+
+def max_lag() -> int:
+    """Checks a staged read may stay unresolved before one blocking wait."""
+    raw = os.environ.get(ENV_MAX_LAG)
+    if raw is None:
+        return 4
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using 4.", ENV_MAX_LAG, raw)
+        return 4
+
+
+def should_defer_status(status_is_cuda: bool, defer_on: bool) -> bool:
+    """Whether THIS transport stages its status read instead of blocking.
+
+    Module-level and importable on purpose -- the single definition of the
+    decision, the same pattern as ``parallel_state.should_build_pynccl``. A
+    test that re-implemented the condition would keep passing after the real
+    one was reverted.
+
+    ``status_is_cuda`` is the whole point of the feature: deferring exists to
+    avoid a device synchronization, and a status word that is NOT on a device
+    has no synchronization to avoid. Reading such a word directly is both
+    cheaper and STRICTER (zero reporting latency), so the CPU case must not
+    take the deferred path -- which is also why every pre-#517 hermetic test,
+    all of which carry a CPU ``_ctl_dev``, keeps its exact meaning.
+    """
+    return bool(status_is_cuda) and bool(defer_on)
 
 
 def register(transport: Any) -> None:
@@ -172,16 +250,21 @@ def check_after_graph_replay(where: str = "cuda-graph replay") -> None:
 
 
 __all__ = [
+    "ENV_DEFER",
     "ENV_ENABLE",
     "ENV_EVERY",
+    "ENV_MAX_LAG",
     "ENV_REPLAY",
     "abort_check_enabled",
     "check_aborts",
     "check_after_graph_replay",
     "check_every",
+    "defer_enabled",
+    "max_lag",
     "register",
     "registered",
     "replay_check_enabled",
     "reset_for_test",
+    "should_defer_status",
     "unregister",
 ]

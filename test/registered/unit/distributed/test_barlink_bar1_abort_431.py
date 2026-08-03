@@ -88,6 +88,19 @@ def _transport(*, cap=CAP, world=3, rank=0, group="dcp:0", aborted=0):
     t._unchecked_launches = 0
     t._captured_launches = False
     t._registered_in_gate = False
+    # #517 state. `_ctl_defer=False` is what a CPU status word gets in
+    # production too (`barlink_abort_gate.should_defer_status`), so every
+    # assertion in this file keeps its pre-#517 meaning: a blocking read,
+    # zero reporting latency. The deferred path has its own file,
+    # test_barlink_bar1_abort_deferred_517.py.
+    t._ctl_defer = False
+    t._ctl_src = None
+    t._ctl_stage = None
+    t._ctl_event = None
+    t._ctl_inflight = False
+    t._ctl_lag = 0
+    t._deferred_launches = 0
+    t._boundary_checks = 0
     t._up = True
     return t
 
