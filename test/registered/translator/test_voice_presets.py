@@ -22,10 +22,35 @@ from sglang.srt.translator.voices import VoiceClass, VoicePool
 
 
 class TestPoolShape(unittest.TestCase):
-    def test_the_descriptors_match_the_recommended_sizing(self):
+    def test_the_descriptors_are_the_MEASURED_pool_not_the_planned_one(self):
+        """18 was the plan; 14 is what survived measurement.
+
+        Four voices were retired on 2026-08-03 because they collided with
+        another preset of their own class above the speaker registry's 0.70
+        same-speaker line (see `voice_presets._RETIRED` for the numbers).
+        Two participants handed a colliding pair are indistinguishable to the
+        listener AND to the registry, and DESIGN_466 SS4.3 is explicit that
+        distinctness beats class match -- so the pool shape follows the
+        measurement, not the plan.
+
+        This test therefore pins the measured shape and deliberately does NOT
+        assert `RECOMMENDED_PER_CLASS`: that constant is the sizing rationale
+        for how many voices to DESIGN, and conflating it with how many
+        survived would make the suite demand a pool we measured to be broken.
+        """
         counts = Counter(d.voice_class.value for d in PRESET_DESCRIPTORS)
-        self.assertEqual(dict(counts), VoicePool.RECOMMENDED_PER_CLASS)
-        self.assertEqual(len(PRESET_DESCRIPTORS), 18)
+        self.assertEqual(dict(counts), {"man": 5, "woman": 4, "boy": 3, "girl": 2})
+        self.assertEqual(len(PRESET_DESCRIPTORS), 14)
+
+    def test_no_retired_voice_leaked_back_into_the_pool(self):
+        from sglang.srt.translator.voice_presets import _RETIRED
+
+        active = {d.voice_id for d in PRESET_DESCRIPTORS}
+        retired = {d.voice_id for d in _RETIRED}
+        self.assertEqual(active & retired, set())
+        # Retired descriptors are KEPT, not deleted: the decision is
+        # reversible and the pinned seeds must not be lost.
+        self.assertEqual(len(retired), 4)
 
     def test_every_adult_class_clears_the_thinness_floor(self):
         for voice_class in (VoiceClass.MAN, VoiceClass.WOMAN):

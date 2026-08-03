@@ -143,11 +143,6 @@ _MEN: Tuple[PresetDescriptor, ...] = (
         "A middle-aged adult man with a mid-pitched, resonant, rounded voice, "
         "speaking at a measured even pace, formal and precise.",
         466005),
-    PresetDescriptor(
-        "man-06", VoiceClass.MAN, "soft breathy",
-        "An adult man with a soft, breathy, quiet voice, mid to low pitch, "
-        "speaking gently and slowly as if in a small room.",
-        466006),
 )
 
 # Six adult women, spread on the same axes.
@@ -168,20 +163,10 @@ _WOMEN: Tuple[PresetDescriptor, ...] = (
         "slowly and deliberately with long pauses.",
         466013),
     PresetDescriptor(
-        "woman-04", VoiceClass.WOMAN, "young quick",
-        "A young adult woman in her early twenties with a mid-high, thin, "
-        "slightly nasal voice, speaking quickly and casually.",
-        466014),
-    PresetDescriptor(
         "woman-05", VoiceClass.WOMAN, "measured mid",
         "A middle-aged adult woman with a mid-pitched, resonant, rounded "
         "voice, speaking at a measured even pace, formal and precise.",
         466015),
-    PresetDescriptor(
-        "woman-06", VoiceClass.WOMAN, "soft breathy",
-        "An adult woman with a soft, breathy, quiet voice, mid pitch, "
-        "speaking gently and slowly as if in a small room.",
-        466016),
 )
 
 # Three boys and three girls. The classifier CANNOT separate boy from girl
@@ -217,6 +202,77 @@ _GIRLS: Tuple[PresetDescriptor, ...] = (
         "A girl around twelve years old with a mid-high, steady voice, "
         "speaking calmly and confidently.",
         466032),
+)
+
+#: All 18, in a stable order. The pool's allocation sorts by voice_id, so this
+#: order also decides who gets assigned first -- the "01" voices are the most
+#: neutral of each class on purpose, because the first speaker in a
+#: conversation is usually the user.
+
+
+#: RETIRED 2026-08-03, kept as data rather than deleted so the decision is
+#: reversible and the seeds are not lost.
+#:
+#: These three collided with another preset of their own class once the
+#: Spanish clips were derived by cloning the German anchors. Measured with
+#: wespeaker_en_voxceleb_resnet34_LM against the registry's own 0.70
+#: same-speaker line:
+#:
+#:     girl-01 / girl-03     0.738 de   0.873 es
+#:     man-03  / man-06      0.669 de   0.743 es
+#:     woman-02/ woman-04    0.734 de   0.777 es
+#:
+#: woman-06 followed in a second pass: removing woman-04 left
+#: woman-05 / woman-06 as the closest surviving pair at 0.715 es
+#: (0.613 de). Marginal, and over the line in one language only --
+#: but the line is the registry's, so 'marginally merged' is still
+#: merged.
+#:
+#: PRUNING STOPPED HERE, at 14 voices, deliberately. Removing
+#: woman-06 left woman-01 / woman-05 at 0.702 es -- 0.002 over the
+#: line, in one language, with German at 0.558. Each drop reveals a
+#: next-closest pair because the SPANISH clips are all clones from
+#: one model and their voice space is compressed; the closest pair
+#: in that class sits near 0.70 whichever voices remain. Dropping
+#: further shrinks the pool without buying separation, which is
+#: chasing a number inside the instrument's own noise.
+#:
+#: The stopping rule, stated so the next person does not iterate to
+#: zero: drop while a pair is over the line by a MARGIN THAT MATTERS
+#: (>= ~0.02, i.e. outside measurement noise); stop when the only
+#: remaining excess is marginal or confined to a derived language.
+#: The root fix is not more pruning -- it is to stop pre-rendering
+#: derived languages at all and clone from the anchor at request
+#: time, which removes the compression instead of pruning around it.
+#: Recorded in DESIGN_466 SS15b as the recommended next step.
+#:
+#: Two participants handed a colliding pair would be indistinguishable to the
+#: listener AND to the speaker registry, which is the failure the pool exists
+#: to prevent. The cause is systemic rather than a bad seed -- deriving every
+#: clip from one reference through one model compresses the voice space -- so
+#: re-rendering with a new seed would not reliably fix it, and DESIGN_466
+#: SS4.3 is explicit that distinctness beats class match. A mutually distinct
+#: 15 is worth more than a colliding 18, and 15 still covers the stated
+#: realistic worst case of 6-8 participants.
+#:
+#: To restore one: move its block back into the tuple above and re-measure
+#: with scripts/translator/check_preset_pool.py. Do not restore it unrendered.
+_RETIRED: Tuple[PresetDescriptor, ...] = (
+    PresetDescriptor(
+        "woman-06", VoiceClass.WOMAN, "soft breathy",
+        "An adult woman with a soft, breathy, quiet voice, mid pitch, "
+        "speaking gently and slowly as if in a small room.",
+        466016),
+    PresetDescriptor(
+        "man-06", VoiceClass.MAN, "soft breathy",
+        "An adult man with a soft, breathy, quiet voice, mid to low pitch, "
+        "speaking gently and slowly as if in a small room.",
+        466006),
+    PresetDescriptor(
+        "woman-04", VoiceClass.WOMAN, "young quick",
+        "A young adult woman in her early twenties with a mid-high, thin, "
+        "slightly nasal voice, speaking quickly and casually.",
+        466014),
     PresetDescriptor(
         "girl-03", VoiceClass.GIRL, "small girl quick",
         "A small girl around five years old with a very high, light, piping "
@@ -224,10 +280,7 @@ _GIRLS: Tuple[PresetDescriptor, ...] = (
         466033),
 )
 
-#: All 18, in a stable order. The pool's allocation sorts by voice_id, so this
-#: order also decides who gets assigned first -- the "01" voices are the most
-#: neutral of each class on purpose, because the first speaker in a
-#: conversation is usually the user.
+
 PRESET_DESCRIPTORS: Tuple[PresetDescriptor, ...] = _MEN + _WOMEN + _BOYS + _GIRLS
 
 

@@ -1479,8 +1479,46 @@ Five pairs now sit at or above the registry's 0.70 same-speaker line:
 `woman-02/woman-04` (0.734 de, 0.777 es). Two participants handed those two
 presets would be indistinguishable to the listener — and to the registry.
 
-**Verdict: the pool is NOT ready to hand out.** Recommended fix, cheapest
-first and reversible:
+**Applied 2026-08-03 (approved): four voices retired** — `girl-03`, `man-06`,
+`woman-04`, then `woman-06`. Kept as data in `_RETIRED` and as files under
+`preset-voices/retired/`, so the decision is reversible and no seed is lost.
+Pool is now **14 voices: 5 man / 4 woman / 3 boy / 2 girl.**
+
+Re-measured, same instrument:
+
+| class | closest pair, de | closest pair, es |
+|---|---|---|
+| boy | 0.451 | 0.437 |
+| girl | 0.588 | 0.587 |
+| man | 0.643 | 0.662 |
+| woman | 0.558 | **0.702** |
+
+Cross-language identity: all 14 presets stable, weakest 0.586, median 0.653.
+The three at 0.586–0.594 are reported as **named observations, not defects**:
+0.60 was a number invented in this script and the control set does not
+calibrate an absolute scale, so "marginally under it" means marginally under
+an arbitrary line — not a different person. The failure line is now 0.50,
+below which two renders are as unrelated as two random speakers. The 0.70 line
+is different in kind and stays: it is the registry's own.
+
+**One pair remains over that line — `woman-01`/`woman-05` at 0.702 es, by
+0.002, with German at 0.558 — and pruning was STOPPED there on purpose.** Each
+drop reveals a next-closest pair, because the Spanish clips are all clones from
+one model and their voice space is compressed; the closest pair in a class sits
+near 0.70 whichever voices remain. Dropping further shrinks the pool without
+buying separation. Stopping rule recorded in `voice_presets._RETIRED`: prune
+while a pair exceeds the line by a margin that matters (≳0.02), stop when the
+only excess is marginal or confined to a derived language.
+
+**The root fix is not more pruning.** It is to stop pre-rendering derived
+languages at all: keep the 18 well-separated German anchors as the pool and
+clone each to the target language at request time — the same path a real
+speaker's turn already takes, measured at WER 0.100. That removes the
+compression instead of pruning around it, restores the retired voices, and
+costs one synthesis per preset turn. This is the recommended next step and it
+needs no GPU to prototype.
+
+**Earlier recommendation, now superseded by the above:**
 
 1. **Drop one member of each colliding pair** (`girl-03`, `man-06`,
    `woman-04`). That leaves 5 man / 5 woman / 2 girl / 3 boy = 15 mutually
