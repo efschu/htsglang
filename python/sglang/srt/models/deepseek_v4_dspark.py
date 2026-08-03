@@ -27,6 +27,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     MqaAttentionBase,
     _dequant_fp8_wo_a,
+    _resolve_num_fused_shared_experts,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -578,6 +579,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        # #33312: the draft head must reach the SAME fusion decision as the
+        # target model. Without it the expert mapping below is built for
+        # n_routed_experts alone, and a checkpoint that ships a FUSED shared
+        # expert loses every one of those tensors to the loader's
+        # "unexpected weight -> continue" drop -- the #491 failure mode, with
+        # a different name family.
+        self.num_fused_shared_experts = _resolve_num_fused_shared_experts(
+            config, quant_config
+        )
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -806,13 +816,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=(self.config.n_routed_experts + self.num_fused_shared_experts),
         )
 
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_weight_name(name)
             if mapped is None:
                 continue
+            if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
+                # The fused layout parks the shared expert in the slot right
+                # after the routed ones, exactly as the target model's
+                # load_weights does.
+                mapped = mapped.replace(
+                    ".mlp.shared_experts.",
+                    f".mlp.experts.{self.config.n_routed_experts}.",
+                )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
