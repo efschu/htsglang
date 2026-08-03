@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Boot refusal and replay-boundary check for the capturable MoE offload fetch.
 
-TWO GATES LIVE HERE
--------------------
+THREE GATES LIVE HERE
+---------------------
 1. :func:`refuse_capturable_offload_decode` -- a BOOT refusal for the whole
    capturable decode path (``SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1``). #443's port
    was measured on a card and REFUTED: see the module constant
@@ -10,6 +10,20 @@ TWO GATES LIVE HERE
 2. :func:`check_after_graph_replay` -- the #394 cold-tier seam's breach counter,
    read at the replay boundary. Reachable only past gate 1's development
    override, and documented below.
+3. :func:`validate_breakable_boot` -- the BOOT preconditions of #462's
+   breakable route, the mode gate 1's refusal left as the only survivor.
+   Selected through :func:`resolve_offload_graph_mode`, which is now THE one
+   place the offload's graph mode is decided; the mechanism lives in
+   ``layers/moe/breakable_offload.py``.
+
+WHY THE MODE DECISION IS HERE AND NOT WITH THE MECHANISM
+--------------------------------------------------------
+Same invariant this module was split out for (see WHY A SEPARATE MODULE): the
+decision must be reachable without importing torch, the breakable-graph runner
+or the 3.8k-line offload machinery, so that a boot can refuse before any of it
+is constructed and so the refusals stay testable hermetically. The mode
+constants therefore live here and ``breakable_offload`` imports them, not the
+other way round.
 
 WHAT GATE 1 GUARDS
 ------------------
@@ -132,6 +146,17 @@ REFUTATION = {
     ),
 }
 
+#: #462 mode selector. ``""``/``eager`` keep the shipped eager offload path;
+#: ``breakable`` selects the fetch-outside-the-graph route. ``capturable`` names
+#: the refuted path in the same vocabulary -- selecting it is equivalent to
+#: ``SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1`` and hits the same #452 refusal.
+ENV_GRAPH_MODE = "SGLANG_MOE_OFFLOAD_GRAPH_MODE"
+
+MODE_EAGER = "eager"
+MODE_CAPTURABLE = "capturable"
+MODE_BREAKABLE = "breakable"
+MODES = (MODE_EAGER, MODE_CAPTURABLE, MODE_BREAKABLE)
+
 _FALSE = ("0", "false", "no", "off", "")
 
 _lock = threading.Lock()
@@ -140,6 +165,24 @@ _caches: List[Any] = []
 
 class CapturableOffloadRefuted(RuntimeError):
     """The capturable MoE offload decode path was refuted at boot (#452)."""
+
+
+class BreakableModeRefused(RuntimeError):
+    """The breakable offload route was asked for in a shape that cannot work.
+
+    Named, rather than a bare ``RuntimeError``, for the reason the sibling
+    refusals give: an operator who catches this wants to know WHICH
+    precondition failed, and a test that pins the refusal must not be satisfied
+    by an unrelated error raised from the same constructor.
+    """
+
+    def __init__(self, reason: str, remedy: str) -> None:
+        self.reason = reason
+        self.remedy = remedy
+        super().__init__(
+            f"MoE expert offload: the breakable graph route "
+            f"({ENV_GRAPH_MODE}={MODE_BREAKABLE}) refuses -- {reason}. {remedy}"
+        )
 
 
 def graph_override_enabled() -> bool:
@@ -189,24 +232,193 @@ def refuse_capturable_offload_decode(layer_id: Any = None) -> None:
     )
 
 
+def env_graph_mode() -> str:
+    """The requested offload graph mode. Read per call, like every flag here."""
+    raw = (os.environ.get(ENV_GRAPH_MODE) or "").strip().lower()
+    if not raw:
+        return MODE_EAGER
+    if raw not in MODES:
+        raise BreakableModeRefused(
+            reason=f"{ENV_GRAPH_MODE}={raw!r} is not a known mode",
+            remedy=f"Pick one of {', '.join(MODES)}.",
+        )
+    return raw
+
+
+def resolve_offload_graph_mode(
+    offload_fraction: float, opt_in: bool, layer_id: Any = None
+) -> str:
+    """THE selection point for the MoE offload's graph mode.
+
+    Returns one of :data:`MODES`:
+
+    * ``eager`` -- the shipped ``run_waves`` path, byte-untouched. Every launch
+      that does not offload, and every launch that asks for nothing, lands here.
+    * ``capturable`` -- the in-graph fetch. REFUTED (#452); reaching this return
+      at all requires the development override, because
+      :func:`refuse_capturable_offload_decode` raises first otherwise.
+    * ``breakable`` -- #462: eager fetch into fixed slots before replay, compute
+      captured. Its own preconditions are checked by
+      :func:`validate_breakable_boot`, which the caller invokes next.
+
+    Two ways to ask for the refuted path (the legacy
+    ``SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1`` and the new
+    ``SGLANG_MOE_OFFLOAD_GRAPH_MODE=capturable``) resolve to the same outcome
+    and the same refusal, so the refusal cannot be walked around by spelling it
+    the new way.
+    """
+    offloading = float(offload_fraction) < 1.0
+    mode = env_graph_mode()
+
+    if mode == MODE_BREAKABLE:
+        if not offloading:
+            # Nothing to offload -> nothing for a slot arena to hold. Let
+            # validate_breakable_boot say so with its own reason rather than
+            # silently downgrading to eager.
+            return MODE_BREAKABLE
+        return MODE_BREAKABLE
+
+    if mode == MODE_CAPTURABLE or bool(opt_in):
+        if not offloading:
+            return MODE_EAGER
+        refuse_capturable_offload_decode(layer_id)
+        return MODE_CAPTURABLE
+
+    return MODE_EAGER
+
+
 def resolve_graph_mode(
     offload_fraction: float, opt_in: bool, layer_id: Any = None
 ) -> bool:
-    """THE selection point for the capturable MoE offload decode mode.
+    """Is the CAPTURABLE decode mode selected? (compatibility shim.)
 
-    ``FusedMoE.__init__`` calls exactly this and stores the result in
-    ``_moe_offload_graph_mode``; keeping the decision here rather than inline
-    is what lets the refusal be exercised without standing up a whole layer.
+    ``FusedMoE.__init__`` stores this in ``_moe_offload_graph_mode``. Kept as a
+    boolean over :func:`resolve_offload_graph_mode` so the one decision lives in
+    one place while the capturable path's existing call sites and its #452
+    regate tests keep their exact contract.
 
     Returns False -- the eager ``run_waves`` path, byte-untouched -- for every
-    launch that does not both offload (``fraction < 1.0``) and set the opt-in.
-    For the launch that sets both, refuses by name (#452) unless the
+    launch that does not both offload (``fraction < 1.0``) and select the
+    capturable mode. For the launch that does, refuses by name (#452) unless the
     development override is set, in which case it returns True.
     """
-    if not (float(offload_fraction) < 1.0 and bool(opt_in)):
-        return False
-    refuse_capturable_offload_decode(layer_id)
-    return True
+    return (
+        resolve_offload_graph_mode(offload_fraction, opt_in, layer_id)
+        == MODE_CAPTURABLE
+    )
+
+
+def validate_breakable_boot(offload_fraction: float, layer_id: Any = None) -> None:
+    """Gate 3: refuse, at boot, every shape of the breakable route that cannot
+    work.
+
+    Called from ``FusedMoE.__init__`` right after the mode is selected, so a
+    launch that asks for something impossible dies before a weight is staged
+    rather than at first capture -- the fail-fast rule the rest of the offload
+    surface already follows.
+
+    Three preconditions, each with its own reason:
+
+    1. there is something to offload (``fraction < 1.0``);
+    2. the decode phase is actually captured by the BREAKABLE backend, because
+       ``eager_on_graph`` is a PASS-THROUGH under any other backend -- there is
+       no segment to split -- so the route's host reads would land inside a real
+       stream capture, where a D2H sync is illegal rather than merely slow;
+    3. the refuted capturable opt-in is not also set, so a launch cannot ask for
+       two mutually exclusive graph modes and silently get one of them.
+    """
+    if not float(offload_fraction) < 1.0:
+        raise BreakableModeRefused(
+            reason=(
+                f"the MoE expert offload is not active on layer {layer_id} "
+                f"(resident fraction {float(offload_fraction):.3f} >= 1.0), so "
+                f"there are no slots for a graph to address"
+            ),
+            remedy=(
+                "Set --rank-moe-resident-fraction below 1.0, or unset "
+                f"{ENV_GRAPH_MODE}."
+            ),
+        )
+
+    if _env_flag("SGLANG_MOE_OFFLOAD_CUDA_GRAPH", False):
+        raise BreakableModeRefused(
+            reason=(
+                "SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1 (the capturable IN-GRAPH "
+                "fetch) is set at the same time. The two are mutually "
+                "exclusive: one keeps the fetch eager and captures only the "
+                "compute, the other captures the fetch itself and was REFUTED "
+                f"on hardware -- B2 {REFUTATION['b2']}; B4 {REFUTATION['b4']}"
+            ),
+            remedy=(
+                "Unset SGLANG_MOE_OFFLOAD_CUDA_GRAPH. The breakable route "
+                "neither needs it nor is compatible with it."
+            ),
+        )
+
+    backend = resolved_backend("decode")
+    if backend is None:
+        # Server args not wired (unit / test context): nothing to validate
+        # against. The runtime scratch guard still applies.
+        return
+    if backend != "breakable":
+        raise BreakableModeRefused(
+            reason=(
+                f"the resolved decode CUDA-graph backend is {backend!r}, not "
+                f"'breakable'. The route splits the decode graph at the MoE "
+                f"fetch through eager_on_graph, which is a NO-OP under any "
+                f"other backend, so the fetch's host reads would execute inside "
+                f"a real stream capture where they are illegal"
+            ),
+            remedy=(
+                "Launch with --cuda-graph-backend-decode=breakable, or unset "
+                f"{ENV_GRAPH_MODE} to keep the shipped eager offload path."
+            ),
+        )
+
+    prefill = resolved_backend("prefill")
+    if prefill is not None and prefill != "disabled":
+        raise BreakableModeRefused(
+            reason=(
+                f"the resolved prefill CUDA-graph backend is {prefill!r}, not "
+                f"'disabled'. A prefill chunk routes far more DISTINCT experts "
+                f"than the slot arena has scratch slots, and the eager path "
+                f"handles that by wave-splitting the forward -- which a "
+                f"captured segment cannot do, because its work is fixed at "
+                f"capture time. Prefill therefore has to stay eager; this is "
+                f"the same decode-graph + eager-prefill hybrid the capturable "
+                f"path uses, and it is a hard shape limit, not a default"
+            ),
+            remedy=(
+                "Launch with --cuda-graph-backend-prefill=disabled. With "
+                "prefill eager, prefill forwards fall through to run_waves and "
+                "keep their wave splitting; only decode is captured."
+            ),
+        )
+
+
+def resolved_backend(phase: str) -> Any:
+    """The POST-cascade backend for ``phase``, or None when args are absent.
+
+    Read off ``cuda_graph_config`` rather than off the legacy
+    ``disable_cuda_graph`` boolean, because several rules rewrite a phase's
+    backend after parsing (``_disable_breakable_cudagraph_if_incompatible`` is
+    one of them) and the boolean does not see those. The boolean is still
+    honoured where it IS authoritative: it forces both phases off.
+    """
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        args = get_server_args()
+    except Exception:
+        return None
+    config = getattr(args, "cuda_graph_config", None)
+    phase_config = getattr(config, phase, None)
+    backend = getattr(phase_config, "backend", None)
+    if backend is None:
+        return None
+    if getattr(args, "disable_cuda_graph", False):
+        return "disabled"
+    return backend
 
 
 class OffloadCaptureBreach(RuntimeError):
@@ -293,17 +505,27 @@ def check_after_graph_replay(where: str = "cuda-graph replay") -> None:
 
 __all__ = [
     "ENV_ENABLE",
+    "ENV_GRAPH_MODE",
     "ENV_GRAPH_REFUTED_OVERRIDE",
+    "MODES",
+    "MODE_BREAKABLE",
+    "MODE_CAPTURABLE",
+    "MODE_EAGER",
     "REFUTATION",
+    "BreakableModeRefused",
     "CapturableOffloadRefuted",
     "OffloadCaptureBreach",
     "check_after_graph_replay",
+    "env_graph_mode",
     "gate_enabled",
     "graph_override_enabled",
     "refuse_capturable_offload_decode",
     "register",
     "resolve_graph_mode",
+    "resolve_offload_graph_mode",
+    "resolved_backend",
     "registered",
     "reset_for_test",
     "unregister",
+    "validate_breakable_boot",
 ]

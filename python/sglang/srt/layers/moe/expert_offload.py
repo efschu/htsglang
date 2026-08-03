@@ -393,6 +393,32 @@ def combine_topk_partials(partials, out, routed_scaling_factor):  # pragma: no c
     return out
 
 
+def remap_ids_host(ids_list, slot_of_needed) -> List[int]:
+    """Host-side twin of ``MoEExpertOffloadCache._remap``, flattened.
+
+    ``_remap`` is ``torch.where(ids >= 0, lut[ids.clamp(min=0)], ids)`` over the
+    LUT ``_build_lut`` fills with ``slot_of_needed`` and ``-1`` everywhere else.
+    The same answer, element for element:
+
+    * ``e < 0``  -> ``e`` (the unrouted / pad marker survives untouched, which is
+      what makes a graph-PADDED batch legal here -- #444's pad-slot family);
+    * ``e >= 0`` -> ``slot_of_needed[e]``, or ``-1`` when the id is absent from
+      the resolved set, which is exactly the value ``_build_lut`` left in that
+      LUT row.
+
+    This exists because the #462 breakable route already paid for the ids on the
+    host (the one D2H rendezvous per layer per step) and can therefore publish a
+    finished slot vector with ONE pinned H2D, instead of shipping a LUT to the
+    device and gathering there. ``_build_lut``'s two pageable H2D copies per
+    layer -- host-blocking, because ``non_blocking`` is only honoured for pinned
+    memory -- disappear with it. Pure Python over ints, so the equivalence is a
+    hermetic test rather than a GPU-window claim
+    (``tests/moe_offload/test_breakable_route_462.py``).
+    """
+    get = slot_of_needed.get
+    return [(e if e < 0 else get(e, -1)) for row in ids_list for e in row]
+
+
 @dataclass
 class ExpertResidencyPlanner:
     """Pure-python FIXED-RESIDENT + SCRATCH residency for one MoE layer.
@@ -458,6 +484,30 @@ class ExpertResidencyPlanner:
     def fully_resident(self) -> bool:
         return self.resident_count >= self.num_local_experts
 
+    def split_needed(
+        self, needed_unique: Sequence[int]
+    ) -> Tuple[List[int], List[int]]:
+        """Split an already-uniqued, sorted needed set into (resident, spill).
+
+        Extracted from :meth:`resolve` so a caller can ask "would this forward
+        overflow the scratch region?" WITHOUT taking the stats side effects
+        resolve() applies (#462's breakable route pre-checks the fixed-shape
+        invariant and must be able to refuse by name before a forward counter
+        moves). Both lists preserve the input order, so the spill list is
+        sorted exactly as resolve() requires for its slot assignment.
+        """
+        if self.resident_ids is None:
+            # Static residency: resident == [0, R) at slot==id.
+            return (
+                [e for e in needed_unique if e < self.resident_count],
+                [e for e in needed_unique if e >= self.resident_count],
+            )
+        # Hot residency: resident == frozen id set at its assigned slot.
+        return (
+            [e for e in needed_unique if e in self.resident_ids],
+            [e for e in needed_unique if e not in self.resident_ids],
+        )
+
     def resolve(
         self, needed: Sequence[int]
     ) -> Tuple[Dict[int, int], List[Tuple[int, int]]]:
@@ -477,15 +527,10 @@ class ExpertResidencyPlanner:
             self.stats.hits += len(needed_unique)
             return {e: e for e in needed_unique}, []
 
+        resident, spill = self.split_needed(needed_unique)
         if self.resident_ids is None:
-            # Static residency: resident == [0, R) at slot==id.
-            resident = [e for e in needed_unique if e < self.resident_count]
-            spill = [e for e in needed_unique if e >= self.resident_count]  # sorted
             resident_slot_of = {e: e for e in resident}
         else:
-            # Hot residency: resident == frozen id set at its assigned slot.
-            resident = [e for e in needed_unique if e in self.resident_ids]
-            spill = [e for e in needed_unique if e not in self.resident_ids]  # sorted
             resident_slot_of = {e: self.resident_slot[e] for e in resident}
         if self.delegated_ids is not None:
             foreign = [e for e in spill if e in self.delegated_ids]
@@ -3022,27 +3067,99 @@ class MoEExpertOffloadCache:
             path,
         )
 
-    def run_waves(self, dispatch_output, apply_fn):
-        """Run the grouped-GEMM for one forward, wave-splitting when the forward
-        needs more unique experts than there are resident slots.
+    def prepare_breakable(self, topk_ids, bridge, stage=None):
+        """#462 breakable route: the EAGER pre-replay phase, in one call.
 
-        ``apply_fn(sub_dispatch_output) -> CombineInput`` runs the unmodified
-        MoE math (``quant_method.apply``) over the resident buffer. We call it
-        once per wave over that wave's token rows and scatter the results back.
+        Runs inside an ``eager_on_graph`` break -- the captured segment before
+        it has ended, the one after it has not begun -- so every host read here
+        is legal, and it re-runs on every replay through the break function the
+        decorator registers. What it must leave behind when it returns is the
+        whole contract the captured compute depends on:
 
-        Returns a CombineInput whose hidden_states is the full [T, H] output,
-        byte-identical to the no-offload path (see module docstring).
+        1. the routed experts' bytes materialised in the FIXED slot arena
+           (``self._resident[attr]``, whose device addresses ``install()`` bound
+           into the layer's parameters and which therefore never move), and
+        2. ``bridge`` -- a static device buffer at a fixed address -- holding
+           this step's expert -> slot vector, which is the only thing the
+           captured kernels read to find out WHICH expert occupies which slot.
+
+        That is the whole of #302b: the graph addresses slots, and the mapping
+        from slot to expert is republished eagerly before every replay.
+
+        SYNC POINTS -- one host/device rendezvous, one pinned H2D, per layer per
+        step. The rendezvous is ``topk_ids.tolist()`` and it is IRREDUCIBLE on
+        this route: which rows to fetch is host knowledge by construction, and
+        MoE routing is sequential across layers (layer L+1's router consumes
+        layer L's output), so the 43 rendezvous a DeepSeek-V4-Flash step pays
+        cannot be batched into fewer. What this route does remove is the eager
+        path's ``_build_lut`` pair of PAGEABLE H2D copies per layer, which block
+        the host because ``non_blocking`` is honoured only for pinned memory:
+        3 host-blocking crossings per layer become 1 rendezvous + 1 pinned copy.
+        See ``docs/dev/DESIGN_462_breakable_route.md`` §4.
+
+        ``stage`` is the pinned host mirror of ``bridge``, owned by the same
+        arena entry so no two bridges can ever share one; ``None`` selects the
+        CPU desk path, where ``bridge`` is host memory and is filled directly.
         """
-        import torch
+        import numpy as np
 
-        topk_output = dispatch_output.topk_output
-        topk_ids = topk_output.topk_ids
+        ids_list = topk_ids.tolist()  # SYNC POINT 1/1: the D2H rendezvous.
+        self._observe_routing(ids_list)
 
-        if self.planner.fully_resident:
-            return apply_fn(dispatch_output)
+        needed = sorted({e for row in ids_list for e in row if e >= 0})
+        # Fixed-shape invariant, checked BEFORE resolve() so a refusal does not
+        # move a forward counter and the message can name the real numbers. A
+        # captured segment cannot wave-split: its work is fixed at capture time,
+        # so an overflow here is a wrong answer, not a slow one.
+        spill = self.planner.split_needed(needed)[1]
+        if len(spill) > self.scratch:
+            from sglang.srt.layers.moe.breakable_offload import (
+                BreakableScratchOverflow,
+            )
 
-        ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+            raise BreakableScratchOverflow(
+                layer_id=getattr(self.layer, "layer_id", None),
+                spill=len(spill),
+                scratch=self.scratch,
+                routed_slots=int(topk_ids.numel()),
+                cold=self.num_local_experts - self.resident_count,
+            )
 
+        slot_of_needed, fetch_plan = self.planner.resolve(needed)
+
+        # Publish the slot vector BEFORE issuing the fetch. The copy below is
+        # deliberately BLOCKING: a non_blocking copy out of a reused pinned
+        # staging buffer is only safe if the DMA lands before the next write to
+        # that buffer, and an ordering rule that lives in a comment is the
+        # shared-buffer family this fork keeps rediscovering (htccl
+        # _get_out_buf, GraphSharedOutput, _DEQUANT_WS). Blocking makes it safe
+        # by construction. It is issued here, ahead of _fetch, so it waits only
+        # on an already-drained stream (the tolist() above drained it) rather
+        # than on this step's expert DMAs; the payload is tokens x top_k ints.
+        flat = remap_ids_host(ids_list, slot_of_needed)
+        if stage is None:
+            np.asarray(bridge.reshape(-1))[:] = flat
+        else:
+            np.asarray(stage)[:] = flat
+            bridge.reshape(-1).copy_(stage, non_blocking=False)
+
+        self._fetch(fetch_plan)
+        return bridge
+
+    def _observe_routing(self, ids_list):
+        """Fold one forward's host-side routing decision into the instruments
+        and the residency policies, BEFORE this forward resolves and fetches.
+
+        Extracted from ``run_waves`` so the #462 breakable route (which plans
+        and fetches in an eager graph break and then hands a captured segment a
+        static slot buffer) runs the SAME preamble instead of a second copy of
+        it. Nothing here is new: the call order -- router stats, then Stage-1
+        hot freeze, then #302a heat migration -- is preserved exactly, and each
+        step keeps the reason it sits where it does.
+
+        Requires ``ids_list`` already on the host; every step below reads Python
+        ints, so no step adds a device sync of its own.
+        """
         # #390: fold this forward's routing decision into the per-layer expert
         # histogram and the hit/miss tally against the resident set. This is the
         # fetch-decision point -- residency is already known here and the ids
@@ -3079,6 +3196,29 @@ class MoEExpertOffloadCache:
             )
             if self._heat.due():
                 self._migrate_heat()
+
+    def run_waves(self, dispatch_output, apply_fn):
+        """Run the grouped-GEMM for one forward, wave-splitting when the forward
+        needs more unique experts than there are resident slots.
+
+        ``apply_fn(sub_dispatch_output) -> CombineInput`` runs the unmodified
+        MoE math (``quant_method.apply``) over the resident buffer. We call it
+        once per wave over that wave's token rows and scatter the results back.
+
+        Returns a CombineInput whose hidden_states is the full [T, H] output,
+        byte-identical to the no-offload path (see module docstring).
+        """
+        import torch
+
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+
+        if self.planner.fully_resident:
+            return apply_fn(dispatch_output)
+
+        ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+
+        self._observe_routing(ids_list)
 
         if self._wave_order == "expert":
             # #254: split over SPILL EXPERTS instead of tokens. The single-wave

@@ -661,6 +661,10 @@ class _StubMoELayer:
         self._expert_offload_fraction = 0.5
         self._expert_offload_install_failed = False
         self._moe_offload_graph_mode = graph_mode
+        # #462 added a third mode to the same selection point; the
+        # real FusedMoE.__init__ always sets this, so the stub must too.
+        self._moe_offload_breakable = False
+        self._moe_offload_arena = None
         self._moe_offload_trace_path = trace_path
         self._moe_offload_trace_step = 0
         self.moe_tp_rank = 0
