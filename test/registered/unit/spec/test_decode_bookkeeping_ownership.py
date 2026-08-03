@@ -46,6 +46,7 @@ _RESOLVE = (
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
 )
 _SS = "session/streaming_session.py"
+_LANE = "model_executor/dual_group_lane.py"
 _OWNER_SITES = {
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
@@ -90,6 +91,63 @@ _OWNER_SITES = {
     (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
     # Inherit the authoritative finished length (not the lagging req clock).
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
+    # -- dual-group lane (#274): a SEPARATE mini-runtime, not the scheduler --
+    #
+    # The lane builds its own ModelRunner and calls `alloc_memory_pool()` on
+    # it, so its `req_to_token_pool` / `token_to_kv_pool_allocator` are
+    # disjoint from the serving group's. Its requests are lane-private
+    # (`_make_batch` constructs `Req(rid="dual-group-lane-<n>")`; they never
+    # enter the scheduler's running_batch), the batch carries
+    # `_LaneTreeCacheStub` (`supports_swa()` False, `evict()` a no-op) and is
+    # built with `enable_overlap=False`. The hazard this register guards --
+    # a clock running fast fires SWA eviction inside the overlap race window
+    # and releases the SWA prefix lock early -- is therefore structurally
+    # absent here, and there is no second worker on these pools (#444/#450):
+    # the lane tick is rank-local and serial by contract.
+    # The lane drives its own decode/verify forwards instead of going through
+    # `prepare_for_decode`, which is why it must settle these fields itself.
+    #
+    # The verify commits `kept` positions the verify forward consumed.
+    (_LANE, "DualGroupLane._verify_by_target_verify", "decode_batch_idx"): 1,
+    (_LANE, "DualGroupLane._verify_by_target_verify", "kv_committed_len"): 1,
+    (_LANE, "DualGroupLane._verify_by_target_verify", "kv_allocated_len"): 1,
+    # Rollback of the head's over-drafted tail: the clock moves BACKWARDS
+    # (`max(0, idx - surplus)`) after the surplus slots are handed back, so it
+    # cannot run fast. `batch_d.reqs[0]` is the draft head's own lane request.
+    (_LANE, "DualGroupLane._truncate_draft", "decode_batch_idx"): 1,
+    (_LANE, "DualGroupLane._truncate_draft", "kv_committed_len"): 1,
+    (_LANE, "DualGroupLane._truncate_draft", "kv_allocated_len"): 1,
+    # Debug probes, env-gated off by default (SGLANG_LANE_SPEC_ROW_ORACLE /
+    # `_dbg_on`): both restore the counters to a value they already held.
+    (_LANE, "DualGroupLane._dbg_rollback_one", "kv_committed_len"): 1,
+    (_LANE, "DualGroupLane._dbg_rollback_one", "kv_allocated_len"): 1,
+    (_LANE, "DualGroupLane._dbg_row_oracle._restore", "decode_batch_idx"): 1,
+    (_LANE, "DualGroupLane._dbg_row_oracle._restore", "kv_committed_len"): 1,
+    (_LANE, "DualGroupLane._dbg_row_oracle._restore", "kv_allocated_len"): 1,
+    # -- kv-session offload: reclaim of the speculative overhang before a spill
+    #
+    # This one IS a scheduler-owned request. It only LOWERS the watermark, and
+    # only after `token_to_kv_pool_allocator.free()` actually returned the
+    # slots in `[snap.free_from, kv_allocated_len)` -- the same range stock
+    # retraction reclaims via `pop_overallocated_kv_cache`. It is ordered after
+    # the in-flight forward (`_wait_forward_stream()` runs before the snapshot
+    # is taken), and `kv_committed_len` is left to the resolve path, which
+    # remains its sole owner. A lowered allocated watermark cannot fire the
+    # early-eviction hazard this register guards.
+    # NOTE, and it is NOT what this register tracks: the same block also sets
+    # `kv_overallocated_freed = True` (kv_session_offload.py:3360) BEFORE three
+    # later decline points (:3394 empty spill plan, :3411 budget regler, :3434
+    # tail exceeds the host region), each of which returns False and leaves the
+    # request running. Only the resume path clears the flag again (:5075), so a
+    # reclaim-then-decline leaves it set on a live request and the eventual
+    # `pop_overallocated_kv_cache()` (schedule_batch.py:1141) asserts. Open
+    # defect, filed separately -- it does not bear on the ownership verdict
+    # above, which is about the watermark write.
+    (
+        "managers/kv_session_offload.py",
+        "KVSessionOffloadManager.try_spill",
+        "kv_allocated_len",
+    ): 1,
 }
 
 

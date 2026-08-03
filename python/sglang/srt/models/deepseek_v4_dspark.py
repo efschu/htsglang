@@ -55,6 +55,16 @@ logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
+# Parameters the draft does NOT load: they are attached from the target model
+# after the load (``attach_shared_modules``), so no draft checkpoint carries
+# them. The checkpoint-name side of the same rule lives in
+# ``_remap_dspark_weight_name``, which skips ``embed.``/``embed_tokens.``/
+# ``head.``/``lm_head.`` inputs; keep the two in step.
+_SHARED_TARGET_MODULE_PREFIXES = ("embed_tokens.", "lm_head.")
+
+# How many unwritten parameter names the completeness error spells out.
+_MISSING_PARAMS_SHOWN = 20
+
 
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
@@ -851,24 +861,66 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(mapped)
 
-        self._assert_confidence_head_loaded(
+        self._assert_required_params_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
 
-    def _assert_confidence_head_loaded(
+    def _assert_required_params_loaded(
         self, *, params_dict: dict, loaded_params: set
     ) -> None:
-        if self.confidence_head is None:
-            return
-        confidence_param_names = {
-            name for name in params_dict if name.startswith("confidence_head.")
+        """Every parameter the draft DECLARES must have been written.
+
+        The loop above drops a checkpoint tensor it cannot match to a
+        parameter with only a warning, and that direction stays a warning on
+        purpose: a checkpoint may legitimately carry tensors this build has
+        no module for, and a hard failure there would make every such
+        checkpoint boot-fatal.
+
+        The opposite direction must not be silent. A remap that produces a
+        name matching no parameter leaves that parameter at its
+        uninitialised construction value; the draft still "loads", and the
+        only symptom is a speculative accept rate pinned at zero. That is
+        how the unanchored ``.scale`` rename hid (see ``_remap_mtp_rest``),
+        and it is the same family as the #113 GGUF draft-MTP namespace bug.
+        Name the unwritten parameters instead.
+        """
+        if self.confidence_head is not None:
+            # Checked first, and separately, because this one has an
+            # actionable knob in its message that the general check cannot
+            # offer.
+            confidence_param_names = {
+                name for name in params_dict if name.startswith("confidence_head.")
+            }
+            missing = confidence_param_names - loaded_params
+            if missing:
+                raise ValueError(
+                    f"DSpark V4 confidence head is enabled but the checkpoint is missing "
+                    f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
+                    f"or disable the confidence head (enable_confidence_head=False)."
+                )
+
+        missing = {
+            name
+            for name in params_dict
+            if name not in loaded_params
+            and not name.startswith(_SHARED_TARGET_MODULE_PREFIXES)
         }
-        missing = confidence_param_names - loaded_params
         if missing:
+            # Capped: a wholly wrong checkpoint leaves EVERY parameter
+            # unwritten, and a several-hundred-name exception line is not a
+            # diagnostic. The count above carries the full extent.
+            shown = sorted(missing)[:_MISSING_PARAMS_SHOWN]
+            if len(missing) > len(shown):
+                shown.append(f"... and {len(missing) - len(shown)} more")
             raise ValueError(
-                f"DSpark V4 confidence head is enabled but the checkpoint is missing "
-                f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"DSpark V4 draft: {len(missing)} declared parameter(s) were never "
+                f"written by the checkpoint load: {shown}. Either the "
+                f"checkpoint genuinely lacks these tensors, or a name remap "
+                f"produced a key that matches no parameter (look for the "
+                f"'unexpected weight' warnings above -- an unmatched checkpoint "
+                f"name and an unwritten parameter are the two ends of the same "
+                f"mismatch). Loading on would leave those parameters at their "
+                f"construction values and pin the speculative accept rate at zero."
             )
 
     @staticmethod
