@@ -10362,6 +10362,99 @@ class ServerArgs:
         )
         return peak_bytes / (1 << 20)
 
+    def _dsv4_indexer_dims(self) -> Optional[Tuple[int, int]]:
+        """``(index_n_heads, index_head_dim)`` of the checkpoint's DSV4 C4
+        indexer, or None when it has none (or its HF config is not readable).
+
+        Same lazy, failure-tolerant shape as ``_gdn_linear_attention_dims``
+        above, and for the same reason: this runs from a boot-time diagnostic,
+        so any config-source difference must degrade to "no estimate" rather
+        than break a boot.
+        """
+        try:
+            from sglang.srt.utils.hf_transformers.common import get_hf_text_config
+            from sglang.srt.utils.hf_transformers.config import get_config
+
+            cfg = get_hf_text_config(
+                get_config(
+                    self.model_path,
+                    trust_remote_code=self.trust_remote_code,
+                    revision=self.revision,
+                    model_config_parser=self.model_config_parser,
+                )
+            )
+        except Exception:  # pragma: no cover - config-source differences
+            return None
+        try:
+            n_heads = int(getattr(cfg, "index_n_heads"))
+            head_dim = int(getattr(cfg, "index_head_dim"))
+        except (AttributeError, TypeError, ValueError):
+            # Not a DSV4-family checkpoint, or an unexpected config shape.
+            return None
+        if min(n_heads, head_dim) <= 0:
+            return None
+        return (n_heads, head_dim)
+
+    def dsv4_indexer_prefill_scratch_mib(self) -> Optional[float]:
+        """Peak transient VRAM (MiB) of ONE DSV4 C4-indexer paged-MQA-logits
+        call on ONE rank, or None when the checkpoint has no C4 indexer (#493).
+
+        THE SIXTH UNBUDGETED TERM. ``pinned_reserve_shortfall_note`` below lists
+        five terms that no reserve charges (CUDA context, NCCL buffers, the
+        flashinfer workspace, graph capture, GDN prefill scratch). This is the
+        sixth, and on the DeepSeek-V4-Flash recipe it is the largest: window 3
+        of 2026-08-03 watched both 3080 ranks fall from 873 MiB free to 271 MiB
+        during the deep prefill, breaching the 400 MiB corridor on 214 samples,
+        while a +500 MiB reserve repair moved the floor not at all. It cannot:
+        the reserve is subtracted from the NVML total to form the rank BUDGET,
+        the KV pool takes what the reserve leaves, and this allocation lands on
+        top of both at runtime. The knob that caps it is
+        ``SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB`` (#449), whose default #493
+        lowered from an inert 2048 MiB to a binding 256 MiB.
+
+        Derived from the allocation sites, not measured -- same contract as
+        ``gdn_prefill_scratch_mib`` -- and deliberately delegated to
+        ``layers.attention.dsv4.indexer`` so the estimate and the allocation
+        share ONE formula rather than two that can drift apart.
+
+        RANK-INVARIANT TODAY, and that is a property of the model rather than of
+        this method: ``C4Indexer.__init__`` sets ``n_local_heads = n_heads`` and
+        builds ``ReplicatedLinear``, so the indexer heads are replicated instead
+        of TP-sharded and every rank pays the same per-row bytes. The row count
+        is not rank-invariant under DP-attention; this estimate takes the
+        undivided ``chunked_prefill_size``, which is the upper bound.
+        """
+        dims = self._dsv4_indexer_dims()
+        if dims is None:
+            return None
+        n_heads, head_dim = dims
+        # Lazy: importing an attention layer module at ServerArgs import time
+        # would pull the model stack into the launcher for every boot.
+        try:
+            from sglang.srt.layers.attention.dsv4.indexer import (
+                indexer_prefill_scratch_bytes,
+            )
+        except Exception:  # pragma: no cover - import-surface differences
+            return None
+        rows = int(self.chunked_prefill_size or 0)
+        if rows <= 0:
+            rows = max(int(self.max_prefill_tokens or 0), 2048)
+        span = int(self.context_length or 0)
+        if span <= 0:
+            return None
+        # The C4 indexer runs on the COMPRESSED span, not on the prompt: the
+        # ratio-4 layers of DeepSeek-V4-Flash turned a 32768-token prompt into
+        # an 8196-position indexer span in the window-3 run. The ratio is a
+        # per-layer property that is not on the text config, so the widest
+        # (ratio-1) case is used -- this is a reserve diagnostic, and an
+        # estimate that is too small is the failure mode that matters.
+        return indexer_prefill_scratch_bytes(
+            num_rows=rows,
+            max_seq_len=span,
+            num_heads=n_heads,
+            head_dim=head_dim,
+        ) / (1 << 20)
+
     # Per-rank CUDA context allowance (MiB). Not covered by
     # --rank-auto-reserve-mib / --rank-gpu-memory-mib by design (the runbook
     # says so), so a plan that fills the free memory to the last MiB is worth
@@ -10530,11 +10623,22 @@ class ServerArgs:
         Warning, never a reject, and the threshold is the UNCHANGED derived
         value: a boot that runs today keeps running. Deliberately no attempt
         to reject at the exact value where a given rig tips over -- that point
-        is the fragmentation-sensitive sum of five unbudgeted terms (CUDA
+        is the fragmentation-sensitive sum of six unbudgeted terms (CUDA
         context, NCCL buffers, the flashinfer workspace allocated after pool
-        init, graph capture, and the per-layer GDN prefill scratch below), so
+        init, graph capture, the per-layer GDN prefill scratch below, and the
+        DSV4 C4-indexer prefill scratch below that -- #493), so
         any such threshold would be a constant reverse-engineered from two
         measurements, which is the defect this diagnostic exists to expose.
+
+        RESERVE SEMANTICS, stated here because window 3 of 2026-08-03 spent a
+        boot on the misreading: this value shapes the rank BUDGET (it is
+        subtracted from the NVML total, and the KV pool takes what it leaves).
+        It does NOT cap any runtime allocation. Raising it buys steady-state
+        free memory at the cost of KV capacity and moves a transient PEAK not at
+        all -- that run raised it by 500 MiB per rank, cut
+        ``max_total_num_tokens`` from 90624 to 41984, and watched the
+        free-memory floor stay at 271 MiB. A transient is capped where it is
+        allocated, which is why the indexer term below has its own knob.
         """
         derived = self.derived_rank_auto_reserve_mib(
             gpu_mem, colocated_ranks, hosts_solo_draft=hosts_solo_draft
@@ -10560,6 +10664,24 @@ class ServerArgs:
                 f"chunked_prefill_size={self.chunked_prefill_size}"
             )
         )
+        # #493: the C4-indexer transient, named because it is the term that
+        # breached the corridor on the DSV4F recipe while the reserve was being
+        # raised to chase it. Reported as its own post rather than folded into
+        # the activation line -- it is capped by its own knob, not by this one.
+        indexer_scratch = self.dsv4_indexer_prefill_scratch_mib()
+        indexer_note = (
+            ""
+            if indexer_scratch is None
+            else (
+                f" The DSV4 C4-indexer prefill scratch is a further "
+                f"{indexer_scratch:.0f} MiB of RUNTIME transient per rank at "
+                f"chunked_prefill_size={self.chunked_prefill_size} and "
+                f"context_length={self.context_length}, which no reserve "
+                f"charges and no reserve can cap; lower "
+                f"SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB (default 256) to shrink "
+                f"it."
+            )
+        )
         return (
             f"--rank-auto-reserve-mib pins {pinned_mib} MiB on GPU {gpu_id}, "
             f"below the {derived} MiB that 'auto' would derive for it "
@@ -10571,7 +10693,8 @@ class ServerArgs:
             f"families x {colocated_ranks} co-located rank(s))"
             f"{ladder_note}; of the "
             f"activation part the GDN prefill scratch alone is "
-            f"{scratch_note}. The KV pool takes whatever the reserve does not "
+            f"{scratch_note}.{indexer_note} The KV pool takes whatever the "
+            f"reserve does not "
             f"hold back, so the shortfall surfaces as an OOM in the first "
             f"real prefill, not at startup. Pass "
             f"--rank-auto-reserve-mib auto to derive it, or raise the pinned "
