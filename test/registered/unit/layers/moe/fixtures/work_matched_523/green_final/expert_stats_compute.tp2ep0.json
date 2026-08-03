@@ -1,0 +1,26 @@
+{
+ "schema": 1,
+ "reason": "fixture",
+ "rank_tag": "tp2ep0",
+ "totals": {
+  "layers": 43,
+  "forwards": 155445,
+  "tokens": 163572,
+  "activations": 981432,
+  "hit_activations": 776784,
+  "miss_activations": 204648,
+  "unique_hits": 270168,
+  "unique_misses": 196564,
+  "hit_rate": 0.791480204435967,
+  "unique_hit_rate": 0.5788503895168962,
+  "host_shard_policy": "equal",
+  "host_shard_ratio": "",
+  "owned_cold_experts": 2408,
+  "delegated_cold_experts": 0,
+  "host_shard_reachability": "local-only",
+  "moe_compute_policy": "link-proportional",
+  "moe_compute_vector": "213,104,157",
+  "h2d_bytes": 1764498210816,
+  "remote_h2d_bytes": 0
+ }
+}

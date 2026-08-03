@@ -74,10 +74,16 @@ shares were 42.1 / 28.9 / 29.0 % where ``b * (1 - f)`` predicts
 CALIBRATION IS FALSIFIED ON HARDWARE, and it is a separate, experimental symbol
 (``--rank-moe-ratio link-calibrated``) rather than an implicit upgrade of
 ``link``. The 2026-08-03 confirmation window measured both arms on the reference
-recipe and the calibrated one LOST: 1.439x on the transfer term against 1.496x
-uncalibrated, and -0.94 % end-to-end against -7.67 %, i.e. inside the same-window
+recipe and the calibrated one LOST -- on its END-TO-END leg, which is the
+economically decisive one: -0.94 % against -7.67 %, i.e. inside the same-window
 A-vs-A floor (CV 2.12 %, spread 4.09 %) and therefore indistinguishable from the
-baseline. The cause is the assumption the coefficient rests on, and it is the
+baseline. The transfer term is explicitly NOT a leg of the rejection: the
+"1.439x against 1.496x" that sentence used to carry divided two counters sampled
+at different fractions of their runs, and work-matched -- both arms read at a
+common work point, the rule of #482, enforced by ``read_arm.py --against``
+since #523 -- the same window gives the calibrated arm 1.4573x against plain
+``link``'s 1.4253x, so it slightly WINS that term. The cause is the assumption
+the coefficient rests on, and it is the
 falsifier ``ARM3_COMPUTE.md`` named in advance: a coefficient treats the hit rate
 as a property of the RANK, and it is not -- it tracks the SIZE of the owned
 expert range, because a smaller range fits the cache better. In that window tp1's
@@ -163,8 +169,8 @@ __all__ = [
 #: The symbolic value ``--rank-moe-ratio`` accepts in place of a vector. This
 #: is the SHIPPED slice-3 solve: uncalibrated, first-order traffic model, no
 #: prior boot required. It is the only one of the two that has beaten its own
-#: baseline above a same-window floor on hardware (1.496x transfer term,
-#: -7.67 % end-to-end, 2026-08-03).
+#: baseline above a same-window floor on hardware (1.4307x transfer term
+#: work-matched, -6.42 % end-to-end, 2026-08-03 green-corridor window).
 COMPUTE_PLACEMENT_LINK = "link"
 
 #: The EXPERIMENTAL calibrated variant, kept because the mechanism is sound and
@@ -838,8 +844,8 @@ def _traffic_coefficients_for_symbol(
                 f"{COMPUTE_PLACEMENT_LINK_CALIBRATED} to spend those "
                 "coefficients, or unset the variable to run the shipped solve. "
                 "Read why before choosing: the calibrated solve is falsified on "
-                "the reference recipe (2026-08-03, 1.439x against 1.496x "
-                "uncalibrated and inside the same-window floor end to end) "
+                "the reference recipe (2026-08-03, -0.94 % end to end inside "
+                "the same-window 4.09 % floor, against -7.67 % uncalibrated) "
                 "because a per-rank hit rate tracks the SIZE of the owned "
                 "expert range, not the rank."
             )
@@ -859,10 +865,13 @@ def _traffic_coefficients_for_symbol(
         "treats the hit rate as a property of the rank, and the 2026-08-03 "
         "window measured it tracking the SIZE of the owned expert range instead "
         "(tp1 0.8450 -> 0.9050 as its range shrank 72 -> 58; tp2 0.8474 -> "
-        "0.7814 as its range grew 72 -> 89). The calibrated arm reached 1.439x "
-        "on the transfer term against 1.496x for plain '%s', and -0.94 %% end "
-        "to end inside a 4.09 %% same-window floor. Use it to test a better "
-        "hit-rate model, not to serve.",
+        "0.7814 as its range grew 72 -> 89). The calibrated arm measured "
+        "-0.94 %% end to end inside a 4.09 %% same-window floor, against "
+        "-7.67 %% for plain '%s'. That end-to-end leg and the mechanism above "
+        "are the whole rejection: work-matched, the calibrated arm reads "
+        "1.4573x on the transfer term against 1.4253x and slightly WINS it, so "
+        "the transfer term is not cited. Use it to test a better hit-rate "
+        "model, not to serve.",
         COMPUTE_PLACEMENT_LINK_CALIBRATED,
         COMPUTE_PLACEMENT_LINK,
     )

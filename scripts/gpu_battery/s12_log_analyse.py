@@ -375,9 +375,12 @@ def auswerten(sources: list, points: dict, hidden: int, welt: int) -> dict:
     wait: list = []
     sizes: list = []
     decode: list = []
+    #: The WINDOW BASIS of each point, for the work-match check below.
+    fenster_basis: dict = {}
     for (arm, sessions), lines in sorted(lines_per_point.items()):
         point = points.get((arm, sessions)) or {}
         requests = ((point.get("prefill") or {}).get("requests")) or 0
+        fenster_basis[f"{arm}:{sessions}"] = requests
         batches = parse_prefill_rang(lines)
         window = punkt_fenster(batches, requests)
         for rank in sorted(window):
@@ -438,7 +441,66 @@ def auswerten(sources: list, points: dict, hidden: int, welt: int) -> dict:
         "wait": wait,
         "groessen": sizes,
         "decode": decode,
+        "fenster_basis": fenster_basis,
+        "fenster_basis_warnungen": fenster_basis_pruefen(fenster_basis),
     }
+
+
+def fenster_basis_pruefen(fenster_basis: dict) -> list:
+    """Work-match check for s12, and it is a NARROWER one than #482's (#523).
+
+    The rule of #482 governs counters that ACCUMULATE over a run: two arms may
+    be divided by each other only at a common work point, because a counter
+    read at 91.9 % of one run against 96.8 % of another measures the sampling
+    difference as much as the treatment. Nothing s12 puts side by side is such
+    a counter -- ``compute_ms_median`` / ``wait_ms_median`` / ``gpu_ms_median``
+    are per-batch medians, ``wait_anteil`` is a ratio of sums within one rank
+    of one arm, and ``belegung`` normalises against its own span. All of them
+    are intensive, so an arm with more batches than another does not bias them
+    and the accumulating-counter rule does not bind here.
+
+    What CAN differ silently is the WINDOW BASIS. ``punkt_fenster`` counts the
+    last ``requests`` large batches from the back, with ``requests`` taken from
+    punkte.jsonl; when the point is missing from that file the count falls
+    through to 0 and the window silently becomes "every large batch in the
+    log, warmup included". Two arms of one comparison then aggregate different
+    phases of the run, which is a work mismatch of a different kind and is
+    invisible in the tables -- the batch count is printed, but nothing says
+    what bounded it.
+
+    Returns one string per offending sessions value; the caller prints them on
+    stderr. Not a refusal: unlike a ratio, a table of medians is still worth
+    reading, and s12 by design "parses, aggregates and prints" and leaves the
+    verdict to the report. What it may not do is stay quiet about it.
+    """
+    per_sessions: dict = {}
+    for key, requests in fenster_basis.items():
+        arm, _, sessions = key.rpartition(":")
+        per_sessions.setdefault(sessions, {})[arm] = requests
+    warnungen = []
+    for sessions in sorted(per_sessions):
+        arme = per_sessions[sessions]
+        if len(arme) < 2:
+            continue
+        basen = set(arme.values())
+        if basen == {0}:
+            warnungen.append(
+                f"sessions={sessions}: NO window basis for any arm "
+                f"({', '.join(sorted(arme))}) -- punkte.jsonl carried no "
+                "request count, so every arm aggregates its whole log "
+                "INCLUDING the warmup. The medians are comparable only if the "
+                "warmup share happens to match, which nothing here checks."
+            )
+        elif len(basen) > 1:
+            detail = ", ".join(f"{arm}={arme[arm]}" for arm in sorted(arme))
+            warnungen.append(
+                f"sessions={sessions}: the arms were aggregated over "
+                f"DIFFERENT window bases ({detail}"
+                + (", 0 = the whole log incl. warmup" if 0 in basen else "")
+                + "). They did not do the same work; read the batch counts in "
+                "the table before comparing the rows."
+            )
+    return warnungen
 
 
 def _f(v, nk=1):
@@ -524,6 +586,8 @@ def main() -> int:
         return 2
 
     payload = auswerten(sources, lade_punkte(args.punkte), args.hidden, args.welt)
+    for warnung in payload["fenster_basis_warnungen"]:
+        print(f"WINDOW BASIS: {warnung}", file=sys.stderr)
     if args.json:
         with open(args.json, "w") as f:
             json.dump(payload, f, indent=2)

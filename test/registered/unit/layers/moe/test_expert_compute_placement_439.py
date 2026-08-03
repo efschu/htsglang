@@ -895,9 +895,12 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
     """#458: which solve ``--rank-moe-ratio link`` resolves to, pinned.
 
     The 2026-08-03 confirmation window measured both solves on the reference
-    recipe and the CALIBRATED one lost -- 1.439x against 1.496x on the transfer
-    term, and -0.94 % against -7.67 % end to end, i.e. inside the same-window
-    A-vs-A floor. The cause is the failure mode ``ARM3_COMPUTE.md`` named in
+    recipe and the CALIBRATED one lost -- -0.94 % against -7.67 % end to end,
+    i.e. inside the same-window A-vs-A floor. Not on the transfer term: read
+    work-matched, the rule of #482, the calibrated arm reads 1.4573x against
+    1.4253x there and slightly wins, and the "1.439x against 1.496x" this
+    docstring used to carry compared two counters sampled at different
+    fractions of their runs. The cause is the failure mode ``ARM3_COMPUTE.md`` named in
     advance: a per-rank cold-traffic coefficient treats the cache hit rate as a
     property of the rank, and it is a property of the owned range SIZE.
 
@@ -987,7 +990,20 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
         help_text = parser.format_help()
         self.assertIn(COMPUTE_PLACEMENT_LINK_CALIBRATED, help_text)
         self.assertIn("FALSIFIED", help_text)
-        self.assertIn("1.496x", help_text)
+        # WORK-MATCHED numbers only (#482 rule, #523 code post). The
+        # pre-teardown 1.496x / 1.439x pair this used to pin divided two
+        # counters read at different fractions of their runs; it is withdrawn,
+        # and pinning it here is what kept it alive in the help text. The
+        # withdrawn pair may still be NAMED as withdrawn -- what may not
+        # survive is either of them stated as a measurement.
+        # argparse wraps the help, and textwrap breaks on hyphens too, so the
+        # assertions run against a whitespace-normalised copy.
+        flat_help = " ".join(help_text.split())
+        self.assertIn("1.4307x", flat_help)
+        self.assertIn("a common work point", flat_help)
+        self.assertNotIn("measured 1.496x", flat_help)
+        self.assertNotIn("reached only", flat_help)
+        self.assertIn("the old '1.439x against 1.496x' sentence", flat_help)
 
         self.assertIn("FALSIFIED", module.__doc__)
         self.assertIn("2026-08-03", module.__doc__)
@@ -995,7 +1011,13 @@ class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
         entry = rejmod.by_key("moe_link_calibrated_coefficients")
         self.assertIsNotNone(entry)
         self.assertEqual(entry.level, rejmod.NOT_DEFAULT)
-        self.assertIn("1.439x", entry.verdict)
+        # The verdict must rest on the END-TO-END leg, not on the transfer
+        # term: work-matched the calibrated arm slightly WINS the transfer
+        # term (1.4573x against 1.4253x), so a verdict that cites it is
+        # citing the artifact of an unmatched comparison (#482/#523).
+        self.assertIn("-0.94 %", entry.verdict)
+        self.assertIn("1.4573x", entry.verdict)
+        self.assertNotIn("1.439x on the transfer term", entry.verdict)
         self.assertIn("2026-08-03_439_confirm", entry.evidence)
         self.assertTrue(entry.unlock.startswith("--rank-moe-ratio"))
 
