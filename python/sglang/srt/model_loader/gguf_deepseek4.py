@@ -234,15 +234,18 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
 
         The published UD-* quantizations store the routed ``down`` projection
         (and, on layer 26, ``gate``/``up`` as well) as MXFP4, the model's native
-        expert dtype. MXFP4 is in none of the GGUF type sets and in no
-        dequantize/MMQ/MMVQ kernel case, so without a repair the failure
-        surfaces as a bare ``NotImplementedError`` from ``fused_mul_mat_gguf``
-        after the whole 119 GiB file has been read.
+        expert dtype.
 
-        The repair is a value-exact load-time repack to Q5_0 in the weight
-        stream (``gguf_mxfp4_repack``), so MXFP4 is no longer an offender here
-        unless ``SGLANG_GGUF_MXFP4_REPACK=0`` switched the repack off. This gate
-        keeps its job for every type the repack does not cover.
+        Since #398 MXFP4 has its own dequantize / MMVQ / MMQ kernels and is in
+        the GGUF type sets directly, so it passes this gate on its own. On a
+        wheel built before #398 (or with ``SGLANG_GGUF_MXFP4_NATIVE=0``) it is
+        instead carried by the value-exact load-time repack to Q5_0 in the
+        weight stream (``gguf_mxfp4_repack``), and is an offender here only
+        when ``SGLANG_GGUF_MXFP4_REPACK=0`` switched THAT off as well. Without
+        either route the failure would surface as a bare
+        ``NotImplementedError`` from ``fused_mul_mat_gguf`` after the whole
+        119 GiB file has been read. This gate keeps its job for every type
+        neither the kernels nor the repack cover.
         """
         from sglang.srt.model_loader.gguf_mxfp4_repack import repack_enabled
         from sglang.srt.model_loader.gguf_shards import iter_gguf_tensors

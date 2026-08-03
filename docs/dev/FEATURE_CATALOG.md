@@ -501,6 +501,21 @@ DeepSeek-V2/3/4 class GGUF-safe (`.qweight` accessors, quantization_config
 drop, tokenizer route). Perf: batched MMVQ, Q8 lm_head, K-quant MMVQ tuned to
 Q8_0 efficiency (TP=2 beats llama.cpp), graph-replay numeric safety for ALL
 quants, `gguf_mmq_decode_threshold`.
+**MXFP4 (ggml type 39) is native since #398** — a complete kernel set
+(dequantize, dense MMVQ, dense MMQ, MoE MMVQ, MoE MMQ, `moe_get_block_size`),
+so the type is in all three GGUF type sets and the load-time MXFP4->Q5_0
+repack that used to carry it (#391 blocker 1) is a no-op on such a wheel. That
+is 4.25 bpw instead of 5.5, i.e. the repack's +29.4 % bytes returned. Block is
+32 values in **17 bytes** (E8M0 byte + 16 split-half nibble pairs of doubled
+E2M1), so it is the first GGUF block type with an ODD stride: every read of
+`qs` must use the byte-granular `get_int_b1`, never the 2-byte-aligned
+loaders. The scale helper `ggml_cuda_e8m0_to_fp32_half` returns 2^(e-128) —
+already halved against the doubled lattice — and is bit-identical to the host
+reference, so dequant is compared EXACTLY, not within a tolerance. Kernel
+presence is a wheel property, probed via the `ggml_mxfp4_native` marker op
+(the #73 pattern) and overridable with `SGLANG_GGUF_MXFP4_NATIVE=0`, which
+hands the checkpoint back to the repack. GPU-pending:
+`TICKET_398_mxfp4_validation.md`.
 
 ## 9. Quant lanes
 FP8 (sm120 GEMM tuned; per-channel fused GEMV; opt-in deterministic

@@ -942,12 +942,38 @@ Three refusals fire instead of a partial load, all naming the offending file:
   mixed in one directory);
 - the parts hold fewer tensors than their `split.tensors.count` declares.
 
-### 4.5.3 GGUF MXFP4 tensors are repacked to Q5_0 at load time
+### 4.5.3 GGUF MXFP4 tensors run natively (#398); the Q5_0 repack is the fallback
 
 Some exports store part of the model as MXFP4 (ggml type 39) — the unsloth
 DeepSeek V4 Flash `UD-*` builds keep the routed `down` projections, and on one
-layer `gate`/`up` too, in the model's native fp4. No GGUF kernel in this build
-dispatches on type 39: there is no dequantize case, no MMVQ case, no MMQ case.
+layer `gate`/`up` too, in the model's native fp4.
+
+**Since #398 the GGUF kernels dispatch on type 39 directly** (dequantize,
+MMVQ, MMQ, and both MoE variants), so those tensors are read as they lie on
+disk at 4.25 bpw. One log line states it:
+
+```
+GGUF MXFP4: 2 tensor(s), 2.12 GiB, run NATIVELY (#398 ggml type 39 kernels
+present) -- no load-time repack, saving the 0.62 GiB the Q5_0 repack would
+have added. Set SGLANG_GGUF_MXFP4_NATIVE=0 to fall back to the repack.
+```
+
+This is a property of the **wheel**, not of the source tree: sgl-kernel is
+pinned separately (§2.1), and a wheel built before #398 has none of the
+kernels. The runtime probe is the `ggml_mxfp4_native` marker op —
+
+```bash
+$V/bin/python -c "import torch,sgl_kernel; \
+  print(hasattr(torch.ops.sgl_kernel,'ggml_mxfp4_native'))"
+```
+
+— and `SGLANG_GGUF_MXFP4_NATIVE=0` forces the pre-#398 behaviour on a new
+wheel, which is the A/B lever and the way out if the native path ever has to
+be taken out of a running configuration. Numerical gates and the payoff boots:
+`docs/dev/TICKET_398_mxfp4_validation.md` (GPU-pending).
+
+Everything below describes that fallback, which is still what runs on an old
+wheel or with the switch set.
 
 The loader converts those tensors to Q5_0 while reading the weight stream
 (`model_loader/gguf_mxfp4_repack.py`), because the MXFP4 lattice is a subset of
@@ -980,6 +1006,9 @@ Two things to know before booting such a file:
 `SGLANG_GGUF_MXFP4_REPACK=0` switches the repack off, which restores the
 pre-#391 behaviour: the family adapter's executability gate refuses the file at
 load time, naming MXFP4. That is a debugging switch, not an operating mode.
+On a #398 wheel it is also inert unless `SGLANG_GGUF_MXFP4_NATIVE=0` is set as
+well — the kernels make the type executable on their own, so the gate passes
+before the repack is consulted.
 
 ### 4.5.4 DeepSeek V4 Flash GGUF, TP=3 uneven (#391/#402)
 

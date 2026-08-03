@@ -37,10 +37,11 @@ projections in mxfp4, and this export pairs MXFP4 ``down`` with IQ3_XXS
 performs it inside the weight stream, and the tests here call that module
 rather than a copy of it.
 
-The last two tests pin the premise the shipped repair rests on -- MXFP4 absent
-from every executable GGUF type set, Q5_0 present in all of them. If someone
-adds an MXFP4 kernel, the first fails and the repack becomes optional rather
-than load-bearing.
+The last two tests pinned the premise the shipped repair rested on -- MXFP4
+absent from every executable GGUF type set, Q5_0 present in all of them. #398
+built the MXFP4 kernels, so the first is now a CONDITIONAL: membership must
+track the build's own capability flag. On a wheel with the kernels the repack
+is optional (and off); on one without it, it is still load-bearing.
 """
 
 from __future__ import annotations
@@ -230,14 +231,24 @@ class TestBridgeToQ5_0(unittest.TestCase):
 
 
 class TestMXFP4IsStillUnexecutable(unittest.TestCase):
-    """Why the repack is load-bearing. When the first of these fails, it is
-    not: an MXFP4 kernel would make the conversion a choice again."""
+    """When the repack is load-bearing, and when it is not.
 
-    def test_mxfp4_absent_from_every_gguf_type_set(self):
+    #398 built the MXFP4 kernels, so the #391 premise ("no executable MXFP4
+    GGUF path") now holds only on a wheel that predates them -- or with
+    ``SGLANG_GGUF_MXFP4_NATIVE=0``. The assertion therefore follows the
+    build's own capability flag instead of being a constant. Both states are
+    exercised in-process by
+    ``test/registered/unit/quantization/test_gguf_mxfp4_native.py``
+    (``TestDispatchFlip``); here the point is only that the repack stays
+    correct and load-bearing exactly while the kernels are absent.
+    """
+
+    def test_mxfp4_type_set_membership_follows_the_kernel_capability(self):
         from sglang.srt.layers.quantization.gguf import (
             DEQUANT_TYPES,
             MMQ_QUANT_TYPES,
             MMVQ_QUANT_TYPES,
+            MXFP4_NATIVE,
         )
 
         mxfp4 = int(GGMLType.MXFP4)
@@ -246,11 +257,14 @@ class TestMXFP4IsStillUnexecutable(unittest.TestCase):
             ("MMVQ_QUANT_TYPES", MMVQ_QUANT_TYPES),
             ("MMQ_QUANT_TYPES", MMQ_QUANT_TYPES),
         ):
-            self.assertNotIn(
-                mxfp4,
-                {int(t) for t in type_set},
-                f"MXFP4 appeared in {name}: the #391 blocker-1 verdict "
-                "(no executable MXFP4 GGUF path) is out of date",
+            present = mxfp4 in {int(t) for t in type_set}
+            self.assertEqual(
+                present,
+                MXFP4_NATIVE,
+                f"{name}: MXFP4 present={present} but the build reports "
+                f"native MXFP4 kernels={MXFP4_NATIVE}. These must agree -- "
+                "either the #398 kernels are in this wheel and the type is "
+                "executable, or they are not and the Q5_0 repack carries it.",
             )
 
     def test_q5_0_is_executable_everywhere_mxfp4_would_need_to_be(self):

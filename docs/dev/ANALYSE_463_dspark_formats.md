@@ -3,6 +3,30 @@ DSpark format/placement question; written under task #463. Body verbatim.
 Recommendation R1 (§5) is the ticket #470 executes; the R4 note in §5 is the
 standing "banked, negative yield on this rig" entry for lossless MXFP4->FP8. -->
 
+> **#398 changes the economics of R4 and R2 (added 2026-08-03, desk).** The
+> body below was written when MXFP4 was executable on this rig only through
+> `Mxfp4MarlinMoEMethod`, i.e. **sm90/sm120 only** — that premise is what makes
+> R4 "dead on sm86" and what forces the DSpark head onto the 5090 alone.
+> Task #398 built a native GGUF MXFP4 (ggml type 39) kernel set — dequantize,
+> MMVQ and MMQ, dense and MoE — which runs on **sm86 as well as sm120**.
+> Consequences, none of them measured yet (`TICKET_398_mxfp4_validation.md`):
+>
+> * **R4 (MXFP4→FP8) loses its remaining rationale.** Its only argument was
+>   reaching a format the 3080s can execute, at +8.5 GiB. A GGUF MXFP4 head is
+>   reachable on the 3080s at +0 GiB. Keep R4 banked, but the "future all-sm90+
+>   box" framing is now the *whole* of it.
+> * **R2 (Q2_K GGUF head) is no longer the only GGUF route.** The MXFP4-Q8_0
+>   drafter GGUFs (`alessandrobologna`, `am17an`, ~10.15 GiB) become loadable
+>   as-is, so the "GGUF head" option no longer requires a second quantization.
+>   What R2's effort estimate was really pricing — a `dflash`-family reader:
+>   arch string, name map, sibling config — is untouched by #398 and remains
+>   the actual cost.
+> * **R3 stays the structural answer** for getting all three cards onto a fast
+>   path; #398 changes reachability, not speed. The GGUF MMVQ/MMQ path is not
+>   marlin, and no A/B exists yet.
+> * **The table in §5 is NOT rewritten.** Re-price it from measurements, not
+>   from this note.
+
 # Task #463 — a DSpark draft head for DeepSeek-V4-Flash in a format this rig can run
 
 Desk + network research, 2026-08-03. **No GPU touched** (every python invocation
