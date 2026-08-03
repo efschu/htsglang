@@ -560,9 +560,18 @@ byte-budgeted audio eviction that keeps the *events*, explicit `resume.gap`,
 and a session that outlives its socket so the reference buffers survive a
 roaming dropout. Client is a single-file PWA (no build, no external asset;
 getUserMedia AEC/NS/AGC is what dissolves the half-duplex feedback loop).
-Desk state: 119 hermetic tests under `CUDA_VISIBLE_DEVICES=99` plus a live
-boot smoke; real ASR/TTS backends and the GPU latency numbers are the open
-half. End-to-end S2ST was surveyed and **rejected on evidence** — no
+Real TTS is an HTTP client (`tts_backends.py`) against vLLM-Omni's
+`/v1/audio/speech` + `/v1/audio/voices`, in its OWN venv -- every candidate TTS
+package pins a `transformers` that conflicts with sglang's, so the process
+boundary is forced, not stylistic; the language set is read from the
+checkpoint's own `talker_config.codec_language_id`. Transport is Opus ~24 kbps
+(measured 23.8 kbps) with a pcm16 floor. Segments are re-cut at intra-segment
+speaker changes BEFORE recognition, so two people in one VAD segment cannot
+poison each other's reference buffer. Desk state: 165 hermetic tests under
+`CUDA_VISIBLE_DEVICES=99` plus a live boot smoke; the TTS adapter is tested
+against a real loopback server, but the vLLM-Omni serving side is
+desk-written and unstarted -- GPU latency numbers and the 36 preset clips are
+the open half. End-to-end S2ST was surveyed and **rejected on evidence** — no
 open-weight model does DE<->ES with speaker preservation (Hibiki fr->en only,
 StreamSpeech X->en, Seamless fixed synthetic voice, Qwen3-Omni three preset
 voices) — so the cascade is the only architecture meeting the requirement.

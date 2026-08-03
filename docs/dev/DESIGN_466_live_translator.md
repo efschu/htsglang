@@ -1,7 +1,9 @@
 # DESIGN #466 — Live speech-to-speech translator, voice-preserving
 
-Status: **Phase 1 complete (survey + architecture + selection + MVP skeleton),
-desk only.** No GPU was taken; every python invocation ran under
+Status: **Phase 2 complete, desk only.** Phase 1 was survey + architecture +
+selection + MVP skeleton; Phase 2 added the real TTS serving path, the Opus
+transport, the preset pool descriptors, the ops scripts, and intra-segment
+speaker splitting. No GPU was taken; every python invocation ran under
 `CUDA_VISIBLE_DEVICES=99`. Hard deadline ~2026-08-10.
 
 The system: a phone streams microphone audio over a WireGuard tunnel to the
@@ -24,6 +26,8 @@ them.
 | 2026-08-03 | **Preset pool sizing.** Realistic worst case 6-8 participants, usually 2-4. Pool shape **6 man / 6 woman / 3 boy / 3 girl = 18**: eight participants can plausibly skew hard to one adult class, children rarely exceed three. On exhaustion: never crash, never silently reuse an identical voice — share a base voice with a deterministic pitch offset and raise a named notice. |
 | 2026-08-03 | **Crash-safety backup.** Every restrictive or irreplaceable component (weights, pinned wheels, patched libs) is backed up to a PRIVATE GitHub repo. Private forever — CPML and NC terms permit private copies, not redistribution. The public fork never points at it. |
 | 2026-08-03 | **Target phone:** OnePlus 10 Pro NE2213_11, Android 16, unlocked bootloader, **not rooted**. Nothing may require root. |
+| 2026-08-03 | **TLS comes from the existing reverse proxy.** The rig already runs an nginx reverse proxy in an LXC container with Certbot-managed Let's Encrypt certificates and a public hostname. The translator is published as one more `location` there. The `chrome://flags` workaround is **demoted to fallback**; it is no longer the primary path. Consequence: risk #1 collapses from "design a secure-context story" to "verify once through the proxy from mobile data". |
+| 2026-08-03 | **No enrollment before the trip.** The user has no time to record voice samples. The user's voice therefore runs the *same* path as every other speaker: a rolling reference buffer accumulated from live speech, with preset mode covering the cold start. No special user-enrollment flow in the MVP. The enrollment endpoint stays (it costs nothing and already works) but is a post-vacation upgrade slot, and the GPU A/B must score cloning from **10-30 s of accumulated live speech**, not from clean curated audio. |
 
 ---
 
@@ -413,7 +417,7 @@ CUDA_VISIBLE_DEVICES=99 PYTHONPATH=/spinning/wt-466-translator/python \
   /spinning/htsglang-gpu/.venv/bin/python -m pytest test/registered/translator/ -q
 ```
 
-**119 passed** (96 + 23 voice tests), ~16 s, no GPU, no network, no model.
+**165 passed**, ~12 s, no GPU, no model weights loaded.
 
 Per-file:
 
@@ -421,10 +425,20 @@ Per-file:
 CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_languages.py -v      # 17
 CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_segmenter.py -v      # 13
 CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_speakers.py -v       # 24
-CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_session.py -v        # 17
+CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_session.py -v        # 22
 CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_audio_and_http.py -v # 25
 CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_voices.py -v         # 23
+CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_voice_presets.py -v  # 11
+CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_opus.py -v           # 12
+CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_tts_backend.py -v    # 18
 ```
+
+`test_tts_backend.py` is hermetic but **not mocked**: a real uvicorn server
+implementing vLLM-Omni's two audio endpoints runs on a loopback port and the
+adapter talks to it over real HTTP. The interesting behaviour -- streaming PCM
+reassembly across odd chunk boundaries, voice-registry caching, error
+surfacing -- only exists on the wire, so a mocked client would test the
+adapter's shape and none of its behaviour.
 
 Live boot smoke (fake backends, real HTTP, no GPU):
 
@@ -541,17 +555,48 @@ is a userspace VPN):
 6. Toggle on, then open `http://${WG_SERVER_ADDR%%/*}:30800/` in Chrome.
 7. Chrome menu → *Add to Home screen* for standalone PWA mode.
 
-**Known constraint, stated rather than discovered in Spain:** `getUserMedia`
-needs a secure context. `http://` over the tunnel is **not** one on Android
-Chrome unless the origin is a loopback. Two options, both to be decided in the
-GPU window: (a) a self-signed TLS cert on the tunnel address with the CA
-installed on the phone (Android 16 requires user-CA installation via Settings →
-Security → Encryption & credentials; note apps do not trust user CAs by default,
-but *Chrome does* for its own navigation), or (b) `chrome://flags` →
-*Insecure origins treated as secure*, adding `http://${WG_SERVER_ADDR%%/*}:30800`.
-Option (b) is one setting and is the MVP path; option (a) is the durable one.
-**This is on the critical path — it must be verified on the actual phone before
-the flight.**
+### 6.2.1 Secure context — solved by the existing reverse proxy
+
+`getUserMedia` needs a secure context, and `http://` over the tunnel is not one
+on Android Chrome unless the origin is a loopback. **The rig already has the
+answer**: an nginx reverse proxy in an LXC container, with Certbot-managed
+Let's Encrypt certificates and a public hostname, already fronting a dozen
+services. The translator becomes one more `location` there, and the phone gets
+a real HTTPS origin with no client-side workaround at all.
+
+`scripts/translator/nginx-translator.conf.template` is the snippet, written in
+the proxy's existing house style (Certbot cert paths, the shared
+`options-ssl-nginx.conf` include, upgrade headers on every location,
+`proxy_buffering off`, and a port-80 server that redirects the known host and
+answers 444 to everything else). Render and apply:
+
+```bash
+source /root/rig-env.sh
+envsubst < scripts/translator/nginx-translator.conf.template > /tmp/translator.conf
+# the OPERATOR installs it in the proxy container and reloads nginx
+```
+
+Two settings in it are load-bearing rather than cosmetic:
+
+* **`proxy_read_timeout 3600s` on `/api/translator/stream`.** The default 60 s
+  kills the WebSocket during any pause longer than a minute. The socket is
+  long-lived by design; the client's own ping is what proves liveness.
+* **`proxy_buffering off`.** Buffered synthesized audio arrives in bursts and
+  destroys the streaming playback the entire latency budget is built on.
+
+Plus `client_max_body_size 32m`, because the enrollment endpoint posts a
+base64 PCM clip and the 1 MB default truncates anything past a few seconds.
+
+The translator itself still binds to the tunnel address, never `0.0.0.0` — the
+proxy is the only thing that reaches it. `scripts/translator/check_tunnel.sh`
+verifies the whole chain (interface, forwarding, service, upstreams, and the
+HTTPS front door) and prints the phone-side steps.
+
+**Fallback only**, if the proxy path is unavailable: `chrome://flags` →
+*Insecure origins treated as secure* → add the tunnel origin. One setting, no
+certificate, and it must be re-applied whenever Chrome's flags are reset.
+Documented so it exists; not recommended.
+
 
 ### 6.3 The PWA wall, evaluated (not silently switched)
 
@@ -611,9 +656,13 @@ the failure mode this guards against. **Pin revisions, not repo names.**
 
 **(a) Desk, done.** 119 hermetic tests + the live boot smoke above.
 
-**(b) GPU window — the ticket.** Ordered so a failure at step 1 does not waste
-the window:
+**(b) GPU window — the ticket.** Ordered so a failure at an early step does not
+waste the window:
 
+0. **Render the preset pool** (`scripts/translator/render_preset_voices.py`,
+   ~36 clips). First, because preset mode is the fallback for every other
+   thing on this list, and a window that runs out of time with no pool leaves
+   the cloning downgrade path with nothing to degrade *to*.
 1. **NeMo coexistence spike (30 min, decides the ASR).** Install
    `nemo_toolkit[asr]` into a *separate* venv; confirm it does not disturb
    `/spinning/htsglang-gpu/.venv`. If it fights the torch/CUDA stack, fall
@@ -622,11 +671,17 @@ the window:
    `large-v3-turbo` `int8_float16` `beam_size=1` on a 3080, and the streaming
    model if step 1 passed. This replaces the extrapolated 250–450 ms in §3 with
    a number. A-vs-A floor first, per the measurement canon.
-3. **TTS head-to-head, DE↔ES cross-lingual.** One German clip → the same
-   Spanish sentence through Qwen3-TTS-Base (`x_vector_only_mode=True` **vs**
-   ICL — the highest-value single comparison, it isolates the mechanism all
-   four leaders rely on), VoxCPM2 (`reference_wav_path` alone), and XTTS-v2 as
-   the legacy arm. Repeat es→de. **Scoring per the dated accent decision:**
+3. **TTS head-to-head, DE↔ES cross-lingual, from REALISTIC references.**
+   Per the no-enrollment decision the reference is 10–30 s of accumulated
+   live speech, so the A/B must use exactly that: a rolling-buffer-shaped
+   reference (several field-quality slices, room noise, phone mic), not a
+   clean studio clip. Run a clean clip as a *control* arm to separate "the
+   model cannot clone cross-lingually" from "the model cannot clone from
+   degraded short audio" — those have different fixes. Arms: Qwen3-TTS-Base
+   (`x_vector_only_mode=True` **vs** ICL — the highest-value single
+   comparison, it isolates the mechanism all four leaders rely on), VoxCPM2
+   (`reference_wav_path` alone), XTTS-v2 as the legacy arm. Both directions.
+   **Scoring per the dated accent decision:**
    ASR-round-trip WER as a **hard intelligibility gate** (transcribe the output
    with Whisper in the target language; above a WER threshold the candidate is
    out regardless of how good it sounds), then rank surviving candidates by
@@ -655,53 +710,89 @@ class-appropriate, and does the mapping survive a reconnect?
 The operator's proposed top three were roaming connectivity, diarization in
 noise, and cross-lingual cloning quality. **Re-ranked on the evidence:**
 
-1. **Secure-context / `getUserMedia` over the tunnel** (new, and now first).
-   Not on the original list, and it is the one that stops the demo *before it
-   starts* rather than degrading it. Android Chrome refuses microphone access
-   on a plain-`http://` non-loopback origin. Cheap to fix (§6.2) and cheap to
-   verify — but only if verified before the flight.
-2. **Roaming connectivity** (confirmed, was #1). Mitigated by design —
+1. **Roaming connectivity** (back to first, after the secure-context risk
+   collapsed). Mitigated by design —
    reconnect with backoff, journal resume, explicit gap reporting, split-tunnel
    AllowedIPs, keepalive 25 — but a CGNAT-ed Spanish carrier plus a dynamic
    home IP can still defeat it. Mitigation to arrange before departure: a
    dynamic-DNS name and a verified inbound UDP path, tested from a foreign
    network, not from home WiFi.
-3. **Cross-lingual cloning quality** (confirmed, promoted above diarization).
-   Promoted because the survey found **no published de↔es evidence for any
-   model** — the selection rests on mechanism and in-language numbers. This is
-   an unmeasured assumption at the heart of the feature, which is exactly why
-   step (b)(3) exists. The dated accent decision materially de-risks it: with
-   accent removed as a failure mode, the bar is intelligibility, which is the
-   property most likely to hold.
-4. **Diarization in noise** (demoted from #2). Demoted for two reasons: the
+2. **Cross-lingual cloning quality from SHORT, LIVE reference audio**
+   (promoted, and the shape of the risk changed on 2026-08-03). The survey
+   found **no published de↔es evidence for any model**, so the selection rests
+   on mechanism and in-language numbers. The no-enrollment decision then made
+   it harder: the reference is now 10–30 s of accumulated *live, in-the-field*
+   speech rather than clean curated audio, for the user as much as for
+   everyone else. The dated accent decision de-risks it in the other
+   direction — with accent removed as a failure mode the bar is
+   intelligibility, the property most likely to hold — and preset mode is a
+   complete fallback if cloning from field audio proves too weak. Step (b)(3)
+   must therefore score cloning from *degraded* references, not clean ones.
+3. **Diarization in noise**. Kept mid-table for two reasons: the
    design already reduces the hard case (per-segment embedding on a completed
    turn, not frame-level tracking under overlap), and both failure modes
    degrade gracefully — an ambiguous segment is translated but barred from the
    reference buffer, and preset mode sidesteps voice identity entirely. Still
    real in a Spanish street or bar, and the mitigation lever is silero-vad
    (never `EnergyVad`) plus preset mode as the noisy-environment default.
-5. **NeMo dependency risk.** Contained by design: faster-whisper is the
+4. **NeMo dependency risk.** Contained by design: faster-whisper is the
    fallback and the spike is step 1 of the window, so this cannot consume the
    deadline.
-6. **VRAM contention with the 27B.** ~7.5 GB from the 5090's allocation is real
+5. **VRAM contention with the 27B.** ~7.5 GB from the 5090's allocation is real
    and must go through the corridor rule before the window.
+6. **Secure context** (was #1, now last). Collapsed by the 2026-08-03 decision
+   to publish through the existing nginx proxy: the mechanism already exists
+   and is in daily use for a dozen other services. What remains is a single
+   verification — load the PWA over HTTPS from mobile data once — rather than
+   a design question.
+7. **Preset pool renders late.** The 18 clips are produced in the GPU window by
+   a second model (VoiceDesign). If that step is skipped or fails, preset mode
+   and the cloning downgrade path both fall back to borrowing another
+   participant's voice, which is the outcome the pool exists to avoid. Cheap
+   insurance: render the pool FIRST in the window, before the latency work.
 
 ---
 
-## 9. What is NOT built (Phase 1 boundary)
+## 9. What is NOT built (Phase 2 boundary)
 
-Stated so the next phase does not rediscover it:
+Stated so the next phase does not rediscover it. Struck-through items were open
+at the end of Phase 1 and are now done.
 
-- **The real TTS backend adapter.** Qwen3-TTS runs behind vLLM-Omni's
-  `/v1/audio/speech` in its own venv, so the adapter is an HTTP client, not an
-  in-process backend. `--tts` currently offers only `fake`.
-- **Opus is wired but unexercised** — PyAV is not installed in this venv, so
-  `available_codecs()` correctly reports only `pcm16` and negotiation lands
-  there. Needs `pip install av` and a real round-trip.
-- **The preset voice clips themselves.** The pool loader, the classifier, the
-  assignment and the exhaustion path are built and tested against synthetic
-  tones; the 18 recorded clips (6/6/3/3, per target language) do not exist yet.
+Closed in Phase 2:
+
+- ~~The real TTS backend adapter~~ — `tts_backends.OpenAiSpeechTts` speaks
+  vLLM-Omni's `/v1/audio/speech` + `/v1/audio/voices`, with reference
+  registration cached by content hash so an unchanged clip costs no round
+  trip. 18 tests against a real loopback server.
+- ~~Opus is wired but unexercised~~ — PyAV 18.0.0 installed, libopus present,
+  round trip verified, measured 23 773 bps against a 24 000 target on
+  speech-like audio. `available_codecs()` now reports `("opus", "pcm16")` on
+  this deployment and the live health endpoint confirms it.
+- ~~The preset voice descriptors~~ — 18 as data, with VoiceDesign prompts and
+  pinned per-voice seeds; `render_preset_voices.py --dry-run` prints the
+  36-clip plan.
+- ~~Intra-segment speaker splitting is detected but not acted on~~ — segments
+  are now re-cut at speaker changes *before* recognition, with a `turn.split`
+  event and a falsifier proving neither speaker's reference buffer is poisoned.
+- ~~WireGuard server side~~ — setup script with placeholders, plus
+  `check_tunnel.sh`, whose pass *and* fail paths were both exercised.
+
+Still open:
+
+- **The preset clips themselves.** Descriptors, seeds, render plan and pool
+  loader are done and tested against synthetic tones; the 36 wav files need a
+  GPU (step 0 of the ticket).
+- **The TTS serving stack is installed by script but never started.** Neither
+  `setup_tts_venv.sh` nor `serve_tts.sh` has run — both need a card. They are
+  desk-written, and that label stands until the window: the vLLM-Omni flag
+  spelling (`--omni`), the `/v1/audio/voices` form-field names and the `pcm`
+  streaming format are all read from documentation, not observed. The adapter
+  is tested against a stub built from the *same* documentation, so a
+  documentation error would pass every test here and fail on first contact.
+  **This is the single largest unvalidated assumption in Phase 2.**
+- **No real audio has ever gone through a real model.** Every clip in every
+  test is a synthetic tone.
 - **Full-duplex / barge-in.** Explicitly a stretch goal, not MVP.
-- **Intra-segment speaker splitting is detected but not yet acted on** —
-  `split_points_by_dispersion` returns the boundaries; the session does not yet
-  re-cut a segment at them.
+- **Enrollment from curated samples.** Implemented and tested, but per the
+  2026-08-03 decision it is deliberately unused before the trip; it becomes a
+  per-speaker upgrade slot afterwards.
