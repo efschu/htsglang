@@ -1,0 +1,362 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>htsglang interview copilot</title>
+<link rel="manifest" href="manifest.webmanifest">
+<!--
+  Live interview copilot (#502), P1 skeleton.
+
+  Target platform is the DESKTOP browser (Chrome), because tab audio capture
+  exists nowhere else. Two capture chains run at once and never mix:
+
+    mic  -> getUserMedia    -> AudioWorklet -> 16 kHz PCM16 -> track "self"
+    tab  -> getDisplayMedia -> AudioWorklet -> 16 kHz PCM16 -> track "other"
+
+  Both feed ONE WebSocket; every binary frame carries a 4-byte header
+  (track, codec, seq16) so the server can attribute it. That header is the one
+  deliberate protocol difference from the #466 translator, which has a single
+  source and therefore sends bare frames.
+
+  Utterance boundaries are decided HERE: the runtime implements no server-side
+  VAD, so a silence timer per track sends an explicit commit.
+-->
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:15px/1.5 system-ui,sans-serif; background:#101014; color:#e8e8ec; }
+  header { display:flex; gap:12px; align-items:center; padding:10px 16px; background:#17171d; border-bottom:1px solid #2a2a33; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0 12px 0 0; font-weight:600; }
+  button { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid #3a3a46; background:#22222b; color:#e8e8ec; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.on { background:#2e5d3a; border-color:#3f7d4e; }
+  #conn { margin-left:auto; font-size:13px; color:#9a9aa8; }
+  #conn.live { color:#7ddc9a; }
+  #conn.down { color:#e88; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:0; height:calc(100vh - 52px); }
+  section { overflow-y:auto; padding:12px 16px; }
+  #hints { background:#14141a; border-right:1px solid #2a2a33; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#8a8a9a; margin:0 0 10px; }
+  .hint { background:#1c1c25; border-left:3px solid #4a7dc4; border-radius:4px; padding:9px 12px; margin-bottom:10px; }
+  .hint .meta { font-size:11px; color:#7a7a8a; margin-bottom:4px; }
+  .hint ul { margin:0; padding-left:18px; }
+  .hint.fake { border-left-color:#c4a04a; }
+  .line { margin-bottom:6px; }
+  .line .who { display:inline-block; min-width:52px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#7a7a8a; }
+  .line.other .who { color:#c48a4a; }
+  .line.self .who { color:#4a9dc4; }
+  .sys { color:#8a8a9a; font-style:italic; font-size:13px; margin:6px 0; }
+  .sys.warn { color:#e0a860; }
+  #topics { display:flex; gap:6px; flex-wrap:wrap; padding:8px 16px; background:#14141a; border-bottom:1px solid #2a2a33; }
+  .topic { font-size:12px; padding:3px 9px; border-radius:12px; border:1px solid #3a3a46; cursor:pointer; }
+  .topic.focus { border-color:#4a7dc4; background:#1e2c40; }
+  .topic .w { font-size:10px; color:#7a7a8a; margin-left:5px; }
+  .topic.warm .w { color:#7ddc9a; }
+  .topic.cold .w { color:#e88; }
+  .topic.partial .w { color:#e0a860; }
+  textarea { width:100%; box-sizing:border-box; height:120px; background:#1a1a22; color:#e8e8ec; border:1px solid #33333f; border-radius:6px; padding:8px; font:13px/1.45 ui-monospace,monospace; }
+</style>
+
+<header>
+  <h1>interview copilot</h1>
+  <button id="mic">start microphone</button>
+  <button id="tab">capture tab audio</button>
+  <button id="brief">briefing…</button>
+  <span id="conn">connecting…</span>
+</header>
+<div id="topics"></div>
+<main>
+  <section id="hints"><h2>hints — read, do not say</h2></section>
+  <section id="transcript"><h2>transcript</h2></section>
+</main>
+
+<script>
+const BUILD = "__CLIENT_BUILD__";
+const PIPELINE_RATE = 16000;
+const FRAME_MS = 20;
+const FRAME_SAMPLES = PIPELINE_RATE * FRAME_MS / 1000;   // 320
+const TRACK_CODE = { self: 0, other: 1 };
+const CODEC_PCM16 = 0;
+// Silence longer than this closes an utterance. The runtime has no
+// server-side VAD, so this timer is the only thing that ever commits.
+const SILENCE_MS = 700;
+const SILENCE_RMS = 0.006;
+
+const el = {
+  conn: document.getElementById("conn"),
+  hints: document.getElementById("hints"),
+  transcript: document.getElementById("transcript"),
+  topics: document.getElementById("topics"),
+  mic: document.getElementById("mic"),
+  tab: document.getElementById("tab"),
+  brief: document.getElementById("brief"),
+};
+
+let ws = null, cursor = 0, sessionId = null, attempt = 0, seq = 0;
+const captures = {};   // track -> {ctx, node, stream, pending, silentSince, open}
+
+function sys(text, warn) {
+  const div = document.createElement("div");
+  div.className = "sys" + (warn ? " warn" : "");
+  div.textContent = text;
+  el.transcript.appendChild(div);
+  el.transcript.scrollTop = el.transcript.scrollHeight;
+}
+
+function setConn(state, text) {
+  el.conn.className = state;
+  el.conn.textContent = text;
+}
+
+// ---------------------------------------------------------------- transport
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}${location.pathname.replace(/\/$/, "")}/api/copilot/stream`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    setConn("live", "connected");
+    send({ kind: "hello", session_id: sessionId, resume_from: cursor, build: BUILD });
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (typeof msg.seq === "number" && msg.seq >= cursor) cursor = msg.seq + 1;
+    onEvent(msg);
+  };
+  ws.onclose = () => {
+    setConn("down", "reconnecting…");
+    const delay = Math.min(500 * Math.pow(1.7, attempt++), 15000);
+    setTimeout(connect, delay);
+  };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function sendAudio(track, pcm16) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;   // drop, never queue
+  const buf = new ArrayBuffer(4 + pcm16.byteLength);
+  const view = new DataView(buf);
+  view.setUint8(0, TRACK_CODE[track]);
+  view.setUint8(1, CODEC_PCM16);
+  view.setUint16(2, seq++ & 0xffff, true);
+  new Uint8Array(buf, 4).set(new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength));
+  ws.send(buf);
+}
+
+// ------------------------------------------------------------------- events
+
+function onEvent(msg) {
+  switch (msg.kind) {
+    case "session.ready":
+      sessionId = msg.session_id;
+      attempt = 0;
+      if (typeof msg.seq === "number") cursor = Math.max(cursor, msg.seq);
+      sessionStorage.setItem("copilot.session", sessionId);
+      renderTopics(msg.topics || []);
+      setConn("live", `connected · ${sessionId}`);
+      break;
+    case "resume.gap":
+      sys("some events were lost while offline", true);
+      break;
+    case "transcript.line":
+      addLine(msg.track, msg.text);
+      break;
+    case "transcript.delta":
+      break;   // partials are not rendered in P1
+    case "hint":
+      addHint(msg);
+      break;
+    case "topic.state":
+    case "session.state":
+      if (msg.topics) renderTopics(msg.topics);
+      break;
+    case "briefing.update":
+      if (msg.reason === "expanded") sys(`briefing extended: ${msg.added_title}`);
+      if (msg.topics) renderTopics(msg.topics);
+      break;
+    case "track.state":
+      sys(`track ${msg.track} ${msg.state}`);
+      break;
+    case "error":
+      sys(`${msg.stage}: ${msg.message}`, true);
+      break;
+  }
+}
+
+function addLine(track, text) {
+  const div = document.createElement("div");
+  div.className = "line " + track;
+  const who = document.createElement("span");
+  who.className = "who";
+  who.textContent = track === "self" ? "you" : "them";
+  div.appendChild(who);
+  div.appendChild(document.createTextNode(text));
+  el.transcript.appendChild(div);
+  el.transcript.scrollTop = el.transcript.scrollHeight;
+}
+
+function addHint(msg) {
+  const div = document.createElement("div");
+  div.className = "hint" + (msg.desk_fake ? " fake" : "");
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = `${msg.topic_id} · ${msg.warmth} · ${msg.latency_ms} ms`
+    + (msg.desk_fake ? " · DESK FAKE" : "");
+  div.appendChild(meta);
+  const ul = document.createElement("ul");
+  (msg.bullets || []).forEach((b) => {
+    const li = document.createElement("li");
+    li.textContent = b;
+    ul.appendChild(li);
+  });
+  div.appendChild(ul);
+  el.hints.appendChild(div);
+  el.hints.scrollTop = el.hints.scrollHeight;
+}
+
+function renderTopics(topics) {
+  if (!topics.length) return;
+  el.topics.textContent = "";
+  topics.forEach((t) => {
+    const span = document.createElement("span");
+    span.className = "topic " + (t.warmth || "unknown");
+    span.textContent = t.title || t.topic_id;
+    const w = document.createElement("span");
+    w.className = "w";
+    w.textContent = t.warmth + (t.cached_tokens != null ? ` ${t.cached_tokens}/${t.primed_tokens}` : "");
+    span.appendChild(w);
+    span.onclick = () => send({ kind: "topic.focus", topic_id: t.topic_id });
+    el.topics.appendChild(span);
+  });
+}
+
+// ------------------------------------------------------------------ capture
+
+const WORKLET_SRC = `
+class Cap extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) this.port.postMessage(new Float32Array(ch));
+    return true;
+  }
+}
+registerProcessor('cap', Cap);
+`;
+
+async function startCapture(track, stream) {
+  const ctx = new AudioContext();
+  await ctx.audioWorklet.addModule(URL.createObjectURL(
+    new Blob([WORKLET_SRC], { type: "application/javascript" })));
+  const node = new AudioWorkletNode(ctx, "cap");
+  const src = ctx.createMediaStreamSource(stream);
+  src.connect(node);
+  // Not connected to the destination: nothing is played back, so tab audio
+  // cannot be re-emitted into the microphone by this page.
+
+  const state = { ctx, node, stream, pending: [], carry: [], silentSince: null, open: true };
+  captures[track] = state;
+  send({ kind: "track.open", track: track });
+
+  const ratio = ctx.sampleRate / PIPELINE_RATE;
+  node.port.onmessage = (ev) => {
+    const input = ev.data;
+    // Box-average decimation to 16 kHz, the #466 capture chain.
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const start = Math.floor(i * ratio), end = Math.floor((i + 1) * ratio);
+      let sum = 0, n = 0;
+      for (let j = start; j < end && j < input.length; j++) { sum += input[j]; n++; }
+      out[i] = n ? sum / n : 0;
+    }
+    let rms = 0;
+    for (let i = 0; i < out.length; i++) rms += out[i] * out[i];
+    rms = Math.sqrt(rms / Math.max(1, out.length));
+
+    state.carry.push(...out);
+    while (state.carry.length >= FRAME_SAMPLES) {
+      const chunk = state.carry.splice(0, FRAME_SAMPLES);
+      const pcm = new Int16Array(FRAME_SAMPLES);
+      for (let i = 0; i < FRAME_SAMPLES; i++) {
+        const s = Math.max(-1, Math.min(1, chunk[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      sendAudio(track, pcm);
+    }
+
+    const now = performance.now();
+    if (rms < SILENCE_RMS) {
+      if (state.silentSince === null) state.silentSince = now;
+      else if (now - state.silentSince > SILENCE_MS && state.spoke) {
+        state.spoke = false;
+        state.silentSince = null;
+        send({ kind: "commit", track: track });
+      }
+    } else {
+      state.silentSince = null;
+      state.spoke = true;
+    }
+  };
+}
+
+function stopCapture(track) {
+  const state = captures[track];
+  if (!state) return;
+  state.stream.getTracks().forEach((t) => t.stop());
+  state.ctx.close();
+  delete captures[track];
+  send({ kind: "track.close", track: track });
+}
+
+el.mic.onclick = async () => {
+  if (captures.self) { stopCapture("self"); el.mic.classList.remove("on"); el.mic.textContent = "start microphone"; return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    });
+    await startCapture("self", stream);
+    el.mic.classList.add("on");
+    el.mic.textContent = "stop microphone";
+  } catch (e) {
+    sys("microphone denied: " + e.message, true);
+  }
+};
+
+el.tab.onclick = async () => {
+  if (captures.other) { stopCapture("other"); el.tab.classList.remove("on"); el.tab.textContent = "capture tab audio"; return; }
+  try {
+    // Chrome requires video to be requested even when only audio is wanted,
+    // and only offers the "share tab audio" checkbox for a TAB share.
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    stream.getVideoTracks().forEach((t) => t.stop());
+    if (stream.getAudioTracks().length === 0) {
+      sys("that share carries no audio — pick a TAB and tick 'share tab audio'", true);
+      return;
+    }
+    await startCapture("other", new MediaStream(stream.getAudioTracks()));
+    el.tab.classList.add("on");
+    el.tab.textContent = "stop tab capture";
+  } catch (e) {
+    sys("tab capture cancelled: " + e.message, true);
+  }
+};
+
+el.brief.onclick = () => {
+  const area = document.createElement("textarea");
+  area.placeholder = "# Briefing\n\n## Topic\nWhat you already know…";
+  const box = document.createElement("div");
+  box.style.padding = "10px 16px";
+  const ok = document.createElement("button");
+  ok.textContent = "load briefing";
+  ok.onclick = () => { send({ kind: "briefing.set", text: area.value }); box.remove(); };
+  box.appendChild(area);
+  box.appendChild(ok);
+  el.hints.prepend(box);
+};
+
+sessionId = sessionStorage.getItem("copilot.session");
+setInterval(() => send({ kind: "ping" }), 20000);
+connect();
+</script>

@@ -902,8 +902,18 @@ high-priority stream, lend/reclaim in ms, SM-contention pairing rule
 (`--dual-group-lane-pairing` needs `--dual-group-lane-concurrent`,
 `server_args.py:9462`), lane-NEXTN head. Admission: an EXPLICIT
 `--rank-tp-ratio` integer list is mandatory (`'auto'` refused,
-`server_args.py:9441`) — a UNIFORM vector is accepted, so the lane is reachable
-on a homogeneous rig — plus `--dual-group-lane-budget-mib` (:9449). Only
+`server_args.py:9497`) — ~~a UNIFORM vector is accepted, so the lane is
+reachable on a homogeneous rig~~ **REFUTED (#502, by execution)**: the lane's
+own block does not reject a uniform vector, but it is not the last word. Both
+checks live in the SAME validation function `_handle_uneven_tp`
+(`server_args.py:9377-9997`), and the general `--rank-tp-ratio` validation
+that runs after it raises `"--rank-tp-ratio with identical entries is the even
+split — omit the flag instead."` (`server_args.py:9619-9623`). Executed on a
+`ServerArgs` with `dual_group_lane=True, tp_size=2, rank_tp_ratio=[1,1]`, that
+is exactly the error raised — so the lane structurally requires `tp_size >= 2`
+with a NON-UNIFORM split and is NOT reachable on a homogeneous rig. The old
+line priced the lane's own block in isolation and missed the second gate in
+the same function — plus `--dual-group-lane-budget-mib` (:9505). Only
 `pp_size>1` and `--enable-dp-attention` are refused (:9455); `ep_size>1` and
 plain `dp_size>1` are NOT. Lane spec chain merged: rank-local draft-KV sizing,
 chain-spec topk=1 — the gate reads the SERVING GROUP's
@@ -1469,6 +1479,25 @@ anything.
 * ffprobe/ffmpeg stderr is logged, not reflected
   (`video_enhance/mux.py:subprocess_failure`) — reflected into a 422 it was a
   filesystem existence oracle for a caller who also chose the input path.
+
+Live interview copilot (#502, `srt/copilot/`, **P1 skeleton — desk fakes, never
+booted against a model**): a browser app that captures the user's microphone
+AND the far side via tab capture, streams both to the runtime's own ASR surface
+as TWO `/v1/realtime` connections (one per track, since that endpoint is one
+stream per socket, `realtime/session.py:143-164`), and shows hints to read.
+Own FastAPI process (`python -m sglang.srt.copilot.launch`) that owns no model,
+no VRAM and no CUDA context — it reaches the runtime only through
+`/v1/realtime` and `/v1/chat/completions`. Live hints carry `lane="fast"`
+(`entrypoints/openai/protocol.py:869`), background briefing expansion carries
+the heavy-tier default. Warm topic contexts are prefill-only primed
+(`max_new_tokens=0`) and ranked by request priority, NOT pinned — no pin API
+exists (`mem_cache/radix_cache.py:598-625`; `session_radix_cache.py:23-27`
+"no pinning, no open") — and their warmth is MEASURED from
+`prompt_tokens_details.cached_tokens` per request rather than assumed. Design
+and phase falsifiers: `docs/dev/DESIGN_502_interview_copilot.md`. Note the
+input-side ASR surface it builds on is upstream, not fork-added:
+`POST /v1/audio/transcriptions` (`http_server.py:2316`) and
+`WEBSOCKET /v1/realtime` (`:2357`), with Whisper/Qwen3-ASR/MiMo-V2 adapters.
 
 Class-3 video enhance, adaptive chain planner (#451,
 `video_enhance/chain_policy.py`): given an ffprobe source and a target, it
