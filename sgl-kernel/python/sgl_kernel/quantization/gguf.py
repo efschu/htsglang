@@ -72,9 +72,13 @@ def ggml_moe_get_block_size(type: int) -> int:
 def ggml_mxfp4_native() -> int:
     """1 on a build carrying the native MXFP4 (ggml type 39) kernel set (#398).
 
-    Registered for the CUDA dispatch key only and takes no tensor, so the
-    dispatcher cannot route the call -- probe by op EXISTENCE
-    (``hasattr(torch.ops.sgl_kernel, "ggml_mxfp4_native")``) rather than by
-    calling this wrapper.
+    Callable since #518, which registered this and the two sibling no-tensor
+    probes catch-all instead of CUDA-only; before that the dispatcher had no
+    tensor to infer a device from and every call raised "no dispatchable
+    fallback". Callers that need to work against an OLDER wheel should still
+    probe by op EXISTENCE
+    (``hasattr(torch.ops.sgl_kernel, "ggml_mxfp4_native")``), which is what
+    ``sglang.srt.layers.quantization.gguf`` does -- existence is the question
+    it is actually asking.
     """
     return torch.ops.sgl_kernel.ggml_mxfp4_native.default()

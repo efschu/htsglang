@@ -252,11 +252,15 @@ def _mxfp4_kernels_present() -> bool:
     The wheel ships prebuilt and is pinned by sha256 (rig-runbook 2.1), so a
     tree that HAS this source change can still be running an older wheel; the
     type sets must follow the wheel, not the tree. Detected by EXISTENCE of the
-    ``ggml_mxfp4_native`` op, the #73 pattern: a probe that takes no tensor
-    cannot be routed by the dispatcher (it would raise "no dispatchable
-    fallback"), but its registration alone identifies the build. Older wheels
-    lack the op -> MXFP4 stays out of every set and the load-time MXFP4 ->
-    Q5_0 repack remains the only executable route, unchanged.
+    ``ggml_mxfp4_native`` op, the #73 pattern: its registration alone
+    identifies the build, so the probe never has to call it. That was
+    originally a necessity -- until #518 the op was registered for the CUDA
+    dispatch key only and, taking no tensor, could not be routed at all
+    ("no dispatchable fallback" on every call, every arch) -- and it stays
+    the right shape afterwards, because existence is exactly the question and
+    an existence check works on old and new wheels alike. Older wheels lack
+    the op -> MXFP4 stays out of every set and the load-time MXFP4 -> Q5_0
+    repack remains the only executable route, unchanged.
 
     ``SGLANG_GGUF_MXFP4_NATIVE=0`` forces the old behaviour on a new wheel --
     the A/B lever for the repack-vs-native comparison, and the fallback if the
@@ -960,16 +964,19 @@ def fused_mul_mat_gguf(
     return y
 
 
-# ggml_moe_get_block_size(int type) -> int takes NO tensor argument and is
-# registered in sgl-kernel exclusively for the CUDA dispatch key, so torch has
-# no tensor from which to infer a device and cannot route the call -> it raises
-# "no dispatchable fallback" NotImplementedError. That aborts the MMQ MoE path
-# (large-M / prefill / needle), while the tensor-carrying MMVQ decode path is
-# unaffected. The kernel body is a pure compile-time lookup: it returns the MMQ
-# tile width MOE_X_Q* for the ggml type, which is 8 on ROCm and 4 on CUDA/others
-# for every supported quant type (see moe.cuh). Mirror that here so the op stays
-# usable WITHOUT a kernel rebuild, while still preferring the real op whenever it
-# is dispatchable (e.g. a future build that registers a CatchAll impl).
+# ggml_moe_get_block_size(int type) -> int takes NO tensor argument. Until #518
+# it was registered in sgl-kernel exclusively for the CUDA dispatch key, so
+# torch had no tensor from which to infer a device and could not route the call
+# -> it raised "no dispatchable fallback" NotImplementedError on EVERY call, on
+# every arch. That aborted the MMQ MoE path (large-M / prefill / needle), while
+# the tensor-carrying MMVQ decode path was unaffected. #518 registers it (and
+# the two sibling probes) catch-all, so on a wheel built from this tree or later
+# the real op answers. The kernel body is a pure compile-time lookup: it returns
+# the MMQ tile width MOE_X_Q* for the ggml type, which is 8 on ROCm and 4 on
+# CUDA/others for every supported quant type (see moe.cuh). The mirror below
+# STAYS -- the wheel ships prebuilt and is pinned by sha256, so a tree carrying
+# the #518 registration can still be running a pre-#518 wheel -- and the real op
+# is preferred whenever it is dispatchable.
 # Supported ggml types: Q4_0=2 Q4_1=3 Q5_0=6 Q5_1=7 Q8_0=8 Q2_K=10 Q3_K=11
 # Q4_K=12 Q5_K=13 Q6_K=14, and MXFP4=39 on a #398 wheel (MOE_X_MXFP4, same 4/8
 # tile width as the rest -- it is only in the set when the wheel has the

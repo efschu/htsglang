@@ -1196,6 +1196,46 @@ records the collision as expected behaviour. Reference implementations for a
 complete key already in this tree:
 `managers/kv_session_spill_destination.py:215-239` and
 `video_enhance/engine_cache.py:79-121`.
+Unreachable-registration family (#81 #518): an op registered for a DEVICE
+dispatch key but taking no tensor argument cannot be routed at all -- the
+dispatcher infers the backend from the tensors and there are none, so every
+call raises "no tensor arguments ... no fallback function is registered",
+identically on every arch, in the dispatcher before any kernel. Three GGUF
+capability probes shipped that way (`ggml_moe_get_block_size`,
+`ggml_mmvq_kq_tuned`, `ggml_mxfp4_native`); the serving path never noticed
+because `layers/quantization/gguf.py` had grown a python mirror around the
+raise, so the defect surfaced only when #398's Gate A called the op directly
+(12/14 on BOTH sm86 and sm120, same two failures). Fix is the keyless
+`m.impl` the same file already uses for `apply_token_bitmask_inplace_cuda`.
+`test/registered/unit/quantization/test_no_tensor_op_dispatch_518.py` pins it
+twice: the dispatcher behaviour on throwaway ops defined in-process (so the
+claim is executed, off-GPU, no wheel) and a ratchet over every
+`TORCH_LIBRARY_FRAGMENT` schema, so the next tensorless probe cannot
+reintroduce it. General lesson: a python-side workaround around a raise keeps
+serving alive AND keeps the defect out of sight -- the mirror stays (the wheel
+is sha-pinned and can lag the tree), but it is a fallback, not the fix.
+Byte-stride width family (#109 #112 #512, from audit #506 A1-1): the GGUF MoE
+MMQ kernel reaches an expert with `(char*)vx + exp_idx * exp_stride` where
+`exp_stride` is a BYTE stride, declared `int` while the call site already
+passed `int64_t` -- so the product wrapped negative once one rank's per-layer
+expert tensor passed 2 GiB (DSV4-Flash Q4_K, 256 experts: 2.416e9 B, first bad
+local expert 227; TP=3 sharding is the only reason this rig never hit it).
+Same read as the #109/#112 expert-id guard, from the other operand, which is
+why the guard is pinned in the same test. Rule: a stride in BYTES needs 64
+bits at every geometry this fork serves; a stride in BLOCK units has 16-32x
+more headroom and `moe_vec.cuh` is left 32-bit WITH the bound written down
+(9x at the widest served geometry) rather than silently.
+Tolerance-that-cannot-fail (#380 #511, from audit #506 axis 4): a numeric gate
+is only a gate if it rejects something. `atol=1.5, rtol=3e1` on outputs whose
+RMS is 5.1e3 is the predicate `|a-b| <= 30|b|`, which an all-zeros and a
+sign-flipped output both satisfy; a "tighter" ratio check denominated by
+`a.abs().max().clamp_min(1e-6)` passes when both arms are zero. Replaced by a
+tolerance DERIVED from the one physical error source (q8_1 activation
+rounding: `sigma_ij^2 = sum_k d_k^2 w_jk^2 / 12`, extreme value over N
+elements ~ sqrt(2 ln N) sigma) plus a spread precondition on the reference and
+a magnitude precondition on each arm. Every gate in that file now has an
+off-GPU can-discriminate test showing it reject a zeroed and a sign-flipped
+output, including the refuted baseline executed as a test.
 Rank-local condition BEFORE any group collective (hang family); bounded waits
 with fixed pool universe; bounded peer-liveness instead of endless spin;
 ColdBuild error unmasking (never substitute "lower mem-fraction" for a real
