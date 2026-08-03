@@ -139,12 +139,34 @@ cmd_add_asset() {
   [ -n "$upload_url" ] || die "could not resolve the release upload URL for ${tag}"
 
   pat="$(read_pat)"
+  local release_id
+  release_id="$(echo "$release" | grep -o '"id"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 | grep -o '[0-9]*$')"
+
   for part in "$staging/${name}".part-*; do
-    echo "uploading $(basename "$part") ($(du -h "$part" | cut -f1))"
-    curl -sS -m 3600 -X POST \
+    # GitHub answers 422 for a name that already exists on the release, which
+    # is exactly what a retry after a failed upload hits -- and the stale asset
+    # is the truncated one. Delete before re-uploading so a retry converges
+    # instead of silently keeping the broken copy.
+    local part_name existing_id
+    part_name="$(basename "$part")"
+    existing_id="$(api GET "/repos/${OWNER}/${REPO_NAME}/releases/${release_id}/assets?per_page=100" \
+      | tr ',' '\n' | grep -B1 "\"name\": *\"${part_name}\"" | grep -o '"id": *[0-9]*' \
+      | grep -o '[0-9]*$' | head -1)"
+    if [ -n "$existing_id" ]; then
+      echo "  replacing existing asset ${part_name}"
+      api DELETE "/repos/${OWNER}/${REPO_NAME}/releases/assets/${existing_id}" > /dev/null
+    fi
+  done
+
+  for part in "$staging/${name}".part-*; do
+    echo "uploading $(basename "$part") ($(stat -c %s "$part") bytes)"
+    # `--data-binary @file` reads the WHOLE file into memory and dies with
+    # "out of memory" on a multi-gigabyte checkpoint -- found by running it.
+    # `-T` streams from disk; `-X POST` keeps the method GitHub's upload API
+    # requires, which `-T` would otherwise turn into a PUT.
+    curl -sS -m 7200 -X POST -T "${part}" \
       -H "Authorization: Bearer ${pat}" \
       -H "Content-Type: application/octet-stream" \
-      --data-binary "@${part}" \
       "${upload_url}?name=$(basename "$part")" -o /dev/null -w '  http=%{http_code}\n' | redact
   done
 
