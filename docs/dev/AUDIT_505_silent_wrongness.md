@@ -135,6 +135,29 @@ question decides whether this is severe or moot, and it is step 0 of the task �
 finding is ranked first on damage-if-real, not on confirmed damage.
 *Task:* `check the early-chunk question first, then measure per-class inter-byte gaps and derive the liveness table (LLM_STREAM=90s vs real TTFT)`
 
+> **CORRECTION (#514, 2026-08-03) — this ranking was wrong; step 0 answers it.**
+> The stated precondition was resolved at the code and **TTFT is outside the
+> budget**, so the "aborts healthy streams" claim does not hold as written.
+> The mechanism is not an early role chunk — that one is emitted *inside* the
+> `async for content in generate_request(...)` loop (`serving_chat.py:1123-1134`)
+> and so cannot restart anything early. It is an ORDERING one level up:
+> `_handle_streaming_request` awaits `generator.__anext__()`
+> (`serving_chat.py:1012`, `serving_completions.py:202`) and only *then* builds the
+> `StreamingResponse`; `serving_base.py:111-119` awaits that handler and passes the
+> **result** to `guard_generate_stream`. The watchdog therefore does not exist while
+> the request queues and prefills, and `last_progress_at` is set at construction
+> (`watchdog.py:204-210`). The 90 s covers the gap BETWEEN chunks — milliseconds at
+> decode — not the time to the first one.
+> What survives: the number is still unmeasured, and its safety now visibly rests on
+> that ordering. #514 therefore did **not** change the default (that would have acted
+> on a refuted premise); it pinned the ordering
+> (`TimeToFirstTokenIsOutsideTheBudgetTest`, 4 tests, the structural pin proven
+> can-fail by removing the pre-pull) and recorded the scope at
+> `DEFAULT_TIMEOUT_RATIONALE`. A measurement of real inter-chunk gaps remains
+> worthwhile but is no longer urgent, and this finding should not have been ranked
+> first. Same lesson as the #500-B1 refutation: an audit finding is a hypothesis
+> until its falsifier is red.
+
 **2. #505-B-01 — `offload_movement` reports a completed wave-in as still parked and
 never releases the booking (executed, not argued).** The comment at
 `offload_movement.py:916-918` says the error path means *"retrieval failed physically.
@@ -1253,6 +1276,12 @@ the transport, so a long first-token latency counts in full. On the standing rec
 obviously above the worst legitimate TTFT — and nobody has checked. Highest damage
 of anything found: silent, user-visible, on the default path.
 *Task:* `#505-C-01: measure per-class inter-byte gaps and derive the liveness timeout table, starting with LLM_STREAM=90s vs real TTFT`
+
+> **CORRECTED by #514** — see the correction under finding 1 in section 5. TTFT is
+> OUTSIDE the budget (the response is built only after `generator.__anext__()`
+> returns, and only that response is wrapped), so "aborts healthy streams" does not
+> hold. The default was deliberately left unchanged; the load-bearing ordering is now
+> pinned instead.
 
 **#505-C-02 — the GGUF host-RAM watermark ships at 0 (off) although the measurement
 that motivated it is recorded at the flag.**

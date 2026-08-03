@@ -958,5 +958,144 @@ class AwaitWithLivenessTest(CustomTestCase):
         asyncio.run(run())
 
 
+class TimeToFirstTokenIsOutsideTheBudgetTest(CustomTestCase):
+    """#514 / #505-C-01: the LLM_STREAM budget does NOT have to cover TTFT.
+
+    Audit #505 ranked the unmeasured 90 s ``LLM_STREAM`` default as its most
+    damaging finding on the reasoning that "the clock starts at watchdog
+    construction and advances only on bytes accepted by the transport, so a
+    long first-token latency counts in full". The first half is right and the
+    conclusion is wrong, because of an ordering the audit did not check:
+    ``_handle_streaming_request`` AWAITS the first chunk out of the generator
+    (``generator.__anext__()``) before it constructs the ``StreamingResponse``,
+    and only the returned response is handed to ``guard_generate_stream``. So
+    the watchdog does not exist yet while prefill runs, and the budget it then
+    starts covers the gap BETWEEN chunks -- milliseconds at decode -- not the
+    time to the first one.
+
+    That makes the finding far less severe than reported, and it makes this
+    ordering load-bearing: move the wrap in front of the pre-pull, or drop the
+    pre-pull, and the desk-picked 90 s silently becomes an abort threshold on
+    prefill. These tests pin the ordering so that change cannot pass unseen.
+    """
+
+    def test_the_watchdog_clock_starts_when_it_is_created_not_when_the_request_arrived(
+        self,
+    ):
+        """The budget is spent from wrap time, so anything the server did
+        before the wrap -- queueing, prefill -- costs the consumer nothing."""
+
+        async def run():
+            clock = FakeClock()
+            clock.advance(1000.0)  # a long prefill happens here, pre-wrap
+            watchdog = ConsumerWatchdog(
+                job_id="ttft",
+                policy=fast_policy(),
+                release=Released(),
+                clock=clock,
+            )
+            # Zero silence at wrap time: the 1000 s that elapsed before the
+            # watchdog existed are not charged against the class budget.
+            self.assertEqual(watchdog.state.silent_for(clock()), 0.0)
+            self.assertEqual(watchdog.state.started_at, clock())
+
+        asyncio.run(run())
+
+    def test_the_pre_pull_happens_before_the_streaming_response_exists(self):
+        """Structural pin, both OpenAI streaming endpoints.
+
+        Read from source rather than executed: the property is an ORDERING
+        inside a method whose real inputs are a tokenizer manager and a live
+        request, and the ordering is exactly what a refactor would move.
+        """
+        import ast
+        import inspect
+
+        from sglang.srt.entrypoints.openai import serving_chat, serving_completions
+
+        for module in (serving_chat, serving_completions):
+            tree = ast.parse(inspect.getsource(module))
+            handlers = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "_handle_streaming_request"
+            ]
+            self.assertTrue(
+                handlers, f"{module.__name__} has no _handle_streaming_request"
+            )
+            for handler in handlers:
+                pre_pull = [
+                    n.lineno
+                    for n in ast.walk(handler)
+                    if isinstance(n, ast.Await)
+                    and isinstance(n.value, ast.Call)
+                    and isinstance(n.value.func, ast.Attribute)
+                    and n.value.func.attr == "__anext__"
+                ]
+                responses = [
+                    n.lineno
+                    for n in ast.walk(handler)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id == "StreamingResponse"
+                ]
+                self.assertTrue(
+                    pre_pull,
+                    f"{module.__name__}._handle_streaming_request no longer awaits "
+                    "the first chunk before returning: TTFT now falls inside the "
+                    "liveness budget and the unmeasured LLM_STREAM default "
+                    "becomes a prefill abort threshold (#505-C-01)",
+                )
+                self.assertTrue(responses, f"{module.__name__} builds no response")
+                self.assertLess(
+                    min(pre_pull),
+                    min(responses),
+                    f"{module.__name__}: the first chunk must be pulled BEFORE the "
+                    "StreamingResponse is constructed",
+                )
+
+    def test_the_guard_is_applied_to_an_already_awaited_response(self):
+        """The wrap must sit after the await, in ``serving_base``. If
+        ``guard_generate_stream`` ever wrapped the coroutine instead of its
+        result, the watchdog would start before the first chunk."""
+        import ast
+        import inspect
+
+        from sglang.srt.entrypoints.openai import serving_base
+
+        tree = ast.parse(inspect.getsource(serving_base))
+        awaits = [
+            n.lineno
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Await)
+            and isinstance(n.value, ast.Call)
+            and isinstance(n.value.func, ast.Attribute)
+            and n.value.func.attr == "_handle_streaming_request"
+        ]
+        guards = [
+            n.lineno
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "guard_generate_stream"
+        ]
+        self.assertTrue(awaits, "serving_base no longer awaits the streaming handler")
+        self.assertTrue(guards, "serving_base no longer guards the token stream")
+        self.assertLess(
+            min(awaits),
+            min(guards),
+            "guard_generate_stream must wrap the AWAITED response, not the "
+            "coroutine -- otherwise the liveness budget starts covering TTFT "
+            "(#505-C-01)",
+        )
+
+    def test_the_rationale_records_that_ttft_is_outside_the_budget(self):
+        """The number is still unmeasured; what is now pinned is its SCOPE.
+        A reader deciding whether 90 s is safe must be told what it covers."""
+        rationale = DEFAULT_TIMEOUT_RATIONALE[EndpointClass.LLM_STREAM]
+        self.assertIn("first chunk", rationale.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

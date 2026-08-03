@@ -99,9 +99,14 @@ DEFAULT_TIMEOUTS_S: dict[EndpointClass, float] = {
 #: encode an argument about the consumer, not a measurement of the server.
 DEFAULT_TIMEOUT_RATIONALE: dict[EndpointClass, str] = {
     EndpointClass.LLM_STREAM: (
-        "Long enough to survive a queued request behind a long prefill and a "
-        "reader on a slow link, short enough that a dead chat client does not "
-        "hold KV blocks for minutes. The most contended resource in the "
+        "Covers the gap BETWEEN chunks, not the time to the first chunk: "
+        "_handle_streaming_request awaits the first chunk out of the generator "
+        "before it builds the StreamingResponse, and only that response is "
+        "wrapped, so the watchdog does not exist yet while the request queues "
+        "and prefills (pinned by TimeToFirstTokenIsOutsideTheBudgetTest, "
+        "#505-C-01). What it must survive is therefore a slow reader and an "
+        "inter-token stall, not TTFT. Short enough that a dead chat client does "
+        "not hold KV blocks for minutes. The most contended resource in the "
         "process, so the least patient of the stream classes."
     ),
     EndpointClass.EMBEDDING: (
