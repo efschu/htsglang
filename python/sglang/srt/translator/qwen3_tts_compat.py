@@ -135,11 +135,43 @@ def _default_rope_init(config, device=None, seq_len=None, **_kwargs):
 
 
 def _adapt_mask_helper(fn):
+    """Adapt a 4.57 mask-helper call to the 5.12 signature WITHOUT losing meaning.
+
+    Two renames and one genuine hazard.
+
+    The renames are trivial: ``input_embeds`` became ``inputs_embeds``.
+
+    The hazard is ``cache_position``, which 5.12 no longer accepts. Filtering
+    it out as an unknown kwarg -- the obvious thing, and what this wrapper did
+    first -- silently changes what the mask MEANS. ``cache_position`` is what
+    tells the builder that a one-token decode step sits at absolute position
+    N: without it the mask is built as though the single query token were the
+    whole sequence, attention returns one row per CACHED position instead of
+    one per query token, and the error finally surfaces as a shape mismatch in
+    ``o_proj`` several frames away
+    (``mat1 and mat2 shapes cannot be multiplied (1x22528 and 2048x1024)``,
+    where 22528 = 11 cached positions x 2048). Prefill is unaffected, so the
+    model loads, prefills correctly, and dies on the first decode step.
+
+    5.12 carries the same information in ``position_ids``, so the fix is to
+    translate rather than drop: promote ``cache_position`` to ``position_ids``
+    when the caller did not supply its own.
+    """
     accepted = set(inspect.signature(fn).parameters)
 
     def wrapper(**kwargs):
         if "input_embeds" in kwargs:
             kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+        cache_position = kwargs.pop("cache_position", None)
+        if (
+            cache_position is not None
+            and kwargs.get("position_ids") is None
+            and "position_ids" in accepted
+        ):
+            positions = cache_position
+            if hasattr(positions, "dim") and positions.dim() == 1:
+                positions = positions.unsqueeze(0)
+            kwargs["position_ids"] = positions
         return fn(**{k: v for k, v in kwargs.items() if k in accepted})
 
     wrapper.__name__ = getattr(fn, "__name__", "mask_helper")

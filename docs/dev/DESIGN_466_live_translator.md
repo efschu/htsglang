@@ -1162,7 +1162,28 @@ costs a backend and not a pipeline.
   meta-device construction) being the only silent one;
 * `mel_filters.py`, validated element-wise against real librosa 0.11.0.
 
-**The blocker: the prompt/embeds builder.** Generation runs through mel,
+**Blocker, now localised to one frame (2026-08-03).** It is NOT the prompt
+builder. Instrumenting the attention entry showed prefill succeeding with
+`inputs_embeds (1, 10, 1024)` and the failure landing on the first DECODE step
+with `(1, 1, 1024)`:
+
+* `o_proj` is `Linear(2048 -> 1024)` and receives 22528 = **11 x 2048**, where
+  11 is the CACHED sequence length and the query length is 1;
+* an attention output always has the QUERY length, so the expansion happens
+  before `o_proj` -- the strong candidate is the M-RoPE apply broadcasting a
+  1-token query against full-length `cos`/`sin`, i.e. decode-step position
+  bookkeeping under 5.x cache semantics rather than anything in the assembly;
+* the `check_model_inputs` shim was **exonerated** by bypassing it entirely
+  (identical failure), and promoting `cache_position` to `position_ids` in the
+  mask helper did not change it either -- correct on its own terms, so it was
+  kept, but it is not this bug.
+
+Next step is that seam specifically: how the talker computes decode-step
+position ids and what it hands the rotary, read against the preserved
+reference. The prompt-builder text below stands as the pre-registered risk it
+was, but it is no longer the leading suspect.
+
+**Superseded suspicion: the prompt/embeds builder.** Generation runs through mel,
 speaker-embedding extraction, prompt assembly and into sampling, then fails in
 `text_projection` with a flattened input:
 
