@@ -145,6 +145,7 @@ class InProcessQwen3Tts:
             ensure_qwen3_tts_importable,
             refresh_rotary_buffers,
             restore_cache_position,
+            verify_and_load_weights,
         )
 
         shims = ensure_qwen3_tts_importable()
@@ -183,6 +184,19 @@ class InProcessQwen3Tts:
         inner = getattr(self._model, "model", self._model)
         refreshed = refresh_rotary_buffers(inner)
         logger.info("refreshed %d rotary buffers", refreshed)
+        # Drift 7, and the reason this check is not optional: under 5.x
+        # `from_pretrained` reported "Loading weights: 478/478" and loaded
+        # NONE of them. A randomly initialised talker in front of a correctly
+        # loaded vocoder does not fail -- it produces fluent babble that never
+        # ends, and every cheap signal (finite, speech-shaped, high speaker
+        # similarity) says it is fine. Only a comparison against the
+        # checkpoint bytes can see it, so it runs on every load.
+        report = verify_and_load_weights(inner, self.config.model_dir)
+        logger.info(
+            "weight verification: %d tensors checked, %d repaired",
+            report["checked"],
+            report["repaired"],
+        )
         self._register_modules()
 
     def _register_modules(self) -> None:

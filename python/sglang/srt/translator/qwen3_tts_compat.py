@@ -44,7 +44,8 @@ import logging
 import sys
 import threading
 import types
-from typing import Any, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ __all__ = [
     "CompatError",
     "refresh_rotary_buffers",
     "restore_cache_position",
+    "verify_and_load_weights",
     "applied_shims",
 ]
 
@@ -406,6 +408,130 @@ def refresh_rotary_buffers(model) -> int:
     if refreshed:
         logger.info("recomputed %d rotary inv_freq buffers after load", refreshed)
     return refreshed
+
+
+def _sample_elements(tensor, count: int = 32):
+    """A deterministic, cheap fingerprint of a tensor's contents."""
+    flat = tensor.reshape(-1)
+    if flat.numel() == 0:
+        return flat
+    step = max(1, flat.numel() // count)
+    return flat[::step][:count].float()
+
+
+def verify_and_load_weights(model, model_dir, files=("model.safetensors",)) -> Dict[str, int]:
+    """Drift 7, and the only one that produced plausible audio while WRONG.
+
+    ``from_pretrained`` printed ``Loading weights: 478/478`` and loaded
+    **nothing**: every talker and speaker-encoder tensor in the live model was
+    still at transformers' random initialisation (``std 0.02``, biases exactly
+    zero) while the checkpoint held trained values. Verified element-wise --
+    ``talker.text_projection.linear_fc2.bias`` was ``[0, 0, 0, ...]`` in the
+    model against ``[0.00227, -0.00110, 0.00616, ...]`` in the file.
+
+    **Why it survived so long is the instructive part.** A randomly initialised
+    talker driving a correctly loaded codec decoder does not produce silence or
+    noise -- it produces fluent-sounding, speech-shaped babble, because the
+    vocoder is trained to turn any code sequence into speech. It also never
+    emits the end-of-utterance code, so generation ran to ``max_new_tokens``
+    every time: 40.9 s of audio for a nine-word sentence, against 3.85 s from
+    the reference implementation on the same checkpoint and direction. That
+    runaway was the only externally visible symptom, and it looks exactly like
+    a sampling or prompt-conditioning problem.
+
+    It also produced a **spuriously excellent measurement**: cosine similarity
+    0.986 between the reference clip's x-vector and the output's -- both
+    extracted by the same randomly initialised speaker encoder. Two garbage
+    vectors from one garbage encoder agree with each other. That is the
+    "reference twin that agrees with the thing it validates" family this
+    project has now hit four times, and it is why this check compares against
+    the FILE rather than against another copy of the model.
+
+    So the guard is not defensive padding: silent non-loading is
+    indistinguishable from a working model by every cheap signal, and only a
+    comparison against the checkpoint bytes can see it.
+
+    The repair is an explicit ``load_state_dict``, which resolves every key
+    (0 missing, 0 unexpected, 0 mismatched) -- so the fault is in 5.x's key
+    remapping for this multi-prefix checkpoint, not in the checkpoint.
+
+    Returns a small report; raises :class:`CompatError` if the weights are
+    still wrong after the repair, because a talker that cannot be loaded must
+    fail loudly rather than sound plausible.
+    """
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    root = Path(model_dir)
+    state = model.state_dict()
+    report = {"checked": 0, "repaired": 0, "mismatched": 0}
+
+    def mismatches(paths) -> List[str]:
+        bad: List[str] = []
+        for path in paths:
+            with safe_open(str(path), framework="pt") as handle:
+                for key in handle.keys():
+                    if key not in state:
+                        continue
+                    report["checked"] += 1
+                    expected = _sample_elements(handle.get_tensor(key))
+                    actual = _sample_elements(state[key])
+                    if expected.shape != actual.shape or not torch.allclose(
+                        expected, actual, atol=1e-3, rtol=1e-3
+                    ):
+                        bad.append(key)
+        return bad
+
+    paths = [root / name for name in files if (root / name).exists()]
+    if not paths:
+        raise CompatError(
+            f"no checkpoint file under {root} out of {list(files)}; the "
+            "weights cannot be verified, and an unverified talker is exactly "
+            "the failure this check exists for"
+        )
+
+    bad = mismatches(paths)
+    if not bad:
+        return report
+
+    logger.warning(
+        "%d of %d checkpoint tensors did not reach the model (e.g. %s); "
+        "from_pretrained reported success. Loading the state dict explicitly.",
+        len(bad),
+        report["checked"],
+        ", ".join(bad[:3]),
+    )
+    merged: Dict[str, object] = {}
+    for path in paths:
+        merged.update(load_file(str(path)))
+    target_dtype = next(iter(state.values())).dtype
+    try:
+        result = model.load_state_dict(
+            {k: v.to(target_dtype) for k, v in merged.items()}, strict=False
+        )
+    except RuntimeError as exc:
+        # A shape mismatch is not caught by strict=False. Re-raised as a
+        # compat error so the caller sees one failure type for "this
+        # checkpoint cannot be loaded into this model".
+        raise CompatError(
+            f"the checkpoint under {root} does not fit this model: {exc}"
+        ) from exc
+    report["repaired"] = len(merged)
+    state = model.state_dict()
+    report["checked"] = 0
+    still_bad = mismatches(paths)
+    report["mismatched"] = len(still_bad)
+    if still_bad:
+        raise CompatError(
+            f"{len(still_bad)} tensors still differ from {root} after an "
+            f"explicit load (e.g. {', '.join(still_bad[:3])}); missing="
+            f"{len(result.missing_keys)} unexpected={len(result.unexpected_keys)}. "
+            "Refusing to run: a partially loaded talker produces fluent "
+            "babble rather than an error, which is worse than a failure."
+        )
+    logger.info("repaired %d checkpoint tensors by explicit load", report["repaired"])
+    return report
 
 
 def restore_cache_position(model_class) -> bool:
