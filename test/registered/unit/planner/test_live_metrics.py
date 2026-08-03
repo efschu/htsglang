@@ -465,3 +465,133 @@ class TestConcurrencyGauges(unittest.TestCase):
         snap, _ = snapshot("x", None, nvml=_rig(),
                            metrics_text=self._with_reqs(running=0), now=0.0)
         self.assertEqual(snap["num_running_reqs"], 0.0)
+
+
+# ---------------------------------------------------------------------------
+# #522: rolling medians, the four-state diagnosis, and the tier view, all
+# carried by the same snapshot/state contract.
+# ---------------------------------------------------------------------------
+class TestRateMediansInSnapshot(unittest.TestCase):
+    """The badge behind an idle rate tile. What must hold end-to-end: idle
+    polls do not enter the window, so an idle server still shows the median of
+    what it did while it was working."""
+
+    def test_first_call_has_no_medians(self):
+        snap, _ = snapshot("x", None, nvml=_rig(),
+                           metrics_text=_metrics(prompt=100, gen=100), now=0.0)
+        self.assertEqual(snap["rate_medians"], {})
+
+    def test_window_survives_in_the_returned_state(self):
+        m0 = _metrics(prompt=100, gen=100)
+        m1 = _metrics(prompt=100, gen=200)
+        _, st0 = snapshot("x", None, nvml=_rig(), metrics_text=m0, now=0.0)
+        snap1, st1 = snapshot("x", st0, nvml=_rig(), metrics_text=m1, now=1.0)
+        self.assertEqual(st1["rate_windows"]["decode_tok_s"], [100.0])
+        self.assertEqual(snap1["rate_medians"]["decode_tok_s"]["median"], 100.0)
+        self.assertEqual(snap1["rate_medians"]["decode_tok_s"]["n"], 1)
+
+    def test_idle_polls_keep_the_median_and_do_not_dilute_it(self):
+        texts = [(_metrics(prompt=100, gen=100), 0.0),
+                 (_metrics(prompt=100, gen=200), 1.0),
+                 (_metrics(prompt=100, gen=260), 2.0)]
+        state = None
+        for text, t in texts:
+            snap, state = snapshot("x", state, nvml=_rig(), metrics_text=text,
+                                   now=t)
+        # now 10 idle polls: counters frozen, decode reads 0
+        idle = _metrics(prompt=100, gen=260)
+        for i in range(10):
+            snap, state = snapshot("x", state, nvml=_rig(), metrics_text=idle,
+                                   now=3.0 + i)
+        self.assertEqual(snap["rates"]["decode_tok_s"], 0.0)
+        med = snap["rate_medians"]["decode_tok_s"]
+        self.assertEqual(med["n"], 2)          # only the two working windows
+        self.assertEqual(med["median"], 80.0)  # median(100, 60)
+
+    def test_spec_median_needs_decode_activity(self):
+        idle = _metrics(prompt=100, gen=100)
+        _, st0 = snapshot("x", None, nvml=_rig(), metrics_text=idle, now=0.0)
+        snap, _ = snapshot("x", st0, nvml=_rig(), metrics_text=idle, now=1.0)
+        self.assertNotIn("spec_accept_rate", snap["rate_medians"])
+
+
+class TestServerStateInSnapshot(unittest.TestCase):
+    """The four-state diagnosis. The falsifier against the defect: a snapshot
+    whose scrape failed must NOT claim the metrics-flag state unless the API
+    probe answered."""
+
+    def test_healthy_scrape_is_state_four(self):
+        snap, _ = snapshot("x", None, nvml=_rig(),
+                           metrics_text=_metrics(prompt=1, gen=1), now=0.0)
+        self.assertEqual(snap["server_state"]["state"], "running_with_metrics")
+        self.assertTrue(snap["server_state"]["running"])
+
+    def test_refused_scrape_without_api_is_not_running(self):
+        from sglang.srt.planner import server_state as ss
+
+        snap, _ = snapshot(
+            "http://127.0.0.1:1", None, nvml=_rig(), metrics_text="",
+            metrics_probe=ss.Probe(ok=False, path="/metrics",
+                                   error="ConnectionRefusedError: refused"),
+            probe_opener=lambda url, timeout=None: (_ for _ in ()).throw(
+                ConnectionRefusedError("refused")),
+            tcp_probe=lambda h, p: False, now=0.0)
+        self.assertEqual(snap["server_state"]["state"], "not_running")
+        self.assertNotIn("enable-metrics", snap["server_state"]["headline"])
+
+    def test_api_up_and_metrics_404_is_the_flag_diagnosis(self):
+        from sglang.srt.planner import server_state as ss
+
+        class _R:
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        snap, _ = snapshot(
+            "http://127.0.0.1:1", None, nvml=_rig(), metrics_text="",
+            metrics_probe=ss.Probe(ok=False, path="/metrics", status=404,
+                                   error="HTTP 404"),
+            probe_opener=lambda url, timeout=None: _R(), now=0.0)
+        self.assertEqual(snap["server_state"]["state"], "running_no_metrics")
+        self.assertIn("--enable-metrics", snap["server_state"]["headline"])
+
+    def test_managed_boot_is_starting_not_a_flag_claim(self):
+        from sglang.srt.planner import server_state as ss
+
+        snap, _ = snapshot(
+            "http://127.0.0.1:1", None, nvml=_rig(), metrics_text="",
+            metrics_probe=ss.Probe(ok=False, path="/metrics", error="refused"),
+            probe_opener=lambda url, timeout=None: (_ for _ in ()).throw(
+                ConnectionRefusedError("refused")),
+            managed_state="booting", now=0.0)
+        self.assertEqual(snap["server_state"]["state"], "starting")
+        self.assertNotIn("enable-metrics", snap["server_state"]["headline"])
+
+
+class TestSpillTiersInSnapshot(unittest.TestCase):
+    def test_tier_rows_are_always_present(self):
+        snap, _ = snapshot("x", None, nvml=_rig(),
+                           metrics_text=_metrics(prompt=1, gen=1), now=0.0)
+        tiers = snap["spill_tiers"]
+        self.assertTrue(tiers["rows"])
+        self.assertTrue(tiers["absent_tiers"])
+        # HiCache is exported by _metrics(), so its host tier is measured.
+        self.assertIn("hicache_host_ram", tiers["measured_tiers"])
+
+    def test_a_measured_tier_shows_up_from_the_scrape(self):
+        extra = ('sglang:spill_tier_used_bytes{model="m",'
+                 'spill_tier="expert_host_ram"} 1024\n')
+        snap, _ = snapshot("x", None, nvml=_rig(),
+                           metrics_text=_metrics(prompt=1, gen=1) + extra,
+                           now=0.0)
+        rows = {r["id"]: r for r in snap["spill_tiers"]["rows"]}
+        self.assertEqual(rows["expert_host_ram"]["provenance"], "measured")
+        self.assertEqual(rows["expert_host_ram"]["used"], 1024.0)

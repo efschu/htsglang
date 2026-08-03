@@ -994,7 +994,7 @@ class TestLandingSnapshotRoute(CustomTestCase):
         seen_prev_states = []
         call_index = [0]
 
-        def fake_snapshot(target, prev_state=None):
+        def fake_snapshot(target, prev_state=None, **kw):
             seen_prev_states.append(prev_state)
             call_index[0] += 1
             if call_index[0] == 1:
@@ -3560,8 +3560,18 @@ class TestObservabilityIsNotOptional(CustomTestCase):
 
     def test_page_names_the_no_metrics_state(self):
         html = webui.INDEX_HTML
-        self.assertIn("Server started without --enable-metrics", html)
-        self.assertIn("noMetricsBanner", html)
+        # The wording is now produced server-side by server_state.py and is
+        # reachable ONLY after a successful API probe (#522): the page renders
+        # the state's own headline instead of asserting a launch flag from a
+        # failed scrape.
+        self.assertIn("serverStateBanner", html)
+        self.assertIn("running_no_metrics", html)
+        from sglang.srt.planner import server_state as _ss
+
+        st = _ss.build(_ss.Probe(ok=True, path="/get_model_info", status=200),
+                       _ss.Probe(ok=False, path="/metrics", status=404))
+        self.assertEqual(st.state, _ss.RUNNING_NO_METRICS)
+        self.assertIn("--enable-metrics", st.headline)
 
     def test_detect_reports_whether_metrics_are_served(self):
         with mock.patch.object(webui, "_probe_sglang", return_value=True), \
@@ -4701,12 +4711,14 @@ class TestLinkThroughput(CustomTestCase):
 
 
 class TestLiveBannerStates(CustomTestCase):
-    """Three states, and the panel is in one of them after EVERY poll.
+    """FOUR states (#522), and the panel is in one of them after EVERY poll.
 
-    A warning that outlives the server it was about is the failure mode here,
-    so the structural guarantee is what gets tested: the panel is not inside
-    the "a server is running" container, and the not-running branch of the
-    poll rewrites it.
+    A warning that outlives the server it was about is one failure mode here;
+    the other -- the one #522 fixes -- is a warning that names a CAUSE the
+    evidence does not support. The structural guarantees tested: the panel is
+    not inside the "a server is running" container, the not-running branch of
+    the poll rewrites it, and the page draws the server_state block instead of
+    deriving a diagnosis from a failed scrape.
     """
 
     def test_panel_is_outside_the_running_container(self):
@@ -4723,11 +4735,34 @@ class TestLiveBannerStates(CustomTestCase):
         i_hide = html.index("$('landing_none').style.display=''", i_branch)
         self.assertLess(i_render, i_hide + 1)
 
-    def test_the_three_states_are_named(self):
+    def test_the_four_states_are_named(self):
+        from sglang.srt.planner import server_state as _ss
+
         html = webui.INDEX_HTML
         self.assertIn("No inference server running", html)
-        self.assertIn("Server started without --enable-metrics", html)
         self.assertIn("function targetLabel(", html)
+        # The four state ids appear verbatim in the page's own comment/branch
+        # so the reader can map a rendered banner back to the machine.
+        for state in _ss.STATES:
+            self.assertIn(state.upper(), html)
+        self.assertIn("serverStateBanner", html)
+
+    def test_the_page_never_derives_the_metrics_diagnosis_itself(self):
+        """The banner text comes from server_state.py; the page must not carry
+        a hardcoded 'started without --enable-metrics' string it could print
+        off a bare scrape failure (that WAS the bug)."""
+        html = webui.INDEX_HTML
+        i = html.index("function serverStateBanner(")
+        seg = html[i:i + 1800]
+        self.assertIn("ss.headline", seg)
+        self.assertNotIn("Server started without", seg)
+
+    def test_not_running_state_hides_the_readings(self):
+        html = webui.INDEX_HTML
+        i = html.index("function renderLivePanel(")
+        seg = html[i:i + 900]
+        self.assertIn("!ss0.running", seg)
+        self.assertIn("strip.style.display='none'", seg)
 
     def test_no_metrics_banner_names_model_and_port(self):
         html = webui.INDEX_HTML
@@ -5292,3 +5327,81 @@ class TestFactorPanelRendering(CustomTestCase):
         i = js.index("function factorPollJob(")
         seg = js[i:i + 700]
         self.assertIn("clearInterval(t)", seg)
+
+
+class TestSpillTierPanel(CustomTestCase):
+    """#522 posten 1: the spill/offload tier panel under the GPU picture.
+
+    The page must not be able to invent a tier view: everything is computed
+    server-side so `curl .../api/live_snapshot | jq .snapshot.spill_tiers` is
+    the same picture. What is checked here is the wiring and the two honesty
+    rules the renderer has to honour.
+    """
+
+    def test_panel_sits_under_the_per_card_placement(self):
+        html = webui.INDEX_HTML
+        self.assertLess(html.index('id="landing_placement"'),
+                        html.index('id="landing_tiers"'))
+
+    def test_the_poll_renders_it_every_tick(self):
+        html = webui.INDEX_HTML
+        i = html.index("function renderLanding(s, tgt){")
+        seg = html[i:i + 1200]
+        self.assertIn("renderLandingTiers(s)", seg)
+
+    def test_absent_rows_are_drawn_dimmed_not_dropped(self):
+        html = webui.INDEX_HTML
+        i = html.index("function tierRowHtml(")
+        seg = html[i:i + 1200]
+        self.assertIn("provenance==='absent'", seg)
+        self.assertIn("missing_reason", seg)
+        self.assertIn("no data", seg)
+
+    def test_the_renderer_never_prints_zero_for_an_absent_tier(self):
+        html = webui.INDEX_HTML
+        i = html.index("function tierRowHtml(")
+        seg = html[i:i + 1200]
+        # the value cell for an absent row is the literal "no data" branch
+        self.assertIn("absent?'<span class=\"muted\">no data</span>'", seg)
+
+    def test_token_valued_rows_are_excluded_from_the_byte_sum(self):
+        from sglang.srt.planner import tier_occupancy
+
+        view = tier_occupancy.tier_view(
+            'sglang:spill_tier_used_bytes{spill_tier="expert_host_ram"} 1024\n',
+            hicache={"host_used_tokens": 5, "host_total_tokens": 10},
+            meminfo_text="MemTotal: 1024 kB\n")
+        self.assertEqual(view["host_ram_counted"], ["expert_host_ram"])
+        self.assertEqual(view["host_ram_excluded_non_byte"], ["hicache_host_ram"])
+        self.assertIn("host_ram_excluded_non_byte", webui.INDEX_HTML)
+
+
+class TestRateMedianBadges(CustomTestCase):
+    """#522 posten 2: "0 (median 43.2)" on the rate tiles."""
+
+    def test_every_rate_tile_carries_a_badge(self):
+        html = webui.INDEX_HTML
+        for key in ("decode_tok_s", "prefill_tok_s", "spec_accept_rate",
+                    "cache_hit_overall", "decode_tok_s_per_request",
+                    "prefill_tok_s_per_request"):
+            self.assertIn("medBadge(s,'" + key + "'", html)
+
+    def test_an_empty_window_renders_no_badge_at_all(self):
+        html = webui.INDEX_HTML
+        i = html.index("function medBadge(")
+        seg = html[i:i + 700]
+        self.assertIn("if(!m||m.median==null) return '';", seg)
+
+    def test_the_badge_names_the_window_it_came_from(self):
+        html = webui.INDEX_HTML
+        i = html.index("function medBadge(")
+        seg = html[i:i + 700]
+        self.assertIn("idle polls excluded", seg)
+
+    def test_the_window_constant_is_server_side(self):
+        from sglang.srt.planner import rate_medians
+
+        # The page must not carry its own client-side history for this: the
+        # median is part of the snapshot so a shell client sees the same one.
+        self.assertEqual(rate_medians.RATE_MEDIAN_WINDOW, 30)
+        self.assertIn("rate_medians", webui.INDEX_HTML)
