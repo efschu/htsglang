@@ -45,6 +45,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
@@ -1938,14 +1939,38 @@ def _reference_png_bytes() -> Optional[bytes]:
 # the model reference, forward the call, and JSON-shape the result.
 # ===========================================================================
 
-#: The delta ``state`` live_metrics.snapshot returns between polls. Kept ONLY
-#: module-side for delta math (rates / cache-hit); nothing is persisted to disk
-#: and the client owns the 60s ring buffers.
-_LANDING_SNAPSHOT_STATE = None
+#: The delta ``state`` live_metrics.snapshot returns between polls, PER TARGET
+#: KEY. Kept ONLY module-side for delta math (rates / cache-hit); nothing is
+#: persisted to disk and the client owns the 60s ring buffers.
+#:
+#: #533: this used to be ONE global baseline plus a single ``_LANDING_TARGET_KEY``,
+#: reset whenever the key changed. That is correct for exactly one client and
+#: silently broken for two: the dashboard resolves its target three ways
+#: (explicit ?endpoint=, supervisor-managed, auto-detected), so a browser tab
+#: polling one way and any second poller resolving another way alternate the
+#: key and reset each other's baseline on EVERY request. ``_rates()`` returns
+#: None without a baseline, so both clients saw ``rates: null`` forever -- the
+#: reported "tiles are constantly empty", with the underlying counters moving
+#: the whole time. Measured before the fix: 8/8 consecutive polls at a stable
+#: key returned null while ``generation_tokens_total`` climbed 24253 -> 27134.
+#: Keyed storage makes concurrent monitors independent instead of mutually
+#: destructive.
+_LANDING_STATE_BY_KEY: "OrderedDict[tuple, dict]" = OrderedDict()
 
-#: Which monitor target the delta state belongs to -- switching targets resets
-#: the delta math (counters from different servers must never be subtracted).
-_LANDING_TARGET_KEY = None
+#: Bound: a handful of monitor targets is the realistic ceiling (one server,
+#: maybe a second one being compared) and the state is two floats plus a
+#: counter dict, but the key is caller-influenced (?endpoint= is user input),
+#: so it is capped rather than left to grow.
+_LANDING_STATE_MAX_KEYS = 8
+
+#: Below this gap, a new scrape does NOT replace the stored baseline (#533).
+#: The counters this rate is built from advance in decode-batch steps, so a
+#: sub-second window usually spans ZERO counter updates and divides to a hard
+#: 0.0 -- which is what a second poller does to the first one's window even
+#: after the keying fix, by landing between its ticks. Holding the older
+#: baseline lets the window grow until it is long enough to mean something;
+#: the rate stays correct because it is still delta/dt over the real interval.
+_LANDING_MIN_RATE_DT_S = 0.75
 
 #: Round 5 bug: the dashboard server is a ThreadingHTTPServer, and the client
 #: aborts a poll that is still in flight when the next one is due (see the
@@ -1953,7 +1978,7 @@ _LANDING_TARGET_KEY = None
 #: request -- an /metrics scrape that runs long while a real inference load
 #: is competing for it keeps going, and the next poll's request can overtake
 #: it on a second thread. Two requests then read-modify-write
-#: _LANDING_SNAPSHOT_STATE / _LANDING_TARGET_KEY out of order: whichever
+#: the target's stored baseline out of order: whichever
 #: finishes LAST wins, even if it started first and holds an OLDER counter
 #: snapshot, which regresses the stored state and hands the NEXT poll a
 #: t_prev that lands at or after its own t_cur. live_metrics._rates() treats
@@ -1964,9 +1989,41 @@ _LANDING_TARGET_KEY = None
 #: be rebuilt. The critical section below (read prev, scrape, write new
 #: state) is serialized so no two requests can interleave their read and
 #: write halves -- one poll's full read-compute-write always completes
-#: before the next one's begins, which is the only granularity at which a
-#: single shared delta baseline is meaningful at all.
+#: before the next one's begins.
+#:
+#: The original form of that last sentence read "...which is the only
+#: granularity at which a single shared delta baseline is meaningful at all",
+#: and #533 falsified it: serialization made concurrent writes ORDERED but a
+#: single SHARED baseline was never meaningful across clients in the first
+#: place, because the target key differs per client and every key change wiped
+#: it. Serializing correctly ordered a destructive operation. The baselines are
+#: now per-key (see ``_LANDING_STATE_BY_KEY``); this lock still guards the
+#: read-modify-write of that mapping, which is what it is actually good for.
 _LANDING_STATE_LOCK = threading.Lock()
+
+
+def _store_landing_baseline(key, prev_state, new_state, dt) -> bool:
+    """Decide whether ``new_state`` becomes the delta baseline for ``key``.
+
+    Returns True when it was stored. Caller must hold ``_LANDING_STATE_LOCK``.
+
+    Two rules, both from #533:
+      * baselines are PER KEY, so concurrent monitors of different targets do
+        not reset one another;
+      * a scrape that lands closer than ``_LANDING_MIN_RATE_DT_S`` to the
+        existing baseline does NOT replace it. The counters advance in
+        decode-batch steps, so a sub-second window typically spans zero
+        updates and divides to a hard 0.0; holding the older baseline lets the
+        window grow until it carries signal. Correctness is unaffected -- the
+        rate is still delta/dt over the real elapsed interval.
+    """
+    if prev_state is not None and dt is not None and dt < _LANDING_MIN_RATE_DT_S:
+        return False
+    _LANDING_STATE_BY_KEY[key] = new_state
+    _LANDING_STATE_BY_KEY.move_to_end(key)
+    while len(_LANDING_STATE_BY_KEY) > _LANDING_STATE_MAX_KEYS:
+        _LANDING_STATE_BY_KEY.popitem(last=False)
+    return True
 
 #: Persistent joule-per-token counter (opt-in, default OFF): lazily loaded
 #: ONCE and kept as the single in-process source of truth for the lifetime of
@@ -3065,7 +3122,7 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
     persisted) and is reset whenever the target changes."""
     from sglang.srt.planner import live_metrics
 
-    global _LANDING_SNAPSHOT_STATE, _LANDING_TARGET_KEY
+    global _LANDING_STATE_BY_KEY
     payload = payload or {}
     explicit = (payload.get("endpoint") or "").strip()
 
@@ -3100,9 +3157,10 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
             label = det
 
     if target is None:
-        with _LANDING_STATE_LOCK:
-            _LANDING_SNAPSHOT_STATE = None  # reset delta math for the next target
-            _LANDING_TARGET_KEY = None
+        # #533: nothing to reset. Per-key baselines mean a poll that resolves
+        # NO target cannot destroy the baseline of a poll that resolved one --
+        # the old single-slot wipe here was one of the two paths that made
+        # every concurrent monitor reset every other one.
         # No target at all resolved: that is NOT_RUNNING with no probe spent,
         # and it is stated as such rather than left for the page to infer.
         from sglang.srt.planner import server_state as _sstate
@@ -3128,10 +3186,10 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
     # newer state with an older one.
     with _LANDING_STATE_LOCK:
         key = (kind, label)
-        if key != _LANDING_TARGET_KEY:
-            # Never subtract counters from two different servers.
-            _LANDING_SNAPSHOT_STATE = None
-            _LANDING_TARGET_KEY = key
+        # Per-key baseline: counters from two different servers are never
+        # subtracted because they live under different keys, rather than
+        # because the single slot was wiped on every target change (#533).
+        prev_state = _LANDING_STATE_BY_KEY.get(key)
         try:
             # ``managed_state`` is the STARTING evidence for a boot this
             # dashboard launched: it is known the moment the child is
@@ -3139,13 +3197,15 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
             # of claiming anything about a server that is not answering yet.
             snap, new_state = live_metrics.snapshot(
                 target,
-                prev_state=_LANDING_SNAPSHOT_STATE,
+                prev_state=prev_state,
                 managed_state=(status or {}).get("state") if kind == "managed" else None,
                 managed_detail=("this dashboard launched the process"
                                 + (f" (pid {(status or {}).get('pid')})"
                                    if (status or {}).get("pid") else "") + "."),
             )
-            _LANDING_SNAPSHOT_STATE = new_state
+            _store_landing_baseline(
+                key, prev_state, new_state, (snap.get("rates") or {}).get("dt")
+            )
         except Exception as e:  # pragma: no cover - defensive
             return {"ok": False, "running": True, "error": str(e),
                     "target": target_info}
