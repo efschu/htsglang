@@ -169,6 +169,39 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   mechanism stays in-tree behind the refusal so a candidate fix can be measured
   against these numbers. Verdict, repricing and what a real fix would require:
   `docs/dev/NOTE_452_desync_boot_refutation.md`.
+  **#462 BUILT THE SURVIVING ROUTE** (`layers/moe/breakable_offload.py`,
+  `SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable`, **OFF by default**): NOTE_452 §3's
+  Option 3, "capture the compute, keep the fetch eager". The eager phase fetches
+  the routed experts into the fixed slot arena and publishes the slot vector
+  through a static bridge buffer BEFORE replay; the captured segment addresses
+  SLOTS only. The key finding is that most of it already existed — `install()`
+  builds the `[R+C]` arena and binds it into the layer's parameters, so a graph
+  captured over that layer already addresses slots; what was missing was the
+  bridge, a host-side remap, and the `eager_on_graph` break. Volume returns to
+  the eager 0.366–0.535 GiB/token because the fetch never enters the graph.
+  Cost, and it is a COUNT not a measurement: 1 D2H rendezvous + 1 pinned
+  blocking copy per MoE layer per step, against the eager path's 1 rendezvous +
+  2 PAGEABLE (hence host-blocking) `_build_lut` copies — 43 layers, 129
+  host-blocking crossings/step → 86. The 43 rendezvous are IRREDUCIBLE: MoE
+  routing is sequential across layers, so no point in a step has several
+  layers' decisions available to batch, and removing them means the refuted
+  in-graph fetch. Refuses by name at boot unless decode backend is `breakable`
+  (`eager_on_graph` is a no-op otherwise → host reads inside a real capture) and
+  prefill is eager (a prefill chunk overflows the arena and a captured segment
+  cannot wave-split). Both spellings of the refuted path still refuse.
+  **DESK-WRITTEN, NEVER EXECUTED — no boot, no replay, no ms/verify figure
+  exists, and F1's 5.3–8.4x is a Qwen3.6-35B-A3B ceiling that is NOT a DSV4F
+  number.** F2 (per-layer break cost, decomposed) is the first measurement of
+  the next window and gates default-on. Tests:
+  `tests/moe_offload/test_breakable_route_462.py`, 37 hermetic, SEVEN executed
+  can-fail arms (pad marker dropped → 3 red; bridges aliased across capture
+  shapes → 2; #286 capture gate removed → 1; overflow check moved after resolve
+  → 2; prefill precondition dropped → 1; breakable silently downgraded to eager
+  → 1; staged publish flipped to non_blocking → 1). Open finding pinned as a
+  test: the `experts` descriptor's `va_stable_required=False` is FALSE under
+  this route, since a captured graph holds the arena's addresses.
+  Design: `docs/dev/DESIGN_462_breakable_route.md`; GPU ticket:
+  `docs/dev/TICKET_462_f2_and_replay.md`.
   **The shipped offload path is the eager one** (`--disable-cuda-graph`,
   149.1 ms/token), unchanged and unaffected. Sizing note from that port: a
   captured decode
@@ -558,7 +591,15 @@ lookup before it is a design question, and the cells are already enumerated:
 `ANALYSE_456_dsv4f_matrix_sweep.md` is the asset x tier x primitive x control
 sweep (§2.1 lists the occupied cells with their evidence, §2.2 names the empty
 ones explicitly, so "nobody looked" and "somebody looked and rejected it" are
-distinguishable rather than both reading as silence); anything that EVICTS
+distinguishable rather than both reading as silence). Cell **#302b — cold
+experts under CUDA graphs — is now BUILT and no longer empty**: the breakable
+route (eager fetch into fixed slots before replay, compute captured, graphs
+addressing SLOTS) exists behind `SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable`,
+gated OFF and never booted (§3, `DESIGN_462_breakable_route.md`). The
+neighbouring cell **#302c (per-expert runtime dispatch) stays empty**, but its
+named prerequisite is discharged: DESIGN_462 §5 records how a foreign
+contribution enters the combine, so #302c starts from a seam rather than from a
+redesign. The in-graph fetch remains register-rejected. Anything that EVICTS
 consumes `DESIGN_407_memtier_registry.md` §8's one global importance ladder
 (cold second model, inactive layout/graph families, cold experts, idle sessions,
 active work last and never out of FCFS order — coldest-first within a class)

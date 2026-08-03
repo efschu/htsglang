@@ -561,6 +561,53 @@ def test_the_eager_lut_build_really_does_issue_the_two_extra_transfers(monkeypat
     ) == 2, f"expected two non_blocking transfers, saw {transfers}"
 
 
+def test_the_staged_publish_is_blocking(monkeypatch):
+    """The shared-buffer falsifier for the PUBLISH itself.
+
+    With a stage present, the slot vector is copied stage -> bridge. That copy
+    must be BLOCKING: a non_blocking copy out of a staging buffer that is
+    rewritten on the next replay is safe only if the DMA lands first, and that
+    is the ordering-rule-in-a-comment shape which keeps biting this fork. A
+    device is not needed to pin the flag, only to make the copy asynchronous --
+    so the contract is asserted here and the CUDA behaviour follows from it.
+    """
+    cache = _cache()
+    topk = _ids([[0, 9, 3]])
+    bridge = torch.empty_like(topk)
+    stage = torch.empty(topk.numel(), dtype=topk.dtype)  # CPU stand-in for pinned
+
+    seen = []
+    original = torch.Tensor.copy_
+
+    def probe(self, src, *a, **kw):
+        if src is stage:
+            seen.append(kw.get("non_blocking", False))
+        return original(self, src, *a, **kw)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", probe)
+    cache.prepare_breakable(topk, bridge, stage=stage)
+
+    assert seen == [False], f"staged publish must be blocking, saw {seen}"
+
+
+def test_the_staged_publish_lands_the_same_values_as_the_direct_one():
+    """The stage branch and the no-stage branch must agree, or the desk path
+    would be proving something the CUDA path does not do."""
+    topk = _ids([[0, 9, 3], [10, 11, 12]])
+
+    direct = _cache()
+    bridge_direct = torch.empty_like(topk)
+    direct.prepare_breakable(topk, bridge_direct, stage=None)
+
+    staged = _cache()
+    bridge_staged = torch.empty_like(topk)
+    staged.prepare_breakable(
+        topk, bridge_staged, stage=torch.empty(topk.numel(), dtype=topk.dtype)
+    )
+
+    assert torch.equal(bridge_direct, bridge_staged)
+
+
 def test_the_breakable_step_issues_no_non_blocking_transfer_at_all(monkeypatch):
     """The other half of the same claim: the breakable publish is ONE copy and
     it is deliberately blocking, so a reused pinned stage cannot be overwritten

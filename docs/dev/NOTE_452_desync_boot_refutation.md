@@ -242,6 +242,37 @@ returns to 0.398 GiB/token. The repo already has the mechanism this needs
 * **Verdict: the only option with a plausibly positive yield, and it should not
   be built before the sizing probe below says there is anything to win.**
 
+> **UPDATE (#462, 2026-08-03): Option 3 IS NOW BUILT, gated OFF.**
+> `layers/moe/breakable_offload.py`,
+> `SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable`. It was built ahead of the sizing
+> probe on an explicit build-go, so the verdict above is superseded on
+> sequencing only, not on substance: **F2 (the per-layer break cost on DSV4F)
+> is still the first measurement of the next window and still gates whether
+> the route is worth running.** Nothing about the route is measured — no boot,
+> no replay, no ms/verify figure.
+>
+> Two things this note predicted are confirmed by the build. First, the
+> `tolist()` sync is NOT removed, and it turns out to be *irreducible* rather
+> than merely awkward: MoE routing is sequential across layers, so no point in
+> a step has several layers' routing decisions available to batch into one
+> rendezvous, and any scheme that removes it is the in-graph fetch again.
+> Second, the volume does return to the eager 0.366–0.535 GiB/token, because
+> the fetch never enters the graph.
+>
+> One thing the note did not anticipate: most of the mechanism already
+> existed. `install()` already builds the `[R+C]` slot arena and binds it into
+> the layer's parameters, so a graph captured over that layer *already*
+> addresses slots — the build added the bridge buffer that publishes which
+> expert sits in which slot, a host-side remap, and the `eager_on_graph`
+> break. That also removed a cost this note did not count: `_build_lut`'s two
+> PAGEABLE host→device copies per layer, host-blocking because `non_blocking`
+> is honoured only for pinned memory. Per layer per step, 3 host-blocking
+> crossings become 2.
+>
+> Details, deviations and the BOOT-PENDING list:
+> `docs/dev/DESIGN_462_breakable_route.md`. GPU ticket:
+> `docs/dev/TICKET_462_f2_and_replay.md`.
+
 ### Repricing the ticket's premise
 
 #443 was justified by the `topk_ids.tolist()` sync being the ranked-#2 cause of

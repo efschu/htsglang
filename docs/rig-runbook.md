@@ -1350,9 +1350,37 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   on the host (~30 GiB) while the pinned spill pool fills to ~22 GiB. Peak
   observed ~45 GiB on the 98 GiB box. Do not launch this next to another
   memory-heavy job.
-- `--disable-cuda-graph` is required unless `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1`
-  is set; the eager offload path resolves residency per forward and is not
-  capturable. The server fails fast rather than capturing a wrong graph.
+- `--disable-cuda-graph` is required unless an offload graph mode is selected;
+  the eager offload path resolves residency per forward and is not capturable.
+  The server fails fast rather than capturing a wrong graph.
+- `SGLANG_MOE_OFFLOAD_GRAPH_MODE` picks the graph mode (#462). Unset or
+  `eager` = the shipped path, byte-untouched. `capturable` is the in-graph
+  fetch and is **REFUTED at boot** (#452: content divergence, 6.60x decode
+  regression) — it is the same thing as `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1` and
+  hits the same refusal.
+- `SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable` is the route that survived: the
+  fetch stays EAGER and runs in a graph break before replay, the compute is
+  captured, and the captured kernels address fixed SLOTS whose occupant the
+  eager phase republishes each step. It is **OFF by default and has never
+  served a token** — no performance claim exists for it until the F2
+  measurement in `docs/dev/TICKET_462_f2_and_replay.md` runs. Requirements,
+  all refused by name at boot if unmet:
+
+  ```bash
+  export SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable
+  unset SGLANG_MOE_OFFLOAD_CUDA_GRAPH        # mutually exclusive
+  # decode MUST be breakable: eager_on_graph is a no-op under any other
+  # backend, so the fetch's host reads would land inside a real capture.
+  # prefill MUST be eager: a prefill chunk routes more distinct experts than
+  # the arena has slots, and a captured segment cannot wave-split.
+  --cuda-graph-backend-decode=breakable --cuda-graph-backend-prefill=disabled
+  ```
+
+  Size `SGLANG_MOE_SCRATCH_SLOTS` for the LARGEST captured decode bucket, not
+  for bs=1: the bound is `min(max_bs x top_k, E_local - R)`. A graph-padded
+  batch's tail rows carry real routed ids, so they count. Undersizing is a
+  named runtime refusal (`BreakableScratchOverflow`), not a silent wrong
+  answer. See `docs/dev/DESIGN_462_breakable_route.md`.
 - Wave order is a throughput knob, not a numerics knob: token-major logged
   27-31 waves and 1.11-1.21 GiB H2D per layer per chunk here, expert-major
   9 waves and 0.34 GiB, and greedy output was byte-identical between them.
