@@ -4,22 +4,73 @@ Read this BEFORE searching the tree or building anything: most capabilities you
 are about to look for already exist. Rules: (1) never declare something
 "impossible" or "missing" without checking this file, FEATURES_VS_UPSTREAM.md
 and `git log`; (2) whoever merges a new feature updates the matching section in
-the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
+the SAME merge; (3) **a conditional line here is a POINTER TO A PREDICATE, not
+the predicate.** Since the #500 reach audit every "only when / gated on / not
+combinable with" line carries the gate's `file:line`; before you act on one,
+read that predicate. Where this file and the code disagree, the code wins and
+this file is corrected in the same change (CLAUDE.md, MECHANISM REACH).
+(4) There is a SECOND flag/env registry: `python/sglang/srt/planner/flags.py`
+carries `requires` / `mutually_exclusive_with` / `allowed` / `model_compat` per
+flag and drives the dashboard. It is authoritative for nothing on its own —
+audit #500 found three of its curated edges NARROWER than the runtime — but it
+is the only place the full flag surface is enumerated, and its own
+"CRITICAL fork-capability note" (`flags.py:38-46`) stated the TP>kv_heads
+capability correctly for as long as this file stated it as a special case.
+Last full refresh: 2026-08-02 (tip 33148dbe0f); reach-audited 2026-08-03 (#500,
+tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
 
 ## 1. Uneven parallelism (core differentiator)
-- **Uneven TP** `--rank-tp-ratio` + `--rank-gpu-id`: per-card weight shards.
-  `auto` = byte-proportional from NVML totals minus auto reserve; with
-  `--rank-perf-tune both|dec|enc|maxkv` the planner solves the vector.
-  Unit system: `tp_units`/`tp_family` per layer class (16-element MLP family;
-  coupled-dim rule: gate_up output and down_proj input partition the SAME
-  intermediate dim and must coarsen identically); per-layer family table for
-  `block_configs` models (Nemotron-Puzzle class).
-- Sibling flags: `--rank-mlp-ratio`, `--rank-vocab-ratio`, `--rank-moe-ratio`
+- **Uneven TP** `--rank-tp-ratio` (+ `--rank-gpu-id` for placement): per-card
+  weight shards. The two are INDEPENDENT — `--rank-tp-ratio` is a pure
+  partition description and is legal with no placement flag at all (the
+  cross-vendor two-launcher bring-up relies on it, `server_args.py:9644`);
+  `--rank-gpu-id` conversely requires `--rank-gpu-memory-mib` or
+  `--rank-tp-ratio auto` (`server_args.py:9434`). `auto` = byte-proportional
+  from NVML totals minus auto reserve, needs `--rank-gpu-id`
+  (`server_args.py:8971`) and collapses to the EVEN split on uniform budgets
+  (`server_args.py:9157`, which then disarms the family flags). With
+  `--rank-perf-tune both|dec|enc|maxkv|phase-prefill|phase-decode`
+  (`server_args.py:723`) the planner solves the vector; the two `phase-*` arms
+  are the #354/#357 phase-optimal recipe. The value that ENGAGES the solver is
+  `--rank-tp-ratio auto-performance` (`server_args.py:433`) — plain `auto` is
+  the capacity-first default and never solves for speed
+  (`_CAPACITY_FIRST_DEFAULT_NOTICE`, `server_args.py:740`).
+  `auto-performance` is refused under `--pp-size > 1` (`server_args.py:9394`);
+  plain `auto` has the per-stage path.
+  Unit system: `tp_units`/`tp_family` per layer class (16-element MLP family,
+  boot-refused per rank at `distributed/utils.py:975`; coupled-dim rule:
+  gate_up output and down_proj input partition the SAME intermediate dim and
+  must coarsen identically — one SYMMETRIC block, `lcm(64,128)=128`,
+  `layers/linear.py:181`). The `block_configs` (Nemotron-NAS/Puzzle) support is
+  a PLANNER-side weight-byte census for the auto-performance cost model
+  (`LayerFamilyCensus`, `uneven_perf.py:2894`), not a runtime shard-family
+  table.
+- Sibling flags (each needs a resolved non-uniform base plan,
+  `server_args.py:10023`; `--rank-vocab-ratio` is additionally incompatible
+  with `--enable-dp-lm-head`, :9911; `--rank-moe-resident-fraction` refuses a
+  per-rank vector when `moe_tp_size != tp_size` and refuses env/flag
+  disagreement, `moe/resident_fraction.py:132`/:107):
+  `--rank-mlp-ratio`, `--rank-vocab-ratio`, `--rank-moe-ratio`
   (per-path meaning below — do not read this as "experts between ranks" in
   general), `--rank-moe-resident-fraction` (GPU/host split WITHIN a rank),
-  `--rank-kv-ratio` (`coupled|speed|vector` — decouples KV split from weight
-  split), `--rank-auto-reserve-mib`, `--rank-gpu-memory-mib` (absolute
-  per-rank MiB budget with a line-item ledger incl. lane pools).
+  `--rank-kv-ratio` (`coupled|capacity` (alias `auto`)`|speed|vector`,
+  `server_args.py:484` — decouples KV split from weight split; `capacity` is
+  the measured one-boot-convergence mode that `--rank-perf-tune maxkv`
+  selects, `speed` degrades to it without bandwidth scores; only the EXPLICIT
+  VECTOR is refused without a non-uniform base plan, `server_args.py:9608` —
+  the derived modes degrade to `coupled` with a warning, :9615),
+  `--rank-auto-reserve-mib` (also usable WITHOUT any uneven flag: a pinned
+  reserve then sizes the plain path as
+  `mem_fraction_static = (NVML total − reserve)/total` exactly, #332,
+  `server_args.py:9370`), `--rank-gpu-memory-mib` (absolute per-rank MiB
+  budget with a line-item ledger incl. lane pools; the per-rank LIST form
+  additionally needs no weight vector under the weightless-KV lane or PP>1,
+  `server_args.py:9694`).
+  Each of these vectors has an env twin that OVERRIDES the flag —
+  `SGLANG_UNEVEN_MLP_VECTOR` / `_MOE_VECTOR` / `_VOCAB_VECTOR` /
+  `_TOKEN_VECTOR` (`environ.py:573-588`, precedence at
+  `distributed/utils.py:490`) — and they are what the planner emits to pin a
+  solved vector into a launch (`planner/runner.py:411`).
   Read `--rank-moe-ratio` precisely: under the **#82 GGUF expert-dim shard** it
   moves whole experts and therefore the COMPUTE assignment (owner runs the
   expert, foreign ids remap to a zero pad, the TP all-reduce sums the disjoint
@@ -29,8 +80,11 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
   taking it: the GPU-resident expert mass stays exactly where the base plan put
   it (VRAM-neutral) and the STREAMED remainder is apportioned by the measured
   link weights, which equalises the per-rank transfer time the group waits on.
-  Refused by name when offload is off, when the link provenance is `absent`, or
-  under `ep_size>1`. Resolved ONCE in the launcher — a symbolic value that
+  Refused by name, all five in the launcher: nothing to move (the mass test
+  `cold_total <= 1e-9`, i.e. offload off, `expert_compute_placement.py:527`),
+  link provenance `absent` (:951), `ep_size>1` (:916), no resolved uneven-TP
+  base plan (:906), and no rank→physical-card vector (:941). Resolved ONCE in
+  the launcher — a symbolic value that
   reaches a worker is a hard error there, never a silent fall back to the base
   plan.
   **CONFIRMED ON HARDWARE 2026-08-03** (first tokens through the slice-3 path,
@@ -56,20 +110,50 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
   running the falsified solve — before #458 that env alone selected it.
   Registered in `planner/rejected.py` (`moe_link_calibrated_coefficients`).
 - **Uneven DCP** (`dcp_size` + token vector): token/KV sharding across ranks,
-  weighted owner rule, SWA-hybrid support, TP>kv_heads via replication+token
-  shard. **Draft-KV-DCP**: draft KV token-sharded (−67 % draft KV; above
-  TP>kv_heads, replicated is the DEGRADED layout). LSE log base follows the
-  attention backend (FlashMLA = natural log).
+  weighted owner rule, SWA-hybrid support. The replication+token-shard axis is
+  NOT kv-head-count-gated: the predicate is
+  `dcp_size > 1 and get_tp_partition_ratios() is not None`
+  (`distributed/utils.py:346`) — it never reads the kv-head count and does not
+  require `dcp_size == tp_size`, so it is live for EVERY kv count. Three ways
+  in: a `--rank-tp-ratio` plan, the weightless-KV lane
+  (`... or self.weightless_kv`, `flashinfer_backend.py:689`), and a #274
+  lane's context-local overlay (`utils.py:168`). The separate REPLICATED-KV
+  attention geometry is `tp_plan_active(tp) and total_num_kv_heads < tp`
+  (`utils.py:1048`; `kv == tp` deliberately excluded, reverted on
+  measurement), and it refuses without DCP spanning the group
+  (`flashinfer_backend.py:735`). MLA models have NO uneven-TP DCP combine and
+  are refused by name (`layers/dcp/comm.py:81`). `dcp_size` is auto-set to
+  `tp_size` only on the `--rank-gpu-id` path (`server_args.py:9845`).
+  **Draft-KV-DCP**: draft KV token-sharded (−67 % draft KV), admitted by
+  `_reject_unsupported_draft_kv_dcp` (`server_args.py:7448`), which today
+  requires the `SGLANG_UNEVEN_DCP`+`_WEIGHTED` env pair and does NOT accept
+  the `--rank-kv-ratio` route the sibling gate at :7628 accepts (open defect).
+  "Replicated is the DEGRADED layout above TP>kv_heads" is a measured
+  recommendation in the CLI help (`server_args.py:1513`), not a code
+  predicate — nothing compares TP to the kv-head count for the draft pool.
+  LSE log base follows the attention backend
+  (`NATURAL_LOG_LSE_ATTENTION_BACKENDS = {"flashmla"}`, `dcp/comm.py:44`).
 - **TPxPPxTP**: pipeline across rigs with per-stage TP groups. Slices 1+2
   merged (cross-rig PP=2 over 40G, full decode graphs on both stages incl.
   sm75). Slice 3 merged and cross-rig pp=2 validated: world-MIN
   `max_total_num_tokens` before the reduce, `--pp-stage-ratio`
   (score-proportional, snaps to full-attention boundaries), stage-local mamba
-  slots, `auto` under PP with an agreement gate, `SGLANG_PP_SHAPE_CACHE` cuts
+  slots (per-stage GPU groups must be pairwise DISJOINT,
+  `server_args.py:8669`), `auto` under PP with an agreement gate (all stages
+  must derive the same vector, `server_args.py:9116`), `SGLANG_PP_SHAPE_CACHE` cuts
   boundary-send by −9.8/−9.2 % at bs=1 (0-1 % floor otherwise) — note the
   in-server counter reads 249 µs, which is not the standalone wire-transfer
   figure.
-- **TP5+ emulation** via NCCL multi-rank co-location (several ranks per card).
+- **TP5+ emulation** via multi-rank co-location (several ranks per card),
+  gated ONLY on duplicate entries in `--rank-gpu-id`
+  (`entrypoints/engine.py:1563`). The NCCL settings that follow
+  (`NCCL_MULTI_RANK_GPU_ENABLE=1`, `NCCL_NVLS_ENABLE=0`,
+  `NCCL_MAX_CTAS=max(1, 8//max_colocated)`) are opportunistic defaults, each
+  skipped if the operator set it; MPS absence is a warning, not a refusal
+  (:1598). Nothing excludes barlink — it is selected by
+  `SGLANG_BARLINK and world_size > 1` (`parallel_state.py:687`), which cannot
+  see the placement. The only forced consequence of co-location is
+  `disable_custom_all_reduce = True` (`server_args.py:9820`).
 
 ## 2. Planner / solver
 Key solver: water-filling over an affine cost model, pair-matrix collective
@@ -88,16 +172,23 @@ gate accepted (#433 measured the gap: 125 504 vs a predicted 358 693 tokens).
 An explicit `--rank-kv-ratio` still wins; the hand-paired
 `--rank-mlp-ratio X + --rank-kv-ratio Y` of #354/#424 is no longer needed.
 **The fundability gate prices the vector the boot runs (#437).** A FIXED KV
-token vector keeps the relative base-plan pricing; a MATCHED one
-(`--rank-kv-ratio capacity|speed`, and the phase arms since #435) has no
-unused capacity to price, so every rank is checked ABSOLUTELY against the
-derived reserve demand on ALL cards. Before #437 `capacity` mode accepted
+token vector keeps the relative base-plan pricing (`unfunded = res[r] <
+_fund_demand[r] <= _fund_base[r]`); a MATCHED one (`--rank-kv-ratio
+capacity|speed`, and the phase arms since #435) has no unused capacity to
+price, so every rank is checked ABSOLUTELY (`unfunded = res[r] <
+_fund_demand[r]`) against the derived reserve demand on ALL cards — the branch
+is `uneven_perf.py:5967-5981`, the two bases `:6027-6034`. The gate needs a
+derived per-GPU auto reserve; without one (`if demand_by_gpu:`, `:5919`) it is
+silently absent and every candidate is reported fundable (#500-B6). Before #437 `capacity` mode accepted
 16,1,1 at reserve 3000,2700,2700 -- #264's OOM config -- because it compared
 a matched residual against an identical matched base; the capacity-directed
 objective did not consult the gate at all. #330's 400 MiB corridor is priced
-alongside the demand and REPORTED (`CORRIDOR-TIGHT`), never binding
-(`SGLANG_PLANNER_CORRIDOR_MIB` overrides it; the number itself lives once in
-`registry/ledger.py`).
+alongside the demand and REPORTED (`CORRIDOR-TIGHT`), never binding — it
+appears in no admissibility term (`admissible = floor_ok and (knee_ok or not
+knee_binding) and unfundable is None`, `uneven_perf.py:6517`;
+`_corridor_note` returns text, `:6051`).
+`SGLANG_PLANNER_CORRIDOR_MIB` overrides it (`:5279`); the number lives once, in
+`registry/ledger.py:69`.
 **The prefill lockstep max is taken PER BARRIER (#475).** A prefill step is
 two all-reduces per layer, not one barrier at the end, so the cost model's
 compute term is `sum_family max_rank`, not `max_rank sum_family`; the Jensen
@@ -136,14 +227,39 @@ is minimal at the same time. **Slice 1 delivers the prefill column's joint cut**
 (`--rank-perf-tune phase-*` solves `(mlp_vector, attn_vector)` PAIRS, reports
 per-candidate family pacers, and prints a `JOINT PREFILL LAYOUT` launch line):
 the attention/GDN family is cut on its own #324 lane and its own grids, the GDN
-state pool and the coupled KV vector follow it, and every candidate keeps >= 1
-unit on the kv-head and GDN k-head grids (#62/#116). On the reference rig the
-attention family is grid-PINNED (4 kv heads, 3 ranks -> only `[2,1,1]` is
-representable), so in practice the lever is the 16-unit GDN grid: desk-predicted
-+1.0 points over the MLP-only cut on INT8-W8A8 and +6.9 on FP8, both bracketed
-(see below). The solve REPORTS the pair and does not install it — the only
-runtime actuator for an attention vector is `--rank-tp-ratio`, since "mlp" is
-the sole named family plan. Where the flash/scan core's per-token mass would be
+state pool and the coupled KV vector follow it. The enumerator escapes the
+kv-head grid ONLY when `attn_units < tp` (`grid = self.attn_units; if grid < n:
+grid = max(self.q_heads, n)`, `uneven_perf.py:4133-4148`), and
+`partition_units` then keeps >= 1 unit per rank (#62/#116; hard —
+`distributed/utils.py:568`, `:589`). **That grid is not the runtime's.** Under
+every uneven-TP boot with DCP the kv heads are REPLICATED and the split rides
+the token axis — `uneven_dcp_kv_replicated` is `dcp_size > 1 and
+get_tp_partition_ratios() is not None` (`distributed/utils.py:346`), no
+kv-head term — which the planner's own placement report already models
+(`replicated = kv_heads < tp or dcp_replicated`, `planner/placement.py:813`)
+and the same cost model already assumes for the KV cache
+(`uneven_perf.py:3852`) while pricing attention weights as head-sharded. So the
+reference rig's "4 kv heads, 3 ranks -> only `[2,1,1]` is representable" is an
+artefact of the ENUMERATOR, not a property of the rig: the real attention axes
+are the q-head grid plus a continuous token vector. Until #500-B1 lands, the
+phase-prefill arm's joint gains (desk-predicted +1.0 points over the MLP-only
+cut on INT8-W8A8 and +6.9 on FP8, both bracketed, see below) are an optimum
+over an INCOMPLETE candidate set, and the "16-unit GDN grid is the lever"
+reading follows from the same artefact. The solve REPORTS the pair and does not
+install it (`if acand is None:` guards the argmax, `uneven_perf.py:6558`) — the
+only runtime actuator for an attention vector is `--rank-tp-ratio`, because
+none of the THREE named family plans is an attention family (`("mlp",
+"rank_mlp_ratio"), ("moe", "rank_moe_ratio"), ("vocab", "rank_vocab_ratio")`,
+`managers/scheduler.py:5860`). Note the mechanism itself has no whitelist:
+`_normalize_partition_plan` (`distributed/utils.py:129`) validates only base
+presence, equal length and positive ints, and layers opt in with an ordinary
+`tp_family=` argument (`layers/linear.py:534`, honoured at `:657`) — today only
+`"mlp"` (8 sites) and `"moe"` (1) declare one, so an attention family plan is a
+constructor argument plus a flag, not a runtime redesign. The joint cut is
+additionally OFF under `--objective energy` (`joint = tune in _PHASE_TUNES and
+not decode_objective and not _objective_is_energy(server_args)`, `:6408`), and
+the LANE-INVARIANT / LANE-SENSITIVE bracket is skipped entirely without a
+measured per-rank bandwidth vector (`if not bw_scores …: return None`, `:5218`). Where the flash/scan core's per-token mass would be
 needed the model BRACKETS instead of estimating: the same solve is run at the
 pure-GEMM and the measured-#231-GEMV lane extremes and the plan log states
 `LANE-INVARIANT` or `LANE-SENSITIVE`. ANALYSE_299's "attention lever = 0.01 %"
@@ -152,8 +268,19 @@ two families' pacers is worth zero by construction. DESK/PREDICTED; the GPU arm
 is `TICKET_485_int8_joint_arm.md`, details in
 `NOTE_485_joint_phase_vectors.md`.
 
-`--objective energy` end to end with refusal over silent substitution. `planner/rejected.py` = machine-readable
-register of discarded approaches — check it before re-proposing anything.
+`--objective energy` with refusal over silent substitution at both ends (solver
+`key_solver.py:1479`, boot `uneven_perf.py:5557`). Scope, not "end to end":
+priceable goals are `("dec", "enc")` only (`ENERGY_PRICEABLE_GOALS`,
+`key_solver.py:1421`), it refuses a second goal or constraints (`if
+objective_is_energy and (goal_b is not None or constraints): raise`, `:2589`),
+and on the boot path it disables the #485 joint pair space (`:6408`).
+`planner/rejected.py` = machine-readable register of 24 discarded approaches —
+check it before re-proposing anything. It is a READING surface first:
+`check_combination` fires only on a full tag match (`set(e.tags).issubset(have)`,
+`rejected.py:731`) and the two tag producers (`wizard.py:820/:1306`,
+`rig_coupling.py:904/:951`) emit a vocabulary that reaches 5 of the 24 rows. The
+other 19 are consulted by humans and by `register_json` (`/api/rejected`), not
+by a gate.
 
 **#363 slice 1 — worth-it autocheck + layout-pair overlap + rung ledger**
 (`planner/regime_switch.py`, `--regime-phase-table`, `PlanResult.regime`,
@@ -168,9 +295,19 @@ quantities — 46 vs 317 units on the real 27B geometry), a pair-solving mode
 that prefers maximal overlap among near-optimal candidates within a stated
 tolerance (default 2.0 %, below the 4.2 % measured A-vs-A floor so it can only
 break ties), and the §20.3 RUNG 0/1/2 feasibility arithmetic against the
-plan's own capacity report. **DECISION LAYER ONLY — nothing in this build
-executes a layout switch**: no pointer flip, no diff spill, no pre-capture
-(#363 slices 2+, `ROADMAP_456` WAVE 4, gated on #286). Switch-cost constants
+plan's own capacity report. **The slice-1 pair solver is DECISION LAYER ONLY** —
+`autocheck` has two call sites, both planner-side
+(`planner/feasibility.py:503`, `planner/solver_api.py:590`), and
+`--regime-phase-table` is a planner-CLI flag (`planner/cli.py:134`), not a
+server flag. The RUNTIME half IS wired, though: `--regime-controller act`
+builds a `RegimeActuator` (`managers/regime_runtime.py:721-727`, from
+`managers/scheduler.py:3401`) that issues a #330 VRAM budget GROW and a #297 KV
+reshard on the running scheduler (`managers/regime_act.py:182-189`), refusing a
+shrink (`:151`) and a missing actuator (`:161`/`:169`), and refused at parse
+time until `--regime-gate-evidence` names four measured items
+(`server_args.py:4993`). What no build executes is the WEIGHT half: no pointer
+flip, no diff spill, no pre-capture (#363 slices 2+, `ROADMAP_456` WAVE 4,
+gated on #286). Switch-cost constants
 are the §20.2 physics estimate and the #102 graph-state analogy; only the KV
 delta inherits a measurement (#297). 65 hermetic tests, five executed can-fail
 arms (`test_regime_switch_363.py`); anything that decides at runtime whether a
@@ -258,10 +395,17 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   host-blocking crossings/step → 86. The 43 rendezvous are IRREDUCIBLE: MoE
   routing is sequential across layers, so no point in a step has several
   layers' decisions available to batch, and removing them means the refuted
-  in-graph fetch. Refuses by name at boot unless decode backend is `breakable`
-  (`eager_on_graph` is a no-op otherwise → host reads inside a real capture) and
-  prefill is eager (a prefill chunk overflows the arena and a captured segment
-  cannot wave-split). Both spellings of the refuted path still refuse.
+  in-graph fetch. Refuses by name at boot unless the RESOLVED decode backend is literally
+  `breakable` (`if backend != "breakable":`, `offload_capture_gate.py:363` —
+  `eager_on_graph` is a no-op otherwise → host reads inside a real capture) and
+  the RESOLVED prefill backend is literally `disabled` (`if prefill is not None
+  and prefill != "disabled":`, `:379` — a prefill chunk overflows the arena and
+  a captured segment cannot wave-split). Both checks are SKIPPED when the
+  backend cannot be resolved (`if backend is None: return`, `:358`, reached
+  whenever `resolved_backend` swallows an exception, `:408-421`) — #500-B8. On
+  DeepSeek-V4 the prefill half is already satisfied: the BCG-incompatibility
+  rule set rewrites prefill to `disabled` (`server_args.py:8281-8309`). Both
+  spellings of the refuted path still refuse.
   **DESK-WRITTEN, NEVER EXECUTED — no boot, no replay, no ms/verify figure
   exists, and F1's 5.3–8.4x is a Qwen3.6-35B-A3B ceiling that is NOT a DSV4F
   number.** F2 (per-layer break cost, decomposed) is the first measurement of
@@ -285,9 +429,22 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   point fits the battery's existing `SGLANG_MOE_SCRATCH_SLOTS=6` at no extra
   VRAM. Double-buffered prefetch with compute overlap; expert-major prefill
   waves (`SGLANG_MOE_OFFLOAD_WAVE_ORDER`, byte-identical proven); fp8 presplit;
-  load-time-aware halves for fp8/GPTQ/AWQ (GGUF-MoE half missing — guarded).
+  load-time-aware halves for fp8/GPTQ/AWQ and, since #123-GGUF, GGUF-MoE on
+  CUDA — admitted per layer on the staging marker
+  (`_OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES`, `expert_offload.py:2069`;
+  `if getattr(layer, marker, False): continue`, `:2111`). The guard is a
+  five-name DENYLIST (Ascend GGUF-MoE, MoeWNA16, three NVFP4 methods,
+  `:2056-2064`) matched by class NAME, so every other quant method —
+  unquantized, INT8, compressed-tensors non-NVFP4 — passes by default.
 - **#394 cold-shard chain** (slices 1+2 merged): measured H2D provenance chain
-  (env > card-probe > nvml-negotiated > refusal; `absent` unselectable),
+  (env > card-probe > nvml-negotiated > refusal; `absent` unselectable as a MINIMUM
+  (`SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE`; `if raw not in ("measured",
+  "estimate"): raise ValueError`, `expert_offload.py:800`; default `estimate`)
+  and a hard refusal at the #439 door (`expert_compute_placement.py:951`) and in
+  `ColdTierAssignment.__post_init__` (`cold_tier_fetch.py:218`) — but at the
+  cold-tier door it DEGRADES instead: an absent provenance yields an equal ratio
+  and `if ratio.is_equal: return None` (`expert_offload.py:1158`), i.e. the
+  pre-#394 path, silently),
   `cold_tier_shm.py` shared-DRAM segments (UUID/BDF identity, manifest read
   lazily after load, header sealed last, PROT_READ views with kernel-enforced
   write protection). **Slice 2 wires the fetch path** (`cold_tier_fetch.py`):
@@ -296,8 +453,13 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   ALLOCATED IN the segment rather than copied into it, and
   `MoEExpertOffloadCache._fetch` sourcing a delegated expert from the owner's
   `PROT_READ` view over this rank's own link. Behind
-  `SGLANG_MOE_COLD_TIER_SHM=1`; with it off the slice-1 boot refusal for
-  delegation on disjoint expert shards is unchanged, field for field.
+  `SGLANG_MOE_COLD_TIER_SHM=1`; with it off the GGUF streaming door warns once and falls back to the
+  pre-#394 plan (`if not cold_tier_enabled() and not
+  envs.SGLANG_MOE_HOST_SHARD_UNSAFE_DELEGATE.get(): … return None`,
+  `fused_moe_triton/layer.py:1450-1455`); the HARD refusal for delegation on
+  disjoint expert shards is the separate marlin-repack door
+  (`refuse_cold_shard_at_repack_door`, `expert_offload.py:3755-3782`). Two
+  doors, two refusal shapes.
   **Honest scope of slice 2**: byte ownership moves, COMPUTE does not, so
   per-rank H2D is predicted unchanged.
   **Slice 3 (#439) moves the compute assignment** and is where ANALYSE_393's
@@ -326,7 +488,12 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   behaviour: the remap clamps and counts on device, and
   `offload_capture_gate` raises by name at the replay boundary. Since #452 that
   seam is behind a SECOND refusal — the capturable decode path itself refuses at
-  boot — so reaching it now takes both overrides. Graphs incl.
+  boot — so reaching it on the CAPTURABLE route takes both overrides. On the
+  #462 BREAKABLE route it takes neither: `refuse_capturable_cold_tier` is armed
+  only inside `install_capturable_buffers` (`expert_offload.py:2936-2940`),
+  which that route never calls, and its eager `_fetch` keeps the peer branch
+  (`if remote is not None and expert_id in self._remote_ids:`, `:2819`).
+  Graphs incl.
   CPU-MoE remain IMPLEMENTATION EFFORT, not blocked: UVA reads, cudaGraph host
   nodes, CUDA>=12.4 conditional nodes, and graphs pin ADDRESSES not CONTENTS
   (spill/restore under fixed buffers is legal). #452 adds the measured caveat
@@ -344,9 +511,19 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   demoted and a #394-delegated expert is never promoted. Two-sided hysteresis
   (relative margin plus an absolute `min_gain` floor, because a purely relative
   margin churns on sampling noise in the tail of the routing distribution).
-  Eager path only: refused by name under `SGLANG_MOE_OFFLOAD_CUDA_GRAPH` and
-  after `install_capturable_buffers()`, since a captured gather's LUTs pin the
-  layout. Counters land in the #390 dump under `heat_migration` / `heat_*`
+  Refused under the CAPTURABLE route only — by name at boot (`if
+  bool(envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.get()):`,
+  `expert_heat_migration.py:339`) and at migration time (`if
+  self._capturable_ready:`, `expert_offload.py:3632`), since a captured
+  gather's LUTs pin the layout. It RUNS under the #462 BREAKABLE route:
+  `prepare_breakable` calls `_observe_routing` (`expert_offload.py:3107`) whose
+  tail is `if self._heat.due(): self._migrate_heat()` (`:3197`), and
+  `_capturable_ready` is False there — sound by construction (in-place swaps
+  into address-stable arena slots, slot vector republished per replay), so §17's
+  cell "#302a x graphs" is OCCUPIED. Same for Stage-1 `SGLANG_MOE_HOT_RESIDENCY`
+  (`layer.py:702` gates on the capturable mode only). Note both refusals read
+  only the legacy env, so `SGLANG_MOE_OFFLOAD_GRAPH_MODE=capturable` escapes
+  them (#500-B9). Counters land in the #390 dump under `heat_migration` / `heat_*`
   totals.
   **DESK-PROVEN, BOOT-PENDING — it has never served a token.** The desk
   falsifier (`scripts/dev/302a_heat_desk/`, run over four independent boots'
@@ -364,19 +541,49 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   heat correlation is indistinguishable from zero (|mean Spearman| <= 0.03,
   top-R overlap on the chance line), which also settles that one shared ranking
   cannot serve several layers.
-- **HiCache** L1-L3 prefix cache (validated with uneven DCP/TP; storage key
-  includes kv-dtype; runtime attach/detach works on UnifiedRadixCache). The
+- **HiCache** L1-L3 prefix cache. Uneven DCP/TP is not a gated combination —
+  there is NO refusal anywhere; the controller BRANCHES on it
+  (`dcp_owner_mode = self._dcp_owner_ctx() is not None`,
+  `managers/cache_controller.py:655`), which drops the rank suffix from the
+  storage key (`mem_cache/hicache_storage.py:427-430`) so a token-sharded rank
+  set shares one entry. Storage key includes kv-dtype; runtime attach/detach
+  works on UnifiedRadixCache. The
   L2 host tier's `page_first_direct` transfer path was blocked on this rig by
   a segfault in `transfer_kv_all_layer_direct_lf_pf` (#436, cu12/cu13
   `cudaMemcpyBatchAsync` ABI split); unblocked by the cu13 `sgl_kernel`
   rebuild.
 - **KV session offload (kvso)**: FCFS spill of youngest sessions to RAM (KV
-  only, GDN stays resident), budgets (volume/rate/window, demote to HiCache),
-  idle-first victim choice, decoupled from speculation.
-- **Hibernate to disk** (weights+KV survive process exit; uneven-TP3 reload
-  50s→8-14s) + suspend-to-RAM (memory saver; reaches the legacy hybrid-SWA
-  `SWAKVPool` since upstream #32213 — before that it was silently a no-op
-  there, while `UnifiedSWAKVPool` already honoured it).
+  only — `bundle_spillable_sizes` returns `[("kv", kv)]` and nothing else,
+  `managers/kv_session_offload.py:126`, so GDN stays resident), budgets
+  (volume/rate/window, demote to HiCache), victim key
+  `(spill_class_rank, fast_lane, -kv_arrival_seq)` — spill class, then
+  non-fast-lane, then YOUNGEST arrival; there is NO idleness term (`:844`).
+  It is NOT decoupled from speculation: `if self.speculative_algorithm is not
+  None and os.environ.get("KVSO_ALLOW_SPEC", "0") != "1": raise ValueError`
+  (`server_args.py:6580`), so with the standing NEXTN recipe the documented
+  pair does not boot (#500-B10). Also mutually exclusive with
+  `--enable-hierarchical-cache` (:6620), PD disagg, `--weightless-kv-fastlane`,
+  `--enable-unified-memory`, `--enable-hisparse`, `--enable-mixed-chunk`,
+  `page_size > 1`, non-flashinfer backends, `pp_size > 1`, `dp_size > 1`
+  (:6596-6641).
+- **Hibernate to disk** (weights + module buffers survive process exit — NO KV
+  is parked: `payload = {... "params", "static_state", "gguf_attrs" ...}`,
+  `model_loader/hibernate.py:448-456`; uneven-TP3 reload 50s→8-14s, the uneven
+  vector being part of the identity hash, `:96`). Scope, all hard refusals:
+  GGUF checkpoints only (`if self.load_format != "gguf": raise`,
+  `server_args.py:13204`), pure single-node TP (`hibernate.py:106-123`), and a
+  per-rank NVML-UUID recheck on restore (`if live_uuid !=
+  rank_meta["nvml_uuid"]: raise RuntimeError`, `:568`).
+  `--enable-weights-disk-backup` and `--hibernate-dir` require each other in
+  both directions (`server_args.py:13191-13199`).
+  Plus suspend-to-RAM (memory saver; reaches the legacy hybrid-SWA `SWAKVPool`
+  since upstream #32213 — `kwargs.setdefault("enable_memory_saver", False)`,
+  `mem_cache/swa_memory_pool.py:54`, both call sites passing the server arg,
+  `model_runner_kv_cache_mixin.py:3311`/`:3491` — before that it was silently a
+  no-op there. `UnifiedSWAKVPool` honours it only INDIRECTLY: its own
+  `enable_memory_saver` parameter (`mem_cache/unified_memory_pool.py:1014`) is
+  never referenced; the saving happens in the shared `UnifiedKVPool` buffer,
+  `:212-216`).
   **#456 writes the image SPARSE by default** (`model_loader/sparse_write.py`,
   `SGLANG_HIBERNATE_DENSE_WRITE=1` to opt out): all-zero 4 KiB pages are
   `lseek`-ed over instead of written. This is the one mechanism that survived
@@ -401,23 +608,47 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   the escape env is the better setting. BOOT-PENDING: a real park/restore round
   trip, recipe in DESIGN_456 §7. Second consumer identified but NOT wired:
   `hicache_migrate.execute_plan` (#297) does not share this writer.
-- **Runtime VRAM dial** per card (VMM page return), **KV pressure ladder**
+- **Runtime VRAM dial** per rank (VMM page return) — requires WEIGHTED uneven
+  DCP (`if not uneven_dcp_active(dcp_size): raise KvCapacityError`,
+  `managers/vram_dial.py:1110`), CUDA and a non-MLA VMM-backed pool, and refuses
+  under 11 named combinations incl. memory-saver, PD disagg, hicache storage,
+  kvso, dual-group, DP>1, kv-canary, hisparse, weightless-KV fastlane and the
+  DFLASH lane (`:1045-1086`); its HTTP actuator is `POST /vram_budget`
+  (`http_server.py:1149`). **KV pressure ladder**
   (geometry stages instead of rejects; explicit ladders work; rung-dependency
-  refusals exist and fire). `--kv-pressure-ladder auto` mode wired via
-  rig-profile bridge (#428), boot validation pending — the table is
+  refusals exist and fire — for EXPLICIT specs only, `if isinstance(spec,
+  tuple):`, `server_args.py:6955`). `--kv-pressure-ladder auto` resolves to a
+  real table at this tip (`ladder = build_ladder_from_server_args(server_args,
+  table_fn=auto_ladder_table_fn(server_args))`,
+  `managers/kv_pressure_runtime.py:467`), which closes AUDIT_421 F1; on a
+  heterogeneous node it REQUIRES `--rank-gpu-id` (`if len(names) > 1: raise
+  ValueError`, `managers/kv_ladder_auto.py:190`). Boot validation pending — the
+  table is
   computed from the rig profile by the #272 planner, rank-uniformly and
   UUID-keyed, and inventories only rungs whose actuator this configuration
   wires. Capacities are labelled placeholders until the measured figures
   arrive. BOOT-PENDING: `scripts/dev/428_boot_checks/`. **KV resharding**
-  at phase boundaries (delta move <1 s, `kv_reshard_vectors`), **GDN slot
-  ladder** (resident-state cap + idle vacate → VRAM back to KV pool).
+  at phase boundaries (delta move <1 s, `kv_reshard_vectors`) — also requires
+  WEIGHTED uneven DCP and the hybrid-linear pool family only
+  (`managers/kv_reshard.py:713-729`), **GDN slot ladder** (resident-state cap +
+  idle vacate → VRAM back to KV pool; its flags validate at boot but are INERT
+  without `SGLANG_OFFLOAD_REGISTER=1` — `if not offload_register_enabled():
+  return []`, `model_executor/offload_gdn_states.py:344`, #500-B11).
   `--lane-offload-profile/-class-policy/-park-targets` are wired at runner
   init once-per-process (#428), boot validation pending; a typo now refuses
   there too. The park chain reaches the register and the movement layer's
   default reads it — but nothing in
   production constructs the movement backend yet, so the chain has a consumer
-  PATH, not a consumer. Whole surface is behind `SGLANG_OFFLOAD_REGISTER=1`
-  (dark launch). BOOT-PENDING: `scripts/dev/428_boot_checks/`.
+  PATH, not a consumer. `SGLANG_OFFLOAD_REGISTER=1` (dark launch) gates the
+  process-global register ONLY (`if not offload_register_enabled(): return
+  None`, `offload_register.py:1227`, `:1261`) — `get_global_register` and the
+  `maybe_*` adapters. The `--lane-offload-*` parsers run at argument time
+  regardless (`server_args.py:6663-6668`), and the #286 asset-class layer
+  (`short_term_offload_register.py`) is not behind it at all: it is already
+  called in production from `breakable_offload.py:216`/`:268-272`. The
+  runner-init typo refusal (`offload_register.py:1239`) sits BEHIND the gate,
+  so by default a typo refuses only at argument time.
+  BOOT-PENDING: `scripts/dev/428_boot_checks/`.
 - **#286 short-term offload register, asset-class layer**
   (`model_executor/short_term_offload_register.py`, desk slice): the half the
   existing `offload_register.py` did not have. (a) One
@@ -468,7 +699,14 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   the gate would refuse. Note a #93 family PARK preserves the VAs and so does
   NOT release the reference; the family must be unregistered.
 - **memtier registry**: tier ids with volatility + payload class and
-  provenance `measured|estimate|absent` (absent refuses use). HONEST STATE
+  provenance `measured|estimate|absent`. ABSENT refuses on the BANDWIDTH axis
+  only, and only under a floor or `allow_unmeasured_bandwidth=False`
+  (`registry.py:407`, `:418`); absent LATENCY refuses nowhere; absent CAPACITY
+  refuses only when bytes are requested (`:455`, `:458`). "Estimates refused by
+  default" is the CALLER's default, not the registry's:
+  `require_measured_bandwidth: bool = False` (`registry.py:199`) vs
+  `price_park_target(..., require_measured: bool = True)`
+  (`short_term_offload_register.py:787`). HONEST STATE
   (audit #421, updated by #286): the FIRST production consumer is wired —
   `model_executor/short_term_offload_register.price_park_target` picks its park
   target through `TierRegistry.select` and refuses a tier whose bandwidth is
@@ -483,8 +721,11 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   Slice 1b (#407 / directive #434) made it hardware-general:
   `TierRegistry.for_machine()` fingerprints the box from NVML UUIDs (#397
   canon), applies a stored profile ONLY at the scope its hardware match
-  licenses (`EXACT` = every tier; `MODEL` = card templates only, no host /
-  filesystem / remote row), and otherwise bootstraps from live facts with
+  licenses (`fingerprint.py:313` EXACT = every tier; `:325` MODEL = card
+  templates only, no host / filesystem / remote row — the whole `tiers` list is
+  dropped at `:416-419`; `:339` NONE), unless `SGLANG_MEMTIER_PROFILE_TRUST=1`
+  promotes an explicit path's NONE verdict to full EXACT
+  (`profile_store.py:208-213`), and otherwise bootstraps from live facts with
   measured sizes and every cost ABSENT naming its probe. `from_profile()` no
   longer defaults to the bundled rig profile — that default handed one
   development box's host RAM, ZFS pool and 40G peer to every machine.
@@ -492,18 +733,35 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   rig artifact #271, `capability_matrix` #278) by `memtier/adapters.py`;
   #407 adds no probe of its own. `TierTransport.link_path` +
   `link_disjointness()` expose PATH identity for #423's striping gate, with
-  `DISJOINT` requiring complete paths on both sides and `UNKNOWN` being a
-  refusal. Design: `docs/dev/DESIGN_407_memtier_registry.md`.
+  `DISJOINT` requiring complete paths on both sides (`tiers.py:570-603`).
+  `UNKNOWN` is RETURNED, not refused — no `raise`, and no production caller;
+  with `link_path_complete=False` hardcoded in bootstrap
+  (`memtier/bootstrap.py:241`) and in the bundled remote rows, DISJOINT is
+  currently unreachable from real data (#500-B12).
+  Design: `docs/dev/DESIGN_407_memtier_registry.md`.
 
 ## 4. Speculative decoding
 NEXTN/MTP standard (steps 3, topk 1, draft 4); adaptive draft length (upstream
 base, fork adds graph-offload, high-accept ladder, frozen-MTP, hetero
-determinism); acceptance-driven DFLASH<->NEXTN switch + adaptive k; DFLASH solo
-draft on the big card (vocab broadcast reclaims ~5 GB); chain-spec on the
-weightless lane; multi-layer EAGLE fixes; spec-algo name validation (one
-source, parse-time refusal); canonical `--speculative-draft-model-path`.
-Tree-spec topk>1 under DCP is HARD-GATED (silently wrong + perf-negative — do
-not re-attempt without new evidence; see rejected register).
+determinism); acceptance-driven DFLASH<->NEXTN switch + adaptive k (DFLASH only
+— DSPARK is not a cross-algo rung, `cross_algo_utils.py:686`) — and in that
+mode the DFLASH rung's solo host is PINNED TO RANK 0 with
+`--speculative-draft-gpu` refused (`cross_algo_utils.py:733-739`), so "DFLASH
+solo draft on the big card (vocab broadcast reclaims ~5 GB)" holds for plain
+`--speculative-draft-placement solo`, not for the cross-algo ladder;
+chain-spec on the weightless lane; multi-layer EAGLE fixes; spec-algo name
+validation (one source, parse-time refusal); canonical
+`--speculative-draft-model-path`.
+Tree-spec topk>1 is HARD-GATED on the CROSS-RANK DCP VARIANTS ONLY — the gate
+is `(rank_tp_ratio is not None or weightless_kv_fastlane) and
+tree_verify_activation_reason() is not None` (`server_args.py:7407`, mirroring
+`flashinfer_backend.py:931`'s `dcp_tree_mask`), reached only at `dcp_size > 1`
+(`:7590`). It fires for a UNIFORM `--rank-tp-ratio` too, and has no `page_size`
+term. DCP without a `--rank-tp-ratio` vector and without the weightless lane is
+NOT gated: there `uneven_dcp` is False and topk>1 runs the stock correct EAGLE
+tree path (live on HIP; on CUDA the separate spec×DCP gate at :7644 shuts that
+door for its own reasons). Silently wrong + perf-negative under the gated
+variants — do not re-attempt without new evidence; see rejected register.
 
 **Per-decode KV reserve is derived, not a blanket 2x (#486).** The reserve
 every running request holds ahead of `kv_committed_len` is `W + L`: the write
@@ -511,7 +769,11 @@ footprint of this step's draft+verify (`get_alloc_len_per_decode`) plus what
 one in-flight verify can still commit while the host is one step behind
 (`get_commit_lag_per_decode` = `max_speculative_num_draft_tokens` under
 overlap, 0 with `--disable-overlap-schedule`). It is now a NAMED posten in the
-pool ledger (`DESIGN_330_vram_dial.md` §3b) instead of an uncounted transient.
+pool ledger (`DESIGN_330_vram_dial.md` §3b) instead of an uncounted transient —
+EXCEPT the hybrid-SWA / SWA-chunk-cap pool sizer, which still computes
+`2 * get_alloc_len_per_decode(sa)` (`pool_configurator.py:628`) and therefore
+disagrees with the allocator on every non-overlap and every topk>1/page>1 run.
+Open (#500-B4).
 Honest result: on our NEXTN recipe (steps 3 / topk 1 / 4 draft) `W == L`, so
 the old `2 x W` was already exactly the need and the fix saves nothing there —
 upstream issue #32459's radix-collapse diagnosis does not transfer to this
@@ -525,19 +787,31 @@ mirror) — adopting it would under-reserve and let verify write past
 `kv_allocated_len`. Both directions are pinned:
 `test/registered/spec/test_alloc_reserve_need.py`.
 
-Draft-solo placement now admits the whole DFLASH FAMILY (#470): DSPARK joins
-DFLASH because it has the same shape — self-drafting block model, token-id
-round output, post-all-reduce hidden-state input — and its one delta, the
+Draft-solo placement admits `algo.is_eagle() or algo.is_dflash_family()`
+(`server_args.py:7147`) — an ENUM MEMBERSHIP test, not a shape test:
+EAGLE / EAGLE3 / NEXTN / DFLASH / DSPARK. A plugin algorithm registered via
+`SpeculativeAlgorithm.register` is refused however DFLASH-shaped it is.
+Solo also needs `tp_size >= 2` (:7282), refuses PD disaggregation (:7275) and
+DP/PP/EP (:7196/:7203/:7209), but is NO LONGER single-node: only
+`--speculative-draft-gpu` is refused across hosts (:7239, RELAXED-NOT-PROVEN).
+DSPARK joined the family (#470) because it has the same shape — self-drafting
+block model, token-id round output, post-all-reduce hidden-state input — and
+its one delta, the
 confidence head's per-request block truncation, rides the SAME per-round
 broadcast as one extra integer per request (`dspark_components/dspark_solo.py`
 packs ids + lengths into one int64 tensor, so the round still costs one
-collective). `FROZEN_KV_MTP` stays refused and is pinned by a test: its draft
+collective). `FROZEN_KV_MTP` stays refused — by NAME, one branch earlier
+(`server_args.py:7111`), pinned by `test_draft_solo_args.py:168`: its draft
 reads the target KV in place, which no single rank holds. Solo DSpark v1 is
 greedy-acceptance-only (a non-greedy round would need `[bs, gamma, vocab]`
 corrected logits on every verifying rank) and switches the default-on
 `SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD` off, with reasons logged rather than
-inferred. `--speculative-moe-runner-backend` (the existing per-draft flag) now
-actually reaches DFLASH/DSPARK draft builds, which is what puts an MXFP4
+inferred. `--speculative-moe-runner-backend` reaches EVERY draft build — the
+`speculative_moe_backend_context()` wrapper is applied in `eagle_worker_v2`,
+`standalone_worker_v2`, `frozen_kv_mtp_worker_v2`, `multi_layer_eagle_worker_v2`,
+`cross_algo_worker` and (new for #470) the shared DFLASH/DSPARK builder
+`draft_worker_common.py:155`; unset, it defaults to `--moe-runner-backend`
+(`overrides.py:2086`). Reaching the DFLASH/DSPARK builds is what puts an MXFP4
 DSpark head on `Mxfp4MarlinMoEMethod` on sm120. **DESK-WRITTEN — no DSpark arm
 has booted; `docs/dev/TICKET_470_dspark_boots.md` is the only evidence path,
 and its Boot A prices the ~21 % rank-0 residency cut the arm costs.** Two
@@ -550,26 +824,53 @@ only a warning, and left as a silently zero accept rate.
 
 ## 5. Multi-group runtime (dual lane)
 Slices A-D merged: lane-correct context overlays (~370 callsites), own thread +
-high-priority stream, lend/reclaim in ms, SM-contention pairing rule,
-lane-NEXTN head. Lane spec chain merged: rank-local draft-KV sizing, chain-spec
-topk=1 on the lane, lane prefill chunking (`dual_group_lane_prefill_chunk`;
-spec chunks carry the head primer — costs measured), Marlin LoRA workspace
-keyed (lane,name). PD disaggregation: prefill satellite carries hybrid GDN
-(KV+mamba slot via mooncake), default graph-covered.
+high-priority stream, lend/reclaim in ms, SM-contention pairing rule
+(`--dual-group-lane-pairing` needs `--dual-group-lane-concurrent`,
+`server_args.py:9462`), lane-NEXTN head. Admission: an EXPLICIT
+`--rank-tp-ratio` integer list is mandatory (`'auto'` refused,
+`server_args.py:9441`) — a UNIFORM vector is accepted, so the lane is reachable
+on a homogeneous rig — plus `--dual-group-lane-budget-mib` (:9449). Only
+`pp_size>1` and `--enable-dp-attention` are refused (:9455); `ep_size>1` and
+plain `dp_size>1` are NOT. Lane spec chain merged: rank-local draft-KV sizing,
+chain-spec topk=1 — the gate reads the SERVING GROUP's
+`--speculative-eagle-topk` (`not in (None, 1)`, `server_args.py:9482`), so
+enabling `--dual-group-lane-spec` also forbids a tree on the main group, and
+the lane's own proposer has no topk knob at all (`dual_group_lane.py:2488`);
+`--dual-group-lane-spec` additionally requires the serving group to speculate
+(:9473) — lane prefill chunking (`dual_group_lane_prefill_chunk`; spec chunks
+carry the head primer — costs measured), Marlin LoRA workspace keyed
+(lane,name). PD disaggregation: prefill satellite carries hybrid GDN (KV+mamba
+slot via mooncake, gated on `tree_cache.supports_mamba()`,
+`disaggregation/prefill.py:911`). Graph coverage: a prefill satellite disables
+only the DECODE graph (`server_args.py:8190`) and keeps the default BREAKABLE
+prefill graph — but the breakable-compat sweep drops that prefill graph for
+`attn_cp_size > 1` and for MLA attention (`server_args.py:8278-8288`), i.e.
+every DCP plan runs the prefill satellite eager.
 
 ## 6. Weightless KV lane
 A card holds ONLY KV + attention (no weights): chunked prefill/extend, fp8/int4
 worker KV, DCP comm fusion, graph-captured streaming decode, host-tier KV
-spill, chain spec. **Live session handover without server stop** + draft
+spill, chain spec — but SPEC AND THE STREAMING BLOCK LOOP DO NOT COMBINE:
+`--weightless-kv-chunked-block-size` / `--weightless-kv-host-spill-tokens` are
+refused together with a speculative algorithm (`server_args.py:6330`), two
+capture axes nobody composed. Chain spec further requires the EAGLE family
+(:6274), `--speculative-draft-placement solo` (:6288) with solo rank ==
+`--weightless-kv-head-rank` (:6304), and no `--speculative-adaptive` (:6316).
+Lane topology: `dcp_size == tp_size >= 2`, no PP/DP-attn/EP (:6069-6088).
+**Live session handover without server stop** + draft
 re-sharder as its own spec type: MERGED and GPU-gate-passed
 (`POST /session_handover`, five-phase at session scope, hard GDN-blob gate
 keyed on `BasePrefixCache.supports_mamba()`; proven byte-identical to a
 never-moved reference via a real cached-tokens import, `cached_tokens=1152`
-on resume, plus seven named-refusal negative controls) — the declared v1
-limit stands unchanged: a booted TP>1 destination still needs the offline
-manifest-scoped umsharder (`page_size == 1`, inherited from
-`dcp_owner_mode`) to reshape into its geometry first, live handover does not
-do that reshape in-process.
+on resume, plus seven named-refusal negative controls). Endpoint at this tip:
+`http_server.py:1126`. v1 limits, AS ENFORCED: live EXPORT requires a
+TP=1 / PP=1 SOURCE (`session_handover.py:418`), `page_size == 1` (:425,
+"inherited from `dcp_owner_mode`") and the `file` hicache storage backend
+(:392). The DESTINATION carries NO `tp_size` predicate — `verify_import`
+checks manifest version, model identity and blob presence only (:266-292); a
+booted TP>1 destination simply misses the blobs and is told to run the offline
+manifest-scoped umsharder for its geometry first, live handover does not do
+that reshape in-process.
 
 Also wired on the tip but easy to miss (audit #421): the regime-controller
 gate machinery, KV-pressure rung-dependency refusals, the hibernate flag
@@ -579,19 +880,75 @@ contract (`hibernate_dir` + weights/draft CPU/disk backup flags), and a
 ## 7. Collectives / transport
 **barlink** (own vendor-neutral CCL): NCCL-parity device transport,
 cross-vendor byte-exact, UCX transport (chunk pipelining, dual worker), tuned
-all_gather ring, graph-capable direct mode. **Smallbar BAR1 direct path**:
-peer VRAM over 256-MiB BARs, beats NCCL 1.13-1.34x in serving.
-`--collective-net-small/-bulk` per message class with typo hard-reject.
-dmabuf GPU-RDMA works on consumer cards with the stock driver. Rig facts: NO
+all_gather ring, graph-capable direct mode — capture-safety is
+TRANSPORT-NAME-keyed, not property-keyed:
+`CAPTURABLE_BARLINK_TRANSPORTS = {"device","host"}` plus
+`GRAPH_ENABLE_TRANSPORTS = {"bar1","matrix"}` through
+`SGLANG_BARLINK_GRAPH_ENABLE` (default on) (`parallel_state.py:298`, `:303`,
+`:352-362`); ucx/shm/gloo are refused at startup unless `--disable-cuda-graph`
+(`:365-383`), and under an active capture there is no silent gloo fallback —
+barlink aborts with the reason (`barlink.py:635-676`).
+Op coverage per transport, from `BARLINK_OPS` at source: device
+`{all_reduce, all_gather, reduce_scatter, broadcast}`
+(`barlink_device.py:1152`); host the same plus send/recv
+(`barlink_host.py:811`); ucx the same four (`barlink_ucx.py:376`); bar1
+`{all_reduce, all_gather, all_to_all, all_to_all_single, broadcast}` — NO
+reduce_scatter (`barlink_bar1.py:1450`); matrix only
+`{all_reduce, all_to_all, all_to_all_single}`
+(`barlink_matrix_transport.py:354`), a strict SUBSET of its own bar1 sub-path
+(#500-B17). The communicator refuses four collectives outright:
+`reduce_scatter(list)`, `reduce_scatterv`, `all_gather(output_tensor_list=)`,
+`all_gatherv` (`parallel_state.py:1348-1371`); bar1 additionally caps the group
+at 8 ranks (`MAX_RANGE`, `barlink_bar1.py:811`, `:1518`). **Smallbar BAR1 direct path**:
+peer VRAM over the card's own BAR aperture — PROBED, not assumed (NVML
+`bar1Free`, sysfs gross fallback, `barlink_matrix_transport.py:280-302`).
+Requested window `SGLANG_BARLINK_BAR1_WINDOW_MIB` (default 96) with a per-group
+override `..._MIB_<GROUP>` (`:113-120`); the group-wide MINIMUM governs
+(`barlink_bar1.py:1953-1985`). Payload eligibility is checked against the
+CONTIGUOUSLY mapped length, never the sysfs gross size
+(`barlink_bar1.py:2385-2405`) — a larger BAR raises reachability directly.
+Measured 1.13-1.34x over NCCL in serving (measurement, not a gate).
+Undocumented sizing knobs on the same plane: `SGLANG_BARLINK_SLOT_MIB` (64,
+`barlink.py:70`), `_HOST_SLOT_MIB` (`barlink_host.py:120`), `_CHUNK_MIB` (8,
+`barlink.py:52`), `_PIPE_CHUNK_MIB` (4, `barlink_device.py:989`).
+`--collective-net-small/-bulk` pin the NIC (not the transport) per message
+class; typo hard-reject against sysfs, not a name list
+(`server_args.py:14089-14098`, accepted set = dirs under
+`/sys/class/infiniband` + `/sys/class/net`, plus `all`, optional `:port`). SMALL
+reaches only the barlink UCX plane and pins BOTH small and large TP collectives
+(one UCX context, `server_args.py:14176-14185`); BULK reaches PD-KV/HiCache via
+`--disaggregation-ib-device`. BAR1 is not selectable here.
+dma-buf EXPORT works on consumer cards with the stock driver — probed
+(`cuMemGetHandleForAddressRange` first, `NV_ESC_EXPORT_TO_DMABUF_FD` ext as
+fallback, `barlink_bar1.py:517-537`). The BAR1 PEER MAPPING on top of it is NOT
+stock: it needs the widened driver guard (regkey
+`BarlinkPeerBar1`/`RMSmallBarP2PPeerBar1`, `barlink_bar1.py:597`, `:2337-2342`),
+the `dmabuf_holder` module (`:589`, `:644-653`) and a passing byte proof
+(`:4644-4656`); `CAP_SYS_ADMIN` or `PeerMappingOverride=1` is the second hurdle
+in a container (`:2352-2374`). Rig facts: NO
 P2P/NVLink here, negotiated PCIe x4/x8/x8 (NVML max-width reports x16
 NAMEPLATE — always read negotiated width), NCCL-verbs broken on our RoCE.
 **Collective-decision recorder** (`barlink_uniformity.py`, #431): per-rank
 ordered log of every `(op, nbytes, path, rounds)` dispatch decision plus a
 pure `first_divergence` comparator — the standing instrument for the
 rank-local-condition-before-a-group-collective family (#94/#194/#312/#431).
-Off by default (`SGLANG_BARLINK_RECORD_DECISIONS=1`, optional per-rank
-on-disk dump via `SGLANG_BARLINK_RECORD_DUMP_DIR` for post-mortems on a
-wedged run). **Scoped slow-boot warning**: barlink BAR1 × uneven weighted DCP × an
+Off by default (`SGLANG_BARLINK_RECORD_DECISIONS=1`, read ONCE at import —
+`barlink_uniformity.py:205` — so it must be exported before the process starts;
+`SGLANG_BARLINK_RECORD_DUMP_DIR` adds the per-rank on-disk dump for post-mortems
+on a wedged run but does nothing on its own, because recorders are only built
+from `record_decision`, which returns early when recording is off, `:250`
+— #500-B20).
+**#279 path dispatcher**: flag-gated (`SGLANG_BARLINK_PATH_DISPATCHER=1`, read at
+call time, `barlink_path_dispatcher.py:428`) and inert — a fresh dispatcher has
+an EMPTY registry, so every decision is the status-quo #240 choice (`:431-443`).
+`PathProfile.saturation_threshold` is permanently 1.0 (no writer) and no
+production code attaches a saturation sensor, so `_utilization_locked` returns
+0.0 and the `>= threshold` overflow tier at `:357` never fires today. It is not
+dead code: the one production-intended sensor, `bus_saturation_sensor`, is
+BINARY (`return 1.0 if stats.get("pending_demand") else 0.0`, `:415`), for which
+threshold 1.0 is exactly right. AUDIT_421 §8's open question is CLOSED —
+reachable by construction, correctly matched to its intended sensor, unreachable
+until #279's measured slice wires both. **Scoped slow-boot warning**: barlink BAR1 × uneven weighted DCP × an
 fp8-quantized checkpoint warns loudly at ModelRunner boot instead of refusing
 (#438a). What #424 recorded as a wedge is a slow FIRST boot: on a cold JIT
 kernel cache the first CUDA-graph capture batch spends ~190 s per rank
@@ -627,9 +984,17 @@ read would be illegal. Knobs:
 Generalized loader (registry + family mapping tables), unsloth-UD, mixed-dtype
 fused GDN qkvz, MoE tensor mapping, vision/mmproj, sibling-config validation,
 DeepSeek-V2/3/4 class GGUF-safe (`.qweight` accessors, quantization_config
-drop, tokenizer route). Perf: batched MMVQ, Q8 lm_head, K-quant MMVQ tuned to
-Q8_0 efficiency (TP=2 beats llama.cpp), graph-replay numeric safety for ALL
-quants, `gguf_mmq_decode_threshold`.
+drop, tokenizer route). Perf: batched MMVQ (default follows the WHEEL probe `_dequant_supports_out`,
+`gguf.py:342-345`), Q8 lm_head, K-quant MMVQ tuned to Q8_0 efficiency (TP=2
+beats llama.cpp; wheel probe `ggml_mmvq_kq_tuned` + `SGLANG_GGUF_KQ_KERNEL` kill
+switch, `gguf.py:355-371` — when present it fully disables the #72 reroute,
+`:442`), graph-replay numeric safety for ALL quants — literally type-agnostic
+(`gguf.py:942-948`), but it needs the `ggml_dequantize(..., out=)` wheel schema;
+on an older wheel the capture OOM returns. `gguf_mmq_decode_threshold` compares
+the CUDA-graph decode BUCKET (raw M rounded UP) against a MEASURED
+per-(capability, shape class) table `_MMQ_BUCKET_MIN` = {sm120, sm86} only
+(`gguf.py:539-542`, `:665-672`) — silently inert on any other device
+(#500-B19).
 **MXFP4 (ggml type 39) is native since #398** — a complete kernel set
 (dequantize, dense MMVQ, dense MMQ, MoE MMVQ, MoE MMQ, `moe_get_block_size`),
 so the type is in all three GGUF type sets and the load-time MXFP4->Q5_0
@@ -641,22 +1006,53 @@ E2M1), so it is the first GGUF block type with an ODD stride: every read of
 loaders. The scale helper `ggml_cuda_e8m0_to_fp32_half` returns 2^(e-128) —
 already halved against the doubled lattice — and is bit-identical to the host
 reference, so dequant is compared EXACTLY, not within a tolerance. Kernel
-presence is a wheel property, probed via the `ggml_mxfp4_native` marker op
-(the #73 pattern) and overridable with `SGLANG_GGUF_MXFP4_NATIVE=0`, which
-hands the checkpoint back to the repack. GPU-pending:
+presence is a wheel property, probed via the `ggml_mxfp4_native` marker op (the
+#73 pattern, `gguf.py:272`) and evaluated ONCE at import (`:277`).
+`SGLANG_GGUF_MXFP4_NATIVE=0` hands the checkpoint back to the repack —
+first-character test (`:265`), so `false`/`no`/`off` do NOT disable it. The
+"no-op on a native wheel" is a short-circuit, not a cheap pass: `_type_map()`
+returns `{}` before any tensor is read (`gguf_mxfp4_repack.py:113-115`). Second,
+undocumented lever: `SGLANG_GGUF_MXFP4_REPACK=0` (default 1, `environ.py:1776`)
+empties the same map (`:122-124`); combined with `NATIVE=0` or an old wheel it
+turns the checkpoint into a loud load-time refusal by tensor name (`:127-135`) —
+never a silent fallback. Native also widens MoE expert-offload coverage, since
+`MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES` (`gguf.py:292`). GPU-pending:
 `TICKET_398_mxfp4_validation.md`.
 
 ## 9. Quant lanes
 FP8 (sm120 GEMM tuned; per-channel fused GEMV; opt-in deterministic
-`SGLANG_DETERMINISTIC_FP8_GEMM`; e4m3 KV bit-exact on sm86), INT8-W8A8 (default
+`SGLANG_DETERMINISTIC_FP8_GEMM` — reaches dense fp8 linears and
+`CompressedTensorsW8A16Fp8` on NVIDIA sm80..sm88 ONLY (`fp8_utils.py:313`,
+`:321-323`), a no-op on sm89/90/120 and on ROCm, and deliberately NOT honoured
+by fp8 MoE experts (`fp8.py:1245-1252`), FBGEMM fp8 (`fpgemm_fp8.py:56-67`) or
+multimodal_gen, each of which logs the gap; it forces
+`fp8_needs_dequant_fallback` on (`fp8_utils.py:361`), costing ~2.5-6x decode
+throughput; e4m3 KV bit-exact on sm86 — a measurement, no sm86 code gate), INT8-W8A8 (default
 recommendation; sm86-native lane; beware the dual-dist wheel trap — pin by
-sha256), NVFP4 (V4 class usable via dequant fallback for unpackable layers),
+sha256), NVFP4 — "unpackable" is a pure SHAPE test, not a checkpoint class: Marlin
+`output_size % 64` on the UNSHARDED width
+(`compressed_tensors_w4a4_nvfp4.py:152-157`), native FP4 `width % 32` on the
+SHARDED width (`:186-192`), routed per rank by the resolved lane (`:225-234`);
+both verdicts land on `CompressedTensorsW4A4Fp4Dequant` (load packed,
+materialise dense once, `F.linear`, exact numerics), so ANY NVFP4 checkpoint at
+ANY `--rank-tp-ratio` is bootable, including layers no TP split can rescue,
 Marlin alignment family (EIGHT sibling bugs fixed — device-free fold predicate,
 lcm=128 on coupled dims; alignment fixes must preserve cross-layer agreement).
 The eighth (#444b) is MXFP8: its `weight_block_size [1, 32]` is the OCP scale
-layout, not an alignment registration, so an asymmetric exposed block is now
-coarsened by `lcm` of both axes before the marlin fold — latent, mxfp8 needs
-capability 100.
+layout, not an alignment registration, so an asymmetric exposed block is
+coarsened by `lcm` of both axes before the marlin fold. The predicate is
+STRUCTURAL — `asymmetric_block = bool(raw) and len(raw) == 2 and raw[0] !=
+raw[1]` (`linear.py:289-291`) — so it covers every future asymmetric exposure,
+not just MXFP8, and symmetric blocks are provably untouched. It is NOT latent:
+the mxfp8 floor is `capability >= 100` (`loader.py:261` against
+`fp8.py:315`), so sm120 (the 5090) CLEARS it; on ROCm the same config floors at
+95 (gfx95) or 94 (gfx942 block-fp8 conversion) (`fp8.py:305-313`). Open defect
+alongside it: the marlin fold is gated on a CLASS-NAME list
+`_MARLIN_PACKABLE_CONFIGS = ("fp8config", "compressedtensorsconfig",
+"fbgemmfp8config")` (`linear.py:206`, `:236`), so `MarlinConfig` /
+`W8A8Fp8Config` / `QuarkConfig` — marlin-served and exposing no
+`weight_block_size` — get NO uneven-TP coarsening at all, which is the
+#377/#383 mid-tile abort reachable through a different class (#500-B18).
 
 ## 10. Determinism / quality gates
 Hetero-determinism roots fixed (verify sync, graph pads, flashinfer workspace,
@@ -720,8 +1116,30 @@ docs/dev/NOTE_472_pad_positions_dcp.md.
 ## 13. Serving surface
 OpenAI-compatible with `--reasoning-parser qwen3 --tool-call-parser
 qwen3_coder` (server-side fix, no template patches); fast lane, priority
-scheduling, admission throttle, prefill delayer; training tenant + idle
-workbench (ledger + pause rung); `/session_handover`; `/kv_reshard`.
+scheduling, admission throttle, prefill delayer; training tenant
+(`--enable-training-tenant`) + idle workbench (`--enable-idle-workbench`,
+ledger + pause rung).
+
+Fork-added HTTP surface, enumerated against upstream (audit #500) — the
+catalog previously named two of these and the rest were discoverable only from
+the router:
+`POST /session_handover` (`http_server.py:1126`), `POST /kv_reshard` (:1109),
+`POST /vram_budget` (:1149 — the runtime VRAM dial's actuator),
+`GET|POST /hibernate` (:1706),
+`POST /v1/images/{generations,edits,variations}` (:2013/:2022/:2057) and
+`POST /v1/audio/speech` (:2067) — the OpenAI-compatible **diffusion** and
+**speech** lane fronts, wired unconditionally at `http_server.py:461-462`,
+routing to a registry-promoted class-2 lane and refusing with the registry's
+own numbers when none is HOT (`serving_images.py:62-100`; `edits`/`variations`
+are a named 501 at `:192-199`),
+`/v1/files` + 4 sub-routes and `/v1/fine_tuning/*` + 6 (:2079-2170, #341-M1),
+`/x-htsglang/workbench{,/events,/pause,/enqueue}` (:2191-2236).
+Outside `http_server.py`: `video_enhance/server.py` serves
+`/v1/video/{enhance,plan,capabilities,engines,tracks,liveness}` plus
+`/v1/video/enhance/{job_id}` and `/v1/video/preview/{job_id}/{which}`, and
+`registry/http_api.py` serves the engine control plane
+`/registry{,/cards,/engines,/engines/{id},/engines/{id}/pin,/engines/{id}/state,/idle,/plan,/default_hot}`
+— which is what the diffusion refusal above tells the operator to use.
 
 Class-3 video enhance, adaptive chain planner (#451,
 `video_enhance/chain_policy.py`): given an ffprobe source and a target, it
@@ -950,14 +1368,28 @@ gated OFF and never booted (§3, `DESIGN_462_breakable_route.md`). The
 neighbouring cell **#302c (per-expert runtime dispatch) stays empty**, but its
 named prerequisite is discharged: DESIGN_462 §5 records how a foreign
 contribution enters the combine, so #302c starts from a seam rather than from a
-redesign. The in-graph fetch remains register-rejected. Anything that EVICTS
+redesign. Cell **"#302a heat migration x CUDA graphs" is OCCUPIED, not empty**
+(audit #500): both refusals key on the CAPTURABLE mode only
+(`expert_heat_migration.py:339`, `expert_offload.py:3632`), while the breakable
+route's `prepare_breakable` reaches `_observe_routing` →
+`if self._heat.due(): self._migrate_heat()` (`expert_offload.py:3107`, `:3197`)
+with `_capturable_ready` False — the swaps are in-place into address-stable
+arena slots, which is exactly what a captured graph permits. The in-graph fetch remains refuted (#452) and is enforced at runtime
+by `refuse_capturable_offload_decode` — both spellings
+(`SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1`, `SGLANG_MOE_OFFLOAD_GRAPH_MODE=capturable`)
+reach the same refusal (`layers/moe/offload_capture_gate.py:257`, `:284`). It
+is NOT in `planner/rejected.py` — #500-B7 registers it there. Anything that EVICTS
 consumes `DESIGN_407_memtier_registry.md` §8's one global importance ladder
 (cold second model, inactive layout/graph families, cold experts, idle sessions,
 active work last and never out of FCFS order — coldest-first within a class)
 instead of writing a local victim policy — that ladder is now EXECUTABLE rather
 than prose (`model_executor/short_term_offload_register.LadderRank` /
-`plan_spill`, #286), so a new consumer calls it instead of restating it, and a
-class added without a ladder rank fails at import; and anything that decides at runtime
+`plan_spill`, #286), and a class added without a ladder rank fails at import
+(`if _MISSING_DESCRIPTORS: raise RuntimeError(...)`,
+`short_term_offload_register.py:465-472`). `describe_class` already has a
+production consumer (`layers/moe/breakable_offload.py:216`); `plan_spill`
+itself has none outside the module's own `rung1_evict` (`:1486`) — a new
+consumer SHOULD call it instead of restating it, but none does yet; and anything that decides at runtime
 whether a path is worth its cost is an instance of `DESIGN_363_regime_controller.md`
 §20.1's worth-it autocheck rather than a new flag. Read those three before
 adding a cell, and register the answer back into them in the same merge.

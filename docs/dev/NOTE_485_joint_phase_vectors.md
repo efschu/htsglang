@@ -3,6 +3,23 @@
 DESK / PREDICTED. No boot was run for this note. The deciding arm is
 `TICKET_485_int8_joint_arm.md`.
 
+> **CORRECTION (audit #500, 2026-08-03).** Every "attention family is
+> grid-pinned at `attn_units = 4`" statement in this note (§ table row
+> "attention grid", the `(grid-pinned)` column, and conclusion 2) describes the
+> ENUMERATOR, not the runtime. `uneven_perf.py:4133-4148` escapes the kv-head
+> grid only when `attn_units < tp`; but every configuration `--rank-perf-tune
+> phase-*` can run in is an uneven-TP boot with a non-uniform base plan, which
+> is exactly the condition under which the runtime REPLICATES the kv heads and
+> shards the token axis instead of head-sharding them
+> (`uneven_dcp_kv_replicated` = `dcp_size > 1 and get_tp_partition_ratios() is
+> not None`, `distributed/utils.py:346` — no kv-head term). The planner's own
+> `placement.py:813` already models this (`replicated = kv_heads < tp or
+> dcp_replicated`) and this same cost model already prices the KV cache as
+> replicated (`uneven_perf.py:3852`). So the attention family's real axes on
+> this rig are the q-head grid plus a continuous token vector, and the numbers
+> below are an optimum over an incomplete candidate set. Fix tracked as
+> #500-B1; see `docs/dev/AUDIT_500_mechanism_reach.md`.
+
 The law this implements (CLAUDE.md, *PER-FAMILY x PER-PHASE OPTIMA*): every
 weight family has its own optimum per phase, so a single-family arm is a
 diagnostic and never a phase verdict. Slice 1 delivers the **prefill column**
@@ -87,7 +104,7 @@ Constraints hit, in the order they bite on Qwen3.6-27B (tp=3):
 
 | constraint | value here | effect |
 |---|---|---|
-| attention grid (#62/#116) | `attn_units = 4` kv heads | every rank keeps >= 1 unit, so the ONLY representable split is `[2,1,1]` — the base. **The attention family has no lever on this checkpoint.** |
+| attention grid (#62/#116) | `attn_units = 4` kv heads *(enumerator only — see the #500 correction above)* | every rank keeps >= 1 unit, so the only split the ENUMERATOR represents is `[2,1,1]` — the base. The runtime is on the replicated-KV geometry here, where the axes are the q-head grid and the token vector, so "no lever on this checkpoint" does not follow. |
 | GDN grid | `gdn_units = 16` k heads | the resolving grid; the whole ladder lives here |
 | MLP grid | 136 quant-group units | unchanged |
 | GDN state coupling (#299) | ~4.7 MiB/req/unit | pool follows the units; priced into `predict_capacity` |
@@ -255,9 +272,15 @@ accepted — not bypassed.
    family as diverging, so #324 hands it the checkpoint-wide lane. The
    bracket contains the right answer but does not know it is the right
    answer. Fixing it would narrow the bracket to a point on both checkpoints.
-2. The attention family is grid-pinned at `attn_units = 4` on this
-   checkpoint. A checkpoint with more kv heads (or DeepSeek V4's `o_groups`)
-   would resolve it, and this machinery already handles that — untested on
-   hardware.
+2. The attention family is grid-pinned at `attn_units = 4` **in the
+   enumerator** on this checkpoint. A checkpoint with more kv heads (or
+   DeepSeek V4's `o_groups`) would resolve it, and this machinery already
+   handles that — untested on hardware. Corrected by audit #500: the pin is
+   not a property of the checkpoint. `uneven_perf.py:4133-4148` leaves the
+   kv-head grid only at `attn_units < tp`, while the boot this arm runs in is
+   always on the replicated-KV geometry (`distributed/utils.py:346`), whose
+   axes are the q-head grid and the token vector. Pricing those is #500-B1 and
+   is the change that would make this arm's number an optimum over the real
+   feasible set.
 3. Whether the joint layout is worth its restart at all is a decision-layer
    question that belongs with #363's `regime_switch` rungs, not here.
