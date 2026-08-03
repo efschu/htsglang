@@ -485,11 +485,46 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --speculative-algorithm NEXTN --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+  --enable-fast-lane \
   --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
 echo $! > /tmp/<yourname>.pid
 ```
+
+**`--enable-fast-lane` belongs on any instance that serves an interactive
+client alongside bulk work** (#533). Without it a latency-critical request
+queues behind whatever the batch tier is doing: measured on this rig, an
+MT-shaped probe took **19.7 s** to first token behind a single 46k-token
+prefill, and **112.9 s** behind four of them, against 154-186 ms idle. Tag the
+interactive request and it jumps the queue -- OpenAI clients send
+`extra_body={"lane": "fast"}`, which is forwarded to `GenerateReqInput.lane`
+(`protocol.py:465-469` -> `serving_chat.py:619` -> `scheduler.py:2691`); the
+validator accepts only `"fast"` or omission. Untagged requests stay in the
+heavy tier by design, which is what makes the flag safe to leave on: the
+default path for an untagged workload is unchanged. Anti-starvation is built
+in and needs no tuning here -- `--fast-lane-reserved-heavy-slots 1` guarantees
+heavy forward progress and `--fast-lane-heavy-aging-ms 10000` promotes a heavy
+request that has waited too long. The flag implies
+`--enable-priority-scheduling` (set in `check_server_args`, NOT in
+`__post_init__` -- a hermetic `prepare_server_args()` still shows
+`enable_priority_scheduling=False`, which is an instrument artifact, not an
+inert flag; verify on the live boot via `/server_info`).
+
+Measured effect, same window, four 46k-token heavy jobs running (#533):
+
+| probe | TTFT |
+|---|---|
+| `lane: "fast"` | **23.6 s** |
+| untagged (heavy tier) | 112.9 s |
+| ratio | **4.8x** |
+
+The counter-probe is what makes this discriminating: both probes were
+identical MT-shaped requests issued concurrently under the same load, so the
+gap is the lane and nothing else. Note the fast probe is still seconds, not
+milliseconds -- preemption happens at admission points, and a 46k prefill
+already in flight is not interrupted mid-chunk. The lane buys an order of
+magnitude, not immunity.
 
 Non-obvious points, each load-bearing:
 
