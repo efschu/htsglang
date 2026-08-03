@@ -329,6 +329,34 @@ def _descriptors() -> Dict[str, AssetClassDescriptor]:
                 "cheaper than a cold second model to give up, it goes first."
             ),
         ),
+        AssetClassDescriptor(
+            offload_class="audio_modules",
+            ladder_rank=LadderRank.COLD_SECOND_MODEL,
+            payload=PayloadClass.RECONSTRUCTABLE,
+            va_stable_required=False,
+            time_constant_tier="turn",
+            dimension_presets=("module",),
+            wired=True,
+            rationale=(
+                "#466 rung B: the live translator's in-process audio modules "
+                "(TTS talker trunk, residual code predictor, 12 Hz codec "
+                "decoder, speaker encoder). RECONSTRUCTABLE and not "
+                "EXPENSIVE_: these are read-only weight blocks re-readable "
+                "from a local checkpoint, so a discarded park costs a file "
+                "read rather than a recomputation, unlike a captured graph. "
+                "Ranked with the cold second model and deliberately NOT at "
+                "IDLE_SESSIONS: an idle translator holding ~2 GB IS the "
+                "cold-provisioned model of DESIGN_407 8.1, and ranking it "
+                "above idle sessions would let a silent phone outrank a "
+                "user's live conversation. va_stable_required is False "
+                "because nothing captures these addresses under rung B (our "
+                "own generation loop, no CUDA graph) -- the native-lane rung "
+                "of #488 must revisit exactly that. Granularity is one "
+                "module: the four park independently, which matters because "
+                "the codec decoder alone is 229 MB and is the one a turn "
+                "needs last."
+            ),
+        ),
     )
     return {desc.offload_class: desc for desc in d}
 
