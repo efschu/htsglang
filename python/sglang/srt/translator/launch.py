@@ -108,6 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mt-model", default="default")
     parser.add_argument(
+        "--mt-lane", default="fast",
+        help="server-side priority lane for translator traffic. 'fast' by default because every call here has a person waiting "
+             "on it; empty string sends no lane, for a backend that does not know the field",
+    )
+    parser.add_argument(
         "--mt-timeout-s", type=float, default=None,
         help="per-request MT budget. The default (20 s) is generous "
              "for an idle backend and NOT generous when the MT server "
@@ -335,6 +340,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     extra_body: Dict[str, object] = {}
     if not args.mt_thinking:
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    # EVERY translator call is latency-critical: a person is waiting mid
+    # sentence. The server's priority lanes (protocol.py) put this traffic
+    # ahead of bulk co-tenants -- eval prefills and the like -- which is the
+    # structural answer to the outages that cost three turns on 2026-08-03.
+    # Measured without a lane: MT time-to-first-token 19.7 s behind a 46k
+    # prefill, against a ~0.24 s median on an idle backend. The retry in
+    # session.py survives such a window; the lane is what stops it happening.
+    # Anti-starvation lives in the server, so this cannot lock anyone out.
+    if args.mt_lane:
+        extra_body["lane"] = args.mt_lane
     if args.mt_extra_body:
         try:
             extra_body.update(json.loads(args.mt_extra_body))
