@@ -32,6 +32,7 @@ them.
 | 2026-08-03 | **Path routing, not a subdomain.** The translator is mounted as `/translate/` under an existing `server_name` with the existing certificate. No DNS record, no `certbot --expand`, nothing touched in the user's certificate setup — zero user action and zero risk to a cert that fronts a dozen other services. A dedicated subdomain is a post-vacation item. |
 | 2026-08-03 | **Routing v2: a rule is an unordered PAIR, and fan-out is the intent.** `de <-> es` routes both directions from one row. Two rows sharing a language (`{de<->es, de<->fr}`) render one German utterance in BOTH targets, played sequentially with a language tag. This inverts two v1 decisions that were the wrong reading of the requirement: "one source routes to exactly one target" made the three-language case unexpressible, and "a duplicate source is refused" refused the very thing the user wants. A repeated pair is deduplicated, not rejected. Capability refusal moves to the pair level, named and greyed out per direction. The ASR keeps identifying the source language (the direction stays observed, never configured) but from a candidate set narrowed to the table's languages; a low-confidence decision resolves to the best in-set language and is TAGGED, never discarded. |
 | 2026-08-03 | **Bad mobile internet is a first-class requirement, not a robustness nicety.** The translator must handle interruptions, high latency, low bandwidth and reconnects as well as it can. Concretely: (1) **no audio is ever lost** — the client buffers microphone segments locally during a disconnect (bounded ring buffer; dropping the oldest entry is permitted ONLY with a visible notice) and uploads them on reconnect, while the server replays missed translations from the session journal per client cursor; (2) **adaptive bitrate** — an Opus ladder 24→16→12 kbps driven by measured RTT/loss in both directions, every switch logged, never silent; (3) **latency tolerance** — per-segment end-to-end timestamps, late results DELIVERED and marked late rather than silently dropped, and no head-of-line blocking (a new utterance never waits on an old delivery); (4) **UX** — visible connection state (connected / reconnecting / buffered N segments) and push-to-talk that works offline, queued and shown as queued; (5) **WS resume** — fast reconnect with exponential backoff plus jitter and session-token resume, with every state proven to survive (routing rules, preset assignments, journal cursor). Test duty as always: hermetic network-chaos tests with injected drops, artificial 1–5 s delays and a bandwidth throttle in the transport layer, one can-fail test per behaviour. A real mobile-network test (aeroplane-mode toggle) is a manual acceptance point in the travel-readiness report. **Priority: after the travel-readiness milestone, before any other polish.** |
+| 2026-08-03 | **Five conversation-surface orders (silence mode, always-on transcript, speaker names, uncertainty marking, speaker buttons).** Specified in full in §17. Recorded here because they arrived in one working thread and were, for one session, carried only in that thread — which is exactly the state the analysis-in-a-file rule exists to prevent. The load-bearing constraints: the transcript is held SERVER-side and survives reconnect; name suggestions are never auto-applied; uncertainty marking is "very important" to the user and shows the top-3 candidates by real similarity with `speaker-N (new)` as a full candidate; a manual speaker button makes the assignment ground truth. |
 | 2026-08-03 | **No enrollment before the trip.** The user has no time to record voice samples. The user's voice therefore runs the *same* path as every other speaker: a rolling reference buffer accumulated from live speech, with preset mode covering the cold start. No special user-enrollment flow in the MVP. The enrollment endpoint stays (it costs nothing and already works) but is a post-vacation upgrade slot, and the GPU A/B must score cloning from **10-30 s of accumulated live speech**, not from clean curated audio. |
 
 ---
@@ -1824,3 +1825,260 @@ and it needs an audio counter-arm before it ships.
   speaker.
 * **Do not render preset languages independently.** Measured, §14 defect 2.
   Same descriptor and seed do not give the same voice; derive from an anchor.
+
+---
+
+## 17. The conversation surface — five ordered features
+
+Provenance: five user orders from the 2026-08-03 working thread, written down
+here before any of them is built. They had lived only in the thread for one
+session; a feature order that exists only in a transcript is lost at the next
+context boundary, which is what the analysis-in-a-file rule is about. Nothing
+in this section was implemented at the time of writing — every subsection
+states its own falsifier so "built" and "documented" cannot drift apart.
+
+These five share one theme, and it is worth naming because it decides several
+design details below: **the phone screen is no longer only a talk button.** It
+is the conversation's record and its correction surface. Everything the machine
+GUESSED — who spoke, what their name is — must be visible as a guess, and must
+be correctable by one tap, without ever rewriting history silently.
+
+### 17.0 Cross-cutting rules
+
+1. **Server-side truth.** Transcript lines, speaker names, manual assignments
+   and confirmed suggestions live in the session on the server. The client
+   renders them; it never owns them. A reconnect that restores a conversation
+   from client memory would lose everything the moment the phone's browser
+   tab is evicted, which on Android happens routinely.
+2. **Never silent.** Every state change a user could disagree with is an event
+   with a reason: a badge changes, a line updates, a chip appears. No
+   overwrite happens without a corresponding event on the wire.
+3. **Never auto-apply a guess.** Name suggestions and uncertain assignments are
+   proposals until a human confirms. The one exception is the ORIGINAL
+   diarization assignment, which must be automatic to work at all — hence
+   §17.4, which makes it visibly provisional instead.
+4. **Manual beats measured.** A human decision is ground truth. It is never
+   overridden by a later similarity computation; it is only ever overridden by
+   another human decision (which must be undoable).
+
+### 17.1 (a) Silence mode — the reading mode
+
+A session-level output mode, `voice` (default) or `silent`. In `silent` the
+pipeline is **identical** up to and excluding synthesis: VAD, segmentation,
+ASR, language identification, speaker assignment, routing and MT all run and
+all emit their events. Only the TTS call is skipped, and with it
+`EventKind.TURN_AUDIO`.
+
+* Switchable at runtime through the same control frame that switches voice
+  mode; sticky per session; survives reconnect (it is part of `state()`).
+* Silent mode does NOT disable clone-reference accumulation. A conversation may
+  start silent and continue with voice, and the reference buffer built while
+  reading is exactly the buffer wanted at the switch.
+* It is not a downgrade path and never chosen automatically. A TTS failure
+  stays a per-turn failure with a reason; it does not silently become a mode.
+
+Falsifier: one turn through the session in each mode with a counting TTS spy.
+`silent` must show `tts.calls == 0`, zero `TURN_AUDIO` events, and a
+`TURN_TRANSLATION` payload byte-identical to the `voice` run on the same input.
+A test that only asserts "no audio" would pass against a broken pipeline that
+produced nothing at all, so the identity assertion is the load-bearing half.
+
+### 17.2 (b) The transcript is always there
+
+**Every mode keeps a full, scrollable transcript.** It ends only at an explicit
+user clear — never at a reconnect, a mode switch, a routing change or a journal
+eviction.
+
+This is not the journal. The journal (§4.4) is a bounded replay buffer sized in
+events and audio bytes; it is allowed to evict, and it must stay allowed to.
+The transcript is a separate, text-only, append-mostly log:
+
+```
+TranscriptLine:
+  line_id, turn_id, at
+  speaker_id, speaker_label          # label = confirmed name or "speaker-N"
+  source_language, source_text
+  translations: {lang: text}
+  confidence: exact | uncertain      # see 17.4
+  candidates: [...]                  # populated only when uncertain
+  origin: auto | manual              # see 17.5
+```
+
+* Per line the client toggles **source text** and **translation** — both are
+  carried, the toggle is pure rendering, and it works per line rather than
+  globally so one line can be inspected without changing the view.
+* Held server-side, addressed by session id. Restored on reconnect via
+  `GET /api/translator/sessions/{id}/transcript?since=<line_id>` and delivered
+  as part of the resume path, so a phone that lost its tab comes back whole.
+* Bounded by an explicit, visible cap (10 000 lines; a full day of dense
+  conversation is far below that). At the cap the oldest lines drop **with a
+  marker line in the transcript**, because a transcript that silently loses its
+  beginning is worse than one that says it did.
+* `DELETE .../transcript` is the only thing that empties it, and the client
+  confirms before calling it.
+* A retroactive rename (§17.3) or a resolved uncertainty (§17.4) UPDATES the
+  affected lines server-side and emits a line-update event. The client patches
+  in place; it never re-fetches and never diverges.
+
+Falsifier: drive N turns, drop and resume the WebSocket, assert the restored
+transcript equals the pre-drop transcript line for line — and, separately,
+overflow the JOURNAL's audio budget and assert the transcript is untouched.
+The second half is the one that catches the tempting implementation where the
+transcript is derived from journal events.
+
+### 17.3 (c) Speaker names — manual, plus three-valued suggestions
+
+**Manual naming is the primary path and always available.** Tap a speaker chip
+or a transcript line, type a name, and it applies **retroactively to every line
+of that speaker id** and forward to all new ones. It is stored on the profile,
+survives reconnect, and is undoable.
+
+**LLM suggestions are the assist.** The 27B that already does the translation
+also runs an extraction prompt over recognized text and returns zero or more
+name candidates, each classified into exactly one of three kinds. The
+classification is the whole point: the same surface form means three different
+things depending on who the name refers to.
+
+| kind | example (verbatim test case) | meaning | effect |
+|---|---|---|---|
+| `self` | "ich bin Matthias Ehrenfeuchter" | the speaker names themselves | suggest this name FOR THE CURRENT SPEAKER |
+| `third_party` | "darf ich vorstellen: Larisa Ehrenfeuchter" | a name is introduced, but it is NOT the speaker | suggestion FLOATS — attached to no speaker id, offered later if evidence appears |
+| `addressed` | "sag hallo, Moritz" | the speaker addresses someone else by name | suggestion for whoever ANSWERS — resolved by adjacency, not by the LLM |
+
+**The adjacency logic lives in the session, not in the LLM.** The model sees
+one utterance's text and answers a classification question about that text; it
+is never asked who was in the room. An `addressed` candidate becomes a
+suggestion for speaker X when the next utterance within a bounded window
+(default 15 s, at most 2 turns) comes from a **different** diarization id than
+the addressing speaker, and X is that id. If the next utterance is from the
+same speaker, or nothing follows inside the window, **the candidate expires**
+and no chip is ever shown. Reason for the split: the LLM has no reliable access
+to turn structure and would confabulate it, while the session knows the
+diarization ids and timestamps exactly.
+
+* **Never auto-apply.** A suggestion is a chip with confirm and discard. A
+  discarded name is not offered again for the same speaker in the same session.
+* **A cheap pre-filter runs first**, so most utterances never reach the LLM: an
+  utterance is a candidate only if it contains a capitalised token that is not
+  sentence-initial-only, or a per-language introduction cue ("ich bin", "ich
+  heiße", "soy", "me llamo", "das ist", "darf ich vorstellen", "sag hallo",
+  "di hola", vocative comma patterns). The filter is allowed false positives
+  (they cost one small LLM call) and its misses are covered by manual naming.
+* **Uncertain lines (§17.4) produce no suggestions at all.** Naming a speaker
+  we are not sure spoke would attach a real name to a wrong identity, which is
+  the one error this whole section exists to prevent.
+
+Falsifier: the three verbatim cases above must each produce exactly their kind,
+plus counter-cases that must produce NOTHING — a `third_party` line must never
+name the speaker; "sag hallo, Moritz" followed by silence must expire; "sag
+hallo, Moritz" followed by the SAME speaker must expire; a sentence containing
+a place name or a capitalised sentence opener must not yield a chip. The
+adjacency cases are hermetic (fake ASR text + synthetic diarization ids), so
+they do not need a card.
+
+### 17.4 (d) Uncertainty marking — "very important"
+
+A speaker assignment the machine is not sure of is **marked as such on the
+line**, and the mark carries the alternatives.
+
+**The band is measured, not chosen.** `probe_speaker_change.py --pool` over the
+17-voice pool at the shipped 2.5 s window, re-run 2026-08-03 for this section:
+
+```
+WITHIN  n=26   min 0.624  p05 0.637  median 0.731   worst: boy-02.de
+BETWEEN n=136  max 0.734  p95 0.583  median 0.228   closest: boy-03.de vs girl-01.de
+```
+
+Within-speaker p05 **0.637** against between-speaker p95 **0.583** is the
+operating band:
+
+| similarity to nearest profile | verdict |
+|---|---|
+| `>= 0.637` | confident — assign, no badge |
+| `0.583 .. 0.637` | **uncertain** — assign to nearest, badge the line, offer candidates |
+| `< 0.583` | confident new speaker — mint `speaker-N`, no badge |
+
+**The populations overlap and no threshold closes the gap.** The pool's own
+worst collision is `boy-03` against `girl-01` at **0.734** — two genuinely
+different people scoring above the confident threshold, and above the
+within-speaker minimum (0.624) as well. (An earlier note put this case at
+0.679; that was the 1.5 s figure from §16.5. At the shipped 2.5 s window it is
+worse, not better, because longer windows raise BOTH populations.) This is the
+standing proof that no threshold makes the problem go away, and therefore the
+reason the user-facing correction path is the actual fix rather than a nicety:
+the machine cannot be made right, so it must be made **correctable**.
+
+* The badge shows the **top-3 candidates ranked by real similarity** — the same
+  cosine the assignment used, not a re-derived score.
+* **`speaker-N (new)` is a full candidate** in that list, ranked by the
+  new-speaker threshold, not appended as an afterthought. The mandatory test
+  scenario is the children's case: two similar young voices (Moritz and Ben)
+  where the correct answer is frequently "neither of the two known ones".
+* **Tap resolves.** The tap re-labels the line, is undoable, and only on
+  confirmation does the embedding fold into that speaker's centroid. An
+  unconfirmed uncertain line must never move a centroid — that is how one
+  ambiguous slice corrupts an identity permanently.
+* **Later auto-resolution is visible.** When more audio makes an earlier
+  uncertain line unambiguous, the badge CHANGES (uncertain → resolved, with the
+  new label) through a line-update event. It is never rewritten silently, and a
+  user-confirmed line is never re-decided at all (rule 17.0.4).
+
+Falsifier: a synthetic embedding sequence placed deliberately in each of the
+three bands must produce exactly the three verdicts; a centroid snapshot before
+and after an unconfirmed uncertain line must be identical (this is the test
+that fails against the obvious implementation); and the Moritz/Ben scenario
+must place `speaker-N (new)` in the top 3. The candidate list must also be
+proven to come from the assignment's own similarities — a spy that returns
+distinct, recognisable numbers is enough to prove it is not recomputed.
+
+### 17.5 (e) Speaker buttons — ground truth by one tap
+
+A row of buttons sits **above** the record button, which stays large and
+unchanged; it is a row, not a menu, so it can be hit without looking.
+
+* **One button per known speaker**, showing the confirmed name or `speaker-N`.
+* **Pressed BEFORE speaking**, it assigns the coming utterance to that speaker
+  directly and **skips identification entirely** — no embedding comparison, no
+  uncertainty badge, no new-profile decision.
+* It applies to **exactly one utterance**. After that utterance completes the
+  selection clears itself. The active button is visibly marked while armed, and
+  tapping it again disarms it.
+* **`+` mints a new speaker** for the unambiguous case where a new person joins:
+  it allocates `speaker-N+1` immediately, and that speaker's first audio seeds
+  the centroid rather than being matched against existing profiles.
+* **A manual assignment is ground truth**: `origin: manual`, never badged
+  uncertain, and never re-decided by a later similarity computation. Its audio
+  MAY enter the reference buffer — subject to the ordinary quality criteria
+  (`min_slice_s`, `min_reference_rms`, `max_slice_s`) but bypassing
+  `reference_threshold`, since that threshold exists to keep MISIDENTIFIED
+  audio out and identification is precisely what was skipped.
+
+The quality criteria staying in force is deliberate: a human can vouch for WHO
+spoke, but not for whether the microphone clipped or the segment is 0.4 s long.
+
+Falsifier: an armed button must route the next utterance to its speaker even
+when the embedder is a spy that would have returned a contradictory match (this
+proves identification was actually skipped, not merely overruled afterwards);
+the arming must clear after exactly one utterance, so the utterance AFTER it
+goes through normal identification; `+` must seed rather than match; and a
+manual line with too-short audio must still be refused for the reference
+buffer.
+
+### 17.6 Build order and what each step needs
+
+Order is by dependency, not by user priority — (b) carries the surface every
+other feature renders into, so it goes first even though (d) is the one the
+user called "very important".
+
+| step | feature | depends on | needs a card? |
+|---|---|---|---|
+| 1 | (b) server-side transcript + line-update events | — | no |
+| 2 | (a) silence mode | 1 (transcript is the whole output in silent mode) | no |
+| 3 | (e) speaker buttons + manual ground truth | 1 | no |
+| 4 | (d) uncertainty band, candidates, resolution | 1, 3 (manual overrides) | no |
+| 5 | (c) name suggestions, three-valued + adjacency | 1, 4 (uncertain lines get no suggestions) | LLM only, at the end |
+
+Steps 1-4 are entirely desk-testable under `CUDA_VISIBLE_DEVICES=99` with the
+existing fake backends. Step 5's classifier needs the 27B for its end proof,
+but its adjacency logic — the part with the interesting failure modes — does
+not, and is hermetic.
