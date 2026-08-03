@@ -262,3 +262,11 @@ same-power-state comparison arm for #478.
   *type mix* — Q3_K_XL drops IQ2_XS entirely (28.9 GiB of the IQ3_XXS tier) and
   replaces it with MXFP4 that this fork cannot execute natively and must repack.
   The determined-answer probe is the gate.
+* **Precondition checked and met:** the comparison is only a *quant* swap if the
+  prompt format is held constant. The sidecar `tokenizer_config.json` carries no
+  `chat_template`, which initially read as "this family has none" — but the GGUF
+  metadata itself does: `tokenizer.chat_template`, 13772 bytes, and
+  **byte-identical between the two tiers** (sha256 `e643c31f…` for both, read
+  directly from each tier's first shard). So the template is extracted from the
+  checkpoint rather than hand-written, and arm 1 is not silently also a
+  prompt-format swap.
