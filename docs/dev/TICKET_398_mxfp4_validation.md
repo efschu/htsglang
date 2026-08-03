@@ -88,8 +88,19 @@ print('marker:', hasattr(torch.ops.sgl_kernel,'ggml_mxfp4_native'))
 from sglang.srt.layers.quantization.gguf import MXFP4_NATIVE, MMVQ_QUANT_TYPES
 print('MXFP4_NATIVE:', MXFP4_NATIVE, '| in MMVQ set:', 39 in {int(t) for t in MMVQ_QUANT_TYPES})"
 # expect: True / True / True
-SGLANG_GGUF_MXFP4_NATIVE=0 $V/bin/python -c "...same..."   # expect False / False / False
+SGLANG_GGUF_MXFP4_NATIVE=0 $V/bin/python -c "...same..."   # expect True / False / False
 ```
+
+**Why the second arm is True/False/False and not False/False/False (#519).**
+The first line is `hasattr(torch.ops.sgl_kernel, 'ggml_mxfp4_native')` — a
+property of the WHEEL, i.e. of which objects are on disk. The environment
+variable cannot change it, and it must not: it is the marker that says the
+build carries the kernels. `SGLANG_GGUF_MXFP4_NATIVE` is read one level up, in
+`layers/quantization/gguf.mxfp4_native()`, which returns False before it ever
+reaches the `hasattr` (`if os.environ.get("SGLANG_GGUF_MXFP4_NATIVE", "1")[:1]
+== "0": return False`). So the lever flips the two DERIVED answers and leaves
+the marker alone. An arm that expected all three to flip would have been red on
+a correct build — the expectation was the defect, not the code.
 
 ---
 

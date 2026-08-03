@@ -236,11 +236,32 @@ mismatch — so the boot check is a single observation, not a new harness:
 # In the existing hibernate recipe, after a park + restart cycle:
 #   1. park with the default (sparse) writer, then restore. The restore log
 #      must print "byte-hash OK". The park log must print the new
-#      "#456 sparse write skipped N of M 4 KiB pages" line with N/M near 12 %.
+#      "#456 sparse write skipped N of M 4 KiB pages" line. Do NOT gate on a
+#      percentage -- see "the hole fraction is a property of the image" below.
 #   2. re-park with SGLANG_HIBERNATE_DENSE_WRITE=1 and compare:
 #      sha256sum <hibernate_dir>/rank*_GPU-*.pt   # must match the sparse run
 #      stat -c '%s %b' <hibernate_dir>/rank*_GPU-*.pt   # apparent size equal
 ```
+
+**The hole fraction is a property of the IMAGE, not of the mechanism (#519).**
+The 12.64 % above is one measurement of one file: `ANALYSE_306_lossless_ratio.md`
+§J, 221 542 of 1 752 229 all-zero 4 KiB pages in a single 7.18 GB hibernate
+image. The synthetic fixture in §4 reproduces exactly that fraction (0.126434)
+BECAUSE it was built to -- it is the probe image's number, carried forward, not
+an independent confirmation of it. The window-4 run on a different real image
+reported **5.49 %** skipped, which is not a regression and not a contradiction:
+holes come from padded/aligned parameter regions, so the fraction moves with
+model geometry, quant mix, TP shard width and which tensors a rank happens to
+hold. Two consequences:
+
+* **No acceptance criterion may be a percentage.** The gate is the byte-hash on
+  restore plus the identical sha256 across the dense and sparse writers; those
+  are properties of the mechanism. A skipped-page share is an observation to
+  record, and the log line already prints the measured value
+  (`model_loader/hibernate.py:483`), so nothing has to be assumed.
+* **A saving quoted from one image is a single-sample claim.** Any figure
+  derived from 12.64 % -- allocated-bytes, wall-clock-per-park -- is as narrow
+  as that one file, and should say which image it came from.
 
 Step 2 is the one that matters: identical sha256 across the two writers on a
 REAL image, not a synthetic one, is the whole safety claim. On this box's ZFS

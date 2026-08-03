@@ -1120,6 +1120,32 @@ This also covers the custom-group object exchange: it names the world gloo
 cpu_group instead of letting torch pick a staging device.
 
 ## 12. Robustness canon
+Forward-compatibility-by-model_type (#497, day-0 prep for a checkpoint that
+does not exist yet): the load path must key on ``model_type`` and on config
+FIELDS, never on a version string in the model name or on a geometry constant
+-- then a new checkpoint that reuses an existing ``model_type`` loads with no
+code change at all. Audited and CONFIRMED for both:
+``gguf_registry.create_gguf_adapter`` reads exactly ``model_type`` and the
+registry contains no ``name_or_path``; ``ServerArgs.declared_layer_kinds``
+probes ``layer_types`` -> ``full_attention_interval`` -> all-attention, from
+the top level or ``text_config``, so a different depth and interval need
+nothing. Both are now ratcheted, including a literal sweep that ignores
+docstrings (the family is documented in prose everywhere, so a naive grep
+ratchet would be pure noise -- the sweep parses and looks only at string
+literals the module evaluates). Two findings came out of it and are NOT fixed
+on purpose: (1) an unregistered architecture does not refuse, it falls back to
+``TransformersForCausalLM`` (``models/registry.py:61-78``), so a boot can
+succeed on the generic backend with none of this fork's features -- assert the
+resolved class at day 0 rather than trusting a green boot; (2) the M-RoPE
+declaration gap vLLM PR #50068 closes on its side exists here too --
+``model_runner.py:599-604`` decides ``model_is_mrope`` from the CONFIG alone
+(true for text-only Qwen3.5/3.6, which carry ``mrope_section``) while
+``models/qwen3_5.py`` sets ``is_mrope_enabled`` only on the two
+``ForConditionalGeneration`` classes, so
+``prefill_cuda_graph_runner.py:521-531`` computes mrope positions and then
+discards them. Closing it changes which positions a captured graph replays and
+therefore needs a boot; it is characterised by tests instead, which flip
+together when the fix lands. `docs/dev/ANALYSE_495_qwen38_forward_compat.md`.
 Rank-local condition BEFORE any group collective (hang family); bounded waits
 with fixed pool universe; bounded peer-liveness instead of endless spin;
 ColdBuild error unmasking (never substitute "lower mem-fraction" for a real
