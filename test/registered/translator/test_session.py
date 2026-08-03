@@ -81,6 +81,30 @@ class ScriptedVad:
         pass
 
 
+class _DriftingEmbedder:
+    """Returns a different vector every call -- short-window instability.
+
+    What the real embedder does on 1.5 s windows: adjacent windows of ONE
+    voice came back at 0.392 similarity, below the 0.62 meant to separate two
+    PEOPLE. A fake that always agrees with itself cannot reproduce that, which
+    is why the tone-based fakes never caught this.
+    """
+
+    min_seconds = 0.5
+    name = "drifting"
+
+    def __init__(self):
+        self._n = 0
+
+    async def embed(self, audio):
+        from sglang.srt.translator.speakers import SpeakerEmbedding
+
+        self._n += 1
+        vector = np.zeros(8, dtype=np.float32)
+        vector[self._n % 8] = 1.0
+        return SpeakerEmbedding(vector)
+
+
 def make_session(
     script=None,
     participants=(LANG_A, LANG_B),
@@ -437,6 +461,70 @@ class TestIntraSegmentSpeakerSplit(unittest.IsolatedAsyncioTestCase):
         await run_conversation(session, [conversation_audio((VOICE_A_HZ, 4.0))])
         # Exactly one embed: the identity pass, no window passes.
         self.assertEqual(len(calls), 1 + before, calls)
+
+    async def test_the_recut_gate_is_wired_to_the_window_length(self):
+        """BINDS-PROOF for the 2.5 s window (measured, see session.py).
+
+        The old 1.5 s window made an identity decision on audio too short for
+        this embedder to be stable on: over the 17-voice pool, within-speaker
+        similarity at 1.5 s falls to 0.392 while the threshold separating
+        DIFFERENT people is 0.62, so 27 of 60 same-speaker window pairs were
+        cut. That is what split one German speaker in two on the real run.
+
+        Reproduced here with an embedder that returns a fresh, dissimilar
+        vector per window -- exactly what short-window instability looks like
+        from the caller. Under the OLD geometry a 3.1 s single-speaker segment
+        is re-cut; under the shipped one the gate does not even open. A
+        default that does not change behaviour has reach zero, so this asserts
+        both halves.
+        """
+        drifting = _DriftingEmbedder()
+        old, _asr, _mt, _tts = make_session(
+            session_id="old",
+            speaker_change_window_s=1.5,
+            speaker_change_min_segment_s=3.0,
+        )
+        old.embedder = drifting
+        await run_conversation(old, [conversation_audio((VOICE_A_HZ, 3.1))])
+        old_splits = [
+            e for e in old.journal.since(0)[0] if e.kind is EventKind.TURN_SPLIT
+        ]
+        self.assertEqual(
+            len(old_splits), 1,
+            "the old 1.5 s geometry did NOT reproduce the split, so this test "
+            "proves nothing about the new one",
+        )
+
+        shipped, _asr, _mt, _tts = make_session(session_id="new")
+        shipped.embedder = _DriftingEmbedder()
+        self.assertEqual(shipped.speaker_change_window_s, 2.5)
+        self.assertEqual(shipped.speaker_change_min_segment_s, 5.0)
+        await run_conversation(shipped, [conversation_audio((VOICE_A_HZ, 3.1))])
+        self.assertEqual(
+            [e for e in shipped.journal.since(0)[0]
+             if e.kind is EventKind.TURN_SPLIT],
+            [],
+            "the shipped geometry still re-cuts a single speaker",
+        )
+        self.assertEqual(
+            len(shipped.speakers), 1,
+            "one speaker became more than one identity",
+        )
+
+    def test_an_impossible_recut_geometry_is_refused(self):
+        """The ">= 2 x window" comment is a claim, so it is pinned.
+
+        Violated, `count < 2` returns early on every segment: the re-cut is
+        silently dead and the protection it exists to give is gone with no
+        error anywhere.
+        """
+        with self.assertRaises(ValueError) as caught:
+            make_session(
+                session_id="bad",
+                speaker_change_window_s=2.5,
+                speaker_change_min_segment_s=4.0,
+            )
+        self.assertIn("would never run", str(caught.exception))
 
     async def test_detection_can_be_switched_off(self):
         session, _asr, _mt, _tts = make_session()

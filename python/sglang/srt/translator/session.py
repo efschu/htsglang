@@ -294,8 +294,32 @@ class TranslatorSession:
         voice_pool: Optional[VoicePool] = None,
         speaker_change_detection: bool = True,
         speaker_change_threshold: float = 0.62,
-        speaker_change_window_s: float = 1.5,
-        speaker_change_min_segment_s: float = 3.0,
+        # 2.5 s, not 1.5 s, and the number is measured rather than chosen.
+        # `probe_speaker_change.py --pool` over the 17-voice pool, adjacent
+        # windows of ONE voice against windows of DIFFERENT voices:
+        #
+        #   window | within-speaker min | between-speaker max | 0.62 cuts
+        #   1.5 s  | 0.392              | 0.679               | 27 of 60 (45%)
+        #   2.0 s  | 0.515              | 0.694               |  7 of 40
+        #   2.5 s  | 0.624              | 0.734               |  0 of 26
+        #   3.0 s  | 0.695              | 0.738               |  0 of 18
+        #
+        # At 1.5 s this embedder's own within-speaker similarity falls to
+        # 0.392 -- BELOW the threshold meant to separate different people --
+        # so nearly half of all same-speaker window pairs were being cut. That
+        # is what split one German speaker into `speaker-1` and `speaker-2` in
+        # the first front-door run, and it is why the reference buffer could
+        # never fill: each half fell under `min_slice_s` and nothing was ever
+        # admitted. The threshold was never the root cause; the window was.
+        speaker_change_window_s: float = 2.5,
+        # Must stay >= 2 x window, or `count < 2` and the re-cut never runs.
+        # The cost of the wider window is stated plainly: two people who
+        # alternate inside a segment shorter than this are no longer split.
+        # That is the deliberate trade -- the measurement says a 1.5 s window
+        # cannot make that call reliably, and splitting on evidence this noisy
+        # is worse than not splitting, because it corrupts identity for
+        # everyone rather than protecting the rare back-to-back case.
+        speaker_change_min_segment_s: float = 5.0,
         speaker_change_min_piece_s: float = 0.8,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -319,6 +343,19 @@ class TranslatorSession:
         self.speaker_change_window_s = speaker_change_window_s
         self.speaker_change_min_segment_s = speaker_change_min_segment_s
         self.speaker_change_min_piece_s = speaker_change_min_piece_s
+        # The "must be >= 2 x window" note above is a claim, so it is checked
+        # rather than trusted. Violated, the re-cut silently never runs: the
+        # `count < 2` guard returns early on every segment and the protection
+        # it exists to give is gone with no error anywhere.
+        if speaker_change_detection and (
+            speaker_change_min_segment_s < 2 * speaker_change_window_s
+        ):
+            raise ValueError(
+                f"speaker_change_min_segment_s={speaker_change_min_segment_s} "
+                f"is below 2 x speaker_change_window_s="
+                f"{speaker_change_window_s}; the re-cut would never run on any "
+                "segment, silently"
+            )
         self.voice_pool = voice_pool
         # Manual routing. Empty table => auto mode (language ID plus
         # elimination over the participant set), which stays the default.
