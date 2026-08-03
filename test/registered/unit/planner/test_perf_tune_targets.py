@@ -219,14 +219,35 @@ class TestFixtureReproducesTheBoot(CustomTestCase):
         self.assertIn("materialized MLP units [62, 37, 37]", log)
 
     def test_candidate_prefill_gains_match_the_measured_plan_log(self):
+        """The #264 log's ladder, re-priced by #475.
+
+        The vectors and their ORDER of merit are the boot's; the magnitudes
+        are not, because #475 takes the lockstep max per barrier instead of
+        once per step. Pre-#475 this fixture read 16,1,2 +18.5 % / 10,1,2
+        +16.6 % / 8,1,1 +16.3 % / 6,1,1 +13.9 % / 5,1,1 +11.5 % / 4,1,1
+        +9.3 %; the barrier term discounts the concentrated end of the ladder
+        and leaves the mild end alone, which reorders it and drops 16,1,2 out
+        of the six lines the log prints (it is still evaluated -- the log
+        shows the top six by gain). The fixture's own reproduction assertions
+        -- base-plan capacity, context, materialized units -- are untouched by
+        #475 and are what pins this to the boot.
+
+        Note what these numbers are NOT scored on: this fixture carries no
+        measured fp8 GEMM lane, so it runs on the dense bf16 fallback and the
+        plan log says so, loudly, three times. That is faithful to the #264
+        log, which predates the lane probe (#298a). It also means the barrier
+        skew shown here (0 % at 4,1,1 rising to 7.5 % at 8,1,1) is computed
+        from an understated rank ratio; on the same rig's measured fp8 lanes
+        the skew at these vectors is 0 (test_phase_optimal_targets).
+        """
         _sa, log = _plan()
         for vector, gain in (
-            ("16,1,2", "+18.5%"),
-            ("10,1,2", "+16.6%"),
-            ("8,1,1", "+16.3%"),
-            ("6,1,1", "+13.9%"),
-            ("5,1,1", "+11.5%"),
             ("4,1,1", "+9.3%"),
+            ("5,1,1", "+9.0%"),
+            ("6,1,1", "+8.2%"),
+            ("10,1,2", "+7.7%"),
+            ("8,1,1", "+7.0%"),
+            ("3,1,1", "+6.5%"),
         ):
             with self.subTest(vector=vector):
                 line = _line_for(log, vector)

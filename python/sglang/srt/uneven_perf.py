@@ -4675,10 +4675,13 @@ class PerfCostModel:
         min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
     ) -> float:
-        """The shard-PROPORTIONAL part of the prefill step: lockstep compute
-        max over ranks (per-token flops ~ 2 x sharded params, the
-        param-proxy) plus the ring-all-reduce term over the narrowest
-        link.
+        """The shard-PROPORTIONAL part of the prefill step: the lockstep
+        compute time (per-token flops ~ 2 x sharded params, the param-proxy)
+        plus the ring-all-reduce term over the narrowest link.
+
+        The lockstep term is ``sum_family max_rank``, NOT ``max_rank
+        sum_family`` -- see ``prefill_lockstep_compute_time`` for why, and
+        ``prefill_barrier_skew`` for the difference the distinction makes.
 
         ``family_tflops`` (#287, delegated by #324) maps a WEIGHT family name
         to its own per-rank compute rate. When given, the per-rank time is
@@ -4693,22 +4696,13 @@ class PerfCostModel:
         equal rates, because float addition of times is not float division of
         a param sum.
         """
-        # Per-rank compute times, then their max. Factored out of this method
-        # rather than inlined so the ENERGY objective (#350 p4) can read every
-        # rank's own time -- a rank that finishes early still draws power
-        # while it waits, so the max alone cannot price joules. The max over
-        # the ranks in ascending order is the identical float to the running
-        # `max(t_comp, t)` this replaced, so the throughput path is unchanged.
         # Called through the CLASS, not through ``self``: the arithmetic is
         # duck-typed on (tp_size, families, _shard_fractions) and several
         # tests bind this method to a stand-in that provides exactly those
         # and nothing else. Going through the class keeps every such caller
-        # working, which is what lets the factoring stay a pure refactor.
-        t_comp = max(
-            PerfCostModel.per_rank_prefill_compute_times(
-                self, mlp_vector, gemm_tflops, family_tflops
-            ),
-            default=0.0,
+        # working.
+        t_comp = PerfCostModel.prefill_lockstep_compute_time(
+            self, mlp_vector, gemm_tflops, family_tflops
         )
         # Two all-reduces of H bf16 per layer per token, ring factor
         # 2(N-1)/N, bounded by the narrowest participating link.
@@ -4732,16 +4726,108 @@ class PerfCostModel:
         t_comm = ar_bytes * 2 * (n - 1) / n / (min_link_gbs * 1e9)
         return t_comp + t_comm
 
+    def per_family_prefill_compute_times(
+        self, mlp_vector, gemm_tflops, family_tflops=None
+    ) -> "Dict[str, List[float]]":
+        """``family name -> that family's per-rank prefill GEMM time`` (s).
+
+        Same arithmetic as ``per_rank_prefill_compute_times``, kept
+        un-summed. A weight family is the unit the lockstep barrier applies
+        to, because under tensor parallelism each family's block ends in a
+        collective: attention and GDN in the output projection's all-reduce,
+        MLP in the down-projection's all-reduce, the vocab head in its
+        gather. ``prefill_lockstep_compute_time`` sums the per-family maxima
+        over exactly this table.
+        """
+        out: Dict[str, List[float]] = {}
+        denom = 1e12 * _PREDICT_GEMM_EFF
+        for name, fam in self.families.items():
+            if fam.params <= 0 or fam.shard == "replicated":
+                continue
+            fractions = self._shard_fractions(fam.shard, mlp_vector)
+            rates = family_tflops.get(name) if family_tflops else None
+            out[name] = [
+                2.0
+                * fam.params
+                * fractions[r]
+                / ((rates[r] if rates else gemm_tflops[r]) * denom)
+                for r in range(self.tp_size)
+            ]
+        return out
+
+    def prefill_lockstep_compute_time(
+        self, mlp_vector, gemm_tflops, family_tflops=None
+    ) -> float:
+        """The compute time one lockstep prefill round really costs (s).
+
+        ``sum_family max_rank``, not ``max_rank sum_family`` (#475).
+
+        The step is not ONE barrier at the end -- it is two all-reduces per
+        layer, which this same method's comm term already prices. The
+        lockstep max therefore applies PER BARRIER: the group leaves the
+        attention block when the slowest rank's attention is done, and leaves
+        the MLP block when the slowest rank's MLP is done, and those need not
+        be the same rank. By Jensen ``sum max >= max sum``, with equality
+        exactly when one rank is slowest in every family -- so the old
+        ``max_rank sum_family`` was a LOWER BOUND that is tight on a rig whose
+        weak card is weak everywhere, and loose precisely when the optimizer
+        does what the phase-prefill arm exists to do: move one family (MLP)
+        onto the rank that is NOT the slow rank for the others.
+
+        Measured (#475, ``docs/dev/NOTE_475_phase_prefill_prediction.md``):
+        on the reference rig's INT8-W8A8 boot, moving from the VRAM-auto
+        split to the solved ``8,1,1`` raised the collective share of the
+        prefill window by 27.9 ms per 1000 prompt tokens
+        (``2026-08-02_424_phase_record_bench`` vs
+        ``2026-08-02_433_int8_prefill``, CollectiveClock per-rank lines); this
+        arithmetic predicts 27.6 ms with no fitted parameter. The old term
+        priced that at zero and reported +6.2% prefill for a vector that
+        measured inside its noise floor.
+
+        On the FP8 checkpoint of the same rig the two forms agree to the last
+        bit (the 3080s run fp8 through Marlin at ~1/10 the 5090's native
+        rate, so they are the slowest rank in every family at every candidate
+        vector), which is why the #216/#230 calibration anchor is unmoved.
+        """
+        fam_times = PerfCostModel.per_family_prefill_compute_times(
+            self, mlp_vector, gemm_tflops, family_tflops
+        )
+        return sum(max(times) for times in fam_times.values())
+
+    def prefill_barrier_skew(
+        self, mlp_vector, gemm_tflops, family_tflops=None
+    ) -> float:
+        """Lockstep time this vector spends because the slowest rank is not
+        the same rank in every family (s, >= 0).
+
+        ``prefill_lockstep_compute_time - max(per_rank_prefill_compute_times)``
+        -- the Jensen gap of #475. Zero on a rig/vector where one rank paces
+        every family. Reported per candidate in the plan log so an operator
+        can see WHY a concentrated candidate is discounted rather than only
+        that it is.
+        """
+        return PerfCostModel.prefill_lockstep_compute_time(
+            self, mlp_vector, gemm_tflops, family_tflops
+        ) - max(
+            PerfCostModel.per_rank_prefill_compute_times(
+                self, mlp_vector, gemm_tflops, family_tflops
+            ),
+            default=0.0,
+        )
+
     def per_rank_prefill_compute_times(
         self, mlp_vector, gemm_tflops, family_tflops=None
     ) -> List[float]:
         """Each rank's OWN prefill GEMM time for one lockstep round (s).
 
-        The vector ``_prefill_sharded_time`` takes the max of. Exposed
-        because the energy objective (#350) needs every rank's term: the
-        round lasts as long as the slowest rank, and the others draw
-        idle-to-active in proportion to how much of it they were busy.
-        Pure arithmetic over the same family shard fractions; no probing.
+        Exposed because the energy objective (#350) needs every rank's term:
+        the round lasts as long as the slowest rank, and the others draw
+        idle-to-active in proportion to how much of it they were busy. Pure
+        arithmetic over the same family shard fractions; no probing.
+
+        NOT the lockstep round time -- that is
+        ``prefill_lockstep_compute_time`` (#475), which maxes per barrier
+        rather than once at the end.
         """
         out: List[float] = []
         if family_tflops:
@@ -6134,11 +6220,29 @@ def apply_auto_performance(server_args) -> None:
             dec_pct = model.decode_cost_percent(
                 list(cand), rank_scores_bw, rank_scores_gemv
             )
+            # #475: how much of this candidate's lockstep round is spent
+            # because the MLP-slowest and the attention-slowest rank are not
+            # the same rank. Priced into the gain above; stated separately
+            # because it is the term that decides whether a concentrated
+            # candidate is worth anything on a rig whose weak card is only
+            # weak in SOME families, and it is invisible in the gain alone.
+            skew = model.prefill_barrier_skew(
+                list(cand), enc_scores, enc_family_tflops
+            )
+            base_time = model.prefill_time_model(
+                base_plan, enc_scores, min_link, enc_family_tflops
+            )
+            skew_note = (
+                f", barrier skew {skew / base_time * 100:.1f}% of the base step"
+                if not decode_objective and base_time > 0 and skew > 0
+                else ""
+            )
             lines.append(
                 f"candidate MLP vector {','.join(map(str, cand))}: "
                 f"predicted ctx ~{int(pred['ctx'])} ({verdict}), "
-                f"predicted {objective_metric} gain {gain * 100:+.1f}%, "
-                f"predicted decode step {dec_pct:+.1f}%"
+                f"predicted {objective_metric} gain {gain * 100:+.1f}%"
+                + skew_note
+                + f", predicted decode step {dec_pct:+.1f}%"
                 + (
                     f", residual free {[int(x) for x in res]} MiB"
                     if res is not None

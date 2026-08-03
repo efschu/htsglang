@@ -4713,6 +4713,7 @@ def check_regressions(
     probe: dict,
     *,
     anchors: Sequence[RegressionAnchor] = REGRESSION_ANCHORS,
+    hardware_profile: Optional[dict] = None,
 ) -> List[dict]:
     """Re-derive every anchor and report predicted vs measured.
 
@@ -4720,6 +4721,17 @@ def check_regressions(
     inside the stated tolerance. Used by the tests and exposed by the
     endpoint, because a calibration nobody can see is a calibration nobody
     can refute.
+
+    ``hardware_profile`` forwards to ``rates_from_probe`` and is what scores
+    an anchor on the lane the measured boot actually dispatched to (#475).
+    Both shipped anchors are FP8 checkpoints whose 3080 ranks run weight-only
+    Marlin, a lane the card probe cannot measure; without the profile they
+    are priced on the dense bf16 fallback, which reads the rank spread as
+    3.5:1 where the hardware ran 9.7:1. That mis-read was invisible while the
+    cost model took the lockstep max once per step, and became visible when
+    #475 made it take the max per barrier -- two errors that had been
+    cancelling. The parameter defaults to None so every existing caller keeps
+    the previous, explicitly-warned fallback.
     """
     from sglang.srt.uneven_perf import PlanInputs
 
@@ -4743,7 +4755,9 @@ def check_regressions(
             rank_gpu_id=rank_gpu_id,
             effective_vram_mib=list(budgets),
         )
-        rates = rates_from_probe(probe, rank_gpu_id)
+        rates = rates_from_probe(
+            probe, rank_gpu_id, hardware_profile=hardware_profile
+        )
         model = build_cost_model(pi, list(budgets), list(budgets), rates)
         f = model.perf.calibration.nonweight_fraction
         tw_ref = model.decode_weight_time(model.perf.mlp_unit_partition(ref_vec))
@@ -4754,9 +4768,16 @@ def check_regressions(
         # prices the same terms. With no pair matrix the prefill prediction
         # omits the collective, so "enc" is reported as not comparable rather
         # than compared through a stand-in link rate (#359).
-        link = rates.link_bw_gbs
-        gemm = rates.require_gemm_tflops()
-        families = rates.gemm_family_tflops or None
+        # ``model.rates``, not ``rates``: ``build_cost_model`` resolves the
+        # checkpoint's own compute format per (rank, family) (#324/#359), and
+        # scoring the anchor on the PRE-resolution rates prices an fp8
+        # checkpoint on the dense bf16 probe (#475). Both shipped anchors are
+        # fp8, so this line decided whether the anchor saw the rig's real
+        # 9.7:1 rank spread or a 3.5:1 fallback.
+        resolved = model.rates
+        link = resolved.link_bw_gbs
+        gemm = resolved.require_gemm_tflops()
+        families = resolved.gemm_family_tflops or None
         p_ref = model.perf.prefill_time_model(ref_vec, gemm, link, families)
         p_cand = model.perf.prefill_time_model(cand_vec, gemm, link, families)
         enc_pred = (p_ref / p_cand - 1.0) * 100.0
@@ -4771,8 +4792,8 @@ def check_regressions(
                 "source": anchor.source,
                 "reference_vector": ref_vec,
                 "candidate_vector": cand_vec,
-                "gemm_format": rates.gemm_format,
-                "gemm_lanes": list(rates.gemm_lanes),
+                "gemm_format": resolved.gemm_format,
+                "gemm_lanes": list(resolved.gemm_lanes),
                 "measured_pct": dict(anchor.measured),
                 "predicted_pct": {k: round(v, 2) for k, v in predicted.items()},
                 "deviation_pct": {k: round(v, 2) for k, v in deviations.items()},

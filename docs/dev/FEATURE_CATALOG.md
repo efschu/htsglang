@@ -75,10 +75,12 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
 Key solver: water-filling over an affine cost model, pair-matrix collective
 term, roles/nesting as box bounds, Pareto+knee, admissibility gates,
 `coresident_budgets()`. Measured phase optima on the reference rig (1x RTX
-5090 + 2x RTX 3080, Qwen3.6-27B, ctx 32768; RIG EXAMPLE, not a portable
-default): prefill 10,1,1 (+ decoupled KV 2,11,10 keeps capacity), decode
-~3,2,2 — solve your own via `--rank-perf-tune phase-prefill|phase-decode`
-and read the `CHOSEN` vector off your boot's log. Under `--rank-perf-tune phase-*` the
+5090 + 2x RTX 3080, Qwen3.6-27B-**FP8**, ctx 32768; RIG EXAMPLE, not a
+portable default): prefill 10,1,1 (+ decoupled KV 2,11,10 keeps capacity),
+decode ~3,2,2 — solve your own via
+`--rank-perf-tune phase-prefill|phase-decode` and read the `CHOSEN` vector off
+your boot's log. The FP8 qualifier is load-bearing: the same rig's INT8-W8A8
+checkpoint has no prefill lever at all (#475 below). Under `--rank-perf-tune phase-*` the
 solve now also OWNS the coupled KV token vector (#435): the chosen candidate's
 matched `predict_capacity` vector is seeded into the boot instead of the
 VRAM-budget split, so the pool the runtime sizes is the one the admissibility
@@ -96,6 +98,25 @@ objective did not consult the gate at all. #330's 400 MiB corridor is priced
 alongside the demand and REPORTED (`CORRIDOR-TIGHT`), never binding
 (`SGLANG_PLANNER_CORRIDOR_MIB` overrides it; the number itself lives once in
 `registry/ledger.py`).
+**The prefill lockstep max is taken PER BARRIER (#475).** A prefill step is
+two all-reduces per layer, not one barrier at the end, so the cost model's
+compute term is `sum_family max_rank`, not `max_rank sum_family`; the Jensen
+gap between them is `PerfCostModel.prefill_barrier_skew`, reported per
+candidate in the plan log as a share of the base step. It is zero exactly when
+one rank paces every family and large exactly when the phase-prefill arm does
+its job — moving MLP onto the rank that is NOT the attention pacer. Measured
+anchor: INT8-W8A8 `8,1,1` predicted 27.6 ms of extra lockstep per 1000 prompt
+tokens with no fitted parameter against 27.9 ms of measured collective growth
+(`#424` vs `#433` CollectiveClock windows). Consequence for reading a plan
+log: **the prefill lever is a property of the checkpoint's GEMM lane spread,
+not of the rig alone.** On FP8 the 3080s go through Marlin at ~1/10 the 5090's
+native rate, pace every barrier, skew is 0, and 10,1,1 measured +15.2 / +18.0 %
+of prefill window; on INT8-W8A8 both 3080s run the native int8 lane (3.7:1),
+the whole concentration ladder is +3.0 to +4.6 % — inside the boots' own
+3.0-3.5 % A-vs-A prefill floor — and INT8 has no prefill lever on this rig.
+Details, backtest and the GPU confirmation ticket:
+`NOTE_475_phase_prefill_prediction.md`.
+
 `--objective energy` end to end with refusal over silent substitution. `planner/rejected.py` = machine-readable
 register of discarded approaches — check it before re-proposing anything.
 

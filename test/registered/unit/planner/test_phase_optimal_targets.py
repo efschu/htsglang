@@ -71,12 +71,20 @@ _MODELS = {
 #: The vector #354 booted for each format, and its measured prefill delta.
 _PHASE_VECTOR = {"fp8": "16,1,1", "int8": "10,1,1"}
 #: What the phase arm solves at ``_RESERVE_MATCHED`` below. FP8 keeps #354's
-#: own vector; INT8 moves one rung down the ladder because the raised 3080
-#: reserve shrinks their budgets -- the SAME re-solve the pre-#437 optimizer
-#: performs at that reserve (verified against the base tree), and the vector
-#: NOTE_433 section 4 already recorded as INT8's optimum once the reserve
-#: goes up. Nothing about #437 picks it.
-_PHASE_VECTOR_MATCHED = {"fp8": "16,1,1", "int8": "8,1,1"}
+#: own vector. INT8 solves 4,1,1: two effects stack. The raised 3080 reserve
+#: shrinks their budgets and moves the solve one rung down the ladder (#437,
+#: 10,1,1 -> 8,1,1, the same re-solve the pre-#437 optimizer performs at that
+#: reserve); #475 then discounts the concentrated end of the INT8 ladder by
+#: its barrier skew and the argmax moves again, 8,1,1 -> 4,1,1. Both 3080s
+#: run INT8 NATIVELY (183.78 / 164.77 against the 5090's 676.69, 3.7:1), so
+#: past a mild concentration the 5090 becomes the pacer of the MLP barrier
+#: while the 3080s stay the pacer of the attention barrier and the round pays
+#: both. The whole INT8 ladder is +3.0 % to +4.6 % now, i.e. inside the
+#: 3.0-3.5 % A-vs-A prefill floor the #424/#433 boots measured -- which is
+#: what those boots found when they ran 10,1,1 (-2.3 %) and 8,1,1 (+3.3 %,
+#: below its own 3.5 % floor). FP8 is untouched because its 3080s go through
+#: Marlin at ~1/10 the 5090's rate and stay the pacer of every barrier.
+_PHASE_VECTOR_MATCHED = {"fp8": "16,1,1", "int8": "4,1,1"}
 
 #: NVML totals of the reference rig in rank order (5090, 3080, 3080).
 _TOTALS = [32607, 20480, 20480]
@@ -254,8 +262,20 @@ class TestFixtureReproducesThe354Ladder(CustomTestCase):
     def test_the_solved_vectors_are_the_ones_354_booted(self):
         """The refusal line of ``plan_fp8_auto.txt`` / ``plan_int8_auto.txt``
         named 16,1,1 (+22.2 %) and 10,1,1 (+9.1 %) as the best forfeited
-        candidates. Same fixture, same ladder, same two vectors."""
-        for fmt, gain in (("fp8", "+22.2%"), ("int8", "+9.1%")):
+        candidates. Same fixture, same ladder, same two vectors -- re-priced
+        by #475 to +19.3 % and +3.3 %.
+
+        Those two deltas are the point of #475 in one line. FP8's 16,1,1
+        carries 2.0 % barrier skew, so its prediction moves 3 points and stays
+        a large positive: #354 measured +22.6 % prefill for it and the
+        decision (concentrate hard) is unchanged. INT8's 10,1,1 carries 5.2 %
+        skew, so its prediction collapses from a reportable +9.1 % to +3.3 %,
+        which is inside the 3.0 % A-vs-A prefill floor of the boot that
+        measured it -- and #424 measured that vector at -2.3 % against the
+        decode layout, i.e. the old number was wrong by ~11 points in the one
+        direction that made the planner recommend a vector that does not pay.
+        """
+        for fmt, gain in (("fp8", "+19.3%"), ("int8", "+3.3%")):
             with self.subTest(fmt=fmt):
                 _sa, log = _plan(
                     model=_MODELS[fmt], reserve=_RESERVE_RUNBOOK, tune="enc"
@@ -285,12 +305,10 @@ class TestPhasePrefillAcceptsWhatBooted(CustomTestCase):
     the log says "rejected by: knee" -- at a reserve whose boot served
     1540.3 tok/s prefill.
 
-    FP8 still solves #354's own 16,1,1 here. INT8 solves 8,1,1 rather than
-    #354's 10,1,1 because ``_RESERVE_MATCHED`` shrinks the 3080 budgets; the
-    pre-#437 optimizer re-solves it the same way at the same reserve, and
-    NOTE_433 section 4 recorded 8,1,1 as INT8's optimum once the reserve goes
-    up. The property under test is that a real lopsided vector is proposed,
-    not that one frozen number survives every operating point.
+    FP8 still solves #354's own 16,1,1 here. INT8 solves 4,1,1 -- see
+    ``_PHASE_VECTOR_MATCHED`` for the two effects that moved it off #354's
+    10,1,1. The property under test is that a real lopsided vector is
+    proposed, not that one frozen number survives every operating point.
     """
 
     def test_the_354_prefill_vector_is_installed_for_both_formats(self):
