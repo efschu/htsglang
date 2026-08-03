@@ -21,9 +21,10 @@ Physical index ≠ torch ordinal on this rig (catalog §11). Resolve through the
 IdentityMap, never by assumption:
 
 ```bash
-CUDA_VISIBLE_DEVICES= python -c "
-from sglang.srt.registry.nvml import IdentityMap
-for e in IdentityMap().entries(): print(e)"
+CUDA_VISIBLE_DEVICES= $V/bin/python -c "
+from sglang.srt.registry.nvml import identity_map
+for c in identity_map(allow_cuda_init=True):
+    print(c.nvml_index, c.cuda_ordinal, c.name, c.uuid, c.pci_bus_id)"
 ```
 
 Both arches are separate gates:

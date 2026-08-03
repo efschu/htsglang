@@ -228,6 +228,38 @@ There is no local CUDA 13 system toolkit — `/usr/local/cuda` is 12.9. `nvcc`
 to build against; point `CMAKE_CUDA_COMPILER`, `CUDAToolkit_ROOT` and
 `CUDA_HOME` at it.
 
+### MXFP4 rebuild (#398) — BUILT, NOT INSTALLED
+
+The native GGUF MXFP4 kernels (§4.5.3) need a wheel rebuild. One exists; it is
+deliberately **not installed**, because at build time another session's pytest
+still mapped `sgl_kernel` and this section's own rule is to swap the files only
+while the venv is quiet.
+
+| item | value |
+| --- | --- |
+| wheel | `/spinning/wt-398-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl` |
+| sha256 | `67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664` |
+| size | 16 638 372 B |
+| source | `sgl-kernel/` at `feat/gguf-mxfp4-kernels-398` (`46f375ab51`), i.e. `integration/r3-probe-next2` + the #398 kernels |
+| build script | `/spinning/wt-398-build.sh` (logs `/spinning/wt-398-build{,2}.log`) |
+| knobs | identical to #436: cu13 nvcc, `SGL_KERNEL_LIMIT_CUDA_ARCHS=86;120`, `SKIP_SM90_VARIANT=ON`, `ENABLE_FA3=OFF`, `COMPILE_THREADS=1`, `MAX_JOBS=4` |
+| ccache | `/spinning/wt-398-ccache`, created empty |
+| drop-in | same 39-file set, same `sglang-kernel` dist name and version as the pinned wheel — so the #384 two-dist situation is unchanged: the fork dist stays the winner and `sgl-kernel` 0.3.21 must stay uninstalled |
+| new op | `ggml_mxfp4_native` — `strings` finds the mangled symbol, the schema `ggml_mxfp4_native() -> int` and the name in `sm100/common_ops.abi3.so`, 3 occurrences, same count as the `ggml_mmvq_kq_tuned` control (the `.so` is stripped, so `nm` shows nothing — use `strings`) |
+| CUDA major | `objdump -p` shows `libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`; no `.so.12` |
+
+To install, follow "Making it durable" above verbatim (check `/proc/*/maps`
+first), then verify all three: version 0.4.4, `int8_scaled_mm` present, and
+
+```bash
+$V/bin/python -c "import torch,sgl_kernel; \
+  print(hasattr(torch.ops.sgl_kernel,'ggml_mxfp4_native'))"   # expect True
+```
+
+Until it is installed, the tree behaves exactly as before #398: the probe
+answers False, MXFP4 stays out of the GGUF type sets, and the Q5_0 repack
+carries the type. Numerical gates: `docs/dev/TICKET_398_mxfp4_validation.md`.
+
 **Evidence.** The falsifier is
 `scripts/dev/436_kv_transfer_repro/kv_transfer_repro.py` (its `--mode abi` arm
 needs no GPU and prints `ABI_SPLIT` / `ABI_CONSISTENT`). Same script, same
