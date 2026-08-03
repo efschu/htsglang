@@ -1273,6 +1273,39 @@ takes its own path. Tests:
 7 hermetic, two executed can-fail arms (`desc_act` dropped → 3 red; the
 pre-port split restored → 4 red). Unmeasured — no auto-round MoE boot exists on
 this rig.
+**The DSV4 `wq_a`+`wkv` fusion is gated on the built leaf inventory, not on a
+quant-method name** (#526, own find; the same symptom class as the open upstream
+issue #33245, which is unfixed there). `SGLANG_OPT_FUSE_WQA_WKV` defaults to
+True (`environ.py:1733`) and joins exactly `_WQKV_A_LEAVES` = `weight`,
+`weight_scale_inv`, `qweight`, `qweight_type` (`deepseek_v4.py:3330`), all by
+`torch.cat(..., dim=0)` — the output-row axis for a dense or GGUF payload. A
+packed integer format builds the linear from OTHER leaves, and both halves went
+wrong quietly: GPTQ/auto-round `qzeros`/`scales`/`g_idx` and AWQ
+`qzeros`/`scales` matched no fusion predicate and fell through to the
+unmatched-name branch, which on a non-GGUF checkpoint only warns and continues
+(`deepseek_v4.py:3147-3148`) — dropped tensors, fused parameter left
+uninitialised; and `qweight` is not row-major there (GPTQ packs the INPUT dim
+into dim 0, `(in//pack, out)`, so the concat joined shards along the pack
+axis). A compressed-tensors packed checkpoint (`weight_packed`/`weight_scale`/
+`weight_shape`/`weight_zero_point`) matched NOTHING at all, so the load ran to
+completion having delivered zero tensors. Reach is wider than "packed integer":
+per-tensor fp8 (`weight_scale` + `input_scale`) has the same hole. The gate is
+`_unroutable_wqkv_a_leaves` (`deepseek_v4.py:3336`) reading
+`named_parameters()` off the module the quant method ACTUALLY built — the §12
+declaration-not-name-list shape, third instance — consumed in two places:
+`_wqkv_a_fusion_survives_quant_format` (`:3388`) turns an inherited default-on
+fusion OFF at construction with a named notice and REFUSES an explicit opt-in,
+and `load_weights` (`:2781-2805`) derives `fuse_wqa_wkv` from the built topology
+instead of re-reading the env (they diverge the moment the auto-off fires) plus
+keeps a refusal backstop placed BEFORE the non-GGUF `list(weights)` drain.
+Routable and byte-unchanged: bf16 (`weight`), fp8-block (`weight` +
+`weight_scale_inv`), GGUF (`qweight` + `qweight_type`) — each asserted against
+the real quant method. This protects the ANALYSE_463 R3 route (GPTQ-INT4 requant
+of the DSpark experts) before it is built. Tests:
+`test/registered/unit/model_loader/test_dsv4_wqkv_a_packed_formats_526.py`,
+20 hermetic, three independently executed can-fail arms (leaf gate neutered →
+8 red; env-driven fuse flag restored → 3 red; construction-time helper neutered
+→ 3 red). Unmeasured — no packed-format DSV4 checkpoint exists on this rig yet.
 
 ## 10. Determinism / quality gates
 Hetero-determinism roots fixed (verify sync, graph pads, flashinfer workspace,
