@@ -3347,36 +3347,52 @@ class KVSessionOffloadManager:
         # the freshly accepted slots [committed_stale, true_L) are NOT freed;
         # outside spec+overlap it is kv_committed_len (== L), the original
         # [committed, allocated) free unchanged.
-        if (
+        #
+        # #501: the reclaim is PLANNED here and COMMITTED below, past the LAST
+        # decline point. It is not a reversible bookkeeping tweak -- it hands
+        # device slots back to the allocator and sets req.kv_overallocated_freed,
+        # which pop_overallocated_kv_cache asserts is still False
+        # (schedule_batch.py:1141). EVERY decline in this function returns False
+        # and leaves the request RUNNING in the batch, so committing the reclaim
+        # before a decline armed that assert on a live request: the request's
+        # eventual stock retraction / finish killed the scheduler instead of
+        # falling back cleanly. Planning is pure, and the predicates between here
+        # and the commit are unaffected by the reclaim: they read the snapshot,
+        # the row HEAD [0, L) and replicated budget state, while the reclaim only
+        # ever frees [snap.free_from, kv_allocated_len) -- and snap.free_from
+        # equals L whenever it fires (true_L under spec+overlap, the
+        # L == kv_committed_len conjunct otherwise), so the two ranges are
+        # disjoint by construction.
+        reclaim_overhang = (
             req.kv_allocated_len > snap.free_from
             and (spec_overlap or L == req.kv_committed_len)
             and not getattr(req, "kv_overallocated_freed", False)
-        ):
-            over = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, snap.free_from : req.kv_allocated_len
-            ]
-            self.allocator.free(over.to(torch.int64))
-            req.kv_allocated_len = snap.free_from
-            req.kv_overallocated_freed = True
+        )
+        allocated_after_reclaim = (
+            snap.free_from if reclaim_overhang else req.kv_allocated_len
+        )
 
-        # After reclaiming the overhang, allocated must equal L. Under
-        # spec+overlap kv_committed_len legitimately still lags L by the pending
+        # After reclaiming the overhang, allocated must equal L; the planned
+        # value is validated here so this check keeps its original position in
+        # the sequence without depending on a mutation. Under spec+overlap
+        # kv_committed_len legitimately still lags L by the pending
         # (not-yet-committed) accept count -- the deferred result processor
         # settles it this same iteration -- so it is validated only OFF the
         # spec+overlap path.
         committed_ok = spec_overlap or (L == req.kv_committed_len)
-        if not committed_ok or L != req.kv_allocated_len:
+        if not committed_ok or L != allocated_after_reclaim:
             # Never spill a request whose slot bookkeeping we STILL do not
             # understand after reclaiming the speculative overhang -- stock
             # retraction handles it.
             logger.warning(
                 "kv-session-offload: skip spill of rid=%s (L %d, "
-                "committed %d, allocated %d, spec_overlap=%s); falling back to "
-                "retraction.",
+                "committed %d, allocated %d -> %d after the planned overhang "
+                "reclaim, spec_overlap=%s); falling back to retraction.",
                 req.rid,
                 L,
                 req.kv_committed_len,
                 req.kv_allocated_len,
+                allocated_after_reclaim,
                 spec_overlap,
             )
             return False
@@ -3394,8 +3410,9 @@ class KVSessionOffloadManager:
             return False
         spill_margin = spill_count - need  # over-eviction metric (<= block-1)
 
-        # #236 volume/rate reglers, checked BEFORE any region claim or D2H so
-        # a decline leaves no partial state. First violated regler wins;
+        # #236 volume/rate reglers, checked BEFORE any region claim, D2H or the
+        # draft-overhang reclaim (#501), so a decline leaves no partial state --
+        # neither on the manager nor on the request. First violated regler wins;
         # decline -> stock retraction (today's fallback), never a corrupt
         # spill. Replicated inputs -> rank-uniform verdict.
         if budget_armed:
@@ -3432,6 +3449,22 @@ class KVSessionOffloadManager:
                 self.region_tokens,
             )
             return False
+
+        # COMMIT the planned draft-overhang reclaim (#501). Every decline point
+        # of this function is behind us -- from here on try_spill runs to
+        # completion and the victim leaves the batch -- so the free and the
+        # kv_overallocated_freed flag can no longer strand on a live request.
+        # Ordering is unchanged from the pre-#501 code on both paths: under
+        # spec+overlap the _wait_forward_stream() that precedes the snapshot
+        # still orders this free after the in-flight forward, and the plain path
+        # still frees without one (committed is settled synchronously there).
+        if reclaim_overhang:
+            over = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, snap.free_from : req.kv_allocated_len
+            ]
+            self.allocator.free(over.to(torch.int64))
+            req.kv_allocated_len = snap.free_from
+            req.kv_overallocated_freed = True
 
         # Claim a free host region for this session (S4).
         region = self._free_regions.pop(0)
