@@ -1206,6 +1206,25 @@ counter split out of an existing one is added to every gate that read the old
 one in the same change (`scripts/gpu_battery/checks/check_s07_offload_register_gpu.py`
 gates all four counters, each with its own can-fail proof).
 
+Group-agreement family (#505-A2-05, fixed in #514): a transport that MAY fall
+back must fall back as a GROUP. `_build_transport` caught any bring-up
+exception for the two transports outside `_NO_FALLBACK` (`bar1`, `matrix`),
+warned, and returned `None` per rank, with nothing reconciling the outcome --
+so a rank that failed after its transport's last bring-up collective ran gloo
+while its peers ran barlink, and a barlink-default run was published as such
+while being a gloo run. Fixed with a one-hot `all_reduce(SUM)` on the CPU group
+that BOTH the success and the failure path reach: all-ok keeps the transport,
+mixed sends every rank to gloo (the successful ones close theirs), and the
+failing ranks are named. Shape taken from `parallel_state.py:975-992` and
+`model_runner.py:1365-1369`. Deliberately unbounded, like the neighbouring
+bring-up exchanges: ranks are legitimately minutes apart on a cold JIT cache
+(#431/#438a) and a deadline would fire on a healthy group. Scope, measured
+rather than assumed: the byte proof already reduces group-wide
+(`barlink_bar1.py:2538`, `:2547`) and the `dmabuf_holder` / `_bind_region`
+guards sit before a remaining collective, so those DESYNC into a hang rather
+than split -- the residual hang class is NOT closed by this and is a named
+follow-up.
+
 Rank-local-verdict family (#505-A2-03, fixed in #514): a decline that hands the
 caller to a NAMED FALLBACK must rest on replicated inputs, or the fallback is
 taken by some ranks and not others. `try_spill`'s host-region check compared

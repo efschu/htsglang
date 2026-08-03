@@ -199,6 +199,21 @@ The fix is one collective and the tree already contains it twice
 (`parallel_state.py:975-992`, `model_runner.py:1365-1369`).
 *Task:* `reconcile the barlink transport outcome across the group before use`
 
+> **PARTIALLY REFUTED by #514 -- the hole is real, the damage story is not.**
+> The missing group agreement is confirmed and was fixed. But none of the three
+> sites this row named can produce the silent split it describes. The byte proof
+> already reduces its verdict group-wide (`dist.broadcast_object_list` at
+> `barlink_bar1.py:2538`, `all(result.values())` at `:2547`), so
+> `_make_bar1_transport` raises on every rank or none; the `dmabuf_holder` guard
+> (`:1938`) and `_bind_region` both run BEFORE a remaining bring-up collective,
+> so they DESYNC into a hang rather than splitting the group. The audit reported
+> the hang-direction question as unproven, and it resolves against the stated
+> damage. The genuine split window is much narrower: a rank-local exception
+> raised AFTER a transport's last bring-up collective, e.g.
+> `barlink_matrix_transport.py:423-428` past `_check_uniform` -- that is what
+> the fix closes. The residual desync class is untouched and still hangs; it is
+> a separate follow-up, recorded as a GPU-window ticket in #514.
+
 **5. #505-A2-04 — PD topology fabricates a CUDA→NVML identity mapping.**
 `disaggregation/topology.py:421-427` logs *"assuming identical enumeration orders"*
 and sets `mapping = {}` — on the rig where CLAUDE.md records that torch order is not
