@@ -148,7 +148,11 @@ tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
   takes any positive integer per rank — no grid, no >= 1-unit floor), and
   replicating the compute role costs NO extra KV bytes because the bytes are
   token-proportional already. A coarse kv-head grid therefore NEVER pins the
-  family. Separately: PROJECTION-weight replication (`attn_kv_replicated`) is
+  family. #503: this axis is REPORTED only where its own gate holds — a boot
+  on the default `--rank-kv-ratio coupled` without `SGLANG_UNEVEN_DCP` never
+  reaches `dcp_size > 1` (`server_args.py:9845-9853`), head-shards the KV
+  cache and installs no token vector, and the planner now refuses the axis by
+  name there instead of pricing a lever that boot cannot actuate. Separately: PROJECTION-weight replication (`attn_kv_replicated`) is
   strictly `kv < tp`, the `<=` flip is measured-rejected, and at 24q/4kv over
   3 ranks it is structurally unrepresentable (`units % groups != 0` and
   `groups >= n` in the #116 alignment repair) — generalizing it is an unbuilt
@@ -254,23 +258,35 @@ state pool and the coupled KV vector follow it. The enumerator escapes the
 kv-head grid ONLY when `attn_units < tp` (`grid = self.attn_units; if grid < n:
 grid = max(self.q_heads, n)`, `uneven_perf.py:4133-4148`), and
 `partition_units` then keeps >= 1 unit per rank (#62/#116; hard —
-`distributed/utils.py:568`, `:589`). **That grid is not the runtime's.** Under
-every uneven-TP boot with DCP the kv heads are REPLICATED and the split rides
-the token axis — `uneven_dcp_kv_replicated` is `dcp_size > 1 and
-get_tp_partition_ratios() is not None` (`distributed/utils.py:346`), no
-kv-head term — which the planner's own placement report already models
-(`replicated = kv_heads < tp or dcp_replicated`, `planner/placement.py:813`)
-and the same cost model already assumes for the KV cache
-(`uneven_perf.py:3852`) while pricing attention weights as head-sharded. So the
-reference rig's "4 kv heads, 3 ranks -> only `[2,1,1]` is representable" is an
-artefact of the ENUMERATOR, not a property of the rig: the real attention axes
-are the q-head grid plus a continuous token vector. Until #500-B1 lands, the
-phase-prefill arm's joint gains (desk-predicted +1.0 points over the MLP-only
-cut on INT8-W8A8 and +6.9 on FP8, both bracketed, see below) are an optimum
-over an INCOMPLETE candidate set, and the "16-unit GDN grid is the lever"
-reading follows from the same artefact. **#492 CORRECTION (still the right
-empirical read on THIS rig, refined by #500-B1 above): the axis is blocked by
-capacity, not the grid** — every token candidate is refused at
+`distributed/utils.py:568`, `:589`). **That grid IS the runtime's, and #503
+executed the check that says so** (audit finding #500-B1 is REFUTED —
+`test_attn_replication_axis_492.py::TestWhatTheRuntimeCanActuallyDoToday`).
+Two independent predicates govern this family and #500-B1 conflated them:
+`attn_kv_replicated(tp_size, total_num_kv_heads)` is strictly `kv < tp`
+(`distributed/utils.py:1081`; the `<=` flip is measured-rejected in its own
+docstring) and is what `linear.py:1423` / `model_config.py:1332` read when they
+build the q/k/v shards — so at `kv_heads >= tp` the k/v PROJECTIONS head-shard
+and the enumerator's kv-head grid is correct. `uneven_dcp_kv_replicated`
+(`dcp_size > 1 and get_tp_partition_ratios() is not None`,
+`distributed/utils.py:346`) replicates the KV **POOL**, not the projections:
+"the attention write gathers this rank's uneven projection shard up to
+`get_total_num_kv_heads()`"
+(`model_executor/model_runner_kv_cache_mixin.py:2721`). Pricing attention
+WEIGHTS on the second predicate would model a layout the #105 ragged-kernel
+guard refuses at the first forward. So "4 kv heads, 3 ranks -> only `[2,1,1]`"
+is a property of the rig after all, the phase-prefill joint gains
+(desk-predicted +1.0 points over the MLP-only cut on INT8-W8A8 and +6.9 on
+FP8, both bracketed, see below) stand unchanged, and the #475 backtest
+reproduces its four measured arms at rms 2.2 with `dcp_size` declared.
+`planner/placement.py:813` (`replicated = kv_heads < tp or dcp_replicated`)
+uses ONE flag for both mechanisms and therefore reports the k/v projection
+heads as replicated under uneven DCP where the runtime shards them — an open
+defect, narrower than #500-B1 claimed and in the placement report rather than
+the solver. **#492 CORRECTION (the right empirical read on THIS rig, and #503
+gated it on the predicate that installs it — the axis is reported only where
+`uneven_dcp_kv_replicated` holds, i.e. not on a bare `--rank-kv-ratio
+coupled` boot, which head-shards the KV cache and installs no token vector):
+the axis is blocked by capacity, not the grid** — every token candidate is refused at
 `--rank-perf-loose-ctx-percent 0` (the weighted owner rule funds
 `min_r(P_r/v_r)` blocks, so concentrating the token vector discards the slow
 cards' pools), and it only becomes reachable at loose 80-95 for +0.1 to +1.9

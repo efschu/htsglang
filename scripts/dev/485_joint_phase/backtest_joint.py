@@ -1,12 +1,20 @@
 """#485 backtest: the joint per-family cut, against every measured point.
 
 Extended by #492, which corrects slice 1's central mistake: sections 1-4
-search HEAD partitions only, and on a checkpoint whose kv-head count does not
-divide across the ranks that space is empty, which #485 wrote down as "the
-attention family is grid-pinned". Sections 5-6 price the axis it forgot --
-replication + token-sharding, the fork's own #62/#116 machinery -- and the
-head-only space is executed as the falsifier that it cannot move the family
-by construction. Sections 1-4 must print exactly what they printed before.
+searched HEAD partitions only and called the attention family grid-pinned.
+Sections 5-6 price the axis it forgot -- replication + token-sharding, the
+fork's own #62/#116 machinery.
+
+#503 re-checked both slices against the runtime predicates and left the head
+axis exactly where #492 put it: the projection split is gated on
+``attn_kv_replicated`` (``kv < tp``, strictly -- ``distributed/utils.py:1081``),
+so at 4 kv heads over 3 ranks the boot really does head-shard on the kv grid
+and section 5's one-partition falsifier stands. What #503 changed is the
+FIXTURE: it now declares ``dcp_size=3``, because that is what these boots ran
+(NOTE_475 §4: DCP token vector ``[31, 17, 16]``), and the token axis is only
+available where ``uneven_dcp_kv_replicated`` holds. Sections 1-4 must still
+print exactly what they printed before -- they carry no attention vector and
+no core plan, so no predicate this task touched is on their path.
 
 Desk-only (``CUDA_VISIBLE_DEVICES=99``). Sections, in the order a
 reader should refuse to believe them:
@@ -83,6 +91,16 @@ def build(model_path):
         speculative_algorithm="NEXTN", speculative_num_draft_tokens=4,
         rank_gpu_id=[0, 1, 2], effective_vram_mib=list(BUDGETS),
         rank_tp_ratio=list(BUDGETS),
+        # #503: the geometry these boots RAN. Every arm below is an uneven-TP
+        # boot with a DCP token vector installed -- NOTE_475 §4 names it
+        # ([31, 17, 16], identical across the two INT8 boots) -- so
+        # ``dcp_size == tp_size`` and the KV POOL was replicated-heads +
+        # token-sharded. Section 5 needs it: the token axis is gated on
+        # ``uneven_dcp_kv_replicated``, and without this the fixture would ask
+        # about a boot that head-shards the KV cache. The PROJECTION split is
+        # unaffected (``attn_kv_replicated`` is strictly ``kv < tp``), which is
+        # why sections 1-4 are unchanged.
+        dcp_size=3,
     )
     return PerfCostModel(pi, list(BUDGETS), list(BUDGETS))
 

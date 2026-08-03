@@ -4199,6 +4199,30 @@ class PerfCostModel:
             # the split path never reaches this branch.
             return [1.0 if r == self.solo_rank else 0.0 for r in range(n)]
         if shard == "attn":
+            # MECHANISM REACH (#503): TWO different replication mechanisms
+            # govern this family and they are gated differently. This branch
+            # prices the PROJECTION WEIGHTS, so the predicate it must follow is
+            #
+            #     def attn_kv_replicated(tp_size, total_num_kv_heads) -> bool:
+            #         ... return total_num_kv_heads < tp_size
+            #
+            # (``distributed/utils.py:1081``) -- strictly ``kv < tp``, and the
+            # ``<=`` flip is measured-rejected in that docstring. It is what
+            # ``linear.py:1423`` and ``model_config.py:1332`` read when they
+            # build the q/k/v shards, so at ``kv_heads >= tp`` the k/v
+            # projections DO head-shard and the grid below is correct.
+            #
+            # The other mechanism, ``uneven_dcp_kv_replicated`` (``:346``,
+            # ``dcp_size > 1 and get_tp_partition_ratios() is not None``),
+            # replicates the KV POOL, not the projections -- "the attention
+            # write gathers this rank's uneven PROJECTION SHARD up to
+            # get_total_num_kv_heads()"
+            # (``model_runner_kv_cache_mixin.py:2721``). It is therefore the
+            # gate on the TOKEN axis (the core's per-rank mass), never on this
+            # weight split. Audit #500-B1 read the second predicate as if it
+            # governed the first; it does not, and pricing these weights on the
+            # q-head grid at ``kv >= tp`` would model a boot the runtime
+            # refuses at the first forward (the #105 ragged-kernel guard).
             grid = self.attn_units
             if grid < n:
                 # Replicated-KV regime (#116 / uneven-TP head geometry): fewer
@@ -5343,6 +5367,14 @@ def _attn_partition_key(model: PerfCostModel, vec: Sequence[int]) -> tuple:
     vector -- the attention grid on this class of checkpoint is 4 kv heads
     wide, so most of the ladder collapses onto ``[2,1,1]`` there and only the
     GDN grid (16 k-heads) actually resolves the ladder.
+
+    #503 checked this against the runtime and it stands: the projection split
+    is gated on ``attn_kv_replicated`` (``kv < tp``,
+    ``distributed/utils.py:1081``), so at 4 kv heads over 3 ranks the boot
+    really does head-shard on the kv grid and the deduplication is not
+    deleting anything reachable. What the boot ALSO runs -- a replicated KV
+    pool with a token shard -- is a different axis, not a finer version of
+    this one; see ``_replication_axis_lines``.
     """
     return (
         tuple(model._shard_fractions("attn", model.base_plan, list(vec))),
@@ -5583,11 +5615,44 @@ def _replication_axis_lines(
     It does NOT choose a share. The share is the attended context depth, which
     this parse-time model does not carry -- the same reason #485 bracketed the
     lane instead of estimating the flash mass.
+
+    #503: GATED on the predicate that actually installs the token vector,
+    instead of being reported for every configuration. The axis exists iff the
+    KV pool runs the replicated-heads + token-shard layout, and that is
+    ``uneven_dcp_kv_replicated`` -- mirrored at plan time by
+    ``plan_uneven_dcp_kv_replicated``. Reported unconditionally, this block
+    advertised a lever to configurations whose boot head-shards the KV cache
+    and never installs a token vector at all -- the same class of defect as
+    #500-B1, read in the other direction.
     """
-    from sglang.srt.distributed.utils import partition_units
+    from sglang.srt.distributed.utils import (
+        partition_units,
+        plan_uneven_dcp_kv_replicated,
+    )
 
     lines: List[str] = []
     base = list(base_plan)
+    if not plan_uneven_dcp_kv_replicated(model.plan_inputs, base):
+        # Quoting the gate rather than paraphrasing it (MECHANISM REACH). The
+        # runtime spelling:
+        #   def uneven_dcp_kv_replicated(dcp_size: int) -> bool:
+        #       return dcp_size > 1 and get_tp_partition_ratios() is not None
+        # ``dcp_size`` auto-sets to ``tp_size`` for a non-'coupled'
+        # ``--rank-kv-ratio`` (``server_args.py:9845-9853``,
+        # ``uneven_kv_flag_active`` at ``:8433``) -- which is exactly what the
+        # phase-prefill arm's own emitted launch command passes, and is why
+        # the arm CAN reach this axis while a bare 'coupled' boot cannot.
+        return [
+            "replication axis (#492/#503): NOT AVAILABLE for this "
+            "configuration -- uneven DCP is not in force, so the KV cache "
+            "head-shards and no DCP token vector is installed "
+            "(uneven_dcp_kv_replicated = dcp_size > 1 and "
+            "get_tp_partition_ratios() is not None; at plan time "
+            f"dcp_size={getattr(model.plan_inputs, 'dcp_size', None)!r}, "
+            f"base plan {base}). The attention family really does have only "
+            "the head axis here. Engage the second axis with a non-'coupled' "
+            "--rank-kv-ratio, which auto-sets dcp_size = tp_size."
+        ]
     base_pred = model.predict_capacity(base)
     gate_live = bool(base_pred.get("feasible")) and bool(
         base_pred.get("token_vector")
