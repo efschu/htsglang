@@ -1166,6 +1166,7 @@ caller-supplied path needs `utils/path_confinement.confine_to_root` against
 the flag that configures it — both pinned by
 `test/registered/unit/entrypoints/test_endpoint_security_510.py`, which
 enumerates the routes rather than sampling them.
+
 Incomplete-cache-key family (#241 #513, from audit #506): a persisted
 artifact whose CONTENT depends on a dimension its KEY does not carry is a
 silent wrong hit, not a miss -- and where the artifact is labelled
@@ -1196,6 +1197,7 @@ records the collision as expected behaviour. Reference implementations for a
 complete key already in this tree:
 `managers/kv_session_spill_destination.py:215-239` and
 `video_enhance/engine_cache.py:79-121`.
+
 Unreachable-registration family (#81 #518): an op registered for a DEVICE
 dispatch key but taking no tensor argument cannot be routed at all -- the
 dispatcher infers the backend from the tensors and there are none, so every
@@ -1214,6 +1216,7 @@ claim is executed, off-GPU, no wheel) and a ratchet over every
 reintroduce it. General lesson: a python-side workaround around a raise keeps
 serving alive AND keeps the defect out of sight -- the mirror stays (the wheel
 is sha-pinned and can lag the tree), but it is a fallback, not the fix.
+
 Byte-stride width family (#109 #112 #512, from audit #506 A1-1): the GGUF MoE
 MMQ kernel reaches an expert with `(char*)vx + exp_idx * exp_stride` where
 `exp_stride` is a BYTE stride, declared `int` while the call site already
@@ -1225,6 +1228,7 @@ why the guard is pinned in the same test. Rule: a stride in BYTES needs 64
 bits at every geometry this fork serves; a stride in BLOCK units has 16-32x
 more headroom and `moe_vec.cuh` is left 32-bit WITH the bound written down
 (9x at the widest served geometry) rather than silently.
+
 Tolerance-that-cannot-fail (#380 #511, from audit #506 axis 4): a numeric gate
 is only a gate if it rejects something. `atol=1.5, rtol=3e1` on outputs whose
 RMS is 5.1e3 is the predicate `|a-b| <= 30|b|`, which an all-zeros and a
@@ -1394,6 +1398,43 @@ value, which is how #449's desk-picked 2048 MiB shipped above the real peak and
 protected nothing for weeks. A green pin means the number is DELIBERATE -- not
 that it is correct, and not that it BINDS; those need their own evidence and
 are the axis-C backlog.
+
+Resolution-ordering family (#499): a `server_args` field read on both sides of
+`materialize_declarations` is TWO values. The #89 hibernate manifest identity
+(`model_loader/hibernate.py:_model_identity`) is computed at the MATCH inside
+`ServerArgs._handle_load_format` (`server_args.py:13332`, reached from
+`__post_init__` at `:5939`) and again at the PARK in the worker
+(`weight_updater._hibernate_park_weights` -> `hibernate.py:518`) -- the first
+BEFORE `materialize_declarations(self)` (`server_args.py:5984`), the second
+long after it. `quantization` is declared `"gguf"` by the `_gguf_quantization`
+pass (`arg_groups/overrides.py:2091`), invoked at the HEAD of that same handler
+(`:13300`), so every manifest was written with `"gguf"` while every subsequent
+boot compared `None`: the identity could never match its own park, and #89's
+fast restore was unreachable on GGUF -- the only checkpoint class #89 supports
+(`if self.load_format != "gguf": raise`, `:13327`). The park kept reporting
+success and the mismatch fell back to a cold load that works, so nothing
+surfaced (SUCCESS-CLAIMS family). Fixed by computing the identity through
+`resolved_view` (`overrides.py:230-235`), the mid-resolution equivalent of the
+post-materialization fields, so both sides read the same value.
+`HIBERNATE_VERSION` stays 2: the park side's bytes do not move, the match side
+joins it, and manifests parked before the fix become matchable rather than
+invalid. Reach of the hazard read off the metadata, not off prose: of the nine
+identity fields only `quantization` and `dtype` are declarable at all
+(`Arg(resolvable=True)`) -- `validate_declarations` (`overrides.py:2176`)
+refuses the other seven by name, so they can only be written imperatively, and
+every such writer runs before `:5939` (`rank_tp_ratio`/`dcp_size` in
+`_handle_uneven_tp`, `:5785`). So the rule: **a value read during
+`__post_init__` and again after it is two values unless it is read through
+`resolved_view`**, and a fingerprint compared across processes is computed by
+ONE function at ONE pipeline stage. Residual, named and NOT fixed: a field
+resolved in the WORKER after the match via `declare_load_time_override` --
+concretely `ModelRunner._sm80_dtype_fallback` declaring `dtype="float16"` on
+pre-Ampere cards (`model_executor/model_runner.py:1980`) -- still diverges;
+unreachable on sm80+ (this rig is sm86/sm120), live on the sm75 hetero host.
+Falsifier: `test/registered/unit/model_loader/test_hibernate_identity_499.py`
+(6 tests incl. a metadata-derived sibling sweep and an end-to-end "park, then
+reboot the same command" arm; 4 executed red against the pre-fix file, the
+sweep red on both declarable fields).
 
 **MERGE DUTY -- bookkeeping-mutation sites (#404 family).** The per-request
 accounting clocks (`decode_batch_idx` / `extend_batch_idx`,

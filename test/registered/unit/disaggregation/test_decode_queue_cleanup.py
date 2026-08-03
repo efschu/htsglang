@@ -207,6 +207,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
+        # Fixture drift, 2026-07-23: the per-session KV offload (21136b063a)
+        # added a `kv_session_offload` term to `is_fully_idle` -- a
+        # host-spilled session is still running. This test builds its
+        # Scheduler with `__new__` and sets every field `is_fully_idle`
+        # reads, so it has to set the new one too. `None` is the value a real
+        # Scheduler carries whenever the feature is off; it is assigned
+        # unconditionally in __init__ (scheduler.py:377), so the attribute
+        # always exists in production.
+        scheduler.kv_session_offload = None
 
         self.assertFalse(scheduler.is_fully_idle())
 
