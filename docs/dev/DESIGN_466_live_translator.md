@@ -934,7 +934,146 @@ what every other path degrades to, and nothing degrades to an empty pool.
 
 ---
 
-## 10. Audio-out fallback ladder (Phase 3, task #488)
+## 11. Feasibility cut — native talker bring-up (#488)
+
+Desk investigation, 2026-08-03. Numbers are measured or cited to file:line, not
+estimated from the model card.
+
+### 11.1 What the runtime already gives us
+
+* **Model registration is a five-line contract.** Auto-discovery scans
+  `python/sglang/srt/models/`; a module needs `EntryClass`, and the class name
+  must equal the `architectures` string verbatim
+  (`models/registry.py:92-131`). `qwen3_asr.py` is a 199-line worked example.
+  One trap: unresolved architectures silently fall back to
+  `TransformersForCausalLM` and import errors are swallowed with a warning
+  (`registry.py:63,107`), so a typo degrades instead of failing.
+* **M-RoPE is free and not entangled with vision.** `MRotaryEmbedding`
+  (`layers/rotary_embedding/mrope.py:139`) is instantiated straight from
+  config (`factory.py:164-177`), and the no-multimodal decode path is explicit
+  (`forward_batch_info.py:1105-1114`). `mrope_section [24,20,20]` sums to 64 =
+  `rotary_dim/2` for `head_dim 128`, so the auto-correction block does not fire.
+* **The Qwen3 decoder stack is reusable verbatim.** `Qwen3Attention` already
+  takes `head_dim` explicitly (`models/qwen3.py:141`) and carries q/k RMSNorm
+  over `head_dim` — an exact match for the checkpoint's `[128]` norms.
+* **RVQ machinery already exists in-tree**: `ResidualVectorQuantization` in
+  `models/mimo_audio.py:260`. Encoder-side, unregistered, but it is not new ground.
+* **Non-generation models are first class** (embedding/rerank/classify/score),
+  so the vocoder has a home; `multimodal_gen/` even has a vocoder-loader tier.
+
+### 11.2 The actual blocker, stated precisely
+
+Not "the decode loop assumes one token per step" — that framing is wrong in
+both directions and it matters:
+
+* the **append** side is already N-tokens-per-step (spec decoding put it there:
+  `batch_result_processor.py:752-758`);
+* the **KV/position** side is strictly one-per-step
+  (`schedule_batch.py:3045-3062`) — and that is exactly what we want, because
+  16 codebook entries are **one audio frame at one sequence position**, not 16
+  positions. The residual codes must never enter the KV sequence.
+
+The real blocker is one line:
+
+```python
+# schedule_batch.py:3006-3008
+self.input_embeds = None
+```
+
+The talker's next input is `codec_embedding[c0] + Σ codec_embedding_q[c_q] +
+text_step` — a **vector**, not a token id — and decode force-clears the only
+channel that carries one. The CUDA-graph side already supports embeds
+(`decode_cuda_graph_runner.py:1710-1713`), so this is a scheduler unblock, not
+a graph rewrite.
+
+**The speculative stack is NOT the vehicle.** A draft head is the right
+*shape* (small transformer per step) and the wrong *contract*: there is nothing
+to verify, no target distribution, no accept length, no tree, and spec exists
+precisely to add sequence positions — the opposite of the requirement.
+Registering a `CustomSpecAlgo` would mean satisfying a verification contract we
+do not have and would poison the spec metrics, the adaptive-draft ladder and
+the cross-algo bandit permanently. Rejected.
+
+**The precedent is the dLLM lane** (`srt/dllm/`, 935 lines + wiring at
+`tp_worker.py:552`, `scheduler.py:4585`): a non-speculative custom decode
+regime that runs extra model work per step and emits a block. Its
+`LogitsProcessorOutput.full_logits` is the precedent for a model returning a
+non-standard logits shape, and `customized_info`
+(`logits_processor.py:217`) is a wired-but-unused transport for the extra codes
+— no model in the fork sets it, so we would be the first user.
+
+**No host exists.** #274 is a dual lane *within one model's world*, not a
+tenant host; #305 is design-only ("no implementation",
+`DESIGN_305_multi_model_serving.md:4-5`); DESIGN_333 M5 is explicitly
+unformulated. ANALYSE_334 §3a already priced this family **HARD/L**. Whatever
+we build lands as a registered model plus a decode-regime hook, in the slot
+dLLM occupies.
+
+### 11.3 Effort, against the reference
+
+The only complete implementation — by the people with the weights and the
+paper — is **5 192 lines across 9 files plus a 2 102-line bespoke model
+runner**, and even they could not host it in a stock decode loop: their
+talker entry point takes `(input_ids, input_embeds, last_talker_hidden,
+text_step)` and returns `(inputs_embeds_out, audio_codes[B,Q])`, a shape no
+stock runner speaks. Discounting for what this fork gives free, ~2 000-2 500
+new lines.
+
+| Phase | Days | Confidence |
+|---|---|---|
+| Config class + registry/AutoConfig wiring + boot | 0.5 | high |
+| Talker trunk, embeddings, `text_projection`, `codec_head`, `load_weights` (3 prefix families) | 1.5 | high |
+| Speaker encoder (ECAPA-TDNN), portable from reference | 0.5 | high |
+| Code predictor: 5 layers, 16-slot scratch KV, 15 heads, sampling loop | 1.5 | medium |
+| Offline parity harness vs reference, on desk | 1.5 | medium |
+| Decode-regime hook (dLLM-shaped) | 2.5 | **low** |
+| CUDA-graph capture over the nested predictor | 1.5 | **low** |
+| Code2Wav vocoder (784-line reference) + streaming boundaries | 2.5 | **low** |
+| Prompt/embeds builder (**1 596-line reference**) | 2.0 | **low** |
+| End-to-end streaming + GPU windows | 2.0 | low |
+| **Total** | **~16 days** | |
+
+**Seven days does not buy the path.** It buys: the config and model file
+loading all 478 tensors clean and boot-proven, the trunk parity-checked at
+desk, the code predictor producing correct frames under a test harness, and a
+written decode-hook design. It does **not** buy in-runtime streaming decode,
+graph coverage, the vocoder, or `/v1/audio/speech` on the native path. **The
+translator cannot move to the native lane before 08-10.**
+
+### 11.4 Three traps worth pre-registering
+
+1. **`interleaved` vs `mrope_interleaved`.** The checkpoint writes
+   `"interleaved": true`; the factory reads
+   `rope_scaling.get("mrope_interleaved", False)` (`factory.py:174`).
+   Pass-through gives non-interleaved M-RoPE — a model that loads, runs, emits
+   plausible codec tokens, and **sounds wrong**. Cheapest bug on the list, most
+   expensive to diagnose from audio. Assert at config construction.
+2. **The prompt/embeds builder is invisible from the config and is 1 596 lines
+   in the reference** — text conditioning, `codec_bos 2149` / `eos 2150` /
+   `pad 2148` / `think 2154` / `think_bos 2156` / `think_eos 2157`,
+   `position_id_per_seconds 13`, speaker-prompt injection. None derivable. Do
+   not estimate it at zero.
+3. **`text_projection` uses `linear_fc1`/`linear_fc2` naming and carries
+   biases**, so it will not match the standard stacked mapping.
+
+### 11.5 Reference preserved
+
+The vLLM-Omni 0.24.0 implementation lived only inside the venv now being
+deleted. Copied to
+`/spinning/llm_stuff/translator-models/vllm-omni-reference/` (20 files, with a
+provenance note) — Apache-2.0, and the source of truth for the prompt builder,
+the predictor loop and the vocoder. **Losing it would have cost more than any
+other artifact in this project.**
+
+### 11.6 Latency is not the risk
+
+Window measurement, same model class: warm streaming first-audio **71 ms** on a
+3080 against a 150-300 ms budget, RTF 0.16. The native lane inherits that as
+the bar. The risk on #488 is integration surface, not performance.
+
+---
+
+## 12. Audio-out fallback ladder (Phase 3, task #488)
 
 Every rung is **architecture-compliant**: one process tree, all VRAM visible to
 the ledger. No rung is an external serving engine — that option no longer
