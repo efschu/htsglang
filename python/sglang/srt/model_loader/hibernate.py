@@ -116,24 +116,50 @@ def _model_identity(server_args) -> Dict[str, Any]:
     can only be written imperatively -- and every such writer runs before
     :5939.
 
-    Residual (NOT covered here, and it cannot be): a value resolved in the
-    WORKER after the match, via ``declare_load_time_override`` -- concretely
-    ``ModelRunner._sm80_dtype_fallback`` (``model_executor/model_runner.py:
-    1980``) declaring ``dtype="float16"`` on pre-Ampere cards. That lands in
-    another process after this boot's match already ran, so a park on such a
-    card writes ``float16`` while the next boot parses ``auto``. Not reachable
-    on sm80+ hardware; tracked separately.
+    #520 closes what #499 named as its residual: a value resolved in the
+    WORKER, AFTER the match. ``resolved_view`` cannot reach it -- the match
+    runs in the launcher, before the process that computes it exists. Two live
+    instances, both re-derivations rather than genuine changes:
+
+      * ``ModelRunner._sm80_dtype_fallback`` (``model_executor/model_runner.py:
+        1980``) declares ``dtype="float16"`` on a card without bfloat16
+        (pre-Ampere NVIDIA, the sm75 hetero host; gfx900-class ROCm). A park on
+        such a card wrote ``float16`` while the next boot parsed ``auto``.
+      * ``spec_worker.match_target_context_length``
+        (``speculative/eagle_worker_v2.py:1764`` and the standalone /
+        frozen-KV-MTP / multi-layer workers) pins ``context_length`` to the
+        TARGET model's resolved ``context_len``. It writes the SHARED
+        ``server_args`` -- the very object the park reads through
+        ``tp_worker.model_runner`` (``BaseSpecWorker.model_runner`` returns
+        ``self.target_worker.model_runner``) -- so every speculative boot wrote
+        a manifest whose ``context_length`` no launch ever parses.
+
+    ``launch_view`` (``overrides.py``) un-applies exactly the sources on the
+    IDENTITY-TRANSPARENT registry: writes that RE-DERIVE a field from state
+    this fingerprint already pins -- the rank's card (re-checked by NVML UUID
+    at ``:568``, presence-gated at match time in ``_manifest_cards_present``)
+    and the checkpoint at ``model_path``. A write that genuinely changes what
+    is loaded is NOT on that registry and keeps showing through: a runtime
+    ``/update_weights`` moving ``model_path`` must still invalidate the
+    manifest, or a safe cold load becomes a silent wrong-weights match.
+
+    Known looseness, NOT introduced here: on heterogeneous hardware only rank
+    0 writes the identity, so a per-rank re-derivation describes rank 0 only.
+    The per-rank NVML-UUID re-check is what actually pins the other ranks.
 
     Manifest compatibility: neither the key set nor the value a PARK writes
     changes (the park side was already materialized), so ``HIBERNATE_VERSION``
     stays 2 -- the fix moves the MATCH side onto the same value, which turns
     already-parked manifests from never-matching into matching. It cannot make
     a previously matching manifest stop matching: without a declaration the
-    overlay read is the field read.
+    overlay read is the field read. #520 keeps that property: a manifest parked
+    on an sm75 card with ``float16`` in it stops matching only in the sense
+    that it never matched at all; every manifest parked without a transparent
+    re-derivation is unaffected, because the overlay is then empty.
     """
-    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.arg_groups.overrides import launch_view
 
-    cfg = resolved_view(server_args)
+    cfg = launch_view(server_args)
     return {
         "model_path": cfg.model_path,
         "quantization": cfg.quantization,

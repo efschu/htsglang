@@ -14774,6 +14774,16 @@ class ServerArgs:
         everything is recorded with its ``source`` for provenance.
         """
         from sglang.srt.arg_groups.arg_utils import resolvable_fields
+        from sglang.srt.arg_groups.overrides import (
+            note_identity_transparent_supersede,
+        )
+
+        # #520: a worker re-derivation of a field that also feeds a
+        # cross-process fingerprint records the launch value it supersedes, so
+        # the fingerprint's other bank -- which runs before this process exists
+        # -- can still be computed from the same value. No-op for every source
+        # outside IDENTITY_TRANSPARENT_SOURCES.
+        note_identity_transparent_supersede(self, source, fields)
 
         whitelist = resolvable_fields(type(self))
         declared = {k: v for k, v in fields.items() if k in whitelist}
