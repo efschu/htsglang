@@ -623,6 +623,14 @@ class MovementStats:
     wave_ins: int = 0
     park_failures: int = 0
     wave_in_failures: int = 0
+    #: Wave-ins whose RETRIEVAL succeeded and whose destination release then
+    #: failed. Counted apart from ``wave_in_failures`` because the two mean
+    #: opposite things about where the bytes are (#514/#505-B-01).
+    destination_release_failures: int = 0
+    #: Bytes still booked at a park target whose destination could not be
+    #: released. They are deliberately never reclaimed automatically -- see
+    #: ``wave_in``. A non-zero value here is an operator-visible leak.
+    leaked_destination_bytes: int = 0
     peer_degradations: int = 0
     chunked_transfers: int = 0
     bytes_by_target: Dict[str, int] = field(default_factory=dict)
@@ -902,6 +910,9 @@ class RealMovementBackend(MovementBackend):
             binding = self._bindings.get(item.item_id)
             payload = binding.payload if binding is not None else None
             mv.state = STATE_WAVE_IN_FLIGHT
+            # STAGE 1 -- RETRIEVAL. Everything here runs BEFORE the bytes are
+            # known to be back, so a failure means they are still at the park
+            # target and PARKED is the truthful state.
             try:
                 if isinstance(payload, TagPayload):
                     self._ops.resume_tag(payload.tag)
@@ -911,20 +922,74 @@ class RealMovementBackend(MovementBackend):
                     self._ops.wait(mv.handle)  # park copy must have landed
                     back = self._ops.copy_in_tensors(mv.handle)
                     self._ops.wait(back)
-                    self._ops.free_destination(mv.handle)
             except Exception as exc:
-                # Error path: retrieval failed physically. The item stays
-                # PARKED (its bytes are still at the park target); the
-                # failure is reported, never swallowed.
+                # Retrieval failed physically. The item stays PARKED (its
+                # bytes are still at the park target) and keeps its booking;
+                # the failure is reported, never swallowed.
                 mv.state = STATE_PARKED
                 self.stats.wave_in_failures += 1
                 raise MovementError(
                     f"wave-in of item {item.item_id!r} from {mv.target!r} failed: {exc}"
                 ) from exc
-            self.ledger.release(mv.target, mv.peer_device, mv.booked_bytes)
-            mv.state = STATE_RESIDENT
-            mv.target = None
-            mv.peer_device = None
-            mv.handle = None
-            mv.booked_bytes = 0
+
+            # STAGE 2 -- RELEASE OF THE PARK DESTINATION. Reached only once
+            # the retrieval above returned, i.e. the bytes ARE back on the
+            # device. A failure here is therefore NOT a failed wave-in and
+            # must not be reported as one: the item is RESIDENT either way,
+            # and only the destination allocation is in doubt (#514/#505-B-01
+            # -- the old single `try` marked this case PARKED, the state whose
+            # meaning is "the bytes are at the park target", and skipped the
+            # ledger release below because it sat outside the try).
+            #
+            # The booking is deliberately RETAINED and counted as leaked
+            # rather than released: we do not know how much of the destination
+            # actually came back, and under-booking would let the next booker
+            # allocate into bytes that may still be held. A leak that is named
+            # and counted is recoverable by an operator; a silent one is not.
+            if mv.handle is not None and not isinstance(
+                payload, (TagPayload, SuspendPayload)
+            ):
+                try:
+                    self._ops.free_destination(mv.handle)
+                except Exception as exc:
+                    leaked = int(mv.booked_bytes)
+                    self.stats.destination_release_failures += 1
+                    self.stats.leaked_destination_bytes += leaked
+                    target, peer_device = mv.target, mv.peer_device
+                    self._finish_wave_in(mv, release_booking=False)
+                    logger.error(
+                        "offload: item %r came back from %r but its destination "
+                        "could not be released: %s -- %d bytes stay booked at "
+                        "%r (device %r) and will NOT be reclaimed automatically",
+                        item.item_id,
+                        target,
+                        exc,
+                        leaked,
+                        target,
+                        peer_device,
+                    )
+                    raise MovementError(
+                        f"item {item.item_id!r} was retrieved from {target!r} but its "
+                        f"destination release failed: {exc}; {leaked} bytes remain "
+                        f"booked at {target!r} and are leaked"
+                    ) from exc
+            self._finish_wave_in(mv, release_booking=True)
             self.stats.wave_ins += 1
+
+    def _finish_wave_in(self, mv: _ItemMovement, *, release_booking: bool) -> None:
+        """Put a retrieved item back into the RESIDENT state.
+
+        Called on both wave-in exits, because in both of them the bytes are
+        back on the device and the movement record must stop describing a
+        park. ``release_booking=False`` is the leaked-destination exit: the
+        record is cleared so no later cycle can release these bytes a second
+        time, and the ledger keeps them booked on purpose (see ``wave_in``).
+        The caller must have accounted the leak before calling.
+        """
+        if release_booking:
+            self.ledger.release(mv.target, mv.peer_device, mv.booked_bytes)
+        mv.state = STATE_RESIDENT
+        mv.target = None
+        mv.peer_device = None
+        mv.handle = None
+        mv.booked_bytes = 0

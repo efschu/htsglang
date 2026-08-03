@@ -530,6 +530,15 @@ def run_probe(env, item_bytes: int, cycles: int) -> dict:
             "wave_ins": getattr(stats, "wave_ins", None),
             "park_failures": getattr(stats, "park_failures", None),
             "wave_in_failures": getattr(stats, "wave_in_failures", None),
+            # #514: a failed destination release is NOT a failed wave-in, so it
+            # has its own counter -- and therefore needs its own line here, or
+            # the check below would stop gating on it.
+            "destination_release_failures": getattr(
+                stats, "destination_release_failures", None
+            ),
+            "leaked_destination_bytes": getattr(
+                stats, "leaked_destination_bytes", None
+            ),
             "peer_degradations": getattr(stats, "peer_degradations", None),
             "chunked_transfers": getattr(stats, "chunked_transfers", None),
             "bytes_by_target": dict(getattr(stats, "bytes_by_target", {}) or {}),

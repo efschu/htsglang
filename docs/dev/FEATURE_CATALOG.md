@@ -1182,6 +1182,30 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Two-stage-error family (#505-B-01, fixed in #514): when ONE `try` spans two
+stages whose failures mean OPPOSITE things about where the bytes are, the
+handler is forced to lie about one of them. `RealMovementBackend.wave_in`
+wrapped the retrieval (`copy_in_tensors` + `wait`) AND the destination release
+(`free_destination`) in one block whose handler wrote `state = STATE_PARKED`
+unconditionally -- the state whose meaning is "the bytes are at the park
+target". A `free_destination` failure happens AFTER the bytes are demonstrably
+back, so the item was reported parked while resident, and because
+`ledger.release` sat outside the `try`, the park-target booking was never
+released: a permanent over-booking of the memtier ledger. The pre-fix test
+injected only at `copy_in`, the one point where the shared handler's comment
+was true, so the suite was green throughout. Split into STAGE 1 (retrieval:
+failure -> PARKED, booking retained, `wave_in_failures`) and STAGE 2 (release:
+failure -> RESIDENT, booking retained **and counted** as
+`leaked_destination_bytes`, `destination_release_failures`, distinct error
+text). The booking is deliberately NOT released on the leak path -- how much of
+the destination came back is unknown and under-booking would let the next
+booker allocate into bytes that may still be held; the requirement is that the
+leak is NAMED and COUNTED, not that it is reclaimed. So the rule: a `try` whose
+stages disagree about the meaning of failure gets one handler per stage, and a
+counter split out of an existing one is added to every gate that read the old
+one in the same change (`scripts/gpu_battery/checks/check_s07_offload_register_gpu.py`
+gates all four counters, each with its own can-fail proof).
+
 **MERGE DUTY -- bookkeeping-mutation sites (#404 family).** The per-request
 accounting clocks (`decode_batch_idx` / `extend_batch_idx`,
 `kv_committed_len` / `kv_allocated_len`, `spec_verify_ct`) and the
