@@ -1561,15 +1561,53 @@ every such writer runs before `:5939` (`rank_tp_ratio`/`dcp_size` in
 `_handle_uneven_tp`, `:5785`). So the rule: **a value read during
 `__post_init__` and again after it is two values unless it is read through
 `resolved_view`**, and a fingerprint compared across processes is computed by
-ONE function at ONE pipeline stage. Residual, named and NOT fixed: a field
-resolved in the WORKER after the match via `declare_load_time_override` --
-concretely `ModelRunner._sm80_dtype_fallback` declaring `dtype="float16"` on
-pre-Ampere cards (`model_executor/model_runner.py:1980`) -- still diverges;
-unreachable on sm80+ (this rig is sm86/sm120), live on the sm75 hetero host.
+ONE function at ONE pipeline stage.
 Falsifier: `test/registered/unit/model_loader/test_hibernate_identity_499.py`
 (6 tests incl. a metadata-derived sibling sweep and an end-to-end "park, then
 reboot the same command" arm; 4 executed red against the pre-fix file, the
 sweep red on both declarable fields).
+
+**#520 (the #499-B residual): a field the WORKER re-derives after the match.**
+`resolved_view` cannot reach it -- the match runs in the launcher, before the
+process that computes it exists. TWO live instances, both found and both fixed:
+`ModelRunner._sm80_dtype_fallback` declaring `dtype="float16"` on a card
+without bfloat16 (`model_executor/model_runner.py:1980`; sm75 hetero host,
+gfx900-class ROCm) and -- the one the ticket did not predict --
+`spec_worker.match_target_context_length` pinning `context_length` to the
+target's `context_len` (`speculative/eagle_worker_v2.py:1764` plus the
+standalone / frozen-KV-MTP / multi-layer workers, all four the SAME source
+string). The spec one writes the SHARED `server_args`, which is exactly the
+object the park reads (`BaseSpecWorker.model_runner` returns
+`self.target_worker.model_runner`, `base_spec_worker.py:384`), so **#89's fast
+restore was unreachable on every speculative boot as well** -- and nothing
+refuses spec under hibernate (`server_args.py:13410-13439` gates only on GGUF).
+Executed divergence, CPU-only: `{'dtype': ('auto','float16')}` and
+`{'context_length': (None, 262144)}`.
+Fix: the identity reads through `launch_view` (`arg_groups/overrides.py`) --
+`resolved_view` plus the un-applied writes of `IDENTITY_TRANSPARENT_SOURCES`.
+A source is identity-TRANSPARENT when it RE-DERIVES a field from state the
+fingerprint already pins (the rank's card, re-checked by NVML UUID at
+`hibernate.py:568` and presence-gated at match time in
+`_manifest_cards_present`; the checkpoint at `model_path`). A source that
+changes WHAT IS LOADED is deliberately absent and must keep showing through --
+`model_runner.update_weights` is the case #499 argued must never be normalized
+away. The superseded launch value is recorded at the single post-resolution
+mutation point (`ServerArgs.override`, `server_args.py:14786`), first writer
+wins; with no such source the register stays absent and the read is
+byte-for-byte the #499 read. `HIBERNATE_VERSION` stays 2 for the same reason as
+#499. Sweep is MAINTAINED, not by eye: an AST scan over `srt/` classifies every
+literal-source post-resolution writer of an identity field as transparent or
+explicitly opaque (8 sites at this tip), so a new worker-side writer turns red.
+Falsifier: `test/registered/unit/model_loader/test_hibernate_identity_520.py`
+(12 tests, 4 executed RED against the unfixed identity read AND separately
+against a disabled recorder hook -- both halves proven load-bearing; the
+`_needs_float16_fallback` arm fakes only the capability tuple and is asked in
+both directions).
+Residual, named and NOT fixable at the identity level: on heterogeneous
+hardware only rank 0 writes the identity, so a per-rank re-derivation describes
+rank 0 only -- the per-rank NVML-UUID re-check is what pins the others. And the
+end-to-end proof (park on the sm75 host, relaunch, expect the 50s -> 8-14s
+restore) is still owed; only a real mixed-hardware park can show it.
 
 **MERGE DUTY -- bookkeeping-mutation sites (#404 family).** The per-request
 accounting clocks (`decode_batch_idx` / `extend_batch_idx`,

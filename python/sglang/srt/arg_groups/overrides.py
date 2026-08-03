@@ -235,6 +235,91 @@ def resolved_view(server_args: Any) -> ResolvedView:
     return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
 
 
+# ---------------------------------------------------------------------------
+# Identity-transparent re-derivations (#520, the #499-B residual)
+# ---------------------------------------------------------------------------
+# A cross-process FINGERPRINT of the launch -- concretely the #89 hibernate
+# manifest identity (``model_loader/hibernate.py:_model_identity``) -- is taken
+# on two banks: the MATCH runs in the launcher inside ``__post_init__``, the
+# PARK runs in a worker long afterwards. #499 aligned the two across
+# ``materialize_declarations``. What it could not reach, and named as the
+# residual, is a field a WORKER re-derives AFTER the match: the process that
+# computes it does not exist yet when the match runs, so no match-side read can
+# ever see it.
+#
+# A source is IDENTITY-TRANSPARENT when its post-resolution write RE-DERIVES a
+# field from state the fingerprint already pins -- the card the rank landed on
+# (the manifest re-checks every rank's NVML UUID, ``hibernate.py:568``, and the
+# card-presence gate runs at match time, ``:220``) or the checkpoint at
+# ``model_path`` (in the fingerprint itself). Such a write carries no
+# information the fingerprint does not already hold, so it is un-applied before
+# the fingerprint is taken and both banks compare the LAUNCH-resolved value.
+#
+# A source that genuinely changes WHAT IS LOADED is deliberately absent here
+# and must keep showing through -- a runtime ``/update_weights`` moving
+# ``model_path`` (``model_runner.update_weights``) is the case #499's docstring
+# argues must never be normalized away, because doing so turns a safe cold load
+# into a silent wrong-weights match.
+SM80_DTYPE_FALLBACK_SOURCE = "ModelRunner._sm80_dtype_fallback"
+SPEC_TARGET_CONTEXT_LENGTH_SOURCE = "spec_worker.match_target_context_length"
+
+IDENTITY_TRANSPARENT_SOURCES = frozenset(
+    {
+        # Pre-Ampere cards have no bfloat16, so the worker re-derives
+        # ``dtype="float16"`` from the card it landed on
+        # (``ModelRunner.load_model`` -> ``_needs_float16_fallback``). The card
+        # is already pinned by the manifest's per-rank NVML UUID, so the same
+        # launch on the same card always re-derives the same dtype.
+        SM80_DTYPE_FALLBACK_SOURCE,
+        # Every speculative worker pins ``context_length`` to the TARGET
+        # model's resolved ``context_len`` at construction time. That is a
+        # function of the checkpoint at ``model_path`` and of the launch's own
+        # ``context_length``, both already in the fingerprint.
+        SPEC_TARGET_CONTEXT_LENGTH_SOURCE,
+    }
+)
+
+_SUPERSEDES_ATTR = "_identity_transparent_supersedes"
+
+
+def note_identity_transparent_supersede(
+    server_args: Any, source: str, fields: Dict[str, Any]
+) -> None:
+    """Record the value an identity-transparent re-derivation overwrites.
+
+    Called from the single post-resolution mutation point
+    (``ServerArgs.override``). First writer wins: the recorded value is the one
+    the LAUNCH resolved, which is what the match bank of a cross-process
+    fingerprint reads. No-op for every other source, so the default path keeps
+    the attribute absent entirely.
+    """
+    if source not in IDENTITY_TRANSPARENT_SOURCES or not fields:
+        return
+    supersedes = getattr(server_args, _SUPERSEDES_ATTR, None)
+    if supersedes is None:
+        supersedes = {}
+        object.__setattr__(server_args, _SUPERSEDES_ATTR, supersedes)
+    for field in fields:
+        if field not in supersedes:
+            supersedes[field] = getattr(server_args, field, None)
+
+
+def launch_view(server_args: Any) -> ResolvedView:
+    """The configuration AS THE LAUNCH RESOLVED IT — the view a cross-process
+    fingerprint must be computed from.
+
+    This is :func:`resolved_view` (so it inherits the #499 fix: declarations
+    that have not been materialized yet still read resolved) with the
+    identity-transparent worker re-derivations un-applied on top, so the value
+    is the same on both banks of the fingerprint. Where no such re-derivation
+    ran -- every launch outside the sm75/ROCm-no-bf16 fallback and speculative
+    decoding -- this is byte-for-byte ``resolved_view``.
+    """
+    overlay = _declaration_overlay(server_args)
+    overlay.update(getattr(server_args, _SUPERSEDES_ATTR, None) or {})
+    return ResolvedView(server_args, overlay=overlay)
+
+
 def attention_backends_of(cfg: Any) -> tuple:
     """(prefill, decode) attention backends of a config-shaped object (a
     ResolvedView mid-resolution, or pristine server_args at dispatch time):
@@ -274,7 +359,11 @@ def declare_load_time_override(source: str, declared: Dict[str, Any]) -> None:
     if override is not None:
         override(source, **declared)
     else:
-        # Config-shaped fixtures without the mutation entry point.
+        # Config-shaped fixtures without the mutation entry point. The
+        # supersede register (#520) is normally kept by ``ServerArgs.override``;
+        # record it here too so the fingerprint normalization does not depend
+        # on which shape of config object is in the slot.
+        note_identity_transparent_supersede(server_args, source, declared)
         _apply_fields(server_args, declared)
 
 
