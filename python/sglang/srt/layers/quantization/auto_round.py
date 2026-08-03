@@ -385,7 +385,6 @@ class AutoRoundConfig(QuantizationConfig):
             from sglang.srt.layers.quantization.gptq import (
                 GPTQMarlinConfig,
                 GPTQMarlinLinearMethod,
-                GPTQMarlinMoEMethod,
             )
 
             quant_args_marlin = GPTQMarlinConfig(
@@ -409,20 +408,32 @@ class AutoRoundConfig(QuantizationConfig):
             )
 
         if isinstance(layer, FusedMoE):
-            if use_marlin:
-                from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+            # Delegate to MoeWNA16, which re-runs the Marlin eligibility check
+            # itself and picks the Marlin MoE method when it passes. Two things
+            # kept that delegation from ever reaching Marlin: the config handed
+            # over lacked the `desc_act` key, and
+            # GPTQMarlinConfig.is_gptq_marlin_compatible treats a missing key
+            # as ineligible (`if ... desc_act is None: return False`,
+            # gptq/gptq.py:575), so the delegation always landed on the Triton
+            # runner; and the `use_marlin=False` arm constructed
+            # GPTQMarlinMoEMethod from `quant_args_marlin`, a variable only
+            # defined in the marlin branch -- a latent NameError, so the split
+            # had no working non-marlin arm either. One delegation with a
+            # complete config covers both cases: MoeWNA16 routes to Marlin when
+            # eligible and to the Triton runner when not. auto-round has no
+            # act-order concept, so desc_act is always False for its
+            # checkpoints. Upstream 00cdd4b85f (PR #33271).
+            from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
-                config = {
-                    "quant_method": "gptq",
-                    "bits": weight_bits,
-                    "group_size": group_size,
-                    "sym": sym,
-                    "lm_head": False,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix
-                )
-            return GPTQMarlinMoEMethod(quant_args_marlin)
+            config = {
+                "quant_method": "gptq",
+                "bits": weight_bits,
+                "group_size": group_size,
+                "sym": sym,
+                "desc_act": False,
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:

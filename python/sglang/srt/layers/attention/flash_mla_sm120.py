@@ -13,6 +13,7 @@ separate region at the end of each page.
 
 import logging
 import math
+from typing import Optional
 
 import torch
 import triton
@@ -306,14 +307,25 @@ def _page_split_kernel(
     DST_SCALE_OFF: tl.constexpr,  # 64 * 576 = 36864
     RATIO: tl.constexpr,  # 4
     BLOCK_SIZE: tl.constexpr,
+    mask_ptr,
+    HAS_MASK: tl.constexpr,
 ):
-    """Fused page-split: copy data+scale for all sub-pages in one kernel."""
+    """Fused page-split: copy data+scale for all sub-pages in one kernel.
+
+    When HAS_MASK is set, only pages flagged in ``mask_ptr`` (int8, 1=touched)
+    are copied; untouched pages are skipped so the kernel no longer rewrites the
+    entire KV pool every decode step.
+    """
     pid = tl.program_id(0)
     page_idx = pid // RATIO
     sub = pid % RATIO
 
     if page_idx >= N_pages:
         return
+
+    if HAS_MASK:
+        if tl.load(mask_ptr + page_idx) == 0:
+            return
 
     src_base = src_ptr + page_idx * src_stride0
     dst_base = dst_ptr + (page_idx * RATIO + sub) * dst_stride0
@@ -335,11 +347,43 @@ def _page_split_kernel(
         tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
 
 
-def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
+@triton.jit
+def _page_mark_kernel(
+    indices_ptr,
+    mask_ptr,
+    N_idx,
+    SRC_PBS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Mark touched source pages (1 byte each) from token-level indices.
+
+    ``indices`` are token indices into the pbs=SRC_PBS SWA pool; -1 = invalid.
+    Each valid token marks ``mask[token // SRC_PBS] = 1``. Concurrent stores of
+    the same value 1 are safe (no atomic needed).
+    """
+    pid = tl.program_id(0)
+    if pid >= N_idx:
+        return
+    idx = tl.load(indices_ptr + pid)
+    if idx < 0:
+        return
+    page = idx // SRC_PBS
+    tl.store(mask_ptr + page, 1)
+
+
+def _split_kv_pages_to_64(
+    kv_u8: torch.Tensor,
+    src_pbs: int,
+    touched_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
-    Uses a fused Triton kernel to do all sub-page copies in a single launch
-    instead of 8 separate copy kernels (4 sub-pages × 2 regions).
+    When ``touched_indices`` (token-level int32 indices into the pbs=src_pbs
+    SWA pool, -1 = invalid) is provided, only the source pages that actually
+    contain a referenced token are copied. This avoids rewriting the entire KV
+    pool on every decode step (only ~2*batch pages are touched vs the full
+    pool). The output buffer is persistent and reused across steps; untouched
+    dst pages simply retain their (unreferenced) stale data.
     """
     assert src_pbs % _PBS_DST == 0 and src_pbs >= _PBS_DST
     if src_pbs == _PBS_DST:
@@ -374,6 +418,35 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
     else:
         src_stride0 = src_2d.stride(0)
 
+    use_mask = touched_indices is not None and touched_indices.numel() > 0
+    mask_ptr = src_2d  # dummy, never dereferenced when HAS_MASK is False
+    if use_mask:
+        # Persistent per-device int8 mask, zeroed each call (cheap memset,
+        # captured cleanly by CUDA graph). 1 = page is referenced this step.
+        mkey = f"flash_mla_sm120_mask:{dev}"
+        mbuf = buffers.get(mkey)
+        if mbuf is None or mbuf.shape[0] < N:
+            # The first allocation can happen under inference mode (autotune),
+            # but the buffer is zeroed again later during CUDA graph capture
+            # outside inference mode -- an inference tensor cannot be mutated
+            # there, so force a normal tensor.
+            with torch.inference_mode(False):
+                mbuf = torch.empty(N, dtype=torch.int8, device=dev)
+            buffers[mkey] = mbuf
+        mask = mbuf[:N]
+        mask.zero_()
+        idx_flat = touched_indices.reshape(-1).contiguous()
+        if idx_flat.dtype != torch.int32:
+            idx_flat = idx_flat.to(torch.int32)
+        _page_mark_kernel[(idx_flat.numel(),)](
+            idx_flat,
+            mask,
+            idx_flat.numel(),
+            src_pbs,  # SRC_PBS
+            1024,  # BLOCK (unused, kept for JIT signature)
+        )
+        mask_ptr = mask
+
     grid = (N * ratio,)
     _page_split_kernel[grid](
         src_2d,
@@ -387,6 +460,8 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
         _PBS_DST * _NOPE_ROPE_STRIDE,  # DST_SCALE_OFF = 36864
         ratio,  # RATIO = 4
         1024,  # BLOCK_SIZE
+        mask_ptr,
+        use_mask,  # HAS_MASK
     )
 
     bpt = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 584
@@ -394,6 +469,26 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
         (num_dst_pages, _PBS_DST, 1, bpt),
         (_BYTES_PER_DST_PAGE_PADDED, bpt, bpt, 1),
     )
+
+
+# CUTLASS SM120 sparse-MLA kernels are instantiated only for these topk
+# widths (decode: (num_heads, topk) table with topk in {128, 512, 1024};
+# prefill orchestrator: {128, 512, 1024, 2048}).
+_SUPPORTED_TOPK_WIDTHS = (128, 512, 1024, 2048)
+
+_noted_bucket_pad = False
+_warned_triton_fb = False
+
+
+def _next_topk_bucket(topk: int):
+    """The smallest instantiated topk width that can hold ``topk``.
+
+    ``None`` when the request is wider than every instantiated kernel, which
+    is the one case padding cannot rescue. Extracted from the inline
+    ``next(...)`` of upstream #33407 so the arithmetic is testable without a
+    card -- it is the whole correctness argument of the pad.
+    """
+    return next((t for t in _SUPPORTED_TOPK_WIDTHS if t >= topk), None)
 
 
 def _flash_mla_flashinfer(
@@ -420,10 +515,19 @@ def _flash_mla_flashinfer(
     B, _, H, D = q.shape  # (batch, 1, num_heads, head_dim)
     dev = q.device
 
+    # Indices: no remapping needed (page-split preserves token addressing).
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
+    # Only the SWA pages actually referenced by `idx` are copied (the rest of
+    # the persistent dst buffer is left untouched and never read).
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
-    kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs) if src_pbs != _PBS_DST else kv_u8
+    kv_64 = (
+        _split_kv_pages_to_64(kv_u8, src_pbs, touched_indices=idx)
+        if src_pbs != _PBS_DST
+        else kv_u8
+    )
 
     extra_kv_u8 = (
         extra_k_cache.view(torch.uint8)
@@ -432,13 +536,91 @@ def _flash_mla_flashinfer(
     )
     extra_kv_64 = extra_kv_u8
 
-    # Indices: no remapping needed (page-split preserves token addressing).
-    idx = indices.squeeze(1) if indices.dim() == 3 else indices
     extra_idx = (
         extra_indices.squeeze(1)
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+
+    # --- Bucket alignment for non-instantiated topk widths (upstream #33407) ---
+    # The CUTLASS SM120 sparse-MLA kernels are instantiated only for a fixed
+    # set of topk widths (decode: topk in {128, 512, 1024}; prefill
+    # orchestrator: {128, 512, 1024, 2048}), and the prefill kernel
+    # additionally asserts num_tokens > 64. DSpark's draft indexer emits
+    # topk=192, which is in no bucket on either path, so both the warmup draft
+    # pass and the draft CUDA-graph capture crash the server at boot
+    # ("num_tokens > 64" check fail / "Unsupported sparse-MLA prefill
+    # configuration ... topk=192"). Same failure family as upstream #33134
+    # (DGX Spark, sm_121).
+    #
+    # Fix: right-pad the index tensor with -1 (the kernels' documented "skip"
+    # sentinel, flashinfer csrc/sparse_mla_sm120.cu) up to the next
+    # instantiated bucket, and cap the scan via topk_length so the padding is
+    # never read. If the call is still not dispatchable (e.g. a draft head
+    # geometry with d_qk != 512), fall back to the Triton sparse-decode kernel
+    # for that call instead of crashing.
+    global _noted_bucket_pad, _warned_triton_fb
+    _topk = idx.shape[-1]
+    _d_qk = q.shape[-1]
+    if _d_qk == 512 and _topk not in _SUPPORTED_TOPK_WIDTHS:
+        _next_w = _next_topk_bucket(_topk)
+        if _next_w is not None:
+            if topk_length is None:
+                # Cap the scan at the true width so the -1 padding is never
+                # even read.
+                topk_length = torch.full((B,), _topk, dtype=torch.int32, device=dev)
+            idx = torch.nn.functional.pad(idx, (0, _next_w - _topk), value=-1)
+            if not _noted_bucket_pad:
+                _noted_bucket_pad = True
+                logger.info(
+                    "SM120 sparse-MLA: padding topk %d -> %d (next "
+                    "instantiated bucket, -1 skip sentinel; scan capped "
+                    "via topk_length).",
+                    _topk,
+                    _next_w,
+                )
+
+    # Unlike upstream, this fork's entry point has no prefill branch -- it
+    # always calls the decode kernel -- so the dispatchability test is
+    # unconditional here rather than gated on `B <= _DECODE_MAX_TOKENS`; an
+    # over-long batch is exactly one of the cases the fallback exists for.
+    from flashinfer.mla._sparse_mla_sm120 import _decode_dsv4_dispatchable
+
+    _extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
+    if not _decode_dsv4_dispatchable(
+        B, H, idx.shape[-1], _d_qk, _PBS_DST, _extra_topk
+    ):
+        # Not coverable by the CUTLASS decode kernel even after bucket padding
+        # (head_dim != 512, an uninstantiated head count, or a batch above
+        # _DECODE_MAX_TOKENS). Route to Triton instead of crashing.
+        if not _warned_triton_fb:
+            _warned_triton_fb = True
+            logger.warning(
+                "SM120 sparse-MLA: batch not dispatchable to the CUTLASS "
+                "decode kernel (num_tokens=%d heads=%d topk=%d d_qk=%d) -- "
+                "using the Triton fallback for these calls.",
+                B,
+                H,
+                idx.shape[-1],
+                _d_qk,
+            )
+        from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+            flash_mla_sparse_decode_triton,
+        )
+
+        out, lse = flash_mla_sparse_decode_triton(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        )
+        return (out, lse)
 
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)

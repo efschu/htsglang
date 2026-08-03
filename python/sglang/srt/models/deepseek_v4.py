@@ -2374,6 +2374,68 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _resolve_num_fused_shared_experts(
+    config: DeepSeekV4Config, quant_config: Optional[QuantizationConfig] = None
+) -> int:
+    """How many shared experts get folded into the routed expert tensors.
+
+    Extracted from ``DeepseekV4ForCausalLM.determine_num_fused_shared_experts``
+    (which now delegates here) so the DSpark draft head can reach the SAME
+    answer -- port of upstream #33312. A draft head that never resolved this
+    built its expert mapping for ``n_routed_experts`` alone while the
+    checkpoint shipped a fused shared expert, and every such tensor fell into
+    the loader's "unexpected weight -> continue" drop.
+
+    The GGUF branch is this fork's, not upstream's: a GGUF stream keeps the
+    shared expert as separate packed linears, which the fused slot cannot
+    hold.
+    """
+    if get_server_args().disable_shared_experts_fusion:
+        return 0
+
+    disable_reason = None
+    if is_gguf_quant_config(quant_config):
+        # Same reason as DeepseekV2ForCausalLM: the fused layout expects
+        # the shared expert pre-packed into the routed expert tensors,
+        # and the GGUF weight stream ships it as separate packed linears.
+        if get_server_args().enforce_shared_experts_fusion:
+            raise NotImplementedError(
+                "--enforce-shared-experts-fusion is not supported for "
+                "GGUF checkpoints (quant method 'gguf'): the fused path "
+                "expects the shared expert pre-packed into the routed "
+                "expert tensors, which the GGUF weight stream does not "
+                "provide. Drop the flag to run the shared expert as its "
+                "own dense MLP."
+            )
+        disable_reason = (
+            "GGUF checkpoints keep the shared expert as separate packed "
+            "linears, which the fused expert slot cannot hold."
+        )
+    elif get_server_args().enforce_shared_experts_fusion:
+        if config.n_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-experts fusion expects exactly one shared "
+                f"expert, but got n_shared_experts={config.n_shared_experts}."
+            )
+    else:
+        disable_reason = "Config does not support fused shared expert(s)."
+
+    if disable_reason is not None:
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+        declare_load_time_override(
+            "DeepseekV4ForCausalLM.determine_num_fused_shared_experts",
+            {"disable_shared_experts_fusion": True},
+        )
+        log_info_on_rank0(
+            logger,
+            f"{disable_reason} Shared experts fusion optimization is disabled.",
+        )
+        return 0
+
+    return config.n_shared_experts
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     def __init__(
         self,
@@ -2458,51 +2520,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.model.dspark_layers_to_capture = list(layer_ids)
 
     def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_server_args().disable_shared_experts_fusion:
-            return
-
-        disable_reason = None
-        if is_gguf_quant_config(getattr(self, "quant_config", None)):
-            # Same reason as DeepseekV2ForCausalLM: the fused layout expects
-            # the shared expert pre-packed into the routed expert tensors,
-            # and the GGUF weight stream ships it as separate packed linears.
-            if get_server_args().enforce_shared_experts_fusion:
-                raise NotImplementedError(
-                    "--enforce-shared-experts-fusion is not supported for "
-                    "GGUF checkpoints (quant method 'gguf'): the fused path "
-                    "expects the shared expert pre-packed into the routed "
-                    "expert tensors, which the GGUF weight stream does not "
-                    "provide. Drop the flag to run the shared expert as its "
-                    "own dense MLP."
-                )
-            disable_reason = (
-                "GGUF checkpoints keep the shared expert as separate packed "
-                "linears, which the fused expert slot cannot hold."
-            )
-        elif get_server_args().enforce_shared_experts_fusion:
-            if self.config.n_shared_experts != 1:
-                raise ValueError(
-                    "DeepSeek V4 shared-experts fusion expects exactly one shared "
-                    f"expert, but got n_shared_experts={self.config.n_shared_experts}."
-                )
-        else:
-            disable_reason = "Config does not support fused shared expert(s)."
-
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "DeepseekV4ForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+        """Kept as the method every subclass and NextN path already calls; the
+        decision itself lives in :func:`_resolve_num_fused_shared_experts` so
+        the DSpark draft head resolves the SAME number (#33312)."""
+        self.num_fused_shared_experts = _resolve_num_fused_shared_experts(
+            self.config, getattr(self, "quant_config", None)
+        )
 
     @torch.no_grad()
     def forward(

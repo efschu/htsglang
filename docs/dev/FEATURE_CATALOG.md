@@ -210,6 +210,28 @@ tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
   boundary-send by −9.8/−9.2 % at bs=1 (0-1 % floor otherwise) — note the
   in-server counter reads 249 µs, which is not the standalone wire-transfer
   figure.
+  **#481 closed three PP defects from the #445 window.** (a) The declared-depth
+  probe joined `config.json` onto `--model-path`, which for EVERY GGUF launch
+  is the `.gguf` FILE (rig-runbook §4.5.4b) — so `--pp-stage-ratio` refused
+  every GGUF checkpoint with "hidden layer count is not readable". It now
+  applies the #402/#414 sibling-directory canon (`declared_config_path`,
+  `server_args.py`), the same one `_log_rank_plan_vectors` already used at
+  `:9276-9280`. (b) `--rank-moe-resident-fraction` was the one rank vector in
+  this family validated against `tp_size` alone; it now also accepts the
+  world-length form (`pp_size x tp_size`, world-rank order
+  `pp_rank * tp_size + tp_rank`) that `--rank-gpu-id` (`:9029-9036`) and
+  `--rank-gpu-memory-mib` (`:9262`) already take, and the consumer indexes a
+  world-length vector by world rank (`resident_fraction._rank_in_vector`). A
+  tp-length vector keeps its old meaning (same pattern on every stage) and
+  every non-PP launch is byte-identical. (c) `expert_stats` tagged its dump
+  `tp{moe_tp_rank}ep{moe_ep_rank}`, which two stages' rank 0 share — both wrote
+  `<path>.tp0ep0.json` and the later dump replaced the earlier. The tag is now
+  built by `expert_stats.moe_rank_tag`, which prefixes `pp{rank}` ONLY when
+  `pp_size > 1`, so existing dump filenames do not move. Tests:
+  `test/registered/unit/test_pp_defects_481.py`, 16 hermetic, four executed
+  can-fail arms (sibling-dir candidate removed → 3 red; world length dropped
+  from the validator → 1; consumer re-indexed by the in-stage rank → 1; call
+  site back to the pp-blind inline tag → 1).
 - **TP5+ emulation** via multi-rank co-location (several ranks per card),
   gated ONLY on duplicate entries in `--rank-gpu-id`
   (`entrypoints/engine.py:1563`). The NCCL settings that follow
@@ -1171,6 +1193,25 @@ turns the checkpoint into a loud load-time refusal by tensor name (`:127-135`) �
 never a silent fallback. Native also widens MoE expert-offload coverage, since
 `MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES` (`gguf.py:292`). GPU-pending:
 `TICKET_398_mxfp4_validation.md`.
+**#479 traced the served checkpoint and found no untraced fallback.** The
+active UD-IQ3_XXS driver carries exactly two type-39 tensors,
+`blk.26`/`blk.42.ffn_down_exps` (2.125 GiB), and their gate/up siblings are
+IQ3_S resp. IQ3_XXS — so those two layers are the ONLY mixed type pair
+(`qweight_type != qweight_type2`) `fused_moe_gguf` ever sees, and nothing
+tested that cell. Both arms take the same exit, the MoE MMVQ branch
+(`gguf.py:1093`): native passes 39 straight into `ggml_moe_a8_vec`, the repack
+arm passes 6. The MMQ branch is unreachable for these layers at ANY batch size
+because the w13 side is an imatrix type with no MMQ kernel, and the slow
+per-expert loop refuses an unknown type by name (`:958-963`) rather than
+computing — so there is no silent path, only a priced one. The load never
+materialises floats: with the kernels native both repack entry points are the
+identity (`gguf_mxfp4_repack.py:113-115`, `:205-207`, `:224-226`), uint8 blocks
+at 17 B/32 values, which settles TICKET_398 §2's open question — the native
+delta is EXACTLY the repack's 0.625 GiB, nothing on top. Offload admission
+checks BOTH expert tensors, not just w13 (`fused_moe_triton/layer.py:2520-2534`).
+`NOTE_479_mxfp4_active_driver_path.md`;
+`test/registered/unit/quantization/test_gguf_mxfp4_dsv4f_moe_479.py`, 8
+hermetic, three executed can-fail arms.
 
 ## 9. Quant lanes
 FP8 (sm120 GEMM tuned; per-channel fused GEMV; opt-in deterministic
@@ -1215,6 +1256,23 @@ reference), so they are correctly out. Every REGISTERED backend whose module
 reaches a marlin repack either declares the capability or exposes a
 `weight_block_size` — asserted per method in
 `test_marlin_unit_coarsening.py::test_every_registered_marlin_repacking_backend_is_covered`.
+**auto-round GPTQ MoE could never reach Marlin** (port of upstream
+`00cdd4b85f`, PR #33271): `apply_gptq_quant_layer` delegates a FusedMoE layer
+to `MoeWNA16Config`, which re-runs the eligibility check itself
+(`moe_wna16.py:98`) — but the config it was handed omitted `desc_act`, and
+`is_gptq_marlin_compatible` treats a MISSING key as ineligible (`if num_bits is
+None or group_size is None or sym is None or desc_act is None: return False`,
+`gptq/gptq.py:575`), so the delegation always landed on the Triton runner while
+the same checkpoint's DENSE layers ran on Marlin. The `use_marlin=False` arm
+was additionally a latent `NameError` (it built `GPTQMarlinMoEMethod` from a
+variable bound only in the other branch), so neither arm worked. Now one
+delegation with a complete config; auto-round has no act-order concept, so
+`desc_act` is always False. Reach: auto-round checkpoints only — plain GPTQ
+takes its own path. Tests:
+`test/registered/unit/layers/quantization/test_auto_round_moe_delegation.py`,
+7 hermetic, two executed can-fail arms (`desc_act` dropped → 3 red; the
+pre-port split restored → 4 red). Unmeasured — no auto-round MoE boot exists on
+this rig.
 
 ## 10. Determinism / quality gates
 Hetero-determinism roots fixed (verify sync, graph pads, flashinfer workspace,
@@ -2000,6 +2058,42 @@ Llama family, Mistral Small 24B FP8 + ministral3 SWA fix, Deckard-40B/Tess-27B,
 OWN sm86+sm120 attention paths (e4m3 bit-decode, f32 staging, indexer arch
 dispatch, torch/triton reference-twin parity: indexer mask oracle, SWA
 page-index wrap oracle, page-table rounding, top-k seq_len contract).
+**The sm120 SWA page-split is MASKED since #471** (port of upstream #32320,
+`204e0fbac0`): `_page_split_kernel` no longer rewrites the whole pbs=256 pool
+into its pbs=64 view every decode step. `_page_mark_kernel` sets one int8 byte
+per source page from the token indices (`mask[token // src_pbs] = 1`, -1
+skipped) and the split kernel returns early for an unmarked page, so ~2*batch
+pages are copied instead of the pool. Untouched destination pages keep stale
+bytes by design — sound because the caller reads only the pages the same
+indices address. Upstream's ITL/TPOT numbers are NOT reproduced here; the port
+is desk-pinned only (`TICKET_471_masked_page_split.md` carries the window
+recipe, incl. a one-line in-tree control arm). The page-split region is
+byte-identical to upstream before and after the port; only `_flash_mla_flashinfer`
+is fork-adapted (idx computed before the split). Tests:
+`test/registered/unit/layers/attention/test_flash_mla_page_split_mask_471.py`,
+10 hermetic, four executed can-fail arms — they run the REAL Triton kernels
+through `TRITON_INTERPRET=1` on CPU, which is how an SM120-only kernel becomes
+falsifiable at the desk; the compiled arm is
+`test_flash_mla_backends.py::TestTouchedPageSplit` (SM120-gated, unrun).
+**The sm120 decode entry point now buckets its topk width** (port of upstream
+#33407, `86c2a34a45`, still open upstream): the CUTLASS decode kernels are
+instantiated only for `topk in {128, 512, 1024}` (`(heads, topk)` table,
+checked against the installed `flashinfer._DECODE_DSV4_DISPATCH`), while
+DSpark's draft indexer emits **192** — a pre-boot crash on the 5090 the first
+time a DSpark draft runs. `_flash_mla_flashinfer` right-pads the index tensor
+with the kernels' `-1` skip sentinel to the next instantiated bucket and caps
+the scan through `topk_length`, so the padding is allocated but never read;
+anything still undispatchable (`d_qk != 512`, an uninstantiated head count, a
+batch above `_DECODE_MAX_TOKENS`) routes to the existing Triton sparse-decode
+kernel instead of dying. Fork deviation, stated: upstream gates the
+dispatch test on `B <= _DECODE_MAX_TOKENS` because it also has a prefill
+branch — this fork's entry point only ever calls the decode kernel, so the test
+is unconditional here and the over-long batch becomes a fallback rather than a
+crash. Tests:
+`test/registered/unit/layers/attention/test_flash_mla_sm120_topk_buckets.py`,
+15 hermetic, five executed can-fail arms (padding removed → 4 red; pad value 0
+instead of -1 → 1; scan cap dropped → 1; dispatch check removed → 4; bucket
+picks the widest instead of the smallest → 7). Unmeasured on a card.
 The torch paged-MQA indexer logits are chunked on BOTH axes — KV positions
 (#426) and query rows under a per-rank MiB budget (#449,
 `SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB`, converted with that rank's own head
@@ -2022,6 +2116,25 @@ and is itemized in `pinned_reserve_shortfall_note` as the sixth term no reserve
 charges. GPU arm packaged, not run: `scripts/dev/493_indexer_transient/`,
 falsifier = `peak_bytes_max` must fall ~326 MiB/rank between the arms.
 `NOTE_493_indexer_prefill_transient.md`.
+**Two DSpark pre-boot blockers closed by upstream ports (unbooted).** (1)
+#33312: `DeepseekV4ForCausalLMDSpark` never resolved
+`num_fused_shared_experts`, so its expert mapping covered `n_routed_experts`
+alone and a checkpoint shipping the shared expert FUSED lost every such tensor
+to the loader's "unexpected weight" drop — the #491 silent class, different
+name family. The decision now lives in
+`deepseek_v4._resolve_num_fused_shared_experts`, which the target model's
+`determine_num_fused_shared_experts` delegates to, so the two cannot drift;
+this fork's GGUF branch (a GGUF stream keeps the shared expert as separate
+packed linears) survives the extraction, `--enforce-shared-experts-fusion`
+refusal included. (2) #33098: `_fill_dp_moe_sync_metadata` filled the DP
+vectors but not `num_token_non_padded`/`_cpu`, the fields the EP token
+accounting reads (`layers/moe/topk.py`, `hash_topk.py`, `mega_moe.py`) — the
+device tensor only under `moe_ep_size > 1` (`forward_batch_info.py:1527-1528`),
+so a non-EP boot allocates nothing new. Tests:
+`test/registered/unit/models/test_dspark_shared_expert_fusion_33312.py` (11
+hermetic, four can-fail arms) and the extended
+`test/registered/spec/dspark/test_dspark_dp_original_global_num_tokens_442.py`
+(8 hermetic, four can-fail arms).
 Nemotron-Puzzle class structurally covered, unbooted.
 
 ## 16. Measurement / window infrastructure

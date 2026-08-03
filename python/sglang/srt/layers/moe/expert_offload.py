@@ -2112,17 +2112,27 @@ def assert_expert_offload_quant_supported(
         if marker is not None:
             if getattr(layer, marker, False):
                 continue  # the half staged this layer -> covered
+            # #479: this used to name MXFP4 as THE uncovered example, which
+            # #398 made false -- type 39 has a full kernel set on a wheel that
+            # carries it. Name the layer's OWN types instead; that is the
+            # information a reader needs anyway, and it cannot go stale.
+            declared = []
+            for attr in ("w13_qweight_type", "w2_qweight_type"):
+                holder = getattr(layer, attr, None) if layer is not None else None
+                raw = getattr(holder, "weight_type", None)
+                if raw is not None:
+                    declared.append(f"{attr}={raw}")
+            types = f" This layer declares {', '.join(declared)}." if declared else ""
             reason = (
                 f"{name!r} has a load-time offload half (#123-GGUF), but it "
                 f"did not stage this layer: the materialization-time staging "
                 f"marker {marker!r} is absent. That happens when the ggml "
-                f"quantization type has no GGUF MoE kernel (MXFP4 / type 39 "
-                f"and every other type outside MMVQ_QUANT_TYPES | "
-                f"MMQ_QUANT_TYPES), when the layer's expert parameters were "
-                f"already materialized by another path, or when the expert "
-                f"count is too small to split at this fraction. Installing "
-                f"the cache anyway would slice a parameter the half never "
-                f"tiered."
+                f"quantization type has no GGUF MoE kernel (any type outside "
+                f"MMVQ_QUANT_TYPES | MMQ_QUANT_TYPES), when the layer's expert "
+                f"parameters were already materialized by another path, or "
+                f"when the expert count is too small to split at this "
+                f"fraction.{types} Installing the cache anyway would slice a "
+                f"parameter the half never tiered."
             )
         elif name in _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES:
             reason = (
@@ -2616,15 +2626,22 @@ class MoEExpertOffloadCache:
         # --- #390 router / residency instrument -----------------------------
         # Opt-in (SGLANG_EXPERT_STATS=1). Resolved ONCE here: on the default
         # path this stays None and run_waves pays a single `is not None` test.
-        from sglang.srt.layers.moe.expert_stats import get_collector, maybe_layer_stats
+        from sglang.srt.layers.moe.expert_stats import (
+            get_collector,
+            maybe_layer_stats,
+            moe_rank_tag,
+        )
 
         self._router_stats = maybe_layer_stats(
             layer_id=getattr(layer, "layer_id", None),
             num_experts=self.num_local_experts,
             resident_count=self.resident_count,
-            rank_tag=(
-                f"tp{getattr(layer, 'moe_tp_rank', 0)}"
-                f"ep{getattr(layer, 'moe_ep_rank', 0)}"
+            # #481c: the tag carries the pipeline stage when there is one, so
+            # two stages' rank 0 stop writing the same dump file. Unchanged
+            # without PP.
+            rank_tag=moe_rank_tag(
+                moe_tp_rank=getattr(layer, "moe_tp_rank", 0),
+                moe_ep_rank=getattr(layer, "moe_ep_rank", 0),
             ),
             graph_mode=self._graph_mode,
         )
