@@ -1635,7 +1635,91 @@ the 27B endpoint is up. Nothing else in the tenant is a stub.
    the Opus ladder, late-delivery marking, the connection-state UI, and the
    hermetic chaos tests.
 
-### 16.3 Two things not to re-litigate
+### 16.3 Window 5, 2026-08-03 — the CUDA path closed, MT live
+
+Everything in §16.2 items 2 and 3 is done. The tenant now answers a real
+WebSocket turn with real Spanish audio in a real voice, with the 27B doing the
+translation.
+
+**The device fault was a snapshot, not a missing device.** Every tensor in the
+reference's prompt assembly is built with an explicit `device=self.talker.device`
+read live off the module. The one tensor arriving from outside is `input_id`,
+and it carries a device the wrapper decided once in `__init__`
+(`inference/qwen3_tts_model.py:75-80`) and never revisited; `_tokenize_texts`
+(line 282) is its only consumer. The reference always passed `device_map=`, so
+that snapshot was right by construction; we cannot, so it said `cpu` while the
+weights sat on `cuda:0`.
+
+**And the same shape, one level deeper, cost 90 % of every call.** The codec
+hangs off `model.speech_tokenizer`, and `Qwen3TTSTokenizer` is a PLAIN class
+(`inference/qwen3_tts_tokenizer.py:44`), not an `nn.Module`. It is not in
+`model._modules`, `model.to("cuda:0")` never reached it, and the whole 12 Hz
+codec ran on the CPU in bfloat16. Nothing failed. `probe_stage_timing.py`
+(new) opens the call:
+
+| | before | after |
+|---|---|---|
+| prompt (codec encode + speaker encoder) | 5.3 s | 0.02 s |
+| talker (autoregressive loop) | 4.3 s | 5.2 s |
+| codec decode | **85.2 s** | 0.04 s |
+| RTF | 24.18 | **1.15** |
+
+`retarget_wrapper_device` now finds such holders structurally rather than by
+name, and verifies the placement by walking every parameter and buffer
+afterwards. Found in passing: `codec_decoder` was registered against
+`inner.code2wav`, which does not exist on this checkpoint — the largest audio
+asset was never in the #286 register at all. A registration with reach zero.
+
+**Numbers, warm, 5090, `latency_window.py` n=10, A-vs-A floor 245 ms:**
+
+| stage | measured | §3 budget |
+|---|---|---|
+| ASR (faster-whisper large-v3-turbo, int8_float16) | 96.9 ms for a 3.11 s utterance | 200-400 ms |
+| TTS whole utterance | 4216 ms for 3.68 s of audio (RTF 1.146) | 150-300 ms *first audio* |
+| MT | measured end to end only (see below) | 150-400 ms first token |
+
+The TTS row is not comparable to the budget line and must not be quoted as if
+it were: the budget is FIRST audio, and rung B has no incremental streaming,
+so first audio is whole-utterance. `mt.py` splits translations into clauses, so
+the practical unit is a clause. The talker is now 99 % of the call at ~90 ms
+per codec frame — the rung-B limitation §12 already names, and what #488 exists
+to remove.
+
+**Front door, end to end** (`front_door_test.py`, the only harness that touches
+nothing but the WebSocket):
+
+```
+recognized : 'Als ich sechs war, sah ich'    faster-whisper, de
+translated : 'Cuando tenía seis años, vi'    our own 27B on port 30030
+heard back : 'Cuando tenía seis años, vi'    es @ 0.994
+WER 0.000 <= 0.15 PASS; control (German audio scored against the Spanish
+text) 2.000, so the instrument discriminates.
+```
+
+Turn wall time 3.7 s for a 1.5 s utterance, whole chain.
+
+### 16.4 The two findings this opened, in priority order
+
+**1. The clone path is unreachable in a real conversation.** Every turn of
+every front-door run reported `admitted=False reference=0s` and downgraded to
+a preset voice. It is a threshold that does not bind at the served geometry:
+the segmenter delivers ~1.5 s turns (from a 3.1 s clip AND from a 9.3 s one),
+while `SpeakerConfig.min_slice_s` is 2.0, so no slice is ever admitted and the
+3.0 s reference budget can never fill. Own-voice cloning is the headline
+requirement, and today nothing in a conversation made of short utterances can
+reach it. Read the segmenter and that threshold together; do not simply lower
+the constant, since it exists to keep unrepresentative snippets out of the
+reference buffer.
+
+**2. One speaker became two.** The intra-segment re-cut split a single German
+voice into `speaker-1` and `speaker-2`, each at similarity 1.0 against its own
+fresh centroid. Independent of finding 1, and on its own it would give one
+person two different preset voices mid-conversation.
+
+Neither is a regression from this window; both were invisible until the chain
+ran end to end from outside, which is the argument for the front-door harness.
+
+### 16.5 Two things not to re-litigate
 
 * **Do not diarize on the TTS speaker encoder.** Measured, reverted, §15. It
   has 0.04 of dynamic range and would merge every participant into one
