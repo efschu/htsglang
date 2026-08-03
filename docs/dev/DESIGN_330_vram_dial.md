@@ -72,6 +72,59 @@ per-vector achievable ceiling from the #297 fitted-ceiling min-reduce in
 until committed; physical backing at boot stays exactly the fitted ceiling,
 so a dial-less boot commits the same bytes as today.
 
+### 3b. Standing token-slot postens inside `C_target` (#260 style, #486)
+
+`C_target` is a slot count, not free inventory. Some of it is permanently
+held by running requests and is therefore invisible to the radix tree. Every
+such holder is a NAMED posten here; an unnamed one is a bug (#486 found the
+per-decode reserve uncounted for the whole life of the fork).
+
+| posten | slots held | where | when |
+|---|---|---|---|
+| committed KV | `sum_r kv_committed_len` | the actual sequences | always |
+| **per-decode reserve** | `bs x get_alloc_reserve_per_decode()` | `mem_cache/common.py` `get_alloc_reserve_per_decode`; consumed by `eagle_utils.eagle_prepare_for_decode` and `dflash_info_v2.prepare_for_decode` | every decode step, per running request, under spec AND plain decode |
+| radix inventory | remainder | `tree_cache`, evictable | the rest |
+
+The per-decode reserve is `W + L`, two independent terms (derivation in the
+`get_alloc_reserve_per_decode` docstring):
+
+    W = get_alloc_len_per_decode()   # this step's draft+verify write footprint
+    L = get_commit_lag_per_decode()  # what one in-flight verify can still commit
+                                     #   = max_speculative_num_draft_tokens under
+                                     #     overlap, 1 without spec, 0 with
+                                     #     --disable-overlap-schedule
+
+Standing occupancy is `bs x (W + L)` slots; the RECLAIMABLE part of it is
+`bs x (W - L)`, which is what #486 removed. On the NEXTN production recipe
+(steps 3 / topk 1 / 4 draft tokens, overlap on) `W = L = 4`, so the reserve
+is `8` slots per request and the reclaimable part is ZERO — the pre-#486
+blanket `2 x W` happened to equal the derived need there. The reclaimable
+part is nonzero on: topk>1 (`topk*steps - D`), page>1 topk>1 (the largest
+case), chains with `num_steps > num_draft_tokens`, and every
+`--disable-overlap-schedule` run (the whole of `W`).
+
+Two consumers of the reserve besides the allocation itself, both of which
+therefore also shrink: `schedule_batch._new_tokens_required_next_decode_spec_v2`
+(the eviction demand handed to `evict_from_tree_cache`) and
+`kv_session_offload`'s spec-in-tick headroom gate.
+
+Coverage: the tree has exactly TWO per-decode watermark sites, and both now
+derive the reserve from the formula above — `eagle_utils.eagle_prepare_for_decode`
+(EAGLE / EAGLE3 / NEXTN-MTP / STANDALONE / frozen-KV-MTP / multi-layer, none of
+which override it) and `dflash_info_v2.prepare_for_decode` (DFLASH and DSpark;
+`dspark_components/` contains no allocation code of its own). The ngram lane
+does not hold a reserve at all: `ngram_worker._prepare_for_speculative_decoding`
+allocates a flat `draft_token_num` from `batch.seq_lens` each step and never
+advances `kv_allocated_len`, so it touches the formula only through the
+admission estimator.
+
+Trap for future readers: `EagleDraftInput.ALLOC_LEN_PER_DECODE` (assigned in
+`multi_layer_eagle_worker_v2` and `standalone_worker_v2`) is a DEAD WRITE — the
+class has no such attribute and nothing in the tree reads it. It is not the W
+term and never was; `get_alloc_len_per_decode` is. It happens to be harmless
+today because adaptive spec requires topk=1, where the two expressions agree;
+do not "restore" it without re-deriving.
+
 ## 4. Rank-uniform protocol (the #287/#297 consensus pattern)
 
 `KvCapacityRuntime` (managers/vram_dial.py) runs in the scheduler loop of

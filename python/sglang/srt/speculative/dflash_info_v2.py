@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    get_alloc_reserve_per_decode,
     get_last_loc,
 )
 from sglang.srt.runtime_context import get_server_args
@@ -146,6 +147,11 @@ class DFlashDraftInputV2(SpecInput):
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
         page_size = batch.token_to_kv_pool_allocator.page_size
+        # #486: same derived reserve as EAGLE -- write footprint (one DFLASH
+        # verify block) + commit lag (one in-flight verify, 0 without overlap).
+        # The old form was a blanket 2 * block_size; that equals the derived
+        # need only while overlap is on and the widest rung is this block.
+        reserve = get_alloc_reserve_per_decode(alloc_len=block_size)
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
@@ -157,7 +163,7 @@ class DFlashDraftInputV2(SpecInput):
             committed_len = int(req.kv_committed_len)
             # Read the allocation watermark from the req object like EAGLE.
             cur_alloc_len = int(req.kv_allocated_len)
-            reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            reserved_len = max(cur_alloc_len, committed_len + reserve)
             top_k = int(req.sampling_params.top_k)
 
             batch_seq_lens_cpu_t[i] = committed_len

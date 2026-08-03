@@ -161,6 +161,12 @@ be applied to hardware it matches). Probe-first bootstrap on unknown hardware
 is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
 
 ## 3. Memory tiers / offload / spill
+- **KV-pool token-slot ledger** (`DESIGN_330_vram_dial.md` §3b, #486): every
+  standing holder of `C_target` slots is a NAMED posten — committed KV, the
+  per-decode reserve (`bs x get_alloc_reserve_per_decode()`, held under spec
+  AND plain decode), radix inventory. Nothing that permanently occupies pool
+  slots may stay an unnamed transient; that is how the spec reserve went
+  uncounted until #486.
 - **Expert offload**: MoE experts in a pinned host-RAM pool, streamed over
   PCIe on demand. **CUDA-graph-compatible path EXISTS** (decode-graph +
   eager-prefill hybrid): GPU kernels read the pinned pool via UVA zero-copy
@@ -439,6 +445,26 @@ weightless lane; multi-layer EAGLE fixes; spec-algo name validation (one
 source, parse-time refusal); canonical `--speculative-draft-model-path`.
 Tree-spec topk>1 under DCP is HARD-GATED (silently wrong + perf-negative — do
 not re-attempt without new evidence; see rejected register).
+
+**Per-decode KV reserve is derived, not a blanket 2x (#486).** The reserve
+every running request holds ahead of `kv_committed_len` is `W + L`: the write
+footprint of this step's draft+verify (`get_alloc_len_per_decode`) plus what
+one in-flight verify can still commit while the host is one step behind
+(`get_commit_lag_per_decode` = `max_speculative_num_draft_tokens` under
+overlap, 0 with `--disable-overlap-schedule`). It is now a NAMED posten in the
+pool ledger (`DESIGN_330_vram_dial.md` §3b) instead of an uncounted transient.
+Honest result: on our NEXTN recipe (steps 3 / topk 1 / 4 draft) `W == L`, so
+the old `2 x W` was already exactly the need and the fix saves nothing there —
+upstream issue #32459's radix-collapse diagnosis does not transfer to this
+shape. It tightens topk>1, page>1 trees, `steps > num_draft_tokens` chains and
+all non-overlap runs, and it unifies the DFLASH solo lane's own hardcoded
+`2 x block_size` onto the same derivation. NOT upstream PR #32574: that drops
+the lag term entirely on the premise that `batch.seq_lens_cpu` is synchronous,
+which is false in this tree (`resolve_seq_lens_cpu` runs inside `run_batch`,
+after `prepare_for_decode`, and is `None` when a backend opts out of the D2H
+mirror) — adopting it would under-reserve and let verify write past
+`kv_allocated_len`. Both directions are pinned:
+`test/registered/spec/test_alloc_reserve_need.py`.
 
 Draft-solo placement now admits the whole DFLASH FAMILY (#470): DSPARK joins
 DFLASH because it has the same shape — self-drafting block model, token-id

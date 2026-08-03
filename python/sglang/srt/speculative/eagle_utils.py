@@ -1230,7 +1230,10 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
-    double_alloc = get_alloc_reserve_per_decode()
+    # #486: derived need, not a blanket 2x -- write footprint + commit lag.
+    # See mem_cache.common.get_alloc_reserve_per_decode for the derivation and
+    # for why upstream #32574's 1x form under-reserves in this tree.
+    alloc_reserve = get_alloc_reserve_per_decode()
 
     cur_kv_lens = [0] * bs
     nxt_kv_lens = [0] * bs
@@ -1238,9 +1241,11 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for i, r in enumerate(batch.reqs):
         cur = r.kv_allocated_len
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
-        # kv_committed_len is honest (bonus committed in resolve, not here),
-        # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        nxt = max(cur, r.kv_committed_len + double_alloc)
+        # kv_committed_len is honest (bonus committed in resolve, not here), so
+        # it lags batch.seq_lens by one verify in overlap; the reserve's commit-lag
+        # term absorbs exactly that, and its write-footprint term covers this
+        # step's draft+verify writes.
+        nxt = max(cur, r.kv_committed_len + alloc_reserve)
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
