@@ -191,6 +191,22 @@ should grow a per-route VA-stability qualifier is left to the #286 owner; this
 note records the contradiction rather than silently working around it, in the
 same style as #286's own unresolved `gdn_state_sets` finding.
 
+**RESOLVED by #468 (2026-08-03), register side.** The descriptor did grow the
+qualifier: `va_stable_when_graph_addressed=True` on `experts`, combined with
+the permanent flag in the single predicate
+`AssetClassDescriptor.va_stability_required(graph_addressed=...)`. A graph
+family declares `addresses_classes` at registration and the register's own gate
+(`refuse_if_move_illegal`, same `OffloadUnderCaptureRefused`, new
+`ground=GROUND_GRAPH_ADDRESSED`) refuses the park — so the rule the arena
+enforces locally is now the register's, one rule with two grounds rather than
+two overlapping ones. `plan_spill` refuses to plan it as well. Nothing in this
+module changed; `refuse_if_capture_active` still spells exactly the old
+class-agnostic check, so `arena.park()`'s behaviour is unchanged. One
+correction this surfaced: the arena's remedy text says to drop the decode
+graphs via "the #286 rung-1 family eviction", but a rung-1 PARK preserves the
+family's VAs by construction and therefore keeps the addresses live — the
+family has to be unregistered. Details: `DESIGN_286_short_term_register.md` §8b.
+
 ## 7. Bug families designed against
 
 | family | how it is addressed | falsifier |

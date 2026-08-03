@@ -38,11 +38,35 @@ exclusion as the pool's RDMA/transfer inventory). The resolver is injectable
 mechanism, so hermetic tests feed fake/meta tensors and the GPU phase sees
 the true figure at the first ``refresh_sizes()`` without adapter changes.
 
+WHAT A PARK OF A SET IS (#461, settled against the movement code)
+-----------------------------------------------------------------
+A park here is a VACATE-then-move, never a move of the live set, and the two
+halves of that have different reasons:
+
+* the LIVE set may not travel -- DESIGN_407 X2's ``DEVICE_BOUND`` law, because
+  recurrent error accumulates and a lossy or reordered round trip is a
+  correctness failure rather than a slowdown;
+* the live set also CANNOT travel as pages. One set is a stride slice of the
+  pool's ``[num_layers, num_slots, ...]`` tensors, not a page range, so there
+  is no VMM range to unmap. That is why every set is registered
+  ``va_stable_required``: the pool tensors' addresses must not move (state
+  kernels and captured graphs address them), which also makes
+  ``offload_movement`` refuse the plain-tensor route for this class outright.
+* the SUSPENDED form is an ordinary byte payload. ``MambaPool``'s
+  ``export_state_blob`` / ``import_state_blob`` round trip is complete and
+  bit-identical, keyed by field NAME, and restores into ANY free slot; #364's
+  ``mem_cache/gdn_slot_executor.py`` already carries that blob to a #224
+  destination tier as one flat uint8 buffer plus a manifest. Host RAM or peer
+  VRAM is a legal resting place for the BLOB.
+
+So the GPU-phase work is not "unmap a set": it is export-then-free-then-move,
+and the wave-in is alloc-then-import. The item's register bookkeeping is
+unchanged by that -- what changes is that no mover may ever be pointed at the
+live set.
+
 What moves, and when, is the GPU phase: executing a plan's
-``park_candidates`` / ``wave_in_candidates`` through the movement backend
-(the sets are ``va_stable_required`` -- kernels and captured graphs address
-them, so their route is the #93 VMM/tag path, a named GPU-phase item), and
-wiring the scheduler's admission path to call ``on_admission_boundary``.
+``park_candidates`` / ``wave_in_candidates`` as the vacate/restore pair above,
+and wiring the scheduler's admission path to call ``on_admission_boundary``.
 Nothing in this module touches torch.cuda.
 """
 
@@ -300,9 +324,12 @@ def register_mamba_state_sets(
       ``set_bytes_fn`` for tests;
     * hot = the slot belongs to an active session (probe attached by the
       allocator owner; unknown = hot, the safe direction);
-    * ``va_stable_required`` -- state kernels and captured graphs address
-      the pool tensors, so a parked set must come back at the same VA
-      (#93 route, GPU phase);
+    * ``va_stable_required`` -- state kernels and captured graphs address the
+      pool tensors, and one set is a stride slice of them rather than a page
+      range, so the pool's addresses never move. The flag is what makes
+      ``offload_movement`` refuse the plain-tensor route for this class; the
+      legal route is the vacate/restore blob pair (see the module docstring),
+      which moves no pool page at all;
     * turn-class time constant, moved only via ``on_admission_boundary``.
 
     No-op (empty return) unless ``SGLANG_OFFLOAD_REGISTER=1`` -- the default
