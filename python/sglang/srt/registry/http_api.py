@@ -34,10 +34,32 @@ from sglang.srt.registry.spec import EngineSpec, ResidencyState, SpecError
 logger = logging.getLogger(__name__)
 
 
-def build_app(registry: EngineRegistry):
-    """A FastAPI app over one registry. Imported lazily; the core needs no web."""
+def build_app(
+    registry: EngineRegistry,
+    *,
+    api_key: str | None = None,
+    admin_api_key: str | None = None,
+):
+    """A FastAPI app over one registry. Imported lazily; the core needs no web.
+
+    #510: the state-changing routes below are marked ADMIN_OPTIONAL and, when
+    either key is configured, this app installs the same api-key middleware the
+    runtime uses. Without a key the behaviour is unchanged (open on whatever
+    address it is bound to, loopback by default) -- the level only decides what
+    a configured key closes. The route that matters most is
+    ``POST /registry/engines``: its ``launch.argv`` is handed to
+    ``subprocess.Popen`` by ``registry/adapters/class3_utility.py``, so an
+    unauthenticated caller who can reach this port can run a command
+    (audit #506, finding A2-F4).
+    """
     from fastapi import Body, FastAPI, Query, Request  # noqa: PLC0415
     from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+    from sglang.srt.utils.auth import (  # noqa: PLC0415
+        AuthLevel,
+        add_api_key_middleware,
+        auth_level,
+    )
 
     app = FastAPI(title="htsglang engine registry", version="1")
     app.state.registry = registry
@@ -85,6 +107,7 @@ def build_app(registry: EngineRegistry):
         return registry.snapshot()
 
     @app.post("/registry/engines")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def post_engine(body: dict = Body(...)):
         """Register a spec. Validates feasibility; does NOT boot (§7.4)."""
         replace = bool(body.pop("replace", False))
@@ -93,12 +116,14 @@ def build_app(registry: EngineRegistry):
         return {"registered": True, "plan": result.to_json()}
 
     @app.delete("/registry/engines/{engine_id}")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def delete_engine(engine_id: str):
         """Demote to COLD, release the slots, deregister."""
         registry.deregister(engine_id)
         return {"deregistered": engine_id}
 
     @app.post("/registry/engines/{engine_id}/state")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def post_state(engine_id: str, body: dict = Body(...)):
         target = str(body.get("target", "")).upper()
         try:
@@ -122,6 +147,7 @@ def build_app(registry: EngineRegistry):
         return instance.to_json()
 
     @app.post("/registry/engines/{engine_id}/pin")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def post_pin(engine_id: str, body: dict = Body(...)):
         instance = registry.instance(engine_id)
         pinned = bool(body.get("pinned", True))
@@ -153,12 +179,14 @@ def build_app(registry: EngineRegistry):
         return instance.to_json()
 
     @app.post("/registry/default_hot")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def post_default_hot(body: dict = Body(...)):
         """§7.3: the resting set. Validated now, not at idle time."""
         registry.set_default_hot(list(body.get("engines") or []))
         return {"default_hot": list(registry.default_hot)}
 
     @app.post("/registry/idle")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def post_idle(body: dict = Body(default={})):
         changed = registry.return_to_idle(force=bool((body or {}).get("force", False)))
         return {"changed": changed, "default_hot": list(registry.default_hot)}
@@ -202,5 +230,10 @@ def build_app(registry: EngineRegistry):
         if with_planner:
             payload["planner"] = planner_opinion(spec, result.cards)
         return payload
+
+    # Installed only when a key is configured, mirroring the runtime's rule at
+    # http_server.py: no key means the deployment is unchanged.
+    if api_key or admin_api_key:
+        add_api_key_middleware(app, api_key=api_key, admin_api_key=admin_api_key)
 
     return app

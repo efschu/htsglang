@@ -33,10 +33,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from fractions import Fraction
+
+logger = logging.getLogger(__name__)
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
@@ -139,6 +142,33 @@ def parse_ffprobe(payload: dict) -> MediaInfo:
     )
 
 
+def subprocess_failure(
+    tool: str, *, returncode: int, stderr: bytes | str | None
+) -> MuxError:
+    """Log a subprocess failure's stderr and return an error that omits it.
+
+    #510 (audit #506, finding A2-F5): ``MuxError`` becomes the ``detail`` of a
+    422 in ``video_enhance/server.py``, and ffprobe/ffmpeg stderr names
+    filesystem paths and distinguishes "no such file" from "permission
+    denied". Reflected to an unauthenticated caller who also chooses the input
+    path, that is an existence oracle over the whole filesystem. The operator
+    still gets the full text -- in the log, where it belongs.
+    """
+    if isinstance(stderr, bytes):
+        detail = stderr.decode(errors="replace")
+    else:
+        detail = stderr or ""
+    detail = detail.strip()
+    if detail:
+        logger.error("%s failed (exit %s): %s", tool, returncode, detail)
+    else:
+        logger.error("%s failed (exit %s) with no stderr", tool, returncode)
+    return MuxError(
+        f"{tool} failed (exit {returncode}); see the server log for the "
+        f"tool's own message."
+    )
+
+
 def probe(source_url: str, *, timeout: int = 60) -> MediaInfo:
     cmd = [
         FFPROBE,
@@ -155,8 +185,8 @@ def probe(source_url: str, *, timeout: int = 60) -> MediaInfo:
     except FileNotFoundError as exc:
         raise MuxError(f"{FFPROBE} not found; muxing requires ffmpeg") from exc
     except subprocess.CalledProcessError as exc:
-        raise MuxError(
-            f"ffprobe failed on {source_url}: {exc.stderr.decode()}"
+        raise subprocess_failure(
+            FFPROBE, returncode=exc.returncode, stderr=exc.stderr
         ) from exc
     return parse_ffprobe(json.loads(out.stdout))
 
@@ -406,10 +436,16 @@ class StreamRemuxer:
         try:
             await self._writer.drain()
         except (BrokenPipeError, ConnectionResetError) as exc:
-            detail = ""
+            detail = b""
             if self.process is not None and self.process.stderr is not None:
-                detail = (await self.process.stderr.read()).decode(errors="replace")
-            raise MuxError(f"remuxer exited while being fed: {detail.strip()}") from exc
+                detail = await self.process.stderr.read()
+            raise subprocess_failure(
+                "remuxer (while being fed)",
+                returncode=(
+                    self.process.returncode if self.process is not None else -1
+                ),
+                stderr=detail,
+            ) from exc
 
     async def close_input(self) -> None:
         if self._writer is not None:
@@ -436,8 +472,9 @@ class StreamRemuxer:
             raise MuxError("remuxer not started")
         code = await self.process.wait()
         if code != 0 and self.process.stderr is not None:
-            detail = (await self.process.stderr.read()).decode(errors="replace")
-            raise MuxError(f"remux failed (exit {code}): {detail.strip()}")
+            raise subprocess_failure(
+                "remux", returncode=code, stderr=await self.process.stderr.read()
+            )
         return code
 
     async def terminate(self) -> None:

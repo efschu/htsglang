@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -68,6 +69,26 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8500)
     parser.add_argument("--engines", help="JSON file of specs to register at start")
+    # #510: the registry's POST routes reach subprocess.Popen through
+    # launch.argv, so give it the same two keys the runtime has. Unset keeps
+    # the previous behaviour (open on whatever --host is bound to).
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("SGLANG_REGISTRY_API_KEY") or None,
+        help=(
+            "Bearer token required by every registry route. Defaults to "
+            "$SGLANG_REGISTRY_API_KEY. Unset means no authentication."
+        ),
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        default=os.environ.get("SGLANG_REGISTRY_ADMIN_API_KEY") or None,
+        help=(
+            "Bearer token required by the state-changing registry routes "
+            "(register / deregister / state / pin / default_hot / idle). "
+            "Defaults to $SGLANG_REGISTRY_ADMIN_API_KEY."
+        ),
+    )
     parser.add_argument(
         "--registry-max-hot",
         type=int,
@@ -117,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from sglang.srt.registry.http_api import build_app  # noqa: PLC0415
 
-    app = build_app(registry)
+    app = build_app(registry, api_key=args.api_key, admin_api_key=args.admin_api_key)
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:

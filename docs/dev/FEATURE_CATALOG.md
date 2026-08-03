@@ -1153,6 +1153,19 @@ This also covers the custom-group object exchange: it names the world gloo
 cpu_group instead of letting torch pick a staging device.
 
 ## 12. Robustness canon
+Unauthenticated-state-change family (#510, from audit #506): a
+state-changing route is not protected by the mere existence of an auth
+mechanism — it is protected by the level it is *registered at*. Four
+independent instances shipped together: routes at the implicit NORMAL level
+that `--admin-api-key` alone does not cover; two whole apps (registry,
+video-enhance) with no auth wiring at all; a caller-supplied directory that
+overrode its own configuration flag and reached `os.makedirs`; and a write
+path missing the enabled-guard its sibling had. The rule this leaves behind:
+a new state-changing route needs an explicit `@auth_level`, and a
+caller-supplied path needs `utils/path_confinement.confine_to_root` against
+the flag that configures it — both pinned by
+`test/registered/unit/entrypoints/test_endpoint_security_510.py`, which
+enumerates the routes rather than sampling them.
 Rank-local condition BEFORE any group collective (hang family); bounded waits
 with fixed pool universe; bounded peer-liveness instead of endless spin;
 ColdBuild error unmasking (never substitute "lower mem-fraction" for a real
@@ -1257,7 +1270,7 @@ catalog previously named two of these and the rest were discoverable only from
 the router:
 `POST /session_handover` (`http_server.py:1126`), `POST /kv_reshard` (:1109),
 `POST /vram_budget` (:1149 — the runtime VRAM dial's actuator),
-`GET|POST /hibernate` (:1706),
+`POST /hibernate` (:1706 — POST-only since #510),
 `POST /v1/images/{generations,edits,variations}` (:2013/:2022/:2057) and
 `POST /v1/audio/speech` (:2067) — the OpenAI-compatible **diffusion** and
 **speech** lane fronts, wired unconditionally at `http_server.py:461-462`,
@@ -1272,6 +1285,46 @@ Outside `http_server.py`: `video_enhance/server.py` serves
 `registry/http_api.py` serves the engine control plane
 `/registry{,/cards,/engines,/engines/{id},/engines/{id}/pin,/engines/{id}/state,/idle,/plan,/default_hot}`
 — which is what the diffusion refusal above tells the operator to use.
+
+Auth and CORS on that surface (#510, closing audit #506's endpoint axis). The
+rule is the same in all three apps and it is **key-gated, not default-on**:
+with no key configured nothing changes, and a configured key is what closes
+anything.
+* Every fork-added state-changing route is now decorated
+  `@auth_level(AuthLevel.ADMIN_OPTIONAL)` — the level whose decision table
+  (`utils/auth.py:149-159`) is "no keys: allow; `--api-key` only: require it;
+  `--admin-api-key` set: require the admin key". Before #510 these routes sat
+  at the implicit NORMAL level, where `--admin-api-key` **alone** protects
+  nothing (`utils/auth.py:161-167`), so an operator who set only the admin key
+  had `/v1/files`, `/v1/fine_tuning/*` and both workbench writers wide open.
+  `/hibernate`, `/vram_budget`, `/kv_reshard` and `/session_handover` were
+  already at ADMIN_OPTIONAL and are unchanged.
+* `registry/http_api.py:build_app(registry, api_key=, admin_api_key=)` and
+  `video_enhance/server.py:create_app(..., api_key=, admin_api_key=)` now
+  accept the two keys and install the runtime's own middleware when either is
+  set; their state-changing routes carry the same level. `python -m
+  sglang.srt.registry` gained `--api-key` / `--admin-api-key`
+  (`$SGLANG_REGISTRY_API_KEY`, `$SGLANG_REGISTRY_ADMIN_API_KEY`). This is what
+  stands between an unauthenticated LAN peer and `launch.argv`, which
+  `registry/adapters/class3_utility.py:171-186` hands to `subprocess.Popen`.
+* `POST /hibernate` is POST-only (it accepted GET, so a link preview parked
+  the model) and a `hibernate_dir` in the body is confined to the configured
+  `--hibernate-dir` by realpath (`utils/path_confinement.py`), enforced both
+  in the handler (400) and at the scheduler-side sink
+  (`weight_updater._hibernate_park_weights`, which the Engine API reaches
+  without the route). It used to override the flag outright.
+* `--cors-allow-origins` (default `*`) replaces the hardcoded
+  `allow_origins=["*"] + allow_credentials=True`. Credentials are sent only
+  for an explicit origin list; the old pair is illegal per the Fetch standard
+  and let any page the operator had open drive a loopback-bound runtime.
+  `http_server.cors_policy()` / `configure_cors()` own it; configure replaces
+  the import-time middleware rather than stacking a second one.
+* `POST /v1/files` is behind the training-enabled guard `create_job` already
+  had (`training/service.py:_require_tenant`), so a server without
+  `--enable-training-tenant` no longer writes uploads to disk.
+* ffprobe/ffmpeg stderr is logged, not reflected
+  (`video_enhance/mux.py:subprocess_failure`) — reflected into a 422 it was a
+  filesystem existence oracle for a caller who also chose the input path.
 
 Class-3 video enhance, adaptive chain planner (#451,
 `video_enhance/chain_policy.py`): given an ffprobe source and a target, it

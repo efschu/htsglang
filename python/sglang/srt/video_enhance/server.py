@@ -1242,11 +1242,26 @@ def create_app(
     *,
     device_id: int = 0,
     liveness: LivenessConfig | None = None,
+    api_key: str | None = None,
+    admin_api_key: str | None = None,
 ):
-    """Build the FastAPI application. Imported lazily by the entry point."""
+    """Build the FastAPI application. Imported lazily by the entry point.
+
+    #510: the two state-changing routes (submit a job, delete a running job)
+    are marked ADMIN_OPTIONAL, and the api-key middleware is installed when
+    either key is configured. Without a key the behaviour is unchanged. Job ids
+    are client-chosen and short, so ``DELETE /v1/video/enhance/{job_id}`` was
+    a guessable way to kill someone else's running job (audit #506, A2-F13).
+    """
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel
+
+    from sglang.srt.utils.auth import (
+        AuthLevel,
+        add_api_key_middleware,
+        auth_level,
+    )
 
     service = VideoEnhanceService(config, device_id=device_id, liveness=liveness)
     app = FastAPI(title="htsglang video-enhance (Class 3)")
@@ -1290,6 +1305,7 @@ def create_app(
         }
 
     @app.post("/v1/video/enhance")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def enhance(body: Body):
         payload = body.model_dump()
         requested_id = payload.pop("job_id", None)
@@ -1446,6 +1462,7 @@ def create_app(
         )
 
     @app.delete("/v1/video/enhance/{job_id}")
+    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def cancel(job_id: str):
         """Explicit abort. Returns only once the job has actually let go.
 
@@ -1530,5 +1547,10 @@ def create_app(
                 "max_in_flight": planned.max_in_flight,
             }
         )
+
+    # Same rule as the runtime and the registry: a key has to be configured
+    # before anything is closed, so an existing deployment is unchanged.
+    if api_key or admin_api_key:
+        add_api_key_middleware(app, api_key=api_key, admin_api_key=admin_api_key)
 
     return app
