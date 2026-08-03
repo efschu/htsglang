@@ -3531,3 +3531,97 @@ ARRIVAL, not visibility; and `line_s` counts transcript-line nodes created on
 that translated text is VISIBLE. The UI agent is building the DOM-visibility
 arm; adopt it into `client_gate.py`'s default repertoire when it lands rather
 than leaving it in his harness.
+
+#### 17.8.12 The stop arm was the flake, 2026-08-03 (sixth session)
+
+**Live: server `da46f2759b` (tenant PID 3799451, unchanged), client
+`9f60fbb742`.** The client is read from disk per request and the tenant runs
+on `PYTHONPATH=/spinning/wt-466-translator/python`, so merging a client-only
+branch into this worktree IS the deploy -- verified rather than assumed by
+reading `CLIENT_BUILD` back off the served page.
+
+**Gate run 2 of the bundle failed, and the server was not at fault.** Turn 3
+returned `aborted_turn_id None` -- "the arm tested nothing". The arm fired one
+poll after the first audio frame reached playback, which reads as
+mid-playback and is not: the talker is BATCH, so a unit's first frame reaches
+the client only once that unit is fully synthesized, and for a single-unit
+turn that instant is also when `_active_turn_id` is cleared
+(`session.py:1073`). Whether the ack could still name a turn was a race
+between a 250 ms poll and the server's own teardown. Run 1 won it, run 2 lost
+it. Everything else in run 2 was green: four turns translated, reload arm
+passed, console clean.
+
+**The trigger is now the transcript line.** A line on the page means the
+server is inside `_run_turn_locked` past recognition with MT and synthesis
+still ahead of it -- a guarantee instead of a race, worth ~6-10 s of margin
+against ~0. `--stop-trigger audio` keeps the old behaviour for the client-side
+half (drop what is already buffered), which the UI agent's arm covers.
+
+**This also turned the quiescence half from decoration into evidence**, which
+§17.8.10 flagged and could not fix at the old trigger. Fired before any audio
+exists, a working stop means the turn is never spoken AT ALL. The window is
+watched to its end there rather than breaking early on silence, because
+silence is the state the arm starts in. Measured, twice:
+`frames after stop 0, quiet 20.2 s` with the ack naming the turn, against a
+sabotage control that saw **284 frames** in the same window. The control is
+what proves the window is long enough to have seen the audio a stop prevents.
+
+**The §17.8.11 discriminator was used as intended and answered.** The arm now
+reads `translator_talker_busy` and `translator_session_queue_depth_max` at the
+instant the stop is written; both gate runs and the sabotage run recorded
+`talker_busy 1.0 / queue_depth 0.0`, i.e. the server was IN synthesis, not
+queued behind it. Printed and never asserted -- both gauges are process-wide,
+not per session.
+
+**The DOM-visibility arm is adopted into `client_gate.py`** rather than left
+in one agent's harness, which closes the third instance of the §17.8 class.
+It polls the rendered translation row (non-empty, non-zero box) beside the
+wire events on one clock. Measured on the merged client: text readable
+**4.0-6.2 s** after the tap against first audio at **7.3-12.8 s**. The defect
+it exists for -- `case turn.translation` opening with `if (event.partial)
+break;`, so every streamed clause was discarded and the screen held a
+placeholder until speaking time -- passed every wire-level assertion this gate
+had.
+
+**Gate: 2x PASS on client `9f60fbb742`** (`gate_int8_a.log`,
+`gate_int8_b.log`), each 4 turns with the reload arm, the stop arm naming its
+aborted turn, 0 frames after the stop, turn 4 healthy afterwards, console
+clean. **The user may be asked to test this build.**
+
+**The MT backend switched to INT8 under us and the smoke is clean.** Both
+gate runs are end-to-end turns against the new server: Spanish output correct,
+no `</think>` artefacts, `mt_first_token` med 0.24 s / `mt_total` med 0.37 s,
+in line with the FP8 numbers. The tenant was never at risk of the leak the
+serving agent warned about -- it sends `chat_template_kwargs
+{"enable_thinking": False}` by default (`launch.py:327-328`), and a direct
+probe of the new backend returned `reasoning_content: None`. A defensive
+`</think>` strip in `mt.py` remains cheap future-proofing, not a fix for
+anything currently broken.
+
+**`turn.speech` is BUILT AND COMMITTED BUT NOT DEPLOYED** -- it needs a
+restart, and the plan is to take that restart together with the `require_pair`
+degradation so the picker becomes usable in the same cut. States
+`queued -> synthesizing -> spoken` per unit, emitted at the transition;
+`synthesizing` fires BEFORE the synthesize call because naming the interval
+before any audio exists is the whole point. `spoken` means handed to the wire,
+not heard -- playback position is the client's audio clock, which draws the
+"about N s left" strip. Units that will never be spoken are never announced
+(reading mode would otherwise leave a spinner nothing can clear). Five cases,
+can-fail proven by two injections; full translator suite 469 passed.
+
+**Open, in order:** the `require_pair` degradation (still the top build item,
+`languages.py:367-370` from `session.py:378`, client constant
+`PARTIAL_PARTICIPANTS_SUPPORTED` waiting on it), then deploy it with
+`turn.speech` in one restart and gate twice; then §19.5 quality ladder, the
+man-02 listening check, the `getSettings()` telemetry of the next phone
+connect (§19.8(b)), and §19.9.
+
+**Not re-litigated, per §17.8.11:** the §19.4 decomposition experiment is now
+a BASELINE arm inside the #488 talker-lane agent's window (he measures
+in-process RTF 1.23 against the native lane), not a window of its own. Clause
+coalescence after the first unit stays here and applies to the lane too. The
+tenant's switch from `inprocess_tts` to the lane API will be this worktree's
+cut when #488 delivers the interface. Capacity note from the serving agent:
+the new server reserves 7500 MiB on the 5090 for this tenant, whose declared
+budget is asr 3000 + tts 4000 + diarization 500 -- if that budget grows, the
+reserve must grow with it.
