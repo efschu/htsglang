@@ -34,6 +34,22 @@ INT8: HEAD axis -- 5 candidates on a 4-kv-head grid realize 1 distinct
 
 A search restricted to that axis cannot move the family whatever it does.
 
+**And the evidence was already on the page.** `NOTE_475_phase_prefill_prediction.md`
+§4, "Residual honesty", says it in as many words:
+
+> The barrier term accounts for 27 of the 41 ms/1k the `#424` INT8 pair moved;
+> the remaining 14 ms/1k is not explained here. That arm also changed
+> `--rank-kv-ratio` to `2,11,10`, which redistributes DCP token ownership and
+> **therefore prefill attention work** — a second skew source the family model
+> does not represent at all. `#433`, which changed only the MLP vector, has no
+> such residual.
+
+That is a MEASURED 14 ms/1k of prefill attention work moving with the token
+vector, on this rig, before #485 was written. Slice 1 read that note, took its
+per-barrier max, and then declared the attention family pinned on the strength
+of a head-grid search. The axis was not merely unpriced — it had a measured
+residual attached to it and no place in the model to put it.
+
 ## 2. What the runtime can actually do today
 
 Checked before building, because "the machinery already handles that" is the
@@ -239,3 +255,10 @@ which on this rig is not a trade anybody has asked for.
 4. Whether a rig with a WIDER context budget per slow card reaches the axis at
    loose 0 is a one-line re-run of §5 with different budgets — the model is
    already general over it, and no boot is needed to answer it.
+5. NOTE_475's unexplained **14 ms/1k** on the `#424` INT8 pair (§1) is the one
+   MEASURED number this axis could claim. This slice does not claim it: the
+   CORE-PACED endpoint redistributes mass rather than growing it, so it cannot
+   reproduce a residual of that size, and asserting the match would be exactly
+   the fitted constant the bracket exists to avoid. Reproducing it needs the
+   attended-depth term (item 2). It is recorded here as the axis's outstanding
+   measured anchor, not as a result.
