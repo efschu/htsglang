@@ -287,13 +287,96 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
         return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
 
 
-def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
-    """KV length reserved per request at each decode step.
+def get_commit_lag_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    """Tokens a single in-flight forward can still commit behind the host's view.
 
-    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_utils.eagle_prepare_for_decode.
+    This is the L term of ``get_alloc_reserve_per_decode``; see the derivation
+    there. Under overlap the scheduler prepares iteration i's allocation before
+    iteration i-1's result has been processed, so ``req.kv_committed_len`` is one
+    verify stale. One verify commits at most ``max_speculative_num_draft_tokens``
+    tokens (batch_result_processor: ``kv_committed_len += len(accept_tokens)``
+    with ``accept_tokens = next_token_ids[i*stride : i*stride + accept_lens[i]]``,
+    ``stride == speculative_num_draft_tokens``), or exactly 1 without spec.
+
+    ``max_speculative_num_draft_tokens`` -- not the currently active width -- is
+    the right ceiling: under adaptive spec or --speculative-cross-algorithm the
+    in-flight step may have run a WIDER rung than the one now being prepared.
     """
-    return 2 * get_alloc_len_per_decode(server_args)
+    if server_args is None:
+        server_args = get_server_args()
+
+    if server_args.disable_overlap_schedule:
+        # No overlap: the previous result is processed before the next
+        # prepare_for_decode, so kv_committed_len is exact and there is no lag.
+        return 0
+
+    if server_args.speculative_algorithm is None:
+        return 1
+
+    return server_args.max_speculative_num_draft_tokens or 1
+
+
+def get_alloc_reserve_per_decode(
+    server_args: Optional[ServerArgs] = None,
+    alloc_len: Optional[int] = None,
+) -> int:
+    """KV length reserved per request ahead of ``kv_committed_len`` each decode step.
+
+    DERIVATION (task #486). The reserve must satisfy, for the forward about to be
+    launched::
+
+        kv_allocated_len >= device_seq_len + W
+
+    where ``device_seq_len`` is where the kernels start writing and ``W`` is how
+    far they write. The host only knows ``kv_committed_len``, so the reserve is
+    the sum of two independent terms -- it is NOT a multiplier on either one:
+
+      W (write footprint) = get_alloc_len_per_decode()
+          The draft write is anchored at ``batch.seq_lens`` and spans
+          ``topk * num_steps`` slots (base_spec_worker.py, ``out_cache_loc =
+          torch.empty((bs * topk * num_steps,))`` / the paged tree branch's
+          ``num_new_pages * page_size`` per branch); the verify write spans
+          ``num_draft_tokens``. Their max is exactly get_alloc_len_per_decode.
+
+      L (commit lag)      = get_commit_lag_per_decode()
+          ``device_seq_len - kv_committed_len`` at prepare time, bounded by one
+          verify's accept run. See that helper.
+
+    So ``reserve = W + L``. Correctness first: this is an upper bound on the true
+    need, never below it, and it must never be shaved -- see
+    ``test/registered/spec/test_alloc_reserve_need.py::...under_reservation...``.
+
+    Why this is not the previous blanket ``2 * get_alloc_len_per_decode()``:
+    that form is W + W. It coincides with W + L on the configurations where
+    ``W == L`` -- no-spec (1+1) and the chain-draft topk=1 case where
+    ``num_draft_tokens >= num_steps`` (our NEXTN production path, W = L = D) --
+    and over-reserves by ``W - L`` everywhere else: topk>1 (by
+    ``topk*num_steps - D``), the page>1 topk>1 tree (by
+    ``num_new_pages*page_size*topk - D``, the largest case), and every
+    non-overlap run (by the whole of W, since L collapses to 0).
+
+    Not upstream #32574's fix. That PR drops the second term entirely (1x) on
+    the premise that ``batch.seq_lens_cpu`` is "perfectly synchronous" with the
+    device. In this tree it is not: ``FutureMap.resolve_seq_lens_cpu`` runs
+    inside ``Scheduler.run_batch``, i.e. AFTER ``prepare_for_decode`` in the same
+    event-loop iteration (scheduler.py ``event_loop_overlap``), so at prepare
+    time ``batch.seq_lens_cpu`` carries the same one-verify staleness as
+    ``kv_committed_len`` -- and it is ``None`` outright whenever
+    ``decide_needs_cpu_seq_lens`` opted the backend out of the D2H mirror.
+    Adopting 1x here would under-reserve by L and let the verify write past
+    ``kv_allocated_len``.
+
+    ``alloc_len`` overrides the W term for lanes that verify a fixed block whose
+    width is not ``get_alloc_len_per_decode`` (DFLASH solo: one block per step).
+    """
+    if server_args is None:
+        server_args = get_server_args()
+
+    write_footprint = (
+        get_alloc_len_per_decode(server_args) if alloc_len is None else alloc_len
+    )
+    commit_lag = get_commit_lag_per_decode(server_args)
+    return write_footprint + commit_lag
 
 
 def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
