@@ -37,16 +37,20 @@ cells:
   equal split (the ANALYSE_393 §7.3/§7.4 145 -> 86 ms/token arithmetic this
   document's §5 cut-2 entry in `DESIGN_407_memtier_registry.md` also cites).
 * **Link-proportional COMPUTE** (#439) — moves the *compute assignment*, not
-  only the bytes, onto the #82 expert-range mechanism. **Status: predicted,
-  not confirmed.** `FEATURE_CATALOG.md` records the band as clock rank
-  92.8 s -> 66.7 s (**1.392x**, uncalibrated) -> 64.0 s (**1.450x**, with
-  coefficients calibrated off the equal arm), against BENCH_394's 1.536x
-  ideal-placement reference, from the 2026-08-02 battery's resolved base plan
-  `30407,19080,19080`. The document states plainly: "the arm has never
-  served a token." A confirmation run directory exists
-  (`/spinning/gpu-battery-results/2026-08-03_439_confirm/`) but is empty at
-  the time of this analysis — the band is still pending confirmation, not
-  yet closed either way.
+  only the bytes, onto the #82 expert-range mechanism. **Status: CONFIRMED
+  2026-08-03, corridor-red.** The window
+  (`/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md`) measured
+  the clock rank at 192.7 s -> 128.8 s = **1.496x** on the transfer term,
+  ahead of the 1.411x its own model predicted for the resolved base plan
+  `30407,19080,19080`, and **-7.67 %** end-to-end against a same-window floor
+  of 4.09 %. The calibrated sub-arm was FALSIFIED in the same window (1.439x,
+  inside the floor end to end): a per-rank cold-traffic coefficient treats the
+  hit rate as a rank property and it tracks the owned range SIZE. Two things
+  keep the cell from being closed: every arm ran outside the 400 MiB corridor
+  (3080s at 211-251 MiB during load), so one green-corridor re-proof is owed
+  at the repaired reserve `2200,1800,1800`; and `--rank-auto-reserve-mib auto`
+  is infeasible on this recipe. Spec: `ARM3_COMPUTE.md`, "Green-corridor
+  window".
 * **Expert-major prefill waves** (#254) — orders prefill's expert dispatch by
   expert rather than by token batch, a prefill-side lever distinct from the
   decode-side levers above.

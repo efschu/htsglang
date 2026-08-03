@@ -9,10 +9,21 @@ H2D delta is NOT null.
     ARM=proportional   slice 2: cold BYTES follow the links, compute does not
     ARM=compute        slice 3: cold COMPUTE follows the links   <-- this file
     ARM=compute-cal    slice 3 with the traffic coefficients measured on arm 1
+                       -- FALSIFIED 2026-08-03, see "What the confirmation
+                       window measured"
+
+**Status in one line (2026-08-03).** The arm served tokens, `compute` measured
+**1.496x** on the transfer term and **-7.67 %** end-to-end against a same-window
+floor of 4.09 %, and `compute-cal` was falsified by that window's own data. The
+uncalibrated solve is the recommendation and the flag's plain symbol. What is
+still open is the corridor: every arm ran outside it, so the 1.496x point needs
+one re-proof in a green corridor before it is acceptance-ready — the spec for
+that window is "Green-corridor window" below.
 
 ## The one flag
 
-    --rank-moe-ratio link
+    --rank-moe-ratio link              # the shipped solve, uncalibrated
+    --rank-moe-ratio link-calibrated   # EXPERIMENTAL, falsified model
 
 Under the #82 GGUF expert-dim shard the "moe" family vector IS the expert
 range: rank `r` owns `[lo_r, hi_r)`, foreign topk ids remap to a zero padding
@@ -32,7 +43,13 @@ to the measured link weights:
 
 `l` comes from the same #394 provenance chain arm 2 uses (env > card-probe H2D
 > NVML nameplate > refusal; `absent` is refused, never guessed). `c` is the
-per-rank cold-traffic coefficient, 1.0 unless a prior boot calibrated it.
+per-rank cold-traffic coefficient, and under `link` it is 1.0 on every rank —
+the symbol decides, not an environment variable. `link-calibrated` is the only
+way to spend measured coefficients, it requires
+`SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS`, and plain `link` REFUSES while that
+variable is set rather than quietly solving something else (#458). Before that
+split, a coefficient export left over from one arm silently turned the next arm
+into the calibrated one with the command line still reading `link`.
 
 ## NOTE — VRAM neutrality, and the fixed point (#439, 2026-08-02)
 
@@ -85,9 +102,12 @@ recipe does not produce that plan.** `--rank-tp-ratio auto` on the 2026-08-02
 battery resolved to `30407,19080,19080` (shares 0.44346 / 0.27827 / 0.27827),
 and every number keyed to `400,256,344` — the vector, the H2D, the 1.358x /
 1.584x band — is a prediction for a rig configuration that boot did not have.
-The numbers for the plan the recipe actually resolves are in "Confirmation
-window" below. Read the resolved plan off the boot log, as this file has always
-said, and use the section that matches it.
+The numbers for the plan the recipe actually resolves are in "What the
+confirmation window measured" below — and those are MEASURED now, not
+predicted. Read the resolved plan off the boot log, as this file has always
+said, and use the section that matches it. Everything in the next two sections
+is a worked example on a plan no boot has run; it is kept because it is where
+the model is derived, not because it is a target.
 
 ## Predicted numbers for the reference recipe
 
@@ -115,7 +135,7 @@ TP=3, bench-length generations) and the arm-1 launch:
 
 That is the 1.36x class ANALYSE_393 predicted for the short-probe mix. It is
 the number to hold arm 3 to ON THIS BASE PLAN, which is not the one the recipe
-resolves — see "Confirmation window". It falls short of BENCH_394's 1.54x "ideal
+resolves — see "What the confirmation window measured". It falls short of BENCH_394's 1.54x "ideal
 proportional placement" for a reason that is measured rather than hand-waved:
 the first-order model says a rank's H2D share is `b_r (1 - f_r)`, i.e.
 37.2 / 26.8 / 36.0 %, and arm 1 measured 42.1 / 28.9 / 29.0 %. The ranks re-fetch
@@ -134,86 +154,201 @@ the MODELLED cold mass does not equalise the MEASURED bytes.
 | clock | 858 -> **542 s = 1.584x** |
 | `moe_compute_policy` | `link-proportional-calibrated` |
 
-**Report the band, not one end of it.** On this base plan the honest statement
-is 1.36x uncalibrated / 1.58x calibrated on the transfer term, against
-BENCH_394's 1.54x ideal-placement reference; on the plan the recipe resolves it
-is 1.39x / 1.45x. Either way, running both sub-arms is what turns a band into a
-measurement; running only `compute-cal` would report a number whose calibration
-came from the arm it is being compared against.
+**That prediction is the one hardware overturned.** Running both sub-arms is
+what turned the band into a measurement, and it inverted: the calibrated arm was
+predicted to be the better end (1.584x here, 1.450x on the resolved plan) and
+measured the WORSE one (1.439x against 1.496x). The reason is in the next
+section, and it is why `compute-cal` is now a separate, experimental symbol.
 
-## Confirmation window (the next boot window, spec)
+## What the confirmation window measured (2026-08-03, RAN)
 
-One window, three boots, in this order. The three defects the 2026-08-02
-battery found are fixed at the desk and are unvalidated on hardware until this
-window runs: **BOOT-PENDING**.
+Three boots, `equal` / `compute` / `compute-cal`, DeepSeek-V4-Flash UD-IQ3_XXS,
+TP=3, 900 tokens x 3 runs x 1 warmup, `--disable-cuda-graph`. Full record:
+`/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md`. All four
+gates PASS. Rank order verified from preflight's NVML table, not assumed:
+**tp0 = 5090 x8 (14.42 GB/s), tp1 = 3080 negotiated x4 (6.45 GB/s), tp2 = 3080
+x8 (13.41 GB/s)**.
 
-Inputs, all read off that battery's own record
-(`/spinning/gpu-battery-results/2026-08-02_439_arm3/RESULTS.md`) rather than
-assumed:
+| arm | vector | h2d GiB tp0/tp1/tp2 | clock | speedup | ms/token | vs equal | above the floor? |
+|---|---|---|---|---|---|---|---|
+| `equal` | 30407,19080,19080 | 1806.2 / 1157.6 / 1143.0 | tp1, 192.7 s | 1.000x | 138.2 | — | — |
+| `compute` | 160,79,119 | 1729.7 / **672.7** / 1455.5 | tp0, 128.8 s | **1.496x** | **127.6** | **-7.67 %** | **YES** |
+| `compute-cal` | 164,85,130 | 1716.9 / 730.2 / 1672.1 | tp2, 133.9 s | 1.439x | 136.9 | -0.94 % | NO |
 
-| input | value | where it came from |
+Same-window A-vs-A floor, measured in the `equal` boot: **CV 2.12 %, spread
+4.09 %** (900 tokens; the prior window's 1.19 % / 2.35 % at 450 tokens does not
+transfer). The clock rank moved OFF tp1, which is the mechanism's whole point.
+
+Three findings came out of it, and the rest of this file is what they changed.
+
+**Finding 1 — the arm works and the uncalibrated solve is the recommendation.**
+`compute` beat its own re-derived prediction (1.411x) at 1.496x, and it is the
+only arm whose end-to-end effect clears the floor. The DESK-WRITTEN label lifts
+for the slice-3 compute path.
+
+**Finding 2 — the calibration is falsified, by the falsifier this file named in
+advance** (readout item 4: *"if the per-rank hit rates move a lot when the ranges
+move, the coefficient is not a property of the rank"*). They move a lot:
+
+| rank | `equal` | `compute` | `compute-cal` | expert extent |
+|---|---|---|---|---|
+| tp0 | 0.7637 | 0.7618 | 0.7774 | 115 -> 115 -> 112 (stable) |
+| tp1 | 0.8450 | **0.9050** | 0.9025 | 72 -> 58 -> 58 (**+7.1 %** as the range SHRANK) |
+| tp2 | 0.8474 | **0.7972** | **0.7814** | 72 -> 86 -> 89 (**-7.8 %** as the range GREW) |
+
+The hit rate tracks the SIZE of the owned range, because a smaller range fits
+the cache better. The calibrated solve read tp2's below-average coefficient
+(0.9586) as spare capacity, moved three more experts onto it, each cost more
+traffic than modelled, and tp2 became the new clock. Registered in
+`planner/rejected.py` (`moe_link_calibrated_coefficients`, NOT_DEFAULT) and
+demoted to its own symbol; see "The one flag".
+
+**Finding 3 — `--rank-auto-reserve-mib auto` is INFEASIBLE for this recipe**, and
+this file's own spec was internally inconsistent about it. `auto` derives
+3968 MiB uniformly (`512 + max(chunked_prefill, 2048) * 1.5 + tp * pp / 8 * 1024`;
+the graph term is correctly 0 under `--disable-cuda-graph`), leaving budgets
+`28639,16512,16512`, and the boot is refused after weight load:
+
+```
+ValueError: The per-rank budget leaves no GPU memory for the KV cache under
+--rank-gpu-memory-mib on rank 1: the 16512 MiB (16.12 GiB) budget is spent on
+weights + runtime state 17.59 GiB -- 17.59 GiB together, 1498 MiB more than the
+budget, before a single KV token.
+```
+
+Gate 4 demands the base plan `30407,19080,19080`, and that plan IS
+`32607-2200 / 20480-1400 / 20480-1400` — produced by the pinned reserve
+`2200,1400,1400` and by nothing else. So `auto` could not have satisfied Gate 4
+even if it had booted, and **the Gates below pin the reserve.** `auto` is not
+taught to avoid this, because it cannot be: it sizes the reserve from the
+activation heuristic and never sees the checkpoint, and the weight bytes it
+would need depend on the shard ratio, which is derived FROM these budgets. What
+#458 changed is the refusal — the error now names the derivation, says `auto`
+cannot self-correct, and gives the pinned value that fits
+(`ServerArgs.derived_reserve_infeasible_note`, pinned by
+`test_uneven_tp_args.TestDerivedReserveInfeasibility`).
+
+## Corridor: BREACHED at the measured recipe, and the arithmetic that repairs it
+
+The window sampled per-card free VRAM every 5 s across the whole serving window
+(`corridor_sampler.sh`, now in this directory). **Minima over the serving window,
+not a post-boot snapshot:**
+
+| arm | nvml0 = tp1 (3080 x4) | nvml1 = tp0 (5090) | nvml2 = tp2 (3080 x8) |
+|---|---|---|---|
+| `equal` | **215 MiB** | 1262 MiB | **215 MiB** |
+| `compute` | **249 MiB** | 1288 MiB | **221 MiB** |
+| `compute-cal` | **251 MiB** | 1282 MiB | **211 MiB** |
+
+All three arms are outside the >= 400 MiB floor on both 3080s, identically in
+kind, so the breach does not bias the A/B — but it does mean the 1.496x point
+was measured in a red corridor. Note what changed the verdict: the ~515 MiB this
+file previously quoted was a single POST-BOOT `nvidia-smi` line (the window's own
+post-boot readings were 549/1374/521), and the serving minimum sits 250-330 MiB
+below it. **Judge the corridor at peak, never at idle.**
+
+The arithmetic, and it is deliberately simple. Under `--rank-gpu-memory-mib` the
+budget is `nvml_total - reserve` and the KV pool takes whatever the budget leaves,
+so a MiB added to the reserve is a MiB the pool never allocates and the card
+keeps free:
+
+    worst 3080 minimum over all arms   = 211 MiB   (nvml2, compute-cal)
+    corridor floor                     = 400 MiB
+    deficit                            = 189 MiB
+    +200 MiB reserve  ->  411-451 MiB free   (inside by 11 MiB: not green)
+    +400 MiB reserve  ->  611-651 MiB free   (inside by >= 211 MiB: green)
+
+**Repaired recipe: `--rank-auto-reserve-mib 2200,1800,1800`** (the 5090 keeps
+2200 — its minimum was 1262 MiB and it was never near the floor). This is now
+the `boot_ab.sh` default.
+
+This is a NEW WINDOW, not a tweak, and the reason is Gate 4: the reserve moves
+the budgets, the budgets ARE the derived weight plan, so the base plan moves with
+it. Everything downstream follows:
+
+| quantity | as measured (1400) | repaired (1800) |
 |---|---|---|
-| base plan | `30407,19080,19080` | resolved `--rank-tp-ratio` in `boot_equal.log` |
-| base expert counts | 114 / 71 / 71 of 256 | `partition_units(256, base)` |
-| resident fraction | `0.485,0.42,0.42` | the launch flag, unchanged across arms |
-| link weights | 14.42 / 6.45 / 13.41 GB/s | measured card probe, `provenance=measured` |
-| measured H2D | 888.6 / 557.7 / 598.2 GiB | equal arm's #390 dump |
-| baseline transfer | 66.2 / **92.8** / 47.9 s | H2D / link; tp1 (x4) is the clock |
-| traffic coefficients | `1.0561,0.9379,1.0060` | `cold_traffic_coefficients_from_measurement` on the four rows above |
-| same-boot A-vs-A floor | CV 1.19 %, spread 2.35 % | equal arm, 3 x 450-token generations |
+| budgets = NVML total - reserve | 30407, 19080, 19080 | 30407, **18680**, **18680** |
+| base plan (`--rank-tp-ratio auto` derived weights) | 30407,19080,19080 | **30407,18680,18680** |
+| base expert counts of 256 | 114 / 71 / 71 | **115 / 71 / 70** |
+| solved `--rank-moe-ratio link` vector | 160,79,119 | **213,104,157** |
+| installed expert counts | 115 / 58 / 86 (+1 pad each) | **115 / 56 / 85** |
+| predicted transfer-term speedup | 1.411x (measured 1.496x) | **1.427x** |
 
-Predictions for THIS base plan (all four inputs above fed through the module's
-own functions; the group H2D total is held at the measured 2044.5 GiB, since
-the same tokens reach the same experts and only ownership moves):
+(Solved with the module's own functions against the same measured links
+14.42/6.45/13.41 GB/s and fractions 0.485,0.42,0.42; the prediction chain is
+RESULTS.md §7's, re-run on the new base plan. The measured arm beat its
+prediction by 6.0 %, so the band to expect is **1.43x - 1.51x**.)
 
-| arm | vector | expert counts | predicted H2D (GiB) | transfer (s) | clock |
-|---|---|---|---|---|---|
-| `equal` | 30407,19080,19080 | 114 / 71 / 71 | 888.6 / 557.7 / 598.2 | 66.2 / 92.8 / 47.9 | 92.8 |
-| `compute` | 160,79,119 | 114 / 57 / 85 | 895.5 / 355.7 / 793.3 | 66.7 / 59.2 / 63.5 | **66.7 = 1.392x** |
-| `compute-cal` | 258,135,197 | 112 / 59 / 85 | 860.0 / 384.7 / 799.8 | 64.0 / 64.0 / 64.0 | **64.0 = 1.450x** |
+Second-order effect to watch, not to correct in advance: the 3080s' share of the
+weight plan drops 0.27827 -> 0.27565 each, so ~0.5 pp of total weight mass moves
+onto the 5090. Its serving minimum was 1262 MiB; a few hundred MiB of that is the
+worst case, and it stays green. If it does not, that is a finding, not a reason to
+re-tune mid-window.
 
-**The band to confirm is 1.39x / 1.45x on the transfer term, not 1.358x /
-1.584x.** The latter belongs to the `400,256,344` worked example above. The
-window's job is to measure this band, not to reproduce a number from a
-different plan.
+## Green-corridor window — THE NEXT WINDOW'S TICKET (BOOT-PENDING)
 
-Discipline for the window:
-
-* **One boot per arm.** Three boots: `equal`, `compute`, `compute-cal`. Each
-  ~7 minutes of load; nothing here is worth a re-boot to re-read.
-* **A-vs-A floor first, in the `equal` boot**, before any delta is quoted. The
-  2026-08-02 value (CV 1.19 %) is the expectation, not a substitute — a floor
-  measured in another window does not cover this one.
-* **`--rank-auto-reserve-mib auto`** (`RESERVE_MIB=auto bash run_arm.sh ...`).
-  The pinned `2200,1400,1400` left both 3080s at ~515 MiB free — above the
-  400 MiB corridor floor, but by 115 MiB, and that is the exact margin the
-  residency defect overran. `auto` derives the reserve per card instead of
-  carrying one window's tuning into the next. Same value on every arm of the
-  window; a reserve that differs between arms is a second treatment.
-* **Same recipe, same fraction, same reserve on all three arms.** The solve
-  holds the resident mass fixed against the base plan, so changing the fraction
-  between arms changes the treatment rather than the measurement.
-* **Check the arm identified itself** before reading anything else:
-  `facts_<arm>.txt` must show `moe_compute_policy=link-proportional` (or
-  `-calibrated`), the solved vector, and — on the two compute arms — the
-  per-rank `resident fraction held at the base plan` lines. A compute arm
-  without those lines is not VRAM-neutral and its corridor is not arm 1's.
-* **Corridor** per card >= 400 MiB free, sampled at 5 s into `corridor.csv`.
+One window, **two boots**: `equal` and `compute`. `compute-cal` is dropped — it is
+falsified and registered, and re-running it would spend a card window
+re-measuring a rejection. That is what makes this window cheaper than the last.
 
 ```
-export RUN=/spinning/gpu-battery-results/$(date +%F)_439_confirm
+export RUN=/spinning/gpu-battery-results/$(date +%F)_439_green
 export REPO_ROOT=/spinning/htsglang VENV=/spinning/htsglang-gpu/.venv
-export WT=<the worktree> PORT=30439 RANK_GPU_ID=<from preflight.sh> RESERVE_MIB=auto
-bash "$WT/scripts/dev/394_s2_proof/preflight.sh"          # must print PREFLIGHT OK
+export WT=<the worktree> PORT=30439 RANK_GPU_ID=<from preflight.sh>
+export RESERVE_MIB=2200,1800,1800          # the repaired recipe; NOT 'auto'
+bash "$WT/scripts/dev/394_s2_proof/preflight.sh"        # must print PREFLIGHT OK
+bash "$WT/scripts/dev/394_s2_proof/corridor_sampler.sh" "$RUN/corridor_equal.csv" 1 &
 bash "$WT/scripts/dev/394_s2_proof/run_arm.sh" equal
+touch "$RUN/corridor_equal.csv.stop"
+bash "$WT/scripts/dev/394_s2_proof/corridor_sampler.sh" "$RUN/corridor_compute.csv" 1 &
 bash "$WT/scripts/dev/394_s2_proof/run_arm.sh" compute
-SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS=1.0561,0.9379,1.0060 \
-  bash "$WT/scripts/dev/394_s2_proof/run_arm.sh" compute-cal
+touch "$RUN/corridor_compute.csv.stop"
 ```
 
-Re-derive the coefficients from THIS window's own `equal` arm if its H2D
-differs from the row above by more than the A-vs-A floor; a coefficient
-measured on one recipe is not a property of the rig.
+**Gates.**
+
+1. **Corridor, and it is a GATE this time, not a note.** Sample at **1 Hz**
+   during load (the 5 s of the last window biases the minimum high, and 1 Hz
+   costs nothing). Per card, over the SERVING window only, minimum free VRAM
+   **>= 400 MiB**. Expect ~611-651 MiB on the 3080s and >= ~900 MiB on the 5090.
+   Map nvml columns to ranks through preflight's table — nvidia-smi order is not
+   `--rank-gpu-id` order on this rig.
+2. **Gate 4 (resolved plan).** `--rank-tp-ratio auto: derived weights
+   [30407, 18680, 18680]` in both boot logs. A different plan means a different
+   reserve reached the boot and the predictions below do not apply.
+3. **Gate 3 (self-identification).** `facts_compute.txt` must show
+   `moe_compute_policy=link-proportional` — NOT `-calibrated`, and not
+   `base-plan` — plus `moe_compute_vector=213,104,157` and the three per-rank
+   `resident fraction held at the base plan` lines.
+4. **A-vs-A floor first**, in the `equal` boot, 900 tokens x 3 runs x 1 warmup.
+   The expectation is the last window's CV 2.12 % / spread 4.09 %; a floor from
+   another window does not cover this one.
+5. **Speedup.** Transfer term `h2d_r / link_r`, clock = slowest rank. Expected
+   **1.43x - 1.51x** (prediction 1.427x, and the last window's arm beat its
+   prediction by 6.0 %). End-to-end **-6 % to -9 %** ms/token, which must clear
+   the floor measured in gate 4 to be reportable at all.
+
+**Labelling rules, so the result is readable without the run dir.**
+
+* A boot refused by the budget check is **INFEASIBLE-AT-RESERVE**, and the label
+  carries the reserve, the derived budgets and the shortfall. It is not "the arm
+  failed".
+* A boot that serves but whose corridor minimum is below 400 MiB on any card is
+  **CORRIDOR-RED**, and its speedup is recorded but **not acceptance-evidence**.
+  That is exactly the status of the 1.496x point today.
+* **No reserve-shrinking rescues.** If a card is short, the window ends and the
+  finding is the shortfall. Lowering the reserve to buy a boot changes the base
+  plan, hence the vector, hence what is being measured — and it silently converts
+  a corridor breach into a different experiment.
+* The reserve is ONE value for the whole window, identical on both arms. A
+  reserve that differs between arms is a second treatment.
+* Quote `read_arm.py`'s pre-teardown numbers, never the post-SIGTERM
+  `expert_stats_*.json` revision.
+
+**Also read out this time:** the per-rank compute/wait split (see readout item 2
+— grep the right string, the last window looked for the wrong one and reported
+the instrument as silent).
 
 ## What must be read out, per rank
 
@@ -224,9 +359,37 @@ this arm exists to move.
    Unlike arms 1 and 2, a NULL delta here falsifies the arm.
 2. **Per-rank ms/round.** Transfer is part of a ~135 ms/token decode on this
    recipe, so the end-to-end effect is smaller than the transfer-term ratio.
-   Report both, and report the per-rank split (compute vs wait) from
+   Report both, and report the per-rank split (compute vs wait) from the #252
    CollectiveClock — a rank that stops being the clock should show its wait time
    move, not vanish.
+
+   **Grep for the LINE, not for the instrument.** The 2026-08-03 window reported
+   "zero CollectiveClock lines in any boot log" and skipped this readout. The
+   instrument was working the whole time: the string `CollectiveClock` is a
+   class name and is never logged. The line is
+
+       Prefill rank batch, #new-token: N, #cached-token: C, #chunks: K,
+       gpu-ms: T (compute Tc, wait Tw)
+
+   and that window's own `boot_equal.log` carries 15 of them, `boot_compute.log`
+   18, on all three ranks (e.g. `TP0 ... gpu-ms: 4472.4 (compute 3113.4, wait
+   1359.0)` next to `TP1 ... (compute 4347.5, wait 124.9)` — the same total, a
+   3.5x spread in wait, which is the shard-imbalance signal). Read them with
+   `scripts/gpu_battery/s12_log_analyse.py`, which already parses exactly this
+   line and reports per-rank compute/wait medians and the wait share; do not
+   re-implement the regex.
+
+   **What the instrument genuinely does NOT cover, and it is a real limit of
+   this readout:** the clock is armed only around PLAIN PREFILL forwards on the
+   target runner (`metrics_reporter._install_rank_prefill_timer`; not the draft
+   runners, not `pp_size > 1`, and the split is dropped entirely for a
+   graph-covered forward because a replayed graph never runs the Python body
+   that records the events). The headline of this arm is a DECODE measurement
+   with prefill excluded by construction (`decode_probe.py:62`), so there is no
+   decode-side compute/wait split to read at all. Report the prefill split as
+   the shard-imbalance evidence it is, and do not present it as the decode
+   round's split. Extending the clock to decode is a separate piece of work and
+   is not in this window.
 3. **`moe_compute_policy` + `moe_compute_vector`** (new in the dump). An arm
    whose policy reads `base-plan` ran the baseline; any delta against it is a
    delta between two baselines. This is the same self-identification rule
@@ -258,15 +421,19 @@ like from the boot log.
   the rig, sets the floor. Every predicted delta above is far above 1.4 %.
 * Same-boot A-vs-A floor before any A/B delta is quoted, per canon. First boot
   after a cache change is a JIT outlier.
-* Arms in one window, same recipe, same reserve (`2200,1400,1400`), same
-  `--rank-moe-resident-fraction 0.485,0.42,0.42`. The solve holds the resident
-  mass fixed, so changing the fraction between arms changes the treatment.
+* Arms in one window, same recipe, same reserve (`2200,1800,1800` since #458 —
+  see the corridor arithmetic; `2200,1400,1400` is what the 2026-08-03 window
+  ran and it is corridor-red), same `--rank-moe-resident-fraction
+  0.485,0.42,0.42`. The solve holds the resident mass fixed, so changing the
+  fraction between arms changes the treatment.
 * `--disable-cuda-graph`, as the published baseline for this configuration does.
 
 ## Corridor and preflight
 
 VRAM-neutral by construction, so the corridor is arm 1's: per-card free
->= 400 MiB, no registered posting wasting > 1.5 GiB net. Host DRAM is where the
+>= 400 MiB, no registered posting wasting > 1.5 GiB net. **Arm 1's corridor was
+itself judged on a post-boot snapshot and is red at peak** — see the corridor
+section above for the measurement and the repaired reserve. Host DRAM is where the
 mass moves; total pinned bytes are unchanged, but the PER-RANK host pool grows
 on tp0/tp2 and shrinks on tp1, so re-run `preflight.sh` for the `/dev/shm`
 headroom if arm 3 is combined with `SGLANG_MOE_COLD_TIER_SHM=1`. Arm 3 does not
@@ -286,34 +453,57 @@ compute, and the two compose but are independent.
 ## Run order
 
 ```
+export RESERVE_MIB=2200,1800,1800                   # the repaired recipe
 bash scripts/dev/394_s2_proof/preflight.sh          # must print PREFLIGHT OK
+bash scripts/dev/394_s2_proof/corridor_sampler.sh "$RUN/corridor_equal.csv" 1 &
 ARM=equal   bash scripts/dev/394_s2_proof/boot_ab.sh
 # bounded curl -m readiness loop, then the bench-length generations
 python3 scripts/dev/394_s2_proof/read_arm.py <run> equal
 ARM=compute bash scripts/dev/394_s2_proof/boot_ab.sh
 python3 scripts/dev/394_s2_proof/read_arm.py <run> compute
+```
 
-# calibrated sub-arm: coefficients from the EQUAL arm's own dump
+`run_arm.sh <arm>` does the whole sequence for one arm and is the driver to use;
+the lines above are what it runs.
+
+The `compute-cal` sub-arm is FALSIFIED and is not part of a measurement window
+any more. To test a replacement hit-rate model against it, derive coefficients
+from the EQUAL arm's own dump and pass the experimental symbol:
+
+```
 python3 -c "
 from sglang.srt.layers.moe.expert_compute_placement import (
     cold_traffic_coefficients_from_measurement as c)
-print(','.join(f'{x:.4f}' for x in c([400,256,344],[0.485,0.42,0.42],[H0,H1,H2])))"
+print(','.join(f'{x:.4f}' for x in c([B0,B1,B2],[0.485,0.42,0.42],[H0,H1,H2])))"
 ARM=compute-cal SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS=<that> \
-  bash scripts/dev/394_s2_proof/boot_ab.sh
-python3 scripts/dev/394_s2_proof/read_arm.py <run> compute-cal
+  bash scripts/dev/394_s2_proof/boot_ab.sh      # -> --rank-moe-ratio link-calibrated
 ```
 
-`H0,H1,H2` are the equal arm's per-rank `h2d_bytes`, and `[400,256,344]` is the
-base plan THAT arm ran (read it off the boot log's resolved `--rank-tp-ratio`,
-do not assume it).
+`H0,H1,H2` are the equal arm's per-rank `h2d_bytes` and `B0,B1,B2` the base plan
+THAT arm ran — read both off its own boot log, never assume them. Plain `link`
+refuses while `SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS` is exported, so the two
+arms cannot be confused for one another.
 
 ## Status
 
-**The band is UNMEASURED. The arm has never served a token.**
+**Slice 3 has served tokens. The DESK-WRITTEN-NEVER-EXECUTED label is LIFTED**
+for the compute path as of the 2026-08-03 confirmation window: the resolver
+reads the launch flag, residency is held at the base plan on all three ranks,
+the arm harness carries the arm, and all three 2026-08-02 defects are confirmed
+fixed ON HARDWARE. The measured effect is `compute` = **1.496x** on the transfer
+term and **-7.67 %** end-to-end against a 4.09 % same-window floor.
 
-The 2026-08-02 battery ran the `equal` baseline in full (that half is real, and
-is where every measured input above comes from) and could not boot `compute` at
-all. Three defects, all found on hardware, all fixed at the desk since:
+What is still open, and it is one boot:
+
+* **CORRIDOR-RED.** Every arm of that window ran with both 3080s below the
+  400 MiB floor (211-251 MiB at the serving minimum). The 1.496x point is real
+  but is not acceptance-evidence until it is re-proven in a green corridor at
+  the repaired reserve — the "Green-corridor window" ticket above. **BOOT-PENDING.**
+* The per-rank compute/wait split was never read (the window grepped for the
+  wrong string; readout item 2 now names the right one). No boot is owed for
+  this — it is in the logs that window already wrote.
+
+The three defects the 2026-08-02 battery found, and how each was closed:
 
 | # | defect | fix | falsifier |
 |---|---|---|---|
@@ -321,13 +511,21 @@ all. Three defects, all found on hardware, all fixed at the desk since:
 | 2 | the arm was not VRAM-neutral: residency was sized off the SOLVED expert count, +19.5 % on tp2 → OOM during staging. Correcting the fraction feeds back into the solve (a fixed point the spec did not address) | residency held at the pre-link base plan through a DERIVED sizing fraction on a channel the solve never reads — see the NOTE above | `TestResidencyIsHeldAtTheBasePlan`, can-fail = drop the correction (tp1 25≠31, tp2 37≠31) |
 | 3 | the battery's driver set `ARM` without exporting it, so every arm booted the baseline; `boot_ab.sh` defaulted to `equal` rather than refusing | `run_arm.sh` is in the repo and exports; `boot_ab.sh` refuses an unset arm and has a `DRY_RUN=1` mode | `TestTheArmHarnessCarriesTheArm`, can-fail = restore the `equal` default (the unexported-arm case fails) |
 
+All three were confirmed fixed on hardware by the confirmation window's Gates
+1-4, which is what a can-fail arm cannot do on its own.
+
 Hermetically tested: `test/registered/unit/layers/moe/test_expert_compute_placement_439.py`,
-76 tests + 141 subtests, including an execution smoke of the full resolver path
+92 tests + 143 subtests, including an execution smoke of the full resolver path
 with the hardware facts injected through `SGLANG_RANK_CARD_UUIDS` +
-`SGLANG_MOE_HOST_SHARD_RATIO`, and seven proven can-fail arms (solve ignores the
+`SGLANG_MOE_HOST_SHARD_RATIO`, and eight proven can-fail arms (solve ignores the
 links; resident mass allowed to float; launcher call removed; worker refusal
-removed; plus the three above). None of it has been observed on hardware.
-The standing DESK-WRITTEN risk label applies until the confirmation window
-above runs. The catalog-first analysis behind the design is
-`docs/dev/ANALYSE_439_expert_compute_placement.md`; the battery record is
-`/spinning/gpu-battery-results/2026-08-02_439_arm3/RESULTS.md`.
+removed; a stale coefficient export silently recalibrating the solve; plus the
+three above). The reserve infeasibility has its own hermetic reproduction in
+`test/registered/unit/server_args/test_uneven_tp_args.py`
+(`TestDerivedReserveInfeasibility`, 7 tests, can-fail = silence the note).
+
+The catalog-first analysis behind the design is
+`docs/dev/ANALYSE_439_expert_compute_placement.md`; the battery records are
+`/spinning/gpu-battery-results/2026-08-02_439_arm3/RESULTS.md` (baseline only)
+and `/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md` (the
+confirmation window).

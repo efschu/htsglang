@@ -447,23 +447,33 @@ def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
     return [int(part.strip()) for part in value.split(",")]
 
 
-#: Symbolic value of --rank-moe-ratio (#394 slice 3). Duplicated here rather
+#: Symbolic values of --rank-moe-ratio (#394 slice 3). Duplicated here rather
 #: than imported because ``layers.moe.expert_compute_placement`` is a runtime
 #: module and argument parsing must not drag it in; the two spellings are
 #: pinned equal by test_expert_compute_placement_439.
 _COMPUTE_PLACEMENT_LINK = "link"
+#: The experimental calibrated variant. A SEPARATE symbol on purpose (#458):
+#: before the 2026-08-03 confirmation window, plain 'link' plus a set
+#: SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS silently produced the calibrated solve,
+#: and that solve is the one the window falsified.
+_COMPUTE_PLACEMENT_LINK_CALIBRATED = "link-calibrated"
+_COMPUTE_PLACEMENT_SYMBOLS = (
+    _COMPUTE_PLACEMENT_LINK,
+    _COMPUTE_PLACEMENT_LINK_CALIBRATED,
+)
 
 
 def _parse_rank_moe_ratio(value: str) -> Union[str, List[int]]:
-    """Parse --rank-moe-ratio: 'link' or a comma-separated integer list.
+    """Parse --rank-moe-ratio: a symbol or a comma-separated integer list.
 
-    'link' is resolved in the LAUNCHER (see
+    The symbols are resolved in the LAUNCHER (see
     ``layers/moe/expert_compute_placement.py``), not here: the solve needs the
     rank -> physical card vector, and the identity map that produces it costs a
     CUDA context this process may not have paid for yet.
     """
-    if value.strip() == _COMPUTE_PLACEMENT_LINK:
-        return _COMPUTE_PLACEMENT_LINK
+    symbol = value.strip()
+    if symbol in _COMPUTE_PLACEMENT_SYMBOLS:
+        return symbol
     return [int(part.strip()) for part in value.split(",")]
 
 
@@ -2429,7 +2439,22 @@ class ServerArgs:
             "time the group waits on. Needs expert offload "
             "(--rank-moe-resident-fraction < 1) and a link ratio of usable "
             "provenance; both absences are refused by name rather than "
-            "resolved to the base plan. "
+            "resolved to the base plan. 'link' is the solve to use: it is "
+            "uncalibrated, needs no prior boot, and measured 1.496x on the "
+            "transfer term / -7.67 %% end-to-end on the reference recipe "
+            "(2026-08-03 confirmation window). "
+            "'link-calibrated' is the EXPERIMENTAL variant that additionally "
+            "spends per-rank cold-traffic coefficients from a prior boot's "
+            "#390 dump (SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS, required, and "
+            "read ONLY under this symbol). Its modelling assumption is "
+            "FALSIFIED on hardware: a coefficient treats the cache hit rate "
+            "as a property of the rank, and the same window measured it "
+            "tracking the SIZE of the owned expert range instead (tp1 "
+            "0.8450 -> 0.9050 as its range shrank 72 -> 58 experts; tp2 "
+            "0.8474 -> 0.7814 as its range grew 72 -> 89). It therefore "
+            "overloaded the rank it thought was cheap and reached only "
+            "1.439x / -0.94 %%, i.e. inside the same-window A-vs-A floor. "
+            "Use it to test a better hit-rate model, not to serve. "
             "The server's profiling logs a suggested vector ('restart "
             "with SGLANG_UNEVEN_MOE_VECTOR=...') when rebalancing gains "
             "> 10%%. The environment variable SGLANG_UNEVEN_MOE_VECTOR "
@@ -9252,7 +9277,7 @@ class ServerArgs:
             # below tells the reader an optimizer exists, and printing it next
             # to a request for that optimizer would be advice to do what they
             # just did.
-            if value is not None and value != _COMPUTE_PLACEMENT_LINK
+            if value is not None and value not in _COMPUTE_PLACEMENT_SYMBOLS
         ]
         if pinned:
             logger.info(
@@ -9935,7 +9960,7 @@ class ServerArgs:
             if (
                 field == "rank_moe_ratio"
                 and env_value
-                and env_value.strip() == _COMPUTE_PLACEMENT_LINK
+                and env_value.strip() in _COMPUTE_PLACEMENT_SYMBOLS
             ):
                 # The symbol is a SOLVE, and the solve runs in the launcher
                 # against the rank -> card vector. Accepting it here would put
@@ -9945,7 +9970,7 @@ class ServerArgs:
                 raise ValueError(
                     f"{env_name}={env_value!r}: the environment channel takes "
                     f"an explicit vector only. Use {flag} "
-                    f"{_COMPUTE_PLACEMENT_LINK} to request the solve."
+                    f"{env_value.strip()} to request the solve."
                 )
             if env_value:
                 try:
@@ -9975,7 +10000,7 @@ class ServerArgs:
                     "base plan (--rank-tp-ratio); without one every "
                     "family already uses the even split."
                 )
-            if vector == _COMPUTE_PLACEMENT_LINK:
+            if vector in _COMPUTE_PLACEMENT_SYMBOLS:
                 # Precondition-checked here (the base plan above is the one
                 # that matters), solved in the launcher. Everything below
                 # validates an explicit vector and does not apply yet.
@@ -10525,6 +10550,68 @@ class ServerArgs:
             f"real prefill, not at startup. Pass "
             f"--rank-auto-reserve-mib auto to derive it, or raise the pinned "
             f"value."
+        )
+
+    def derived_reserve_infeasible_note(
+        self, tp_rank: int, short_mib: int
+    ) -> Optional[str]:
+        """Why an ``auto``-derived reserve cannot fix a budget shortfall by
+        itself, and the pinned value that would (#458).
+
+        ``None`` unless the reserve really was derived: under a pinned reserve
+        the standing advice ("lower it by the shortfall") is followable and
+        this note would only repeat it.
+
+        The inconsistency this names, measured on 2026-08-03: ``auto`` sizes
+        the reserve from the stock ACTIVATION heuristic
+        (:meth:`mamba_pre_capture_reserve_mb` plus the captured-token graph
+        term) and from nothing else. It never sees the model, so it cannot know
+        that what it leaves as budget is already below the rank's weights plus
+        runtime state -- on the #439 recipe it derived 3968 MiB per 20 GiB card,
+        leaving a 16512 MiB budget against 17.59 GiB of weights + runtime, and
+        the boot died 1498 MiB short AFTER loading the weights. There is no
+        derivation that would have avoided it: the weight bytes depend on the
+        shard ratio, the shard ratio is derived FROM these budgets, and the
+        resident-expert split moves both. So the honest fix is not a cleverer
+        ``auto``; it is a refusal that says what ``auto`` did, why it cannot
+        self-correct, and which pinned number fits.
+        """
+        if str(self.rank_auto_reserve_mib) != self.AUTO_RANK_MEMORY_RESERVE_MIB:
+            return None
+        rank_gpu_ids = list(self.rank_gpu_id or [])
+        if not 0 <= tp_rank < len(rank_gpu_ids):
+            return None
+        gpu_id = rank_gpu_ids[tp_rank]
+        colocated = sum(1 for g in rank_gpu_ids if g == gpu_id)
+        try:
+            gpu_mem = get_device_memory_capacity(self.device)
+            derived = self.derived_rank_auto_reserve_mib(
+                gpu_mem,
+                colocated,
+                hosts_solo_draft=(gpu_id == self.ladder_reserve_gpu_id()),
+            )
+            runtime_reserve = self.mamba_pre_capture_reserve_mb(gpu_mem)
+        except Exception as e:  # pragma: no cover - advisory only
+            logger.debug("Could not derive the reserve for the boot note: %s", e)
+            return None
+        # budget = (nvml_total - reserve) // colocated, so every MiB taken off
+        # the reserve returns 1/colocated MiB of budget to THIS rank.
+        fits = max(derived - short_mib * colocated, 0)
+        return (
+            f" That budget was DERIVED, not chosen: --rank-auto-reserve-mib "
+            f"auto sized {derived} MiB of headroom for GPU {gpu_id} "
+            f"({runtime_reserve:.0f} MiB stock runtime/activation reserve + "
+            f"{derived - runtime_reserve:.0f} MiB captured-token graph demand "
+            f"x {colocated} co-located rank(s)) and handed the rest out as "
+            f"budget. 'auto' reads the activation heuristic only -- it never "
+            f"sees the checkpoint, so it cannot detect that the budget it "
+            f"leaves is already below this rank's weights plus runtime state, "
+            f"and re-running will derive the same {derived} MiB again. Pin the "
+            f"reserve instead: --rank-auto-reserve-mib <= {fits} MiB on GPU "
+            f"{gpu_id} clears this shortfall, and it needs to be lower still by "
+            f"the KV pool you actually want. Pinning replaces the whole derived "
+            f"demand model, so keep enough headroom for graph capture and the "
+            f"prefill activations yourself."
         )
 
     def pinned_rank_auto_reserve_mib(self, tp_rank: int) -> Optional[int]:

@@ -9,8 +9,9 @@ four can-fail arms). What only a boot can show is in this directory.
 | script | proves |
 |---|---|
 | `preflight.sh` | `/dev/shm` is large enough and clean, the NVML rank→card table is what the arm's `--rank-gpu-id` is derived from, and the ratio resolves from a MEASURED probe rather than the nameplate |
-| `boot_ab.sh` | the arms boot on the V4-Flash recipe: `ARM=equal` (baseline, pre-#394 plan field for field), `ARM=proportional` (measured ratio + shared cold tier), `ARM=compute` / `ARM=compute-cal` (slice 3: the compute assignment moves) |
+| `boot_ab.sh` | the arms boot on the V4-Flash recipe: `ARM=equal` (baseline, pre-#394 plan field for field), `ARM=proportional` (measured ratio + shared cold tier), `ARM=compute` (slice 3: the compute assignment moves — CONFIRMED 1.496x on the transfer term, 2026-08-03), `ARM=compute-cal` (the calibrated variant, FALSIFIED by that same window) |
 | `run_arm.sh` | drives ONE arm end to end: boot, bounded readiness loop, facts, bench generations, `read_arm.py`, teardown with a VRAM check |
+| `corridor_sampler.sh` | per-card free VRAM at 1 Hz into a CSV for the whole serving window; the corridor is judged on the MINIMUM, and a post-boot snapshot overstates free by 250-330 MiB here |
 | `read_arm.py` | reads one arm out of its #390 dumps: which arm it was, per-rank H2D, per-rank hit rate, and the share that came from a peer's segment |
 | `ARM3_COMPUTE.md` | the slice-3 arm spec: the one flag, the solve, the predicted per-rank numbers, what must be read out, and the confirmation-window spec |
 
@@ -63,7 +64,11 @@ produce. That marker is `ARM=compute`'s target instead (#394 slice 3, task
 mass matches its own link, with the GPU-resident mass held fixed. Its
 predictions and readouts are in `ARM3_COMPUTE.md`; its per-rank H2D delta is
 predicted NON-null, which is the one place in this window where a null result
-is a falsification rather than a confirmation.
+is a falsification rather than a confirmation. It is no longer a prediction:
+the 2026-08-03 window measured tp1's H2D falling 1157.6 → 672.7 GiB and the
+clock moving off the x4 card, worth **1.496x** on the transfer term and
+**-7.67 %** end-to-end. It is still CORRIDOR-RED and owes one green-corridor
+re-proof.
 
 So the arm is instrumented to falsify rather than to confirm: the primary
 readout is per-rank H2D, a null delta is the expected and publishable result,
@@ -77,14 +82,23 @@ worth having either way. The measurement uses bench-length generations
 Per-card free VRAM ≥ 400 MiB, no single registered posting wasting > 1.5 GiB
 net. The cold tier lives in host DRAM, so do not tighten
 `--rank-auto-reserve-mib` to buy it headroom — it does not need VRAM. The
-scripts default to the reserve arms 1 and 2 were measured at
-(`RESERVE_MIB=2200,1400,1400`). That reserve left both 3080s at ~515 MiB free
-on the 2026-08-02 equal arm — inside the corridor by 115 MiB, and the same
-margin the #439 residency defect overran — so the slice-3 confirmation window
-runs at `RESERVE_MIB=auto` instead (`ARM3_COMPUTE.md`, "Confirmation window").
-Whichever is chosen, every arm in one window uses the SAME value: the reserve
-moves the KV pool, so a reserve that differs between arms is a second
-treatment.
+scripts default to `RESERVE_MIB=2200,1800,1800`, which is NOT the reserve arms
+1 and 2 were measured at. `2200,1400,1400` looked green on a post-boot snapshot
+(~515 MiB free on both 3080s) and is red at peak: the 2026-08-03 window sampled
+the whole serving window and the 3080s bottom out at **211-251 MiB** against the
+400 MiB floor. +400 MiB of reserve is +400 MiB of free VRAM (the KV pool takes
+whatever the budget leaves), which lands the minimum at ~611-651 MiB. It also
+moves the derived budgets and therefore the base plan — see `ARM3_COMPUTE.md`,
+"Corridor: BREACHED at the measured recipe". `RESERVE_MIB=auto` is NOT usable on
+this recipe: it derives 3968 MiB per card and the resulting budget is below what
+weights + runtime state already need on a 3080. Whichever is chosen, every arm
+in one window uses the SAME value: the reserve moves the KV pool, so a reserve
+that differs between arms is a second treatment.
+
+Sample the corridor with `corridor_sampler.sh <out.csv> 1` for the whole serving
+window and read the MINIMUM per card. A single post-boot `nvidia-smi` line
+overstates free VRAM by 250-330 MiB on this recipe and is how the breach went
+unnoticed for two windows.
 
 ## Graph path
 
