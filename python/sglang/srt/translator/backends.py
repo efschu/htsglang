@@ -244,8 +244,15 @@ class TtsBackend(Protocol):
         language: str,
         reference: AudioChunk,
         reference_text: Optional[str] = None,
+        voice_id: Optional[str] = None,
     ) -> AsyncIterator[AudioChunk]:
         """Stream synthesized audio for ``text`` in ``reference``'s voice.
+
+        ``voice_id`` names a voice the backend already holds -- a preset
+        registered once with a serving-side voice registry. When set, the
+        backend may skip re-uploading ``reference``; when None, the reference
+        clip is the whole specification. Backends without a registry ignore it
+        and clone from the clip every time, which is correct, just slower.
 
         ``reference_text`` is the transcript of the reference audio; some
         backends (F5-TTS class) require it, others (CosyVoice cross-lingual
@@ -414,6 +421,7 @@ class FakeTts:
         self._chunk_seconds = chunk_seconds
         self._seconds_per_char = seconds_per_char
         self.calls: List[Tuple[str, str, float, Optional[str]]] = []
+        self.voice_ids: List[Optional[str]] = []
 
     def supported_languages(self) -> Iterable[str]:
         return tuple(self._languages)
@@ -424,8 +432,10 @@ class FakeTts:
         language: str,
         reference: AudioChunk,
         reference_text: Optional[str] = None,
+        voice_id: Optional[str] = None,
     ) -> AsyncIterator[AudioChunk]:
         self.calls.append((text, language, reference.duration_s, reference_text))
+        self.voice_ids.append(voice_id)
         if language not in self._languages:
             raise BackendError("tts", f"checkpoint cannot speak {language!r}")
         if reference.duration_s < self.min_reference_seconds:
