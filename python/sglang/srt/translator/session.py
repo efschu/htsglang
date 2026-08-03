@@ -77,6 +77,7 @@ from sglang.srt.translator.speakers import (
     ReferenceTooShort,
     SpeakerRegistry,
     SpeakerRegistryConfig,
+    split_points_by_dispersion,
 )
 from sglang.srt.translator.voices import (
     VoiceAssignment,
@@ -107,6 +108,7 @@ class EventKind(str, enum.Enum):
     TURN_OPENED = "turn.opened"
     TURN_TRANSCRIPT = "turn.transcript"
     TURN_SPEAKER = "turn.speaker"
+    TURN_SPLIT = "turn.split"
     TURN_VOICE = "turn.voice"
     TURN_TRANSLATION = "turn.translation"
     TURN_AUDIO = "turn.audio"
@@ -288,6 +290,11 @@ class TranslatorSession:
         max_queued_turns: int = 2,
         voice_mode: VoiceMode = VoiceMode.CLONE,
         voice_pool: Optional[VoicePool] = None,
+        speaker_change_detection: bool = True,
+        speaker_change_threshold: float = 0.62,
+        speaker_change_window_s: float = 1.5,
+        speaker_change_min_segment_s: float = 3.0,
+        speaker_change_min_piece_s: float = 0.8,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         conversation.validate_against(matrix)
@@ -305,6 +312,11 @@ class TranslatorSession:
         # configured bounds would be silently replaced by the defaults.
         self.journal = journal if journal is not None else Journal()
         self.min_reference_seconds = min_reference_seconds
+        self.speaker_change_detection = speaker_change_detection
+        self.speaker_change_threshold = speaker_change_threshold
+        self.speaker_change_window_s = speaker_change_window_s
+        self.speaker_change_min_segment_s = speaker_change_min_segment_s
+        self.speaker_change_min_piece_s = speaker_change_min_piece_s
         self.voice_pool = voice_pool
         # The pool is what makes preset mode possible; asking for it without
         # one is a configuration error, not something to silently ignore, but
@@ -444,17 +456,118 @@ class TranslatorSession:
         results: List[TurnResult] = []
         while self._queue and not self._closed:
             segment = self._queue.popleft()
-            result = await self.run_turn(segment)
-            if result is not None:
-                results.append(result)
+            results.extend(await self.run_turn_multi(segment))
         return results
 
     # -- the pipeline -------------------------------------------------------
 
     async def run_turn(self, segment: Segment) -> Optional[TurnResult]:
-        """One segment, all the way to audio. Serialized per session."""
+        """One segment, all the way to audio. Returns the LAST turn produced.
+
+        Kept for callers that want a single result; a segment containing two
+        speakers produces two turns and only the last is returned here. Prefer
+        :meth:`run_turn_multi` when every result matters.
+        """
+        results = await self.run_turn_multi(segment)
+        return results[-1] if results else None
+
+    async def run_turn_multi(self, segment: Segment) -> List[TurnResult]:
+        """One segment, re-cut at speaker changes, all the way to audio.
+
+        Serialized per session. The split check runs BEFORE recognition, not
+        after: two people in one segment must be transcribed separately or the
+        ASR produces one run-on utterance whose halves are in different
+        languages, and no amount of later attribution repairs that.
+        """
         async with self._turn_lock:
-            return await self._run_turn_locked(segment)
+            pieces = await self._split_at_speaker_changes(segment)
+            results: List[TurnResult] = []
+            for piece in pieces:
+                result = await self._run_turn_locked(piece)
+                if result is not None:
+                    results.append(result)
+            return results
+
+    async def _split_at_speaker_changes(self, segment: Segment) -> List[Segment]:
+        """Re-cut a segment wherever the voice changes inside it.
+
+        The one real failure mode of per-segment (rather than frame-level)
+        diarization: two people speaking back-to-back with no pause between
+        them land in a single VAD segment, get one embedding, and one of them
+        contributes their voice to the other's reference buffer. A poisoned
+        reference buffer is audible in every later turn by that speaker, which
+        makes this the expensive kind of mistake.
+
+        Gated on segment length: a short segment cannot hold two turns, and
+        paying N extra embedder passes on every utterance to discover that
+        would put the cost on the common case to protect the rare one.
+        """
+        if not self.speaker_change_detection:
+            return [segment]
+        if segment.duration_s < self.speaker_change_min_segment_s:
+            return [segment]
+
+        window_s = self.speaker_change_window_s
+        rate = segment.audio.sample_rate
+        window = int(window_s * rate)
+        count = int(segment.duration_s // window_s)
+        if count < 2:
+            return [segment]
+
+        embeddings = []
+        for index in range(count):
+            start = index * window
+            chunk = AudioChunk(
+                segment.audio.samples[start : start + window], rate
+            )
+            try:
+                embeddings.append(await self.embedder.embed(chunk))
+            except BackendError:
+                # An unembeddable window (too quiet, too short) makes the whole
+                # dispersion test unreliable rather than partially valid, so
+                # the segment is left whole. Splitting on incomplete evidence
+                # would be worse than not splitting.
+                return [segment]
+
+        points = split_points_by_dispersion(
+            embeddings, self.speaker_change_threshold
+        )
+        if not points:
+            return [segment]
+
+        boundaries = [0, *[p * window for p in points], len(segment.audio.samples)]
+        pieces: List[Segment] = []
+        for index in range(len(boundaries) - 1):
+            start, end = boundaries[index], boundaries[index + 1]
+            piece_audio = AudioChunk(segment.audio.samples[start:end], rate)
+            if piece_audio.duration_s < self.speaker_change_min_piece_s:
+                continue
+            pieces.append(
+                dataclasses.replace(
+                    segment,
+                    audio=piece_audio,
+                    start_s=segment.start_s + start / rate,
+                )
+            )
+        if len(pieces) < 2:
+            return [segment]
+
+        self.journal.append(
+            EventKind.TURN_SPLIT,
+            {
+                "segment_index": segment.index,
+                "pieces": len(pieces),
+                "at_seconds": [round(p * window_s, 2) for p in points],
+                "durations_s": [round(p.duration_s, 2) for p in pieces],
+            },
+        )
+        logger.info(
+            "session %s re-cut segment %d into %d pieces at a speaker change",
+            self.session_id,
+            segment.index,
+            len(pieces),
+        )
+        return pieces
 
     async def _run_turn_locked(self, segment: Segment) -> Optional[TurnResult]:
         turn_id = uuid.uuid4().hex[:12]
@@ -684,7 +797,7 @@ class TranslatorSession:
                 return
             tts_start = self._clock()
             async for piece in self.tts.synthesize(
-                unit, target, reference, reference_text
+                unit, target, reference, reference_text, voice.backend_voice_id
             ):
                 if first_audio_at is None:
                     first_audio_at = self._clock()
@@ -942,14 +1055,10 @@ async def run_conversation(
     results: List[TurnResult] = []
     for chunk in audio:
         for segment in session.push_audio(chunk):
-            result = await session.run_turn(segment)
-            if result is not None:
-                results.append(result)
+            results.extend(await session.run_turn_multi(segment))
     tail = session.release()
     if tail is not None:
-        result = await session.run_turn(tail)
-        if result is not None:
-            results.append(result)
+        results.extend(await session.run_turn_multi(tail))
     return results
 
 

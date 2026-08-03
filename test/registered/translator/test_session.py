@@ -345,6 +345,113 @@ class TestJournalAndResume(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0].speaker_id, speakers_before[0]["speaker_id"])
 
 
+class TestIntraSegmentSpeakerSplit(unittest.IsolatedAsyncioTestCase):
+    """Two people back-to-back with no pause land in ONE VAD segment.
+
+    Left alone, that segment gets one embedding and one of the two speakers
+    contributes their voice to the other's reference buffer -- a poisoned
+    buffer is audible in every later turn by that speaker, which is the
+    expensive kind of mistake. These are the falsifiers for the re-cut.
+    """
+
+    async def test_a_two_speaker_segment_is_re_cut_into_two_turns(self):
+        session, _asr, mt, _tts = make_session()
+        # No silence between the voices: one continuous 6 s segment.
+        run_on = AudioChunk(
+            np.concatenate(
+                [silence(0.3), tone(VOICE_A_HZ, 3.0), tone(VOICE_B_HZ, 3.0),
+                 silence(0.4)]
+            ),
+            RATE,
+        )
+        results = await run_conversation(session, [run_on])
+        self.assertEqual(len(results), 2, "the run-on segment was not re-cut")
+        self.assertNotEqual(results[0].speaker_id, results[1].speaker_id)
+        # And each half was routed by ITS OWN detected language.
+        self.assertEqual(results[0].source_language, LANG_A)
+        self.assertEqual(results[1].source_language, LANG_B)
+        self.assertEqual(
+            [(s, t) for _text, s, t in mt.calls],
+            [(LANG_A, LANG_B), (LANG_B, LANG_A)],
+        )
+        split_events = [
+            e for e in session.journal.since(0)[0] if e.kind is EventKind.TURN_SPLIT
+        ]
+        self.assertEqual(len(split_events), 1)
+        self.assertEqual(split_events[0].payload["pieces"], 2)
+
+    async def test_neither_speaker_poisons_the_other_reference_buffer(self):
+        session, _asr, _mt, _tts = make_session()
+        run_on = AudioChunk(
+            np.concatenate(
+                [silence(0.3), tone(VOICE_A_HZ, 3.0), tone(VOICE_B_HZ, 3.0),
+                 silence(0.4)]
+            ),
+            RATE,
+        )
+        await run_conversation(session, [run_on])
+        self.assertEqual(len(session.speakers), 2)
+        # Each profile's retained reference must carry only its OWN pitch.
+        for profile in session.speakers.profiles():
+            audio = profile.reference_audio()
+            self.assertGreater(audio.duration_s, 0.0)
+            peak = dominant_hz(audio)
+            self.assertTrue(
+                abs(peak - VOICE_A_HZ) < 15.0 or abs(peak - VOICE_B_HZ) < 15.0,
+                f"speaker {profile.speaker_id} reference is at {peak:.0f} Hz, "
+                "which is neither voice -- the buffer was poisoned",
+            )
+
+    async def test_a_single_speaker_segment_is_left_whole(self):
+        session, _asr, _mt, _tts = make_session()
+        results = await run_conversation(
+            session, [conversation_audio((VOICE_A_HZ, 6.0))]
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            [e for e in session.journal.since(0)[0]
+             if e.kind is EventKind.TURN_SPLIT],
+            [],
+        )
+
+    async def test_a_short_segment_skips_the_check_entirely(self):
+        # The gate exists so the common case does not pay N embedder passes to
+        # discover it is the common case.
+        session, _asr, _mt, _tts = make_session()
+        session.speaker_change_min_segment_s = 30.0
+        embedder = session.embedder
+        before = 0
+
+        original = embedder.embed
+        calls = []
+
+        async def counting(audio):
+            calls.append(audio.duration_s)
+            return await original(audio)
+
+        session.embedder = type("E", (), {
+            "min_seconds": embedder.min_seconds,
+            "name": embedder.name,
+            "embed": staticmethod(counting),
+        })()
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 4.0))])
+        # Exactly one embed: the identity pass, no window passes.
+        self.assertEqual(len(calls), 1 + before, calls)
+
+    async def test_detection_can_be_switched_off(self):
+        session, _asr, _mt, _tts = make_session()
+        session.speaker_change_detection = False
+        run_on = AudioChunk(
+            np.concatenate(
+                [silence(0.3), tone(VOICE_A_HZ, 3.0), tone(VOICE_B_HZ, 3.0),
+                 silence(0.4)]
+            ),
+            RATE,
+        )
+        results = await run_conversation(session, [run_on])
+        self.assertEqual(len(results), 1, "the segment was re-cut despite the flag")
+
+
 class TestQueueAndFailures(unittest.IsolatedAsyncioTestCase):
     async def test_queue_overrun_drops_the_oldest_turn(self):
         session, _asr, _mt, _tts = make_session(max_queued_turns=1)
