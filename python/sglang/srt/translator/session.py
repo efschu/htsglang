@@ -775,16 +775,23 @@ class TranslatorSession:
             if line.resolved_by is not None:
                 self._pending.pop(line_id, None)
                 continue
-            # Ranked against everybody EXCEPT the line's current speaker. That
-            # profile was seeded by this very embedding, so it matches itself
-            # at ~1.0 forever; counting it would clear every badge on the next
-            # turn while learning nothing. The open question is whether this
-            # was somebody else, so only somebody else can answer it.
-            ranked = [
-                pair
-                for pair in self.speakers.rank(self._pending[line_id])
-                if pair[0] != line.speaker_id
-            ]
+            # Ranked against EVERYBODY, the current speaker included.
+            #
+            # This used to exclude the line's own speaker, and that was right
+            # while an uncertain turn MINTED its own profile: a profile seeded
+            # by this very embedding matches itself at ~1.0 forever, so
+            # counting it would clear every badge on the next turn while
+            # learning nothing. The continuity guard removed that case --
+            # a line can only be pending while its similarity sat in the
+            # uncertainty band, and in that band the turn is now attributed to
+            # an EXISTING speaker rather than to a fresh self-seeded one.
+            #
+            # So the exclusion no longer protects anything and now costs
+            # something: the guess "this was probably the same person" could
+            # never be CONFIRMED, only overturned, and an uncertain badge
+            # would sit there for the rest of the conversation even after the
+            # centroid moved and settled the question.
+            ranked = self.speakers.rank(self._pending[line_id])
             if not ranked:
                 continue
             best_id, best_sim = ranked[0]
@@ -1286,6 +1293,14 @@ class TranslatorSession:
     # -- stages -------------------------------------------------------------
 
     async def _recognize(self, segment: Segment) -> Transcript:
+        # Pushed per call, not once at construction: ONE recognizer serves
+        # every session in this process, so a whitelist installed when a
+        # session opened would be whichever session opened LAST. Setting it
+        # immediately before the call makes it this session's, which is the
+        # best a shared backend allows without a per-call parameter. (Capacity
+        # is one conversation anyway -- §17.8.2 -- so the remaining interleave
+        # window is not reachable in practice today.)
+        self._push_asr_whitelist()
         hint = None
         profiles = self.speakers.profiles()
         if profiles:
@@ -1427,13 +1442,33 @@ class TranslatorSession:
 
         Duck-typed: a backend that cannot restrict simply does not implement
         the method, and the session neither requires nor pretends otherwise.
-        In auto mode the whitelist is cleared, because there the participant
-        set -- not the table -- bounds the conversation.
         """
         setter = getattr(self.asr, "set_restrict_languages", None)
         if not callable(setter):
             return
-        setter(self.routing_table.languages() if self.routing_table else ())
+        setter(self.detection_whitelist())
+
+    def detection_whitelist(self) -> Tuple[str, ...]:
+        """The languages the identifier is allowed to answer with.
+
+        The routing table when the user named pairs; otherwise the
+        conversation's PARTICIPANT set, which is the other thing that bounds
+        a conversation and is what auto mode routes by elimination over.
+
+        The participant fallback used to be missing, and that WAS the bug: a
+        session opened with ``de,es`` and no explicit pairs pushed an EMPTY
+        restriction, which `constrained_language_choice` correctly treats as
+        "no restriction". Whisper was therefore free to answer ``en`` for a
+        German sentence -- and did, on a real device, with English selected
+        nowhere. Auto mode is the DEFAULT, so requirement 5's constrained
+        detection reached almost nobody: it was wired only for the minority
+        of sessions that had set a manual table. A whitelist that is only
+        pushed on a path most sessions never take is a whitelist that does
+        not exist.
+        """
+        if self.routing_table:
+            return tuple(self.routing_table.languages())
+        return tuple(sorted(self.conversation.participants))
 
     def _resolve_source(self, transcript: Transcript, speaker_id: str) -> str:
         """Detected language, with a low-confidence fallback to speaker history.

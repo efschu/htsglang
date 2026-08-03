@@ -215,6 +215,8 @@ class Playback {
     this.errors = [];
     this.lastResume = "none";
     this.blocked = false;
+    this.dropped = 0;
+    this.skippedReplay = 0;
   }
 
   /** Create and START the output context. MUST be called on a user gesture.
@@ -264,11 +266,24 @@ class Playback {
     return this.ctx;
   }
 
+  /** Forget any schedule made against an old clock. */
+  reset() { this.cursor = 0; }
+
   push(float32, rate) {
     this.pushed += 1;
     const ctx = this.ensure();
     if (!ctx) return;
-    if (ctx.state !== "running") this.blocked = true;
+    if (ctx.state !== "running") {
+      // Do NOT schedule into a stopped clock. `currentTime` is frozen while
+      // the context is suspended, so every buffer would be booked against the
+      // very start of the timeline and the whole backlog would fire the
+      // instant the context resumes -- seconds of overlapping speech at the
+      // first tap, which is indistinguishable from noise. Dropping is the
+      // honest choice: nobody could have heard it anyway.
+      this.blocked = true;
+      this.dropped += 1;
+      return;
+    }
     try {
       const buffer = ctx.createBuffer(1, float32.length, rate);
       buffer.copyToChannel(float32, 0);
@@ -293,6 +308,8 @@ class Playback {
       rate: this.ctx ? this.ctx.sampleRate : 0,
       pushed: this.pushed,
       scheduled: this.scheduled,
+      dropped: this.dropped,
+      skipped_replay: this.skippedReplay,
       last_resume: this.lastResume,
       blocked: this.blocked,
       errors: this.errors.slice(-3),
@@ -439,6 +456,28 @@ class Microphone {
   startFallback() {
     if (this.path !== "worklet" || !this.ctx || !this.source) return;
     this.path = "scriptprocessor";
+    // RETIRE THE WORKLET FIRST. Nothing used to disconnect it, and the word
+    // "disconnect" appeared nowhere in this file. A worklet that was merely
+    // SLOW to start -- more than the 400 ms watchdog, which is ordinary on a
+    // cold phone -- therefore kept delivering after the fallback engaged, and
+    // both paths called handle(): two interleaved copies of the microphone
+    // packed into one uplink stream.
+    //
+    // That is not a lost turn, it is a corrupted one, and it corrupts
+    // everything computed downstream from the audio at once: recognition gets
+    // garbled speech, the language decision flips on it, the speaker
+    // embedding lands somewhere new every utterance, and the clone reference
+    // is built from the mess -- which is heard as a noisy voice that changes
+    // from turn to turn. One defect, four symptoms.
+    if (this.node) {
+      try { this.node.disconnect(); } catch (err) { /* already detached */ }
+      this.node.port.onmessage = null;
+      this.node = null;
+    }
+    if (this.sink) {
+      try { this.sink.disconnect(); } catch (err) { /* already detached */ }
+      this.sink = null;
+    }
     const size = 2048;
     this.script = this.ctx.createScriptProcessor(size, 1, 1);
     this.script.onaudioprocess = (event) => {
@@ -572,6 +611,9 @@ class Connection {
     this.ws = ws;
 
     ws.onopen = () => {
+      // A new socket means a new timeline: anything still booked against the
+      // old clock must not survive into it.
+      playback.reset();
       ws.send(JSON.stringify({
         kind: "hello",
         codecs: ["pcm16"],
@@ -615,6 +657,15 @@ class Connection {
   }
 
   onBinary(buffer) {
+    // History must not be spoken. A freshly loaded page resumes from cursor
+    // zero, so the journal answers with every turn.audio the conversation
+    // ever produced; playing those is the whole conversation at once at the
+    // first tap. The transcript already carries the text, and the server
+    // marks what is replay, so this is a decision and not a guess.
+    if (this.pendingAudio && this.pendingAudio.replayed) {
+      playback.skippedReplay += 1;
+      return;
+    }
     const view = new DataView(buffer);
     const samples = new Float32Array(buffer.byteLength / 2);
     for (let i = 0; i < samples.length; i++) {
@@ -1027,6 +1078,7 @@ function reportCapture(reason) {
     " | peak " + d.peak +
     " || out " + p.state + " @" + p.rate + " t=" + p.current_time +
     " pushed " + p.pushed + "/" + p.scheduled +
+    " dropped " + p.dropped + " replay-skipped " + p.skipped_replay +
     " resume " + p.last_resume + (p.blocked ? " BLOCKED" : "");
   connection.sendControl({ kind: "diag", capture: d, playback: p });
   return d;

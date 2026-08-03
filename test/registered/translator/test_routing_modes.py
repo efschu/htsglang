@@ -232,11 +232,22 @@ class TestAsrWhitelist(unittest.IsolatedAsyncioTestCase):
         session.set_routing_pairs([(LANG_A, LANG_B)])
         self.assertEqual(asr.restrict_languages, (LANG_A, LANG_B))
 
-    async def test_auto_mode_clears_the_whitelist(self):
+    async def test_auto_mode_falls_back_to_the_participant_set(self):
+        """Dropping the table must not drop the bound.
+
+        This test previously asserted that auto mode CLEARS the whitelist,
+        which is what the code did and what made requirement 5's constrained
+        detection reach almost nobody: auto is the default, so most sessions
+        ran with no restriction at all and the recognizer was free to answer
+        a language nobody had chosen. It did, on a real device. The bound in
+        auto mode is the participant set -- the same set auto routing
+        eliminates over -- not nothing.
+        """
         session, asr, _mt, _tts = make_session()
         session.set_routing_pairs([(LANG_A, LANG_B)])
         session.set_routing_pairs([])
-        self.assertEqual(asr.restrict_languages, ())
+        self.assertEqual(asr.restrict_languages, (LANG_A, LANG_B))
+        self.assertEqual(session.detection_whitelist(), (LANG_A, LANG_B))
 
     def test_a_backend_without_the_hook_is_not_required_to_have_one(self):
         # Duck-typed on purpose: pushing the whitelist must not become a

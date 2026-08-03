@@ -301,3 +301,60 @@ class TestRollingReferenceHelper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestContinuityGuard(unittest.TestCase):
+    """A borderline cosine must not mint a voice.
+
+    Reported from a real conversation: "lots of different voices came out of
+    what I said -- it cloned a new voice every time". The cascade is short.
+    In the uncertainty band the registry used to fall through to MINTING a
+    speaker; a new speaker has no reference buffer, so it gets a fresh preset
+    or a fresh clone, and one person changes voice from turn to turn.
+
+    The asymmetry is the point. A wrong continuity is a badge the user can
+    tap; a wrong new speaker is a different voice that has already been heard.
+    """
+
+    #: cos(52 deg) = 0.616 -- inside [uncertain_floor 0.583, match 0.637).
+    BAND_ANGLE = 52.0
+
+    def test_the_band_is_where_this_test_thinks_it_is(self):
+        config = SpeakerRegistryConfig()
+        cosine = math.cos(math.radians(self.BAND_ANGLE))
+        self.assertLess(cosine, config.match_threshold)
+        self.assertGreaterEqual(cosine, config.uncertain_floor)
+
+    def test_a_borderline_voice_does_not_mint_a_speaker(self):
+        registry = SpeakerRegistry(clock=_Clock())
+        first, _sim, _adm = registry.assign(_vec(0), _speech(3.0), "a", "xx")
+        profile, sim, admitted = registry.assign(
+            _vec(self.BAND_ANGLE), _speech(3.0), "b", "xx"
+        )
+        self.assertEqual(
+            len(registry), 1,
+            "a borderline utterance minted a second speaker, which is a new "
+            "voice mid-conversation rather than a correctable badge",
+        )
+        self.assertEqual(profile.speaker_id, first.speaker_id)
+        self.assertLess(sim, SpeakerRegistryConfig().match_threshold)
+        self.assertFalse(
+            admitted,
+            "a guessed attribution must never reach the clone reference",
+        )
+
+    def test_a_borderline_voice_does_not_move_the_centroid(self):
+        """Continuity is a guess; a guess must not rewrite the identity."""
+        registry = SpeakerRegistry(clock=_Clock())
+        first, _sim, _adm = registry.assign(_vec(0), _speech(3.0), "a", "xx")
+        before = np.array(first.centroid.vector, dtype=np.float32).copy()
+        registry.assign(_vec(self.BAND_ANGLE), _speech(3.0), "b", "xx")
+        after = np.array(first.centroid.vector, dtype=np.float32)
+        np.testing.assert_allclose(before, after, atol=1e-6)
+
+    def test_a_genuinely_distant_voice_still_mints(self):
+        """The guard must not weld two real people into one profile."""
+        registry = SpeakerRegistry(clock=_Clock())
+        registry.assign(_vec(0), _speech(3.0), "a", "xx")
+        registry.assign(_vec(80), _speech(3.0), "b", "yy")
+        self.assertEqual(len(registry), 2)

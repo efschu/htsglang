@@ -8,6 +8,7 @@ socket is opened and no model is loaded; the backends are the fakes.
     CUDA_VISIBLE_DEVICES=99 python -m pytest test/registered/translator/test_audio_and_http.py -v
 """
 
+import time
 import json
 import re
 import math
@@ -665,3 +666,94 @@ class TestClientAsset(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReplayIsMarkedAsHistory(unittest.TestCase):
+    """A resumed journal must not be mistaken for something just said.
+
+    A freshly loaded page resumes from cursor zero, so the journal answers
+    with every ``turn.audio`` the conversation ever produced. Played as if
+    live, that is the whole conversation at once out of the speaker at the
+    first tap -- which is what a real device reported as "noise starts as
+    soon as I press, before I have said anything". The client can only refuse
+    to speak history if the server says which events are history.
+    """
+
+    def setUp(self):
+        self.service = build_service()
+        self.client = TestClient(build_app(self.service))
+
+    def _hello(self, ws, **overrides):
+        payload = {
+            "kind": "hello",
+            "codecs": ["pcm16"],
+            "participants": [LANG_A, LANG_B],
+        }
+        payload.update(overrides)
+        ws.send_text(json.dumps(payload))
+        return json.loads(ws.receive_text())
+
+    def _run_one_turn(self):
+        codec = Pcm16Codec(sample_rate=RATE, frame_ms=20)
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="replay")
+            speech = AudioChunk(tone(VOICE_A_HZ, 2.0), RATE)
+            for frame in codec.encode(speech):
+                ws.send_bytes(frame)
+            ws.send_text(json.dumps({"kind": "release"}))
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                message = ws.receive()
+                if "text" in message and message["text"]:
+                    event = json.loads(message["text"])
+                    if event.get("kind") == "turn.done":
+                        return
+
+    def test_live_audio_is_not_marked_replayed(self):
+        seen = []
+        codec = Pcm16Codec(sample_rate=RATE, frame_ms=20)
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="live")
+            speech = AudioChunk(tone(VOICE_A_HZ, 2.0), RATE)
+            for frame in codec.encode(speech):
+                ws.send_bytes(frame)
+            ws.send_text(json.dumps({"kind": "release"}))
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                message = ws.receive()
+                if "text" in message and message["text"]:
+                    event = json.loads(message["text"])
+                    seen.append(event)
+                    if event.get("kind") == "turn.done":
+                        break
+        audio = [e for e in seen if e.get("kind") == "turn.audio"]
+        self.assertTrue(audio, "the turn produced no audio to judge")
+        for event in audio:
+            self.assertNotIn(
+                "replayed", event,
+                "live audio must never be tagged as history, or the client "
+                "would refuse to play the turn that just happened",
+            )
+
+    def test_resumed_audio_is_marked_replayed(self):
+        self._run_one_turn()
+        replayed = []
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            self._hello(ws, session_id="replay", resume_from=0)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                message = ws.receive()
+                if "text" not in message or not message["text"]:
+                    continue
+                event = json.loads(message["text"])
+                if event.get("kind") == "turn.audio":
+                    replayed.append(event)
+                if event.get("kind") == "turn.done":
+                    break
+        self.assertTrue(replayed, "resuming from zero replayed no audio")
+        for event in replayed:
+            self.assertTrue(
+                event.get("replayed"),
+                "replayed audio was indistinguishable from live audio, which "
+                "is what made a fresh page load play the whole conversation",
+            )

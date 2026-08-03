@@ -2422,6 +2422,135 @@ measured thing**: his own turns took 3.3-6.1 s to first audio and up to 10.2 s
 in total, which is the §18.4 decomposition (85 % non-incremental clause
 synthesis), not a transport defect.
 
+#### 17.8.4 The noise, and the one-root-four-symptoms theory — two real roots
+
+User, escalating over one session: sound arrives as noise the instant "tap to
+speak" is pressed, before anything is said; and "everything is ultra-noisy",
+the cloned voices included. The working theory offered was a single root: the
+microphone leaking to the speaker, contaminating capture, and therefore
+poisoning recognition, language ID, embeddings and clone references at once.
+
+**The proposed leak does not exist, and that was checked before anything was
+changed.** Both capture paths already terminate in a zero-gain sink --
+`index.html:397` (`this.sink.gain.value = 0`, worklet) and `index.html:449`
+(`mute.gain.value = 0`, ScriptProcessor). The unlock buffer is one sample from
+`createBuffer`, which is zero-filled by specification. Neither can put the
+microphone on the speaker. Refuted by code, not by argument.
+
+**Root 1, and the actual source of the noise: history was being spoken.** A
+fresh page load resumes from cursor zero (`index.html:560`, `:579`), and the
+server replayed the whole journal *including every `turn.audio` payload*,
+emitted identically to live audio (`server.py:381`). His session held 53 such
+events / 655 kB -- measured directly. Worse, in combination with the output
+unlock: while the context is suspended `currentTime` is frozen, so every
+replayed buffer was booked against the very start of the timeline; the moment
+he tapped, the context resumed and **the entire conversation fired at once**,
+overlapping. That is the "noise on tap, before I said anything", and it is
+also why voices sounded noisy -- they were several turns playing over
+each other. Fixed on both sides: the server marks replayed events, the client
+refuses to speak history, refuses to schedule into a stopped clock, and resets
+the queue on every new socket.
+
+**Root 2, latent and genuinely of the shape that was suspected: two capture
+paths at once.** The word `disconnect` appeared NOWHERE in the client.
+`startFallback()` switched to the ScriptProcessor without retiring the
+worklet, so a worklet that was merely SLOW to start -- more than the 400 ms
+watchdog, ordinary on a cold phone -- kept delivering afterwards and *both*
+paths called `handle()`: two interleaved copies of the microphone in one
+uplink stream. That is one defect with exactly the four downstream symptoms
+predicted -- garbled recognition, a flipping language decision, an embedding
+that lands somewhere new every utterance, and a clone reference built from the
+mess. Fixed by disconnecting the worklet and its sink when switching.
+
+**The good news, and it is load-bearing:** noise coming OUT of the speaker
+proves the output path on his device is no longer blocked. The unlock fix of
+§17.8.3 works; what it unblocked was the wrong content.
+
+**The synthesizer is not noisy, measured rather than assumed.** Through the
+public front door, one full turn: WER **0.000** on the returned Spanish audio
+re-recognized, peak 0.397 over 4.16 s, `clone` voice, speaker similarity
+**0.971** against a 6.22 s reference, language `es` at 0.999. Server-side
+audio quality is clean end to end, so the noise was client-side playback and
+the embedder separates a speaker cleanly on clean input.
+
+**Consequently the tuning order stands as instructed and for a measured
+reason:** do not swap ASR models or recalibrate speaker thresholds against
+contaminated input. Capture correctness first, then re-measure WER and speaker
+similarity, then decide whether a model swap or recalibration is still needed.
+
+#### 17.8.6 Constrained detection had reach almost zero
+
+User: the identifier answered "English" for German speech, with English chosen
+nowhere in the pair selection. Requirement 5 (addendum 5 v2) asked for
+detection constrained to the table's languages, and it WAS implemented, wired
+and tested -- `set_restrict_languages`, `constrained_language_choice`, the
+lot.
+
+**It was pushed only from `set_routing_pairs`.** Auto mode is the default, and
+in auto mode the whitelist was explicitly CLEARED -- a test even asserted that
+("auto mode clears the whitelist"). So a session opened with
+`--participants de,es` and no manual table ran with an EMPTY restriction,
+which `constrained_language_choice` correctly reads as "no restriction at
+all". The identifier was free to answer any of 98 languages, and on a short
+ambiguous German opening it answered `en`. A whitelist pushed only on a path
+most sessions never take does not exist.
+
+Fixed: the bound in auto mode is the PARTICIPANT set -- the same set auto
+routing eliminates over -- and it is pushed before every recognition rather
+than once, because one recognizer serves every session and a whitelist
+installed at session start would be whichever session opened last. The old
+test was rewritten to the corrected contract with the reason recorded in it.
+
+Falsifier, as ordered: a recognizer fake that reports `en` at 0.55 with German
+a close second, driven through the shipped decision function. Unfixed it
+routes the turn as English; fixed it can only answer `de` or `es`. Verified by
+reverting the fix and watching the assertion fail.
+
+#### 17.8.5 Speaker identity: the cascade, and the continuity guard
+
+User: "I am recognized as somebody different every time", and then the
+consequence: "lots of different voices came out of what I said -- it cloned a
+new voice every time."
+
+**The cascade was one branch.** In the uncertainty band
+`[uncertain_floor 0.583, match_threshold 0.637)` `SpeakerRegistry.assign()`
+fell through to MINTING a speaker. A new speaker has no reference buffer, so
+it receives a fresh preset or a fresh clone -- and one person changes voice
+mid-conversation. The badge machinery was already there; what was missing was
+that the borderline case defaulted to *discontinuity*.
+
+**Continuity guard, with the asymmetry stated:** in that band the turn is now
+attributed to the nearest EXISTING speaker and the line keeps its uncertain
+badge. A wrong continuity is a badge the user can tap; a wrong new speaker is
+a different voice that has already been heard. A genuinely distant voice
+(below the floor) still mints, so two real people are never welded together.
+
+Two things the tests forced, both worth keeping:
+
+* **A guess must not move the centroid.** The pre-existing invariant "an
+  unconfirmed uncertain line never moves a centroid" survives the guard: the
+  guard changes who a line is attributed to, not what the system believes
+  afterwards. Confirmation -- manual, or a later confident turn -- moves
+  centroids.
+* **A guess must not become the voice.** `_maybe_admit_reference` waives its
+  identity gate for a profile's FIRST reference (the enrollment anchor), and
+  since a guarded assignment does not fold, `observations` never grows past 1
+  -- so every borderline turn would have slipped through that exemption and
+  become the clone prompt. Guarded assignments are now barred from the
+  reference buffer explicitly. This was caught by a failing assertion, not by
+  reading.
+
+`_auto_resolve` also had to stop excluding the line's own speaker from its
+ranking. That exclusion was correct while an uncertain turn minted its own
+self-matching profile; under the guard it meant a continuity guess could only
+ever be overturned, never confirmed, and the badge would sit there forever.
+
+**Still open on this front** (unbuilt, deliberately, because it must be
+measured on CLEAN capture first per §17.8.4): threshold calibration against
+his real device audio, per-decision candidate-cosine logging persisted
+server-side, rolling reference growth, and speaker MERGE with reference-buffer
+union and history relabelling.
+
 ### 17.6 Build order and what each step needs
 
 Order is by dependency, not by user priority — (b) carries the surface every
@@ -2604,3 +2733,98 @@ stage. The **assertion** exists as `--max-first-audio-s` and is deliberately
 §18.4's item 1 lands and the number it should defend is the *new* one. Turning
 it on against today's floor would only pin the latency this work exists to
 remove.
+
+---
+
+## 19. Standing user orders, recorded before they are built (2026-08-03)
+
+Written down here because a feature order that lives only in a transcript is
+lost at the next handover (§17 exists for the same reason). Priority is the
+one the user set, and it is a measured priority, not a taste one: contaminated
+input must not be tuned against.
+
+### 19.1 STT quality
+
+(a) **The whitelist bug is FIXED** -- see §17.8.6. (b) Beyond it, unbuilt and
+to be decided on numbers taken with CLEAN capture (§17.8.4): decoding
+parameters (beam, VAD filter, `initial_prompt` carrying session context,
+`condition_on_previous`), and a candidate bake-off measured as WER on a German
+test set -- `large-v3` against `large-v3-turbo`, and the Qwen3-ASR adapter the
+runtime already carries -- with the VRAM budget respected and the cards held.
+Session bias: the recent turns' language as a prior. **Measure, do not
+prefer.**
+
+### 19.2 Speaker identity
+
+Continuity guard shipped (§17.8.5). Open: calibration on his device audio,
+persisted per-decision candidate cosines, rolling reference growth, and
+speaker merge (union the reference buffers -- more reference is a better clone
+-- keep ONE voice, relabel the history, which is a correction and not a
+rewrite of content).
+
+### 19.3 UI redesign (unbuilt)
+
+User: "the current design is absolutely ugly and unfunctional... look at how
+others build live translators on mobile, take your lead from them", and about
+the language chooser: "the selection at the top, really?"
+
+Research the established patterns first (Google Translate conversation mode,
+DeepL mobile, iTranslate) and rebuild to them: a clear two-direction view with
+large language buttons, an unmistakable speaking-state indicator, large
+readable conversation bubbles coloured per speaker, and a completely reworked
+language-pair chooser. Usable outdoors on a phone: large touch targets, high
+contrast, functional before pretty, but both. **Every existing capability is
+rearranged, none is dropped** -- tap-toggle, speaker buttons, badges,
+renaming, the bilingual transcript, auto-scroll, connection and queue state.
+
+### 19.4 Pipeline speed (unbuilt, measured target)
+
+§18.4 stands: 85 % of the 3.95 s is the first clause's synthesis. Build, in
+order: a shorter FIRST synthesis unit (synthesize and stream the opening
+clause immediately, the rest follows), MT streamed at sentence boundaries, ASR
+partials into the transcript (a reading-mode win, not an audio-latency one).
+Then pull the latency assertions up in the gate (`--max-first-audio-s` exists
+and is off by default until there is a new floor worth defending).
+
+### 19.5 Quality ladder, upwards (unbuilt)
+
+User: "couldn't it be somewhat better quality? if there were enough bandwidth,
+with a fallback?" -- he is on LAN wifi with bandwidth to spare, and the
+pipeline runs 16 kHz everywhere. This is the upward extension of the existing
+bad-network ladder (addendum 6 asked for adaptive Opus downwards).
+
+**The premise is verified, not assumed:** the talker synthesizes at 24 kHz
+(`inprocess_tts.py:69`, `config.py:69`) and `PIPELINE_SAMPLE_RATE` is 16000
+(`audio.py:62`), so the wire downsamples for no reason on a LAN.
+
+1. **Output side, the largest audible win.** Carry native 24 kHz when
+   bandwidth allows (high-bitrate Opus, or PCM on a LAN), with the client
+   playing it at the correctly announced rate. EXTEND the rate chain, do not
+   rebuild it -- it is freshly fixed and under test.
+2. **Capture side.** Capture device-native (typically 48 kHz) and carry it
+   when bandwidth allows. The chief beneficiaries are the CLONE REFERENCES:
+   voices cloned from 16 kHz references sound dull, so the reference buffers
+   should hold the highest available rate (check what the TTS reference path
+   natively digests). ASR resamples to 16 kHz internally anyway. This couples
+   directly to the reference rebuild after the capture fixes -- build the NEW
+   references at high quality immediately.
+3. **Negotiation.** A capability handshake measures or estimates bandwidth
+   (a LAN identifies itself by RTT and throughput), picks a rung, and
+   renegotiates on degradation over the existing reconnect path. The chosen
+   rung is VISIBLE (a quality badge, which belongs in the new §19.3 surface)
+   and every change is named rather than silent. Sticky per session, with a
+   manual downgrade.
+4. **Proofs.** Per rung, the rate/duration proof in the gate (an N-second clip
+   stays N seconds); for the quality claim, an A/B artefact -- the same
+   utterance rendered at 16 kHz and 24 kHz, written to the results directory
+   so the user can listen; and the bandwidth fallback tested hermetically
+   through an injected throttle (check the reach of the addendum-6f network
+   chaos harness first).
+
+### 19.6 Cheap wins from the competition, to fold in where they are cheap
+
+Replay button per line and tap-a-line-to-replay (this one also buys back what
+§17.8.4's "never speak history" gives up), automatic language badges per
+bubble, a visible recording level, and copy/share of the transcript. Judge
+each on effort against payoff with the deadline in view; the core (§19.1-19.4)
+comes first.

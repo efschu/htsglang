@@ -500,10 +500,48 @@ class SpeakerRegistry:
         """
         best_id, best_sim = self._nearest(embedding)
         now = self._clock()
+        #: True when this turn was attributed by the continuity guard rather
+        #: than by a confident match. Such a turn must never reach the clone
+        #: reference: the identity gate in `_maybe_admit_reference` is
+        #: deliberately waived for a profile's FIRST reference (the enrollment
+        #: anchor), and a guarded assignment does not fold, so `observations`
+        #: never grows past 1 and every borderline turn would slip through
+        #: that exemption and become the voice.
+        guessed = False
 
         if best_id is not None and best_sim >= self.config.match_threshold:
             profile = self._profiles[best_id]
             self._fold(profile, embedding)
+        elif best_id is not None and best_sim >= self.config.uncertain_floor:
+            # CONTINUITY GUARD. In the uncertainty band this used to fall
+            # through and MINT A NEW SPEAKER, and that is the defect a real
+            # conversation reported as "lots of different voices came out of
+            # what I said -- it cloned a new voice every time". The cascade is
+            # short and brutal: a borderline cosine becomes a new speaker, a
+            # new speaker has no reference buffer, so it gets a fresh preset
+            # or a fresh clone, and one person changes voice mid-conversation.
+            #
+            # The asymmetry is deliberate. A wrong continuity is a badge the
+            # user can tap to correct, and the line already carries that badge
+            # because `uncertainty()` reads the same band. A wrong new speaker
+            # is a different voice in the middle of a conversation, which is
+            # not correctable after the fact -- it has already been heard.
+            #
+            # The centroid is deliberately NOT folded here. Continuity is a
+            # guess, and a guess must not rewrite the identity it guessed at:
+            # if this turn was in fact a second person, folding would drag the
+            # first person's centroid toward them and every later decision
+            # would inherit the error. That invariant predates this guard
+            # ("an unconfirmed uncertain line never moves a centroid") and it
+            # survives it -- the guard changes WHO the line is attributed to,
+            # not what the system believes afterwards. Confirmation, manual or
+            # by a later confident turn, is what moves centroids.
+            #
+            # Reference admission is likewise untouched: it is gated at
+            # `reference_threshold` (0.80), far above this band, so a
+            # possibly-wrong turn can never reach the clone prompt.
+            profile = self._profiles[best_id]
+            guessed = True
         elif len(self._profiles) >= self.config.max_speakers:
             # At capacity: rather than evicting a profile (which would drop a
             # reference buffer someone is still using), the segment joins the
@@ -527,8 +565,12 @@ class SpeakerRegistry:
         if language and language_confidence >= 0.5:
             profile.last_language = language
 
-        admitted = self._maybe_admit_reference(
-            profile, audio, text, language, best_sim
+        admitted = (
+            False
+            if guessed
+            else self._maybe_admit_reference(
+                profile, audio, text, language, best_sim
+            )
         )
         return profile, best_sim, admitted
 

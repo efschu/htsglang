@@ -379,7 +379,13 @@ class _Connection:
                 }
             )
         for event in events:
-            await self._emit(event)
+            # Marked, because a client cannot otherwise tell history from
+            # news. A freshly loaded page asks from cursor 0 and the journal
+            # answers with every turn.audio of the whole conversation; played
+            # as if live, that is the entire conversation at once out of the
+            # speaker. Which is exactly what a real device did on the first
+            # tap after the output unlock started working.
+            await self._emit(event, replayed=True)
 
     async def _receive_loop(self) -> None:
         assert self.session is not None
@@ -635,8 +641,12 @@ class _Connection:
                 self.sent_seq = event.seq + 1
             await asyncio.sleep(0.02)
 
-    async def _emit(self, event) -> None:
+    async def _emit(self, event, replayed: bool = False) -> None:
         payload = event.to_json()
+        if replayed:
+            # History, not news. The transcript still renders it; only the
+            # speaker must not treat it as something just said.
+            payload["replayed"] = True
         if event.audio is not None:
             # Audio rides the binary channel; the JSON event announces it so
             # the client can attribute the frames that follow to a turn.
