@@ -2029,6 +2029,39 @@ _TARGET_PROVIDED_DRAFT_PARAM_FRAGMENTS = (
 )
 
 
+#: Draft classes already reported as unchecked, so the notice is one line per
+#: class per process rather than one per rank per load.
+_DRAFT_LOAD_UNCHECKED_SEEN: set = set()
+
+
+def _warn_draft_load_unchecked(
+    model: torch.nn.Module, model_path: str, reason: str
+) -> None:
+    """Say out loud that the draft-load completeness check did NOT run.
+
+    The failure this guard exists for -- a draft that loads "successfully" and
+    then proposes noise, with an accept rate near zero as the only symptom --
+    is silent. A guard that silently declines to run therefore reproduces the
+    exact condition it was written to remove, which is what audit #505 found:
+    the hoist to the loader was meant to make the check "a property of loading
+    A DRAFT, not of one model class", and most draft classes were skipping it.
+    """
+    name = type(model).__name__
+    if name in _DRAFT_LOAD_UNCHECKED_SEEN:
+        return
+    _DRAFT_LOAD_UNCHECKED_SEEN.add(name)
+    logger.warning(
+        "draft-load completeness NOT checked for %s (%s): %s. An unwritten "
+        "parameter would leave the drafter on uninitialised memory, whose only "
+        "symptom is a speculative accept rate near zero. Have this class's "
+        "load_weights return the set of parameter names it filled to enable "
+        "the check (#505-A1-01).",
+        name,
+        model_path or "<no path>",
+        reason,
+    )
+
+
 def raise_on_unloaded_draft_parameters(
     model: torch.nn.Module,
     loaded_params: Optional[Iterable[str]],
@@ -2053,17 +2086,35 @@ def raise_on_unloaded_draft_parameters(
     of loading A DRAFT, not of one model class.
 
     Only models whose ``load_weights`` REPORTS the parameters it filled are
-    checked; a model that returns ``None`` is left exactly as it was.
+    checked; a model that returns ``None`` is left exactly as it was -- but NOT
+    silently (#514/#505-A1-01). Audit #505 measured this function's real reach
+    and found it skipping most draft classes, with the skip indistinguishable
+    from a pass. The unchecked state is still allowed -- retro-fitting every
+    draft class's ``load_weights`` to return its set is a per-class change with
+    real risk -- but it is no longer invisible.
     """
-    if loaded_params is None:
-        return
-    if not isinstance(loaded_params, (set, frozenset, list, tuple)):
+    if loaded_params is None or not isinstance(
+        loaded_params, (set, frozenset, list, tuple)
+    ):
+        _warn_draft_load_unchecked(
+            model,
+            model_path,
+            "its load_weights returns None instead of the set of parameters it "
+            "filled, so completeness cannot be checked",
+        )
         return
     loaded = {name for name in loaded_params if isinstance(name, str)}
     if not loaded:
         # Nothing reported at all: a load that filled everything through a
         # different mechanism is indistinguishable from one that filled
         # nothing, so this stays out of the raising business.
+        _warn_draft_load_unchecked(
+            model,
+            model_path,
+            "its load_weights reported an EMPTY set of filled parameters, "
+            "which a load that fills everything by another mechanism cannot be "
+            "told apart from a load that filled nothing",
+        )
         return
 
     missing = sorted(

@@ -146,7 +146,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        super().load_weights(weights, is_mtp=True)
+        # RETURN the base class's set of filled parameters (#514/#505-A1-01).
+        # Dropping it here silently disabled raise_on_unloaded_draft_parameters
+        # for this draft class -- the guard reads None as "cannot check" -- even
+        # though Qwen3NextForCausalLM.load_weights reports the set correctly.
+        return super().load_weights(weights, is_mtp=True)
 
 
 EntryClass = [Qwen3NextForCausalLMMTP]
