@@ -2590,6 +2590,25 @@ for. Recorded rather than silently half-done.
 Still open: the gate arm above (foreign audio through the real client, across
 a resume, with a second client driving turns).
 
+**Shipped to the live service and gated twice, 2026-08-03.** Build
+`daac6753db`, tenant restarted from `boot_tenant.sh`, log
+`tenant16_decodefix.log`. Cold run PASS; soak 9 turns / 85 s gaps PASS twice
+in a row, console clean, socket OPEN throughout both.
+
+This is also the two-pass path's first execution against the REAL
+faster-whisper -- until then it had only ever run against a fake, which is the
+desk-code trap this project keeps paying for. **The measured cost of the
+second pass is smaller than estimated**: ASR medians 0.11 s and 0.12 s across
+the two soaks, against the 0.09 s baseline of §18.4. Roughly +0.02 s, not the
+~0.1 s budgeted -- `detect_language` is cheap next to a full decode.
+
+One honest observation from the soak, recorded so it is not mistaken later for
+a regression of this fix: the gate's fake microphone LOOPS a 3.9 s clip, so
+some turns are fragments, and Whisper hallucinates on fragments (one turn
+returned `espelho.` under a `de` label). That is a property of a looped test
+clip, not of the constrained decode, and it is not evidence either way about
+his real speech.
+
 #### 17.8.5 Speaker identity: the cascade, and the continuity guard
 
 User: "I am recognized as somebody different every time", and then the
@@ -2928,6 +2947,16 @@ Items 1 and 2 are the §18.2 targets worth building; §18.2's item 1 (ASR
 partials) is reclassified as a reading-mode feature, not a latency fix. That
 reordering is a consequence of the measurement and is why §18.4 exists.
 
+**A constraint the first-unit work must honour** (from the parallel §19.3 UI
+build, 2026-08-03): the new surface's per-line replay is built on the
+`turn_id` attribution carried by `turn.audio` frames. Shortening the first
+synthesis unit changes how audio is chunked, so the rule is stated before the
+work rather than discovered by breaking it: **every audio chunk keeps its
+`turn_id`**, whatever the clause boundaries become. A chunk that arrives
+without one, or with a different one per clause, silently breaks replay in a
+client this document does not own -- and any change to that attribution is
+reported so the UI side can follow.
+
 ### 18.5 Acceptance
 
 Through the standing headless-client gate (§17.8), extended with latency
@@ -3212,12 +3241,45 @@ cost three boots:
   measured from `meta_info`, NEVER from `spec_ema_accept_len` -- that field
   is not the acceptance length.
 
-**Deliverables:** VRAM arithmetic beside the talker and the ASR model
-(mandatory); a DE<->ES quality sample of 10 sentences side by side against the
-current 27 B; first-token and throughput numbers; and the NVFP4 findings
-reported SEPARATELY from the MT decision, because they feed the capability
-catalogue whichever way the model choice goes. **A model swap is a ship
-decision and waits for an explicit go.**
+**A tight fit is NOT a rejection reason** (user correction, 2026-08-03, aimed
+at exactly the wrong phrasing "the VRAM arithmetic beside talker/ASR is
+mandatory", which read as a go/no-go). When space is short, the fork spills
+and offloads -- that is what the machinery is for. So the VRAM arithmetic
+stays, but as a PLANNING INPUT (how much expert residency stays on the card,
+what goes to RAM), never as a gate. Reporting "does not fit beside the talker"
+as a stopper is a defect in the report.
+
+The machinery to price, with its reach verified AT THE CODE and cited
+`file:line` -- never from a catalogue shorthand, per the repo's mechanism-reach
+law, and the catalogue sections read must be named in the report:
+
+* MoE expert offload to RAM, load-time aware (#77/#123 line; the NVFP4 half
+  was brought up with the #323 round);
+* the CUDA-graph-compatible offload route (#122/#462 breakable path), so
+  offload does not cost the graph;
+* the KV pressure ladder and the runtime VRAM budget dial (#330), if
+  coexistence with the live translator service needs adjusting.
+
+**And the option space is not one-dimensional** (second user correction, same
+day): spill/offload applies to the DENSE 27 B too, not only to the MoE
+candidate. The comparison is therefore NOT "27 B fully resident versus A3B
+with expert offload" -- both candidates are priced with their best
+offload-supported placement out of the memory matrix. Dense weight shards are
+just as parkable/spillable (weight-shard asset class, KV session spill, graph
+state offload #93/#102/#286, the GDN slot ladder #364, the #330 dial); MoE
+merely adds one extra and unusually cheap axis in its experts. Give the best
+offload-supported variant per candidate, not only the fully resident one.
+
+**Side effect worth having:** the run then also exercises offload x NVFP4,
+a crossing point that has never been booted. Report it as its own finding --
+never-booted crossings are exactly the gaps an integration run exists to find.
+
+**Deliverables:** the placement/offload arithmetic per candidate (planning
+input, not a gate); a DE<->ES quality sample of 10 sentences side by side
+against the current 27 B; first-token and throughput numbers; and the NVFP4
+and offload-crossing findings reported SEPARATELY from the MT decision,
+because they feed the capability catalogue whichever way the model choice
+goes. **A model swap is a ship decision and waits for an explicit go.**
 
 ### 19.10 The placeholder voice must match the speaker (user order, field defect)
 
@@ -3250,3 +3312,35 @@ under the fix, and that is the falsifier.
 
 This sits in the speaker complex AHEAD of threshold calibration: calibration
 improves a number, this fixes something the user hears on contact.
+
+### 19.11 The audio stack is a movable asset class, not a fixed cost (user order)
+
+User, extending the placement calculus of §19.9: *"asr/talker naturally have
+to be spilled too."* So ASR, the TTS talker, its codec/vocoder and the
+diarization embedder are SHIFTABLE asset classes in every coexistence
+calculation -- never a fixed overhead to be subtracted before the interesting
+question starts. Any layout arithmetic that treats the 7.5 GiB audio budget as
+immovable is answering an easier question than the one asked.
+
+**(a) Price the vacate options too.** Alongside the MT candidates' placements,
+cost "ASR/talker idle-vacate or park": the talker's weights can go to RAM
+during pure LISTENING phases -- there is no active speaking turn then -- and be
+restored at turn start, PROVIDED the restore latency lands under the TTS start
+offset that already exists in the chain. That proviso is a MEASUREMENT, not an
+assumption: quantify park and restore time for the talker weights and put the
+number against the §18 latency chain before claiming the option is free.
+The shape is promising precisely because §18.4 shows the talker is the
+dominant term and idle between turns.
+
+**(b) What is reachable TODAY, stated honestly.** As long as the audio stack
+runs as its own tenant process (the state before #488), the htsglang ledger
+cannot see it -- so the fork's spill machinery does not apply to it. Process
+local park/load still works (unload the model to RAM, load it back); it simply
+does not get the arbitration. Saying "spill the talker" today means that
+cruder mechanism, and a report must not blur the two.
+
+**(c) The #488 target architecture is confirmed by this order.** ASR, talker
+and codec become LEDGER asset classes in the #286 register -- parkable, with a
+residency ladder in the #305 sense. Recorded here as user-confirmed direction.
+No immediate rebuild obligation; but from now on the calculations and the
+design carry it.
