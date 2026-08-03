@@ -44,15 +44,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--asr-budget-mib", type=int, default=3000)
 
     parser.add_argument(
-        "--tts", default="fake", choices=("fake",),
+        "--tts", default="fake", choices=("fake", "inprocess"),
         help=(
-            "synthesizer backend. Only the hermetic fake is wired today: the "
-            "chosen real backend (Qwen3-TTS via vLLM-Omni) runs in its own "
-            "venv as a separate process and is reached over its OpenAI-"
-            "compatible /v1/audio/speech endpoint, which is a client, not an "
-            "in-process backend. See DESIGN_466 for why."
+            "synthesizer backend. 'inprocess' loads Qwen3-TTS as an "
+            "nn.Module in this process, its weights registered as a ledgered "
+            "asset class -- one runtime, no second engine. 'fake' needs no "
+            "GPU and no model and is what the hermetic suite uses."
         ),
     )
+    parser.add_argument(
+        "--tts-model-dir", type=Path,
+        default=Path("/spinning/llm_stuff/translator-models/qwen3-tts-0.6b-base"),
+        help="checkpoint for --tts inprocess",
+    )
+    parser.add_argument(
+        "--tts-device", default="cuda:0",
+        help="'cpu' works and is slow; the seam and the audio are identical",
+    )
+    parser.add_argument("--tts-dtype", default="bfloat16")
     parser.add_argument("--tts-budget-mib", type=int, default=4000)
     parser.add_argument("--tts-sample-rate", type=int, default=24000)
     parser.add_argument(
@@ -207,11 +216,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         embedder = FakeEmbedder()
 
-    tts = FakeTts(
-        languages=participants,
-        sample_rate=args.tts_sample_rate,
-        min_reference_seconds=args.min_reference_seconds,
-    )
+    if args.tts == "inprocess":
+        from sglang.srt.translator.inprocess_tts import (
+            InProcessQwen3Tts,
+            InProcessTtsConfig,
+        )
+
+        tts = InProcessQwen3Tts(
+            InProcessTtsConfig(
+                model_dir=args.tts_model_dir,
+                device=args.tts_device,
+                dtype=args.tts_dtype,
+                sample_rate=args.tts_sample_rate,
+                min_reference_seconds=args.min_reference_seconds,
+            )
+        )
+        # Load here rather than lazily on the first turn: the checkpoint takes
+        # seconds and, more importantly, the weight verification and the two
+        # transformers-5.x shims must have run and been SEEN to run before the
+        # server advertises itself as ready. A first turn that discovers a
+        # broken load is a first turn the user has already spoken into.
+        tts.load()
+    else:
+        tts = FakeTts(
+            languages=participants,
+            sample_rate=args.tts_sample_rate,
+            min_reference_seconds=args.min_reference_seconds,
+        )
 
     mt = OpenAiMt(
         MtConfig(
