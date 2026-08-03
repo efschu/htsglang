@@ -295,7 +295,13 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
 
 def _dequant_supported(linear: torch.nn.Module) -> bool:
     """Mirrors the preconditions asserted in _dequant_linear_weight."""
-    weight = linear.weight
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        # Quant schemes that repack the weight expose e.g. `qweight` instead
+        # (int4 marlin / AWQ / GPTQ). This is a support probe: its contract is
+        # to answer False for them, not to raise -- the per-linear torch
+        # fallback in execute() drives such a module itself and handles it.
+        return False
     if weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
         return True
     if weight.dtype != torch.float8_e4m3fn:
@@ -306,7 +312,8 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
         (out_dim + block - 1) // block,
         (in_dim + block - 1) // block,
     )
-    return tuple(linear.weight_scale_inv.shape) == expected_scale_shape
+    scale = getattr(linear, "weight_scale_inv", None)
+    return scale is not None and tuple(scale.shape) == expected_scale_shape
 
 
 def _fused_commit_kv_proj_supported(*, wkv_linears: list[torch.nn.Module]) -> bool:
