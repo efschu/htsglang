@@ -1,0 +1,6 @@
+# The repo-wide `.gitignore:184` excludes `*.jsonl` (it is aimed at benchmark
+# output and dataset dumps). These two files are the #306 probe's raw evidence
+# -- one line per (sample, layout, codec) -- and the ANALYSE document's tables
+# are derived from them, so they are committed deliberately.
+!results.jsonl
+!ceiling.jsonl

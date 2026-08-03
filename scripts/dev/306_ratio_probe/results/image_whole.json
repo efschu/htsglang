@@ -1,0 +1,35 @@
+{
+  "path": "/spinning/gpu-battery-results/2026-07-31_333_m1_registry/hibernate-qwen35-9b/rank0_GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d.pt",
+  "size": 7177133323,
+  "hole_pages": 221542,
+  "total_pages": 1752229,
+  "hole_fraction": 0.12643438728613668,
+  "sparse_only_ratio": 1.1447337045392036,
+  "h0_bits": 7.382291091697532,
+  "arms": [
+    {
+      "level": 3,
+      "threads": 0,
+      "comp_bytes": 6004402625,
+      "ratio": 1.1953118022294515,
+      "comp_mbs": 566.8478077791433,
+      "decomp_mbs": 914.5606998605418
+    },
+    {
+      "level": 3,
+      "threads": 16,
+      "comp_bytes": 6007728770,
+      "ratio": 1.1946500246215344,
+      "comp_mbs": 1565.1199969507818,
+      "decomp_mbs": 875.9077730506505
+    },
+    {
+      "level": 19,
+      "threads": 16,
+      "comp_bytes": 5953856297,
+      "ratio": 1.2054596155799693,
+      "comp_mbs": 34.89150590065428,
+      "decomp_mbs": 754.0325323217005
+    }
+  ]
+}
