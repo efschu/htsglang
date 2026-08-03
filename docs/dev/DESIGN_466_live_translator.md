@@ -3625,3 +3625,55 @@ cut when #488 delivers the interface. Capacity note from the serving agent:
 the new server reserves 7500 MiB on the 5090 for this tenant, whose declared
 budget is asr 3000 + tts 4000 + diarization 500 -- if that budget grows, the
 reserve must grow with it.
+
+#### 17.8.13 Cut A in flight, 2026-08-03 (sixth session, end)
+
+**Live: server `da46f2759b` (tenant PID 3799451, UNCHANGED -- no restart
+taken this session), client `8498385d90`.** The client is served from this
+worktree per request, so the resampler fix went live on merge. **It is NOT
+gated**: the one gate run against it went red for MT reasons (below), so the
+user must not be asked to test this build.
+
+**Shipped and gated: nothing new. Shipped and ungated: the client
+resampler.** Everything else in Cut A is committed and waits on one tenant
+restart: `turn.speech`, the MT retry, `--mt-timeout-s`, `--mt-lane`.
+
+**The click is per-frame resampling, proven with a control.** See commit
+`94bd13cc82`. The client built one `AudioBufferSource` per 20 ms frame at
+the WIRE rate while the context runs at 44.1/48 kHz, so every frame was
+resampled as an island. Measured against the same signal rendered as one
+buffer: residual peak **0.490 against a 0.5 signal**, with **exactly zero**
+energy between frame edges; at 16k->16k the residual is 0.0, which is what
+proves the mechanism is the resampler and not the scheduling.
+
+**The fix caught two of its own defects by being verified framed-against-
+whole rather than by inspection.** An accumulated read position drifts
+differently across one long call than across many short ones -- at 48 kHz
+the ratio is 1/3 and the rounding is systematic, so the fix was broken at
+exactly the rate a phone uses while clean at the 44.1 kHz it was first run
+at. And an earlier special-case for a zero fraction never fired, because 1/3
+is not exact in binary; the identical failing number said so. Deriving the
+position from the global output index makes framed and whole agree by
+construction: bit-identical at 16/22.05/32/44.1/48 kHz.
+
+**The gate red is MT, not the resampler, and the shape says so.** Run
+`gate_resample_a.log`: turns 1 and 4 produced no audio AND no visible text,
+and text never touches the resampler. Turn 2 DID produce audio through it
+(236 frames) with text visible at 20.2 s -- against a 4.8 s median on the
+previous build. That matches the independently measured 19.7 s MT
+time-to-first-token behind a 46k-token co-tenant prefill. A probe taken
+after the run: 25.0 s and 12.0 s for a FOUR-token request. Gating in that
+state measures the neighbour, not the build.
+
+**Next, in order:** wait for the 30030 restart carrying `--enable-fast-lane`,
+then re-gate the client twice; then the `require_pair` degradation and
+auto-scroll, which are the two Cut A items still unbuilt; then take ONE
+tenant restart for the whole server side (turn.speech, retry, timeout, lane)
+and gate twice again. The onset probe is the standing regression arm for the
+seams, and `probe_resample_seam.py` for the output.
+
+**Do not re-litigate:** the three original click candidates are each
+falsified with numbers (§17.8.12) -- the talker's onset rises over 11.6 ms,
+seams are not the step outlier, and 1 of 268 schedules started in the past
+and it was the benign initialization. The talker module is not implicated
+and remains the #488 agent's.
