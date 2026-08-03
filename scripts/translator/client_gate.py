@@ -92,12 +92,22 @@ PROBE_JS = """
 () => {
   // Count what the playback path actually receives. Reading the DOM cannot
   // tell whether audio arrived; only the playback call can.
-  window.__gate = { frames: 0, samples: 0, rate: 0, errors: [], timings: [] };
+  window.__gate = { frames: 0, samples: 0, rate: 0, errors: [], timings: [],
+                    // §19.13 ordering: text and audio have to be timestamped
+                    // on ONE clock to be comparable at all, so both are taken
+                    // from `performance.now()` in the page rather than from
+                    // the harness, which sees only what it polls for.
+                    text: [], firstPushAt: null,
+                    // §19.12: the stop's receipt, read where it arrives.
+                    acks: [] };
   const original = playback.push.bind(playback);
   playback.push = (float32, rate) => {
     window.__gate.frames += 1;
     window.__gate.samples += float32.length;
     window.__gate.rate = rate;
+    if (window.__gate.firstPushAt === null) {
+      window.__gate.firstPushAt = performance.now();
+    }
     return original(float32, rate);
   };
   // The server already measures every stage (``Stopwatch``) and ships the
@@ -117,6 +127,20 @@ PROBE_JS = """
       try { event = JSON.parse(ev.data); } catch (err) { return; }
       if (event && event.kind === 'turn.done' && event.timings) {
         window.__gate.timings.push(event.timings);
+      }
+      // Every clause of translated TEXT, stamped on arrival. The defect this
+      // catches is not "no text" -- it is text that arrives at the speed of
+      // the SPEAKER, which only an ordering against the audio can show.
+      if (event && event.kind === 'turn.translation') {
+        window.__gate.text.push({
+          at: performance.now(),
+          turn_id: event.turn_id || null,
+          partial: !!event.partial,
+          chars: (event.text || '').length,
+        });
+      }
+      if (event && event.kind === 'playback.stop.ack') {
+        window.__gate.acks.push({at: performance.now(), ack: event});
       }
     });
     return true;
@@ -159,7 +183,87 @@ SABOTAGE_JS = """
 """
 
 
-async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
+#: How long a stop may still be followed by audio before the button is a lie.
+#: Generous on purpose: frames already on the wire when the stop is written
+#: still have to arrive, and failing those would be failing physics.
+STOP_QUIESCE_S = 8.0
+#: But the tail has to go QUIET, not merely thin out. A turn that keeps
+#: trickling frames for the whole window has not been stopped, whatever the
+#: rate. This is the assertion; the window above only bounds the wait.
+STOP_QUIET_S = 2.5
+
+
+async def stop_arm(page, sabotage: bool = False) -> dict:
+    """Send ``playback.stop`` mid-playback and watch what the server does.
+
+    Two things are measured and they answer different questions. The ACK says
+    the server understood and names what it abandoned -- that is the protocol
+    half, and it is what the client needs in order to drop audio per turn id.
+    The frame count going QUIET is the half that matters to a person: it is
+    the difference between a stop and a receipt for a stop.
+
+    ``sabotage`` runs the whole arm and sends nothing. It is the can-fail
+    proof (§17.8.7's lesson: an arm whose failure nobody has seen is a
+    decoration) -- with the frame never sent, no ack arrives and the arm must
+    fail.
+
+    WHAT THE CAN-FAIL PROOF ACTUALLY COVERED, measured rather than claimed
+    (run `gate_stopcanfail_b17.log`): the ACK half failed as required, and the
+    QUIESCENCE half did NOT -- it reported `frames after stop 0, quiet 2.52 s`
+    in the sabotage run too. The reason is the workload, not the assertion:
+    the talker is batch, so a single-clause turn's audio has entirely arrived
+    before the arm looks, and `dropped_queued` was 0, so there was nothing
+    left for a stop to prevent. On that shape the quiescence assertion is
+    trivially true and therefore proves nothing.
+
+    So it bites only where there IS a backlog -- a multi-clause turn, or a
+    queued second turn, with the stop fired while the worker still has units
+    to synthesize. Until this arm is driven with such a turn, treat the
+    quiescence half as UNPROVEN and read the ack half as the evidence.
+    """
+    frames_at_stop = await page.evaluate("window.__gate.frames")
+    acks_before = await page.evaluate("window.__gate.acks.length")
+    sent = False
+    if not sabotage:
+        sent = bool(await page.evaluate(
+            """() => {
+              if (!connection.ws || connection.ws.readyState !== 1) return false;
+              connection.ws.send(JSON.stringify(
+                {kind: 'playback.stop', reason: 'gate'}));
+              return true;
+            }"""
+        ))
+    t0 = time.monotonic()
+    last_change = t0
+    last_count = frames_at_stop
+    while time.monotonic() - t0 < STOP_QUIESCE_S:
+        await asyncio.sleep(0.25)
+        now = await page.evaluate("window.__gate.frames")
+        if now != last_count:
+            last_count = now
+            last_change = time.monotonic()
+        elif time.monotonic() - last_change >= STOP_QUIET_S:
+            break
+    quiet_for = time.monotonic() - last_change
+    acks = await page.evaluate(f"window.__gate.acks.slice({acks_before})")
+    ws_state = await page.evaluate(
+        "connection.ws ? connection.ws.readyState : -1"
+    )
+    return {
+        "sent": sent,
+        "sabotage": sabotage,
+        "frames_at_stop": frames_at_stop,
+        "frames_after_stop": last_count - frames_at_stop,
+        "quiet_for_s": round(quiet_for, 2),
+        "quiesced": quiet_for >= STOP_QUIET_S,
+        "acks": [entry["ack"] for entry in acks],
+        "ws": ws_state,
+    }
+
+
+async def one_turn(
+    page, index: int, speak_s: float, budgets: dict, stop_mode: str = "",
+) -> dict:
     """Tap, speak, tap, and wait for what a person would wait for."""
     # Re-attach after a reconnect: ``connection.ws`` is replaced, and the
     # listener goes with the old socket. Idempotent via a marker on the socket.
@@ -169,6 +273,11 @@ async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
     )
     before_frames = await page.evaluate("window.__gate.frames")
     before_timings = await page.evaluate("window.__gate.timings.length")
+    before_text = await page.evaluate("window.__gate.text.length")
+    # The first push is a PER-TURN marker, so it is cleared per turn. Left
+    # cumulative it would answer "did this page ever play anything", which is
+    # not the question §19.13 asks.
+    await page.evaluate("() => { window.__gate.firstPushAt = null; }")
     started = time.monotonic()
 
     await page.click("#talk")                     # tap to speak
@@ -200,6 +309,14 @@ async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
             break
         await asyncio.sleep(0.25)
 
+    # THE STOP ARM (§19.12). Fired here, one poll after the FIRST frame
+    # reached the playback path, which is the only moment worth testing: a
+    # stop that arrives before the talker started, or after it finished,
+    # proves nothing about the case the button exists for.
+    stop_report = None
+    if stop_mode and audio_at is not None:
+        stop_report = await stop_arm(page, sabotage=(stop_mode == "sabotage"))
+
     # ``turn.done`` lands AFTER the last audio frame, so the loop above has
     # already broken out by the time the stage timings exist. Wait for it
     # separately and bounded: the numbers are diagnostic, and a turn that
@@ -212,6 +329,12 @@ async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
     timings = await page.evaluate(
         f"window.__gate.timings.slice({before_timings})"
     )
+    # Read AFTER the summary wait, so a clause that lands late is still in the
+    # ordering rather than silently outside the window that judges it.
+    text_events = await page.evaluate(
+        f"window.__gate.text.slice({before_text})"
+    )
+    first_push_at = await page.evaluate("window.__gate.firstPushAt")
     # What the OUTPUT did, not what was handed to it. Counting playback.push
     # calls proves the frames arrived and says nothing about whether a sound
     # was made -- the distinction a real device paid for.
@@ -247,6 +370,11 @@ async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
         "client": state,
         "saw_waiting": saw_waiting,
         "out": out,
+        # §19.13, on the page's own clock: every translated clause with its
+        # arrival time, and when the first audio frame was pushed.
+        "text_events": text_events,
+        "first_push_at": first_push_at,
+        "stop": stop_report,
         # One entry per target language; a DE turn fans out to one target
         # today, but the list keeps a fan-out honest rather than averaging it.
         "stages": timings,
@@ -400,7 +528,12 @@ async def run_gate(args) -> tuple:
                 await page.evaluate(PROBE_JS)
                 if args.prove_can_fail:
                     await page.evaluate(SABOTAGE_JS)
-            turn = await one_turn(page, i + 1, min(speak_s, 4.0), budgets)
+            stop_mode = ""
+            if args.stop_during_playback and i + 1 == args.stop_during_playback:
+                stop_mode = "sabotage" if args.stop_sabotage else "send"
+            turn = await one_turn(
+                page, i + 1, min(speak_s, 4.0), budgets, stop_mode=stop_mode
+            )
             results.append(turn)
             print(f"[gate] turn {turn['turn']}: line {turn['line_s']}s "
                   f"audio {turn['audio_s']}s frames {turn['audio_frames']} "
@@ -429,6 +562,83 @@ async def run_gate(args) -> tuple:
                     f"turn {turn['turn']}: no audio reached playback within "
                     f"{budgets['audio']}s"
                 )
+            # §19.13 ORDERING. The user's report was not "no text" -- it was
+            # text that arrived at the speed of the speaker, because `speak()`
+            # was awaited inside the MT loop. The property that fix delivers is
+            # an ORDER, so an order is what is asserted: every translated
+            # clause of the turn is on the page before its first audio frame.
+            #
+            # This holds while MT is faster than one clause of synthesis, which
+            # on the measured floor it is by more than an order of magnitude
+            # (§18.4: mt_total ~0.4 s against tts_first_audio ~5.9 s). The
+            # MARGIN is printed rather than only the verdict, so a future
+            # narrowing is visible long before it becomes a failure instead of
+            # arriving as one.
+            if not stop_mode:
+                order = text_order(turn)
+                print(f"[gate]   text/audio: {order['events']} streamed "
+                      f"clauses, last one {order['margin_s']}s before the "
+                      f"first audio frame")
+                if order["late"]:
+                    failures.append(
+                        f"turn {turn['turn']}: {len(order['late'])} of "
+                        f"{order['events']} streamed clauses arrived AFTER "
+                        f"the first audio frame (§19.13: text must not wait "
+                        f"for audio); margins {order['late']}"
+                    )
+                if turn["audio_s"] is not None and not order["events"]:
+                    # Silence here would be the decoration case: no clause to
+                    # compare reads as a pass, on precisely the turn where the
+                    # streaming path did not stream.
+                    failures.append(
+                        f"turn {turn['turn']}: audio arrived but no streamed "
+                        f"translation clause did, so the ordering was never "
+                        f"actually tested"
+                    )
+            if turn["stop"] is not None:
+                stop = turn["stop"]
+                print(f"[gate]   stop   : sent {stop['sent']} "
+                      f"sabotage {stop['sabotage']} "
+                      f"frames after stop {stop['frames_after_stop']} "
+                      f"quiet {stop['quiet_for_s']}s ws {stop['ws']} "
+                      f"acks {stop['acks']}")
+                if not stop["acks"]:
+                    failures.append(
+                        f"turn {turn['turn']}: playback.stop was never "
+                        f"acknowledged -- the client cannot know which turn's "
+                        f"audio to drop"
+                    )
+                else:
+                    ack = stop["acks"][0]
+                    missing = [
+                        k for k in
+                        ("aborted_turn_id", "dropped_queued", "stop_epoch")
+                        if k not in ack
+                    ]
+                    if missing:
+                        failures.append(
+                            f"turn {turn['turn']}: the stop ack is missing "
+                            f"{missing}"
+                        )
+                    elif ack.get("aborted_turn_id") is None:
+                        failures.append(
+                            f"turn {turn['turn']}: the stop ack names no "
+                            f"aborted turn, so nothing was in flight when the "
+                            f"arm fired -- the arm tested nothing"
+                        )
+                if not stop["quiesced"]:
+                    failures.append(
+                        f"turn {turn['turn']}: audio kept arriving for "
+                        f"{STOP_QUIESCE_S}s after the stop "
+                        f"({stop['frames_after_stop']} frames, longest quiet "
+                        f"stretch {stop['quiet_for_s']}s) -- it did not stop"
+                    )
+                if stop["ws"] != 1:
+                    failures.append(
+                        f"turn {turn['turn']}: the socket is in state "
+                        f"{stop['ws']} after the stop; a stop must free the "
+                        f"talker, not the connection"
+                    )
             # The output half. A turn that pushed frames into a context that
             # is not running produced no sound, however healthy every other
             # counter looks -- which is precisely what a phone reported while
@@ -509,6 +719,35 @@ def stage_summary(results: list) -> None:
               f"min {min(values):6.2f}s  max {max(values):6.2f}s")
 
 
+def text_order(turn: dict) -> dict:
+    """Where each STREAMED clause sits relative to the first audio frame.
+
+    Only the partial events are judged, which is the shipped contract
+    (`test_text_before_audio.py` filters on exactly this flag): the streamed
+    clauses are the text a reader sees arrive, while the final non-partial
+    event is the whole-translation record, journalled once the turn is done
+    and therefore legitimately after the audio it summarises. Asserting over
+    both fails every healthy turn by ~0.02 s -- measured, and it is what this
+    arm did before the contract was read.
+
+    Returns the clause count, the margin of the LAST clause (the tight one --
+    the first is trivially early), and any clause that was late. A turn with
+    no partial clause at all answers "nothing to compare" rather than passing
+    by default, which is how an ordering assertion becomes a decoration on
+    exactly the turns that would fail it.
+    """
+    events = [e for e in (turn.get("text_events") or []) if e.get("partial")]
+    first_push = turn.get("first_push_at")
+    if not events or first_push is None:
+        return {"events": len(events), "margin_s": None, "late": []}
+    late = [
+        round((e["at"] - first_push) / 1000.0, 2)
+        for e in events if e["at"] > first_push
+    ]
+    margin = round((first_push - max(e["at"] for e in events)) / 1000.0, 2)
+    return {"events": len(events), "margin_s": margin, "late": late}
+
+
 def report(failures, results, console, build) -> int:
     print()
     print(f"[gate] build   : {build}")
@@ -564,6 +803,18 @@ def main() -> int:
              "only ever loads once cannot see a defect that needs a reload -- "
              "and one reached the user: after a reload the old text was "
              "there, speaking again updated nothing and produced no sound",
+    )
+    parser.add_argument(
+        "--stop-during-playback", type=int, default=0, metavar="N",
+        help="on turn N, send playback.stop once the first audio frame has "
+             "reached the playback path, and require the server to say what "
+             "it abandoned AND to go quiet. Put a turn after it (--turns N+1) "
+             "to prove the stop freed the talker rather than wedging it",
+    )
+    parser.add_argument(
+        "--stop-sabotage", action="store_true",
+        help="run the stop arm and send NOTHING. The can-fail proof: the arm "
+             "must then FAIL on both halves (no ack, audio keeps arriving)",
     )
     parser.add_argument(
         "--prove-can-fail", action="store_true",
