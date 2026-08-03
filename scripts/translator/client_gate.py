@@ -319,6 +319,87 @@ async def run_gate(args) -> tuple:
         for i in range(args.turns):
             if i:
                 await asyncio.sleep(args.gap_s)
+            if args.reload_after and i == args.reload_after:
+                # THE REPLAY-THEN-LIVE ARM. Every earlier run loaded the page
+                # once and spoke into it, so the gate only ever exercised a
+                # client with no history -- and a defect that needs a RELOAD to
+                # appear was structurally invisible to it. That is exactly the
+                # shape that reached the user: after a reload his text was
+                # there, speaking again updated nothing and made no sound, and
+                # reloading again showed the translation. The cursor his page
+                # carried across the reload was the whole fault.
+                #
+                # The reload is a real navigation to the same URL, so
+                # sessionStorage survives it just as it does on the phone.
+                # Anything the client persists and reuses is therefore under
+                # test here, which is the point.
+                # The collector is emulated rather than waited for. A plain
+                # reload alone does NOT reproduce the defect: the session is
+                # still alive, so the stored cursor is still valid and live
+                # delivery keeps working. What the user hit is the reload of a
+                # page whose session had already been COLLECTED -- the server
+                # then mints a fresh session under the same id with a journal
+                # starting at zero, while the page still carries the old
+                # conversation's high-water cursor. Dropping the session here
+                # is that state exactly, and it takes a second instead of the
+                # idle timeout.
+                dropped = await page.evaluate(
+                    """async () => {
+                      const id = connection.sessionId;
+                      if (!id) return null;
+                      // Stop the client from racing us. Deleting the session
+                      // closes the socket, the page reconnects on a backoff,
+                      // and that reconnect RE-CREATES the session and starts
+                      // its journal growing again -- if enough events land
+                      // before the reload, the new journal overtakes the
+                      // stale cursor and the defect hides. That race is why
+                      // this arm passed twice against a build with the fix
+                      // deliberately disabled before it was pinned down.
+                      connection.closedByUser = true;
+                      const r = await fetch(
+                        BASE + "api/translator/sessions/" + id,
+                        {method: "DELETE"});
+                      return {id: id, status: r.status};
+                    }"""
+                )
+                # The cursor is REPORTED, not assumed. This arm was written
+                # once on the assumption that a reload alone re-sends a high
+                # cursor; it passed with the fix disabled, because after a
+                # single turn the stale cursor is small enough that the new
+                # journal overtakes it within the next turn. The number is the
+                # difference between a gate and a decoration, so it is printed.
+                carried = await page.evaluate(
+                    "() => ({cursor: connection.cursor, "
+                    "stored: sessionStorage.getItem('translator.cursor')})"
+                )
+                print(f"[gate] the page carries cursor {carried} into the "
+                      "reload; live delivery is only swallowed while the new "
+                      "journal sits below it")
+                print(f"[gate] dropped the session server-side: {dropped}")
+                if not dropped or dropped.get("status") not in (200, 204):
+                    failures.append(
+                        f"the reload arm could not drop the session: {dropped}"
+                    )
+                print(f"[gate] reloading the page after turn {i} -- the "
+                      "next turn must arrive LIVE, with history on board")
+                await page.goto(
+                    args.url, wait_until="domcontentloaded", timeout=60000
+                )
+                try:
+                    await page.wait_for_function(
+                        "() => connection && connection.ws "
+                        "&& connection.ws.readyState === 1",
+                        timeout=30000,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(
+                        f"the client never reopened its socket after the "
+                        f"reload: {exc}"
+                    )
+                    break
+                await page.evaluate(PROBE_JS)
+                if args.prove_can_fail:
+                    await page.evaluate(SABOTAGE_JS)
             turn = await one_turn(page, i + 1, min(speak_s, 4.0), budgets)
             results.append(turn)
             print(f"[gate] turn {turn['turn']}: line {turn['line_s']}s "
@@ -474,6 +555,15 @@ def main() -> int:
         help="fail a turn whose SERVER-side first_audio_ms exceeds this. "
              "Off by default on purpose: a budget picked before the floor is "
              "measured (DESIGN §18.4) would be a number nobody can defend",
+    )
+    parser.add_argument(
+        "--reload-after", type=int, default=0, metavar="N",
+        help="reload the page after turn N and keep speaking. The remaining "
+             "turns then run on a client that carries history and a stored "
+             "cursor, which is the state a phone is actually in. A gate that "
+             "only ever loads once cannot see a defect that needs a reload -- "
+             "and one reached the user: after a reload the old text was "
+             "there, speaking again updated nothing and produced no sound",
     )
     parser.add_argument(
         "--prove-can-fail", action="store_true",

@@ -2551,6 +2551,82 @@ his real device audio, per-decision candidate-cosine logging persisted
 server-side, rolling reference growth, and speaker MERGE with reference-buffer
 union and history relabelling.
 
+#### 17.8.7 A cursor outliving its session silenced every live event
+
+User, on the build that had just fixed the replayed-history noise: "nothing
+happens when I press tap to speak", and then the precision that made the
+diagnosis: "if I reload the page, the text I spoke before is there. If I speak
+again now, nothing updates again, no sound comes out. Reload again, and the
+NEW translation is there too."
+
+That last sentence excludes almost everything. The uplink, the recognizer, the
+translator and the synthesizer all worked -- the translation existed
+server-side and appeared on the next reload. Only LIVE delivery was broken.
+
+**Read from his session before anything was changed**, in this order:
+
+* two turns completed server-side, each with a full ASR/MT/TTS run in the
+  tenant log (`faster_whisper`, the MT request, and `qwen_tts` synthesis lines
+  per clause);
+* the journal held every `turn.audio` payload intact -- `audio_follows` true,
+  `audio_evicted` false -- read back over a read-only replay client, so the
+  audio existed and the 24 MB eviction budget was nowhere near;
+* his own `playback` telemetry reported the output context `running` with
+  `currentTime` advancing, while `pushed`, `dropped` and `skipped_replay` were
+  all **zero** a full minute after the first turn's audio existed.
+
+`Playback.push()` increments `pushed` as its FIRST statement, so zero pushes
+proves `onBinary` never ran; `skipped_replay` zero proves the fresh
+replay-refusal was not eating them either. No binary frame ever reached the
+device. That is a fourth case §17.8.3's decision table did not have, and the
+table now needs it: **nothing arrived to play.**
+
+**One cursor, both symptoms.** The client persists `translator.cursor` beside
+`translator.session` and resets neither when the server hands back a session
+it had to MINT. Once the idle collector has taken the old session, the server
+re-creates it under the same id with a journal starting at zero, while the
+page still carries the old conversation's high-water cursor. `_handshake`
+seeded the delivery cursor from that number without validating it, and
+`Journal.since()` answers a cursor past the end with an empty list and no gap
+-- so `_journal_pump` had nothing to send until the new journal grew past a
+high-water mark belonging to a conversation that no longer existed.
+
+The reload kept working because the written record travels on the handshake's
+`transcript` frame, keyed on a SEPARATE cursor the client does not persist.
+That is precisely what hid this: the one path that still worked was the one
+the user could see.
+
+**The session-collection fix is what made a latent cursor bug reachable.**
+Before it, his session survived and the cursor stayed valid. Neither change
+was wrong on its own; the reach of the first was what the second changed.
+
+Fixed on both sides, the server half deliberately, because it repairs clients
+already on a phone: the handshake clamps a resume cursor to the journal's
+`next_seq` and logs when it does; `resumed` reports whether the session
+actually existed instead of `bool(session_id)`, which was true whenever the
+client named any id; and the client drops its cursor when the id it gets back
+is not the one it asked for, or when the server did not resume.
+
+**The gate could not have caught this, and now has an arm that can.** Every
+previous run loaded the page once and spoke into it, so the gate only ever
+exercised a client with NO history -- a defect that needs a reload was
+structurally invisible to it, the same blind-spot shape as §17.8's original
+lesson. `--reload-after N` now drops the session server-side (the collector,
+emulated, in a second instead of the idle timeout), reloads the page so
+`sessionStorage` carries the stale cursor exactly as a phone does, and
+requires the next turn to arrive live.
+
+**Two things this arm taught, both worth keeping.** It PASSED twice against a
+build with the fix deliberately disabled before it was pinned down: the client
+reconnects on a backoff after the delete, that reconnect re-creates the
+session, and if enough events land before the reload the new journal overtakes
+the stale cursor and the defect hides. The arm now suppresses that reconnect
+(`connection.closedByUser`) and PRINTS the carried cursor, because the number
+is the difference between a gate and a decoration. Only after that did the
+can-fail proof succeed -- carried cursor 84 against `journal_next_seq` 1,
+FAIL unfixed, PASS fixed. An arm whose can-fail proof has not been run is not
+evidence, and this one would have shipped green and blind.
+
 ### 17.6 Build order and what each step needs
 
 Order is by dependency, not by user priority — (b) carries the surface every
@@ -2820,6 +2896,66 @@ bad-network ladder (addendum 6 asked for adaptive Opus downwards).
    so the user can listen; and the bandwidth fallback tested hermetically
    through an injected throttle (check the reach of the addendum-6f network
    chaos harness first).
+
+### 19.3b A reset button (unbuilt, user order 2026-08-03)
+
+User: "it generally needs a reset button." A reset in the surface that
+starts the conversation genuinely fresh, and is effective on the SERVER, not
+only in the display:
+
+1. the transcript is cleared (the existing clear semantics);
+2. every speaker profile goes -- voice references, centroids, names and pool
+   assignments;
+3. the queue and any pending turns are dropped;
+4. a fresh session id, which deliberately ends the sticky resume of the old
+   session.
+
+Behind a confirmation dialog that NAMES what is lost: a mistap must not
+delete a conversation. Placed well away from the speaking controls in the new
+layout -- no fat-finger risk beside the big button.
+
+It is worth double right now: this is the user's own way to get rid of
+contaminated old profiles without anybody intervening server-side. Which is
+also the honest reading of what a "reset" is for -- the state that accumulates
+here is exactly the state that goes wrong.
+
+Gate arm: after a reset the health session is fresh, the speaker list is
+empty, and the first turn mints a speaker again.
+
+### 19.7 A temporal continuity prior on speaker assignment (unbuilt, user order)
+
+User: "generally somebody speaks continuously and nobody else chatters in
+-- the assumption should hold first that the same person is speaking, above
+all when the words or sentences are close together." Recorded after §17.8.5's continuity guard had
+shipped and STILL produced a new speaker on turn 3 of a clean session.
+
+The assignment combines embedding evidence with a prior taken from the gap to
+the previous turn. A short gap -- order of a few seconds, the threshold chosen
+from his real session data and NOT guessed -- is strong evidence for the same
+speaker as before; the prior decays as the gap grows. Only clearly
+contradicting voice evidence (well past the minting bound AND nearer to a
+different existing profile) or an explicit user action (speaker button, "+")
+overrides it.
+
+This composes with the existing guard rather than replacing it: the guard
+handles the uncertainty band, the prior additionally moves the boundary itself
+when temporal coherence argues for it. Conversational reality is that speaker
+changes happen at pauses, not mid-flow.
+
+The edge cases, handled honestly:
+
+* a direct attribution by speaker button is absolute -- the prior is
+  irrelevant there;
+* after a long pause the prior is neutral;
+* in a genuine dialogue exchange the prior must not drown out a REAL change.
+  The turn's language identification is a strong counter-signal here and it is
+  already available for free: a turn arriving in the OTHER language of the
+  pair makes a change more likely than continuity, and it is folded in.
+
+Made provable: the prior component is persisted per decision alongside the
+cosine and the final score, and the falsifier drives synthetic sequences --
+short gaps in one voice must NEVER mint, and a language-change turn must not
+be overridden by the prior.
 
 ### 19.6 Cheap wins from the competition, to fold in where they are cheap
 
