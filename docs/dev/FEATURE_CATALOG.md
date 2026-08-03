@@ -540,7 +540,13 @@ inferred. `--speculative-moe-runner-backend` (the existing per-draft flag) now
 actually reaches DFLASH/DSPARK draft builds, which is what puts an MXFP4
 DSpark head on `Mxfp4MarlinMoEMethod` on sm120. **DESK-WRITTEN — no DSpark arm
 has booted; `docs/dev/TICKET_470_dspark_boots.md` is the only evidence path,
-and its Boot A prices the ~21 % rank-0 residency cut the arm costs.**
+and its Boot A prices the ~21 % rank-0 residency cut the arm costs.** Two
+pre-boot blockers on any PACKED DSpark draft are cleared (#491, from the #490
+upstream sweep, `NOTE_490_pr33271_abgleich.md` §C): the fused-KV-projection
+support probe answers `False` for marlin/AWQ/GPTQ linears instead of raising
+inside the branch whose job is to decline, and the draft's `.scale` rename is
+suffix-anchored so `.scales`/`.scale_inv` are no longer mangled, dropped with
+only a warning, and left as a silently zero accept rate.
 
 ## 5. Multi-group runtime (dual lane)
 Slices A-D merged: lane-correct context overlays (~370 callsites), own thread +

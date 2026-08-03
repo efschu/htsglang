@@ -110,6 +110,39 @@ rebase time:
    solo embed hoist after that rebase") -- cross-referenced here, not
    duplicated.
 
+Gates 6-9 come from the #490 sweep of upstream PR #33271 (the 8 commits of
+2026-08-03). Full reasoning with file:line evidence is in
+`NOTE_490_pr33271_abgleich.md` §E -- summarised here so this section stays the
+single list of rebase gates, not duplicated in substance.
+
+6. **`dsv4/indexer.py` is a guaranteed conflict past #33271, in the region we
+   own.** Upstream's `fp8_paged_mqa_logits_torch_sm120` gains an `out=`
+   parameter, a recursive `_QUERY_CHUNK = 1024` self-call and a bf16
+   accumulation; ours is a flat double loop with fp32 accumulation and an
+   env-driven MiB budget. Resolution rule, fixed in advance: **keep ours
+   whole.** Their four commits repair a defect class ours does not have, and
+   their `head_dim * 2` bf16 byte formula would *undercount* our fp32
+   transient and reintroduce the OOM they were fixing.
+7. **Their non-paged arch guard now lands inside `_can_use_nonpaged_indexer`
+   itself** (`8a930437f1`), i.e. in the function our #417 Cut 3 guard already
+   occupies (`indexer.py:731`). Keep our
+   `deepgemm_indexer_supported(device_id)` call, drop their
+   `_has_deep_gemm_indexer` module global -- it is an import-time, device-blind
+   constant and is wrong for at least one rank on a heterogeneous rig. Do
+   **not** take both: two guards with different device semantics in one
+   function is the "two decisions that must not be able to disagree" trap
+   `indexer_arch.py:98-101` names.
+8. **The DSpark fused-KV-projection module MOVED upstream**, from our
+   `python/sglang/srt/speculative/dspark_components/kernels/dspark_draft_model.py`
+   to `python/sglang/kernels/ops/speculative/dspark/dspark_draft_model.py`.
+   Same family as gate 3: our patches to this file become a *port*, not a
+   cherry-pick, once we rebase past the move -- this now includes the #491 C2
+   probe fix (`getattr` guards in `_dequant_supported`).
+9. **`models/deepseek_v4_dspark.py` gains a `_remap_mtp_rest` staticmethod**
+   (`728a27fa81`). We adopted that fix in #491 under upstream's exact method
+   name and signature precisely so this rebase hunk is a no-op merge; keep the
+   name if the method is ever touched again.
+
 ## (c) #33348 (page-size/allocator-granularity mismatch) vs our #108 draft-KV-DCP layout
 
 **Verdict: our REPLICATED draft-KV fallback does not share the root cause --
