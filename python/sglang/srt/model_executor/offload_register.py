@@ -27,11 +27,19 @@ depth FRACTION 0..1, Ergaenzung 7c):
 * ``gdn_state_sets``  -- GDN-/Mamba session state SETS (Erg. 8): one item per
                          session slot across all GDN layers. The pool is
                          dimensioned for MAX sessions; with fewer running
-                         sessions the surplus sets are dead weight and
-                         parkable (host RAM or peer VRAM). Turn-class time
-                         constant with its OWN boundary type: moves happen at
-                         ADMISSION boundaries, planned by the session-set
-                         ladder (``on_admission_boundary``), with the
+                         sessions the surplus sets are dead weight. Parking
+                         one is a VACATE-then-move, never a move of the live
+                         set (#461): live GDN state is device-bound (DESIGN_407
+                         X2) and is in any case a stride slice of the pool's
+                         ``[num_layers, num_slots, ...]`` tensors rather than a
+                         page range, so there is nothing to unmap. What travels
+                         is the EXPORTED blob -- ``MambaPool.export_state_blob``
+                         copies the slot's persistent fields to host tensors and
+                         ``import_state_blob`` restores them into any free slot
+                         -- and that blob may rest in host RAM or peer VRAM.
+                         Turn-class time constant with its OWN boundary type:
+                         moves happen at ADMISSION boundaries, planned by the
+                         session-set ladder (``on_admission_boundary``), with the
                          invariant that an arriving session NEVER meets a
                          parked set (raise before admission, lower with
                          hysteresis).

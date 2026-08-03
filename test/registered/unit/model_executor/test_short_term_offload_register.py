@@ -59,8 +59,11 @@ from sglang.srt.model_executor.offload_register import (
 )
 from sglang.srt.model_executor.short_term_offload_register import (
     ASSET_CLASSES,
+    GROUND_CAPTURE_ACTIVE,
+    GROUND_GRAPH_ADDRESSED,
     AdaptiveGraphStateMover,
     AssetClassDescriptor,
+    ContentState,
     FakeGraphStateMover,
     GraphFamilyRegister,
     LadderRank,
@@ -68,10 +71,14 @@ from sglang.srt.model_executor.short_term_offload_register import (
     UnpricedTierRefused,
     capture_is_active,
     describe_class,
+    graph_addressed_classes,
     graph_family_item_id,
     plan_spill,
     price_park_target,
+    refuse_if_capture_active,
+    refuse_if_move_illegal,
     set_capture_probe,
+    set_graph_reference_probe,
 )
 from sglang.srt.planner.cost_model import Provenance, Rate
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -249,12 +256,16 @@ class AssetClassDescriptorTest(unittest.TestCase):
             ],
         )
 
-    def test_gdn_state_sets_are_device_bound(self):
-        """DESIGN_407 X2: recurrent state may not leave its card. Declaring it
-        anything weaker would let the tier table offer host RAM, which is a
-        correctness failure and not a slowdown."""
+    def test_live_gdn_state_sets_are_device_bound(self):
+        """DESIGN_407 X2: LIVE recurrent state may not leave its card.
+        Declaring it anything weaker would let the tier table offer host RAM
+        for a set the GDN kernels are still updating in place."""
         self.assertIs(
             describe_class("gdn_state_sets").payload, PayloadClass.DEVICE_BOUND
+        )
+        self.assertIs(
+            describe_class("gdn_state_sets").payload_for(ContentState.LIVE),
+            PayloadClass.DEVICE_BOUND,
         )
 
     def test_a_graph_family_is_not_droppable(self):
@@ -654,20 +665,17 @@ class TierPricingTest(unittest.TestCase):
         )
         self.assertIn(tmpfs, workspaces.tier_ids)
 
-    def test_a_device_bound_class_has_no_park_target_at_all(self):
-        """FINDING, recorded rather than papered over (DESIGN_286 §8).
+    def test_a_live_device_bound_class_has_no_park_target_at_all(self):
+        """#461, POSITIVE PIN 1 of 2 (was the red-if-changed contradiction pin).
 
         ``memtier.tiers.admission_refusal`` states the DEVICE_BOUND law in two
         parts: the volatility table admits it only on ``DEVICE_BOUND_ONLY``
         tiers, AND it "never travels, not even one hop over P2P" -- so once the
-        origin card is excluded, a DEVICE_BOUND class has nowhere to go.
+        origin card is excluded, a LIVE device-bound class has nowhere to go.
+        That law is unchanged by #461 and stays pinned here.
 
-        That is the #407 law working as written, and it CONTRADICTS
-        ``offload_register.py``'s Erg.-8 docstring, which says a surplus GDN
-        session set is "parkable (host RAM or peer VRAM)". One of the two is
-        wrong. This slice does not wire ``gdn_state_sets`` and does not settle
-        it; it pins the contradiction so the next author meets it as a red
-        test rather than as a silent divergence between two documents.
+        Can-fail proof: give ``gdn_state_sets`` the suspended payload as its
+        LIVE payload and this returns a priced peer-VRAM target.
         """
         with self.assertRaises(UnpricedTierRefused) as ctx:
             price_park_target(
@@ -677,6 +685,10 @@ class TierPricingTest(unittest.TestCase):
                 origin=ORIGIN,
             )
         self.assertIn("never travels", str(ctx.exception))
+        # The refusal must name the remedy, not just the law: the register's
+        # answer for this class is vacate-then-move, never move-live.
+        self.assertIn("VACATE-then-move", str(ctx.exception))
+        self.assertIn("content_state=SUSPENDED", str(ctx.exception))
 
     def test_no_admitting_tier_refuses_with_the_full_itemisation(self):
         """The refusal carries every rejected tier with its rule, not a bare
@@ -986,6 +998,236 @@ class AdaptiveMoverTest(unittest.TestCase):
         )
 
         self.assertEqual(GraphStateMover().footprint_bytes("k", "t"), 0)
+
+
+# ---------------------------------------------------------------------------
+# 6. #461 -- the GDN state class is STATE-dependent, not statically classified
+# ---------------------------------------------------------------------------
+
+
+class GdnStateClassificationTest(unittest.TestCase):
+    """FALSIFIER GROUP 9 (#461). Drop ``suspended_payload`` from the
+    ``gdn_state_sets`` descriptor and the pricing tests here turn red.
+
+    The contradiction #286 §8 recorded was between two true statements about
+    two DIFFERENT things. The movement code settles it:
+
+    * LIVE: one set is a stride slice of the pool's
+      ``[num_layers, num_slots, ...]`` tensors that GDN kernels update in
+      place and captured graphs address (``memory_pool.py`` copy_from /
+      ``offload_gdn_states.register_mamba_state_sets`` registers it
+      ``va_stable_required``). It is DEVICE_BOUND and has no park target.
+    * SUSPENDED: ``MambaPool.export_state_blob`` copies every persistent field
+      of the slot to CPU tensors (``memory_pool.py:918``), keyed by NAME, and
+      ``import_state_blob`` restores them into ANY free slot
+      (``memory_pool.py:972``). #364's executor already carries that blob to a
+      #224 destination tier as one flat uint8 buffer plus a manifest
+      (``gdn_slot_executor.py:214``). The blob is a transportable byte payload.
+    """
+
+    def test_the_two_forms_carry_different_payload_classes(self):
+        desc = describe_class("gdn_state_sets")
+        self.assertIs(desc.payload_for(ContentState.LIVE), PayloadClass.DEVICE_BOUND)
+        self.assertIs(
+            desc.payload_for(ContentState.SUSPENDED),
+            PayloadClass.EXPENSIVE_RECONSTRUCTABLE,
+        )
+        self.assertTrue(desc.park_requires_suspend)
+
+    def test_a_suspended_gdn_state_blob_does_have_a_park_target(self):
+        """#461, POSITIVE PIN 2 of 2. Erg. 8's "host RAM or peer VRAM" is
+        right about the DESTINATION and was wrong only about the FORM."""
+        priced = price_park_target(
+            _registry(),
+            offload_class="gdn_state_sets",
+            bytes_needed=MIB,
+            origin=ORIGIN,
+            content_state=ContentState.SUSPENDED,
+        )
+        self.assertEqual(priced.tier_id, PEER)
+        self.assertGreater(priced.move_ms.value, 0.0)
+
+    def test_the_suspended_blob_is_not_droppable_either(self):
+        """EXPENSIVE_RECONSTRUCTABLE, not RECONSTRUCTABLE: losing a parked
+        blob costs the session a full re-prefill, so a tmpfs may not hold it
+        (``import_state_blob`` refuses to resume onto an uninitialised slot --
+        ``gdn_slot_executor.py:413``)."""
+        registry = _registry(with_tmpfs=True)
+        selection = registry.select(
+            TierQuery(
+                payload=describe_class("gdn_state_sets").payload_for(
+                    ContentState.SUSPENDED
+                ),
+                object_class="gdn_state_sets",
+                bytes_needed=MIB,
+                require_measured_bandwidth=True,
+            )
+        )
+        self.assertNotIn(filesystem_tier_id("rig-1", "/dev/shm"), selection.tier_ids)
+
+    def test_a_class_with_no_suspended_form_prices_the_same_in_both_states(self):
+        """The state axis is not a second knob for every class. Only a class
+        that declares a distinct suspended form has one."""
+        self.assertIsNone(describe_class("graph_rungs").suspended_payload)
+        for state in ContentState:
+            priced = price_park_target(
+                _registry(),
+                offload_class="graph_rungs",
+                bytes_needed=GIB,
+                origin=ORIGIN,
+                content_state=state,
+            )
+            self.assertEqual(priced.tier_id, PEER)
+
+    def test_the_descriptor_agrees_with_what_the_erg8_ladder_registers(self):
+        """``offload_gdn_states.register_mamba_state_sets`` books every set
+        with ``va_stable_required=True``; the descriptor said False. Two
+        answers to one question is how #461 happened, so it is pinned."""
+        import ast
+        import pathlib
+
+        import sglang.srt.model_executor.offload_gdn_states as ladder
+
+        self.assertTrue(describe_class("gdn_state_sets").va_stable_required)
+        source = pathlib.Path(ladder.__file__).read_text()
+        tree = ast.parse(source)
+        booked = [
+            kw.value.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            for kw in node.keywords
+            if kw.arg == "va_stable_required" and isinstance(kw.value, ast.Constant)
+        ]
+        self.assertEqual(booked, [True], "the Erg.-8 ladder's own registration")
+
+    def test_a_live_set_is_never_planned_as_a_plain_park(self):
+        """A spill step for this class is a VACATE-then-move, and the plan
+        says so -- an executor that took the plain ``park()`` route would be
+        moving live device-bound state."""
+        reg = _register()
+        reg.register("gdn_state_set/00007", "gdn_state_sets", GIB, 0.0)
+        reg.register("some_family", "graph_rungs", GIB, 0.0)
+        plan = plan_spill(reg, 2 * GIB)
+        by_id = {s.item_id: s for s in plan.steps}
+        self.assertTrue(by_id["gdn_state_set/00007"].requires_suspend)
+        self.assertFalse(by_id["some_family"].requires_suspend)
+        self.assertIn("vacate", plan.render())
+
+
+# ---------------------------------------------------------------------------
+# 7. #468 -- VA stability is a property of the ROUTE, not only of the class
+# ---------------------------------------------------------------------------
+
+
+class ExpertArenaVaStabilityTest(unittest.TestCase):
+    """FALSIFIER GROUP 10 (#468). Set
+    ``va_stable_when_graph_addressed=False`` on the ``experts`` descriptor and
+    the first four tests turn red.
+
+    #462 built a route in which a captured decode graph holds the expert slot
+    arena's device addresses (``DESIGN_462_breakable_route.md`` §6). The arena
+    refuses a park locally; the REGISTER did not, so the one rule lived in two
+    places and only one of them knew about it.
+    """
+
+    def setUp(self):
+        self.addCleanup(set_capture_probe, None)
+        self.addCleanup(set_graph_reference_probe, None)
+        set_capture_probe(lambda: False)
+        self.reg = _register()
+        self.families = GraphFamilyRegister(
+            mover=FakeGraphStateMover(), register=self.reg
+        )
+
+    def _family_addressing_experts(self):
+        self.families.register_family(
+            "decode_breakable", "tag_b", size_bytes=GIB, addresses_classes=("experts",)
+        )
+        set_graph_reference_probe(self.families.addressed_classes)
+
+    def test_the_register_refuses_an_arena_park_while_a_graph_addresses_it(self):
+        """The falsifier #462 §6 says is missing at register level."""
+        self._family_addressing_experts()
+        with self.assertRaises(OffloadUnderCaptureRefused) as ctx:
+            refuse_if_move_illegal(
+                "park", "MoE breakable slot arena (layer 3)", offload_class="experts"
+            )
+        self.assertEqual(ctx.exception.ground, GROUND_GRAPH_ADDRESSED)
+        self.assertIn("decode_breakable", str(ctx.exception))
+        self.assertIn("VA", str(ctx.exception))
+
+    def test_without_a_referencing_family_the_arena_park_is_allowed(self):
+        """Default-inert: the eager offload's droppable cache still parks.
+        A rule that refused unconditionally would be the arena's local rule
+        again, just moved one module up."""
+        refuse_if_move_illegal("park", "arena", offload_class="experts")
+        self.assertEqual(graph_addressed_classes(), frozenset())
+        # ... and it reports CLASSES once a family declares some, not the
+        # family keys the probe is keyed by.
+        self._family_addressing_experts()
+        self.assertEqual(graph_addressed_classes(), frozenset({"experts"}))
+
+    def test_parking_the_family_does_not_release_the_reference(self):
+        """A #93 family park PRESERVES the VAs -- that is its whole point --
+        so the captured graphs still hold the arena's addresses afterwards.
+        Only dropping the graphs (unregistering the family) releases them."""
+        self._family_addressing_experts()
+        self.families.offload_family("decode_breakable")
+        with self.assertRaises(OffloadUnderCaptureRefused):
+            refuse_if_move_illegal("park", "arena", offload_class="experts")
+        self.families.unregister_family("decode_breakable")
+        refuse_if_move_illegal("park", "arena", offload_class="experts")
+
+    def test_plan_spill_skips_a_class_whose_addresses_a_capture_baked_in(self):
+        """The planner may not plan what the gate would refuse; otherwise the
+        rule is enforced only by whoever remembers to call it."""
+        self._family_addressing_experts()
+        self.reg.register("an_expert", "experts", 8 * GIB, 0.0)
+        plan = plan_spill(self.reg, 8 * GIB)
+        self.assertNotIn("an_expert", [s.item_id for s in plan.steps])
+        self.assertIn("an_expert", plan.skipped)
+        self.assertIn("addresses", plan.skipped["an_expert"])
+
+    def test_it_is_one_rule_with_two_grounds_not_two_rules(self):
+        """Same gate, same named error, distinguishable ground. A second
+        exception type would let a caller catch one and miss the other -- and
+        one ground spelt two ways would let it retry at the next replay
+        boundary forever, which only ever helps for the capture ground."""
+        self.assertNotEqual(GROUND_CAPTURE_ACTIVE, GROUND_GRAPH_ADDRESSED)
+        set_capture_probe(lambda: True)
+        with self.assertRaises(OffloadUnderCaptureRefused) as ctx:
+            refuse_if_move_illegal("park", "arena", offload_class="experts")
+        self.assertEqual(ctx.exception.ground, GROUND_CAPTURE_ACTIVE)
+        self.assertIn("BETWEEN replays", str(ctx.exception))
+
+    def test_the_capture_ground_needs_no_class_and_is_unchanged(self):
+        """``refuse_if_capture_active`` keeps its exact old behaviour for the
+        callers that name no class (``breakable_offload.BreakableOffloadArena``
+        is one), so #468 cannot regress the #462 pin."""
+        self._family_addressing_experts()
+        refuse_if_capture_active("park", "arena")  # graph ground needs the class
+        set_capture_probe(lambda: True)
+        with self.assertRaises(OffloadUnderCaptureRefused) as ctx:
+            refuse_if_capture_active("park", "arena")
+        self.assertEqual(ctx.exception.ground, GROUND_CAPTURE_ACTIVE)
+
+    def test_va_stability_is_conditional_for_experts_and_static_elsewhere(self):
+        experts = describe_class("experts")
+        self.assertFalse(experts.va_stable_required)
+        self.assertFalse(experts.va_stability_required(graph_addressed=False))
+        self.assertTrue(experts.va_stability_required(graph_addressed=True))
+        families = describe_class("graph_rungs")
+        self.assertTrue(families.va_stability_required(graph_addressed=False))
+        workspaces = describe_class("lane_workspaces")
+        self.assertFalse(workspaces.va_stability_required(graph_addressed=True))
+
+    def test_a_family_may_not_declare_an_unknown_class(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.families.register_family(
+                "bad", "tag", size_bytes=GIB, addresses_classes=("no_such_class",)
+            )
+        self.assertIn("no_such_class", str(ctx.exception))
+        self.assertEqual(self.families.families(), ())
 
 
 if __name__ == "__main__":

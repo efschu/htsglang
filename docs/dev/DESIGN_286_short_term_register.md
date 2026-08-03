@@ -6,8 +6,9 @@ BOOT-PENDING list and the GPU ticket that would retire it.
 
 Scope of this document: what already existed before this slice (§1), what the
 slice adds and why each piece is where it is (§2–§5), the falsifier results
-(§6), what needs a card (§7), and the one contradiction the work surfaced and
-did not resolve (§8).
+(§6), what needs a card (§7), and the two classification questions the work
+surfaced and a later slice settled (§8 `gdn_state_sets` / #461, §8b `experts`
+VA stability under the breakable route / #468).
 
 ---
 
@@ -167,8 +168,8 @@ zeroing, which the link model does not contain — see §7.
 | `drafter_heads` | `EXPENSIVE_RECONSTRUCTABLE` | Same rung — the weight half of the same "this family is not running" decision — but no capture points at it, so `va_stable_required=False`. |
 | `lane_workspaces` | `RECONSTRUCTABLE` | Genuine scratch: content after a resume is undefined anyway. The one class here that may rest on a `RECONSTRUCTABLE_OK` tier. |
 | `cold_lane` | `EXPENSIVE_RECONSTRUCTABLE` | #89 suspend route. Indivisible: the suspend path takes a lane's whole tag set, so partial spill of this class is a no-op rather than a fraction, and its only dimension preset is the lane. |
-| `experts` | `RECONSTRUCTABLE` | The host pool is the source of truth; the VRAM copy is a cache. |
-| `gdn_state_sets` | `DEVICE_BOUND` | DESIGN_407 X2. See §8. |
+| `experts` | `RECONSTRUCTABLE` | The host pool is the source of truth; the VRAM copy is a cache. VA stability is route-acquired, not absent — see §8b (#468). |
+| `gdn_state_sets` | `DEVICE_BOUND` live, `EXPENSIVE_RECONSTRUCTABLE` suspended | DESIGN_407 X2 for the live set; the exported blob is an ordinary byte payload. A park is vacate-then-move. See §8 (#461). |
 | `kv_shadow` | `RECONSTRUCTABLE`, rank 1 | The old layout stays the source of truth while a shadow exists, so park/discard is free. Cheaper to give up than a cold second model, hence most disposable of all. |
 
 ---
@@ -191,6 +192,20 @@ Baseline **55 passed**. Eight can-fail arms, each run and reverted:
 | F8 | `move_ms` relabelled `Provenance.MEASURED` | **1 red** |
 
 Baseline restored and re-run green after each arm.
+
+### Second round (#461 + #468, executed 2026-08-03)
+
+Baseline **69 passed** (55 + 14 new). Seven further arms, each run and reverted:
+
+| # | Neuter | Result |
+|---|---|---|
+| F9a | `suspended_payload` dropped from the `gdn_state_sets` descriptor | **4 red** |
+| F9b | `payload_for` ignores the state and always answers `self.payload` | **2 red** |
+| F9c | descriptor `va_stable_required` back to False for `gdn_state_sets` | **1 red**: the ladder-agreement pin |
+| F10a | `experts` `va_stable_when_graph_addressed=False` | **4 red** |
+| F10b | `plan_spill`'s graph-addressed skip dropped | **1 red** |
+| F10c | `GraphFamilyRegister.addressed_classes` reports nothing | **3 red** |
+| F10d | the two refusal grounds collapsed to one string | **1 red** — and this arm stayed GREEN on the first attempt, which is what added the explicit `assertNotEqual` of the two grounds. A ground that is only ever compared against its own constant is not pinned by that comparison. |
 
 ---
 
@@ -222,6 +237,22 @@ so none of them reads as established:
 5. **Per-family capture-pool residue is assumed, not measured, for a LAYOUT
    family.** #102's ~0.3 GB/state is the spec-ladder rung case; §20.3 itself
    carries it "by analogy" to the layout-family case.
+6. **(#461) No GDN set has been vacated through the register.** The
+   classification is settled from the movement code and the round trip is
+   exercised by #364's own CPU tests, but no `gdn_state_sets` item has ever
+   been parked *by this register*: there is no vacate-then-move mover here, and
+   the ladder still plans only. What a card would have to show: an
+   export/free/restore cycle driven from an admission boundary that leaves the
+   session's output bit-identical, and the blob resting on the tier
+   `price_park_target(content_state=SUSPENDED)` picked.
+7. **(#468) The graph-reference declaration has no production producer.** The
+   register can be told which classes a family's captures address, and refuses
+   accordingly, but nothing in the tree calls `register_family(...,
+   addresses_classes=("experts",))` yet — #462's route is itself gated off and
+   never booted. Until a boot wires it, the refusal is proven only against a
+   declared family, not against a real captured graph. The claim that a #93
+   family park preserves the VAs (and therefore does not release the
+   reference) is read from the route's design, not observed.
 
 ### GPU ticket for the next window
 
@@ -248,35 +279,119 @@ Vehicle: the standard TP=3 uneven boot on 5090 + 2×3080. Hold `/spinning/gpu-ar
 
 ---
 
-## 8. Unresolved: `gdn_state_sets` has no park target
+## 8. RESOLVED (#461): `gdn_state_sets` is classified by STATE, not statically
 
-Pinned as a test
-(`TierPricingTest::test_a_device_bound_class_has_no_park_target_at_all`) rather
-than papered over.
+The contradiction this section recorded was between two statements that are
+each true of a *different form* of the same content. The missing thing was the
+axis, not the answer.
+
+### What the contradiction was
 
 `memtier.tiers.admission_refusal` states the `DEVICE_BOUND` law in two parts:
 the volatility table admits it only on `DEVICE_BOUND_ONLY` tiers, **and** it
 "never travels, not even one hop over P2P". Once the origin card is excluded —
 and it must be, because parking to where the bytes already are is not parking —
-a `DEVICE_BOUND` class has nowhere to go at all.
+a `DEVICE_BOUND` class has nowhere to go at all. That contradicted
+`offload_register.py`'s Erg.-8 docstring ("parkable — host RAM or peer VRAM")
+and the `offload_gdn_states` ladder built on it.
 
-That is the #407 law working exactly as written. It contradicts
-`offload_register.py`'s Erg.-8 docstring, which says a surplus GDN session set
-is "parkable (host RAM or peer VRAM)", and the `offload_gdn_states` ladder built
-on that claim.
+### What the movement code says
 
-One of the two is wrong. Either:
+Checked against the code that moves the bytes, not against either document:
 
-* GDN state is genuinely device-bound and the Erg.-8 ladder can only ever
-  *free* sets, never park them — in which case its docstring and its target
-  list need correcting; or
-* a lossless, order-preserving round trip of GDN state to host RAM is in fact
-  safe, and `DESIGN_407` X2's assignment is too strict — in which case the
-  payload class, not the ladder, is what changes.
+| evidence | file:line | says |
+|---|---|---|
+| one set is a stride slice of `[num_layers, num_slots, ...]` | `mem_cache/memory_pool.py:908-916` | the LIVE set is not a page range; there is no VMM range to unmap, so an in-place park is not merely forbidden, it is not expressible |
+| every set registers `va_stable_required=True` | `model_executor/offload_gdn_states.py:360` | the pool tensors' addresses must not move (kernels + captured graphs address them) |
+| `export_state_blob` copies every persistent per-slot field to CPU, keyed by name | `mem_cache/memory_pool.py:918-970` | the SUSPENDED form is an ordinary host byte payload |
+| `import_state_blob` restores into ANY free slot, by name | `mem_cache/memory_pool.py:972-1009` | the blob carries no slot identity and no device identity |
+| `TieredGdnBlobStore` flattens the blob to one uint8 buffer + manifest and puts it on a #224 `DestinationTier` | `mem_cache/gdn_slot_executor.py:214-262` | it already travels past host RAM in the shipped #364 path |
+| `#224`'s own "never travels" is scoped to the KV-tail park path | `mem_cache/gdn_slot_executor.py:46-50` | the invariant `DESIGN_407` X2 quotes was never about the mamba pool's own relief axis |
+| the round trip is used by `get_cpu_copy` / `load_cpu_copy` and by RDMA registration of conv+temporal | `mem_cache/memory_pool.py:1028-1048`, `:1050+` | the exported form crosses the wire in two shipped features |
 
-This slice does not wire `gdn_state_sets` and does not settle it. The test
-exists so the next author meets the contradiction as a red assertion rather than
-as a silent divergence between two documents.
+The hypothesis (live = device-bound, suspended = transportable) is
+**CONFIRMED**, and with a stronger reason than expected on the live side: the
+live set is not just unlicensed to move, it has no page-level move at all.
+
+### What changed
+
+* `AssetClassDescriptor` grew `suspended_payload` and `payload_for(state)`;
+  `ContentState` is the axis (`LIVE` default — the conservative answer).
+  `gdn_state_sets` is `DEVICE_BOUND` live and `EXPENSIVE_RECONSTRUCTABLE`
+  suspended (not `RECONSTRUCTABLE`: losing a parked blob costs the session a
+  re-prefill, and `gdn_slot_executor.py:413` refuses to resume onto an
+  uninitialised slot rather than paper over it).
+* `price_park_target(..., content_state=...)`. LIVE keeps the old refusal and
+  now names the remedy — evacuate first — instead of only the law.
+* Park of this class is a VACATE-then-move everywhere: `SpillStep` carries
+  `requires_suspend`, `SpillPlan.render()` marks the step, and both docstrings
+  that claimed the live set is parkable (`offload_register.py` Erg. 8,
+  `offload_gdn_states.py`) now describe export/restore.
+* The descriptor's `va_stable_required` was **False** while the Erg.-8 ladder
+  registers every set with **True** — two answers to one question, in the two
+  modules that own it. The descriptor is now True, and the agreement is pinned
+  by a test that parses the ladder's own registration call.
+* `DESIGN_407`'s doctrine text (`memtier/tiers.py` `PayloadClass.DEVICE_BOUND`
+  and `admission_refusal`) now says the class is a property of content in a
+  state. **The law itself is unchanged**: nothing device-bound travels. An
+  evacuation produces a different payload; it does not create an exception.
+
+Pinned positively in both directions
+(`TierPricingTest::test_a_live_device_bound_class_has_no_park_target_at_all`,
+`GdnStateClassificationTest`), replacing the red-if-changed contradiction pin.
+
+**Still not wired.** #461 settles the classification; it does not build the
+vacate-then-move mover into the register, and #364's executor remains the only
+implementation of the round trip. See §7.
+
+---
+
+## 8b. RESOLVED (#468): `experts` VA stability is route-acquired
+
+`DESIGN_462` §6 recorded that the `experts` descriptor's
+`va_stable_required=False` is false under the breakable route: a captured
+decode graph holds the slot arena's device addresses, so moving the arena
+invalidates it. #462 enforced the stronger rule *locally* in
+`BreakableOffloadArena.park`, leaving the register — the module that owns the
+rule — unaware of it.
+
+The fix keeps ONE rule. `AssetClassDescriptor.va_stable_when_graph_addressed`
+marks a requirement that arrives with the ROUTE rather than with the class, and
+`va_stability_required(graph_addressed=...)` is the single place the two
+sources combine. A `GraphFamily` declares `addresses_classes` at registration
+(the point where what the capture contains is known), and
+`GraphFamilyRegister.addressed_classes()` is the production argument for
+`set_graph_reference_probe`.
+
+The gate is the existing one, generalised rather than duplicated:
+`refuse_if_move_illegal(op, subject, offload_class=...)` raises the SAME
+`OffloadUnderCaptureRefused` with a `ground` field —
+
+* `GROUND_CAPTURE_ACTIVE`: a capture is recording now. Class-agnostic; retrying
+  at the next replay boundary helps. This is the pre-existing rule, and
+  `refuse_if_capture_active` still spells exactly it, so `breakable_offload`'s
+  own call is byte-for-byte unchanged.
+* `GROUND_GRAPH_ADDRESSED`: a capture already baked this class's addresses in.
+  Class-specific, and it bites BETWEEN replays — precisely where ground 1 says
+  the move is legal. Retrying never helps; the graphs must be dropped.
+
+Two consequences worth stating because they are not obvious:
+
+* **A family park does not release the reference.** The #93 park preserves the
+  family's VAs by construction — that is its whole purpose — so the captured
+  graphs and the addresses they hold survive it. Only unregistering the family
+  releases the class. The arena's own remedy text ("drop the decode graphs
+  first (the #286 rung-1 family eviction)") therefore under-specifies: a rung-1
+  park is not enough.
+* **The refusal is for the ACQUIRED requirement only.** `graph_rungs` and
+  `gdn_state_sets` declare VA stability permanently and have a VA-preserving
+  route for exactly that reason (the #93 tag park; `offload_movement` refuses
+  every other route for them). A class that acquires the requirement has no
+  such mover, so for it the only correct answer is "do not move this at all".
+
+`plan_spill` enforces the same predicate, so the planner cannot plan what the
+gate would refuse. Default-inert: with no probe installed, nothing is addressed
+and no behaviour changes.
 
 ---
 
@@ -292,7 +407,12 @@ Concurrency discipline — two other agents were active in adjacent territory.
   `set_active(key)` on a flip. Nothing in `DESIGN_363` was edited.
 * **`layers/moe/expert_offload.py` and `offload_capture_gate.py`** (#452-prep's
   strand) — read-only reference for the refusal precedent.
-* **`offload_register.py` itself** was not modified. The ladder rank lives in
+* **`offload_register.py` itself** was not modified *by the original slice*.
+  #461 changed exactly one thing in it: the Erg.-8 class docstring, which
+  claimed the live GDN set is parkable. No code there changed. The same is true
+  of `offload_gdn_states.py` (docstrings only) and `memtier/tiers.py` (the
+  `DEVICE_BOUND` and `admission_refusal` doctrine text only — the law and the
+  refusal logic are untouched). The ladder rank lives in
   this module's class descriptors, which is also how `DESIGN_407` §8 frames it
   ("importance is a registry attribute per asset"). A future per-ITEM rank
   override would want a field on `OffloadItem`; it is not needed yet and would

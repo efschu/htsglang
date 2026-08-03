@@ -229,9 +229,12 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   can-fail arms (pad marker dropped → 3 red; bridges aliased across capture
   shapes → 2; #286 capture gate removed → 1; overflow check moved after resolve
   → 2; prefill precondition dropped → 1; breakable silently downgraded to eager
-  → 1; staged publish flipped to non_blocking → 1). Open finding pinned as a
-  test: the `experts` descriptor's `va_stable_required=False` is FALSE under
-  this route, since a captured graph holds the arena's addresses.
+  → 1; staged publish flipped to non_blocking → 1). The open finding it pinned
+  — the `experts` descriptor's `va_stable_required=False` is FALSE under this
+  route, since a captured graph holds the arena's addresses — is RESOLVED in
+  the register by #468 (see the #286 entry above); nothing in
+  `breakable_offload.py` changed, and no producer declares the reference until
+  this route boots.
   Design: `docs/dev/DESIGN_462_breakable_route.md`; GPU ticket:
   `docs/dev/TICKET_462_f2_and_replay.md`.
   **The shipped offload path is the eager one** (`--disable-cuda-graph`,
@@ -380,11 +383,25 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   §7. It states NO reload-latency figure: `DESIGN_363` §20.3's ~25 ms is a
   projection that #102's own measured 40-51 ms avg / 85 ms max per state swap
   already contradicts, and the derived link time this module computes is
-  labelled a FLOOR (ESTIMATE) even off a MEASURED bandwidth. Open finding
-  pinned as a test: under the #407 DEVICE_BOUND law a `gdn_state_sets` item has
-  NO park target at all (it "never travels, not even one hop over P2P"), which
-  contradicts `offload_register.py`'s Erg.-8 docstring claim that a surplus GDN
-  set is parkable to host RAM or peer VRAM — unresolved, §8 of the design note.
+  labelled a FLOOR (ESTIMATE) even off a MEASURED bandwidth.
+  **Both open findings are now settled** (#461/#468, §8/§8b of the design note,
+  69 hermetic tests, SEVEN further executed can-fail arms). (e) `gdn_state_sets`
+  is classified per CONTENT STATE, not statically: LIVE it is `DEVICE_BOUND`
+  (DESIGN_407 X2) and has no park target at all — and is not even a page range,
+  since one set is a stride slice of the pool's `[layers, slots, ...]` tensors —
+  while the EXPORTED blob (`MambaPool.export_state_blob`, name-keyed, restorable
+  into any free slot, already carried to a #224 tier by #364) is an ordinary
+  `EXPENSIVE_RECONSTRUCTABLE` byte payload. A park of this class is therefore
+  always VACATE-then-move; `ContentState` is the axis, `SpillStep` marks the
+  step, and the #407 doctrine text now says the class describes content in a
+  state — the law that nothing device-bound travels is unchanged. (f) `experts`
+  VA stability is ROUTE-acquired: under #462's breakable route a captured graph
+  holds the slot arena's addresses, so a graph family declares
+  `addresses_classes` and the register refuses the park by name
+  (`ground=GROUND_GRAPH_ADDRESSED`) at the same gate that refuses under an
+  active capture — one rule, two grounds, and `plan_spill` will not plan what
+  the gate would refuse. Note a #93 family PARK preserves the VAs and so does
+  NOT release the reference; the family must be unregistered.
 - **memtier registry**: tier ids with volatility + payload class and
   provenance `measured|estimate|absent` (absent refuses use). HONEST STATE
   (audit #421, updated by #286): the FIRST production consumer is wired —

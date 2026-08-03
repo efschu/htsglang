@@ -275,6 +275,15 @@ class PayloadClass(str, enum.Enum):
     #: May not leave the owning card's VRAM. Not a preference: recurrent error
     #: accumulates, so a lossy or reordered round trip of GDN/Mamba state is a
     #: correctness failure (DESIGN_407 X2).
+    #:
+    #: This classifies CONTENT IN A GIVEN STATE, not a feature (#461). Live
+    #: GDN/Mamba state is device-bound. The same session's state EXPORTED into
+    #: a blob (``MambaPool.export_state_blob``) is not: it is a self-describing
+    #: byte payload that #364 already moves to host RAM and to a #224
+    #: destination tier, and it declares itself as
+    #: ``EXPENSIVE_RECONSTRUCTABLE`` when it does. That is not an exception to
+    #: the law below -- it is a different payload, produced by an evacuation
+    #: the owning card performs. Nothing device-bound ever travels.
     DEVICE_BOUND = "device_bound"
 
 
@@ -728,7 +737,11 @@ def admission_refusal(
 
     * ``DEVICE_BOUND`` content may rest only on the card that owns it, so a
       peer card's VRAM refuses it even though both tiers are
-      ``DEVICE_BOUND_ONLY``.
+      ``DEVICE_BOUND_ONLY``. A caller holding GDN/Mamba state that needs to go
+      somewhere does not argue with this: it evacuates the state into a blob
+      first and asks again with the blob's own payload class (#461,
+      ``short_term_offload_register.ContentState``). The refusal below is
+      final for the content as it stands.
     * a tier no local NVML has ever resolved admits nothing, whatever its
       declared volatility says.
     """

@@ -58,6 +58,21 @@ What was missing, and what this module adds:
    REFUSES a tier whose bandwidth provenance is ``ABSENT``. An unmeasured path
    is never assumed usable.
 
+7. **Classification by content STATE (#461).** A payload class describes what
+   content needs from a resting place, and for GDN/Mamba state the answer is
+   different for the live set (``DEVICE_BOUND``: kernels update it in place,
+   and one set is a stride slice of the pool's tensors rather than a page
+   range) and for the exported blob (an ordinary byte payload #364 already
+   carries to a #224 tier). :class:`ContentState` is that axis; a park of such
+   a class is always a VACATE-then-move. See
+   ``docs/dev/DESIGN_286_short_term_register.md`` §8.
+
+8. **VA stability acquired from the ROUTE (#468).** ``experts`` may move under
+   the eager offload and may not under #462's breakable route, where a
+   captured graph holds the slot arena's addresses. A graph family declares
+   which classes its captures address; :func:`refuse_if_move_illegal` is the
+   one gate, with two grounds. See §8b of the same note.
+
 Scope of this slice, stated so the next reader does not over-read it:
 
 * Graph-state families get the full wiring (descriptor, sizing, ladder rank,
@@ -84,7 +99,16 @@ import enum
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from sglang.srt.memtier.registry import TierQuery, TierRegistry
 from sglang.srt.memtier.tiers import PayloadClass, TierId
@@ -101,7 +125,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ASSET_CLASSES",
+    "GROUND_CAPTURE_ACTIVE",
+    "GROUND_GRAPH_ADDRESSED",
     "AssetClassDescriptor",
+    "ContentState",
     "GraphFamilyRegister",
     "GraphStateMover",
     "AdaptiveGraphStateMover",
@@ -114,11 +141,14 @@ __all__ = [
     "UnpricedTierRefused",
     "capture_is_active",
     "describe_class",
+    "graph_addressed_classes",
     "graph_family_item_id",
     "plan_spill",
     "price_park_target",
     "refuse_if_capture_active",
+    "refuse_if_move_illegal",
     "set_capture_probe",
+    "set_graph_reference_probe",
 ]
 
 
@@ -168,6 +198,24 @@ _UNPLANNABLE_RANKS = frozenset({LadderRank.ACTIVE_WORK})
 # ---------------------------------------------------------------------------
 
 
+class ContentState(str, enum.Enum):
+    """The FORM the content is in when a move is planned (#461).
+
+    A payload class describes what the content needs from a resting place.
+    For most classes that is a property of the class alone. For one it is
+    not: GDN/Mamba state is device-bound while it is LIVE and a transportable
+    byte payload once it has been SUSPENDED, and the two answers are not a
+    contradiction but a missing axis. Every consumer that prices or plans a
+    move names the state it is pricing; the default everywhere is
+    :attr:`LIVE`, which is the conservative one.
+    """
+
+    #: Kernels may still write it, and a slot-addressed layout applies.
+    LIVE = "live"
+    #: Evacuated into a self-describing blob; nothing points at it any more.
+    SUSPENDED = "suspended"
+
+
 @dataclass(frozen=True)
 class AssetClassDescriptor:
     """What one ``OFFLOAD_CLASSES`` member IS, as opposed to what it is called.
@@ -176,12 +224,26 @@ class AssetClassDescriptor:
     needs from wherever it comes to rest. It is what makes a tier admissible
     or not (``memtier.tiers.ADMITTED_PAYLOADS`` is the whole law), so getting
     it wrong is a correctness question, not a tuning one -- each choice below
-    carries its reason.
+    carries its reason. It describes the LIVE form.
+
+    ``suspended_payload`` is the payload class of the same content once it has
+    been evacuated into a blob, when that differs (#461). ``None`` means the
+    class has no distinct suspended form and :meth:`payload_for` answers the
+    same in both states. A class that declares one can only be parked in the
+    suspended form -- see :attr:`park_requires_suspend`.
 
     ``va_stable_required`` marks a class whose VIRTUAL addresses must survive
     the park. For a captured CUDA graph this is not an optimisation: a graph
     pins addresses, so a park that frees and re-allocates invalidates the
     capture, while a #93 unmap/remap at the same VA does not.
+
+    ``va_stable_when_graph_addressed`` is the same requirement acquired from
+    the ROUTE rather than owned by the class (#468). ``experts`` is the case:
+    under the eager offload the VRAM copy is a droppable cache that may move,
+    but under #462's breakable route a captured graph holds the slot arena's
+    device addresses, so the same class must not move while such a graph
+    exists. :meth:`va_stability_required` is the one place the two are
+    combined; nothing reads the raw fields to decide whether a move is legal.
 
     ``dimension_presets`` is the granularity at which the class can be cut --
     the unit :func:`plan_spill` moves. Partial spill (§8) is only meaningful
@@ -203,6 +265,8 @@ class AssetClassDescriptor:
     dimension_presets: Tuple[str, ...]
     wired: bool
     rationale: str
+    suspended_payload: Optional[PayloadClass] = None
+    va_stable_when_graph_addressed: bool = False
 
     def __post_init__(self) -> None:
         if self.offload_class not in OFFLOAD_CLASSES:
@@ -210,6 +274,40 @@ class AssetClassDescriptor:
                 f"asset-class descriptor names unknown offload class "
                 f"{self.offload_class!r}; known: {', '.join(OFFLOAD_CLASSES)}."
             )
+
+    def payload_for(self, state: ContentState = ContentState.LIVE) -> PayloadClass:
+        """The payload class of this content in ``state``.
+
+        LIVE is the default because it is the stricter answer for every class
+        that has two: a caller that has not evacuated the content yet must not
+        be offered a tier that only the evacuated form may rest on.
+        """
+        if state is ContentState.SUSPENDED and self.suspended_payload is not None:
+            return self.suspended_payload
+        return self.payload
+
+    @property
+    def park_requires_suspend(self) -> bool:
+        """True when a park of this class is a VACATE-then-move.
+
+        The live form of such a class has no legal resting place at all, so
+        "park it" is not an operation the mover can perform: the owner has to
+        evacuate the content first and move the resulting blob.
+        """
+        return self.suspended_payload is not None
+
+    def va_stability_required(self, *, graph_addressed: bool = False) -> bool:
+        """Whether this class's VIRTUAL addresses must survive a move now.
+
+        ONE predicate, two sources: the class's own permanent requirement, and
+        the requirement a captured graph imposes on a class that would
+        otherwise be free to move (#468). Callers ask this rather than reading
+        ``va_stable_required``, so a route-acquired requirement cannot be
+        missed by a consumer that only knows the static field.
+        """
+        return self.va_stable_required or (
+            graph_addressed and self.va_stable_when_graph_addressed
+        )
 
 
 def _descriptors() -> Dict[str, AssetClassDescriptor]:
@@ -287,6 +385,7 @@ def _descriptors() -> Dict[str, AssetClassDescriptor]:
             ladder_rank=LadderRank.COLD_EXPERTS,
             payload=PayloadClass.RECONSTRUCTABLE,
             va_stable_required=False,
+            va_stable_when_graph_addressed=True,
             time_constant_tier="wave",
             dimension_presets=("expert", "layer", "half"),
             wired=False,
@@ -294,22 +393,46 @@ def _descriptors() -> Dict[str, AssetClassDescriptor]:
                 "The existing MoE expert spill (#77/#123/#125/#236/#242). "
                 "Referenced so accounting and the ladder are unified; movement "
                 "stays with the expert-offload machinery. Droppable: the host "
-                "pool is the source of truth, the VRAM copy is a cache."
+                "pool is the source of truth, the VRAM copy is a cache. VA "
+                "stability is route-acquired rather than permanent (#468): the "
+                "eager offload may move the VRAM copy freely, but #462's "
+                "breakable route captures decode graphs against the slot "
+                "arena's device addresses (DESIGN_462 §6), and moving the "
+                "arena invalidates every graph that baked them in. The "
+                "condition is 'a live captured graph family declares it "
+                "addresses this class', not 'the breakable flag is set' -- the "
+                "flag is not what makes the addresses baked in."
             ),
         ),
         AssetClassDescriptor(
             offload_class="gdn_state_sets",
             ladder_rank=LadderRank.IDLE_SESSIONS,
             payload=PayloadClass.DEVICE_BOUND,
-            va_stable_required=False,
+            suspended_payload=PayloadClass.EXPENSIVE_RECONSTRUCTABLE,
+            va_stable_required=True,
             time_constant_tier="turn",
             dimension_presets=("session_set",),
             wired=False,
             rationale=(
-                "GDN/Mamba session state sets. DEVICE_BOUND per DESIGN_407 X2: "
-                "recurrent error accumulates, so a lossy or reordered round "
-                "trip is a correctness failure, not a slowdown. The planner "
-                "that owns this class is the Erg.-8 admission ladder "
+                "GDN/Mamba session state sets, classified per STATE (#461). "
+                "LIVE it is DEVICE_BOUND per DESIGN_407 X2 -- recurrent error "
+                "accumulates, so a lossy or reordered round trip is a "
+                "correctness failure -- and it is not even physically "
+                "parkable in place: one set is a stride slice of the pool's "
+                "[num_layers, num_slots, ...] tensors, not a page range, and "
+                "GDN kernels write it where it lies. Hence "
+                "va_stable_required: the pool tensors' addresses never move, "
+                "which is also what makes offload_movement refuse the plain "
+                "tensor route for this class. SUSPENDED it is an ordinary "
+                "byte payload: MambaPool.export_state_blob copies every "
+                "persistent per-slot field to CPU tensors keyed by NAME and "
+                "import_state_blob restores them into ANY free slot, so #364's "
+                "executor already carries the blob to a #224 destination tier "
+                "as one flat uint8 buffer plus a manifest. Losing a parked "
+                "blob costs the session a re-prefill, so the suspended form is "
+                "EXPENSIVE_RECONSTRUCTABLE and not droppable. A park of this "
+                "class is therefore always vacate-then-move, never move-live. "
+                "The planner that owns it is the Erg.-8 admission ladder "
                 "(offload_gdn_states.SessionSetLadder), not this module."
             ),
         ),
@@ -365,32 +488,63 @@ def describe_class(offload_class: str) -> AssetClassDescriptor:
 # ---------------------------------------------------------------------------
 
 
+#: Ground 1: a capture is RECORDING right now on this context. Class-agnostic
+#: -- unmapping pages a recording capture writes into corrupts the recording.
+GROUND_CAPTURE_ACTIVE = "capture_active"
+#: Ground 2 (#468): a capture has ALREADY RECORDED this class's addresses.
+#: Class-specific, and it bites between replays too, which is exactly where
+#: ground 1 says the move would otherwise be legal.
+GROUND_GRAPH_ADDRESSED = "captured_graph_addresses_class"
+
+
 class OffloadUnderCaptureRefused(RuntimeError):
-    """A register move was asked for while a CUDA graph capture is active.
+    """A register move a captured CUDA graph forbids.
 
     Named, with structured fields, for the same reason
     ``offload_capture_gate.OffloadCaptureBreach`` is: a caller that wants to
     retry between replays must be able to catch THIS and not every
     ``RuntimeError`` the move path can raise.
 
-    #452 settled the underlying question at boot: work inside a capture is
-    refuted (``CapturableOffloadRefuted``), and the surviving pattern is eager
-    work into slots BETWEEN replays with the compute captured. A park is eager
-    work by definition -- it unmaps physical pages -- so it is legal only
-    between replays, never during capture and never during replay.
+    ONE error with a ``ground``, not two error types, because it is one rule
+    -- "a captured graph forbids this move" -- reached two ways:
+
+    * :data:`GROUND_CAPTURE_ACTIVE` -- #452 settled the underlying question at
+      boot: work inside a capture is refuted (``CapturableOffloadRefuted``),
+      and the surviving pattern is eager work into slots BETWEEN replays with
+      the compute captured. A park is eager work by definition (it unmaps
+      physical pages), so it is legal only between replays. Retrying later
+      helps.
+    * :data:`GROUND_GRAPH_ADDRESSED` -- the capture is over, but it BAKED IN
+      this class's device addresses, and moving them invalidates it. Retrying
+      later does not help; the graphs have to be dropped first.
+
+    A caller that catches this and retries at the next replay boundary must
+    look at ``ground``: only the first one is a timing problem.
     """
 
-    def __init__(self, operation: str, subject: str, where: str = "") -> None:
+    def __init__(
+        self,
+        operation: str,
+        subject: str,
+        where: str = "",
+        *,
+        ground: str = GROUND_CAPTURE_ACTIVE,
+        reason: str = "",
+    ) -> None:
         self.operation = operation
         self.subject = subject
         self.where = where
+        self.ground = ground
+        if not reason:
+            reason = (
+                "a CUDA graph capture is active on this context. The register "
+                "moves physical pages, which is eager work; per #452 the only "
+                "legal placement for it is BETWEEN replays, with the compute "
+                "captured. Retry at the next replay boundary."
+            )
         super().__init__(
             f"short-term offload register refuses {operation} of {subject!r}"
-            f"{f' ({where})' if where else ''}: a CUDA graph capture is "
-            f"active on this context. The register moves physical pages, which "
-            f"is eager work; per #452 the only legal placement for it is "
-            f"BETWEEN replays, with the compute captured. Retry at the next "
-            f"replay boundary."
+            f"{f' ({where})' if where else ''}: {reason}"
         )
 
 
@@ -398,6 +552,12 @@ class OffloadUnderCaptureRefused(RuntimeError):
 #: ``get_is_capture_mode`` is imported lazily -- keeping torch out of this
 #: module's import graph so the hermetic tests need no CUDA.
 _CAPTURE_PROBE: Optional[Callable[[], bool]] = None
+#: Injectable source of "which offload classes do live captured graphs
+#: address". Production installs a :class:`GraphFamilyRegister`'s own
+#: ``addressed_classes``; None means nothing is known to be addressed, which
+#: is the pre-#462 world and leaves every class's static VA requirement in
+#: force and nothing else.
+_GRAPH_REFERENCE_PROBE: Optional[Callable[[], object]] = None
 _PROBE_LOCK = threading.Lock()
 
 
@@ -406,6 +566,30 @@ def set_capture_probe(probe: Optional[Callable[[], bool]]) -> None:
     with _PROBE_LOCK:
         global _CAPTURE_PROBE  # noqa: PLW0603 - one module-level test seam
         _CAPTURE_PROBE = probe
+
+
+def set_graph_reference_probe(probe: Optional[Callable[[], object]]) -> None:
+    """Install the source of "which classes do captured graphs address" (#468).
+
+    The natural production argument is
+    :meth:`GraphFamilyRegister.addressed_classes` of the register that owns
+    the pre-captured families, so the answer comes from the object that knows
+    when a family's graphs are built and dropped rather than from a flag a
+    second module has to remember to clear. ``None`` detaches.
+    """
+    with _PROBE_LOCK:
+        global _GRAPH_REFERENCE_PROBE  # noqa: PLW0603 - one module-level seam
+        _GRAPH_REFERENCE_PROBE = probe
+
+
+def graph_addressed_classes() -> frozenset:
+    """Offload classes whose device addresses a live captured graph holds.
+
+    Empty when no probe is installed. Empty is the right default: it leaves
+    every class's PERMANENT VA requirement untouched and adds no refusal, so a
+    tree without #462 behaves exactly as before.
+    """
+    return frozenset().union(*_addressing_families().values() or [frozenset()])
 
 
 def capture_is_active() -> bool:
@@ -435,10 +619,110 @@ def capture_is_active() -> bool:
     return bool(get_is_capture_mode())
 
 
-def refuse_if_capture_active(operation: str, subject: str, where: str = "") -> None:
-    """Raise :class:`OffloadUnderCaptureRefused` if a capture is running."""
+def _graph_addressed_refusal(offload_class: str) -> Optional[str]:
+    """Ground-2 reason for ``offload_class``, or None (#468).
+
+    The grain is the CLASS, because the descriptor is what carries the VA
+    requirement and a family declares which CLASSES its captures address. A
+    finer grain (this arena vs that arena) would need the graphs to enumerate
+    the allocations they baked in, which no torch API exposes.
+
+    The refusal is for the ACQUIRED requirement only. A class that declares VA
+    stability permanently (``graph_rungs``, ``gdn_state_sets``) is not refused
+    here: it has a VA-PRESERVING route precisely because it always needed one
+    -- the #93 tag park -- and ``offload_movement`` already refuses every
+    other route for it (``item.va_stable_required`` there). A class whose
+    requirement only arrives with the route has no such mover, so for it the
+    only correct answer is "do not move this at all".
+    """
+    desc = ASSET_CLASSES.get(offload_class)
+    if desc is None or desc.va_stable_required:
+        return None
+    if not desc.va_stable_when_graph_addressed:
+        return None
+    holders = sorted(k for k, v in _addressing_families().items() if offload_class in v)
+    if not holders:
+        return None
+    return (
+        f"captured graph famil{'y' if len(holders) == 1 else 'ies'} "
+        f"{', '.join(holders)} hold this class's device addresses, so its VA "
+        f"stability is required on THIS route even though the class does not "
+        f"require it in general (#468 / DESIGN_462 §6). Moving it would "
+        f"invalidate every graph that baked the addresses in, which no replay "
+        f"boundary makes safe -- drop those graph families (unregister them; a "
+        f"#93 family PARK deliberately preserves their VAs and therefore keeps "
+        f"the addresses live) before moving this class."
+    )
+
+
+def _addressing_families() -> Dict[str, frozenset]:
+    """``{family_key: classes it addresses}`` from the installed probe.
+
+    A probe that answers a flat set of class names (the documented shape) is
+    reported under one synthetic key, so the refusal message can always name a
+    holder instead of degrading to "something".
+    """
+    with _PROBE_LOCK:
+        probe = _GRAPH_REFERENCE_PROBE
+    if probe is None:
+        return {}
+    answer = probe() or ()
+    if isinstance(answer, Mapping):
+        return {str(k): frozenset(v) for k, v in answer.items()}
+    if not isinstance(answer, Iterable):
+        raise TypeError(
+            f"the graph-reference probe must answer a mapping "
+            f"{{family: classes}} or an iterable of class names, got "
+            f"{type(answer).__name__}"
+        )
+    return {"<captured graphs>": frozenset(answer)}
+
+
+def refuse_if_move_illegal(
+    operation: str,
+    subject: str,
+    *,
+    offload_class: Optional[str] = None,
+    where: str = "",
+) -> None:
+    """THE park/onload gate: raise if a captured graph forbids this move.
+
+    One predicate with the two grounds :class:`OffloadUnderCaptureRefused`
+    documents, evaluated in that order because ground 1 is the unrecoverable
+    one (it corrupts a recording rather than failing it) and because it holds
+    for every class, named or not.
+
+    ``offload_class`` is optional so the pre-#468 callers keep their exact
+    behaviour; naming it is what buys ground 2. A caller that owns bytes of a
+    known class should always name it -- the ground it unlocks is the one that
+    still bites between replays, where ground 1 says the move is fine.
+    """
     if capture_is_active():
-        raise OffloadUnderCaptureRefused(operation, subject, where)
+        raise OffloadUnderCaptureRefused(
+            operation, subject, where, ground=GROUND_CAPTURE_ACTIVE
+        )
+    if offload_class is None:
+        return
+    reason = _graph_addressed_refusal(offload_class)
+    if reason is not None:
+        raise OffloadUnderCaptureRefused(
+            operation,
+            subject,
+            where,
+            ground=GROUND_GRAPH_ADDRESSED,
+            reason=reason,
+        )
+
+
+def refuse_if_capture_active(operation: str, subject: str, where: str = "") -> None:
+    """Raise :class:`OffloadUnderCaptureRefused` if a capture is running.
+
+    The class-agnostic spelling of :func:`refuse_if_move_illegal`, kept
+    because it is the gate ``layers/moe/breakable_offload`` and this module's
+    own family moves already call, and because a move whose class is genuinely
+    unknown can still be checked against ground 1.
+    """
+    refuse_if_move_illegal(operation, subject, where=where)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +785,7 @@ def price_park_target(
     bytes_needed: int,
     origin: TierId,
     require_measured: bool = True,
+    content_state: ContentState = ContentState.LIVE,
 ) -> PricedTarget:
     """Pick and price a park target for one class through the #407 registry.
 
@@ -530,6 +815,13 @@ def price_park_target(
       ESTIMATE never appears either, and an ABSENT one never appears under any
       setting.
 
+    ``content_state`` names the FORM the bytes are in (#461). It defaults to
+    ``LIVE``, the conservative answer: a class whose live form is
+    ``DEVICE_BOUND`` gets no target at all until the caller states that it has
+    evacuated the content, because the evacuation is precisely what makes the
+    payload transportable. Only ``gdn_state_sets`` declares two forms today;
+    for every other class the argument changes nothing.
+
     When nothing survives, this raises :class:`UnpricedTierRefused` carrying
     the registry's full itemisation -- every refused tier with its rule and
     reason -- rather than a bare "no target".
@@ -539,7 +831,7 @@ def price_park_target(
         raise ValueError(f"bytes_needed must be >= 0, got {bytes_needed}")
     selection = registry.select(
         TierQuery(
-            payload=desc.payload,
+            payload=desc.payload_for(content_state),
             bytes_needed=bytes_needed,
             object_class=offload_class,
             require_measured_bandwidth=require_measured,
@@ -548,10 +840,21 @@ def price_park_target(
     )
     candidates = [c for c in selection.candidates if c.tier_id != origin]
     if not candidates:
+        remedy = ""
+        suspended = desc.suspended_payload
+        if suspended is not None and content_state is ContentState.LIVE:
+            remedy = (
+                f"; the LIVE form of {offload_class!r} is "
+                f"{desc.payload.value} and has no resting place by design -- a "
+                f"park of this class is a VACATE-then-move: evacuate the "
+                f"content first and price the "
+                f"{suspended.value} blob with "
+                f"content_state=SUSPENDED"
+            )
         raise UnpricedTierRefused(
             offload_class,
             f"origin {origin} excluded (tier 0 of the ladder = stay resident, "
-            f"not a park destination); {selection.render()}",
+            f"not a park destination); {selection.render()}{remedy}",
         )
     best = candidates[0]
     bw = best.bandwidth_gbs
@@ -595,13 +898,21 @@ def price_park_target(
 
 @dataclass(frozen=True)
 class SpillStep:
-    """One item the plan would park, with the rank that put it there."""
+    """One item the plan would park, with the rank that put it there.
+
+    ``requires_suspend`` marks a step whose park is a VACATE-then-move (#461):
+    the live content has no legal resting place, so an executor must evacuate
+    it into a blob and move that. It is on the STEP rather than looked up by
+    the executor so a plan can be handed to a caller that does not consult the
+    descriptors, and still cannot mistake it for a plain page park.
+    """
 
     item_id: str
     offload_class: str
     ladder_rank: LadderRank
     size_bytes: int
     last_access_s: float
+    requires_suspend: bool = False
 
 
 @dataclass
@@ -639,6 +950,7 @@ class SpillPlan:
             f"  {i + 1}. rank {s.ladder_rank.value} "
             f"({s.ladder_rank.name}) {s.item_id} [{s.offload_class}] "
             f"{s.size_bytes} B"
+            f"{' (vacate-then-move)' if s.requires_suspend else ''}"
             for i, s in enumerate(self.steps)
         ]
         return "\n".join([head, *body])
@@ -677,6 +989,15 @@ def plan_spill(
     the scheduler's admission path, not something a pressure planner may
     override by widening a budget.
 
+    Two class-level rules run before the per-item ones:
+
+    * a class whose device addresses a live captured graph family holds is
+      skipped entirely (#468) -- the planner may not plan what
+      :func:`refuse_if_move_illegal` would refuse;
+    * a class whose park is a vacate-then-move (#461) is still planned, but
+      its steps carry ``requires_suspend`` so an executor cannot mistake the
+      step for a plain page park.
+
     Already-parked and priority-protected items are skipped with a reason, as
     are items whose class policy or hysteresis would make
     :meth:`OffloadRegister.park` refuse -- but this planner does NOT
@@ -709,6 +1030,12 @@ def plan_spill(
     running = 0
     for item in sorted(candidates, key=_ladder_sort_key):
         desc = ASSET_CLASSES[item.offload_class]
+        graph_refusal = _graph_addressed_refusal(item.offload_class)
+        if graph_refusal is not None:
+            # #468: the planner may not plan what the gate would refuse.
+            # Otherwise the rule holds only for callers who remember to ask.
+            plan.skipped[item.item_id] = graph_refusal
+            continue
         if desc.ladder_rank in _UNPLANNABLE_RANKS:
             plan.skipped[item.item_id] = (
                 f"ladder rank {desc.ladder_rank.value} "
@@ -738,6 +1065,7 @@ def plan_spill(
                 ladder_rank=desc.ladder_rank,
                 size_bytes=item.size_bytes,
                 last_access_s=item.last_access_s,
+                requires_suspend=desc.park_requires_suspend,
             )
         )
         running += item.size_bytes
@@ -883,12 +1211,22 @@ class AdaptiveGraphStateMover(GraphStateMover):
 
 @dataclass
 class GraphFamily:
-    """One pre-captured layout/algo family known to the register."""
+    """One pre-captured layout/algo family known to the register.
+
+    ``addresses_classes`` are the offload classes whose DEVICE ADDRESSES this
+    family's captured graphs baked in (#468). A family declares them at
+    registration because that is where the capture's contents are known;
+    nothing infers them from a flag. The declaration outlives a park by
+    design: a #93 park preserves the family's VAs, so the graphs -- and the
+    addresses they hold -- survive it. Only unregistering the family (its
+    graphs are gone) drops the declaration.
+    """
 
     family_key: str
     tag: str
     item_id: str
     active: bool = False
+    addresses_classes: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -961,6 +1299,7 @@ class GraphFamilyRegister:
         size_source: Optional[object] = None,
         restore_cost_ms: float = 0.0,
         active: bool = False,
+        addresses_classes: Sequence[str] = (),
     ) -> GraphFamily:
         """Book one pre-captured family as a ``graph_rungs`` register item.
 
@@ -976,9 +1315,19 @@ class GraphFamilyRegister:
         biased AGAINST parking, which is the safe direction. Do not substitute
         DESIGN_363 §20.3's ~25 ms -- that number is a projection the tree's own
         #102 measurement (40-51 ms avg, 85 ms max) already contradicts.
+
+        ``addresses_classes`` declares the offload classes whose device
+        addresses this family's captures baked in (#468). #462's breakable
+        decode route is the case that needs it: its graphs address the MoE
+        expert slot arena, which makes ``experts`` unmovable for as long as
+        those graphs exist. Unknown class names are a hard error at
+        registration -- a typo here would silently under-protect a class.
         """
         desc = describe_class("graph_rungs")
         item_id = graph_family_item_id(family_key)
+        addressed = tuple(dict.fromkeys(addresses_classes))
+        for klass in addressed:
+            describe_class(klass)
         with self._lock:
             if family_key in self._families:
                 raise ValueError(
@@ -987,7 +1336,11 @@ class GraphFamilyRegister:
                     f"first or fix the pre-capture lifecycle."
                 )
             family = GraphFamily(
-                family_key=family_key, tag=tag, item_id=item_id, active=active
+                family_key=family_key,
+                tag=tag,
+                item_id=item_id,
+                active=active,
+                addresses_classes=addressed,
             )
             self._families[family_key] = family
         self._reg().register(
@@ -1012,6 +1365,22 @@ class GraphFamilyRegister:
     def families(self) -> Tuple[str, ...]:
         with self._lock:
             return tuple(sorted(self._families))
+
+    def addressed_classes(self) -> Dict[str, frozenset]:
+        """``{family_key: classes its captured graphs address}`` (#468).
+
+        Install this as the module's graph-reference probe
+        (:func:`set_graph_reference_probe`) and the register refuses a park of
+        a class a live capture holds addresses of, by name, at the same gate
+        that refuses a park during an active capture -- one rule, reached from
+        the object that knows when the graphs exist.
+        """
+        with self._lock:
+            return {
+                key: frozenset(family.addresses_classes)
+                for key, family in self._families.items()
+                if family.addresses_classes
+            }
 
     def is_active(self, family_key: str) -> bool:
         """True for the family currently serving. The ACTIVE family is HOT and

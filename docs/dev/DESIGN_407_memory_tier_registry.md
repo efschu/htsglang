@@ -165,9 +165,9 @@ already eight strong, and the volatility class is an *attribute* of each.
 | Class | Meaning | Members (with the site that fixes them there) |
 |---|---|---|
 | **RECONSTRUCTABLE** | can be dropped and regenerated at a known, bounded cost; no evacuation path needed | `graph_rungs` (recapture), `lane_workspaces` (scratch), `drafter_heads` and `experts` (re-readable from the checkpoint — this is what makes the #389 NVMe tier legal at all), `kv_shadow` (`offload_register.py:112-122`: *"the only class whose park/discard is FREE — there is nothing to copy back"*) |
-| **EXPENSIVE** | reconstructable only by redoing user-visible work; must be evacuated, never dropped | session KV (#224: the whole point is *"no re-prefill, no output cap"*), `cold_lane`, `gdn_state_sets` |
+| **EXPENSIVE** | reconstructable only by redoing user-visible work; must be evacuated, never dropped | session KV (#224: the whole point is *"no re-prefill, no output cap"*), `cold_lane`, `gdn_state_sets` **in its exported/SUSPENDED form** (#461) |
 | **PERSISTENT** | correctness depends on surviving process exit, and in #89's case a reboot | hibernate images (#89), and by inheritance #306's compressed form of them |
-| **DEVICE-BOUND** | may not leave local VRAM at all; not a preference, a named invariant | GDN/Mamba recurrent state — `kv_session_spill_destination.py:35`: *"It never travels, is never quantized, never crosses the wire … the most corruption-sensitive payload in the system (recurrent error accumulates)"* |
+| **DEVICE-BOUND** | may not leave local VRAM at all; not a preference, a named invariant | **LIVE** GDN/Mamba recurrent state — `kv_session_spill_destination.py:35`: *"It never travels, is never quantized, never crosses the wire … the most corruption-sensitive payload in the system (recurrent error accumulates)"*. The row above holds the same content once evacuated; see X2 and `DESIGN_286` §8 (#461) |
 
 The fourth row is why admission has to be a *refusal* mechanism and not a
 ranking. A registry that merely ordered tiers by cost would happily offer the
@@ -782,12 +782,27 @@ logical wall, named.
   contiguous-prefix backup invariant in `write_backup`. Reordering or bypassing
   a rung is a rewrite of three modules for a goal #407 does not have. The
   registry owns *which* L3 and *how big* L2, which is where the value is.
-* **X2 — GDN/Mamba state never gets a tier.** Not a scope decision: recurrent
-  error accumulates, so a lossy or reordered round trip is a correctness
-  failure, and #224 already names it *"the most corruption-sensitive payload in
-  the system"*. The registry expresses this as `DEVICE_BOUND_ONLY` admission,
-  which is a refusal mechanism rather than an omission — the class is
-  enumerated and every tier refuses it by name.
+* **X2 — LIVE GDN/Mamba state never gets a tier.** Not a scope decision:
+  recurrent error accumulates, so a lossy or reordered round trip is a
+  correctness failure, and #224 already names it *"the most
+  corruption-sensitive payload in the system"*. The registry expresses this as
+  `DEVICE_BOUND_ONLY` admission, which is a refusal mechanism rather than an
+  omission — the class is enumerated and every tier refuses it by name.
+
+  **Scope correction (#461, 2026-08-03):** this classifies the content in a
+  STATE, not the feature. Live state is device-bound. The same session's state
+  once EXPORTED (`MambaPool.export_state_blob` → CPU tensors keyed by field
+  name, restorable into any free slot) is a self-describing byte payload that
+  #364's slot executor already puts on a #224 `DestinationTier`, and it asks
+  the registry as `EXPENSIVE_RECONSTRUCTABLE` when it does. That is not an
+  exception to the law — nothing device-bound travels; an evacuation produces a
+  DIFFERENT payload, which is why the correct park of a GDN set is always
+  vacate-then-move. #224's own "never travels" sentence is scoped to the KV-tail
+  park path it describes, as `mem_cache/gdn_slot_executor.py:46-50` already
+  states. Consumers name the state through
+  `short_term_offload_register.ContentState` (default `LIVE`, the conservative
+  answer); details and the code evidence are in
+  `DESIGN_286_short_term_register.md` §8.
 * **X3 — cross-rig GPU-to-GPU as a tier edge.** Physically undemonstrated on
   this hardware, and the userspace route is closed by a driver guard (#280,
   `osCheckGpuBarsOverlapAddrRange`). The registry declares `T4-VRAM` with
