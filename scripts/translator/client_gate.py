@@ -183,6 +183,34 @@ VISIBLE_TEXT_JS = """
 }
 """
 
+#: Is the NEWEST transcript line actually inside the scroll container's
+#: viewport? The user's report was "das neue gesprochene muss im text immer
+#: automatisch hochgescrollt werden", and the client already answers it --
+#: `atBottom()` with a 60 px threshold plus `follow()` at every append, which
+#: is the standard "only auto-scroll if the user has not scrolled up" shape.
+#: That behaviour had no arm, so nothing would have noticed it regressing.
+#:
+#: Geometry, not scrollTop arithmetic: a line can be "scrolled to" and still
+#: sit behind a sticky control, and what the user means is that they can SEE
+#: the newest line.
+NEWEST_LINE_VISIBLE_JS = """
+() => {
+  const box = document.getElementById('transcript');
+  const lines = box ? box.querySelectorAll('.line') : [];
+  if (!box || !lines.length) return null;
+  const last = lines[lines.length - 1].getBoundingClientRect();
+  const view = box.getBoundingClientRect();
+  return {
+    lines: lines.length,
+    // Fully inside, with a pixel of tolerance for sub-pixel layout.
+    visible: last.top >= view.top - 1 && last.bottom <= view.bottom + 1,
+    overflow_below: Math.round(last.bottom - view.bottom),
+    scrolled_to_bottom:
+      box.scrollHeight - box.scrollTop - box.clientHeight < 60,
+  };
+}
+"""
+
 #: Stage keys carried by ``turn.done``, in pipeline order, with the two that
 #: are cumulative-from-segment-close marked. ``first_audio_ms`` is THE number:
 #: what a listener waits after the speaker stops.
@@ -479,6 +507,7 @@ async def one_turn(
     # What the OUTPUT did, not what was handed to it. Counting playback.push
     # calls proves the frames arrived and says nothing about whether a sound
     # was made -- the distinction a real device paid for.
+    scroll = await page.evaluate(NEWEST_LINE_VISIBLE_JS)
     out = await page.evaluate("playback.diagnostics()")
 
     # The client's own view, per turn. A stall that is only visible as a
@@ -519,6 +548,8 @@ async def one_turn(
         "text_events": text_events,
         "first_push_at": first_push_at,
         "stop": stop_report,
+        # Auto-scroll (user order): the newest line must be on screen.
+        "scroll": scroll,
         # One entry per target language; a DE turn fans out to one target
         # today, but the list keeps a fan-out honest rather than averaging it.
         "stages": timings,
@@ -768,6 +799,18 @@ async def run_gate(args) -> tuple:
                         f"turn {turn['turn']}: audio arrived but no streamed "
                         f"translation clause did, so the ordering was never "
                         f"actually tested"
+                    )
+            scroll = turn.get("scroll")
+            if scroll:
+                print(f"[gate]   scroll : {scroll['lines']} lines, newest "
+                      f"visible {scroll['visible']}, overflow below "
+                      f"{scroll['overflow_below']}px, at bottom "
+                      f"{scroll['scrolled_to_bottom']}")
+                if not scroll["visible"]:
+                    failures.append(
+                        f"turn {turn['turn']}: the newest transcript line is "
+                        f"{scroll['overflow_below']}px below the visible area "
+                        f"-- new speech must scroll itself into view"
                     )
             if turn["stop"] is not None:
                 stop = turn["stop"]
