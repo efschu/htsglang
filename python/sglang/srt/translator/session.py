@@ -64,6 +64,7 @@ from sglang.srt.translator.languages import (
     ConversationLanguages,
     LanguageError,
     LanguageMatrix,
+    RoutingTable,
 )
 from sglang.srt.translator.mt import SentenceAccumulator
 from sglang.srt.translator.segmenter import (
@@ -109,6 +110,7 @@ class EventKind(str, enum.Enum):
     TURN_TRANSCRIPT = "turn.transcript"
     TURN_SPEAKER = "turn.speaker"
     TURN_SPLIT = "turn.split"
+    TURN_UNROUTED = "turn.unrouted"
     TURN_VOICE = "turn.voice"
     TURN_TRANSLATION = "turn.translation"
     TURN_AUDIO = "turn.audio"
@@ -318,6 +320,11 @@ class TranslatorSession:
         self.speaker_change_min_segment_s = speaker_change_min_segment_s
         self.speaker_change_min_piece_s = speaker_change_min_piece_s
         self.voice_pool = voice_pool
+        # Manual routing. Empty table => auto mode (language ID plus
+        # elimination over the participant set), which stays the default.
+        # The table lives on the SESSION, so it survives a reconnect for free
+        # -- the same property the preset voice assignment relies on.
+        self.routing_table = RoutingTable()
         # The pool is what makes preset mode possible; asking for it without
         # one is a configuration error, not something to silently ignore, but
         # it must not prevent the session from existing -- so it falls back to
@@ -384,6 +391,8 @@ class TranslatorSession:
             "turns_dropped": self.turns_dropped,
             "queued": len(self._queue),
             "voice_mode": self.voice_mode.value,
+            "routing_mode": "manual" if self.routing_table else "auto",
+            "routing_rules": self.routing_table.to_json(),
             "voice_pool": self.voice_pool.to_json() if self.voice_pool else None,
             "speaking": self.segmenter.speaking,
             "journal_seq": self.journal.next_seq,
@@ -442,6 +451,8 @@ class TranslatorSession:
                     "reason": "queue_overrun",
                     "queued": len(self._queue),
             "voice_mode": self.voice_mode.value,
+            "routing_mode": "manual" if self.routing_table else "auto",
+            "routing_rules": self.routing_table.to_json(),
             "voice_pool": self.voice_pool.to_json() if self.voice_pool else None,
                 },
             )
@@ -632,7 +643,29 @@ class TranslatorSession:
         # 3. Which way does it go. Elimination over the conversation's
         #    participant set -- no pair is named anywhere in this file.
         source = self._resolve_source(transcript, speaker_id)
-        targets = self.conversation.targets_for(source)
+        targets = self._targets_for(source)
+        if targets is None:
+            # Manual mode with no rule for this language. Passed through
+            # untranslated and TAGGED rather than dropped: silence would read
+            # as a broken translator, while a visible tag tells the user
+            # exactly which rule is missing.
+            self.journal.append(
+                EventKind.TURN_UNROUTED,
+                {
+                    "turn_id": turn_id,
+                    "speaker_id": speaker_id,
+                    "source": source,
+                    "text": transcript.text,
+                    "reason": f"no routing rule for {source!r}",
+                    "known_sources": list(self.routing_table.sources()),
+                },
+            )
+            self.journal.append(
+                EventKind.TURN_DONE,
+                {"turn_id": turn_id, "empty": True, "reason": "no_routing_rule",
+                 "source": source},
+            )
+            return None
         if not targets:
             self.journal.append(
                 EventKind.TURN_DONE,
@@ -748,6 +781,32 @@ class TranslatorSession:
             language_confidence=transcript.language_confidence,
         )
         return profile.speaker_id, similarity, admitted
+
+    def _targets_for(self, source: str) -> Optional[Tuple[str, ...]]:
+        """Where this utterance goes.
+
+        Manual mode is a deterministic table lookup and deliberately does NOT
+        fall back to elimination: once the user has written rules, a guessed
+        direction is exactly what they asked to be rid of. ``None`` means the
+        table is in force and has nothing for this source -- distinct from an
+        empty tuple, which means auto mode found no target.
+        """
+        if self.routing_table:
+            target = self.routing_table.target_for(source)
+            return None if target is None else (target,)
+        return self.conversation.targets_for(source)
+
+    def set_routing_rules(self, rules: Sequence[Tuple[str, str]]) -> None:
+        """Replace the manual routing table. Empty restores auto mode."""
+        table = RoutingTable()
+        table.replace_all(rules)
+        table.validate_against(self.matrix)
+        self.routing_table = table
+        self.journal.append(
+            EventKind.SESSION_STATE,
+            {"routing_mode": "manual" if table else "auto",
+             "routing_rules": table.to_json()},
+        )
 
     def _resolve_source(self, transcript: Transcript, speaker_id: str) -> str:
         """Detected language, with a low-confidence fallback to speaker history.

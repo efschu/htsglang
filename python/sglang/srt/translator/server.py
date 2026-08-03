@@ -62,6 +62,7 @@ from sglang.srt.translator.languages import (
     ConversationLanguages,
     LanguageError,
     LanguageMatrix,
+    display_name,
 )
 from sglang.srt.translator.session import (
     EventKind,
@@ -186,6 +187,27 @@ class TranslatorService:
             "embedder": getattr(self.stack.embedder, "name", "unknown"),
         }
         payload["default_participants"] = list(self.config.default_participants)
+        # Every language any stage knows about, each labelled usable or not
+        # WITH THE REASON. The client greys out the unusable ones and shows
+        # why; silently filtering them would leave the user wondering whether
+        # a language is missing or merely unsupported by one checkpoint.
+        catalogue = sorted(matrix.asr | matrix.tts | (matrix.mt or frozenset()))
+        selectable = []
+        for code in catalogue:
+            missing = []
+            if code not in matrix.asr:
+                missing.append("ASR cannot hear it")
+            if code not in matrix.tts:
+                missing.append("TTS cannot speak it")
+            if not matrix.unconstrained_mt and code not in matrix.mt:
+                missing.append("MT does not cover it")
+            entry = display_name(code)
+            entry["as_source"] = code in matrix.sources
+            entry["as_target"] = code in matrix.targets
+            entry["usable"] = code in matrix.bidirectional
+            entry["reason"] = "; ".join(missing)
+            selectable.append(entry)
+        payload["selectable"] = selectable
         # The default pair must itself be routable; advertising a default the
         # deployment cannot run is the exact failure the runtime derivation
         # exists to prevent, so it is checked here rather than trusted.
@@ -498,6 +520,26 @@ def build_app(service: TranslatorService) -> FastAPI:
         return JSONResponse(
             {"speaker_id": speaker_id, "state": session.state()}
         )
+
+    @app.post("/api/translator/sessions/{session_id}/routing")
+    async def set_routing(session_id: str, body: Dict[str, Any]) -> JSONResponse:
+        """Replace a session's manual routing table. Empty list = auto mode."""
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        raw = body.get("rules", [])
+        try:
+            rules = [(str(r["source"]), str(r["target"])) for r in raw]
+        except (KeyError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="each rule needs a 'source' and a 'target'",
+            ) from exc
+        try:
+            session.set_routing_rules(rules)
+        except LanguageError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(session.state())
 
     @app.get("/api/translator/voices")
     async def voices() -> JSONResponse:

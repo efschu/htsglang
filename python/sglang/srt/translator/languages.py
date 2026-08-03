@@ -34,13 +34,24 @@ lets an ASR that reports ``es-419`` meet a TTS that declares ``es``.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, FrozenSet, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 __all__ = [
     "LanguageError",
     "LanguageMatrix",
     "canonical_code",
     "canonical_set",
+    "DirectionRule",
+    "RoutingTable",
     "display_name",
 ]
 
@@ -353,3 +364,92 @@ class ConversationLanguages:
         for src in sorted(self.participants):
             for tgt in self.targets_for(src):
                 matrix.require_pair(src, tgt)
+
+
+@dataclasses.dataclass(frozen=True)
+class DirectionRule:
+    """One explicit source -> target routing rule."""
+
+    source: str
+    target: str
+
+    def to_json(self) -> Dict[str, str]:
+        return {"source": self.source, "target": self.target}
+
+
+class RoutingTable:
+    """The manual routing mode: several source -> target rules at once.
+
+    The user's point, and the reason this is not just "pick a pair": with a
+    table in place the system no longer has to GUESS a direction. The ASR's
+    language identification still classifies the source of every utterance --
+    that is needed and cheap -- but the target then comes deterministically
+    from the table instead of by elimination over the participant set.
+
+    One source maps to exactly one target. A duplicate source is refused
+    rather than resolved, because two rules for one source make the routing
+    ambiguous and any tie-break would be a silent guess -- which is precisely
+    what this mode exists to remove.
+
+    A language with no rule is NOT an error and NOT dropped: the utterance is
+    passed through untranslated and tagged, so the user sees "no rule for X"
+    in the transcript rather than silence and a shrug.
+    """
+
+    def __init__(self, rules: Iterable[DirectionRule] = ()) -> None:
+        self._rules: Dict[str, str] = {}
+        for rule in rules:
+            self.add(rule.source, rule.target)
+
+    def __len__(self) -> int:
+        return len(self._rules)
+
+    def __bool__(self) -> bool:
+        # Explicit: an empty table means "fall back to auto", and relying on
+        # __len__ alone would make that read as a bug at the call site.
+        return bool(self._rules)
+
+    def add(self, source: str, target: str) -> DirectionRule:
+        src, tgt = canonical_code(source), canonical_code(target)
+        if src == tgt:
+            raise LanguageError(
+                f"rule {src}->{tgt} is a no-op; a routing rule needs two "
+                "different languages"
+            )
+        if src in self._rules:
+            raise LanguageError(
+                f"a rule for source {src!r} already exists "
+                f"({src}->{self._rules[src]}); one source routes to exactly "
+                "one target, so change or remove it instead of adding a second"
+            )
+        self._rules[src] = tgt
+        return DirectionRule(src, tgt)
+
+    def remove(self, source: str) -> bool:
+        return self._rules.pop(canonical_code(source), None) is not None
+
+    def replace_all(self, rules: Iterable[Tuple[str, str]]) -> None:
+        """Set the whole table at once, atomically.
+
+        Validation happens on a scratch table first, so a rejected update
+        leaves the live one untouched rather than half-applied.
+        """
+        scratch = RoutingTable()
+        for source, target in rules:
+            scratch.add(source, target)
+        self._rules = dict(scratch._rules)
+
+    def target_for(self, source: str) -> Optional[str]:
+        return self._rules.get(canonical_code(source))
+
+    def sources(self) -> Tuple[str, ...]:
+        return tuple(sorted(self._rules))
+
+    def validate_against(self, matrix: "LanguageMatrix") -> None:
+        for source, target in sorted(self._rules.items()):
+            matrix.require_pair(source, target)
+
+    def to_json(self) -> List[Dict[str, str]]:
+        return [
+            {"source": s, "target": t} for s, t in sorted(self._rules.items())
+        ]
