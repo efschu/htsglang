@@ -1171,6 +1171,25 @@ turns the checkpoint into a loud load-time refusal by tensor name (`:127-135`) �
 never a silent fallback. Native also widens MoE expert-offload coverage, since
 `MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES` (`gguf.py:292`). GPU-pending:
 `TICKET_398_mxfp4_validation.md`.
+**#479 traced the served checkpoint and found no untraced fallback.** The
+active UD-IQ3_XXS driver carries exactly two type-39 tensors,
+`blk.26`/`blk.42.ffn_down_exps` (2.125 GiB), and their gate/up siblings are
+IQ3_S resp. IQ3_XXS — so those two layers are the ONLY mixed type pair
+(`qweight_type != qweight_type2`) `fused_moe_gguf` ever sees, and nothing
+tested that cell. Both arms take the same exit, the MoE MMVQ branch
+(`gguf.py:1093`): native passes 39 straight into `ggml_moe_a8_vec`, the repack
+arm passes 6. The MMQ branch is unreachable for these layers at ANY batch size
+because the w13 side is an imatrix type with no MMQ kernel, and the slow
+per-expert loop refuses an unknown type by name (`:958-963`) rather than
+computing — so there is no silent path, only a priced one. The load never
+materialises floats: with the kernels native both repack entry points are the
+identity (`gguf_mxfp4_repack.py:113-115`, `:205-207`, `:224-226`), uint8 blocks
+at 17 B/32 values, which settles TICKET_398 §2's open question — the native
+delta is EXACTLY the repack's 0.625 GiB, nothing on top. Offload admission
+checks BOTH expert tensors, not just w13 (`fused_moe_triton/layer.py:2520-2534`).
+`NOTE_479_mxfp4_active_driver_path.md`;
+`test/registered/unit/quantization/test_gguf_mxfp4_dsv4f_moe_479.py`, 8
+hermetic, three executed can-fail arms.
 
 ## 9. Quant lanes
 FP8 (sm120 GEMM tuned; per-channel fused GEMV; opt-in deterministic
