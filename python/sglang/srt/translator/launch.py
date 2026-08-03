@@ -102,8 +102,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def require_websocket_library() -> str:
+    """Refuse to start without a WebSocket implementation.
+
+    Found the hard way: uvicorn serves the REST surface perfectly without one
+    and answers **404** on the WebSocket route, because it never upgrades the
+    connection. Every hermetic test passed regardless -- Starlette's TestClient
+    implements the protocol in-process and never touches uvicorn's stack. So
+    the entire desk suite was green while the live server could not accept a
+    single conversation.
+
+    That is the exact shape of failure this project keeps rediscovering: a
+    green suite over a path the tests do not actually traverse. A startup
+    refusal is the cheap fix, because the alternative is discovering it from a
+    phone on a foreign network.
+    """
+    import importlib.util
+
+    for module in ("websockets", "wsproto"):
+        if importlib.util.find_spec(module) is not None:
+            return module
+    raise SystemExit(
+        "no WebSocket library is installed, so the audio stream endpoint "
+        "would answer 404 while every other endpoint worked.\n"
+        "  fix: pip install websockets\n"
+        "This is refused at startup on purpose: the failure is invisible to "
+        "the REST surface and to the hermetic test suite."
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    websocket_library = require_websocket_library()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -197,7 +227,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     languages = service.languages()
     logger.info(
         "translator ready on %s:%d | asr=%s tts=%s mt=%s | %d routable pairs | "
-        "voice=%s presets=%d",
+        "voice=%s presets=%d | ws=%s",
         args.host,
         args.port,
         getattr(asr, "name", "?"),
@@ -206,6 +236,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         languages["pair_count"],
         service.voice_mode.value,
         len(service.voice_pool_template) if service.voice_pool_template else 0,
+        websocket_library,
     )
     if not languages["default_participants_supported"]:
         logger.error(
