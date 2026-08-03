@@ -250,6 +250,50 @@ def codec_pool_bytes(res: Resolution, pool_depth: int, fmt: PixelFormat) -> int:
 # because under-reserving is what produces a runtime OOM.
 TENANT_CTX_OVERHEAD_BYTES = 1 * GIB
 
+# Driver-side device memory one in-process NVENC session holds beyond the
+# input surfaces the chain hands it: the encoder's reconstructed-picture and
+# reference buffers, its bitstream output buffers, and the libnvidia-encode
+# context itself (#484).
+#
+# This post exists because moving the encode in-process moves that memory INTO
+# our ledger. Under the ffmpeg subprocess fallback the same allocation exists
+# on the same card and is invisible to every accounting this runtime does --
+# it lives in a foreign process. That invisibility is the VRAM half of the
+# ONE-RUNTIME argument, and the post is what discharges it.
+#
+# MEASURED, and it is NOT one number: it moves with geometry, so it is a
+# function rather than a constant. Card 0 (RTX 3080), h264 P4/high_quality,
+# 2026-08-03, read as the device-wide NVML free delta around session creation
+# plus one encode with the input surface subtracted (NVML, not the torch
+# allocator -- the #333 P3 lesson):
+#
+#     1280x720    51.8 MiB
+#     3840x2160  263.8 MiB
+#
+# Two points, two unknowns, so the affine fit below REPRODUCES them rather
+# than being validated by them -- a third geometry would be the first real
+# test of the shape. The per-pixel term works out at ~30 B/px, which is about
+# twenty NV12 frames: the reconstructed-picture and reference buffers scale
+# with the frame, the libnvidia-encode context does not. Not a safety margin.
+NVENC_SESSION_FIXED_BYTES = int(25.3 * MIB)
+NVENC_SESSION_BYTES_PER_PIXEL = 30.15
+
+
+def nvenc_session_bytes(resolution: "Resolution") -> int:
+    """Device memory one in-process NVENC session holds at this geometry.
+
+    Beyond the input surfaces the chain hands it: reconstructed-picture and
+    reference buffers, bitstream output buffers, and the encode context.
+
+    This post exists because moving the encode in-process moves that memory
+    INTO our ledger. Under the ffmpeg subprocess fallback the same allocation
+    exists on the same card and is invisible to every accounting this runtime
+    does -- it lives in a foreign process. That invisibility is the VRAM half
+    of the ONE-RUNTIME argument, and this function is what discharges it.
+    """
+    pixels = resolution.width * resolution.height
+    return NVENC_SESSION_FIXED_BYTES + int(NVENC_SESSION_BYTES_PER_PIXEL * pixels)
+
 
 @dataclass(frozen=True)
 class ReservationBreakdown:
@@ -290,12 +334,20 @@ def chain_reservation(
     sr_scale: int = SR_SCALE,
     with_resize: bool = True,
     ctx_overhead_bytes: int = TENANT_CTX_OVERHEAD_BYTES,
+    inprocess_nvenc: bool = False,
 ) -> ReservationBreakdown:
     """Compute ``reserved(C)`` exactly as DESIGN #333 §6.2 specifies.
 
     ``reserved(C) = ctx_overhead + sum(engine bytes)
                     + sum over stages: streams_in_flight * peak_intermediate
-                    + codec surface pools``
+                    + codec surface pools [+ in-process encoder session]``
+
+    ``inprocess_nvenc`` adds the encoder session's own device memory (#484).
+    It defaults to False so the reservation of a chain that still encodes
+    through the ffmpeg subprocess is unchanged: that memory is real either
+    way, but under the subprocess it belongs to a process this ledger does not
+    own, and reserving for it here would double-count against a card the
+    subprocess is already charging.
     """
     if streams_in_flight <= 0:
         raise ValueError("streams_in_flight must be positive")
@@ -310,6 +362,8 @@ def chain_reservation(
             target, encoder_pool_depth, PixelFormat.NV12
         ),
     }
+    if inprocess_nvenc:
+        posts["nvenc_session"] = nvenc_session_bytes(target)
     if with_sr:
         posts["stage_sr"] = streams_in_flight * sr_reserved_bytes(
             source, dtype, sr_scale

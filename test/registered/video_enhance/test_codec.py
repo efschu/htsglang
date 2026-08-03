@@ -41,6 +41,7 @@ from sglang.srt.video_enhance.codec import (
     select_encode_backend,
     synthetic_frame_rgb,
 )
+from sglang.srt.video_enhance import frame_math
 from sglang.srt.video_enhance.frame_math import (
     PixelFormat,
     Resolution,
@@ -378,11 +379,16 @@ def test_explicit_decode_backend_fails_loudly_rather_than_falling_back():
 
 def test_encode_backend_policy_routes_muxed_containers_to_ffmpeg():
     assert (
-        select_encode_backend("h264", "annexb", "auto", nvc_available=True)
+        select_encode_backend(
+            "h264", "annexb", "auto", nvc_available=True, inprocess_enabled=True
+        )
         == "pynvvideocodec"
     )
     assert (
-        select_encode_backend("h264", "mpegts", "auto", nvc_available=True) == "ffmpeg"
+        select_encode_backend(
+            "h264", "mpegts", "auto", nvc_available=True, inprocess_enabled=True
+        )
+        == "ffmpeg"
     )
     with pytest.raises(CodecBackendUnavailable, match="needs a muxer"):
         select_encode_backend("h264", "mpegts", "pynvvideocodec", nvc_available=True)
@@ -736,7 +742,7 @@ def _nv12_device_frame(res: Resolution, index: int) -> Frame:
 def test_encode_emits_one_segment_per_segment_frames(fake_nvc):
     res = Resolution(16, 8)
     fake_nvc(res)
-    stage = EncodeStage(res, segment_frames=3)
+    stage = EncodeStage(res, segment_frames=3, backend="pynvvideocodec")
     emitted = []
     for i in range(7):
         emitted.extend(stage.submit(_nv12_device_frame(res, i)))
@@ -750,7 +756,7 @@ def test_encode_emits_one_segment_per_segment_frames(fake_nvc):
 def test_encode_close_flushes_the_tail_and_is_idempotent(fake_nvc):
     res = Resolution(16, 8)
     fake = fake_nvc(res)
-    stage = EncodeStage(res, segment_frames=4)
+    stage = EncodeStage(res, segment_frames=4, backend="pynvvideocodec")
     stage.process([_nv12_device_frame(res, i) for i in range(2)])
     trailing = stage.close()
     assert len(trailing) == 1
@@ -763,7 +769,7 @@ def test_encode_close_flushes_the_tail_and_is_idempotent(fake_nvc):
 def test_encode_close_on_an_exact_segment_boundary_still_flushes(fake_nvc):
     res = Resolution(16, 8)
     fake_nvc(res)
-    stage = EncodeStage(res, segment_frames=2)
+    stage = EncodeStage(res, segment_frames=2, backend="pynvvideocodec")
     segments = stage.process([_nv12_device_frame(res, i) for i in range(2)])
     assert len(segments) == 1
     assert stage.close() == (b"TAIL",)
@@ -803,7 +809,13 @@ def test_encode_validates_the_frame_it_is_handed(fake_nvc):
 def test_encode_configures_nvenc_for_device_input(fake_nvc):
     res = Resolution(64, 32)
     fake = fake_nvc(res)
-    EncodeStage(res, codec="hevc", bitrate=4_000_000, device_id=1).warmup()
+    EncodeStage(
+        res,
+        codec="hevc",
+        bitrate=4_000_000,
+        device_id=1,
+        backend="pynvvideocodec",
+    ).warmup()
     assert (fake.encoder.width, fake.encoder.height) == (64, 32)
     assert fake.encoder.fmt == "NV12"
     assert fake.encoder.cpu_input is False
@@ -899,3 +911,381 @@ def test_module_imports_without_the_optional_codec_package(monkeypatch):
     monkeypatch.setattr(codec, "_import_pynvvideocodec", _boom)
     assert codec.pynvvideocodec_available() is False
     assert select_decode_backend("h264", "auto") == "ffmpeg"
+
+
+# ==========================================================================
+# #484: the in-process zero-copy NVENC lane
+# ==========================================================================
+#
+# TASK_333 §9.5 left the device-input path of PyNvVideoCodec "still not
+# working ... rejected with 'incorrect usage of CPU input buffer'", and every
+# measurement in that ticket therefore ran through the ffmpeg host round trip.
+# The tests below encode the contract that was missing, read off the shipped
+# 2.2.0 extension itself:
+#
+#   PyNvEncoder::Encode  ->  PyObject_HasAttrString(frame, "cuda")
+#                            |
+#                            +-- present: use frame.cuda(), a LIST of
+#                            |            per-plane __cuda_array_interface__
+#                            |            views
+#                            +-- absent AND usecpuinputbuffer=False:
+#                                         throw error 8, "incorrect usage of
+#                                         CPU input buffer"
+#
+# ``_StrictFakeEncoder`` below is that branch, in Python. It is what makes
+# these tests a falsifier rather than a description: it fails against the
+# pre-#484 wrapper (which exposed only ``__cuda_array_interface__`` through
+# ``__slots__`` and so had no ``cuda`` attribute at all) and passes against
+# the current one.
+
+
+class _FakeDeviceTensor:
+    """A device tensor as the encoder adapter sees it: shape, dtype, pointer.
+
+    No GPU and no allocation -- the adapter only reads geometry and an integer
+    address, so a stand-in that answers those questions exercises exactly the
+    code under test. ``is_cuda`` is what ``_NvencDeviceFrame.wrap`` dispatches
+    on.
+    """
+
+    is_cuda = True
+    #: ``_sync_producer`` waits on the stream of the tensor's own device.
+    device = "cuda:0"
+
+    def __init__(self, shape, ptr=0x1000, dtype=torch.uint8, contiguous=True):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self._ptr = ptr
+        self._contiguous = contiguous
+
+    def is_contiguous(self):
+        return self._contiguous
+
+    def data_ptr(self):
+        return self._ptr
+
+
+class _StrictFakeEncoder(_FakeEncoder):
+    """``_FakeEncoder`` with the 2.2.0 device-input gate modelled.
+
+    Everything it rejects, it rejects for the reason the real extension does,
+    and the message is the one the real extension emits.
+    """
+
+    def Encode(self, frame, *args):  # noqa: N802 - mirrors the pybind11 name
+        if hasattr(frame, "__dlpack__"):
+            # The binding probes __dlpack__ before the array interface and
+            # calls it with the stream POSITIONALLY; torch declares that
+            # parameter keyword-only. The TypeError escapes from inside the
+            # encoder and the session's next use faults.
+            raise TypeError("__dlpack__() takes 1 positional argument but 2 were given")
+        if not hasattr(frame, "cuda"):
+            if self.cpu_input is False:
+                raise RuntimeError("incorrect usage of CPU input buffer")
+            return super().Encode(frame)
+        planes = frame.cuda()
+        assert isinstance(planes, list), "the device path consumes a plane LIST"
+        assert len(planes) == 2, f"NV12 has two planes, got {len(planes)}"
+        luma, chroma = (p.__cuda_array_interface__ for p in planes)
+        assert luma["typestr"] == chroma["typestr"] == "|u1"
+        assert luma["version"] == 3
+        # "__cuda_array_interface__ protocol specifies that stream must not
+        # be 0" -- the key is omitted rather than set.
+        assert "stream" not in luma and "stream" not in chroma
+        assert luma["shape"] == (self.height, self.width, 1)
+        assert luma["strides"] == (self.width, 1, 1)
+        assert chroma["shape"] == (self.height // 2, self.width // 2, 2)
+        # One chroma row holds width//2 interleaved UV pairs, so its stride is
+        # the full luma width, not half of it.
+        assert chroma["strides"] == (self.width, 2, 1)
+        base = luma["data"][0]
+        assert chroma["data"][0] == base + self.width * self.height
+        assert luma["data"][1] is False and chroma["data"][1] is False
+        return super().Encode(frame)
+
+
+def test_nvenc_device_frame_exposes_the_attribute_the_binding_probes():
+    """The gate is ``hasattr(frame, "cuda")``. Without it, error 8."""
+    frame = codec._NvencDeviceFrame(_FakeDeviceTensor((48, 64)), Resolution(64, 32))
+    assert hasattr(frame, "cuda")
+    # Nothing here exports __dlpack__: that is the other half of the defect.
+    assert not hasattr(frame, "__dlpack__")
+
+
+def test_nvenc_device_frame_describes_nv12_as_two_planes():
+    res = Resolution(64, 32)
+    tensor = _FakeDeviceTensor((48, 64), ptr=0x2_0000)
+    luma, chroma = (
+        p.__cuda_array_interface__ for p in codec._NvencDeviceFrame(tensor, res).cuda()
+    )
+    assert luma["shape"] == (32, 64, 1)
+    assert luma["strides"] == (64, 1, 1)
+    assert luma["data"] == (0x2_0000, False)
+    assert chroma["shape"] == (16, 32, 2)
+    assert chroma["strides"] == (64, 2, 1)
+    assert chroma["data"] == (0x2_0000 + 64 * 32, False)
+
+
+def test_nvenc_device_frame_refuses_a_frame_it_cannot_address():
+    res = Resolution(64, 32)
+    with pytest.raises(CodecError, match="NV12"):
+        codec._NvencDeviceFrame(_FakeDeviceTensor((32, 64)), res)
+    with pytest.raises(CodecError, match="uint8"):
+        codec._NvencDeviceFrame(_FakeDeviceTensor((48, 64), dtype=torch.float16), res)
+    with pytest.raises(CodecError, match="contiguous"):
+        codec._NvencDeviceFrame(_FakeDeviceTensor((48, 64), contiguous=False), res)
+
+
+def test_nvenc_device_frame_keeps_the_allocation_alive():
+    """The encoder holds raw pointers; the frame must own a reference."""
+    tensor = _FakeDeviceTensor((48, 64))
+    frame = codec._NvencDeviceFrame(tensor, Resolution(64, 32))
+    assert frame._tensor is tensor
+
+
+def test_inprocess_nvenc_encodes_through_the_device_path(monkeypatch):
+    """The falsifier: the pre-#484 wrapper raises error 8 here."""
+    res = Resolution(64, 32)
+    encoders = []
+
+    class _Nvc:
+        def CreateEncoder(self, w, h, fmt, cpu_input, **options):  # noqa: N802
+            enc = _StrictFakeEncoder(w, h, fmt, cpu_input, **options)
+            encoders.append(enc)
+            return enc
+
+    monkeypatch.setattr(codec, "_import_pynvvideocodec", lambda: _Nvc())
+    monkeypatch.setattr(
+        codec._PyNvEncodeBackend, "_sync_producer", staticmethod(lambda tensor: None)
+    )
+    backend = codec._PyNvEncodeBackend(res)
+    packets = backend.encode(_FakeDeviceTensor((48, 64)))
+    assert packets and encoders[0].frames == 1
+
+
+def test_a_bare_torch_tensor_would_still_trip_the_dlpack_probe(monkeypatch):
+    """Shows the gate is able to fail, and on which input it does.
+
+    Handing the tensor over unwrapped is the obvious thing to try; it enters
+    the device path (``Tensor.cuda`` exists) and dies in the dlpack probe.
+    """
+    encoder = _StrictFakeEncoder(64, 32, "NV12", False)
+    with pytest.raises(TypeError, match="__dlpack__"):
+        encoder.Encode(torch.zeros(48, 64, dtype=torch.uint8))
+
+
+def test_an_array_interface_only_view_reproduces_the_recorded_error():
+    """The §9.5 symptom, reproduced from its cause.
+
+    An object exposing only ``__cuda_array_interface__`` -- the shape the
+    pre-#484 wrapper had -- never reaches the device path.
+    """
+
+    class _ArrayInterfaceOnly:
+        __slots__ = ("__cuda_array_interface__",)
+
+        def __init__(self):
+            self.__cuda_array_interface__ = {
+                "shape": (48, 64),
+                "strides": (64, 1),
+                "data": (0x1000, False),
+                "typestr": "|u1",
+                "version": 3,
+            }
+
+    encoder = _StrictFakeEncoder(64, 32, "NV12", False)
+    with pytest.raises(RuntimeError, match="incorrect usage of CPU input buffer"):
+        encoder.Encode(_ArrayInterfaceOnly())
+
+
+def test_auto_keeps_the_ffmpeg_bootstrap_until_the_switch_is_thrown(monkeypatch):
+    """The default is the fallback, and the flip is a decision, not an install."""
+    monkeypatch.delenv(codec.INPROCESS_NVENC_ENV, raising=False)
+    assert not codec.inprocess_nvenc_enabled()
+    assert (
+        select_encode_backend("h264", "annexb", "auto", nvc_available=True) == "ffmpeg"
+    )
+    monkeypatch.setenv(codec.INPROCESS_NVENC_ENV, "1")
+    assert codec.inprocess_nvenc_enabled()
+    assert (
+        select_encode_backend("h264", "annexb", "auto", nvc_available=True)
+        == "pynvvideocodec"
+    )
+    # An explicit request ignores the switch: that is how a GPU window runs
+    # the path it is about to grade.
+    monkeypatch.delenv(codec.INPROCESS_NVENC_ENV, raising=False)
+    assert (
+        select_encode_backend("h264", "annexb", "pynvvideocodec", nvc_available=True)
+        == "pynvvideocodec"
+    )
+
+
+def test_auto_falls_back_when_the_session_cannot_be_opened(monkeypatch, caplog):
+    res = Resolution(16, 8)
+
+    def _boom():
+        raise CodecBackendUnavailable("libnvidia-encode missing")
+
+    monkeypatch.setattr(codec, "_import_pynvvideocodec", _boom)
+    monkeypatch.setattr(codec, "pynvvideocodec_available", lambda: True)
+    monkeypatch.setenv(codec.INPROCESS_NVENC_ENV, "1")
+    opened = {}
+
+    class _Sub:
+        def __init__(self, *a, **kw):
+            opened["yes"] = True
+
+    monkeypatch.setattr(codec, "_FfmpegEncodeBackend", _Sub)
+    stage = EncodeStage(res, backend="auto")
+    assert stage.backend_name == "pynvvideocodec"
+    stage.warmup()
+    assert stage.backend_name == "ffmpeg"
+    assert stage.fell_back_to_ffmpeg is True
+    assert opened == {"yes": True}
+
+
+def test_an_explicit_request_does_not_fall_back(monkeypatch):
+    res = Resolution(16, 8)
+
+    def _boom():
+        raise CodecBackendUnavailable("libnvidia-encode missing")
+
+    monkeypatch.setattr(codec, "_import_pynvvideocodec", _boom)
+    monkeypatch.setattr(codec, "pynvvideocodec_available", lambda: True)
+    stage = EncodeStage(res, backend="pynvvideocodec")
+    with pytest.raises(CodecBackendUnavailable):
+        stage.warmup()
+    assert stage.fell_back_to_ffmpeg is False
+
+
+def test_the_encoder_session_is_a_ledger_post_only_when_it_is_ours(monkeypatch):
+    """#286: in-process VRAM is registered; a subprocess's VRAM is not ours."""
+    res = Resolution(1280, 720)
+    monkeypatch.setattr(codec, "pynvvideocodec_available", lambda: True)
+    inprocess = EncodeStage(res, backend="pynvvideocodec")
+    assert inprocess.session_bytes == frame_math.nvenc_session_bytes(res)
+    assert EncodeStage(res, backend="ffmpeg").session_bytes == 0
+
+
+def test_the_session_post_reproduces_both_measured_points():
+    """The affine fit is not free to drift off the two numbers it was cut from.
+
+    Card 0 (RTX 3080), h264 P4/high_quality, 2026-08-03, NVML device-wide
+    free delta around session creation with the input surface subtracted.
+    """
+    mib = frame_math.MIB
+    at_720p = frame_math.nvenc_session_bytes(Resolution(1280, 720))
+    at_4k = frame_math.nvenc_session_bytes(Resolution(3840, 2160))
+    assert at_720p / mib == pytest.approx(51.8, abs=0.1)
+    assert at_4k / mib == pytest.approx(263.8, abs=0.1)
+    # It is a FUNCTION of geometry, which is the finding: a 4K session is not
+    # a 720p session, and one constant would have been wrong by 5x.
+    assert at_4k > 4 * at_720p
+
+
+def test_the_reservation_carries_the_session_only_on_the_inprocess_lane():
+    target = Resolution(3840, 2160)
+    kwargs = dict(
+        source=Resolution(1920, 1080),
+        target=target,
+        streams_in_flight=1,
+        with_rife=False,
+    )
+    without = frame_math.chain_reservation(**kwargs)
+    with_session = frame_math.chain_reservation(**kwargs, inprocess_nvenc=True)
+    expected = frame_math.nvenc_session_bytes(target)
+    assert "nvenc_session" not in without.posts
+    assert with_session.posts["nvenc_session"] == expected
+    assert with_session.total_bytes - without.total_bytes == expected
+
+
+def test_the_producing_stream_is_synchronised_before_nvenc_reads(monkeypatch):
+    """The hardware finding, pinned.
+
+    NVENC reads the input surface on its own engine with no dependency on the
+    stream that wrote it. Without this ordering the encoder does not fail --
+    it encodes a partially written frame. Measured on card 0, 2026-08-03,
+    60 frames at 720p: 8.59 dB without, 15.65 dB with, against an ffmpeg
+    baseline of 15.65 dB. None of that is visible in a frame count, so only
+    an explicit assertion on the ordering can hold it in place.
+    """
+    res = Resolution(64, 32)
+    order = []
+
+    class _Nvc:
+        def CreateEncoder(self, w, h, fmt, cpu_input, **options):  # noqa: N802
+            encoder = _StrictFakeEncoder(w, h, fmt, cpu_input, **options)
+            real = encoder.Encode
+
+            def _record(frame, *args):
+                order.append("encode")
+                return real(frame, *args)
+
+            encoder.Encode = _record
+            return encoder
+
+    monkeypatch.setattr(codec, "_import_pynvvideocodec", lambda: _Nvc())
+    monkeypatch.setattr(
+        codec._PyNvEncodeBackend,
+        "_sync_producer",
+        staticmethod(lambda tensor: order.append("sync")),
+    )
+    backend = codec._PyNvEncodeBackend(res)
+    backend.encode(_FakeDeviceTensor((48, 64)))
+    assert order == ["sync", "encode"], "the sync must precede the read, not follow it"
+
+    # A host buffer is not a device pointer and has no stream to wait on, so
+    # the wait is skipped rather than paid on every ffmpeg-lane frame.
+    # An input that is not a device tensor -- a host buffer, or an already
+    # built frame -- has no stream to wait on, so the wait is skipped rather
+    # than paid on every frame of a lane that does not need it.
+    order.clear()
+    backend.encode(codec._NvencDeviceFrame(_FakeDeviceTensor((48, 64)), res))
+    assert order == ["encode"]
+
+
+def test_submitted_frames_stay_referenced_while_nvenc_may_read_them(monkeypatch):
+    """Zero-copy means NVENC borrows the allocation, so somebody must own it.
+
+    The session does not consume the surface inside ``Encode``: on card 0 the
+    first packet came back from the SEVENTH call, so six frames were live at
+    once. torch's caching allocator would hand an unreferenced block straight
+    to the next frame. A 300-frame bypass arm on the card did NOT reproduce a
+    corruption, so this is a contract guard rather than the fix for an
+    observed failure -- and it is asserted here because a guard nobody checks
+    is a guard somebody deletes.
+    """
+    res = Resolution(64, 32)
+
+    class _Nvc:
+        def CreateEncoder(self, w, h, fmt, cpu_input, **options):  # noqa: N802
+            encoder = _StrictFakeEncoder(w, h, fmt, cpu_input, **options)
+
+            def _lagged(frame, *args):
+                # Model the measured lookahead: nothing for six frames.
+                encoder.frames += 1
+                if encoder.frames <= 6:
+                    return []
+                return [{"data": b"XXXX", "timestamp": encoder.frames}]
+
+            encoder.Encode = _lagged
+            return encoder
+
+    monkeypatch.setattr(codec, "_import_pynvvideocodec", lambda: _Nvc())
+    monkeypatch.setattr(
+        codec._PyNvEncodeBackend, "_sync_producer", staticmethod(lambda tensor: None)
+    )
+    backend = codec._PyNvEncodeBackend(res)
+    submitted = []
+    for _ in range(6):
+        tensor = _FakeDeviceTensor((48, 64))
+        submitted.append(tensor)
+        backend.encode(tensor)
+    held = {id(frame._tensor) for frame in backend._inflight}
+    assert held == {id(t) for t in submitted}, "every unconsumed frame is still owned"
+    # The ring never drops below its floor while the encoder is still lagging.
+    for _ in range(20):
+        backend.encode(_FakeDeviceTensor((48, 64)))
+    assert len(backend._inflight) >= codec.MIN_INFLIGHT_HOLD
+    backend.flush()
+    assert not backend._inflight, "EndEncode drains the queue; nothing is read after"
