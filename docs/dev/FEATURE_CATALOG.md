@@ -1306,6 +1306,39 @@ of the DSpark experts) before it is built. Tests:
 20 hermetic, three independently executed can-fail arms (leaf gate neutered →
 8 red; env-driven fuse flag restored → 3 red; construction-time helper neutered
 → 3 red). Unmeasured — no packed-format DSV4 checkpoint exists on this rig yet.
+**The same fusion also cuts a SCALE BLOCK, not a row** (#528, follow-on find
+from the #526 review, where the axis was deliberately left byte-identical):
+`weight_scale_inv` is routable and is joined by the same
+`torch.cat(..., dim=0)` as the weight, but for a block-quantized checkpoint dim
+0 of the scale governs `weight_block_size[0]` WEIGHT rows. The join is exact
+only while `wq_a`'s width is a whole number of blocks; otherwise fused scale
+block `q_lora_rank // b` spans wq_a's tail AND wkv's first rows under wq_a's
+scale and every later block is shifted — and for the DSV4 shape
+(`kv_rows = head_dim`, a multiple of 128) `ceil(q/b) + ceil(kv/b)` still equals
+`ceil((q+kv)/b)`, so the wrong scales are simply copied in with no shape error.
+REACH TODAY IS ZERO, established before the fix: `q_lora_rank` is 1024 in both
+the config class defaults (`configs/deepseek_v4.py:78`) and the DSpark export
+(`config.json`, `weight_block_size [128, 128]`), and wqkv_a is a
+`ReplicatedLinear`, so no `--rank-tp-ratio` shard can move the cut. The #444b
+eighth alignment sibling CROSSES this fusion — MXFP8 builds exactly
+`weight`+`weight_scale_inv`, so the #526 gate lets it fuse — and is provably
+immune: its `[1, 32]` dim-0 block IS a single row, so the two `cat`s are the
+same axis at any split. Shipped as a REFUSAL rather than a block-aware concat,
+because fused block `q // b` is fed by two independently quantized tensors and
+no single scale row describes it — repairing the join would mean requantizing
+the seam, i.e. changing the checkpoint's numbers. Two consumers of one
+predicate `_misaligned_scale_block_axis` (`deepseek_v4.py:3414`): the
+construction-time gate gained an optional `q_rows=` (`:3507`, the call site
+passes `self.q_lora_rank` at `:499`) and turns an inherited fusion off / refuses
+an explicit opt-in, and `load_weights` keeps a config-driven backstop next to
+the #526 one, before the stream is touched (`:2824`). Tests:
+`test/registered/unit/model_loader/test_dsv4_scale_inv_block_axis_528.py`,
+21 hermetic, two executed can-fail arms (predicate neutered → 5 red; the
+`q_rows=` argument dropped from the call site → 1 red), including a pin that
+turns red the day a DSV4 geometry stops being block-aligned and an executed
+falsifier that dequantizes both routes and shows the corrupted rows are exactly
+the 4 × (128 − 104) wkv rows the shift predicts. Unmeasured — no misaligned
+DSV4 geometry exists.
 
 ## 10. Determinism / quality gates
 Hetero-determinism roots fixed (verify sync, graph pads, flashinfer workspace,

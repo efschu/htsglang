@@ -491,7 +491,12 @@ class MqaAttentionBase(nn.Module):
                 prefix=add_prefix("wqkv_a", prefix),
             )
             fuse = _wqkv_a_fusion_survives_quant_format(
-                candidate, fuse_requested_explicitly
+                candidate,
+                fuse_requested_explicitly,
+                # Where the join cuts. wqkv_a is REPLICATED, so no shard can
+                # move the cut away from q_lora_rank -- the block-axis verdict
+                # is the same on every rank and under every --rank-tp-ratio.
+                q_rows=self.q_lora_rank,
             )
             if fuse:
                 self.wqkv_a = candidate
@@ -2810,6 +2815,27 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "unfused."
             )
 
+        # Same backstop for the OTHER axis the join assumes (#528): dim 0 of
+        # `weight_scale_inv` is a BLOCK axis, and the concatenation only agrees
+        # with it when wq_a's row count is a whole number of blocks. The
+        # construction-time gate reads the height off the built module; here the
+        # config is the source, which is equivalent because wqkv_a is a
+        # ReplicatedLinear -- the cut sits at `q_lora_rank` on every rank.
+        misaligned_block_axis = _misaligned_scale_block_axis(
+            (lambda raw: int(raw[0]) if raw else None)(
+                getattr(getattr(self, "quant_config", None), "weight_block_size", None)
+            ),
+            getattr(getattr(self, "config", None), "q_lora_rank", None),
+        )
+        if fused_wqkv_a_blocks and misaligned_block_axis is not None:
+            block, remainder = misaligned_block_axis
+            raise ValueError(
+                "cannot load the fused wqkv_a of this checkpoint: "
+                f"{_misaligned_block_axis_detail(block, self.config.q_lora_rank, remainder)}"
+                ". Set SGLANG_OPT_FUSE_WQA_WKV=0 to load the two projections "
+                "unfused."
+            )
+
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -3385,6 +3411,89 @@ def _unroutable_leaves_detail(unroutable: Tuple[str, ...], built_by: str) -> str
     )
 
 
+def _misaligned_scale_block_axis(
+    block_height: Optional[int], q_rows: Optional[int]
+) -> Optional[Tuple[int, int]]:
+    """``(block height, rows into the last block)`` when the join would lie.
+
+    ``_fuse_wqkv_a`` joins ``weight_scale_inv`` with the same
+    ``torch.cat(..., dim=0)`` it uses for the weight, but dim 0 is not the same
+    axis for the two: for a block-quantized weight one scale row governs
+    ``block_height`` WEIGHT rows. Scale row ``r`` of the fused tensor therefore
+    covers fused weight rows ``[r*b, r*b+b)``, which only agrees with the two
+    unfused scale tensors as long as ``wq_a``'s row count is a whole number of
+    blocks. When it is not, the fused block ``q_rows // b`` spans wq_a's tail
+    AND wkv's first rows while the concatenation hands it wq_a's scale, and
+    every later block is shifted by ``q_rows % b`` rows.
+
+    Nothing raises on the way: with ``q_rows % b != 0`` and ``kv_rows % b == 0``
+    (the DSV4 shape -- wkv is one head wide) the concatenated scale has exactly
+    the row count the fused parameter declares, so the wrong scales are simply
+    copied in. ``None`` means the join is exact, which covers every case shipped
+    today: no block scale at all (bf16, GGUF, per-tensor fp8), ``b == 1`` (the
+    MXFP8 ``[1, 32]`` OCP layout, where dim 0 IS an element axis), or
+    ``q_rows % b == 0`` (fp8-block ``[128, 128]`` with ``q_lora_rank`` 1024).
+    """
+    if not block_height or block_height <= 1 or q_rows is None:
+        return None
+    remainder = q_rows % block_height
+    return None if remainder == 0 else (block_height, remainder)
+
+
+def _wqkv_a_scale_block_height(fused_linear: nn.Module) -> Optional[int]:
+    """Weight rows governed by ONE row of the fused module's block scale.
+
+    ``None`` when the built module carries no 2-D block scale, i.e. when dim 0
+    of every leaf the join touches is a plain output-row axis.
+
+    The height is read off the quant config the built module carries rather
+    than recovered from the two shapes, because ``ceil(rows / b)`` is not
+    invertible exactly when the last block is partial -- which is the case this
+    predicate exists to catch. The shape ratio remains as the fallback for a
+    format that block-scales without declaring ``weight_block_size``; it is
+    exact whenever the axis divides evenly, and where it is not, it reports a
+    height that still fails the divisibility test, so the join is refused.
+    """
+    scale = getattr(fused_linear, "weight_scale_inv", None)
+    weight = getattr(fused_linear, "weight", None)
+    if scale is None or weight is None or scale.dim() != 2 or weight.dim() != 2:
+        return None
+    declared = getattr(
+        getattr(getattr(fused_linear, "quant_method", None), "quant_config", None),
+        "weight_block_size",
+        None,
+    )
+    if declared:
+        return int(declared[0])
+    scale_rows = int(scale.shape[0])
+    if scale_rows <= 0:
+        return None
+    return -(-int(weight.shape[0]) // scale_rows)
+
+
+def _wqkv_a_scale_block_misalignment(
+    fused_linear: nn.Module, q_rows: int
+) -> Optional[Tuple[int, int]]:
+    """``_misaligned_scale_block_axis`` against the module the quant method built."""
+    return _misaligned_scale_block_axis(
+        _wqkv_a_scale_block_height(fused_linear), q_rows
+    )
+
+
+def _misaligned_block_axis_detail(block: int, q_rows: int, remainder: int) -> str:
+    """The shared body of the auto-off notice and the load-time refusal."""
+    return (
+        "the wq_a/wkv fusion joins weight_scale_inv along dim 0, which for this "
+        f"checkpoint is a {block}-row BLOCK axis, not a row axis, but wq_a "
+        f"contributes {q_rows} weight rows -- {remainder} row(s) into its last "
+        f"block. Fused scale block {q_rows // block} would then govern wq_a's "
+        "tail AND wkv's first rows while carrying wq_a's scale, and every later "
+        f"block is shifted by {remainder} rows, with no shape error to show for "
+        "it. One scale row cannot describe a block fed by two independently "
+        "quantized tensors, so the fusion is refused instead of joined"
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def _warn_wqkv_a_fusion_auto_off(detail: str) -> None:
     """Emit the auto-off notice once per distinct cause, not once per layer."""
@@ -3396,7 +3505,9 @@ def _warn_wqkv_a_fusion_auto_off(detail: str) -> None:
 
 
 def _wqkv_a_fusion_survives_quant_format(
-    fused_linear: nn.Module, requested_explicitly: bool
+    fused_linear: nn.Module,
+    requested_explicitly: bool,
+    q_rows: Optional[int] = None,
 ) -> bool:
     """Whether the fused ``wqkv_a`` *fused_linear* can be filled by the join.
 
@@ -3405,16 +3516,33 @@ def _wqkv_a_fusion_survives_quant_format(
     rather than by its name. When the join cannot carry it, an inherited
     default-on fusion is turned off with a named notice and an explicit request
     is refused -- the one thing that must not happen is loading on.
+
+    Two independent ways the join can fail, in the order they are checked:
+
+    * a leaf with no route at all (``_unroutable_wqkv_a_leaves``, #526);
+    * a leaf that IS routed but whose dim 0 is a block axis the split does not
+      land on (``_wqkv_a_scale_block_misalignment``, #528). *q_rows* is
+      ``wq_a``'s output width, i.e. where the concatenation cuts; the check is
+      skipped when the caller does not know it.
     """
     unroutable = _unroutable_wqkv_a_leaves(
         name for name, _ in fused_linear.named_parameters(recurse=False)
     )
-    if not unroutable:
+    if unroutable:
+        detail = _unroutable_leaves_detail(
+            unroutable, type(getattr(fused_linear, "quant_method", None)).__name__
+        )
+    elif (
+        misaligned := (
+            None
+            if q_rows is None
+            else _wqkv_a_scale_block_misalignment(fused_linear, q_rows)
+        )
+    ) is not None:
+        detail = _misaligned_block_axis_detail(misaligned[0], q_rows, misaligned[1])
+    else:
         return True
 
-    detail = _unroutable_leaves_detail(
-        unroutable, type(getattr(fused_linear, "quant_method", None)).__name__
-    )
     if requested_explicitly:
         raise NotImplementedError(
             f"SGLANG_OPT_FUSE_WQA_WKV was requested explicitly, but {detail}. "
@@ -3524,6 +3652,12 @@ def _fuse_wqkv_a(param_name: str, bucket: dict) -> torch.Tensor:
     (Q4_0 and Q4_K are both 144 bytes per 256 elements, Q4_0 and IQ4_NL both
     18 bytes per 32), so a mismatched pair can concatenate without error and
     then be decoded with the wrong layout for one half.
+
+    Precondition for the ``weight_scale_inv`` leaf, enforced by the callers and
+    NOT re-checkable here (this function sees the scales, never the row count
+    they describe): ``wq_a``'s width is a whole number of scale blocks. Both
+    guards are named in ``_misaligned_scale_block_axis``; the construction-time
+    one refuses the fused build, the ``load_weights`` one refuses the load.
     """
     q, kv = bucket["q"], bucket["kv"]
     if param_name.endswith(".qweight_type"):
