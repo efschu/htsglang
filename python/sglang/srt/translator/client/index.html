@@ -648,6 +648,16 @@ class Connection {
     }
     if (event.kind === "ready") {
       this.attempt = 0;
+      // A cursor counts events of ONE session. If the server did not resume
+      // the session we asked for -- the idle collector took it and minted a
+      // new one -- then our cursor counts a conversation that no longer
+      // exists, and sending it again would ask the new session to skip past
+      // everything it is about to say. Drop it with the session it belonged
+      // to, before it is stored again below.
+      if (event.session_id !== this.sessionId || !event.resumed) {
+        this.cursor = 0;
+        sessionStorage.setItem("translator.cursor", "0");
+      }
       this.sessionId = event.session_id;
       sessionStorage.setItem("translator.session", this.sessionId);
       setStatus(event.resumed ? "resumed" : "connected", "on");

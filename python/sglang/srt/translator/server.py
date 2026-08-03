@@ -329,6 +329,13 @@ class _Connection:
         session_id = hello.get("session_id")
         resume_from = int(hello.get("resume_from", 0))
 
+        # Whether this RESUMES anything is a property of the session, not of
+        # the request. It used to be ``bool(session_id)`` -- true whenever the
+        # client named an id, including one the collector had already taken and
+        # the server was about to mint fresh. A client cannot decide whether to
+        # keep or drop its cursor from an answer that is true either way.
+        existed = bool(session_id) and session_id in self.service.sessions.ids()
+
         self.session = self.service.open_session(participants, session_id)
         matrix = self.service.stack.matrix()
 
@@ -340,7 +347,7 @@ class _Connection:
                 "pipeline_sample_rate": PIPELINE_SAMPLE_RATE,
                 "languages": matrix.to_json(),
                 "state": self.session.state(),
-                "resumed": bool(session_id),
+                "resumed": existed,
             }
         )
 
@@ -357,6 +364,32 @@ class _Connection:
                 **self.session.transcript.to_json(since=transcript_from),
             }
         )
+
+        # A cursor PAST the end of the journal is never legitimate: no client
+        # can have acknowledged an event this session has not yet produced. It
+        # arrives when the client's stored cursor outlives the session it was
+        # counted for -- the page keeps ``translator.cursor`` across a reload,
+        # the idle collector takes the old session, and the server mints a new
+        # one whose journal starts at zero.
+        #
+        # Unclamped, this silences the connection for good. ``Journal.since()``
+        # answers an out-of-range cursor with an empty list and no gap, so the
+        # pump has nothing to send until the new journal grows past a
+        # high-water mark belonging to a different conversation -- while the
+        # uplink, the recognizer, the translator and the synthesizer all keep
+        # working. Reported from a phone as "speaking updates nothing and makes
+        # no sound, but reloading shows the translation": the written record
+        # travels on the handshake's ``transcript`` frame, which is keyed on a
+        # separate cursor, so the reload path stayed healthy and hid this.
+        if resume_from > self.session.journal.next_seq:
+            logger.info(
+                "session %s: ignoring a cursor of %d past the journal end "
+                "(%d) -- it belongs to a session that no longer exists",
+                self.session.session_id,
+                resume_from,
+                self.session.journal.next_seq,
+            )
+            resume_from = self.session.journal.next_seq
 
         # Seed the delivery cursor BEFORE replaying. A fresh connection starts
         # at zero, and if the resume window happens to be empty nothing would

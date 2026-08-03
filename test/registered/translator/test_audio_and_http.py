@@ -757,3 +757,82 @@ class TestReplayIsMarkedAsHistory(unittest.TestCase):
                 "replayed audio was indistinguishable from live audio, which "
                 "is what made a fresh page load play the whole conversation",
             )
+
+
+class TestAStaleCursorCannotSwallowLiveDelivery(unittest.TestCase):
+    """A cursor from a session that no longer exists must not silence the new one.
+
+    Reported from a phone: after a reload the previously spoken text is there,
+    but speaking again updates nothing and produces no sound -- and reloading
+    again shows the new translation. So the uplink, the recognizer, the
+    translator and the synthesizer all worked; only live delivery did not.
+
+    The mechanism is one cursor. The client persists ``translator.cursor``
+    beside ``translator.session`` but resets neither when the server hands back
+    a DIFFERENT session id, which is exactly what happens once the idle
+    collector has taken the old session. The handshake then seeds the delivery
+    cursor from that stale number, and ``Journal.since()`` answers a cursor
+    past the end with an empty list and no gap -- so ``_journal_pump`` has
+    nothing to send until the new journal organically grows past a high-water
+    mark belonging to a different conversation.
+
+    The reload appears to work because the written record travels on the
+    handshake's ``transcript`` frame, which is keyed on a separate cursor the
+    client does not persist. One defect, both symptoms: no live text and no
+    live audio.
+    """
+
+    def setUp(self):
+        self.service = build_service()
+        self.client = TestClient(build_app(self.service))
+
+    def _hello(self, ws, **overrides):
+        payload = {
+            "kind": "hello",
+            "codecs": ["pcm16"],
+            "participants": [LANG_A, LANG_B],
+        }
+        payload.update(overrides)
+        ws.send_text(json.dumps(payload))
+        return json.loads(ws.receive_text())
+
+    def test_a_cursor_beyond_the_journal_still_delivers_the_next_turn(self):
+        codec = Pcm16Codec(sample_rate=RATE, frame_ms=20)
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            # A brand-new session, and a cursor that can only have come from a
+            # different one. Unfixed, this silences every live event forever.
+            self._hello(ws, session_id="minted-fresh", resume_from=5000)
+            speech = AudioChunk(tone(VOICE_A_HZ, 2.0), RATE)
+            for frame in codec.encode(speech):
+                ws.send_bytes(frame)
+            ws.send_text(json.dumps({"kind": "release"}))
+            done, seen = drain_until(ws, lambda e: e.get("kind") == "turn.done")
+
+        kinds = [e.get("kind") for e in seen]
+        self.assertIsNotNone(
+            done,
+            "a stale cursor swallowed the whole turn: the client spoke, the "
+            f"pipeline ran, and nothing was delivered live. saw {kinds}",
+        )
+        self.assertIn("turn.transcript", kinds)
+        self.assertIn("turn.audio", kinds)
+
+    def test_the_handshake_reports_whether_it_actually_resumed(self):
+        """``resumed`` must describe the session, not the request.
+
+        It used to be ``bool(session_id)`` -- true whenever the client named
+        any id, including one the server had already collected and was now
+        minting fresh. A client cannot decide whether to keep or drop its
+        cursor from an answer that is true either way.
+        """
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            ready = self._hello(ws, session_id="never-seen-before")
+            self.assertFalse(
+                ready["resumed"],
+                "a session the server had to mint was reported as resumed",
+            )
+        with self.client.websocket_connect("/api/translator/stream") as ws:
+            ready = self._hello(ws, session_id="never-seen-before")
+            self.assertTrue(
+                ready["resumed"], "an existing session was reported as new"
+            )
