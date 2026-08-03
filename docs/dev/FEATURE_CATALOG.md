@@ -117,6 +117,41 @@ the whole concentration ladder is +3.0 to +4.6 % — inside the boots' own
 Details, backtest and the GPU confirmation ticket:
 `NOTE_475_phase_prefill_prediction.md`.
 
+**THE MATRIX DOCTRINE — rows are FAMILIES, columns are PHASES (#485).** A
+layout is not one vector. It is a table: every weight family (MLP / routed
+experts, attention projections, GDN or mamba state, KV cache, vocab head,
+vision tower, ...) has its own optimum in every phase or regime (prefill-class,
+decode-class, and whatever else a workload adds), because the cards differ on
+every resource axis at once. "One layout serves both phases" is a red flag,
+never a default; where it appears measured, suspect an incomplete family cut
+or the instrument floor first, and single-family/single-axis arms are
+DIAGNOSTIC — never phrase their result as a phase-level verdict. The per-barrier
+max of #475 is what makes the prefill column TRACTABLE: because the round is
+`sum_family max_rank`, the prefill objective is SEPARABLE over families, so
+each family's optimum is its own lane's rate-proportional split and nothing
+else — and compensating one family's imbalance with another family's vector,
+which is all a single-family solve can do, is precisely what manufactures the
+barrier skew. At perfect per-family balance the skew is 0 and the lockstep time
+is minimal at the same time. **Slice 1 delivers the prefill column's joint cut**
+(`--rank-perf-tune phase-*` solves `(mlp_vector, attn_vector)` PAIRS, reports
+per-candidate family pacers, and prints a `JOINT PREFILL LAYOUT` launch line):
+the attention/GDN family is cut on its own #324 lane and its own grids, the GDN
+state pool and the coupled KV vector follow it, and every candidate keeps >= 1
+unit on the kv-head and GDN k-head grids (#62/#116). On the reference rig the
+attention family is grid-PINNED (4 kv heads, 3 ranks -> only `[2,1,1]` is
+representable), so in practice the lever is the 16-unit GDN grid: desk-predicted
++1.0 points over the MLP-only cut on INT8-W8A8 and +6.9 on FP8, both bracketed
+(see below). The solve REPORTS the pair and does not install it — the only
+runtime actuator for an attention vector is `--rank-tp-ratio`, since "mlp" is
+the sole named family plan. Where the flash/scan core's per-token mass would be
+needed the model BRACKETS instead of estimating: the same solve is run at the
+pure-GEMM and the measured-#231-GEMV lane extremes and the plan log states
+`LANE-INVARIANT` or `LANE-SENSITIVE`. ANALYSE_299's "attention lever = 0.01 %"
+does NOT transfer — it was computed under the pre-#475 model, in which aligning
+two families' pacers is worth zero by construction. DESK/PREDICTED; the GPU arm
+is `TICKET_485_int8_joint_arm.md`, details in
+`NOTE_485_joint_phase_vectors.md`.
+
 `--objective energy` end to end with refusal over silent substitution. `planner/rejected.py` = machine-readable
 register of discarded approaches — check it before re-proposing anything.
 
