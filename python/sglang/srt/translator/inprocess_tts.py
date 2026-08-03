@@ -273,28 +273,22 @@ class InProcessQwen3Tts:
         self.ensure_resident()
 
         reference_np = np.asarray(reference.samples, dtype=np.float32)
-        try:
-            prompt = self._model.create_voice_clone_prompt(
-                audios=[(reference_np, reference.sample_rate)],
-                ref_texts=[reference_text or ""],
-                x_vector_only_mode=self.config.x_vector_only_mode,
-            )
-        except TypeError:
-            # The reference wrapper's signature has moved between releases;
-            # try the positional form before giving up, and say which one
-            # failed rather than reporting a bare TypeError.
-            prompt = self._model.create_voice_clone_prompt(
-                [(reference_np, reference.sample_rate)],
-                [reference_text or ""],
-            )
-
+        # The wrapper builds the voice-clone prompt itself from (audio, sr).
+        # Going through create_voice_clone_prompt() and passing the result as
+        # voice_clone_prompt= is the documented alternative, but it hands the
+        # talker a differently-shaped prompt and fails deep inside the text
+        # projection -- so the simple form is also the correct one here.
         model_language = self._code_to_name.get(language, language)
         with torch.inference_mode():
             output = self._model.generate_voice_clone(
                 text=[text],
                 language=[model_language],
-                voice_clone_prompt=prompt,
+                ref_audio=[(reference_np, reference.sample_rate)],
+                ref_text=[reference_text or ""],
+                x_vector_only_mode=self.config.x_vector_only_mode,
+                non_streaming_mode=True,
                 max_new_tokens=self.config.max_new_tokens,
+                do_sample=True,
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
             )
@@ -311,6 +305,14 @@ class InProcessQwen3Tts:
         import torch
 
         candidate = output
+        # Documented return is (List[np.ndarray], sample_rate); take the list
+        # and ignore the rate, which the caller already knows.
+        if (
+            isinstance(candidate, tuple)
+            and len(candidate) == 2
+            and isinstance(candidate[1], (int, float))
+        ):
+            candidate = candidate[0]
         for attribute in ("audio_values", "waveform", "audios", "audio"):
             if hasattr(candidate, attribute):
                 candidate = getattr(candidate, attribute)

@@ -1142,3 +1142,47 @@ between rungs: the session, the journal, reconnect, the voice-mode machinery,
 the preset pool and the client are rung-independent. That is the concrete
 payoff of having built the interface first, and it is why revoking the sidecar
 costs a backend and not a pipeline.
+
+---
+
+## 13. Rung B status, 2026-08-03 (current blocker)
+
+**Working, executed, not merely written:**
+
+* the M-RoPE assert, with its can-fail proof;
+* the ledger: four audio modules registered as `audio_modules`, park frees for
+  real (parameters become meta tensors, the module stops working), restore
+  returns bit-identical weights;
+* the codec decoder: 114.3 M params, 10 s of audio in 3.18 s on **CPU**
+  (RTF 0.32);
+* the transport, end to end through the real front door: PWA, manifest, health
+  and a **101** WebSocket handshake under `/translate/`;
+* the compat layer: five `transformers` 4.57 -> 5.12 drifts found and fixed,
+  the fifth (NaN rotary `inv_freq` from non-persistent buffers under
+  meta-device construction) being the only silent one;
+* `mel_filters.py`, validated element-wise against real librosa 0.11.0.
+
+**The blocker: the prompt/embeds builder.** Generation runs through mel,
+speaker-embedding extraction, prompt assembly and into sampling, then fails in
+`text_projection` with a flattened input:
+
+    mat1 and mat2 shapes cannot be multiplied (1x36864 and 2048x1024)
+
+36864 = 18 text tokens x 2048. The projection is a plain two-Linear stack that
+reshapes nothing, so the flattening happens upstream in the prompt assembly:
+somewhere a `(1, T, 2048)` embedding is arriving as `(1, T*2048)`. Both the
+simulated-streaming and `non_streaming_mode=True` text paths fail the same way
+with only the token count changing, which points at the assembly rather than at
+either path.
+
+This is exactly the component §11.4 pre-registered as unestimatable: the
+reference's builder is **1 596 lines**, none of it derivable from the config
+(control ids, `position_id_per_seconds`, speaker-prompt injection). The
+preserved reference at
+`/spinning/llm_stuff/translator-models/vllm-omni-reference/` is the source of
+truth for it, and reading it against the qwen-tts path is the next step.
+
+**Ladder position unchanged.** Rungs C (preset-only) and D (text-only) remain
+reachable and are unaffected by this blocker: everything above the TTS backend
+interface -- session, journal, reconnect, voice modes, preset pool, client,
+transport -- is done and green.
