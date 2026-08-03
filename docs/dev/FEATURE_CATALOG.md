@@ -420,6 +420,13 @@ layer: GGUF GLM-4-MoE blocks now construct instead of raising on
 `.weight.dtype`, glm4_moe_lite can reach its fp8 shared-expert path at all,
 GPTQ-family MLA fuses on its real output axis, and GPTQ `desc_act=True` is
 refused by name rather than fused wrong -- see docs/dev/NOTE_446_gptq_cat_dim.md).
+Pad-slot family (#444a #444e -- graph-padded verify batches carry
+`PAD_SLOT_ID=-1` rows: #444a made the GDN TARGET_VERIFY conv run on a
+request-private window unconditionally, but its `index_select`
+(`gdn_backend.py:417`) crashed with a device-side assert on those rows
+whenever a decode batch was graph-padded under GDN+spec; triton kernels
+already skip PAD_SLOT_ID natively, so any torch-level indexing on
+cache_indices must skip/mask it explicitly too -- fixed by #444e).
 
 ## 13. Serving surface
 OpenAI-compatible with `--reasoning-parser qwen3 --tool-call-parser
