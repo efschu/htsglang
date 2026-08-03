@@ -108,6 +108,20 @@ from sglang.srt.translator.voices import (
 
 logger = logging.getLogger(__name__)
 
+#: Backoff between MT attempts, in seconds. Sized to bridge the co-tenancy
+#: windows this rig produces rather than to be polite: the MT server shares
+#: its cards with the talker and with whatever else is running, and a long
+#: prefill next door can make it unanswerable for tens of seconds. Sleeping
+#: 37 s across four retries covers that, and each attempt may additionally
+#: spend its own request timeout before failing.
+#:
+#: The real bound is NOT this list. It is the queue guard at the call site: a
+#: turn stops retrying the moment the user has spoken enough to fill the
+#: queue, because `enqueue` drops the OLDEST segment and waiting longer for a
+#: stale sentence would cost a fresh one. That is what keeps a 60 s outage
+#: from turning into a conversation-wide stall.
+MT_RETRY_DELAYS_S = (2.0, 5.0, 10.0, 20.0)
+
 __all__ = [
     "EventKind",
     "Event",
@@ -1712,20 +1726,68 @@ class TranslatorSession:
 
         worker = asyncio.create_task(speech_worker())
         try:
-            async for delta in self.mt.translate_stream(
-                transcript.text, source, target
-            ):
-                if first_token_at is None:
-                    first_token_at = self._clock()
-                    watch.mt_first_token_ms = (first_token_at - mt_start) * 1000.0
-                for unit in accumulator.push(delta):
-                    pieces.append(unit)
-                    self.journal.append(
-                        EventKind.TURN_TRANSLATION,
-                        {"turn_id": turn_id, "target": target, "text": unit,
-                         "partial": True},
+            attempt = 0
+            while True:
+                try:
+                    async for delta in self.mt.translate_stream(
+                        transcript.text, source, target
+                    ):
+                        if first_token_at is None:
+                            first_token_at = self._clock()
+                            watch.mt_first_token_ms = (
+                                first_token_at - mt_start
+                            ) * 1000.0
+                        for unit in accumulator.push(delta):
+                            pieces.append(unit)
+                            self.journal.append(
+                                EventKind.TURN_TRANSLATION,
+                                {"turn_id": turn_id, "target": target,
+                                 "text": unit, "partial": True},
+                            )
+                            enqueue_speech(unit)
+                    break
+                except BackendError as exc:
+                    # FOUR reasons not to try again, and each is a different
+                    # kind of wrong to ignore:
+                    #
+                    #  * the server refused rather than failed (a 400 is a 400
+                    #    every time, and retrying only delays saying so);
+                    #  * tokens already arrived -- restarting the stream would
+                    #    re-emit the clauses the user has already read, and
+                    #    re-speak them, which is worse than a failed turn;
+                    #  * the budget is spent;
+                    #  * the user has kept talking and something is already
+                    #    waiting. `drain` has popped this segment, so a
+                    #    non-empty queue means NEWER speech exists -- and
+                    #    `enqueue` drops the OLDEST on overrun, so every
+                    #    second spent retrying this one can cost a fresh one.
+                    #    A stale sentence is not worth that.
+                    if (not getattr(exc, "retryable", False)
+                            or first_token_at is not None
+                            or attempt >= len(MT_RETRY_DELAYS_S)
+                            or self._queue):
+                        raise
+                    delay = MT_RETRY_DELAYS_S[attempt]
+                    attempt += 1
+                    logger.warning(
+                        "session %s turn %s: MT unreachable (%s), retry %d of "
+                        "%d in %.0fs",
+                        self.session_id, turn_id, exc, attempt,
+                        len(MT_RETRY_DELAYS_S), delay,
                     )
-                    enqueue_speech(unit)
+                    # Reuses the frame the client ALREADY renders into the
+                    # translation slot and already clears when the translation
+                    # lands (index.html, `case "turn.queued"`). The user's
+                    # complaint was a turn that hung silently; this is the
+                    # difference between waiting and having frozen, and it
+                    # costs no client change.
+                    self.journal.append(
+                        EventKind.TURN_QUEUED,
+                        {"turn_id": turn_id, "target": target,
+                         "reason": "mt_unreachable", "attempt": attempt,
+                         "retry_in_s": delay},
+                    )
+                    await asyncio.sleep(delay)
             tail = accumulator.flush()
             watch.mt_total_ms = (self._clock() - mt_start) * 1000.0
             if tail:

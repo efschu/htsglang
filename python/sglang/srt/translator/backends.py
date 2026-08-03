@@ -78,11 +78,20 @@ TTS_QUEUE_WAIT_S: contextvars.ContextVar = contextvars.ContextVar(
 
 
 class BackendError(RuntimeError):
-    """A backend failed a request. Carries the stage name for the turn event."""
+    """A backend failed a request. Carries the stage name for the turn event.
 
-    def __init__(self, stage: str, message: str) -> None:
+    ``retryable`` separates "the backend is momentarily unreachable" from
+    "the backend refused this request". Only the first is worth trying again:
+    a 400 is a 400 on every attempt, while a read timeout on a card shared
+    with the talker is a window that closes by itself. The caller decides the
+    policy; this flag only carries the fact, because the backend is the only
+    layer that still knows which exception it caught.
+    """
+
+    def __init__(self, stage: str, message: str, retryable: bool = False) -> None:
         super().__init__(f"{stage}: {message}")
         self.stage = stage
+        self.retryable = retryable
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

@@ -53,6 +53,22 @@ __all__ = [
 ]
 
 
+
+def _is_retryable(exc: "httpx.HTTPError") -> bool:
+    """Transport trouble is worth another attempt; a refusal is not.
+
+    ``httpx.RequestError`` covers everything that happened on the way --
+    timeouts, resets, a server that closed the connection mid-stream. On this
+    rig those are the NORMAL failure: the MT server shares its cards with the
+    talker and with whatever else is co-tenanted, so a window where it cannot
+    answer in time opens and closes on its own.
+
+    ``httpx.HTTPStatusError`` is the opposite: the server answered, and it
+    said no. Retrying a 400 produces a second 400 and delays the turn's
+    failure by the whole backoff budget.
+    """
+    return isinstance(exc, httpx.RequestError)
+
 # Sentence-ish boundary: terminal punctuation followed by whitespace, plus the
 # inverted marks Spanish opens with (which must NOT be treated as terminators)
 # handled by requiring the mark to be preceded by a word character.
@@ -60,6 +76,7 @@ _BOUNDARY = re.compile(r"(?<=[\w\"'”»)\]])\s*([.!?…]+)(?=\s|$)")
 
 
 @dataclasses.dataclass(frozen=True)
+
 class MtConfig:
     """Where the LLM is and how it is asked."""
 
@@ -249,7 +266,8 @@ class OpenAiMt:
                 "mt",
                 f"request to {self.config.base_url} failed: "
                 f"{type(exc).__name__}: {exc or '(no detail)'} "
-                f"[timeout {self.config.timeout_s:g}s]"
+                f"[timeout {self.config.timeout_s:g}s]",
+                retryable=_is_retryable(exc),
             )
         try:
             return payload["choices"][0]["message"]["content"].strip()
@@ -284,7 +302,8 @@ class OpenAiMt:
                 "mt",
                 f"request to {self.config.base_url} failed: "
                 f"{type(exc).__name__}: {exc or '(no detail)'} "
-                f"[timeout {self.config.timeout_s:g}s]"
+                f"[timeout {self.config.timeout_s:g}s]",
+                retryable=_is_retryable(exc),
             )
         try:
             return payload["choices"][0]["message"]["content"].strip()
@@ -334,5 +353,6 @@ class OpenAiMt:
                 "mt",
                 f"stream from {self.config.base_url} failed: "
                 f"{type(exc).__name__}: {exc or '(no detail)'} "
-                f"[timeout {self.config.timeout_s:g}s]"
+                f"[timeout {self.config.timeout_s:g}s]",
+                retryable=_is_retryable(exc),
             )
