@@ -360,10 +360,57 @@ class ConversationLanguages:
         return tuple(sorted(self.participants - {src}))
 
     def validate_against(self, matrix: LanguageMatrix) -> None:
-        """Refuse a conversation this deployment cannot actually run."""
+        """Refuse a conversation this deployment cannot actually run.
+
+        ALL-OR-NOTHING, and that is right for the two places that ask it: the
+        server advertising a DEFAULT pair (a default the deployment cannot run
+        is exactly the failure the runtime derivation exists to prevent), and
+        anywhere a caller wants the strict answer. A live session uses
+        :meth:`direction_report` instead -- see its docstring for why a
+        session must not be refused for one bad direction.
+        """
         for src in sorted(self.participants):
             for tgt in self.targets_for(src):
                 matrix.require_pair(src, tgt)
+
+    def direction_report(
+        self, matrix: LanguageMatrix
+    ) -> Tuple[Tuple[Tuple[str, str], ...], Dict[Tuple[str, str], str]]:
+        """Split every direction into the servable ones and the rest.
+
+        Returns ``(servable, unroutable)``, the second mapping
+        ``(source, target)`` to the reason naming the stage that refuses.
+
+        WHY THIS EXISTS. ``validate_against`` raises on the FIRST direction
+        the deployment cannot serve, and a live session called it in its
+        constructor -- so adding one participant language whose TTS this
+        deployment does not have did not degrade that one direction, it
+        refused to open the conversation at all. Everything else the user had
+        picked went with it. The picker consequently could not offer the ten
+        languages the deployment can hear and translate but not speak, and the
+        client carried a constant (`PARTIAL_PARTICIPANTS_SUPPORTED`) waiting
+        for exactly this.
+
+        The turn path already knew how to degrade: it calls
+        ``matrix.require_pair`` per target inside the loop and skips the ones
+        that refuse, and ``turn.unrouted`` is the event that tells the user
+        which direction is missing rather than leaving silence. Only the
+        constructor was all-or-nothing.
+
+        A conversation with NO servable direction is still refused -- that is
+        not a degraded conversation, it is not a conversation.
+        """
+        servable = []
+        unroutable: Dict[Tuple[str, str], str] = {}
+        for src in sorted(self.participants):
+            for tgt in self.targets_for(src):
+                try:
+                    matrix.require_pair(src, tgt)
+                except LanguageError as exc:
+                    unroutable[(canonical_code(src), canonical_code(tgt))] = str(exc)
+                else:
+                    servable.append((canonical_code(src), canonical_code(tgt)))
+        return tuple(servable), unroutable
 
 
 @dataclasses.dataclass(frozen=True)

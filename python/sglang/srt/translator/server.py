@@ -117,6 +117,18 @@ class Stack:
         )
 
 
+#: What the boot warmup says. Real sentences in the languages this deployment
+#: is for, because a synthesizer's first call should traverse the same
+#: tokenizer and phonemiser path a turn will -- a string of "aaa" can warm a
+#: shorter one. Short, because every second here is a second of boot.
+WARMUP_TEXT = {
+    "de": "Guten Tag, der Übersetzer ist bereit.",
+    "es": "Buenos días, el traductor está listo.",
+    "en": "Good morning, the translator is ready.",
+}
+WARMUP_TEXT_DEFAULT = "Ready."
+
+
 class TranslatorService:
     """Owns the sessions, the stack and the config. One per process."""
 
@@ -177,6 +189,76 @@ class TranslatorService:
         if self.voice_pool_template is None:
             return None
         return VoicePool(self.voice_pool_template.presets())
+
+    async def warmup(self) -> Dict[str, object]:
+        """Synthesize one throwaway sentence before the port is opened.
+
+        THE DEFECT THIS EXISTS FOR: the first real turn of every boot paid
+        ~15 s that no later turn pays. A zero-shot cloning backend does its
+        kernel autotuning, its CUDA graph capture and its first weight touch
+        on the first `synthesize` call, and turn 1 of a live conversation is
+        the worst possible place to spend it -- it is also the turn on which
+        somebody decides whether this thing works.
+
+        Run BEFORE `uvicorn.run`, so the port is not open until the talker is
+        warm. That is stronger than warming behind a ready flag: there is no
+        window in which `/api/translator/health` says ok and a turn would
+        still hit the cold path, because nothing can reach the health endpoint
+        yet.
+
+        The reference clip is a preset voice when the pool has one -- real
+        material of the length the backend expects, so the warm path is the
+        path a turn takes. Without a pool there is nothing honest to clone
+        from, and the warmup reports that it was skipped rather than
+        synthesizing from noise and warming a code path no turn uses.
+
+        Never fatal. A boot that refuses to serve because a warmup sentence
+        failed has turned an optimisation into an outage.
+        """
+        started = time.time()
+        report: Dict[str, object] = {"ran": False, "reason": None, "seconds": 0.0}
+        pool = self.voice_pool_template
+        presets = pool.presets() if pool is not None else ()
+        if not presets:
+            report["reason"] = "no preset voice pool to take a reference from"
+            return report
+        speakable = set(self.stack.matrix().tts)
+        preset = presets[0]
+        language = next(
+            (code for code in preset.languages() if code in speakable), None
+        )
+        if language is None:
+            language = next(iter(sorted(speakable)), None)
+        if language is None:
+            report["reason"] = "the TTS stage speaks no language"
+            return report
+        reference, reference_text = preset.reference_for(language)
+        if reference is None:
+            report["reason"] = f"preset {preset.voice_id!r} has no reference clip"
+            return report
+        # Short on purpose: this buys the one-off initialisation, not a
+        # measurement, and every second here is a second of boot.
+        text = WARMUP_TEXT.get(language, WARMUP_TEXT_DEFAULT)
+        chunks = 0
+        try:
+            async for chunk in self.stack.tts.synthesize(
+                text, language, reference,
+                reference_text=reference_text,
+                voice_id=preset.backend_voice_id,
+            ):
+                chunks += 1
+        except Exception as exc:  # noqa: BLE001 - never fatal, see docstring
+            report["reason"] = f"{type(exc).__name__}: {exc}"
+            report["seconds"] = round(time.time() - started, 2)
+            return report
+        report["ran"] = chunks > 0
+        report["chunks"] = chunks
+        report["language"] = language
+        report["voice_id"] = preset.voice_id
+        report["seconds"] = round(time.time() - started, 2)
+        if not chunks:
+            report["reason"] = "the synthesizer produced no audio"
+        return report
 
     # -- read surfaces ------------------------------------------------------
 

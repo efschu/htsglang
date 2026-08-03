@@ -17,6 +17,7 @@ that a deployment's networking works before any model is downloaded.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -107,6 +108,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="our own OpenAI-compatible endpoint; the dogfood hop",
     )
     parser.add_argument("--mt-model", default="default")
+    parser.add_argument(
+        "--warmup", dest="warmup", action="store_true", default=True,
+        help="synthesize one throwaway sentence before opening the port, so "
+             "the first real turn does not pay the talker's one-off "
+             "initialisation (~15 s measured). On by default",
+    )
+    parser.add_argument(
+        "--no-warmup", dest="warmup", action="store_false",
+        help="open the port immediately and let turn 1 pay the cold start",
+    )
     parser.add_argument(
         "--mt-lane", default="fast",
         help="server-side priority lane for translator traffic. 'fast' by default because every call here has a person waiting "
@@ -389,6 +400,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "the default conversation cannot run here: %s",
             languages["default_participants_error"],
         )
+
+    # BEFORE the port opens, not behind a ready flag: there must be no window
+    # in which health says ok and a turn would still pay the cold start. See
+    # `TranslatorService.warmup` for the ~15 s this buys back on turn 1.
+    if args.warmup:
+        report = asyncio.run(service.warmup())
+        if report["ran"]:
+            logger.info(
+                "talker warm after %.2fs (%d chunks, %s, voice %s) -- turn 1 "
+                "no longer pays the cold start",
+                report["seconds"], report["chunks"], report["language"],
+                report["voice_id"],
+            )
+        else:
+            # Never fatal, and never silent: a boot that quietly skipped the
+            # warmup looks identical to one that did it, right up to the 15 s
+            # the user waits for their first sentence.
+            logger.warning(
+                "talker warmup did not run (%s) -- turn 1 will pay the cold "
+                "start", report["reason"],
+            )
 
     import uvicorn
 

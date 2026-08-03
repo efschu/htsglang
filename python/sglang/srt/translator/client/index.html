@@ -2263,17 +2263,26 @@ function openAddSpeakerSheet() {
 const catalogue = { bidirectional: [], selectable: [], all: [] };
 let slots = [];
 
-//: Flips when the server accepts a participant language it cannot speak.
-//: TODAY it cannot: `TranslatorSession.__init__` calls
-//: `conversation.validate_against(matrix)` (`session.py:370`), and that
-//: requires EVERY direction between participants (`languages.py:362-366` ->
-//: `matrix.require_pair`), which needs ASR for the source and TTS for the
-//: target. So a text-only participant does not degrade -- the session
-//: refuses to open at all. The picker therefore SHOWS every language and
-//: says exactly what is missing, rather than offering a tap that produces a
-//: dead session; this constant is the single line that opens it up once the
-//: server side lands.
-const PARTIAL_PARTICIPANTS_SUPPORTED = false;
+/** Does the CONNECTED server accept a participant language it cannot speak?
+ *
+ * It used not to: `TranslatorSession.__init__` called
+ * `conversation.validate_against(matrix)`, which raises on the FIRST
+ * unservable direction -- so a text-only participant did not degrade, it
+ * refused to open the conversation at all and took every other language the
+ * user had picked with it. The picker therefore showed every language and
+ * said what was missing rather than offering a tap that produced a dead
+ * session.
+ *
+ * The server now degrades instead (`direction_report`): the session opens on
+ * the directions it can serve and tags the rest with `turn.unrouted`. This is
+ * asked of the server rather than hardcoded for the same reason the merge
+ * gesture is -- this page is live on merge while its server half waits for a
+ * restart, and a picker that offers a language the RUNNING server still
+ * refuses would produce exactly the dead session it was written to avoid.
+ */
+function partialParticipantsSupported() {
+  return !!(serverSupports && serverSupports.partial_participants);
+}
 
 /** The picker's data source, in ONE shape, from whatever the server sends.
  *
@@ -2431,8 +2440,8 @@ function openLanguageSheet(index) {
     const hearable = entry.asr;
     // A language that cannot be a participant here is shown and explained,
     // never silently dropped -- "es is not in the list" is unactionable.
-    const blocked = taken
-      || (!entry.usable && !PARTIAL_PARTICIPANTS_SUPPORTED);
+    const partial = partialParticipantsSupported();
+    const blocked = taken || (!entry.usable && !partial);
     button.className = "listrow" + (chosen ? " on" : "");
     button.disabled = taken;
     const name = document.createElement("span");
@@ -2466,13 +2475,23 @@ function openLanguageSheet(index) {
     button.appendChild(code);
     button.onclick = () => {
       if (blocked) {
-        // Named refusal, with the deployment's own reason. Applying it would
-        // not degrade to text -- the session would refuse to open.
+        // Named refusal, with the deployment's own reason. On a server that
+        // does not degrade, applying it would not fall back to text -- the
+        // session would refuse to open, and every other language chosen with
+        // it would go too.
         sys(entry.endonym + " cannot be a conversation language on this "
             + "deployment yet: " + (entry.reason || "a stage is missing")
             + ". It is still available as a translation target in the "
             + "language pairs.", true);
         return;
+      }
+      if (!entry.usable && partial) {
+        // Chosen with a stage missing, on a server that degrades. Said BEFORE
+        // the first turn, because the alternative is a bubble that silently
+        // never gets a translation and a user who reads that as a hang.
+        sys(entry.endonym + " joins as far as this deployment goes: "
+            + (entry.reason || "a stage is missing")
+            + ". Turns it cannot serve are marked in the transcript.", false);
       }
       rememberLanguage(entry.code);
       if (index < 0) slots.push(entry.code);

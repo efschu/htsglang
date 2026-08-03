@@ -408,7 +408,29 @@ class TranslatorSession:
         silence_peak_floor: float = 1e-3,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        conversation.validate_against(matrix)
+        # DEGRADE, do not refuse (§17.8.14). This used to be
+        # `conversation.validate_against(matrix)`, which raises on the first
+        # direction this deployment cannot serve -- so one participant
+        # language without a TTS voice did not lose its own direction, it
+        # refused to open the conversation at all and took every other
+        # language the user had picked with it. The turn path already skips
+        # unservable targets one by one and tags them; only this line was
+        # all-or-nothing. A conversation with NO servable direction is still
+        # refused, because that is not a degraded conversation.
+        servable, self.unroutable = conversation.direction_report(matrix)
+        if not servable:
+            raise LanguageError(
+                "this deployment cannot serve any direction between "
+                f"{sorted(conversation.participants)}: "
+                + "; ".join(sorted(self.unroutable.values()))
+            )
+        if self.unroutable:
+            logger.warning(
+                "session %s opens with %d of %d directions unservable: %s",
+                session_id, len(self.unroutable),
+                len(servable) + len(self.unroutable),
+                "; ".join(f"{s}->{t}" for s, t in sorted(self.unroutable)),
+            )
         self.session_id = session_id
         self.asr = asr
         self.embedder = embedder
@@ -618,7 +640,22 @@ class TranslatorSession:
             # a gesture that silently does nothing in that window is worse
             # than one that is not offered yet. An older server simply does
             # not send the key and the client leaves the gesture off.
-            "supports": {"speaker_merge": True},
+            # Directions this session opened WITHOUT, with the stage that
+            # refuses each named. A degraded conversation that does not say
+            # which half of it is missing is indistinguishable from a broken
+            # one -- the user picked those languages and is owed the reason.
+            "unroutable_directions": [
+                {"source": src, "target": tgt, "reason": reason}
+                for (src, tgt), reason in sorted(self.unroutable.items())
+            ],
+            "supports": {
+                "speaker_merge": True,
+                # The picker's gate: this server opens a session for a
+                # participant set it can only partly serve, and tags the
+                # directions it cannot. The client constant
+                # PARTIAL_PARTICIPANTS_SUPPORTED was waiting on exactly this.
+                "partial_participants": True,
+            },
         }
 
     # -- the written record (§17.2) -----------------------------------------
@@ -1412,7 +1449,25 @@ class TranslatorSession:
             try:
                 self.matrix.require_pair(source, target)
             except LanguageError as exc:
-                self._fail(turn_id, "routing", str(exc), close=False)
+                # TAGGED, not errored. This direction is one the session was
+                # deliberately opened without (see `direction_report`): the
+                # deployment can hear the speaker and cannot speak this
+                # target, which is a known shape of the conversation and not
+                # a fault in this turn. An error toast per utterance would
+                # make a working conversation look broken; `turn.unrouted`
+                # puts the reason in the bubble where the missing translation
+                # would have been, which is where the user is looking.
+                self.journal.append(
+                    EventKind.TURN_UNROUTED,
+                    {
+                        "turn_id": turn_id,
+                        "speaker_id": speaker_id,
+                        "source": source,
+                        "target": target,
+                        "text": transcript.text,
+                        "reason": str(exc),
+                    },
+                )
                 continue
             try:
                 text, audio, fallback, marks = await self._translate_and_speak(

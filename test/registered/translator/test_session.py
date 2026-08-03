@@ -226,11 +226,33 @@ class TestDirectionRouting(unittest.IsolatedAsyncioTestCase):
             "an unconfident language ID reversed the conversation",
         )
 
-    async def test_an_unroutable_pair_is_refused_not_guessed(self):
-        # TTS cannot speak LANG_B, so the conversation cannot be constructed.
-        with self.assertRaises(Exception) as ctx:
-            make_session(tts_languages=(LANG_A,))
-        self.assertIn("TTS cannot speak", str(ctx.exception))
+    async def test_an_unroutable_pair_is_tagged_not_guessed(self):
+        """The direction is never guessed -- but it no longer takes the
+        session down with it (§17.8.14).
+
+        This arm used to assert that constructing the session RAISED. That was
+        the all-or-nothing constructor check, and it meant one participant
+        language without a voice refused the whole conversation, including the
+        direction the deployment could serve perfectly. The session now opens
+        on what it can serve and tags the rest.
+
+        What has NOT changed, and is the part this test is named for: nothing
+        is guessed. The unservable direction produces no translation and no
+        substituted target -- it produces a tagged turn naming the stage.
+        """
+        session, _asr, mt, _tts = make_session(tts_languages=(LANG_A,))
+        self.assertEqual(
+            [(s, t) for s, t in session.unroutable], [(LANG_A, LANG_B)]
+        )
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.4))])
+        unrouted = [
+            e.payload for e in session.journal.since(0)[0]
+            if e.kind is EventKind.TURN_UNROUTED
+        ]
+        self.assertEqual(len(unrouted), 1, unrouted)
+        self.assertIn("TTS cannot speak", unrouted[0]["reason"])
+        # Not guessed: no translation was requested in any direction for it.
+        self.assertEqual(mt.calls, [])
 
 
 class TestVoicePreservation(unittest.IsolatedAsyncioTestCase):
