@@ -1159,6 +1159,15 @@ re-initialization. **Boot-checked** for dense GGUF under asymmetric TP=3; number
 documented range rather than a single raw A/B run. The FP8 path is functional but has no expensive
 transform to skip; MoE-model hibernation is deferred.
 
+The image is written **sparse** by default (#456): all-zero 4 KiB pages are `lseek`-ed over rather
+than written, because 12.64 % of a real rank image is zero pages — parked pre-allocated buffers.
+This does not move the format (holes read back as zeros, so a reader sees identical bytes; the
+restore path and the image version are untouched) and `SGLANG_HIBERNATE_DENSE_WRITE=1` restores the
+dense write bit-identically. Measured rather than projected: the allocation win is the full 1.1447x
+on a filesystem that folds nothing, and **exactly zero on a ZFS pool with compression**, which had
+already collapsed the same blocks; the write-time delta is inside the A-vs-A floor either way. Not
+yet boot-checked on a real park/restore round trip.
+
 **Upstream:** sglang has diffusion-server offload/wake-up only, no full LLM-server snapshot.
 
 <a id="f20"></a>

@@ -37,6 +37,8 @@ import torch
 import torch.nn as nn
 from torch.nn import Parameter
 
+from sglang.srt.model_loader.sparse_write import DENSE_WRITE_ENV, torch_save_sparse
+
 logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "manifest.json"
@@ -428,6 +430,7 @@ def park_weights_to_disk(
     import fcntl
 
     byte_hash = None
+    sparse_stats = None
     with open(lock_path, "w") as lock_f:
         fcntl.flock(lock_f, fcntl.LOCK_EX)
         try:
@@ -452,18 +455,44 @@ def park_weights_to_disk(
                 "byte_hash": byte_hash,
             }
             tmp = file_path + ".tmp"
-            torch.save(payload, tmp)
+            # #456: skip the image's all-zero 4 KiB pages instead of writing
+            # them. The container format is untouched -- holes read back as
+            # zeros, which is what those pages held -- so no reader, no
+            # manifest field and no version gate changes. #306 measured 12.64 %
+            # zero pages on a real rank image (pre-allocated buffers parked in
+            # full). SGLANG_HIBERNATE_DENSE_WRITE=1 forces the old dense write;
+            # both branches emit bit-identical containers.
+            sparse_stats = torch_save_sparse(payload, tmp)
             os.replace(tmp, file_path)
         finally:
             fcntl.flock(lock_f, fcntl.LOCK_UN)
 
-    logger.info(
-        "#89 hibernate: rank %s parked %d params to %s (byte_hash=%s...).",
-        tp_rank,
-        len(param_items),
-        file_path,
-        byte_hash[:12],
-    )
+    if sparse_stats is None:
+        logger.info(
+            "#89 hibernate: rank %s parked %d params to %s (byte_hash=%s..., "
+            "dense write forced by %s).",
+            tp_rank,
+            len(param_items),
+            file_path,
+            byte_hash[:12],
+            DENSE_WRITE_ENV,
+        )
+    else:
+        logger.info(
+            "#89 hibernate: rank %s parked %d params to %s (byte_hash=%s...); "
+            "#456 sparse write skipped %d of %d 4 KiB pages (%.2f%%), wrote "
+            "%.2f GiB of a %.2f GiB image (%.4fx).",
+            tp_rank,
+            len(param_items),
+            file_path,
+            byte_hash[:12],
+            sparse_stats.hole_pages,
+            sparse_stats.total_pages,
+            100.0 * sparse_stats.hole_fraction,
+            sparse_stats.written_bytes / (1 << 30),
+            sparse_stats.logical_bytes / (1 << 30),
+            sparse_stats.sparse_ratio,
+        )
 
     # Collect per-rank metadata for the manifest.
     rank_meta = {
