@@ -458,6 +458,30 @@ class ExpertResidencyPlanner:
     def fully_resident(self) -> bool:
         return self.resident_count >= self.num_local_experts
 
+    def split_needed(
+        self, needed_unique: Sequence[int]
+    ) -> Tuple[List[int], List[int]]:
+        """Split an already-uniqued, sorted needed set into (resident, spill).
+
+        Extracted from :meth:`resolve` so a caller can ask "would this forward
+        overflow the scratch region?" WITHOUT taking the stats side effects
+        resolve() applies (#462's breakable route pre-checks the fixed-shape
+        invariant and must be able to refuse by name before a forward counter
+        moves). Both lists preserve the input order, so the spill list is
+        sorted exactly as resolve() requires for its slot assignment.
+        """
+        if self.resident_ids is None:
+            # Static residency: resident == [0, R) at slot==id.
+            return (
+                [e for e in needed_unique if e < self.resident_count],
+                [e for e in needed_unique if e >= self.resident_count],
+            )
+        # Hot residency: resident == frozen id set at its assigned slot.
+        return (
+            [e for e in needed_unique if e in self.resident_ids],
+            [e for e in needed_unique if e not in self.resident_ids],
+        )
+
     def resolve(
         self, needed: Sequence[int]
     ) -> Tuple[Dict[int, int], List[Tuple[int, int]]]:
@@ -477,15 +501,10 @@ class ExpertResidencyPlanner:
             self.stats.hits += len(needed_unique)
             return {e: e for e in needed_unique}, []
 
+        resident, spill = self.split_needed(needed_unique)
         if self.resident_ids is None:
-            # Static residency: resident == [0, R) at slot==id.
-            resident = [e for e in needed_unique if e < self.resident_count]
-            spill = [e for e in needed_unique if e >= self.resident_count]  # sorted
             resident_slot_of = {e: e for e in resident}
         else:
-            # Hot residency: resident == frozen id set at its assigned slot.
-            resident = [e for e in needed_unique if e in self.resident_ids]
-            spill = [e for e in needed_unique if e not in self.resident_ids]  # sorted
             resident_slot_of = {e: self.resident_slot[e] for e in resident}
         if self.delegated_ids is not None:
             foreign = [e for e in spill if e in self.delegated_ids]
@@ -3022,27 +3041,20 @@ class MoEExpertOffloadCache:
             path,
         )
 
-    def run_waves(self, dispatch_output, apply_fn):
-        """Run the grouped-GEMM for one forward, wave-splitting when the forward
-        needs more unique experts than there are resident slots.
+    def _observe_routing(self, ids_list):
+        """Fold one forward's host-side routing decision into the instruments
+        and the residency policies, BEFORE this forward resolves and fetches.
 
-        ``apply_fn(sub_dispatch_output) -> CombineInput`` runs the unmodified
-        MoE math (``quant_method.apply``) over the resident buffer. We call it
-        once per wave over that wave's token rows and scatter the results back.
+        Extracted from ``run_waves`` so the #462 breakable route (which plans
+        and fetches in an eager graph break and then hands a captured segment a
+        static slot buffer) runs the SAME preamble instead of a second copy of
+        it. Nothing here is new: the call order -- router stats, then Stage-1
+        hot freeze, then #302a heat migration -- is preserved exactly, and each
+        step keeps the reason it sits where it does.
 
-        Returns a CombineInput whose hidden_states is the full [T, H] output,
-        byte-identical to the no-offload path (see module docstring).
+        Requires ``ids_list`` already on the host; every step below reads Python
+        ints, so no step adds a device sync of its own.
         """
-        import torch
-
-        topk_output = dispatch_output.topk_output
-        topk_ids = topk_output.topk_ids
-
-        if self.planner.fully_resident:
-            return apply_fn(dispatch_output)
-
-        ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
-
         # #390: fold this forward's routing decision into the per-layer expert
         # histogram and the hit/miss tally against the resident set. This is the
         # fetch-decision point -- residency is already known here and the ids
@@ -3079,6 +3091,29 @@ class MoEExpertOffloadCache:
             )
             if self._heat.due():
                 self._migrate_heat()
+
+    def run_waves(self, dispatch_output, apply_fn):
+        """Run the grouped-GEMM for one forward, wave-splitting when the forward
+        needs more unique experts than there are resident slots.
+
+        ``apply_fn(sub_dispatch_output) -> CombineInput`` runs the unmodified
+        MoE math (``quant_method.apply``) over the resident buffer. We call it
+        once per wave over that wave's token rows and scatter the results back.
+
+        Returns a CombineInput whose hidden_states is the full [T, H] output,
+        byte-identical to the no-offload path (see module docstring).
+        """
+        import torch
+
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+
+        if self.planner.fully_resident:
+            return apply_fn(dispatch_output)
+
+        ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+
+        self._observe_routing(ids_list)
 
         if self._wave_order == "expert":
             # #254: split over SPILL EXPERTS instead of tokens. The single-wave
