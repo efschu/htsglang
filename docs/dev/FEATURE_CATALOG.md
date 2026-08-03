@@ -514,7 +514,11 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   **DESK-WRITTEN, NEVER EXECUTED — no boot, no replay, no ms/verify figure
   exists, and F1's 5.3–8.4x is a Qwen3.6-35B-A3B ceiling that is NOT a DSV4F
   number.** F2 (per-layer break cost, decomposed) is the first measurement of
-  the next window and gates default-on. Tests:
+  the next window and gates default-on; **its instrument now exists (#494, §16
+  break-cost probe)**, so F2 is a measurement ticket rather than an
+  implementation one — the crossing cost is read off
+  `scripts/dev/494_break_cost/summarise.py`, not reconstructed from logs.
+  Tests:
   `tests/moe_offload/test_breakable_route_462.py`, 37 hermetic, SEVEN executed
   can-fail arms (pad marker dropped → 3 red; bridges aliased across capture
   shapes → 2; #286 capture gate removed → 1; overflow check moved after resolve
@@ -2038,6 +2042,28 @@ between, and any boot under `LOG_FORWARD_ITERS` (`:962`). Four missed shapes,
 three of them not in the ticket. `accept_len` / `accept_rate` are now `None`,
 never `0.0`, and `spec: bool` names the shape; all three tick aggregators
 (s12/s14/s16) report `ticks_with_accept`.
+
+**Break-cost probe (#494)**, `srt/utils/break_cost_clock.py`: prices ONE
+CUDA-graph crossing of a breakable capture -- `segment_end -> eager slot ->
+segment_start` -- with a CUDA event pair around every segment and every break
+slot in `BreakableCUDAGraph.replay()`, read `SGLANG_BREAK_COST_DEFER_ROUNDS`
+(default 2) rounds LATE through `query()` only, so the read never synchronises
+the round it measures. Per crossing: `gap_in_ms` / `slot_ms` / `gap_out_ms`
+(device wait, device compute, device wait) plus `host_ms` split into the four
+terms the #462 F2 ticket names (`rendezvous`, `planning`, `publish`, `fetch`,
+bracketed in `MoEExpertOffloadCache.prepare_breakable`); per round:
+`compute_ms` / `wait_ms` / `span_ms` / `residual_ms`, per rank, as JSONL.
+Crossings carry the break function's name, so MoE breaks are separable from
+any other break point. `SGLANG_BREAK_COST_PROBE=1`, **OFF by default and
+byte-neutral off** (the disabled `replay()` loop is the original one, statement
+for statement: no event created, none recorded, nothing allocated per round --
+pinned by a call-count spy). Reader: `scripts/dev/494_break_cost/summarise.py`.
+It is route-agnostic: any `eager_on_graph` break point is priced, not only the
+MoE one. `tests/moe_offload/test_break_cost_probe_494.py`, 21 hermetic, three
+executed can-fail arms (crossing->segment mapping shifted by one -> 3 red;
+probe default flipped ON -> 4 red incl. the neutrality spy; one host phase
+bracket renamed -> 1 red). No GPU number exists yet -- the probe has never run
+on a card; it is the instrument F2 was missing, not a result.
 
 ## 17. META: combination matrix + eviction doctrine
 Every "can asset X live at tier Y under primitive Z" question is a matrix-cell

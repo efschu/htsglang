@@ -102,6 +102,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.utils.break_cost_clock import break_cost_phase
+
 # --- M-C routing trace ------------------------------------------------------
 # Append-only JSONL sink consumed by moe_offload/sim.py. One handle per output
 # file, shared by every FusedMoE layer in a process and serialized by a lock so
@@ -3103,29 +3105,36 @@ class MoEExpertOffloadCache:
         """
         import numpy as np
 
-        ids_list = topk_ids.tolist()  # SYNC POINT 1/1: the D2H rendezvous.
-        self._observe_routing(ids_list)
+        # #494: the four F2 terms are bracketed by host wall clocks here, in the
+        # order the ticket names them. With the probe off, break_cost_phase()
+        # returns one shared no-op object -- no allocation, no clock read.
+        with break_cost_phase("rendezvous"):
+            ids_list = topk_ids.tolist()  # SYNC POINT 1/1: the D2H rendezvous.
 
-        needed = sorted({e for row in ids_list for e in row if e >= 0})
-        # Fixed-shape invariant, checked BEFORE resolve() so a refusal does not
-        # move a forward counter and the message can name the real numbers. A
-        # captured segment cannot wave-split: its work is fixed at capture time,
-        # so an overflow here is a wrong answer, not a slow one.
-        spill = self.planner.split_needed(needed)[1]
-        if len(spill) > self.scratch:
-            from sglang.srt.layers.moe.breakable_offload import (
-                BreakableScratchOverflow,
-            )
+        with break_cost_phase("planning"):
+            self._observe_routing(ids_list)
 
-            raise BreakableScratchOverflow(
-                layer_id=getattr(self.layer, "layer_id", None),
-                spill=len(spill),
-                scratch=self.scratch,
-                routed_slots=int(topk_ids.numel()),
-                cold=self.num_local_experts - self.resident_count,
-            )
+            needed = sorted({e for row in ids_list for e in row if e >= 0})
+            # Fixed-shape invariant, checked BEFORE resolve() so a refusal does
+            # not move a forward counter and the message can name the real
+            # numbers. A captured segment cannot wave-split: its work is fixed
+            # at capture time, so an overflow here is a wrong answer, not a slow
+            # one.
+            spill = self.planner.split_needed(needed)[1]
+            if len(spill) > self.scratch:
+                from sglang.srt.layers.moe.breakable_offload import (
+                    BreakableScratchOverflow,
+                )
 
-        slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                raise BreakableScratchOverflow(
+                    layer_id=getattr(self.layer, "layer_id", None),
+                    spill=len(spill),
+                    scratch=self.scratch,
+                    routed_slots=int(topk_ids.numel()),
+                    cold=self.num_local_experts - self.resident_count,
+                )
+
+            slot_of_needed, fetch_plan = self.planner.resolve(needed)
 
         # Publish the slot vector BEFORE issuing the fetch. The copy below is
         # deliberately BLOCKING: a non_blocking copy out of a reused pinned
@@ -3136,14 +3145,16 @@ class MoEExpertOffloadCache:
         # by construction. It is issued here, ahead of _fetch, so it waits only
         # on an already-drained stream (the tolist() above drained it) rather
         # than on this step's expert DMAs; the payload is tokens x top_k ints.
-        flat = remap_ids_host(ids_list, slot_of_needed)
-        if stage is None:
-            np.asarray(bridge.reshape(-1))[:] = flat
-        else:
-            np.asarray(stage)[:] = flat
-            bridge.reshape(-1).copy_(stage, non_blocking=False)
+        with break_cost_phase("publish"):
+            flat = remap_ids_host(ids_list, slot_of_needed)
+            if stage is None:
+                np.asarray(bridge.reshape(-1))[:] = flat
+            else:
+                np.asarray(stage)[:] = flat
+                bridge.reshape(-1).copy_(stage, non_blocking=False)
 
-        self._fetch(fetch_plan)
+        with break_cost_phase("fetch"):
+            self._fetch(fetch_plan)
         return bridge
 
     def _observe_routing(self, ids_list):
