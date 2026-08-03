@@ -2227,6 +2227,65 @@ one-runtime law is untouched.
 **The gate runs green twice before the user is asked to test anything.** The
 user is final acceptance, never the test device.
 
+#### 17.8.1 Handover state, 2026-08-03 (context exhausted mid-investigation)
+
+**The gate exists, runs, and passes cold.** Measured on the live service
+through the public URL with the real client:
+
+| run | result |
+|---|---|
+| cold, 1 turn | line 6.3 s, audio 13.4 s, 268 frames @16 kHz, console clean, socket OPEN |
+| 3 turns, 22 s apart | lines 1/3/5, audio frames 216/472/760, socket OPEN throughout |
+| soak #1, 85 s gaps | turn 1 passed, **turn 2 produced nothing** |
+| soak #2, 85 s gaps | turn 1 line 6.0 s / audio 13.1 s; **turn 2 line 4.0 s / audio 4.7 s** |
+
+**Correction, and it matters for whoever continues.** After soak #1 I wrote
+that the R5 fault is "idle-related". **Soak #2 refutes that**: identical 85 s
+gaps, turn 2 passes in 4.0 s. The difference between the two runs was not
+idle time — during soak #1 the user was testing on the phone concurrently
+(`health` showed their session with 4 turns, idle 5.3 s, alongside the
+gate's). Two conversations on one 5090.
+
+So the leading hypothesis is now **contention, not an idle socket**: one
+in-process TTS on the card serialising against the 27B and against a second
+conversation. That also fits the user's "ultra langsam" better than any
+transport fault, and it is consistent with the 52 s measured earlier when six
+abandoned sessions were draining. **It is a hypothesis, not a finding** — the
+evidence is two runs differing in load, not an instrumented measurement.
+
+Excluded by evidence, not argument:
+
+* **nginx idle timeout** — the live CT208 location carries
+  `proxy_read_timeout 3600s` / `proxy_send_timeout 3600s`, read from
+  `/etc/nginx/sites-enabled/efeu.ddnss.de.conf`, not from the repo template.
+* **session pile-up at the time of R5** — `health` showed 2 of 8 sessions,
+  both attached.
+* **socket death** — `connection.ws.readyState` was 1 after every turn of
+  every run, including across the 85 s gaps.
+* **capture** — `microphone.frames` ~197 per turn in every turn, context
+  `running` throughout.
+
+**Exact next steps, in order:**
+
+1. Read the soak #2 verdict:
+   `tail -24 /root/.claude/jobs/1481bb40/tmp/gate_soak2.log` (9 turns, 85 s
+   gaps; it prints a PASS/FAIL summary with per-turn client counters).
+2. If it is green, run it a second time — the standing rule is **twice** —
+   and only then tell the user to test:
+   `CUDA_VISIBLE_DEVICES=99 PYTHONPATH=<worktree>/python
+   /spinning/htsglang-gpu/.venv/bin/python -u
+   scripts/translator/client_gate.py --turns 9 --gap-s 85`
+   (launch with `setsid`, or the shell exiting kills it — that cost one run).
+3. Test the contention hypothesis deliberately rather than by accident: run
+   the gate ALONE, then again while a second WebSocket client drives turns,
+   and compare per-turn `line_s`/`audio_s`. If it holds, the answer is
+   scheduling/admission between tenants on the 5090, not the transport.
+4. Then §18: decompose the ~7 s first-audio figure per stage before
+   rebuilding anything, per §18.4.
+
+**Do not** re-litigate nginx, socket death or the capture chain without new
+evidence — each is excluded above with its probe.
+
 ### 17.6 Build order and what each step needs
 
 Order is by dependency, not by user priority — (b) carries the surface every
