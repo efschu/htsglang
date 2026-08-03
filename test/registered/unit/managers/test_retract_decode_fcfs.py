@@ -113,9 +113,7 @@ class TestRetractDecodeProtectsTheOldestUnderExtremePressure(unittest.TestCase):
         # sole survivor's own next decode step still does not fit (spill
         # budget exhausted -- kv_session_offload.try_spill already declined
         # for lack of a free region before stock retraction ever runs).
-        self.batch = _make_batch(
-            [self.old_req, self.new_req], always_short=True
-        )
+        self.batch = _make_batch([self.old_req, self.new_req], always_short=True)
         self.server_args = server_args
 
     def test_the_new_session_is_retracted_first(self):
@@ -168,9 +166,7 @@ class TestRetractDecodeProtectsTheOldestUnderExtremePressure(unittest.TestCase):
         """release_req must be called for every request removed from the
         running batch -- retracted AND (if it ever legitimately happens)
         aborted alike -- or the KV/req-pool bookkeeping leaks a slot."""
-        retracted_reqs, _, reqs_to_abort = self.batch.retract_decode(
-            self.server_args
-        )
+        retracted_reqs, _, reqs_to_abort = self.batch.retract_decode(self.server_args)
         removed = len(retracted_reqs) + len(reqs_to_abort)
         self.assertEqual(
             len(self.batch._released_indices),
@@ -230,6 +226,21 @@ class TestRetractDecodeGivesUpAfterRepeatedSoloOOM(unittest.TestCase):
         server_args = types.SimpleNamespace(retraction_policy="length")
         req = _make_req("stuck-session", num_decoded=100)
         max_retries = envs.SGLANG_RETRACT_SOLO_OOM_MAX_RETRIES.get()
+        # VALUE PINNING (#514/#505-C-05). Reading the default and deriving the
+        # loop bound from it -- which is all this test used to do -- makes the
+        # test pass for EVERY possible value: it proves the guard fires, never
+        # that the number is right. That is the shape audit #505 found across
+        # the whole fork, and this test was named as its example, so it is the
+        # first one corrected. The literal below is the contract: changing the
+        # shipped default now turns this red and forces the change to be
+        # argued, which is the only thing that would have caught #449.
+        self.assertEqual(
+            max_retries,
+            8,
+            "SGLANG_RETRACT_SOLO_OOM_MAX_RETRIES changed; see environ.py:482-486 "
+            "for the argument behind 8 (ordinary pressure resolves in a couple "
+            "of scheduler iterations) and update it together with this pin",
+        )
 
         # Simulate the SAME request re-entering retract_decode alone
         # (as if repeatedly re-admitted and immediately solo-OOMing again)

@@ -1206,6 +1206,20 @@ counter split out of an existing one is added to every gate that read the old
 one in the same change (`scripts/gpu_battery/checks/check_s07_offload_register_gpu.py`
 gates all four counters, each with its own can-fail proof).
 
+**VALUE PINNING for bounding defaults (#505-C-05, convention adopted in #514).**
+A numeric default that exists to BOUND something (cap/budget/threshold/limit/
+reserve/margin/watermark/timeout) ships with a test that FAILS when the value
+changes -- see `docs/dev/CONVENTION_bounding_defaults.md` and the reference
+implementation `test/registered/unit/test_bounding_default_value_pins.py`.
+Audit #505 enumerated 106 fork-added bounding defaults and found ZERO with such
+a test, while 71 of them sit behind a gate that is off in the served
+configuration. The anti-pattern is a test that READS the default and derives its
+assertion from it: it proves the guard fires and passes for every possible
+value, which is how #449's desk-picked 2048 MiB shipped above the real peak and
+protected nothing for weeks. A green pin means the number is DELIBERATE -- not
+that it is correct, and not that it BINDS; those need their own evidence and
+are the axis-C backlog.
+
 **MERGE DUTY -- bookkeeping-mutation sites (#404 family).** The per-request
 accounting clocks (`decode_batch_idx` / `extend_batch_idx`,
 `kv_committed_len` / `kv_allocated_len`, `spec_verify_ct`) and the
