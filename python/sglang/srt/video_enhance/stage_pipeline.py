@@ -324,7 +324,7 @@ Placement = Mapping[str, "str | Sequence[str]"]
 class PipelinePrice:
     """A placement scored: throughput, the card that binds, and why."""
 
-    placement: dict[str, "str | tuple[str, ...]"]
+    placement: dict[str, str | tuple[str, ...]]
     #: Per card: compute ms + unhidden transfer ms, per chain-input frame.
     card_load_ms: dict[str, float]
     #: Per card, compute only.
@@ -715,7 +715,7 @@ def enumerate_placements(
     cards: Sequence[CardProfile],
     *,
     replicable: Sequence[str] = (),
-) -> Iterable[dict[str, "str | tuple[str, ...]"]]:
+) -> Iterable[dict[str, str | tuple[str, ...]]]:
     """Every stage->card assignment. Small by construction: five stages over
     three cards is 243 combinations, so an exhaustive sweep is cheaper than any
     heuristic and cannot miss the optimum of the model it is sweeping.

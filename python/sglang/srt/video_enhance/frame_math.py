@@ -279,7 +279,7 @@ NVENC_SESSION_FIXED_BYTES = int(25.3 * MIB)
 NVENC_SESSION_BYTES_PER_PIXEL = 30.15
 
 
-def nvenc_session_bytes(resolution: "Resolution") -> int:
+def nvenc_session_bytes(resolution: Resolution) -> int:
     """Device memory one in-process NVENC session holds at this geometry.
 
     Beyond the input surfaces the chain hands it: reconstructed-picture and
