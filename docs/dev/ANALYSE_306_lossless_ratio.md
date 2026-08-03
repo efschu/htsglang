@@ -552,6 +552,23 @@ Where the holes come from is worth naming for #89's benefit: the image is a
 it is zero pages — pre-allocated buffers written out in full. Nothing about
 that needs a codec to fix.
 
+**Follow-up, and it corrects this table's implied value.** #456 built the sparse
+write and measured it instead of projecting it
+(`DESIGN_456_sparse_image_write.md`). Two things came back different:
+
+* the 1.1447x is **exact** — reproduced to four decimals on tmpfs — but on the
+  `/spinning` pool it is **not additive with the 1.1735x above, it is inside
+  it**. Allocated bytes for a 3 GiB image at this hole fraction are
+  2 816 098 816 whether the write is sparse or dense: ZFS had already folded
+  the same zero blocks. Sparse write adds **zero** disk bytes on this box;
+* "at zero CPU" is wrong. The zero-page detector is a second full pass over the
+  image, measured at 67 ms/GiB (~0.45 s for this 6.68 GiB rank). No write-time
+  win is established on either filesystem: the point estimates are 0.897 (ZFS)
+  and 0.855 (tmpfs), both negative and both at or inside their A-vs-A floor.
+  It ships default-on because it is byte-identical and free of restore-path
+  cost, and because the 1.1447x is real on any filesystem that does not already
+  fold zeros — not because it was measured to pay here.
+
 ## 6. Verdicts per cell
 
 The tables above give the arithmetic; this is what it decides, per cell of

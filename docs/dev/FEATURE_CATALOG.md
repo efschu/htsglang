@@ -312,6 +312,30 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   50s→8-14s) + suspend-to-RAM (memory saver; reaches the legacy hybrid-SWA
   `SWAKVPool` since upstream #32213 — before that it was silently a no-op
   there, while `UnifiedSWAKVPool` already honoured it).
+  **#456 writes the image SPARSE by default** (`model_loader/sparse_write.py`,
+  `SGLANG_HIBERNATE_DENSE_WRITE=1` to opt out): all-zero 4 KiB pages are
+  `lseek`-ed over instead of written. This is the one mechanism that survived
+  the #306 codec refutation — 12.64 % of a real rank image is zero pages,
+  parked pre-allocated buffers. The format does NOT move: sparseness sits under
+  the `torch.save` container, holes read back as zeros, `HIBERNATE_VERSION`
+  stays 2, and there is no reader change. **Re-measured honestly, and the #306
+  projection does not survive contact with this box's filesystem**
+  (`DESIGN_456_sparse_image_write.md` §4, 3 GiB synthetic at the measured hole
+  fraction, rotated arms, drain-before-timing, 11 reps): on `/spinning` ZFS the
+  allocated bytes are **identical** dense vs sparse (2 816 098 816 both ways —
+  ZFS compression had already taken the same 12.64 %, so the byte win here is
+  ZERO). On tmpfs, which folds nothing, the allocation win is exactly the
+  projected **1.1447x**. **No write-time win exists on either**: the point
+  estimates are 0.897 / 0.855, both negative and both at or inside their A-vs-A
+  floor (10.3 % / 16.9 %), and the detector is a second full pass over the image
+  measured at 67 ms/GiB (≈0.45 s per 6.68 GiB rank) — not the "zero CPU" the
+  ticket assumed. The ext4/xfs-on-a-real-device arm, where the win should be
+  there to take, is UNMEASURED: this box has no such filesystem. It ships
+  default-on because it is byte-identical (sha256 gate dense-vs-sparse) and the
+  1.1447x is real on any non-folding target; on a compressing `hibernate_dir`
+  the escape env is the better setting. BOOT-PENDING: a real park/restore round
+  trip, recipe in DESIGN_456 §7. Second consumer identified but NOT wired:
+  `hicache_migrate.execute_plan` (#297) does not share this writer.
 - **Runtime VRAM dial** per card (VMM page return), **KV pressure ladder**
   (geometry stages instead of rejects; explicit ladders work; rung-dependency
   refusals exist and fire). `--kv-pressure-ladder auto` mode wired via
