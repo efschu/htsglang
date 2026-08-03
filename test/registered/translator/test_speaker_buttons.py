@@ -233,5 +233,56 @@ class TestSpeakerButtonsInSession(unittest.IsolatedAsyncioTestCase):
         self.assertIs(speaker_events[-1]["manual"], True)
 
 
+class TestManualSpeakerClass(unittest.IsolatedAsyncioTestCase):
+    """The class must steer the VOICE, not just be stored (design 17.5b)."""
+
+    def _session_with_pool(self):
+        from sglang.srt.translator.voices import VoiceClass, VoiceMode, synthetic_pool
+        from test_session import LANG_A, LANG_B
+
+        session, _asr, _mt, _tts = make_session(
+            voice_pool=synthetic_pool([LANG_A, LANG_B]),
+            voice_mode=VoiceMode.PRESET,
+        )
+        return session, VoiceClass
+
+    async def test_the_class_picks_the_voice_before_a_word_is_spoken(self):
+        session, VoiceClass = self._session_with_pool()
+        man = session.add_speaker("Papa", voice_class=VoiceClass.MAN)
+        woman = session.add_speaker("Mama", voice_class=VoiceClass.WOMAN)
+        boy = session.add_speaker("Moritz", voice_class=VoiceClass.BOY)
+
+        # No audio has been seen at all; the preset must already be decided.
+        chosen = {
+            sid: session.voice_pool.assign(sid)[0]
+            for sid in (man, woman, boy)
+        }
+        self.assertEqual(chosen[man].voice_class, VoiceClass.MAN)
+        self.assertEqual(chosen[woman].voice_class, VoiceClass.WOMAN)
+        self.assertIn(
+            chosen[boy].voice_class, (VoiceClass.BOY, VoiceClass.CHILD)
+        )
+        # Three different people, three different voices.
+        self.assertEqual(len({v.voice_id for v in chosen.values()}), 3)
+
+    async def test_a_different_class_gives_a_different_voice(self):
+        """The falsifier for a class that is stored but never reaches the pool."""
+        session, VoiceClass = self._session_with_pool()
+        as_boy = session.add_speaker(voice_class=VoiceClass.BOY)
+        as_woman = session.add_speaker(voice_class=VoiceClass.WOMAN)
+        self.assertNotEqual(
+            session.voice_pool.assign(as_boy)[0].voice_id,
+            session.voice_pool.assign(as_woman)[0].voice_id,
+        )
+
+    async def test_a_manual_name_is_never_overwritten_by_the_automatic_path(self):
+        session, _asr, _mt, _tts = make_session()
+        sid = session.add_speaker()
+        session.name_speaker(sid, "Matthias")
+        # The automatic path tries to rename and must be refused.
+        self.assertEqual(session.name_speaker(sid, "Somebody", manual=False), [])
+        self.assertEqual(session.speakers.get(sid).label, "Matthias")
+
+
 if __name__ == "__main__":
     unittest.main()

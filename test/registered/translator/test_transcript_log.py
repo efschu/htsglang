@@ -163,6 +163,31 @@ class TestTranscriptInSession(unittest.IsolatedAsyncioTestCase):
             # rendering rather than a round trip.
             self.assertEqual(line.translations, result.translations)
 
+    async def test_the_line_carries_the_original_and_every_translation(self):
+        """A protocol pin, because the display collapsing them looked the same.
+
+        The user reported the transcript showing only the translation. That
+        was a rendering fault, but the two are indistinguishable from outside
+        unless the FRAME is pinned: if the record kept only the translated
+        text, no client could ever show the original again.
+        """
+        session, _asr, _mt, _tts = make_session()
+        results = await run_conversation(
+            session, [conversation_audio((VOICE_A_HZ, 1.2))]
+        )
+        line = session.transcript.lines()[0]
+        payload = line.to_json()
+        self.assertTrue(payload["source_text"])
+        self.assertEqual(payload["source_text"], results[0].source_text)
+        self.assertTrue(payload["translations"])
+        self.assertNotEqual(
+            payload["source_text"], list(payload["translations"].values())[0]
+        )
+        # And both survive the server-side persistence, not just the event.
+        restored = session.transcript.to_json(since=0)["lines"][0]
+        self.assertEqual(restored["source_text"], payload["source_text"])
+        self.assertEqual(restored["translations"], payload["translations"])
+
     async def test_journal_eviction_does_not_touch_the_transcript(self):
         """The falsifier for a transcript derived from journal events.
 

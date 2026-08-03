@@ -284,7 +284,7 @@ class TestSuggestionsInSession(unittest.IsolatedAsyncioTestCase):
         await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.2))])
         return session, scripted
 
-    async def test_a_self_name_becomes_a_chip_and_is_not_applied(self):
+    async def test_a_self_introduction_is_applied_at_once_and_undoable(self):
         from sglang.srt.translator.session import EventKind
 
         session, _mt = await self._session(
@@ -299,15 +299,20 @@ class TestSuggestionsInSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(events), 1)
         suggestion_id = events[0].payload["suggestion_id"]
         speaker_id = events[0].payload["speaker_id"]
-        # NOT applied: the chip exists, the name does not.
-        self.assertIsNone(session.speakers.get(speaker_id).label)
-        self.assertEqual(session.transcript.lines()[0].speaker_label, speaker_id)
-
-        changed = session.confirm_suggestion(suggestion_id)
+        # A self-introduction has no ambiguity to resolve, so it APPLIES --
+        # the user reported the name plainly not working while it sat in a
+        # chip waiting for a confirmation nobody knew was needed.
+        self.assertIs(events[0].payload["applied"], True)
+        self.assertIs(events[0].payload["automatic"], True)
         self.assertEqual(session.speakers.get(speaker_id).label, "Matthias")
-        self.assertTrue(changed)
         self.assertEqual(
             session.transcript.lines()[0].speaker_label, "Matthias"
+        )
+        # ...and it can be taken back, which is what makes applying it safe.
+        self.assertTrue(session.undo_name(suggestion_id))
+        self.assertIsNone(session.speakers.get(speaker_id).label)
+        self.assertEqual(
+            session.transcript.lines()[0].speaker_label, speaker_id
         )
 
     async def test_ordinary_speech_never_reaches_the_model(self):
@@ -328,9 +333,10 @@ class TestSuggestionsInSession(unittest.IsolatedAsyncioTestCase):
             session.confirm_suggestion(suggestion_id)
 
     async def test_a_discarded_chip_is_gone_and_stays_gone(self):
+        # third_party still queues: it belongs to nobody in the room yet.
         session, _mt = await self._session(
-            '{"candidates": [{"name": "Matthias", "kind": "self"}]}',
-            script=[("ich bin Matthias", LANG_A)],
+            '{"candidates": [{"name": "Larisa", "kind": "third_party"}]}',
+            script=[("darf ich vorstellen: Larisa", LANG_A)],
         )
         suggestion_id = next(iter(session.suggestions))
         self.assertTrue(session.discard_suggestion(suggestion_id))

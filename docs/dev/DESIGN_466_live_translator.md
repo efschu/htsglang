@@ -2135,6 +2135,66 @@ goes through normal identification; `+` must seed rather than match; and a
 manual line with too-short audio must still be refused for the reference
 buffer.
 
+### 17.5b (f) Manual speakers carry their voice class, and everyone is renameable
+
+Two further orders, 2026-08-03, after the first working conversation.
+
+**The "+" button asks for a class.** Man / woman / boy / girl — exactly the
+four the preset pool is built from. The user knows it and the F0 heuristic
+only guesses, and crucially it is known BEFORE the first utterance, which is
+precisely when a preset voice has to be chosen. A manually added speaker
+therefore: gets their own hold-to-speak button immediately; in `preset` mode
+gets a distinct pool voice of that class at once (sticky per session, existing
+exhaustion rules and their named notice unchanged); in `clone` mode uses the
+class for the preset start until enough own reference exists (the existing
+downgrade path); and may be named on creation.
+
+Falsifier, and it must be about the VOICE rather than the label: two speakers
+added with different classes must receive presets from different classes, and
+the same speaker added as `boy` versus `woman` must get a different pool
+voice. A test that only checks the stored class would pass against an
+implementation where the class never reaches the pool.
+
+**Every speaker is renameable, automatic or manual.** This was in the original
+five ("with the possibility of giving the speakers names") but had lived only
+in the protocol. Long-press a speaker button — the short press is
+hold-to-speak — and type a name. A typed name outranks every suggestion and is
+never overwritten by the automatic path.
+
+### 17.3b Self-introductions apply, they do not queue
+
+Revised 2026-08-03, against the first real conversation: the user said "hallo
+ich bin matthias", stayed `speaker-1`, and reported the naming as simply not
+working.
+
+"Nothing is ever auto-applied" was a design call of mine, not a user order.
+The user's order was that names come out of such statements. A `self`
+classification is the one case with no ambiguity to resolve — the speaker is
+talking about themselves, and there is no other party the name could belong
+to. So `self` now applies immediately, is marked as automatic, and carries an
+undo chip.
+
+The two ambiguous kinds keep queueing, and the asymmetry is the point:
+`third_party` belongs to nobody in the room yet, and `addressed` is inferred
+from turn adjacency — exactly where a wrong guess is expensive.
+
+Measured on the real 27B through the live endpoint, using the user's own
+sentence as the first case:
+
+| utterance | gate | classification |
+|---|---|---|
+| "hallo ich bin matthias" | passes (cue) | `matthias` / **self** |
+| "darf ich vorstellen: Larisa Ehrenfeuchter" | passes (cue) | `Larisa Ehrenfeuchter` / **third_party** |
+| "sag hallo, Moritz" | passes (cue) | **nothing** — the model declined |
+| "Als ich sechs war, sah ich einmal ein wunderbares Bild." | blocked | never reaches the model |
+
+So the pipeline did produce the right answer for the user's sentence. It was
+invisible for two independent reasons, and both are now fixed: there was no
+chip UI to show it, and `match_threshold` was minting a new speaker every
+utterance so a name could never stick to anybody. The `addressed` row is an
+honest gap — the model returned no candidate for it, and the adjacency logic
+it feeds is therefore unexercised on real speech.
+
 ### 17.6 Build order and what each step needs
 
 Order is by dependency, not by user priority — (b) carries the surface every

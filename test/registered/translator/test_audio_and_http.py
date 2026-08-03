@@ -632,6 +632,33 @@ class TestClientAsset(unittest.TestCase):
         )
         self.assertIn("no-cache", again.headers.get("cache-control", ""))
 
+        # The section 17 surface must actually be on the screen. It lived in
+        # the protocol and in 380 tests for a while, which made "implemented"
+        # read as "usable" -- the phone could reach none of it.
+        for marker in ('id="transcript"', 'id="speakers"', 'id="chips"'):
+            self.assertIn(marker, html, marker)
+        self.assertIn("bindTalkButton", html,
+                      "each speaker needs its own hold-to-speak button")
+        self.assertIn('kind: "speaker.arm"', html)
+        self.assertIn('kind: "line.resolve"', html)
+        self.assertIn('kind: "suggestion.confirm"', html)
+        # Auto-scroll that yields to a reader who scrolled up.
+        self.assertIn("function atBottom", html)
+        self.assertIn("if (follow) transcriptBox.scrollTop", html)
+        # Tap-to-toggle, not press-and-hold: on Android a long press is the
+        # text-selection gesture and it cancelled the recording mid-word.
+        self.assertIn("function toggleTalk", html)
+        self.assertIn("tap to stop", html)
+        self.assertIn("MIN_TURN_MS", html, "a stray double tap must not "
+                      "send an empty turn silently")
+        for guard in ("-webkit-touch-callout", "user-select", "contextmenu",
+                      "touch-action"):
+            self.assertIn(guard, html, guard)
+        # Both texts on every line. The original is the only thing a speaker
+        # can check the translation against.
+        self.assertIn("txt.textContent = line.source_text", html)
+        self.assertIn('target + ": " + line.translations[target]', html)
+
         manifest = client.get("/manifest.webmanifest").json()
         self.assertEqual(manifest["display"], "standalone")
 

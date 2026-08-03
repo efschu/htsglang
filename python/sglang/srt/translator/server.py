@@ -426,6 +426,12 @@ class _Connection:
                  "suggestion_id": message.get("suggestion_id"),
                  "lines_updated": len(changed)}
             )
+        elif kind == "name.undo":
+            took_back = self.session.undo_name(
+                str(message.get("suggestion_id", ""))
+            )
+            await self._send({"kind": "name.undone", "known": took_back,
+                              "state": self.session.state()})
         elif kind == "suggestion.discard":
             dropped = self.session.discard_suggestion(
                 str(message.get("suggestion_id", ""))
@@ -473,8 +479,21 @@ class _Connection:
                 return
             await self._send({"kind": "speaker.armed", "speaker_id": armed})
         elif kind == "speaker.add":
+            try:
+                voice_class = (
+                    VoiceClass(str(message["voice_class"]).strip().lower())
+                    if message.get("voice_class") else None
+                )
+            except ValueError:
+                await self._send(
+                    {"kind": "error", "stage": "voice",
+                     "message": f"unknown voice class "
+                                f"{message.get('voice_class')!r}"}
+                )
+                return
             speaker_id = self.session.add_speaker(
-                str(message.get("label") or "").strip() or None
+                str(message.get("label") or "").strip() or None,
+                voice_class=voice_class,
             )
             # Arm it at once: the "+" button exists because somebody new is
             # about to speak, and requiring a second tap to say so would make

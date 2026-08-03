@@ -69,6 +69,7 @@ from sglang.srt.translator.languages import (
 from sglang.srt.translator.mt import SentenceAccumulator
 from sglang.srt.translator.name_hints import (
     EXTRACTION_PROMPT,
+    KIND_SELF,
     NameSuggestion,
     SuggestionTracker,
     looks_like_naming,
@@ -432,6 +433,11 @@ class TranslatorSession:
         # LLM only ever classifies one utterance's text.
         self.name_hints = SuggestionTracker(clock=clock)
         self.suggestions: Dict[str, NameSuggestion] = {}
+        #: Names applied automatically, kept so they can be taken back.
+        self.applied_names: Dict[str, NameSuggestion] = {}
+        #: Speakers the user named by hand; the automatic path never touches
+        #: them again.
+        self._manual_names: set = set()
         self.name_suggestions_enabled = True
         self._clock = clock
         self._queue: Deque[Segment] = deque()
@@ -523,14 +529,26 @@ class TranslatorSession:
             {"line": line.to_json()},
         )
 
-    def name_speaker(self, speaker_id: str, label: str) -> List[TranscriptLine]:
+    def name_speaker(
+        self, speaker_id: str, label: str, manual: bool = True
+    ) -> List[TranscriptLine]:
         """Give a speaker a name; applies retroactively AND forward (§17.3).
 
         Returns the transcript lines that changed. The rename is stored on the
         profile, so lines created later carry it without a second pass.
         """
         profile = self.speakers.get(speaker_id)
+        if not manual and speaker_id in self._manual_names:
+            # A name the user typed is never overwritten by the automatic
+            # path. The machine may be right more often; the human is the one
+            # who has to live with the answer.
+            return []
         profile.label = label or None
+        if manual:
+            if label:
+                self._manual_names.add(speaker_id)
+            else:
+                self._manual_names.discard(speaker_id)
         changed = self.transcript.relabel_speaker(speaker_id, label or speaker_id)
         for line in changed:
             self._emit_line(line, update=True)
@@ -569,10 +587,41 @@ class TranslatorSession:
         )
         for suggestion in suggestions:
             self.suggestions[suggestion.suggestion_id] = suggestion
-            self.journal.append(
-                EventKind.SPEAKER_SUGGESTION, suggestion.to_json()
-            )
+            payload = suggestion.to_json()
+            # A person saying "ich bin X" about THEMSELVES is not a guess that
+            # needs confirming -- there is no other party the name could
+            # belong to, and the user reported the name plainly not working
+            # when it sat in a chip. So `self` applies immediately, is marked
+            # as automatic, and stays undoable. The two AMBIGUOUS kinds do
+            # not: a third-party introduction belongs to nobody in the room
+            # yet, and an addressed name is inferred from turn adjacency,
+            # which is exactly where a wrong guess would be expensive.
+            if suggestion.kind == KIND_SELF and suggestion.speaker_id:
+                try:
+                    changed = self.name_speaker(
+                        suggestion.speaker_id, suggestion.name, manual=False
+                    )
+                except KeyError:
+                    changed = []
+                payload["applied"] = True
+                payload["automatic"] = True
+                payload["lines_updated"] = len(changed)
+                self.suggestions.pop(suggestion.suggestion_id, None)
+                self.applied_names[suggestion.suggestion_id] = suggestion
+            self.journal.append(EventKind.SPEAKER_SUGGESTION, payload)
         return suggestions
+
+    def undo_name(self, suggestion_id: str) -> bool:
+        """Take back an automatically applied name (§17.3)."""
+        suggestion = self.applied_names.pop(suggestion_id, None)
+        if suggestion is None:
+            return False
+        try:
+            self.name_speaker(suggestion.speaker_id, "", manual=False)
+        except KeyError:
+            return False
+        self.name_hints.discard(suggestion.speaker_id, suggestion.name)
+        return True
 
     def confirm_suggestion(
         self, suggestion_id: str, speaker_id: Optional[str] = None
@@ -728,7 +777,11 @@ class TranslatorSession:
         )
         return self._armed_speaker
 
-    def add_speaker(self, label: Optional[str] = None) -> str:
+    def add_speaker(
+        self,
+        label: Optional[str] = None,
+        voice_class: Optional[VoiceClass] = None,
+    ) -> str:
         """The "+" button: somebody new is here, and the user says so.
 
         No audio yet, so no centroid yet. Their first attributed utterance
@@ -737,9 +790,21 @@ class TranslatorSession:
         person against the existing ones and could have merged them.
         """
         profile = self.speakers.create_speaker(label=label)
+        # The user stating the class is better evidence than the F0 heuristic
+        # could ever be, and it is available BEFORE the first utterance --
+        # which is exactly when a preset voice has to be chosen. Without it a
+        # manually added speaker would have to talk once before sounding
+        # right.
+        if voice_class is not None and self.voice_pool is not None:
+            self.override_voice_class(profile.speaker_id, voice_class)
         self.journal.append(
             EventKind.SESSION_STATE,
-            {"speaker_added": profile.speaker_id, "label": label},
+            {
+                "speaker_added": profile.speaker_id,
+                "label": label,
+                "voice_class": voice_class.value if voice_class else None,
+                "manual": True,
+            },
         )
         return profile.speaker_id
 

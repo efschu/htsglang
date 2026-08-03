@@ -47,11 +47,45 @@
   footer { padding:12px 14px calc(12px + env(safe-area-inset-bottom));
            border-top:1px solid #24242e; display:flex; gap:10px;
            align-items:center; }
+  #transcript { flex:1; overflow-y:auto; padding:8px 10px; min-height:120px; }
+  #transcript .line { border-left:3px solid #2c2c3a; padding:5px 8px; margin:5px 0;
+                      background:#16161e; border-radius:0 8px 8px 0; }
+  #transcript .who { font:11px ui-monospace,Menlo,monospace; color:#8a8aa0; }
+  #transcript .txt { font-size:15px; margin-top:2px; }
+  #transcript .alt { font-size:14px; color:#9ad0b8; margin-top:3px;
+                     padding-left:8px; border-left:2px solid #2c4a3e; }
+  #transcript .alt.pending { color:#6a6a80; font-style:italic; }
+  #transcript .line.uncertain { border-left-color:#c8912f; }
+  #transcript .notice { color:#8a8aa0; font-size:12px; font-style:italic; }
+  .cands { margin-top:4px; display:flex; gap:6px; flex-wrap:wrap; }
+  .cand { font-size:12px; padding:3px 8px; border-radius:12px;
+          border:1px solid #3a3a4c; background:#1c1c26; color:#d8d8e4; }
+  .cand.new { border-style:dashed; }
+  #chips { display:flex; gap:6px; flex-wrap:wrap; padding:0 10px; }
+  .chip { font-size:13px; padding:5px 9px; border-radius:14px;
+          border:1px solid #3a5d7c; background:#1a2733; }
+  .chip button { font-size:12px; margin-left:6px; padding:2px 7px; }
+  #speakers { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  #speakers button { flex:1 1 auto; min-width:88px; padding:11px 8px;
+                     font-size:14px; border-radius:11px; background:#1c1c26; }
+  #speakers button.add { flex:0 0 auto; min-width:46px; }
   #diag { font:11px/1.5 ui-monospace,Menlo,Consolas,monospace; color:#7a7a8c;
           padding:6px 10px; word-break:break-all; }
   #talk { flex:1; padding:20px; font-size:19px; border-radius:14px;
-          background:#1c1c26; touch-action:none; user-select:none; }
-  #talk.live { background:#2f5d7c; border-color:var(--accent); }
+          background:#1c1c26; }
+  /* Android reads a long press on a normal element as "select text", which
+     cancels the press and leaves the user holding a selection handle instead
+     of recording. All four properties are needed: the callout is the iOS/
+     WebKit half, user-select the selection half, touch-action the gesture
+     half. */
+  #talk, #speakers button, .cand, .chip button {
+    touch-action: manipulation;
+    user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.55 } }
+  #talk.live, #speakers button.live { background:#7c2f3d; border-color:#c8556b;
+                                      animation:pulse 1.1s infinite; }
   #meter { height:6px; border-radius:3px; background:#24242e; flex:0 0 70px; }
   #meter > i { display:block; height:100%; width:0; border-radius:3px;
                background:var(--accent); }
@@ -104,11 +138,20 @@
 <div id="log"></div>
 <!-- The capture chain, on screen. The same values go to the server so a
      log reader sees exactly what the person holding the phone sees. -->
+<!-- The conversation, as the reader scrolls it (design 17.2). Fed by
+     transcript.line / transcript.update, restored whole on reconnect, and
+     ended only by an explicit clear. -->
+<div id="transcript"></div>
+<div id="chips"></div>
 <div id="diag">build ? | capture not started</div>
 
 <footer>
   <div id="meter"><i></i></div>
-  <button id="talk" disabled>hold to speak</button>
+  <!-- One hold-to-speak button per known speaker (design 17.5). Holding one
+       attributes the utterance directly and skips identification. The general
+       button stays large underneath. -->
+  <div id="speakers"></div>
+  <button id="talk" disabled>tap to speak</button>
 </footer>
 
 <script>
@@ -531,17 +574,259 @@ function turnNode(id) {
   return node;
 }
 
+// ---------------------------------------------------------------------------
+// The transcript panel (design 17.2), the speaker row (17.5), the uncertainty
+// badges (17.4) and the name chips (17.3).
+//
+// Every one of these renders SERVER state. The client owns none of it: a
+// reconnect replays the record, and a correction is a round trip, so two
+// devices in the same session never disagree about who said what.
+// ---------------------------------------------------------------------------
+const transcriptBox = el("transcript");
+const speakerRow = el("speakers");
+const chipBox = el("chips");
+let knownSpeakers = [];
+
+/** Follow new lines unless the reader has deliberately scrolled up. */
+function atBottom() {
+  return transcriptBox.scrollHeight - transcriptBox.scrollTop
+         - transcriptBox.clientHeight < 40;
+}
+
+function renderLine(line) {
+  const existing = transcriptBox.querySelector('[data-line="' + line.line_id + '"]');
+  const follow = atBottom();
+  const node = existing || document.createElement("div");
+  if (!existing) {
+    node.dataset.line = line.line_id;
+    transcriptBox.appendChild(node);
+  }
+  if (line.kind === "notice") {
+    node.className = "line notice";
+    node.textContent = line.text;
+  } else {
+    node.className = "line" + (line.confidence === "uncertain" ? " uncertain" : "");
+    const targets = Object.keys(line.translations || {}).sort();
+    node.innerHTML = "";
+    const who = document.createElement("div");
+    who.className = "who";
+    who.textContent = line.speaker_label + " · " + line.source_language
+      + (line.origin === "manual" ? " · you said so" : "")
+      + (line.resolved_by ? " · resolved (" + line.resolved_by + ")" : "");
+    // BOTH, always. The original is what the speaker actually said and it is
+    // the only thing they can check the translation against; showing one of
+    // the two made the transcript unverifiable. Fan-out gets one line per
+    // target with its language tag.
+    const txt = document.createElement("div");
+    txt.className = "txt";
+    txt.textContent = line.source_text;
+    node.append(who, txt);
+    if (targets.length) {
+      for (const target of targets) {
+        const out = document.createElement("div");
+        out.className = "alt";
+        out.textContent = target + ": " + line.translations[target];
+        node.appendChild(out);
+      }
+    } else {
+      const out = document.createElement("div");
+      out.className = "alt pending";
+      out.textContent = "(translating)";
+      node.appendChild(out);
+    }
+    if (line.confidence === "uncertain" && (line.candidates || []).length) {
+      const row = document.createElement("div");
+      row.className = "cands";
+      for (const c of line.candidates) {
+        const b = document.createElement("button");
+        b.className = "cand" + (c.new ? " new" : "");
+        b.textContent = (c.new ? c.label + " (new)" : c.label)
+                        + " " + c.similarity;
+        b.onclick = (e) => {
+          e.stopPropagation();
+          connection.sendControl({
+            kind: "line.resolve", line_id: line.line_id,
+            speaker_id: c.new ? null : c.speaker_id,
+          });
+        };
+        row.appendChild(b);
+      }
+      node.appendChild(row);
+    }
+  }
+  // Auto-scroll, but never yank a reader who went back to look at something.
+  if (follow) transcriptBox.scrollTop = transcriptBox.scrollHeight;
+}
+
+function applyTranscript(payload) {
+  if (!payload.lines) return;
+  if (payload.replace) transcriptBox.innerHTML = "";
+  for (const line of payload.lines) renderLine(line);
+  transcriptBox.scrollTop = transcriptBox.scrollHeight;
+}
+
+function renderSpeakers(speakers) {
+  knownSpeakers = speakers || [];
+  speakerRow.innerHTML = "";
+  for (const sp of knownSpeakers) {
+    const b = document.createElement("button");
+    b.dataset.speaker = sp.speaker_id;
+    b.textContent = sp.label || sp.speaker_id;
+    bindTalkButton(b, sp.speaker_id);
+    let hold = null;
+    b.addEventListener("pointerdown", () => {
+      hold = setTimeout(() => {
+        hold = null;
+        // Mark the press as consumed so the pointerup does not also toggle
+        // recording -- a rename must never start a turn.
+        b.dataset.renamed = "1";
+        renameSpeaker(sp.speaker_id, sp.label);
+      }, 650);
+    });
+    for (const ev of ["pointerup", "pointercancel", "pointerleave"]) {
+      b.addEventListener(ev, () => { if (hold) { clearTimeout(hold); hold = null; } });
+    }
+    speakerRow.appendChild(b);
+  }
+  const add = document.createElement("button");
+  add.className = "add";
+  add.textContent = "+";
+  add.title = "somebody new is speaking";
+  add.onclick = addSpeaker;
+  speakerRow.appendChild(add);
+}
+
+/** The "+" button: declare somebody new, with their voice class.
+ *
+ * The class is asked for because the user knows it and the F0 heuristic only
+ * guesses -- and it is needed BEFORE the first utterance, which is when a
+ * preset voice has to be picked. Without it a new speaker has to talk once
+ * before sounding right.
+ */
+function addSpeaker() {
+  const answer = (prompt(
+    "new speaker - voice class: man / woman / boy / girl", "man") || ""
+  ).trim().toLowerCase();
+  if (!answer) return;
+  if (["man", "woman", "boy", "girl"].indexOf(answer) < 0) {
+    sys("unknown voice class " + answer, true);
+    return;
+  }
+  const name = (prompt("name (optional)", "") || "").trim();
+  connection.sendControl({
+    kind: "speaker.add", voice_class: answer, label: name || null,
+  });
+}
+
+/** Rename any speaker, automatic or manual (design 17.3, manual path).
+ *
+ * A typed name outranks every suggestion and is never overwritten by the
+ * automatic path. Long-press, because the short press is hold-to-speak.
+ */
+function renameSpeaker(speakerId, current) {
+  const name = prompt("name for " + (current || speakerId), current || "");
+  if (name === null) return;
+  connection.sendControl({
+    kind: "speaker.name", speaker_id: speakerId, label: name.trim(),
+  });
+}
+
+function chip(suggestion) {
+  const node = document.createElement("div");
+  node.className = "chip";
+  const who = suggestion.speaker_id || "somebody";
+  if (suggestion.applied) {
+    // Already in force: a self-introduction leaves nothing to decide, so the
+    // only useful control is taking it back.
+    node.textContent = 'named ' + who + ' "' + suggestion.name + '"';
+    const undo = document.createElement("button");
+    undo.textContent = "undo";
+    undo.onclick = () => {
+      connection.sendControl({
+        kind: "name.undo", suggestion_id: suggestion.suggestion_id,
+      });
+      node.remove();
+    };
+    node.appendChild(undo);
+    chipBox.appendChild(node);
+    setTimeout(() => node.remove(), 20000);
+    return;
+  }
+  node.textContent = '"' + suggestion.name + '" — ' + who;
+  const yes = document.createElement("button");
+  yes.textContent = "name";
+  yes.onclick = () => {
+    connection.sendControl({
+      kind: "suggestion.confirm", suggestion_id: suggestion.suggestion_id,
+    });
+    node.remove();
+  };
+  const no = document.createElement("button");
+  no.textContent = "no";
+  no.onclick = () => {
+    connection.sendControl({
+      kind: "suggestion.discard", suggestion_id: suggestion.suggestion_id,
+    });
+    node.remove();
+  };
+  node.append(yes, no);
+  chipBox.appendChild(node);
+}
+
 function onEvent(event) {
   switch (event.kind) {
+    case "transcript":
+      applyTranscript({ lines: event.lines, replace: true });
+      break;
+    case "transcript.line":
+    case "transcript.update":
+      renderLine(event.line);
+      break;
+    case "transcript.cleared":
+      transcriptBox.innerHTML = "";
+      break;
+    case "speaker.suggestion":
+      chip(event);
+      break;
+    case "speaker.added":
+    case "name.undone":
+      if (event.state) renderSpeakers(event.state.speakers);
+      break;
+    case "speaker.named":
+      connection.sendControl({ kind: "state" });
+      break;
+    case "state":
+      if (event.state && event.state.speakers) {
+        renderSpeakers(event.state.speakers);
+      }
+      break;
+    case "session.ready":
+    case "session.state":
+      if (event.state && event.state.speakers) {
+        renderSpeakers(event.state.speakers);
+      }
+      break;
     case "turn.transcript": {
       const node = turnNode(event.turn_id);
       node.querySelector(".src").textContent = event.text;
       node.dataset.lang = event.language;
       break;
     }
+    case "ready":
+      if (event.state && event.state.speakers) {
+        renderSpeakers(event.state.speakers);
+      }
+      break;
     case "turn.speaker": {
       const node = turnNode(event.turn_id);
       node.dataset.speaker = event.speaker_id;
+      // A voice the row does not know yet gets a button, so the correction
+      // is available on the very next utterance rather than a turn later.
+      if (!knownSpeakers.some((sp) => sp.speaker_id === event.speaker_id)) {
+        renderSpeakers(
+          knownSpeakers.concat([{ speaker_id: event.speaker_id, label: null }])
+        );
+      }
       node.querySelector(".who").textContent =
         event.speaker_id + " · " + (node.dataset.lang || "?");
       break;
@@ -684,12 +969,78 @@ function endTalking() {
   talk.classList.remove("live");
 }
 
-for (const [down, up] of [["pointerdown", "pointerup"],
-                          ["pointerdown", "pointercancel"]]) {
-  talk.addEventListener(down, (e) => { e.preventDefault(); beginTalking(); });
-  talk.addEventListener(up, (e) => { e.preventDefault(); endTalking(); });
+/** Hold-to-speak, optionally attributed to one speaker (design 17.5).
+ *
+ * A speaker button ARMS the server before recording, so the utterance skips
+ * identification entirely rather than being identified and then overruled --
+ * overruling would still have folded the segment into the wrong centroid on
+ * the way past. The arming lasts exactly one utterance; the server clears it.
+ */
+let activeButton = null;
+let startedAt = 0;
+const MIN_TURN_MS = 300;
+
+/** Tap to speak, tap again to stop (user order, replaces press-and-hold).
+ *
+ * Holding was the original design and it lost to the platform: on Android a
+ * long press on any element is the text-selection gesture, so the press was
+ * cancelled mid-utterance and the user was left holding a selection handle.
+ * Tapping sidesteps the gesture entirely; the CSS hardening above stays
+ * anyway, because a button that can be "selected" is a bug in either model.
+ *
+ * A speaker button ARMS the server first, so the utterance skips
+ * identification rather than being identified and then overruled.
+ */
+function toggleTalk(node, speakerId) {
+  if (activeButton && activeButton !== node) {
+    // Switching speaker mid-recording ends the current turn rather than
+    // silently reattributing it.
+    stopTalk();
+  }
+  if (activeButton === node) {
+    if (Date.now() - startedAt < MIN_TURN_MS) {
+      // Named, not silent: a stray double tap would otherwise send an empty
+      // turn and look like the app ignoring the press.
+      sys("that was a double tap, still recording", false);
+      return;
+    }
+    stopTalk();
+    return;
+  }
+  if (speakerId) {
+    connection.sendControl({ kind: "speaker.arm", speaker_id: speakerId });
+  }
+  activeButton = node;
+  startedAt = Date.now();
+  node.classList.add("live");
+  node.dataset.idle = node.textContent;
+  node.textContent = "tap to stop";
+  beginTalking();
 }
-talk.addEventListener("pointerleave", endTalking);
+
+function stopTalk() {
+  const node = activeButton;
+  activeButton = null;
+  if (node) {
+    node.classList.remove("live");
+    if (node.dataset.idle) node.textContent = node.dataset.idle;
+  }
+  endTalking();
+}
+
+function bindTalkButton(node, speakerId) {
+  // Pointer events only, and the context menu is refused: both halves of the
+  // long-press gesture have to be closed or Android reopens it.
+  node.addEventListener("contextmenu", (e) => e.preventDefault());
+  node.addEventListener("selectstart", (e) => e.preventDefault());
+  node.addEventListener("pointerup", (e) => {
+    e.preventDefault();
+    if (node.dataset.renamed === "1") { node.dataset.renamed = "0"; return; }
+    toggleTalk(node, speakerId);
+  });
+}
+
+bindTalkButton(talk, null);
 
 el("mode").addEventListener("change", async (e) => {
   if (e.target.value === "vad") {
@@ -714,8 +1065,9 @@ el("mode").addEventListener("change", async (e) => {
     talk.textContent = "listening (auto)";
     talk.disabled = true;
   } else {
+    stopTalk();
     microphone.setOpen(false);
-    talk.textContent = "hold to speak";
+    talk.textContent = "tap to speak";
     talk.disabled = false;
   }
 });
