@@ -46,9 +46,13 @@ import asyncio
 import json
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 DEFAULT_URL = "https://efeu.ddnss.de/translate/"
+#: The tenant's own metrics endpoint, read directly rather than through the
+#: public front door: ``/translate/`` is a path mount and does not carry it.
+DEFAULT_METRICS_URL = "http://192.168.0.101:30800/metrics"
 DEFAULT_CLIP = Path(
     "/spinning/llm_stuff/translator-models/xtts-v2/samples/de_sample.wav"
 )
@@ -191,10 +195,54 @@ STOP_QUIESCE_S = 8.0
 #: trickling frames for the whole window has not been stopped, whatever the
 #: rate. This is the assertion; the window above only bounds the wait.
 STOP_QUIET_S = 2.5
+#: Under the ``line`` trigger the arm fires BEFORE any audio exists, so the
+#: question is no longer "did the tail stop" but "did the audio ever come".
+#: That cannot be answered by an early break on silence -- silence is the
+#: state the arm starts in. The window is therefore watched to the end, and
+#: sized to outlast a healthy turn's synthesis: measured first audio is
+#: 4-15 s from the turn's start against a transcript line at ~4 s, so 20 s
+#: after the line covers it with margin. The control that proves the window
+#: is long enough is the sabotage run, which must see frames inside it.
+STOP_WATCH_S = 20.0
 
 
-async def stop_arm(page, sabotage: bool = False) -> dict:
-    """Send ``playback.stop`` mid-playback and watch what the server does.
+def read_talker_gauges(metrics_url: str) -> dict:
+    """The two gauges that say WHERE a turn is: in synthesis, or behind it.
+
+    Diagnostic only -- never an assertion. §17.8.11 added
+    ``translator_talker_busy`` and ``translator_session_queue_depth_max``
+    precisely so a stop arm can record whether the pipeline was synthesizing
+    (busy 1, depth 0) or queued (depth > 0) at the instant the stop was
+    written, instead of leaving that to be argued afterwards.
+
+    Both gauges are process-wide rather than per session, so with more than
+    one live conversation they answer "was this SERVER synthesizing", not
+    "was this session". That is why they are printed and not asserted.
+    """
+    wanted = ("translator_talker_busy", "translator_session_queue_depth_max")
+    out: dict = {}
+    try:
+        with urllib.request.urlopen(metrics_url, timeout=3) as response:
+            body = response.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    for raw in body.splitlines():
+        if raw.startswith("#"):
+            continue
+        name, _, value = raw.partition(" ")
+        if name in wanted:
+            try:
+                out[name.replace("translator_", "")] = float(value)
+            except ValueError:
+                continue
+    return out
+
+
+async def stop_arm(
+    page, sabotage: bool = False, metrics_url: str = "",
+    trigger: str = "line",
+) -> dict:
+    """Send ``playback.stop`` while the turn is live and watch the server.
 
     Two things are measured and they answer different questions. The ACK says
     the server understood and names what it abandoned -- that is the protocol
@@ -207,20 +255,33 @@ async def stop_arm(page, sabotage: bool = False) -> dict:
     decoration) -- with the frame never sent, no ack arrives and the arm must
     fail.
 
-    WHAT THE CAN-FAIL PROOF ACTUALLY COVERED, measured rather than claimed
-    (run `gate_stopcanfail_b17.log`): the ACK half failed as required, and the
-    QUIESCENCE half did NOT -- it reported `frames after stop 0, quiet 2.52 s`
-    in the sabotage run too. The reason is the workload, not the assertion:
-    the talker is batch, so a single-clause turn's audio has entirely arrived
-    before the arm looks, and `dropped_queued` was 0, so there was nothing
-    left for a stop to prevent. On that shape the quiescence assertion is
-    trivially true and therefore proves nothing.
+    WHEN THIS ARM FIRES IS THE WHOLE DESIGN, and it was wrong until run
+    `gate_bundle_b.log` failed on it. It used to fire one poll after the first
+    audio frame reached playback, which reads as "mid-playback" but is not:
+    the talker is BATCH, so the client's first frame of a unit arrives only
+    once that unit is fully synthesized. For a single-unit turn that instant
+    is also the instant the turn ENDS and ``_active_turn_id`` is cleared
+    (`session.py:1073`), so whether the ack could still name an aborted turn
+    was decided by a race between a 250 ms poll and the server's own teardown.
+    Run 1 of the bundle won that race, run 2 lost it and reported
+    `aborted_turn_id None` -- correctly failed by the gate as an arm that
+    tested nothing.
 
-    So it bites only where there IS a backlog -- a multi-clause turn, or a
-    queued second turn, with the stop fired while the worker still has units
-    to synthesize. Until this arm is driven with such a turn, treat the
-    quiescence half as UNPROVEN and read the ack half as the evidence.
+    The trigger is therefore the TRANSCRIPT LINE, not the first audio frame.
+    A line on the page means the server is inside ``_run_turn_locked`` past
+    recognition (`session.py:1157-1171`) with MT and synthesis still ahead of
+    it, which is a guarantee rather than a race -- on the measured floor it
+    buys ~6-10 s of margin instead of ~0. It also makes the QUIESCENCE half
+    bite for the first time: fired before any audio exists, a working stop
+    yields no frames at all, while the sabotage run gets the turn's entire
+    output and fails. That half was a decoration under the old trigger
+    because all the audio had already landed before the arm looked.
+
+    ``--stop-trigger audio`` keeps the old behaviour for comparison. It tests
+    the client half (drop what is already buffered), which the UI agent's own
+    arm covers, and it is racy for the server half by construction.
     """
+    gauges = read_talker_gauges(metrics_url) if metrics_url else {}
     frames_at_stop = await page.evaluate("window.__gate.frames")
     acks_before = await page.evaluate("window.__gate.acks.length")
     sent = False
@@ -233,16 +294,28 @@ async def stop_arm(page, sabotage: bool = False) -> dict:
               return true;
             }"""
         ))
+    # Watched to the end under ``line`` -- see ``STOP_WATCH_S``. Breaking
+    # early on silence there would be reporting the arm's own starting state
+    # as its result.
+    watch_s = STOP_WATCH_S if trigger == "line" else STOP_QUIESCE_S
     t0 = time.monotonic()
     last_change = t0
     last_count = frames_at_stop
-    while time.monotonic() - t0 < STOP_QUIESCE_S:
+    # When audio FIRST appeared after the arm fired. Without this the turn's
+    # ``audio_s`` would be stamped at the end of the watch window, reporting a
+    # 20 s wait for audio that arrived in 5 -- a number that reads as a
+    # measurement and is an artefact of how long the arm chose to look.
+    first_frame_at = None
+    while time.monotonic() - t0 < watch_s:
         await asyncio.sleep(0.25)
         now = await page.evaluate("window.__gate.frames")
         if now != last_count:
+            if first_frame_at is None:
+                first_frame_at = time.monotonic()
             last_count = now
             last_change = time.monotonic()
-        elif time.monotonic() - last_change >= STOP_QUIET_S:
+        elif (trigger == "audio"
+                and time.monotonic() - last_change >= STOP_QUIET_S):
             break
     quiet_for = time.monotonic() - last_change
     acks = await page.evaluate(f"window.__gate.acks.slice({acks_before})")
@@ -252,17 +325,23 @@ async def stop_arm(page, sabotage: bool = False) -> dict:
     return {
         "sent": sent,
         "sabotage": sabotage,
+        "trigger": trigger,
+        "first_frame_after_stop_at": first_frame_at,
         "frames_at_stop": frames_at_stop,
         "frames_after_stop": last_count - frames_at_stop,
         "quiet_for_s": round(quiet_for, 2),
         "quiesced": quiet_for >= STOP_QUIET_S,
         "acks": [entry["ack"] for entry in acks],
         "ws": ws_state,
+        # What the server was doing when the stop was written. Printed, never
+        # asserted -- see ``read_talker_gauges``.
+        "gauges": gauges,
     }
 
 
 async def one_turn(
     page, index: int, speak_s: float, budgets: dict, stop_mode: str = "",
+    stop_trigger: str = "line", metrics_url: str = "",
 ) -> dict:
     """Tap, speak, tap, and wait for what a person would wait for."""
     # Re-attach after a reconnect: ``connection.ws`` is replaced, and the
@@ -290,6 +369,10 @@ async def one_turn(
     # checked at the end, because the notice is deliberately transient: the
     # translation that clears it is the same event that ends the wait.
     saw_waiting = False
+    # THE STOP ARM (§19.12). Fired from inside the wait loop the moment its
+    # trigger is met -- see ``stop_arm`` for why that trigger is the
+    # transcript line and not the first audio frame.
+    stop_report = None
     deadline = started + max(budgets["line"], budgets["audio"])
     while time.monotonic() < deadline:
         if not saw_waiting:
@@ -305,17 +388,27 @@ async def one_turn(
         if audio_at is None:
             if await page.evaluate("window.__gate.frames") > before_frames:
                 audio_at = time.monotonic() - started
+        armed = line_at if stop_trigger == "line" else audio_at
+        if stop_mode and stop_report is None and armed is not None:
+            stop_report = await stop_arm(
+                page,
+                sabotage=(stop_mode == "sabotage"),
+                metrics_url=metrics_url,
+                trigger=stop_trigger,
+            )
+            # The arm has already spent its own quiescence window watching the
+            # frame counter, so everything this turn will ever deliver is in
+            # its report. A stopped turn produces no audio BY DESIGN, and
+            # waiting out the audio budget for it would only be waiting for
+            # something the test just cancelled.
+            if audio_at is None and stop_report["first_frame_after_stop_at"]:
+                audio_at = (
+                    stop_report["first_frame_after_stop_at"] - started
+                )
+            break
         if line_at is not None and audio_at is not None:
             break
         await asyncio.sleep(0.25)
-
-    # THE STOP ARM (§19.12). Fired here, one poll after the FIRST frame
-    # reached the playback path, which is the only moment worth testing: a
-    # stop that arrives before the talker started, or after it finished,
-    # proves nothing about the case the button exists for.
-    stop_report = None
-    if stop_mode and audio_at is not None:
-        stop_report = await stop_arm(page, sabotage=(stop_mode == "sabotage"))
 
     # ``turn.done`` lands AFTER the last audio frame, so the loop above has
     # already broken out by the time the stage timings exist. Wait for it
@@ -532,7 +625,9 @@ async def run_gate(args) -> tuple:
             if args.stop_during_playback and i + 1 == args.stop_during_playback:
                 stop_mode = "sabotage" if args.stop_sabotage else "send"
             turn = await one_turn(
-                page, i + 1, min(speak_s, 4.0), budgets, stop_mode=stop_mode
+                page, i + 1, min(speak_s, 4.0), budgets, stop_mode=stop_mode,
+                stop_trigger=args.stop_trigger,
+                metrics_url=args.metrics_url,
             )
             results.append(turn)
             print(f"[gate] turn {turn['turn']}: line {turn['line_s']}s "
@@ -557,7 +652,15 @@ async def run_gate(args) -> tuple:
                     f"turn {turn['turn']}: no transcript line appeared live "
                     f"within {budgets['line']}s (the user's 'only after a reload')"
                 )
-            if turn["audio_s"] is None:
+            # A turn the stop arm ABORTED is supposed to produce no audio, so
+            # the audio assertion would fail it for doing exactly what was
+            # asked. The sabotage variant sends nothing and therefore still
+            # owes its audio -- without it the can-fail proof is vacuous, and
+            # that vacuity is asserted a few lines below.
+            stopped_on_purpose = (
+                turn["stop"] is not None and turn["stop"]["sent"]
+            )
+            if turn["audio_s"] is None and not stopped_on_purpose:
                 failures.append(
                     f"turn {turn['turn']}: no audio reached playback within "
                     f"{budgets['audio']}s"
@@ -599,9 +702,33 @@ async def run_gate(args) -> tuple:
                 stop = turn["stop"]
                 print(f"[gate]   stop   : sent {stop['sent']} "
                       f"sabotage {stop['sabotage']} "
+                      f"trigger {args.stop_trigger} "
+                      f"frames before stop {stop['frames_at_stop']} "
                       f"frames after stop {stop['frames_after_stop']} "
                       f"quiet {stop['quiet_for_s']}s ws {stop['ws']} "
+                      f"gauges {stop['gauges']} "
                       f"acks {stop['acks']}")
+                # The can-fail proof has to be able to fail. Sent nothing and
+                # got no audio either: the quiescence half was true for want
+                # of a workload, not because a stop worked (§17.8.10).
+                if stop["sabotage"] and stop["frames_after_stop"] == 0:
+                    failures.append(
+                        f"turn {turn['turn']}: the sabotage arm saw no audio "
+                        f"at all, so 'it went quiet' was trivially true and "
+                        f"the quiescence half proved nothing"
+                    )
+                # Fired before the talker produced anything, a stop that works
+                # means the turn is never spoken AT ALL -- not merely that it
+                # tails off. The sabotage run is the control that this window
+                # is long enough to have seen audio.
+                if (stop["trigger"] == "line" and stop["sent"]
+                        and stop["frames_after_stop"] > 0):
+                    failures.append(
+                        f"turn {turn['turn']}: {stop['frames_after_stop']} "
+                        f"audio frames arrived after a stop sent BEFORE any "
+                        f"audio existed -- the turn was not abandoned, it was "
+                        f"spoken anyway"
+                    )
                 if not stop["acks"]:
                     failures.append(
                         f"turn {turn['turn']}: playback.stop was never "
@@ -810,6 +937,23 @@ def main() -> int:
              "reached the playback path, and require the server to say what "
              "it abandoned AND to go quiet. Put a turn after it (--turns N+1) "
              "to prove the stop freed the talker rather than wedging it",
+    )
+    parser.add_argument(
+        "--stop-trigger", choices=("line", "audio"), default="line",
+        help="WHEN the stop arm fires. 'line' (default) fires once the "
+             "transcript line is on the page, which guarantees the server is "
+             "inside the turn with synthesis still ahead of it. 'audio' is "
+             "the old trigger and is racy against a batch talker: the first "
+             "frame of a single-unit turn arrives as that turn ends, so the "
+             "ack could name no aborted turn through no fault of the server "
+             "(gate_bundle_b.log)",
+    )
+    parser.add_argument(
+        "--metrics-url", default=DEFAULT_METRICS_URL,
+        help="read translator_talker_busy / _session_queue_depth_max at the "
+             "instant of the stop and print them. Diagnostic only, never "
+             "asserted -- the gauges are process-wide, not per session. "
+             "Empty string disables the read",
     )
     parser.add_argument(
         "--stop-sabotage", action="store_true",
