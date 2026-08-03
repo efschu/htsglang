@@ -301,12 +301,23 @@ of it has executed against hardware.
    against a real server or a real holder file.
 8. **`probes.py` server-facing modes** — `prefill`, `decode`, `avsa`,
    `determined`, `accept`, `chatprobe`, `idem-record`, `idem-compare`. Only
-   their pure helpers were selftested. In particular `stream_bounded`'s SSE
-   loop has never seen a real sglang stream: **the assumption that
-   `meta_info.spec_verify_ct` and `completion_tokens` appear on streamed
-   chunks is UNVERIFIED.** The code degrades named (`round_kind` reports
-   `"token (no spec_verify_ct in meta_info)"`) rather than silently, but the
-   first F2/DSpark arm must check that line before any ms/round is quoted.
+   their pure helpers were selftested. `stream_bounded`'s SSE loop has still
+   never seen a real sglang stream.
+
+   **RESOLVED at desk (was the biggest unverified assumption).** The counters
+   do NOT appear on intermediate streamed chunks:
+   `_calculate_spec_decoding_metrics` is called only inside `if state.finished:`
+   (`tokenizer_manager.py:2145-2153`), so `spec_verify_ct` is attached to the
+   FINAL chunk and to no other. The original per-chunk delta
+   (`last - first`) could therefore never fire — it would have reported
+   token-kind rounds on a perfectly healthy speculative arm, permanently and
+   quietly, defeating the ms/verify measurement that #470 and #462 both hang
+   on. Fixed: the count is read from the final `meta_info`, a stream cut off
+   before finish now refuses to report verify rounds by name instead of
+   falling back, and `max_new_tokens` is sized so the request COMPLETES inside
+   the time budget (the time bound is the safety cut-off, not the intended
+   stop). The decision moved into the pure `classify_rounds()` and is pinned
+   by eight selftest arms, including a can-fail arm for the cut-off case.
 9. **The `43` crossings assertion** — the number comes from TICKET_462 §3; it
    has not been observed here.
 10. **The determined-answer scorers against the actual model.** They are proven

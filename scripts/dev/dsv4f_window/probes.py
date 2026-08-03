@@ -137,6 +137,36 @@ def parse_sse_line(line: str) -> dict | None:
         return None
 
 
+def classify_rounds(
+    cut_off: bool,
+    tokens: int,
+    spec_verify_ct: Any,
+    completion_tokens: int,
+) -> dict:
+    """Decide what a "round" was, from the FINAL meta_info only.
+
+    Pure, so the decision is testable without a server. See ``stream_bounded``
+    for why only the final chunk can carry ``spec_verify_ct``.
+    """
+    if cut_off:
+        # The request never finished, so no verify count exists anywhere. Say
+        # so rather than reporting ms/token under a verify label.
+        return {
+            "rounds": tokens,
+            "round_kind": "token (stream cut off before finish: no verify count exists)",
+        }
+    if spec_verify_ct is not None and int(spec_verify_ct) > 0:
+        rounds = int(spec_verify_ct)
+        out = {"rounds": rounds, "round_kind": "verify"}
+        # completion_tokens / verify_ct is the accept length INCLUDING the
+        # bonus token -- the same definition as tokenizer_manager.py:2421.
+        out["accept_length"] = round(completion_tokens / rounds, 4)
+        return out
+    # Non-speculative arm: one round IS one token. Stated, not silently
+    # assumed, so a speculative arm that lost its counter stays visible.
+    return {"rounds": tokens, "round_kind": "token (no spec_verify_ct in meta_info)"}
+
+
 def stream_bounded(
     base: str, text: str, window_seconds: float, max_new_tokens: int = 100000,
     connect_timeout: float = 120.0,
@@ -148,8 +178,28 @@ def stream_bounded(
                       (time to first token = the prefill phase),
       ``decode_s``    wall seconds from the first chunk to the last one,
       ``tokens``      completion tokens produced inside that decode span,
-      ``rounds``      verify rounds inside the span when the arm is
-                      speculative (``spec_verify_ct`` delta), else tokens.
+      ``rounds``      verify rounds when the arm is speculative and the request
+                      RAN TO COMPLETION, else tokens.
+
+    On ``spec_verify_ct`` and why a time-bounded cut-off cannot price a verify
+    round (verified at desk, tokenizer_manager.py:2145-2153): the speculative
+    counters are attached to ``meta_info`` only inside ``if state.finished:``,
+    via ``_calculate_spec_decoding_metrics``. They therefore appear on the
+    FINAL chunk and on no other. Two consequences:
+
+      * A per-chunk delta (``last - first``) can never fire -- the first chunk
+        never carries the counter -- so it would silently and permanently
+        report token-kind rounds even on a healthy speculative arm.
+      * A stream that is cut off by the time bound never finishes, so it
+        carries no counter at all.
+
+    So ms/verify needs a request that COMPLETES. Size ``max_new_tokens`` to
+    land inside the time budget at the arm's expected decode rate and leave
+    ``window_seconds`` as the safety cut-off rather than the intended stop;
+    ``rounds`` is then the final ``spec_verify_ct`` for the whole generation.
+    That total includes the verify round overlapping prefill, which is why
+    ``ms_prefill`` is reported separately and ``ms_round`` is derived over the
+    decode span only.
     """
     body = {
         "text": text,
@@ -198,15 +248,14 @@ def stream_bounded(
     tok_last = last_meta.get("completion_tokens") or 0
     rec["tokens"] = max(0, int(tok_last) - int(tok_first))
 
-    vc_first, vc_last = first_meta.get("spec_verify_ct"), last_meta.get("spec_verify_ct")
-    if vc_first is not None and vc_last is not None and int(vc_last) > int(vc_first):
-        rec["rounds"] = int(vc_last) - int(vc_first)
-        rec["round_kind"] = "verify"
-    else:
-        # No speculation on this arm: one round IS one token. Stated, not
-        # silently assumed, so a spec arm that lost its counter is visible.
-        rec["rounds"] = rec["tokens"]
-        rec["round_kind"] = "token (no spec_verify_ct in meta_info)"
+    rec.update(
+        classify_rounds(
+            cut_off=bool(rec["cut_off"]),
+            tokens=int(rec["tokens"]),
+            spec_verify_ct=last_meta.get("spec_verify_ct"),
+            completion_tokens=int(tok_last),
+        )
+    )
     rec["last_meta_info"] = last_meta
     return derive_rates(rec)
 
@@ -981,6 +1030,35 @@ def selftest() -> int:
     other = hashlib.sha256(b"abz").hexdigest()
     check("identical texts hash the same", same == hashlib.sha256(b"abc").hexdigest())
     check("different texts hash differently (can-fail arm)", same != other)
+
+    # --- 7b. round classification -------------------------------------------
+    # The counters live only on the final chunk (tokenizer_manager.py:2145-2153),
+    # so these arms pin the three cases apart. The can-fail arm is the cut-off
+    # one: a truncated stream must NOT be allowed to report verify rounds.
+    print("\n round classification")
+    fin = classify_rounds(False, 40, 20, 40)
+    check("a finished spec run reports verify rounds", fin["round_kind"] == "verify")
+    check("and rounds is the final verify count", fin["rounds"] == 20)
+    check("and accept length is tokens/rounds", fin["accept_length"] == 2.0)
+    cut = classify_rounds(True, 40, 20, 40)
+    check(
+        "a cut-off stream refuses verify rounds (can-fail arm)",
+        cut["round_kind"].startswith("token (stream cut off"),
+    )
+    check("and falls back to token rounds", cut["rounds"] == 40)
+    plain = classify_rounds(False, 40, None, 40)
+    check(
+        "a non-spec arm names the missing counter",
+        plain["round_kind"] == "token (no spec_verify_ct in meta_info)",
+    )
+    check(
+        "the three cases are distinguishable",
+        len({fin["round_kind"], cut["round_kind"], plain["round_kind"]}) == 3,
+    )
+    check(
+        "a zero verify count does not divide",
+        classify_rounds(False, 40, 0, 40)["rounds"] == 40,
+    )
 
     # --- 8. prompt construction --------------------------------------------
     print("\n prompt construction")
