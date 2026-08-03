@@ -1849,6 +1849,33 @@ qwen3_coder` (server-side fix, no template patches); fast lane, priority
 scheduling, admission throttle, prefill delayer; training tenant
 (`--enable-training-tenant`) + idle workbench (`--enable-idle-workbench`,
 ledger + pause rung).
+**Fast lane: two independent pressure mechanisms, only one lane-aware by
+default, #533/#534.** `--enable-fast-lane` tags a request via
+`GenerateReqInput.lane` (OpenAI clients: `extra_body={"lane": "fast"}`,
+`protocol.py:465-469` -> `serving_chat.py:619` -> `scheduler.py:2691`) and
+implies `--enable-priority-scheduling` (`server_args.py:15169` refuses the
+combination rather than silently degrading). Measured on this rig: an
+MT-shaped probe took 19.7 s to first token behind one 46k-token prefill and
+112.9 s behind four, against 154-186 ms idle; tagged `lane: "fast"` under the
+identical four-prefill load measured 23.6 s — a 4.8x win, not immunity,
+because `preempt_to_schedule` (`schedule_policy.py:1368`, `:1382`) iterates
+`running_batch.reqs` and a request still being chunk-prefilled is not in that
+set; chunk-preemptive admission is a separate, unbuilt cut. Two DIFFERENT
+mechanisms decide who yields under pressure and only one reads the lane by
+default: SLOT pressure (`--max-running-requests` full) already goes through
+`batch_is_full` -> `preempt_to_schedule` (`scheduler.py:3797-3809`), armed by
+`--enable-fast-lane` alone and **pinned end to end by #534's 9 hermetic
+tests** — this ticket was opened to build that trigger and found it already
+live, so the tests are pins against regression, not new mechanism. KV pressure
+(pool exhausted) goes through `retract_decode` ->
+`_get_decode_retraction_order` (`schedule_batch.py:2774`, `:2874`), which
+consults `req.priority` **only under `--retraction-policy priority`**
+(`schedule_batch.py:2894`) — at the shipped default (`length`) a fast-lane
+request can be retracted in favour of a heavy one under KV pressure alone,
+the opposite of the lane's purpose. `--retraction-policy priority` costs
+nothing beyond being named once `--enable-priority-scheduling` is already
+implied. The standard INT8 recipe (`docs/rig-runbook.md`) now carries both
+`--enable-fast-lane --retraction-policy priority`.
 
 Fork-added HTTP surface, enumerated against upstream (audit #500) — the
 catalog previously named two of these and the rest were discoverable only from

@@ -485,11 +485,72 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --speculative-algorithm NEXTN --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+  --enable-fast-lane --retraction-policy priority \
   --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
 echo $! > /tmp/<yourname>.pid
 ```
+
+**`--enable-fast-lane` belongs on any instance that serves an interactive
+client alongside bulk work** (#533). Without it a latency-critical request
+queues behind whatever the batch tier is doing: measured on this rig, an
+MT-shaped probe took **19.7 s** to first token behind a single 46k-token
+prefill, and **112.9 s** behind four of them, against 154-186 ms idle. Tag the
+interactive request and it jumps the queue -- OpenAI clients send
+`extra_body={"lane": "fast"}`, which is forwarded to `GenerateReqInput.lane`
+(`protocol.py:465-469` -> `serving_chat.py:619` -> `scheduler.py:2691`); the
+validator accepts only `"fast"` or omission. Untagged requests stay in the
+heavy tier by design, which is what makes the flag safe to leave on: the
+default path for an untagged workload is unchanged. Anti-starvation is built
+in and needs no tuning here -- `--fast-lane-reserved-heavy-slots 1` guarantees
+heavy forward progress and `--fast-lane-heavy-aging-ms 10000` promotes a heavy
+request that has waited too long. The flag implies
+`--enable-priority-scheduling` (set in `check_server_args`, NOT in
+`__post_init__` -- a hermetic `prepare_server_args()` still shows
+`enable_priority_scheduling=False`, which is an instrument artifact, not an
+inert flag; verify on the live boot via `/server_info`).
+
+Measured effect, same window, four 46k-token heavy jobs running (#533):
+
+| probe | TTFT |
+|---|---|
+| `lane: "fast"` | **23.6 s** |
+| untagged (heavy tier) | 112.9 s |
+| ratio | **4.8x** |
+
+The counter-probe is what makes this discriminating: both probes were
+identical MT-shaped requests issued concurrently under the same load, so the
+gap is the lane and nothing else. Note the fast probe is still seconds, not
+milliseconds -- preemption happens at admission points, and a 46k prefill
+already in flight is not interrupted mid-chunk. The lane buys an order of
+magnitude, not immunity.
+
+**`--retraction-policy priority` is the other half and is NOT the default**
+(#534). Two different mechanisms decide who yields, and only one of them was
+lane-aware:
+
+| pressure | mechanism | lane-aware? |
+|---|---|---|
+| SLOT (`--max-running-requests` full) | `batch_is_full` -> `preempt_to_schedule` (`scheduler.py:3797-3809`, `schedule_policy.py:1368`) | yes, via priority; armed by `--enable-fast-lane` alone |
+| KV (pool exhausted) | `retract_decode` -> `_get_decode_retraction_order` (`schedule_batch.py:2774`, `:2874`) | **only under `--retraction-policy priority`** |
+
+At the default `length` the KV-pressure path orders victims by output/input
+length and ignores `req.priority` entirely (`schedule_batch.py:2894` is the
+branch that reads it), so a fast-lane request can be retracted in favour of a
+heavy one -- the opposite of the lane's whole purpose. The flag requires
+`--enable-priority-scheduling`, which `--enable-fast-lane` already implies
+(`server_args.py:15169` refuses the combination rather than silently degrading
+to length ordering), so it costs nothing beyond being named.
+
+**Where the lane stops, stated at the width of what was checked.**
+`preempt_to_schedule` iterates `self.running_batch.reqs`
+(`schedule_policy.py:1382`) -- requests that are RUNNING. A request still being
+chunk-prefilled is not in that set and cannot be preempted. That is why the
+fast probe above still measured 23.6 s rather than milliseconds: it was waiting
+for four 46k-token prefills, not for a scheduling decision. Chunk-preemptive
+admission is a separate, unbuilt cut; the lane buys the order of magnitude,
+that cut would buy the milliseconds.
 
 Non-obvious points, each load-bearing:
 
