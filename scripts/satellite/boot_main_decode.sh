@@ -90,6 +90,7 @@ docker run -d --name "$NAME" --network host --ipc host \
       --mem-fraction-static $MAIN_MEM_FRAC \
       --context-length $MAIN_CTX \
       --max-running-requests 8 --page-size 1 \
+      --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
       --trust-remote-code --enable-metrics \
       --host 0.0.0.0 --port $MAIN_PORT $EXTRA
   "

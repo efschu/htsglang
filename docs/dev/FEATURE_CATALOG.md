@@ -2065,6 +2065,43 @@ named fallback rather than the feature: `scripts/dev/local_model_agent.sh`
 starts a separate `claude` process with a process-scoped environment, and
 `scripts/dev/register_local_model.sh` regenerates `.claude/agents/local-model.md`
 from `GET /v1/models` so the entry follows a serving switch. Runbook §13.
+**The usability trias — chat template + `--reasoning-parser` +
+`--tool-call-parser` — is a STANDARD boot setting, not a tuning knob** (user
+standing order 2026-08-03, #531). A boot missing them answers HTTP 200 while
+degrading silently in three separate ways, all observed on this rig's FP8 boot:
+chain-of-thought lands in `content` as raw `</think>` text, an Anthropic
+`thinking` block is refused with `400 Anthropic thinking is not supported for
+models without a reasoning parser`, and a tool call returns as a JSON-looking
+STRING rather than a structured `tool_calls` entry. The mapping is CODE, not a
+doc table: `planner/flags.py::usability_parsers` resolves the pair from the
+checkpoint's `architectures` (path as fallback) over a squashed identity
+string, so `Qwen3.6-27B`, `qwen3_5` and `Qwen3_5ForConditionalGeneration` all
+resolve alike; the table is ordered specific-first because `v3` is a substring
+of `v32`; and `validate_usability_parsers()` checks every emitted name against
+the live `ReasoningParser.DetectorMap` / `FunctionCallParser.ToolCallParserEnum`
+so a registry rename turns the mapping red instead of shipping a flag the
+server rejects. Both planner command generators emit it
+(`feasibility.py::_launch_flags`, `key_solver.py::_usability_launch_flags`) and
+an unrecognised family emits a NAMED HINT instead of a bare command.
+`register_local_model.sh` reads the live `/server_info` and writes
+`current boot lacks <what>; agentic tool use degraded` into the generated agent
+header. Scope is deliberately serving-only: the measurement arms under
+`gpu_battery/`, `dual_group/`, `probe*/`, `determinism/`, `nordstern/` are NOT
+patched, because a reasoning parser moves text out of `content` and would shift
+the very token accounting those arms produce. Boot-proven on the INT8 instance:
+template applied (system rule obeyed two turns later, zero marker leak),
+reasoning split into `reasoning_content` (1103 chars, no `</think>` in
+content), tool call parsed to `get_weather{"city":"Oslo"}`. Tests:
+`test/registered/unit/test_usability_parsers_531.py`, 11 hermetic + 13
+subtests, three executed can-fail arms (pre-fix token-set match → dotted
+families go None; `v3` row moved ahead of `v32` → wrong point-release parser;
+bogus name injected → registry check fires).
+**Coexistence reserves come from a co-tenant's DECLARED budget, never from a
+momentary observation** (#530, runbook §4.1): the #466 translator held 4204 MiB
+on the 5090 while declaring 7500, so the INT8 boot reserved `13000,3800,3800`
+(5500 long-prompt + 7500 declared) rather than sizing against what nvidia-smi
+happened to show. Cost ~135k KV tokens, bought a coexistence that survives the
+tenant growing into its own budget.
 **Checkpoint switching is a RESTART, and the three live routes were priced at
 their source before that verdict** (runbook §14): `update_weights_from_disk`
 refills the EXISTING module tree and rebuilds neither the quant methods nor the

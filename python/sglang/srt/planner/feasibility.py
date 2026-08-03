@@ -682,4 +682,17 @@ def _launch_flags(inputs: PlanInputs) -> List[str]:
             "SGLANG_UNEVEN_TOKEN_VECTOR="
             + ",".join(str(v) for v in inputs.kv_token_vector)
         )
+    # #531 standing order: a generated boot command carries the model-family
+    # reasoning + tool-call parsers, because a parser-less boot serves the
+    # checkpoint with its chain-of-thought as raw text and its tool calls as
+    # unparsed strings -- degraded in a way that still answers HTTP 200. An
+    # unrecognised family emits the NAMED HINT instead of a bare command, so
+    # the gap is visible at copy time rather than at first agentic use.
+    from sglang.srt.planner.flags import usability_argv
+
+    parser_argv, parser_note = usability_argv(inputs.model_path)
+    if parser_argv:
+        flags.append(" ".join(parser_argv))
+    else:
+        flags.append("# " + parser_note)
     return flags

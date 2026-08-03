@@ -71,12 +71,46 @@ if [[ "$MSG_CODE" != "200" ]]; then
     exit 4
 fi
 
-# A boot WITHOUT --reasoning-parser leaks raw </think> markers into the answer
-# and refuses Anthropic `thinking` blocks outright. The wrapper suppresses the
-# request; report the state so the operator can fix the boot recipe instead.
-REASONING="unknown"
-if printf '%s' "$MODELS_JSON" | grep -q '"reasoning'; then
-    REASONING="advertised"
+# #531: read the ACTUAL parser settings off the running boot instead of
+# guessing from the model listing. /server_info returns the live ServerArgs,
+# so reasoning_parser / tool_call_parser are authoritative here.
+#
+# Why this is worth a warning rather than a note: a boot without
+# --reasoning-parser leaks raw </think> markers into the answer text and
+# refuses Anthropic `thinking` blocks outright; a boot without
+# --tool-call-parser returns a tool call as a JSON-looking STRING inside
+# `content` instead of a structured `tool_calls` entry. Both degrade an
+# agentic client while every response is still HTTP 200 -- observed on this
+# rig's own FP8 boot, which reported both as None.
+SERVER_INFO="$(curl -sS -m 15 "$BASE_URL/server_info" 2>/dev/null || echo '{}')"
+read -r REASONING TOOLCALL < <(
+    printf '%s' "$SERVER_INFO" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+print(d.get("reasoning_parser") or "NONE", d.get("tool_call_parser") or "NONE")
+' 2>/dev/null || echo "UNKNOWN UNKNOWN"
+)
+[ -z "${REASONING:-}" ] && REASONING=UNKNOWN
+[ -z "${TOOLCALL:-}" ] && TOOLCALL=UNKNOWN
+
+MISSING=""
+[ "$REASONING" = "NONE" ] && MISSING="reasoning parser"
+if [ "$TOOLCALL" = "NONE" ]; then
+    if [ -n "$MISSING" ]; then MISSING="$MISSING and tool-call parser"
+    else MISSING="tool-call parser"; fi
+fi
+PARSER_WARNING=""
+if [ -n "$MISSING" ]; then
+    PARSER_WARNING="current boot lacks ${MISSING}; agentic tool use degraded"
+    {
+        echo "register_local_model: WARNING -- $PARSER_WARNING"
+        echo "  reasoning_parser=$REASONING tool_call_parser=$TOOLCALL at $BASE_URL"
+        echo "  Re-boot with the parsers for this model family (runbook 4.1;"
+        echo "  Qwen3.x = qwen3 / qwen3_coder, DeepSeek-V4 = deepseek-v4 / deepseekv4)."
+    } >&2
 fi
 
 mkdir -p "$AGENT_DIR" "$CONF_DIR"
@@ -118,7 +152,15 @@ Currently served:
 | max_model_len | $CTX_LEN |
 | residency | $RESIDENCY |
 | Anthropic Messages front | present (HTTP $MSG_CODE on POST /v1/messages) |
-| reasoning parser advertised | $REASONING |
+| reasoning parser | $REASONING |
+| tool-call parser | $TOOLCALL |
+${PARSER_WARNING:+
+> **WARNING: $PARSER_WARNING.** This boot returns the chain-of-thought as raw
+> text inside \`content\` and/or hands back tool calls as unparsed strings, so
+> structured tool use will not work through this agent. Every response is
+> still HTTP 200 -- the degradation is silent. Fix the boot recipe rather than
+> working around it here.
+}
 
 ## What you are
 
@@ -159,4 +201,4 @@ EOF
 
 echo "register_local_model: wrote $AGENT_DIR/local-model.md"
 echo "register_local_model: wrote $CONF_DIR/local_model_agent.env"
-echo "register_local_model: model=$MODEL_ID ctx=$CTX_LEN residency=$RESIDENCY reasoning=$REASONING"
+echo "register_local_model: model=$MODEL_ID ctx=$CTX_LEN residency=$RESIDENCY reasoning=$REASONING toolcall=$TOOLCALL"

@@ -75,6 +75,7 @@ exec "$SAT_VENV_PY" -u -m sglang.launch_server \
   --disaggregation-mode prefill \
   --disaggregation-transfer-backend mooncake_tcp \
   --disaggregation-bootstrap-port "$SAT_BOOTSTRAP" \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --trust-remote-code --enable-metrics \
   --host 0.0.0.0 --port "$SAT_PORT" \
   >> "$SAT_LOG" 2>&1

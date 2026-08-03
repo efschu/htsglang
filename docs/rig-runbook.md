@@ -368,6 +368,44 @@ export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_
 
 ## 3. Mandatory boot flags
 
+**The usability trias is a STANDARD boot setting, not a tuning knob** (user
+standing order 2026-08-03, #531): every serving boot carries
+`--reasoning-parser` and `--tool-call-parser` for its model family, alongside
+the chat template the checkpoint already ships. The reason is that a boot
+missing them still answers HTTP 200 while degrading silently — the
+chain-of-thought arrives as raw `</think>` text inside `content`, an Anthropic
+`thinking` block is refused outright with `400 Anthropic thinking is not
+supported for models without a reasoning parser`, and a tool call comes back as
+a JSON-looking STRING instead of a structured `tool_calls` entry. All three
+were observed on this rig's own FP8 boot. Per family on this rig:
+
+| family | `--reasoning-parser` | `--tool-call-parser` |
+|---|---|---|
+| Qwen3.x (27B, 35B-A3B, 2B, all quants incl. GGUF) | `qwen3` | `qwen3_coder` |
+| DeepSeek-V4 / V4-Flash | `deepseek-v4` | `deepseekv4` |
+| DeepSeek-V3.2 / V3.1 / V3 | `deepseek-v3` | `deepseekv32` / `deepseekv31` / `deepseekv3` |
+| DeepSeek-R1 | `deepseek-r1` | `deepseekv3` |
+
+The full mapping lives in code, not in this table:
+`planner/flags.py::usability_parsers` resolves the pair from the checkpoint's
+`architectures` (falling back to the path), the planner's generated boot
+commands carry it, and an unrecognised family emits a NAMED HINT instead of a
+bare command. `validate_usability_parsers()` checks every name against the live
+`ReasoningParser.DetectorMap` / `FunctionCallParser.ToolCallParserEnum`, so a
+registry rename turns the mapping red rather than shipping a flag value the
+server rejects. Verify a running boot with
+`curl -s $BASE/server_info | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["reasoning_parser"], d["tool_call_parser"])'`;
+`scripts/dev/register_local_model.sh` performs exactly that check and writes a
+warning line into the generated agent header when either is missing.
+
+**Scope, stated honestly:** this applies to boots that SERVE. The one-off
+measurement arms under `scripts/gpu_battery/`, `scripts/dual_group/`,
+`scripts/probe*/`, `scripts/determinism/` and `scripts/nordstern/` are
+deliberately NOT patched — a reasoning parser moves text from `content` into
+`reasoning_content`, which changes what a benchmark's token accounting sees.
+Adding it to a measurement arm would silently move the numbers those arms
+exist to produce.
+
 `--enable-metrics` is required on **every** `sglang.launch_server` invocation
 on this rig, with no exceptions: measurements, smoke boots, one-off checks,
 every topology in section 4. Omitting it changes nothing about inference —
@@ -446,6 +484,7 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --max-running-requests 16 \
   --speculative-algorithm NEXTN --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
@@ -503,6 +542,20 @@ Non-obvious points, each load-bearing:
   nothing else (section 7).
 - Pick the port yourself and check it is free (`ss -ltn`); several agents
   share this box.
+- **COEXISTENCE RESERVES COME FROM THE CO-TENANT'S DECLARED BUDGET, NEVER FROM
+  A MOMENTARY OBSERVATION** (#530 finding, now a rule). When another tenant
+  shares a card, raise that card's `--rank-auto-reserve-mib` by what the
+  co-tenant is ALLOWED to grow to, not by what `nvidia-smi` shows right now.
+  Measured instance: the #466 translator sat at 4204 MiB on the 5090 while its
+  own `/api/translator/health` declared `budgets_mib {asr 3000, tts 4000,
+  diarization 500, total 7500}` — sizing against the observed 4204 leaves the
+  serving engine holding memory the tenant is entitled to reclaim, and whoever
+  asks second OOMs. The INT8 boot therefore ran `13000,3800,3800` (5500
+  long-prompt reserve + 7500 declared tenant budget) rather than the
+  single-tenant `5500,3800,3800`, costing ~135k KV tokens and buying a
+  coexistence that holds under load. Ask every co-tenant for its declared
+  budget; if it does not publish one, that is the finding to report, not a
+  number to guess.
 
 Validate with CUDA graphs and speculative decoding ON (the defaults above) —
 eager-only validation hides graph-replay bugs.
@@ -886,6 +939,7 @@ setsid "$VENV/bin/python" -u -m sglang.launch_server \
   --attention-backend flashinfer \
   --speculative-algorithm NEXTN --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --trust-remote-code --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
@@ -1090,6 +1144,7 @@ setsid "$VENV/bin/python" -u -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 \
   --context-length 8192 --max-running-requests 1 \
   --disable-cuda-graph \
+  --reasoning-parser deepseek-v4 --tool-call-parser deepseekv4 \
   --trust-remote-code --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
@@ -1520,6 +1575,7 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --tp-size 1 --trust-remote-code \
   --context-length 8192 --max-running-requests 1 \
   --disable-cuda-graph \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
@@ -1592,6 +1648,7 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --tp-size 1 --trust-remote-code \
   --context-length 4096 --max-running-requests 1 \
   --disable-cuda-graph \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
@@ -1744,6 +1801,7 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --rank-gpu-memory-mib 29607,17780,17780 \
   --kv-cache-dtype fp8_e4m3 \
   --context-length 8192 --max-running-requests 1 \
+  --reasoning-parser deepseek-v4 --tool-call-parser deepseekv4 \
   --disable-cuda-graph --trust-remote-code --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
@@ -1773,6 +1831,7 @@ setsid "$VENV/bin/python" -u -m sglang.launch_server \
   --disable-overlap-schedule \
   --context-length 16384 --max-running-requests 4 \
   --attention-backend flashinfer \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
   --trust-remote-code --enable-metrics \
   --host 127.0.0.1 --port <free-port> \
   > "$LOG" 2>&1 &
@@ -1884,7 +1943,8 @@ docker run -d --name t212_decode --network host --ipc host \
     exec python3 -u -m sglang.launch_server --model-path /root/models/qwen3.5-2b \
       --served-model-name satellite-pair --dtype float16 --tp-size 1 --base-gpu-id 0 \
       --mem-fraction-static 0.45 --context-length 16384 --max-running-requests 8 \
-      --page-size 1 --trust-remote-code --enable-metrics --host 0.0.0.0 --port 31213 \
+      --page-size 1 --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+      --trust-remote-code --enable-metrics --host 0.0.0.0 --port 31213 \
       --disaggregation-mode decode --disaggregation-transfer-backend mooncake_tcp" '
 
 # --- gate, then measure (from the host: it is the only place that can

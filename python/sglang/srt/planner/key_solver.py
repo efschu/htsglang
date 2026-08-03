@@ -1846,6 +1846,19 @@ def _ratio_of(units: Sequence[int]) -> List[int]:
     return [v // g for v in vals]
 
 
+def _usability_launch_flags(model_path: str) -> List[str]:
+    """#531 standing order: every generated boot command carries the
+    model-family reasoning + tool-call parsers. A parser-less boot answers
+    HTTP 200 while putting the chain-of-thought into ``content`` as raw text
+    and handing back tool calls as unparsed strings, so the degradation is
+    invisible until an agentic client trips over it. An unrecognised family
+    yields the NAMED HINT as a comment rather than a silently bare command."""
+    from sglang.srt.planner.flags import usability_argv
+
+    argv, note = usability_argv(model_path)
+    return argv if argv else ["# " + note]
+
+
 def _remeasure_hook(model_path: str, units: Sequence[int], tp_size: int) -> dict:
     """The "measure it" hook for a predicted key — a split_probe job pinned
     to exactly this vector, so the measurement lands next to the prediction
@@ -2652,7 +2665,8 @@ def solve(
             launch_flags=[
                 "--rank-mlp-ratio",
                 ",".join(str(v) for v in _ratio_of(units)),
-            ],
+            ]
+            + _usability_launch_flags(plan_inputs.model_path),
         )
 
     base_units = model.perf.mlp_unit_partition(list(base_plan))
