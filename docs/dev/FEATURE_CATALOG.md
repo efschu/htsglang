@@ -1488,10 +1488,14 @@ Guided config wizard whose refusals each cite their source and which never emits
 a flag it cannot explain (`planner/wizard.py:703-714`, `:1521`, plus
 `wizard_islands/_lanes/_links/_offload/_tipping`). Comm benchmark suite; its
 anonymization gate (`rig_artifact.assert_anonymized`, `rig_artifact.py:558`,
-reachable only through `build_digest`, `:784-795`) covers the **rig-artifact
-share route only** — the #152 result-share route renders the start command's
-argv verbatim (`github_share.py:186`, `:214`) and passes through neither
-`scrub_tree` nor the gate (#505-D3). Energy metering (tok/s + J/token) is
+reachable only through `build_digest`, `:784-795`) covers **both** share routes
+since #514: the #152 result-share route runs its payload through the same
+`scrub_tree` + `assert_anonymized` inside `build_report`
+(`github_share.py:144`, `:296`) before a single line is rendered, and `submit`
+refuses a #152 body this process did not render (`:584`), so the previewed
+string and the posted body are the same bytes (#505-D3 fixed). One field is
+held out of the gate by necessity: the quality shot's `svg`, because the shared
+path rule would rewrite its markup. Energy metering (tok/s + J/token) is
 NVML board power integrated per phase (`energy.py:23-24`, `:383-412`) and is
 therefore **GPU power only — not wall-socket energy** (`energy.py:278-279`).
 Benchmark tiles carry measured/estimate/absent provenance with no "probably"
@@ -1503,8 +1507,9 @@ Self-update installs in any serve mode; **switching + auto-rollback need
 `--serve-supervised`** (`webui.py:3632`, `self_update.py:659-688`), and the
 health gate is HTTP 200 on `/` (`self_update.py:691-712`, #505-D8). GitHub
 result posting is opt-in per-use PAT, redacted from every error path
-(`github_share.py:97-105`); env-value redaction keys on five NAME suffixes only
-(`:89`).
+(`github_share.py:97-105`); env-value redaction keys on five NAME suffixes
+(`:89`) — since #505-D3 that is a second layer on top of the shared scrub, not
+the only redaction.
 
 ## 15. Model bring-ups (boot-proven)
 Qwen3.5/3.6 family (all quants), Gemma4 26/31B (+GGUF, quadratic-mask skip;

@@ -39,12 +39,36 @@ EXPLICIT-CONSENT DISCIPLINE -- posting sends data to an EXTERNAL service:
 ``confirmed=True``, which the UI may only set after the user approved the
 previewed report. There is no auto-submit path in this module.
 
-The report itself deliberately keeps the start command EXACT (argv + env,
-that is the point of sharing a reproducible result), with ONE exception:
-env values whose NAME looks credential-like (TOKEN / SECRET / KEY /
-PASSWORD / PAT) are replaced by ``<redacted>`` -- a launch env sometimes
-carries HF_TOKEN and that must never reach a public issue. Suffix matching
-keeps non-credential names like SGLANG_UNEVEN_TOKEN_VECTOR exact.
+ANONYMITY (#505-D3) -- the report is rendered from a SCRUBBED payload:
+:func:`build_report` runs the whole payload through
+``rig_artifact.scrub_tree`` and then the ``rig_artifact.assert_anonymized``
+gate before it renders a single line, so this route is held to the SAME
+definition of "anonymous" as the rig-artifact route rather than a second one
+that can drift. Absolute filesystem paths become basenames, the hostname,
+``$USER``, non-loopback IPs, GPU UUIDs and bare credential strings are
+removed. Earlier revisions emitted argv verbatim, which put a real launch
+command -- model paths under the user's home or data mount -- into a PUBLIC
+issue body.
+
+On top of the shared scrub, env values whose NAME looks credential-like
+(TOKEN / SECRET / KEY / PASSWORD / PAT) are replaced by ``<redacted>``.
+Suffix matching keeps non-credential names like SGLANG_UNEVEN_TOKEN_VECTOR
+exact. This is kept exactly as strict as it was; it is now a second layer,
+not the only one.
+
+ONE documented exception to the scrub: the quality shot's ``svg``. It is
+generated MARKUP, not collected environment, and the shared path rule would
+corrupt it (``</defs>`` -> ``<defs>``, the ``xmlns`` URI -> ``svg``) while
+the gate's absolute-path regex would flag those same closing tags. It is
+therefore rendered byte-exact and is the one field a caller is trusted with;
+everything else in the payload passes the gate.
+
+WHAT IS POSTED IS WHAT WAS PREVIEWED: :func:`submit` refuses a #152 body
+that this process did not render through :func:`build_report` (a fingerprint
+of every rendered report is remembered in-process). Without that, the
+preview is not a consent mechanism -- the caller could approve one string
+and post another, and the scrub would be trivially bypassable by not calling
+the renderer at all.
 
 HONEST NOTE: the create/update flow is exercised against a MOCKED GitHub API
 in the unit tests; it has not been run against api.github.com from this
@@ -53,10 +77,12 @@ module yet (needs a real PAT + network, deferred to live validation).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 __all__ = [
     "DEFAULT_REPO",
@@ -110,6 +136,66 @@ def _redact_env_value(name: str, value: str) -> str:
     if any(upper.endswith(sfx) for sfx in _SECRET_ENV_SUFFIXES):
         return "<redacted>"
     return value
+
+
+# ===========================================================================
+# Anonymity (#505-D3): ONE definition, shared with the rig-artifact route.
+# ===========================================================================
+def _scrub_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Scrub the share payload, then run the anonymity gate on it.
+
+    Both steps are ``rig_artifact``'s: ``scrub_tree`` (identity/log keys
+    dropped, every string leaf scrubbed -- paths to basenames, hostname,
+    ``$USER``, IPs, UUIDs, bare credentials) and ``assert_anonymized`` (the
+    gate, which raises on anything that survived). Reused rather than
+    re-expressed so this repo keeps ONE definition of "anonymous"
+    (``rig_artifact.py:528``); a second copy is what drifts.
+
+    ``quality.svg`` is held out of both steps and re-attached afterwards --
+    see the module docstring: the path rule corrupts markup (``</defs>`` ->
+    ``<defs>``) and the gate's absolute-path regex flags XML closing tags.
+
+    The import is function-local on purpose: ``rig_artifact`` imports THIS
+    module at module level, so a top-level import here would be a cycle.
+    """
+    from sglang.srt.planner import rig_artifact
+
+    payload = dict(payload or {})
+    svg = None
+    quality = payload.get("quality")
+    if isinstance(quality, dict) and quality.get("svg") is not None:
+        quality = dict(quality)
+        svg = quality.pop("svg")
+        payload["quality"] = quality
+
+    scrubbed = rig_artifact.scrub_tree(payload)
+    try:
+        rig_artifact.assert_anonymized(scrubbed)
+    except ValueError as e:
+        msg = f"refusing to render a shareable report: {e}"
+        raise GitHubShareError(msg) from None
+
+    if svg is not None:
+        quality_out = scrubbed.get("quality")
+        if not isinstance(quality_out, dict):
+            quality_out = {}
+        quality_out["svg"] = svg
+        scrubbed["quality"] = quality_out
+    return scrubbed
+
+
+#: Fingerprints of the reports THIS process rendered through
+#: :func:`build_report`. :func:`submit` posts a #152 body only if it is in
+#: here, which makes "the preview the user approved" and "the body that is
+#: posted" the same string by construction -- and makes the scrub above
+#: unskippable, because a body that never went through the renderer never
+#: went through the gate. Bounded: only the most recent renders are kept,
+#: a preview is cheap to redo and stale consent is not worth honouring.
+_RENDERED_REPORTS: Deque[str] = deque(maxlen=64)
+
+
+def _report_fingerprint(report: str) -> str:
+    return hashlib.sha256((report or "").encode("utf-8")).hexdigest()
 
 
 # ===========================================================================
@@ -178,13 +264,24 @@ def build_report(payload: Dict[str, Any]) -> str:
     nothing -- the UI shows this as the preview the user must approve before
     :func:`submit` may be called with ``confirmed=True``.
 
+    Scrub, gate, render: the payload goes through :func:`_scrub_payload`
+    (``rig_artifact.scrub_tree`` + ``assert_anonymized``) BEFORE anything is
+    rendered, and the result is fingerprinted so :func:`submit` can refuse a
+    body that skipped this function. The three steps live here together for
+    the reason ``rig_artifact.build_digest`` gives for its own three: they
+    are not separable in practice, and making them separable is how one of
+    them gets skipped. Raises :class:`GitHubShareError` if the gate finds
+    something identifying that the scrub did not remove -- fail closed, no
+    partial report.
+
     ``payload`` keys (all optional except command/metrics being the point):
 
       * ``model``: served model name (heading)
       * ``hardware``: short hardware summary string (heading)
       * ``command``: ``{"argv": [...], "env": {NAME: VALUE, ...}}`` -- the
-        EXACT start command. argv is emitted verbatim; env values with
-        credential-looking names are redacted (see module docstring).
+        start command, scrubbed: argv keeps its structure but absolute paths
+        are reduced to basenames, and env values are additionally redacted
+        by credential-looking NAME (see module docstring).
       * ``metrics``: measured numbers -- ``decode_tok_s``, ``prefill_tok_s``,
         ``ttft_ms``, ``j_per_decode_token``, ``j_per_prefill_token``,
         ``per_card`` ({card: {metric: value}}), plus any extra keys
@@ -196,6 +293,7 @@ def build_report(payload: Dict[str, Any]) -> str:
         rendered as a compact status table.
       * ``notes``: free-text appendix.
     """
+    payload = _scrub_payload(payload or {})
     model = payload.get("model") or "unknown model"
     hardware = payload.get("hardware")
     md: List[str] = []
@@ -274,7 +372,9 @@ def build_report(payload: Dict[str, Any]) -> str:
         md.append("")
 
     md.append(MARKER)
-    return "\n".join(md)
+    report = "\n".join(md)
+    _RENDERED_REPORTS.append(_report_fingerprint(report))
+    return report
 
 
 # ===========================================================================
@@ -456,6 +556,16 @@ def submit(
     approval; only then may it pass ``confirmed=True``. Without it this
     function raises and performs NO network call whatsoever.
 
+    ANONYMITY (#505-D3): a report for the #152 route (the default
+    :data:`MARKER`) must have been rendered by :func:`build_report` in THIS
+    process, which is where the scrub and the anonymity gate live. Anything
+    else is refused before a single API call -- otherwise the gate could be
+    bypassed by simply not calling the renderer, and the previewed string
+    and the posted string would not have to match. A caller using its OWN
+    marker (the #271 rig artifact) is exempt: it owns its own gate
+    (``rig_artifact.build_digest`` -> ``scrub_tree`` + ``assert_anonymized``)
+    and this module must not second-guess a body it did not render.
+
     Flow: ``existing_issue`` (a number) wins when given; otherwise the
     user's issue is located via :func:`find_existing_issue` (marker +
     creator). Found -> PATCH in place (update); not found -> POST a new
@@ -471,6 +581,14 @@ def submit(
         )
     if not token:
         raise GitHubShareError("no GitHub token given")
+    if marker == MARKER and _report_fingerprint(report) not in _RENDERED_REPORTS:
+        raise GitHubShareError(
+            "refusing to submit: this body was not rendered by "
+            "build_report() in this process, so it never passed the "
+            "anonymity scrub and it is not the string the user previewed. "
+            "Build the report with build_report(payload), show THAT string, "
+            "and submit it unchanged."
+        )
     api = api or _default_api
 
     body = report if marker in report else report + "\n\n" + marker

@@ -6,8 +6,9 @@
 
 Hermetic: the GitHub REST API is a fake; no network. Covers:
 
-  * the report contains the EXACT start command (argv + env) and the full
-    metrics + quality shot (SVG, verdict, token counts) + the stable marker,
+  * the report contains the start command (argv + env, SCRUBBED -- see
+    test_github_share_scrub_505d3.py for the anonymity falsifiers) and the
+    full metrics + quality shot (SVG, verdict, token counts) + the marker,
   * credential-looking env values are redacted from the report,
   * the PAT NEVER appears in results or exception text (redaction),
   * create vs update-in-place: marker+creator lookup chooses PATCH for an
@@ -97,14 +98,17 @@ class FakeApi:
 # Report rendering.
 # ---------------------------------------------------------------------------
 class TestBuildReport(unittest.TestCase):
-    def test_exact_command_and_env(self):
+    def test_command_is_exact_except_for_the_anonymity_scrub(self):
         md = build_report(PAYLOAD)
-        # argv EXACT, single line, unmodified paths
+        # argv on one line, every flag and value kept -- but the model path is
+        # a basename, not the local filesystem path (#505-D3). Sharing a
+        # reproducible result needs the FLAGS, never the directory layout.
         self.assertIn(
             "python -m sglang.launch_server --model-path "
-            "/models/Qwen3.6-27B-FP8 --tp 3 --rank-gpu-id 0,1,2",
+            "Qwen3.6-27B-FP8 --tp 3 --rank-gpu-id 0,1,2",
             md,
         )
+        self.assertNotIn("/models/Qwen3.6-27B-FP8", md)
         self.assertIn("SGLANG_UNEVEN_DCP=1", md)
         self.assertIn("SGLANG_UNEVEN_TOKEN_VECTOR=33,13,18", md)
 
@@ -172,7 +176,8 @@ class TestRedaction(unittest.TestCase):
         api = FakeApi(fail_with=RuntimeError(
             f"connection reset while sending Bearer {TOKEN}"))
         with self.assertRaises(GitHubShareError) as cm:
-            submit("report", TOKEN, confirmed=True, existing_issue=3, api=api)
+            submit(build_report(PAYLOAD), TOKEN, confirmed=True,
+                   existing_issue=3, api=api)
         self.assertNotIn(TOKEN, str(cm.exception))
         self.assertIn("<redacted-token>", str(cm.exception))
 
@@ -246,14 +251,20 @@ class TestCreateOrUpdate(unittest.TestCase):
             "explicit issue number must not trigger the lookup")
 
     def test_marker_appended_when_report_lacks_it(self):
+        # A body from ANOTHER route (own marker, own anonymity gate -- the
+        # #271 rig artifact) still gets its marker appended if it lacks one.
+        # The #152 marker cannot reach this path: a body that build_report
+        # did not render is refused outright (see the scrub falsifiers).
+        other = "<!-- some-other-route v1 -->"
         api = FakeApi(issues=[])
-        submit("a report without a marker", TOKEN, confirmed=True, api=api)
+        submit("a report without a marker", TOKEN, confirmed=True,
+               marker=other, api=api)
         post = [c for c in api.calls if c["method"] == "POST"][0]
-        self.assertIn(MARKER, post["body"]["body"])
+        self.assertIn(other, post["body"]["body"])
 
     def test_default_repo_target(self):
         api = FakeApi(issues=[])
-        submit("r", TOKEN, confirmed=True, api=api)
+        submit(build_report(PAYLOAD), TOKEN, confirmed=True, api=api)
         post = [c for c in api.calls if c["method"] == "POST"][0]
         self.assertEqual(post["url"],
                          f"{API_ROOT}/repos/{DEFAULT_REPO}/issues")
