@@ -2506,6 +2506,54 @@ a close second, driven through the shipped decision function. Unfixed it
 routes the turn as English; fixed it can only answer `de` or `es`. Verified by
 reverting the fix and watching the assertion fail.
 
+#### 17.8.8 The whitelist binds the LABEL, never the DECODE
+
+User, after §17.8.6 had fixed constrained detection: his wife spoke German,
+the identifier answered English, and the turn after that "something else
+again". If detection were genuinely bound to `{de, es}` both answers would be
+impossible, so the fix looked as if it had reach zero in production.
+
+**It does not. Read from his session's journal rather than from the raw
+recognizer log, the constraint demonstrably ACTED:**
+
+| stage | value |
+|---|---|
+| faster-whisper raw identification | `is` (Icelandic), p = 0.99 |
+| `turn.transcript` language | **`de`** |
+| `turn.done` source / targets | **`de`** / `['es']` |
+| `turn.transcript` text | **`Það er ló. Ég finn.`** |
+
+The label was narrowed to the participant set exactly as designed. What was
+never narrowed is the **decoding**: `asr_backends.py:222-228` calls
+`self._model.transcribe(...)` with no `language=`, deliberately -- the comment
+above it (`:214-219`) explains that passing one would disable Whisper's own
+identification and pin the direction, which requirement 5 forbids.
+`constrained_language_choice` then runs on the RESULT.
+
+So Whisper decoded freely across 98 languages, produced Icelandic text, and
+the label was corrected to German afterwards. Relabelling Icelandic text as
+German does not make it German -- and the user sees the text, not the label.
+The earlier turn is the same defect in the other direction: text `Thank you.`
+carrying language `es`.
+
+**The reach of the whitelist is one field.** This is the parameter-reach
+lesson again in its purest form: the mechanism exists, it is wired, it is
+tested, it demonstrably fires -- and it acts on a value that is not the one
+the failure runs through.
+
+The fix is a second pass, and it does NOT violate requirement 5: identify with
+the model's own posterior, narrow that posterior to the participant set, then
+DECODE with the language the constrained identification actually chose. The
+direction is still discovered rather than declared; it is discovered from a
+restricted candidate set instead of an unrestricted one. What must not happen
+is decoding with a language nobody identified.
+
+Gate arm to add with the fix: foreign or ambiguous audio must come out as the
+best WHITELIST language *in the text as well as the label*, across a session
+resume and with a second client driving turns concurrently.
+
+Not yet built. Recorded before building, per §17's reason for existing.
+
 #### 17.8.5 Speaker identity: the cascade, and the continuity guard
 
 User: "I am recognized as somebody different every time", and then the
