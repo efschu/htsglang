@@ -2114,8 +2114,19 @@ binding (the subagent frontmatter schema carries no `baseUrl`/`provider`/`env`
 key; every `ANTHROPIC_*_BASE_URL` is process-global), so the fork ships the
 named fallback rather than the feature: `scripts/dev/local_model_agent.sh`
 starts a separate `claude` process with a process-scoped environment, and
-`scripts/dev/register_local_model.sh` regenerates `.claude/agents/local-model.md`
-from `GET /v1/models` so the entry follows a serving switch. Runbook §13.
+`scripts/dev/register_local_model.sh` regenerates the USER-GLOBAL
+`~/.claude/agents/local-model.md` from `GET /v1/models` so the entry follows a
+serving switch, then VERIFIES the file at the path that is actually read and
+prints it. The verification exists because the first version wrote to
+`$REPO_ROOT/.claude/agents`, which for a worktree is read by no session: the
+agent type appeared in no agent list while the script reported a successful
+write, and the wrapper round-trip could not catch it because the wrapper reads
+`~/.config/htsglang/`, never the agent file — it proved the WRAPPER, never the
+REGISTRATION (§12 success-claims-are-not-evidence, and the reason the closing
+probe re-reads the canonical path rather than trusting its own `cat`). An
+`--agent-dir` that is neither user-global nor the current project exits 7.
+Session-lifetime rule: an agent list is loaded at session START, so a
+re-registration reaches NEW sessions only. Runbook §13.
 **The usability trias — chat template + `--reasoning-parser` +
 `--tool-call-parser` — is a STANDARD boot setting, not a tuning knob** (user
 standing order 2026-08-03, #531). A boot missing them answers HTTP 200 while

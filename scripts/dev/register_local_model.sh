@@ -25,16 +25,30 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BASE_URL="http://127.0.0.1:30030"
-AGENT_DIR="$REPO_ROOT/.claude/agents"
-CONF_DIR="$HOME/.config/htsglang"
+# USER-GLOBAL, and deliberately NOT repo-relative (#531 follow-up, user-caught).
+# The first version defaulted to "$REPO_ROOT/.claude/agents", which for a
+# WORKTREE checkout is a directory no Claude Code session ever reads: project
+# agents are loaded from the SESSION's own project directory, so a file written
+# under /spinning/wt-<something>/ registers nothing. The agent type simply never
+# appeared in any agent list, while the script printed "wrote ..." and the
+# wrapper round-trip still passed -- the wrapper reads $CONF_DIR, not the agent
+# file, so it could never have caught this. Hence the canonical user-global path
+# plus the read-path verification at the end of this script.
+AGENT_DIR="${HOME:-/root}/.claude/agents"
+CONF_DIR="${HOME:-/root}/.config/htsglang"
 MAX_TOKENS=4096
+ALLOW_UNREAD_AGENT_DIR=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -b|--base-url)   BASE_URL="$2"; shift 2 ;;
+        # Override only for a test harness or a genuinely different project
+        # dir. Anything that is not a path Claude Code READS is warned about
+        # below rather than silently accepted.
         --agent-dir)     AGENT_DIR="$2"; shift 2 ;;
         --conf-dir)      CONF_DIR="$2"; shift 2 ;;
         -t|--max-tokens) MAX_TOKENS="$2"; shift 2 ;;
+        --allow-unread-agent-dir) ALLOW_UNREAD_AGENT_DIR=1; shift ;;
         -h|--help)       sed -n '1,25p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -59,14 +73,37 @@ print(m["id"], m.get("max_model_len", "unknown"), x.get("residency", "unknown"))
 # The Anthropic Messages front is what a Claude Code process needs. Probe it
 # rather than assume it: a boot that does not expose it cannot back an agent,
 # and finding that out here beats finding it out inside an agent run.
-MSG_CODE="$(curl -sS -m 20 -o /dev/null -w '%{http_code}' \
-    -X POST "$BASE_URL/v1/messages" \
-    -H 'content-type: application/json' \
-    -H 'anthropic-version: 2023-06-01' \
-    -d '{"model":"probe","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' || echo 000)"
+# Retried with a generous timeout: a healthy server that is mid-prefill on a
+# long request answers this LATE, not never (observed at a 55k-token prefill,
+# ~40 s of chunked prefill ahead of the probe in the queue). A single short
+# probe turned that into a refusal to update the config, i.e. a transient load
+# spike looked identical to a missing endpoint. Distinguish the two by asking
+# /health when the probe fails.
+MSG_CODE=000
+for attempt in 1 2 3; do
+    MSG_CODE="$(curl -sS -m 60 -o /dev/null -w '%{http_code}' \
+        -X POST "$BASE_URL/v1/messages" \
+        -H 'content-type: application/json' \
+        -H 'anthropic-version: 2023-06-01' \
+        -d '{"model":"probe","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}' \
+        2>/dev/null || echo 000)"
+    [ "$MSG_CODE" = "200" ] && break
+    echo "register_local_model: /v1/messages probe attempt $attempt -> $MSG_CODE" >&2
+    sleep 5
+done
 if [[ "$MSG_CODE" != "200" ]]; then
+    HEALTH_CODE="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
+        "$BASE_URL/health" 2>/dev/null || echo 000)"
     echo "register_local_model: POST /v1/messages returned HTTP $MSG_CODE" >&2
-    echo "  the local-model agent needs the Anthropic Messages front; refusing" >&2
+    if [ "$HEALTH_CODE" = "200" ]; then
+        echo "  /health answers 200, so the SERVER is alive: this is either a" >&2
+        echo "  boot without the Anthropic front, or a server too loaded to" >&2
+        echo "  answer within 3x60 s. Re-run when the queue drains; refusing" >&2
+        echo "  rather than recording an unverified endpoint." >&2
+    else
+        echo "  /health also failed ($HEALTH_CODE) -- the endpoint is down." >&2
+    fi
+    echo "  The local-model agent needs the Anthropic Messages front; refusing" >&2
     echo "  to write a config that points at an endpoint which cannot serve it." >&2
     exit 4
 fi
@@ -199,6 +236,48 @@ Rules:
   \`curl -sS $BASE_URL/v1/messages -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -d '{"model":"$MODEL_ID","max_tokens":256,"messages":[{"role":"user","content":"..."}]}'\`
 EOF
 
-echo "register_local_model: wrote $AGENT_DIR/local-model.md"
 echo "register_local_model: wrote $CONF_DIR/local_model_agent.env"
 echo "register_local_model: model=$MODEL_ID ctx=$CTX_LEN residency=$RESIDENCY reasoning=$REASONING toolcall=$TOOLCALL"
+
+# ---------------------------------------------------------------------------
+# Closing probe: "wrote the file" is not "registered the agent". Verify the
+# file EXISTS at the path that will actually be READ, is non-empty, parses as
+# frontmatter with the expected `name:`, and name that absolute path in the
+# output -- the #531 follow-up defect was invisible precisely because the
+# script reported a write to a path nobody loads.
+# ---------------------------------------------------------------------------
+AGENT_FILE="$AGENT_DIR/local-model.md"
+USER_AGENT_DIR="${HOME:-/root}/.claude/agents"
+
+if [ ! -s "$AGENT_FILE" ]; then
+    echo "register_local_model: FAILED -- $AGENT_FILE is missing or empty" >&2
+    exit 5
+fi
+AGENT_NAME="$(sed -n 's/^name:[[:space:]]*//p' "$AGENT_FILE" | head -1)"
+if [ "$AGENT_NAME" != "local-model" ]; then
+    echo "register_local_model: FAILED -- $AGENT_FILE has no usable 'name:'" >&2
+    echo "  frontmatter name read as: ${AGENT_NAME:-<empty>}" >&2
+    exit 6
+fi
+
+echo "register_local_model: VERIFIED agent '$AGENT_NAME' at $AGENT_FILE ($(wc -c < "$AGENT_FILE") bytes)"
+
+if [ "$AGENT_DIR" != "$USER_AGENT_DIR" ] && [ "$AGENT_DIR" != "$PWD/.claude/agents" ]; then
+    {
+        echo "register_local_model: UNREADABLE TARGET -- $AGENT_DIR is neither"
+        echo "  the user-global agent dir ($USER_AGENT_DIR) nor the current"
+        echo "  project's ($PWD/.claude/agents). Claude Code will NOT load an"
+        echo "  agent from there, so this run registered nothing usable."
+        echo "  This is exactly the #531 defect; re-run without --agent-dir."
+        echo "  (Pass --allow-unread-agent-dir if you are a test harness and"
+        echo "  meant to write somewhere inert.)"
+    } >&2
+    # Non-zero on purpose: the failure this guards against is a SILENT no-op,
+    # so a caller that does not read stderr must still be able to detect it.
+    [ "$ALLOW_UNREAD_AGENT_DIR" = "1" ] || exit 7
+fi
+
+echo "register_local_model: NOTE -- a session loads its agent list at START."
+echo "  The 'local-model' type appears in NEW sessions; the current one keeps"
+echo "  the list it booted with. Existing sessions can still drive the model"
+echo "  directly via scripts/dev/local_model_agent.sh."

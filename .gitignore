@@ -310,4 +310,9 @@ scripts/r3val/logs/
 # (#530). It carries the currently-served checkpoint id, port and a
 # timestamp, so a committed copy goes stale the moment the serving instance
 # switches. Regenerate it instead of tracking it.
+#
+# As of the #531 follow-up the script writes to the USER-GLOBAL agent dir
+# (~/.claude/agents), not here -- a worktree's .claude/agents is read by no
+# session, which is exactly the defect that follow-up fixed. This entry stays
+# as a backstop for a run that passes --agent-dir into the repo.
 .claude/agents/local-model.md
