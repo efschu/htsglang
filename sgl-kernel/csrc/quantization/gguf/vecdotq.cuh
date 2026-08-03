@@ -2,6 +2,22 @@
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/vecdotq.cuh
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/vecdotq.cuh
 // and https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmq.cu
+
+// Byte-granular 32-bit gather: the ONLY safe way to read `qs` of a block type
+// whose stride is odd (block_mxfp4 is 17 bytes, so its `qs` sits at an odd
+// offset in every other block). get_int_b2 / get_int_from_uint8 below assume
+// 2-byte alignment and would raise a misaligned-address fault there.
+static __device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
+  const uint8_t* x8 = (const uint8_t*)x;
+
+  int x32 = x8[4 * i32 + 0] << 0;
+  x32 |= x8[4 * i32 + 1] << 8;
+  x32 |= x8[4 * i32 + 2] << 16;
+  x32 |= x8[4 * i32 + 3] << 24;
+
+  return x32;
+}
+
 static __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
   const uint16_t* x16 = (const uint16_t*)x;  // assume at least 2 byte alignment
 
@@ -2034,4 +2050,146 @@ vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
   }
   return d * (sumi1 + sumi2);
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 (ggml type 39). Block geometry is IDENTICAL to q4_0/iq4_nl -- 32
+// values, qr=2, qi=4, split-half nibble order -- so the MMVQ and MMQ plumbing
+// below is the q4_0 plumbing with two substitutions:
+//   * the 4-bit code is mapped through kvalues_mxfp4 (a table lookup, as for
+//     iq4_nl) instead of the `(v >> s) & 0x0F0F0F0F` shift, and there is no
+//     "-8" zero point to subtract, so need_sum is false for the MMQ tile;
+//   * the per-block scale is an E8M0 byte read with
+//     ggml_cuda_e8m0_to_fp32_half (2^(e-128), i.e. already halved against the
+//     doubled lattice).
+// Every read of `qs` goes through get_int_b1 because block_mxfp4 is 17 bytes
+// wide and therefore not 2-byte aligned in an array.
+// ---------------------------------------------------------------------------
+#define VDR_MXFP4_Q8_1_MMVQ 2
+#define VDR_MXFP4_Q8_1_MMQ 4
+
+template <int vdr>
+static __device__ __forceinline__ float
+vec_dot_mxfp4_q8_1_impl(const int* v, const int* u, const float& d4, const float& d8) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+  const uint8_t* values = (const uint8_t*)kvalues_mxfp4;
+
+  int sumi = 0;
+
+#pragma unroll
+  for (int i = 0; i < vdr; ++i) {
+    int v1, v2;
+    get_int_from_table_16((uint32_t)v[i], values, v1, v2);
+    // low nibbles -> elements  0..15, high nibbles -> elements 16..31
+    sumi = __dp4a(v1, u[2 * i + 0], sumi);
+    sumi = __dp4a(v2, u[2 * i + 1], sumi);
+  }
+
+  return d4 * d8 * sumi;
+#endif
+}
+
+static __device__ __forceinline__ float
+vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+  const block_mxfp4* bq = (const block_mxfp4*)vbq;
+
+  const int32_t* q8 = (const int32_t*)bq8_1->qs + iqs;
+
+  int v[VDR_MXFP4_Q8_1_MMVQ];
+  int u[2 * VDR_MXFP4_Q8_1_MMVQ];
+
+#pragma unroll
+  for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+    v[l] = get_int_b1(bq->qs, iqs + l);
+    u[2 * l + 0] = q8[l + 0];
+    u[2 * l + 1] = q8[l + QI_MXFP4];
+  }
+
+  return vec_dot_mxfp4_q8_1_impl<VDR_MXFP4_Q8_1_MMVQ>(v, u, ggml_cuda_e8m0_to_fp32_half(bq->e), __low2float(bq8_1->ds));
+#endif
+}
+
+template <int mmq_y>
+static __device__ __forceinline__ void allocate_tiles_mxfp4(int** x_ql, half2** x_dm, int** x_qh, int** x_sc) {
+  __shared__ int tile_x_qs[mmq_y * (WARP_SIZE_GGUF) + mmq_y];
+  __shared__ float tile_x_d[mmq_y * (WARP_SIZE_GGUF / QI_MXFP4) + mmq_y / QI_MXFP4];
+  *x_ql = tile_x_qs;
+  *x_dm = (half2*)tile_x_d;
+}
+
+template <int mmq_y, int nwarps, bool need_check>
+static __device__ __forceinline__ void load_tiles_mxfp4(
+    const void* __restrict__ vx,
+    int* __restrict__ x_ql,
+    half2* __restrict__ x_dm,
+    int* __restrict__ x_qh,
+    int* __restrict__ x_sc,
+    const int& i_offset,
+    const int& i_max,
+    const int& k,
+    const int& blocks_per_row) {
+  const int kbx = k / QI_MXFP4;
+  const int kqsx = k % QI_MXFP4;
+
+  const block_mxfp4* bx0 = (const block_mxfp4*)vx;
+  float* x_dmf = (float*)x_dm;
+
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+    int i = i0 + i_offset;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_mxfp4* bxi = bx0 + i * blocks_per_row + kbx;
+    // raw nibbles; the kvalues_mxfp4 lookup happens in the dot below
+    x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_b1(bxi->qs, kqsx);
+  }
+
+  const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI_MXFP4;
+  const int kbxd = k % blocks_per_tile_x_row;
+
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI_MXFP4) {
+    int i = i0 + i_offset * QI_MXFP4 + k / blocks_per_tile_x_row;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_mxfp4* bxi = bx0 + i * blocks_per_row + kbxd;
+    x_dmf[i * (WARP_SIZE_GGUF / QI_MXFP4) + i / QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32_half(bxi->e);
+  }
+}
+
+static __device__ __forceinline__ float vec_dot_mxfp4_q8_1_mul_mat(
+    const int* __restrict__ x_ql,
+    const half2* __restrict__ x_dm,
+    const int* __restrict__ x_qh,
+    const int* __restrict__ x_sc,
+    const int* __restrict__ y_qs,
+    const half2* __restrict__ y_ds,
+    const int& i,
+    const int& j,
+    const int& k) {
+  (void)x_qh;
+  (void)x_sc;
+
+  const int kyqs = k % (QI8_1 / 2) + QI8_1 * (k / (QI8_1 / 2));
+  const float* x_dmf = (const float*)x_dm;
+  // need_sum == false for MXFP4 (no zero point), so the y scales were stored
+  // as plain floats in the low half of each tile_y_ds slot.
+  const float* y_df = (const float*)y_ds;
+
+  int u[2 * VDR_MXFP4_Q8_1_MMQ];
+
+#pragma unroll
+  for (int l = 0; l < VDR_MXFP4_Q8_1_MMQ; ++l) {
+    u[2 * l + 0] = y_qs[j * WARP_SIZE_GGUF + (kyqs + l) % WARP_SIZE_GGUF];
+    u[2 * l + 1] = y_qs[j * WARP_SIZE_GGUF + (kyqs + l + QI_MXFP4) % WARP_SIZE_GGUF];
+  }
+
+  return vec_dot_mxfp4_q8_1_impl<VDR_MXFP4_Q8_1_MMQ>(
+      &x_ql[i * (WARP_SIZE_GGUF + 1) + k],
+      u,
+      x_dmf[i * (WARP_SIZE_GGUF / QI_MXFP4) + i / QI_MXFP4 + k / QI_MXFP4],
+      y_df[j * (WARP_SIZE_GGUF / QI8_1) + (2 * k / QI8_1) % (WARP_SIZE_GGUF / QI8_1)]);
 }

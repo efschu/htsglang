@@ -111,6 +111,15 @@ int64_t ggml_mmvq_kq_tuned() {
   return sglang_gguf_kq_kernel_enabled() ? 1 : 0;
 }
 
+// Task #398 marker (see sgl_kernel_ops.h): schema-detectable capability probe
+// for the native GGUF MXFP4 (ggml type 39) kernel set -- dequantize, MMVQ
+// (dense + MoE) and MMQ (dense + MoE). Detected by op EXISTENCE on the python
+// side, exactly like ggml_mmvq_kq_tuned: a probe taking no tensor cannot be
+// routed by the dispatcher, but its registration alone identifies the build.
+int64_t ggml_mxfp4_native() {
+  return 1;
+}
+
 torch::Tensor ggml_mul_mat_vec_a8(
     torch::Tensor W,  // quant weight
     torch::Tensor X,  // input
@@ -202,6 +211,10 @@ torch::Tensor ggml_mul_mat_vec_a8(
         break;
       case 29:
         mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+        break;
+      case 39:  // MXFP4
+        mul_mat_vec_mxfp4_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
     }
@@ -337,6 +350,18 @@ torch::Tensor ggml_mul_mat_a8(
         break;
       case 14:
         ggml_mul_mat_q6_K_q8_1_cuda(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            col,
+            row,
+            batch,
+            padded,
+            row,
+            stream);
+        break;
+      case 39:  // MXFP4
+        ggml_mul_mat_mxfp4_q8_1_cuda(
             (void*)W.data_ptr(),
             (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(),
@@ -546,6 +571,25 @@ torch::Tensor ggml_moe_a8(
         break;
       case 14:
         ggml_moe_q6_K_q8_1_cuda(
+            (void*)quant_X.data_ptr(),
+            (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(),
+            W.stride(0),
+            (int)W.sizes()[0],
+            col,
+            row,
+            tokens,
+            padded,
+            row,
+            top_k,
+            sorted_token_ids.sizes()[0],
+            stream);
+        break;
+      case 39:  // MXFP4
+        ggml_moe_mxfp4_q8_1_cuda(
             (void*)quant_X.data_ptr(),
             (void*)W.data_ptr(),
             (scalar_t*)Y.data_ptr(),
@@ -834,6 +878,19 @@ torch::Tensor ggml_moe_a8_vec(
             quant_X.stride(0),
             stream);
         break;
+      case 39:  // MXFP4
+        moe_vec_mxfp4_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(),
+            (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(),
+            (int*)topk_ids.data_ptr(),
+            top_k,
+            tokens,
+            col,
+            row,
+            quant_X.stride(0),
+            stream);
+        break;
     }
   });
   return Y;
@@ -861,6 +918,8 @@ int64_t ggml_moe_get_block_size(int64_t type) {
       return MOE_X_Q5_K;
     case 14:
       return MOE_X_Q6_K;
+    case 39:  // MXFP4
+      return MOE_X_MXFP4;
   }
   return 0;
 }

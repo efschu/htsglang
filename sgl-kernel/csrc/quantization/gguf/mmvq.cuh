@@ -507,6 +507,20 @@ static void mul_mat_vec_iq4_nl_q8_1_cuda(
 }
 
 template <typename scalar_t>
+static void mul_mat_vec_mxfp4_q8_1_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int ncols,
+    const int nrows,
+    const int nvecs,
+    cudaStream_t stream) {
+  // Same (qk, qi, vdr) triple as iq4_nl, so the batched ncols_dst<=8 dispatch
+  // amortizes one weight stream over the whole spec-decode verify range.
+  mul_mat_vec_q_dispatch<scalar_t, QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(vx, vy, dst, ncols, nrows, nvecs, stream);
+}
+
+template <typename scalar_t>
 static void mul_mat_vec_iq4_xs_q8_1_cuda(
     const void* vx,
     const void* vy,
