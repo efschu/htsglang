@@ -1333,13 +1333,55 @@ green, and unchanged by any of this.
   in §3, the VRAM corridor entry in §6.1 and the ASR numbers all still need an
   arbitrated window. The audio-out path is correct; how fast it is on a 3080
   or the 5090 is unmeasured here.
-* **No ASR round trip.** Intelligibility is argued from structure (voiced
-  fraction, syllabic band) and from matching the reference implementation's
-  duration, not from transcribing the output. `faster-whisper` is not
-  installed in this venv, and installing into it while another agent held the
-  GPU window would have been the wrong kind of shared-box behaviour. The
-  intelligibility gate of §7(b)(3) is therefore still owed.
-* **The 36 preset clips.** Unchanged from §10: still the cheapest
-  high-value item on the list, still needs a window.
+* ~~**No ASR round trip.**~~ **DONE, and it passes.** §7(b)(3)'s gate is
+  implemented (`scripts/translator/asr_roundtrip_gate.py`, threshold 0.15
+  argued in the script) and executed on CPU with faster-whisper
+  large-v3-turbo int8:
+
+  | arm | heard | language | WER |
+  |---|---|---|---|
+  | synthesized output | "Hola buenos días, me alegro mucho de verte otra vez." | es @ 0.997 | **0.100 → PASS** |
+  | control (pre-fix babble) | "I'm curious to see how you are in a small situation…" | en @ 0.515 | **19.200 → rejected** |
+
+  The one substitution in the passing arm is `dias` → `días`: the recognizer
+  produced the correctly accented form and the request text omitted it.
+  Content error is zero. Left uncorrected because it also demonstrates that
+  accent-preserving normalisation works — stripping accents would hide exactly
+  the vowel-error class a cross-lingual cloner produces.
+
+  **The control is the point.** It is the babble from the randomly initialised
+  talker: finite, speech-shaped, correctly pitched, 0.986 speaker similarity.
+  It transcribes as 193 words of English gibberish. The gate can fail on the
+  one input that fooled every cheaper signal, and it re-proves that on every
+  run rather than asserting it once. This also vindicates leaving WER
+  uncapped — 19.2 instead of saturating at "1.0, same as silence" keeps the
+  signal that says *running away*, not merely *wrong*.
+
+  Constrained detection was exercised on the real model, not reasoned about:
+  `('de','es') → 'es' @ 0.997`, and `('de','fr') → 'fr' @ 0.000` — the
+  out-of-set fallback taking its best-in-set branch (faster-whisper populates
+  `all_language_probs` whenever no language is passed,
+  `transcribe.py:469-479`, so `fr` genuinely outranked `de` at a probability
+  rounding to zero). Nothing discarded; the turn resolves and is tagged
+  uncertain.
+
+  faster-whisper lives in its own tree appended to `sys.path`; the shared
+  serving venv is byte-unchanged (transformers 5.12.1, tokenizers 0.22.2,
+  numpy 2.3.5 before and after), which mattered because two long-running
+  services map it.
+* **The 36 preset clips.** Renderer ported from a desk-written API that never
+  existed to the real `generate_voice_design(text, instruct, language)`, and
+  the first clip is rendered and gated (WER 0.105 → PASS; both substitutions
+  are the recognizer writing digits for the number words in the render
+  sentence, a standing ~0.1 orthographic cost of this gate rather than a
+  synthesis error). **The VoiceDesign checkpoint carries the same silent
+  weight fault — `404 checked, 404 repaired`** — so without §13.1's guard the
+  batch would have produced 36 plausible, useless clips, and the pool is what
+  every other path degrades TO. Two checkpoints now confirm the fault is a
+  property of this transformers version rather than a one-off. Batch running
+  on CPU; `check_preset_pool.py` then has to certify distinctness (pairwise
+  x-vector cosine within each class against
+  `SpeakerRegistryConfig.match_threshold`, imported rather than copied) and
+  cross-language identity stability.
 * **True incremental streaming** remains a #488 item; rung B chunks a finished
   utterance (module docstring in `inprocess_tts.py` states the gap).
