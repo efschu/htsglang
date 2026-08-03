@@ -923,6 +923,8 @@ next to the pipeline's.
 
 ## 14. Adaptive chain planning (#451)
 
+> Extended by §17: the RIFE version is now chosen by the #460 ladder rather than configured, and §17.4 adds the stage-pipeline regime alongside the Regime-A pricing described here.
+
 `chain_policy.py`. `plan_job` answers "does the chain the caller asked for
 fit"; this answers "which chain should the caller have asked for", which a
 client cannot answer for itself because it would need the per-stage rate
@@ -1101,6 +1103,8 @@ this scenario.
 
 ### 16.3 Target: 1080p@25 -> 2160p@50, and the budget math
 
+> Superseded in part by §17.5, which re-derives this target on the 2026-08-03 measured numbers under the stage-pipeline model. The 1.78x-ceiling arithmetic below is the Regime-A framing and is kept as the record of how the budget was first reasoned about.
+
 Input 25 fps means a 40 ms budget per input frame at 1x. The rig's own
 measured aggregate ceiling against a single 5090 is **1.78x**
 (`TASK_333_M2_VIDEO_ENHANCE.md` §9.4 / `TASK_333_M2_MEASUREMENTS.md`
@@ -1138,3 +1142,233 @@ above it"), so `scale=0.5` is the candidate that leaves the fp16/bf16-TRT SR
 step room to be measured at all, not only the candidate with a faster RIFE
 pair. Not yet a shipped default — it is a candidate pending the SR engine's
 own measured ms/frame at this chain's resolutions, per §16.3.
+
+## 17. The RIFE version ladder (#460) and stage-pipeline pricing (#457 desk)
+
+Both halves land on `feat/video-rife-ladder-460`. §14 (adaptive chain planning)
+and §16 (the target scenario) are the sections they change; nothing in §1-§13
+moves.
+
+### 17.1 User directives, 2026-08-03
+
+Three, recorded here because they define the scope and each one is answered by
+a specific mechanism rather than by a general intention.
+
+1.  **A selectable RIFE version, auto-picking the best that can be computed.**
+    The user's belief is that the 4.1x and lite families look better than 4.6
+    and that the newest heavy variant is not required to win. So: a ladder,
+    with an explicitly-labelled quality order, that climbs as high as the
+    *measured* frontier allows and no higher.
+2.  **NVENC/NVDEC is optional.** Raw frames may be pushed between cards or
+    parked in host RAM. A few seconds of latency is acceptable; the gate stays
+    aggregate output fps >= input fps (§16.1).
+3.  **Prefetch.** The next frame a card is to work on can be spilled onto that
+    card shortly before the current step ends, so there is no waiting time in
+    between — the #125 double-buffer pattern applied to video frames.
+
+### 17.2 The ladder: eight rungs off four vendored files
+
+`video_enhance/rife_ladder.py`. Rungs: `4.6`, `4.15`, `4.15.lite`,
+`4.16.lite`, `4.17`, `4.17.lite`, `4.18`, `4.26`.
+
+The five new ones cost one new vendored file, because upstream ships several
+IFNet files that are **byte-identical to each other** at the commit already
+pinned in `_vendor/rife/README.md`:
+
+| upstream sha256 | files | versions |
+|---|---|---|
+| `96816a3b…` | `IFNet_HDv3_v4_{15,17,18}.py` | 4.15, 4.17, 4.18 |
+| `57ec7e07…` | `IFNet_HDv3_v4_{15,16,17}_lite.py` | 4.15.lite, 4.16.lite, 4.17.lite |
+
+`rife._VENDORED` maps the aliases onto one module each. That is not the
+substitution `require_supported` refuses — it is the same bytes under two
+names — and the *weights* still differ per version and are pinned separately.
+All eight rungs were loaded from their real checkpoints on CPU and produce
+finite output; the alias mapping is validated by execution, not by reading.
+
+Each rung carries four facts:
+
+* **quality rank** — configurable, default in `DEFAULT_QUALITY_RANK`, and
+  labelled `ASSUMPTION` in every report that prints it. Nothing in this tree
+  has graded RIFE output. The default order is 4.26 > 4.18 > 4.17 > 4.15 >
+  4.17.lite > 4.16.lite > 4.15.lite > 4.6, which is directive 1 turned into a
+  total order with two mechanical tie-breaks (newer beats older within a
+  family; a full variant beats its own `.lite` sibling). A quality gate — a
+  PSNR/SSIM-against-ground-truth harness on held-out frame triples — would
+  replace it through `with_quality_ranks` without touching selection code. It
+  is a GPU ticket and it does not exist.
+* **frontier** — `RifeFrontier`, keyed `(version, card, resolution, scale)`,
+  cells are `Rate` with measured/estimate/absent. Separate from the shared
+  `StageRateTable` because that table's key has neither version nor scale in
+  it.
+* **VRAM class** — headless / lite / standard / deep, derivable from the
+  architecture. The measured peak bytes live in the frontier alongside the
+  rates and are absent wherever P4 did not run.
+* **weight state** — present on disk / pinned / unavailable. The registry
+  *refuses* an entry that is neither present nor pinned, at construction time,
+  because a rung that cannot be fetched reproducibly is a rung missing.
+
+Seeded provenance, `seeded_frontier()`:
+
+| version | 5090 | 3080 | provenance |
+|---|---|---|---|
+| 4.6 | 1080p s1.0/s0.5, 4K s1.0/s0.5 | same four | measured (ticket V) |
+| 4.26 | same four (encode-cache *amortised*) | same four | measured (ticket V) |
+| 4.15, 4.15.lite, 4.16.lite, 4.17, 4.17.lite, 4.18 | — | — | **absent** |
+
+Six of eight rungs are absent. That is the state of the rig, and it is why the
+"never auto-pick an unmeasured variant" rule has teeth rather than being a
+formality.
+
+### 17.3 How a version is chosen
+
+`chain_policy.choose_chain` now nests two decisions. The outer one is the
+version, and it deliberately does **not** derive a per-pair budget: splitting a
+frame budget across three unequal cards under Regime A has no clean closed
+form, and inventing one would be exactly the kind of quiet number this module
+refuses. Instead the policy walks the ladder in quality order and asks the
+*existing* aggregate-throughput gate whether the whole chain carries that
+version. The first version whose chain is feasible wins.
+
+* A variant with no measured frontier is never entered into the walk. It
+  surfaces in the decision as `measure_first`, which is where TICKET_460's work
+  list comes from.
+* `pin_rife_version` overrides everything including an absent frontier — that
+  is how a GPU window runs the variant it is about to measure — and the
+  selection then reports `provenance=absent` so a pinned unmeasured run cannot
+  be mistaken for a priced one.
+* `rife_budget_ms` short-circuits the walk for a caller that has done its own
+  arithmetic. Judged on the **slowest card in play**, because Regime A runs the
+  same chain everywhere and a version too slow on the weakest card drags the
+  aggregate.
+* `auto_rife_version` is **off by default**, so an existing caller's stream
+  does not change model underneath it.
+
+One defect this exposed and fixed: the shared `StageRateTable` is keyed
+`(stage, card, resolution)` and cannot tell 4.6 from 4.26. Priced off it, every
+version would cost the same and the walk would be theatre. So when a ladder is
+supplied *and it has a cell for this card at this geometry*, its version-keyed
+frontier is the authority for the interpolation stage. When the ladder has
+never heard of the card, it has no opinion and the shared table stands — which
+is what keeps deployments whose probe reports use other card keys working.
+
+### 17.4 Stage-pipeline pricing (#457)
+
+`video_enhance/stage_pipeline.py`. `chain_policy` prices Regime A (each card
+runs the whole chain over its own stretch; rates add). This prices Regime B:
+stages are placed on cards and every frame walks the rig.
+
+* Throughput is `1 / max(card load)`, not `1 / sum(stage costs)`.
+* A stage boundary crossing a card is a transfer. No NVLink, no GPUDirect P2P
+  (all PHB), so it is a host bounce: D2H over the sender's link, H2D over the
+  receiver's, each half charged to the card whose link carries it. barlink BAR1
+  is the named alternative and the house default transport wherever a
+  combination supports it — but nobody has measured a BAR1 raw-frame move, so
+  `barlink_link()` carries an **absence** and a plan that needs it is refused
+  by name rather than priced with a guess.
+* Directive 3 is `max(0, transfer − window)`, where the window is the receiving
+  card's own compute times `prefetch_depth`. `prefetch_depth=0` prices every
+  byte and is the pessimistic bound worth keeping next to the optimistic one.
+* Deep buffering: `frames_in_flight` buys latency and nothing else
+  (`latency_s = frames_in_flight / throughput`), bounded by `max_latency_s`
+  when the caller gives one. The smoothness gate stays the aggregate.
+
+Two hard constraints, enforced rather than reported:
+
+* **Co-residency.** SR and the tail resize must share a card. The 8K fp16
+  intermediate is 189.84 MiB, ~13.5 ms one way over x8 — more than the entire
+  25 ms SR budget.
+* **The x4 taboo.** A card may declare `max_transfer_mib`; at or above it, it
+  is disqualified as a transfer endpoint. Default for an x4 card is
+  `EIGHT_K_FP16_MIB`, derived from the geometry rather than typed in. Expressed
+  per card, never as a hard-coded NVML index — enumeration order is not stable
+  across boots.
+
+### 17.5 Re-derived verdict: 1080p@25 -> 2160p@50 under the pipeline model
+
+Cards: 5090 (x8), 3080 (x8), 3080 (x4). Stage table is ticket V, 2026-08-03,
+per source frame; encode is x2 at 2160p on the **ffmpeg fallback** price
+because direct NVENC fails Error 8 on both arches.
+
+| stage | 5090 | 3080 (either) | provenance |
+|---|---:|---:|---|
+| decode 1080p h264 NVDEC | 4.254 | 7.140 | measured |
+| SR 1080p -> 8K, TRT fp16 | 25.424 | 90.343 | measured |
+| resize 8K -> 4K, Lanczos-3 | 24.367 | **absent** | — |
+| RIFE 4.6 @4K s1.0 | 20.539 | 63.108 | measured |
+| RIFE 4.6 @4K s0.5 | 11.359 | 31.999 | measured |
+| encode 4K h264 x2 (ffmpeg) | 40.780 | 47.080 | measured |
+| host link, one way | 13.70 GiB/s | 13.70 GiB/s (x8) / 6.85 (x4, **estimate**) | |
+
+**At RIFE `scale=0.5`** the exhaustive sweep's best placement is
+
+```
+5090     sr + resize                 25.424 + 24.367 = 49.791 ms   <- binds
+3080_x8  decode + rife               7.140 + 31.999  = 39.139 ms
+3080_x4  encode                                        47.080 ms
+
+crossings, all hidden at prefetch_depth=1:
+  decode->sr    1080p NV12   2.97 MiB   0.21 ms each way   (window 39.14 / 49.79)
+  resize->rife  4K fp16     47.46 MiB   3.38 ms each way   (window 49.79 / 39.14)
+  rife->encode  4K fp16 x2  94.92 MiB   6.77 ms d2h, 13.53 ms h2d over x4
+                                                           (window 39.14 / 47.08)
+
+period = max(49.791, 39.139, 47.080) = 49.791 ms  ->  20.08 source-fps
+```
+
+**Binding card: the 5090. Binding stage: SR, at 25.42 ms — narrowly, against
+resize at 24.37 ms on the same card.** Not encode, which is what bound the
+serial figure in ticket V's RESULTS.md.
+
+**At RIFE `scale=1.0`** the best placement is 5090 `decode+sr+resize` (54.05),
+3080_x8 `rife` (63.108), 3080_x4 `encode` (47.08): **period 63.108 ms -> 15.85
+source-fps, binding card 3080_x8, binding stage RIFE @4K.**
+
+**Verdict: still not-FULL.** 20.08 < 25 at s0.5, 15.85 < 25 at s1.0.
+
+Three things worth reading off this rather than the headline:
+
+1.  **The pipeline verdict is fully measured; the replicated one is not.**
+    Every cell in the s0.5 placement above is a ticket-V measurement, because
+    resize lands on the only card that has a resize row. The Regime-A figure
+    cannot say that: `replicated_throughput` with the default (strict) reading
+    drops both 3080s for the absent resize row and reports 8.67 src-fps as a
+    **lower** bound; with `omit_absent_stages=True` it drops the absent *term*
+    and reproduces RESULTS.md's 18.299 src-fps as an **upper** bound. The true
+    replicated figure is somewhere between, and nobody knows where, because the
+    3080 resize row was never taken. The pipeline number needs no such caveat.
+2.  **Which cells are estimate or absent.** The x4 link rate is an estimate
+    (half the measured x8 rate, no transfer benchmark was run on that card) —
+    but at `prefetch_depth=1` its crossing is fully hidden and contributes
+    exactly zero milliseconds, so the pricer does *not* degrade the verdict's
+    provenance to estimate. At `prefetch_depth=0` the same placement yields
+    16.50 src-fps and *is* labelled estimate, because then the estimated half
+    is actually paid. `color_to_rgb` and `color_to_yuv` remain **absent** at
+    these resolutions and are carried as `unpriced_stages` on every report, so
+    20.08 is a chain-stage figure and slightly optimistic. The 3080 resize row
+    is **absent** and is the reason the replicated comparison has a bound
+    rather than a value.
+3.  **Fusing the tail resize moves the bind to encode.** `FUSED_TAIL_RESIZE_NOTE`
+    in `sr.py` aims at exactly the 24.367 ms term. Setting it to zero:
+    5090 `sr` 25.424, 3080_x8 `decode+rife` 39.139, 3080_x4 `encode` 47.080 ->
+    **period 47.08 ms, 21.24 src-fps, binding stage encode.** Still short of 25,
+    so the fused tail is necessary and not sufficient — the ffmpeg encode
+    round-trip is the wall behind it, and that is the NVENC arm, not this one.
+
+Stage-level replication — letting one stage's frames be split across two cards
+in proportion to their rates — is **not built**. It would turn the placement
+question into an LP, and the honest single-card-per-stage sweep is what is
+priced here. It is the most obvious next lever: encode runs twice per source
+frame and is the term that binds once resize is fused.
+
+### 17.6 What is BOOT-PENDING
+
+* The frontier for six of the eight rungs (4.15, 4.15.lite, 4.16.lite, 4.17,
+  4.17.lite, 4.18) on both arches, 1080p/4K x scale 1.0/0.5. Spec:
+  `docs/dev/TICKET_460_rife_frontier.md`.
+* The RIFE quality order itself. Everything above treats it as an assumption.
+* The host-bounce and prefetch-hiding rates as *observed* rather than modelled:
+  the 13.70 GiB/s figure is a round-trip number reused one-way, and the x4 rate
+  is halved arithmetic.
+* The 3080 resize row, without which the Regime-A comparison stays a bound.
+* `color_to_rgb` / `color_to_yuv` at 1080p and 2160p.

@@ -37,6 +37,7 @@ file buffers a frame outside a bounded ring.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -99,6 +100,8 @@ from sglang.srt.video_enhance.tenant import (
     build_stages,
     plan_job,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Depth of the bridge between the encode stage and the ASGI send coroutine.
 #: One, deliberately: any larger value is a buffer between the socket and the
@@ -327,6 +330,19 @@ class EnhanceRequestBody:
     enable_resize: bool = True
     rife_scale: float = 1.0
     rife_version: str = "4.6"
+    #: #460. Let the RIFE ladder pick the highest-quality variant whose
+    #: measured cost the chain can carry, instead of running ``rife_version``.
+    #: Off by default so an existing caller's stream does not change model
+    #: underneath it; the chosen version and the whole ladder come back in the
+    #: job's ``chain_decision``.
+    auto_rife_version: bool = False
+    #: #460. Force one variant. Beats both the ladder and ``rife_version``,
+    #: and is the only way to run a variant whose frontier is unmeasured.
+    pin_rife_version: str | None = None
+    #: #460. Milliseconds per frame pair the ladder may spend, for a caller
+    #: that has done its own budget arithmetic. Absent, the ladder walks the
+    #: rungs in quality order against the chain's own aggregate gate.
+    rife_budget_ms: float | None = None
     streams_in_flight: int = 2
     overload_policy: str = OverloadPolicy.STALL.value
     container: str = "video/mp4"
@@ -459,6 +475,9 @@ class EnhanceRequestBody:
             sr_scale=self.sr_scale,
             rife_scale=self.rife_scale,
             rife_version=self.rife_version,
+            auto_rife_version=self.auto_rife_version,
+            pin_rife_version=self.pin_rife_version,
+            rife_budget_ms=self.rife_budget_ms,
             streams_in_flight=self.streams_in_flight,
             allow_decimation=self.allow_decimation,
             max_decimation=self.max_decimation,
@@ -547,7 +566,9 @@ class VideoEnhanceService:
         decision = require_chain(
             probe_result,
             body.policy_request(probe_result.frame_rate),
-            PolicyInputs.from_probe_dir(self.config.measurement_dir),
+            PolicyInputs.from_probe_dir(
+                self.config.measurement_dir, rife_ladder=self._rife_ladder()
+            ),
             self.config,
         )
         chosen = decision.request
@@ -561,8 +582,32 @@ class VideoEnhanceService:
             enable_sr=chosen.enable_sr,
             sr_scale=chosen.sr_scale,
             enable_resize=chosen.enable_resize,
+            # The ladder may have moved the version; the executor has to build
+            # the stage the planner priced, not the one the caller named.
+            rife_version=chosen.rife_version,
         )
         return plan_job(self.config, chosen), resolved, decision
+
+    def _rife_ladder(self):
+        """The #460 ladder, or ``None`` when it cannot be built.
+
+        Built lazily and never fatally: a deployment whose weight directory is
+        unreadable should still be able to plan a chain with the version the
+        caller named. A ``None`` ladder makes ``auto_rife_version`` report that
+        no ladder was supplied rather than silently choosing.
+        """
+        cached = getattr(self, "_rife_ladder_cache", "unset")
+        if cached != "unset":
+            return cached
+        try:
+            from sglang.srt.video_enhance.rife_ladder import default_ladder
+
+            ladder = default_ladder()
+        except Exception as exc:  # noqa: BLE001 - planning must not die of this
+            logger.warning("RIFE ladder unavailable, version stays as requested: %s", exc)
+            ladder = None
+        self._rife_ladder_cache = ladder
+        return ladder
 
     def source_probe(
         self, body: EnhanceRequestBody, info: MediaInfo | None = None

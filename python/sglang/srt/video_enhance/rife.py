@@ -152,8 +152,22 @@ class VendoredArch:
         return self.encode_channels is not None
 
 
+#: Upstream ships one IFNet file per version, but several of those files are
+#: byte-identical to each other at the pinned commit -- 4.15, 4.17 and 4.18
+#: share one architecture and 4.15.lite, 4.16.lite and 4.17.lite share another
+#: (sha256 proof in ``_vendor/rife/README.md``). Only the *weights* differ, and
+#: the weights are pinned separately. Mapping the aliases onto the single
+#: vendored module is therefore not a substitution of the kind
+#: :func:`require_supported` refuses -- it is the same bytes under two names,
+#: and it is what lets the #460 ladder offer 4.15/4.17 and the lite family
+#: without carrying five more near-duplicate files.
 _VENDORED: dict[str, VendoredArch] = {
     "4.6": VendoredArch("4.6", "IFNet_HDv3_v4_6", None, 4),
+    "4.15": VendoredArch("4.15", "IFNet_HDv3_v4_18", 8, 4),
+    "4.15.lite": VendoredArch("4.15.lite", "IFNet_HDv3_v4_17_lite", 4, 4),
+    "4.16.lite": VendoredArch("4.16.lite", "IFNet_HDv3_v4_17_lite", 4, 4),
+    "4.17": VendoredArch("4.17", "IFNet_HDv3_v4_18", 8, 4),
+    "4.17.lite": VendoredArch("4.17.lite", "IFNet_HDv3_v4_17_lite", 4, 4),
     "4.18": VendoredArch("4.18", "IFNet_HDv3_v4_18", 8, 4),
     "4.26": VendoredArch("4.26", "IFNet_HDv3_v4_26", 4, 5),
 }
@@ -263,11 +277,19 @@ def padding_amounts(
 # --------------------------------------------------------------------------
 
 #: sha256 of the upstream release assets, recorded when they were first
-#: fetched (2026-07-31). A download that does not match is rejected: the
-#: release tag is mutable on GitHub, so pinning the hash is the only thing
-#: that makes the fetch reproducible.
+#: fetched (4.6/4.18/4.26 on 2026-07-31, the rest on 2026-08-03 for the #460
+#: ladder). A download that does not match is rejected: the release tag is
+#: mutable on GitHub, so pinning the hash is the only thing that makes the
+#: fetch reproducible. ``scripts/video_enhance/fetch_rife_weights.py`` is the
+#: only thing that establishes a new entry here, and only with
+#: ``--record-new-pin``; it refuses an unpinned re-download outright.
 KNOWN_WEIGHT_SHA256: dict[str, str] = {
     "4.6": "008646e761f0e67cb77f0c6c44cfe3c3e5a05d9d9465311b9681ca650ce030db",
+    "4.15": "bf969affb3f6e9a09eea8c1da6c51bb22d6da45e92cafb9273689d05e2360dd2",
+    "4.15.lite": "54fe3fb51efb880f64ffe2048a88220ad2b0b3d03f7cb800742e90821dcfb24f",
+    "4.16.lite": "290cf343fb5a933f4503920ca07826c4d30561bd9b573b11b054b33ea0dee642",
+    "4.17": "b1ee3186270312a38316e4d53c77b31a60062cfa5636e13d6f0a1dd89bb7b128",
+    "4.17.lite": "9303f59001bc40e801273828cc0da84b8f7696a9485cd7c45e7796f20ed2f086",
     "4.18": "955fc8b552417ae4808999f5d671d024438e904c0bebf766ae6fb61806ce021c",
     "4.26": "45c7f74156704769dc9f85cfcaf8552e1e926f9399dcfa3a553dee88fac6f53f",
 }
