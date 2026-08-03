@@ -162,9 +162,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._peer: Optional[MultiEndedAllocator] = None
 
         # Inverse history of relocations (spec rollback), at PAGE granularity.
-        self._inverse_history: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
-            []
-        )
+        self._inverse_history: List[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
 
         # --- Lazy compaction state (all unused when lazy_compaction=False) ---
         # `_free_phys_pages`: GPU free list of physical PAGE ids, sorted at `_flush`.
@@ -790,9 +790,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         v2p stays -1 and translation yields negative ids → CUDA OOB.
         """
         with record_function("MultiEndedAlloc.alloc_extend"):
-            assert (
-                self.is_id_owner
-            ), f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
+            assert self.is_id_owner, (
+                f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
+            )
             if num_new_pages is None:
                 num_new_pages = get_num_new_pages(
                     seq_lens=seq_lens_cpu,
@@ -859,9 +859,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         virtual page on THIS sub-allocator (else v2p stays -1 → CUDA OOB).
         """
         with record_function("MultiEndedAlloc.alloc_decode"):
-            assert (
-                self.is_id_owner
-            ), f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
+            assert self.is_id_owner, (
+                f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
+            )
             bs = len(seq_lens)
             # CPU-only count BEFORE the kernel, to snapshot the exact slice the
             # kernel will consume.
@@ -1763,7 +1763,24 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     @size.setter
     def size(self, value) -> None:
-        pass  # base init writes here; computed dynamically
+        # NO-OP ABSORBER, deliberately -- and deliberately NOT a raise (#514,
+        # audit #505-A2-01). Two production paths assign here without wanting
+        # anything to happen: `BaseTokenToKVPoolAllocator.__init__`
+        # (`allocator/base.py:38`) and the inherited `resize()`
+        # (`allocator/base.py:125`), which this class does not override because
+        # its size follows the sub-allocators it just resized. Raising would
+        # break both for no gain, and a "raise only after init" flag would
+        # still fire on the legitimate resize.
+        #
+        # The consequence is that a caller who assigns EXPECTING an effect gets
+        # silence, not an exception -- `size -= n` in a `try/except` is the
+        # worst case, because the handler proves nothing. That is a CALLER
+        # obligation, not something this setter can carry: read `size` back and
+        # refuse when it did not move (see
+        # `managers/kv_session_offload.py::_carve_out_draft_scratch` /
+        # `draft_scratch_carveout_error`, the fix for the silently-dropped
+        # draft-scratch carve-out).
+        pass
 
     # -- token-slot surface: MHA side --
 
@@ -1973,6 +1990,11 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     @size.setter
     def size(self, value) -> None:
+        # NO-OP ABSORBER for the base-init / resize writes, same decision and
+        # same caller obligation as the mamba composite above: a caller that
+        # assigns EXPECTING an effect must read `size` back and refuse when it
+        # did not move -- this setter cannot distinguish that caller from the
+        # two internal ones (#514, audit #505-A2-01).
         pass
 
     def __init__(

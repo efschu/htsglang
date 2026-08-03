@@ -288,6 +288,62 @@ class TestBackendStateMachine(unittest.TestCase):
         self.assertEqual(backend.ledger.booked("host_ram"), 1000)
         self.assertEqual(backend.stats.wave_in_failures, 1)
 
+    def test_failed_destination_release_is_resident_not_parked(self):
+        """#514/#505-B-01 falsifier: a RETRIEVAL failure and a RELEASE failure
+        are different events and the error path must not merge them.
+
+        ``free_destination`` runs AFTER ``copy_in_tensors`` + ``wait`` have
+        both returned, i.e. after the bytes are demonstrably back on the
+        device. Reporting that as ``STATE_PARKED`` -- the state whose meaning
+        is "the bytes are at the park target" -- is a false state claim, and
+        it is the one the register reads when it decides what is evictable.
+        The destination allocation genuinely did NOT come back, so the
+        booking is deliberately RETAINED (never under-book, or the next
+        booker allocates into bytes that may still be held); the point is
+        that the leak is named and counted instead of silent.
+        """
+        ops = FakeDeviceOps(fail_ops={"free_destination": RuntimeError("EIO")})
+        backend, item = self._bound_backend(ops)
+        backend.park(item)
+        backend.settle(item.item_id)
+        with self.assertRaisesRegex(MovementError, "destination release"):
+            backend.wave_in(item)
+
+        names = [c[0] for c in ops.calls]
+        self.assertEqual(
+            names, ["copy_out", "wait", "wait", "copy_in", "wait", "free_destination"]
+        )
+        # The retrieval succeeded, so the item is back -- not parked.
+        self.assertEqual(backend.state_of(item.item_id), STATE_RESIDENT)
+        # A release failure is not a retrieval failure.
+        self.assertEqual(backend.stats.wave_in_failures, 0)
+        self.assertEqual(backend.stats.destination_release_failures, 1)
+        # Conservative and VISIBLE: the bytes stay booked and are named as leaked.
+        self.assertEqual(backend.ledger.booked("host_ram"), 1000)
+        self.assertEqual(backend.stats.leaked_destination_bytes, 1000)
+
+    def test_leaked_destination_is_not_released_by_a_later_park(self):
+        """The leak must not be laundered by the next park/wave-in cycle:
+        a second round books its own bytes ON TOP of the leaked ones.
+        Without this, a retry would make the ledger look healthy while the
+        first destination is still held."""
+        ops = FakeDeviceOps(fail_ops={"free_destination": RuntimeError("EIO")})
+        backend, item = self._bound_backend(ops)
+        backend.park(item)
+        backend.settle(item.item_id)
+        with self.assertRaises(MovementError):
+            backend.wave_in(item)
+        self.assertEqual(backend.ledger.booked("host_ram"), 1000)
+
+        ops.fail_ops.clear()
+        backend.park(item)
+        backend.settle(item.item_id)
+        backend.wave_in(item)
+        self.assertEqual(backend.state_of(item.item_id), STATE_RESIDENT)
+        # Second cycle released only its OWN booking; the leak survives.
+        self.assertEqual(backend.ledger.booked("host_ram"), 1000)
+        self.assertEqual(backend.stats.leaked_destination_bytes, 1000)
+
 
 class TestTargetLadder(unittest.TestCase):
     def _peer_ready_backend(self, size=1000, window_policy="reject", cap=None):

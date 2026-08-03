@@ -1493,6 +1493,8 @@ def _offload(**over):
             "wave_ins": 25,
             "park_failures": 0,
             "wave_in_failures": 0,
+            "destination_release_failures": 0,
+            "leaked_destination_bytes": 0,
         },
         "latency_term_ms": {"lane_workspaces": 58.0},
         "negative_control": {
@@ -1572,6 +1574,28 @@ class TestOffloadRegisterCheck:
         payload["stats"]["wave_in_failures"] = 2
         write_json(tmp_path / "offload_register_gpu.json", payload)
         assert_fail(self.CHECK, tmp_path, self.STEP)
+
+    def test_destination_release_failure_is_fail(self, tmp_path):
+        """#514: split out of wave_in_failures, so it needs its own can-fail
+        proof -- otherwise the split would silently widen what this passes."""
+        payload = _offload()
+        payload["stats"]["destination_release_failures"] = 1
+        write_json(tmp_path / "offload_register_gpu.json", payload)
+        assert_fail(self.CHECK, tmp_path, self.STEP)
+
+    def test_leaked_destination_bytes_are_fail(self, tmp_path):
+        payload = _offload()
+        payload["stats"]["leaked_destination_bytes"] = 4096
+        write_json(tmp_path / "offload_register_gpu.json", payload)
+        assert_fail(self.CHECK, tmp_path, self.STEP)
+
+    def test_missing_release_telemetry_is_stop(self, tmp_path):
+        """An older artifact without the #514 counters must STOP (unknown),
+        never pass: absence of the field is not evidence of zero leaks."""
+        payload = _offload()
+        del payload["stats"]["destination_release_failures"]
+        write_json(tmp_path / "offload_register_gpu.json", payload)
+        assert_stop(self.CHECK, tmp_path, self.STEP)
 
     def test_missing_latency_term_is_fail(self, tmp_path):
         write_json(tmp_path / "offload_register_gpu.json", _offload(latency_term_ms={}))

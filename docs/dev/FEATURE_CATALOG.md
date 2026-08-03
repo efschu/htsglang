@@ -1258,6 +1258,103 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Two-stage-error family (#505-B-01, fixed in #514): when ONE `try` spans two
+stages whose failures mean OPPOSITE things about where the bytes are, the
+handler is forced to lie about one of them. `RealMovementBackend.wave_in`
+wrapped the retrieval (`copy_in_tensors` + `wait`) AND the destination release
+(`free_destination`) in one block whose handler wrote `state = STATE_PARKED`
+unconditionally -- the state whose meaning is "the bytes are at the park
+target". A `free_destination` failure happens AFTER the bytes are demonstrably
+back, so the item was reported parked while resident, and because
+`ledger.release` sat outside the `try`, the park-target booking was never
+released: a permanent over-booking of the memtier ledger. The pre-fix test
+injected only at `copy_in`, the one point where the shared handler's comment
+was true, so the suite was green throughout. Split into STAGE 1 (retrieval:
+failure -> PARKED, booking retained, `wave_in_failures`) and STAGE 2 (release:
+failure -> RESIDENT, booking retained **and counted** as
+`leaked_destination_bytes`, `destination_release_failures`, distinct error
+text). The booking is deliberately NOT released on the leak path -- how much of
+the destination came back is unknown and under-booking would let the next
+booker allocate into bytes that may still be held; the requirement is that the
+leak is NAMED and COUNTED, not that it is reclaimed. So the rule: a `try` whose
+stages disagree about the meaning of failure gets one handler per stage, and a
+counter split out of an existing one is added to every gate that read the old
+one in the same change (`scripts/gpu_battery/checks/check_s07_offload_register_gpu.py`
+gates all four counters, each with its own can-fail proof).
+
+Group-agreement family (#505-A2-05, fixed in #514): a transport that MAY fall
+back must fall back as a GROUP. `_build_transport` caught any bring-up
+exception for the two transports outside `_NO_FALLBACK` (`bar1`, `matrix`),
+warned, and returned `None` per rank, with nothing reconciling the outcome --
+so a rank that failed after its transport's last bring-up collective ran gloo
+while its peers ran barlink, and a barlink-default run was published as such
+while being a gloo run. Fixed with a one-hot `all_reduce(SUM)` on the CPU group
+that BOTH the success and the failure path reach: all-ok keeps the transport,
+mixed sends every rank to gloo (the successful ones close theirs), and the
+failing ranks are named. Shape taken from `parallel_state.py:975-992` and
+`model_runner.py:1365-1369`. Deliberately unbounded, like the neighbouring
+bring-up exchanges: ranks are legitimately minutes apart on a cold JIT cache
+(#431/#438a) and a deadline would fire on a healthy group. Scope, measured
+rather than assumed: the byte proof already reduces group-wide
+(`barlink_bar1.py:2538`, `:2547`) and the `dmabuf_holder` / `_bind_region`
+guards sit before a remaining collective, so those DESYNC into a hang rather
+than split -- the residual hang class is NOT closed by this and is a named
+follow-up.
+
+Rank-local-verdict family (#505-A2-03, fixed in #514): a decline that hands the
+caller to a NAMED FALLBACK must rest on replicated inputs, or the fallback is
+taken by some ranks and not others. `try_spill`'s host-region check compared
+THIS rank's owned tail rows (`n_own`, derived from the rank-local owner window
+`cp_prefix[dcp_rank : dcp_rank+1]`, whose width differs per rank under uneven
+DCP) against the replicated `region_tokens`, then returned False -- sending only
+that rank down stock retraction while its peers spilled. The caller's own
+comment claimed "no second collective, no branch-count divergence"
+(`scheduler.py:4058-4059`), which the rank-local verdict falsified; the
+prefill-spill twin RAISES on the identical condition (`:3906-3913`). Fixed by
+taking the verdict on the WIDEST rank (`spill_tail_rows_max_over_ranks`) --
+computable locally, with no new collective, because the `req_to_token` row
+carries global slot ids and `cp_prefix` is replicated, the same trick `_restore`
+already uses. `plain`/single-rank is byte-identical to the old path. Raising
+like the twin was rejected deliberately: the decode path HAS a named fallback
+the prefill path lacks. #501 ordering untouched -- still a `return False` ahead
+of the reclaim commit.
+
+Fabricated-identity family (#505-A2-04, fixed in #514): a bridge that cannot
+answer must return UNKNOWN, never the index it already has.
+`nvml_card_totals_mib` logged "assuming identical enumeration orders" and fell
+back to the identity map, so on the reference rig (5090 = CUDA 0 / NVML 1) the
+PD feasibility check compared each card's plan against ANOTHER card's capacity
+and passed a plan that cannot fit -- warn-only downstream, so it booted with no
+error. Two aggravations found while fixing it: the `except` arm was not the main
+entrance (`registry/nvml.py:706-729` returns `{}` NON-exceptionally whenever
+torch cannot place cards, so the fabrication was on the ordinary success path),
+and an existing test PINNED the defect (`test_empty_mapping_is_identity`
+asserted `reindex_totals_cuda_order(nvml, {}) == nvml`). It was the one caller
+#397 never migrated -- `test_device_order_bridges_397.py::NoCudaBridgeTest`
+pins the refusal for every other. Now routed through the IdentityMap
+(`registry_nvml.identity_map`, PCI-BDF), an empty bridge yields `None` with a
+named warning (the barlink `"sysfs-gross"` shape), a partial bridge keeps the
+placeable cards and names the unplaced ones, and a single-GPU host stays
+identity because `cuda:0` can only be that card. What BOOTS is unchanged: the
+unverified state is loud, not fatal -- a strict mode belongs behind an explicit
+flag rather than a silent default flip. So the rule: an unavailable bridge
+degrades to a NAMED unknown, and a test asserting `f({}) == identity` is pinning
+the defect.
+
+**VALUE PINNING for bounding defaults (#505-C-05, convention adopted in #514).**
+A numeric default that exists to BOUND something (cap/budget/threshold/limit/
+reserve/margin/watermark/timeout) ships with a test that FAILS when the value
+changes -- see `docs/dev/CONVENTION_bounding_defaults.md` and the reference
+implementation `test/registered/unit/test_bounding_default_value_pins.py`.
+Audit #505 enumerated 106 fork-added bounding defaults and found ZERO with such
+a test, while 71 of them sit behind a gate that is off in the served
+configuration. The anti-pattern is a test that READS the default and derives its
+assertion from it: it proves the guard fires and passes for every possible
+value, which is how #449's desk-picked 2048 MiB shipped above the real peak and
+protected nothing for weeks. A green pin means the number is DELIBERATE -- not
+that it is correct, and not that it BINDS; those need their own evidence and
+are the axis-C backlog.
+
 **MERGE DUTY -- bookkeeping-mutation sites (#404 family).** The per-request
 accounting clocks (`decode_batch_idx` / `extend_batch_idx`,
 `kv_committed_len` / `kv_allocated_len`, `spec_verify_ct`) and the
@@ -1276,6 +1373,23 @@ the defect is written up. Registering to silence the test is the one forbidden
 resolution. #496 discharged the backlog this rule was written for -- the
 dual-group lane (#274) and the kv-session-offload spill had both landed
 mutation sites without an entry.
+
+**Verified carve-outs (#505-A2-01, #514).** A size/budget carve-out written
+onto an allocator is VERIFIED BY READ-BACK and refused by name if it did not
+take. `kv_session_offload` did `self.allocator.size -= mtp_resident_slices`
+inside `except Exception: pass` and then logged "reserved %d draft-read scratch
+slots"; on `UnifiedMambaTokenToKVPoolAllocator` / `UnifiedSWATokenToKVPoolAllocator`
+`size` is a COMPUTED property whose setter is literally `pass`
+(`multi_ended_allocator.py:1764-1766`, `:1974-1976`), so the write vanished with
+no exception -- the handler hid nothing and the success message was the only
+evidence. The damage is a standing false leak report: the invariant checker
+reads exactly that value (`invariant_checker.py:124`), and on the composite the
+permanent `alloc()` moves `schedulable_available -> allocated_count` leaving
+`size` unchanged, so the accounting is off by `mtp_resident_slices` forever. The
+composite setters deliberately STAY no-op absorbers -- `BaseTokenToKVPoolAllocator.__init__`
+and the inherited `resize()` (#330 VRAM dial) legitimately write there and a
+raise would break them -- so the obligation is the caller's. This is the
+SUCCESS-CLAIMS law as a code rule: where a write can be absorbed, read it back.
 
 **MERGE DUTY -- SITREP (#509).** A merge that changes what this fork can do,
 how fast it does it, or which claim about it still holds also UPDATES the
@@ -1544,10 +1658,14 @@ Guided config wizard whose refusals each cite their source and which never emits
 a flag it cannot explain (`planner/wizard.py:703-714`, `:1521`, plus
 `wizard_islands/_lanes/_links/_offload/_tipping`). Comm benchmark suite; its
 anonymization gate (`rig_artifact.assert_anonymized`, `rig_artifact.py:558`,
-reachable only through `build_digest`, `:784-795`) covers the **rig-artifact
-share route only** — the #152 result-share route renders the start command's
-argv verbatim (`github_share.py:186`, `:214`) and passes through neither
-`scrub_tree` nor the gate (#505-D3). Energy metering (tok/s + J/token) is
+reachable only through `build_digest`, `:784-795`) covers **both** share routes
+since #514: the #152 result-share route runs its payload through the same
+`scrub_tree` + `assert_anonymized` inside `build_report`
+(`github_share.py:144`, `:296`) before a single line is rendered, and `submit`
+refuses a #152 body this process did not render (`:584`), so the previewed
+string and the posted body are the same bytes (#505-D3 fixed). One field is
+held out of the gate by necessity: the quality shot's `svg`, because the shared
+path rule would rewrite its markup. Energy metering (tok/s + J/token) is
 NVML board power integrated per phase (`energy.py:23-24`, `:383-412`) and is
 therefore **GPU power only — not wall-socket energy** (`energy.py:278-279`).
 Benchmark tiles carry measured/estimate/absent provenance with no "probably"
@@ -1559,8 +1677,9 @@ Self-update installs in any serve mode; **switching + auto-rollback need
 `--serve-supervised`** (`webui.py:3632`, `self_update.py:659-688`), and the
 health gate is HTTP 200 on `/` (`self_update.py:691-712`, #505-D8). GitHub
 result posting is opt-in per-use PAT, redacted from every error path
-(`github_share.py:97-105`); env-value redaction keys on five NAME suffixes only
-(`:89`).
+(`github_share.py:97-105`); env-value redaction keys on five NAME suffixes
+(`:89`) — since #505-D3 that is a second layer on top of the shared scrub, not
+the only redaction.
 
 ## 15. Model bring-ups (boot-proven)
 Qwen3.5/3.6 family (all quants), Gemma4 26/31B (+GGUF, quadratic-mask skip;

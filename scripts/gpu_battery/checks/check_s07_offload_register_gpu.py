@@ -128,7 +128,17 @@ def check(step_dir: str) -> None:
         raise CheckFail(f"no row for route(s) {missing}")
 
     stats = payload.get("stats") or {}
-    for field in ("park_failures", "wave_in_failures"):
+    # #514: destination_release_failures / leaked_destination_bytes are gated
+    # here for the same reason wave_in_failures is. They were split out of
+    # wave_in_failures, so omitting them would silently widen what this check
+    # passes -- a release failure leaves the item resident with its park-target
+    # bytes still booked, which is precisely a leak the battery must not pass.
+    for field in (
+        "park_failures",
+        "wave_in_failures",
+        "destination_release_failures",
+        "leaked_destination_bytes",
+    ):
         value = stats.get(field)
         if value is None:
             raise CheckStop(f"movement telemetry without {field}")

@@ -2406,8 +2406,20 @@ class GGUFModelLoader(BaseModelLoader):
                     yield item
 
             _t_lw0 = time.perf_counter()
-            model.load_weights(_timed(iter(weights_iterator)))
+            _loaded_params = model.load_weights(_timed(iter(weights_iterator)))
             _t_lw = time.perf_counter() - _t_lw0
+            # #514/#505-A1-01: the draft-load completeness check used to run in
+            # DefaultModelLoader only, so a GGUF draft -- the fork's own #113
+            # territory, where a packed-name mismatch is exactly the failure
+            # mode -- was loaded with no check at all. Same call, same place in
+            # the sequence as the default path: before any quant
+            # post-processing, so the diagnostic names the unloaded parameters.
+            if getattr(model_config, "is_draft_model", False):
+                raise_on_unloaded_draft_parameters(
+                    model,
+                    _loaded_params,
+                    model_path=getattr(model_config, "model_path", ""),
+                )
             logger.info(
                 "[#89 STEP-0] load_weights (rank %s) done. elapsed=%.2f s "
                 "(producer parse+disk+transform=%.2f s over %d tensors | "

@@ -185,9 +185,7 @@ def new_token_residue(position: int, split_factor: int) -> int:
     return int(position) % max(1, int(split_factor))
 
 
-def owned_counts_weighted(
-    residues: torch.Tensor, prefix: List[int]
-) -> List[int]:
+def owned_counts_weighted(residues: torch.Tensor, prefix: List[int]) -> List[int]:
     """Per-rank owned-token counts under the weighted owner rule.
 
     ``prefix`` is ``cp_token_prefix``: rank r owns residues in
@@ -203,6 +201,56 @@ def owned_counts_even(seq_len: int, dcp_size: int) -> List[int]:
         seq_len // dcp_size + (1 if (seq_len % dcp_size) > r else 0)
         for r in range(dcp_size)
     ]
+
+
+def spill_tail_rows_max_over_ranks(
+    seg: torch.Tensor,
+    *,
+    mode: str,
+    S: int,
+    cp_prefix: List[int],
+    dcp_size: int,
+    boundary: int,
+    L: int,
+) -> int:
+    """Host rows the WIDEST rank needs for the tail segment ``[boundary, L)``.
+
+    The number of host rows a spill claims is rank-LOCAL: under the weighted
+    owner rule rank r takes the tail slots whose residue falls in
+    ``[cp_prefix[r], cp_prefix[r+1])``, and those windows have different widths
+    under uneven DCP (a [1, 3] token vector puts three quarters of the tail on
+    one rank). Comparing THIS rank's count against the replicated region size
+    therefore yields a rank-DEPENDENT spill verdict, and the two outcomes --
+    spill vs. stock retraction -- are different collective sequences. This
+    fork's rule (module header: "RANK-UNIFORMITY ... divergence == NCCL hang,
+    not a wrong number") makes that a hang, not a wrong number, so the region
+    check has to be the ANY-rank check: it is the widest rank that decides
+    whether one region can hold the tail.
+
+    NO COLLECTIVE is needed for it. Every input here is REPLICATED: ``seg`` is
+    a slice of the ``req_to_token`` row, which carries GLOBAL slot ids and is
+    identical on every rank (the weighted rule derives ownership FROM the
+    global id -- see ``compact_weighted``, the inverse of the ``_dcp_masked_write``
+    packing), and ``cp_prefix`` / ``dcp_size`` / ``boundary`` / ``L`` are
+    replicated geometry. So each rank can compute EVERY rank's count locally --
+    the same trick ``_restore`` already uses when it sizes the owner-matched
+    allocation for all ranks at once.
+
+    Pure and deterministic: identical on every rank by construction.
+    Single-rank ("plain", ``dcp_size == 1``) returns exactly the local count,
+    so that path is byte-identical to the pre-fix predicate."""
+    if mode == "weighted":
+        residues = (seg.to(torch.int64) % S).contiguous()
+        return max(owned_counts_weighted(residues, cp_prefix))
+    if mode == "even":
+        # Positional rule keyed on the ABSOLUTE position (same convention as
+        # ``owned_device_indices(..., pos_offset=boundary)``): the counts over
+        # [boundary, L) are the prefix counts of L minus those of boundary.
+        head = owned_counts_even(int(boundary), dcp_size)
+        whole = owned_counts_even(int(L), dcp_size)
+        return max(w - h for w, h in zip(whole, head))
+    assert mode == "plain"
+    return int(seg.numel())
 
 
 def prefill_spill_deep_reject_reason(
@@ -541,7 +589,7 @@ def host_ram_budget_error(
         return (
             "--kv-session-offload-host-ram-gib="
             f"{b:g} GiB exceeds the machine's TOTAL host RAM "
-            f"({int(total_bytes) / (1024 ** 3):.1f} GiB). The kv-session-offload "
+            f"({int(total_bytes) / (1024**3):.1f} GiB). The kv-session-offload "
             "host pool is PINNED memory and cannot be swapped out."
         )
     usable = int(available_bytes) - int(reserve_bytes)
@@ -549,9 +597,9 @@ def host_ram_budget_error(
         return (
             "--kv-session-offload-host-ram-gib="
             f"{b:g} GiB does not fit in the currently available host RAM: "
-            f"{int(available_bytes) / (1024 ** 3):.1f} GiB available minus a "
-            f"{int(reserve_bytes) / (1024 ** 3):.1f} GiB OS reserve = "
-            f"{max(0, usable) / (1024 ** 3):.1f} GiB usable. Lower the budget, "
+            f"{int(available_bytes) / (1024**3):.1f} GiB available minus a "
+            f"{int(reserve_bytes) / (1024**3):.1f} GiB OS reserve = "
+            f"{max(0, usable) / (1024**3):.1f} GiB usable. Lower the budget, "
             "or free host memory first (the pool is pinned; over-committing it "
             "invokes the OOM killer instead of swapping)."
         )
@@ -630,9 +678,7 @@ def spill_graph_rung_ladder(max_blocks: int) -> List[int]:
     return sorted(ladder)
 
 
-def spill_graph_pick_rung(
-    needed_blocks: int, ladder: List[int]
-) -> Optional[int]:
+def spill_graph_pick_rung(needed_blocks: int, ladder: List[int]) -> Optional[int]:
     """Smallest captured rung >= ``needed_blocks`` (the RANK-UNIFORM host
     block count), or None when the seq len needs more blocks than the largest
     rung -> eager fallback. Rank-uniform: ``needed_blocks`` derives only from
@@ -688,17 +734,15 @@ def spill_graph_out_plan(
     plan = []
     for j, cnt in enumerate(counts):
         s = base + j * b
-        host_rows = torch.arange(
-            s, s + cnt, dtype=torch.int64, device=device
-        )
+        host_rows = torch.arange(s, s + cnt, dtype=torch.int64, device=device)
         indptr = torch.tensor([0, cnt], dtype=torch.int32, device=device)
         plan.append({"cnt": cnt, "host_rows": host_rows, "indptr": indptr})
     return plan
 
 
-def compact_weighted(loc: torch.Tensor, S: int, lo: int, hi: int) -> Tuple[
-    torch.Tensor, torch.Tensor
-]:
+def compact_weighted(
+    loc: torch.Tensor, S: int, lo: int, hi: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """(owned_mask, compact_slots) for GLOBAL slot ids under the weighted
     owner rule -- the exact inverse of the ``_dcp_masked_write`` packing."""
     loc64 = loc.to(torch.int64)
@@ -981,6 +1025,42 @@ def mtp_resident_reservation_error(
             "--max-total-tokens, or lower --chunked-prefill-size."
         )
     return None
+
+
+def draft_scratch_carveout_error(
+    before: int, after: int, slices: int, allocator_name: str
+) -> Optional[str]:
+    """Reject a draft-scratch carve-out whose write did not take effect.
+
+    ``--kv-session-offload-mtp-resident-slices`` reserves device KV slots for
+    the spill tick's device draft FOREVER, and the reservation is only honest
+    if the slots also leave ``allocator.size`` -- that is the ``total`` the
+    scheduler's leak invariant balances against. Some allocators cannot honour
+    the write: on the hybrid composites (``UnifiedMambaTokenToKVPoolAllocator``
+    / ``UnifiedSWATokenToKVPoolAllocator``) ``size`` is COMPUTED from live
+    sub-allocator state and the setter is a no-op absorber, so ``size -= n``
+    is silently dropped. The permanent allocation then shows up as a standing
+    leak of ``slices`` slots in every invariant check, while the advertised
+    capacity still counts slots no request can ever get.
+
+    Returns the error text, or None when the carve-out really happened.
+    """
+    before, after, slices = int(before), int(after), int(slices)
+    if after == before - slices:
+        return None
+    return (
+        f"the draft-read scratch carve-out did not take effect on "
+        f"{allocator_name}: allocator.size stayed {after} where "
+        f"{before - slices} was expected ({before} - {slices} reserved "
+        "slots). On this allocator `size` is a computed property whose "
+        "setter absorbs the write, so the reservation would stay counted in "
+        "the advertised capacity while being permanently out of circulation "
+        "-- the scheduler's pool-leak invariant would report exactly these "
+        f"{slices} slots as leaked, every check, for the manager's life. "
+        "Refusing instead of logging a carve-out that did not happen. Run "
+        "spec-in-tick with an allocator whose size is settable, or unset "
+        "--kv-session-offload-mtp-resident-slices."
+    )
 
 
 def spill_tick_seq_len(n_origin_input_ids: int, n_output_ids: int) -> Optional[int]:
@@ -2023,9 +2103,7 @@ class KVSessionOffloadManager:
         # steal each other's iterations.
         self.decouple = bool(spill_decouple_enabled())
         self.restore_margin_tokens = int(sa.kv_session_offload_restore_margin_tokens)
-        self._hysteresis_steps = int(
-            sa.kv_session_offload_restore_hysteresis_steps
-        )
+        self._hysteresis_steps = int(sa.kv_session_offload_restore_hysteresis_steps)
         # P1 (S3): minimum free device slots before wave-back peels another
         # block off the host tail. 0 = today's "any free slot waves" behaviour
         # (byte-identical). Server-global -> replicated on every rank, so the
@@ -2109,9 +2187,7 @@ class KVSessionOffloadManager:
         # is off by the ctx-gate at spill lengths anyway). Gated so OFF is
         # byte-identical: spec_in_tick_ready False -> _build_spill_batch keeps
         # spec_algorithm=NONE (plain host tick, unchanged).
-        self.spec_in_tick = bool(
-            getattr(sa, "kv_session_offload_spec_in_tick", False)
-        )
+        self.spec_in_tick = bool(getattr(sa, "kv_session_offload_spec_in_tick", False))
         self.mtp_resident_slices = int(
             getattr(sa, "kv_session_offload_mtp_resident_slices", 0) or 0
         )
@@ -2119,9 +2195,7 @@ class KVSessionOffloadManager:
         # prefill-time admission (PS1), the born-spilled write hook (PS2), the
         # host-prefix read (PS3) and the handover (PS4) are all gated on this.
         # Default False -> the prefill path is byte-identical to today.
-        self.prefill_spill = bool(
-            getattr(sa, "kv_session_offload_prefill", False)
-        )
+        self.prefill_spill = bool(getattr(sa, "kv_session_offload_prefill", False))
         if self.prefill_spill:
             logger.info(
                 "kv-session-offload prefill-spill (born-spilled) ENABLED: a "
@@ -2195,26 +2269,7 @@ class KVSessionOffloadManager:
             _sc = self.allocator.alloc(self.mtp_resident_slices)
             if _sc is not None:
                 self._draft_read_scratch = _sc.to(torch.int64)
-                # Take the reserved slots OUT of the pool's accounted size so the
-                # SchedulerInvariantChecker (available + evictable + protected +
-                # session_held + uncached == total, total = allocator.size)
-                # stays balanced -- they are genuinely out of circulation for the
-                # manager's life. This honestly shrinks the effective KV capacity
-                # by the resident cap (the operator's device-draft budget).
-                try:
-                    self.allocator.size -= int(self.mtp_resident_slices)
-                except Exception:
-                    pass
-                logger.info(
-                    "kv-session-offload spec-in-tick: reserved %d draft-read "
-                    "scratch slots (held for the manager's life; index the "
-                    "shared draft/target slot space, written on the draft pool "
-                    "only; allocator.size shrunk to %d to keep the leak "
-                    "invariant balanced). (rank %d)",
-                    self.mtp_resident_slices,
-                    self.allocator.size,
-                    self.dcp_rank,
-                )
+                self._carve_out_draft_scratch()
             else:
                 logger.warning(
                     "kv-session-offload spec-in-tick: could NOT reserve %d "
@@ -2252,11 +2307,7 @@ class KVSessionOffloadManager:
         # rely on (rank-divergent region counts desync, they do not just differ).
         self.max_spills = max(
             1,
-            int(
-                getattr(
-                    mr, "kv_sess_max_spills", sa.kv_session_offload_max_spills
-                )
-            ),
+            int(getattr(mr, "kv_sess_max_spills", sa.kv_session_offload_max_spills)),
         )
         self.region_tokens = int(
             getattr(mr, "kv_sess_region_tokens", self.host_pool.size)
@@ -2282,9 +2333,9 @@ class KVSessionOffloadManager:
         self.tick_controller = None
         # Per-rank measurement state feeding the regulator (device-timer
         # reporter + host wall clock). Untouched when the regulator is off.
-        self._busy_ms_accum = 0.0        # device-busy ms harvested since last iter
-        self._tick_cost_ms = None        # EMA of a spill-tick forward's cost (ms)
-        self._last_iter_wall = None      # host perf_counter of the last pre_schedule
+        self._busy_ms_accum = 0.0  # device-busy ms harvested since last iter
+        self._tick_cost_ms = None  # EMA of a spill-tick forward's cost (ms)
+        self._last_iter_wall = None  # host perf_counter of the last pre_schedule
         # A spill tick is a bs=1 PLAIN decode (spec_algo NONE) -> device-timer
         # category "decode". In a SPEC server the main forwards are
         # target_verify / extend / draft, so category=="decode" cleanly isolates
@@ -2422,6 +2473,60 @@ class KVSessionOffloadManager:
                 self.tick_controller.deadzone_sigma,
                 self._regulator_spec_server,
             )
+
+    def _carve_out_draft_scratch(self) -> None:
+        """Take the reserved draft-read scratch slots OUT of the allocator's
+        accounted size -- and PROVE the write took effect.
+
+        The slots are allocated once and held for the manager's life, so they
+        must leave the advertised capacity: the SchedulerInvariantChecker
+        balances ``available + evictable + protected + session_held + uncached
+        == total`` with ``total = allocator.size``
+        (``scheduler_components/invariant_checker.py:124``), and an allocation
+        nobody ever frees shows up there as a permanent leak of exactly this
+        many slots.
+
+        The write is VERIFIED rather than assumed. On the hybrid composites
+        this fork serves (``UnifiedMambaTokenToKVPoolAllocator``,
+        ``UnifiedSWATokenToKVPoolAllocator``) ``size`` is a COMPUTED property
+        whose setter is a deliberate no-op absorber, so the assignment vanishes
+        WITHOUT raising -- the pre-#514 ``try: ... except Exception: pass``
+        caught nothing, the carve-out silently did not happen, and the success
+        log was printed anyway. A framework's success message about state has
+        to be backed by an independent state probe (CLAUDE.md), so the size is
+        read back and a carve-out that did not take is refused BY NAME instead
+        of running the manager on a capacity figure that is a lie.
+
+        The refusal leaves no partial state (#501 house rule): the reserved
+        slots go back to the allocator and the handle is cleared before the
+        raise, so the caller's ``spec_in_tick_ready`` teardown sees exactly the
+        "could not reserve" state."""
+        slices = int(self.mtp_resident_slices)
+        name = type(self.allocator).__name__
+        before = int(self.allocator.size)
+        failure: Optional[str] = None
+        try:
+            self.allocator.size = before - slices
+        except Exception as exc:  # a property with no setter at all
+            failure = f"the write raised {type(exc).__name__}: {exc}"
+        after = int(self.allocator.size)
+        if failure is None:
+            failure = draft_scratch_carveout_error(before, after, slices, name)
+        if failure is not None:
+            self.allocator.free(self._draft_read_scratch)
+            self._draft_read_scratch = None
+            raise ValueError("kv-session-offload spec-in-tick: " + failure)
+        logger.info(
+            "kv-session-offload spec-in-tick: reserved %d draft-read "
+            "scratch slots (held for the manager's life; index the "
+            "shared draft/target slot space, written on the draft pool "
+            "only; allocator.size shrunk %d -> %d to keep the leak "
+            "invariant balanced). (rank %d)",
+            slices,
+            before,
+            after,
+            self.dcp_rank,
+        )
 
     def _effective_spec_algorithm(self):
         """The spec family that would ACTUALLY run on a spill tick right now.
@@ -2668,7 +2773,8 @@ class KVSessionOffloadManager:
         except Exception as e:  # noqa: BLE001 -- sizing only, never fatal
             logger.warning(
                 "kv-session-offload budget: GDN token equivalent unavailable "
-                "(%r); GDN states are NOT charged to the volume budgets.", e
+                "(%r); GDN states are NOT charged to the volume budgets.",
+                e,
             )
             local = 0
         grp = getattr(self.scheduler, "tp_cpu_group", None)
@@ -2768,9 +2874,7 @@ class KVSessionOffloadManager:
             decode_tokens_after=dec + sess_after,
             total_tokens_after=total + sess_after,
             rate_ready=(
-                self._budget_bucket.ready()
-                if self._budget_bucket is not None
-                else True
+                self._budget_bucket.ready() if self._budget_bucket is not None else True
             ),
         )
         if reason is not None:
@@ -2786,9 +2890,7 @@ class KVSessionOffloadManager:
         blocked = {
             i
             for i, r in enumerate(reqs)
-            if self._budget_cooldown.blocked(
-                r.rid, len(r.output_ids), self._budget_now
-            )
+            if self._budget_cooldown.blocked(r.rid, len(r.output_ids), self._budget_now)
         }
         return blocked or None
 
@@ -2819,14 +2921,14 @@ class KVSessionOffloadManager:
             )
             if reason is not None:
                 self._budget_demote(slot, reason)
+
         # Aggregate reglers: one demotion per class per iteration, youngest
         # live session of the class (FCFS-consistent; re-evaluated next iter).
         def _youngest(phase=None):
             live = [
                 s
                 for s in ordered
-                if not s.budget_demoted
-                and (phase is None or s.budget_phase == phase)
+                if not s.budget_demoted and (phase is None or s.budget_phase == phase)
             ]
             if not live:
                 return None
@@ -3206,9 +3308,7 @@ class KVSessionOffloadManager:
         # was just PREVENTED (pendulum_blocked); an ACTUAL round inside the
         # lock (pendulum_events) is what the exclusion makes impossible and
         # is counted defensively below, at the spill commit.
-        blocked = (
-            self._budget_blocked_victims(batch.reqs) if budget_armed else None
-        )
+        blocked = self._budget_blocked_victims(batch.reqs) if budget_armed else None
         idx = select_spill_victim(
             batch.reqs,
             sizes=sizes,
@@ -3401,9 +3501,7 @@ class KVSessionOffloadManager:
         # host. boundary splits the row into a device-resident head
         # [0, boundary) (kept, tree-locked) and a host tail [boundary, L).
         protected = int(req.cache_protected_len or 0)
-        boundary, spill_count = partial_spill_plan(
-            L, protected, need, self.block_size
-        )
+        boundary, spill_count = partial_spill_plan(L, protected, need, self.block_size)
         if spill_count <= 0:
             # need <= 0 after the internal recompute: nothing to free. Leave
             # the batch untouched (the stock retract path decides).
@@ -3440,12 +3538,32 @@ class KVSessionOffloadManager:
             pos_offset=boundary,  # even-mode ownership keys on absolute position
         )
         n_own = int(dev_idx.numel())
-        if n_own > self.region_tokens:
+        # RANK-UNIFORM region check. `n_own` is this rank's owned row count and
+        # is rank-LOCAL under uneven DCP (different owner-window widths), while
+        # `region_tokens` is replicated -- comparing the two decided SPILL vs.
+        # STOCK RETRACTION per rank, i.e. two different collective sequences in
+        # the same iteration. The verdict is taken on the WIDEST rank instead
+        # (`spill_tail_rows_max_over_ranks`, computed locally from replicated
+        # inputs -- no collective, see its docstring); `n_own` stays in the log
+        # line because the local count is what a rank-side trace shows.
+        n_own_max = spill_tail_rows_max_over_ranks(
+            seg,
+            mode=self.mode,
+            S=self.S,
+            cp_prefix=self.cp_prefix,
+            dcp_size=self.dcp_size,
+            boundary=boundary,
+            L=L,
+        )
+        if n_own_max > self.region_tokens:
             logger.warning(
-                "kv-session-offload: session rid=%s tail needs %d host rows > "
-                "region %d; falling back to stock retraction.",
+                "kv-session-offload: session rid=%s tail needs %d host rows on "
+                "the widest rank (%d on rank %d) > region %d; falling back to "
+                "stock retraction (rank-uniform verdict).",
                 req.rid,
+                n_own_max,
                 n_own,
+                self.dcp_rank,
                 self.region_tokens,
             )
             return False
@@ -3479,8 +3597,7 @@ class KVSessionOffloadManager:
             residues = (seg.to(torch.int64) % self.S).contiguous()
         else:
             residues = (
-                torch.arange(boundary, L, dtype=torch.int64, device=row.device)
-                % self.S
+                torch.arange(boundary, L, dtype=torch.int64, device=row.device) % self.S
             )
 
         # Register the session's backend slot (region base, fresh head/count
@@ -3772,12 +3889,8 @@ class KVSessionOffloadManager:
         batch.req_pool_indices = torch.tensor(
             [req.req_pool_idx], dtype=torch.int64, device=device
         )
-        batch.req_pool_indices_cpu = torch.tensor(
-            [req.req_pool_idx], dtype=torch.int64
-        )
-        seq_len = spill_tick_seq_len(
-            len(req.origin_input_ids), len(req.output_ids)
-        )
+        batch.req_pool_indices_cpu = torch.tensor([req.req_pool_idx], dtype=torch.int64)
+        seq_len = spill_tick_seq_len(len(req.origin_input_ids), len(req.output_ids))
         assert seq_len is not None, (
             "kv-session-offload tick build: rid=%s has no output token yet "
             "(born-spilled, prefill result not processed); _pick_tick_slot "
@@ -3789,9 +3902,7 @@ class KVSessionOffloadManager:
         )
         batch.seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int64)
-        batch.orig_seq_lens = torch.tensor(
-            [seq_len], dtype=torch.int32, device=device
-        )
+        batch.orig_seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
         batch.seq_lens_sum = seq_len
         last_tokens = torch.tensor(
             [req.output_ids[-1]], dtype=torch.int64, device=device
@@ -3999,7 +4110,8 @@ class KVSessionOffloadManager:
         pending = [
             slot
             for slot in self.spills.values()
-            if getattr(slot, "born_spilled", False) and not getattr(slot, "adopted", True)
+            if getattr(slot, "born_spilled", False)
+            and not getattr(slot, "adopted", True)
         ]
         if not pending:
             return running_batch
@@ -4056,7 +4168,9 @@ class KVSessionOffloadManager:
             self._busy_ms_accum = 0.0
             tick_cost = (
                 self._tick_cost_ms
-                if (self._tick_cost_ms is not None and self._tick_cost_ms > _MEAS_EPS_MS)
+                if (
+                    self._tick_cost_ms is not None and self._tick_cost_ms > _MEAS_EPS_MS
+                )
                 else None
             )
             self.tick_controller.observe_sample(wall_ms, busy_ms, tick_cost)
@@ -4068,7 +4182,9 @@ class KVSessionOffloadManager:
                     "(headroom=%.2f, tick_cost=%.2fms, spilled=%d, changes=%d)",
                     tc._effective,
                     headroom,
-                    self._tick_cost_ms if self._tick_cost_ms is not None else float("nan"),
+                    self._tick_cost_ms
+                    if self._tick_cost_ms is not None
+                    else float("nan"),
                     len(self.spills),
                     tc.n_changes,
                 )
@@ -4199,12 +4315,8 @@ class KVSessionOffloadManager:
         if not fast_waiting:
             return
         # FCFS among fast-lane requests.
-        fr = min(
-            fast_waiting, key=lambda r: getattr(r, "kv_arrival_seq", 0) or 0
-        )
-        ratio = getattr(
-            getattr(sch, "new_token_ratio_tracker", None), "current", 1.0
-        )
+        fr = min(fast_waiting, key=lambda r: getattr(r, "kv_arrival_seq", 0) or 0)
+        ratio = getattr(getattr(sch, "new_token_ratio_tracker", None), "current", 1.0)
         max_new = getattr(fr.sampling_params, "max_new_tokens", 0) or 0
         need = len(fr.origin_input_ids) + int(max_new * ratio) + 1
 
@@ -4236,9 +4348,7 @@ class KVSessionOffloadManager:
                 break  # normal admission will take it now
             # Free the residual shortfall (block-rounded inside try_spill);
             # each victim is a partial tail spill into its own region.
-            if not self.try_spill(
-                running_batch, fast_pressure=True, need=need - have
-            ):
+            if not self.try_spill(running_batch, fast_pressure=True, need=need - have):
                 break  # no eligible victim in the batch
             spilled_any += 1
 
@@ -4357,9 +4467,17 @@ class KVSessionOffloadManager:
                 "kv-session-offload restore-gate: iter=%d L=%d boundary=%d "
                 "remaining=%d avail=%d evictable=%d margin=%d drained=%s "
                 "fits_now=%s quiescent=%s suppress_tick=%s",
-                self._iter_ct, L, boundary, remaining, avail,
-                restorable - avail, self.restore_margin_tokens,
-                drained, fits_now, quiescent, slot.suppress_tick,
+                self._iter_ct,
+                L,
+                boundary,
+                remaining,
+                avail,
+                restorable - avail,
+                self.restore_margin_tokens,
+                drained,
+                fits_now,
+                quiescent,
+                slot.suppress_tick,
             )
         if drained or fits_now:
             if not quiescent:
@@ -4423,9 +4541,12 @@ class KVSessionOffloadManager:
                 # content settles before the transfer snapshots it. False on
                 # every slot unless the destination chain armed it.
                 continue
-            if spill_tick_seq_len(
-                len(slot.req.origin_input_ids), len(slot.req.output_ids)
-            ) is None:
+            if (
+                spill_tick_seq_len(
+                    len(slot.req.origin_input_ids), len(slot.req.output_ids)
+                )
+                is None
+            ):
                 # BORN-SPILLED, prefill result not processed yet: no output
                 # token exists, so there is nothing for a decode tick to feed
                 # (see spill_tick_seq_len). Defer one iteration instead of
@@ -4478,10 +4599,7 @@ class KVSessionOffloadManager:
                 else False
             )
             interval = self.tick_controller.effective_interval(fast_pressure)
-        if (
-            device_has_work
-            and (self._iter_ct - self._last_tick_iter) <= interval
-        ):
+        if device_has_work and (self._iter_ct - self._last_tick_iter) <= interval:
             return None
 
         slot = self._pick_tick_slot(running_batch)
@@ -4901,8 +5019,7 @@ class KVSessionOffloadManager:
         if self.mode == "weighted":
             counts = owned_counts_weighted(residues, self.cp_prefix)
             bounds = [
-                (self.cp_prefix[r], self.cp_prefix[r + 1])
-                for r in range(len(counts))
+                (self.cp_prefix[r], self.cp_prefix[r + 1]) for r in range(len(counts))
             ]
             class_slots = self.allocator.alloc_owner_matched_classes(
                 self.S, bounds, counts
@@ -4910,9 +5027,7 @@ class KVSessionOffloadManager:
             if class_slots is None:
                 slot.hysteresis.reset()
                 return running_batch
-            new_locs = assign_owner_matched_slots(
-                residues, self.cp_prefix, class_slots
-            )
+            new_locs = assign_owner_matched_slots(residues, self.cp_prefix, class_slots)
         else:
             new_locs = self.allocator.alloc(tail)
             if new_locs is None:
@@ -4957,8 +5072,8 @@ class KVSessionOffloadManager:
                 self.host_pool.load_to_device_per_layer(
                     self.full_pool, host_ids, dev_idx, fl, io_backend="kernel"
                 )
-        self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:L] = (
-            new_locs.to(torch.int32)
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:L] = new_locs.to(
+            torch.int32
         )
         # DRAFT-KV BUNDLE: write the snapshotted draft KV of the overlapping
         # pre-spill positions back into these same new_locs (draft shares the
@@ -5005,17 +5120,14 @@ class KVSessionOffloadManager:
         if self.mode == "weighted":
             counts = owned_counts_weighted(residues, self.cp_prefix)
             bounds = [
-                (self.cp_prefix[r], self.cp_prefix[r + 1])
-                for r in range(len(counts))
+                (self.cp_prefix[r], self.cp_prefix[r + 1]) for r in range(len(counts))
             ]
             class_slots = self.allocator.alloc_owner_matched_classes(
                 self.S, bounds, counts
             )
             if class_slots is None:
                 return False  # not enough owner-matched room this window
-            new_locs = assign_owner_matched_slots(
-                residues, self.cp_prefix, class_slots
-            )
+            new_locs = assign_owner_matched_slots(residues, self.cp_prefix, class_slots)
         else:
             new_locs = self.allocator.alloc(hi_pos - boundary)
             if new_locs is None:
@@ -5140,8 +5252,7 @@ class KVSessionOffloadManager:
         n_sent = int((row_chk >= self.host_base).sum().item())
         assert n_sent == 0, (
             "kv-session-offload RESTORE row not clean: rid=%s L=%d has %d "
-            "sentinel(s) after restore (rank %d)"
-            % (req.rid, L, n_sent, self.dcp_rank)
+            "sentinel(s) after restore (rank %d)" % (req.rid, L, n_sent, self.dcp_rank)
         )
         if getattr(self, "_budget_armed", False):
             self._budget_counters.episodes_restored += 1
@@ -5225,7 +5336,10 @@ class KVSessionOffloadManager:
             self._log(
                 "kv-session-offload MTP resume: backfill unavailable rid=%s "
                 "gap=%d n_hiddens=%d -> seed-only (rank %d)",
-                slot.req.rid, gap, nh, self.dcp_rank,
+                slot.req.rid,
+                gap,
+                nh,
+                self.dcp_rank,
             )
         if seed is None:
             seed = self._seed_only_resume(slot, L)
@@ -5324,9 +5438,7 @@ class KVSessionOffloadManager:
         batch.req_pool_indices = torch.tensor(
             [req.req_pool_idx], dtype=torch.int64, device=device
         )
-        batch.req_pool_indices_cpu = torch.tensor(
-            [req.req_pool_idx], dtype=torch.int64
-        )
+        batch.req_pool_indices_cpu = torch.tensor([req.req_pool_idx], dtype=torch.int64)
         batch.input_ids = torch.tensor(
             full[prefix_len:L], dtype=torch.int64, device=device
         )

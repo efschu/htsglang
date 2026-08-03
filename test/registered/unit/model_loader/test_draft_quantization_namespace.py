@@ -471,6 +471,110 @@ class TestSkippedDraftParametersAreLoud(unittest.TestCase):
         raise_on_unloaded_draft_parameters(model, None)
         raise_on_unloaded_draft_parameters(model, set())
 
+    def test_a_model_that_reports_nothing_says_so_out_loud(self):
+        """#514/#505-A1-01: still allowed, no longer silent.
+
+        Audit #505 measured this guard's reach and found it skipping most draft
+        classes, with the skip indistinguishable from a pass. A guard that
+        silently declines to run reproduces exactly the condition it exists to
+        remove -- an unwritten draft parameter whose only symptom is an accept
+        rate near zero. The unchecked state stays permitted; it is now logged
+        once per class.
+        """
+        from sglang.srt.model_loader import weight_utils
+
+        weight_utils._DRAFT_LOAD_UNCHECKED_SEEN.clear()
+        model = _Drafter(quantized=True)
+        with self.assertLogs(weight_utils.logger, level="WARNING") as captured:
+            raise_on_unloaded_draft_parameters(model, None, model_path="/ckpt/x")
+        joined = "\n".join(captured.output)
+        self.assertIn("completeness NOT checked", joined)
+        self.assertIn("_Drafter", joined)
+        self.assertIn("accept rate", joined)
+
+        # Once per class, not once per rank per load.
+        with self.assertNoLogs(weight_utils.logger, level="WARNING"):
+            raise_on_unloaded_draft_parameters(model, None, model_path="/ckpt/x")
+
+        # The empty-set arm is the same story and must also speak.
+        weight_utils._DRAFT_LOAD_UNCHECKED_SEEN.clear()
+        with self.assertLogs(weight_utils.logger, level="WARNING") as captured:
+            raise_on_unloaded_draft_parameters(model, set(), model_path="/ckpt/x")
+        self.assertIn("EMPTY set", "\n".join(captured.output))
+
+    def test_the_gguf_loader_checks_draft_completeness_too(self):
+        """#514/#505-A1-01: GGUFModelLoader discarded load_weights' return, so
+        a GGUF draft -- the fork's own #113 territory, where a packed-name
+        mismatch is precisely the failure mode -- got no check at all."""
+        import inspect
+
+        from sglang.srt.model_loader.loader import GGUFModelLoader
+
+        import ast
+        import textwrap
+
+        source = textwrap.dedent(inspect.getsource(GGUFModelLoader.load_model))
+        self.assertIn("raise_on_unloaded_draft_parameters", source)
+
+        tree = ast.parse(source)
+        # Every `model.load_weights(...)` here must have its result BOUND --
+        # a bare Expr statement is the discard that disabled the check.
+        discarded = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "load_weights"
+        ]
+        self.assertEqual(
+            discarded,
+            [],
+            "GGUFModelLoader discards load_weights' return value again "
+            f"(line {discarded}); the draft completeness check cannot run "
+            "without it (#505-A1-01)",
+        )
+
+    def test_the_mtp_wrappers_return_their_base_class_report(self):
+        """One missing `return` in a thin MTP wrapper disables the guard for
+        that whole draft class, and nothing anywhere says so. Structural pin:
+        a wrapper whose load_weights only CALLS super() drops the report."""
+        import ast
+        import inspect
+
+        from sglang.srt.models import qwen3_next_mtp
+
+        tree = ast.parse(inspect.getsource(qwen3_next_mtp))
+        handlers = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
+        ]
+        self.assertTrue(handlers, "qwen3_next_mtp has no load_weights")
+        for handler in handlers:
+            supers = [
+                node
+                for node in ast.walk(handler)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "load_weights"
+                and isinstance(node.func.value, ast.Call)
+                and getattr(node.func.value.func, "id", None) == "super"
+            ]
+            if not supers:
+                continue
+            returned = [
+                node
+                for node in ast.walk(handler)
+                if isinstance(node, ast.Return) and node.value is not None
+            ]
+            self.assertTrue(
+                returned,
+                "qwen3_next_mtp.load_weights calls super().load_weights but "
+                "returns nothing, so raise_on_unloaded_draft_parameters reads "
+                "None and skips this draft class entirely (#505-A1-01)",
+            )
+
     def test_the_escape_hatch_downgrades_the_error(self):
         from sglang.srt.environ import envs
 

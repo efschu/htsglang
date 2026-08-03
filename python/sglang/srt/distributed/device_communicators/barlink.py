@@ -366,6 +366,134 @@ def _invoke_factory(factory, cpu_group, device, group: str):
     return factory(cpu_group, device)
 
 
+def _close_quietly(t) -> None:
+    """Tear a transport down without letting the teardown become the error.
+
+    Used on the path where the GROUP decided against a transport this rank
+    had already built: the reason to report is the peers' failure, never
+    whatever a ``close()`` of the abandoned object happens to raise.
+    """
+    close = getattr(t, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as e:      # noqa: BLE001 - teardown must not mask the cause
+        logger.warning(
+            "barlink: tearing down the transport the group decided against "
+            "failed (%r). The group still runs on the gloo plane.", e,
+        )
+
+
+def _agree_fallback(name: str, t, cpu_group, group: str, reason: str,
+                    stage: str):
+    """ONE transport choice for the whole group. Returns ``(t, reason, stage)``.
+
+    **The rule this enforces.** Falling back to the gloo plane is allowed for
+    every transport outside ``_NO_FALLBACK`` -- that is deliberate and stays
+    that way. What is NOT allowed is falling back ALONE. ``handles()``,
+    ``supports_async()`` and the whole #240 dispatch seam are built on the
+    assumption that every rank of a group answers the same question the same
+    way; a rank that quietly runs the host-staged plane while its peers drive
+    BAR1 kernels breaks that assumption at the transport level, which is one
+    level below where any of the existing uniformity checks look.
+
+    Bring-up failures that differ per rank are the normal case here, not an
+    exotic one: the BAR1 peer mapping is a property of a PAIR of cards, the
+    kernel JIT build is per architecture, and the window probe reads the
+    individual card's aperture. Any one of them can say no on exactly one
+    card of a mixed rig.
+
+    **Why a one-hot SUM all_reduce and not an object gather.** The vote is an
+    ``int64`` vector with this rank's slot set, reduced with SUM, so the
+    result names every failing rank at a fixed size and without a pickle
+    round trip. The reasons are exchanged afterwards and ONLY in the
+    divergence branch, which every rank enters or none does, because the
+    branch condition is the reduced vector itself.
+
+    **And why it is NOT a bounded wait.** This is the one point where the
+    ranks are legitimately minutes apart: the transport bring-up compiles
+    kernels, and on a cold JIT cache the per-rank build times differ by the
+    whole cold-build window (#431/#438a). A steady-state deadline here would
+    fire on a healthy group -- exactly the failure ``wait_timeout_s`` scales
+    itself to avoid. The bring-up collectives this one sits next to
+    (``barlink_bar1``'s BDF, fd and window exchanges) are unbounded object
+    collectives for the same reason, so the agreement adds no deadline that
+    was not already there.
+
+    Skipped without a group (``cpu_group is None``) or at world size 1: there
+    is no second rank that could disagree. ``BarlinkCommunicator`` always
+    passes the group's real gloo ``ProcessGroup``, so this is not a way in
+    for production code -- it keeps the seam callable from CPU tests.
+
+    **What this does NOT fix.** A rank-local failure INSIDE a collective
+    bring-up (bar1 exchanges BDFs, dma-buf fds and window minima, and binds
+    peer regions in between) leaves the group's collective sequence, and its
+    peers are then waiting in a collective this rank will never issue. That
+    desync is upstream of this agreement and is a hang, not a silent split;
+    the agreement closes the window where every rank COMPLETED its bring-up
+    and the outcomes still differ.
+    """
+    if cpu_group is None:
+        return t, reason, stage
+    try:
+        world = dist.get_world_size(cpu_group)
+        rank = dist.get_rank(cpu_group)
+    except Exception as e:      # noqa: BLE001 - never fail the build over this
+        logger.warning(
+            "barlink: the transport choice for group %r could not be agreed "
+            "across the group (%r). Proceeding with this rank's own outcome.",
+            group or "<unnamed>", e,
+        )
+        return t, reason, stage
+    if world < 2:
+        return t, reason, stage
+
+    votes = torch.zeros(world, dtype=torch.int64)
+    votes[rank] = 1 if t is not None else 0
+    dist.all_reduce(votes, op=dist.ReduceOp.SUM, group=cpu_group)
+    failed = [r for r in range(world) if int(votes[r]) == 0]
+    if not failed:
+        return t, reason, stage
+    if len(failed) == world:
+        # Every rank failed on its own merits. The group is already uniform,
+        # so this rank's own reason stays the reported one -- calling that a
+        # divergence would bury the actual cause under a second message.
+        return None, reason, stage
+
+    # Divergence. Every rank reaches this branch, because `failed` is derived
+    # from the reduced vector and is therefore identical everywhere -- so the
+    # reason exchange below is balanced.
+    reasons: list = [None] * world
+    try:
+        dist.all_gather_object(reasons, reason or "", group=cpu_group)
+    except Exception as e:      # noqa: BLE001 - the ranks are the payload
+        logger.warning(
+            "barlink: the per-rank reasons could not be exchanged (%r); the "
+            "failing ranks are named from the vote alone.", e,
+        )
+    named = "; ".join(
+        f"rank {r}: {reasons[r] or 'reason not reported'}" for r in failed
+    )
+    group_reason = (
+        f"transport {name!r} came up on some ranks and not on others "
+        f"(failed on {failed} of {world}) -- {named}"
+    )
+    logger.warning(
+        "barlink: group %r does NOT get the requested transport %r on every "
+        "rank -- it came up on %s and failed on %s. The WHOLE group therefore "
+        "runs over the host-staged gloo layer: a rank on %r while its peers "
+        "are on gloo is not a slower group, it is a group whose ranks answer "
+        "handles() differently. Reasons: %s. Fix the failing ranks or select "
+        "a transport every rank can build.",
+        group or "<unnamed>", name,
+        [r for r in range(world) if r not in failed], failed, name, named,
+    )
+    if t is not None:
+        _close_quietly(t)
+    return None, group_reason, "group-agreement"
+
+
 def _build_transport(name: str, cpu_group, device, disabled: bool,
                      group: str = ""):
     if disabled:
@@ -381,12 +509,14 @@ def _build_transport(name: str, cpu_group, device, disabled: bool,
         t = _invoke_factory(factory, cpu_group, device, group)
         report_state(group, name, name)
         return t
+    reason = ""
+    stage = ""
     try:
         t = _invoke_factory(factory, cpu_group, device, group)
     except Exception as e:
+        t = None
         stage = getattr(e, "stage", "setup")
         reason = getattr(e, "reason", f"{type(e).__name__}: {e}")
-        report_state(group, name, "gloo", reason=reason, stage=stage)
         # WARNING, not INFO, and with the group name. One group failing is
         # not an edge case: it turns any measurement over this run into a
         # mixed one, and that is exactly what happened here unnoticed.
@@ -397,15 +527,22 @@ def _build_transport(name: str, cpu_group, device, disabled: bool,
             "NOT be reported as a %r number.",
             group or "<unnamed>", name, stage, reason, name,
         )
-        return None
+    else:
+        if t is None:
+            reason = "factory returned None without a reason"
+            stage = "setup"
+            logger.warning(
+                "barlink: group %r does not get the requested transport %r "
+                "(the factory returned None). gloo layer.",
+                group or "<unnamed>", name,
+            )
+    # The fallback is a GROUP decision, not a per-rank one (#505-A2-05).
+    # Reached on BOTH paths on purpose: a rank that already knows it failed
+    # must still cast its vote, otherwise its peers wait for an answer that
+    # never arrives -- which is the desync this agreement exists to remove.
+    t, reason, stage = _agree_fallback(name, t, cpu_group, group, reason, stage)
     if t is None:
-        report_state(group, name, "gloo",
-                    reason="factory returned None without a reason", stage="setup")
-        logger.warning(
-            "barlink: group %r does not get the requested transport %r "
-            "(the factory returned None). gloo layer.",
-            group or "<unnamed>", name,
-        )
+        report_state(group, name, "gloo", reason=reason, stage=stage)
         return None
     report_state(group, name, name)
     return t
