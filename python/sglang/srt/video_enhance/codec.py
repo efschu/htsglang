@@ -42,9 +42,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -55,6 +57,7 @@ from sglang.srt.video_enhance.frame_math import (
     Resolution,
     codec_pool_bytes,
     frame_bytes,
+    nvenc_session_bytes,
 )
 from sglang.srt.video_enhance.frames import Frame, StageBase
 
@@ -67,6 +70,15 @@ BackendName = Literal["auto", "pynvvideocodec", "ffmpeg"]
 #: ``chain_reservation``'s ``decoder_pool_depth``.
 DEFAULT_DECODER_POOL_DEPTH = 4
 DEFAULT_ENCODER_POOL_DEPTH = 4
+
+#: Floor on how many submitted frames the in-process NVENC backend keeps
+#: referenced (#484). NVENC reads an external input surface until the frame
+#: leaves its lookahead queue, measured at six frames on a 3080 at
+#: ``P4``/``high_quality``; eight is that with room, and it is a FLOOR under
+#: the packet-count arithmetic rather than the rule itself. At 4K NV12 it
+#: pins about 100 MiB, which is the input half of the encoder surface pool
+#: the §6.2 reservation already charges.
+MIN_INFLIGHT_HOLD = 8
 
 #: Frames per emitted byte segment. §8.4 makes one HTTP chunk per encoded
 #: muxed segment the response contract, so this is the chunk granularity the
@@ -640,18 +652,48 @@ def select_decode_backend(
     return "ffmpeg"
 
 
+#: Environment switch for the in-process zero-copy NVENC lane (#484).
+#:
+#: The lane is BUILT and gated OFF by default. ``auto`` resolves to the ffmpeg
+#: subprocess -- the named bootstrap fallback -- until the parity gate in
+#: ``scripts/video_enhance/nvenc_parity.py`` has been executed on the cards and
+#: its numbers recorded; see ``docs/dev/DESIGN_484_inprocess_nvenc.md`` §5 for
+#: what has to be true before this default flips. Setting it to 1 makes
+#: ``auto`` prefer the in-process lane wherever the container allows one.
+#: An explicit ``backend="pynvvideocodec"`` ignores the switch entirely: that
+#: is how a GPU window runs the very path it is about to grade.
+INPROCESS_NVENC_ENV = "SGLANG_VIDEO_INPROCESS_NVENC"
+
+
+def inprocess_nvenc_enabled() -> bool:
+    """Whether ``auto`` may resolve to the in-process NVENC lane."""
+    return os.environ.get(INPROCESS_NVENC_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def select_encode_backend(
     codec: str,
     container: str,
     requested: BackendName = "auto",
     *,
     nvc_available: bool | None = None,
+    inprocess_enabled: bool | None = None,
 ) -> str:
     """Resolve ``auto`` to a concrete encode backend, or validate an explicit one.
 
     ``mpegts`` forces ffmpeg: PyNvVideoCodec's encoder emits an elementary
     stream and its muxer writes a file, neither of which is a transport-stream
     chunk.
+
+    ``auto`` additionally consults :func:`inprocess_nvenc_enabled`, so the
+    in-process lane is reachable by configuration rather than by whether a
+    package happens to be installed. Before #484 the presence of the package
+    alone flipped the sink for every annexb job, which is how the §9.5 defect
+    reached a preview lane that had never asked for it.
     """
     if codec.lower() not in NVENC_CODECS:
         raise ValueError(
@@ -677,7 +719,10 @@ def select_encode_backend(
         return "pynvvideocodec"
     if requested != "auto":
         raise ValueError(f"unknown encode backend {requested!r}")
-    if available and container == "annexb":
+    enabled = (
+        inprocess_nvenc_enabled() if inprocess_enabled is None else inprocess_enabled
+    )
+    if enabled and available and container == "annexb":
         return "pynvvideocodec"
     return "ffmpeg"
 
@@ -1262,10 +1307,29 @@ class DecodeStage(StageBase):
 class _PyNvEncodeBackend:
     """NVENC through PyNvVideoCodec, taking device memory directly.
 
-    ``PyNvEncoder.Encode`` accepts any object exposing
-    ``__cuda_array_interface__``; a contiguous uint8 torch CUDA tensor of
-    shape ``(H*3//2, W)`` is exactly the NV12 input NVENC wants, so the frame
-    goes from the colour stage into the encoder without leaving VRAM.
+    This is the in-process zero-copy sink (#484): the NV12 frame the colour
+    stage produced in VRAM is handed to NVENC as a pair of device pointers and
+    never touches host memory, which is the §8.1 property the ffmpeg fallback
+    below cannot have.
+
+    Zero-copy has a lifetime rule, and it is not optional
+    ----------------------------------------------------
+    NVENC does not consume an external input surface inside ``Encode``. It
+    registers the pointer and returns, and the frame stays in the session's
+    lookahead queue until the encoder emits the packet for it -- measured at
+    six frames deep on a 3080 at ``P4``/``high_quality``: the first non-empty
+    packet list came back from the SEVENTH ``Encode`` call. A caller that
+    only keeps its tensor alive for the duration of the call therefore hands
+    the block straight back to torch's caching allocator, the next frame's
+    ``rgb_to_nv12`` gets the same block, and NVENC encodes a buffer that is
+    being overwritten underneath it. Observed as a **segmentation fault** on
+    card 0, 2026-08-03, three frames after the first submission; the same run
+    with every input pinned in a list encoded all ten frames and flushed six.
+
+    So this backend owns a ring of the frames NVENC may still be reading. It
+    is the input side of the surface pool the §6.2 reservation already prices
+    (``codec_pool_bytes``); what changes here is that the pool is now really
+    held rather than assumed.
     """
 
     name = "pynvvideocodec"
@@ -1282,6 +1346,7 @@ class _PyNvEncodeBackend:
         extra_options: dict[str, str] | None = None,
     ) -> None:
         nvc = _import_pynvvideocodec()
+        self.resolution = resolution
         options: dict[str, object] = {
             "codec": codec,
             "preset": preset,
@@ -1298,52 +1363,158 @@ class _PyNvEncodeBackend:
             False,  # usecpuinputbuffer: the input is a device pointer
             **options,
         )
+        # Frames NVENC may still be reading from. See the class docstring for
+        # why this exists and what happens without it.
+        self._inflight: deque = deque()
 
     def encode(self, tensor) -> list[bytes]:
-        # PyNvVideoCodec 2.2.0 probes the input for __dlpack__ first and calls
-        # it with the stream as a POSITIONAL argument. torch's
-        # Tensor.__dlpack__ takes the stream keyword-only, so handing it a
-        # torch tensor raises TypeError from inside the encoder and leaves the
-        # NVENC session in a state whose next use faults. The documented
-        # alternative input form is __cuda_array_interface__, so the tensor is
-        # wrapped in an object that exposes only that.
-        return _packets_to_bytes(self._encoder.Encode(_CudaArrayView.wrap(tensor)))
+        frame = _NvencDeviceFrame.wrap(tensor, self.resolution)
+        # NVENC reads the surface on its own engine with NO dependency on the
+        # stream that produced it, so the colour stage's kernels must be
+        # complete before the pointer is handed over. Skipping this does not
+        # fail loudly: the encoder happily encodes a half-written frame and
+        # the output is merely WRONG. Measured on card 0, 2026-08-03, 60
+        # frames at 720p through the full gate:
+        #
+        #     no ordering                     8.59 dB   <- silently wrong
+        #     current-stream sync            15.65 dB   <- ffmpeg's 15.65 dB
+        #     session cudastream= option      9.43 dB   <- not honoured
+        #
+        # The third row is why this is a host-side sync rather than a shared
+        # stream: PyNvVideoCodec accepts ``cudastream`` at session creation
+        # and it does not order the input read behind it.
+        if getattr(tensor, "is_cuda", False):
+            self._sync_producer(tensor)
+        self._inflight.append(frame)
+        packets = _packets_to_bytes(self._encoder.Encode(frame))
+        # One emitted packet is one frame that has left the queue, so the
+        # ring self-corrects to whatever depth the session actually runs at
+        # instead of hard-coding one. MIN_INFLIGHT_HOLD is the floor under
+        # that arithmetic, in case a frame ever yields more than one packet
+        # and the count would otherwise run ahead of consumption.
+        for _ in range(len(packets)):
+            if len(self._inflight) > MIN_INFLIGHT_HOLD:
+                self._inflight.popleft()
+        return packets
+
+    @staticmethod
+    def _sync_producer(tensor) -> None:
+        """Wait for the stream that wrote ``tensor`` before NVENC reads it."""
+        torch = _import_torch()
+        torch.cuda.current_stream(tensor.device).synchronize()
 
     def flush(self) -> list[bytes]:
         if self._encoder is None:
             return []
-        return _packets_to_bytes(self._encoder.EndEncode())
+        packets = _packets_to_bytes(self._encoder.EndEncode())
+        # EndEncode drains the queue, so nothing is being read any more.
+        self._inflight.clear()
+        return packets
 
     def close(self) -> None:
         self._encoder = None
+        self._inflight.clear()
 
 
-class _CudaArrayView:
-    """Exposes only ``__cuda_array_interface__`` over a device tensor.
+class _NvencPlaneView:
+    """One NV12 plane, addressed by the CUDA array interface.
 
-    Hiding ``__dlpack__`` is deliberate: it forces PyNvVideoCodec down the
-    array-interface path, which is the one that accepts a foreign allocation
-    without negotiating a stream. The view keeps a reference to the tensor so
-    the allocation cannot be freed while the encoder holds the pointer.
+    ``version`` 3 with no ``stream`` key is deliberate. The binding rejects a
+    ``stream`` of 0 by name ("__cuda_array_interface__ protocol specifies that
+    stream must not be 0"), and omitting the key means "the consumer may use
+    the legacy default stream", which is what the chain wants: the colour
+    stage's work is already ordered on the current stream when ``encode``
+    returns to Python.
     """
 
-    __slots__ = ("_tensor", "__cuda_array_interface__")
+    __slots__ = ("__cuda_array_interface__",)
 
-    def __init__(self, tensor) -> None:
+    def __init__(self, shape, strides, ptr: int, typestr: str = "|u1") -> None:
+        self.__cuda_array_interface__ = {
+            "shape": tuple(int(x) for x in shape),
+            "strides": tuple(int(x) for x in strides),
+            "data": (int(ptr), False),
+            "typestr": typestr,
+            "version": 3,
+        }
+
+
+class _NvencDeviceFrame:
+    """The device-input form ``PyNvEncoder.Encode`` actually accepts.
+
+    Two facts about the 2.2.0 binding, read off the shipped extension and its
+    own ``samples/utils/Utils.py`` reference implementation, decide this shape:
+
+    1.  ``PyNvEncoder::Encode`` selects the device path with
+        ``PyObject_HasAttrString(frame, "cuda")``. If the attribute is absent
+        AND the session was created with ``usecpuinputbuffer=False``, it
+        raises NVENC error 8, ``"incorrect usage of CPU input buffer"`` --
+        which is exactly the failure TASK_333 §9.5 recorded as open and
+        undiagnosed. The predecessor of this class exposed *only*
+        ``__cuda_array_interface__`` through ``__slots__``, so it had no
+        ``cuda`` attribute and could never reach the device path at all. The
+        error message names the CPU buffer because the check is written from
+        the CPU-mode side; it is not a statement about where the pointer
+        lives.
+    2.  The value the device path consumes is ``frame.cuda()`` -- a LIST of
+        per-plane views, one ``__cuda_array_interface__`` each, not a single
+        flat array. NVIDIA's ``AppFrame`` describes NV12 as luma
+        ``(H, W, 1)`` stride ``(W, 1, 1)`` plus interleaved chroma
+        ``(H//2, W//2, 2)`` stride ``(W, 2, 1)``; the chroma row stride is the
+        full luma width because one chroma row holds ``W//2`` UV pairs.
+
+    Handing the torch tensor over directly does not work either, and for a
+    third reason: ``Tensor.cuda`` exists, so the device path is entered, and
+    the object it then probes exports ``__dlpack__``, which the binding calls
+    with the stream POSITIONALLY while torch declares it keyword-only. That
+    ``TypeError`` escapes from inside the encoder and leaves the session in a
+    state whose next use faults. Nothing here exports ``__dlpack__``.
+
+    The frame keeps a reference to the source tensor, so the allocation cannot
+    be freed while NVENC holds the pointers.
+    """
+
+    __slots__ = ("_tensor", "_planes")
+
+    def __init__(self, tensor, resolution: Resolution) -> None:
+        expected = (resolution.height * 3 // 2, resolution.width)
+        shape = tuple(int(x) for x in tensor.shape)
+        if shape != expected:
+            raise CodecError(
+                f"NVENC takes NV12 as a {expected} uint8 tensor for "
+                f"{resolution}, got {shape}"
+            )
+        if str(tensor.dtype) != "torch.uint8":
+            raise CodecError(f"NVENC takes uint8 NV12, got {tensor.dtype}")
+        if not tensor.is_contiguous():
+            raise CodecError(
+                "NVENC addresses the NV12 frame by plane pointer, so the "
+                "tensor must be contiguous"
+            )
         self._tensor = tensor
-        self.__cuda_array_interface__ = tensor.__cuda_array_interface__
+        base = int(tensor.data_ptr())
+        width, height = resolution.width, resolution.height
+        self._planes = [
+            _NvencPlaneView((height, width, 1), (width, 1, 1), base),
+            _NvencPlaneView(
+                (height // 2, width // 2, 2), (width, 2, 1), base + width * height
+            ),
+        ]
+
+    def cuda(self):
+        """The plane list the binding reads. Named for the attribute it probes."""
+        return self._planes
 
     @classmethod
-    def wrap(cls, tensor):
+    def wrap(cls, tensor, resolution: Resolution):
         """Wrap a device tensor; pass anything else through untouched.
 
-        Only a CUDA tensor exposes ``__cuda_array_interface__``. Objects that
-        do not (a host tensor, or a test double) are handed to the encoder as
-        they are, so the wrapper narrows the encoder input form without
-        becoming a second type check.
+        Only a CUDA tensor can be addressed by pointer. A host tensor or a
+        test double is handed to the encoder as it is, so the wrapper narrows
+        the encoder input form without becoming a second type check.
         """
         if getattr(tensor, "is_cuda", False):
-            return cls(tensor)
+            return cls(tensor, resolution)
         return tensor
 
 
@@ -1498,6 +1669,10 @@ class EncodeStage(StageBase):
         self.ffmpeg_path = ffmpeg_path
 
         self.backend_name = select_encode_backend(self.codec, container, backend)
+        #: True once ``auto`` opened the in-process lane, failed, and took the
+        #: subprocess fallback. Reported rather than swallowed so a measurement
+        #: cannot be attributed to the lane that did not run it.
+        self.fell_back_to_ffmpeg = False
         self._backend: object | None = None
         self._pending: list[bytes] = []
         self._frames_in_segment = 0
@@ -1514,26 +1689,43 @@ class EncodeStage(StageBase):
         if self._backend is not None:
             return self._backend
         if self.backend_name == "pynvvideocodec":
-            self._backend = _PyNvEncodeBackend(
-                self.resolution,
-                codec=self.codec,
-                device_id=self.device_id,
-                bitrate=self.bitrate,
-                preset=self.preset,
-                tuning_info=self.tuning_info,
-                extra_options=self.extra_options,
-            )
-        else:
-            self._backend = _FfmpegEncodeBackend(
-                self.resolution,
-                self.fps,
-                codec=self.codec,
-                container=self.container,
-                device_id=self.device_id,
-                bitrate=self.bitrate,
-                preset=self.preset.lower(),
-                ffmpeg_path=self.ffmpeg_path,
-            )
+            try:
+                self._backend = _PyNvEncodeBackend(
+                    self.resolution,
+                    codec=self.codec,
+                    device_id=self.device_id,
+                    bitrate=self.bitrate,
+                    preset=self.preset,
+                    tuning_info=self.tuning_info,
+                    extra_options=self.extra_options,
+                )
+                return self._backend
+            except CodecError:
+                # An explicit request is a statement that this lane is the one
+                # under test, so it fails loudly. Only ``auto`` -- which asked
+                # for "whatever works" -- falls back, and it says so: a silent
+                # substitution is how the §9.5 defect survived three windows.
+                if self.requested_backend != "auto":
+                    raise
+                logger.warning(
+                    "in-process NVENC session could not be opened for %s; "
+                    "falling back to the ffmpeg subprocess encoder, which is a "
+                    "host round trip per frame",
+                    self.resolution,
+                    exc_info=True,
+                )
+                self.backend_name = "ffmpeg"
+                self.fell_back_to_ffmpeg = True
+        self._backend = _FfmpegEncodeBackend(
+            self.resolution,
+            self.fps,
+            codec=self.codec,
+            container=self.container,
+            device_id=self.device_id,
+            bitrate=self.bitrate,
+            preset=self.preset.lower(),
+            ffmpeg_path=self.ffmpeg_path,
+        )
         return self._backend
 
     @property
@@ -1545,6 +1737,21 @@ class EncodeStage(StageBase):
     def pool_bytes(self) -> int:
         """``nvenc_surface_pool_bytes`` for the §6.2 reservation."""
         return codec_pool_bytes(self.resolution, self.pool_depth, PixelFormat.NV12)
+
+    @property
+    def session_bytes(self) -> int:
+        """Device memory this stage's ENCODER SESSION holds, for the ledger.
+
+        Zero on the ffmpeg lane -- not because the memory does not exist, but
+        because it is held by a subprocess and reserving for it here would
+        charge the card twice. On the in-process lane it is ours, and #484's
+        whole ledger argument is that it must be visible. Reported from the
+        RESOLVED backend, so a fallback that happened at open time moves this
+        number with it.
+        """
+        if self.backend_name != "pynvvideocodec":
+            return 0
+        return nvenc_session_bytes(self.resolution)
 
     # -- consumption -------------------------------------------------------
 

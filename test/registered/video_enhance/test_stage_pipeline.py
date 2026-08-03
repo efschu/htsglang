@@ -33,11 +33,13 @@ from sglang.srt.video_enhance.stage_pipeline import (
     absorbed_tail_rates,
     barlink_link,
     best_placement,
+    enumerate_placements,
     compare_regimes,
     fuse_stages,
     host_bounce_links,
     price_placement,
     replicated_throughput,
+    split_shares,
     stage_table,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -778,3 +780,195 @@ class FusedVerdictTest(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------
+# #484: stage-level replication
+# --------------------------------------------------------------------------
+
+
+class StageReplicationTest(CustomTestCase):
+    """One stage's frames split across cards, priced by water-fill.
+
+    §17.7.5 named this as the obvious next lever for exactly the stage that
+    binds after the fused tail: encode runs twice per source frame and can be
+    split. The catalog recorded it as not built.
+    """
+
+    def test_the_split_equalises_finishing_time_rather_than_frame_count(self):
+        """The falsifier for 'why not just halve it'.
+
+        Two cards, one twice as slow, nothing else on either. An equal split
+        finishes at the slow card's 2x; the water-fill finishes both at the
+        same time and is strictly faster.
+        """
+        shares, period = split_shares({"a": 0.0, "b": 0.0}, {"a": 10.0, "b": 20.0})
+        self.assertAlmostEqual(shares["a"], 2.0 / 3.0, places=6)
+        self.assertAlmostEqual(shares["b"], 1.0 / 3.0, places=6)
+        # Both cards finish at 20/3 ms; an equal split would finish at 10.0.
+        self.assertAlmostEqual(period, 20.0 / 3.0, places=6)
+        self.assertAlmostEqual(shares["a"] * 10.0, shares["b"] * 20.0, places=6)
+
+    def test_a_card_already_past_the_period_takes_no_share(self):
+        """Water-fill, not proportional split: fixed load comes off the top."""
+        shares, period = split_shares({"a": 0.0, "b": 100.0}, {"a": 10.0, "b": 10.0})
+        self.assertAlmostEqual(shares["a"], 1.0, places=6)
+        self.assertAlmostEqual(shares["b"], 0.0, places=6)
+        self.assertAlmostEqual(period, 10.0, places=6)
+
+    def test_a_partly_loaded_card_takes_the_remainder(self):
+        shares, period = split_shares({"a": 0.0, "b": 4.0}, {"a": 10.0, "b": 10.0})
+        # P solves P/10 + (P-4)/10 = 1  ->  P = 7.
+        self.assertAlmostEqual(period, 7.0, places=6)
+        self.assertAlmostEqual(shares["a"], 0.7, places=6)
+        self.assertAlmostEqual(shares["b"], 0.3, places=6)
+
+    def test_replicating_the_binding_stage_moves_the_period(self):
+        """The pair: same table, one stage widened, and the answer changes."""
+        stages = toy_stages(heavy_on=100.0, light=10.0)
+        cards = toy_cards()
+        single = price_placement(
+            stages, {"first": "a", "middle": "a", "last": "a"}, cards
+        )
+        replicated = price_placement(
+            stages, {"first": "a", "middle": ("a", "b"), "last": "a"}, cards
+        )
+        self.assertTrue(replicated.feasible)
+        self.assertLess(replicated.period_ms, single.period_ms)
+        shares = replicated.stage_shares["middle"]
+        self.assertAlmostEqual(sum(shares.values()), 1.0, places=6)
+        # 'a' also carries first+last (20 ms), so it takes the smaller share.
+        self.assertLess(shares["a"], shares["b"])
+
+    def test_a_report_without_replication_is_unchanged(self):
+        """The pre-#484 form still prices to the same numbers and shape."""
+        stages = toy_stages()
+        cards = toy_cards()
+        price = price_placement(
+            stages, {"first": "b", "middle": "a", "last": "b"}, cards
+        )
+        self.assertEqual(price.stage_shares, {})
+        self.assertEqual(price.as_dict()["placement"]["middle"], "a")
+        self.assertAlmostEqual(price.period_ms, 100.0, places=3)
+
+    def test_two_replicated_stages_are_refused_by_name(self):
+        stages = toy_stages()
+        cards = toy_cards()
+        price = price_placement(
+            stages,
+            {"first": ("a", "b"), "middle": ("a", "b"), "last": "a"},
+            cards,
+        )
+        self.assertFalse(price.feasible)
+        self.assertIn("one stage at a time", price.reason)
+        self.assertIn("linear program", price.reason)
+
+    def test_a_co_resident_stage_cannot_be_replicated(self):
+        stages = ticket_v_stages(rife_5090=11.359, rife_3080=63.108)
+        cards = rig_cards()
+        price = price_placement(
+            stages,
+            {
+                "decode": "5090",
+                "sr": ("5090", "3080_x8"),
+                "resize": "5090",
+                "rife": "5090",
+                "encode": "5090",
+            },
+            cards,
+        )
+        self.assertFalse(price.feasible)
+        self.assertIn("neither can be replicated", price.reason)
+
+    def test_the_crossing_carries_only_the_replicated_share(self):
+        """Half the frames going to the other card is half the bytes."""
+        stages = toy_stages(heavy_on=100.0, light=10.0)
+        cards = toy_cards()
+        price = price_placement(
+            stages,
+            {"first": "a", "middle": "a", "last": ("a", "b")},
+            cards,
+            prefetch_depth=0,
+        )
+        self.assertTrue(price.feasible)
+        crossing = [t for t in price.transfers if t.boundary.to_card == "b"]
+        self.assertTrue(crossing)
+        share_to_b = price.stage_shares["last"]["b"]
+        whole = stages[1].payload_mib()
+        for transfer in crossing:
+            self.assertAlmostEqual(
+                transfer.boundary.payload_mib, whole * share_to_b, places=6
+            )
+
+    def test_the_x4_taboo_survives_replication(self):
+        """A share of the frames is still whole 8K frames over a narrow link.
+
+        The ceiling is a per-MOVE limit. Replication makes fewer crossings,
+        not smaller ones, so halving the share must not buy a card past a
+        taboo it fails on the whole frame.
+        """
+        big = stage_table(
+            [
+                ("first", {"wide": 10.0, "narrow": 10.0}),
+                ("last", {"wide": 10.0, "narrow": 10.0}),
+            ],
+            source="synthetic",
+            geometry={
+                "first": (R8K, PixelFormat.RGB_FP16, 1.0),
+                "last": (None, PixelFormat.RGB_FP16, 0.0),
+            },
+        )
+        cards = host_bounce_links(x8_cards=("wide",), x4_cards=("narrow",))
+        # The whole 8K frame is exactly the narrow card's ceiling.
+        self.assertGreaterEqual(big[0].payload_mib(), EIGHT_K_FP16_MIB)
+        price = price_placement(
+            big, {"first": "wide", "last": ("wide", "narrow")}, cards
+        )
+        self.assertFalse(price.feasible)
+        self.assertIn("transport taboo", price.reason)
+
+    def test_the_encode_split_is_what_ticket_v_predicted(self):
+        """#457 §17.7.5's named next lever, priced.
+
+        The fused table binds on ``encode`` at 47.08 ms with the 3080_x8
+        carrying it alone. Splitting encode across the two 3080s has to move
+        the bind off it -- and if it does not, the lever is not worth taking.
+        """
+        stages = fused_ticket_v(rife_5090=11.359, rife_3080=63.108)
+        cards = rig_cards()
+        base = {
+            "decode": "5090",
+            "sr_fused": "5090",
+            "rife": "5090",
+        }
+        single = price_placement(stages, {**base, "encode": "3080_x8"}, cards)
+        split = price_placement(
+            stages, {**base, "encode": ("3080_x8", "3080_x4")}, cards
+        )
+        self.assertTrue(single.feasible and split.feasible)
+        self.assertAlmostEqual(single.period_ms, 47.080, places=3)
+        self.assertEqual(single.binding_stage, "encode")
+        # Two equally-priced cards, nothing else on either: an even split.
+        self.assertAlmostEqual(split.stage_shares["encode"]["3080_x8"], 0.5, places=6)
+        self.assertGreater(split.throughput_fps, single.throughput_fps)
+        # The bind moves off encode and onto the 5090's own chain: the period
+        # drops to that card's 41.04 ms, i.e. 21.24 -> 24.37 source-fps.
+        self.assertEqual(split.binding_card, "5090")
+        self.assertEqual(split.binding_stage, "sr_fused")
+        self.assertAlmostEqual(split.period_ms, 41.037, places=3)
+        self.assertAlmostEqual(split.throughput_fps, 24.368, places=3)
+
+    def test_best_placement_only_replicates_when_asked(self):
+        stages = toy_stages(heavy_on=100.0, light=10.0)
+        cards = toy_cards()
+        closed, _ = best_placement(stages, cards)
+        opened, _ = best_placement(stages, cards, replicable=("middle",))
+        self.assertEqual(closed.stage_shares, {})
+        self.assertTrue(opened.stage_shares)
+        self.assertGreater(opened.throughput_fps, closed.throughput_fps)
+
+    def test_replicating_an_unknown_stage_is_an_error(self):
+        stages = toy_stages()
+        cards = toy_cards()
+        with self.assertRaises(PipelineError):
+            list(enumerate_placements(stages, cards, replicable=("nope",)))

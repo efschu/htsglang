@@ -817,6 +817,84 @@ round trip is the wall behind it) in `TASK_333_M2_VIDEO_ENHANCE.md` §17.7,
 pinned by `test_stage_pipeline.FusedVerdictTest`. The fused stage's ms/frame
 is BOOT-PENDING (`TICKET_460_rife_frontier.md` §5).
 
+Class-3 video enhance, in-process zero-copy NVENC (#484, `video_enhance/
+codec.py`): the §8.1 sink, built and gated OFF. TASK_333 §9.5's open
+"incorrect usage of CPU input buffer" is diagnosed at instruction level on the
+installed 2.2.0 extension and it was **the earlier workaround's own doing**:
+`PyNvEncoder::Encode` selects its device path with
+`PyObject_HasAttrString(frame, "cuda")` -- not with
+`__cuda_array_interface__` as the docs say -- and throws error 8 when the
+attribute is absent under `usecpuinputbuffer=False`. The `__slots__` view
+added to hide `__dlpack__` (whose stream argument the binding passes
+positionally and torch declares keyword-only) hid `cuda` with it, so the
+fix for symptom one created symptom two and both read as one wall.
+`_NvencDeviceFrame` is the shape the binding actually consumes:
+`frame.cuda()` returning the two NV12 plane views NVIDIA's own `AppFrame`
+describes -- luma `(H,W,1)/(W,1,1)`, interleaved chroma
+`(H/2,W/2,2)/(W,2,1)`, `version` 3, no `stream` key -- over the one
+contiguous tensor `rgb_to_nv12` already produces, so no copy and no host
+bounce. A SECOND defect only the card could show: NVENC reads that surface on
+its own engine with **no dependency on the stream that wrote it** and does not
+complain about a half-written frame -- it encodes it. 60 frames at 720p:
+8.59 dB with no ordering, 15.65 dB with a current-stream sync, 9.43 dB when
+the session's own `cudastream=` option is passed instead (not honoured),
+against an ffmpeg baseline of 15.65 dB. Every arm delivered exactly 60 frames,
+so none of it is visible in a count -- expect this from any zero-copy consumer
+that is not a torch operator. `_StrictFakeEncoder` is the binding's branch in
+Python and is a real falsifier: it reproduces the recorded error message
+against the pre-#484 wrapper and passes against the current one (the old fake
+accepted anything, which is how three windows of green tests coexisted with a
+lane that had never encoded a frame). `auto` no longer flips the sink merely
+because the package imports -- that is how the defect reached a preview lane
+that had never asked for it -- but consults `SGLANG_VIDEO_INPROCESS_NVENC`,
+defaulting to the **named ffmpeg bootstrap fallback**; an explicit
+`backend="pynvvideocodec"` ignores the switch, and `auto` falls back with a
+logged warning plus `EncodeStage.fell_back_to_ffmpeg` so a measurement cannot
+be credited to the lane that did not run it. The encoder session is a LEDGER
+post (`frame_math.nvenc_session_bytes`, `EncodeStage.session_bytes`,
+`chain_reservation(inprocess_nvenc=True)`), zero on the ffmpeg lane because
+that memory belongs to a process this runtime cannot see or evict -- which is
+the VRAM half of the ONE-RUNTIME argument as a number. It is a FUNCTION of
+geometry, not a constant: 51.8 MiB measured at 720p and 263.8 MiB at 2160p,
+fitted affine (~25.3 MiB + ~30 B/px, about twenty NV12 frames); two points and
+two unknowns, so a third geometry is its first real test. **EXECUTED on card
+0, 2026-08-03**: the parity gate (`scripts/video_enhance/nvenc_parity.py`,
+decode-roundtrip PSNR/SSIM per frame in both arms) PASSES at 15.65 dB against
+15.65 dB, 60/60 frames, with the `wrong-chroma` can-fail arm rejected at
+11.22 dB; a single-frame plane check at 200 Mbit/s puts the lanes at the same
+pixels (luma mean|d| 0.12, chroma 0.13, identical in both arms). **1.72x** on
+ms/frame at 720p (4.881 vs 8.376, three runs each, the 3.50 ms gap 2.6x the
+noisier arm's whole spread). The default stays ffmpeg: the gate ran on one
+card at one geometry and the chain's operating point is 2160p with two output
+frames per source frame, which is the remaining open measurement
+(TICKET_484 §4). `DESIGN_484_inprocess_nvenc.md`,
+`TICKET_484_nvenc_window.md`.
+
+Class-3 video enhance, stage-level replication (#484,
+`video_enhance/stage_pipeline.py`): one stage's frames split across cards --
+what §17.7.5 named as the next lever for the stage that binds after the
+fusion, and what this catalog previously recorded as not built. A placement
+value may now be a tuple of cards, and the split is a **water-fill, not a
+halving**: shares bring every participating card to the same finishing time
+(`sum_i max(0, (P - fixed_i)/stage_i) = 1`, solved in closed form by walking
+the fixed-load breakpoints), so a card already loaded takes less and a card
+past the period takes nothing. That is the per-family x per-phase law applied
+to one stage, cut by that stage's own binding resource and reported per card.
+Two limits are refused by name rather than approximated: TWO replicated
+stages make the split a linear program instead of a water-fill (a water-fill
+applied twice returns an answer indistinguishable from the optimum), and a
+co-resident stage cannot be spread. The x4 taboo is unchanged and is judged
+on the frame that crosses -- replication makes crossings fewer, not smaller.
+Worth **21.24 -> 24.37 src-fps (+14.7 %)** on ticket V's fused table with
+encode split across the two 3080s, moving the bind onto the 5090's own chain,
+pinned by `StageReplicationTest`; both figures inherit that table's ESTIMATE
+provenance. It is the SMALLER of #484's two levers and says so: §17.7.5's own
+arithmetic gives 31.25 src-fps for encode at ~0, i.e. removing the host round
+trip beats dividing it. `best_placement` only replicates stages the caller
+names in `replicable=`, because a split encode emits two elementary streams
+the executor must interleave back into output order and that wiring is not
+built.
+
 Class-3 video enhance, streaming-input admission (#448 desk half,
 `video_enhance/streaming.py`): source kinds finished/growing/live with named
 refusals (no growing source on the chunk executor — the split is verified
