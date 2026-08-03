@@ -5,8 +5,11 @@
 #       [max_tokens] [runs] [warmups]
 #
 # Boots the arm through boot_ab.sh, waits with a BOUNDED loop, records the
-# VRAM/corridor facts, runs bench-length generations, reads the #390 dump with
-# read_arm.py, and tears the boot down verifying the cards come back to 0 MiB.
+# VRAM/corridor facts, runs bench-length generations, tears the boot down
+# verifying the cards come back to 0 MiB, and reads the #390 dump with
+# read_arm.py TWICE: once before teardown as a liveness check (read_$ARM.txt,
+# not quotable) and once after it on the final, work-matched revision
+# (read_final_$ARM.txt), which is the one a result is quoted from.
 #
 # WHY THIS FILE IS IN THE REPO (#439). The 2026-08-02 ARM3 battery drove
 # boot_ab.sh from an ad-hoc copy of this script that assigned ARM without
@@ -78,7 +81,10 @@ if [ "$ok" = "1" ]; then
     --label "$ARM" --out "$RUN/decode_$ARM.json" 2>&1 | tee "$RUN/decode_$ARM.log"
   # give the 45 s interval dump one more tick so the last generations land
   sleep 50
-  echo "=== ARM $ARM: #390 readout ==="
+  # NOT the quotable readout -- see the post-teardown read below. This one is a
+  # liveness/self-identification check on a live server; its counters are a
+  # mid-run snapshot per rank and must never be divided by another arm's.
+  echo "=== ARM $ARM: #390 readout (pre-teardown snapshot, NOT quotable) ==="
   PYTHONPATH="$WT/python" "$VENV/bin/python" \
     "$WT/scripts/dev/394_s2_proof/read_arm.py" "$RUN" "$ARM" 2>&1 \
     | tee "$RUN/read_$ARM.txt"
@@ -92,3 +98,20 @@ kill -9 -"$PID" 2>/dev/null
 sleep 10
 echo "--- VRAM after teardown ---"
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+
+# THE QUOTABLE READOUT (rule of 2026-08-03, replaces "quote the pre-teardown
+# numbers"). SIGTERM makes every rank write a FINAL dump revision at a common,
+# well-defined endpoint, so the arms of a window are work-matched and their
+# counters may be divided by each other. The pre-teardown revisions cannot:
+# each rank writes on its own 45 s timer, so two arms get caught at different
+# fractions of their runs -- 96.8 % against 91.9 % in the #439 green-corridor
+# window, which inflated that window's transfer-term ratio by ~5 % (1.5028x
+# reported against 1.4307x work-matched). See ARM3_COMPUTE.md, "Which revision
+# to read". Compare the `work point of this arm:` lines of the two arms before
+# quoting any ratio; read_arm.py warns when a revision is not final.
+if [ "$ok" = "1" ]; then
+  echo "=== ARM $ARM: #390 readout (FINAL, work-matched -- quote THIS) ==="
+  PYTHONPATH="$WT/python" "$VENV/bin/python" \
+    "$WT/scripts/dev/394_s2_proof/read_arm.py" "$RUN" "$ARM" 2>&1 \
+    | tee "$RUN/read_final_$ARM.txt"
+fi

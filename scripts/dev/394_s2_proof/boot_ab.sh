@@ -22,11 +22,16 @@
 #                     hit-rate model. --rank-moe-ratio link-calibrated with the
 #                     per-rank cold-traffic coefficients measured on the equal
 #                     arm supplied through SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS.
-#                     It LOST to plain 'compute' on hardware -- 1.439x against
-#                     1.496x on the transfer term, -0.94 % against -7.67 % end
-#                     to end, i.e. inside the same-window floor -- because a
-#                     per-rank hit rate tracks the SIZE of the owned expert
-#                     range, not the rank. Do not run it as a serving
+#                     It is falsified on TWO legs, and the transfer term is not
+#                     one of them: (1) END-TO-END, -0.94 % against -7.67 % for
+#                     plain 'compute', i.e. inside the same-window floor; and
+#                     (2) MECHANISM, a per-rank hit rate tracks the SIZE of the
+#                     owned expert range, not the rank, so the coefficient is
+#                     not the rank property the solve assumes. The old
+#                     "1.439x against 1.496x" transfer-term argument is
+#                     WITHDRAWN -- it divided two dumps sampled at different
+#                     work points, and work-matched the calibrated arm reads
+#                     1.4573x against 1.4253x. Do not run it as a serving
 #                     recommendation; see ARM3_COMPUTE.md.
 #
 # WHAT THIS ARM DOES AND DOES NOT TEST -- read before quoting a delta.

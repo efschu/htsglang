@@ -87,28 +87,53 @@ tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
   the launcher — a symbolic value that
   reaches a worker is a hard error there, never a silent fall back to the base
   plan.
-  **CONFIRMED ON HARDWARE 2026-08-03** (first tokens through the slice-3 path,
-  `/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md`, DeepSeek-
-  V4-Flash UD-IQ3_XXS TP=3 on 5090 + 2x 3080, 900 tok x 3 x 1 warmup): the
-  clock moved off the x4 card (tp1 H2D 1157.6 → 672.7 GiB), transfer term
-  192.7 → 128.8 s = **1.496x** against a re-derived prediction of 1.411x, and
-  **-7.67 %** end-to-end ms/token against a same-window A-vs-A floor of
-  CV 2.12 % / spread 4.09 %. All four gates PASS; the DESK-WRITTEN label is
-  lifted for this path and the three 2026-08-02 defects are confirmed fixed on
-  hardware. Still owed: ONE re-proof in a green corridor — every arm of that
-  window ran with both 3080s at 211-251 MiB free against the 400 MiB floor, so
-  the number is real but is not acceptance-evidence (`ARM3_COMPUTE.md`,
-  "Green-corridor window", BOOT-PENDING).
+  **ACCEPTANCE-EVIDENCE 2026-08-03** (green-corridor re-proof,
+  `/spinning/gpu-battery-results/2026-08-03_439_green/RESULTS.md`, DeepSeek-
+  V4-Flash UD-IQ3_XXS TP=3 on 5090 + 2x 3080, 900 tok x 3 x 1 warmup, repaired
+  reserve `2200,1800,1800`, all five gates PASS): the clock moved off the x4
+  card (tp1 H2D 1197.4 → 706.8 GiB), transfer term 199.3 → 139.3 s =
+  **1.4307x** against a prediction of 1.427x, and **-6.42 %** end-to-end
+  ms/token against a same-window A-vs-A floor of CV 0.223 % / spread 0.424 %,
+  with per-card corridor minima 655-1318 MiB at 1 Hz against the 400 MiB floor.
+  Those are the FINAL, WORK-MATCHED dump revision (163486 vs 163572 tokens
+  across the two arms), which is the only basis on which two arms may be divided
+  by each other. The night window
+  (`/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md`, first
+  tokens through the path, corridor-red at 211-251 MiB free) re-reads to
+  **1.4253x** on the same basis against its own 1.411x prediction, so the two
+  windows agree to 0.4 %. The pre-teardown revision reads 1.5028x / 1.496x and
+  is ~5 % high because the two arms' dumps land at different fractions of their
+  runs (96.8 % vs 91.9 %); it is not quotable — see `ARM3_COMPUTE.md`, "Which
+  revision to read". The DESK-WRITTEN label is lifted for this path and the
+  three 2026-08-02 defects are confirmed fixed on hardware.
   `link-calibrated` (per-rank cold-traffic coefficients from a prior boot's
   #390 dump, `SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS`, required and read ONLY
-  under this symbol) is EXPERIMENTAL and **FALSIFIED** by the same window: the
-  coefficient treats the cache hit rate as a property of the RANK and it
-  tracks the SIZE of the owned expert range instead (tp1 0.8450 → 0.9050 as its
-  range shrank 72 → 58; tp2 0.8474 → 0.7814 as it grew 72 → 89), so the solve
-  overloaded tp2 and reached only 1.439x / -0.94 %, inside the floor. Plain
+  under this symbol) is EXPERIMENTAL and **FALSIFIED** on exactly TWO
+  load-bearing legs. (1) END-TO-END, the economically decisive leg: it measured
+  **-0.94 %** ms/token against the baseline, inside that window's own 4.09 %
+  spread — a non-result, and probe-measured rather than dump-derived, so no
+  revision choice can move it. (2) MECHANISM: the coefficient treats the cache
+  hit rate as a property of the RANK and it tracks the SIZE of the owned expert
+  range instead (night window tp1 0.8450 → 0.9050 as its range shrank 72 → 58,
+  tp2 0.8474 → 0.7814 as it grew 72 → 89; independently reproduced in the green
+  window, where the one rank whose range did not move did not move its hit
+  rate), so the solve overloaded tp2 and made it the new clock. The
+  transfer-term comparison is NOT a leg and is no longer cited: work-matched,
+  `compute-cal` reads **1.4573x** against `compute`'s **1.4253x**, i.e. it
+  slightly WINS that term, and the older "reached only 1.439x against 1.496x"
+  sentence divided two counters sampled at different work points. Plain
   `link` REFUSES while the coefficient variable is set rather than silently
   running the falsified solve — before #458 that env alone selected it.
   Registered in `planner/rejected.py` (`moe_link_calibrated_coefficients`).
+  **Not yet propagated into code (#482 was a docs/harness post).** The
+  pre-teardown numbers still stand in `server_args.py:2443-2456` (help text),
+  `planner/rejected.py:659-666` (verdict) and
+  `planner/expert_compute_placement.py`, and two assertions in
+  `test/registered/unit/layers/moe/test_expert_compute_placement_439.py` pin
+  the old strings (`"1.496x" in help_text`, `"1.439x" in entry.verdict`). Docs
+  and code disagree by design until a code+test post lands; the docs are the
+  corrected side. Same for `ROADMAP_456_matrix_execution.md:32-33` and
+  `ANALYSE_456_dsv4f_matrix_sweep.md:43-46`.
 - **Uneven DCP** (`dcp_size` + token vector): token/KV sharding across ranks,
   weighted owner rule, SWA-hybrid support. The replication+token-shard axis is
   NOT kv-head-count-gated: the predicate is
@@ -178,6 +203,7 @@ tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
   `SGLANG_BARLINK and world_size > 1` (`parallel_state.py:687`), which cannot
   see the placement. The only forced consequence of co-location is
   `disable_custom_all_reduce = True` (`server_args.py:9820`).
+
 
 ## 2. Planner / solver
 Key solver: water-filling over an affine cost model, pair-matrix collective
@@ -516,18 +542,19 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   Path A′ lives. It needed no new mechanism: the #82 expert range IS the "moe"
   family vector, so the slice is a SOLVE plus its wiring
   (`layers/moe/expert_compute_placement.py`, `--rank-moe-ratio link`, see §1).
-  MEASURED on the reference recipe 2026-08-03 (base plan `30407,19080,19080`,
-  solved vector `160,79,119`): clock rank 192.7 s → 128.8 s = **1.496x**, ahead
-  of the 1.411x its own model predicted, and -7.67 % end-to-end. The calibrated
-  variant reached 1.439x and is falsified (§1). Two findings the window added:
+  MEASURED and re-proven in a green corridor 2026-08-03 at the repaired reserve
+  `2200,1800,1800` (base plan `30407,18680,18680`, solved vector
+  `213,104,157`): clock rank 199.3 s → 139.3 s = **1.4307x** work-matched,
+  against the 1.427x its own model predicted, and -6.42 % end-to-end. The
+  calibrated variant is falsified on its end-to-end and mechanism legs, not on
+  the transfer term (§1). Two findings the night window added:
   `--rank-auto-reserve-mib auto` is INFEASIBLE on this recipe (it derives
   3968 MiB per card from the activation heuristic, leaving a 16512 MiB budget
   against 17.59 GiB of weights + runtime — the refusal now names the derivation
   and the pinned value that fits, `ServerArgs.derived_reserve_infeasible_note`),
-  and the recipe is CORRIDOR-RED at `2200,1400,1400`; the repaired reserve is
-  `2200,1800,1800` (base plan `30407,18680,18680`, vector `213,104,157`).
-  BOOT-PENDING: the green-corridor re-proof of the 1.496x point
-  (`ARM3_COMPUTE.md`, two boots), the eager arms 1+2 of
+  and the recipe is CORRIDOR-RED at `2200,1400,1400` (211-251 MiB free on the
+  3080s) against 655-1318 MiB at the repaired reserve.
+  BOOT-PENDING: the eager arms 1+2 of
   `scripts/dev/394_s2_proof/`, and
   the graph seam, which refuses by name for TWO reasons (#443 named the nearer
   one): the captured gather sources only this rank's pinned pool, so a routed
@@ -1120,6 +1147,33 @@ This also covers the custom-group object exchange: it names the world gloo
 cpu_group instead of letting torch pick a staging device.
 
 ## 12. Robustness canon
+Reach-before-fix (#487, the shape of a good negative result): the stock
+even-DCP allocator branch (`model_runner_kv_cache_mixin.py`, the `else` of the
+allocator chain) inflates BOTH the index space and the page granularity by
+`dcp_size`, i.e. it assumes a token-sharded pool -- while a draft worker at
+`--draft-kv-layout replicated` (the default) has the opposite geometry, which
+the pool SIZING guards on (`draft_pool_is_replicated`) and the allocator
+selection never mentions. #108 never audited the crossing. Answer, established
+without a boot: **unreachable on CUDA**, by two predicates, one per producer of
+`is_draft_worker=True`. Given `dcp_size > 1` the stock branch is taken exactly
+when `rank_tp_ratio is None and not weightless_kv_active()`; (1) a SPECULATIVE
+draft worker cannot exist in that shape because
+`ServerArgs._handle_dcp_validation` refuses `dcp_size>1` + speculation on CUDA
+unless the boot is uneven-weighted DCP (requires rank_tp_ratio) or the
+weightless fast lane -- the gate's own two disjuncts; (2) a #274 DUAL-GROUP
+LANE runner also sets `is_draft_worker=True` and is NOT speculative, so leg 1
+misses it -- it is closed instead by `_lane_server_args_view` forcing
+`view.dcp_size = 1`. Leg 2 exists only because the obvious premise ("a draft
+pool implies a speculative algorithm") turned out FALSE when the producer set
+was enumerated rather than assumed; the test now pins that set, so a third
+family lands as a red test instead of a wrong address. Residual, named rather
+than fixed: on HIP/ROCm leg 1 does not run (`if is_hip(): return` precedes the
+CUDA branch), so there the crossing IS admitted -- not changed, because this
+fork does not serve ROCm and a desk-guessed change to an address computation is
+the #345 right-token/wrong-slot class waiting to happen. Corroboration that the
+two layouts are not interchangeable comes from a guard written for another
+feature: `_init_pools` refuses `--enable-kv-session-offload` on this branch
+because "the stock even-DCP inflated-page layout re-interprets slot identity".
 Rank-local condition BEFORE any group collective (hang family); bounded waits
 with fixed pool universe; bounded peer-liveness instead of endless spin;
 ColdBuild error unmasking (never substitute "lower mem-fraction" for a real
