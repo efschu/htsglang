@@ -130,6 +130,44 @@ def build_parser() -> argparse.ArgumentParser:
         "routed experts tiered to host RAM (slower, PCIe-bound). Default: "
         "auto-detected from the local host.",
     )
+    r = p.add_argument_group("#363 regime autocheck (decision only, nothing switches)")
+    r.add_argument(
+        "--regime-phase-table",
+        default=None,
+        metavar="PATH",
+        help="JSON phase table (one row per layout, one column per phase, "
+        "every cell with its own provenance and source). The planner then "
+        "reports the DESIGN_363 §20.1 worth-it verdict for the layout pair: "
+        "NO_SWITCH / SWITCH_KV_ONLY / SWITCH_FULL / UNPRICEABLE, with the "
+        "numbers it used and the §20.3 residency rung. Decision layer only — "
+        "nothing in this build executes a layout switch.",
+    )
+    r.add_argument(
+        "--regime-prefill-layout",
+        default="prefill",
+        help="Name of the prefill-phase layout row in the phase table.",
+    )
+    r.add_argument(
+        "--regime-decode-layout",
+        default="decode",
+        help="Name of the decode-phase layout row in the phase table.",
+    )
+    r.add_argument(
+        "--regime-workload",
+        type=_int_list,
+        default=None,
+        metavar="PREFILL,DECODE[,SWITCHES]",
+        help="Round shape the verdict is priced against: prefill tokens, "
+        "decode tokens, and optionally switches per round (default 2). A "
+        "tok/s divergence cannot be compared with a seconds-valued switch "
+        "cost without one. Default: 20000,512,2.",
+    )
+    r.add_argument(
+        "--regime-not-pre-captured",
+        action="store_true",
+        help="Declare the second layout family OUTSIDE the boot's pre-capture "
+        "set, which pins the §20.3 ladder to RUNG 2 (lazy recapture).",
+    )
     p.add_argument(
         "--json", action="store_true", help="Machine-readable JSON output."
     )
@@ -672,6 +710,23 @@ def _print_mrr_balance(result) -> None:
     print()
 
 
+def _print_regime(result) -> None:
+    """#363 §20.1's verdict, printed whether it acts or not.
+
+    A no-op verdict is stated with its reason exactly as an acting one is —
+    that is the section's own rule, so this block never returns early on
+    NO_SWITCH, only on "no phase table was supplied".
+    """
+    regime = getattr(result, "regime", None)
+    if regime is None:
+        return
+    from sglang.srt.planner.regime_switch import render_autocheck_text
+
+    for line in render_autocheck_text(regime):
+        print(line)
+    print()
+
+
 def _print_report(result, model_path: str) -> None:
     hw = result.hardware
     cap = result.capacity
@@ -743,6 +798,7 @@ def _print_report(result, model_path: str) -> None:
     print()
 
     _print_mrr_balance(result)
+    _print_regime(result)
 
     adv = result.advantage
     if adv is None:
@@ -1038,6 +1094,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    regime_table = None
+    regime_workload = None
+    if args.regime_phase_table:
+        try:
+            with open(args.regime_phase_table) as f:
+                regime_table = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"error: --regime-phase-table: {e}", file=sys.stderr)
+            return 2
+        if args.regime_workload:
+            from sglang.srt.planner.regime_switch import WorkloadShape
+
+            w = list(args.regime_workload)
+            if len(w) not in (2, 3):
+                print(
+                    "error: --regime-workload takes PREFILL,DECODE or "
+                    "PREFILL,DECODE,SWITCHES",
+                    file=sys.stderr,
+                )
+                return 2
+            regime_workload = WorkloadShape(
+                prefill_tokens=w[0],
+                decode_tokens=w[1],
+                switches_per_round=(w[2] if len(w) == 3 else 2),
+            )
+
     hardware = _load_hardware(args)
     mem = args.rank_gpu_memory_mib
     if mem is not None and len(mem) == 1:
@@ -1073,6 +1155,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if args.host_ram_gb is not None
                 else None
             ),
+            regime_phase_table=regime_table,
+            regime_prefill_layout=args.regime_prefill_layout,
+            regime_decode_layout=args.regime_decode_layout,
+            regime_workload=regime_workload,
+            regime_pre_captured=not args.regime_not_pre_captured,
         )
     except PlanRejected as e:
         if args.json:
@@ -1113,6 +1200,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             "mrr_balance": (
                 dataclasses.asdict(result.mrr_balance)
                 if getattr(result, "mrr_balance", None) is not None
+                else None
+            ),
+            # #363 §20.1: the verdict object carries its own JSON shape,
+            # including the "executes: false" flag — slice 1 decides, the
+            # runtime half that would act on it does not exist yet.
+            "regime": (
+                result.regime.to_json()
+                if getattr(result, "regime", None) is not None
                 else None
             ),
         }

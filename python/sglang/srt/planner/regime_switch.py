@@ -16,6 +16,11 @@
 `DESIGN_363_regime_controller.md` §20 decides three things on paper. This
 module builds the part of them that is a computation:
 
+* **§20.1 WORTH-IT AUTOCHECK** — :func:`autocheck` reads a per-phase layout
+  table for one ``(format, model, rig)`` triple and returns a named verdict:
+  ``NO_SWITCH`` / ``SWITCH_KV_ONLY`` / ``SWITCH_FULL`` / ``UNPRICEABLE``,
+  with the reason and every number it used. "One layout, checked, it does not
+  pay" is an OUTPUT here, never silence, exactly as that section demands.
 * **§20.3 planner consequence** — :func:`layout_overlap` computes the
   per-rank shard-range overlap of a layout PAIR and the dual-residency extra
   bytes; :func:`solve_layout_pair` adds the secondary objective (maximal
@@ -30,8 +35,6 @@ module builds the part of them that is a computation:
 flips a pointer, spills a diff or captures a graph. Those are #363 slices 2+
 (`ROADMAP_456_matrix_execution.md` WAVE 4). The controller stays off; this is
 the layer that decides and plans, and its output is a report object.
-The remaining §20 pieces of this slice land in the commits that follow
-this one.
 
 **Provenance discipline.** Every phase-table cell is a
 :class:`~sglang.srt.planner.cost_model.Rate` and therefore carries
@@ -61,6 +64,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from sglang.srt.planner.cost_model import Provenance, Rate
 
 __all__ = [
+    "Verdict",
     "LayoutVector",
     "PhaseTable",
     "PhaseCandidate",
@@ -71,11 +75,14 @@ __all__ = [
     "OverlapReport",
     "RankResidency",
     "ResidencyReport",
+    "AutocheckResult",
     "PairSolution",
     "unit_ranges",
     "layout_overlap",
     "residency_rung",
     "solve_layout_pair",
+    "autocheck",
+    "render_autocheck_text",
     "DEFAULT_PAIR_TOLERANCE_PCT",
     "DEFAULT_SWITCH_COST_MODEL",
 ]
@@ -1022,3 +1029,516 @@ def solve_layout_pair(
         considered_pairs=considered,
         reason=reason,
     )
+
+# ---------------------------------------------------------------------------
+# §20.1 — the worth-it autocheck
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class AutocheckResult:
+    """The named verdict object §20.1 asks for.
+
+    A no-op verdict is stated with its reason exactly as an acting one is, so
+    ``verdict``, ``reason`` and ``numbers`` are populated in every case that
+    is not ``UNPRICEABLE`` — and ``UNPRICEABLE`` names the missing cells.
+    """
+
+    verdict: Verdict
+    triple: str
+    reason: str
+    #: The per-phase winners the table names (``None`` under UNPRICEABLE).
+    prefill_layout: Optional[LayoutVector]
+    decode_layout: Optional[LayoutVector]
+    #: Every number the decision consumed, keyed by name. Flat and JSON-safe.
+    numbers: Dict[str, Any]
+    provenance: Provenance
+    #: Cells that were absent, if any. Non-empty exactly under UNPRICEABLE.
+    missing: Tuple[str, ...] = ()
+    switch_cost: Optional[SwitchCost] = None
+    residency: Optional[ResidencyReport] = None
+    overlap: Optional[OverlapReport] = None
+    workload: Optional[WorkloadShape] = None
+
+    @property
+    def acts(self) -> bool:
+        """True when the verdict authorises a switch. The runtime half that
+        would consume this does not exist yet (#363 slices 2+)."""
+        return self.verdict in (Verdict.SWITCH_KV_ONLY, Verdict.SWITCH_FULL)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "verdict": self.verdict.value,
+            "acts": self.acts,
+            "triple": self.triple,
+            "reason": self.reason,
+            "prefill_layout": (
+                self.prefill_layout.to_json() if self.prefill_layout else None
+            ),
+            "decode_layout": (
+                self.decode_layout.to_json() if self.decode_layout else None
+            ),
+            "numbers": dict(self.numbers),
+            "provenance": self.provenance.value,
+            "missing": list(self.missing),
+            "switch_cost": (self.switch_cost.to_json() if self.switch_cost else None),
+            "residency": (self.residency.to_json() if self.residency else None),
+            "overlap": (self.overlap.to_json() if self.overlap else None),
+            "workload": (self.workload.to_json() if self.workload else None),
+            "executes": False,
+            "executes_note": (
+                "#363 slice 1 is the DECISION layer only: no pointer flip, no "
+                "diff spill and no pre-capture exists yet (ROADMAP_456 WAVE 4)"
+            ),
+        }
+
+
+def _phase_seconds(tokens: int, tok_s: float) -> float:
+    return (tokens / tok_s) if tok_s > 0 else float("inf")
+
+
+def autocheck(
+    table: PhaseTable,
+    *,
+    prefill_layout: str,
+    decode_layout: str,
+    workload: Optional[WorkloadShape] = None,
+    overlap: Optional[OverlapReport] = None,
+    residency: Optional[ResidencyReport] = None,
+    cost_model: SwitchCostModel = DEFAULT_SWITCH_COST_MODEL,
+) -> AutocheckResult:
+    """Decide, from the TABLE, whether a stage flip beats its own switch cost.
+
+    Four steps, in this order, each able to end the check:
+
+    1. **Completeness.** All four cells of the 2x2 (both layouts on both
+       phases) must be priced. A missing one yields ``UNPRICEABLE`` naming it.
+    2. **Dominance.** If one layout is at least as good as the other on EVERY
+       phase — allowing for the table's own A-vs-A floor — there is nothing to
+       switch to: ``NO_SWITCH``, with the comparison as the reason. This is
+       the INT8 canon shape (§20.1: the decode layout wins even on prefill).
+    3. **KV-only.** If the two layouts' WEIGHT vectors are identical and only
+       the #435-coupled KV token vector differs, the switch is the #297 delta
+       and nothing else: ``SWITCH_KV_ONLY``.
+    4. **Pricing.** Otherwise compare the per-round benefit of running each
+       phase on its own optimum against ``switches_per_round`` switches at the
+       rung ``residency`` reports. Benefit above cost -> ``SWITCH_FULL``;
+       below -> ``NO_SWITCH`` with both numbers in the reason.
+
+    ``overlap`` and ``residency`` are optional: without them the check prices
+    the switch at RUNG 1 and says so, because assuming RUNG 0 without the
+    ledger arithmetic would be assuming the cheapest answer.
+    """
+    shape = workload or WorkloadShape()
+    floor_pct, floor_src = table.floor_pct()
+    lp = table.layout(prefill_layout)
+    ld = table.layout(decode_layout)
+
+    wanted = [
+        (prefill_layout, "prefill"),
+        (prefill_layout, "decode"),
+        (decode_layout, "prefill"),
+        (decode_layout, "decode"),
+    ]
+    rates = {key: table.cell(*key) for key in wanted}
+    missing = [
+        f"({name}, {phase}): {rates[(name, phase)].source}"
+        for (name, phase) in wanted
+        if rates[(name, phase)].provenance is Provenance.ABSENT
+    ]
+    if missing:
+        return AutocheckResult(
+            verdict=Verdict.UNPRICEABLE,
+            triple=table.triple,
+            reason=(
+                "the phase table does not price "
+                f"{len(missing)} of the 4 cells the decision needs; a layout "
+                "switch is not refused here, it is UNPRICED — run the missing "
+                "arm rather than reading this as a no"
+            ),
+            prefill_layout=lp,
+            decode_layout=ld,
+            numbers={
+                "cells_needed": 4,
+                "cells_absent": len(missing),
+                "noise_floor_pct": floor_pct,
+                "noise_floor_source": floor_src,
+            },
+            provenance=Provenance.ABSENT,
+            missing=tuple(missing),
+            workload=shape,
+        )
+
+    p_on_p = float(rates[(prefill_layout, "prefill")].value)
+    p_on_d = float(rates[(prefill_layout, "decode")].value)
+    d_on_p = float(rates[(decode_layout, "prefill")].value)
+    d_on_d = float(rates[(decode_layout, "decode")].value)
+
+    cell_prov = [rates[k].provenance for k in wanted]
+    prov = (
+        Provenance.MEASURED
+        if all(p is Provenance.MEASURED for p in cell_prov)
+        else Provenance.ESTIMATE
+    )
+
+    # Percent deltas, both directions, as §20.1 words them: what the prefill
+    # layout gains on prefill, what it costs on decode. Denominator is the
+    # decode layout, the standing default.
+    prefill_gain_pct = (p_on_p - d_on_p) / d_on_p * 100.0 if d_on_p > 0 else 0.0
+    decode_cost_pct = (p_on_d - d_on_d) / d_on_d * 100.0 if d_on_d > 0 else 0.0
+
+    numbers: Dict[str, Any] = {
+        "prefill_layout_on_prefill_tok_s": p_on_p,
+        "prefill_layout_on_decode_tok_s": p_on_d,
+        "decode_layout_on_prefill_tok_s": d_on_p,
+        "decode_layout_on_decode_tok_s": d_on_d,
+        "prefill_gain_pct": prefill_gain_pct,
+        "decode_cost_pct": decode_cost_pct,
+        "noise_floor_pct": floor_pct,
+        "noise_floor_source": floor_src,
+    }
+
+    # --- step 2: dominance, judged against the table's own floor ------------
+    def _dominates(x_p: float, x_d: float, y_p: float, y_d: float) -> bool:
+        """x is at least as good as y on both phases, allowing the floor."""
+        return (
+            (x_p - y_p) / y_p * 100.0 >= -floor_pct
+            and (x_d - y_d) / y_d * 100.0 >= -floor_pct
+        )
+
+    d_dominates = _dominates(d_on_p, d_on_d, p_on_p, p_on_d)
+    p_dominates = _dominates(p_on_p, p_on_d, d_on_p, d_on_d)
+    if d_dominates or p_dominates:
+        winner = decode_layout if d_dominates else prefill_layout
+        loser = prefill_layout if d_dominates else decode_layout
+        numbers["dominant_layout"] = winner
+        return AutocheckResult(
+            verdict=Verdict.NO_SWITCH,
+            triple=table.triple,
+            reason=(
+                f"one layout, checked: {winner} is within the "
+                f"{floor_pct:.1f} % A-vs-A floor of {loser} or better on BOTH "
+                f"phases (prefill {d_on_p:.1f} vs {p_on_p:.1f} tok/s, decode "
+                f"{d_on_d:.1f} vs {p_on_d:.1f} tok/s) — there is no phase it "
+                "would be switched away from. It does not pay because there "
+                "is nothing to pay for."
+            ),
+            prefill_layout=lp,
+            decode_layout=ld,
+            numbers=numbers,
+            provenance=prov,
+            switch_cost=None,
+            residency=residency,
+            overlap=overlap,
+            workload=shape,
+        )
+
+    # --- step 3: same weights, different KV vector --------------------------
+    kv_only = lp.same_weights_as(ld)
+
+    # --- step 4: price it ---------------------------------------------------
+    rung = 1 if residency is None else residency.rung
+    rung_note = (
+        "no residency ledger supplied: priced at RUNG 1 rather than assuming "
+        "the cheap rung"
+        if residency is None
+        else residency.reason
+    )
+    cost = price_switch(0 if kv_only else rung, kv_only=kv_only, model=cost_model)
+
+    t_single_prefill = _phase_seconds(shape.prefill_tokens, max(p_on_p, d_on_p))
+    # The single-layout arm must run ONE layout for both phases: it takes the
+    # better of the two ROUND times, not the better of each phase separately.
+    round_p = _phase_seconds(shape.prefill_tokens, p_on_p) + _phase_seconds(
+        shape.decode_tokens, p_on_d
+    )
+    round_d = _phase_seconds(shape.prefill_tokens, d_on_p) + _phase_seconds(
+        shape.decode_tokens, d_on_d
+    )
+    best_single_s = min(round_p, round_d)
+    best_single_layout = prefill_layout if round_p <= round_d else decode_layout
+    paired_s = t_single_prefill + _phase_seconds(shape.decode_tokens, max(p_on_d, d_on_d))
+    benefit_s = best_single_s - paired_s
+    switch_s = cost.seconds * shape.switches_per_round
+    margin_s = benefit_s - switch_s
+    benefit_pct = (benefit_s / best_single_s * 100.0) if best_single_s > 0 else 0.0
+
+    numbers.update(
+        {
+            "workload_prefill_tokens": shape.prefill_tokens,
+            "workload_decode_tokens": shape.decode_tokens,
+            "switches_per_round": shape.switches_per_round,
+            "best_single_layout": best_single_layout,
+            "best_single_round_s": best_single_s,
+            "phase_optimal_round_s": paired_s,
+            "benefit_s_per_round": benefit_s,
+            "benefit_pct_of_round": benefit_pct,
+            "switch_cost_s_per_round": switch_s,
+            "margin_s_per_round": margin_s,
+            "rung": cost.rung,
+            "rung_note": rung_note,
+            "kv_only": kv_only,
+        }
+    )
+
+    if margin_s > 0.0 and benefit_pct >= floor_pct:
+        verdict = Verdict.SWITCH_KV_ONLY if kv_only else Verdict.SWITCH_FULL
+        reason = (
+            f"real divergence: the prefill layout gains "
+            f"{prefill_gain_pct:+.1f} % on prefill and costs "
+            f"{decode_cost_pct:+.1f} % on decode, so no single layout serves "
+            f"both. Running each phase on its own optimum saves "
+            f"{benefit_s:.2f} s per round ({benefit_pct:.1f} % of the "
+            f"{best_single_s:.2f} s best single-layout round, above the "
+            f"{floor_pct:.1f} % floor) against {switch_s:.2f} s of switching "
+            f"at RUNG {cost.rung} — margin {margin_s:+.2f} s."
+        )
+    else:
+        verdict = Verdict.NO_SWITCH
+        if benefit_pct < floor_pct:
+            why = (
+                f"the divergence is real but the round-level benefit "
+                f"({benefit_pct:.1f} %) is below the {floor_pct:.1f} % A-vs-A "
+                f"floor, so it is not a measurable gain on this rig"
+            )
+        else:
+            why = (
+                f"the {benefit_s:.2f} s per-round benefit does not clear "
+                f"{switch_s:.2f} s of switching at RUNG {cost.rung} "
+                f"(margin {margin_s:+.2f} s)"
+            )
+        reason = (
+            f"one layout, checked, it does not pay: {why}. Prefill layout "
+            f"{prefill_gain_pct:+.1f} % on prefill / {decode_cost_pct:+.1f} % "
+            f"on decode; best single layout is {best_single_layout}."
+        )
+
+    return AutocheckResult(
+        verdict=verdict,
+        triple=table.triple,
+        reason=reason,
+        prefill_layout=lp,
+        decode_layout=ld,
+        numbers=numbers,
+        provenance=(
+            Provenance.ESTIMATE
+            if cost.provenance is Provenance.ESTIMATE
+            else prov
+        ),
+        switch_cost=cost,
+        residency=residency,
+        overlap=overlap,
+        workload=shape,
+    )
+
+# ---------------------------------------------------------------------------
+# JSON in, and the plan-level convenience wrapper
+# ---------------------------------------------------------------------------
+
+
+def _rate_from_json(data: Mapping[str, Any], *, where: str) -> Rate:
+    prov = str(data.get("provenance") or "").strip()
+    source = str(data.get("source") or "").strip()
+    if not source:
+        raise ValueError(
+            f"{where}: a phase-table cell must name its source — the boot or "
+            "battery it came off, or the reason it is absent"
+        )
+    if prov == Provenance.ABSENT.value:
+        if data.get("tok_s") is not None:
+            raise ValueError(f"{where}: an absent cell must not carry a value")
+        return Rate.absent(source, unit="tok/s")
+    if prov not in (Provenance.MEASURED.value, Provenance.ESTIMATE.value):
+        raise ValueError(
+            f"{where}: provenance {prov!r} is not one of "
+            f"{[p.value for p in Provenance]}"
+        )
+    value = data.get("tok_s")
+    if value is None:
+        raise ValueError(
+            f"{where}: a {prov} cell must carry tok_s; use provenance "
+            '"absent" to record that the arm was never run'
+        )
+    return Rate(float(value), Provenance(prov), source, "tok/s", "")
+
+
+def phase_table_from_json(data: Mapping[str, Any]) -> PhaseTable:
+    """Build a :class:`PhaseTable` from the payload/CLI JSON shape.
+
+    ::
+
+        {"triple": "INT8-W8A8 / Qwen3.6-27B / 5090+2x3080",
+         "noise_floor_pct": 3.0, "noise_floor_source": "...",
+         "layouts": [{"name": "prefill", "weights": [10,1,1],
+                      "kv_tokens": [2,11,10]}, ...],
+         "cells": [{"layout": "prefill", "phase": "prefill",
+                    "tok_s": 1847.2, "provenance": "measured",
+                    "source": "#424 comparison_table.md"}, ...]}
+
+    Every cell must name its source. A number with no provenance is refused
+    here rather than silently promoted, which is the whole reason the
+    autocheck can distinguish "checked, does not pay" from "never measured".
+    """
+    layouts = []
+    for raw in data.get("layouts") or []:
+        kv = raw.get("kv_tokens")
+        layouts.append(
+            LayoutVector(
+                name=str(raw["name"]),
+                weights=tuple(int(x) for x in raw["weights"]),
+                kv_tokens=(tuple(int(x) for x in kv) if kv else None),
+            )
+        )
+    if len(layouts) < 2:
+        raise ValueError(
+            "a phase table needs at least the two layouts the pair is made of"
+        )
+    cells: Dict[Tuple[str, str], Rate] = {}
+    known = {ly.name for ly in layouts}
+    for raw in data.get("cells") or []:
+        name, phase = str(raw["layout"]), str(raw["phase"])
+        if name not in known:
+            raise ValueError(
+                f"cell names layout {name!r}, which the table does not declare "
+                f"(declared: {sorted(known)})"
+            )
+        cells[(name, phase)] = _rate_from_json(raw, where=f"cell ({name}, {phase})")
+    floor = data.get("noise_floor_pct")
+    return PhaseTable(
+        triple=str(data.get("triple") or "unnamed (format, model, rig) point"),
+        layouts=tuple(layouts),
+        cells=cells,
+        noise_floor_pct=(None if floor is None else float(floor)),
+        noise_floor_source=str(data.get("noise_floor_source") or ""),
+    )
+
+
+def mlp_geometry(inputs, base_plan: Sequence[int], budgets_mib: Sequence[int]):
+    """``(total MLP units, bytes per unit)`` for this plan's checkpoint.
+
+    The layout pair is a pair of MLP weight vectors, so the shardable
+    dimension the overlap lives on is the MLP unit grid the partitioner
+    already uses (``PerfCostModel.mlp_units``), and one unit's byte cost is
+    that family's total bytes divided by the grid.
+    """
+    from sglang.srt.uneven_perf import PerfCostModel
+
+    model = PerfCostModel(inputs, list(base_plan), list(budgets_mib))
+    units = int(model.mlp_units)
+    fam = model.families.get("mlp")
+    if units <= 0 or fam is None or not fam.bytes:
+        raise ValueError(
+            "this checkpoint exposes no MLP unit grid to shard a layout pair "
+            "over; the #363 pair objective has nothing to overlap"
+        )
+    return units, float(fam.bytes) / units
+
+
+def regime_report_for_plan(
+    table: PhaseTable,
+    *,
+    inputs,
+    hardware,
+    capacity,
+    prefill_layout: str,
+    decode_layout: str,
+    workload: Optional[WorkloadShape] = None,
+    pre_captured: bool = True,
+    corridor_mib: Optional[int] = None,
+) -> AutocheckResult:
+    """Autocheck a phase table against a PLAN's own ledger.
+
+    This is the wiring point: the plan already knows each rank's card total,
+    its predicted weight/KV/overhead commitment and its MLP geometry, which
+    is exactly what §20.3's rung arithmetic needs. Nothing is invented — the
+    committed bytes come from the same ``CapacityReport`` the plan reports.
+    """
+    base_plan = inputs.rank_tp_ratio or [1] * inputs.tp_size
+    units, bytes_per_unit = mlp_geometry(
+        inputs, base_plan, inputs.effective_vram_mib
+    )
+    overlap = layout_overlap(
+        table.layout(prefill_layout),
+        table.layout(decode_layout),
+        units=units,
+        bytes_per_unit=bytes_per_unit,
+        active=decode_layout,
+    )
+
+    if corridor_mib is None:
+        from sglang.srt.uneven_perf import planner_corridor_mib
+
+        corridor_mib = planner_corridor_mib()
+
+    totals: List[float] = []
+    committed: List[float] = []
+    kv_cell = _kv_cell_bytes_of(inputs)
+    for rc in capacity.per_rank:
+        card = hardware.gpu(rc.gpu_index) if rc.gpu_index is not None else None
+        totals.append(
+            float(card.total_mib) * MIB if card is not None else float(rc.budget_mib) * MIB
+        )
+        committed.append(
+            rc.weight_gib * GIB
+            + rc.mamba_gib * GIB
+            + capacity.overhead_mib * MIB
+            + max(rc.kv_tokens, 0.0) * kv_cell
+        )
+    residency = residency_rung(
+        overlap,
+        card_total_bytes=totals,
+        committed_bytes=committed,
+        pre_captured=pre_captured,
+        corridor_bytes=float(corridor_mib) * MIB,
+    )
+    return autocheck(
+        table,
+        prefill_layout=prefill_layout,
+        decode_layout=decode_layout,
+        workload=workload,
+        overlap=overlap,
+        residency=residency,
+    )
+
+
+def _kv_cell_bytes_of(inputs) -> float:
+    from sglang.srt.uneven_perf import PerfCostModel
+
+    base_plan = inputs.rank_tp_ratio or [1] * inputs.tp_size
+    model = PerfCostModel(inputs, list(base_plan), list(inputs.effective_vram_mib))
+    return float(model.kv_cell_bytes)
+
+
+def render_autocheck_text(result: AutocheckResult) -> List[str]:
+    """The verdict as plan-report lines (§20.1: a no-op is stated, not silent)."""
+    lines = [
+        f"REGIME AUTOCHECK (#363 §20.1) — {result.triple}",
+        f"  verdict : {result.verdict.value} [{result.provenance.value}]",
+        f"  reason  : {result.reason}",
+    ]
+    if result.missing:
+        for m in result.missing:
+            lines.append(f"    absent: {m}")
+    if result.switch_cost is not None:
+        comps = ", ".join(
+            f"{k} {v * 1000:.0f} ms" for k, v in result.switch_cost.components.items()
+        )
+        lines.append(
+            f"  cost    : RUNG {result.switch_cost.rung}, "
+            f"{result.switch_cost.seconds:.2f} s/switch ({comps})"
+        )
+    if result.residency is not None:
+        lines.append(f"  rung    : {result.residency.rung} — {result.residency.reason}")
+    if result.overlap is not None:
+        lines.append(
+            f"  overlap : {result.overlap.overlap_fraction:.3f}, "
+            f"dual-residency extra "
+            f"{result.overlap.extra_bytes_vs_active / MIB:.0f} MiB, "
+            f"RUNG 1 diff {result.overlap.diff_units} rank-units "
+            f"(grid {result.overlap.units} units/rank-dimension)"
+        )
+    lines.append(
+        "  NOTE    : decision layer only — nothing in this build executes a "
+        "layout switch (#363 slices 2+)"
+    )
+    return lines

@@ -127,6 +127,12 @@ class PlanResult:
     #: non-hybrid models (no state pool -> no trade) and for measured-residency
     #: plans. Typed loosely (sglang.srt.planner.mrr_balance).
     mrr_balance: Optional[object] = None
+    #: #363 §20.1 WORTH-IT AUTOCHECK verdict for a layout PAIR on this plan
+    #: (``sglang.srt.planner.regime_switch.AutocheckResult``), or None when no
+    #: phase table was supplied. Advisory and additive: it changes no field
+    #: the plan computed, and NOTHING in this build executes a layout switch —
+    #: slice 1 is the decision layer only. Typed loosely.
+    regime: Optional[object] = None
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +279,11 @@ def plan(
     include_vision: bool = True,
     with_advantage: bool = True,
     roofline_context_tokens: int = 4096,
+    regime_phase_table: Optional[dict] = None,
+    regime_prefill_layout: str = "prefill",
+    regime_decode_layout: str = "decode",
+    regime_workload: Optional[object] = None,
+    regime_pre_captured: bool = True,
 ) -> PlanResult:
     """Plan ``model_path`` on ``hardware``.
 
@@ -471,6 +482,34 @@ def plan(
             )
         except Exception:
             result = dataclasses.replace(result, mrr_balance=None)
+
+        # #363 §20.1 WORTH-IT AUTOCHECK. Opt-in: only runs when a phase table
+        # was actually supplied, so every existing caller's answer is
+        # unchanged field for field. Deliberately NOT guarded by a bare
+        # except: a malformed or unsourced phase table is a caller error the
+        # planner has to name, exactly like an invalid manual edit — silently
+        # dropping it would turn "you gave me a table I cannot read" into
+        # "there is nothing to decide", which is the one confusion §20.1
+        # exists to prevent.
+        if regime_phase_table is not None:
+            from sglang.srt.planner.regime_switch import (
+                phase_table_from_json,
+                regime_report_for_plan,
+            )
+
+            result = dataclasses.replace(
+                result,
+                regime=regime_report_for_plan(
+                    phase_table_from_json(regime_phase_table),
+                    inputs=inputs,
+                    hardware=hardware,
+                    capacity=capacity,
+                    prefill_layout=regime_prefill_layout,
+                    decode_layout=regime_decode_layout,
+                    workload=regime_workload,
+                    pre_captured=regime_pre_captured,
+                ),
+            )
     return result
 
 
