@@ -155,17 +155,31 @@ safety argument that also defines the wall
 > expert pool, the CUDA host allocations and the Python heap are all
 > structurally out of reach and only page cache can be taken
 
-Whether the cold pool is the private `torch.empty(...).pin_memory()`
-(`expert_offload.py:1430`, anonymous) or the #394 shared segment in `/dev/shm`
-(`cold_tier_shm.py:130-132`, tmpfs, unswappable at swap 0), it is unreclaimable
-either way; only the cgroup accounting bucket differs. This reconciles the
-previous window's reading of `current=85.1GiB anon=14.1GiB file=70.2GiB`
-(`2026-08-01_417_dsv4arch/ram417_w5.log`): the ~36 GiB cold pool sat in the
-`file` bucket as tmpfs, ~34 GiB was genuinely reclaimable GGUF page cache, and
-the 14.1 GiB `anon` is runtime overhead (Python heap + CUDA host allocations).
+The cold pool is the private `torch.empty(...).pin_memory()` of
+`expert_offload.py:1430`: neither `boot394.sh` nor `boot417_w5.sh` sets
+`SGLANG_MOE_COLD_TIER_SHM`, so `cold_tier_enabled()`
+(`cold_tier_fetch.py:136-148`) was False and the #394 shared `/dev/shm` segment
+was never in play. Either backing is unreclaimable at swap 0 — pinned pages
+cannot be paged out, and tmpfs has nowhere to go — so the floor below does not
+depend on which one is used.
 
-**The often-quoted "85.1 GiB" is therefore not a wall and never was.** The
-binding quantity is `cold pool + runtime overhead`.
+**Unresolved, and deliberately not guessed:** the previous window read
+`current=85.1GiB anon=14.1GiB file=70.2GiB`
+(`2026-08-01_417_dsv4arch/ram417_w5.log`), and a ~36-50 GiB pinned pool cannot
+fit inside 14.1 GiB of `anon`. So the pool is landing in the `file` bucket —
+plausibly because CUDA pinned host memory is mapped through the nvidia driver
+character device and accounted as file-backed rather than anonymous — but this
+desk pass did not prove that, and a plausible mechanism is not a measurement.
+The window resolves it directly: `rammon` records `anon` and `file` separately
+and the offload ledger prints `pinned(host)`, so one IQ3_XXS boot settles it.
+
+The attribution matters for *diagnosis*, not for the budget: the floor below is
+derived from the in-memory footprint and the VRAM ceiling, neither of which
+depends on which cgroup bucket the pool is counted in.
+
+**What is settled is that the often-quoted "85.1 GiB" is not a wall.** It is a
+total that includes reclaimable page cache. The binding quantity is
+`host-side weight bytes + runtime overhead`.
 
 ### The verdict for UD-Q3_K_XL
 
