@@ -56,6 +56,7 @@ from typing import (
 import numpy as np
 
 from sglang.srt.translator.backends import (
+    TTS_QUEUE_WAIT_S,
     AudioChunk,
     BackendError,
     Transcript,
@@ -133,6 +134,11 @@ class EventKind(str, enum.Enum):
     TURN_AUDIO = "turn.audio"
     TURN_DONE = "turn.done"
     TURN_DROPPED = "turn.dropped"
+    #: This turn is behind another conversation's synthesis (§17.8.2). One
+    #: talker serves every session, so the wait is real and bounded by the
+    #: other turn -- the event exists so the client can say that instead of
+    #: appearing to have frozen.
+    TURN_QUEUED = "turn.queued"
     # The written record (§17.2). Separate from TURN_TRANSCRIPT, which
     # reports one stage of one turn: these carry the durable line the reader
     # scrolls, and they are the only events that may mutate history.
@@ -261,6 +267,10 @@ class Stopwatch:
     mt_first_token_ms: float = 0.0
     mt_total_ms: float = 0.0
     tts_first_audio_ms: float = 0.0
+    #: Of ``tts_first_audio_ms``, how much was spent WAITING for a synthesizer
+    #: another conversation was holding. Separated because the two halves have
+    #: different fixes: compute wants a faster talker, waiting wants capacity.
+    tts_wait_ms: float = 0.0
     tts_total_ms: float = 0.0
     #: Wall time from segment close to the first synthesized audio frame. This
     #: is THE number: what the listener waits after the speaker stops.
@@ -274,6 +284,7 @@ class Stopwatch:
             "mt_first_token_ms": round(self.mt_first_token_ms, 1),
             "mt_total_ms": round(self.mt_total_ms, 1),
             "tts_first_audio_ms": round(self.tts_first_audio_ms, 1),
+            "tts_wait_ms": round(self.tts_wait_ms, 1),
             "tts_total_ms": round(self.tts_total_ms, 1),
             "first_audio_ms": round(self.first_audio_ms, 1),
             "total_ms": round(self.total_ms, 1),
@@ -1492,12 +1503,25 @@ class TranslatorSession:
             if silent or not unit.strip() or reference is None:
                 return
             tts_start = self._clock()
+            # One talker serves every conversation. A turn that arrives while
+            # another is synthesizing does not run slowly, it does not run at
+            # all -- so say so NOW rather than letting the user watch nothing
+            # happen and conclude the translator is broken. Sampled before the
+            # call because the wait is only knowable in advance; the exact
+            # duration lands in the stopwatch afterwards.
+            if getattr(self.tts, "busy", False):
+                self.journal.append(
+                    EventKind.TURN_QUEUED,
+                    {"turn_id": turn_id, "target": target, "reason": "tts_busy"},
+                )
+            TTS_QUEUE_WAIT_S.set(0.0)
             async for piece in self.tts.synthesize(
                 unit, target, reference, reference_text, voice.backend_voice_id
             ):
                 if first_audio_at is None:
                     first_audio_at = self._clock()
                     watch.tts_first_audio_ms = (first_audio_at - tts_start) * 1000.0
+                    watch.tts_wait_ms = TTS_QUEUE_WAIT_S.get() * 1000.0
                 chunks.append(piece)
                 self.journal.append(
                     EventKind.TURN_AUDIO,

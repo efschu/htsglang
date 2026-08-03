@@ -36,12 +36,17 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import time
 from pathlib import Path
 from typing import AsyncIterator, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
-from sglang.srt.translator.backends import AudioChunk, BackendError
+from sglang.srt.translator.backends import (
+    TTS_QUEUE_WAIT_S,
+    AudioChunk,
+    BackendError,
+)
 from sglang.srt.translator.ledger import AudioAssetLedger
 from sglang.srt.translator.talker_config import TalkerGeometry, read_talker_geometry
 from sglang.srt.translator.tts_backends import (
@@ -114,6 +119,19 @@ class InProcessQwen3Tts:
         self._lock = asyncio.Lock()
 
     # -- capability ---------------------------------------------------------
+
+    @property
+    def busy(self) -> bool:
+        """True while another turn is inside the synthesizer.
+
+        One talker serves every session, so a second conversation's turn does
+        not run slowly -- it does not run at all until this clears. Measured
+        (DESIGN §17.8.2): a turn arriving while another is synthesizing pays
+        the whole of that synthesis, a median 4.8 s. The caller reads this to
+        tell the user WHY, because a queue nobody can see is indistinguishable
+        from a system that has become slow.
+        """
+        return self._lock.locked()
 
     def supported_languages(self) -> Iterable[str]:
         return self._languages
@@ -294,7 +312,9 @@ class InProcessQwen3Tts:
 
         # One turn at a time: the modules are shared mutable state and a
         # second concurrent generate would interleave KV caches.
+        queued_at = time.monotonic()
         async with self._lock:
+            TTS_QUEUE_WAIT_S.set(time.monotonic() - queued_at)
             waveform = await asyncio.get_running_loop().run_in_executor(
                 None, self._generate, text, language, reference, reference_text
             )

@@ -590,8 +590,27 @@ language TAGGED rather than discarded. Desk state: 273 hermetic tests under
 `CUDA_VISIBLE_DEVICES=99` plus a live boot smoke, and an executed audio-out
 run -- real German reference clip -> Spanish in that voice, 3.76 s against
 the reference implementation's own 3.85 s for the same checkpoint and
-direction, Opus round trip 20.8 kbps. Open: GPU latency numbers, an ASR
-intelligibility round trip, and the 36 preset clips. End-to-end S2ST was surveyed and **rejected on evidence** — no
+direction, Opus round trip 20.8 kbps. Acceptance is a **headless real-client
+gate** (`scripts/translator/client_gate.py`): Chromium with a fake microphone
+fed real speech, against the PUBLIC URL, tapping the DOM, asserting what a
+person sees — it exists because four consecutive defects were invisible to a
+protocol-level harness. It doubles as the latency instrument by reading the
+per-stage `Stopwatch` the server already ships on `turn.done`. **First audio
+decomposed** (idle tenant, median over 5 real turns): ASR 0.09 s, embedding
+0.02 s, MT-to-first-token 0.30 s, **TTS first clause 3.36 s** = 3.95 s total,
+so 85 % is one non-incremental clause synthesis at RTF 1.23 and the
+recognition side is not the latency. **Contention is measured, not assumed**
+(`contention_probe.py` drives a second conversation): ASR and MT are
+unaffected by a second stream, but one `asyncio.Lock` serialises all
+synthesis, so a co-running conversation costs a median +4.8 s. Since RTF > 1
+already for ONE conversation, the queue is correct and the capacity is one
+conversation — what was added is that the queue is now **visible**:
+`turn.queued` fires before the wait, the client says "another turn is being
+spoken" in that turn's translation slot, and `tts_wait_ms` splits queueing
+from compute per turn through a `ContextVar` (an attribute would report
+whichever turn finished last, i.e. be wrong exactly when it matters). Open:
+an ASR intelligibility round trip, and shortening the first synthesized unit
+(DESIGN_466 §18.4). End-to-end S2ST was surveyed and **rejected on evidence** — no
 open-weight model does DE<->ES with speaker preservation (Hibiki fr->en only,
 StreamSpeech X->en, Seamless fixed synthetic voice, Qwen3-Omni three preset
 voices) — so the cascade is the only architecture meeting the requirement.

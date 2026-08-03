@@ -2286,6 +2286,142 @@ Excluded by evidence, not argument:
 **Do not** re-litigate nginx, socket death or the capture chain without new
 evidence — each is excluded above with its probe.
 
+#### 17.8.2 The gate is green twice, and contention is now measured
+
+**The gate passed twice in a row**, 9 turns at 85 s gaps each, console clean,
+socket OPEN after every turn — soak #2 (inherited) and soak #3. §17.8.1's
+"idle-related" reading stays refuted, and the standing rule is satisfied.
+
+**The contention hypothesis was tested deliberately and it holds.** Two arms
+through the public URL, same clip, same client, one with a second conversation
+driven alongside by `scripts/translator/contention_probe.py` (new):
+
+| stage, median | gate alone | gate + one second conversation |
+|---|---|---|
+| asr | 0.09 s | 0.10 s |
+| embed | 0.02 s | 0.07 s |
+| mt first token | 0.30 s | 0.19 s |
+| tts first audio | 3.36 s | 8.21 s |
+| **first audio (segment close → sound)** | **3.95 s** | **8.77 s** |
+| worst turn | 7.00 s | 11.94 s |
+
+**The contention is entirely in the synthesizer.** ASR is unchanged and MT is
+unchanged — the 27B on TP=3 absorbs a second stream without cost, which also
+means the MT hop is not the thing to protect. `inprocess_tts.py` serialises
+every synthesis in the tenant behind one `asyncio.Lock`, so a second
+conversation's turn does not run slowly, it does not run at all until the
+first one finishes. The measured penalty is one whole synthesis: a median
++4.8 s, worst +8.4 s.
+
+**Contention is real but it does NOT explain R5.** Soak #1's turn 2 produced
+*nothing* within a 45 s budget; a 2.2× slowdown reaches ~9 s. So contention is
+confirmed as a latency effect and is not sufficient as the R5 root cause. The
+session-collection fix landed between those runs and is the other candidate.
+Stated as an open end rather than closed, because two runs that differ in load
+remain two runs.
+
+**Decision: one conversation at a time is the honest capacity, and the queue
+is correct.** The talker's measured RTF is 1.23 (4.88 s of audio from 6.00 s
+of synthesis), so a single conversation already consumes more than real time
+and no scheduling policy can make two fit. Queueing is therefore the right
+behaviour and was already what happened. What was wrong is that it was
+invisible — the second conversation simply appeared to have become slow, which
+is exactly the shape the user reported. So:
+
+* `InProcessQwen3Tts.busy` exposes the lock;
+* a turn that finds it held emits **`turn.queued` before it waits**, and the
+  client writes "waiting - another turn is being spoken" into that turn's
+  translation slot, where the arriving translation clears it;
+* `Stopwatch.tts_wait_ms` separates queueing from compute on every turn, via a
+  `ContextVar` (`backends.TTS_QUEUE_WAIT_S`) rather than a backend attribute —
+  an attribute would carry whichever turn finished last, i.e. be wrong exactly
+  when two conversations run and the number finally matters.
+
+Verified on the live service, not at the desk: over four turns under load,
+`tts_wait` was 3.13 / 4.96 / 0.00 / 5.73 s and the page announced the queue on
+exactly the three non-zero ones. Compute stayed ~3.3-3.7 s in both arms, which
+is what makes the split trustworthy.
+
+#### 17.8.3 The phone, read from its own data — sent is not played
+
+The user reported no sound and no fluid updating on a real Android phone while
+the gate was passing. Read from HIS session (`a6806f9f626c`) rather than from
+rig runs, three things are now established and one is not.
+
+**1. His client is NOT stale.** Every diagnostics frame from his device
+reports the current build. The PWA/HTTP cache hypothesis — the only structural
+difference between his device and the gate — is refuted by his own frames, not
+argued away. His sessions are identifiable in the log because the gate's
+report `track_label: "Fake Default Audio Input"` and his reports `"Standard"`.
+
+**2. The server sent him audio, and the pipeline worked.** His five turns
+carry correct German recognition and correct Spanish translations
+("Hallo, ich bin Matthias. Wer bist du?" → "Hola, soy Matthias. ¿Quién eres
+tú?"), the clone voice engaged on several of them (`mode: clone`,
+`downgraded: false`), and the journal holds **53 `turn.audio` events**; a
+read-only replay pulled **1024 binary frames, 655 kB**. The non-silence gate
+never fired. So this is not "the server produced nothing" and not "the server
+produced silence" — the audio existed and left the building.
+
+**3. Therefore the break is between the socket and the speaker**, on the
+device. That is a different fix from everything attempted in the previous
+rounds, all of which were server- or transport-shaped.
+
+**4. WHY it does not play is NOT yet proven, and must not be claimed.** There
+was no output telemetry at all — the diagnostics frame described the capture
+context and said nothing about the playback context. Two candidates survive
+and they are distinguishable by one number:
+
+* the output `AudioContext` never started (mobile autoplay policy), or
+* it started and played into a muted or elsewhere-routed sink (media volume,
+  Bluetooth), which no code change can fix.
+
+**The defect found in the code, which is real regardless.** `Playback.ensure()`
+created the output context lazily, and `beginTalking()` called it *after*
+`await microphone.start()`. Awaiting `getUserMedia` ends the gesture's
+transient activation, so the context was created outside a user gesture; a
+mobile browser then leaves it `suspended`, ignores `resume()`, schedules every
+buffer against a clock that never advances, and throws nothing. Fixed: the
+unlock now runs as the first statement of `beginTalking()`, before any await,
+and starts a one-sample buffer to make the browser commit.
+
+**The gate could not have caught this, and now says so.** `client_gate.py`
+counted `playback.push` calls — "the frames reached the playback path" — which
+is true on a phone that makes no sound. Worse, it launched Chromium with
+`--autoplay-policy=no-user-gesture-required`, waiving the exact policy at
+issue. The override is removed and the gate now asserts the OUTPUT: context
+state `running`, `currentTime` advancing, every pushed frame scheduled, no
+push errors. **But that is still not equivalent to a phone**, and this was
+tested rather than assumed: `--prove-can-fail` disables the page's unlock at
+runtime, and headless Chromium *still* reports `running` — it starts its
+context regardless of gesture, because it has no real audio device. So:
+
+> The headless gate is necessary and it cannot speak for Android's autoplay
+> policy. Any future "the gate is green" about audibility is worth exactly
+> nothing on its own. The device telemetry below is the instrument for this
+> class.
+
+**What was added so the next real press settles it.** The diagnostics frame
+now carries a `playback` half — context state, `currentTime`, sample rate,
+frames pushed vs scheduled, the outcome of `resume()` (resolved/rejected), and
+the last errors — logged server-side on one line next to the capture half. The
+page also stops failing silently: when audio arrives while the output is not
+running, it says "the browser is blocking sound output — tap 'tap to speak'
+once to allow it" and sets the status to `sound blocked`.
+
+**Decision procedure for the next press**, so nobody has to guess again:
+
+| his `playback` telemetry | reading |
+|---|---|
+| `state: running`, `current_time` advancing, `pushed == scheduled` | the browser played it — the fault is the device's volume or output routing, not the code |
+| `state: suspended`, `last_resume: rejected...` | the autoplay block; the unlock fix targets exactly this |
+| `pushed > scheduled`, `errors` non-empty | a decode/scheduling fault, localised by the error text |
+
+**The second complaint, "it does not update fluidly", is a separate and
+measured thing**: his own turns took 3.3-6.1 s to first audio and up to 10.2 s
+in total, which is the §18.4 decomposition (85 % non-incremental clause
+synthesis), not a transport defect.
+
 ### 17.6 Build order and what each step needs
 
 Order is by dependency, not by user priority — (b) carries the surface every
@@ -2367,6 +2503,11 @@ If that table holds, the big serial block is **turn-close → ASR → first MT
 token**, and the win is in overlapping recognition with speech rather than in
 rebuilding the whole chain.
 
+**Measured, and the expectation above was wrong about where the time goes.**
+The table's *shape* holds — ASR takes a closed segment, MT streams into
+clauses, TTS runs per clause — but "turn-close → ASR → first MT token" is not
+the serial block. It is 0.4 s of a 3.95 s wait. See §18.4.
+
 ### 18.2 Target
 
 1. **ASR partials live** — text appears in the transcript WHILE the person is
@@ -2396,9 +2537,70 @@ The decomposition also answers whether faster-than-real-time is reachable on
 rung B (in-process talker, measured RTF 1.15 with the codec on the GPU) or
 where the hard floor is. **State the floor honestly; never promise it.**
 
+**Done, 2026-08-03.** The server already measured every stage (`Stopwatch`)
+and shipped the numbers on `turn.done`; nothing was instrumented that did not
+already exist — the gate simply grew a second listener on the client's own
+socket and now prints the decomposition per turn. Five turns through the
+public URL with the real client, an idle tenant, medians:
+
+| stage | median | share of first audio |
+|---|---|---|
+| ASR (faster-whisper large-v3-turbo) | 0.09 s | 2 % |
+| speaker embedding | 0.02 s | 1 % |
+| MT to first token (27B, TP=3) | 0.30 s | 8 % |
+| MT to the first clause boundary | ~0.45 s | 11 % |
+| **TTS, first clause** | **3.36 s** | **85 %** |
+| **first audio, segment close → sound** | **3.95 s** | |
+
+Steady state is 3.57 s; the first turn of a session costs 7.0 s (cold path,
+empty reference buffer) and drags nothing but the maximum.
+
+**The recognition side is already fast enough to be uninteresting.** ASR,
+embedding and MT together are 0.4 s. Streaming ASR partials would therefore
+buy roughly nothing in *audio* latency — it would improve the moment
+**text** appears, which is a real and separate benefit for the reading mode
+(§17.1), but it is not the answer to "the translation arrives long after I
+stop speaking".
+
+**The whole term is one non-incremental clause synthesis.** `inprocess_tts`
+generates a complete waveform and only then chunks it (§12, stated there
+before it was measured), so first audio for a clause equals full synthesis of
+that clause. Measured RTF **1.23** — 4.88 s of audio from 6.00 s of work.
+
+**The floor, honestly.** With RTF > 1 the talker cannot outrun speech, so
+"faster than real time" is not reachable on rung B *at all*, and no amount of
+pipelining changes that: a stream whose producer is slower than its consumer
+starves. What IS reachable on rung B, in falling order of value:
+
+1. **Shorten the first unit.** First audio is proportional to the length of
+   the first clause, not the utterance. Splitting the first clause at the
+   earliest defensible boundary — the accumulator already owns clause
+   splitting — converts a 3.4 s wait into roughly RTF × (first phrase), and
+   is the only change here that needs no new capability.
+2. **Overlap synthesis with playback.** Clause N+1 can be synthesized while
+   clause N plays. At RTF 1.23 this does not keep up indefinitely, but it
+   hides the *second* clause onwards behind the first one's playback, which
+   is where a long turn currently stutters.
+3. **A faster talker** — #488's native lane. This is the only lever that
+   moves the floor itself, and it is the one this rung was always a stand-in
+   for.
+
+Items 1 and 2 are the §18.2 targets worth building; §18.2's item 1 (ASR
+partials) is reclassified as a reading-mode feature, not a latency fix. That
+reordering is a consequence of the measurement and is why §18.4 exists.
+
 ### 18.5 Acceptance
 
 Through the standing headless-client gate (§17.8), extended with latency
 assertions per turn: time to first partial text, time to first audio chunk,
 both logged per turn so a regression is visible as a number rather than as a
 user complaint.
+
+**Logging is in place** — every gate turn now prints the full server-side
+decomposition and `--json-out` keeps it, so two runs are comparable stage by
+stage. The **assertion** exists as `--max-first-audio-s` and is deliberately
+**off by default**: with the floor now measured at 3.57 s steady state and
+3.95 s median on an idle tenant, a budget belongs in the gate command once
+§18.4's item 1 lands and the number it should defend is the *new* one. Turning
+it on against today's floor would only pin the latency this work exists to
+remove.

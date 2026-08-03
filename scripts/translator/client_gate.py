@@ -16,7 +16,17 @@ DOM events, and asserts what a person would see:
 
 * the transcript line appears WITHOUT a reload, within a budget;
 * audio frames arrive, in the right quantity for their announced rate;
+* the OUTPUT context is running and its clock advances -- because "frames
+  reached the playback path" was the assertion this harness made while a real
+  phone sat there in silence;
 * the console is clean.
+
+**Known blind spot, tested rather than assumed.** Headless Chromium has no
+audio device and starts its ``AudioContext`` whether or not a user gesture
+preceded it. ``--prove-can-fail`` disables the page's own unlock, and the run
+still passes -- so this gate CANNOT reproduce a mobile autoplay block, and a
+green run here is not evidence that a phone makes a sound. The device's own
+``playback`` telemetry is the instrument for that class (DESIGN §17.8.3).
 
 Then it SOAKS: a dozen minutes with a turn every 90 s, which is the only way
 to catch the two classes that only appear over time -- an idle socket dying
@@ -49,6 +59,8 @@ FAKE_RATE = 48000
 # every one of them is a thing the user reported as broken.
 FIRST_LINE_BUDGET_S = 45.0
 FIRST_AUDIO_BUDGET_S = 90.0
+#: How long to wait for the ``turn.done`` summary after the audio arrived.
+TIMINGS_WAIT_S = 25.0
 
 
 def prepare_fake_input(clip: Path, out: Path) -> float:
@@ -80,13 +92,67 @@ PROBE_JS = """
 () => {
   // Count what the playback path actually receives. Reading the DOM cannot
   // tell whether audio arrived; only the playback call can.
-  window.__gate = { frames: 0, samples: 0, rate: 0, errors: [] };
+  window.__gate = { frames: 0, samples: 0, rate: 0, errors: [], timings: [] };
   const original = playback.push.bind(playback);
   playback.push = (float32, rate) => {
     window.__gate.frames += 1;
     window.__gate.samples += float32.length;
     window.__gate.rate = rate;
     return original(float32, rate);
+  };
+  // The server already measures every stage (``Stopwatch``) and ships the
+  // numbers on ``turn.done``. Read them off a SECOND listener on the same
+  // socket rather than by patching the client's dispatch: the page under test
+  // must behave exactly as it does for a phone, and an extra listener changes
+  // nothing about how the first one runs. This is what turns the gate from a
+  // pass/fail into the per-stage instrument DESIGN §18.4 asks for.
+  window.__gateAttach = () => {
+    const ws = (typeof connection !== 'undefined' && connection.ws)
+      ? connection.ws : null;
+    if (!ws || ws.__gateHooked) return false;
+    ws.__gateHooked = true;
+    ws.addEventListener('message', (ev) => {
+      if (typeof ev.data !== 'string') return;   // binary = audio, not events
+      let event;
+      try { event = JSON.parse(ev.data); } catch (err) { return; }
+      if (event && event.kind === 'turn.done' && event.timings) {
+        window.__gate.timings.push(event.timings);
+      }
+    });
+    return true;
+  };
+  return window.__gateAttach();
+}
+"""
+
+#: Stage keys carried by ``turn.done``, in pipeline order, with the two that
+#: are cumulative-from-segment-close marked. ``first_audio_ms`` is THE number:
+#: what a listener waits after the speaker stops.
+STAGE_KEYS = (
+    "asr_ms",
+    "embed_ms",
+    "mt_first_token_ms",
+    "mt_total_ms",
+    "tts_first_audio_ms",
+    "tts_wait_ms",
+    "tts_total_ms",
+    "first_audio_ms",
+    "total_ms",
+)
+
+
+#: Re-creates the defect the output assertions exist to catch: no unlock on
+#: the gesture, and a context that is never resumed. Injected only under
+#: ``--prove-can-fail``. A gate assertion nobody has ever seen fail is a
+#: decoration, and this one replaced an assertion that WAS a decoration.
+SABOTAGE_JS = """
+() => {
+  playback.unlock = function () { return this.ctx; };
+  playback.ensure = function () {
+    if (!this.ctx) {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    return this.ctx;            // deliberately never resumed
   };
   return true;
 }
@@ -95,10 +161,14 @@ PROBE_JS = """
 
 async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
     """Tap, speak, tap, and wait for what a person would wait for."""
+    # Re-attach after a reconnect: ``connection.ws`` is replaced, and the
+    # listener goes with the old socket. Idempotent via a marker on the socket.
+    await page.evaluate("() => window.__gateAttach && window.__gateAttach()")
     before_lines = await page.evaluate(
         "document.querySelectorAll('#transcript .line').length"
     )
     before_frames = await page.evaluate("window.__gate.frames")
+    before_timings = await page.evaluate("window.__gate.timings.length")
     started = time.monotonic()
 
     await page.click("#talk")                     # tap to speak
@@ -107,8 +177,16 @@ async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
 
     line_at = None
     audio_at = None
+    # Did the page ever SAY it was waiting (§17.8.2)? Polled rather than
+    # checked at the end, because the notice is deliberately transient: the
+    # translation that clears it is the same event that ends the wait.
+    saw_waiting = False
     deadline = started + max(budgets["line"], budgets["audio"])
     while time.monotonic() < deadline:
+        if not saw_waiting:
+            saw_waiting = await page.evaluate(
+                "document.querySelectorAll('.turn .dst.waiting').length > 0"
+            )
         if line_at is None:
             now_lines = await page.evaluate(
                 "document.querySelectorAll('#transcript .line').length"
@@ -121,6 +199,23 @@ async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
         if line_at is not None and audio_at is not None:
             break
         await asyncio.sleep(0.25)
+
+    # ``turn.done`` lands AFTER the last audio frame, so the loop above has
+    # already broken out by the time the stage timings exist. Wait for it
+    # separately and bounded: the numbers are diagnostic, and a turn that
+    # produced line and audio must not be failed for a late summary frame.
+    stage_deadline = time.monotonic() + budgets["timings"]
+    while time.monotonic() < stage_deadline:
+        if await page.evaluate("window.__gate.timings.length") > before_timings:
+            break
+        await asyncio.sleep(0.25)
+    timings = await page.evaluate(
+        f"window.__gate.timings.slice({before_timings})"
+    )
+    # What the OUTPUT did, not what was handed to it. Counting playback.push
+    # calls proves the frames arrived and says nothing about whether a sound
+    # was made -- the distinction a real device paid for.
+    out = await page.evaluate("playback.diagnostics()")
 
     # The client's own view, per turn. A stall that is only visible as a
     # missing line is undiagnosable; these are the counters that say WHERE it
@@ -150,10 +245,15 @@ async def one_turn(page, index: int, speak_s: float, budgets: dict) -> dict:
         "text": text[:120],
         "samples_total": samples,
         "client": state,
+        "saw_waiting": saw_waiting,
+        "out": out,
+        # One entry per target language; a DE turn fans out to one target
+        # today, but the list keeps a fan-out honest rather than averaging it.
+        "stages": timings,
     }
 
 
-async def run_gate(args) -> int:
+async def run_gate(args) -> tuple:
     from playwright.async_api import async_playwright
 
     fake = Path("/tmp/gate_fake_input.wav")
@@ -168,7 +268,14 @@ async def run_gate(args) -> int:
                 "--use-fake-ui-for-media-stream",
                 "--use-fake-device-for-media-stream",
                 f"--use-file-for-fake-audio-capture={fake}",
-                "--autoplay-policy=no-user-gesture-required",
+                # NO autoplay override. It used to be here, and it is exactly
+                # what made this harness unable to see the defect a real phone
+                # hit: with the policy waived, an output context that a phone
+                # would refuse to start starts anyway, every frame is
+                # scheduled, and the gate reports audio while the device is
+                # silent. Playwright's clicks are trusted events, so the page
+                # gets real user activation here just as it does on a phone --
+                # which is the only way this gate can speak for one.
             ],
         )
         context = await browser.new_context(permissions=["microphone"])
@@ -195,12 +302,20 @@ async def run_gate(args) -> int:
         except Exception as exc:  # noqa: BLE001
             failures.append(f"the client never opened its socket: {exc}")
             await browser.close()
-            return report(failures, [], console, build)
+            return report(failures, [], console, build), []
 
         await page.evaluate(PROBE_JS)
+        if args.prove_can_fail:
+            await page.evaluate(SABOTAGE_JS)
+            print("[gate] SABOTAGE: the output unlock is disabled; a PASS "
+                  "here would mean the output assertions cannot see it")
 
         results = []
-        budgets = {"line": args.line_budget, "audio": args.audio_budget}
+        budgets = {
+            "line": args.line_budget,
+            "audio": args.audio_budget,
+            "timings": args.timings_wait_s,
+        }
         for i in range(args.turns):
             if i:
                 await asyncio.sleep(args.gap_s)
@@ -210,6 +325,19 @@ async def run_gate(args) -> int:
                   f"audio {turn['audio_s']}s frames {turn['audio_frames']} "
                   f"@{turn['rate']}Hz | client {turn['client']} | "
                   f"{turn['text']}")
+            if turn["saw_waiting"]:
+                print("[gate]   the page announced the queue while it waited")
+            for stage in turn["stages"]:
+                print(f"[gate]   stages: {stage_line(stage)}")
+            if args.max_first_audio_s is not None:
+                for stage in turn["stages"]:
+                    server_s = stage.get("first_audio_ms", 0.0) / 1000.0
+                    if server_s > args.max_first_audio_s:
+                        failures.append(
+                            f"turn {turn['turn']}: first audio took "
+                            f"{server_s:.1f}s server-side, over the "
+                            f"{args.max_first_audio_s:.1f}s budget"
+                        )
             if turn["line_s"] is None:
                 failures.append(
                     f"turn {turn['turn']}: no transcript line appeared live "
@@ -219,6 +347,36 @@ async def run_gate(args) -> int:
                 failures.append(
                     f"turn {turn['turn']}: no audio reached playback within "
                     f"{budgets['audio']}s"
+                )
+            # The output half. A turn that pushed frames into a context that
+            # is not running produced no sound, however healthy every other
+            # counter looks -- which is precisely what a phone reported while
+            # this gate was passing.
+            out = turn["out"]
+            print(f"[gate]   output : {out['state']} @{out['rate']} "
+                  f"t={out['current_time']} pushed {out['pushed']}/"
+                  f"{out['scheduled']} resume {out['last_resume']}")
+            if out["pushed"] and out["state"] != "running":
+                failures.append(
+                    f"turn {turn['turn']}: {out['pushed']} frames were pushed "
+                    f"into an output context in state {out['state']!r} "
+                    f"(resume {out['last_resume']}) -- nothing was heard"
+                )
+            if out["pushed"] and out["current_time"] <= 0:
+                failures.append(
+                    f"turn {turn['turn']}: the output clock never advanced "
+                    f"(currentTime {out['current_time']}), so no scheduled "
+                    f"buffer can have played"
+                )
+            if out["scheduled"] < out["pushed"]:
+                failures.append(
+                    f"turn {turn['turn']}: {out['pushed'] - out['scheduled']} "
+                    f"pushed frames were never scheduled: {out['errors']}"
+                )
+            if out["blocked"]:
+                failures.append(
+                    f"turn {turn['turn']}: the page flagged its own output as "
+                    f"blocked"
                 )
             # A socket that died silently is the R5 root candidate: check it
             # every turn rather than only at the end.
@@ -232,7 +390,42 @@ async def run_gate(args) -> int:
                 )
 
         await browser.close()
-    return report(failures, results, console, build)
+    return report(failures, results, console, build), results
+
+
+def stage_line(stage: dict) -> str:
+    """One turn's server-side decomposition, in pipeline order."""
+    return " ".join(
+        f"{key[:-3]} {stage.get(key, 0.0) / 1000.0:.2f}s" for key in STAGE_KEYS
+    )
+
+
+def median(values: list) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if not ordered:
+        return 0.0
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def stage_summary(results: list) -> None:
+    """Median per stage over every turn -- the §18.4 decomposition.
+
+    Median rather than mean: one cold first turn (model warm-up, an empty
+    reference buffer) would drag a mean and hide what the steady state costs.
+    """
+    stages = [s for r in results for s in r.get("stages", [])]
+    if not stages:
+        print("[gate] stages  : none reported "
+              "(no turn.done carried timings)")
+        return
+    print(f"[gate] stages  : medians over {len(stages)} translated turns")
+    for key in STAGE_KEYS:
+        values = [s.get(key, 0.0) / 1000.0 for s in stages]
+        print(f"          {key[:-3]:<16} med {median(values):6.2f}s  "
+              f"min {min(values):6.2f}s  max {max(values):6.2f}s")
 
 
 def report(failures, results, console, build) -> int:
@@ -245,6 +438,7 @@ def report(failures, results, console, build) -> int:
         print(f"[gate] text    : min {min(lines)}s max {max(lines)}s")
     if audio:
         print(f"[gate] audio   : min {min(audio)}s max {max(audio)}s")
+    stage_summary(results)
     noisy = [c for c in console if "favicon" not in c.lower()]
     print(f"[gate] console : {len(noisy)} error/warning lines")
     for line in noisy[:10]:
@@ -270,11 +464,38 @@ def main() -> int:
                         help="silence between turns; 90 for the soak")
     parser.add_argument("--line-budget", type=float, default=FIRST_LINE_BUDGET_S)
     parser.add_argument("--audio-budget", type=float, default=FIRST_AUDIO_BUDGET_S)
+    parser.add_argument(
+        "--timings-wait-s", type=float, default=TIMINGS_WAIT_S,
+        help="how long to wait for the turn.done summary frame after audio; "
+             "diagnostic only, a late summary never fails a turn",
+    )
+    parser.add_argument(
+        "--max-first-audio-s", type=float, default=None,
+        help="fail a turn whose SERVER-side first_audio_ms exceeds this. "
+             "Off by default on purpose: a budget picked before the floor is "
+             "measured (DESIGN §18.4) would be a number nobody can defend",
+    )
+    parser.add_argument(
+        "--prove-can-fail", action="store_true",
+        help="disable the page's output unlock, so a run that still PASSES "
+             "proves the output assertions are blind",
+    )
+    parser.add_argument(
+        "--label", default="gate",
+        help="tag written into --json-out, so two runs can be compared",
+    )
     parser.add_argument("--json-out", type=Path, default=None)
     args = parser.parse_args()
-    code = asyncio.run(run_gate(args))
+    code, results = asyncio.run(run_gate(args))
     if args.json_out:
-        args.json_out.write_text(json.dumps({"exit": code}), encoding="utf-8")
+        args.json_out.write_text(
+            json.dumps(
+                {"label": args.label, "exit": code, "url": args.url,
+                 "turns": results},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     return code
 
 

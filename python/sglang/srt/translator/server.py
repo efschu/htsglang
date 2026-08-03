@@ -575,10 +575,14 @@ class _Connection:
             # against the session it belongs to. This is the only channel by
             # which a defect between the microphone and the socket becomes
             # visible to anyone but the person holding the phone.
+            # Both halves, always, on one line: a device that hears nothing is
+            # either not being sent audio or not playing it, and the two have
+            # nothing in common except that they look identical from here.
             logger.info(
-                "session %s capture diagnostics: %s",
+                "session %s capture diagnostics: %s playback: %s",
                 self._sid(),
                 json.dumps(message.get("capture") or {}, sort_keys=True),
+                json.dumps(message.get("playback") or {}, sort_keys=True),
             )
             await self._send({"kind": "diag.ack"})
         elif kind == "ping":

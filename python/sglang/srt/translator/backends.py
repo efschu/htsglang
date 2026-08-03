@@ -26,6 +26,7 @@ Three rules the interfaces enforce by shape:
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import math
 from typing import (
@@ -54,7 +55,26 @@ __all__ = [
     "FakeEmbedder",
     "FakeMt",
     "FakeTts",
+    "TTS_QUEUE_WAIT_S",
 ]
+
+
+#: Seconds THIS synthesis call spent waiting for a busy synthesizer, published
+#: to the CALLER's context by whichever TTS backend serialises itself.
+#:
+#: A ContextVar rather than an attribute on the backend, because one backend
+#: serves every session: an attribute would carry whichever turn finished
+#: last, which is the wrong turn exactly when two conversations are running
+#: and the number finally matters. Async generators do not isolate context, so
+#: a value set inside ``synthesize`` is read by its driving task and by no
+#: other -- verified with concurrent callers, not assumed.
+#:
+#: It exists because waiting and computing are different defects with
+#: different fixes (DESIGN §18.4): a slow synthesizer wants a faster talker, a
+#: queued one wants capacity or an honest "someone else is speaking".
+TTS_QUEUE_WAIT_S: contextvars.ContextVar = contextvars.ContextVar(
+    "tts_queue_wait_s", default=0.0
+)
 
 
 class BackendError(RuntimeError):

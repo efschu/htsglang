@@ -41,6 +41,7 @@
   .turn .who { font-size:12px; color:var(--dim); letter-spacing:.03em; }
   .turn .src { color:var(--dim); }
   .turn .dst { font-size:18px; }
+  .turn .dst.waiting { font-size:13px; color:var(--warn); font-style:italic; }
   .turn.borrowed .who::after { content:" · borrowed voice"; color:var(--warn); }
   .sys { font-size:12px; color:var(--dim); }
   .sys.err { color:var(--bad); }
@@ -200,24 +201,104 @@ function setStatus(text, cls) {
 // would leave the queue scheduling into the past.
 // ---------------------------------------------------------------------------
 class Playback {
-  constructor() { this.ctx = null; this.cursor = 0; }
+  constructor() {
+    this.ctx = null;
+    this.cursor = 0;
+    // Counted separately on purpose. "Frames arrived", "frames were
+    // scheduled" and "the output clock is running" are three different
+    // claims, and a phone that plays nothing while the server sent 53 audio
+    // events is telling us which of them broke -- but only if they are
+    // counted apart. They were not, which is why that phone could not be
+    // diagnosed from here.
+    this.pushed = 0;
+    this.scheduled = 0;
+    this.errors = [];
+    this.lastResume = "none";
+    this.blocked = false;
+  }
+
+  /** Create and START the output context. MUST be called on a user gesture.
+   *
+   * A mobile browser lets any script CREATE an AudioContext and refuses to
+   * start its clock outside a gesture. A context created when the first
+   * audio frame arrives -- seconds after the tap -- is therefore born
+   * suspended, `resume()` there is not honoured, every buffer is scheduled
+   * against a clock that never advances, and nothing is heard and nothing is
+   * thrown. Unlocking has to happen on the tap, BEFORE any await, because
+   * awaiting getUserMedia consumes the activation that makes it legal.
+   */
+  unlock() {
+    const ctx = this.ensure();
+    if (!ctx) return null;
+    try {
+      // Starting a one-sample buffer is what makes the browser commit.
+      const buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+    } catch (err) {
+      this.errors.push("unlock: " + err);
+    }
+    return ctx;
+  }
+
   ensure() {
-    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    if (this.ctx.state === "suspended") this.ctx.resume();
+    if (!this.ctx) {
+      try {
+        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      } catch (err) {
+        this.errors.push("create: " + err);
+        return null;
+      }
+    }
+    if (this.ctx.state === "suspended") {
+      // The promise is READ, not ignored: a rejected resume is the whole
+      // diagnosis, and dropping it on the floor is what made this invisible.
+      this.lastResume = "requested";
+      this.ctx.resume().then(
+        () => { this.lastResume = "resolved"; },
+        (err) => { this.lastResume = "rejected: " + err; }
+      );
+    }
     return this.ctx;
   }
+
   push(float32, rate) {
+    this.pushed += 1;
     const ctx = this.ensure();
-    const buffer = ctx.createBuffer(1, float32.length, rate);
-    buffer.copyToChannel(float32, 0);
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    const now = ctx.currentTime;
-    if (this.cursor < now + 0.02) this.cursor = now + 0.05;
-    source.start(this.cursor);
-    this.cursor += buffer.duration;
+    if (!ctx) return;
+    if (ctx.state !== "running") this.blocked = true;
+    try {
+      const buffer = ctx.createBuffer(1, float32.length, rate);
+      buffer.copyToChannel(float32, 0);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      const now = ctx.currentTime;
+      if (this.cursor < now + 0.02) this.cursor = now + 0.05;
+      source.start(this.cursor);
+      this.cursor += buffer.duration;
+      this.scheduled += 1;
+    } catch (err) {
+      this.errors.push("push: " + err);
+    }
   }
+
+  /** Everything a log reader needs to tell "not sent" from "not played". */
+  diagnostics() {
+    return {
+      state: this.ctx ? this.ctx.state : "none",
+      current_time: this.ctx ? Math.round(this.ctx.currentTime * 1000) / 1000 : 0,
+      rate: this.ctx ? this.ctx.sampleRate : 0,
+      pushed: this.pushed,
+      scheduled: this.scheduled,
+      last_resume: this.lastResume,
+      blocked: this.blocked,
+      errors: this.errors.slice(-3),
+    };
+  }
+
   get busy() { return this.ctx && this.cursor > this.ctx.currentTime; }
 }
 const playback = new Playback();
@@ -542,6 +623,16 @@ class Connection {
     const rate = (this.pendingAudio && this.pendingAudio.sample_rate)
       || PIPELINE_RATE;
     playback.push(samples, rate);
+    // Audio arrived and the output is not running: say it, once, in words the
+    // person can act on. Silence here is the failure that cost five rounds --
+    // the server sent every frame and the phone reported nothing wrong.
+    if (playback.blocked && !this.warnedBlocked) {
+      this.warnedBlocked = true;
+      sys("the browser is blocking sound output -- tap 'tap to speak' once "
+          + "to allow it, then say the sentence again", true);
+      setStatus("sound blocked", "err");
+      reportCapture("playback-blocked");
+    }
   }
 
   sendFrame(buffer) {
@@ -864,10 +955,25 @@ function onEvent(event) {
       if (event.notice) sys(event.notice, true);
       break;
     }
+    case "turn.queued": {
+      // One synthesizer serves every conversation, so a turn can be waiting
+      // rather than working. Saying which is the whole point: a queue nobody
+      // can see is indistinguishable from a translator that has frozen.
+      // Written into the translation slot, so the translation itself clears
+      // it -- no timer, no second event to miss.
+      const dst = turnNode(event.turn_id).querySelector(".dst");
+      if (!dst.textContent) {
+        dst.textContent = "waiting - another turn is being spoken";
+        dst.classList.add("waiting");
+      }
+      break;
+    }
     case "turn.translation": {
       if (event.partial) break;
       const node = turnNode(event.turn_id);
-      node.querySelector(".dst").textContent = event.text;
+      const dst = node.querySelector(".dst");
+      dst.classList.remove("waiting");
+      dst.textContent = event.text;
       break;
     }
     case "turn.done": {
@@ -907,14 +1013,22 @@ const microphone = new Microphone(
 function reportCapture(reason) {
   const d = microphone.diagnostics();
   d.reason = reason;
+  // The OUTPUT half. Capture telemetry alone cannot distinguish "the server
+  // sent no audio" from "the phone never played it", and that ambiguity is
+  // exactly what a real device kept running into: 53 audio events sent, no
+  // sound, and nothing in any log that could say which end was at fault.
+  const p = playback.diagnostics();
   el("diag").textContent =
     "build " + d.build + " | " + d.path + " | ctx " + d.context_state + " @" +
     d.context_rate + " | track " + d.track_state +
     (d.track_muted ? " MUTED" : "") + " @" + d.track_rate +
     " | worklet " + d.worklet_calls + " (" + d.worklet_empty + " empty, ch " +
     d.worklet_channels + ") | chunks " + d.chunks + " | frames " + d.frames +
-    " | peak " + d.peak;
-  connection.sendControl({ kind: "diag", capture: d });
+    " | peak " + d.peak +
+    " || out " + p.state + " @" + p.rate + " t=" + p.current_time +
+    " pushed " + p.pushed + "/" + p.scheduled +
+    " resume " + p.last_resume + (p.blocked ? " BLOCKED" : "");
+  connection.sendControl({ kind: "diag", capture: d, playback: p });
   return d;
 }
 
@@ -925,6 +1039,11 @@ let silentCapture = null;
 async function beginTalking() {
   if (holding) return;
   holding = true;
+  // Output is unlocked HERE, before the first await. `await microphone.start()`
+  // ends the gesture's transient activation, and an output context started
+  // after that point stays suspended on a phone -- audio is pushed, nothing
+  // throws, nothing is heard. This line used to sit after the await.
+  playback.unlock();
   try {
     await microphone.start();
   } catch (err) {
@@ -937,7 +1056,7 @@ async function beginTalking() {
     setStatus("no microphone", "err");
     return;
   }
-  playback.ensure();          // unlock audio output on the same gesture
+  playback.unlock();          // again, now that permission cannot be pending
   acquireWakeLock();          // keep the screen alive for the conversation
   microphone.setOpen(true);
   talk.classList.add("live");
