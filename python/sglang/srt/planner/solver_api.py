@@ -66,6 +66,7 @@ __all__ = [
     "key_solver_aggregate_payload",
     "key_solver_model_payload",
     "key_solver_spread_payload",
+    "regime_switch_payload",
     "cached_card_probe",
     "cached_hardware_profile",
 ]
@@ -472,6 +473,196 @@ def key_solver_model_payload(payload: Optional[dict] = None) -> dict:
             cost="one cold boot to READY plus a prefill and a decode window",
         ).to_json(),
     }
+
+
+def regime_switch_payload(payload: Optional[dict] = None) -> dict:
+    """``POST /api/regime_switch`` -- the #363 §20.1 worth-it autocheck.
+
+    Pure computation: it reads the phase table the caller supplies and the
+    ledger numbers the caller supplies, and touches no GPU, no probe and no
+    server. Body::
+
+        {"phase_table": {...},                     # required, see
+                                                   # regime_switch.phase_table_from_json
+         "prefill_layout": "prefill",
+         "decode_layout": "decode",
+         "workload": {"prefill_tokens": 20000, "decode_tokens": 512,
+                      "switches_per_round": 2},
+         "geometry": {"units": 12, "bytes_per_unit": 1717986918},
+         "ledger":   {"card_total_bytes": [...], "committed_bytes": [...],
+                      "graph_state_bytes": [...],   # optional, ESTIMATE
+                      "corridor_bytes": 419430400,
+                      "pre_captured": true},
+         "pair_mode": {"tolerance_pct": 2.0,
+                       "candidates_prefill": [{"layout": {...},
+                                               "tok_s": ..., "provenance": ...,
+                                               "source": ...}, ...],
+                       "candidates_decode":  [...]}}
+
+    ``geometry`` and ``ledger`` are optional; without them the verdict is
+    priced at RUNG 1 and says so, rather than assuming the cheap rung.
+    ``pair_mode`` is the §20.3 secondary objective and is reported alongside
+    the verdict, never folded into it.
+
+    WIRING: the same two-line ``webui.py`` binding the module docstring
+    describes for the key-solver paths, tested before the shorter prefixes.
+
+    Nothing this returns executes: #363 slice 1 is the decision layer.
+    """
+    from sglang.srt.planner import regime_switch as rs
+
+    p = dict(payload or {})
+    raw_table = p.get("phase_table")
+    if not raw_table:
+        return {
+            "ok": False,
+            "reasons": [
+                "no phase_table given; §20.1's whole point is that the "
+                "verdict is read off the measured table, so there is nothing "
+                "to decide from without one"
+            ],
+        }
+    try:
+        table = rs.phase_table_from_json(raw_table)
+    except (KeyError, TypeError, ValueError) as e:
+        return {"ok": False, "reasons": [f"malformed phase_table: {e}"]}
+
+    prefill_name = str(p.get("prefill_layout") or "prefill")
+    decode_name = str(p.get("decode_layout") or "decode")
+    try:
+        table.layout(prefill_name)
+        table.layout(decode_name)
+    except KeyError as e:
+        return {"ok": False, "reasons": [str(e)]}
+
+    workload = None
+    if p.get("workload"):
+        try:
+            w = dict(p["workload"])
+            workload = rs.WorkloadShape(
+                prefill_tokens=int(w.get("prefill_tokens", 20000)),
+                decode_tokens=int(w.get("decode_tokens", 512)),
+                switches_per_round=float(w.get("switches_per_round", 2.0)),
+            )
+        except (TypeError, ValueError) as e:
+            return {"ok": False, "reasons": [f"malformed workload: {e}"]}
+
+    overlap = None
+    residency = None
+    geom = p.get("geometry") or {}
+    ledger = p.get("ledger") or {}
+    if geom:
+        try:
+            overlap = rs.layout_overlap(
+                table.layout(prefill_name),
+                table.layout(decode_name),
+                units=int(geom["units"]),
+                bytes_per_unit=float(geom["bytes_per_unit"]),
+                active=decode_name,
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            return {"ok": False, "reasons": [f"malformed geometry: {e}"]}
+    if ledger:
+        if overlap is None:
+            return {
+                "ok": False,
+                "reasons": [
+                    "a ledger was given without a geometry; the rung "
+                    "arithmetic needs the shard overlap to know how many "
+                    "extra bytes dual residency costs"
+                ],
+            }
+        try:
+            gsb = ledger.get("graph_state_bytes")
+            residency = rs.residency_rung(
+                overlap,
+                card_total_bytes=[float(x) for x in ledger["card_total_bytes"]],
+                committed_bytes=[float(x) for x in ledger["committed_bytes"]],
+                graph_state_bytes=(
+                    [float(x) for x in gsb] if gsb is not None else None
+                ),
+                pre_captured=bool(ledger.get("pre_captured", True)),
+                corridor_bytes=float(ledger.get("corridor_bytes") or 0.0),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            return {"ok": False, "reasons": [f"malformed ledger: {e}"]}
+
+    result = rs.autocheck(
+        table,
+        prefill_layout=prefill_name,
+        decode_layout=decode_name,
+        workload=workload,
+        overlap=overlap,
+        residency=residency,
+    )
+    out: Dict[str, Any] = {"ok": True, "phase_table": table.to_json()}
+    out.update(result.to_json())
+
+    pair = p.get("pair_mode")
+    if pair:
+        if not geom:
+            return {
+                "ok": False,
+                "reasons": [
+                    "pair_mode needs a geometry: the secondary objective is "
+                    "shard overlap, which is measured in units and bytes"
+                ],
+            }
+        try:
+            cands_a = _pair_candidates(pair.get("candidates_prefill"), "prefill")
+            cands_b = _pair_candidates(pair.get("candidates_decode"), "decode")
+            out["pair"] = rs.solve_layout_pair(
+                cands_a,
+                cands_b,
+                units=int(geom["units"]),
+                bytes_per_unit=float(geom["bytes_per_unit"]),
+                tolerance_pct=float(
+                    pair.get("tolerance_pct", rs.DEFAULT_PAIR_TOLERANCE_PCT)
+                ),
+                # No `active` override: the candidates carry their own names,
+                # which need not match the phase table's rows, and the decode
+                # candidate is the active layout by the same standing default.
+            ).to_json()
+        except (KeyError, TypeError, ValueError) as e:
+            return {"ok": False, "reasons": [f"malformed pair_mode: {e}"]}
+    return out
+
+
+def _pair_candidates(rows, phase: str):
+    """Decode one phase's near-optimal candidate list for the pair objective."""
+    from sglang.srt.planner import regime_switch as rs
+    from sglang.srt.planner.cost_model import Provenance, Rate
+
+    if not rows:
+        raise ValueError(f"pair_mode: no candidates given for phase {phase!r}")
+    out = []
+    for raw in rows:
+        d = dict(raw)
+        ly = dict(d["layout"])
+        kv = ly.get("kv_tokens")
+        source = str(d.get("source") or "").strip()
+        if not source:
+            raise ValueError(
+                f"pair_mode candidate for {phase!r} has no source; an "
+                "unsourced score cannot be ranked against a measured one"
+            )
+        prov = Provenance(str(d.get("provenance") or "estimate"))
+        if prov is Provenance.ABSENT:
+            score = Rate.absent(source, unit="tok/s")
+        else:
+            score = Rate(float(d["tok_s"]), prov, source, "tok/s", "")
+        out.append(
+            rs.PhaseCandidate(
+                phase=phase,
+                layout=rs.LayoutVector(
+                    name=str(ly["name"]),
+                    weights=tuple(int(x) for x in ly["weights"]),
+                    kv_tokens=(tuple(int(x) for x in kv) if kv else None),
+                ),
+                score=score,
+            )
+        )
+    return out
 
 
 def key_solver_spread_payload(payload: Optional[dict] = None) -> dict:
