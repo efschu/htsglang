@@ -576,6 +576,37 @@ loudspeaker-into-microphone feedback loop for half-duplex playback, for free.
 
 ---
 
+### 6.4 Crash-safety backup (dated decision, 2026-08-03)
+
+Components that are restrictively licensed, gated, or published by a source
+that can disappear are backed up to a **private** GitHub repository. A local
+copy on one machine is not a backup, and Coqui — publisher of XTTS-v2 — is
+defunct, so its HF mirror is exactly the kind of source that vanishes.
+
+`scripts/translator/vendor_backup.sh` — small files (configs, licences,
+vocabularies, install recipes) go into git; large weights go into GitHub
+release assets, split at 1900 MiB because a single asset caps at 2 GiB. Every
+entry lands in `MANIFEST.md` with its sha256, license and source URL, plus the
+`cat <name>.part-* > <name>` reassembly line, so a restore is *verified* rather
+than hoped at.
+
+`init` will not push anything until the GitHub API itself answers
+`private: true`. Trusting the create request's intent instead of the API's
+answer is how a non-commercial checkpoint ends up world-readable.
+
+The repository is **private forever**: CPML and CC-BY-NC permit private copies,
+not redistribution. The public fork never references it — the fork only knows
+the neutral backend interface.
+
+Backed up in this phase: **XTTS-v2** (`coqui/XTTS-v2`, Coqui Public Model
+License 1.0.0, non-commercial) — `LICENSE.txt`, `config.json`, `vocab.json`,
+`README.md` in git; `model.pth`, `dvae.pth`, `speakers_xtts.pth`,
+`mel_stats.pth` as assets on release tag `xtts-v2`. Qwen3-TTS and VoxCPM2 are
+Apache-2.0 and ungated, so they are re-downloadable and do not need this; they
+get backed up anyway once pinned to a specific revision, because Higgs Audio
+silently moved from `apache-2.0` to `license: other` on 2026-06-25 and that is
+the failure mode this guards against. **Pin revisions, not repo names.**
+
 ## 7. Test plan before the flight
 
 **(a) Desk, done.** 119 hermetic tests + the live boot smoke above.
