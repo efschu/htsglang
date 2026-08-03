@@ -172,3 +172,71 @@ class TestServerInfoIsCachedNotRefetchedPerPoll(unittest.TestCase):
         self.lm._SERVER_INFO_CACHE["http://z:1"] = (0.0, good)
         self.lm._http_get_json = lambda url, timeout: None
         self.assertEqual(self.lm._fetch_server_info("http://z:1", 10.0), good)
+
+
+class TestAutoDetectReachesTheRigsServingPort(unittest.TestCase):
+    """#533 part 3: the landing page's AUTOMATIC target detection swept a
+    four-port shortlist (30000, 30001, 30100, 8000) while the "Find a server"
+    button swept range(30000, 30101) + (8000, 8080). This rig serves on 30030 --
+    inside the button's range, outside the shortlist -- so auto-detection could
+    never find the production server. It worked only while a hand-clicked
+    sweep's _DETECTED_ENDPOINT survived in module memory, and a dashboard
+    restart silently turned the page into "no server running" against a healthy
+    server answering /health 200.
+    """
+
+    def setUp(self):
+        from sglang.srt.planner import webui as w
+
+        self.w = w
+        self._orig_detected = w._DETECTED_ENDPOINT
+        w._DETECTED_ENDPOINT = None
+
+        def restore():
+            w._DETECTED_ENDPOINT = self._orig_detected
+
+        self.addCleanup(restore)
+
+    def test_a_server_on_30030_is_found_from_a_cold_start(self):
+        w = self.w
+        seen_ports = []
+
+        def fake_tcp_open(host, port, timeout=0.15):
+            seen_ports.append(port)
+            return port == 30030
+
+        orig_tcp, orig_probe = w._tcp_open, w._probe_sglang
+        w._tcp_open = fake_tcp_open
+        w._probe_sglang = lambda url, timeout=0.8: url.endswith(":30030")
+        self.addCleanup(lambda: (setattr(w, "_tcp_open", orig_tcp),
+                                 setattr(w, "_probe_sglang", orig_probe)))
+
+        got = w._detect_external_endpoint()
+        self.assertEqual(got, "http://127.0.0.1:30030")
+        self.assertIn(30030, seen_ports,
+                      "30030 was never even scanned -- the shortlist is back")
+
+    def test_scan_covers_the_same_ports_as_the_find_a_server_button(self):
+        """The two paths must not diverge again: that divergence WAS the bug."""
+        w = self.w
+        seen = []
+        orig_tcp, orig_probe = w._tcp_open, w._probe_sglang
+        w._tcp_open = lambda host, port, timeout=0.15: (seen.append(port), False)[1]
+        w._probe_sglang = lambda url, timeout=0.8: False
+        self.addCleanup(lambda: (setattr(w, "_tcp_open", orig_tcp),
+                                 setattr(w, "_probe_sglang", orig_probe)))
+        w._detect_external_endpoint()
+        self.assertEqual(sorted(set(seen)), sorted(set(w._DETECT_SWEEP_PORTS)))
+
+    def test_a_known_endpoint_is_reverified_without_a_sweep(self):
+        """Steady state must stay one cheap probe, not a 103-port scan."""
+        w = self.w
+        w._DETECTED_ENDPOINT = "http://127.0.0.1:30030"
+        swept = []
+        orig_tcp, orig_probe = w._tcp_open, w._probe_sglang
+        w._tcp_open = lambda host, port, timeout=0.15: (swept.append(port), False)[1]
+        w._probe_sglang = lambda url, timeout=0.8: True
+        self.addCleanup(lambda: (setattr(w, "_tcp_open", orig_tcp),
+                                 setattr(w, "_probe_sglang", orig_probe)))
+        self.assertEqual(w._detect_external_endpoint(), "http://127.0.0.1:30030")
+        self.assertEqual(swept, [], "steady state fell through to the full sweep")

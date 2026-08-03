@@ -3001,14 +3001,33 @@ def _detect_external_endpoint(
     last hit is cached and re-verified FIRST, so a stable hand-started server
     costs one probe per poll instead of a sweep. Returns a base URL or None."""
     global _DETECTED_ENDPOINT
-    candidates: List[str] = []
-    if _DETECTED_ENDPOINT:
-        candidates.append(_DETECTED_ENDPOINT)
-    for p in ports or _MONITOR_DETECT_PORTS:
-        url = f"http://{host}:{p}"
-        if url not in candidates:
-            candidates.append(url)
-    for url in candidates:
+    # Re-verify the last hit first: a stable hand-started server costs exactly
+    # one cheap probe per poll and never reaches the sweep below.
+    if _DETECTED_ENDPOINT and _probe_sglang(_DETECTED_ENDPOINT, timeout=timeout):
+        return _DETECTED_ENDPOINT
+
+    # #533: the automatic path used to try a FOUR-port shortlist
+    # (30000, 30001, 30100, 8000) while the "Find a server" button swept
+    # _DETECT_SWEEP_PORTS = range(30000, 30101) + (8000, 8080). This rig serves
+    # on 30030, which is inside the button's range and outside the shortlist,
+    # so auto-detection could never find the production server: it worked only
+    # for as long as a hand-clicked sweep's _DETECTED_ENDPOINT survived in
+    # module memory, and a dashboard restart silently turned the landing page
+    # into "no server running" against a healthy server. Same ports as the
+    # button now, made cheap by the two-stage scan _tcp_open exists for -- a
+    # closed port refuses instantly, so only the ports that actually answer
+    # pay for an HTTP probe.
+    from concurrent.futures import ThreadPoolExecutor
+
+    scan = [int(x) for x in (ports or _DETECT_SWEEP_PORTS)]
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        open_ports = [
+            prt
+            for prt, is_open in zip(scan, ex.map(lambda q: _tcp_open(host, q), scan))
+            if is_open
+        ]
+    for prt in open_ports:
+        url = f"http://{host}:{prt}"
         if _probe_sglang(url, timeout=timeout):
             _DETECTED_ENDPOINT = url
             return url
@@ -6306,10 +6325,13 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .mtile .mt-s { font-size: var(--t-xs); color: var(--fg-muted);
                  line-height: 1.4; min-height: 1.7em;
                  font-variant-numeric: tabular-nums; }
-  /* median-of-recent-PROCESSING badge next to a rate that reads 0 while idle.
-     Deliberately quieter than the headline: it is history, not a reading. */
-  .mtile .mt-med { font-size: var(--t-xs); font-weight: 400;
-                   color: var(--fg-muted); }
+  /* Secondary line of a rate tile. Since #533 the HEADLINE is the median and
+     this carries the instantaneous reading, so it must be readable rather
+     than merely present: .mt-v is white-space:nowrap, which silently clipped
+     this to "insta..." in the narrow strip tiles. Own line, wrapping allowed. */
+  .mtile .mt-med { display: block; font-size: var(--t-xs); font-weight: 400;
+                   color: var(--fg-muted); white-space: normal;
+                   line-height: 1.35; }
   /* spill/offload tier rows: one row per tier (type x place). An ABSENT row
      is drawn at the same weight as a measured one -- dimmed, never hidden,
      because "this rig has no remote tier" is information. */
@@ -10750,6 +10772,31 @@ function stripTile(id,label,value,sub,sparkKey,tip){
 // median that counted them would read 0 on an idle rig and mean nothing.
 // An EMPTY window renders no badge at all -- "nothing processed yet" is not a
 // zero, and a tile must not be able to be read as if it were.
+// #533 (user decision 2026-08-03): for the tok/s rate tiles the MEDIAN is the
+// HEADLINE number and the instantaneous rate is the labelled secondary.
+// Reason, from the measurement that found it: these counters advance in
+// decode-batch steps, so a 2 s instantaneous window routinely spans ZERO
+// counter updates and reads a hard 0.0 while the median beside it reads
+// 75-150 tok/s. Headlining the instant made a working server look dead -- the
+// success-claim-vs-state trap in UI form, where the prominent figure is the
+// one that cannot be trusted. The instant is kept, not dropped: it is the only
+// thing that moves within a single poll and is worth seeing.
+// With no completed processing window there is NO median, and the instant
+// carries the tile with an explicit note -- an empty window is "nothing
+// processed yet", never a zero (the invariant medBadge already documents).
+function rateTokPerS(s,key,instTxt){
+  const m=(s&&s.rate_medians)?s.rate_medians[key]:null;
+  if(!m||m.median==null){
+    return instTxt+'<small> tok/s</small>'
+      +'<span class="mt-med" title="no completed processing window yet, so there is no median; this headline is the instantaneous rate"> (no median yet)</span>';
+  }
+  return Number(m.median).toFixed(1)+'<small> tok/s</small>'
+    +'<span class="mt-med" title="headline is the median of the last '+m.n
+    +' processing window'+(m.n===1?'':'s')+' (idle polls excluded; window '
+    +m.window+'). instant is the latest poll window, which spans zero counter '
+    +'updates often enough to read 0 on a busy server."> median &middot; instant '
+    +instTxt+'</span>';
+}
 function medBadge(s,key,dgt,unit,scale){
   const m=(s&&s.rate_medians)?s.rate_medians[key]:null;
   if(!m||m.median==null) return '';
@@ -10838,13 +10885,13 @@ function renderLandingStrip(s){
   $('landing_strip').innerHTML=
     stripTile('strip_decode','decode tok/s',
       noMetrics?STRIP_DASH
-        :num(dec)+'<small> tok/s</small>'+medBadge(s,'decode_tok_s'),
+        :rateTokPerS(s,'decode_tok_s',num(dec)),
       sub(rates?('server gauge '+num(rates.gen_throughput_server)+' tok/s')
                :'(rates on next tick)'),
       'st_dec')
    +stripTile('strip_prefill','prefill tok/s (non-cached)',
       noMetrics?STRIP_DASH
-        :num(pfx)+'<small> tok/s</small>'+medBadge(s,'prefill_tok_s'),
+        :rateTokPerS(s,'prefill_tok_s',num(pfx)),
       sub(rates?('gross incl. cache-served: '+num(rates.prefill_tok_s_gross)+' tok/s')
                :'(rates on next tick)'),
       'st_pfx',
@@ -11889,14 +11936,14 @@ function renderLivePanel(s, envelope){
   strip.style.display=''; $('live_legend').style.display='';
   setHTML(strip,
     liveTile('decode per request',
-      n1(decPer)+'<small> tok/s</small>'
-      +(noMetrics?'':medBadge(s,'decode_tok_s_per_request')),
+      noMetrics?(n1(decPer)+'<small> tok/s</small>')
+              :rateTokPerS(s,'decode_tok_s_per_request',n1(decPer)),
       'server total '+n1(dec)+' tok/s &middot; '
       +(running==null?'parallel requests n/a':running+' running')
       +(queued?(' &middot; '+queued+' queued'):''), 'lv_dec')
    +liveTile('prefill per request',
-      n1(pfxPer)+'<small> tok/s</small>'
-      +(noMetrics?'':medBadge(s,'prefill_tok_s_per_request')),
+      noMetrics?(n1(pfxPer)+'<small> tok/s</small>')
+              :rateTokPerS(s,'prefill_tok_s_per_request',n1(pfxPer)),
       'server total '+n1(pfx)+' tok/s (non-cached)', 'lv_pfx')
    +liveTile('tokens per watt (total)',
       n2(tpwTotal)+'<small> tok/W</small>',
