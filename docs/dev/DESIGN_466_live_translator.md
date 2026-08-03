@@ -3789,6 +3789,14 @@ capability gate); 11 new hermetic server tests; full translator suite **487
 passed**. Screenshots recorded for the drag mid-gesture and for the unread
 pill.
 
+**Gate on the roster build: 2x PASS on client `01ed65f1e2`**
+(`gate_roster_a.log`, `gate_roster_b.log`), same shape -- 4 turns each with
+the reload arm, the stop arm naming its aborted turn (`frames after stop 0,
+quiet 20.2 s`), console clean, the scroll arm green on every sample. MT
+medians across the run: `mt_first_token` 0.14 s, `first_audio` 5.99 s. Four
+gate runs were taken this session in total, all green, across the two client
+cuts. **The user may be asked to test `01ed65f1e2`.**
+
 **THE RESTART BUNDLE has grown and is now the top item.** One tenant restart
 carries: `turn.speech`, the MT retry, `--mt-timeout-s`, `--mt-lane` (all from
 Cut A, still undeployed), PLUS `speaker.merge` + its REST route + the
