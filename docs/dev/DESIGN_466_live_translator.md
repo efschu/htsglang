@@ -2136,15 +2136,45 @@ Order is by dependency, not by user priority — (b) carries the surface every
 other feature renders into, so it goes first even though (d) is the one the
 user called "very important".
 
-| step | feature | depends on | needs a card? |
-|---|---|---|---|
-| 1 | (b) server-side transcript + line-update events | — | no |
-| 2 | (a) silence mode | 1 (transcript is the whole output in silent mode) | no |
-| 3 | (e) speaker buttons + manual ground truth | 1 | no |
-| 4 | (d) uncertainty band, candidates, resolution | 1, 3 (manual overrides) | no |
-| 5 | (c) name suggestions, three-valued + adjacency | 1, 4 (uncertain lines get no suggestions) | LLM only, at the end |
+| step | feature | depends on | needs a card? | state |
+|---|---|---|---|---|
+| 1 | (b) server-side transcript + line-update events | — | no | **done**, 2026-08-03 |
+| 2 | (a) silence mode | 1 (transcript is the whole output in silent mode) | no | **done**, 2026-08-03 |
+| 3 | (e) speaker buttons + manual ground truth | 1 | no | **done**, 2026-08-03 |
+| 4 | (d) uncertainty band, candidates, resolution | 1, 3 (manual overrides) | no | **done**, 2026-08-03 |
+| 5 | (c) name suggestions, three-valued + adjacency | 1, 4 (uncertain lines get no suggestions) | LLM only, at the end | **server side done**, 2026-08-03 |
 
 Steps 1-4 are entirely desk-testable under `CUDA_VISIBLE_DEVICES=99` with the
 existing fake backends. Step 5's classifier needs the 27B for its end proof,
 but its adjacency logic — the part with the interesting failure modes — does
 not, and is hermetic.
+
+### 17.7 Status, 2026-08-03 — server side complete, client surface open
+
+All five are implemented and tested on the **server**: 380 hermetic tests
+(from 286), `ruff` and `codespell` clean. The protocol carries everything the
+five need, over both the WebSocket and REST:
+
+| | control frames | REST |
+|---|---|---|
+| (b) | `transcript`, `transcript.clear`, `speaker.name` | `GET`/`DELETE .../transcript`, `POST .../speakers/{id}/name` |
+| (a) | `output.mode` | `POST .../voice {"output_mode": ...}` |
+| (e) | `speaker.arm`, `speaker.add` | `POST .../arm`, `POST .../speakers` |
+| (d) | `line.resolve`, `line.undo` | `POST`/`DELETE .../lines/{id}/speaker` |
+| (c) | `suggestion.confirm`, `suggestion.discard` | — (chips arrive as `speaker.suggestion` events) |
+
+Plus: the handshake now delivers the written record before the journal
+replay, so a reconnect from cursor zero restores the conversation whole.
+
+**What is NOT built: the PWA surface.** `client/index.html` still shows the
+pre-§17 screen — no transcript panel, no reading-mode toggle, no speaker
+button row, no uncertainty badges, no name chips. Until that lands, the five
+features are reachable only by a client that speaks the protocol (the test
+suite does; a phone does not). That is the next step, it needs no card, and
+it is the whole remaining distance between "implemented" and "usable on the
+phone".
+
+One end proof also remains open and does need the card: (c)'s classifier
+against the real 27B. Its adjacency — where the interesting failure modes
+live — is hermetic and green; what is unproven is how well the 27B itself
+separates `self` from `third_party` from `addressed` on real speech.
