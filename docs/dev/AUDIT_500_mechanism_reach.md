@@ -123,6 +123,30 @@ task proposals in §5.
 
 ## 5. Bug candidates — proposed tasks
 
+**Status, 2026-08-03 (#504, branch `fix/audit-bundle-504`).** Six of the rows
+below are FIXED, with a falsifier each: **B3** (draft-KV-DCP now keys on the
+installer's own predicate `uneven_weighted_dcp_enabled()`, so the
+`--rank-kv-ratio` route is admitted), **B8** (`validate_breakable_boot`'s
+`None` arm split into a `NO_SERVER_ARGS` sentinel that skips and an
+unresolvable backend that refuses by name), **B10** (verdict: the refusal is
+DELIBERATE, not stale — the reason and the one unobserved round are now in the
+message, and `KVSO_ALLOW_SPEC` is surfaced in the CLI help, which it never
+was), **B2** (`--rank-kv-ratio` without a placement refuses by name instead of
+being accepted-and-inert), **B18** (the marlin fold reads a per-backend
+`marlin_packable_linear` declaration instead of a class-name list), and
+**I-2/I-3** (`planner/flags.py`'s two inverted edges, plus a contract test that
+drives every declared uneven-TP edge against the runtime).
+
+Two corrections to rows below, from executing rather than reading. **B18**:
+of the three configs named, only `MarlinConfig` is genuinely marlin-served and
+blockless, and it is neither registered in `QUANTIZATION_METHODS` nor concrete
+(no `get_scaled_act_names`) — a LATENT hole, not a live boot failure;
+`W8A8Fp8Config` and `QuarkConfig` reach no marlin repack entry point at all, so
+they were not gaps. **I-2**: the `rank_gpu_id` x `dp_size`/`ep_size`/`nnodes`
+edges the audit recorded as declared-but-unverified are REAL runtime refusals
+(driven in the contract test), so those edges stay.
+
+
 Sixteen [NARROWER] rows carry real user harm rather than a sloppy catalog line.
 Ranked by leverage. Every one is a named, self-contained task; none of them was
 fixed in this audit (the audit changed documentation only).

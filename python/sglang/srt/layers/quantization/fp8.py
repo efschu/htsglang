@@ -243,6 +243,11 @@ def cast_e2m1fn_to_e4m3fn(
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
+    # ``process_weights_after_loading`` repacks through
+    # ``prepare_fp8_layer_for_marlin`` whenever ``use_marlin`` resolves True
+    # (:1000), which on sm80..88 is the only fp8 GEMM there is.
+    marlin_packable_linear = True
+
     def __init__(
         self,
         is_checkpoint_fp8_serialized: bool = False,

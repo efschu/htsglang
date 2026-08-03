@@ -1773,8 +1773,15 @@ class ServerArgs:
             "evicted. FIFO restore with hysteresis once device KV frees up. "
             "S1 scope: exactly ONE spilled session at a time (further "
             "pressure falls back to stock retraction), eager spill tick (no "
-            "CUDA graph, no H2D/compute overlap), no speculative decoding, "
-            "page_size 1, flashinfer backend, single node. The spilled "
+            "CUDA graph, no H2D/compute overlap), page_size 1, flashinfer "
+            "backend, single node. Speculative decoding is BUILT but OPT-IN: "
+            "a spilled session decodes under MTP/NEXTN (its draft-KV share "
+            "spills and restores with it, and the drafter can run in the "
+            "spill tick via --kv-session-offload-spec-in-tick), and every "
+            "spill+spec boot requires the environment variable "
+            "KVSO_ALLOW_SPEC=1 -- one round is still unobserved in "
+            "validation, a spill landing in the same round as a "
+            "drafter-in-tick step. The spilled "
             "session's decode is PCIe-bound (every step streams its whole "
             "context H2D); with token-sharded uneven DCP the volume is split "
             "across ranks, without it the single-link stream is SLOW. "
@@ -6580,18 +6587,36 @@ class ServerArgs:
         if self.speculative_algorithm is not None and (
             os.environ.get("KVSO_ALLOW_SPEC", "0") != "1"
         ):
-            # The S1 "no speculative decoding" limit. Being LIFTED (spill +
-            # MTP): the spill tick is a plain bs=1 decode while device sessions
-            # run draft/verify, and MTP carries its own 1-layer draft KV that
-            # a spilled session must co-handle (the bundle_spillable_sizes seam
-            # reserves the draft share). Gated by KVSO_ALLOW_SPEC=1 during
-            # bring-up so the default path stays rejected (byte-identical);
-            # the gate is removed once spill+MTP is validated.
+            # The S1 "no speculative decoding" limit, LIFTED as a mechanism and
+            # kept as an OPT-IN (#500-B10 verdict). The spill tick is a plain
+            # bs=1 decode while device sessions run draft/verify, and MTP
+            # carries its own 1-layer draft KV that a spilled session must
+            # co-handle (the bundle_spillable_sizes seam reserves the draft
+            # share); spill, restore, on-device resume and draft backfill all
+            # exist and are exercised.
+            #
+            # WHY THE GATE STAYS, rather than being deleted as stale: the
+            # combination has a named unobserved case. FEATURES_VS_UPSTREAM's
+            # kv-session-offload "Bounds that hold" row records that a spill
+            # landing in the SAME round as a drafter-in-tick step has not been
+            # observed in validation, and the same table's Speculation row
+            # states the opt-in as the supported route rather than as a
+            # temporary bring-up hack. So this is not "not implemented" -- it
+            # is "implemented, opt-in until that round is observed", and the
+            # message says exactly that. The audit found the old wording ("does
+            # not yet support") describing a mechanism that was in fact built,
+            # while the env that reaches it appeared in no help text at all.
             raise ValueError(
-                "--enable-kv-session-offload does not yet support "
-                "speculative decoding (--speculative-algorithm="
-                f"{self.speculative_algorithm}). Set KVSO_ALLOW_SPEC=1 to "
-                "opt into the spill+MTP bring-up path."
+                "--enable-kv-session-offload x speculative decoding "
+                f"(--speculative-algorithm={self.speculative_algorithm}) is an "
+                "OPT-IN combination: set KVSO_ALLOW_SPEC=1. It is built, not "
+                "missing -- a spilled session decodes under MTP/NEXTN, its "
+                "draft-KV share spills and restores with the session, and the "
+                "drafter can run inside the spill tick "
+                "(--kv-session-offload-spec-in-tick). The gate stays because "
+                "one round remains unobserved in validation: a spill landing "
+                "in the same round as a drafter-in-tick step. Everything else "
+                "in the pair has run on hardware."
             )
         if self.attention_backend not in (None, "flashinfer"):
             raise ValueError(
@@ -7445,10 +7470,31 @@ class ServerArgs:
         # The owner rule the draft pool would reuse is installed only by the
         # uneven-hybrid WEIGHTED DCP path. Without it there is no weight
         # vector to shard the draft tokens by, so 'dcp' has nothing to mean.
+        #
+        # ASK THE INSTALLER'S OWN PREDICATE (#500-B3). The weighted rule is
+        # installed by configure_scheduler_process under
+        #
+        #     _dcp_size > 1 and base_plan is not None
+        #     and server_args.uneven_weighted_dcp_enabled()
+        #
+        # (managers/scheduler.py:5952-5958), and uneven_weighted_dcp_enabled()
+        # is `SGLANG_UNEVEN_DCP_WEIGHTED=1 OR uneven_kv_flag_active()` (:8457)
+        # -- i.e. any non-'coupled' --rank-kv-ratio puts the boot on the same
+        # owner rule as the legacy env pair, task #88. This gate used to spell
+        # out the env pair literally and therefore refused the flag route,
+        # which is the SUPPORTED route: the sibling speculation x DCP gate has
+        # accepted both spellings since #88 (`... or self.uneven_kv_flag_active()`,
+        # :7628). The consequence was that #108's measured -67 % draft-KV win
+        # was unreachable for every boot configured through --rank-kv-ratio.
+        #
+        # SGLANG_UNEVEN_DCP is deliberately NOT a separate condition here. It
+        # installs no owner rule; its only effect is auto-setting dcp_size to
+        # tp_size (:9845), and that outcome is checked directly below. Keeping
+        # it as an extra lock made a second spelling of an already-checked
+        # fact into an independent requirement.
         _uneven_weighted_dcp = (
             self.speculative_algorithm is not None
-            and os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
-            and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
+            and self.uneven_weighted_dcp_enabled()
             and self.rank_tp_ratio is not None
             and len(set(self.rank_tp_ratio)) > 1
             and self.dcp_size > 1
@@ -7457,13 +7503,13 @@ class ServerArgs:
         if not _uneven_weighted_dcp:
             raise ValueError(
                 "--draft-kv-layout dcp requires the uneven-hybrid weighted "
-                "DCP + speculative path: a speculative algorithm, "
-                "SGLANG_UNEVEN_DCP=1, SGLANG_UNEVEN_DCP_WEIGHTED=1, a "
-                "non-uniform --rank-tp-ratio, and dcp_size == tp_size > 1. "
+                "DCP + speculative path: a speculative algorithm, the "
+                "weighted owner rule (a non-'coupled' --rank-kv-ratio, or "
+                "SGLANG_UNEVEN_DCP_WEIGHTED=1), a non-uniform "
+                "--rank-tp-ratio, and dcp_size == tp_size > 1. "
                 "Got speculative_algorithm="
-                f"{self.speculative_algorithm}, SGLANG_UNEVEN_DCP="
-                f"{os.environ.get('SGLANG_UNEVEN_DCP', '0')}, "
-                "SGLANG_UNEVEN_DCP_WEIGHTED="
+                f"{self.speculative_algorithm}, --rank-kv-ratio="
+                f"{self.rank_kv_ratio}, SGLANG_UNEVEN_DCP_WEIGHTED="
                 f"{os.environ.get('SGLANG_UNEVEN_DCP_WEIGHTED', '0')}, "
                 f"rank_tp_ratio={self.rank_tp_ratio}, "
                 f"dcp_size={self.dcp_size}, tp_size={self.tp_size}. "
@@ -9640,6 +9686,46 @@ class ServerArgs:
                 # uneven weights.
                 g = math.gcd(*self.rank_kv_ratio)
                 self.rank_kv_ratio = [v // g for v in self.rank_kv_ratio]
+
+        # ACCEPTED-THEN-INERT, refused by name (#500-B2).
+        #
+        # --rank-kv-ratio is validated up here because it describes the
+        # PARTITION, not the placement. But the thing that makes it ACT --
+        # the uneven-DCP auto-engage `self.dcp_size = self.tp_size` -- sits
+        # below the early return, in the placement half. Without
+        # --rank-gpu-id the flag therefore passed every check and did nothing:
+        # dcp_size stayed 1, uneven_dcp_kv_replicated() answered False,
+        # configure_scheduler_process installed no token vector (its gate is
+        # `_dcp_size > 1`, managers/scheduler.py:5952) -- and the honesty
+        # guard written for exactly this class, reject_silently_inert_dcp, is
+        # itself gated on dcp_size and so could not see it. The operator asked
+        # for the #210 decode lever and was served the coupled layout in
+        # silence.
+        #
+        # Refused rather than auto-engaged. Nothing that works today changes:
+        # the combination is inert by construction, so no boot depends on it.
+        # And the no-placement path is the cross-vendor two-launcher arm's
+        # path (see the PLAN-ONLY comment above); silently switching that
+        # launch to a token-sharded KV layout is the opposite of what the
+        # decoupling exists for. Both ways out are named instead.
+        if (
+            self.rank_gpu_id is None
+            and self.uneven_kv_flag_active()
+            and self.rank_tp_ratio is not None
+            and self.dcp_size <= 1
+        ):
+            raise ValueError(
+                f"--rank-kv-ratio {self.rank_kv_ratio} would be INERT here. It "
+                "needs the weighted-DCP token axis, and DCP is auto-engaged "
+                "(dcp_size = tp_size) only on the placement path, so without "
+                f"--rank-gpu-id dcp_size stays {self.dcp_size} and the KV "
+                "token ownership silently remains coupled to the weight "
+                "split. Either pass --rank-gpu-id (one physical GPU per rank, "
+                "which auto-engages DCP), or engage it explicitly with "
+                f"--dcp-size {self.tp_size} if this launch places its ranks "
+                "some other way (e.g. the cross-vendor --nnodes 2 bring-up). "
+                "Drop --rank-kv-ratio to keep the coupled layout."
+            )
 
         if self.rank_gpu_id is None:
             self._handle_uneven_mlp_ratio()

@@ -644,6 +644,13 @@ class MarlinConfig(QuantizationConfig):
     Reference: https://github.com/IST-DASLab/marlin/tree/master
     """
 
+    # By definition. It exposes no ``weight_block_size``, so before #500-B18
+    # its uneven-TP shards were never coarsened and an element-granular family
+    # landed mid-tile -- the #377/#383 abort reached through the one config
+    # that IS marlin. Its own ``min_n_threads``/``min_k_threads`` (64/128)
+    # are the same constants the coarsening folds in.
+    marlin_packable_linear = True
+
     def __init__(
         self,
         group_size: int,

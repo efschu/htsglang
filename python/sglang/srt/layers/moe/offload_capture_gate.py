@@ -356,10 +356,38 @@ def validate_breakable_boot(offload_fraction: float, layer_id: Any = None) -> No
         )
 
     backend = resolved_backend("decode")
-    if backend is None:
-        # Server args not wired (unit / test context): nothing to validate
-        # against. The runtime scratch guard still applies.
+    if backend is NO_SERVER_ARGS:
+        # There are no server args in this process AT ALL (unit / test
+        # context): nothing to validate against, and no boot to protect. The
+        # runtime scratch guard still applies.
         return
+    if backend is None:
+        # Server args ARE present and the decode backend could not be resolved
+        # from them (#500-B8). This used to share the arm above, which made the
+        # gate's own None branch a total bypass of BOTH preconditions -- and
+        # `None` is what `resolved_backend` answers for a missing
+        # `cuda_graph_config`, a missing phase config and a phase whose
+        # `backend` is unset, all of which are real boots. Unresolvable is not
+        # "nothing to check": the route is a no-op off the breakable backend,
+        # so admitting an unknown backend admits exactly the illegal in-capture
+        # host read this gate exists to prevent.
+        raise BreakableModeRefused(
+            reason=(
+                f"the decode CUDA-graph backend could not be resolved on layer "
+                f"{layer_id}. Server args are present, but "
+                f"`cuda_graph_config.decode.backend` is unset, so the gate "
+                f"cannot establish that the decode graph is the BREAKABLE one. "
+                f"The route splits the decode graph at the MoE fetch through "
+                f"eager_on_graph, which is a NO-OP under any other backend -- "
+                f"admitting an unknown backend would let the fetch's host reads "
+                f"execute inside a real stream capture, where they are illegal"
+            ),
+            remedy=(
+                "Launch with an explicit --cuda-graph-backend-decode=breakable, "
+                f"or unset {ENV_GRAPH_MODE} to keep the shipped eager offload "
+                "path."
+            ),
+        )
     if backend != "breakable":
         raise BreakableModeRefused(
             reason=(
@@ -375,6 +403,11 @@ def validate_breakable_boot(offload_fraction: float, layer_id: Any = None) -> No
             ),
         )
 
+    # Reached only with the decode backend RESOLVED to 'breakable', so the
+    # args and their cuda_graph_config both exist and `prefill` is never the
+    # NO_SERVER_ARGS sentinel here. `None` at this point means the launch
+    # configures no prefill graph at all -- which IS the state this
+    # precondition requires, so it passes rather than refusing.
     prefill = resolved_backend("prefill")
     if prefill is not None and prefill != "disabled":
         raise BreakableModeRefused(
@@ -396,8 +429,34 @@ def validate_breakable_boot(offload_fraction: float, layer_id: Any = None) -> No
         )
 
 
+class _NoServerArgs:
+    """Sentinel: this process has no ``ServerArgs`` to read at all."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "NO_SERVER_ARGS"
+
+
+#: Distinct from ``None`` on purpose (#500-B8). "There are no server args"
+#: (a unit/test context, nothing to protect) and "the args are there and the
+#: backend could not be resolved from them" (a real boot with an unknown graph
+#: backend) are opposite situations, and collapsing both onto ``None`` gave
+#: :func:`validate_breakable_boot` a silent total-bypass arm. Callers that
+#: treat an unresolved backend as permissive MUST distinguish the two.
+NO_SERVER_ARGS = _NoServerArgs()
+
+
 def resolved_backend(phase: str) -> Any:
-    """The POST-cascade backend for ``phase``, or None when args are absent.
+    """The POST-cascade backend for ``phase``.
+
+    Three distinct answers, and the distinction is load-bearing:
+
+    * a backend name -- resolved;
+    * ``None`` -- server args ARE present, but this phase's backend is not
+      resolvable from them (no ``cuda_graph_config``, no config for the phase,
+      or ``backend`` unset);
+    * :data:`NO_SERVER_ARGS` -- there are no server args in this process.
 
     Read off ``cuda_graph_config`` rather than off the legacy
     ``disable_cuda_graph`` boolean, because several rules rewrite a phase's
@@ -410,7 +469,9 @@ def resolved_backend(phase: str) -> Any:
 
         args = get_server_args()
     except Exception:
-        return None
+        return NO_SERVER_ARGS
+    if args is None:
+        return NO_SERVER_ARGS
     config = getattr(args, "cuda_graph_config", None)
     phase_config = getattr(config, phase, None)
     backend = getattr(phase_config, "backend", None)
@@ -511,6 +572,7 @@ __all__ = [
     "MODE_BREAKABLE",
     "MODE_CAPTURABLE",
     "MODE_EAGER",
+    "NO_SERVER_ARGS",
     "REFUTATION",
     "BreakableModeRefused",
     "CapturableOffloadRefuted",

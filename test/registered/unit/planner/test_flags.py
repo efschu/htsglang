@@ -257,15 +257,42 @@ class TestExclusion(CustomTestCase):
         self.assertFalse(res["rank_gpu_id"]["enabled"])
         self.assertIn("mem-fraction", res["rank_gpu_id"]["disabled_reason"])
 
-    def test_pp_dp_ep_conflict_with_rank_gpu_id(self):
+    def test_dp_ep_conflict_with_rank_gpu_id(self):
+        for partner in ("dp_size", "ep_size"):
+            with self.subTest(partner=partner):
+                res = flags.resolve(
+                    {"tp_size": 2, "rank_gpu_id": [0, 1],
+                     "rank_gpu_memory_mib": 16000, partner: 2},
+                    _MOE_CFG,
+                )
+                # both active -> both flagged.
+                self.assertFalse(res[partner]["enabled"])
+                self.assertFalse(res["rank_gpu_id"]["enabled"])
+
+    def test_pp_size_does_NOT_conflict_with_rank_gpu_id(self):
+        """#500-I2: the runtime REQUIRES the placement under a pipeline (each
+        stage needs its own group of cards) and validates the world-length
+        pp_size x tp_size form. Greying the pair made §1's TPxPPxTP feature
+        unreachable from the dashboard. Asserted against the real predicate in
+        test_flag_registry_contract_500.py."""
         res = flags.resolve(
-            {"tp_size": 2, "rank_gpu_id": [0, 1],
-             "rank_gpu_memory_mib": 16000, "pp_size": 2},
+            {"tp_size": 2, "pp_size": 2, "rank_gpu_id": [0, 1, 2, 3],
+             "rank_gpu_memory_mib": 16000},
             _MOE_CFG,
         )
-        # both active -> both flagged.
-        self.assertFalse(res["pp_size"]["enabled"])
-        self.assertFalse(res["rank_gpu_id"]["enabled"])
+        self.assertTrue(res["pp_size"]["enabled"])
+        self.assertTrue(res["rank_gpu_id"]["enabled"])
+        self.assertIsNone(res["rank_gpu_id"]["error"])
+
+    def test_the_world_length_rule_holds_under_a_pipeline(self):
+        """A tp_size-length vector under pp_size > 1 is the shape the runtime
+        rejects, so the resolver must report it too."""
+        res = flags.resolve(
+            {"tp_size": 2, "pp_size": 2, "rank_gpu_id": [0, 1],
+             "rank_gpu_memory_mib": 16000},
+            _MOE_CFG,
+        )
+        self.assertIn("4 entries", res["rank_gpu_id"]["error"] or "")
 
 
 class TestDependency(CustomTestCase):
@@ -274,8 +301,22 @@ class TestDependency(CustomTestCase):
         res = flags.resolve({"tp_size": 3, "rank_mlp_ratio": [2, 1, 1]}, _MOE_CFG)
         self.assertTrue(res["rank_tp_ratio"]["auto_set"])
         self.assertEqual(res["rank_tp_ratio"]["value"], "auto")
-        # and rank_tp_ratio in turn requires rank_gpu_id -> transitively set.
-        self.assertTrue(res["rank_gpu_id"]["auto_set"])
+        # rank_tp_ratio no longer carries a flat requires=("rank_gpu_id",):
+        # an explicit vector is a PARTITION and needs no placement (#500-I3,
+        # the cross-vendor two-launcher arm). The auto-set picks the 'auto'
+        # MODE, which does derive its weights from per-card budgets, so the
+        # placement requirement is reported as a value-level error instead of
+        # a transitive auto-set -- see _c_rank_tp_ratio_placement.
+        self.assertFalse(res["rank_gpu_id"]["auto_set"])
+        self.assertIn("--rank-gpu-id", res["rank_tp_ratio"]["error"] or "")
+
+    def test_an_explicit_ratio_vector_needs_no_placement(self):
+        """#500-I3 in the resolver: the runtime accepts it, so the dashboard
+        must not grey or flag it (asserted against the real predicate in
+        test_flag_registry_contract_500.py)."""
+        res = flags.resolve({"tp_size": 3, "rank_tp_ratio": [2, 1, 1]}, _MOE_CFG)
+        self.assertIsNone(res["rank_tp_ratio"]["error"])
+        self.assertFalse(res["rank_gpu_id"]["auto_set"])
 
     def test_requires_any_first_wins(self):
         # rank_gpu_id requires one of (rank_gpu_memory_mib, rank_tp_ratio);

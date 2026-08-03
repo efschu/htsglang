@@ -126,6 +126,33 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
+    #: Can a LINEAR layer served by this backend be repacked into marlin tiles
+    #: on SOME supported device? Declared by the backend that owns the kernels,
+    #: because only it knows (#500-B18).
+    #:
+    #: Read by ``layers/linear._marlin_packable_family`` to decide whether an
+    #: element-granular uneven-TP unit family has to be coarsened to marlin's
+    #: minimum thread pair. A checkpoint that repacks through marlin and gets
+    #: no coarsening dies at weight load with "size_n = ... is not divisible by
+    #: tile_n_size = 64" (#377/#383); one that is coarsened without needing it
+    #: pays a slightly coarser split and nothing else. So the failure is
+    #: asymmetric, and a backend that repacks through marlin ANYWHERE must
+    #: declare it here.
+    #:
+    #: DEVICE-FREE AND RANK-UNIFORM, deliberately. The obvious alternative --
+    #: read the resolved scheme's ``use_marlin`` -- is rank-LOCAL: on a mixed
+    #: rig the same checkpoint resolves differently per rank (measured, #377:
+    #: TP0 on sm120 took native FP8 while TP1/TP2 on sm86 fell back to marlin),
+    #: so a unit count derived from it would differ BETWEEN ranks and the ranks
+    #: would silently disagree about the shard plan. This is a property of the
+    #: checkpoint format, not of the local card.
+    #:
+    #: This replaces a class-NAME list held in ``layers/linear.py``, which is
+    #: the §12 quant-name-list family (#443/#446): the list named three
+    #: backends and missed ``MarlinConfig`` itself, which exposes no
+    #: ``weight_block_size`` to coarsen by and is marlin-served by definition.
+    marlin_packable_linear: bool = False
+
     def __init__(self):
         super().__init__()
         # mapping is updated by models as they initialize

@@ -470,6 +470,11 @@ class FlagSpec:
       * ``is_env``      -- True for environment variables (not CLI flags).
       * ``tuple_len_flag`` -- when set, a list value's length must equal the
         current value of this other flag (e.g. ``tp_size``).
+      * ``tuple_len_times_flag`` -- optional SECOND factor for that length, so
+        a WORLD-length vector can be expressed (``--rank-gpu-id`` under a
+        pipeline wants ``pp_size * tp_size`` entries, in world-rank order
+        ``pp_rank * tp_size + tp_rank`` -- ``server_args.py:9698-9712``).
+        Absent (or 1) reduces to the plain ``tuple_len_flag`` rule.
       * ``_compat``     -- optional ``model_cfg -> (ok, reason)`` predicate.
     """
 
@@ -487,6 +492,7 @@ class FlagSpec:
     source: str = "upstream"
     is_env: bool = False
     tuple_len_flag: Optional[str] = None
+    tuple_len_times_flag: Optional[str] = None
     _compat: Optional[Callable[[Optional[dict]], Tuple[bool, str]]] = None
 
     def model_compat(self, model_cfg: Optional[dict]) -> Tuple[bool, str]:
@@ -505,12 +511,21 @@ class FlagSpec:
 #
 # Every edge below was verified against server_args.py's own validation
 # (ServerArgs.__post_init__ / _resolve_rank_gpu_mapping): the fork rejects
-# --rank-gpu-id together with pp/dp/ep > 1, nnodes > 1, an explicit
+# --rank-gpu-id together with dp/ep > 1, nnodes > 1, an explicit
 # --mem-fraction-static, and a non-default --base-gpu-id/--gpu-id-step; it
 # requires --rank-gpu-memory-mib (or --rank-tp-ratio auto) whenever
-# --rank-gpu-id is set; --rank-{tp,mlp,vocab,moe,kv}-ratio all require an
+# --rank-gpu-id is set; --rank-{mlp,vocab,moe,kv}-ratio all require an
 # active plan as noted in their help; the weightless-KV lane requires its
 # fast-lane switch and hard-rejects speculative decoding + mixed-chunk.
+#
+# "Verified" now means EXECUTED, not read (#500-I1/I2/I3). Two of these edges
+# had drifted the other way -- pp_size was listed as exclusive with
+# --rank-gpu-id where the runtime REQUIRES it, and --rank-tp-ratio was listed
+# as requiring a placement where the runtime deliberately decouples them -- so
+# the dashboard forbade two configurations the server supports. Every edge on
+# the uneven-TP flags is now asserted against the real predicate by driving
+# ServerArgs: test/registered/unit/planner/test_flag_registry_contract_500.py.
+# Add an edge there when you add one here.
 # ===========================================================================
 
 
@@ -539,10 +554,16 @@ _CURATED: Dict[str, dict] = {
     ),
     "pp_size": dict(
         group="parallelism",
-        mutually_exclusive_with=("rank_gpu_id",),
-        hover="Pipeline-parallel size. The fork's heterogeneous rank->GPU "
-        "mapping is pure single-node TENSOR parallelism only; pp_size > 1 is "
-        "hard-rejected together with --rank-gpu-id.",
+        # The reverse half of #500-I2: `resolve` treats exclusion
+        # SYMMETRICALLY, so leaving the edge here would keep greying
+        # --rank-gpu-id under a pipeline even with the forward edge removed.
+        hover="Pipeline-parallel size. Combines WITH the fork's heterogeneous "
+        "rank->GPU mapping: an uneven plan under pp_size > 1 REQUIRES "
+        "--rank-gpu-id, given as pp_size x tp_size entries in world-rank order "
+        "(pp_rank * tp_size + tp_rank) so each stage owns its own group of "
+        "physical cards. Without a placement every stage would shard by the "
+        "same ratio onto the same cards, which is what the runtime refuses "
+        "(server_args.py:9596).",
     ),
     "dp_size": dict(
         group="parallelism",
@@ -596,20 +617,32 @@ _CURATED: Dict[str, dict] = {
         group="uneven-tp",
         type="list",
         tuple_len_flag="tp_size",
+        tuple_len_times_flag="pp_size",
         requires_any=(("rank_gpu_memory_mib", "rank_tp_ratio"),),
+        # pp_size is NOT here (#500-I2). The runtime does the opposite: with a
+        # pipeline and an uneven plan it REQUIRES --rank-gpu-id
+        # (server_args.py:9596, "requires --rank-gpu-id to give each pipeline
+        # stage its own group of physical GPUs") and validates the world-length
+        # form (:9698-9712). Listing it as exclusive made the dashboard unable
+        # to express §1's TPxPPxTP feature at all. dp/ep/nnodes/base_gpu_id/
+        # gpu_id_step ARE refused by the runtime -- each verified by driving
+        # _handle_uneven_tp, see test_flag_registry_contract_500.
         mutually_exclusive_with=(
             "mem_fraction_static",
-            "pp_size",
             "dp_size",
             "ep_size",
             "nnodes",
             "base_gpu_id",
             "gpu_id_step",
         ),
-        hover="One physical GPU index per rank (length == tp_size). Duplicates "
-        "co-locate several ranks on one physical card (MPS-isolated). Requires "
-        "--rank-gpu-memory-mib, OR --rank-tp-ratio auto to derive the budgets "
-        "from NVML totals. Enables the heterogeneous-TP path.",
+        hover="One physical GPU index per rank: length == tp_size without a "
+        "pipeline, pp_size x tp_size WITH one (world-rank order "
+        "pp_rank * tp_size + tp_rank, no card shared between stages). "
+        "Duplicates co-locate several ranks on one physical card "
+        "(MPS-isolated). Requires --rank-gpu-memory-mib, OR --rank-tp-ratio "
+        "auto to derive the budgets from NVML totals. Enables the "
+        "heterogeneous-TP path, and is REQUIRED (not forbidden) when an "
+        "uneven plan runs under --pp-size > 1.",
     ),
     "rank_gpu_memory_mib": dict(
         source="fork",
@@ -630,14 +663,26 @@ _CURATED: Dict[str, dict] = {
         type="list",
         tuple_len_flag="tp_size",
         allowed=("auto", "auto-performance"),
-        requires=("rank_gpu_id",),
+        # NO `requires=("rank_gpu_id",)` (#500-I3). The vector describes the
+        # PARTITION, not the placement, and the runtime decouples them on
+        # purpose (server_args.py:9540-9548): the whole --rank-tp-ratio /
+        # --rank-kv-ratio validation block is hoisted ABOVE the
+        # `if self.rank_gpu_id is None: ... return` early return, because the
+        # cross-vendor two-launcher bring-up (--nnodes 2, one CUDA venv + one
+        # ROCm venv) places each rank itself and --rank-gpu-id could not
+        # describe the AMD rank at all -- it resolves devices through NVML.
+        # The 'auto' MODES do need a placement to derive budgets from (:8971),
+        # which is a value-level rule and lives in cross_field_errors.
         hover="Uneven-TP weight vector (one positive int per rank, sum must "
         "divide every sharded dim), or 'auto' (weights from the VRAM budgets) "
         "or 'auto-performance' (VRAM split + a measured MLP-family vector for "
-        "throughput). Attention splits in whole KV-head units. Requires "
-        "--rank-gpu-id. NOTE: this is enumerable ('auto'/'auto-performance') "
-        "OR a free integer list -- the dropdown offers the two auto modes and "
-        "a 'custom vector' entry.",
+        "throughput). Attention splits in whole KV-head units. An EXPLICIT "
+        "vector does NOT require --rank-gpu-id (it is a partition, not a "
+        "placement; this is what lets another launcher place the ranks); the "
+        "'auto' modes do, since they derive the weights from per-card budgets, "
+        "and so does any pipeline (--pp-size > 1). NOTE: this is enumerable "
+        "('auto'/'auto-performance') OR a free integer list -- the dropdown "
+        "offers the two auto modes and a 'custom vector' entry.",
     ),
     "rank_auto_reserve_mib": dict(
         source="fork",
@@ -1342,6 +1387,45 @@ def _c_rank_gpu_id_budget(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
     )
 
 
+def _c_rank_tp_ratio_placement(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    """The two value-level cases where --rank-tp-ratio DOES need a placement.
+
+    The flat ``requires=("rank_gpu_id",)`` edge this replaces was wrong for the
+    common case (#500-I3): an explicit vector describes the partition and is
+    legal alone, which is what the cross-vendor two-launcher bring-up needs.
+    Two narrower rules are real, and both are runtime raises:
+
+    * the ``auto`` modes derive the weights from per-card budgets, so they need
+      the placement -- ``server_args.py:8971``, "--rank-tp-ratio auto requires
+      --rank-gpu-id";
+    * under a pipeline every stage must own its own group of physical cards,
+      or all stages shard by the same vector onto the same cards --
+      ``server_args.py:9596``.
+    """
+    ratio = values.get("rank_tp_ratio")
+    if not _is_active(catalog()["rank_tp_ratio"], ratio):
+        return None
+    if _is_active(catalog()["rank_gpu_id"], values.get("rank_gpu_id")):
+        return None
+    if ratio in ("auto", "auto-performance"):
+        return (
+            "rank_tp_ratio",
+            f"--rank-tp-ratio {ratio} derives the per-rank weights from the "
+            "cards' budgets, so it requires --rank-gpu-id. An EXPLICIT integer "
+            "vector does not (it is a partition, not a placement).",
+        )
+    if _int_or(values.get("pp_size"), 1) > 1:
+        return (
+            "rank_gpu_id",
+            "--rank-tp-ratio with --pp-size > 1 requires --rank-gpu-id: pass "
+            "pp_size x tp_size entries in world-rank order "
+            "(pp_rank * tp_size + tp_rank) so each pipeline stage owns its own "
+            "group of physical GPUs. Without it every stage would shard by the "
+            "same ratio onto the same cards.",
+        )
+    return None
+
+
 def _c_hicache_hybrid_layout(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
     # MambaPoolHost (hybrid/mamba models) only supports page_first_direct.
     if not values.get("enable_hierarchical_cache"):
@@ -1372,6 +1456,7 @@ _CROSS_CONSTRAINTS: Tuple[
     _c_weighted_needs_dcp_env,
     _c_adaptive_needs_spec,
     _c_rank_gpu_id_budget,
+    _c_rank_tp_ratio_placement,
     _c_hicache_hybrid_layout,
 )
 
@@ -1568,11 +1653,19 @@ def resolve(
         if lst is None:
             continue
         need = int(values.get(spec.tuple_len_flag, 1) or 1)
+        basis = f"{cat[spec.tuple_len_flag].name}={need}"
+        if spec.tuple_len_times_flag:
+            factor = int(values.get(spec.tuple_len_times_flag, 1) or 1)
+            if factor > 1:
+                basis = (
+                    f"{cat[spec.tuple_len_times_flag].name}={factor} x "
+                    f"{cat[spec.tuple_len_flag].name}={need}"
+                )
+                need *= factor
         if len(lst) != need:
             out[cid]["error"] = (
                 f"{spec.name} must have exactly {need} entries to match "
-                f"{cat[spec.tuple_len_flag].name}={need} (got {len(lst)}: "
-                f"{lst})."
+                f"{basis} (got {len(lst)}: {lst})."
             )
 
     # -- 5. cross-field constraints (numeric-equality / enum-value /

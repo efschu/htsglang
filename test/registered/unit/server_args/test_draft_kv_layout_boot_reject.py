@@ -323,6 +323,92 @@ class TestGateRunsAfterArgResolution(unittest.TestCase):
             self.assertIn("rank_tp_ratio=auto-performance", str(cm.exception))
 
 
+class TestDraftKvLayoutDcpAcceptsTheFlagRoute(unittest.TestCase):
+    """#500-B3: the gate must key on the OWNER RULE, not on one spelling of it.
+
+    The weighted owner rule -- the thing ``dcp`` reuses -- is installed by
+    ``configure_scheduler_process`` under exactly one predicate::
+
+        if (
+            _dcp_size > 1
+            and base_plan is not None
+            and server_args.uneven_weighted_dcp_enabled()
+        ):
+            set_cp_token_ratios(resolve_cp_token_ratios(server_args))
+
+    (``managers/scheduler.py:5952-5958``), and
+    ``uneven_weighted_dcp_enabled`` (``server_args.py:8457``) is
+    ``SGLANG_UNEVEN_DCP_WEIGHTED=1 OR uneven_kv_flag_active()``. So a boot
+    that reaches the weighted rule through ``--rank-kv-ratio`` is on the same
+    machinery as one that reaches it through the env pair. The sibling
+    speculation x DCP gate already accepts both spellings
+    (``server_args.py:7628``, ``... or self.uneven_kv_flag_active()``); this
+    one refused the flag route, which put the measured -67 % draft-KV win
+    out of reach for every boot that uses the flag.
+    """
+
+    def _no_env(self):
+        return patch.dict(
+            os.environ,
+            {"SGLANG_UNEVEN_DCP": "0", "SGLANG_UNEVEN_DCP_WEIGHTED": "0"},
+        )
+
+    def test_rank_kv_ratio_modes_reach_the_weighted_lane(self):
+        for mode in ("speed", "capacity", "auto"):
+            with self.subTest(mode=mode), self._no_env():
+                args = admitted_args(rank_kv_ratio=mode)
+                self.assertTrue(args.uneven_weighted_dcp_enabled())
+                args._reject_unsupported_draft_kv_dcp()
+
+    def test_an_explicit_kv_vector_reaches_the_weighted_lane(self):
+        with self._no_env():
+            admitted_args(rank_kv_ratio=[2, 1])._reject_unsupported_draft_kv_dcp()
+
+    def test_coupled_is_still_off_the_lane(self):
+        """'coupled' is the default and does NOT imply the weighted rule, so
+        without the env pair there is no token vector to shard by."""
+        with self._no_env():
+            args = admitted_args(rank_kv_ratio="coupled")
+            self.assertFalse(args.uneven_weighted_dcp_enabled())
+            with self.assertRaises(ValueError) as cm:
+                args._reject_unsupported_draft_kv_dcp()
+            self.assertIn("--rank-kv-ratio", str(cm.exception))
+
+    def test_the_gate_matches_the_scheduler_install_predicate(self):
+        """Structural pin: for every (env, flag) spelling, the gate's verdict
+        follows ``uneven_weighted_dcp_enabled()`` -- the predicate the
+        installer itself reads -- and nothing else."""
+        for weighted_env in ("0", "1"):
+            for kv_ratio in ("coupled", "speed", "capacity"):
+                with self.subTest(env=weighted_env, kv=kv_ratio):
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "SGLANG_UNEVEN_DCP": "0",
+                            "SGLANG_UNEVEN_DCP_WEIGHTED": weighted_env,
+                        },
+                    ):
+                        args = admitted_args(rank_kv_ratio=kv_ratio)
+                        installed = args.uneven_weighted_dcp_enabled()
+                        if installed:
+                            args._reject_unsupported_draft_kv_dcp()
+                        else:
+                            with self.assertRaises(ValueError):
+                                args._reject_unsupported_draft_kv_dcp()
+
+    def test_sglang_uneven_dcp_alone_is_not_the_weighted_rule(self):
+        """``SGLANG_UNEVEN_DCP=1`` only auto-sets ``dcp_size`` -- it installs
+        no token vector (``server_args.py:9845``). The gate used to demand it
+        as a separate condition even though ``dcp_size == tp_size`` is checked
+        directly, so it read as a second, redundant lock."""
+        with patch.dict(
+            os.environ,
+            {"SGLANG_UNEVEN_DCP": "1", "SGLANG_UNEVEN_DCP_WEIGHTED": "0"},
+        ):
+            with self.assertRaises(ValueError):
+                admitted_args()._reject_unsupported_draft_kv_dcp()
+
+
 class TestMultiLayerDraftCheckpointGate(unittest.TestCase):
     """Tier 2: the draft CHECKPOINT's layer count, which ServerArgs cannot see.
 

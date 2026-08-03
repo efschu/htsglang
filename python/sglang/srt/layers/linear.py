@@ -200,12 +200,6 @@ def _marlin_min_thread_pair() -> tuple:
     return (GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_MIN_THREAD_K)
 
 
-#: Quant-config classes that repack through marlin on SOME supported device
-#: and may expose no ``weight_block_size`` to coarsen by. Matched by class
-#: name so this module does not import every quantization backend.
-_MARLIN_PACKABLE_CONFIGS = ("fp8config", "compressedtensorsconfig", "fbgemmfp8config")
-
-
 def _marlin_packable_family(quant_config) -> bool:
     """Could THIS CHECKPOINT be marlin-packed on some rank? Rank-uniform.
 
@@ -226,14 +220,28 @@ def _marlin_packable_family(quant_config) -> bool:
     checkpoint, not of the local device.
 
     So the question asked here is not "does this rank use marlin" but "can this
-    checkpoint be marlin-packed anywhere in the group", answered from the
-    config's class alone. Coarsening is only ever safe-but-coarser, so applying
-    it on a rank that will not use marlin costs a slightly coarser split and
-    never correctness -- while keeping every rank's plan identical.
+    checkpoint be marlin-packed anywhere in the group".
+
+    ASKED OF THE BACKEND, NOT OF ITS NAME (#500-B18). This used to be a
+    class-NAME list held here --
+    ``("fp8config", "compressedtensorsconfig", "fbgemmfp8config")`` -- and a
+    name list in a module that owns none of the kernels is the §12 family
+    #443/#446 fixed twice already. It missed ``MarlinConfig`` itself, which
+    exposes no ``weight_block_size`` to coarsen by and repacks through marlin
+    by definition, so an element-granular family on a marlin checkpoint landed
+    mid-tile: the #377/#383 abort, reached again through a different class.
+    The capability is now declared where the kernels are known, on
+    ``QuantizationConfig.marlin_packable_linear``.
+
+    Coarsening is only ever safe-but-coarser, so a backend that declares it
+    without needing it on some rank pays a slightly coarser split and never
+    correctness -- while keeping every rank's plan identical. A backend that
+    needs it and does not declare it aborts at weight load. Declare when in
+    doubt.
     """
     if quant_config is None:
         return False
-    return type(quant_config).__name__.lower() in _MARLIN_PACKABLE_CONFIGS
+    return bool(getattr(quant_config, "marlin_packable_linear", False))
 
 
 def _quant_block_aligned_units(

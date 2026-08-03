@@ -16,6 +16,12 @@ audit #500 found three of its curated edges NARROWER than the runtime — but it
 is the only place the full flag surface is enumerated, and its own
 "CRITICAL fork-capability note" (`flags.py:38-46`) stated the TP>kv_heads
 capability correctly for as long as this file stated it as a special case.
+Its uneven-TP edges are no longer maintained by reading: every declared
+`requires` / `mutually_exclusive_with` / `requires_any` edge on those flags is
+DRIVEN against the real `ServerArgs` validation by
+`test/registered/unit/planner/test_flag_registry_contract_500.py`, so a
+registry that forbids more than the server does fails a test instead of
+silently greying a field. Add an edge there when you add one to `flags.py`.
 Last full refresh: 2026-08-02 (tip 33148dbe0f); reach-audited 2026-08-03 (#500,
 tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
 
@@ -58,7 +64,10 @@ tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
   the measured one-boot-convergence mode that `--rank-perf-tune maxkv`
   selects, `speed` degrades to it without bandwidth scores; only the EXPLICIT
   VECTOR is refused without a non-uniform base plan, `server_args.py:9608` —
-  the derived modes degrade to `coupled` with a warning, :9615),
+  the derived modes degrade to `coupled` with a warning, :9615; every
+  non-`coupled` value additionally requires `--rank-gpu-id`, because DCP is
+  auto-engaged only on the placement path and the flag is otherwise inert,
+  #500-B2),
   `--rank-auto-reserve-mib` (also usable WITHOUT any uneven flag: a pinned
   reserve then sizes the plain path as
   `mem_fraction_static = (NVML total − reserve)/total` exactly, #332,
@@ -123,12 +132,20 @@ tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
   measurement), and it refuses without DCP spanning the group
   (`flashinfer_backend.py:735`). MLA models have NO uneven-TP DCP combine and
   are refused by name (`layers/dcp/comm.py:81`). `dcp_size` is auto-set to
-  `tp_size` only on the `--rank-gpu-id` path (`server_args.py:9845`).
+  `tp_size` only on the `--rank-gpu-id` path (`server_args.py:9845`); a
+  non-`coupled` `--rank-kv-ratio` WITHOUT a placement is therefore refused by
+  name rather than accepted-and-inert (#500-B2).
   **Draft-KV-DCP**: draft KV token-sharded (−67 % draft KV), admitted by
-  `_reject_unsupported_draft_kv_dcp` (`server_args.py:7448`), which today
-  requires the `SGLANG_UNEVEN_DCP`+`_WEIGHTED` env pair and does NOT accept
-  the `--rank-kv-ratio` route the sibling gate at :7628 accepts (open defect,
-  #500-B3/#108). "Replicated is the DEGRADED layout above TP>kv_heads" is a
+  `_reject_unsupported_draft_kv_dcp` (`server_args.py:7448`). Its gate is the
+  INSTALLER's own predicate — `self.uneven_weighted_dcp_enabled()`
+  (`server_args.py:8457` = `SGLANG_UNEVEN_DCP_WEIGHTED=1` OR any non-`coupled`
+  `--rank-kv-ratio`), plus a non-uniform `--rank-tp-ratio` and
+  `dcp_size == tp_size > 1` — so BOTH routes to the weighted owner rule are
+  admitted, the same set the sibling speculation×DCP gate takes at :7628
+  (#500-B3 fixed; it previously spelled the env pair literally and refused the
+  flag route, putting the −67 % win out of reach for every `--rank-kv-ratio`
+  boot). `SGLANG_UNEVEN_DCP` is not a separate condition: it only auto-sets
+  `dcp_size` (:9845), which the gate checks directly. "Replicated is the DEGRADED layout above TP>kv_heads" is a
   measured recommendation in the CLI help (`server_args.py:1513`), not a code
   predicate — nothing compares TP to the kv-head count for the draft pool
   (audit #500, S1-34: NOT-FOUND, superseding the earlier "two-sided rule"
@@ -594,8 +611,15 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   non-fast-lane, then YOUNGEST arrival; there is NO idleness term (`:844`).
   It is NOT decoupled from speculation: `if self.speculative_algorithm is not
   None and os.environ.get("KVSO_ALLOW_SPEC", "0") != "1": raise ValueError`
-  (`server_args.py:6580`), so with the standing NEXTN recipe the documented
-  pair does not boot (#500-B10). Also mutually exclusive with
+  (`server_args.py:6580`), so with the standing NEXTN recipe the pair needs an
+  explicit opt-in. #500-B10 verdict: the refusal is DELIBERATE, not stale —
+  the mechanism exists (a spilled session decodes under MTP/NEXTN, the
+  draft-KV share spills and restores with it, `--kv-session-offload-spec-in-tick`
+  runs the drafter in the tick), and the gate stays for one named unobserved
+  round: a spill landing in the same round as a drafter-in-tick step. Both
+  facts are now IN the refusal text, and `KVSO_ALLOW_SPEC` is named in
+  `--enable-kv-session-offload`'s CLI help (it appeared in no help text
+  before). Also mutually exclusive with
   `--enable-hierarchical-cache` (:6620), PD disagg, `--weightless-kv-fastlane`,
   `--enable-unified-memory`, `--enable-hisparse`, `--enable-mixed-chunk`,
   `page_size > 1`, non-flashinfer backends, `pp_size > 1`, `dp_size > 1`
@@ -1080,13 +1104,22 @@ raw[1]` (`linear.py:289-291`) — so it covers every future asymmetric exposure,
 not just MXFP8, and symmetric blocks are provably untouched. It is NOT latent:
 the mxfp8 floor is `capability >= 100` (`loader.py:261` against
 `fp8.py:315`), so sm120 (the 5090) CLEARS it; on ROCm the same config floors at
-95 (gfx95) or 94 (gfx942 block-fp8 conversion) (`fp8.py:305-313`). Open defect
-alongside it: the marlin fold is gated on a CLASS-NAME list
+95 (gfx95) or 94 (gfx942 block-fp8 conversion) (`fp8.py:305-313`). The fold's family
+predicate is a DECLARATION, not a name list (#500-B18): each backend sets
+`QuantizationConfig.marlin_packable_linear` where its kernels are known, and
+`_marlin_packable_family` reads it (`linear.py:209`). It previously carried
 `_MARLIN_PACKABLE_CONFIGS = ("fp8config", "compressedtensorsconfig",
-"fbgemmfp8config")` (`linear.py:206`, `:236`), so `MarlinConfig` /
-`W8A8Fp8Config` / `QuarkConfig` — marlin-served and exposing no
-`weight_block_size` — get NO uneven-TP coarsening at all, which is the
-#377/#383 mid-tile abort reachable through a different class (#500-B18).
+"fbgemmfp8config")` — the §12 quant-name-list family (#443/#446), second
+instance. Reach of the fix, stated at the width of what was checked: of the
+three configs the audit named, only `MarlinConfig` is genuinely marlin-served
+and blockless, and it is neither in `QUANTIZATION_METHODS` nor concrete (no
+`get_scaled_act_names`), so it is a LATENT hole, not a live boot failure;
+`W8A8Fp8Config` and `QuarkConfig` reach no marlin repack entry point at all
+(`apply_fp8_linear` does not repack, and `quark/` contains no marlin
+reference), so they are correctly out. Every REGISTERED backend whose module
+reaches a marlin repack either declares the capability or exposes a
+`weight_block_size` — asserted per method in
+`test_marlin_unit_coarsening.py::test_every_registered_marlin_repacking_backend_is_covered`.
 
 ## 10. Determinism / quality gates
 Hetero-determinism roots fixed (verify sync, graph pads, flashinfer workspace,

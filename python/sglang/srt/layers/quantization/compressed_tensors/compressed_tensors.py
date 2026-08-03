@@ -108,6 +108,11 @@ class DeviceCapability(NamedTuple):
 
 
 class CompressedTensorsConfig(QuantizationConfig):
+    # Two of its schemes repack through marlin:
+    # ``CompressedTensorsW8A16Fp8`` (``prepare_fp8_layer_for_marlin``) and
+    # ``CompressedTensorsWNA16`` (``gptq_marlin_repack``).
+    marlin_packable_linear = True
+
     def __init__(
         self,
         target_scheme_map: Dict[str, Any],
