@@ -82,7 +82,7 @@ happens (CUDA / Triton / Python).
 | A1-7 | `sgl-kernel/csrc/elementwise/copy.cu:49` | `int N = static_cast<int>(input.numel())` | `TORCH_CHECK`ed to N in {32,64,72} | Pin (non-issue) |
 | A1-8 | `python/sglang/srt/mem_cache/unified_memory_pool.py:1110`, `python/sglang/srt/mem_cache/multi_ended_allocator.py:2233` | `(swa_phys_pages * ps + offsets).to(torch.int32)` | product is a token slot id, bounded by pool size in tokens (<= ~1e7 here) | Pin |
 | A1-9 | `python/sglang/srt/mem_cache/unified_memory_pool.py:216` | `self._raw = torch.empty(total_bytes, dtype=torch.uint8)` — one flat multi-GiB buffer | numel > 2^31 for any pool > 2 GiB, but every consumer indexes through torch views (int64 strides) | Pin — becomes live the moment a custom kernel takes `_raw` and an `int` offset |
-| A1-10 | `python/sglang/srt/layers/attention/dsv4/unified_kv_kernels/paged_decode.py:274,287,440` | `slot[:, None] * kv_stride_n` — `slot` is int32 (`kv_indices` is int32, `:20/:193`), `kv_stride_n` is `unified_kv.stride(0)` (`:743`), so the product is a Triton i32 multiply with no `.to(tl.int64)` anywhere in the directory | `stride(0)` = DSV4 head_dim 512; overflow at slot >= 2^31/512 = **4 194 304 rows in ONE layer's pool** | Pin — see 1.4b for the threshold in GiB |
+| A1-10 | `python/sglang/srt/layers/attention/dsv4/unified_kv_kernels/paged_decode.py:274,287,440` | `slot[:, None] * kv_stride_n` — `slot` is int32 (`kv_indices` is int32, `:20/:193`), `kv_stride_n` is `unified_kv.stride(0)` (`:743`), so the product is a Triton i32 multiply with no `.to(tl.int64)` anywhere in the directory | `stride(0)` = DSV4 head_dim 512; overflow at slot >= 2^31/512 = **4 194 304 rows in ONE layer's pool** | Pin — see 1.4 for the threshold in GiB |
 
 ### 1.2 A1-1 in detail (the one with a number that actually crosses)
 
@@ -159,7 +159,7 @@ tensor above 2.1e9 elements (about 300k tokens at hidden 7168), far above the
 `--max-num-batched-tokens` values this rig runs, hence Pin — but the fix is a
 one-token change and removes a latent divergence between the two files.
 
-### 1.4b A1-10 in detail (the one that looked like the biggest find and is not)
+### 1.4 A1-10 in detail (the one that looked like the biggest find and is not)
 
 `paged_decode.py:272-278` gathers KV with
 
@@ -199,7 +199,7 @@ to pull the row threshold down (the threshold scales as 1/head_dim, so it is
 `2^31 / head_dim` rows regardless of model). The fix, if it is ever wanted, is
 one `.to(tl.int64)` on `slot` — the same shape upstream applies elsewhere.
 
-### 1.4 What Axis 1 did NOT cover (honest coverage)
+### 1.5 What Axis 1 did NOT cover (honest coverage)
 
 - `sgl-kernel/csrc` was swept for **byte-pointer arithmetic** (`(char*)p + x`
   / `(uint8_t*)p + x` without an int64 operand): exactly one hit, A1-1. It
