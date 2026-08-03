@@ -43,6 +43,10 @@ __all__ = [
     "normalize_rope_scaling",
     "assert_mrope_mapped",
     "read_talker_geometry",
+    "ShapeContractError",
+    "assert_prompt_block",
+    "assert_position_contract",
+    "assert_rotary_contract",
 ]
 
 #: What the checkpoint writes.
@@ -252,3 +256,137 @@ def factory_would_interleave(rope_scaling: Mapping[str, Any]) -> bool:
 def describe_trap() -> Tuple[str, str]:
     """The two key names, for error messages and docs. Single source of truth."""
     return CHECKPOINT_INTERLEAVED_KEY, FACTORY_INTERLEAVED_KEY
+
+
+# ---------------------------------------------------------------------------
+# Shape contracts
+# ---------------------------------------------------------------------------
+#
+# The class of bug these exist for: a tensor that is the right SIZE but the
+# wrong SHAPE travels a long way before anything complains. The decode-step
+# rotary bug is the worked example -- a (1, 1, 1024) query rotated against
+# full-length cos/sin silently became eleven positions, and the first symptom
+# was a matmul mismatch in o_proj, thirty layers and one module away from the
+# cause. Prefill was unaffected throughout, which is why every earlier check
+# passed.
+#
+# Each contract below is cheap enough to assert on every call and names the
+# invariant it protects, so the next member of this family fails at the seam
+# instead of downstream.
+
+
+class ShapeContractError(ValueError):
+    """A prompt or position tensor whose shape breaks a stated invariant."""
+
+
+def _shape_of(tensor: object) -> Tuple[int, ...]:
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        raise ShapeContractError(f"expected a tensor, got {type(tensor).__name__}")
+    return tuple(int(d) for d in shape)
+
+
+def assert_prompt_block(
+    name: str,
+    tensor: object,
+    hidden_size: int,
+    batch: int = 1,
+    min_length: int = 1,
+) -> Tuple[int, ...]:
+    """A prompt building block must be ``(batch, length, hidden_size)``.
+
+    Every piece the talker's input is assembled from -- the role embeddings,
+    the projected text, the speaker prompt, the codec prompt, the BOS/EOS
+    markers -- has this shape. Flattening any of them to ``(batch, length *
+    hidden)`` keeps the element count identical, which is exactly why a
+    concatenation of the wrong-shaped block still succeeds and the failure
+    appears much later.
+    """
+    shape = _shape_of(tensor)
+    if len(shape) != 3:
+        raise ShapeContractError(
+            f"prompt block {name!r} has shape {shape}; expected 3 dimensions "
+            f"(batch, length, hidden={hidden_size}). A 2-D block here is the "
+            "flattening failure mode: the element count still matches, so a "
+            "later concatenation succeeds and the error surfaces in an "
+            "unrelated matmul."
+        )
+    if shape[0] != batch:
+        raise ShapeContractError(
+            f"prompt block {name!r} has batch {shape[0]}, expected {batch}"
+        )
+    if shape[2] != hidden_size:
+        raise ShapeContractError(
+            f"prompt block {name!r} has hidden size {shape[2]}, expected "
+            f"{hidden_size}"
+        )
+    if shape[1] < min_length:
+        raise ShapeContractError(
+            f"prompt block {name!r} has length {shape[1]}, expected at least "
+            f"{min_length}"
+        )
+    return shape
+
+
+def assert_position_contract(
+    position_ids: object,
+    query_length: int,
+    cache_length: Optional[int] = None,
+    axes: int = 3,
+) -> None:
+    """Positions must describe the QUERY, never the whole cache.
+
+    The invariant, and the reason it is worth an assert on every step:
+    M-RoPE turns ``position_ids`` into ``cos``/``sin`` of that length, and the
+    rotation is element-wise against the query. Hand it full-length positions
+    on a one-token decode step and the query BROADCASTS to the cache length
+    instead of failing -- so attention silently returns one row per cached
+    position, and the mismatch only becomes visible when ``o_proj`` receives
+    ``cache_length * head_dim * heads`` features.
+
+    Prefill hides this completely, because there query length and cache length
+    are equal. That asymmetry is what makes the bug survive every
+    prefill-shaped test.
+
+    ``axes`` is M-RoPE's section count (3 for this checkpoint: the position
+    tensor is ``(axes, batch, length)``).
+    """
+    shape = _shape_of(position_ids)
+    length = shape[-1]
+    if length != query_length:
+        detail = (
+            f"position_ids has length {length} but the query has "
+            f"{query_length}"
+        )
+        if cache_length is not None and length == cache_length:
+            detail += (
+                f" -- that is the CACHE length ({cache_length}). On a decode "
+                "step the rotary must be sliced to the current position; full "
+                "positions broadcast the query across the whole cache instead "
+                "of raising"
+            )
+        raise ShapeContractError(detail)
+    if len(shape) == 3 and shape[0] != axes:
+        raise ShapeContractError(
+            f"position_ids has {shape[0]} M-RoPE axes, expected {axes}"
+        )
+
+
+def assert_rotary_contract(
+    cos: object, sin: object, query_length: int, cache_length: Optional[int] = None
+) -> None:
+    """``cos``/``sin`` must match the query length, not the cache length."""
+    for name, tensor in (("cos", cos), ("sin", sin)):
+        shape = _shape_of(tensor)
+        length = shape[-2] if len(shape) >= 2 else shape[-1]
+        if length != query_length:
+            detail = (
+                f"rotary {name} has length {length} but the query has "
+                f"{query_length}"
+            )
+            if cache_length is not None and length == cache_length:
+                detail += (
+                    f" -- that is the CACHE length ({cache_length}); the "
+                    "query would broadcast across it instead of raising"
+                )
+            raise ShapeContractError(detail)

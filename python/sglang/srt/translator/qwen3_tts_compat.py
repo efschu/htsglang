@@ -53,6 +53,7 @@ __all__ = [
     "load_talker_modeling",
     "load_codec_modeling",
     "CompatError",
+    "refresh_rotary_buffers",
     "applied_shims",
 ]
 

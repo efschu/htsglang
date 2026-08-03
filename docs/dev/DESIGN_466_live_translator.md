@@ -1178,6 +1178,26 @@ with `(1, 1, 1024)`:
   mask helper did not change it either -- correct on its own terms, so it was
   kept, but it is not this bug.
 
+**Narrowed further, 2026-08-03.** The talker builds its M-RoPE positions as
+`batch_size, seq_length = input_ids.shape` and then `torch.arange(seq_length)`.
+On 4.57 `prepare_inputs_for_generation` handed the decode step a *sliced*
+`input_ids` of width 1; 5.x passes the full tensor and expresses the query
+width through `cache_position` instead, which is exactly how `seq_length`
+becomes the cache length. Slicing `input_ids` in a wrapper around the talker's
+forward did NOT fire, so the positions are assembled on a path that does not
+receive them as keyword arguments there -- that call path is the next thing to
+read, and it is a short read now that the mechanism is known. (A signature
+lesson worth keeping: `generate()` validates `model_kwargs` by inspecting the
+forward signature, so any wrapper needs `functools.wraps` or every legitimate
+kwarg is reported as unused.)
+
+**The invariant is now pinned regardless of where the fix lands**:
+`assert_position_contract` / `assert_rotary_contract` in `talker_config.py`,
+with `test_shape_contracts.py` proving each fires on the exact decode-shaped
+input that hid the bug, and one test showing that the identical construction
+PASSES at prefill shape -- which is why prefill-shaped tests could never have
+caught it.
+
 Next step is that seam specifically: how the talker computes decode-step
 position ids and what it hands the rotary, read against the preserved
 reference. The prompt-builder text below stands as the pre-registered risk it
