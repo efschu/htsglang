@@ -4935,7 +4935,7 @@ class PerfCostModel:
         min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
         attn_vector: Optional[List[int]] = None,
-        core: Optional["AttnCorePlan"] = None,
+        core: Optional[AttnCorePlan] = None,
     ) -> float:
         """The shard-PROPORTIONAL part of the prefill step: the lockstep
         compute time (per-token flops ~ 2 x sharded params, the param-proxy)
@@ -5210,8 +5210,8 @@ class PerfCostModel:
         min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
         attn_vector: Optional[List[int]] = None,
-        core: Optional["AttnCorePlan"] = None,
-        base_core: Optional["AttnCorePlan"] = None,
+        core: Optional[AttnCorePlan] = None,
+        base_core: Optional[AttnCorePlan] = None,
     ) -> float:
         """Relative prefill step time. Only ratios between candidates are
         consumed. ``family_tflops`` switches the sharded term to the
