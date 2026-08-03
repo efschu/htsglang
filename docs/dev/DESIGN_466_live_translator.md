@@ -3467,3 +3467,67 @@ has -- it is in the OLD logs too, so it is not a regression of the FIFO
 worker. It measures first-audio-to-last-audio, which for a batch talker is
 genuinely nothing. It is a metric with no information at the served geometry;
 either give it a meaning or drop it when `--enable-metrics` lands.
+
+#### 17.8.11 The bundled deploy, 2026-08-03 (end of fifth session)
+
+**Live: server `da46f2759b` (tenant PID 3799451, log `tenant18_bundle.log`),
+client `9d39ac76b8`.** Restart taken only after the user's field test ended
+(`sessions: 0`); it had been deferred once while he was mid-test, which was
+the right call and is why this window is late in the session.
+
+Four things shipped in the one restart, each verified by a STATE PROBE rather
+than by the boot succeeding:
+
+* `/metrics` answers, with all four live depth gauges present;
+* the ASR capability fix: `stages.asr` went from 2 to **98**, and **usable
+  went from 2 to 10** (de, en, es, fr, it, ja, ko, pt, ru, zh). The talker's
+  coverage is now the binding constraint, which is what §19.5 always said it
+  should be;
+* Cut 2 (roster + picker), client `9d39ac76b8`;
+* `boot_tenant.sh` carries `--enable-metrics` from now on.
+
+**Gate: run 1 PASS** (4 turns, reload arm, stop arm with
+`aborted_turn_id 37579feb87d3`, 0 frames after the stop, socket OPEN, turn 4
+fine afterwards, console clean). **Run 2 is still owed** -- the standing rule
+is twice, so the user must NOT be asked to test on this build yet.
+
+**The metrics earned their keep within one run.** Read live mid-turn:
+`translator_talker_busy 1.0` with `translator_session_queue_depth_max 0.0`.
+That combination is the discriminator §17.8.10 lacked -- the pipeline was IN
+synthesis, not queued behind it. One reading is not a diagnosis, but the
+instrument that was missing now exists and answers.
+
+**Standing decisions recorded so they are not re-litigated:**
+
+* the §19.4 decomposition experiment (fixed overhead vs RTF slope over clause
+  lengths, plus an MT-idle arm for the contention share) waits until AFTER
+  the parallel serving switch to INT8 / NVFP4-A3B. That switch changes the
+  5090's contention landscape fundamentally -- an A3B activates ~3 B against
+  27 B dense -- so measuring now would characterise a landscape that will not
+  exist. Run both arms (MT idle, MT loaded) in the same exclusive window if
+  cheap;
+* the overlap hypothesis is REFUTED and must not be rebuilt: the server never
+  waits for playback, so synthesis of clause n+1 already overlaps playback of
+  clause n. The gaps are arithmetic -- RTF 1.23 means synthesis costs more
+  than the audio it produces, so a gap of roughly `fixed + 0.23 x D` opens
+  after every clause and compounds;
+* `non_streaming_mode=True` (`inprocess_tts.py:356`) is NOT the streaming
+  lever it looks like. The library's own docstring
+  (`qwen3_tts_model.py:513-515`) says the flag "only simulates streaming text
+  INPUT... rather than enabling true streaming input or streaming
+  generation". There is no true streaming generation through this call.
+  Checked before anyone spent a window on it;
+* `turn.speech` (`{turn_id, target, unit_index, state:
+  queued|synthesizing|spoken}`) goes into the next server cut together with
+  the `require_pair` degradation. Nothing today announces that a clause is
+  being synthesized, which is exactly the interval the user experiences as
+  the gap.
+
+**The wire-vs-DOM gap is the THIRD instance of the §17.8 class and belongs in
+the standing gate.** The ordering arm reads `turn.translation` off a
+WebSocket listener, so its "text lands 2.6-7.1 s before audio" is frame
+ARRIVAL, not visibility; and `line_s` counts transcript-line nodes created on
+`turn.transcript`, not on the translation. So the gate has never asserted
+that translated text is VISIBLE. The UI agent is building the DOM-visibility
+arm; adopt it into `client_gate.py`'s default repertoire when it lands rather
+than leaving it in his harness.
