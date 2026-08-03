@@ -108,6 +108,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mt-model", default="default")
     parser.add_argument(
+        "--mt-timeout-s", type=float, default=None,
+        help="per-request MT budget. The default (20 s) is generous "
+             "for an idle backend and NOT generous when the MT server "
+             "shares a card with the talker: synthesis starves the "
+             "forward pass, the first token misses the budget, and the "
+             "turn fails with a read timeout while the recording is "
+             "still running. Raise it where the cards are shared",
+    )
+    parser.add_argument(
         "--mt-languages", default="",
         help="comma-separated; empty means the LLM claims no restriction",
     )
@@ -338,6 +347,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             model=args.mt_model,
             languages=mt_languages,
             extra_body=extra_body,
+            **({} if args.mt_timeout_s is None
+               else {"timeout_s": args.mt_timeout_s}),
         )
     )
 

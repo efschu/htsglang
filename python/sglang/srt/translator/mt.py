@@ -245,7 +245,12 @@ class OpenAiMt:
             response.raise_for_status()
             payload = response.json()
         except httpx.HTTPError as exc:
-            raise BackendError("mt", f"request to {self.config.base_url} failed: {exc}")
+            raise BackendError(
+                "mt",
+                f"request to {self.config.base_url} failed: "
+                f"{type(exc).__name__}: {exc or '(no detail)'} "
+                f"[timeout {self.config.timeout_s:g}s]"
+            )
         try:
             return payload["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, AttributeError, TypeError) as exc:
@@ -275,7 +280,12 @@ class OpenAiMt:
             response.raise_for_status()
             payload = response.json()
         except httpx.HTTPError as exc:
-            raise BackendError("mt", f"request to {self.config.base_url} failed: {exc}")
+            raise BackendError(
+                "mt",
+                f"request to {self.config.base_url} failed: "
+                f"{type(exc).__name__}: {exc or '(no detail)'} "
+                f"[timeout {self.config.timeout_s:g}s]"
+            )
         try:
             return payload["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, AttributeError, TypeError) as exc:
@@ -311,4 +321,18 @@ class OpenAiMt:
                     if delta:
                         yield delta
         except httpx.HTTPError as exc:
-            raise BackendError("mt", f"stream from {self.config.base_url} failed: {exc}")
+            # The TYPE, always, and the timeout with it. `str(exc)` is EMPTY
+            # for httpx.ReadTimeout, ConnectTimeout, ReadError and
+            # RemoteProtocolError alike, so the message this used to raise was
+            # literally "stream from <url> failed:" with nothing after the
+            # colon -- true, useless, and it cost a whole investigation to get
+            # back to. A read timeout here means MT produced no token within
+            # the budget, which on a shared card is what contention with the
+            # talker looks like; a protocol error means the server went away.
+            # Those need opposite responses, so they must not log the same.
+            raise BackendError(
+                "mt",
+                f"stream from {self.config.base_url} failed: "
+                f"{type(exc).__name__}: {exc or '(no detail)'} "
+                f"[timeout {self.config.timeout_s:g}s]"
+            )
