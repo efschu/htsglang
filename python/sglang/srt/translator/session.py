@@ -321,6 +321,12 @@ class TranslatorSession:
         # everyone rather than protecting the rare back-to-back case.
         speaker_change_min_segment_s: float = 5.0,
         speaker_change_min_piece_s: float = 0.8,
+        #: Assembled turn audio below this peak counts as silence.
+        #: 1e-3 is two orders below the quietest real synthesis
+        #: measured (peak 0.31 worst of five arms) and above any
+        #: dither floor, so it separates the two populations
+        #: without sitting near either.
+        silence_peak_floor: float = 1e-3,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         conversation.validate_against(matrix)
@@ -343,6 +349,7 @@ class TranslatorSession:
         self.speaker_change_window_s = speaker_change_window_s
         self.speaker_change_min_segment_s = speaker_change_min_segment_s
         self.speaker_change_min_piece_s = speaker_change_min_piece_s
+        self.silence_peak_floor = silence_peak_floor
         # The "must be >= 2 x window" note above is a claim, so it is checked
         # rather than trusted. Violated, the re-cut silently never runs: the
         # `count < 2` guard returns early on every segment and the protection
@@ -981,6 +988,47 @@ class TranslatorSession:
             merged = AudioChunk(
                 np.concatenate([c.samples for c in chunks]), rate
             )
+            # NON-SILENCE GATE. A turn that returns the right DURATION of
+            # silence is the worst failure shape this pipeline has: every
+            # event says success, the client plays nothing, and the listener
+            # cannot tell it from a network drop. It happened -- the clone
+            # path returned 4.24 s of exact zeros while the reference, the
+            # arguments and the synthesizer were each provably fine in
+            # isolation -- so the assembled audio is now checked once, here,
+            # where every voice mode passes through.
+            peak = float(np.abs(merged.samples).max()) if len(merged.samples) else 0.0
+            if peak < self.silence_peak_floor:
+                reference_peak = (
+                    float(np.abs(reference.samples).max())
+                    if reference is not None and len(reference.samples)
+                    else 0.0
+                )
+                logger.error(
+                    "session %s turn %s synthesized %.2fs of SILENCE "
+                    "(peak %.5f < %.5f) in %s mode from a reference of "
+                    "%.2fs at peak %.4f -- the audio is dropped rather than "
+                    "delivered, because silence that arrives on time is "
+                    "indistinguishable from a working system",
+                    self.session_id, turn_id, merged.duration_s, peak,
+                    self.silence_peak_floor, voice.mode.value,
+                    0.0 if reference is None else reference.duration_s,
+                    reference_peak,
+                )
+                self.journal.append(
+                    EventKind.ERROR,
+                    {
+                        "turn_id": turn_id,
+                        "target": target,
+                        "stage": "tts",
+                        "error": (
+                            f"synthesis produced {merged.duration_s:.2f}s of "
+                            f"silence (peak {peak:.5f}); reference was "
+                            f"{0.0 if reference is None else reference.duration_s:.2f}s "
+                            f"at peak {reference_peak:.4f}"
+                        ),
+                    },
+                )
+                merged = None
         return text, merged, fallback, first_audio_at
 
     def set_voice_mode(self, mode: VoiceMode) -> VoiceMode:
