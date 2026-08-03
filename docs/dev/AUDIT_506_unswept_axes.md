@@ -187,9 +187,13 @@ one `.to(tl.int64)` on `slot` — the same shape upstream applies elsewhere.
   `indexer.py:237,552,585,826,1081` are id tensors bounded by page/topk
   counts). `paged_prefill.py` was NOT read in
   full; only its `slot * stride` sites (`:79,81,135,173`) were matched and
-  they share A1-10's threshold. The ~40 other Triton files with
-  `tl.arange`/`tl.int32` hits (fla/, mamba/, moe/ep_moe, quantization/*) were
-  **not** read line-by-line.
+  they share A1-10's threshold. The other Triton files were
+  **not** read line-by-line. Scale of what is left: 102 files under
+  `python/sglang/srt` contain `tl.arange` (i.e. are Triton kernels) and only
+  47 of them mention `tl.int64` anywhere, so the widen-the-index convention
+  exists in this tree but is not universal, and 55 kernel files have not been
+  checked for A1-10's shape (`<int32 index loaded from a table> * <stride>`).
+  That is the single largest open surface this axis leaves behind.
 - Python: `torch.int32` sites in `mem_cache/`, `managers/kv_session_offload.py`,
   `memtier/`, `distributed/device_communicators/barlink*` were scanned. Every
   int32 tensor found there carries an **id** (page id, token slot, request
