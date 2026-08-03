@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_prefill_backend,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -408,21 +409,46 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         batch_size = cache_indices.shape[0]
         rows = intermediate_state_indices[:batch_size]
+        # #444b: a verify replayed into a larger captured graph carries
+        # PAD_SLOT_ID (-1) in the tail of `cache_indices`
+        # (`hybrid_linear_attn_backend.py:378`/`:459` fill the per-bs buffers
+        # with it, `:555` re-stamps it over the padding requests on every
+        # replay, `:97-99` does the same eagerly). The conv kernel tolerates
+        # that by construction -- USE_PAD_SLOT returns before the padded lane
+        # reads or writes anything (`causal_conv1d_triton.py:659-662`) -- but
+        # `index_select` / `index_copy_` bounds-check, and a -1 row is the
+        # device-side assert `indexSelectSmallIndex: srcIndex <
+        # srcSelectDimSize`. Both sides therefore have to be masked, and the
+        # mask has to stay on the device: this runs per layer per verify, so
+        # `.item()` / `.nonzero()` would put a D2H sync on the hot path and
+        # would not be capturable in a CUDA graph at all.
+        pad_lanes = cache_indices < 0
+        # Gather side: clamp the padded rows onto row 0 so the read is in
+        # bounds. Their seeded values are never consumed -- the kernel skips
+        # exactly those lanes below -- so which valid row is read is arbitrary.
         # Seed the private rows with the persistent window the kernel needs as
         # its prior state. `rows` is the same index space the intermediate
         # caches use, so a row is owned by exactly one in-flight request.
         scratch.index_copy_(
             0,
             rows.to(torch.int64),
-            conv_states.index_select(0, cache_indices.to(torch.int64)),
+            conv_states.index_select(
+                0, cache_indices.masked_fill(pad_lanes, 0).to(torch.int64)
+            ),
         )
+        # Scatter side: hand the kernel PAD_SLOT_ID for the padded lanes so it
+        # still skips them. Masking only the gather would leave every padded
+        # lane pointing at a real scratch row, and the kernel would run the
+        # conv on it instead of not running it -- writing a private row and an
+        # intermediate window the pre-#444a path never wrote.
+        kernel_rows = rows.masked_fill(pad_lanes, PAD_SLOT_ID)
         return causal_conv1d_update(
             mixed_qkv_reshaped,
             scratch,
             layer.conv_weights,
             layer.bias,
             layer.activation,
-            conv_state_indices=rows,
+            conv_state_indices=kernel_rows,
             intermediate_conv_window=intermediate_conv_window_cache,
             intermediate_state_indices=rows,
             retrieve_next_token=retrieve_next_token,
