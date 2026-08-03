@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import enum
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Sequence
 
 from sglang.srt.planner.cost_model import Provenance, Rate
@@ -84,6 +84,7 @@ __all__ = [
     "host_bounce_links",
     "price_placement",
     "replicated_throughput",
+    "split_shares",
     "stage_table",
 ]
 
@@ -304,7 +305,14 @@ class TransferPrice:
         }
 
 
-Placement = Mapping[str, str]  # stage name -> card key
+#: stage name -> the card it runs on, or the cards it is REPLICATED across.
+#:
+#: A tuple value is stage-level replication (#484): that one stage's frames are
+#: split over several cards while the rest of the chain stays where it is. A
+#: bare string is the degenerate width-1 case and is what every pre-#484 caller
+#: passes, so the two forms cost the same to write and price identically where
+#: they mean the same thing.
+Placement = Mapping[str, "str | Sequence[str]"]
 
 
 # --------------------------------------------------------------------------
@@ -316,7 +324,7 @@ Placement = Mapping[str, str]  # stage name -> card key
 class PipelinePrice:
     """A placement scored: throughput, the card that binds, and why."""
 
-    placement: dict[str, str]
+    placement: dict[str, "str | tuple[str, ...]"]
     #: Per card: compute ms + unhidden transfer ms, per chain-input frame.
     card_load_ms: dict[str, float]
     #: Per card, compute only.
@@ -334,6 +342,10 @@ class PipelinePrice:
     unpriced_stages: tuple[str, ...] = ()
     frames_in_flight: int = 0
     latency_s: float = 0.0
+    #: For each replicated stage, the fraction of its frames each card takes
+    #: (#484). Empty when nothing is replicated, so a report that never asked
+    #: for replication reads exactly as it did before.
+    stage_shares: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @property
     def period_ms(self) -> float:
@@ -341,7 +353,14 @@ class PipelinePrice:
 
     def as_dict(self) -> dict:
         return {
-            "placement": dict(self.placement),
+            "placement": {
+                name: (value if isinstance(value, str) else list(value))
+                for name, value in self.placement.items()
+            },
+            "stage_shares": {
+                stage: {card: round(share, 4) for card, share in shares.items()}
+                for stage, shares in self.stage_shares.items()
+            },
             "feasible": self.feasible,
             "reason": self.reason,
             "provenance": self.provenance.value,
@@ -358,6 +377,72 @@ class PipelinePrice:
             "frames_in_flight": self.frames_in_flight,
             "latency_s": round(self.latency_s, 3),
         }
+
+
+def _normalise_placement(placement: Placement) -> dict[str, tuple[str, ...]]:
+    """Every stage's cards as a tuple, whichever form the caller wrote."""
+    out: dict[str, tuple[str, ...]] = {}
+    for stage_name, value in placement.items():
+        if isinstance(value, str):
+            out[stage_name] = (value,)
+        else:
+            out[stage_name] = tuple(value)
+    return out
+
+
+def split_shares(
+    fixed_ms: Mapping[str, float], stage_ms: Mapping[str, float]
+) -> tuple[dict[str, float], float]:
+    """Split one stage's frames over cards that already carry other work.
+
+    ``fixed_ms`` is what each participating card owes per chain-input frame
+    BEFORE this stage; ``stage_ms`` is what one frame of this stage costs on
+    that card. Returns the per-card share of the stage's frames and the period
+    those shares produce.
+
+    This is a water-fill, and it is the honest reading of the per-family x
+    per-phase law for a replicated stage: the cards differ on the resource the
+    stage is bound by, so an equal split would hand the slow card the same
+    number of frames as the fast one and let it set the period. The shares
+    that minimise the period are the ones that bring every participating card
+    to the SAME finishing time, except for cards whose fixed load already
+    exceeds it -- those take nothing rather than a negative share.
+
+    Exactly: with cards active above their own fixed load, the period P solves
+    ``sum_i (P - fixed_i) / stage_i = 1``. ``g(P)`` is piecewise linear and
+    increasing, its breakpoints are the ``fixed_i``, so the solution is found
+    by walking the cards in fixed-load order and taking the first segment
+    whose closed-form root lies inside it. No search, no tolerance.
+    """
+    if not stage_ms:
+        raise PipelineError("a replicated stage must name at least one card")
+    for card, ms in stage_ms.items():
+        if ms <= 0.0:
+            raise PipelineError(
+                f"card {card!r} prices the replicated stage at {ms} ms; a "
+                "non-positive per-frame cost has no share that means anything"
+            )
+    order = sorted(stage_ms, key=lambda c: fixed_ms.get(c, 0.0))
+    active: list[str] = []
+    period = 0.0
+    for index, card in enumerate(order):
+        active.append(card)
+        inv = sum(1.0 / stage_ms[c] for c in active)
+        weighted = sum(fixed_ms.get(c, 0.0) / stage_ms[c] for c in active)
+        candidate = (1.0 + weighted) / inv
+        # The segment ends where the next card's fixed load would join in.
+        upper = fixed_ms.get(order[index + 1], 0.0) if index + 1 < len(order) else None
+        if upper is None or candidate <= upper:
+            period = candidate
+            break
+    shares = {
+        card: max(0.0, (period - fixed_ms.get(card, 0.0)) / stage_ms[card])
+        for card in stage_ms
+    }
+    total = sum(shares.values())
+    if total <= 0.0:  # pragma: no cover - the walk above cannot produce this
+        raise PipelineError("water-fill produced no share for any card")
+    return {card: value / total for card, value in shares.items()}, period
 
 
 def _refusal(placement: Placement, reason: str) -> PipelinePrice:
@@ -401,16 +486,39 @@ def price_placement(
     """
     by_key = {c.key: c for c in cards}
     by_name = {s.name: s for s in stages}
+    cards_for = _normalise_placement(placement)
     for stage in stages:
-        card = placement.get(stage.name)
-        if card is None:
+        assigned = cards_for.get(stage.name)
+        if not assigned:
             return _refusal(placement, f"stage {stage.name!r} was not placed")
-        if card not in by_key:
+        for card in assigned:
+            if card not in by_key:
+                return _refusal(
+                    placement,
+                    f"stage {stage.name!r} is placed on unknown card {card!r}; known "
+                    f"cards: {sorted(by_key)}",
+                )
+        if len(set(assigned)) != len(assigned):
             return _refusal(
                 placement,
-                f"stage {stage.name!r} is placed on unknown card {card!r}; known "
-                f"cards: {sorted(by_key)}",
+                f"stage {stage.name!r} names card {assigned!r} twice; a "
+                "replicated stage takes each card at most once",
             )
+
+    replicated = tuple(name for name, cs in cards_for.items() if len(cs) > 1)
+    if len(replicated) > 1:
+        # V1 limit, and it is a real one rather than a shortcut not taken:
+        # with one replicated stage the split has a closed form (see
+        # split_shares). With two, the shares interact through the cards they
+        # share and the minimum-period problem becomes a linear program. A
+        # water-fill applied twice would return AN answer, not the optimum,
+        # and there is no way to tell the two apart from the output.
+        return _refusal(
+            placement,
+            f"stage-level replication is priced for one stage at a time; "
+            f"{sorted(replicated)} were all replicated. The joint split is a "
+            "linear program rather than a water-fill and is not built",
+        )
 
     # -- hard constraint 1: co-residency ---------------------------------
     for stage in stages:
@@ -421,7 +529,13 @@ def price_placement(
                     f"stage {stage.name!r} declares co-residency with unknown "
                     f"stage {partner!r}",
                 )
-            if placement[partner] != placement[stage.name]:
+            if stage.name in replicated or partner in replicated:
+                return _refusal(
+                    placement,
+                    f"co-residency violated: {stage.name!r} and {partner!r} must "
+                    "share a card, so neither can be replicated across cards",
+                )
+            if cards_for[partner] != cards_for[stage.name]:
                 return _refusal(
                     placement,
                     f"co-residency violated: {stage.name!r} is on "
@@ -434,86 +548,130 @@ def price_placement(
     compute: dict[str, float] = {c.key: 0.0 for c in cards}
     per_stage_ms: dict[str, float] = {}
     provenance = Provenance.MEASURED
+    replicated_name = replicated[0] if replicated else None
+    replicated_ms: dict[str, float] = {}
     for stage in stages:
-        card = placement[stage.name]
-        rate = stage.rate_on(card)
-        if rate.is_absent:
-            return _refusal(
-                placement,
-                f"unpriceable: {rate.source}",
-            )
-        if rate.provenance is Provenance.ESTIMATE:
-            provenance = Provenance.ESTIMATE
-        compute[card] += float(rate.value)
-        per_stage_ms[stage.name] = float(rate.value)
+        for card in cards_for[stage.name]:
+            rate = stage.rate_on(card)
+            if rate.is_absent:
+                return _refusal(
+                    placement,
+                    f"unpriceable: {rate.source}",
+                )
+            if rate.provenance is Provenance.ESTIMATE:
+                provenance = Provenance.ESTIMATE
+            if stage.name == replicated_name:
+                replicated_ms[card] = float(rate.value)
+            else:
+                compute[card] += float(rate.value)
+                per_stage_ms[stage.name] = float(rate.value)
+
+    # -- the replicated stage's split -------------------------------------
+    #
+    # Solved on COMPUTE, before transfers are priced. That ordering is exact
+    # whenever prefetch hides the crossings -- which is the case the split is
+    # worth taking at all -- and is an approximation when it does not, because
+    # a share that shifts also shifts the bytes that cross behind it. The
+    # alternative is a fixed point with no closed form; the reason is recorded
+    # here rather than left to be rediscovered from a surprising number.
+    stage_shares: dict[str, dict[str, float]] = {}
+    if replicated_name is not None:
+        shares, _fill_period = split_shares(compute, replicated_ms)
+        stage_shares[replicated_name] = shares
+        carried = 0.0
+        for card, share in shares.items():
+            compute[card] += share * replicated_ms[card]
+            carried = max(carried, share * replicated_ms[card])
+        per_stage_ms[replicated_name] = carried
+
+    def _share_of(stage_name: str, card: str) -> float:
+        shares = stage_shares.get(stage_name)
+        if shares is None:
+            return 1.0
+        return shares.get(card, 0.0)
 
     # -- transfers --------------------------------------------------------
     transfers: list[TransferPrice] = []
     transfer_load: dict[str, float] = {c.key: 0.0 for c in cards}
     for left, right in zip(stages, stages[1:]):
-        from_card = placement[left.name]
-        to_card = placement[right.name]
-        if from_card == to_card:
-            continue
-        payload = left.payload_mib()
-        boundary = StageBoundary(
-            from_stage=left.name,
-            to_stage=right.name,
-            from_card=from_card,
-            to_card=to_card,
-            payload_mib=payload,
-        )
-        # -- hard constraint 2: the x4 taboo ------------------------------
-        for endpoint in (from_card, to_card):
-            ceiling = by_key[endpoint].max_transfer_mib
-            if ceiling is not None and payload >= ceiling:
-                return _refusal(
-                    placement,
-                    f"transport taboo: the {left.name}->{right.name} boundary "
-                    f"moves {payload:.1f} MiB and card {endpoint!r} is "
-                    f"disqualified as an endpoint above {ceiling:.1f} MiB "
-                    "(narrow link). Keep the two stages co-resident or place "
-                    "the boundary on a wider-linked card",
+        # At most one side of a boundary can be replicated (the V1 limit
+        # above), so the frames of the replicated side each have exactly one
+        # destination and the crossing is that side's share of the payload.
+        crossings: list[tuple[str, str, float]] = []
+        for from_card in cards_for[left.name]:
+            for to_card in cards_for[right.name]:
+                if from_card == to_card:
+                    continue
+                fraction = _share_of(left.name, from_card) * _share_of(
+                    right.name, to_card
                 )
-        for card_key, direction in ((from_card, "d2h"), (to_card, "h2d")):
-            profile = by_key[card_key]
-            rate = profile.transfer_ms(payload)
-            if rate.is_absent:
-                return _refusal(placement, f"unpriceable transfer: {rate.source}")
-            raw = float(rate.value)
-            # The window a copy stream can hide this transfer behind is the
-            # compute the same card is already doing for the frames it holds.
-            # Depth 0 hides nothing; depth n overlaps n steps of compute.
-            window = compute[card_key] * max(0, prefetch_depth)
-            hidden = min(raw, window)
-            unhidden = raw - hidden
-            # A transfer priced from an estimated link rate only degrades the
-            # verdict's provenance if some of it is actually paid. A crossing
-            # that prefetch hides completely contributes exactly zero
-            # milliseconds to the period, so an estimate in its rate cannot
-            # move the answer and must not be reported as if it had.
-            if unhidden > 0.0 and rate.provenance is Provenance.ESTIMATE:
-                provenance = Provenance.ESTIMATE
-            transfers.append(
-                TransferPrice(
-                    boundary=boundary,
-                    card=card_key,
-                    direction=direction,
-                    raw_ms=raw,
-                    hidden_ms=hidden,
-                    unhidden_ms=unhidden,
-                    provenance=rate.provenance,
-                    source=rate.source,
-                )
+                if fraction > 0.0:
+                    crossings.append((from_card, to_card, fraction))
+        for from_card, to_card, fraction in crossings:
+            payload = left.payload_mib() * fraction
+            boundary = StageBoundary(
+                from_stage=left.name,
+                to_stage=right.name,
+                from_card=from_card,
+                to_card=to_card,
+                payload_mib=payload,
             )
-            transfer_load[card_key] += unhidden
+            # -- hard constraint 2: the x4 taboo --------------------------
+            for endpoint in (from_card, to_card):
+                ceiling = by_key[endpoint].max_transfer_mib
+                # The taboo is a per-MOVE ceiling, so it is judged on the
+                # frame that actually crosses, not on the stage's whole
+                # output: replication does not make an 8K frame smaller and a
+                # share of the frames is still whole frames.
+                if ceiling is not None and left.payload_mib() >= ceiling:
+                    return _refusal(
+                        placement,
+                        f"transport taboo: the {left.name}->{right.name} boundary "
+                        f"moves {left.payload_mib():.1f} MiB and card "
+                        f"{endpoint!r} is "
+                        f"disqualified as an endpoint above {ceiling:.1f} MiB "
+                        "(narrow link). Keep the two stages co-resident or place "
+                        "the boundary on a wider-linked card",
+                    )
+            for card_key, direction in ((from_card, "d2h"), (to_card, "h2d")):
+                profile = by_key[card_key]
+                rate = profile.transfer_ms(payload)
+                if rate.is_absent:
+                    return _refusal(placement, f"unpriceable transfer: {rate.source}")
+                raw = float(rate.value)
+                # The window a copy stream can hide this transfer behind is the
+                # compute the same card is already doing for the frames it holds.
+                # Depth 0 hides nothing; depth n overlaps n steps of compute.
+                window = compute[card_key] * max(0, prefetch_depth)
+                hidden = min(raw, window)
+                unhidden = raw - hidden
+                # A transfer priced from an estimated link rate only degrades the
+                # verdict's provenance if some of it is actually paid. A crossing
+                # that prefetch hides completely contributes exactly zero
+                # milliseconds to the period, so an estimate in its rate cannot
+                # move the answer and must not be reported as if it had.
+                if unhidden > 0.0 and rate.provenance is Provenance.ESTIMATE:
+                    provenance = Provenance.ESTIMATE
+                transfers.append(
+                    TransferPrice(
+                        boundary=boundary,
+                        card=card_key,
+                        direction=direction,
+                        raw_ms=raw,
+                        hidden_ms=hidden,
+                        unhidden_ms=unhidden,
+                        provenance=rate.provenance,
+                        source=rate.source,
+                    )
+                )
+                transfer_load[card_key] += unhidden
 
     load = {key: compute[key] + transfer_load[key] for key in compute}
     active = {k: v for k, v in load.items() if v > 0.0}
     if not active:
         return _refusal(placement, "no card carries any work under this placement")
     binding_card = max(active, key=lambda k: active[k])
-    on_binding = [s.name for s in stages if placement[s.name] == binding_card]
+    on_binding = [s.name for s in stages if binding_card in cards_for[s.name]]
     binding_stage = (
         max(on_binding, key=lambda name: per_stage_ms[name]) if on_binding else None
     )
@@ -548,24 +706,55 @@ def price_placement(
         unpriced_stages=tuple(unpriced_stages),
         frames_in_flight=frames_in_flight,
         latency_s=latency_s,
+        stage_shares=stage_shares,
     )
 
 
 def enumerate_placements(
-    stages: Sequence[PipelineStage], cards: Sequence[CardProfile]
-) -> Iterable[dict[str, str]]:
+    stages: Sequence[PipelineStage],
+    cards: Sequence[CardProfile],
+    *,
+    replicable: Sequence[str] = (),
+) -> Iterable[dict[str, "str | tuple[str, ...]"]]:
     """Every stage->card assignment. Small by construction: five stages over
     three cards is 243 combinations, so an exhaustive sweep is cheaper than any
-    heuristic and cannot miss the optimum of the model it is sweeping."""
+    heuristic and cannot miss the optimum of the model it is sweeping.
+
+    ``replicable`` names stages that may additionally be spread over several
+    cards (#484). Each named stage contributes its multi-card subsets on top of
+    the single-card assignments, and since :func:`price_placement` prices one
+    replicated stage at a time, the candidates are generated the same way: the
+    base sweep, then for each replicable stage the sweep again with that stage
+    widened. The sweep therefore grows additively rather than multiplicatively,
+    and an empty ``replicable`` yields exactly what it always did.
+    """
     keys = [c.key for c in cards]
     names = [s.name for s in stages]
+    known = set(names)
+    for name in replicable:
+        if name not in known:
+            raise PipelineError(
+                f"cannot replicate unknown stage {name!r}; stages: {names}"
+            )
     for combo in itertools.product(keys, repeat=len(names)):
         yield dict(zip(names, combo))
+    for target in replicable:
+        others = [n for n in names if n != target]
+        widths = range(2, len(keys) + 1)
+        subsets = [
+            subset for width in widths for subset in itertools.combinations(keys, width)
+        ]
+        for combo in itertools.product(keys, repeat=len(others)):
+            base = dict(zip(others, combo))
+            for subset in subsets:
+                yield {**base, target: subset}
 
 
 def best_placement(
     stages: Sequence[PipelineStage],
     cards: Sequence[CardProfile],
+    *,
+    replicable: Sequence[str] = (),
     **kwargs,
 ) -> tuple[PipelinePrice | None, tuple[PipelinePrice, ...]]:
     """Highest-throughput feasible placement, and every one that was rejected.
@@ -573,10 +762,17 @@ def best_placement(
     Returns ``(best, refusals)``. ``refusals`` carries the reason each rejected
     placement failed, deduplicated by reason so a caller gets the *kinds* of
     refusal rather than 200 copies of the same sentence.
+
+    ``replicable`` opens stage-level replication for the named stages (#484).
+    It is opt-in per call rather than always-on because replicating a stage has
+    consequences outside this arithmetic -- an encode split across two cards
+    produces two elementary streams that the executor has to interleave back
+    into output order -- and a pricer must not quietly recommend a shape the
+    executor cannot run.
     """
     best: PipelinePrice | None = None
     seen_reasons: dict[str, PipelinePrice] = {}
-    for placement in enumerate_placements(stages, cards):
+    for placement in enumerate_placements(stages, cards, replicable=replicable):
         price = price_placement(stages, placement, cards, **kwargs)
         if not price.feasible:
             seen_reasons.setdefault(price.reason, price)
