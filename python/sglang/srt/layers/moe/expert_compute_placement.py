@@ -63,16 +63,32 @@ and the installed vector is the smallest integer weight vector that represents
 ``share`` to a hundredth of a percentage point.
 
 ``c_r`` is the per-rank COLD-TRAFFIC COEFFICIENT: bytes actually streamed per
-unit of non-resident expert mass. It is 1.0 everywhere by default, which is the
-first-order model "a cold expert is fetched, a resident one is not". A prior
-boot's #390 dump calibrates it -- see
-:func:`cold_traffic_coefficients_from_measurement` -- because the reference-rig
-battery shows the first-order model has a residual: measured H2D shares were
-42.1 / 28.9 / 29.0 % where ``b * (1 - f)`` predicts 37.2 / 26.8 / 36.0 %, i.e.
-the ranks re-fetch at materially different rates (hit rates 0.772 / 0.843 /
-0.841 over the same window). The coefficient is the one place that residual is
-allowed to enter, it is never invented, and with it absent the solve says so in
-its own log line.
+unit of non-resident expert mass. It is 1.0 everywhere -- the first-order model
+"a cold expert is fetched, a resident one is not" -- and that is what
+``--rank-moe-ratio link`` solves with. A prior boot's #390 dump can calibrate it
+(see :func:`cold_traffic_coefficients_from_measurement`), because the
+reference-rig battery showed the first-order model has a residual: measured H2D
+shares were 42.1 / 28.9 / 29.0 % where ``b * (1 - f)`` predicts
+37.2 / 26.8 / 36.0 %, i.e. the ranks re-fetch at materially different rates.
+
+CALIBRATION IS FALSIFIED ON HARDWARE, and it is a separate, experimental symbol
+(``--rank-moe-ratio link-calibrated``) rather than an implicit upgrade of
+``link``. The 2026-08-03 confirmation window measured both arms on the reference
+recipe and the calibrated one LOST: 1.439x on the transfer term against 1.496x
+uncalibrated, and -0.94 % end-to-end against -7.67 %, i.e. inside the same-window
+A-vs-A floor (CV 2.12 %, spread 4.09 %) and therefore indistinguishable from the
+baseline. The cause is the assumption the coefficient rests on, and it is the
+falsifier ``ARM3_COMPUTE.md`` named in advance: a coefficient treats the hit rate
+as a property of the RANK, and it is not -- it tracks the SIZE of the owned
+expert range, because a smaller range fits the cache better. In that window tp1's
+hit rate rose 0.8450 -> 0.9050 as its range shrank 72 -> 58 experts, while tp2's
+fell 0.8474 -> 0.7814 as its range grew 72 -> 89. The calibrated solve read tp2's
+below-average coefficient (0.9586) as spare capacity, moved three more experts
+onto it, each cost more traffic than modelled, and tp2 became the new clock.
+A range-size-aware hit-rate model would be needed before calibration is worth
+its complexity; a single-shot coefficient is not a property of the rig.
+Evidence: ``/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md``
+§6, and ``planner/rejected.py`` key ``moe_link_calibrated_coefficients``.
 
 Holding ``resident_r`` fixed is the whole reason this is safe to install: every
 rank keeps EXACTLY the resident expert count it has today, so no card's VRAM
@@ -129,6 +145,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "COMPUTE_BASE_PLAN_ENV",
     "COMPUTE_PLACEMENT_LINK",
+    "COMPUTE_PLACEMENT_LINK_CALIBRATED",
+    "COMPUTE_PLACEMENT_SYMBOLS",
     "COMPUTE_POLICY_ENV",
     "TRAFFIC_COEFFICIENT_ENV",
     "ComputePlacement",
@@ -142,8 +160,26 @@ __all__ = [
     "vram_neutral_resident_fraction",
 ]
 
-#: The symbolic value ``--rank-moe-ratio`` accepts in place of a vector.
+#: The symbolic value ``--rank-moe-ratio`` accepts in place of a vector. This
+#: is the SHIPPED slice-3 solve: uncalibrated, first-order traffic model, no
+#: prior boot required. It is the only one of the two that has beaten its own
+#: baseline above a same-window floor on hardware (1.496x transfer term,
+#: -7.67 % end-to-end, 2026-08-03).
 COMPUTE_PLACEMENT_LINK = "link"
+
+#: The EXPERIMENTAL calibrated variant, kept because the mechanism is sound and
+#: a better hit-rate model could revive it, and named separately because it is
+#: falsified as it stands (see the module docstring). It requires
+#: :data:`TRAFFIC_COEFFICIENT_ENV`; ``link`` never reads that variable, so a
+#: leftover export cannot turn the shipped solve into the falsified one behind
+#: the operator's back.
+COMPUTE_PLACEMENT_LINK_CALIBRATED = "link-calibrated"
+
+#: Every symbolic value the flag accepts, for the parser and the validators.
+COMPUTE_PLACEMENT_SYMBOLS = (
+    COMPUTE_PLACEMENT_LINK,
+    COMPUTE_PLACEMENT_LINK_CALIBRATED,
+)
 
 #: How a worker learns WHICH policy produced the explicit vector it was handed.
 #: The launcher resolves the symbol once and every worker inherits the numbers,
@@ -778,12 +814,76 @@ def _traffic_coefficients_from_env(world: int) -> Optional[Tuple[float, ...]]:
     return tuple(values)
 
 
+def _traffic_coefficients_for_symbol(
+    symbol: str, world: int
+) -> Optional[Tuple[float, ...]]:
+    """The coefficients this symbol is allowed to solve with.
+
+    The whole point of the split introduced after the 2026-08-03 window: the
+    coefficients enter through the SYMBOL the operator typed, never through an
+    environment variable that happens to still be exported. ``link`` is the
+    uncalibrated solve by definition, and a set coefficient variable under it
+    is refused rather than ignored -- an operator who took a measurement gets
+    told which flag spends it, and an operator who left one exported from the
+    previous arm does not silently run the falsified solve.
+    """
+    env_coefficients = _traffic_coefficients_from_env(world)
+    if symbol == COMPUTE_PLACEMENT_LINK:
+        if env_coefficients is not None:
+            raise NoComputeLever(
+                f"--rank-moe-ratio {COMPUTE_PLACEMENT_LINK} is the UNCALIBRATED "
+                f"solve and does not read {TRAFFIC_COEFFICIENT_ENV}, but that "
+                "variable is set. Calibration is a separate, experimental "
+                f"symbol: pass --rank-moe-ratio "
+                f"{COMPUTE_PLACEMENT_LINK_CALIBRATED} to spend those "
+                "coefficients, or unset the variable to run the shipped solve. "
+                "Read why before choosing: the calibrated solve is falsified on "
+                "the reference recipe (2026-08-03, 1.439x against 1.496x "
+                "uncalibrated and inside the same-window floor end to end) "
+                "because a per-rank hit rate tracks the SIZE of the owned "
+                "expert range, not the rank."
+            )
+        return None
+    if env_coefficients is None:
+        raise NoComputeLever(
+            f"--rank-moe-ratio {COMPUTE_PLACEMENT_LINK_CALIBRATED} has nothing "
+            f"to calibrate with: {TRAFFIC_COEFFICIENT_ENV} is unset. Derive one "
+            "coefficient per rank from a PRIOR boot's #390 dump with "
+            "cold_traffic_coefficients_from_measurement, or use "
+            f"--rank-moe-ratio {COMPUTE_PLACEMENT_LINK}, which needs no prior "
+            "boot and measured faster on the reference recipe."
+        )
+    logger.warning(
+        "--rank-moe-ratio %s is EXPERIMENTAL and its modelling assumption is "
+        "FALSIFIED on the reference recipe: a per-rank cold-traffic coefficient "
+        "treats the hit rate as a property of the rank, and the 2026-08-03 "
+        "window measured it tracking the SIZE of the owned expert range instead "
+        "(tp1 0.8450 -> 0.9050 as its range shrank 72 -> 58; tp2 0.8474 -> "
+        "0.7814 as its range grew 72 -> 89). The calibrated arm reached 1.439x "
+        "on the transfer term against 1.496x for plain '%s', and -0.94 %% end "
+        "to end inside a 4.09 %% same-window floor. Use it to test a better "
+        "hit-rate model, not to serve.",
+        COMPUTE_PLACEMENT_LINK_CALIBRATED,
+        COMPUTE_PLACEMENT_LINK,
+    )
+    return env_coefficients
+
+
 def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement]:
     """Resolve ``--rank-moe-ratio link`` into an explicit vector, in the LAUNCHER.
 
-    A no-op -- and no import of anything heavy -- unless the symbolic value is
+    A no-op -- and no import of anything heavy -- unless a symbolic value is
     set. Returns the placement it installed, or ``None`` when there was nothing
     to resolve.
+
+    Two symbols, and which one was typed is the ONLY thing that decides whether
+    the solve is calibrated. ``link`` is the shipped, uncalibrated solve;
+    ``link-calibrated`` is the experimental one and is refused without explicit
+    coefficients. Before the 2026-08-03 window the distinction was implicit --
+    ``link`` plus a set :data:`TRAFFIC_COEFFICIENT_ENV` silently produced the
+    calibrated policy -- which is exactly the shape of accident that A/B window
+    discipline exists to prevent, and it is now the falsified solve that the
+    accident would install.
 
     ONE process resolves and every worker inherits the numbers through the
     pickled ``ServerArgs``. That is not an optimisation: the vector decides
@@ -791,16 +891,23 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
     the group's expert coverage at the mercy of three independent NVML reads.
     Rank-uniformity here is structural, not checked.
     """
-    if getattr(server_args, "rank_moe_ratio", None) != COMPUTE_PLACEMENT_LINK:
+    symbol = getattr(server_args, "rank_moe_ratio", None)
+    if symbol not in COMPUTE_PLACEMENT_SYMBOLS:
         return None
 
     world = int(getattr(server_args, "tp_size", 1) or 1)
+    # Before anything that touches NVML or the card registry: which solve was
+    # asked for is a property of the launch arguments alone, and getting it
+    # wrong is the one failure that produces a plausible boot rather than an
+    # error.
+    coefficients = _traffic_coefficients_for_symbol(symbol, world)
+
     base_plan = getattr(server_args, "rank_tp_ratio", None)
     if not isinstance(base_plan, list) or len(base_plan) != world:
         # ServerArgs validation already refuses this; repeated here because the
         # launcher is a second entry point (an Engine built in-process).
         raise NoComputeLever(
-            "--rank-moe-ratio link needs a resolved uneven-TP base plan of "
+            f"--rank-moe-ratio {symbol} needs a resolved uneven-TP base plan of "
             f"length {world} to hold the resident mass fixed against; got "
             f"--rank-tp-ratio {base_plan!r}"
         )
@@ -808,7 +915,7 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
     ep_size = int(getattr(server_args, "ep_size", 1) or 1)
     if ep_size > 1:
         raise NoComputeLever(
-            f"--rank-moe-ratio link is a TP-group placement, but ep_size="
+            f"--rank-moe-ratio {symbol} is a TP-group placement, but ep_size="
             f"{ep_size} gives the MoE its own dispatch and its own group "
             "shape. The vector would index a different group than the one it "
             "was solved for; pass an explicit vector if that is intended."
@@ -833,8 +940,8 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
         cards = resolve_rank_card_vector(server_args)
     if not cards.present:
         raise NoComputeLever(
-            "--rank-moe-ratio link cannot be solved: the rank -> physical card "
-            f"vector is not available ({cards.reason}). The link weights are "
+            f"--rank-moe-ratio {symbol} cannot be solved: the rank -> physical "
+            f"card vector is not available ({cards.reason}). The link weights are "
             "keyed by card UUID, and guessing the mapping from CUDA "
             "enumeration order is the #392/#397 defect this chain exists to "
             "avoid."
@@ -843,7 +950,7 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
     ratio = resolve_host_shard_ratio(world, card_uuids=cards.uuids)
     if ratio.provenance == "absent":
         raise NoComputeLever(
-            "--rank-moe-ratio link cannot be solved: no link bandwidth of "
+            f"--rank-moe-ratio {symbol} cannot be solved: no link bandwidth of "
             f"usable provenance for these cards ({ratio.detail}). An equal "
             "ratio is the shape a refusal takes, not a placement -- run the "
             "card probe (python -m sglang.srt.rigmon.card_probe) or set "
@@ -860,13 +967,14 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
         # third thing nobody asked for. Hold byte ownership at the baseline
         # with SGLANG_MOE_COLD_TIER_SHM instead.
         logger.warning(
-            "--rank-moe-ratio link is solving against an EQUAL link ratio that "
+            "--rank-moe-ratio %s is solving against an EQUAL link ratio that "
             "came from %s. That variable is both the link-weight source and "
             "the cold-tier baseline switch; if it was set to hold byte "
             "ownership at the baseline, unset it and use "
             "SGLANG_MOE_COLD_TIER_SHM for that instead -- otherwise this boot "
             "equalises the cold mass across ranks rather than following the "
             "links, which is neither the baseline nor the treatment.",
+            symbol,
             HOST_SHARD_RATIO_ENV,
         )
 
@@ -875,7 +983,7 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
         base_plan,
         fractions,
         ratio.weights,
-        traffic_coefficients=_traffic_coefficients_from_env(world),
+        traffic_coefficients=coefficients,
         link_source=ratio.source,
         link_provenance=ratio.provenance,
         link_detail=ratio.detail,
@@ -908,20 +1016,22 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
         # to hold byte ownership at the baseline, which is also the FIRST
         # source of the link weights this solve reads.
         logger.warning(
-            "--rank-moe-ratio link -> %s. The solve is the IDENTITY: this "
+            "--rank-moe-ratio %s -> %s. The solve is the IDENTITY: this "
             "group's link shares already match its plan shares, so no expert "
             "changes owner and this boot is the base plan field for field. If "
             "that is not what you expected, check whether the link ratio came "
             "from an equal %s.",
+            symbol,
             placement.describe(),
             HOST_SHARD_RATIO_ENV,
         )
     else:
         predicted = placement.predicted_transfer_shares()
         logger.info(
-            "--rank-moe-ratio link -> %s. Predicted per-rank transfer-time "
+            "--rank-moe-ratio %s -> %s. Predicted per-rank transfer-time "
             "shares %s (the optimum is %.4f on every rank; the slowest rank is "
             "the clock).",
+            symbol,
             placement.describe(),
             [round(p, 4) for p in predicted],
             1.0 / world,

@@ -1768,3 +1768,203 @@ class TestDerivedPlanVectorLog(CustomTestCase):
             run_handler(args)
         self.assertEqual(self._plan_lines(captured.output), [])
         self.assertEqual(args.rank_tp_ratio, [5, 3, 3])
+
+
+class TestDerivedReserveInfeasibility(CustomTestCase):
+    """#458: what ``--rank-auto-reserve-mib auto`` cannot see, said out loud.
+
+    The 2026-08-03 #439 confirmation window spent a boot on this. Its spec
+    mandated ``RESERVE_MIB=auto``; ``auto`` derived 3968 MiB uniformly per GPU
+    and the boot died after loading the weights with
+
+        The per-rank budget leaves no GPU memory for the KV cache under
+        --rank-gpu-memory-mib on rank 1: the 16512 MiB (16.12 GiB) budget is
+        spent on weights + runtime state 17.59 GiB -- 17.59 GiB together,
+        1498 MiB more than the budget, before a single KV token.
+
+    The derivation is not wrong, it is BLIND: ``auto`` sizes the reserve from
+    the stock activation heuristic (512 + max(chunked_prefill, 2048) * 1.5 +
+    tp * pp / 8 * 1024, graph term 0 under --disable-cuda-graph) and nothing in
+    it looks at the checkpoint. Making it look is not available at that point
+    either -- the weight bytes depend on the shard ratio, and the shard ratio is
+    derived FROM these budgets.
+
+    So the fix is the message, not the model: the remedy the error used to give
+    ("lower --rank-auto-reserve-mib for this GPU by the same amount") is not
+    followable under ``auto``, where there is no value to lower and the next
+    boot derives the identical number. These tests reproduce the infeasibility
+    arithmetically and pin the note that now names it.
+    """
+
+    # The reference rig, NVML totals as the window read them.
+    RIG_MEMORY = {
+        0: (32607, 32300),  # RTX 5090
+        1: (20480, 20100),  # RTX 3080
+        2: (20480, 20100),  # RTX 3080
+    }
+
+    def _window_args(self, reserve):
+        from sglang.srt.model_executor.cuda_graph_config import (
+            default_cuda_graph_config,
+        )
+
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib=reserve,
+        )
+        args.cuda_graph_config = default_cuda_graph_config()
+        # The recipe: --disable-cuda-graph and --chunked-prefill-size 512, so
+        # the capture term is 0 and the 2048-token floor sets the activation
+        # part.
+        args.disable_cuda_graph = True
+        args.chunked_prefill_size = 512
+        # A local path that does not exist: the pinned-reserve advisory reads
+        # the HF config for its GDN scratch line, and 'dummy' sends it to the
+        # hub with a retry loop.
+        args.model_path = os.path.join(tempfile.mkdtemp(), "absent")
+        return args
+
+    def _resolve(self, args):
+        with patch.object(
+            server_args_module,
+            "_query_rank_gpu_memory_mib",
+            lambda ids: {g: self.RIG_MEMORY[g] for g in sorted(set(ids))},
+        ), patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=20480.0,
+            create=True,
+        ):
+            args._handle_uneven_tp()
+        return args
+
+    def test_auto_derives_the_3968_mib_the_window_measured(self):
+        args = self._window_args("auto")
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=20480.0,
+            create=True,
+        ):
+            derived = args.derived_rank_auto_reserve_mib(20480.0, 1)
+        # 512 + max(512, 2048) * 1.5 + 3 * 1 / 8 * 1024
+        self.assertEqual(derived, 512 + 3072 + 384)
+        self.assertEqual(derived, 3968)
+
+    def test_the_derived_reserve_produces_the_infeasible_budget(self):
+        """The falsifier for the SPEC inconsistency, arithmetic only.
+
+        Gate 4 of ARM3_COMPUTE.md demands the base plan 30407,19080,19080, and
+        that plan is 32607-2200 / 20480-1400 / 20480-1400 -- it is produced by
+        the pinned reserve 2200,1400,1400 and by nothing else. ``auto`` cannot
+        satisfy it even if the boot survived, and the boot does not: 16512 MiB
+        is below the 17.59 GiB of weights + runtime state the window measured.
+        """
+        auto = self._resolve(self._window_args("auto"))
+        self.assertEqual(auto.rank_gpu_memory_mib, [28639, 16512, 16512])
+        # The window's error reported the shortfall as 1498 MiB and the demand
+        # as 17.59 GiB; 16512 + 1498 = 18010 MiB is that 17.59 GiB, so the
+        # budget derived here is the one that boot was handed.
+        self.assertLess(auto.rank_gpu_memory_mib[1], 17.59 * 1024)
+        self.assertEqual(round((auto.rank_gpu_memory_mib[1] + 1498) / 1024, 2), 17.59)
+        # And the plan Gate 4 asks for is not the one 'auto' resolves.
+        self.assertNotEqual(auto.rank_tp_ratio, [30407, 19080, 19080])
+
+        pinned = self._resolve(self._window_args("2200,1400,1400"))
+        self.assertEqual(pinned.rank_gpu_memory_mib, [30407, 19080, 19080])
+        self.assertEqual(pinned.rank_tp_ratio, [30407, 19080, 19080])
+
+    def test_the_corridor_repaired_reserve_resolves_its_own_base_plan(self):
+        """The repaired recipe (#458): +400 MiB on each 3080.
+
+        Measured serving minima were 211-251 MiB free on the 3080s against the
+        400 MiB corridor floor; +400 MiB of reserve returns the same 400 MiB to
+        the card, so the minimum lands at ~611-651 MiB. It moves the budgets,
+        hence the base plan, which is why it is a new window rather than a
+        tweak -- pinned here so the window's Gate 4 has a number to check.
+        """
+        repaired = self._resolve(self._window_args("2200,1800,1800"))
+        self.assertEqual(repaired.rank_gpu_memory_mib, [30407, 18680, 18680])
+        self.assertEqual(repaired.rank_tp_ratio, [30407, 18680, 18680])
+
+    def test_the_note_names_the_derivation_and_a_reserve_that_fits(self):
+        args = self._resolve(self._window_args("auto"))
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=20480.0,
+            create=True,
+        ):
+            note = args.derived_reserve_infeasible_note(1, 1498)
+        self.assertIsNotNone(note)
+        self.assertIn("3968 MiB of headroom for GPU 1", note)
+        self.assertIn("never sees the checkpoint", note)
+        # One rank on this GPU, so every MiB off the reserve is a MiB of
+        # budget: 3968 - 1498 = 2470.
+        self.assertIn("<= 2470 MiB", note)
+        self.assertIn("--rank-auto-reserve-mib", note)
+
+    def test_a_pinned_reserve_gets_no_note(self):
+        """The standing advice is followable there, and repeating it would
+        make the message longer without making it more useful."""
+        args = self._resolve(self._window_args("2200,1400,1400"))
+        self.assertIsNone(args.derived_reserve_infeasible_note(1, 1498))
+
+    def test_the_note_halves_the_credit_when_two_ranks_share_the_card(self):
+        """budget = (total - reserve) // colocated, so a MiB taken off the
+        reserve is worth 1/colocated MiB to THIS rank. Getting that backwards
+        would name a reserve that fails again for the same reason."""
+        args = self._window_args("auto")
+        args.rank_gpu_id = [0, 0, 1]
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=20480.0,
+            create=True,
+        ):
+            solo = args.derived_reserve_infeasible_note(2, 100)
+            shared = args.derived_reserve_infeasible_note(0, 100)
+        self.assertIn("<= 3868 MiB", solo)  # 3968 - 100 * 1
+        self.assertIn("<= 3768 MiB", shared)  # 3968 - 100 * 2
+        self.assertIn("2 co-located rank(s)", shared)
+
+    def test_the_exhausted_budget_message_carries_the_note(self):
+        """The two halves meet: the ValueError the window saw now ends with
+        the reason its own remedy line could not be followed."""
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            ModelRunnerKVCacheMixin,
+        )
+
+        args = self._resolve(self._window_args("auto"))
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=20480.0,
+            create=True,
+        ):
+            note = args.derived_reserve_infeasible_note(1, 1498)
+        message = ModelRunnerKVCacheMixin.budget_exhausted_message(
+            tp_rank=1,
+            budget_mib=16512,
+            budget_gb=16.12,
+            posts=[("weights + runtime state", 17.59)],
+            rest_memory_gb=-1498 / 1024,
+            device_free_gb=2.0,
+            occupancy=(20.0, 1.0),
+            reserve_note=note,
+        )
+        self.assertIn("before a single KV token", message)
+        self.assertIn("That budget was DERIVED, not chosen", message)
+        # Without the note the message ends on advice that cannot be taken.
+        bare = ModelRunnerKVCacheMixin.budget_exhausted_message(
+            tp_rank=1,
+            budget_mib=16512,
+            budget_gb=16.12,
+            posts=[("weights + runtime state", 17.59)],
+            rest_memory_gb=-1498 / 1024,
+            device_free_gb=2.0,
+            occupancy=(20.0, 1.0),
+        )
+        self.assertNotIn("DERIVED", bare)

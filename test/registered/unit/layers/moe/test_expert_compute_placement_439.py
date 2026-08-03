@@ -43,6 +43,8 @@ from sglang.srt.distributed.device_communicators import barlink_uniformity as un
 from sglang.srt.distributed.utils import partition_units
 from sglang.srt.layers.moe.expert_compute_placement import (
     COMPUTE_PLACEMENT_LINK,
+    COMPUTE_PLACEMENT_LINK_CALIBRATED,
+    COMPUTE_PLACEMENT_SYMBOLS,
     COMPUTE_POLICY_ENV,
     ComputePlacement,
     NoComputeLever,
@@ -756,13 +758,12 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
             resolve_moe_compute_placement_flag,
         )
 
-        os.environ["SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS"] = "1.1251,1.0726,0.8023"
-        plain_args = self._args()
-        os.environ.pop("SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS")
-        plain = resolve_moe_compute_placement_flag(plain_args)
+        plain = resolve_moe_compute_placement_flag(self._args())
 
         os.environ["SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS"] = "1.1251,1.0726,0.8023"
-        calibrated = resolve_moe_compute_placement_flag(self._args())
+        calibrated = resolve_moe_compute_placement_flag(
+            self._args(rank_moe_ratio=COMPUTE_PLACEMENT_LINK_CALIBRATED)
+        )
         self.assertNotEqual(plain.weights, calibrated.weights)
         self.assertEqual(os.environ[COMPUTE_POLICY_ENV], "link-proportional-calibrated")
 
@@ -888,6 +889,146 @@ class TestTheResolverRunsEndToEnd(CustomTestCase):
         os.environ["SGLANG_RANK_CARD_UUIDS"] = "GPU-aaa,GPU-bbb"
         with self.assertRaises(NoComputeLever):
             resolve_moe_compute_placement_flag(self._args())
+
+
+class TestTheUncalibratedSolveIsTheDefault(TestTheResolverRunsEndToEnd):
+    """#458: which solve ``--rank-moe-ratio link`` resolves to, pinned.
+
+    The 2026-08-03 confirmation window measured both solves on the reference
+    recipe and the CALIBRATED one lost -- 1.439x against 1.496x on the transfer
+    term, and -0.94 % against -7.67 % end to end, i.e. inside the same-window
+    A-vs-A floor. The cause is the failure mode ``ARM3_COMPUTE.md`` named in
+    advance: a per-rank cold-traffic coefficient treats the cache hit rate as a
+    property of the rank, and it is a property of the owned range SIZE.
+
+    Before this change the two solves were selected by an ENVIRONMENT VARIABLE:
+    ``link`` plus a set ``SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS`` silently
+    produced the calibrated policy. So a coefficient export left over from one
+    arm turned the next arm into the falsified solve without touching the
+    command line. The symbol the operator typed now decides, and nothing else
+    does.
+
+    Inherits the resolver harness above (same injected hardware facts, same
+    env save/restore).
+    """
+
+    def test_the_bare_symbol_resolves_to_the_uncalibrated_solve(self):
+        import os
+
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            resolve_moe_compute_placement_flag,
+        )
+
+        placement = resolve_moe_compute_placement_flag(self._args())
+        self.assertFalse(placement.is_calibrated)
+        self.assertIn("UNCALIBRATED", placement.describe())
+        self.assertEqual(os.environ[COMPUTE_POLICY_ENV], "link-proportional")
+
+    def test_can_fail_a_stale_coefficient_export_no_longer_changes_the_solve(self):
+        """The falsifier, and the exact accident it prevents.
+
+        Under the old route this asserted vector IS the calibrated one, and the
+        policy label reads ``link-proportional-calibrated`` -- with the launch
+        command still saying ``--rank-moe-ratio link``. Restoring
+        ``traffic_coefficients=_traffic_coefficients_from_env(world)`` in the
+        resolver fails both halves.
+        """
+        import os
+
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            resolve_moe_compute_placement_flag,
+        )
+
+        uncalibrated = resolve_moe_compute_placement_flag(self._args())
+
+        os.environ["SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS"] = "1.0705,0.9709,0.9586"
+        with self.assertRaises(NoComputeLever) as caught:
+            resolve_moe_compute_placement_flag(self._args())
+        message = str(caught.exception)
+        self.assertIn(COMPUTE_PLACEMENT_LINK_CALIBRATED, message)
+        self.assertIn("falsified", message.lower())
+        # And the refusal is a refusal, not a silent downgrade: nothing was
+        # installed, and the policy label still names the previous, honest run.
+        self.assertEqual(os.environ[COMPUTE_POLICY_ENV], "link-proportional")
+
+        # The coefficients the refusal pointed at do produce a different
+        # vector, which is what makes the silent route a real hazard rather
+        # than a theoretical one.
+        calibrated = resolve_moe_compute_placement_flag(
+            self._args(rank_moe_ratio=COMPUTE_PLACEMENT_LINK_CALIBRATED)
+        )
+        self.assertNotEqual(uncalibrated.weights, calibrated.weights)
+
+    def test_the_experimental_symbol_refuses_without_coefficients(self):
+        from sglang.srt.layers.moe.expert_compute_placement import (
+            resolve_moe_compute_placement_flag,
+        )
+
+        with self.assertRaises(NoComputeLever) as caught:
+            resolve_moe_compute_placement_flag(
+                self._args(rank_moe_ratio=COMPUTE_PLACEMENT_LINK_CALIBRATED)
+            )
+        self.assertIn("nothing to calibrate with", str(caught.exception))
+
+    def test_the_falsification_is_stated_where_an_operator_reads_it(self):
+        """The help text, the module, and the machine-readable register.
+
+        A verdict that lives only in a battery result is a verdict the next
+        operator does not have.
+        """
+        import argparse
+
+        from sglang.srt.layers.moe import expert_compute_placement as module
+        from sglang.srt.planner import rejected as rejmod
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        help_text = parser.format_help()
+        self.assertIn(COMPUTE_PLACEMENT_LINK_CALIBRATED, help_text)
+        self.assertIn("FALSIFIED", help_text)
+        self.assertIn("1.496x", help_text)
+
+        self.assertIn("FALSIFIED", module.__doc__)
+        self.assertIn("2026-08-03", module.__doc__)
+
+        entry = rejmod.by_key("moe_link_calibrated_coefficients")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.level, rejmod.NOT_DEFAULT)
+        self.assertIn("1.439x", entry.verdict)
+        self.assertIn("2026-08-03_439_confirm", entry.evidence)
+        self.assertTrue(entry.unlock.startswith("--rank-moe-ratio"))
+
+    def test_both_symbols_survive_the_flag_and_validator_chain(self):
+        """A second symbol is only real if every gate that special-cased the
+        first one knows about it -- parser, the auto-plan notice, the family
+        validator, and the worker refusal."""
+        import argparse
+
+        from sglang.srt.managers.scheduler import uneven_family_plans
+        from sglang.srt.server_args import ServerArgs, _parse_rank_moe_ratio
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for symbol in COMPUTE_PLACEMENT_SYMBOLS:
+            with self.subTest(symbol=symbol):
+                self.assertEqual(_parse_rank_moe_ratio(symbol), symbol)
+                parsed = parser.parse_args(
+                    ["--model-path", "m", "--rank-moe-ratio", symbol]
+                )
+                self.assertEqual(parsed.rank_moe_ratio, symbol)
+
+                args = ServerArgs(model_path="dummy")
+                args.tp_size = 3
+                args.rank_tp_ratio = [400, 256, 344]
+                args.rank_moe_ratio = symbol
+                # Passes family validation without a length check ...
+                args._handle_uneven_mlp_ratio()
+                self.assertEqual(args.rank_moe_ratio, symbol)
+                # ... and is a hard error if it ever reaches a worker.
+                with self.assertRaises(ValueError) as caught:
+                    uneven_family_plans(args)
+                self.assertIn("symbolic placement", str(caught.exception))
 
 
 class TestTheArmCanIdentifyItself(CustomTestCase):

@@ -18,13 +18,16 @@
 #                     assignment, i.e. the #82 expert range itself, so a rank's
 #                     streamed mass is proportional to its own link. This is
 #                     the arm whose per-rank H2D delta is predicted NON-null.
-#   ARM=compute-cal   the same, with the per-rank cold-traffic coefficients
-#                     measured on the equal arm supplied through
-#                     SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS. Read ARM3_COMPUTE.md
-#                     before quoting either -- the two bracket the effect
-#                     (predicted 1.36x and 1.58x on the transfer term) and
-#                     reporting only the calibrated one would report a number
-#                     calibrated on the arm it is compared against.
+#   ARM=compute-cal   FALSIFIED (2026-08-03), kept only to test a better
+#                     hit-rate model. --rank-moe-ratio link-calibrated with the
+#                     per-rank cold-traffic coefficients measured on the equal
+#                     arm supplied through SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS.
+#                     It LOST to plain 'compute' on hardware -- 1.439x against
+#                     1.496x on the transfer term, -0.94 % against -7.67 % end
+#                     to end, i.e. inside the same-window floor -- because a
+#                     per-rank hit rate tracks the SIZE of the owned expert
+#                     range, not the rank. Do not run it as a serving
+#                     recommendation; see ARM3_COMPUTE.md.
 #
 # WHAT THIS ARM DOES AND DOES NOT TEST -- read before quoting a delta.
 #
@@ -80,15 +83,21 @@ fi
 PORT="${PORT:-30394}"
 RUN="${RUN:-/spinning/gpu-battery-results/$(date +%F)_394_s2}"
 GGUF_DIR="${GGUF_DIR:-$MODEL_ROOT/DeepSeek-V4-Flash-0731-GGUF/UD-IQ3_XXS}"
-# Defaults are the recipe arms 1 and 2 were measured at, verbatim. Both are
-# overridable because the #439 confirmation window runs at
-# RESERVE_MIB=auto (see ARM3_COMPUTE.md, "Confirmation window"): the pinned
-# 2200,1400,1400 left the two 3080s at ~515 MiB free on the equal arm, which is
-# above the 400 MiB corridor floor but is the same thin margin the residency
-# defect overran. Whatever is chosen, every arm in one window must use the SAME
-# value -- the reserve moves the KV pool, and a reserve that differs between
-# arms is a second treatment.
-RESERVE_MIB="${RESERVE_MIB:-2200,1400,1400}"
+# CORRIDOR-REPAIRED DEFAULT (#458). Arms 1 and 2 were measured at
+# 2200,1400,1400, and the 2026-08-03 window proved that recipe breaches the
+# corridor: sampled DURING load, both 3080s bottom out at 211-251 MiB free
+# against the 400 MiB floor (the ~515 MiB previously quoted was a post-boot
+# snapshot, which overstates free by 250-330 MiB). +400 MiB on each 3080 lifts
+# the measured minimum to ~611-651 MiB; the 5090 was never near the floor
+# (1262 MiB minimum) and keeps its 2200. This changes the derived budgets and
+# therefore the base plan -- see ARM3_COMPUTE.md, "Green-corridor window".
+# 'auto' is NOT usable on this recipe: it derives 3968 MiB uniformly from the
+# stock activation heuristic and the resulting 16512 MiB budget is below what
+# weights + runtime state already need on a 3080 (measured 17.59 GiB).
+# Whatever is chosen, every arm in one window must use the SAME value -- the
+# reserve moves the KV pool, and a reserve that differs between arms is a
+# second treatment.
+RESERVE_MIB="${RESERVE_MIB:-2200,1800,1800}"
 # The solve holds the resident mass fixed against the BASE plan, so this value
 # is part of the treatment definition: changing it between arms changes what is
 # being compared.
@@ -159,7 +168,6 @@ case "$ARM" in
     # Same refusal as the proportional arm: the placement must be weighted by a
     # timed transfer, not by a datasheet.
     export SGLANG_MOE_HOST_SHARD_MIN_PROVENANCE=measured
-    ARM_ARGS+=(--rank-moe-ratio link)
     if [ "$ARM" = "compute-cal" ]; then
       if [ -z "${SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS:-}" ]; then
         echo "FAIL ARM=compute-cal needs SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS" >&2
@@ -167,8 +175,14 @@ case "$ARM" in
         echo "     scripts/dev/394_s2_proof/ARM3_COMPUTE.md" >&2
         exit 1
       fi
+      # The FALSIFIED arm, and it names itself on the command line (#458). The
+      # coefficients are read only under this symbol; plain 'link' refuses
+      # while they are exported, so a leftover export from this arm cannot
+      # turn the next arm into this one.
+      ARM_ARGS+=(--rank-moe-ratio link-calibrated)
     else
       unset SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS || true
+      ARM_ARGS+=(--rank-moe-ratio link)
     fi
     ;;
   *)

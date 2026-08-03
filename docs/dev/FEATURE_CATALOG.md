@@ -29,21 +29,32 @@ the SAME merge. Last full refresh: 2026-08-02 (tip 33148dbe0f).
   taking it: the GPU-resident expert mass stays exactly where the base plan put
   it (VRAM-neutral) and the STREAMED remainder is apportioned by the measured
   link weights, which equalises the per-rank transfer time the group waits on.
-  Optional per-rank cold-traffic coefficients
-  (`SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS`, measured from a prior boot's #390
-  dump) replace the first-order "a cold expert is fetched, a resident one is
-  not" model; without them the solve labels itself UNCALIBRATED. Refused by
-  name when offload is off, when the link provenance is `absent`, or under
-  `ep_size>1`. Resolved ONCE in the launcher — a symbolic value that reaches a
-  worker is a hard error there, never a silent fall back to the base plan.
-  Honest status: the mode is BUILT and hermetically tested, its predicted band
-  is UNMEASURED. The 2026-08-02 ARM3 battery could not boot the arm; three
-  defects were found there and fixed (resolver read the resident fraction as
-  1.0 because it runs before the ServerArgs are published; residency was sized
-  off the SOLVED expert count and inflated tp2 by 19.5 % into an OOM, now held
-  at the base plan through a derived sizing fraction the solve never reads;
-  the battery harness did not carry the arm into the boot command). One
-  confirmation window is specified and pending — `ARM3_COMPUTE.md`.
+  Refused by name when offload is off, when the link provenance is `absent`, or
+  under `ep_size>1`. Resolved ONCE in the launcher — a symbolic value that
+  reaches a worker is a hard error there, never a silent fall back to the base
+  plan.
+  **CONFIRMED ON HARDWARE 2026-08-03** (first tokens through the slice-3 path,
+  `/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md`, DeepSeek-
+  V4-Flash UD-IQ3_XXS TP=3 on 5090 + 2x 3080, 900 tok x 3 x 1 warmup): the
+  clock moved off the x4 card (tp1 H2D 1157.6 → 672.7 GiB), transfer term
+  192.7 → 128.8 s = **1.496x** against a re-derived prediction of 1.411x, and
+  **-7.67 %** end-to-end ms/token against a same-window A-vs-A floor of
+  CV 2.12 % / spread 4.09 %. All four gates PASS; the DESK-WRITTEN label is
+  lifted for this path and the three 2026-08-02 defects are confirmed fixed on
+  hardware. Still owed: ONE re-proof in a green corridor — every arm of that
+  window ran with both 3080s at 211-251 MiB free against the 400 MiB floor, so
+  the number is real but is not acceptance-evidence (`ARM3_COMPUTE.md`,
+  "Green-corridor window", BOOT-PENDING).
+  `link-calibrated` (per-rank cold-traffic coefficients from a prior boot's
+  #390 dump, `SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS`, required and read ONLY
+  under this symbol) is EXPERIMENTAL and **FALSIFIED** by the same window: the
+  coefficient treats the cache hit rate as a property of the RANK and it
+  tracks the SIZE of the owned expert range instead (tp1 0.8450 → 0.9050 as its
+  range shrank 72 → 58; tp2 0.8474 → 0.7814 as it grew 72 → 89), so the solve
+  overloaded tp2 and reached only 1.439x / -0.94 %, inside the floor. Plain
+  `link` REFUSES while the coefficient variable is set rather than silently
+  running the falsified solve — before #458 that env alone selected it.
+  Registered in `planner/rejected.py` (`moe_link_calibrated_coefficients`).
 - **Uneven DCP** (`dcp_size` + token vector): token/KV sharding across ranks,
   weighted owner rule, SWA-hybrid support, TP>kv_heads via replication+token
   shard. **Draft-KV-DCP**: draft KV token-sharded (−67 % draft KV; above
@@ -195,17 +206,19 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   Path A′ lives. It needed no new mechanism: the #82 expert range IS the "moe"
   family vector, so the slice is a SOLVE plus its wiring
   (`layers/moe/expert_compute_placement.py`, `--rank-moe-ratio link`, see §1).
-  Predicted on the reference recipe from the 2026-08-02 battery's own measured
-  inputs and its OWN resolved base plan `30407,19080,19080`: clock rank 92.8 s
-  → 66.7 s (1.392x) uncalibrated, → 64.0 s (1.450x) with the coefficients
-  calibrated off the equal arm, against BENCH_394's 1.536x ideal-placement
-  reference. (The 1.358x / 1.584x pair quoted earlier is keyed to a
-  `400,256,344` base plan the recipe does not resolve to.) All of it is
-  PREDICTION: the arm has never served a token — the battery booted only the
-  baseline, and the three defects that blocked the treatment arm are fixed at
-  the desk but unvalidated on hardware.
-  BOOT-PENDING: `scripts/dev/394_s2_proof/` (eager arms 1+2, plus the slice-3
-  arms `ARM=compute` / `ARM=compute-cal` specified in `ARM3_COMPUTE.md`), and
+  MEASURED on the reference recipe 2026-08-03 (base plan `30407,19080,19080`,
+  solved vector `160,79,119`): clock rank 192.7 s → 128.8 s = **1.496x**, ahead
+  of the 1.411x its own model predicted, and -7.67 % end-to-end. The calibrated
+  variant reached 1.439x and is falsified (§1). Two findings the window added:
+  `--rank-auto-reserve-mib auto` is INFEASIBLE on this recipe (it derives
+  3968 MiB per card from the activation heuristic, leaving a 16512 MiB budget
+  against 17.59 GiB of weights + runtime — the refusal now names the derivation
+  and the pinned value that fits, `ServerArgs.derived_reserve_infeasible_note`),
+  and the recipe is CORRIDOR-RED at `2200,1400,1400`; the repaired reserve is
+  `2200,1800,1800` (base plan `30407,18680,18680`, vector `213,104,157`).
+  BOOT-PENDING: the green-corridor re-proof of the 1.496x point
+  (`ARM3_COMPUTE.md`, two boots), the eager arms 1+2 of
+  `scripts/dev/394_s2_proof/`, and
   the graph seam, which refuses by name for TWO reasons (#443 named the nearer
   one): the captured gather sources only this rank's pinned pool, so a routed
   DELEGATED expert has no row — the eager path covers it with a host read of a

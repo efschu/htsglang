@@ -647,6 +647,59 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         tags=("verify-intermediate-rows", "dual-group-lane"),
         scope="general",
     ),
+    RejectedEntry(
+        key="moe_link_calibrated_coefficients",
+        what=(
+            "calibrating the link-proportional cold-expert compute placement "
+            "with per-rank cold-traffic coefficients measured on a prior boot "
+            "(--rank-moe-ratio link-calibrated)"
+        ),
+        verdict=(
+            "FALSIFIED MODEL, and it LOSES to the uncalibrated solve it was "
+            "supposed to improve: 1.439x on the transfer term against 1.496x, "
+            "and -0.94 % end to end against -7.67 %, i.e. inside the "
+            "same-window A-vs-A floor of 4.09 % spread while the uncalibrated "
+            "arm is well outside it"
+        ),
+        gain=(
+            "removing the first-order traffic model's residual; predicted "
+            "1.498x against the uncalibrated arm's 1.411x"
+        ),
+        cost=(
+            "a prior boot of the same recipe, spent on overloading whichever "
+            "rank that boot left the smallest expert range"
+        ),
+        why=(
+            "the coefficient treats the cache hit rate as a property of the "
+            "RANK; it is a property of the owned RANGE SIZE, because a smaller "
+            "range fits the cache better. Measured in the window that produced "
+            "the coefficients: tp1 0.8450 -> 0.9050 as its range shrank "
+            "72 -> 58, tp2 0.8474 -> 0.7814 as its grew 72 -> 89. The solve "
+            "read tp2's 0.9586 as spare capacity and made it the new clock."
+        ),
+        level=NOT_DEFAULT,
+        evidence=(
+            "/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md "
+            "sections 5 and 6 (three boots, 900 tokens x 3 runs x 1 warmup, "
+            "DeepSeek-V4-Flash UD-IQ3_XXS, TP=3 on 1x RTX 5090 + 2x RTX 3080); "
+            "the falsifier was named in advance in "
+            "scripts/dev/394_s2_proof/ARM3_COMPUTE.md, readout item 4"
+        ),
+        tags=("moe-offload", "moe-link-calibrated"),
+        scope="general",
+        note=(
+            "The MECHANISM is not rejected -- --rank-moe-ratio link, the "
+            "uncalibrated solve, is the confirmed one and is what the flag "
+            "resolves to. Only the coefficient model is. The symbol stays in "
+            "tree so a range-size-aware replacement can be measured against "
+            "these three arms rather than against a memory of them."
+        ),
+        unlock=(
+            "--rank-moe-ratio link-calibrated plus one coefficient per rank in "
+            "SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS (both required; plain 'link' "
+            "refuses while that variable is set)"
+        ),
+    ),
 )
 
 

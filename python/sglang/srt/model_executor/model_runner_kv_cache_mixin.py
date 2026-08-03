@@ -437,6 +437,7 @@ class ModelRunnerKVCacheMixin:
         device_free_gb: float,
         occupancy: Tuple,
         ceiling: Optional[int] = None,
+        reserve_note: Optional[str] = None,
     ) -> str:
         """The per-rank "no room for KV" message, itemized.
 
@@ -445,6 +446,13 @@ class ModelRunnerKVCacheMixin:
         The driver-free line is part of it on purpose: a shortfall on a
         shared card invites the theory that the neighbour was charged twice,
         and the numbers that refute (or confirm) it belong in the message.
+
+        ``reserve_note`` (#458) is appended when the budget was DERIVED by
+        ``--rank-auto-reserve-mib auto`` rather than chosen. Without it the
+        message's own remedy -- "lower --rank-auto-reserve-mib for this GPU by
+        the same amount" -- is not followable: under ``auto`` there is no value
+        to lower, and the next boot derives the identical reserve. See
+        ``ServerArgs.derived_reserve_infeasible_note``.
 
         ``ceiling`` is ``--max-running-requests-ceiling`` (#287). When it is
         set, the mamba post scales linearly with it, so the message can name
@@ -490,7 +498,9 @@ class ModelRunnerKVCacheMixin:
             f"was handed out in full: {device_free_gb:.2f} GiB of the device "
             f"is free at this point ({total_gb:.2f} GiB total, "
             f"{outside_gb:.2f} GiB held outside this process), and a "
-            f"co-resident process does not reduce the budget." + ceiling_note
+            f"co-resident process does not reduce the budget."
+            + ceiling_note
+            + (reserve_note or "")
         )
 
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
@@ -704,6 +714,12 @@ class ModelRunnerKVCacheMixin:
                         device_free_gb=device_free_gb,
                         occupancy=self._device_occupancy_gb(device_free_gb),
                         ceiling=self.server_args.max_running_requests_ceiling,
+                        # World-rank order, like every other read of the
+                        # per-rank vectors (#201) -- tp_rank alone makes every
+                        # PP stage name stage 0's card.
+                        reserve_note=self.server_args.derived_reserve_infeasible_note(
+                            self._rank_vector_index(), math.ceil(-rest_memory * 1024)
+                        ),
                     )
                 )
             raise ValueError(

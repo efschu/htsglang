@@ -29,12 +29,14 @@ default, stated explicitly rather than implied by tense.
 | item | task # | prerequisite / gate | evidence expected |
 |---|---|---|---|
 | Video frontier probes: fp16/bf16-TRT SR + RIFE 4.26 + P1 decode/encode rows | #333-M2 | TRT 11.2.1.2 installed (done, `ANALYSE_363...` §"TensorRT rungs") | fills the one unmeasured number in `TASK_333_M2_VIDEO_ENHANCE.md` §16.3's budget table |
-| #439 confirmation band | #439 | arm boots without the three defects already fixed at desk (`FEATURE_CATALOG.md`) | confirms or refutes 1.392x/1.450x; `2026-08-03_439_confirm/` is the target directory, empty as of this writing |
+| ~~#439 confirmation band~~ **RAN 2026-08-03** | #439 | — | CONFIRMED: `compute` 1.496x on the transfer term (predicted 1.411x), -7.67 % end-to-end above a 4.09 % same-window floor; `compute-cal` FALSIFIED at 1.439x. Evidence `2026-08-03_439_confirm/RESULTS.md`. Two follow-ups: `--rank-auto-reserve-mib auto` infeasible on this recipe, and every arm CORRIDOR-RED (3080s at 211-251 MiB vs the 400 MiB floor) |
+| #439 green-corridor re-proof | #439 | repaired reserve `2200,1800,1800` (base plan `30407,18680,18680`) | two boots, `equal` + `compute`; 1.43x-1.51x expected with the corridor sampled at 1 Hz DURING load and >= 400 MiB per card as a GATE. Spec: `ARM3_COMPUTE.md`, "Green-corridor window" |
 | #444a + bs=12/16/24 sweep + spec-off point | #444a | none named beyond a free card window | fills the bs sweep gap noted in prior batteries |
 | #447 DSpark spec arm | #447 | DSpark head assembled (`ANALYSE_447_llamacpp_dsv4_harvest.md`) | accept-rate and multiplier measurement on the actual head, replacing the 0.6-0.77/1.5-1.8x estimate in `ANALYSE_456` §6 |
 | Optional: #410 gate / #452 arms (B2 control + tolist sizing probe) | #410, #452 | slot availability in the same window | prices the breakable-graph route (`ANALYSE_456` §2.2 #302b) for DSV4-Flash specifically |
 
-BOOT-PENDING in full; nothing in this wave has run as of this document.
+BOOT-PENDING except the #439 confirmation band, which ran on 2026-08-03 and
+left one cheaper successor window in its place (row 2).
 
 ---
 
