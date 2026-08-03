@@ -348,6 +348,80 @@ def _indexer_logits_chunk_rows(
     return max(1, min(int(rows), num_rows))
 
 
+#: KV page height the paged torch indexer hardcodes (asserted in
+#: :func:`fp8_paged_mqa_logits_torch_sm120`); named so the boot-time estimator
+#: below does not restate the literal.
+INDEXER_PAGE_SIZE = 64
+
+
+def _indexer_logits_output_bytes(num_rows: int, max_seq_len: int) -> int:
+    """Bytes of the ``[rows, max_seq_len]`` fp32 logits tensor the call returns.
+
+    Named separately because it is the one term of the transient that NEITHER
+    chunking axis bounds: it is the return value, allocated before the loops
+    (``logits = q.new_full(...)``) and live across all of them, and it grows
+    linearly with the context. At 256 query rows it is 32 MiB at a 32K span and
+    1 GiB at a 1M span. #493 counts it explicitly so the boot-time estimate is
+    the whole transient rather than only its chunked part.
+    """
+    return max(0, num_rows) * max(0, max_seq_len) * 4
+
+
+def indexer_prefill_scratch_bytes(
+    *,
+    num_rows: int,
+    max_seq_len: int,
+    num_heads: int,
+    head_dim: int,
+) -> int:
+    """Modelled peak transient of ONE :func:`fp8_paged_mqa_logits_torch_sm120`
+    call on THIS rank, in bytes, under the knobs currently in the environment.
+
+    THE POINT (#493): this transient was the sixth unbudgeted term of the list
+    ``ServerArgs.pinned_reserve_shortfall_note`` enumerates, and the largest of
+    them on the DSV4-Flash recipe. It is a RUNTIME allocation, so
+    ``--rank-auto-reserve-mib`` cannot cap it -- the reserve forms the rank
+    budget and the KV pool takes what the reserve leaves, while this lands on
+    top of both. Window 3 of 2026-08-03 measured the consequence: both 3080
+    ranks fell to 271 MiB free from a 873 MiB steady state, and a +500 MiB
+    reserve repair left that floor where it was.
+
+    Composed from the two terms above, using the SAME functions the loop uses,
+    so the estimate cannot drift from the allocation it estimates::
+
+        peak = chunk_rows * step_bytes(chunk_seq)  +  output_bytes
+
+    where ``chunk_seq`` and ``chunk_rows`` are what
+    :func:`_indexer_logits_chunk_pages` and :func:`_indexer_logits_chunk_rows`
+    decide for this geometry under the current env. With the query budget
+    disabled (``SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB=0``) it reproduces the
+    pre-#449 peak, which is what makes it usable as the predicted delta of an
+    A/B window: ``(num_rows - chunk_rows) * step_bytes``.
+
+    Reads the environment and nothing else -- no CUDA call, no device, no group
+    state -- so it is callable from the launcher process before any worker
+    exists, which is where the reserve diagnostic needs it.
+    """
+    max_pages = (max(0, max_seq_len) + INDEXER_PAGE_SIZE - 1) // INDEXER_PAGE_SIZE
+    chunk_pages = _indexer_logits_chunk_pages(INDEXER_PAGE_SIZE, max(1, max_pages))
+    chunk_seq = chunk_pages * INDEXER_PAGE_SIZE
+    chunk_rows = _indexer_logits_chunk_rows(
+        chunk_seq=chunk_seq,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        num_rows=num_rows,
+    )
+    step_bytes = _indexer_logits_step_bytes(
+        chunk_seq=chunk_seq,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    # `chunk_rows` is a `range` step and is never 0, but an empty query axis
+    # must model as zero loop bytes rather than one phantom row.
+    live_rows = min(chunk_rows, num_rows) if num_rows > 0 else 0
+    return live_rows * step_bytes + _indexer_logits_output_bytes(num_rows, max_seq_len)
+
+
 def fp8_paged_mqa_logits_torch_sm120(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,

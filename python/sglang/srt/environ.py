@@ -1635,7 +1635,34 @@ class Envs:
     # #395). Bounds the per-query-token duplication of the KV gather described
     # in ANALYSE_447 section 2.3 L1. 0 disables it (one pass over the whole
     # query axis, the pre-#449 shape). See #449.
-    SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB = EnvInt(2048)
+    #
+    # THE DEFAULT MUST BIND (#493). #449 shipped 2048 MiB and NOTE_449 section 5
+    # names it for what it was: "a ceiling picked at desk, not a tuned value".
+    # It is above the peak it was meant to bound on the geometry this fork
+    # actually serves, so the cap was inert. On the DeepSeek-V4-Flash C4 indexer
+    # (index_n_heads=64, index_head_dim=128, heads replicated) one query row
+    # costs `chunk_seq * 1160` bytes, so at --chunked-prefill-size 256:
+    #   SEQ_CHUNK 2048 -> 2.27 MiB/row -> 580 MiB for 256 rows; 2048 MiB permits
+    #                     903 rows, i.e. it never binds;
+    #   SEQ_CHUNK 8192 (this file's default) -> 9.06 MiB/row -> 2320 MiB for 256
+    #                     rows; 2048 MiB permits 225 rows, i.e. it trims 12 %.
+    # Window 3 of 2026-08-03 measured what that costs: both 3080 ranks fell from
+    # 873 MiB free to 271 MiB during the deep DSV4F prefill, a 602 MiB excursion
+    # (a LOWER bound -- the sampler ran at 1 Hz against a sub-second transient),
+    # breaching the 400 MiB corridor floor on 214 samples. The model for that
+    # run is 588 MiB: 580 MiB of loop step (256 rows at SEQ_CHUNK 2048) plus
+    # 8 MiB of returned logits at the C4 indexer span of 8196 -- the indexer
+    # runs on the compress_ratio-4 span, not on the 32768-token prompt. Raising
+    # --rank-auto-reserve-mib by 500 MiB did not move that floor: the reserve
+    # forms the rank BUDGET and cannot cap a runtime allocation. Only this knob
+    # caps it.
+    # 256 MiB is chosen as the largest power-of-two budget that still binds on
+    # the reference geometry above at both SEQ_CHUNK settings, and it leaves the
+    # corridor intact on the same run: 112 rows x 2.27 MiB = 254 MiB of step
+    # plus 8 MiB of logits, i.e. 873 - 262 = 611 MiB free at peak. The
+    # regrouping it forces is exact -- no reduction crosses a chunk boundary --
+    # so this buys corridor without giving up any KV capacity.
+    SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB = EnvInt(256)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     # Validate the non-negative-seq_len precondition of the DSV4 top-k
     # wrappers (v1 and v2) before the launch. The check costs a device-to-host

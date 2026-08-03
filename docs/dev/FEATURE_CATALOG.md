@@ -964,6 +964,21 @@ geometry as #395 does) — bit-identical to the single-pass form, collective-fre
 inside the loops. This BOUNDS the per-query-token duplication of the KV gather
 (one copy per query token, ANALYSE_447 L1); it does not remove it, and the
 speed effect is unmeasured (no GPU window taken).
+**#493 made that budget BIND.** Reach note, and it is the point of the entry:
+#449 shipped the knob at 2048 MiB, which is ABOVE the peak it bounds on the
+geometry this fork serves — at `--chunked-prefill-size 256` one query row costs
+2.27 MiB at `SEQ_CHUNK` 2048, so 2048 MiB permits 903 rows against 256 asked
+for, and the cap returned the whole query axis. A present mechanism with zero
+reach. The gate predicate is `rows = budget_bytes // step_bytes`
+(`layers/attention/dsv4/indexer.py:347`); the default is now **256 MiB**, the
+largest power of two that binds at both `SEQ_CHUNK` settings. Peak at the
+window-3 geometry falls 588 → 262 MiB per rank. The transient is also NAMEABLE
+at boot now (`indexer_prefill_scratch_bytes` +
+`ServerArgs.dsv4_indexer_prefill_scratch_mib`, one formula shared with the loop),
+and is itemized in `pinned_reserve_shortfall_note` as the sixth term no reserve
+charges. GPU arm packaged, not run: `scripts/dev/493_indexer_transient/`,
+falsifier = `peak_bytes_max` must fall ~326 MiB/rank between the arms.
+`NOTE_493_indexer_prefill_transient.md`.
 Nemotron-Puzzle class structurally covered, unbooted.
 
 ## 16. Measurement / window infrastructure
@@ -971,6 +986,15 @@ gpu-arb (UUID-based holder + heartbeat — stop the heartbeat BEFORE releasing),
 forward_peak.py (VRAM corridor judged AT PEAK, not idle), cachetrim with
 --ready-url self-retirement, expert_stats (router distribution + hit rate),
 CollectiveClock (compute vs wait per rank), measured-KV-budget stale-boot trap.
+**Transients need a transient-rate sampler (#493):** a 1 Hz `nvidia-smi` loop
+undersamples a sub-second prefill excursion by ~12x, so its minimum is a LOWER
+bound and its apparent ramp is extreme-value statistics, not a signal — use
+`scripts/dev/493_indexer_transient/sample_corridor.sh` (`nvidia-smi -lms`, 100 ms)
+for the shape and `forward_peak`'s per-forward `nvml_free_bytes_min` for the
+number. And `--rank-auto-reserve-mib` shapes the BUDGET, never a transient: it
+trades KV capacity for steady-state free memory and moves a peak not at all
+(runbook §4.5.4 items 4-7 carry the evidence, incl. "a corridor repair applies to
+every violating card, not the one the briefing named").
 
 ## 17. META: combination matrix + eviction doctrine
 Every "can asset X live at tier Y under primitive Z" question is a matrix-cell

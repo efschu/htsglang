@@ -1303,6 +1303,55 @@ staging) from an OOM message; window 5 measured 0.640 GiB directly via
 `max_memory_allocated` cannot see it, so any budget built from the torch
 number alone is optimistic by that much. Use 1.46 GiB for a 5090-class rank.
 
+**4. A corridor repair applies to EVERY violating card, not to the one the
+briefing names.** Window 3 of 2026-08-03 was briefed on gpu0 and reported
+gpu2 as "never repaired" — the boot script had in fact raised all three ranks
+by 500 MiB (`2200,1400,1400` -> `2700,1900,1900`), so what the run actually
+demonstrated is the stronger result: the repair reached every card and still
+did not work. Both readings share one defect, which is why the rule is worth
+stating twice over: the corridor is a property of the RIG, so the set of cards
+a repair touches is decided by the trace, never by the sentence in the
+briefing. Read `min free` per card off the corridor trace, list every card
+under the floor, and repair or explain each one by name.
+
+**5. `--rank-auto-reserve-mib` shapes the BUDGET; it does not cap a
+transient.** The reserve is subtracted from the NVML total to form the rank
+budget, and the KV pool takes what the reserve leaves. Raising it therefore
+buys steady-state free memory *by giving up KV capacity*, and moves a runtime
+allocation peak not at all. The same window is the proof: +500 MiB per rank
+cut `max_total_num_tokens` from 90624 to 41984 and left the free-memory floor
+at 271 MiB, within 2 MiB of the 273 MiB it was trying to fix. When a corridor
+breach is a transient — a floor far below a stable median, recurring on a
+period rather than persisting — the reserve is the wrong knob by construction.
+Cap the allocation where it is made. For the DSV4 C4 indexer that knob is
+`SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB` (#493, default 256 MiB; it was shipped at
+an inert 2048 MiB and bound nothing); the boot-time reserve diagnostic now
+names the term and its size, and `scripts/dev/493_indexer_transient/predict.py`
+prints it for any geometry.
+
+**6. Do not pull large files or install packages in a window that will also
+boot a big model.** cgroup v2 charges page cache to the same limit as anonymous
+memory, and this box is swapless at 104 GiB. Attempt 1 of the same window was
+killed by the cgroup OOM killer with `memory.peak` at exactly the limit and
+zero `CUDA out of memory` in the log — the tell is that a rank vanishes
+silently mid-prefill and the survivors then die on gloo `Connection closed by
+peer`, which is the downstream symptom, not the cause. Check
+`memory.events oom_kill` before blaming CUDA. The DSV4-GGUF recipe has no host
+headroom left: set `SGLANG_GGUF_STREAM_TRIM_SOFT_GIB=70` and
+`SGLANG_GGUF_STREAM_TRIM_TARGET_GIB=60` (down from 88/78) before the boot —
+that is what made attempt 2 survive — and do the downloads in a different
+window.
+
+**7. Sample a transient at 100 ms, not at 1 Hz.** The window-3 corridor trace
+was a shell loop with `sleep 1`; the transient it was chasing is sub-second and
+recurs once per prefill chunk, so the trace caught it only occasionally and at
+random points on its rise and fall. Its 602 MiB excursion is a LOWER bound on
+the peak, and the apparent growth of the dip over the first 700 s is
+extreme-value statistics of undersampling rather than a real ramp. Use
+`scripts/dev/493_indexer_transient/sample_corridor.sh` (`nvidia-smi -lms`, no
+per-sample process start) for the shape, and `SGLANG_FORWARD_PEAK_PATH`'s
+per-forward `nvml_free_bytes_min` for the number.
+
 ### 4.5.5 The GGUF page cache is released behind the stream (#391)
 
 `gguf.GGUFReader` maps each part with `np.memmap` and hands out views into it,
