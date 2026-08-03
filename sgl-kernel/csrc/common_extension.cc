@@ -463,6 +463,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("ggml_mmvq_kq_tuned() -> int");
   m.impl("ggml_mmvq_kq_tuned", torch::kCUDA, &ggml_mmvq_kq_tuned);
 
+  // Task #398: capability probe for the native GGUF MXFP4 (ggml type 39)
+  // kernel set. Old wheels lack this op entirely, so the python dispatch
+  // keeps MXFP4 out of the GGUF type sets on them and the load-time
+  // MXFP4 -> Q5_0 repack stays the only executable route.
+  m.def("ggml_mxfp4_native() -> int");
+  m.impl("ggml_mxfp4_native", torch::kCUDA, &ggml_mxfp4_native);
+
   /*
    * From csrc/mamba
    */

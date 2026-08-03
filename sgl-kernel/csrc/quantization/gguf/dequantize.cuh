@@ -445,6 +445,39 @@ static __global__ void dequantize_block_iq4_xs(const void* __restrict__ vx, dst_
   }
 }
 
+// MXFP4 (ggml type 39), iq4_nl template above with three differences:
+//   * the nibble->value table is kvalues_mxfp4 (doubled E2M1),
+//   * the scale is an E8M0 byte, converted with the already-halved
+//     ggml_cuda_e8m0_to_fp32_half so the doubling cancels exactly,
+//   * an explicit block-count guard. The iq4_nl launcher rounds k up to a
+//     whole 256-element super-block and the kernel then reads/writes 8 blocks
+//     unconditionally, so any k that is a multiple of the 32-element block but
+//     NOT of 256 runs off both ends -- the #109 out-of-bounds family, one
+//     level down. Today's callers are safe by accident, not by contract:
+//     GGUFConfig coarsens uneven-TP shards to 256 (weight_block_size), which
+//     is stricter than the 32 the format needs. The guard makes the kernel
+//     correct for the 32-multiple contract the block type actually states,
+//     instead of inheriting an assumption from a caller.
+template <typename dst_t>
+static __global__ void dequantize_block_mxfp4(const void* __restrict__ vx, dst_t* __restrict__ yy, const int nblocks) {
+  const auto i = blockIdx.x;
+  const block_mxfp4* x = (const block_mxfp4*)vx + i * (QK_K / QK_MXFP4);
+
+  const auto tid = threadIdx.x;
+  const int il = tid / 8;  // 0...3
+  const int ib = tid % 8;  // 0...7
+  if (i * (QK_K / QK_MXFP4) + ib >= nblocks) {
+    return;
+  }
+  dst_t* y = yy + i * QK_K + 32 * ib + 4 * il;
+  const uint8_t* q4 = x[ib].qs + 4 * il;
+  const float d = ggml_cuda_e8m0_to_fp32_half(x[ib].e);
+  for (int j = 0; j < 4; ++j) {
+    y[j + 0] = d * kvalues_mxfp4[q4[j] & 0xf];
+    y[j + 16] = d * kvalues_mxfp4[q4[j] >> 4];
+  }
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void
 dequantize_block_cuda(const void* __restrict__ vx, dst_t* __restrict__ y, const int k, cudaStream_t stream) {
@@ -531,6 +564,12 @@ static void dequantize_row_iq4_nl_cuda(const void* vx, dst_t* y, const int k, cu
 }
 
 template <typename dst_t>
+static void dequantize_row_mxfp4_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
+  const int nb = (k + QK_K - 1) / QK_K;
+  dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y, k / QK_MXFP4);
+}
+
+template <typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
   const int nb = (k + QK_K - 1) / QK_K;
   dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
@@ -577,6 +616,8 @@ static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
       return dequantize_row_iq4_xs_cuda;
     case 29:
       return dequantize_row_iq1_m_cuda;
+    case 39:  // MXFP4
+      return dequantize_row_mxfp4_cuda;
     default:
       return nullptr;
   }

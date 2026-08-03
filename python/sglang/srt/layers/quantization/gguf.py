@@ -232,6 +232,12 @@ IMATRIX_QUANT_TYPES = {
     WeightType.IQ4_XS,
     WeightType.IQ4_NL,
 }
+#: OCP microscaling FP4 (ggml type 39), native since #398. The kernel set is
+#: complete -- dequantize (``dequantize_row_mxfp4_cuda``), MMVQ
+#: (``vec_dot_mxfp4_q8_1``, dense + MoE) and MMQ (``mul_mat_mxfp4`` /
+#: ``moe_mxfp4``) -- so MXFP4 joins all three sets rather than only DEQUANT.
+#: A wheel built before #398 has none of them: see ``_mxfp4_kernels_present``.
+MXFP4_QUANT_TYPES = {WeightType.MXFP4}
 # TODO(Isotr0py): Currently, we don't have MMQ kernel for I-Matrix quantization.
 # Consolidate DEQUANT_TYPES, MMVQ_QUANT_TYPES and MMQ_QUANT_TYPES after we add
 # MMQ kernel for I-Matrix quantization.
@@ -239,13 +245,47 @@ DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
+
+def _mxfp4_kernels_present() -> bool:
+    """Whether the INSTALLED sgl-kernel wheel carries the #398 MXFP4 kernels.
+
+    The wheel ships prebuilt and is pinned by sha256 (rig-runbook 2.1), so a
+    tree that HAS this source change can still be running an older wheel; the
+    type sets must follow the wheel, not the tree. Detected by EXISTENCE of the
+    ``ggml_mxfp4_native`` op, the #73 pattern: a probe that takes no tensor
+    cannot be routed by the dispatcher (it would raise "no dispatchable
+    fallback"), but its registration alone identifies the build. Older wheels
+    lack the op -> MXFP4 stays out of every set and the load-time MXFP4 ->
+    Q5_0 repack remains the only executable route, unchanged.
+
+    ``SGLANG_GGUF_MXFP4_NATIVE=0`` forces the old behaviour on a new wheel --
+    the A/B lever for the repack-vs-native comparison, and the fallback if the
+    native path ever has to be taken out of a running configuration.
+    """
+    if os.environ.get("SGLANG_GGUF_MXFP4_NATIVE", "1")[:1] == "0":
+        return False
+    try:
+        # Deliberately NOT gated on _is_cuda: the question is what the WHEEL
+        # contains, and a host without a visible device never reaches a GGUF
+        # kernel anyway (the ops are not even imported above). Gating on the
+        # device would make the type sets untestable off-GPU.
+        return hasattr(torch.ops.sgl_kernel, "ggml_mxfp4_native")
+    except Exception:
+        return False
+
+
+MXFP4_NATIVE = _mxfp4_kernels_present()
+if MXFP4_NATIVE:
+    DEQUANT_TYPES = DEQUANT_TYPES | MXFP4_QUANT_TYPES
+    MMVQ_QUANT_TYPES = MMVQ_QUANT_TYPES | MXFP4_QUANT_TYPES
+    MMQ_QUANT_TYPES = MMQ_QUANT_TYPES | MXFP4_QUANT_TYPES
+
 #: ggml types the GGUF MoE expert-offload half (#123) covers.
 #:
 #: ``fused_moe_gguf`` has exactly two real expert kernels -- ``ggml_moe_a8``
 #: (MMQ, prefill) and ``ggml_moe_a8_vec`` (MMVQ, decode) -- plus a per-token
 #: Python fallback loop that is unusable at scale. MMQ is a strict subset of
 #: MMVQ, so MMVQ membership is the coverage test for both. Types outside it
-#: (MXFP4 / type 39 among them, which no GGUF kernel set contains at all)
 #: are NOT covered: the offload would tier bytes that nothing can then read
 #: at expert granularity. The #268 guard refuses those layers -- see
 #: ``gguf_moe_offload_covered_type``.
@@ -931,8 +971,12 @@ def fused_mul_mat_gguf(
 # usable WITHOUT a kernel rebuild, while still preferring the real op whenever it
 # is dispatchable (e.g. a future build that registers a CatchAll impl).
 # Supported ggml types: Q4_0=2 Q4_1=3 Q5_0=6 Q5_1=7 Q8_0=8 Q2_K=10 Q3_K=11
-# Q4_K=12 Q5_K=13 Q6_K=14.
-_GGML_MOE_MMQ_TYPES = frozenset({2, 3, 6, 7, 8, 10, 11, 12, 13, 14})
+# Q4_K=12 Q5_K=13 Q6_K=14, and MXFP4=39 on a #398 wheel (MOE_X_MXFP4, same 4/8
+# tile width as the rest -- it is only in the set when the wheel has the
+# kernel, otherwise the mirror would promise a tile the build cannot serve).
+_GGML_MOE_MMQ_TYPES = frozenset(
+    {2, 3, 6, 7, 8, 10, 11, 12, 13, 14} | ({39} if MXFP4_NATIVE else set())
+)
 
 
 def _ggml_moe_get_block_size(qtype: int) -> int:

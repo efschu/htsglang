@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lossless load-time repack of GGUF MXFP4 (ggml type 39) to Q5_0 (type 6).
 
+SUPERSEDED BY #398 on a wheel that carries the native MXFP4 kernels: this
+module then reports an empty type map and every entry point is the identity
+(:func:`native_mxfp4_kernels`). It stays in the tree because the wheel is
+pinned separately from the source (rig-runbook 2.1) and because
+``SGLANG_GGUF_MXFP4_NATIVE=0`` is the A/B lever against the native path -- both
+cases need a working repack. Everything below describes that fallback.
+
 #391 blocker 1. The published DeepSeek V4 Flash GGUF stores 45 of its expert
 tensors -- every routed ``down`` projection plus layer 26's ``gate``/``up`` --
 as MXFP4, 47.8 GiB of the 119.4 GiB file. MXFP4 is in none of the GGUF type
@@ -79,10 +86,32 @@ def repack_enabled() -> bool:
     return bool(envs.SGLANG_GGUF_MXFP4_REPACK.get())
 
 
+def native_mxfp4_kernels() -> bool:
+    """Whether the installed wheel executes MXFP4 directly (#398).
+
+    When it does, this whole module is a no-op: MXFP4 is in DEQUANT_TYPES /
+    MMVQ_QUANT_TYPES / MMQ_QUANT_TYPES, the tensors are executable as they lie
+    on disk, and repacking them would spend 22/17 of the bytes for nothing.
+    Single source of truth is the quantization layer's probe, so the two
+    cannot drift; ``SGLANG_GGUF_MXFP4_NATIVE=0`` disables it there and hands
+    the checkpoint back to the repack (the A/B lever).
+    """
+    try:
+        from sglang.srt.layers.quantization.gguf import MXFP4_NATIVE
+
+        return bool(MXFP4_NATIVE)
+    except Exception:
+        # No CUDA GGUF kernels at all (CPU/NPU import, missing wheel): the
+        # repack is the only route, keep it.
+        return False
+
+
 def _type_map() -> Dict[Any, Any]:
     """``{source ggml type: target ggml type}`` this module can repack."""
     import gguf
 
+    if native_mxfp4_kernels():
+        return {}
     return {gguf.GGMLQuantizationType.MXFP4: gguf.GGMLQuantizationType.Q5_0}
 
 
@@ -95,7 +124,7 @@ def repack_source_types() -> set:
     return set(_type_map())
 
 
-def _refuse(tensor_name: str, type_name: str) -> "RuntimeError":
+def _refuse(tensor_name: str, type_name: str) -> RuntimeError:
     return RuntimeError(
         f"GGUF tensor {tensor_name!r} is {type_name}, which no GGUF kernel in "
         f"this build dispatches on, and {_ENV_VAR}=0 disabled the lossless "
@@ -218,6 +247,28 @@ def log_gguf_repack_plan(tensors: Iterable[Any]) -> None:
     which lands in host RAM and (for the resident share) in VRAM. Nobody should
     have to derive that from a type table.
     """
+    if native_mxfp4_kernels():
+        import gguf
+
+        native = [
+            t for t in tensors if t.tensor_type == gguf.GGMLQuantizationType.MXFP4
+        ]
+        if native:
+            nbytes = sum(int(t.n_bytes) for t in native)
+            logger.info(
+                "GGUF MXFP4: %d tensor(s), %.2f GiB, run NATIVELY (#398 ggml "
+                "type 39 kernels present) -- no load-time repack, saving the "
+                "%.2f GiB the Q5_0 repack would have added. Set "
+                "SGLANG_GGUF_MXFP4_NATIVE=0 to fall back to the repack.",
+                len(native),
+                nbytes / float(1 << 30),
+                nbytes
+                * (_Q5_0_TYPE_SIZE - _MXFP4_TYPE_SIZE)
+                / _MXFP4_TYPE_SIZE
+                / float(1 << 30),
+            )
+        return
+
     counts: Dict[Any, Tuple[int, int]] = {}
     for tensor in tensors:
         target = _type_map().get(tensor.tensor_type)

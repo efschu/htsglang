@@ -67,3 +67,14 @@ def ggml_moe_a8_vec(
 
 def ggml_moe_get_block_size(type: int) -> int:
     return torch.ops.sgl_kernel.ggml_moe_get_block_size.default(type)
+
+
+def ggml_mxfp4_native() -> int:
+    """1 on a build carrying the native MXFP4 (ggml type 39) kernel set (#398).
+
+    Registered for the CUDA dispatch key only and takes no tensor, so the
+    dispatcher cannot route the call -- probe by op EXISTENCE
+    (``hasattr(torch.ops.sgl_kernel, "ggml_mxfp4_native")``) rather than by
+    calling this wrapper.
+    """
+    return torch.ops.sgl_kernel.ggml_mxfp4_native.default()

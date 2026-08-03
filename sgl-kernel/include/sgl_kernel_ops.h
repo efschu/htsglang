@@ -790,6 +790,13 @@ int64_t ggml_moe_get_block_size(int64_t type);
 // is actually active (old wheels lack this op entirely -> old thresholds).
 int64_t ggml_mmvq_kq_tuned();
 
+// Task #398: returns 1 on a build that carries the native GGUF MXFP4 (ggml
+// type 39) kernels -- dequantize_row_mxfp4_cuda, vec_dot_mxfp4_q8_1 (dense
+// MMVQ + MoE MMVQ) and mul_mat_mxfp4 / moe_mxfp4 (MMQ). Older wheels lack the
+// op entirely, which is how the python side decides whether MXFP4 may enter
+// DEQUANT_TYPES / MMVQ_QUANT_TYPES / MMQ_QUANT_TYPES.
+int64_t ggml_mxfp4_native();
+
 /*
  * From csrc/spatial
  */

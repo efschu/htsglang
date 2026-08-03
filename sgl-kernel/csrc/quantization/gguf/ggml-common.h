@@ -191,6 +191,25 @@ typedef struct {
   uint8_t qs[QK_K / 2];
 } block_iq4_xs;
 
+// MXFP4 (ggml type 39, OCP microscaling FP4). Layout reference:
+// llama.cpp/ggml ggml/src/ggml-common.h `block_mxfp4` (MIT); reimplemented
+// here in this file's idiom. 32 values in 17 bytes:
+//   byte 0      -- E8M0 biased exponent
+//   bytes 1..16 -- 16 nibble PAIRS of E2M1 codes, split-half order: the LOW
+//                  nibble of byte j is element j, the HIGH nibble is element
+//                  j + 16 (same order as iq4_nl / q4_0).
+// The struct is byte-aligned and 17 bytes wide, so it is NOT 2- or 4-byte
+// aligned inside an array -- every multi-byte read of `qs` must go through the
+// byte-granular `get_int_b1` (vecdotq.cuh), never `get_int_from_uint8`.
+#define QK_MXFP4 32
+#define QR_MXFP4 2
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+typedef struct {
+  uint8_t e;  // E8M0 scale exponent
+  uint8_t qs[QK_MXFP4 / 2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == 17, "wrong mxfp4 block size/padding");
+
 static const __device__ uint64_t iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08, 0x0808080808082b2b,
     0x0808080808190819, 0x0808080808191908, 0x08080808082b0808, 0x08080808082b082b, 0x08080808082b2b08,
@@ -926,6 +945,27 @@ static const __device__ uint64_t ksigns64[128] = {
 static const __device__ uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 static const __device__ int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// E2M1 lattice DOUBLED so it fits in int8 (0.5 -> 1, 0.75 is not on the
+// lattice, 6.0 -> 12). The factor 2 is paid back by halving the block scale:
+// ggml_cuda_e8m0_to_fp32_half() returns 2^(e-128) rather than 2^(e-127), so
+// `kvalues_mxfp4[code] * scale_half` is the exact element value and the
+// integer dp4a path needs no extra multiply. Layout/values reference:
+// llama.cpp/ggml `kvalues_fp4` (MIT).
+static const __device__ int8_t kvalues_mxfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// 2^(x - 128) for an E8M0 byte, i.e. the OCP scale 2^(x-127) already halved
+// for the doubled kvalues_mxfp4 lattice above. x < 2 lands in the fp32
+// subnormal range (2^-128, 2^-127) and is built by shifting the subnormal
+// pattern instead of writing the exponent field. Bit-identical to the
+// reference host decoder (gguf.quants.MXFP4.e8m0_to_fp32_half / ggml's
+// ggml_e8m0_to_fp32_half), so dequant results compare EXACTLY, not within a
+// tolerance. Deliberately not __nv_cvt_e8m0_to_bf16raw: that needs CUDA >=
+// 12.8 and would make the numerics CUDA-version dependent.
+static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32_half(const uint8_t x) {
+  const uint32_t bits = x < 2 ? (uint32_t(0x00200000) << x) : (uint32_t(x - 1) << 23);
+  return __int_as_float((int)bits);
+}
 
 typedef half dfloat;  // dequantize float
 typedef half2 dfloat2;

@@ -228,6 +228,38 @@ There is no local CUDA 13 system toolkit — `/usr/local/cuda` is 12.9. `nvcc`
 to build against; point `CMAKE_CUDA_COMPILER`, `CUDAToolkit_ROOT` and
 `CUDA_HOME` at it.
 
+### MXFP4 rebuild (#398) — BUILT, NOT INSTALLED
+
+The native GGUF MXFP4 kernels (§4.5.3) need a wheel rebuild. One exists; it is
+deliberately **not installed**, because at build time another session's pytest
+still mapped `sgl_kernel` and this section's own rule is to swap the files only
+while the venv is quiet.
+
+| item | value |
+| --- | --- |
+| wheel | `/spinning/wt-398-wheel/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl` |
+| sha256 | `67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664` |
+| size | 16 638 372 B |
+| source | `sgl-kernel/` at `feat/gguf-mxfp4-kernels-398` (`46f375ab51`), i.e. `integration/r3-probe-next2` + the #398 kernels |
+| build script | `/spinning/wt-398-build.sh` (logs `/spinning/wt-398-build{,2}.log`) |
+| knobs | identical to #436: cu13 nvcc, `SGL_KERNEL_LIMIT_CUDA_ARCHS=86;120`, `SKIP_SM90_VARIANT=ON`, `ENABLE_FA3=OFF`, `COMPILE_THREADS=1`, `MAX_JOBS=4` |
+| ccache | `/spinning/wt-398-ccache`, created empty |
+| drop-in | same 39-file set, same `sglang-kernel` dist name and version as the pinned wheel — so the #384 two-dist situation is unchanged: the fork dist stays the winner and `sgl-kernel` 0.3.21 must stay uninstalled |
+| new op | `ggml_mxfp4_native` — `strings` finds the mangled symbol, the schema `ggml_mxfp4_native() -> int` and the name in `sm100/common_ops.abi3.so`, 3 occurrences, same count as the `ggml_mmvq_kq_tuned` control (the `.so` is stripped, so `nm` shows nothing — use `strings`) |
+| CUDA major | `objdump -p` shows `libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`; no `.so.12` |
+
+To install, follow "Making it durable" above verbatim (check `/proc/*/maps`
+first), then verify all three: version 0.4.4, `int8_scaled_mm` present, and
+
+```bash
+$V/bin/python -c "import torch,sgl_kernel; \
+  print(hasattr(torch.ops.sgl_kernel,'ggml_mxfp4_native'))"   # expect True
+```
+
+Until it is installed, the tree behaves exactly as before #398: the probe
+answers False, MXFP4 stays out of the GGUF type sets, and the Q5_0 repack
+carries the type. Numerical gates: `docs/dev/TICKET_398_mxfp4_validation.md`.
+
 **Evidence.** The falsifier is
 `scripts/dev/436_kv_transfer_repro/kv_transfer_repro.py` (its `--mode abi` arm
 needs no GPU and prints `ABI_SPLIT` / `ABI_CONSISTENT`). Same script, same
@@ -942,12 +974,38 @@ Three refusals fire instead of a partial load, all naming the offending file:
   mixed in one directory);
 - the parts hold fewer tensors than their `split.tensors.count` declares.
 
-### 4.5.3 GGUF MXFP4 tensors are repacked to Q5_0 at load time
+### 4.5.3 GGUF MXFP4 tensors run natively (#398); the Q5_0 repack is the fallback
 
 Some exports store part of the model as MXFP4 (ggml type 39) — the unsloth
 DeepSeek V4 Flash `UD-*` builds keep the routed `down` projections, and on one
-layer `gate`/`up` too, in the model's native fp4. No GGUF kernel in this build
-dispatches on type 39: there is no dequantize case, no MMVQ case, no MMQ case.
+layer `gate`/`up` too, in the model's native fp4.
+
+**Since #398 the GGUF kernels dispatch on type 39 directly** (dequantize,
+MMVQ, MMQ, and both MoE variants), so those tensors are read as they lie on
+disk at 4.25 bpw. One log line states it:
+
+```
+GGUF MXFP4: 2 tensor(s), 2.12 GiB, run NATIVELY (#398 ggml type 39 kernels
+present) -- no load-time repack, saving the 0.62 GiB the Q5_0 repack would
+have added. Set SGLANG_GGUF_MXFP4_NATIVE=0 to fall back to the repack.
+```
+
+This is a property of the **wheel**, not of the source tree: sgl-kernel is
+pinned separately (§2.1), and a wheel built before #398 has none of the
+kernels. The runtime probe is the `ggml_mxfp4_native` marker op —
+
+```bash
+$V/bin/python -c "import torch,sgl_kernel; \
+  print(hasattr(torch.ops.sgl_kernel,'ggml_mxfp4_native'))"
+```
+
+— and `SGLANG_GGUF_MXFP4_NATIVE=0` forces the pre-#398 behaviour on a new
+wheel, which is the A/B lever and the way out if the native path ever has to
+be taken out of a running configuration. Numerical gates and the payoff boots:
+`docs/dev/TICKET_398_mxfp4_validation.md` (GPU-pending).
+
+Everything below describes that fallback, which is still what runs on an old
+wheel or with the switch set.
 
 The loader converts those tensors to Q5_0 while reading the weight stream
 (`model_loader/gguf_mxfp4_repack.py`), because the MXFP4 lattice is a subset of
@@ -980,6 +1038,9 @@ Two things to know before booting such a file:
 `SGLANG_GGUF_MXFP4_REPACK=0` switches the repack off, which restores the
 pre-#391 behaviour: the family adapter's executability gate refuses the file at
 load time, naming MXFP4. That is a debugging switch, not an operating mode.
+On a #398 wheel it is also inert unless `SGLANG_GGUF_MXFP4_NATIVE=0` is set as
+well — the kernels make the type executable on their own, so the gate passes
+before the repack is consulted.
 
 ### 4.5.4 DeepSeek V4 Flash GGUF, TP=3 uneven (#391/#402)
 
