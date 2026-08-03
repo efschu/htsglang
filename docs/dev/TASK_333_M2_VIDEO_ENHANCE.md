@@ -1354,6 +1354,8 @@ Three things worth reading off this rather than the headline:
     **period 47.08 ms, 21.24 src-fps, binding stage encode.** Still short of 25,
     so the fused tail is necessary and not sufficient — the ffmpeg encode
     round-trip is the wall behind it, and that is the NVENC arm, not this one.
+    §17.7 builds that fusion and re-derives this line properly: setting a term
+    to zero is not what fusing does to a stage table.
 
 Stage-level replication — letting one stage's frames be split across two cards
 in proportion to their rates — is **not built**. It would turn the placement
@@ -1372,3 +1374,231 @@ frame and is the term that binds once resize is fused.
   is halved arithmetic.
 * The 3080 resize row, without which the Regime-A comparison stays a bound.
 * `color_to_rgb` / `color_to_yuv` at 1080p and 2160p.
+* The fused stage's own ms/frame on both arches (§17.7). Every re-priced
+  figure in §17.7 is ESTIMATE until that row lands.
+
+### 17.7 The fused tail resize (#457 build half)
+
+§17.5 named `sr + resize` on the 5090 as the binding pair — 25.424 + 24.367 =
+49.791 ms — and pointed at `FUSED_TAIL_RESIZE_NOTE`. This section builds it.
+Everything numeric below that describes the *chain* is ESTIMATE; everything
+numeric that describes the *artifact* was executed on 2026-08-03 at a desk,
+CPU only, and is quoted with the command that produced it.
+
+#### 17.7.1 Two routes, and why one of them is free
+
+**Route (a), built — the downscale goes into the ONNX graph** before TensorRT
+sees it, so one engine emits 4K. The engine's output drops from 189.84 MiB to
+47.46 MiB per frame and the 8K intermediate is never materialised.
+
+**Route (b), not built — a CUDA op on the engine's output inside the same
+stage.** The briefing for this work described it as the safe fallback that
+"saves the stage-boundary crossing but not the intermediate". The first half of
+that is true and the second half is what makes it worthless *here*: the
+pricer charges a stage boundary only when it crosses a **card**, and §17.4's
+co-residency constraint already forces `sr` and `resize` onto one card. Route
+(b)'s saving is therefore **exactly 0.000 ms by the pricer's own model** —
+`price_placement` skips the boundary with `if from_card == to_card: continue`.
+Whatever route (b) could win would have to come from a faster resize *kernel*,
+which is a different piece of work and is named as one at the end of this
+section. Route (b) survives in the tree as `fused_tail.apply_tail_torch`,
+which exists to give the registered test a reference twin and to be the
+fallback if the fused engine ever fails to build on an arch.
+
+The obstacle route (a) was expected to have: **Lanczos-3 is not an ONNX
+operator.** The expected workaround was `Resize` with `antialias=1` and a
+quality gate to justify the substituted filter. That is not needed, and the
+reason is arithmetic rather than luck.
+
+For a resample ratio `p/q` in lowest terms the source window advances by `q/p`
+per output pixel, so the fractional part of the window centre — and with it
+the whole tap vector — repeats with period `p`. At `p == 1`, i.e. any exact
+integer decimation, **every output pixel shares one tap vector**, and the
+resample is by definition a stride-`q` convolution. Substituting `ratio = 0.5`
+into `resize._taps`:
+
+```
+support_scale = 1 / 0.5             = 2
+support       = a * 2               = 6      (a = 3)
+n_taps        = ceil(6) * 2         = 12
+center(i)     = (i + 0.5) / 0.5 - 0.5 = 2i + 0.5
+start(i)      = floor(center - support + 0.5) = 2i - 5
+src - center  = t - 5.5                      <- no i
+```
+
+The index clamping `_taps` does at the borders is edge replication, which is a
+`Pad(mode="edge")` of 5 before and 6 after. So the fused tail is
+
+```
+Pad(edge, W: 5/6) -> Conv(3 groups, 1x12, stride 1x2)
+Pad(edge, H: 5/6) -> Conv(3 groups, 12x1, stride 2x1)
+```
+
+four opset-16 nodes, +1103 bytes of artifact, **no opset bump**, and it
+computes the reference filter rather than a stand-in. Separable rather than
+one 12x12 kernel: 24 multiply-adds per output pixel instead of 144.
+
+The restriction is enforced, not assumed. `600 -> 200` (1/3) collapses;
+`600 -> 400` (2/3) does not, and its rows differ by up to 0.23 — asserted in
+`test_fused_tail.HalvingTapsTest`. Only 2:1 is built: it is the ratio the
+chain asks for and the only one leaving an x4 model with an integer net scale.
+
+#### 17.7.2 The gate, executed
+
+Candidate: the fused ONNX. Reference: the pinned fp32 ONNX followed by
+`resize.lanczos3_resize` — the *existing two-stage path*, not a
+re-derivation of it, because the claim under test is that one engine produces
+what two stages produced. Both on onnxruntime's CPU provider, inputs sampled
+on the CPU with a fixed seed, thresholds the standing 40 dB / 0.995.
+
+```
+PYTHONPATH=python:/tmp/onnxtools python scripts/video_enhance/export_sr_fused_tail.py \
+    --arm {lanczos3,nearest,bicubic_antialias} --grade [--expect-fail]
+```
+
+| arm | nodes | opset | PSNR dB | SSIM | max abs err | verdict |
+|---|---:|---:|---|---|---:|---|
+| **lanczos3** (built) | 4 | 16 | **145.24 – 145.49** | 1.000000 | 3.6e-07 | pass 4/4 |
+| nearest (can-fail) | 4 | 16 | 17.18 – 17.61 | 0.7338 – 0.7545 | 1.06 | **reject 4/4** |
+| bicubic_antialias | 1 | **18** | 40.01 – 40.32 | 0.9980 | 5.7e-02 | pass 4/4 |
+
+Read three things off this table.
+
+1.  **The production arm is a filter identity.** 145 dB and a max absolute
+    error of 3.6e-07 is float rounding order, not a filter difference. For
+    comparison the fp16 engine clears the same bar at 48.1 dB.
+2.  **The gate can fail.** The `nearest` arm is a legitimate resize and a
+    wrong one, and the gate rejects it in every sample. `--expect-fail`
+    inverts the exit status so that rejection is *executed* rather than
+    asserted.
+3.  **The loser's price is a number.** `bicubic_antialias` — the route this
+    would have had to take if the tap collapse had not existed — scrapes over
+    the 40 dB threshold with **0.01 dB of margin** on the worst sample, and
+    its 5.7e-02 max error is comparable to the entire fp16 conversion's error
+    budget (ticket V measured 0.064). It also needs the graph's opset raised
+    from 16 to 18, because `antialias` first exists in `Resize-18`. It would
+    have been shippable only behind a real content quality gate. It is kept
+    buildable so this comparison stays reproducible, and `derived_fused_tail_model`
+    refuses to serve any arm but `lanczos3` by name.
+
+Provenance is the existing pattern: the source stays the sha256-pinned
+styler00dollar artifact, the fused file is derived with a sidecar naming the
+source hash, and the loader verifies the chain rather than the filename. The
+chain composes with the fp16 derivation — pinned (4 864 534 B, opset 16) →
+fused (4 865 637 B, opset 16) → fused fp16 (2 438 895 B, 103 tensors
+converted) — and each step was loaded once on the CPU provider before its
+sidecar was written.
+
+#### 17.7.3 What the fusion does to the stage table
+
+Fusing is **not** "set the resize term to zero", which is what §17.5's
+sensitivity line did. Three things move together and `stage_pipeline.fuse_stages`
+moves all three:
+
+1.  **Cost.** One cell per card. `absorbed_tail_rates` keeps the producer's
+    measured value and replaces the absorbed stage's with `tail_ms`, because
+    the absorbed stage stops being a separate pass over device memory. Every
+    resulting cell is ESTIMATE — the fused stage has never been timed.
+2.  **Geometry.** The fused stage hands on 47.46 MiB, not 189.84 MiB.
+3.  **Constraints.** The co-residency requirement between the two is
+    discharged: the intermediate it protected no longer exists. A requirement
+    between a fused member and an outside stage survives and is re-pointed.
+
+Two structural consequences follow from (2) and (3), and neither is visible if
+only the cost is changed:
+
+* **Every refusal in the sweep disappears.** The unfused table produces
+  refusals of two kinds (`co-residency violated`, `unpriceable` 8K crossings);
+  the fused table produces **none**, and no payload above 94.92 MiB crosses a
+  card in the best placement. The x4 card stops being disqualified by the 8K
+  taboo, because there is no 8K frame.
+* **The absent 3080 resize row stops being a question.** It is what made the
+  Regime-A comparison a bound (8.67 strict / 18.299 loose). After the fusion
+  there is no separate resize pass on a 3080 to have measured, so
+  `replicated_throughput` returns the same figure under both readings with an
+  empty gap list — at the honest price that the fused cell is itself an
+  estimate.
+
+#### 17.7.4 Re-derived verdict, ESTIMATE
+
+Table: ticket V, `sr`+`resize` fused into `sr_fused`, `tail_ms = 0.0` (the
+optimistic end of the band; the fused engine cannot be cheaper than that).
+
+**At RIFE `scale=0.5`:**
+
+```
+5090     decode + sr_fused + rife    4.254 + 25.424 + 11.359 = 41.037 ms
+3080_x8  encode                                                47.080 ms  <- binds
+3080_x4  (idle)                                                 0.000 ms
+
+period = max(41.037, 47.080) = 47.080 ms  ->  21.24 source-fps
+```
+
+was 20.08 (binding 5090/`sr`) — **+5.8 %**, binding stage now `encode`.
+
+**At RIFE `scale=1.0`:**
+
+```
+3080_x8  decode                                       7.140 ms
+5090     sr_fused + rife            25.424 + 20.539 = 45.963 ms
+3080_x4  encode                                      47.080 ms  <- binds
+
+period = max(7.140, 45.963, 47.080) = 47.080 ms  ->  21.24 source-fps
+```
+
+was 15.85 (binding 3080_x8/`rife` at 63.108) — **+34 %**.
+
+**The finding worth reading off this is the s1.0 row, not the s0.5 one.**
+Freeing 24.4 ms on the 5090 lets that card carry RIFE at *full* flow
+resolution, which deletes the 63.1 ms RIFE-on-a-3080 bind entirely. The two
+scales converge on the same 47.08 ms period, i.e. **after the fusion the
+`scale=0.5` quality concession buys nothing on this rig** — the lever §16.4
+made the 4K-point default candidate stops being needed. The fusion is worth
+5.8 % at the cheap RIFE point and 34 % at the good one.
+
+Robustness of the verdict to the one unmeasured input:
+
+| fused tail cost on the 5090 | throughput | binding stage |
+|---|---|---|
+| 0.0 ms (optimistic) | 21.24 | encode |
+| 3.0 ms | 21.24 | encode |
+| 21.6 ms | 21.24 | encode |
+| 21.7 ms | 21.24 | **sr_fused** |
+
+So the paper verdict holds for any fused tail up to **21.66 ms**: the fusion
+has to beat the separate resize's 24.367 ms by only 2.7 ms to deliver it, and
+route (a) removes a 190 MiB write plus a 190 MiB read plus a kernel launch.
+The pessimistic column (`prefetch_depth=0`, every transferred byte paid) is
+18.57 src-fps against the optimistic 21.24.
+
+Regime A off the same fused table: **23.550 src-fps**, no gaps, ESTIMATE —
+which *overtakes* the pipeline's 21.24. Before the fusion the pipeline was the
+only regime with a value at all; after it, whole-chain replication is ahead
+and the planner has to be allowed to reach that conclusion.
+
+#### 17.7.5 Verdict: still not-FULL, and the briefing's expectation was wrong
+
+The work order for this build expected the fused chain to "cross 25 src-fps on
+paper". **It does not.** The best figure in any regime is 23.55 (replicated,
+estimate) and the pipeline figure is 21.24, both below 25 and both still
+omitting `color_to_rgb` / `color_to_yuv`. The wall behind the fusion is the
+one ticket V already named: encode at 47.08 ms per source frame, which is the
+**ffmpeg host-round-trip fallback** in use only because direct NVENC fails
+Error 8 on both arches. Setting encode to ~0 on the fused table gives
+31.25 src-fps at s0.5 (binding `rife`) and 21.76 at s1.0 (binding `sr_fused`),
+so fusion **and** the NVENC repair together clear 25 at s0.5 and neither
+clears it alone.
+
+Two further levers this section does not take:
+
+* **A faster resize kernel** — the separate stage costs 24.367 ms to read
+  189.84 MiB and write 47.46 MiB, which is ~10 GB/s of effective bandwidth on
+  a card that has two orders of magnitude more. `_resize_axis` accumulates one
+  tap at a time over an fp32 upcast of the 8K frame, so it makes roughly a
+  dozen passes over 380 MiB. That is worth fixing on its own merits for every
+  ratio the fusion refuses, and it is the thing route (b) would actually have
+  bought.
+* **Stage-level replication** (§17.5's closing paragraph) is still not built,
+  and after the fusion it is the obvious next lever for exactly the stage that
+  now binds: encode runs twice per source frame and could be split across two
+  cards.

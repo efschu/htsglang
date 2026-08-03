@@ -75,10 +75,12 @@ __all__ = [
     "StageBoundary",
     "TransferKind",
     "TransferPrice",
+    "absorbed_tail_rates",
     "best_placement",
     "enumerate_placements",
     "barlink_link",
     "compare_regimes",
+    "fuse_stages",
     "host_bounce_links",
     "price_placement",
     "replicated_throughput",
@@ -750,3 +752,149 @@ def stage_table(
 #: absolute fps figure is read as the chain-stage figure it is. Same two colour
 #: conversions ``chain_policy.PRICED_STAGES`` omits, for the same reason.
 UNPRICED_CHAIN_STAGES: tuple[str, ...] = ("color_to_rgb", "color_to_yuv")
+
+
+# --------------------------------------------------------------------------
+# Fusion (#457)
+# --------------------------------------------------------------------------
+
+
+def _consecutive_slice(stages: Sequence[PipelineStage], members: Sequence[str]) -> int:
+    names = [s.name for s in stages]
+    if len(members) < 2:
+        raise PipelineError("fusing needs at least two stages")
+    for member in members:
+        if member not in names:
+            raise PipelineError(
+                f"cannot fuse unknown stage {member!r}; table has {names}"
+            )
+    first = names.index(members[0])
+    if names[first : first + len(members)] != list(members):
+        raise PipelineError(
+            f"stages {list(members)} are not consecutive in {names}; fusing "
+            "non-adjacent stages would change the order frames pass through"
+        )
+    return first
+
+
+def absorbed_tail_rates(
+    stages: Sequence[PipelineStage],
+    members: Sequence[str],
+    *,
+    tail_ms: float = 0.0,
+    source: str,
+) -> dict[str, Rate]:
+    """Per-card cost of a fusion in which the LAST member is absorbed.
+
+    That is what fusing the tail resize into the SR engine does: the resize
+    stops being a separate pass over device memory and becomes part of the
+    producer's last layer, so its own cost is replaced by ``tail_ms`` rather
+    than added to the producer's. Everything ahead of it in the fused run is
+    kept at its measured value.
+
+    Every cell is an **estimate**, and deliberately so: the fused stage has
+    never been timed. ``tail_ms=0.0`` is the optimistic end of the band and
+    the fused engine cannot be cheaper than that, so a verdict computed from
+    it is an upper bound on the fusion's benefit.
+
+    A card whose *absorbed* stage cell was absent becomes priceable, which is
+    not a trick: after the fusion there is no separate resize pass on that
+    card to have measured. A card whose *kept* cell is absent stays absent.
+    """
+    _consecutive_slice(stages, members)
+    kept = list(members[:-1])
+    by_name = {s.name: s for s in stages}
+    cards = sorted({card for name in kept for card in by_name[name].ms})
+    out: dict[str, Rate] = {}
+    for card in cards:
+        total = 0.0
+        missing: str | None = None
+        for name in kept:
+            rate = by_name[name].rate_on(card)
+            if rate.is_absent:
+                missing = rate.source
+                break
+            total += float(rate.value)
+        if missing is not None:
+            out[card] = Rate.absent(missing, unit="ms", label=f"fused@{card}")
+            continue
+        out[card] = Rate.estimate(
+            total + tail_ms,
+            f"{' + '.join(kept)} at {source}, with {members[-1]} absorbed into "
+            f"the producer at {tail_ms:.3f} ms; the fused stage has not been "
+            "timed",
+            unit="ms",
+            label=f"fused@{card}",
+        )
+    return out
+
+
+def fuse_stages(
+    stages: Sequence[PipelineStage],
+    members: Sequence[str],
+    *,
+    name: str,
+    ms: Mapping[str, Rate],
+) -> tuple[PipelineStage, ...]:
+    """Collapse consecutive stages into one, and repair the table around them.
+
+    Fusion is not "set one stage's cost to zero". Three things move together,
+    and a re-priced verdict that changes only the first is wrong:
+
+    1.  **Cost.** One cell per card instead of several.
+    2.  **Geometry.** The fused stage hands on what its *last* member handed
+        on. For the SR pair that is the difference between emitting a
+        189.84 MiB 8K frame and a 47.46 MiB 4K one -- which is the whole point
+        of the fusion and also what decides whether the next boundary is
+        legal.
+    3.  **Constraints.** A co-residency requirement between two fused members
+        is discharged: the intermediate they were kept together for no longer
+        exists. A requirement between a member and an outside stage survives
+        and is re-pointed at the fused name.
+    """
+    first = _consecutive_slice(stages, members)
+    absorbed = set(members)
+    tail = stages[first + len(members) - 1]
+    fused = PipelineStage(
+        name=name,
+        ms=dict(ms),
+        out_resolution=tail.out_resolution,
+        out_format=tail.out_format,
+        out_frames=tail.out_frames,
+        co_resident_with=tuple(
+            sorted(
+                {
+                    partner
+                    for member in members
+                    for partner in next(
+                        s for s in stages if s.name == member
+                    ).co_resident_with
+                    if partner not in absorbed
+                }
+            )
+        ),
+    )
+    out: list[PipelineStage] = []
+    for index, stage in enumerate(stages):
+        if index == first:
+            out.append(fused)
+            continue
+        if stage.name in absorbed:
+            continue
+        partners = tuple(
+            name if partner in absorbed else partner
+            for partner in stage.co_resident_with
+        )
+        out.append(
+            stage
+            if partners == stage.co_resident_with
+            else PipelineStage(
+                name=stage.name,
+                ms=stage.ms,
+                out_resolution=stage.out_resolution,
+                out_format=stage.out_format,
+                out_frames=stage.out_frames,
+                co_resident_with=tuple(dict.fromkeys(partners)),
+            )
+        )
+    return tuple(out)

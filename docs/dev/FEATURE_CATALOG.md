@@ -642,6 +642,37 @@ for 1080p@25 -> 2160p@50 on ticket V's numbers is in
 `TASK_333_M2_VIDEO_ENHANCE.md` §17.5 and pinned by a test. Stage-level
 replication (splitting one stage's frames across cards) is not built.
 
+Class-3 video enhance, fused SR tail resize (#457 build half,
+`video_enhance/fused_tail.py`): the 8K->4K Lanczos-3 downscale is appended to
+the pinned SR graph before the TensorRT build, so one engine emits 4K directly
+and the 189.84 MiB 8K intermediate is never materialised (engine output drops
+to 47.46 MiB/frame). Lanczos-3 is not an ONNX op and no substitute filter was
+needed: for a resample ratio p/q in lowest terms the tap vector repeats with
+period p, so at p=1 -- any exact integer decimation -- every output pixel
+shares one vector and the resample **is** a stride-2 depthwise convolution
+with edge padding. Four opset-16 nodes (Pad+Conv per axis, separable), no
+opset bump, and the graph computes the reference filter rather than an
+approximation: graded on the CPU provider against the existing
+SR-fp32-then-`lanczos3_resize` path at **145 dB / max abs 3.6e-07**, with a
+deliberately-wrong `nearest` arm **rejected at 17 dB** so the gate is shown to
+be able to fail. The `bicubic_antialias` route that was NOT taken stays
+buildable for comparison and is the loser's price in a number: 40.01 dB
+against a 40 dB threshold, and it needs opset 18. Any non-halving geometry is
+refused by name and keeps the separate stage; `apply_tail_torch` is the torch
+twin (registered-test reference and per-arch fallback). Artifact provenance is
+the existing derived-sidecar chain -- pinned -> fused -> fused fp16, each step
+CPU-loaded before its sidecar is written -- and `derived_fused_tail_model`
+returns the **net** scale (x2), so a stage built from it needs no knowledge
+that a fusion happened. `stage_pipeline.fuse_stages` /`absorbed_tail_rates`
+carry the consequence into the pricer as three coupled changes (cost,
+handed-on geometry, discharged co-residency), which removes every refusal from
+the placement sweep and turns the Regime-A comparison from a bound into a
+value. Re-priced verdict and the honest negative result (21.24 pipeline /
+23.55 replicated src-fps, both ESTIMATE, both short of 25 -- the ffmpeg encode
+round trip is the wall behind it) in `TASK_333_M2_VIDEO_ENHANCE.md` §17.7,
+pinned by `test_stage_pipeline.FusedVerdictTest`. The fused stage's ms/frame
+is BOOT-PENDING (`TICKET_460_rife_frontier.md` §5).
+
 Class-3 video enhance, streaming-input admission (#448 desk half,
 `video_enhance/streaming.py`): source kinds finished/growing/live with named
 refusals (no growing source on the chunk executor — the split is verified

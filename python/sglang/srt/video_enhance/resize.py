@@ -77,6 +77,73 @@ def _taps(in_size: int, out_size: int, a: int = LANCZOS_A):
     return indices, weights
 
 
+# --------------------------------------------------------------------------
+# The exact-halving special case (#457)
+# --------------------------------------------------------------------------
+#
+# For one ratio -- exactly 2:1 -- the tap table above collapses to a single
+# vector that every output pixel shares, and that is the whole reason the tail
+# resize can be fused into the SR engine as a plain convolution.
+#
+# Substitute ``ratio = 0.5`` into ``_taps``:
+#
+#     support_scale = 1 / 0.5              = 2
+#     support       = a * 2                = 2a
+#     n_taps        = ceil(2a) * 2         = 4a
+#     center(i)     = (i + 0.5) / 0.5 - 0.5 = 2i + 0.5
+#     start(i)      = floor(center - support + 0.5) = 2i + 1 - 2a
+#     src(i, t)     = 2i + 1 - 2a + t
+#     src - center  = t + 0.5 - 2a                    <- no i
+#
+# The weight of tap ``t`` therefore does not depend on the output index at
+# all, only the source *offset* does, and that offset advances by exactly 2
+# per output pixel. That is the definition of a stride-2 convolution with a
+# fixed ``4a``-tap kernel. The index clamping ``_taps`` does at the borders is
+# edge replication, which is a ``Pad(mode="edge")`` of ``2a-1`` before the
+# window and ``2a`` after it.
+#
+# The general condition, measured rather than assumed (see
+# ``test_fused_tail.HalvingTapsTest``): for a ratio ``p/q`` in lowest terms
+# the source position advances by ``q/p`` per output pixel, so the fractional
+# part of the window centre -- and with it the tap vector -- repeats with
+# period ``p``. The taps collapse to one vector exactly when ``p == 1``, i.e.
+# for any exact integer decimation. ``600 -> 200`` (1/3) collapses; ``600 ->
+# 400`` (2/3) does not, and its rows differ by up to 0.23.
+#
+# Only the ``p == 1, q == 2`` case is built. That is the ratio the chain asks
+# for, and it is the only one that leaves an x4 model with an integer net
+# scale. Everything else keeps the separate resize stage and is refused by
+# name rather than approximated.
+
+
+def is_exact_halving(source: Resolution, target: Resolution) -> bool:
+    """True when ``target`` is ``source`` decimated by exactly two on both axes."""
+    return (
+        target.width * 2 == source.width
+        and target.height * 2 == source.height
+        and source.width % 2 == 0
+        and source.height % 2 == 0
+    )
+
+
+def halving_taps(a: int = LANCZOS_A) -> tuple[float, ...]:
+    """The one normalised tap vector an exact 2:1 Lanczos-``a`` decimation uses.
+
+    Equal, term by term, to any row of ``_taps(n, n // 2)``. The test that
+    asserts that equality is what keeps the fused convolution and the torch
+    reference from drifting apart.
+    """
+    n_taps = 4 * a
+    weights = [_lanczos((t + 0.5 - 2 * a) / 2.0, a) for t in range(n_taps)]
+    total = sum(weights)
+    return tuple(w / total for w in weights)
+
+
+def halving_pad(a: int = LANCZOS_A) -> tuple[int, int]:
+    """Edge replication before and after the window, per spatial axis."""
+    return (2 * a - 1, 2 * a)
+
+
 def _tap_tensors(in_size: int, out_size: int, device, dtype):
     import torch
 
