@@ -1507,6 +1507,28 @@ class BarlinkBar1Transport:
         #: the per-collective counter cannot see a replay at all.
         self._captured_launches = False
         self._registered_in_gate = False
+        # #517: the deferred status read. All of it stays None/0 until
+        # bring-up decides (via `barlink_abort_gate.should_defer_status`)
+        # that this transport's status word is a DEVICE word and therefore
+        # worth staging; a host word is read directly, which is both cheaper
+        # and stricter.
+        self._ctl_defer = False
+        self._ctl_src = None          # persistent 1-element view of _ctl_dev
+        self._ctl_stage = None        # pinned host destination of the D2H
+        self._ctl_event = None        # completion of the staged copy
+        self._ctl_inflight = False
+        self._ctl_lag = 0
+        #: Collectives (host-path and captured) that have run since the last
+        #: RESOLVED read of the status word. With a blocking read this always
+        #: equals the current window; with a staged read it accumulates over
+        #: the checks whose value had not arrived yet, so the raise still
+        #: names the true size of the unverified window.
+        self._deferred_launches = 0
+        #: Replay-boundary entries since the last boundary check, so
+        #: ``..._CHECK_EVERY`` reaches Seam B too (#517). The host-path
+        #: counter cannot serve here: at a boundary it is zero by
+        #: construction, which is exactly why the knob used to miss.
+        self._boundary_checks = 0
 
         if enabled is None:
             enabled = os.environ.get("SGLANG_BARLINK_MATRIX_DIRECT", "1") not in (
@@ -2170,6 +2192,8 @@ class BarlinkBar1Transport:
         # never touched by a peer.
         self._round_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
         self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
+        # #517: arm the deferred status read now that the word exists.
+        self._arm_status_stage()
         # Absolute chunk counter of the sliding window. Separate from the
         # round counter, because it grows by K per call and is only
         # advanced by mesh_pipe -- it is the reference against which the
@@ -4345,6 +4369,98 @@ class BarlinkBar1Transport:
             pass
         return 0
 
+    # -- The deferred status read (#517) -------------------------------------
+
+    def _arm_status_stage(self) -> None:
+        """Build the staging buffer for the asynchronous status read.
+
+        Called once, from bring-up, right after ``_ctl_dev`` exists. Whether
+        the deferred path is used at all is
+        ``barlink_abort_gate.should_defer_status`` -- one definition, tested
+        directly -- and it says no for a status word that is not on a device:
+        there is no synchronization to avoid there, and a direct read is both
+        cheaper and stricter.
+
+        The 1-element view is built ONCE and kept. ``self._ctl_dev[0]`` is an
+        aten dispatch, and the pre-#517 read paid it plus ``.item()`` on
+        every single check; the staged path pays one ``copy_`` dispatch and
+        nothing else.
+        """
+        ctl = self._ctl_dev
+        if ctl is None:
+            return
+        if not barlink_abort_gate.should_defer_status(
+            bool(getattr(ctl, "is_cuda", False)),
+            barlink_abort_gate.defer_enabled(),
+        ):
+            return
+        import torch
+
+        try:
+            src = ctl[0:1]
+            stage = torch.zeros(1, dtype=ctl.dtype, pin_memory=True)
+            event = torch.cuda.Event()
+        except Exception as e:  # noqa: BLE001 - degrade to the blocking read
+            logger.warning(
+                "barlink-BAR1 group %s: no staged status read (%s); falling "
+                "back to the blocking read.",
+                self.group,
+                e,
+            )
+            return
+        self._ctl_src = src
+        self._ctl_stage = stage
+        self._ctl_event = event
+        self._ctl_inflight = False
+        self._ctl_lag = 0
+        self._ctl_defer = True
+
+    def _read_status_for_check(self):
+        """The status value for one check, or ``None`` if it is not in yet.
+
+        Blocking mode (``_ctl_defer`` false) is the pre-#517 read verbatim:
+        one D2H plus a stream synchronization, and never ``None``.
+
+        Staged mode issues a non-blocking D2H of the sticky word onto the
+        CURRENT stream -- the same stream the collective or the replayed
+        graph just ran on, so the copy is ordered after it -- and reads the
+        value staged by an EARLIER check. Three properties make that a guard
+        rather than a hope:
+
+        * ``ctlStatus`` is sticky (only ever written ``1u`` by a tripped
+          kernel, only ever zeroed by the ``torch.zeros`` at bring-up), so a
+          value seen late is the same value seen on time;
+        * the report is bounded: after ``max_lag()`` consecutive unresolved
+          checks one ``event.synchronize()`` is forced, which is a wait the
+          blocking mode paid at EVERY check;
+        * the size of the unverified window is accumulated
+          (``_deferred_launches``) rather than reset, so the raise still
+          names how many collectives are implicated.
+        """
+        if not self._ctl_defer:
+            return self.status()
+        value = None
+        if self._ctl_inflight:
+            if self._ctl_event.query():
+                self._ctl_inflight = False
+                value = int(self._ctl_stage[0])
+            else:
+                self._ctl_lag += 1
+                if self._ctl_lag >= barlink_abort_gate.max_lag():
+                    # The bound. An overlap-scheduled host can queue work
+                    # indefinitely; without this the staged word could stay
+                    # in flight for as long as it keeps queueing, and a
+                    # check that never resolves is not a check.
+                    self._ctl_event.synchronize()
+                    self._ctl_inflight = False
+                    value = int(self._ctl_stage[0])
+        if not self._ctl_inflight:
+            self._ctl_stage.copy_(self._ctl_src, non_blocking=True)
+            self._ctl_event.record()
+            self._ctl_inflight = True
+            self._ctl_lag = 0
+        return value
+
     def check_aborted(self, where: str) -> None:
         """The production check: raise if a kernel took its abort path.
 
@@ -4374,10 +4490,24 @@ class BarlinkBar1Transport:
         kernel it is meant to report on. ``_wait_abort`` above records the
         same reasoning for the same read; a thread does not change it.
 
-        COST. One 4-byte D2H plus a stream synchronization, once per
-        ``SGLANG_BARLINK_BAR1_ABORT_CHECK_EVERY`` host-path collectives
-        (default: every one). Free when nothing has been launched since the
-        last check, which is what makes it cheap at a boundary.
+        COST (#517). Free when nothing has been launched since the last
+        check. Otherwise one 4-byte D2H, STAGED: a non-blocking copy onto the
+        current stream plus a ``cudaEventQuery``, reading the value an
+        earlier check staged. No stream synchronization in the steady state.
+        The pre-#517 blocking read -- which the #476 window measured at 6.64
+        pp of code decode_TPS on Seam A and 5.26 pp on Seam B -- is restored
+        exactly by ``SGLANG_BARLINK_BAR1_ABORT_DEFER=0``, and a staged value
+        that does not arrive within ``..._ABORT_MAX_LAG`` checks forces one
+        wait, so the report stays bounded.
+
+        WHY THIS DOES NOT WEAKEN THE GUARD. ``ctlStatus`` is sticky: the
+        kernels only ever write ``1u`` and the only host write is the
+        ``torch.zeros`` at bring-up. A late read of a sticky bit is the same
+        bit. What the deferral changes is the reporting latency, and #476 §3
+        is the case it has to keep catching -- an intermittent abort observed
+        at a replay boundary, which under the overlap scheduler is still many
+        checks before the round's tokens reach the host at
+        ``batch_result_processor.py:217`` (``copy_done.synchronize()``).
         """
         if self._ctl_dev is None:
             return
@@ -4386,8 +4516,19 @@ class BarlinkBar1Transport:
         pending = self._unchecked_launches
         if pending <= 0 and not self._captured_launches:
             return
-        if pending > 0 and pending < barlink_abort_gate.check_every():
-            return
+        every = barlink_abort_gate.check_every()
+        if pending > 0:
+            if pending < every:
+                return
+        else:
+            # Replay-boundary entry. Its own counter, because the host-path
+            # one is zero here by construction -- which is why ..._CHECK_EVERY
+            # could not reach this seam before #517. K = 1 keeps every
+            # boundary checking, i.e. the default is behaviour-identical.
+            self._boundary_checks += 1
+            if self._boundary_checks < every:
+                return
+            self._boundary_checks = 0
         from sglang.srt.distributed.device_communicators.barlink import (
             graph_capture_running,
         )
@@ -4395,20 +4536,35 @@ class BarlinkBar1Transport:
         if graph_capture_running():
             return
         self._unchecked_launches = 0
-        if self.status() != 1:
+        self._deferred_launches += pending
+        status = self._read_status_for_check()
+        if status != 1:
+            if status is not None:
+                # A RESOLVED clean read closes the window it covered; an
+                # unresolved one (None) must not, or the raise would
+                # understate how many collectives are implicated.
+                self._deferred_launches = 0
             return
+        pending = self._deferred_launches
         op = self._last_op or "unknown"
         nbytes = int(self._last_nbytes)
         rounds = self._rounds_for(op, nbytes)
         window = self._abort_window
         reason = window.reason if window is not None and window.tripped else None
+        staged = (
+            " The status word was read from the STAGED copy (#517), so the "
+            "abort may have happened one check earlier than this line; the "
+            "word is sticky, so nothing is lost, only delayed."
+            if self._ctl_defer
+            else ""
+        )
         raise Bar1CollectiveAborted(
             f"barlink-BAR1 rank {self.rank}/{self.world} group "
             f"{self.group or '<unnamed>'}: a spin kernel took its abort path, "
             f"observed at {where}. Last collective launched: {op} "
             f"({nbytes} bytes, {rounds} rounds); {pending} collective(s) ran "
             f"since the previous check, so the abort is in that window and "
-            f"the named one is its most recent member. Cause: either the "
+            f"the named one is its most recent member.{staged} Cause: either the "
             f"kernel exceeded its cycle deadline "
             f"(SGLANG_BARLINK_BAR1_CAP_CYCLES={self.cap_cycles}, effective "
             f"this launch {self._deadline_cycles()}) waiting for a peer's "
@@ -4586,6 +4742,14 @@ class BarlinkBar1Transport:
                     setattr(self, attr, (0, 0, 0))
         self._round_dev = None
         self._ctl_dev = None
+        # #517: the staged read holds a VIEW of `_ctl_dev`, so dropping the
+        # device tensor alone would not free it. The pinned host page and the
+        # event go with it.
+        self._ctl_defer = False
+        self._ctl_src = None
+        self._ctl_stage = None
+        self._ctl_event = None
+        self._ctl_inflight = False
         self._step_dev = None
         self._result_gen_dev = None
 

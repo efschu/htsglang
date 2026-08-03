@@ -50,9 +50,9 @@ GRAPH_CHECK_PY = os.path.join(REPO_ROOT, "benchmark", "bar1_graph_check.py")
 #: The exact source lines the renderers below are pinned to. Kept in one
 #: place so a source move shows up as one changed number, not a hunt through
 #: every render function.
-LINE_BAR1_SETUP = 2212
-LINE_BAR1_LEDGER = 2226
-LINE_BAR1_PIPE_POOL_EXHAUSTED = 3183
+LINE_BAR1_SETUP = 2236
+LINE_BAR1_LEDGER = 2250
+LINE_BAR1_PIPE_POOL_EXHAUSTED = 3207
 LINE_BARLINK_CAPTURE_BOLT = 810
 LINE_PARALLEL_STATE_GROUP_OK = 727
 LINE_PARALLEL_STATE_GROUP_FALLBACK = 735

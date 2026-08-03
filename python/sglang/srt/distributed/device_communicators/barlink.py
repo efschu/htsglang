@@ -881,10 +881,18 @@ class BarlinkCommunicator:
         problem. The check itself no-ops under stream capture -- the read
         would be illegal there -- and the CUDA-graph replay boundary picks
         those kernels up instead (``barlink_abort_gate``).
+
+        LABEL (#517). ``op`` is passed through as-is, never formatted. The
+        old form built ``f"{op} on group {self.group}"`` EAGERLY on every
+        collective -- an f-string plus a ``getattr`` per call on a path that
+        issues ~150 collectives per eager prefill forward and five per NEXTN
+        decode round -- and every byte of it was already in the raised
+        message, which opens with ``rank r/w group <group>``. The interned
+        literal from the call site costs nothing and loses nothing.
         """
         check = getattr(t, "check_aborted", None)
         if check is not None:
-            check(f"{op} on group {getattr(self, 'group', '?') or '<unnamed>'}")
+            check(op)
 
     def _get_out_buf(self, ref: torch.Tensor) -> torch.Tensor:
         """One FRESH output tensor per call — never a shape-keyed cache.

@@ -63,6 +63,11 @@ POINT_S="${S15_POINT_SECONDS:-12}"
 WARMUP_S="${S15_WARMUP_SECONDS:-6}"
 PROMPT_TOKENS="${S15_PROMPT_TOKENS:-2048}"
 DECODE_BATCHES="${S15_DECODE_BATCHES:-1,8}"
+# A-vs-A floor draws per point, back to back inside ONE driver invocation after
+# one discarded warm-up draw (#475 SS6: the floor arms of #435 idled 48-51 s
+# between draws and reported a monotone clock ramp as a 13 % noise floor). 1 =
+# the single point this step always took.
+FLOOR_DRAWS="${S15_FLOOR_DRAWS:-1}"
 
 # The pinned reserve of the bar1_hi recipe (#293's best arm). Kept on every
 # arm including the NCCL ones, so the reserve never becomes a hidden variable.
@@ -181,6 +186,7 @@ set -uo pipefail
   --mode messen --port $PORT --out-dir $DIR_HOST \\
   --point-seconds $POINT_S --warmup-seconds $WARMUP_S \\
   --prompt-tokens $PROMPT_TOKENS --decode-batches $DECODE_BATCHES \\
+  --floor-draws $FLOOR_DRAWS \\
   --arm "\$1" --sessions "\$2" --folge "\$3" --server-log "\$4" \\
   --with-decode "\$5"
 EOF

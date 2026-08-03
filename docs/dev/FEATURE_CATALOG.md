@@ -425,6 +425,18 @@ AST leak guard) and `test_borrowed_calibration_434.py` (a measurement may only
 be applied to hardware it matches). Probe-first bootstrap on unknown hardware
 is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
 
+**#483 is REFUTED: `check_regressions` already prices prefill on the RESOLVED
+rates** (`resolved = model.rates`, `key_solver.py:4777-4780`, landed with #475).
+What was missing was the PIN, not the fix: the only test that calls the function
+is checkpoint-gated (`test_key_solver.py:433`, `skipUnless(_have(_FP8))`) and
+skips in every hermetic run, so a revert was invisible.
+`test_check_regressions_pricing_483.py` is the hermetic falsifier (synthetic fp8
+checkpoint + lane profile; unresolved 3.54:1 vs resolved 9.70:1 rank spread,
+2.85 % vs 10.70 % predicted prefill on the 2,1,1 -> 6,1,1 pair). Note what the
+can-fail arm does NOT move: `gemm_format` / `gemm_lanes` come off `resolved` at
+`:4795-4796` whatever priced the numbers, so the artifact named the right lane
+while the arithmetic ran on the wrong one -- that is what kept the defect alive.
+
 ## 3. Memory tiers / offload / spill
 - **KV-pool token-slot ledger** (`DESIGN_330_vram_dial.md` §3b, #486): every
   standing holder of `C_target` slots is a NAMED posten — committed KV, the
@@ -1080,6 +1092,42 @@ captured decode, at the CUDA-graph replay boundary
 read would be illegal. Knobs:
 `SGLANG_BARLINK_BAR1_ABORT_CHECK=0` (restore the old silence),
 `..._CHECK_EVERY=N`, `..._CHECK_REPLAY=0`.
+**Guard cost, and where it lands** (#476 measured, #517 named). The blocking
+read cost -9.22 % of code decode_TPS against the same-tree NCCL baseline;
+removing both seams gives +2.68 %, reproducing #424's pre-#431 BAR1 advantage.
+Split: replay boundary 5.26 pp, host-path collectives **6.64 pp**. A DECODE
+round is not free of host-path collectives — the model that said so is wrong:
+per NEXTN round there are **3 replay boundaries** (the draft chain is ONE
+captured graph, `eagle_draft_cuda_graph_runner.py:458` +
+`eagle_worker_v2.py:1027-1030`, not one per step) and **5 host-path BAR1
+broadcasts**, all of them the #50 speculative rank-agreement syncs: 3 in
+`eagle_sample` (`eagle_utils.py:1149`, after the target-verify replay,
+`eagle_worker_v2.py:2680`) and 2 in `_draft_extend_for_decode`
+(`eagle_worker_v2.py:1583`, whose own comment says "runs every decode
+iteration, outside any cuda graph"). They reach barlink because a barlink boot
+does not CONSTRUCT pynccl (`parallel_state.py:440`, `:778-781`), so
+`capture_safe_tp_broadcast`'s pynccl branch is dead and `spec_utils.py:138`
+takes `tp_group.broadcast`; a BAR1 broadcast is issued as an `all_to_all`
+(`barlink_bar1.py:3648-3651`), which is what the #476 §3 crash line
+("all_to_all (8 bytes, 0 rounds)") names.
+**Staged abort read** (#517): the status word is read asynchronously — a
+non-blocking D2H onto the current stream plus a `cudaEventQuery`, returning
+the value an earlier check staged — so a check costs no stream
+synchronization. `ctlStatus` is sticky (only `*A.ctlStatus = 1u` in the ext,
+only `torch.zeros` at bring-up), so deferral trades reporting LATENCY, never
+detection, and `SGLANG_BARLINK_BAR1_ABORT_MAX_LAG` (default 4) forces one wait
+after that many unresolved checks — the bound is what keeps it a guard, and it
+has a can-fail proof (a never-ready event passes 200 boundaries over a tripped
+word once the bound is raised out of the way).
+`..._ABORT_DEFER=0` restores the pre-#517 blocking `.item()` exactly. A CPU
+status word never defers (`barlink_abort_gate.should_defer_status`), so no
+hermetic test changes meaning. `..._CHECK_EVERY` now also reaches the replay
+boundary (before #517 a boundary was entered with `_unchecked_launches == 0`,
+below the interval test, so the documented knob throttled Seam A only); K=1,
+the default, is behaviour-identical. **Unmeasured: the benefit.** The saving
+is a count of syncs (8 per decode round to 0 in the steady state), desk-only;
+no arm has run. See `docs/dev/NOTE_517_bar1_guard_desk.md` for the named
+collectives, the corrected round model and the GPU-window ticket.
 
 ## 8. GGUF stack
 Generalized loader (registry + family mapping tables), unsloth-UD, mixed-dtype
@@ -1555,6 +1603,18 @@ and the inherited `resize()` (#330 VRAM dial) legitimately write there and a
 raise would break them -- so the obligation is the caller's. This is the
 SUCCESS-CLAIMS law as a code rule: where a write can be absorbed, read it back.
 
+**An absent measurement is `None`, never `0.0` -- including in the harness
+(#459).** The #359 rule for `RigRates` now also holds for the log parsers: a
+spec-off tick has no accept length, and a `0.0` there survives every arithmetic
+it enters and divides into ms/verify as if it had been measured.
+
+**A procedural property must be visible in the artifact or it is not evidence
+(#459).** The s12 warm-up draw ran for months and was discarded SILENTLY, so a
+warmed-up point and a cold one wrote the same file. Any run property a later
+verdict rests on (warm-up discarded, draws back-to-back, gap between draws) is
+recorded as a measured NUMBER plus the verdict derived from it, so the claim can
+be refuted from the file rather than taken on the harness's word.
+
 **MERGE DUTY -- SITREP (#509).** A merge that changes what this fork can do,
 how fast it does it, or which claim about it still holds also UPDATES the
 matching head section of `STATUS.md` in the private dev-log repo
@@ -1909,6 +1969,31 @@ shapes the BUDGET, never a transient: it trades KV capacity for steady-state
 free memory and moves a peak not at all (runbook §4.5.4 items 4-7 carry the
 evidence, incl. "a corridor repair applies to every violating card, not the
 one the briefing named").
+
+**A floor round is one invocation, not three (#459, from #475 §6).**
+`s12_prefill_kurve.py --floor-draws N` runs the N A-vs-A draws back to back in
+ONE process after one explicitly discarded warm-up draw, and the artifact
+carries the evidence for both properties rather than the claim:
+`floor_series.warmup_draw` (which draw was discarded, why, and ITS OWN rate),
+`discarded_draws`, per-draw `gap_before_s`, `max_gap_s`, `back_to_back` judged
+against the named `BACK_TO_BACK_MAX_GAP_S`, and a summary `floor[]` with
+`spread_pct` AND `monotone`. Default `1` = the pre-#459 single point,
+byte-for-byte. Why: #435 sub-arm B2's three draws sat 48-51 s apart around ~12 s
+of work and reported a monotone 13.0 % as a noise floor where #424 reported
+3.0 % -- drift reported as noise, and loose in the direction that lets a real
+regression pass as "within the floor" (#435 sub-arm B: -8.5 % scored as parity).
+`monotone: true` is the flag that says the spread may not be used as a floor at
+all. The GPU re-measurement is not yet run.
+
+**The s12 decode parser reads both spec modes (#459).** `RE_DECODE` required the
+accept block the scheduler writes only when speculation is ON
+(`metrics_reporter.py:968-972`, `:1018`) and allowed nothing between it and the
+graph flag, so a spec-off boot parsed ZERO decode ticks and s12 reported 0/0 --
+and so did a spec-ON CAP_ACCEPT boot, whose `cap len:` (`:1020`) sits in
+between, and any boot under `LOG_FORWARD_ITERS` (`:962`). Four missed shapes,
+three of them not in the ticket. `accept_len` / `accept_rate` are now `None`,
+never `0.0`, and `spec: bool` names the shape; all three tick aggregators
+(s12/s14/s16) report `ticks_with_accept`.
 
 ## 17. META: combination matrix + eviction doctrine
 Every "can asset X live at tier Y under primitive Z" question is a matrix-cell
