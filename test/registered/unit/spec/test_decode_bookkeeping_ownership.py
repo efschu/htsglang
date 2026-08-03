@@ -135,14 +135,18 @@ _OWNER_SITES = {
     # remains its sole owner. A lowered allocated watermark cannot fire the
     # early-eviction hazard this register guards.
     # NOTE, and it is NOT what this register tracks: the same block also sets
-    # `kv_overallocated_freed = True` (kv_session_offload.py:3360) BEFORE three
-    # later decline points (:3394 empty spill plan, :3411 budget regler, :3434
-    # tail exceeds the host region), each of which returns False and leaves the
-    # request running. Only the resume path clears the flag again (:5075), so a
-    # reclaim-then-decline leaves it set on a live request and the eventual
-    # `pop_overallocated_kv_cache()` (schedule_batch.py:1141) asserts. Open
-    # defect, filed separately -- it does not bear on the ownership verdict
-    # above, which is about the watermark write.
+    # `kv_overallocated_freed = True`. That used to happen BEFORE three later
+    # decline points (empty spill plan / budget regler / tail exceeds the host
+    # region), each of which returns False and leaves the request running, so a
+    # reclaim-then-decline left the flag set on a live request and the eventual
+    # `pop_overallocated_kv_cache()` (schedule_batch.py:1141) asserted -- a dead
+    # scheduler instead of a named fallback. FIXED by #501: the reclaim is now
+    # PLANNED where the watermark used to be written and COMMITTED past the last
+    # decline (`reclaim_overhang` / `allocated_after_reclaim`), so the write
+    # audited here only ever runs on a request that is leaving the batch.
+    # Falsifier: `test/registered/unit/test_kvso_reclaim_decline_501.py`.
+    # The site count is unchanged -- still exactly one `kv_allocated_len` write
+    # in `try_spill`, only later in the function.
     (
         "managers/kv_session_offload.py",
         "KVSessionOffloadManager.try_spill",

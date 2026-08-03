@@ -1147,6 +1147,25 @@ backend indexes alongside Q/K/V is narrowed with them, and an owner rule with
 no usable mask fails loudly -- there is no correct maskless DCP write. See
 docs/dev/NOTE_472_pad_positions_dcp.md.
 
+Reclaim-then-decline family (#501): a path that DECLINES and hands the caller
+back to a named fallback must leave the request byte-untouched, and a one-shot
+flag is the sharp edge. `try_spill` committed the speculative-overhang reclaim
+(`allocator.free` + `kv_allocated_len` + `kv_overallocated_freed = True`)
+before three later declines -- empty spill plan, #236 budget regler, tail wider
+than one host region -- each of which returns False and leaves the victim
+RUNNING, so the request's eventual `pop_overallocated_kv_cache()` asserted
+(`schedule_batch.py:1141`) and killed the scheduler instead of falling back to
+stock retraction. Fixed by PLANNING the reclaim where the state used to be
+written and COMMITTING it past the last decline (`reclaim_overhang` /
+`allocated_after_reclaim` in `managers/kv_session_offload.py`); the three
+predicates in between are pure over the snapshot, the row head `[0, L)` and
+replicated budget state, none of which the reclaim touches. So the rule: an
+irreversible mutation belongs behind the LAST decline of its function, and a
+comment claiming "a decline leaves no partial state" is a testable assertion,
+not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
+ordering structurally so a decline added later cannot move in front of it
+(4 tests, all four executed can-fail against the pre-fix file).
+
 **MERGE DUTY -- bookkeeping-mutation sites (#404 family).** The per-request
 accounting clocks (`decode_batch_idx` / `extend_batch_idx`,
 `kv_committed_len` / `kv_allocated_len`, `spec_verify_ct`) and the
