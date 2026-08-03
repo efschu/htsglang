@@ -182,6 +182,20 @@ class VoiceAssignment:
     #: and the listener should be told rather than left to wonder.
     notice: str = ""
 
+    @property
+    def backend_voice_id(self) -> Optional[str]:
+        """A serving-side voice name, when the chosen preset has one.
+
+        Only meaningful in preset mode, and only for a preset registered with
+        the backend's voice registry. A pitch-shifted VARIANT deliberately does
+        not use it: the registered voice is the unshifted base, so a variant
+        must go through the shifted reference clip instead or every sharer
+        would get the identical registered voice back.
+        """
+        if self.preset is None or self.variant_index > 0:
+            return None
+        return self.preset.backend_voice_id
+
     def to_json(self) -> Dict[str, object]:
         return {
             "mode": self.mode.value,
