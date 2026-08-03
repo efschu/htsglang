@@ -470,6 +470,54 @@ not runnable* on the M2 executor (no scaled/strided decode) and say so;
 status. Tipping points are correct for the 4.6/fp32-parity P1 table; the
 fp16-TRT operating point is unmeasured.
 
+Class-3 video enhance, RIFE version ladder (#460, `video_enhance/rife_ladder.py`):
+eight selectable rungs (4.6, 4.15, 4.15.lite, 4.16.lite, 4.17, 4.17.lite, 4.18,
+4.26) off four vendored IFNet files -- upstream ships several byte-identical
+architecture files, so 4.15/4.17/4.18 share one module and the lite trio
+another, with weights still pinned per version in `rife.KNOWN_WEIGHT_SHA256`.
+Each rung carries a quality rank (configurable, and labelled **ASSUMPTION** in
+every report -- no quality gate has graded RIFE output in this tree), a
+frontier keyed `(version, card, resolution, scale)` with measured/estimate/absent
+cells, a VRAM class, and a weight state; the registry *refuses* a rung that is
+neither present on disk nor sha256-pinned. `auto_rife_version` walks the ladder
+in quality order and takes the first version whose whole chain clears the
+existing aggregate gate, so no per-pair budget has to be invented; a variant
+with no measured frontier is never entered and surfaces as `measure_first`
+instead. `pin_rife_version` overrides the ranking, the budget and an absent
+frontier (that is how a GPU window runs what it is about to measure) and says
+so. The version-keyed frontier is the authority for the interpolation stage
+wherever the ladder knows the card -- the shared `StageRateTable` is keyed
+`(stage, card, resolution)` and cannot tell 4.6 from 4.26 -- and the shared
+table still stands for cards the ladder has never heard of.
+`scripts/video_enhance/fetch_rife_weights.py` establishes a pin only with
+`--record-new-pin` and refuses an unpinned re-download. Seeded with ticket V's
+sixteen measured cells; six of the eight rungs are ABSENT and are TICKET_460's
+work list.
+
+Class-3 video enhance, stage-pipeline pricing (#457 desk half,
+`video_enhance/stage_pipeline.py`): the Regime-B counterpart to the chain
+planner's Regime A. Stages are placed on cards and throughput is
+`1 / max(card load)` rather than `1 / sum(stage costs)`; an exhaustive sweep
+over placements is cheaper than any heuristic at this size. Card crossings are
+priced as a host bounce (D2H over the sender's link, H2D over the receiver's,
+each charged to the card that carries it) because this rig has no NVLink and no
+GPUDirect P2P; barlink BAR1 is the named alternative and carries an **absence**
+for raw video frames, so a plan needing it is refused rather than guessed. Two
+hard constraints are enforced, not reported: SR and the tail resize stay
+co-resident, and a card may declare a `max_transfer_mib` above which it is
+disqualified as an endpoint (the x4 card's default is the 8K fp16 frame size,
+derived from geometry, expressed per card and never as an NVML index). Transfer
+that prefetch can hide behind the receiving card's own compute is charged at
+its unhidden remainder only, and an estimate that is fully hidden does not
+degrade the verdict's provenance. `frames_in_flight` buys latency and nothing
+else, bounded by `max_latency_s`. `replicated_throughput` prices Regime A off
+the same table in two explicitly named readings -- strict (an absent stage
+drops the card: lower bound) and `omit_absent_stages` (drops the term: upper
+bound) -- so a comparison between the regimes cannot silently mix them. Verdict
+for 1080p@25 -> 2160p@50 on ticket V's numbers is in
+`TASK_333_M2_VIDEO_ENHANCE.md` §17.5 and pinned by a test. Stage-level
+replication (splitting one stage's frames across cards) is not built.
+
 Class-3 video enhance, streaming-input admission (#448 desk half,
 `video_enhance/streaming.py`): source kinds finished/growing/live with named
 refusals (no growing source on the chunk executor — the split is verified
