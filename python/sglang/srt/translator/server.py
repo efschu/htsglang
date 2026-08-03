@@ -230,6 +230,9 @@ class TranslatorService:
             "uptime_s": round(time.time() - self.started_at, 1),
             "sessions": len(self.sessions),
             "max_sessions": self.config.max_sessions,
+            # Age and idleness per session, so an accumulation is visible
+            # before it is felt as latency.
+            "session_detail": self.sessions.to_json(),
             "codecs": list(available_codecs()),
             "voice_mode": self.voice_mode.value,
             "preset_voices": (
@@ -286,6 +289,7 @@ class _Connection:
         await self.ws.accept()
         try:
             await self._handshake()
+            self.session.attach()
             self._pump = asyncio.create_task(self._journal_pump())
             await self._receive_loop()
         except WebSocketDisconnect:
@@ -296,6 +300,10 @@ class _Connection:
             await self._send({"kind": "error", "stage": "language", "message": str(exc)})
         finally:
             self._closing = True
+            if self.session is not None:
+                # The session stays for the resume grace; what goes now is the
+                # claim that somebody is listening.
+                self.session.detach()
             if self._pump is not None:
                 self._pump.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -529,6 +537,21 @@ class _Connection:
             # and nothing else in the protocol empties the record.
             removed = self.session.clear_transcript()
             await self._send({"kind": "transcript.cleared", "removed": removed})
+        elif kind == "speaker.delete":
+            try:
+                gone = self.session.delete_speaker(
+                    str(message.get("speaker_id", ""))
+                )
+            except KeyError:
+                await self._send(
+                    {"kind": "error", "stage": "speaker",
+                     "message": f"no speaker {message.get('speaker_id')!r}"}
+                )
+                return
+            await self._send(
+                {"kind": "speaker.deleted", **gone,
+                 "state": self.session.state()}
+            )
         elif kind == "speaker.name":
             try:
                 changed = self.session.name_speaker(
@@ -639,7 +662,41 @@ class _Connection:
 
 def build_app(service: TranslatorService) -> FastAPI:
     """Wire the service into a FastAPI app."""
-    app = FastAPI(title="htsglang live translator", version="1")
+
+    async def _collect_forever() -> None:
+        """Collect on a TIMER, not only when a new session is opened.
+
+        Collection used to run inside SessionManager.open(), so a server
+        nobody connects to never collected and abandoned sessions accumulated
+        until the next arrival -- who then paid for all of them. Six of them
+        turned 4 s of first-audio latency into 52 s on the live service.
+        """
+        while True:
+            await asyncio.sleep(15.0)
+            try:
+                dropped = service.sessions.collect()
+            except Exception:  # noqa: BLE001 - a sweeper must not die
+                logger.exception("session collection failed")
+                continue
+            if dropped:
+                logger.info(
+                    "collected %d abandoned session(s): %s",
+                    len(dropped), ", ".join(dropped),
+                )
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        collector = asyncio.create_task(_collect_forever())
+        try:
+            yield
+        finally:
+            collector.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await collector
+
+    app = FastAPI(
+        title="htsglang live translator", version="1", lifespan=lifespan
+    )
     app.state.service = service
 
     @app.get("/api/translator/languages")
@@ -821,6 +878,19 @@ def build_app(service: TranslatorService) -> FastAPI:
                 status_code=404, detail=f"nothing to undo on line {line_id}"
             )
         return JSONResponse(reverted.to_json())
+
+    @app.delete("/api/translator/sessions/{session_id}/speakers/{speaker_id}")
+    async def delete_speaker(session_id: str, speaker_id: str) -> JSONResponse:
+        """Forget a speaker: centroid, reference buffer, label, preset slot."""
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        try:
+            return JSONResponse(session.delete_speaker(speaker_id))
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"no speaker {speaker_id!r}"
+            ) from exc
 
     @app.post("/api/translator/sessions/{session_id}/speakers")
     async def add_speaker(session_id: str, body: Dict[str, Any]) -> JSONResponse:

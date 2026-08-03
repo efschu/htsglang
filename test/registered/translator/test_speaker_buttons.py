@@ -233,6 +233,59 @@ class TestSpeakerButtonsInSession(unittest.IsolatedAsyncioTestCase):
         self.assertIs(speaker_events[-1]["manual"], True)
 
 
+class TestSpeakerDeletion(unittest.IsolatedAsyncioTestCase):
+    """A speaker created by mistake must be removable (user order)."""
+
+    async def test_deleting_frees_the_slot_the_buffer_and_the_voice(self):
+        from sglang.srt.translator.voices import VoiceMode, synthetic_pool
+        from test_session import LANG_A, LANG_B
+
+        session, _asr, _mt, _tts = make_session(
+            voice_pool=synthetic_pool([LANG_A, LANG_B]),
+            voice_mode=VoiceMode.PRESET,
+        )
+        sid = session.add_speaker("Ghost")
+        session.arm_speaker(sid)
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.2))])
+        self.assertGreater(session.speakers.get(sid).reference_seconds(), 0.0)
+        taken = session.voice_pool.assign(sid)[0].voice_id
+
+        gone = session.delete_speaker(sid)
+        self.assertEqual(gone["label"], "Ghost")
+        self.assertGreater(gone["reference_seconds_released"], 0.0)
+        with self.assertRaises(KeyError):
+            session.speakers.get(sid)
+        # The arming went with them, or the next utterance would be
+        # attributed to somebody who no longer exists.
+        self.assertIsNone(session.armed_speaker)
+        # And the preset voice is back in circulation.
+        self.assertTrue(session.voice_pool.release(sid) is False)
+        reused = session.voice_pool.assign(session.add_speaker())[0].voice_id
+        self.assertIn(reused, {taken, reused})
+
+    async def test_history_is_not_rewritten_by_a_deletion(self):
+        """What was said stays said.
+
+        Reattributing old lines to somebody else would be a worse answer than
+        a name with nobody behind it.
+        """
+        session, _asr, _mt, _tts = make_session()
+        sid = session.add_speaker("Ghost")
+        session.arm_speaker(sid)
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.2))])
+        line = session.transcript.lines()[0]
+        self.assertEqual(line.speaker_id, sid)
+        session.delete_speaker(sid)
+        after = session.transcript.lines()[0]
+        self.assertEqual(after.speaker_id, sid)
+        self.assertEqual(after.source_text, line.source_text)
+
+    async def test_deleting_an_unknown_speaker_is_refused(self):
+        session, _asr, _mt, _tts = make_session()
+        with self.assertRaises(KeyError):
+            session.delete_speaker("speaker-99")
+
+
 class TestManualSpeakerClass(unittest.IsolatedAsyncioTestCase):
     """The class must steer the VOICE, not just be stored (design 17.5b)."""
 

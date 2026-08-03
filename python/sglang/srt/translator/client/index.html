@@ -724,10 +724,22 @@ function addSpeaker() {
  * automatic path. Long-press, because the short press is hold-to-speak.
  */
 function renameSpeaker(speakerId, current) {
-  const name = prompt("name for " + (current || speakerId), current || "");
+  // One prompt does both, because a phone row has no space for a second
+  // control per speaker and a hidden gesture nobody finds is not a feature.
+  const name = prompt(
+    "name for " + (current || speakerId) + "\n(empty = DELETE this speaker)",
+    current || ""
+  );
   if (name === null) return;
+  const trimmed = name.trim();
+  if (!trimmed) {
+    if (!confirm("delete " + (current || speakerId)
+                 + "? their voice reference is lost")) return;
+    connection.sendControl({ kind: "speaker.delete", speaker_id: speakerId });
+    return;
+  }
   connection.sendControl({
-    kind: "speaker.name", speaker_id: speakerId, label: name.trim(),
+    kind: "speaker.name", speaker_id: speakerId, label: trimmed,
   });
 }
 
@@ -787,6 +799,12 @@ function onEvent(event) {
       break;
     case "speaker.suggestion":
       chip(event);
+      break;
+    case "speaker.deleted":
+      sys("deleted " + (event.label || event.speaker_id)
+          + " (" + event.reference_seconds_released + "s of voice reference)",
+          false);
+      if (event.state) renderSpeakers(event.state.speakers);
       break;
     case "speaker.added":
     case "name.undone":

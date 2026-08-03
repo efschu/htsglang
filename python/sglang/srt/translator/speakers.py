@@ -428,6 +428,24 @@ class SpeakerRegistry:
         self._profiles[sid] = profile
         return profile
 
+    def remove(self, speaker_id: str) -> SpeakerProfile:
+        """Forget a speaker completely (user order, 2026-08-03).
+
+        Everything this profile holds goes: the centroid, the reference
+        buffer, the label. That is the point -- a speaker created by mistake,
+        or one who left the room, otherwise keeps a slot under
+        ``max_speakers`` and a preset voice for the rest of the session, and
+        keeps attracting utterances that belong to somebody else.
+
+        The id is NOT recycled. Transcript lines already attributed to it stay
+        as they are: history is what was said, and silently reattributing old
+        lines to somebody else would be a worse answer than a dangling name.
+        """
+        profile = self._profiles.pop(speaker_id, None)
+        if profile is None:
+            raise KeyError(f"unknown speaker {speaker_id!r}")
+        return profile
+
     def assign_manual(
         self,
         speaker_id: str,

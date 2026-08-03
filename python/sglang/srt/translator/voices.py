@@ -493,6 +493,17 @@ class VoicePool:
         slot = self._assigned.get(speaker_id)
         return 0 if slot is None else slot[1]
 
+    def release(self, speaker_id: str) -> bool:
+        """Give a deleted speaker's preset slot back to the pool.
+
+        Without this a session that corrects a handful of mistaken speakers
+        runs the pool dry and starts handing out pitch-shifted reuses of a
+        base voice, for people who are not in the room.
+        """
+        had = self._assigned.pop(speaker_id, None) is not None
+        self._overrides.pop(speaker_id, None)
+        return had
+
     def classify(self, speaker_id: str, audio: Optional[AudioChunk]) -> VoiceClass:
         if speaker_id in self._overrides:
             return self._overrides[speaker_id]

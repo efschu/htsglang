@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sys
 import time
@@ -133,6 +134,13 @@ async def one_turn(args, samples: np.ndarray, rate: int) -> dict:
 
     # The LAST completed turn that carried audio: with --repeats that is the
     # one whose speaker already has a reference buffer, i.e. the clone path.
+        # Release the session rather than leaving it to the resume grace. A
+        # harness that holds a slot for two minutes after it finishes is the
+        # same accumulation the collector exists to clean up, just
+        # self-inflicted.
+        with contextlib.suppress(Exception):
+            await ws.send(json.dumps({"kind": "close"}))
+
     scored = next(
         (t for t in reversed(finished) if any(turn == t for turn, _ in audio_frames)),
         None,

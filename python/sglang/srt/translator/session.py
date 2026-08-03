@@ -445,6 +445,8 @@ class TranslatorSession:
         self._turn_lock = asyncio.Lock()
         self._closed = False
         self.last_activity = clock()
+        self._attached = 0
+        self._detached_at: Optional[float] = None
         self.turns_completed = 0
         self.turns_dropped = 0
         self.journal.append(
@@ -471,6 +473,42 @@ class TranslatorSession:
 
     def idle_seconds(self) -> float:
         return self._clock() - self.last_activity
+
+    def attach(self) -> int:
+        """A client connected. Returns the number now attached."""
+        self._attached += 1
+        self._detached_at = None
+        self.touch()
+        return self._attached
+
+    def detach(self) -> int:
+        """A client's socket went away.
+
+        The session is NOT closed here: a dropped mobile link is the normal
+        case and must be resumable by token. But the moment of detachment is
+        recorded, because "idle" and "abandoned" need different deadlines --
+        a conversation that pauses for two minutes while attached is alive,
+        one whose socket died two minutes ago probably is not.
+        """
+        self._attached = max(0, self._attached - 1)
+        if self._attached == 0:
+            self._detached_at = self._clock()
+            # Anything still queued belongs to a client that is no longer
+            # listening. Draining it would keep the synthesizer busy for
+            # nobody -- which is precisely how six abandoned sessions turned
+            # 4 s of first-audio latency into 52 s.
+            self._queue.clear()
+        return self._attached
+
+    @property
+    def attached(self) -> int:
+        return self._attached
+
+    def detached_seconds(self) -> Optional[float]:
+        """Seconds since the last client left, or None while one is here."""
+        if self._attached > 0 or self._detached_at is None:
+            return None
+        return self._clock() - self._detached_at
 
     def on_reconnect(self) -> None:
         """The transport came back. Reset stream state, keep everything else.
@@ -807,6 +845,47 @@ class TranslatorSession:
             },
         )
         return profile.speaker_id
+
+    def delete_speaker(self, speaker_id: str) -> Dict[str, object]:
+        """Remove a speaker and everything attached to them (§17.5).
+
+        Returns what was released, so the caller can say so rather than the
+        row simply losing a button.
+        """
+        profile = self.speakers.remove(speaker_id)
+        released = round(profile.reference_seconds(), 2)
+        if self._armed_speaker == speaker_id:
+            # A button that no longer exists must not stay armed, or the next
+            # utterance would be attributed to a speaker who is gone.
+            self._armed_speaker = None
+        # Pending suggestions for this speaker are meaningless now.
+        for sid, suggestion in list(self.suggestions.items()):
+            if suggestion.speaker_id == speaker_id:
+                self.suggestions.pop(sid, None)
+        self.applied_names = {
+            sid: sug for sid, sug in self.applied_names.items()
+            if sug.speaker_id != speaker_id
+        }
+        self._manual_names.discard(speaker_id)
+        if self.voice_pool is not None:
+            # Give the preset voice back to the pool, or a session that
+            # corrects a few mistaken speakers runs the pool dry.
+            release = getattr(self.voice_pool, "release", None)
+            if callable(release):
+                release(speaker_id)
+        self.journal.append(
+            EventKind.SESSION_STATE,
+            {
+                "speaker_deleted": speaker_id,
+                "label": profile.label,
+                "reference_seconds_released": released,
+            },
+        )
+        return {
+            "speaker_id": speaker_id,
+            "label": profile.label,
+            "reference_seconds_released": released,
+        }
 
     def clear_transcript(self) -> int:
         """The only thing that empties the record. Returns lines removed."""
@@ -1654,11 +1733,18 @@ class SessionManager:
         factory: Callable[[str, ConversationLanguages], TranslatorSession],
         max_sessions: int = 8,
         idle_timeout_s: float = 300.0,
+        resume_grace_s: float = 120.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._factory = factory
         self._max = max_sessions
         self._idle_timeout = idle_timeout_s
+        #: How long a session survives with nobody attached. Shorter than the
+        #: idle timeout on purpose: it is the window in which a reconnect can
+        #: still resume by token, not a conversation pause. Long enough for a
+        #: tunnel to come back, short enough that an abandoned session does
+        #: not hold its share of the machine for five minutes.
+        self._resume_grace = resume_grace_s
         self._clock = clock
         self._sessions: Dict[str, TranslatorSession] = {}
 
@@ -1669,15 +1755,46 @@ class SessionManager:
         return tuple(self._sessions)
 
     def collect(self) -> List[str]:
-        """Drop idle sessions. Returns the ids collected."""
-        dead = [
-            sid
-            for sid, session in self._sessions.items()
-            if session.idle_seconds() > self._idle_timeout
-        ]
+        """Drop sessions nobody is coming back to. Returns the ids collected.
+
+        Two independent deadlines, because two different things go wrong:
+
+        * a session with a client attached is alive no matter how long the
+          conversation pauses, and is only collected after ``idle_timeout_s``;
+        * a session whose socket died is collected after ``resume_grace_s``,
+          which is the window a reconnect has to resume it by token.
+
+        Sticky semantics are untouched inside the grace: the id, the speaker
+        registry, the reference buffers and the transcript are all still there
+        for a client that comes back.
+        """
+        dead = []
+        for sid, session in self._sessions.items():
+            gone = session.detached_seconds()
+            if gone is not None and gone > self._resume_grace:
+                dead.append(sid)
+            elif session.idle_seconds() > self._idle_timeout:
+                dead.append(sid)
         for sid in dead:
             self._sessions.pop(sid).close()
         return dead
+
+    def to_json(self) -> List[Dict[str, object]]:
+        """Per-session age and idleness, so this class stays diagnosable."""
+        return [
+            {
+                "session_id": sid,
+                "attached": session.attached,
+                "idle_s": round(session.idle_seconds(), 1),
+                "detached_s": (
+                    None if session.detached_seconds() is None
+                    else round(session.detached_seconds(), 1)
+                ),
+                "turns": session.turns_completed,
+                "queued": session.pending(),
+            }
+            for sid, session in self._sessions.items()
+        ]
 
     def get(self, session_id: str) -> Optional[TranslatorSession]:
         session = self._sessions.get(session_id)
