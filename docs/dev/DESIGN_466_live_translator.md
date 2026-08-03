@@ -3344,3 +3344,126 @@ and codec become LEDGER asset classes in the #286 register -- parkable, with a
 residency ladder in the #305 sense. Recorded here as user-confirmed direction.
 No immediate rebuild obligation; but from now on the calculations and the
 design carry it.
+
+#### 17.8.10 Handover, 2026-08-03 (fifth session)
+
+**Live: server `cba698fb5b` (tenant PID 3776998, started 20:41:35, log
+`tenant17_stopstream.log`), client `173d52e541`.** The client is read from
+disk on every request, so a client-only merge goes live WITHOUT a restart --
+that is why Cut 1 needed no second window and why the two halves can differ.
+Always read both identities before diagnosing anything.
+
+**Shipped this session**
+
+* the three undeployed server posten of §19.12/§19.13/§19.10 (playback.stop,
+  text decoupled from audio, placeholder voice class) went live in one
+  restart, taken while `health` reported `sessions: 0`;
+* the UI agent's Cut 1 (stop button + silence) merged onto that tip, client
+  build `173d52e541`;
+* two gate arms, `dcfb8ab57e` (below);
+* the ASR capability reach fix, `974300a315` -- NOT YET DEPLOYED, it needs
+  the next restart.
+
+**The gate is 1 green / 1 red on the merged build, so the user must NOT be
+asked to test yet.** Run A (`gate_cut1a.log`): 4 turns, reload arm, stop arm,
+console clean, PASS. Run B (`gate_cut1b.log`), identical invocation: turn 3
+produced a transcript line at 4.0 s and then NO translation and no audio
+inside the 90 s budget -- the page sat on `translating`. What was excluded
+before writing this, by probe rather than argument: the MT server was alive
+throughout (PID 3602337, unchanged since 14:21, `/v1/models` answering); the
+tenant log holds no error, traceback or refusal in that window, only the
+gap itself (last synthesis 20:56:41, next diagnostics 20:58:43 with the push
+counter frozen at 232); and no third process was on the cards --
+`nvidia-smi --query-compute-apps` showed only the three 27B schedulers and
+the tenant, so the 5090's rise from 24983 to 29379 MiB was the talker's own
+allocation and not an intruder. **The stall is therefore unexplained and is
+NOT attributed to the parallel INT8 work, which was the convenient answer.**
+It is one occurrence in six runs of this build.
+
+**Turn 4 then corrected the diagnosis, which is why the run was read to the
+end instead of stopped at the first red.** It reported `line 85.1 s / audio
+83.9 s / frames 8188` -- roughly thirty-five times a normal turn's audio,
+arriving in one burst. So nothing was wedged: the pipeline was BACKED UP by
+about eighty seconds and then flushed everything at once. "Stalled and never
+recovered" would have been the wrong bug to hunt. This is the queueing family
+of §17.8.2 (one talker, RTF 1.23, no scheduling policy makes two turns fit),
+not a new fault -- what is unexplained is the SIZE of the backlog, since the
+gate drives one conversation with 8 s gaps. Next step is a rerun with the MT
+hop and the talker queue depth instrumented per turn, which is exactly what
+the `--enable-metrics` item below is for; reasoning further without that
+instrument is how the last four rounds were lost.
+
+**Two gate arms, and what their can-fail proofs actually cover**
+
+`--stop-during-playback N` fires `playback.stop` on the page's own socket one
+poll after the first frame reaches playback. Verified live: ack
+`aborted_turn_id 427d34bee557 / dropped_queued 0 / stop_epoch 1`, 0 frames
+after, socket OPEN, and the NEXT turn completed in 4.7 s -- the talker was
+freed rather than wedged, which is the assertion worth having.
+
+`--stop-sabotage` is the can-fail proof and it came back HALF green, which is
+recorded rather than rounded up: the ack half failed as required, the
+quiescence half did not. With a batch talker and a single-clause turn all
+audio has arrived before the arm looks, so "it went quiet" is true with or
+without a stop. **That half is a decoration until the arm is driven with a
+backlog** (a multi-clause turn, or a queued second turn). The UI agent
+reports his own stop arm going red on the audio assertions; prefer his for
+that half.
+
+Text-vs-audio ordering is asserted on every turn, both sides stamped on the
+page's clock. Only PARTIAL events are judged -- the shipped contract filters
+on that flag, and the final non-partial event is the whole-translation record
+journalled at turn end. Asserting over both fails every healthy turn by
+~0.02 s, which is what the arm did until the contract was read instead of
+assumed. Measured through the real client: the last streamed clause lands
+**2.6-5.8 s before** the first audio frame. §19.13 works, seen from the page.
+
+**Queue item 2 (roster) is answered and needs no server change.** A frame DOES
+go out on automatic naming: `name_speaker` (session.py:598-628) journals
+`SESSION_STATE` with `{speaker_named, label, lines_updated}` and re-emits every
+relabelled transcript line, which is exactly why the transcript said
+"Matthias" while the button row did not. What it does NOT carry is a roster,
+and the client's handler is `applyState(event.state)` (index.html:2496-2498)
+-- no emitter of `SESSION_STATE` anywhere sets a `state` key, so that handler
+receives `undefined` on the arming path too. Embedding a full snapshot was
+considered and REJECTED: journal events replay on resume, and a replayed
+snapshot would overwrite a newer roster, while `{speaker_named, label}` is a
+monotone fact that replays correctly. Cut 2's client-side fix (refresh
+`state()` on divergence) is the right shape; its premise is verified --
+`state()["speakers"]` carries `label` (speakers.py:283).
+
+**Queue item 4 (languages): the machinery was complete and answering with the
+wrong set.** `LanguageMatrix` already derives the honest intersection and
+`GET /api/translator/languages` already ships per-language `as_source` /
+`as_target` / `usable` / `reason` -- that IS the format for the UI agent, no
+new frame needed. Measured live BEFORE the fix: `stages.asr ["de","es"]`,
+eight languages carrying `"ASR cannot hear it"`, from a model that hears 102.
+One attribute did two jobs: `_restrict` was both the deployment bound and the
+per-turn decode whitelist that §17.8.6 pushes before every recognition, and
+`supported_languages()` read it -- so the capability answer was whatever the
+last conversation selected, leaking across sessions since one recognizer
+serves them all. Split into `_deployment_languages` (capability) and
+`_restrict` (decode). Falsifier `test_asr_capability_reach.py`, can-fail
+proven in both adapters.
+
+**The remaining half of "all languages selectable", NOT built.**
+`RoutingTable.validate_against` (languages.py:367-370) calls
+`matrix.require_pair` for EVERY direction between participants, from the
+Session constructor (session.py:378). A participant whose language has no TTS
+coverage therefore refuses the whole conversation instead of degrading that
+direction to text-only. The client already carries
+`PARTIAL_PARTICIPANTS_SUPPORTED` for it. This is the precondition for the
+picker to be usable, and it is the top build item.
+
+**Open, in order:** reproduce and root-cause the run-B stall with the MT hop
+instrumented; deploy the ASR fix together with Cut 2 in one restart and gate
+twice; the require_pair degradation; then §19.5 quality ladder,
+`--enable-metrics` for `launch.py` (still absent from `boot_tenant.sh` --
+every boot in this session violated that standing order and the script is
+where to fix it), the man-02 listening check, and §19.9.
+
+**One instrument note.** `tts_total_ms` reads 0.00 s on every turn and always
+has -- it is in the OLD logs too, so it is not a regression of the FIFO
+worker. It measures first-audio-to-last-audio, which for a batch talker is
+genuinely nothing. It is a metric with no information at the served geometry;
+either give it a meaning or drop it when `--enable-metrics` lands.
