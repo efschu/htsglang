@@ -52,9 +52,12 @@ from client_gate import (  # noqa: E402  - sibling harness, reused deliberately
     prepare_fake_input,
 )
 
-#: Samples kept per captured buffer: 200 ms at 16 kHz is far more than an
-#: onset needs and small enough to hand back through the CDP bridge.
-KEEP_SAMPLES = 3200
+#: Buffers kept, WHOLE. The wire frame is 20 ms (320 samples at 16 kHz), not
+#: the talker's 0.4 s chunk, so keeping "the first few buffers" keeps only the
+#: leading silence -- the first attempt at this probe measured 60 ms of
+#: nothing and proved nothing. 200 buffers is 4 s, which reaches well past the
+#: onset of speech and lets the boundaries be examined as a population.
+KEEP_BUFFERS = 200
 
 #: Patch ``playback.schedule`` so every call records BOTH the samples it was
 #: given and the clock it was given them against. The second half is what
@@ -78,9 +81,9 @@ CAPTURE_JS = """
       // report says whether it FIRED rather than whether it could have.
       reanchored: ctx ? (this.cursor < ctx.currentTime + 0.02) : null,
     });
-    if (window.__onset.buffers.length < 3) {
+    if (window.__onset.buffers.length < keep) {
       window.__onset.buffers.push(
-        Array.from(float32.slice(0, keep)).map((v) => Math.round(v * 32768))
+        Array.from(float32).map((v) => Math.round(v * 32768))
       );
     }
     return original(float32, rate);
@@ -152,7 +155,7 @@ async def run(args) -> int:
             "() => connection && connection.ws && connection.ws.readyState === 1",
             timeout=30000,
         )
-        await page.evaluate(CAPTURE_JS, KEEP_SAMPLES)
+        await page.evaluate(CAPTURE_JS, KEEP_BUFFERS)
 
         await page.click("#talk")
         await asyncio.sleep(min(speak_s, 4.0))
@@ -170,7 +173,96 @@ async def run(args) -> int:
         captured = await page.evaluate("window.__onset")
         await browser.close()
 
-    report["scheduled"] = captured["sched"][:6]
+    # THE DISCRIMINATOR. Concatenate the buffers in the order they were
+    # scheduled and compare the sample-to-sample step ACROSS a buffer seam
+    # against the steps INSIDE the buffers. The client starts one
+    # AudioBufferSourceNode per 20 ms frame, so if the seams are where the
+    # energy jumps, the click is framing/scheduling; if seams look like any
+    # other sample pair, the stream is continuous and the artefact is not a
+    # discontinuity at all.
+    buffers = [np.asarray(b, dtype=np.float32) / 32768.0
+               for b in captured["buffers"]]
+    if buffers:
+        stream = np.concatenate(buffers)
+        steps = np.abs(np.diff(stream))
+        seam_positions = np.cumsum([len(b) for b in buffers])[:-1] - 1
+        seam_positions = seam_positions[seam_positions < len(steps)]
+        seam_steps = steps[seam_positions]
+        inner = np.delete(steps, seam_positions)
+        peak = float(np.max(np.abs(stream))) or 1.0
+        speech_at = int(np.argmax(np.abs(stream) > 0.02 * peak))
+        report["stream"] = {
+            "buffers": len(buffers),
+            "samples": int(stream.size),
+            "peak": peak,
+            "speech_starts_at_sample": speech_at,
+            "speech_starts_in_buffer": speech_at // len(buffers[0]),
+            "seam_step_max": float(np.max(seam_steps)) if seam_steps.size else 0.0,
+            "seam_step_mean": float(np.mean(seam_steps)) if seam_steps.size else 0.0,
+            "inner_step_max": float(np.max(inner)) if inner.size else 0.0,
+            "inner_step_p99": float(np.percentile(inner, 99)) if inner.size else 0.0,
+        }
+        st = report["stream"]
+        print(f"[onset] stream: {st['buffers']} buffers, {st['samples']} samples, "
+              f"peak {st['peak']:.4f}")
+        print(f"[onset] speech starts at sample {st['speech_starts_at_sample']} "
+              f"(buffer {st['speech_starts_in_buffer']})")
+        print(f"[onset] SEAM steps : max {st['seam_step_max']:.5f} "
+              f"mean {st['seam_step_mean']:.5f}")
+        print(f"[onset] INNER steps: max {st['inner_step_max']:.5f} "
+              f"p99 {st['inner_step_p99']:.5f}")
+        verdict = ("SEAMS ARE THE OUTLIER -- framing/scheduling"
+                   if st["seam_step_max"] > st["inner_step_max"]
+                   else "seams look like ordinary sample pairs -- the stream "
+                        "is continuous, the click is NOT a seam discontinuity")
+        print(f"[onset] verdict: {verdict}")
+        # The onset of SPEECH, which is what the user hears -- not the onset
+        # of the buffer, which is leading silence.
+        # Windowed from BEFORE the crossing. Slicing at the crossing and then
+        # asking how long the rise took answers a question about the slice,
+        # not the signal -- the first attempt did exactly that and reported a
+        # rise of 0 samples, which was true by construction and meaningless.
+        pre = 320
+        start = max(0, speech_at - pre)
+        window = stream[start:speech_at + 1600]
+        report["speech_onset"] = describe_onset(window, 16000)
+        env = np.abs(window)
+        local_peak = float(np.max(env)) or 1.0
+        crossings = {
+            f"samples_to_{int(f * 100)}pct": int(np.argmax(env > f * local_peak))
+            for f in (0.01, 0.10, 0.50)
+        }
+        report["speech_onset"]["rise_from_silence"] = crossings
+        report["speech_onset"]["silence_before"] = float(np.max(env[:pre]))
+        print(f"[onset] onset window ({pre} samples of lead-in): "
+              f"silence before {report['speech_onset']['silence_before']:.5f}, "
+              f"reaches 1%/10%/50% of local peak at samples "
+              f"{crossings['samples_to_1pct']}/{crossings['samples_to_10pct']}/"
+              f"{crossings['samples_to_50pct']} "
+              f"(lead-in ends at {pre})")
+
+    # A buffer whose cursor has already passed `currentTime` is started in
+    # the PAST; Web Audio clamps that to "now", so it overlaps its
+    # predecessor instead of following it. That is a crackle mechanism that
+    # leaves the samples themselves perfectly continuous, which is why the
+    # seam analysis above cannot see it.
+    sched = captured["sched"]
+    late = [e for e in sched
+            if e["now"] is not None and e["cursor"] <= e["now"]]
+    report["scheduled"] = sched
+    report["scheduling"] = {
+        "calls": len(sched),
+        "reanchored": sum(1 for e in sched if e.get("reanchored")),
+        "started_in_the_past": len(late),
+        "min_lead_s": min(
+            (e["cursor"] - e["now"] for e in sched if e["now"] is not None),
+            default=None),
+    }
+    sc = report["scheduling"]
+    print(f"[onset] scheduling: {sc['calls']} calls, "
+          f"{sc['reanchored']} re-anchored, "
+          f"{sc['started_in_the_past']} started in the past, "
+          f"min lead {sc['min_lead_s']:.3f}s")
     report["buffers"] = []
     for index, raw in enumerate(captured["buffers"]):
         samples = np.asarray(raw, dtype=np.float32) / 32768.0
