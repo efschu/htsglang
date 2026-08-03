@@ -59,6 +59,14 @@ _SERVER_ARGS_SNIPPET = (
 )
 
 
+#: The decode capture-bs list `_SERVER_ARGS_SNIPPET` declares. Since #513 the
+#: anchor key carries the LIST, not just its length, so a lookup has to pass
+#: the same one. Before #513 these tests passed `list(range(12))` -- a
+#: DIFFERENT list of the same length -- and still hit the anchor, which is the
+#: collision #513 removed: the key said `nbs:12` for both.
+_SNIPPET_DECODE_BS = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16]
+
+
 class TestCaptureParser(CustomTestCase):
     def test_real_decode_lines_parse_exact_values(self):
         # Three real tp=3 target-decode lines: per-rank MiB must match the
@@ -95,9 +103,7 @@ class TestCaptureParser(CustomTestCase):
         self.assertGreater(decodes[0]["mib"], 3 * decodes[1]["mib"])
 
     def test_summarize_itemizes_per_kind_and_rung(self):
-        s = graphmem.summarize_captures(
-            graphmem.parse_capture_lines(_REAL_SPEC_LADDER)
-        )
+        s = graphmem.summarize_captures(graphmem.parse_capture_lines(_REAL_SPEC_LADDER))
         labels = [it["label"] for it in s["items"]]
         self.assertIn("target verify", labels)
         self.assertIn("draft extend k=6", labels)
@@ -142,11 +148,48 @@ class TestAnchorStore(CustomTestCase):
                 "speculative_num_steps": 5,
                 "speculative_num_draft_tokens": 6,
                 "speculative_adaptive": True,
-                "decode_bs": list(range(12)),
+                "decode_bs": list(_SNIPPET_DECODE_BS),
             }
         )
         self.assertIsNotNone(hit)
         self.assertEqual(hit["provenance"], "measured")
+
+    def test_a_different_capture_list_of_the_same_length_now_misses(self):
+        """#513: this lookup USED to hit the anchor above.
+
+        Same length, different batch sizes -- the old key was `nbs:12` for
+        both, so the second config was handed the first one's measured graph
+        memory with provenance "measured". A miss falls back to the labelled
+        heuristic, which is the honest answer.
+        """
+        tmp = tempfile.mkdtemp()
+        log = os.path.join(tmp, "sglang_boot_3.log")
+        with open(log, "w") as f:
+            f.write(_SERVER_ARGS_SNIPPET + _REAL_SPEC_LADDER)
+        store = self._store()
+        graphmem.scan_boot_logs([log], store=store)
+        meta = {
+            "model_path": "/models/Qwen3.6-27B-FP8",
+            "tp_size": 3,
+            "kv_cache_dtype": "fp8_e4m3",
+            "speculative_algorithm": "EAGLE",
+            "speculative_num_steps": 5,
+            "speculative_num_draft_tokens": 6,
+            "speculative_adaptive": True,
+        }
+        self.assertIsNotNone(
+            store.lookup({**meta, "decode_bs": list(_SNIPPET_DECODE_BS)})
+        )
+        self.assertIsNone(store.lookup({**meta, "decode_bs": list(range(12))}))
+
+    def test_the_attention_backend_separates_two_anchors(self):
+        """#513: BASE_MIB is documented as the flashinfer workspace, so the
+        backend is part of the quantity and has to be part of the key."""
+        key_a = graphmem.anchor_key({"model_path": "/m", "tp_size": 3})
+        key_b = graphmem.anchor_key(
+            {"model_path": "/m", "tp_size": 3, "attention_backend": "triton"}
+        )
+        self.assertNotEqual(key_a, key_b)
 
     def test_anchor_beats_heuristic_and_key_shape_changes_fall_back(self):
         # measured-overrides-estimate: an anchored config shape returns the
@@ -163,7 +206,7 @@ class TestAnchorStore(CustomTestCase):
             "num_hidden_layers": 64,
             "tp_size": 3,
             "max_running_requests": 32,
-            "decode_bs": list(range(12)),
+            "decode_bs": list(_SNIPPET_DECODE_BS),
         }
         spec = {
             "speculative_algorithm": "EAGLE",
@@ -172,8 +215,12 @@ class TestAnchorStore(CustomTestCase):
             "speculative_adaptive": True,
         }
         hit = graphmem.estimate(
-            geom, spec, model_path="/models/Qwen3.6-27B-FP8",
-            kv_cache_dtype="fp8_e4m3", store=store, scan=False,
+            geom,
+            spec,
+            model_path="/models/Qwen3.6-27B-FP8",
+            kv_cache_dtype="fp8_e4m3",
+            store=store,
+            scan=False,
         )
         self.assertEqual(hit["provenance"], "measured")
         self.assertAlmostEqual(
@@ -182,9 +229,12 @@ class TestAnchorStore(CustomTestCase):
             places=1,
         )
         miss = graphmem.estimate(
-            geom, dict(spec, speculative_num_draft_tokens=4),
+            geom,
+            dict(spec, speculative_num_draft_tokens=4),
             model_path="/models/Qwen3.6-27B-FP8",
-            kv_cache_dtype="fp8_e4m3", store=store, scan=False,
+            kv_cache_dtype="fp8_e4m3",
+            store=store,
+            scan=False,
         )
         self.assertEqual(miss["provenance"], "heuristic")
 
@@ -251,8 +301,9 @@ class TestHeuristic(CustomTestCase):
                 "speculative_adaptive": True,
             },
         )
-        measured_rank0 = (0.33 + 0.35 + 0.14 + 0.09 + 0.08 + 0.07 + 0.08
-                          + 0.07 + 0.06 + 0.07) * 1024
+        measured_rank0 = (
+            0.33 + 0.35 + 0.14 + 0.09 + 0.08 + 0.07 + 0.08 + 0.07 + 0.06 + 0.07
+        ) * 1024
         self._assert_in_band(est["per_rank_mib"], measured_rank0)
 
     def test_ladder_awareness_changes_prediction(self):
@@ -278,8 +329,7 @@ class TestHeuristic(CustomTestCase):
         # smaller k -> fewer rungs than the 5-rung ladder.
         small_k = graphmem.heuristic_estimate(
             base_geom,
-            dict(spec, speculative_num_steps=3,
-                 speculative_num_draft_tokens=4),
+            dict(spec, speculative_num_steps=3, speculative_num_draft_tokens=4),
         )
         self.assertLess(small_k["per_rank_mib"], full["per_rank_mib"])
         # the itemization names each rung separately.
@@ -290,16 +340,17 @@ class TestHeuristic(CustomTestCase):
     def test_rung_list_shapes(self):
         self.assertEqual(
             graphmem.ladder_rungs(
-                {"speculative_num_draft_tokens": 6,
-                 "speculative_num_steps": 5,
-                 "speculative_adaptive": True}
+                {
+                    "speculative_num_draft_tokens": 6,
+                    "speculative_num_steps": 5,
+                    "speculative_adaptive": True,
+                }
             ),
             [6, 5, 4, 3, 2],
         )
         self.assertEqual(
             graphmem.ladder_rungs(
-                {"speculative_num_draft_tokens": 4,
-                 "speculative_adaptive": False}
+                {"speculative_num_draft_tokens": 4, "speculative_adaptive": False}
             ),
             [4],
         )

@@ -37,7 +37,9 @@ def compute_model_identity_hash(server_args: Any) -> str:
     suffix turns that silent wrong hit into a clean miss.
 
     Matches the recipe of upstream PR #24794 so keys converge with stock
-    sglang once it lands.
+    sglang once it lands; the two uneven-TP vectors below are fork-only and
+    enter the string only when they are set, so an even-TP key is
+    byte-identical to the upstream recipe.
     """
     identity_parts = [
         os.path.normpath(server_args.model_path) if server_args.model_path else "",
@@ -46,6 +48,22 @@ def compute_model_identity_hash(server_args: Any) -> str:
         server_args.quantization or "",
         str(server_args.kv_cache_dtype or "auto").lower(),
     ]
+    # #513 (audit #506, finding A3-2): under this fork's uneven TP,
+    # tp_rank/tp_size in the key suffix do NOT determine a rank's kv-head
+    # count -- `--rank-tp-ratio 13,6,6` and an even split are both
+    # (tp_rank=0, tp_size=3) with different bytes per stored page, and page
+    # hashes cover token ids only. The sibling fingerprint in
+    # managers/kv_session_spill_destination.py already treats these vectors as
+    # key-relevant for exactly this reason.
+    #
+    # APPENDED ONLY WHEN SET, so an even-TP deployment keeps the pages it has
+    # already persisted: re-keying every rig to fix a case that cannot occur
+    # there would be a cost with no benefit. Same convention
+    # uneven_perf.measured_kv_budget_fingerprint_fields uses for pp_size.
+    for name in ("rank_tp_ratio", "rank_kv_ratio"):
+        value = getattr(server_args, name, None)
+        if value:
+            identity_parts.append(f"{name}={value}")
     identity_str = "|".join(identity_parts)
     return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
 
