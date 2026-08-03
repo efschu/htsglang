@@ -55,6 +55,7 @@ from gguf.quants import dequantize, quantize
 
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.model_loader.gguf_mxfp4_repack import repacked_gguf_bytes
+from sglang.test.gguf_mxfp4_state import ForcesRepackPath
 
 #: llama.cpp's ``kvalues_mxfp4`` (ggml-common.h): the E2M1 lattice, doubled so
 #: it fits in int8. Indexed by the raw 4-bit code.
@@ -199,8 +200,16 @@ class TestBridgeToSafetensorsMXFP4(unittest.TestCase):
         self.assertEqual(scale.dtype, np.uint8)
 
 
-class TestBridgeToQ5_0(unittest.TestCase):
-    """Contract 3: MXFP4 is exactly representable in a supported GGUF type."""
+class TestBridgeToQ5_0(ForcesRepackPath, unittest.TestCase):
+    """Contract 3: MXFP4 is exactly representable in a supported GGUF type.
+
+    The repack path is forced (#529): on a post-#398 wheel
+    ``repacked_gguf_bytes`` is the identity, which turned this contract into
+    three assertions about 17-byte payloads that were never converted. The
+    representability claim is a property of the two LATTICES, not of which
+    kernel the wheel happens to carry, so it is pinned where the conversion
+    actually runs.
+    """
 
     def test_repack_is_value_exact(self):
         x = _sample_blocks()

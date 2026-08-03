@@ -29,6 +29,7 @@ Usage:
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -288,20 +289,34 @@ def _write_config(tmp: str, **overrides) -> str:
 
 
 class _ArgsStub:
-    """Just enough of ServerArgs to exercise the two real methods."""
+    """Just enough of ServerArgs to exercise the real geometry methods.
+
+    Everything except ``model_path`` is DELEGATED BY LOOKUP rather than listed.
+    The previous stub named ``declared_num_hidden_layers`` and
+    ``declared_layer_kinds`` explicitly and carried a hand-copied
+    ``_NUM_LAYER_CONFIG_KEYS``; when those two methods were refactored to share
+    a ``_read_declared_config`` helper, the stub no longer answered for it and
+    all five tests in this class died with ``AttributeError`` -- five red tests
+    that said nothing about the production code, for weeks (#529). Delegating
+    generically means a private helper the real methods grow travels with them,
+    and a genuinely missing attribute still raises rather than being invented.
+    """
 
     def __init__(self, model_path: str):
         from sglang.srt.server_args import ServerArgs
 
         self.model_path = model_path
-        self._NUM_LAYER_CONFIG_KEYS = ServerArgs._NUM_LAYER_CONFIG_KEYS
         self._sa = ServerArgs
 
-    def declared_num_hidden_layers(self):
-        return self._sa.declared_num_hidden_layers(self)
-
-    def declared_layer_kinds(self):
-        return self._sa.declared_layer_kinds(self)
+    def __getattr__(self, name: str):
+        # Only reached when normal lookup fails, so `model_path` / `_sa` never
+        # land here. Guard `_sa` itself against recursion during __init__.
+        if name.startswith("__") or name == "_sa":
+            raise AttributeError(name)
+        attribute = getattr(self._sa, name)
+        if callable(attribute):
+            return functools.partial(attribute, self)
+        return attribute
 
 
 class TestGeometryIsConfigDriven(unittest.TestCase):
