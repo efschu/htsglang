@@ -431,6 +431,18 @@ class Microphone {
       track_muted: track ? track.muted : null,
       track_enabled: track ? track.enabled : null,
       track_label: track ? String(track.label).slice(0, 60) : "",
+      // We REQUEST echo cancellation, noise suppression and gain control
+      // below, but a plain `true` in a constraint dictionary is "ideal", not
+      // "exact" -- a browser is free to ignore it and say nothing. The user
+      // reports his own voice is still noisy, so what was requested is not
+      // evidence; what the track actually got is. Reported so the answer
+      // comes from his device rather than from our source.
+      track_echo_cancellation: settings.echoCancellation === undefined
+        ? null : settings.echoCancellation,
+      track_noise_suppression: settings.noiseSuppression === undefined
+        ? null : settings.noiseSuppression,
+      track_auto_gain: settings.autoGainControl === undefined
+        ? null : settings.autoGainControl,
       worklet_calls: this.tapCalls,
       worklet_empty: this.tapEmpty,
       worklet_channels: this.tapChannels,

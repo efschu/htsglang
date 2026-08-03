@@ -880,6 +880,29 @@ def build_app(service: TranslatorService) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
         return JSONResponse({"removed": session.clear_transcript()})
 
+    @app.get("/api/translator/sessions/{session_id}/speaker-decisions")
+    async def speaker_decisions(session_id: str, limit: int = 50) -> JSONResponse:
+        """Why each turn was attributed the way it was.
+
+        Read-only calibration surface. The thresholds in force
+        (`match_threshold` / `uncertain_floor`) were measured on a synthetic
+        voice pool, and the only way to check them against a real conversation
+        is the real conversation's own numbers -- the full candidate ranking
+        per decision, not just the winner. Grepping the tenant log works and
+        does not survive a restart; this does not need one.
+        """
+        session = service.sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+        return JSONResponse(
+            {
+                "session_id": session_id,
+                "match_threshold": session.speakers.config.match_threshold,
+                "uncertain_floor": session.speakers.config.uncertain_floor,
+                "decisions": session.speakers.decisions_json(limit),
+            }
+        )
+
     @app.post("/api/translator/sessions/{session_id}/speakers/{speaker_id}/name")
     async def name_speaker(
         session_id: str, speaker_id: str, body: Dict[str, Any]

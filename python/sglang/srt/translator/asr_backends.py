@@ -213,24 +213,70 @@ class FasterWhisperAsr:
     ) -> Transcript:
         import asyncio
 
-        # The hint is NOT passed as ``language=``: doing so would disable
-        # Whisper's language identification and pin the direction, which is
-        # exactly the hardcoded-pair failure requirement 5 forbids. The hint
-        # is used only to restrict the candidate set when one was configured.
+        # The hint is NOT passed as ``language=``: doing so would pin the
+        # direction from OUTSIDE the audio, which is exactly the hardcoded-pair
+        # failure requirement 5 forbids. The direction is always discovered
+        # from the utterance; what a restriction changes is the candidate set
+        # it is discovered from, never that it is discovered.
         del hint_language
 
+        restrict = list(self._restrict)
+
         def _run():
+            chosen: Optional[str] = None
+            confidence = 0.0
+            if restrict and hasattr(self._model, "detect_language"):
+                # TWO PASSES, and this is the whole point of the method.
+                #
+                # Narrowing the identifier's ANSWER after the fact -- what the
+                # first version did -- binds the LABEL and nothing else:
+                # `transcribe()` without `language=` runs Whisper's own
+                # identification internally and decodes in whatever it picks,
+                # across all 98 languages. A German utterance identified as
+                # Icelandic therefore came back as Icelandic TEXT wearing a
+                # `de` label, and the user reads the text, not the label.
+                #
+                # So: identify first, narrow that posterior to the routable
+                # set, then DECODE with the language constrained
+                # identification actually chose. Still discovered, never
+                # declared -- discovered from a restricted candidate set.
+                # The cost is one extra encoder pass, paid only when a
+                # restriction exists; ASR is ~2 % of first-audio latency
+                # (DESIGN §18.4), so this buys correctness at a measured
+                # ~0.1 s.
+                detected, probability, posterior = self._model.detect_language(
+                    audio.samples
+                )
+                if not detected:
+                    raise BackendError(
+                        "asr", "recognizer returned no language identification"
+                    )
+                chosen, confidence = constrained_language_choice(
+                    str(detected).lower(),
+                    float(probability or 0.0),
+                    posterior,
+                    restrict,
+                )
             segments, info = self._model.transcribe(
                 audio.samples,
+                language=chosen,
                 beam_size=self._beam_size,
                 vad_filter=self._vad_filter,
                 condition_on_previous_text=False,
                 task="transcribe",
             )
             text = " ".join(s.text.strip() for s in segments).strip()
-            return text, info
+            return text, info, chosen, confidence
 
-        text, info = await asyncio.get_running_loop().run_in_executor(None, _run)
+        text, info, chosen, confidence = await asyncio.get_running_loop().run_in_executor(
+            None, _run
+        )
+        if chosen is not None:
+            return Transcript(text, chosen, language_confidence=confidence)
+        # Unrestricted (or a model too old to expose `detect_language`): the
+        # decode identified the language itself and the narrowing below is a
+        # no-op for the empty restriction. Kept as the single-pass path so an
+        # unbounded session costs exactly what it always did.
         language = getattr(info, "language", None)
         if not language:
             raise BackendError("asr", "recognizer returned no language identification")
@@ -241,7 +287,7 @@ class FasterWhisperAsr:
             str(language).lower(),
             probability,
             getattr(info, "all_language_probs", None),
-            self._restrict,
+            restrict,
         )
         return Transcript(text, language, language_confidence=probability)
 
@@ -322,6 +368,14 @@ class NemoStreamingAsr:
         # an honest confidence of zero. That is a real limitation of the
         # backend rather than of the contract, and it is why the shared helper
         # takes the posterior as optional rather than assuming one exists.
+        #
+        # KNOWN GAP, stated rather than papered over: this backend still binds
+        # only the LABEL, exactly the defect fixed above for faster-whisper.
+        # A second pass would have to re-transcribe with `target_lang=code`,
+        # and NeMo is not installed in this venv, so that call cannot be
+        # executed or tested here -- writing it blind would be a desk fix. The
+        # faster-whisper backend is the shipped one; when NeMo is brought up,
+        # this is the first thing to close.
         code, confidence = constrained_language_choice(
             str(language).lower().split("-")[0],
             confidence,

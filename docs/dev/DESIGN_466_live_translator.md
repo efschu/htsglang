@@ -2552,7 +2552,43 @@ Gate arm to add with the fix: foreign or ambiguous audio must come out as the
 best WHITELIST language *in the text as well as the label*, across a session
 resume and with a second client driving turns concurrently.
 
-Not yet built. Recorded before building, per §17's reason for existing.
+**FIXED, 2026-08-03** (`asr_backends.py`, `FasterWhisperAsr.transcribe`).
+The remedy is the one stated above and nothing more: when a restriction is in
+force, `detect_language()` runs first, `constrained_language_choice` narrows
+that posterior to the participant set, and `transcribe()` is then called with
+`language=` set to what constrained identification chose. The direction is
+still discovered from the audio -- discovered from a restricted candidate set
+instead of an unrestricted one -- so requirement 5 is intact.
+
+Three properties were deliberately built in, because each is a way this could
+have shipped looking correct:
+
+* **The unrestricted path is untouched.** No whitelist means no
+  `detect_language` call, one encoder pass, byte-identical behaviour. Pinned
+  by a test that counts the passes, not by inspection.
+* **The cost is named.** One extra encoder pass, paid only when a restriction
+  exists. ASR is 2 % of first audio (§18.4), so this is ~0.1 s bought for
+  correctness -- it is not free and it is not significant, and both halves of
+  that sentence are load-bearing.
+* **A model without `detect_language` degrades** to the old single-pass path
+  rather than raising. A version difference must not take a turn down.
+
+Falsifier: `test/registered/translator/test_decode_language.py`, driving the
+SHIPPED adapter over a fake whose free decode returns the journal's actual
+Icelandic line and whose directed decode returns German. **Can-fail proof
+run** (the §17.8.7 lesson): with the two-pass branch disabled, three
+assertions fail with `AssertionError: 'Það er ló. Ég finn.' != 'Das ist alles,
+ich glaube.'`; with it enabled, 6 pass. Suite 438 (from 424), ruff and
+codespell clean.
+
+**The NeMo backend still has this hole** and says so in a comment at the
+place it would be closed. It is not the shipped recognizer and NeMo is not
+installed in this venv, so a fix there could not be executed or tested --
+writing it would be a desk fix, which is the thing this project keeps paying
+for. Recorded rather than silently half-done.
+
+Still open: the gate arm above (foreign audio through the real client, across
+a resume, with a second client driving turns).
 
 #### 17.8.5 Speaker identity: the cascade, and the continuity guard
 
@@ -2930,11 +2966,35 @@ prefer.**
 
 ### 19.2 Speaker identity
 
-Continuity guard shipped (§17.8.5). Open: calibration on his device audio,
-persisted per-decision candidate cosines, rolling reference growth, and
-speaker merge (union the reference buffers -- more reference is a better clone
--- keep ONE voice, relabel the history, which is a correction and not a
-rewrite of content).
+Continuity guard shipped (§17.8.5). **Per-decision logging shipped,
+2026-08-03** -- it was the forced first step, because `speakers.py` contained
+no logging at all and every assignment was therefore unreadable after the
+fact. What is recorded per decision, in `SpeakerRegistry.decisions` (bounded
+ring, 200) and on one log line:
+
+* the full candidate ranking, taken BEFORE any centroid folds -- a confident
+  match moves the centroid it matched, so ranking afterwards would record
+  numbers the decision never saw;
+* which branch fired (`match` / `guard` / `capacity` / `mint` / `manual`), so
+  a continuity guess is distinguishable from a confident match without
+  re-deriving it from the score;
+* both thresholds in force at the time, so a series stays interpretable
+  across a retune;
+* a `prior` slot, present and neutral, so the §19.7 prior does not change the
+  record's shape when it lands and split the calibration series in two;
+* manual attributions together with what the automatic path WOULD have said
+  -- the only decisions where the correct answer is known.
+
+Readable live at `GET /api/translator/sessions/{id}/speaker-decisions`, which
+does not require grepping the tenant log and survives what a log rotation does
+not. Pinned by `test/registered/translator/test_speaker_decision_log.py`.
+
+Open: the calibration itself, on the clean profiles the restarts left behind
+(§17.8.9) and now with a genuine second speaker; the §19.10 voice-class pick,
+which comes first because it is audible on first contact; rolling reference
+growth; and speaker merge (union the reference buffers -- more reference is a
+better clone -- keep ONE voice, relabel the history, which is a correction and
+not a rewrite of content).
 
 ### 19.3 UI redesign (unbuilt)
 
@@ -3062,3 +3122,131 @@ Replay button per line and tap-a-line-to-replay (this one also buys back what
 bubble, a visible recording level, and copy/share of the transcript. Judge
 each on effort against payoff with the deadline in view; the core (§19.1-19.4)
 comes first.
+
+### 19.8 Denoising the capture, before anything analyses it (user order 2026-08-03)
+
+User: *"my own voice still hisses badly ... run very good/strong denoising and
+background-noise filtering, ideally some model, over the audio input before
+the samples are analysed."* Recorded together with a positive confirmation on
+the same build -- *"now it updates properly and it comes through"* -- so this
+is a quality complaint on a working pipeline, not another delivery defect.
+
+**(a) The free check, done first and answered.** The browser constraints are
+already requested: `index.html` asks for `echoCancellation`,
+`noiseSuppression` and `autoGainControl`, all `true`. So "they are switched
+off" is refuted at the source and is not the explanation.
+
+But that is what was REQUESTED, and a plain `true` in a constraint dictionary
+is `ideal`, not `exact` -- a browser may ignore any of them and report
+nothing. Nothing in the system ever checked what the track actually got. The
+capture diagnostics now report `track_echo_cancellation`,
+`track_noise_suppression` and `track_auto_gain` from
+`MediaStreamTrack.getSettings()`, which the server already logs verbatim
+beside the playback half. **The next diagnostics frame from his phone settles
+whether the browser is denoising at all**, and that answer decides how much
+(b) has to carry. This is the parameter-reach rule applied to a constraint we
+do not own: requesting is not binding.
+
+**(b) A real neural denoiser server-side**, ahead of the reference buffer and
+the embedder. Candidates: DeepFilterNet3 and the RNNoise class -- streaming
+capable, low latency. Licence to be checked before installation, installed
+into the translator venv, integrated as an in-process module (one-runtime
+law: no sidecar).
+
+**(c) Measure, do not believe.** Denoising can HARM ASR -- this is a known
+effect, not a hedge -- so the arms are separated and each is measured on his
+real turns: WER with/without, speaker similarity with/without, and a listening
+artefact check on the clone with/without, because voice identity must not be
+ironed flat by the very step meant to clean it. Expected outcome is a
+DIFFERENTIATED switch rather than one global flag: references always denoised
+(they are the direct cause of clone quality), ASR only if WER does not suffer.
+The raw signal stays in the journal in parallel, so nothing is irreversible.
+The denoiser's own latency is quantified and has to fit the real-time chain --
+it is added to the §18.4 decomposition like any other stage.
+
+This couples to §19.5's capture-side rung: a 48 kHz reference that is also
+denoised is the target state, and both changes land in the same consumer.
+
+### 19.9 A faster MT model, and the NVFP4 lane's first real load (user order)
+
+User: *"qwen3.6-35b-a3b for example?"*, and then: *"prefer NVFP4 -- that would
+be a good test of that at the same time"*, and finally *"of course the NVFP4
+MoE model with the phase-optimal cuts for prefill and decode, and with MTP."*
+
+**The honest arithmetic first, because it bounds the prize.** Per §18.4, MT to
+first token is 0.30 s of a 3.95 s first-audio figure. A faster LLM can
+therefore remove at most ~0.3 s of START latency; the dominant term remains
+the first clause's synthesis at 3.36 s (85 %), which is §19.4's job and not
+this one. Anyone reading this expecting a latency fix should read §18.4 first.
+
+**Where it could nevertheless pay, stated as hypotheses to be measured:**
+
+1. **MT throughput on long sentences.** An A3B MoE activates ~3 B parameters,
+   so the per-token cost falls sharply against a dense 27 B. Long turns are
+   where the current chain visibly stutters.
+2. **SM contention against the talker.** This is the more interesting one.
+   The talker's measured RTF is 1.23 -- it is AT the capacity limit
+   (§17.8.2), and it shares the 5090 with MT. Less LLM work on that card may
+   help the term that actually dominates, indirectly. Whether it does is an
+   empirical question about co-residency, not about the LLM's own speed.
+
+**The evaluation is deliberately a full-stack one**, because the model is also
+the vehicle for three separate questions and running them separately would
+cost three boots:
+
+* **NVFP4 lane proof.** Checkpoint availability on the box first (otherwise
+  name HF candidates with download size and check disk). Then read the
+  #332/#336/#323 line's reach AT THE CODE before assuming anything -- native
+  fp4 on the 5090 (sm120) versus the dequant fallback for unpackable layers
+  on the sm86 ranks. The PLACEMENT is a deliberate choice and must be named
+  in the report: MT alone on the 5090 is a purely NATIVE fp4 test; spread
+  across the 3080s additionally exercises the dequant lane. Both are
+  valuable; run both if cheap, and say which arm produced which number.
+* **Phase-optimal cuts.** Not a single compromise layout: have the planner
+  solve prefill and decode layouts separately for this model x quant (#485
+  phase matrix / `uneven_perf`), with MoE as its own family axis. Verify the
+  machinery's reach at the code, per the mechanism-reach law.
+* **MTP/spec.** The model carries an MTP head. Watch the #318/#387 family:
+  a draft that wrongly inherits the target's quantisation method, or an
+  acceptance rate that collapses on a quantised target. Acceptance length is
+  measured from `meta_info`, NEVER from `spec_ema_accept_len` -- that field
+  is not the acceptance length.
+
+**Deliverables:** VRAM arithmetic beside the talker and the ASR model
+(mandatory); a DE<->ES quality sample of 10 sentences side by side against the
+current 27 B; first-token and throughput numbers; and the NVFP4 findings
+reported SEPARATELY from the MT decision, because they feed the capability
+catalogue whichever way the model choice goes. **A model swap is a ship
+decision and waits for an explicit go.**
+
+### 19.10 The placeholder voice must match the speaker (user order, field defect)
+
+User: *"in the initial selection of the synthetic voices something has to
+quickly detect whether a woman or a man or a child is speaking. right now it
+sometimes takes a female voice for me when there is no profile yet. for my
+wife it takes a male voice until her own voice clone exists."*
+
+Both directions observed on real turns, which makes this the most
+user-visible defect remaining: it is what EVERY first contact sounds like,
+before any clone exists.
+
+The requirement is a fast voice-class decision from the first turn's audio --
+fractions of a second, at the start of the turn -- choosing among the
+manually creatable man/woman/boy/girl profiles rather than inventing a new
+taxonomy.
+
+**Check what is already computed before fetching a model.** The speaker
+embedding is produced for every turn anyway, and ECAPA/ResNet-class embeddings
+carry sex information densely; an F0/pitch median over the segment is nearly
+free and is the classical discriminator (with the well-known adult-female /
+child overlap that a formant check or the embedding can break). The order of
+investigation is therefore: what the existing embedding already separates,
+then pitch, then a dedicated classifier -- and only if the cheap paths
+measurably fail.
+
+Test cases are drawn from the journal rather than synthesised: his turns that
+picked a female voice, and his wife's that picked a male one. Both must flip
+under the fix, and that is the falsifier.
+
+This sits in the speaker complex AHEAD of threshold calibration: calibration
+improves a number, this fixes something the user hears on contact.

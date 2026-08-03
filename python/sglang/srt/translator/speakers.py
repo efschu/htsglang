@@ -34,12 +34,16 @@ the primary key.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from collections import deque
+from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from sglang.srt.translator.backends import AudioChunk, SpeakerEmbedding
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "SpeakerProfile",
@@ -237,6 +241,9 @@ class SpeakerRegistryConfig:
 class SpeakerRegistry:
     """Online speaker assignment plus per-speaker reference buffers."""
 
+    #: How many assignment decisions to keep in memory for inspection.
+    DECISION_LOG = 200
+
     def __init__(
         self,
         config: Optional[SpeakerRegistryConfig] = None,
@@ -246,6 +253,14 @@ class SpeakerRegistry:
         self._clock = clock
         self._profiles: Dict[str, SpeakerProfile] = {}
         self._next_id = 1
+        #: Every assignment decision, newest last. This module logged NOTHING
+        #: at all until now, which made every threshold question unanswerable
+        #: after the fact: the user reported "I am recognized as somebody
+        #: different every time", and the only way to check WHY was to
+        #: reproduce it. A decision is cheap to record and impossible to
+        #: reconstruct, so it is recorded -- the ring is bounded because this
+        #: runs for the length of a conversation, not of a request.
+        self.decisions: Deque[Dict[str, object]] = deque(maxlen=self.DECISION_LOG)
 
     # -- read side ----------------------------------------------------------
 
@@ -468,6 +483,18 @@ class SpeakerRegistry:
         """
         profile = self.get(speaker_id)
         now = self._clock()
+        # Ranked BEFORE folding, for the same reason as in `assign`. A manual
+        # attribution is the most valuable calibration point there is -- it is
+        # the only one where the correct answer is KNOWN -- so what the
+        # automatic path would have scored is worth keeping next to it.
+        candidates = (
+            [(sid, round(sim, 4)) for sid, sim in self.rank(embedding, 4)]
+            if embedding is not None
+            else []
+        )
+        would_have, would_have_sim = (
+            self._nearest(embedding) if embedding is not None else (None, -1.0)
+        )
         profile.last_seen = now
         if embedding is not None:
             if profile.centroid is None:
@@ -481,6 +508,19 @@ class SpeakerRegistry:
             profile.last_language = language
         admitted = self._maybe_admit_reference(
             profile, audio, text, language, similarity=1.0, enforce_identity=False
+        )
+        self._record_decision(
+            profile=profile,
+            outcome="manual",
+            best_id=would_have,
+            best_sim=would_have_sim,
+            candidates=candidates,
+            guessed=False,
+            admitted=admitted,
+            language=language,
+            language_confidence=1.0,
+            duration_s=audio.duration_s,
+            at=now,
         )
         return profile, admitted
 
@@ -500,6 +540,12 @@ class SpeakerRegistry:
         """
         best_id, best_sim = self._nearest(embedding)
         now = self._clock()
+        # Snapshot the candidate cosines BEFORE anything folds. A confident
+        # match moves the matched centroid, so ranking afterwards would record
+        # numbers the decision never saw -- which is the difference between a
+        # calibration record and a plausible-looking fiction.
+        candidates = [(sid, round(sim, 4)) for sid, sim in self.rank(embedding, 4)]
+        outcome = "mint"
         #: True when this turn was attributed by the continuity guard rather
         #: than by a confident match. Such a turn must never reach the clone
         #: reference: the identity gate in `_maybe_admit_reference` is
@@ -512,6 +558,7 @@ class SpeakerRegistry:
         if best_id is not None and best_sim >= self.config.match_threshold:
             profile = self._profiles[best_id]
             self._fold(profile, embedding)
+            outcome = "match"
         elif best_id is not None and best_sim >= self.config.uncertain_floor:
             # CONTINUITY GUARD. In the uncertainty band this used to fall
             # through and MINT A NEW SPEAKER, and that is the defect a real
@@ -542,6 +589,7 @@ class SpeakerRegistry:
             # possibly-wrong turn can never reach the clone prompt.
             profile = self._profiles[best_id]
             guessed = True
+            outcome = "guard"
         elif len(self._profiles) >= self.config.max_speakers:
             # At capacity: rather than evicting a profile (which would drop a
             # reference buffer someone is still using), the segment joins the
@@ -552,6 +600,7 @@ class SpeakerRegistry:
                 raise RuntimeError("speaker registry at capacity with no profiles")
             profile = self._profiles[best_id]
             best_sim = min(best_sim, self.config.reference_threshold - 1e-6)
+            outcome = "capacity"
         else:
             sid = f"speaker-{self._next_id}"
             self._next_id += 1
@@ -572,7 +621,93 @@ class SpeakerRegistry:
                 profile, audio, text, language, best_sim
             )
         )
+        self._record_decision(
+            profile=profile,
+            outcome=outcome,
+            best_id=best_id,
+            best_sim=best_sim,
+            candidates=candidates,
+            guessed=guessed,
+            admitted=admitted,
+            language=language,
+            language_confidence=language_confidence,
+            duration_s=audio.duration_s,
+            at=now,
+        )
         return profile, best_sim, admitted
+
+    def _record_decision(
+        self,
+        *,
+        profile: SpeakerProfile,
+        outcome: str,
+        best_id: Optional[str],
+        best_sim: float,
+        candidates: Sequence[Tuple[str, float]],
+        guessed: bool,
+        admitted: bool,
+        language: Optional[str],
+        language_confidence: float,
+        duration_s: float,
+        at: float,
+    ) -> None:
+        """Persist WHY this turn was attributed the way it was.
+
+        The fields are chosen so a threshold can be re-derived from the log
+        alone, without the audio: the full candidate ranking (not only the
+        winner), both thresholds IN FORCE at the time, and which branch fired.
+        A record that named only the winner would answer "who" and leave "why"
+        exactly as unanswerable as no record at all -- the interesting cases
+        are the ones where the runner-up was close.
+
+        ``prior`` is present and neutral. The §19.7 temporal-continuity prior
+        is not built yet; the slot exists so the record's SHAPE does not change
+        when it lands, because a calibration series that changes schema
+        halfway is two short series.
+        """
+        record: Dict[str, object] = {
+            "at": round(at, 3),
+            "speaker_id": profile.speaker_id,
+            "outcome": outcome,
+            "nearest_id": best_id,
+            "score": round(float(best_sim), 4),
+            "candidates": [list(item) for item in candidates],
+            "match_threshold": self.config.match_threshold,
+            "uncertain_floor": self.config.uncertain_floor,
+            "reference_threshold": self.config.reference_threshold,
+            "prior": None,
+            "guessed": guessed,
+            "admitted_reference": admitted,
+            "observations": profile.observations,
+            "reference_s": round(profile.reference_seconds(), 2),
+            "language": language or "",
+            "language_confidence": round(float(language_confidence), 3),
+            "segment_s": round(float(duration_s), 2),
+        }
+        self.decisions.append(record)
+        logger.info(
+            "speaker decision: %s -> %s score=%.4f (match>=%.3f floor>=%.3f) "
+            "candidates=%s guessed=%s reference=%s obs=%d ref_s=%.2f "
+            "lang=%s/%.2f seg_s=%.2f",
+            outcome,
+            profile.speaker_id,
+            record["score"],
+            self.config.match_threshold,
+            self.config.uncertain_floor,
+            record["candidates"],
+            guessed,
+            admitted,
+            profile.observations,
+            record["reference_s"],
+            language or "-",
+            language_confidence,
+            duration_s,
+        )
+
+    def decisions_json(self, limit: int = 50) -> List[Dict[str, object]]:
+        """The most recent decisions, newest last."""
+        items = list(self.decisions)
+        return items[-limit:] if limit > 0 else items
 
     # -- internals ----------------------------------------------------------
 
