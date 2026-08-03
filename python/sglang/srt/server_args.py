@@ -2646,6 +2646,16 @@ class ServerArgs:
         Optional[str],
         "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
     ] = None
+    cors_allow_origins: A[
+        List[str],
+        "Origins allowed to make cross-origin requests. The default '*' permits "
+        "any origin but, per the Fetch standard, sends no credentials with it. "
+        "Pass an explicit list (e.g. --cors-allow-origins https://ui.example) to "
+        "allow credentialed cross-origin requests; a wildcard combined with "
+        "credentials is not accepted because it would let any page the operator "
+        "has open drive this server's state-changing routes through a "
+        "loopback-only bind.",
+    ] = dataclasses.field(default_factory=lambda: ["*"])
     served_model_name: A[
         Optional[str],
         "Override the model name returned by the v1/models endpoint in OpenAI API server.",

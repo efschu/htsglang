@@ -592,13 +592,59 @@ app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+#: Origins the CORS policy falls back to before --cors-allow-origins is known
+#: (the app object is built at import time, server args arrive at launch).
+DEFAULT_CORS_ALLOW_ORIGINS = ["*"]
+
+
+def cors_policy(cors_allow_origins) -> dict:
+    """CORS keyword arguments for one origin list.
+
+    #510: the previous policy was ``allow_origins=["*"]`` **with**
+    ``allow_credentials=True``. That pair is illegal per the Fetch standard
+    (a wildcard `Access-Control-Allow-Origin` may not be sent with
+    credentials) and, more concretely, it defeats a loopback-only bind: any
+    page the operator has open can then POST to `127.0.0.1:30000` *and read
+    the response*, which reaches every state-changing route on this app
+    (audit #506, finding A2-F3).
+
+    Credentials are therefore enabled only for an explicit origin list. A
+    wildcard keeps working for plain, uncredentialed cross-origin calls, so
+    the default deployment is unchanged for everything except the case that
+    was never legal.
+    """
+    origins = list(cors_allow_origins or DEFAULT_CORS_ALLOW_ORIGINS)
+    wildcard = "*" in origins
+    return dict(
+        allow_origins=origins,
+        allow_credentials=not wildcard,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+def configure_cors(app, server_args) -> dict:
+    """Apply --cors-allow-origins to ``app``, replacing the import-time policy.
+
+    Replaces rather than appends: two CORSMiddleware instances would both
+    answer a preflight and the effective policy would depend on stack order.
+    Safe to call before startup, which is when the middleware stack is built.
+    """
+    policy = cors_policy(getattr(server_args, "cors_allow_origins", None))
+    app.user_middleware = [
+        m for m in app.user_middleware if m.cls is not CORSMiddleware
+    ]
+    app.add_middleware(CORSMiddleware, **policy)
+    if not policy["allow_credentials"] and "*" in policy["allow_origins"]:
+        logger.info(
+            "CORS: wildcard origins, credentials disabled. Pass "
+            "--cors-allow-origins with an explicit list to allow credentialed "
+            "cross-origin requests."
+        )
+    return policy
+
+
+app.add_middleware(CORSMiddleware, **cors_policy(DEFAULT_CORS_ALLOW_ORIGINS))
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -1703,7 +1749,7 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.api_route("/hibernate", methods=["GET", "POST"])
+@app.api_route("/hibernate", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def hibernate(
     obj: Annotated[Optional[ReleaseMemoryOccupationReqInput], Body()] = None,
@@ -1712,10 +1758,37 @@ async def hibernate(
     """#89 hibernate (suspend-to-disk): park each rank's FINAL post-transform
     weights to --hibernate-dir, then release. A later boot with a matching
     manifest restores them fast (LoadFormat.HIBERNATE). Requires the server to
-    be fully idle (mirrors /release_memory_occupation)."""
+    be fully idle (mirrors /release_memory_occupation).
+
+    POST only (#510): parking the model is a state change, and the route used
+    to accept GET, so a bare browser navigation or a link preview fetch parked
+    the server. A ``hibernate_dir`` in the body is confined to the configured
+    --hibernate-dir; see the confinement note below."""
     try:
         if obj is None:
             obj = ReleaseMemoryOccupationReqInput()
+        # #510 (audit #506 A2-F1): a request-supplied hibernate_dir used to
+        # override --hibernate-dir outright and reach os.makedirs(). Confine
+        # it here so the caller gets a 400 with the reason, and again at the
+        # scheduler-side sink (weight_updater._hibernate_park_weights) so the
+        # Engine API and any future caller inherit the same rule.
+        requested_dir = getattr(obj, "hibernate_dir", None)
+        if requested_dir is not None:
+            from sglang.srt.utils.path_confinement import (
+                PathConfinementError,
+                confine_to_root,
+            )
+
+            try:
+                obj.hibernate_dir = confine_to_root(
+                    requested_dir,
+                    _global_state.tokenizer_manager.server_args.hibernate_dir,
+                )
+            except PathConfinementError as exc:
+                return ORJSONResponse(
+                    {"error": {"message": str(exc)}},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
         obj.destination = "disk"
         obj.tags = ["weights"]
         await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
@@ -2077,6 +2150,7 @@ async def openai_v1_audio_speech(raw_request: Request):
 
 
 @app.post("/v1/files")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)  # #510: state-changing fork route
 async def openai_v1_files(
     raw_request: Request,
     file: UploadFile = File(...),
@@ -2101,6 +2175,7 @@ async def openai_v1_files_retrieve(file_id: str, raw_request: Request):
 
 
 @app.delete("/v1/files/{file_id}", response_class=ORJSONResponse)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)  # #510: state-changing fork route
 async def openai_v1_files_delete(file_id: str, raw_request: Request):
     return await raw_request.app.state.openai_serving_files.delete(file_id)
 
@@ -2111,6 +2186,7 @@ async def openai_v1_files_content(file_id: str, raw_request: Request):
 
 
 @app.post("/v1/fine_tuning/jobs", dependencies=[Depends(validate_json_request)])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)  # #510: state-changing fork route
 async def openai_v1_fine_tuning_jobs(raw_request: Request):
     """OpenAI-compatible fine-tuning job submission. Run by the idle tenant."""
     body = await raw_request.json()
@@ -2132,6 +2208,7 @@ async def openai_v1_fine_tuning_job(job_id: str, raw_request: Request):
 
 
 @app.post("/v1/fine_tuning/jobs/{job_id}/cancel", response_class=ORJSONResponse)
+@auth_level(AuthLevel.ADMIN_OPTIONAL)  # #510: state-changing fork route
 async def openai_v1_fine_tuning_job_cancel(job_id: str, raw_request: Request):
     return await raw_request.app.state.openai_serving_fine_tuning.cancel(job_id)
 
@@ -2211,6 +2288,7 @@ async def workbench_events(raw_request: Request, after: int = 0, limit: int = 20
 
 
 @app.post("/x-htsglang/workbench/pause", dependencies=[Depends(validate_json_request)])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)  # #510: state-changing fork route
 async def workbench_pause(raw_request: Request):
     """Pause or resume the whole bench, or one tenant by name."""
     from sglang.srt.workbench.http_api import pause_payload
@@ -2224,6 +2302,7 @@ async def workbench_pause(raw_request: Request):
 @app.post(
     "/x-htsglang/workbench/enqueue", dependencies=[Depends(validate_json_request)]
 )
+@auth_level(AuthLevel.ADMIN_OPTIONAL)  # #510: state-changing fork route
 async def workbench_enqueue(raw_request: Request):
     """Add one work item to one tenant's queue."""
     from sglang.srt.workbench.http_api import enqueue_payload
@@ -2929,6 +3008,11 @@ def _setup_and_run_http_server(
 
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
+
+    # #510: apply the configured CORS policy. Done for both tokenizer modes,
+    # unlike the api-key middleware below, because CORS is a browser-facing
+    # property of the app and not a single-tokenizer feature.
+    configure_cors(app, server_args)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.

@@ -253,9 +253,30 @@ class TrainingService:
     # -- files --------------------------------------------------------------
 
     def create_file(self, *, filename: str, content: bytes, purpose: str):
+        # #510 (audit #506, finding A2-F6): this had no enabled-guard although
+        # create_job did, so POST /v1/files wrote to disk on EVERY boot,
+        # including servers that never asked for the training tenant. The cap
+        # is per file, not per store, so the route was an unauthenticated way
+        # to fill the artifact root.
+        self._require_tenant("file uploads")
         return self.files.create(filename=filename, content=content, purpose=purpose)
 
+    def _require_tenant(self, what: str) -> None:
+        """Refuse a write when the tenant is off, by name.
+
+        A named rejection, not a 404: "this route does not exist" and "this
+        route exists and is switched off" are different problems with different
+        fixes, and only one of them is the operator's.
+        """
+        if not self.config.enabled:
+            raise TenantDisabled(
+                f"The idle training tenant is not enabled on this server, so "
+                f"{what} are not accepted. Restart with "
+                f"--enable-training-tenant to turn it on."
+            )
+
     def delete_file(self, file_id: str) -> None:
+        self._require_tenant("file deletions")
         if file_id in self.jobs.files_in_use():
             raise InvalidJobState(
                 f"file {file_id} is the training file of a job that has not "
@@ -266,15 +287,7 @@ class TrainingService:
     # -- jobs ---------------------------------------------------------------
 
     def create_job(self, body: Mapping[str, Any]) -> TrainingJob:
-        if not self.config.enabled:
-            # A named rejection, not a 404. "This route does not exist" and
-            # "this route exists and is switched off" are different problems
-            # with different fixes, and only one of them is the operator's.
-            raise TenantDisabled(
-                "The idle training tenant is not enabled on this server, so "
-                "fine-tuning jobs are not accepted. Restart with "
-                "--enable-training-tenant to turn it on."
-            )
+        self._require_tenant("fine-tuning jobs")
         model = str(body.get("model") or "").strip()
         if not model:
             raise StoreError("'model' is required")

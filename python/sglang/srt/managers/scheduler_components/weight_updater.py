@@ -330,14 +330,17 @@ class SchedulerWeightUpdaterManager:
         model_runner = self.tp_worker.model_runner
         server_args = model_runner.server_args
         model = model_runner.model
-        hibernate_dir = (
-            getattr(recv_req, "hibernate_dir", None) or server_args.hibernate_dir
+        # #510 (audit #506 A2-F1): the request may narrow the directory but
+        # never leave the configured root. Enforced here as well as in the HTTP
+        # handler because this is the sink -- os.makedirs()/os.path.join() are
+        # two calls further down -- and it is reachable from the Engine API
+        # without passing through the route.
+        from sglang.srt.utils.path_confinement import confine_to_root
+
+        hibernate_dir = confine_to_root(
+            getattr(recv_req, "hibernate_dir", None),
+            server_args.hibernate_dir,
         )
-        if hibernate_dir is None:
-            raise ValueError(
-                "#89 hibernate: /hibernate requires --hibernate-dir (or a "
-                "hibernate_dir in the request)."
-            )
         tp_rank = model_runner.tp_rank
         park_weights_to_disk(
             model=model,
