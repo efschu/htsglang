@@ -544,7 +544,7 @@ class TranslatorSession:
     # -- name suggestions (§17.3) -------------------------------------------
 
     async def _suggest_names(
-        self, turn_id: str, speaker_id: str, text: str
+        self, turn_id: str, speaker_id: str, text: str, language: str = ""
     ) -> List[NameSuggestion]:
         """Offer names heard in this turn. Never applies any of them."""
         if not self.name_suggestions_enabled:
@@ -553,7 +553,7 @@ class TranslatorSession:
         # The pre-filter decides whether the LLM is asked at all. An earlier
         # turn's addressed candidate still has to be OFFERED this turn, so the
         # tracker runs either way -- only the extraction is skipped.
-        if looks_like_naming(text):
+        if looks_like_naming(text, language):
             ask = getattr(self.mt, "ask", None)
             if callable(ask):
                 try:
@@ -1097,7 +1097,9 @@ class TranslatorSession:
                 remember(transcript.text, translations[first_target])
 
         self.turns_completed += 1
-        await self._suggest_names(turn_id, speaker_id, transcript.text)
+        await self._suggest_names(
+            turn_id, speaker_id, transcript.text, source
+        )
         # Later audio may have settled an earlier ambiguity. Run after this
         # turn's centroid update, which is the thing that could have changed
         # the answer.

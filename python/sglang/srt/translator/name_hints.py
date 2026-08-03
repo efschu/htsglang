@@ -50,6 +50,7 @@ __all__ = [
     "NameSuggestion",
     "SuggestionTracker",
     "looks_like_naming",
+    "NOUN_CAPITALIZING",
     "parse_candidates",
     "EXTRACTION_PROMPT",
     "KIND_SELF",
@@ -89,6 +90,15 @@ CUES: Tuple[str, ...] = (
 #: cheap signal. Sentence-initial capitals are excluded because every
 #: sentence has one and they would let everything through.
 _MID_SENTENCE_CAPITAL = re.compile(r"(?<![.!?]\s)(?<!^)\b[A-ZÀ-ÖØ-Þ][\wÀ-ÿ'-]{2,}")
+
+#: Languages that capitalise every noun, where the capital signal has no
+#: discriminating power at all. Measured rather than assumed: the first real
+#: German turn through the front door ("Als ich sechs war, sah ich einmal ein
+#: wunderbares Bild.") tripped the gate on "Bild" and spent an LLM round trip
+#: on a sentence containing no name. A gate that never blocks anything in the
+#: language being developed against has reach zero, so in these languages the
+#: cue list is the whole gate.
+NOUN_CAPITALIZING = frozenset({"de", "lb"})
 
 EXTRACTION_PROMPT = """You extract personal NAMES from one spoken utterance.
 
@@ -147,18 +157,25 @@ class NameSuggestion:
         }
 
 
-def looks_like_naming(text: str) -> bool:
+def looks_like_naming(text: str, language: Optional[str] = None) -> bool:
     """Cheap gate: could this utterance contain somebody's name?
 
     False positives are fine and expected — they cost one small request. A
     false negative costs a suggestion that the manual path would have to
     supply instead, which is a mild degradation rather than a wrong answer.
+
+    ``language`` turns the capital heuristic off where it cannot discriminate
+    (see ``NOUN_CAPITALIZING``). Without it the gate passes essentially every
+    German sentence, which is not a wrong answer but is a round trip per turn
+    bought for nothing.
     """
     if not text or not text.strip():
         return False
     lowered = text.lower()
     if any(cue in lowered for cue in CUES):
         return True
+    if language and language.split("-")[0].lower() in NOUN_CAPITALIZING:
+        return False
     return bool(_MID_SENTENCE_CAPITAL.search(text.strip()))
 
 

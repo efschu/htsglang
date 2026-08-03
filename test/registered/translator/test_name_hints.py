@@ -63,6 +63,28 @@ class TestPreFilter(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(looks_like_naming(text))
 
+    def test_german_noun_capitals_do_not_trip_the_gate(self):
+        """The measured defect, pinned.
+
+        The first real German turn through the front door -- "Als ich sechs
+        war, sah ich einmal ein wunderbares Bild." -- tripped the capital
+        heuristic on "Bild" and bought an LLM round trip for a sentence with
+        no name in it. German capitalises every noun, so in German the cue
+        list is the whole gate.
+        """
+        sentence = "Als ich sechs war, sah ich einmal ein wunderbares Bild."
+        self.assertTrue(looks_like_naming(sentence), "language-blind, it passes")
+        self.assertFalse(looks_like_naming(sentence, "de"))
+        self.assertFalse(looks_like_naming(sentence, "de-DE"))
+        # A cue still gets through in German, which is the point of keeping
+        # the cue list rather than switching the gate off.
+        self.assertTrue(looks_like_naming("ich bin Matthias", "de"))
+        self.assertTrue(
+            looks_like_naming("darf ich vorstellen: Larisa", "de")
+        )
+        # And the heuristic still works where nouns are lower case.
+        self.assertTrue(looks_like_naming("yesterday I met Ana there", "en"))
+
     def test_a_sentence_initial_capital_alone_is_not_a_signal(self):
         # Every sentence has one; letting it through would defeat the gate.
         self.assertFalse(looks_like_naming("Heute regnet es sehr stark"))
