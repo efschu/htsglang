@@ -1479,56 +1479,73 @@ Five pairs now sit at or above the registry's 0.70 same-speaker line:
 `woman-02/woman-04` (0.734 de, 0.777 es). Two participants handed those two
 presets would be indistinguishable to the listener — and to the registry.
 
-**Applied 2026-08-03 (approved): four voices retired** — `girl-03`, `man-06`,
-`woman-04`, then `woman-06`. Kept as data in `_RETIRED` and as files under
-`preset-voices/retired/`, so the decision is reversible and no seed is lost.
-Pool is now **14 voices: 5 man / 4 woman / 3 boy / 2 girl.**
+**ROOT FIX APPLIED 2026-08-03 (approved).** Preset mode no longer uses
+pre-rendered per-language clips at all. The pool is the **18 German anchors**;
+the target language is produced by cloning the anchor at REQUEST time — the
+same path every real turn already takes, so the change costs nothing extra: it
+only swaps which clip is handed to the cloner as the reference. The derived
+per-language clips are demoted to an optional cache
+(`preset-voices-derived-cache/`).
 
-Re-measured, same instrument:
+This removes the compression instead of pruning around it, and all four
+retired voices come back. `PresetVoice.reference_for` already fell back to
+"any clip" when the requested language is absent, so no new machinery was
+needed — the change is policy, plus `speaks_natively()` now correctly
+reporting `False` for the derived language, which the turn event already
+records.
 
-| class | closest pair, de | closest pair, es |
+**Why it helps, measured.** The old path cloned twice: the pre-rendered
+Spanish clip was itself a clone, and the turn cloned again from it. The new
+path clones once, from the anchor.
+
+| class | old path (double clone, es) | new path (anchor, de) |
 |---|---|---|
-| boy | 0.451 | 0.437 |
-| girl | 0.588 | 0.587 |
-| man | 0.643 | 0.662 |
-| woman | 0.558 | **0.702** |
+| man, closest pair | 0.743 | **0.669** |
+| woman, closest pair | 0.777 | **0.734** |
+| boy, closest pair | 0.437 | **0.451** |
 
-Cross-language identity: all 14 presets stable, weakest 0.586, median 0.653.
-The three at 0.586–0.594 are reported as **named observations, not defects**:
-0.60 was a number invented in this script and the control set does not
-calibrate an absolute scale, so "marginally under it" means marginally under
-an arbitrary line — not a different person. The failure line is now 0.50,
-below which two renders are as unrelated as two random speakers. The 0.70 line
-is different in kind and stays: it is the registry's own.
+**PRESET MODE IS NOW USABLE: 17 voices, every class distinct.**
 
-**One pair remains over that line — `woman-01`/`woman-05` at 0.702 es, by
-0.002, with German at 0.558 — and pruning was STOPPED there on purpose.** Each
-drop reveals a next-closest pair, because the Spanish clips are all clones from
-one model and their voice space is compressed; the closest pair in a class sits
-near 0.70 whichever voices remain. Dropping further shrinks the pool without
-buying separation. Stopping rule recorded in `voice_presets._RETIRED`: prune
-while a pair exceeds the line by a margin that matters (≳0.02), stop when the
-only excess is marginal or confined to a derived language.
+| class | closest pair (anchors) |
+|---|---|
+| boy | 0.451 |
+| girl | 0.588 |
+| man | 0.669 |
+| woman | 0.690 |
 
-**The root fix is not more pruning.** It is to stop pre-rendering derived
-languages at all: keep the 18 well-separated German anchors as the pool and
-clone each to the target language at request time — the same path a real
-speaker's turn already takes, measured at WER 0.100. That removes the
-compression instead of pruning around it, restores the retired voices, and
-costs one synthesis per preset turn. This is the recommended next step and it
-needs no GPU to prototype.
+All under the registry's 0.70 line; the checker reports *"pool is usable:
+every class distinct, every preset stable"*.
 
-**Earlier recommendation, now superseded by the above:**
+Getting there took two further steps, both of a different kind than the
+earlier pruning:
 
-1. **Drop one member of each colliding pair** (`girl-03`, `man-06`,
-   `woman-04`). That leaves 5 man / 5 woman / 2 girl / 3 boy = 15 mutually
-   distinct voices. The design's own priority is explicit — "distinctness
-   beats class match" — so a distinct 15 is worth more than a colliding 18,
-   and 15 still covers the stated realistic worst case of 6–8 participants.
-2. Only if a fuller pool is wanted: re-render the dropped descriptors with new
-   seeds and re-measure. Seeds are pinned so that a re-render reproduces the
-   same voices; changing one is therefore a deliberate, recordable act, not a
-   retry.
+* `woman-02`/`woman-04` collided at 0.734 in the anchors themselves — a
+  descriptor/seed problem, not compression, so re-rendering was the CORRECT
+  fix here where it would have been symptom-chasing before. Seed
+  466014→466114: **0.734 → 0.690**, fixed.
+* `girl-01`/`girl-03` did not yield: 0.738 original, **0.777** after a
+  re-seed, **0.769** after a description rewritten on three independent axes
+  (timbre, dynamics, pace). A seed samples *within* a description and cannot
+  escape it, and the description had already been moved as far as it goes — so
+  the remaining explanation is that VoiceDesign has little separable range
+  left in the small-girl corner. `girl-03` is retired. **Pruning is the right
+  response to a model limit; it was the wrong response to the derive
+  compression, which is why the two look alike and are not.** Cost is small:
+  §4.3 notes boy/girl are indistinguishable from F0 before puberty and both
+  match CHILD, so two girls plus three boys still gives five child voices
+  against a stated worst case of three.
+
+**Superseded — the earlier two-collision note:** `girl-01`/`girl-03`
+at 0.738 and `woman-02`/`woman-04` at 0.734 collide *in the anchors
+themselves* — two natural-language descriptions produced the same voice. That
+is a descriptor/seed problem, not systemic compression, so re-rendering with a
+new seed is now the CORRECT fix where before it would have been chasing a
+symptom. Seeds changed 466033→466133 (`girl-03`) and 466014→466114
+(`woman-04`); re-rendered and re-measured.
+
+**Superseded:** the four-voice retirement below. It pruned around the cause
+and is fully reverted; the reasoning is kept because the stopping rule it
+produced still applies.
 
 **A caveat on the absolute numbers, stated rather than buried.** The control
 set is the XTTS demo clips, whose speaker identities are not independently
