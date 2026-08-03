@@ -1,6 +1,14 @@
 """#485 backtest: the joint per-family cut, against every measured point.
 
-Desk-only (``CUDA_VISIBLE_DEVICES=99``). Three sections, in the order a
+Extended by #492, which corrects slice 1's central mistake: sections 1-4
+search HEAD partitions only, and on a checkpoint whose kv-head count does not
+divide across the ranks that space is empty, which #485 wrote down as "the
+attention family is grid-pinned". Sections 5-6 price the axis it forgot --
+replication + token-sharding, the fork's own #62/#116 machinery -- and the
+head-only space is executed as the falsifier that it cannot move the family
+by construction. Sections 1-4 must print exactly what they printed before.
+
+Desk-only (``CUDA_VISIBLE_DEVICES=99``). Sections, in the order a
 reader should refuse to believe them:
 
 1. REGRESSION. The four measured 2026-08-02 concentration arms of #475,
@@ -14,6 +22,12 @@ reader should refuse to believe them:
 3. FALSIFIER. A deliberately DETUNED attention vector paired with the
    optimal MLP vector must price WORSE than the aligned pair. If it does
    not, the objective is not reading the attention family at all.
+4. LANE BRACKET. Which RATE paces the attention barrier.
+5. REPLICATION AXIS (#492). Which VECTOR distributes it. Prints how many
+   distinct attention partitions the whole #485 head space realizes (one, on
+   this checkpoint -- the executed falsifier), the geometric core/projection
+   crossover depth, and the CORE-FREE / CORE-PACED bracket.
+6. FALSIFIER. A detuned TOKEN vector must price WORSE than the aligned one.
 
     CUDA_VISIBLE_DEVICES=99 PYTHONPATH=python \\
         python scripts/dev/485_joint_phase/backtest_joint.py
@@ -24,6 +38,7 @@ printed here is DESK/PREDICTED.
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -233,7 +248,112 @@ def main():
                   f"JOINT {j[1]!s:12s} + {j[2]!s:10s} {j[0] * 100:+6.2f}%   "
                   f"delta {(j[0] - s1[0]) * 100:+5.2f} pts")
         print()
+
+    ok &= section5(models)
     return 0 if ok else 1
+
+
+def section5(models):
+    """#492: the axis section 2 could not see.
+
+    Section 2 searched head partitions only, found that the 4-kv-head grid at
+    tp=3 admits exactly one of them, and NOTE_485 wrote the attention family
+    down as grid-pinned. The fork's own #62/#116 machinery clones kv heads and
+    shards the token axis, so the attention CORE's per-rank mass follows the
+    DCP token vector -- continuous, no grid. Three things are printed:
+
+    1. the falsifier, executed: how many distinct attention partitions the
+       WHOLE #485 candidate space realizes. One means the head axis is empty
+       and a search restricted to it cannot move the family by construction.
+    2. the geometric crossover depth, so a reader can place an operating point
+       between the two bracket endpoints.
+    3. the bracket itself, at both endpoints, with the argmax verdict.
+    """
+    from sglang.srt.uneven_perf import (
+        _attn_candidates,
+        _attn_token_candidates,
+        _mlp_candidates,
+        _replication_axis_lines,
+        AttnCorePlan,
+    )
+
+    print("== 5. REPLICATION AXIS (#492): the attention family is NOT pinned\n")
+    ok = True
+    for key, m in models.items():
+        gemm = GEMM[key]
+        attn_grid = [list(c) for c in _attn_candidates(m, gemm, BUDGETS)]
+        realized = {
+            tuple(m._shard_fractions("attn", BUDGETS, list(v)))
+            for v in [list(BUDGETS)] + attn_grid
+        }
+        base_tok = [
+            v // math.gcd(*BUDGETS) for v in BUDGETS
+        ]
+        tok_grid = [list(c) for c in _attn_token_candidates(m, gemm, base_tok)]
+        print(f"{key}: HEAD axis -- {len(attn_grid)} candidates on a "
+              f"{m.attn_units}-kv-head grid realize {len(realized)} distinct "
+              f"attention partition(s) {sorted(realized)}")
+        print(f"      TOKEN axis -- {len(tok_grid)} candidates {tok_grid}, "
+              "grid-free (the owner rule takes any positive integer per rank)")
+        verdict = "PASS" if len(realized) == 1 and tok_grid else "FAIL"
+        ok &= verdict == "PASS"
+        print(f"      falsifier (head-only space cannot move the family): "
+              f"{verdict}")
+        print(f"      core/projection crossover: "
+              f"{m.attn_core_crossover_tokens():,.0f} attended tokens\n")
+
+    for key, m in models.items():
+        gemm = GEMM[key]
+        mlp_grid = [list(c) for c in _mlp_candidates(m, gemm, BUDGETS)]
+        attn_grid = [list(c) for c in _attn_candidates(m, gemm, BUDGETS)]
+        print(f"{key}:")
+        for line in _replication_axis_lines(
+            m, list(BUDGETS), mlp_grid + [tuple(BUDGETS)], attn_grid,
+            gemm, gemm, None, MIN_LINK,
+        ):
+            print("  " + line.strip())
+        print()
+
+    print("== 6. FALSIFIER: a detuned TOKEN vector must price WORSE\n")
+    for key, m in models.items():
+        gemm = GEMM[key]
+        mlp_grid = [list(c) for c in _mlp_candidates(m, gemm, BUDGETS)]
+        attn_grid = [list(c) for c in _attn_candidates(m, gemm, BUDGETS)]
+        base_tok = tuple(
+            v // math.gcd(*BUDGETS) for v in BUDGETS
+        )
+        tok_grid = [list(c) for c in _attn_token_candidates(m, gemm, base_tok)]
+        if not tok_grid:
+            # A symmetric lane proposes nothing, which is the correct
+            # generalization and not a failure -- say so instead of raising.
+            print(f"{key}: symmetric attention lane, no token candidate to "
+                  "detune")
+            continue
+        base_core = AttnCorePlan(base_tok, 1.0)
+        ref = m.prefill_time_model(
+            list(BUDGETS), gemm, MIN_LINK, None, None, base_core, base_core
+        )
+
+        def g(v, a, t):
+            return ref / m.prefill_time_model(
+                v, gemm, MIN_LINK, None, a,
+                AttnCorePlan(tuple(t), 1.0), base_core,
+            ) - 1.0
+
+        best = max(
+            ((g(v, a, t), v, a, t)
+             for v in mlp_grid for a in attn_grid for t in tok_grid),
+            key=lambda x: x[0],
+        )
+        det = list(reversed(best[3]))
+        g_det = g(best[1], best[2], det)
+        verdict = "PASS" if g_det < best[0] - 1e-9 else "FAIL"
+        ok &= verdict == "PASS"
+        print(f"{key}: aligned tokens {best[3]} {best[0] * 100:+.2f}%  vs  "
+              f"detuned {det} {g_det * 100:+.2f}%  -> {verdict} "
+              f"({(best[0] - g_det) * 100:+.2f} points)")
+    print("\nreplication-axis falsifiers:", "PASS" if ok else "FAIL")
+    return ok
 
 
 if __name__ == "__main__":

@@ -3,6 +3,18 @@
 Status: BOOT-PENDING. Everything in `NOTE_485_joint_phase_vectors.md` is
 DESK/PREDICTED; this ticket is the only thing that can turn it into a result.
 
+> **#492 re-check (2026-08-03).** NOTE_485's "the attention family is
+> grid-pinned" is refuted: the family has a second, continuous axis
+> (replication + token-sharding). The predicted band below is now understood
+> as the **CORE-FREE endpoint** of a wider bracket, and it is **unchanged** —
+> at this ticket's own operating point (ctx 131072, the matched KV vector
+> pinned, `--rank-perf-loose-ctx-percent 0`) the token axis is REFUSED on
+> capacity by the same fundability gate that governs arm A, so no second arm
+> is needed to make this ticket decidable. The `[2,1,1]` note in §2 stays
+> factually correct about the HEAD partition; read it as such, not as a
+> statement about the family. Details:
+> `NOTE_492_attention_replication_axis.md` §5-6.
+
 One boot pair, two arms, same session ordering, one checkpoint. It settles
 three questions at once: whether the joint cut moves the prefill window at
 all, whether the barrier-skew prediction holds at a SECOND operating point
@@ -44,8 +56,9 @@ probe will differ by ~15 % (NOTE_433 saw exactly that). Expected shape:
 ```
 
 Desk expectation for orientation only: MLP `4,1,1` + attention/GDN `3,1,1`
-(GDN units `[10,3,3]`, attention units `[2,1,1]` — grid-pinned and therefore
-unchanged from the base).
+(GDN units `[10,3,3]`, attention units `[2,1,1]` — the HEAD grid admits no
+other partition, so unchanged from the base; #492: that is a fact about the
+head axis, not about the family).
 
 **Why arm A pins the KV vector while arm B uses `coupled`.** An explicit
 `--rank-tp-ratio` takes the pin path in `apply_auto_performance`, so the #435
@@ -91,8 +104,8 @@ tok/s, which disagreed by up to 9 points on the same arm pair).
 Skew line, which is why the band is where it is: the joint pair's predicted
 barrier-skew growth over the base is **+5.0 ms/1k**, against **+27.0 ms/1k**
 for the `#433` `8,1,1` arm — **18.4 % of the old**. The joint cut does not buy
-its gain by removing skew (the attention family is pinned to `[2,1,1]` by the
-4-kv-head grid and keeps pacing rank 2); it buys it by lowering the GDN
+its gain by removing skew (the attention family's HEAD partition is pinned to
+`[2,1,1]` by the 4-kv-head grid and keeps pacing rank 2); it buys it by lowering the GDN
 barrier's own maximum, 25.22 -> 18.91 us/token, which no MLP vector can touch.
 
 **A legitimate outcome is "inside the floor".** The lower bracket endpoint

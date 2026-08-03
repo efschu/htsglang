@@ -74,7 +74,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -3592,6 +3592,69 @@ def _config_quant_bpp(cfg: dict, is_moe: bool) -> Optional[Dict[str, float]]:
 #: "replicated"/"solo_host" are unaffected by that vector by construction.
 _ATTN_VECTOR_SHARDS = ("attn", "gdn", "gdn_base")
 
+#: The families whose per-rank prefill work has a TOKEN-shaped component
+#: (#492). Keyed by family NAME, not by shard, and that distinction is
+#: load-bearing twice over:
+#:
+#: * ``draft_attn`` shares the ``"attn"`` SHARD but must NOT be here. The
+#:   target's KV is token-sharded under uneven DCP; the draft's is a separate
+#:   decision (``--draft-kv-layout``) whose correct value at tp <= kv_heads is
+#:   ``replicated`` -- and ``dcp`` there costs 10-16 % acceptance (#108). A
+#:   core term on ``draft_attn`` would silently price a layout this fork
+#:   deliberately refuses (``rejected.draft_kv_dcp_below_kv_threshold``).
+#: * the GDN/mamba state is per-REQUEST, not per-context-token, and stays
+#:   resident on the rank owning the k-head units, so the GDN barrier keeps
+#:   following the head vector alone.
+_ATTN_CORE_FAMILIES = ("attn",)
+
+
+class AttnCorePlan(NamedTuple):
+    """How the attention family's per-rank work is distributed (#492).
+
+    The attention/KV family has TWO distribution axes, not one (CLAUDE.md,
+    *PER-FAMILY x PER-PHASE OPTIMA*):
+
+    * **head-partitioning** -- the qkv/o PROJECTIONS shard on the kv-head grid
+      (``attn_units``). On a checkpoint whose kv-head count does not divide
+      across the ranks this grid is coarse, and on Qwen3.6-27B at tp=3 it is
+      degenerate: 4 kv heads, every rank >= 1 unit, so ``[2,1,1]`` is the ONLY
+      representable partition. #485 saw exactly this and concluded the family
+      was "grid-pinned".
+    * **replication + token-sharding** -- and this is the axis #485 missed.
+      Under uneven DCP every rank already stores the FULL, replicated kv-heads
+      and only its own token shard
+      (``distributed.utils.uneven_dcp_kv_replicated``, which is gated on
+      ``dcp_size > 1 and a base plan is installed`` and NOT on kv-heads vs
+      ranks), and every rank runs the attention CORE over the FULL head set that
+      ``layers.dcp.comm.cp_all_gather_heads_uneven`` gathers for it. So the
+      core's per-rank mass follows the TOKEN vector -- a continuous quantity
+      with no grid at all. A kv-head count that does not divide across the
+      ranks therefore never pins the family.
+
+    ``share`` is the fraction of the attention family's per-token work that is
+    core rather than projection. It is deliberately NOT estimated: it depends
+    on the attended context depth, which this parse-time model does not carry
+    (the same reason #485 bracketed the lane instead of estimating the mass).
+    The solve runs the two endpoints -- ``0.0`` (CORE-FREE, byte-identically
+    the #485 model) and ``1.0`` (CORE-PACED) -- and reports whether the argmax
+    survives both. ``PerfCostModel.attn_core_crossover_tokens`` says which
+    endpoint an operating point is near, from geometry alone.
+    """
+
+    token_vector: Tuple[int, ...]
+    share: float
+
+
+def _with_core(fn, *args, core=None):
+    """``fn(*args)`` when no #492 core plan is in play, ``fn(*args, core=...)``
+    when there is.
+
+    Same contract as ``_with_attn``: the cost model's prefill surface is
+    duck-typed and monkey-patched in several suites, and a solve that carries
+    no core plan must execute the identical call the pre-#492 tree made.
+    """
+    return fn(*args) if core is None else fn(*args, core=core)
+
 
 def _with_attn(fn, *args, attn_vector=None):
     """Call ``fn(*args)`` when there is no #485 attention vector, and
@@ -3925,6 +3988,11 @@ class PerfCostModel:
         q_size = self.q_heads * self.head_dim * (2 if self.attn_gate else 1)
         kv_size = self.kv_heads * self.head_dim
         attn_layer = H * (q_size + 2 * kv_size) + (self.q_heads * self.head_dim) * H
+        # #492: kept as an attribute because the attention family has a SECOND
+        # per-token term the param proxy cannot see -- the flash core, whose
+        # mass is not weight-proportional. ``attn_core_crossover_tokens`` needs
+        # the projection mass to say at what context depth the two are equal.
+        self.attn_proj_params_per_layer = float(attn_layer)
         if self.num_experts > 0:
             # MoE FFN mass: num_experts routed experts (gate+up+down = 3 H*Wi)
             # of width moe_intermediate, plus an optional always-on shared
@@ -4159,6 +4227,50 @@ class PerfCostModel:
             return [u / self.mlp_units for u in units]
         raise ValueError(shard)
 
+    def token_shard_fractions(self, token_vector: Sequence[int]) -> List[float]:
+        """Per-rank share of the CONTEXT tokens under an uneven-DCP token
+        vector (#492).
+
+        Exact, and deliberately grid-free: the weighted owner rule gives rank
+        ``r`` exactly ``v[r]`` of every ``sum(v)`` context slots
+        (``distributed.utils.cp_token_prefix`` / ``cp_token_context_budget``),
+        so the share IS the plain proportion. This is why the replication axis
+        is CONTINUOUS where the head axis is not -- there is no unit grid to
+        round to and no "every rank keeps >= 1 head" floor, only a positive
+        integer per rank.
+        """
+        total = float(sum(token_vector))
+        if total <= 0:
+            raise ValueError(
+                f"token vector must be positive, got {list(token_vector)!r}"
+            )
+        return [float(v) / total for v in token_vector]
+
+    def attn_core_crossover_tokens(self) -> float:
+        """Attended context depth at which the attention CORE's per-token
+        FLOPs equal the attention PROJECTIONS' (#492). Pure geometry, no
+        fitted constant, no probe.
+
+        Per token and full-attention layer the projections cost
+        ``2 * attn_proj_params_per_layer`` FLOPs (the param proxy the whole
+        cost model already uses), while the core costs ``4 * q_heads *
+        head_dim * S`` -- ``QK^T`` and ``PV``, each ``q_heads * head_dim * S``
+        MACs against an attended depth of ``S``. Equal at
+
+            S* = attn_proj_params_per_layer / (2 * q_heads * head_dim)
+
+        and the core share of the family is ``S / (S + S*)``. The model does
+        NOT assert an ``S``: it reports ``S*`` so a reader can place their own
+        operating point between the CORE-FREE and CORE-PACED endpoints. On
+        Qwen3.6-27B that number is a few thousand tokens, i.e. a deep-context
+        prefill sits far on the CORE-PACED side and a short one does not --
+        which is precisely the reason this is bracketed and not estimated.
+        """
+        denom = 2.0 * self.q_heads * self.head_dim
+        if denom <= 0:
+            return 0.0
+        return self.attn_proj_params_per_layer / denom
+
     def mlp_unit_partition(self, mlp_vector: List[int]) -> List[int]:
         from sglang.srt.distributed.utils import partition_units
 
@@ -4321,7 +4433,10 @@ class PerfCostModel:
         return p
 
     def predict_capacity(
-        self, mlp_vector: List[int], attn_vector: Optional[List[int]] = None
+        self,
+        mlp_vector: List[int],
+        attn_vector: Optional[List[int]] = None,
+        token_vector: Optional[Sequence[int]] = None,
     ) -> dict:
         """Predicted per-rank KV token capacity P_r and max context for a
         candidate MLP vector. Same math family as the pool sizing: budget
@@ -4334,6 +4449,15 @@ class PerfCostModel:
         mamba/SSM pool follows the GDN units it implies. ``None`` holds the
         base plan's attention/GDN/DCP splits fixed, which is the pre-#485
         behaviour and stays byte-identical.
+
+        ``token_vector`` (#492) PINS the DCP token vector instead of deriving
+        the capacity-matched one. This is what the replication axis costs: a
+        token vector chosen to balance the attention CORE barrier is not the
+        one that maximises context, so the funded context is
+        ``cp_token_context_budget`` of the pinned vector -- strictly the
+        weaker of the two -- and the fundability gate sees that number rather
+        than the optimistic one. ``None`` keeps the derived matched vector,
+        which is the pre-#492 behaviour and stays byte-identical.
         """
         from sglang.srt.distributed.utils import partition_units
 
@@ -4427,7 +4551,19 @@ class PerfCostModel:
         else:
             p = [f / self.kv_cell_bytes for f in free_bytes]
         feasible = all(x >= _PREDICT_MIN_RANK_TOKENS for x in p)
-        if feasible:
+        if feasible and token_vector is not None:
+            # #492: the pinned vector's OWN budget under the weighted owner
+            # rule -- rank r owns v[r] of every sum(v) slots, so the group can
+            # only fund min_r(P_r / v_r) blocks. Never the matched optimum,
+            # by construction; that gap IS the price of the replication axis
+            # and it must reach the gate, not be rounded away.
+            from sglang.srt.distributed.utils import cp_token_context_budget
+
+            vec = [max(int(v), 1) for v in token_vector]
+            ctx = float(
+                cp_token_context_budget(vec, [max(int(x), 1) for x in p])
+            )
+        elif feasible:
             ctx = min(sum(p), _PREDICT_TOKEN_UNITS * min(p))
             vec = partition_units(
                 _PREDICT_TOKEN_UNITS, [max(int(x), 1) for x in p]
@@ -4799,6 +4935,7 @@ class PerfCostModel:
         min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
         attn_vector: Optional[List[int]] = None,
+        core: Optional["AttnCorePlan"] = None,
     ) -> float:
         """The shard-PROPORTIONAL part of the prefill step: the lockstep
         compute time (per-token flops ~ 2 x sharded params, the param-proxy)
@@ -4826,8 +4963,14 @@ class PerfCostModel:
         # tests bind this method to a stand-in that provides exactly those
         # and nothing else. Going through the class keeps every such caller
         # working.
-        t_comp = PerfCostModel.prefill_lockstep_compute_time(
-            self, mlp_vector, gemm_tflops, family_tflops, attn_vector
+        t_comp = _with_core(
+            PerfCostModel.prefill_lockstep_compute_time,
+            self,
+            mlp_vector,
+            gemm_tflops,
+            family_tflops,
+            attn_vector,
+            core=core,
         )
         # Two all-reduces of H bf16 per layer per token, ring factor
         # 2(N-1)/N, bounded by the narrowest participating link.
@@ -4852,7 +4995,12 @@ class PerfCostModel:
         return t_comp + t_comm
 
     def per_family_prefill_compute_times(
-        self, mlp_vector, gemm_tflops, family_tflops=None, attn_vector=None
+        self,
+        mlp_vector,
+        gemm_tflops,
+        family_tflops=None,
+        attn_vector=None,
+        core=None,
     ) -> "Dict[str, List[float]]":
         """``family name -> that family's per-rank prefill GEMM time`` (s).
 
@@ -4863,15 +5011,33 @@ class PerfCostModel:
         MLP in the down-projection's all-reduce, the vocab head in its
         gather. ``prefill_lockstep_compute_time`` sums the per-family maxima
         over exactly this table.
+
+        ``core`` (an ``AttnCorePlan``, #492) redistributes the ``share``
+        fraction of the ATTENTION family's mass by the DCP token vector
+        instead of by the head vector. It varies only the inter-rank RATIO,
+        never the mass (``sum(fractions)`` stays 1 by construction) -- the
+        same discipline ``_attn_lane_bracket`` applies to the rates. ``None``
+        is the pre-#492 branch and is byte-identical.
         """
         out: Dict[str, List[float]] = {}
         denom = 1e12 * _PREDICT_GEMM_EFF
+        core_fracs = (
+            self.token_shard_fractions(core.token_vector)
+            if core is not None and core.share > 0.0
+            else None
+        )
         for name, fam in self.families.items():
             if fam.params <= 0 or fam.shard == "replicated":
                 continue
             fractions = _shard_fractions_of(
                 self, fam.shard, mlp_vector, attn_vector
             )
+            if core_fracs is not None and name in _ATTN_CORE_FAMILIES:
+                w = core.share
+                fractions = [
+                    (1.0 - w) * fractions[r] + w * core_fracs[r]
+                    for r in range(self.tp_size)
+                ]
             rates = family_tflops.get(name) if family_tflops else None
             out[name] = [
                 2.0
@@ -4883,7 +5049,12 @@ class PerfCostModel:
         return out
 
     def prefill_lockstep_compute_time(
-        self, mlp_vector, gemm_tflops, family_tflops=None, attn_vector=None
+        self,
+        mlp_vector,
+        gemm_tflops,
+        family_tflops=None,
+        attn_vector=None,
+        core=None,
     ) -> float:
         """The compute time one lockstep prefill round really costs (s).
 
@@ -4916,13 +5087,24 @@ class PerfCostModel:
         rate, so they are the slowest rank in every family at every candidate
         vector), which is why the #216/#230 calibration anchor is unmoved.
         """
-        fam_times = PerfCostModel.per_family_prefill_compute_times(
-            self, mlp_vector, gemm_tflops, family_tflops, attn_vector
+        fam_times = _with_core(
+            PerfCostModel.per_family_prefill_compute_times,
+            self,
+            mlp_vector,
+            gemm_tflops,
+            family_tflops,
+            attn_vector,
+            core=core,
         )
         return sum(max(times) for times in fam_times.values())
 
     def prefill_barrier_skew(
-        self, mlp_vector, gemm_tflops, family_tflops=None, attn_vector=None
+        self,
+        mlp_vector,
+        gemm_tflops,
+        family_tflops=None,
+        attn_vector=None,
+        core=None,
     ) -> float:
         """Lockstep time this vector spends because the slowest rank is not
         the same rank in every family (s, >= 0).
@@ -4933,17 +5115,34 @@ class PerfCostModel:
         can see WHY a concentrated candidate is discounted rather than only
         that it is.
         """
-        return PerfCostModel.prefill_lockstep_compute_time(
-            self, mlp_vector, gemm_tflops, family_tflops, attn_vector
+        return _with_core(
+            PerfCostModel.prefill_lockstep_compute_time,
+            self,
+            mlp_vector,
+            gemm_tflops,
+            family_tflops,
+            attn_vector,
+            core=core,
         ) - max(
-            PerfCostModel.per_rank_prefill_compute_times(
-                self, mlp_vector, gemm_tflops, family_tflops, attn_vector
+            _with_core(
+                PerfCostModel.per_rank_prefill_compute_times,
+                self,
+                mlp_vector,
+                gemm_tflops,
+                family_tflops,
+                attn_vector,
+                core=core,
             ),
             default=0.0,
         )
 
     def per_rank_prefill_compute_times(
-        self, mlp_vector, gemm_tflops, family_tflops=None, attn_vector=None
+        self,
+        mlp_vector,
+        gemm_tflops,
+        family_tflops=None,
+        attn_vector=None,
+        core=None,
     ) -> List[float]:
         """Each rank's OWN prefill GEMM time for one lockstep round (s).
 
@@ -4955,7 +5154,20 @@ class PerfCostModel:
         NOT the lockstep round time -- that is
         ``prefill_lockstep_compute_time`` (#475), which maxes per barrier
         rather than once at the end.
+
+        ``core`` (#492) is honoured by summing the per-family table, which is
+        the one place the attention family's token-shaped half is applied.
+        Without a core plan the original two branches run unchanged, so the
+        pre-#492 float arithmetic is reproduced bit for bit.
         """
+        if core is not None and core.share > 0.0:
+            fam_times = PerfCostModel.per_family_prefill_compute_times(
+                self, mlp_vector, gemm_tflops, family_tflops, attn_vector, core
+            )
+            return [
+                sum(times[r] for times in fam_times.values())
+                for r in range(self.tp_size)
+            ]
         out: List[float] = []
         if family_tflops:
             denom = 1e12 * _PREDICT_GEMM_EFF
@@ -4998,6 +5210,8 @@ class PerfCostModel:
         min_link_gbs: Optional[float],
         family_tflops: Optional[Dict[str, List[float]]] = None,
         attn_vector: Optional[List[int]] = None,
+        core: Optional["AttnCorePlan"] = None,
+        base_core: Optional["AttnCorePlan"] = None,
     ) -> float:
         """Relative prefill step time. Only ratios between candidates are
         consumed. ``family_tflops`` switches the sharded term to the
@@ -5023,19 +5237,39 @@ class PerfCostModel:
         candidates: ranking is untouched, but the reported gains no longer
         pretend the whole step scales with the shard. Without it the model
         over-predicted every measured concentration gain by x1.4-1.8
-        (predicted +21.6 % for 6,1,1 where +13.0 % was measured)."""
+        (predicted +21.6 % for 6,1,1 where +13.0 % was measured).
+
+        ``core`` / ``base_core`` (#492): the attention family's token-shaped
+        half, for the candidate and for the reference respectively. They must
+        carry the SAME ``share`` and differ only in the token vector -- the
+        bracket varies which vector distributes the mass, never how much mass
+        there is, and a reference priced at a different share would compare
+        two different physics."""
         f = self.calibration.prefill_invariant
-        t_sharded = self._prefill_sharded_time(
-            mlp_vector, gemm_tflops, min_link_gbs, family_tflops, attn_vector
+        t_sharded = _with_core(
+            self._prefill_sharded_time,
+            mlp_vector,
+            gemm_tflops,
+            min_link_gbs,
+            family_tflops,
+            attn_vector,
+            core=core,
         )
         if f <= 0.0:
             return t_sharded
         # The invariant is charged against the BASE plan in BOTH families:
         # the reference a candidate pair is measured against is the plain
         # VRAM-auto layout, not "the same attention vector with a different
-        # MLP vector". Deliberately no ``attn_vector`` here.
-        t_base = self._prefill_sharded_time(
-            self.base_plan, gemm_tflops, min_link_gbs, family_tflops
+        # MLP vector". Deliberately no ``attn_vector`` here -- and, for the
+        # same reason, the BASE token vector rather than the candidate's.
+        t_base = _with_core(
+            self._prefill_sharded_time,
+            self.base_plan,
+            gemm_tflops,
+            min_link_gbs,
+            family_tflops,
+            None,
+            core=base_core,
         )
         return t_sharded + f / (1.0 - f) * t_base
 
@@ -5162,16 +5396,94 @@ def _attn_candidates(
     return out
 
 
+#: The two endpoints of the #492 core-share bracket. ``0.0`` reproduces the
+#: #485 model exactly (the attention family is all projections, so the coarse
+#: kv-head grid is its only actuator); ``1.0`` is the regime in which the
+#: flash core paces the attention barrier, so the family follows the DCP token
+#: vector and the grid does not bind at all. The truth is a convex combination
+#: whose weight is the attended context depth -- a quantity this parse-time
+#: model does not carry, and therefore does not invent.
+_CORE_FREE = 0.0
+_CORE_PACED = 1.0
+
+
+def _attn_token_candidates(
+    model: PerfCostModel,
+    scores: Sequence[float],
+    base_token_vector: Sequence[int],
+    resolutions: Sequence[int] = (4, 8, 16),
+) -> List[Tuple[int, ...]]:
+    """Candidate DCP TOKEN vectors for the attention family (#492).
+
+    The second distribution axis of the attention/KV family. Under uneven DCP
+    every rank holds the full replicated kv-heads and its own token shard, and
+    runs the attention core over the all-gathered head set, so the core's
+    per-rank mass is ``v[r] / sum(v)`` -- continuous, no unit grid, no "every
+    rank keeps one head" floor. Where ``_attn_candidates`` collapses onto a
+    single realizable partition on a 4-kv-head checkpoint at tp=3, this ladder
+    does not collapse at all.
+
+    Same shape as the other ladders (score^alpha at several resolutions) over
+    the attention family's OWN lane rates, because under the per-barrier max
+    (#475) the family's optimum is its own lane's rate-proportional split.
+    Every entry keeps >= 1 slot per rank, which is all the owner rule demands.
+
+    The CAPACITY side is not modelled here and must not be: a token vector
+    that balances the core barrier funds less context than the matched one,
+    and ``predict_capacity(token_vector=...)`` is where that shows up, in
+    front of the fundability gate.
+    """
+    smax = max(scores)
+    if smax <= 0:
+        return []
+    base_key = tuple(_gcd_reduce([max(int(v), 1) for v in base_token_vector]))
+    cands: List[Tuple[int, ...]] = []
+    for alpha in (0.5, 1.0, 1.5, 2.0):
+        for k in resolutions:
+            cands.append(
+                _gcd_reduce(
+                    tuple(max(1, round(k * (s / smax) ** alpha)) for s in scores)
+                )
+            )
+    out: List[Tuple[int, ...]] = []
+    seen = {base_key}
+    for c in cands:
+        if len(set(c)) <= 1 or c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
 def _cand_vectors(cand) -> Tuple[List[int], Optional[List[int]]]:
     """``(mlp_vector, attn_vector or None)`` from a candidate entry.
 
     Every target but the joint phase-prefill arm produces a plain MLP vector;
-    that arm produces a ``(mlp, attn)`` pair (#485). One accessor so the
-    verdict/refusal paths read both shapes.
+    that arm produces a ``(mlp, attn)`` pair (#485), optionally with a third
+    entry -- the #492 token vector -- which ``_cand_token_vector`` reads. The
+    arity here stays two so every pre-#492 caller keeps working.
     """
     if cand and isinstance(cand[0], (tuple, list)):
         return list(cand[0]), (list(cand[1]) if cand[1] else None)
     return list(cand), None
+
+
+def _cand_token_vector(cand) -> Optional[List[int]]:
+    """The candidate's DCP TOKEN vector (#492), or ``None``.
+
+    The attention family's second axis rides as a third entry rather than
+    widening ``_cand_vectors``: a candidate WITHOUT one is the #485 shape and
+    must keep pricing identically, so its absence has to be representable.
+    """
+    if (
+        isinstance(cand, (tuple, list))
+        and len(cand) >= 3
+        and cand[0] is not None
+        and isinstance(cand[0], (tuple, list))
+        and cand[2]
+    ):
+        return list(cand[2])
+    return None
 
 
 def _cand_label(cand) -> str:
@@ -5180,7 +5492,307 @@ def _cand_label(cand) -> str:
     txt = ",".join(map(str, mlp))
     if attn is not None:
         txt += " + attn/GDN " + ",".join(map(str, attn))
+    tok = _cand_token_vector(cand)
+    if tok is not None:
+        txt += " + KV tokens " + ",".join(map(str, tok))
     return txt
+
+
+def _attn_head_axis_is_pinned(
+    model: PerfCostModel, base_plan: Sequence[int], attn_cands: Sequence[Sequence[int]]
+) -> bool:
+    """True when NO attention head vector in the candidate space realizes a
+    different attention partition than the base plan (#492).
+
+    This is the condition #485 read as "the attention family has no lever". It
+    is a statement about ONE axis: on Qwen3.6-27B at tp=3 the 4 kv-head grid
+    with a >= 1-unit-per-rank floor can only ever produce ``[2,1,1]``, so the
+    whole ladder collapses onto the base and the head axis really is empty.
+    What does NOT follow is that the FAMILY is pinned -- the replication +
+    token-shard axis is untouched by this, and it has no grid at all.
+
+    Keyed on the ATTENTION shard alone, deliberately NOT on
+    ``_attn_partition_key``: that key pairs the attention partition with the
+    GDN one, and the 16-unit GDN grid resolves the whole ladder, so a
+    pair-key would report "5 distinct candidates" for a space in which the
+    attention partition never moves. That conflation is how one axis's
+    emptiness got read as the family's.
+    """
+    base_key = tuple(model._shard_fractions("attn", list(base_plan), list(base_plan)))
+    return all(
+        tuple(model._shard_fractions("attn", list(base_plan), list(c))) == base_key
+        for c in attn_cands
+    )
+
+
+#: Why a candidate that leans on the replication axis must not drag the DRAFT
+#: onto it (#492, measured in #108). Stated as a refusal rather than priced as
+#: a malus because the number is an ACCEPTANCE rate, not a time: the target's
+#: attention barrier and the draft's are different rounds, and trading one for
+#: the other is a decision an operator makes with both numbers in view.
+_SPEC_REPLICATION_REFUSAL = (
+    "spec cross-charge (#108, measured): the token vector this axis solves "
+    "for is the TARGET's. The draft KV layout is a separate flag and the rule "
+    "is two-sided -- at tp <= kv_heads (this checkpoint) '--draft-kv-layout "
+    "replicated' is correct and 'dcp' costs 10-16 % acceptance, while above "
+    "the threshold replicated is the DEGRADED layout (accept 1.05, 61 verify "
+    "rounds for 64 tokens). So the lever reported here applies to the target "
+    "prefill barrier and the draft is deliberately NOT dragged onto it; "
+    "flipping the draft layout to extend it is registered as rejected "
+    "(planner/rejected.py: draft_kv_dcp_below_kv_threshold)."
+)
+
+
+def _replication_axis_lines(
+    model: PerfCostModel,
+    base_plan: Sequence[int],
+    mlp_options: Sequence[Sequence[int]],
+    attn_cands: Sequence[Sequence[int]],
+    attn_scores: Sequence[float],
+    enc_scores: Sequence[float],
+    enc_family_tflops: Optional[Dict[str, List[float]]],
+    min_link: Optional[float],
+    ctx_floor: Optional[float] = None,
+    loose: float = 0.0,
+) -> List[str]:
+    """The attention family's SECOND distribution axis, priced (#492).
+
+    #485 solved the attention family on head partitions only, found the single
+    realizable partition its kv-head grid admits, and called the family
+    grid-pinned. That is a verdict about one axis read as a verdict about the
+    family. Under the fork's own #62/#116 machinery the kv heads are CLONED
+    and the context is token-sharded, so the attention core's per-rank mass
+    follows the DCP token vector -- continuous, no grid.
+
+    What this reports, and what it deliberately does not:
+
+    * the head axis's realized partition count, so "pinned" is a measured
+      property of the space rather than a claim;
+    * the geometric crossover depth at which the core's per-token FLOPs equal
+      the projections', so a reader can place their operating point;
+    * the best triple at BOTH ends of the core-share bracket, and whether the
+      argmax survives them (``CORE-INVARIANT`` / ``CORE-SENSITIVE``);
+    * the context each winner funds, because a token vector solved for the
+      barrier is not the one that maximises capacity and the gap is the
+      axis's real price -- and on this rig that price is the story: the same
+      ``--rank-perf-loose-ctx-percent`` floor the main solve applies is
+      applied here, so the axis can never advertise a layout the boot would
+      refuse;
+    * the spec cross-charge, as a refusal rather than a fabricated malus.
+
+    It does NOT choose a share. The share is the attended context depth, which
+    this parse-time model does not carry -- the same reason #485 bracketed the
+    lane instead of estimating the flash mass.
+    """
+    from sglang.srt.distributed.utils import partition_units
+
+    lines: List[str] = []
+    base = list(base_plan)
+    base_pred = model.predict_capacity(base)
+    gate_live = bool(base_pred.get("feasible")) and bool(
+        base_pred.get("token_vector")
+    )
+    # The reference token vector. When the plan funds one, that IS the vector
+    # the boot installs (#435 seeds the matched vector). When it does not, the
+    # runtime's own documented fallback is the gcd-reduced weight vector
+    # (``distributed.utils.resolve_cp_token_ratios``, "weights fallback"), and
+    # using anything else here would price a layout no boot would run.
+    if gate_live:
+        base_tok = list(base_pred["token_vector"])
+    else:
+        base_tok = list(_gcd_reduce(partition_units(_PREDICT_TOKEN_UNITS, base)))
+    tok_cands = _attn_token_candidates(model, attn_scores, base_tok)
+    pinned = _attn_head_axis_is_pinned(model, base, attn_cands)
+    crossover = model.attn_core_crossover_tokens()
+    lines.append(
+        "replication axis (#492): the attention/KV family has TWO axes. "
+        f"HEAD axis -- {model.attn_units} kv-head units over {model.tp_size} "
+        f"ranks with every rank >= 1 unit, "
+        + (
+            f"and all {len(attn_cands)} candidates in the ladder realize the "
+            "SAME attention partition as the base: this axis is EMPTY on this "
+            "checkpoint."
+            if pinned
+            else f"{len(attn_cands)} candidates realize distinct attention "
+            "partitions."
+        )
+        + " REPLICATION+TOKEN axis -- under uneven DCP every rank already "
+        "stores the full replicated kv-heads and only its own token shard "
+        "(distributed.utils.uneven_dcp_kv_replicated, which keys on the base "
+        "plan and the DCP size, NOT on kv-heads vs ranks), and runs the "
+        "attention core over the all-gathered head set, so the core's "
+        f"per-rank mass follows the token vector: {len(tok_cands)} candidates "
+        "on a grid-free axis. A kv-head count that does not divide across the "
+        "ranks therefore never pins the family."
+    )
+    lines.append(
+        "core crossover (#492): the attention core's per-token FLOPs equal "
+        f"the projections' at an attended depth of ~{crossover:,.0f} tokens "
+        f"(geometry only: {model.attn_proj_params_per_layer:,.0f} projection "
+        f"params per full-attention layer / 2 x {model.q_heads} q heads x "
+        f"{model.head_dim} head dim). Below it the family is projection-paced "
+        "and the head axis is the only actuator; above it the core dominates "
+        "and the token vector is. The model does not assert which side an "
+        "operating point is on -- it brackets. Note what the CORE-PACED "
+        "endpoint below does NOT do: it redistributes the family's existing "
+        "mass by the token vector and leaves the mass alone, exactly as the "
+        "lane bracket varies only rates. The real core mass GROWS with depth "
+        "(x S / crossover), so the endpoint is a LOWER bound on the axis at "
+        "deep context, not a centred estimate."
+    )
+    if not tok_cands:
+        lines.append(
+            "replication axis (#492): the attention lane is symmetric across "
+            "ranks, so the token ladder proposes no vector. Correct "
+            "generalization, not a missing lever -- the axis is a property of "
+            "lane spread, not of the machinery."
+        )
+        return lines
+
+    cap: Dict[tuple, dict] = {}
+
+    def _cap(mlp, attn, tok):
+        key = (tuple(mlp), tuple(attn) if attn else None, tuple(tok) if tok else None)
+        if key not in cap:
+            args = [list(mlp)]
+            # Same discipline as ``_with_attn``: the cost model's public
+            # surface is monkey-patched and duck-typed in several suites, and
+            # those stand-ins carry the pre-#485/#492 signature. Pass an
+            # argument only when it is meaningful.
+            if attn is not None or tok is not None:
+                args.append(list(attn) if attn else None)
+            if tok is not None:
+                args.append(list(tok))
+            cap[key] = model.predict_capacity(*args)
+        return cap[key]
+
+    try:
+        _cap(base, None, list(base_tok))
+    except TypeError:
+        # A stand-in cost model that cannot be asked about a pinned token
+        # vector cannot price this axis. Say so; do not fall back to pricing
+        # the axis without its capacity term, which would report a lever with
+        # its cost silently removed.
+        lines.append(
+            "replication axis (#492): this cost model does not accept a "
+            "pinned KV token vector, so the axis's capacity price cannot be "
+            "computed and nothing is claimed about it here."
+        )
+        return lines
+
+    attn_options: List[Optional[Sequence[int]]] = [None] + list(attn_cands)
+    tok_options: List[Optional[Sequence[int]]] = [None] + list(tok_cands)
+    rejected_by_floor: List[tuple] = []
+    verdicts = {}
+    for share in (_CORE_FREE, _CORE_PACED):
+        base_core = AttnCorePlan(tuple(base_tok), share)
+        ref = model.prefill_time_model(
+            base, enc_scores, min_link, enc_family_tflops, None, base_core, base_core
+        )
+        best = None
+        for mlp in mlp_options:
+            for attn in attn_options:
+                for tok in tok_options:
+                    pred = _cap(mlp, attn, tok)
+                    if gate_live and not pred["feasible"]:
+                        # Only a LIVE gate may filter. When the base plan
+                        # itself does not fund a pool (compute-only fixtures,
+                        # a budget model with no measured posts), every
+                        # candidate is infeasible and filtering on it would
+                        # silently return "no lever" for a reason that has
+                        # nothing to do with the lever.
+                        continue
+                    if (
+                        gate_live
+                        and ctx_floor is not None
+                        and pred["ctx"] < ctx_floor
+                        and not math.isclose(
+                            pred["ctx"], ctx_floor, rel_tol=1e-9
+                        )
+                    ):
+                        # The same floor the main solve applies, and it is the
+                        # binding constraint on this axis rather than a
+                        # formality: a token vector that balances the core
+                        # barrier concentrates the context onto one rank, and
+                        # the owner rule then funds min_r(P_r/v_r) blocks --
+                        # an order of magnitude below the matched vector at
+                        # the aggressive end of the ladder. Reporting the
+                        # unfiltered argmax would advertise a layout the boot
+                        # refuses.
+                        rejected_by_floor.append(
+                            (tuple(tok) if tok else None, pred["ctx"])
+                        )
+                        continue
+                    core = AttnCorePlan(tuple(tok or base_tok), share)
+                    t = model.prefill_time_model(
+                        list(mlp),
+                        enc_scores,
+                        min_link,
+                        enc_family_tflops,
+                        list(attn) if attn else None,
+                        core,
+                        base_core,
+                    )
+                    g = ref / t - 1.0 if t > 0 else -1.0
+                    entry = (tuple(mlp), tuple(attn) if attn else None,
+                             tuple(tok) if tok else None)
+                    if best is None or g > best[0] + 1e-12:
+                        best = (g, entry, pred["ctx"])
+        verdicts[share] = best
+    free, paced = verdicts[_CORE_FREE], verdicts[_CORE_PACED]
+    if free is None or paced is None:
+        lines.append(
+            "replication axis (#492): no admissible candidate at one of the "
+            "bracket endpoints -- nothing to compare."
+        )
+        return lines
+    def _ctx(v):
+        return f", funds ctx ~{int(v)}" if gate_live else ""
+
+    lines.append(
+        f"  CORE-FREE  endpoint (share 0, the #485 model): "
+        f"{_cand_label(free[1])} {free[0] * 100:+.1f}%" + _ctx(free[2])
+    )
+    lines.append(
+        f"  CORE-PACED endpoint (share 1, deep context): "
+        f"{_cand_label(paced[1])} {paced[0] * 100:+.1f}%"
+        + _ctx(paced[2])
+        + (f"  (base ctx ~{int(base_pred['ctx'])})" if gate_live else
+           "  (capacity gate not live on this fixture: the base plan funds no "
+           "pool, so only the COMPUTE half of the axis is priced here)")
+    )
+    if free[1] == paced[1]:
+        lines.append(
+            "core bracket (#492): CORE-INVARIANT -- the same layout wins at "
+            "both endpoints, so the unmeasured core mass cannot change this "
+            "argmax."
+        )
+    else:
+        lines.append(
+            "core bracket (#492): CORE-SENSITIVE -- the projection-paced "
+            f"endpoint prefers {_cand_label(free[1])} and the core-paced one "
+            f"prefers {_cand_label(paced[1])}. Which one applies is a "
+            "MEASUREMENT (the attended depth against the crossover above), "
+            "not a model output. #485's 'the attention family is grid-pinned' "
+            "is REFUTED either way: the head axis being empty is not the "
+            "family being pinned."
+        )
+    if rejected_by_floor:
+        worst = min(x[1] for x in rejected_by_floor)
+        toks = sorted({x[0] for x in rejected_by_floor if x[0]})
+        lines.append(
+            f"  capacity price (#492): {len(toks)} token vector(s) {toks} are "
+            f"REJECTED by the context floor ({int(ctx_floor or 0)} tokens, "
+            f"--rank-perf-loose-ctx-percent {loose:g}); the most concentrated "
+            f"of them funds only ~{int(worst)}. This is the axis's real cost "
+            "and it is not small: the weighted owner rule funds "
+            "min_r(P_r / v_r) blocks, so concentrating the token vector onto "
+            "the fast rank throws away the slow ranks' pools. The compute "
+            "lever is real; on this rig the capacity term is what decides "
+            "whether any of it is reachable."
+        )
+    lines.append("  " + _SPEC_REPLICATION_REFUSAL)
+    return lines
 
 
 def _attn_lane_bracket(
@@ -6753,6 +7365,28 @@ def apply_auto_performance(server_args) -> None:
                     "model output. Treat the joint layout as unresolved until "
                     "one boot decides it."
                 )
+        if joint:
+            # #492: the correction to slice 1. The lane bracket above asks
+            # WHICH RATE paces the attention barrier; this asks WHICH VECTOR
+            # distributes it -- and the answer is not only the head vector.
+            # Reported, never installed here, for the same reason the joint
+            # pair is: the actuators are --rank-tp-ratio and --rank-kv-ratio,
+            # and writing either from a desk prediction is what #485 §6
+            # declined to do.
+            lines.extend(
+                _replication_axis_lines(
+                    model,
+                    base_plan,
+                    mlp_options,
+                    attn_cands,
+                    attn_scores,
+                    enc_scores,
+                    enc_family_tflops,
+                    min_link,
+                    floor,
+                    loose,
+                )
+            )
         if chosen is None:
             # Deliberately the SINGLE-family results: the refusal is about the
             # vector this arm would have installed. The joint space cannot
