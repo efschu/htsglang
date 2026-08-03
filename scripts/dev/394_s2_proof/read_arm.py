@@ -20,6 +20,28 @@ nothing else -- a server log is never read into anybody's context.
      is aimed at.
   4. The per-rank hit rate, which fills the row ANALYSE_389 left open and is
      the input the calibrated slice-3 sub-arm needs.
+  5. The WORK POINT the dump was written at (tokens / forwards / activations),
+     without which none of the above may be divided by another arm's.
+
+WHICH REVISION TO READ (rule of 2026-08-03, replaces the earlier one).
+Read the FINAL, WORK-MATCHED revision: run this tool AFTER teardown. The
+previous rule -- "quote the pre-teardown numbers, never the post-SIGTERM
+revision" -- is WITHDRAWN, because it compares two arms at different points of
+their runs. Each rank writes its dump on its own 45 s timer, so a pre-teardown
+read catches whatever fraction of the run the last tick landed on; in the
+#439 green-corridor window that was 96.8 % for one arm against 91.9 % for the
+other, and the treatment arm's accumulating H2D counter was read ~5 % early.
+The resulting transfer-term ratio was inflated by about that much (1.5028x
+pre-teardown against 1.4307x work-matched, prediction 1.427x). The final
+revision is a common, well-defined endpoint and is the only valid basis for a
+ratio. Evidence: 2026-08-03_439_green/RESULTS.md, "Which revision to read".
+
+This tool therefore prints each rank's work counters and refuses to be quiet
+when they disagree: within one final revision all ranks of an arm carry
+identical tokens/forwards/activations, so a spread is how a non-final revision
+announces itself. Comparing two arms is still the reader's job -- their work
+counters have to agree too, and the printed ``work=`` line is what that check
+reads.
 
 Usage:
   python3 read_arm.py <run_dir> <arm>
@@ -51,6 +73,10 @@ def main() -> int:
     print(f"== arm {arm!r} in {run_dir} ==")
     total_h2d = 0
     total_remote = 0
+    #: Work counters, per rank. A ratio between two arms is only defined at a
+    #: common work point -- see "WHICH REVISION TO READ" above.
+    work_keys = ("tokens", "forwards", "activations")
+    work_seen: dict[str, set] = {key: set() for key in work_keys}
     for name, payload in load(run_dir, arm):
         totals = payload.get("totals", {})
         policy = totals.get("host_shard_policy", "?")
@@ -62,12 +88,16 @@ def main() -> int:
         total_h2d += h2d
         total_remote += remote
         share = (100.0 * remote / h2d) if h2d else 0.0
+        work = {key: totals.get(key, "?") for key in work_keys}
+        for key, value in work.items():
+            work_seen[key].add(value)
         print(
             f"  {name}: policy={policy} reachability={reach} "
             f"compute={compute_policy} vector={vector} "
             f"h2d={h2d / 2**30:.1f} GiB remote={remote / 2**30:.1f} GiB "
             f"({share:.1f} %) hit_rate={totals.get('hit_rate', '?')} "
-            f"unique_hit_rate={totals.get('unique_hit_rate', '?')}"
+            f"unique_hit_rate={totals.get('unique_hit_rate', '?')} "
+            "work=" + "/".join(f"{key}={work[key]}" for key in work_keys)
         )
         if arm == "proportional" and reach != "shared-cold-tier":
             print(
@@ -91,6 +121,25 @@ def main() -> int:
     print(
         f"  group h2d={total_h2d / 2**30:.1f} GiB remote={total_remote / 2**30:.1f} GiB"
     )
+    work_point = " ".join(
+        f"{key}={sorted(work_seen[key])[0]}" if len(work_seen[key]) == 1 else f"{key}=*"
+        for key in work_keys
+    )
+    print(f"  work point of this arm: {work_point}")
+    if any(len(values) > 1 for values in work_seen.values()):
+        print(
+            "    WARNING: the ranks of this arm disagree on their work "
+            "counters, so this is NOT the final revision -- each rank was "
+            "caught at its own point of the run. Read the dumps AFTER "
+            "teardown. Dividing this arm's counters by another arm's is "
+            "undefined; see ARM3_COMPUTE.md, 'Which revision to read'."
+        )
+    else:
+        print(
+            "    Quotable only against another arm at the SAME work point: "
+            "compare this line with the other arm's before dividing any "
+            "counter by any other."
+        )
     if arm in compute_arms:
         print(
             "  Reminder: for a slice-3 arm a NON-null per-rank H2D delta is "

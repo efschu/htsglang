@@ -9,10 +9,10 @@ four can-fail arms). What only a boot can show is in this directory.
 | script | proves |
 |---|---|
 | `preflight.sh` | `/dev/shm` is large enough and clean, the NVML rank→card table is what the arm's `--rank-gpu-id` is derived from, and the ratio resolves from a MEASURED probe rather than the nameplate |
-| `boot_ab.sh` | the arms boot on the V4-Flash recipe: `ARM=equal` (baseline, pre-#394 plan field for field), `ARM=proportional` (measured ratio + shared cold tier), `ARM=compute` (slice 3: the compute assignment moves — CONFIRMED 1.496x on the transfer term, 2026-08-03), `ARM=compute-cal` (the calibrated variant, FALSIFIED by that same window) |
-| `run_arm.sh` | drives ONE arm end to end: boot, bounded readiness loop, facts, bench generations, `read_arm.py`, teardown with a VRAM check |
+| `boot_ab.sh` | the arms boot on the V4-Flash recipe: `ARM=equal` (baseline, pre-#394 plan field for field), `ARM=proportional` (measured ratio + shared cold tier), `ARM=compute` (slice 3: the compute assignment moves — CONFIRMED 1.4307x work-matched on the transfer term, green corridor, 2026-08-03), `ARM=compute-cal` (the calibrated variant, FALSIFIED on its end-to-end and mechanism legs) |
+| `run_arm.sh` | drives ONE arm end to end: boot, bounded readiness loop, facts, bench generations, a pre-teardown `read_arm.py` liveness check, teardown with a VRAM check, and then the quotable post-teardown `read_arm.py` on the final work-matched revision (`read_final_<arm>.txt`) |
 | `corridor_sampler.sh` | per-card free VRAM at 1 Hz into a CSV for the whole serving window; the corridor is judged on the MINIMUM, and a post-boot snapshot overstates free by 250-330 MiB here |
-| `read_arm.py` | reads one arm out of its #390 dumps: which arm it was, per-rank H2D, per-rank hit rate, and the share that came from a peer's segment |
+| `read_arm.py` | reads one arm out of its #390 dumps: which arm it was, per-rank H2D, per-rank hit rate, the share that came from a peer's segment, and the arm's WORK POINT. Run it AFTER teardown — the value to quote is the final, work-matched revision, and the tool warns when the ranks disagree because that is a non-final one |
 | `ARM3_COMPUTE.md` | the slice-3 arm spec: the one flag, the solve, the predicted per-rank numbers, what must be read out, and the confirmation-window spec |
 
 ## Run order
@@ -65,10 +65,10 @@ mass matches its own link, with the GPU-resident mass held fixed. Its
 predictions and readouts are in `ARM3_COMPUTE.md`; its per-rank H2D delta is
 predicted NON-null, which is the one place in this window where a null result
 is a falsification rather than a confirmation. It is no longer a prediction:
-the 2026-08-03 window measured tp1's H2D falling 1157.6 → 672.7 GiB and the
-clock moving off the x4 card, worth **1.496x** on the transfer term and
-**-7.67 %** end-to-end. It is still CORRIDOR-RED and owes one green-corridor
-re-proof.
+the 2026-08-03 green-corridor window measured tp1's H2D falling
+1197.4 → 706.8 GiB and the clock moving off the x4 card, worth **1.4307x** on
+the transfer term (work-matched dump revision) and **-6.42 %** end-to-end, in a
+green corridor. That is acceptance-evidence; no re-proof is owed.
 
 So the arm is instrumented to falsify rather than to confirm: the primary
 readout is per-rank H2D, a null delta is the expected and publishable result,
@@ -87,7 +87,8 @@ scripts default to `RESERVE_MIB=2200,1800,1800`, which is NOT the reserve arms
 (~515 MiB free on both 3080s) and is red at peak: the 2026-08-03 window sampled
 the whole serving window and the 3080s bottom out at **211-251 MiB** against the
 400 MiB floor. +400 MiB of reserve is +400 MiB of free VRAM (the KV pool takes
-whatever the budget leaves), which lands the minimum at ~611-651 MiB. It also
+whatever the budget leaves), predicted to land the minimum at ~611-651 MiB and
+measured at 655-1318 MiB per card in the green-corridor window. It also
 moves the derived budgets and therefore the base plan — see `ARM3_COMPUTE.md`,
 "Corridor: BREACHED at the measured recipe". `RESERVE_MIB=auto` is NOT usable on
 this recipe: it derives 3968 MiB per card and the resulting budget is below what

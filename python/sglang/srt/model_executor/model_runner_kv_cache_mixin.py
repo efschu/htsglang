@@ -4001,6 +4001,44 @@ class ModelRunnerKVCacheMixin:
                     else:
                         # Stock even-DCP (unchanged): interleave via inflated
                         # page granularity.
+                        #
+                        # #487 REACH AUDIT (no behaviour change here). This
+                        # branch inflates BOTH the index space and the page
+                        # granularity by dcp_size, i.e. it assumes the pool
+                        # behind it is token-sharded across the DCP group. A
+                        # draft worker at --draft-kv-layout replicated (the
+                        # default) has the opposite geometry -- full token
+                        # context, head-sharded -- which the pool sizing above
+                        # knows (it guards on draft_pool_is_replicated) and
+                        # this selection does not mention at all. #108 never
+                        # audited the combination.
+                        # On CUDA the combination is UNREACHABLE, by two real
+                        # predicates rather than by luck -- one per producer of
+                        # is_draft_worker=True. (1) A SPECULATIVE draft worker:
+                        # ServerArgs._handle_dcp_validation refuses dcp_size>1
+                        # + speculation on CUDA unless the boot is either
+                        # uneven-weighted DCP (requires rank_tp_ratio) or the
+                        # weightless-KV fast lane -- which are exactly the two
+                        # disjuncts of the gate above, so such a boot always
+                        # takes the branch above this one. (2) A #274
+                        # DUAL-GROUP LANE runner, which also sets
+                        # is_draft_worker=True and is NOT speculative, so (1)
+                        # does not cover it: _lane_server_args_view forces
+                        # view.dcp_size = 1, so a lane never enters this chain,
+                        # and at dcp_size==1 both multipliers here are
+                        # identities anyway.
+                        # On HIP/ROCm that refusal does not run (the validator
+                        # returns at `if is_hip(): return` before the CUDA
+                        # branch), so there the combination IS admitted and
+                        # this branch would size an allocator for a token
+                        # split the replicated draft pool does not perform.
+                        # Left as a named residual: this fork does not serve
+                        # ROCm and the audit had no ROCm hardware, and a
+                        # desk-guessed change to an address computation is the
+                        # #345 right-token/wrong-slot class waiting to happen.
+                        # Pinned by
+                        # test/registered/unit/distributed/
+                        # test_stock_dcp_allocator_reach_487.py
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                             self.max_total_num_tokens * self.dcp_size,
                             page_size=self.page_size * self.dcp_size,

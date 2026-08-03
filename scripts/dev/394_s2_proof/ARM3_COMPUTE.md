@@ -9,16 +9,21 @@ H2D delta is NOT null.
     ARM=proportional   slice 2: cold BYTES follow the links, compute does not
     ARM=compute        slice 3: cold COMPUTE follows the links   <-- this file
     ARM=compute-cal    slice 3 with the traffic coefficients measured on arm 1
-                       -- FALSIFIED 2026-08-03, see "What the confirmation
-                       window measured"
+                       -- FALSIFIED 2026-08-03 on two legs, end-to-end and
+                       mechanism; see "What the confirmation window measured"
 
-**Status in one line (2026-08-03).** The arm served tokens, `compute` measured
-**1.496x** on the transfer term and **-7.67 %** end-to-end against a same-window
-floor of 4.09 %, and `compute-cal` was falsified by that window's own data. The
-uncalibrated solve is the recommendation and the flag's plain symbol. What is
-still open is the corridor: every arm ran outside it, so the 1.496x point needs
-one re-proof in a green corridor before it is acceptance-ready — the spec for
-that window is "Green-corridor window" below.
+**Status in one line (2026-08-03).** The arm served tokens in two windows and the
+green-corridor re-proof PASSED all five gates: `compute` measures **1.4307x** on
+the transfer term and **-6.42 %** end-to-end against a same-window floor of
+0.424 % spread, with per-card corridor minima of 655-1318 MiB against the
+400 MiB floor. That figure is the FINAL, WORK-MATCHED dump revision — the only
+basis on which two arms may be divided by each other (see "Which revision to
+read"). The night window re-reads to **1.4253x** on the same basis, so the two
+windows agree to 0.4 % and the model's predictions (1.427x green, 1.411x night)
+sit between them. The uncalibrated solve is the recommendation and the flag's
+plain symbol; `compute-cal` stays falsified on two legs, end-to-end and
+mechanism. Evidence:
+`/spinning/gpu-battery-results/2026-08-03_439_green/RESULTS.md`.
 
 ## The one flag
 
@@ -154,13 +159,19 @@ the MODELLED cold mass does not equalise the MEASURED bytes.
 | clock | 858 -> **542 s = 1.584x** |
 | `moe_compute_policy` | `link-proportional-calibrated` |
 
-**That prediction is the one hardware overturned.** Running both sub-arms is
-what turned the band into a measurement, and it inverted: the calibrated arm was
-predicted to be the better end (1.584x here, 1.450x on the resolved plan) and
-measured the WORSE one (1.439x against 1.496x). The reason is in the next
-section, and it is why `compute-cal` is now a separate, experimental symbol.
+**That prediction is the one hardware overturned — but not on the transfer
+term.** Running both sub-arms is what turned the band into a measurement. On the
+pre-teardown dump revision the calibrated arm read 1.439x against 1.496x, and
+that comparison REVERSES once both arms are read at the same work point:
+work-matched, `compute-cal` reads **1.4573x** against `compute`'s **1.4253x**.
+The transfer term is therefore not something the rejection can rest on. What
+overturned the calibrated arm is its end-to-end result and its mechanism — the
+next section — and that is why `compute-cal` is a separate, experimental symbol.
 
-## What the confirmation window measured (2026-08-03, RAN)
+## What the confirmation window measured (2026-08-03 night window, RAN)
+
+Referred to as the "night window" throughout this file, after its own record
+(`2026-08-03_439_confirm/RESULTS.md`: "2026-08-02/03, night window 2").
 
 Three boots, `equal` / `compute` / `compute-cal`, DeepSeek-V4-Flash UD-IQ3_XXS,
 TP=3, 900 tokens x 3 runs x 1 warmup, `--disable-cuda-graph`. Full record:
@@ -175,6 +186,12 @@ x8 (13.41 GB/s)**.
 | `compute` | 160,79,119 | 1729.7 / **672.7** / 1455.5 | tp0, 128.8 s | **1.496x** | **127.6** | **-7.67 %** | **YES** |
 | `compute-cal` | 164,85,130 | 1716.9 / 730.2 / 1672.1 | tp2, 133.9 s | 1.439x | 136.9 | -0.94 % | NO |
 
+The H2D and speedup columns above are the PRE-TEARDOWN dump revision, which is
+what that window quoted. Read at a common work point instead, the same window
+gives `compute` **1.4253x** and `compute-cal` **1.4573x** — see "Which revision
+to read". The ms/token and floor columns are probe-measured, not dump-derived,
+and are unaffected by the revision choice.
+
 Same-window A-vs-A floor, measured in the `equal` boot: **CV 2.12 %, spread
 4.09 %** (900 tokens; the prior window's 1.19 % / 2.35 % at 450 tokens does not
 transfer). The clock rank moved OFF tp1, which is the mechanism's whole point.
@@ -182,13 +199,24 @@ transfer). The clock rank moved OFF tp1, which is the mechanism's whole point.
 Three findings came out of it, and the rest of this file is what they changed.
 
 **Finding 1 — the arm works and the uncalibrated solve is the recommendation.**
-`compute` beat its own re-derived prediction (1.411x) at 1.496x, and it is the
-only arm whose end-to-end effect clears the floor. The DESK-WRITTEN label lifts
-for the slice-3 compute path.
+`compute` is the only arm whose end-to-end effect clears the floor: **-7.67 %**
+against a 4.09 % spread. On the work-matched revision its transfer term is
+**1.4253x** against a re-derived prediction of 1.411x. The recurring "it beat
+its own prediction by 6 %" reading came from the pre-teardown revision and does
+not survive work-matching; the prediction was right. The DESK-WRITTEN label
+lifts for the slice-3 compute path.
 
-**Finding 2 — the calibration is falsified, by the falsifier this file named in
-advance** (readout item 4: *"if the per-rank hit rates move a lot when the ranges
-move, the coefficient is not a property of the rank"*). They move a lot:
+**Finding 2 — the calibration is falsified, and the rejection rests on exactly
+TWO load-bearing legs.**
+
+**Leg 1 — end-to-end. This is the economically decisive leg.** `compute-cal`
+measured **-0.94 %** ms/token against the baseline, inside that window's own
+**4.09 %** A-vs-A spread: a non-result. The end-to-end figure is probe-measured,
+not dump-derived, so no choice of dump revision can move it.
+
+**Leg 2 — mechanism, via the falsifier this file named in advance** (readout
+item 4: *"if the per-rank hit rates move a lot when the ranges move, the
+coefficient is not a property of the rank"*). They move a lot:
 
 | rank | `equal` | `compute` | `compute-cal` | expert extent |
 |---|---|---|---|---|
@@ -199,9 +227,25 @@ move, the coefficient is not a property of the rank"*). They move a lot:
 The hit rate tracks the SIZE of the owned range, because a smaller range fits
 the cache better. The calibrated solve read tp2's below-average coefficient
 (0.9586) as spare capacity, moved three more experts onto it, each cost more
-traffic than modelled, and tp2 became the new clock. Registered in
-`planner/rejected.py` (`moe_link_calibrated_coefficients`, NOT_DEFAULT) and
-demoted to its own symbol; see "The one flag".
+traffic than modelled, and tp2 became the new clock. The green-corridor window
+reproduced this on independent data with a clean control: tp0's range did not
+move and its hit rate did not move (0.7636 -> 0.7649), tp1's range shrank
+72 -> 57 and its hit rate rose 0.8465 -> 0.9092, tp2's grew 71 -> 86 and its hit
+rate fell 0.8415 -> 0.7915.
+
+**Demoted, and it is NOT a leg: the transfer-term comparison.** The sentence
+"it reached only 1.439x against 1.496x" divided two counters sampled at
+different fractions of their runs. Work-matched, the same window gives
+`compute-cal` **1.4573x** against `compute`'s **1.4253x** — the calibrated arm
+slightly WINS that term. The rejection never depended on it and does not cite it
+any more.
+
+**Demoted with it: "it underperformed its own 1.498x prediction."** That
+statement is the same pre-teardown ratio compared against a prediction, so it
+inherits the same defect and is not evidence either.
+
+Registered in `planner/rejected.py` (`moe_link_calibrated_coefficients`,
+NOT_DEFAULT) and demoted to its own symbol; see "The one flag".
 
 **Finding 3 — `--rank-auto-reserve-mib auto` is INFEASIBLE for this recipe**, and
 this file's own spec was internally inconsistent about it. `auto` derives
@@ -228,6 +272,44 @@ cannot self-correct, and gives the pinned value that fits
 (`ServerArgs.derived_reserve_infeasible_note`, pinned by
 `test_uneven_tp_args.TestDerivedReserveInfeasibility`).
 
+## Which revision to read — THE RULE, and it replaces the old one
+
+**Read the FINAL, WORK-MATCHED dump revision. Never divide two arms' pre-teardown
+snapshots by each other.** The previous instruction in this file — *"quote
+`read_arm.py`'s pre-teardown numbers, never the post-SIGTERM `expert_stats_*.json`
+revision"* — is WITHDRAWN. It is the defect behind every inflated transfer-term
+ratio this ticket has reported.
+
+Why. Each rank writes its dump on its own 45 s timer, so a pre-teardown read
+catches an arm at whatever fraction of its run the last tick happened to land
+on. Within one arm the three ranks are well synchronised; the two ARMS are not.
+In the green-corridor window `equal` was caught at 96.8 % of its run and
+`compute` at 91.9 % of its own, and the treatment arm's accumulating H2D counter
+was therefore read ~5 % early, inflating the ratio by about that much:
+
+    work-matched   equal 199.3 s -> compute 139.3 s = 1.4307x   (prediction 1.427x)
+    pre-teardown   equal 192.8 s -> compute 128.3 s = 1.5028x
+
+The final revision has no such problem: it is a common, well-defined endpoint,
+and the two arms are work-matched to 0.05 % (163486 vs 163572 tokens, 155359 vs
+155445 forwards, 980916 vs 981432 activations — and within each arm all three
+ranks are identical). It is the right basis for a ratio.
+
+This retro-corrects the night window as well. Re-read on the work-matched basis:
+
+| window | as reported (pre-teardown) | work-matched | prediction |
+|---|---|---|---|
+| `2026-08-03_439_confirm`, `compute` | 1.496x | **1.4253x** | 1.411x |
+| `2026-08-03_439_green`, `compute` | 1.5028x | **1.4307x** | 1.427x |
+
+The two windows agree to 0.4 % work-matched and the model's prediction sits
+between them.
+
+Operationally: run `read_arm.py` AFTER teardown, and read the `work=` line it
+prints. Two arms may be divided by each other only when their `tokens` /
+`forwards` / `activations` counters agree; the tool warns when a dump's own
+ranks disagree, which is how a non-final revision announces itself.
+
 ## Corridor: BREACHED at the measured recipe, and the arithmetic that repairs it
 
 The window sampled per-card free VRAM every 5 s across the whole serving window
@@ -241,7 +323,7 @@ not a post-boot snapshot:**
 | `compute-cal` | **251 MiB** | 1282 MiB | **211 MiB** |
 
 All three arms are outside the >= 400 MiB floor on both 3080s, identically in
-kind, so the breach does not bias the A/B — but it does mean the 1.496x point
+kind, so the breach does not bias the A/B — but it does mean that window's point
 was measured in a red corridor. Note what changed the verdict: the ~515 MiB this
 file previously quoted was a single POST-BOOT `nvidia-smi` line (the window's own
 post-boot readings were 549/1374/521), and the serving minimum sits 250-330 MiB
@@ -273,12 +355,23 @@ it. Everything downstream follows:
 | base expert counts of 256 | 114 / 71 / 71 | **115 / 71 / 70** |
 | solved `--rank-moe-ratio link` vector | 160,79,119 | **213,104,157** |
 | installed expert counts | 115 / 58 / 86 (+1 pad each) | **115 / 56 / 85** |
-| predicted transfer-term speedup | 1.411x (measured 1.496x) | **1.427x** |
+| predicted transfer-term speedup | 1.411x (work-matched 1.4253x) | **1.427x** (work-matched **1.4307x**) |
 
 (Solved with the module's own functions against the same measured links
 14.42/6.45/13.41 GB/s and fractions 0.485,0.42,0.42; the prediction chain is
-RESULTS.md §7's, re-run on the new base plan. The measured arm beat its
-prediction by 6.0 %, so the band to expect is **1.43x - 1.51x**.)
+RESULTS.md §7's, re-run on the new base plan. The band set for the next window
+was **1.43x - 1.51x**, widened upward from the apparent 6.0 % prediction beat —
+which the work-matched re-read shows was an artifact of the dump revision, not a
+margin. Both windows land near the band's lower edge, which is where the model
+put them.)
+
+The repaired column is a prediction and the green-corridor window measured it
+slightly differently: base extents came out **116 / 72 / 71** and installed
+extents **116 / 57 / 86** (conserved, 259 either way), against the 115/71/70 and
+115/56/85 predicted here. The vector `213,104,157` and the base plan
+`30407,18680,18680` are exactly as predicted. The off-by-one on the extents is
+not reconciled in this file — the measured values are the ones in
+`2026-08-03_439_green/RESULTS.md`, Gate 3.
 
 Second-order effect to watch, not to correct in advance: the 3080s' share of the
 weight plan drops 0.27827 -> 0.27565 each, so ~0.5 pp of total weight mass moves
@@ -286,7 +379,18 @@ onto the 5090. Its serving minimum was 1262 MiB; a few hundred MiB of that is th
 worst case, and it stays green. If it does not, that is a finding, not a reason to
 re-tune mid-window.
 
-## Green-corridor window — THE NEXT WINDOW'S TICKET (BOOT-PENDING)
+## Green-corridor window — RAN 2026-08-03, PASS on all five gates
+
+Record: `/spinning/gpu-battery-results/2026-08-03_439_green/RESULTS.md`. Outcome
+against the gates below: corridor GREEN on every card in both arms (655 / 1318 /
+1039 MiB `equal`, 663 / 1318 / 1007 MiB `compute`, 1 Hz, whole run); resolved
+plan `[30407, 18680, 18680]` in both boot logs; `link-proportional` with vector
+`213,104,157` and the three residency lines; A-vs-A floor CV 0.223 % / spread
+0.424 %; transfer term **1.4307x** work-matched (1.5028x pre-teardown) and
+**-6.42 %** end-to-end. The 1.4307x point is acceptance-evidence.
+
+The ticket as it was written, kept because the gates are what the result is read
+against:
 
 One window, **two boots**: `equal` and `compute`. `compute-cal` is dropped — it is
 falsified and registered, and re-running it would spend a card window
@@ -324,10 +428,10 @@ touch "$RUN/corridor_compute.csv.stop"
 4. **A-vs-A floor first**, in the `equal` boot, 900 tokens x 3 runs x 1 warmup.
    The expectation is the last window's CV 2.12 % / spread 4.09 %; a floor from
    another window does not cover this one.
-5. **Speedup.** Transfer term `h2d_r / link_r`, clock = slowest rank. Expected
-   **1.43x - 1.51x** (prediction 1.427x, and the last window's arm beat its
-   prediction by 6.0 %). End-to-end **-6 % to -9 %** ms/token, which must clear
-   the floor measured in gate 4 to be reportable at all.
+5. **Speedup.** Transfer term `h2d_r / link_r`, clock = slowest rank, read off
+   the FINAL WORK-MATCHED revision. Expected **1.43x - 1.51x** (prediction
+   1.427x). End-to-end **-6 % to -9 %** ms/token, which must clear the floor
+   measured in gate 4 to be reportable at all.
 
 **Labelling rules, so the result is readable without the run dir.**
 
@@ -336,15 +440,19 @@ touch "$RUN/corridor_compute.csv.stop"
   failed".
 * A boot that serves but whose corridor minimum is below 400 MiB on any card is
   **CORRIDOR-RED**, and its speedup is recorded but **not acceptance-evidence**.
-  That is exactly the status of the 1.496x point today.
+  That was the status of the night window's point; the green-corridor window
+  cleared it.
 * **No reserve-shrinking rescues.** If a card is short, the window ends and the
   finding is the shortfall. Lowering the reserve to buy a boot changes the base
   plan, hence the vector, hence what is being measured — and it silently converts
   a corridor breach into a different experiment.
 * The reserve is ONE value for the whole window, identical on both arms. A
   reserve that differs between arms is a second treatment.
-* Quote `read_arm.py`'s pre-teardown numbers, never the post-SIGTERM
-  `expert_stats_*.json` revision.
+* Quote the FINAL, WORK-MATCHED dump revision: run `read_arm.py` AFTER teardown
+  and check the `work=` line before dividing two arms by each other. The old
+  rule ("quote the pre-teardown numbers, never the post-SIGTERM revision") is
+  WITHDRAWN — see "Which revision to read", where it is measured to inflate the
+  ratio by ~5 %.
 
 **Also read out this time:** the per-rank compute/wait split (see readout item 2
 — grep the right string, the last window looked for the wrong one and reported
@@ -421,9 +529,13 @@ like from the boot log.
   the rig, sets the floor. Every predicted delta above is far above 1.4 %.
 * Same-boot A-vs-A floor before any A/B delta is quoted, per canon. First boot
   after a cache change is a JIT outlier.
+* Same WORK POINT before any A/B ratio is quoted. Counters that accumulate over
+  a run (H2D bytes above all) are only comparable between two arms at a common
+  endpoint — see "Which revision to read".
 * Arms in one window, same recipe, same reserve (`2200,1800,1800` since #458 —
-  see the corridor arithmetic; `2200,1400,1400` is what the 2026-08-03 window
-  ran and it is corridor-red), same `--rank-moe-resident-fraction
+  see the corridor arithmetic; the green-corridor window ran it and is green,
+  `2200,1400,1400` is what the night window ran and it is corridor-red), same
+  `--rank-moe-resident-fraction
   0.485,0.42,0.42`. The solve holds the resident mass fixed, so changing the
   fraction between arms changes the treatment.
 * `--disable-cuda-graph`, as the published baseline for this configuration does.
@@ -457,14 +569,18 @@ export RESERVE_MIB=2200,1800,1800                   # the repaired recipe
 bash scripts/dev/394_s2_proof/preflight.sh          # must print PREFLIGHT OK
 bash scripts/dev/394_s2_proof/corridor_sampler.sh "$RUN/corridor_equal.csv" 1 &
 ARM=equal   bash scripts/dev/394_s2_proof/boot_ab.sh
-# bounded curl -m readiness loop, then the bench-length generations
+# bounded curl -m readiness loop, then the bench-length generations, then the
+# teardown -- and only THEN the readout, on the final work-matched revision
 python3 scripts/dev/394_s2_proof/read_arm.py <run> equal
 ARM=compute bash scripts/dev/394_s2_proof/boot_ab.sh
 python3 scripts/dev/394_s2_proof/read_arm.py <run> compute
 ```
 
 `run_arm.sh <arm>` does the whole sequence for one arm and is the driver to use;
-the lines above are what it runs.
+the lines above are what it runs. It reads the dump twice — a pre-teardown
+liveness check into `read_<arm>.txt` and the quotable post-teardown one into
+`read_final_<arm>.txt`. Quote the latter, and only after checking that the two
+arms' `work point of this arm:` lines agree.
 
 The `compute-cal` sub-arm is FALSIFIED and is not part of a measurement window
 any more. To test a replacement hit-rate model against it, derive coefficients
@@ -486,22 +602,30 @@ arms cannot be confused for one another.
 
 ## Status
 
-**Slice 3 has served tokens. The DESK-WRITTEN-NEVER-EXECUTED label is LIFTED**
-for the compute path as of the 2026-08-03 confirmation window: the resolver
-reads the launch flag, residency is held at the base plan on all three ranks,
-the arm harness carries the arm, and all three 2026-08-02 defects are confirmed
-fixed ON HARDWARE. The measured effect is `compute` = **1.496x** on the transfer
-term and **-7.67 %** end-to-end against a 4.09 % same-window floor.
+**Slice 3 has served tokens and the result is ACCEPTANCE-EVIDENCE. The
+DESK-WRITTEN-NEVER-EXECUTED label is LIFTED** for the compute path as of the
+2026-08-03 night window: the resolver reads the launch flag, residency is held
+at the base plan on all three ranks, the arm harness carries the arm, and all
+three 2026-08-02 defects are confirmed fixed ON HARDWARE. The green-corridor
+re-proof then cleared the last open item.
 
-What is still open, and it is one boot:
+The number to quote, work-matched on the final dump revision:
 
-* **CORRIDOR-RED.** Every arm of that window ran with both 3080s below the
-  400 MiB floor (211-251 MiB at the serving minimum). The 1.496x point is real
-  but is not acceptance-evidence until it is re-proven in a green corridor at
-  the repaired reserve — the "Green-corridor window" ticket above. **BOOT-PENDING.**
-* The per-rank compute/wait split was never read (the window grepped for the
-  wrong string; readout item 2 now names the right one). No boot is owed for
-  this — it is in the logs that window already wrote.
+* **`compute` = 1.4307x** on the transfer term (green-corridor window,
+  prediction 1.427x) and **-6.42 %** end-to-end against a 0.424 % same-window
+  spread, in a corridor whose per-card minimum is 655-1318 MiB.
+* The night window reads **1.4253x** on the same basis (prediction 1.411x). The
+  two windows agree to 0.4 %.
+* The pre-teardown readings — 1.5028x and 1.496x — are ~5 % high for the reason
+  set out in "Which revision to read" and are not quotable.
+
+What is still open:
+
+* Nothing that owes a boot. The per-rank compute/wait split the night window
+  skipped was read in the green window from the prefill clock: `equal` TP1 waits
+  3.6 % of its time and `compute` TP1 rises to 15.3 % while TP2 becomes the new
+  prefill clock at 5.0 % — the wait time moved rather than vanishing, which is
+  the shape this file asked to see.
 
 The three defects the 2026-08-02 battery found, and how each was closed:
 
@@ -526,6 +650,9 @@ three above). The reserve infeasibility has its own hermetic reproduction in
 
 The catalog-first analysis behind the design is
 `docs/dev/ANALYSE_439_expert_compute_placement.md`; the battery records are
-`/spinning/gpu-battery-results/2026-08-02_439_arm3/RESULTS.md` (baseline only)
-and `/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md` (the
-confirmation window).
+`/spinning/gpu-battery-results/2026-08-02_439_arm3/RESULTS.md` (baseline only),
+`/spinning/gpu-battery-results/2026-08-03_439_confirm/RESULTS.md` (the night
+window, corridor-red) and
+`/spinning/gpu-battery-results/2026-08-03_439_green/RESULTS.md` (the
+green-corridor re-proof, and the source of the work-matched rule and of every
+number this file now quotes as acceptance-evidence).
