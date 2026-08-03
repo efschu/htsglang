@@ -552,6 +552,26 @@ request-private window unconditionally, but its `index_select`
 whenever a decode batch was graph-padded under GDN+spec; triton kernels
 already skip PAD_SLOT_ID natively, so any torch-level indexing on
 cache_indices must skip/mask it explicitly too -- fixed by #444e).
+Third member, #472 (upstream sgl-project/sglang#33253): under the breakable /
+piecewise graph the attention wrapper narrowed `out_cache_loc` but not
+`positions`, and the EVEN DCP owner rule reads `positions`. The damage was not
+the padded rows themselves (their ZERO `out_cache_loc` lands in the pool's
+reserved slot) but the resulting LENGTH DISAGREEMENT: the upstream
+`positions.numel() == loc.numel()` guard rejected the mask, the fallback
+`forward_batch.dcp_kv_mask` is HIP-only, and a `None` mask degrades
+`set_kv_buffer` to an UNMASKED write -- every rank then claims every real
+token and the compact row keeps whichever write was last. #355's bound does
+not eat this (it bounds the write to the buffer, and only inside the masked
+kernel). Our WEIGHTED owner rule (#173) was immune throughout: it derives
+ownership from `out_cache_loc`, the tensor the wrapper already narrows. Fixed
+in two places rather than upstream's one -- `narrow_pcg_token_views` /
+`restore_pcg_token_views` cover all THREE piecewise ops (upstream's diff
+touches one and misses `unified_sparse_attention_with_output`), and
+`dcp_even_write_mask` refuses a mask-less token-sharded write by name instead
+of returning `None`. So the rule for this family: a token-axis FB field the
+backend indexes alongside Q/K/V is narrowed with them, and an owner rule with
+no usable mask fails loudly -- there is no correct maskless DCP write. See
+docs/dev/NOTE_472_pad_positions_dcp.md.
 
 ## 13. Serving surface
 OpenAI-compatible with `--reasoning-parser qwen3 --tool-call-parser

@@ -21,6 +21,7 @@ from sglang.srt.layers.dcp import (
     cp_all_gather_heads_uneven,
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_even_write_mask,
     dcp_token_sharded_layer,
     dcp_verify_mask_mode,
     dcp_verify_paged_lens,
@@ -2192,15 +2193,16 @@ class TritonAttnBackend(AttentionBackend):
                 )
             else:
                 loc = forward_batch.out_cache_loc // self.dcp_size
-                if (
-                    forward_batch.positions is not None
-                    and forward_batch.positions.numel() == loc.numel()
-                ):
-                    dcp_kv_mask = (
-                        forward_batch.positions % self.dcp_size == self.dcp_rank
-                    )
-                else:
-                    dcp_kv_mask = forward_batch.dcp_kv_mask
+                # EVEN modulo owner rule via the shared helper: it refuses a
+                # padded ``positions`` against a narrowed ``out_cache_loc``
+                # (#472) instead of falling through to an unmasked write.
+                dcp_kv_mask = dcp_even_write_mask(
+                    forward_batch.positions,
+                    loc.numel(),
+                    self.dcp_size,
+                    self.dcp_rank,
+                    forward_batch.dcp_kv_mask,
+                )
             kwargs = {"dcp_kv_mask": dcp_kv_mask}
         else:
             loc = loc_info

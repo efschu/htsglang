@@ -40,6 +40,7 @@ __all__ = [
     "build_dcp_weighted_kv_indices",
     "dcp_accounting_total_slots",
     "dcp_compact_pool_rows",
+    "dcp_even_write_mask",
     "dcp_global_context_slots",
     "dcp_token_sharded_layer",
     "dcp_verify_mask_mode",
@@ -357,6 +358,49 @@ def dcp_weighted_owner_bounds(dcp_size: int, dcp_rank: int):
     cp_lo = prefix[dcp_rank]
     cp_hi = prefix[dcp_rank + 1]
     return cp_S, cp_lo, cp_hi, cp_hi - cp_lo
+
+
+def dcp_even_write_mask(
+    positions: Optional[torch.Tensor],
+    num_rows: int,
+    dcp_size: int,
+    dcp_rank: int,
+    precomputed: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """EVEN modulo owner mask for a token-sharded DCP write, stated once.
+
+    ``mask[i]`` is True iff this rank owns write row ``i``, i.e. iff
+    ``positions[i] % dcp_size == dcp_rank``. ``num_rows`` is the row count of
+    the WRITE (``out_cache_loc`` after the piecewise-graph wrapper narrowed it),
+    and both candidate sources have to agree with it.
+
+    The refusal is the point (#472, pad-slot family). Under the breakable /
+    piecewise CUDA graph the attention wrapper narrows ``out_cache_loc`` to the
+    real token count; if ``positions`` is still at the padded bucket length the
+    two disagree and there is NO usable owner mask. Returning ``None`` there --
+    which is what the previous inline expression did on CUDA, where the HIP-only
+    ``forward_batch.dcp_kv_mask`` fallback is unset -- degrades the write to an
+    UNMASKED one: every rank then writes every token into its compact row, and
+    the token that survives is whichever the last write happened to be. That is
+    silent cross-rank KV corruption, so it fails loudly here instead.
+
+    The WEIGHTED rule (``dcp_weighted_write_slots``) needs none of this: it
+    derives ownership from ``out_cache_loc`` itself, so a padded ``positions``
+    cannot reach it at all.
+    """
+    if positions is not None and positions.numel() == num_rows:
+        return positions % dcp_size == dcp_rank
+    if precomputed is not None and precomputed.numel() == num_rows:
+        return precomputed
+    raise ValueError(
+        "even-DCP owner mask: no source agrees with the write's row count "
+        f"({num_rows}) -- positions="
+        f"{None if positions is None else positions.numel()}, precomputed="
+        f"{None if precomputed is None else precomputed.numel()}. A padded "
+        "positions tensor against a narrowed out_cache_loc is the breakable "
+        "CUDA-graph case (#472); writing unmasked instead would let this rank "
+        "claim tokens owned by other DCP ranks."
+    )
 
 
 def dcp_weighted_write_slots(

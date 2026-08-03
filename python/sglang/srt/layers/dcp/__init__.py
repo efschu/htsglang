@@ -64,6 +64,7 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.layers.dcp.owner import (
     build_dcp_weighted_kv_indices,
     dcp_compact_pool_rows,
+    dcp_even_write_mask,
     dcp_token_sharded_layer,
     dcp_verify_mask_mode,
     dcp_verify_paged_lens,
@@ -98,6 +99,7 @@ __all__ = [
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
     "dcp_compact_pool_rows",
+    "dcp_even_write_mask",
     "dcp_token_sharded_layer",
     "dcp_verify_mask_mode",
     "dcp_verify_paged_lens",

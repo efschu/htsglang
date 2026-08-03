@@ -34,6 +34,7 @@ from sglang.srt.layers.dcp import (
     dcp_weighted_write_slots,
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_even_write_mask,
     get_dcp_lens,
 )
 from sglang.srt.layers.dcp.lockstep import (
@@ -2488,11 +2489,17 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             loc = cache_loc // self.dcp_size
-            positions = forward_batch.positions
-            if positions is not None and positions.numel() == loc.numel():
-                dcp_kv_mask = positions % self.dcp_size == self.dcp_rank
-            else:
-                dcp_kv_mask = forward_batch.dcp_kv_mask
+            # EVEN modulo owner rule via the shared helper: it refuses a padded
+            # ``positions`` against a narrowed ``cache_loc`` (#472) instead of
+            # falling through to an unmasked write. Same call as the Triton
+            # twin, so the two lanes cannot classify a row differently.
+            dcp_kv_mask = dcp_even_write_mask(
+                forward_batch.positions,
+                loc.numel(),
+                self.dcp_size,
+                self.dcp_rank,
+                forward_batch.dcp_kv_mask,
+            )
         if getattr(self, "_wl_spill_active", False):
             # Stage B1: owned slots may land in the HOST region of the logical
             # slot space; split the write (device part unchanged, host part
