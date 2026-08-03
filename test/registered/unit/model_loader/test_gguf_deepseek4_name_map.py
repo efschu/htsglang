@@ -29,6 +29,7 @@ from sglang.srt.model_loader.gguf_registry import (
     get_gguf_adapter_class,
     sibling_config_gguf_archs,
 )
+from sglang.test.gguf_mxfp4_state import native_path, repack_path
 
 DSV4_GGUF_DIR = (
     "/spinning/llm_stuff/club-3090/models-cache/DeepSeek-V4-Flash-0731-GGUF/UD-Q3_K_XL"
@@ -339,21 +340,44 @@ class TestDeepseek4NameMapAgainstFile(unittest.TestCase):
         self.assertIn("vocab_size", str(ctx.exception))
 
     def test_mxfp4_passes_the_gate_only_while_the_repack_is_on(self):
-        """UD-Q3_K_XL stores 45 expert tensors as MXFP4, for which this build
-        has no dequantize or matmul kernel. The load-time repack to Q5_0
+        """UD-Q3_K_XL stores 45 expert tensors as MXFP4, for which a pre-#398
+        build has no dequantize or matmul kernel. The load-time repack to Q5_0
         (#391 blocker 1) makes them executable, so the gate must let the file
         through -- and must go back to refusing it, by name, the moment the
-        repack is switched off. Both directions on the real shard set."""
+        repack is switched off. Both directions on the real shard set.
+
+        Scoped to the repack path (#529): with the native kernels present the
+        repack is not what carries MXFP4, so the second direction does not hold
+        and this assertion described nothing. The native half is the test
+        below.
+        """
         from sglang.srt.environ import envs
 
-        self.adapter.assert_quant_types_executable()
+        with repack_path():
+            self.adapter.assert_quant_types_executable()
 
-        with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
-            with self.assertRaises(RuntimeError) as ctx:
+            with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.adapter.assert_quant_types_executable()
+            message = str(ctx.exception)
+            self.assertIn("MXFP4", message)
+            self.assertIn("SGLANG_GGUF_MXFP4_REPACK", message)
+
+    def test_mxfp4_passes_the_gate_without_the_repack_when_kernels_are_native(self):
+        """The path this rig actually serves (#529).
+
+        With the #398 kernels the gate must accept the same file for a reason
+        that has nothing to do with the repack: MXFP4 is in ``DEQUANT_TYPES``
+        on its own. Switching the repack OFF must therefore change nothing --
+        the property the repack-scoped test above cannot express, and the one
+        that decides whether today's boot gets past the gate.
+        """
+        from sglang.srt.environ import envs
+
+        with native_path():
+            self.adapter.assert_quant_types_executable()
+            with envs.SGLANG_GGUF_MXFP4_REPACK.override(False):
                 self.adapter.assert_quant_types_executable()
-        message = str(ctx.exception)
-        self.assertIn("MXFP4", message)
-        self.assertIn("SGLANG_GGUF_MXFP4_REPACK", message)
 
 
 if __name__ == "__main__":

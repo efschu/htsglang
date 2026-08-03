@@ -38,6 +38,36 @@ DEFAULT_DEVICE = "cuda:0"
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 
+def _accelerator_probe():
+    """``(available, why_not)`` from the SAME call the tests below trip on.
+
+    ``get_device()`` raises ``RuntimeError: No accelerator ...`` when none is
+    visible, and both classes below reach it -- one through ``DeviceConfig`` in
+    ``setUp``, one through ``ServerArgs.from_cli_args``. Deriving the skip
+    predicate from that call rather than from a hand-written CUDA check means
+    the skip cannot drift away from its own cause, and it lifts by itself the
+    moment a device is visible: this file is registered as CUDA CI and runs in
+    full on the GPU runner. It only ever skips on a hermetic CPU sweep
+    (CUDA_VISIBLE_DEVICES=99), where it previously produced six red tests that
+    said nothing about the code.
+    """
+    try:
+        get_device()
+        return True, ""
+    except Exception as exc:  # RuntimeError today; any raise means "no device"
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+_HAS_ACCELERATOR, _NO_ACCELERATOR_WHY = _accelerator_probe()
+
+requires_accelerator = unittest.skipUnless(
+    _HAS_ACCELERATOR,
+    "needs a visible accelerator; runs unmodified as soon as one is "
+    f"({_NO_ACCELERATOR_WHY})",
+)
+
+
+@requires_accelerator
 class TestModelOptModelLoader(CustomTestCase):
     """Test cases for ModelOptModelLoader functionality."""
 
@@ -401,6 +431,7 @@ class TestModelOptModelLoader(CustomTestCase):
         self.assertEqual(config_auto._get_modelopt_quant_type(), "fp8")
 
 
+@requires_accelerator
 class TestModelOptLoaderIntegration(CustomTestCase):
     """Integration tests for ModelOptModelLoader with Engine API."""
 

@@ -1444,6 +1444,57 @@ a magnitude precondition on each arm. Every gate in that file now has an
 off-GPU can-discriminate test showing it reject a zeroed and a sign-flipped
 output, including the refuted baseline executed as a test.
 
+Superseded-premise family (#529, same audit axis, third instance): a test that
+still RUNS but whose world changed. `test/registered/unit/model_loader/` stood
+at a permanent **37 failed / 284 passed**, and the red block was not a product
+defect in any of its three causes -- it was the harness. Standing red is not
+neutral: it anaesthetises the regression signal, and the #526 merge had to diff
+failure sets line by line to tell a new break from the noise. Causes and the
+repair chosen per cause, since "skip it" is only right for one of them:
+(1) **19 MXFP4 repack failures** -- #398 made the wheel execute ggml type 39
+natively, so `gguf_mxfp4_repack` is the identity and every assertion about a
+Q5_0 payload described bytes nobody rewrites. NOT skipped: the repack still
+ships (the wheel is pinned separately from the source, and
+`SGLANG_GGUF_MXFP4_NATIVE=0` is the standing A/B lever), so the state is forced
+IN-PROCESS via `sglang/test/gguf_mxfp4_state.py` (env lever + module reload),
+which is deterministic on every wheel and needs no capability skip that would
+sleep forever on a native one. The measured value of that distinction: with an
+off-by-one planted in the repack lattice offset, the pre-#529 file caught
+**0** (15 red before, 15 red after -- pure noise), the forced-state file catches
+**6**. Four of its tests had also been passing VACUOUSLY, e.g. "a slice of a
+repack equals a repack of a slice" is trivially true of the identity.
+(2) **5 Qwen3.8 forward-compat failures** -- a test stub that hand-listed the
+`ServerArgs` methods it forwarded, which stopped matching when those methods
+were refactored to share a `_read_declared_config` helper. Repaired by
+delegating generically (`__getattr__` -> `functools.partial`) so a future
+private helper travels with them; a planted off-by-one in
+`full_attention_interval` now turns 2 tests red, where before the fix the file
+caught nothing at all.
+(3) **6 modelopt failures** -- a `register_cuda_ci` file that has no business
+running on a hermetic CPU sweep. Skipped, but with the predicate derived from
+`get_device()`, i.e. the SAME call the tests trip on, so the marker cannot
+drift from its cause and lifts by itself on the GPU runner (proven: with the
+probe reporting an accelerator, all 6 run instead of skipping).
+The native MXFP4 path -- the one this rig actually serves -- had LESS
+loader-level coverage than the dead repack path beside it, so
+`test_gguf_mxfp4_native_path_529.py` pins it through the real
+`gguf_quant_weights_iterator`: markers stay 39, payload stays 17 B/block, the
+per-expert slice stays self-contained and decodable, the load-time line
+announces the SAVING rather than a conversion, and the executability gate
+accepts MXFP4 with the repack explicitly off. Its own falsifier runs both paths
+over the same bytes and asserts they differ. After: **0 failed / 320 passed /
+15 skipped**.
+The red count was itself WHEEL-DEPENDENT, which is why two agents reported two
+different numbers for the same tree on the same day: at the line tip the suite
+is **37 failed** with the shipped native wheel and **11 failed** under
+`SGLANG_GGUF_MXFP4_NATIVE=0` (both measured), the 26-failure difference being
+exactly the MXFP4 repack block, which passes whenever the repack actually runs.
+11 = 6 modelopt + 5 Qwen3.8; neither of those depends on the wheel. A suite
+whose failure count moves with an env var cannot be used as a regression
+signal at all. After the fix both states give the identical **0 failed / 320
+passed / 15 skipped**, because each test now forces the state it means instead
+of inheriting it.
+
 Reach-before-fix (#487, the shape of a good negative result): the stock
 even-DCP allocator branch (`model_runner_kv_cache_mixin.py`, the `else` of the
 allocator chain) inflates BOTH the index space and the page granularity by
