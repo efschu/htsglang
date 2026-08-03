@@ -560,6 +560,30 @@ class TestClientAsset(unittest.TestCase):
         for forbidden in ("http://", "https://cdn", "<script src="):
             self.assertNotIn(forbidden, html, forbidden)
         self.assertIn("getUserMedia", html)
+
+        # The first real phone test failed here, and the server looked
+        # perfectly healthy while it did: nine WebSocket connections, two
+        # sessions, zero segments. The capture AudioContext is created after
+        # an await on getUserMedia -- which on the first press also spans the
+        # Android permission dialog -- so the user gesture has expired and
+        # Chrome starts it SUSPENDED. A suspended context never runs the
+        # worklet, so no frame is ever produced and nothing is ever sent.
+        #
+        # These are string assertions on an asset, which is a weak instrument;
+        # they are here because the alternative is no instrument at all, and
+        # because each one pins a specific line whose removal reproduces a
+        # failure that is invisible from the server side.
+        self.assertIn("await this.ctx.resume()", html,
+                      "the capture context must be resumed, not assumed")
+        self.assertIn('this.ctx.state !== "running"', html,
+                      "a backgrounded page suspends capture; resume on reopen")
+        self.assertIn("microphone unavailable", html,
+                      "a refused microphone must be reported, not swallowed")
+        self.assertIn("no audio is arriving", html,
+                      "an open microphone producing nothing must say so")
+        self.assertIn("released without any audio", html,
+                      "a release with no audio is indistinguishable from "
+                      "silence at the server, so the client must report it")
         manifest = client.get("/manifest.webmanifest").json()
         self.assertEqual(manifest["display"], "standalone")
 

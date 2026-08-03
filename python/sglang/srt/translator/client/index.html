@@ -215,6 +215,16 @@ class Microphone {
       },
     });
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // RESUME, and do not assume it worked. This context is created AFTER an
+    // await on getUserMedia -- on the first press that await also spans the
+    // Android permission dialog -- so the user gesture that allowed audio has
+    // already expired and Chrome starts the context SUSPENDED. A suspended
+    // context never calls the worklet's process(), so no frame is ever
+    // produced, nothing is ever sent, and the whole app looks dead while the
+    // socket, the session and the server are all healthy. That is exactly
+    // what happened on the first real phone test: nine WebSocket connections,
+    // two sessions, and not one segment.
+    await this.ctx.resume();
     const blob = new Blob([WORKLET_SOURCE], { type: "application/javascript" });
     const url = URL.createObjectURL(blob);
     await this.ctx.audioWorklet.addModule(url);
@@ -265,13 +275,24 @@ class Microphone {
         const s = Math.max(-1, Math.min(1, out[start + i]));
         pcm.setInt16(i * 2, s * 32767, true);
       }
+      this.frames = (this.frames || 0) + 1;
       this.onFrame(pcm.buffer);
     }
   }
 
   setOpen(open) {
     this.open = open;
-    if (!open) this.carry = new Float32Array(0);
+    if (!open) { this.carry = new Float32Array(0); return; }
+    this.frames = 0;
+    // Android suspends the capture context whenever the page is backgrounded,
+    // and resuming it is not automatic on return. Cheap to repeat, silent to
+    // omit.
+    if (this.ctx && this.ctx.state !== "running") this.ctx.resume();
+  }
+
+  /** Frames handed to the sender since the last setOpen(true). */
+  sent() {
+    return this.frames || 0;
   }
 
   stop() {
@@ -455,21 +476,52 @@ const microphone = new Microphone(
 
 const talk = el("talk");
 let holding = false;
+let silentCapture = null;
 
 async function beginTalking() {
   if (holding) return;
   holding = true;
-  await microphone.start();
+  try {
+    await microphone.start();
+  } catch (err) {
+    // A refused or unavailable microphone must SAY so. Without this the flag
+    // stayed true, the button never lit, and every later press was a silent
+    // no-op -- indistinguishable from a broken server.
+    holding = false;
+    sys("microphone unavailable: " + (err && err.message ? err.message : err),
+        true);
+    setStatus("no microphone", "err");
+    return;
+  }
   playback.ensure();          // unlock audio output on the same gesture
   acquireWakeLock();          // keep the screen alive for the conversation
   microphone.setOpen(true);
   talk.classList.add("live");
+  // If the capture graph is not actually producing frames, say so rather than
+  // recording nothing in a lit-up button. 700 ms is several worklet quanta at
+  // any sample rate the browser picks.
+  clearTimeout(silentCapture);
+  silentCapture = setTimeout(() => {
+    if (holding && microphone.sent() === 0) {
+      sys("the microphone is open but no audio is arriving (capture context "
+          + (microphone.ctx ? microphone.ctx.state : "gone") + ")", true);
+      setStatus("no audio from the microphone", "err");
+    }
+  }, 700);
 }
 
 function endTalking() {
   if (!holding) return;
   holding = false;
+  clearTimeout(silentCapture);
+  const sent = microphone.sent();
   microphone.setOpen(false);
+  if (sent === 0) {
+    // A release with no audio produces no segment and therefore no turn. The
+    // server cannot distinguish it from a user who said nothing, so the
+    // client is the only place this can be reported.
+    sys("released without any audio -- nothing was sent for this turn", true);
+  }
   connection.sendControl({ kind: "release" });
   talk.classList.remove("live");
 }
@@ -483,10 +535,24 @@ talk.addEventListener("pointerleave", endTalking);
 
 el("mode").addEventListener("change", async (e) => {
   if (e.target.value === "vad") {
-    await microphone.start();
+    try {
+      await microphone.start();
+    } catch (err) {
+      sys("microphone unavailable: " + (err && err.message ? err.message : err),
+          true);
+      setStatus("no microphone", "err");
+      e.target.value = "ptt";
+      return;
+    }
     playback.ensure();
     acquireWakeLock();
     microphone.setOpen(true);         // server-side VAD segments the stream
+    setTimeout(() => {
+      if (microphone.sent() === 0) {
+        sys("listening, but no audio is arriving from the microphone", true);
+        setStatus("no audio from the microphone", "err");
+      }
+    }, 1000);
     talk.textContent = "listening (auto)";
     talk.disabled = true;
   } else {
