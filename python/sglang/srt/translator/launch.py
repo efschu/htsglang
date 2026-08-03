@@ -17,11 +17,12 @@ that a deployment's networking works before any model is downloaded.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 logger = logging.getLogger("translator.launch")
 
@@ -109,6 +110,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mt-languages", default="",
         help="comma-separated; empty means the LLM claims no restriction",
+    )
+    parser.add_argument(
+        "--mt-thinking", action="store_true",
+        help=(
+            "let a reasoning-capable MT model think out loud. OFF by default, "
+            "and measured: Qwen3.6-27B-FP8 answered a German->Spanish request "
+            "with \"Here's a thinking process: 1. Analyze User Input...\" and "
+            "ran into the token limit before producing a translation. The "
+            "chain of thought is not separable downstream -- it would be read "
+            "aloud in the target voice."
+        ),
+    )
+    parser.add_argument(
+        "--mt-extra-body", default="",
+        help=(
+            "JSON merged into every MT request body, for options this "
+            "launcher does not name (sampling, adapters, routing hints)."
+        ),
     )
 
     parser.add_argument(
@@ -287,11 +306,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         embedder = FakeEmbedder()
 
+    # Thinking is suppressed through the chat template rather than filtered out
+    # of the answer: a reasoning model's output has no reliable marker the
+    # translator could strip, and anything left in the string is spoken.
+    extra_body: Dict[str, object] = {}
+    if not args.mt_thinking:
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    if args.mt_extra_body:
+        try:
+            extra_body.update(json.loads(args.mt_extra_body))
+        except (ValueError, AttributeError) as exc:
+            raise SystemExit(f"--mt-extra-body is not a JSON object: {exc}") from exc
+
     mt = OpenAiMt(
         MtConfig(
             base_url=args.mt_base_url,
             model=args.mt_model,
             languages=mt_languages,
+            extra_body=extra_body,
         )
     )
 
