@@ -58,8 +58,48 @@ class TestVersionGating(unittest.TestCase):
             self.assertIn(variant, rife.KNOWN_VERSIONS)
 
     def test_supported_is_a_strict_subset(self):
-        self.assertEqual(rife.SUPPORTED_VERSIONS, {"4.6", "4.18", "4.26"})
+        # Eight rungs off three vendored IFNet files: 4.15/4.17/4.18 share one
+        # architecture and 4.15.lite/4.16.lite/4.17.lite share another, both
+        # groups byte-identical upstream at the pinned commit (#460, sha256
+        # proof in _vendor/rife/README.md). The weights still differ per
+        # version and are pinned separately.
+        self.assertEqual(
+            rife.SUPPORTED_VERSIONS,
+            {
+                "4.6",
+                "4.15",
+                "4.15.lite",
+                "4.16.lite",
+                "4.17",
+                "4.17.lite",
+                "4.18",
+                "4.26",
+            },
+        )
         self.assertTrue(rife.SUPPORTED_VERSIONS < rife.KNOWN_VERSIONS)
+
+    def test_alias_group_members_share_one_vendored_module(self):
+        # The alias mapping is the thing that could go wrong silently: pointing
+        # 4.15 at the wrong module would load real weights onto a wrong graph.
+        for group in (("4.15", "4.17", "4.18"), ("4.15.lite", "4.16.lite", "4.17.lite")):
+            modules = {rife.require_supported(v).module for v in group}
+            self.assertEqual(len(modules), 1, f"{group} must share one module")
+        self.assertNotEqual(
+            rife.require_supported("4.18").module,
+            rife.require_supported("4.17.lite").module,
+        )
+        # ... and the lite family is the narrower encode head, which is what
+        # distinguishes it from the full one at load time.
+        self.assertEqual(rife.require_supported("4.18").encode_channels, 8)
+        self.assertEqual(rife.require_supported("4.17.lite").encode_channels, 4)
+
+    def test_every_supported_version_is_pinned(self):
+        # A rung with no pin cannot be fetched reproducibly; #460's ladder
+        # refuses such an entry, and the refusal is only meaningful if the
+        # shipped set has none.
+        for version in sorted(rife.SUPPORTED_VERSIONS):
+            self.assertIn(version, rife.KNOWN_WEIGHT_SHA256, version)
+            self.assertEqual(len(rife.KNOWN_WEIGHT_SHA256[version]), 64, version)
 
     def test_unknown_version_rejected(self):
         with self.assertRaises(rife.UnknownRifeVersionError):
