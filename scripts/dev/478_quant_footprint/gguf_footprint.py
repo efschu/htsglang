@@ -341,6 +341,7 @@ def solve_resident_fraction(
     rig: Rig,
     tp_ratio: List[float],
     kv_and_activation_gib: List[float],
+    extra_vram_gib: List[float] | None = None,
 ) -> Dict[str, object]:
     """How much of the expert stack fits in VRAM, and what spills to host?
 
@@ -350,6 +351,10 @@ def solve_resident_fraction(
     corridor and the KV/activation term is what resident experts may use.
     """
     ratios = [r / sum(tp_ratio) for r in tp_ratio]
+    # Per-rank VRAM taken by something other than this model's weights: a
+    # co-resident speculative draft head (#470 solo placement), graph pools,
+    # anything else that must be paid before resident experts get what is left.
+    extra = list(extra_vram_gib or [0.0] * len(ratios))
     per_rank = []
     total_resident = 0.0
     total_spill = 0.0
@@ -361,7 +366,7 @@ def solve_resident_fraction(
         budget_gib = (
             total_mib - rig.reserve_mib[r] - rig.corridor_mib
         ) / 1024.0 - kv_and_activation_gib[r]
-        for_experts = budget_gib - nonexpert_gib
+        for_experts = budget_gib - nonexpert_gib - extra[r]
         if for_experts < 0:
             feasible = False
             resident = 0.0
@@ -376,6 +381,7 @@ def solve_resident_fraction(
                 "rank": r,
                 "card": rig.card_names[r],
                 "share": round(share, 4),
+                "extra_vram_gib": round(extra[r], 3),
                 "card_total_gib": round(total_mib / 1024.0, 3),
                 "nonexpert_gib": round(nonexpert_gib, 3),
                 "expert_gib": round(expert_gib, 3),
@@ -500,6 +506,23 @@ def selftest() -> int:
     apply_mxfp4_repack(fp_no)
     check("no MXFP4 means no growth", fp_no.expert_bytes == 17 * 1000)
 
+    rig_mid = Rig([32000.0], ["mid"], 104.0, [1000.0])
+    fp2 = QuantFootprint("t2", "-")
+    fp2.nonexpert_bytes = 3 * (1 << 30)
+    fp2.expert_bytes = 40 * (1 << 30)
+    base = solve_resident_fraction(fp2, rig_mid, [1.0], [2.0])
+    cut = solve_resident_fraction(fp2, rig_mid, [1.0], [2.0], [10.0])
+    check(
+        "a co-resident draft head cuts residency",
+        cut["per_rank"][0]["resident_gib"] < base["per_rank"][0]["resident_gib"],
+    )
+    check(
+        "and moves exactly that much to the host pool",
+        abs(
+            (cut["host_cold_pool_gib"] - base["host_cold_pool_gib"]) - 10.0
+        ) < 0.01,
+    )
+
     print("SELFTEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -527,6 +550,12 @@ def main() -> int:
     )
     ap.add_argument("--reserve-mib", default="2200,1400,1400")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument(
+        "--extra-vram-gib",
+        default=None,
+        help="per-rank VRAM taken by a non-weight consumer, e.g. a co-resident "
+        "draft head: '10.12,0,0'",
+    )
     ap.add_argument(
         "--repack-mxfp4",
         action="store_true",
@@ -580,7 +609,14 @@ def main() -> int:
         fp = scan_quant(label, path)
         if args.repack_mxfp4:
             fp = apply_mxfp4_repack(fp)
-        report["quants"].append(solve_resident_fraction(fp, rig, tp_ratio, kv_act))
+        extra = (
+            [float(x) for x in args.extra_vram_gib.split(",")]
+            if args.extra_vram_gib
+            else None
+        )
+        report["quants"].append(
+            solve_resident_fraction(fp, rig, tp_ratio, kv_act, extra)
+        )
 
     text = json.dumps(report, indent=2)
     print(text)
