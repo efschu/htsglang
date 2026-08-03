@@ -2020,6 +2020,25 @@ is fork-adapted (idx computed before the split). Tests:
 through `TRITON_INTERPRET=1` on CPU, which is how an SM120-only kernel becomes
 falsifiable at the desk; the compiled arm is
 `test_flash_mla_backends.py::TestTouchedPageSplit` (SM120-gated, unrun).
+**The sm120 decode entry point now buckets its topk width** (port of upstream
+#33407, `86c2a34a45`, still open upstream): the CUTLASS decode kernels are
+instantiated only for `topk in {128, 512, 1024}` (`(heads, topk)` table,
+checked against the installed `flashinfer._DECODE_DSV4_DISPATCH`), while
+DSpark's draft indexer emits **192** — a pre-boot crash on the 5090 the first
+time a DSpark draft runs. `_flash_mla_flashinfer` right-pads the index tensor
+with the kernels' `-1` skip sentinel to the next instantiated bucket and caps
+the scan through `topk_length`, so the padding is allocated but never read;
+anything still undispatchable (`d_qk != 512`, an uninstantiated head count, a
+batch above `_DECODE_MAX_TOKENS`) routes to the existing Triton sparse-decode
+kernel instead of dying. Fork deviation, stated: upstream gates the
+dispatch test on `B <= _DECODE_MAX_TOKENS` because it also has a prefill
+branch — this fork's entry point only ever calls the decode kernel, so the test
+is unconditional here and the over-long batch becomes a fallback rather than a
+crash. Tests:
+`test/registered/unit/layers/attention/test_flash_mla_sm120_topk_buckets.py`,
+15 hermetic, five executed can-fail arms (padding removed → 4 red; pad value 0
+instead of -1 → 1; scan cap dropped → 1; dispatch check removed → 4; bucket
+picks the widest instead of the smallest → 7). Unmeasured on a card.
 The torch paged-MQA indexer logits are chunked on BOTH axes — KV positions
 (#426) and query rows under a per-rank MiB budget (#449,
 `SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB`, converted with that rank's own head

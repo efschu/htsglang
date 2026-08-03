@@ -471,6 +471,26 @@ def _split_kv_pages_to_64(
     )
 
 
+# CUTLASS SM120 sparse-MLA kernels are instantiated only for these topk
+# widths (decode: (num_heads, topk) table with topk in {128, 512, 1024};
+# prefill orchestrator: {128, 512, 1024, 2048}).
+_SUPPORTED_TOPK_WIDTHS = (128, 512, 1024, 2048)
+
+_noted_bucket_pad = False
+_warned_triton_fb = False
+
+
+def _next_topk_bucket(topk: int):
+    """The smallest instantiated topk width that can hold ``topk``.
+
+    ``None`` when the request is wider than every instantiated kernel, which
+    is the one case padding cannot rescue. Extracted from the inline
+    ``next(...)`` of upstream #33407 so the arithmetic is testable without a
+    card -- it is the whole correctness argument of the pad.
+    """
+    return next((t for t in _SUPPORTED_TOPK_WIDTHS if t >= topk), None)
+
+
 def _flash_mla_flashinfer(
     q,
     k_cache,
@@ -521,6 +541,86 @@ def _flash_mla_flashinfer(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+
+    # --- Bucket alignment for non-instantiated topk widths (upstream #33407) ---
+    # The CUTLASS SM120 sparse-MLA kernels are instantiated only for a fixed
+    # set of topk widths (decode: topk in {128, 512, 1024}; prefill
+    # orchestrator: {128, 512, 1024, 2048}), and the prefill kernel
+    # additionally asserts num_tokens > 64. DSpark's draft indexer emits
+    # topk=192, which is in no bucket on either path, so both the warmup draft
+    # pass and the draft CUDA-graph capture crash the server at boot
+    # ("num_tokens > 64" check fail / "Unsupported sparse-MLA prefill
+    # configuration ... topk=192"). Same failure family as upstream #33134
+    # (DGX Spark, sm_121).
+    #
+    # Fix: right-pad the index tensor with -1 (the kernels' documented "skip"
+    # sentinel, flashinfer csrc/sparse_mla_sm120.cu) up to the next
+    # instantiated bucket, and cap the scan via topk_length so the padding is
+    # never read. If the call is still not dispatchable (e.g. a draft head
+    # geometry with d_qk != 512), fall back to the Triton sparse-decode kernel
+    # for that call instead of crashing.
+    global _noted_bucket_pad, _warned_triton_fb
+    _topk = idx.shape[-1]
+    _d_qk = q.shape[-1]
+    if _d_qk == 512 and _topk not in _SUPPORTED_TOPK_WIDTHS:
+        _next_w = _next_topk_bucket(_topk)
+        if _next_w is not None:
+            if topk_length is None:
+                # Cap the scan at the true width so the -1 padding is never
+                # even read.
+                topk_length = torch.full((B,), _topk, dtype=torch.int32, device=dev)
+            idx = torch.nn.functional.pad(idx, (0, _next_w - _topk), value=-1)
+            if not _noted_bucket_pad:
+                _noted_bucket_pad = True
+                logger.info(
+                    "SM120 sparse-MLA: padding topk %d -> %d (next "
+                    "instantiated bucket, -1 skip sentinel; scan capped "
+                    "via topk_length).",
+                    _topk,
+                    _next_w,
+                )
+
+    # Unlike upstream, this fork's entry point has no prefill branch -- it
+    # always calls the decode kernel -- so the dispatchability test is
+    # unconditional here rather than gated on `B <= _DECODE_MAX_TOKENS`; an
+    # over-long batch is exactly one of the cases the fallback exists for.
+    from flashinfer.mla._sparse_mla_sm120 import _decode_dsv4_dispatchable
+
+    _extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
+    if not _decode_dsv4_dispatchable(
+        B, H, idx.shape[-1], _d_qk, _PBS_DST, _extra_topk
+    ):
+        # Not coverable by the CUTLASS decode kernel even after bucket padding
+        # (head_dim != 512, an uninstantiated head count, or a batch above
+        # _DECODE_MAX_TOKENS). Route to Triton instead of crashing.
+        if not _warned_triton_fb:
+            _warned_triton_fb = True
+            logger.warning(
+                "SM120 sparse-MLA: batch not dispatchable to the CUTLASS "
+                "decode kernel (num_tokens=%d heads=%d topk=%d d_qk=%d) -- "
+                "using the Triton fallback for these calls.",
+                B,
+                H,
+                idx.shape[-1],
+                _d_qk,
+            )
+        from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+            flash_mla_sparse_decode_triton,
+        )
+
+        out, lse = flash_mla_sparse_decode_triton(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        )
+        return (out, lse)
 
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
