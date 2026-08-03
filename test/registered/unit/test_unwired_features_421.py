@@ -191,44 +191,29 @@ class TestRuntimeDraftLifecycleIsUnreachable(CustomTestCase):
 # ``tests/moe_offload/test_cold_tier_fetch.py``.
 
 
-class TestMemTierRegistryHasNoConsumers(CustomTestCase):
-    """#407 memory-tier registry: no production code picks tiers from it.
-
-    ``FEATURE_CATALOG.md`` §3 states "All new spill/offload consumers must
-    pick targets from it" -- a normative rule. At this tip the package
-    ``srt/memtier/`` (registry, tiers, probe, profile, reservations) has zero
-    production importers and zero production symbol references; every
-    reference outside the package is a unit test. The two offload consumers
-    audited under #421 (the #286 offload register and the #394 cold tier)
-    both pick targets without it.
-
-    So the rule is aspirational. That is a legitimate state for a freshly cut
-    node layer -- the merge said "no consumers yet" -- but a catalog that
-    states it as an active constraint invites the next author to assume a
-    reconciler exists.
-    """
-
-    MEMTIER_MODULES = (
-        "sglang.srt.memtier.registry",
-        "sglang.srt.memtier.tiers",
-        "sglang.srt.memtier.probe",
-        "sglang.srt.memtier.profile",
-        "sglang.srt.memtier.reservations",
-    )
-
-    def test_no_production_importer_of_any_memtier_module(self):
-        found = {}
-        for dotted in self.MEMTIER_MODULES:
-            importers = _production_importers_of(dotted, exclude_package=True)
-            if importers:
-                found[dotted] = importers
-        self.assertEqual(
-            found,
-            {},
-            "GOOD NEWS: the memtier registry now has a production consumer "
-            f"({found}). #421 finding F6 is fixed -- delete this pin and "
-            "re-check whether the catalog rule is now enforced.",
-        )
+# RETIRED PIN -- #421 F6 is FIXED (task #286).
+#
+# ``TestMemTierRegistryHasNoConsumers`` asserted that ``srt/memtier/`` had zero
+# production importers, i.e. that the catalog's "all new spill/offload
+# consumers must pick targets from it" was aspirational rather than enforced.
+#
+# ``model_executor/short_term_offload_register.py`` is the first production
+# consumer: it imports ``memtier.registry`` and ``memtier.tiers`` at module
+# scope and picks its park target through ``TierRegistry.select`` rather than
+# from ``offload_register.PARK_TARGETS``. The pin therefore fires, and per this
+# module's own rule it is deleted rather than widened.
+#
+# The replacement asserts the POSITIVE fact and pins the call site -- the same
+# treatment #394's cold-tier pin got above -- in
+# ``test/registered/unit/model_executor/test_short_term_offload_register.py``
+# (``MemTierIsNowWiredTest``): the module-scope imports are pinned by AST, and
+# the priced target is pinned to be a ``TierId`` that is NOT one of the three
+# hand-written ``PARK_TARGETS`` strings.
+#
+# What is NOT yet true, and is stated in ``FEATURE_CATALOG.md`` §3 rather than
+# pinned here: the OTHER consumers (expert offload, the #394 cold tier, the
+# rest of the #286 park-target ladder) still carry their own target lists.
+# One consumer is not the reconciliation.
 
 
 if __name__ == "__main__":

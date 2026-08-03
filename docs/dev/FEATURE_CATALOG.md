@@ -283,13 +283,54 @@ is designed, not built: `docs/dev/DESIGN_434_probe_first_bootstrap.md`.
   production constructs the movement backend yet, so the chain has a consumer
   PATH, not a consumer. Whole surface is behind `SGLANG_OFFLOAD_REGISTER=1`
   (dark launch). BOOT-PENDING: `scripts/dev/428_boot_checks/`.
+- **#286 short-term offload register, asset-class layer**
+  (`model_executor/short_term_offload_register.py`, desk slice): the half the
+  existing `offload_register.py` did not have. (a) One
+  `AssetClassDescriptor` per `OFFLOAD_CLASSES` member — ladder rank, memtier
+  payload class, VA-stability, dimension presets, and the reason for each —
+  with an IMPORT-TIME guard that a new class without a descriptor cannot exist.
+  (b) `DESIGN_407` §8's global importance ladder as executable order
+  (`LadderRank`, `plan_spill`): rank-ascending, coldest-first within a rank,
+  partial spill (the walk stops at the first item covering the shortfall, so a
+  class is never emptied for a request one item covers), and rank 5 (active
+  work) never planned — that stays the scheduler's #273 FCFS call. Before this
+  the ladder existed only as prose, so every consumer was free to invent a
+  local victim list. (c) Graph-state FAMILIES as a wired asset class
+  (`GraphFamilyRegister`) over the existing #102/#93 machinery in
+  `speculative/adaptive_graph_memory.py` — this is what `DESIGN_363` §20.3
+  RUNG 1 calls (`rung1_evict`), plan-only by default so the controller can
+  price a rung before committing. (d) A NAMED refusal under active capture
+  (`OffloadUnderCaptureRefused`, probing `get_is_capture_mode()`): a park
+  unmaps pages, which is eager work, and #452 settled that eager work belongs
+  BETWEEN replays. 55 hermetic tests, EIGHT executed can-fail arms (ladder key
+  neutered → 3 red; capture gate removed → 4 red; provenance flags flipped
+  → 1 red, and 2 red with the module's own defensive absent-check also removed;
+  partial-spill `break` dropped → 1; origin exclusion dropped → 8; rank-5 guard
+  dropped → 1; rung-1 class list widened → 1; derived move time relabelled
+  MEASURED → 1). **DESK-ONLY — no page has ever moved.** The production mover
+  (`AdaptiveGraphStateMover`) is desk-written and never executed; BOOT-PENDING
+  list and the GPU ticket are in `docs/dev/DESIGN_286_short_term_register.md`
+  §7. It states NO reload-latency figure: `DESIGN_363` §20.3's ~25 ms is a
+  projection that #102's own measured 40-51 ms avg / 85 ms max per state swap
+  already contradicts, and the derived link time this module computes is
+  labelled a FLOOR (ESTIMATE) even off a MEASURED bandwidth. Open finding
+  pinned as a test: under the #407 DEVICE_BOUND law a `gdn_state_sets` item has
+  NO park target at all (it "never travels, not even one hop over P2P"), which
+  contradicts `offload_register.py`'s Erg.-8 docstring claim that a surplus GDN
+  set is parkable to host RAM or peer VRAM — unresolved, §8 of the design note.
 - **memtier registry**: tier ids with volatility + payload class and
   provenance `measured|estimate|absent` (absent refuses use). HONEST STATE
-  (audit #421): ZERO consumers wired today — "all consumers pick targets from
-  it" is the TARGET rule, not the current state; existing offload/spill paths
-  still carry their own target lists. The #421 pin test
-  (`test_unwired_features_421.py`) enforces that statement and must be updated
-  in the same merge as the first real consumer.
+  (audit #421, updated by #286): the FIRST production consumer is wired —
+  `model_executor/short_term_offload_register.price_park_target` picks its park
+  target through `TierRegistry.select` and refuses a tier whose bandwidth is
+  ABSENT (and, by default, one that is only an ESTIMATE), so "an unmeasured
+  path is never assumed usable" is now enforced code for the classes that
+  module owns. It is ONE consumer, not the reconciliation: expert offload, the
+  #394 cold tier and the rest of the #286 park-target ladder still carry their
+  own target lists. The #421 F6 pin is retired accordingly and replaced by the
+  positive `MemTierIsNowWiredTest`, which pins the module-scope import and
+  pins that a priced target is a `TierId` and not one of the three
+  hand-written `PARK_TARGETS` strings.
   Slice 1b (#407 / directive #434) made it hardware-general:
   `TierRegistry.for_machine()` fingerprints the box from NVML UUIDs (#397
   canon), applies a stored profile ONLY at the scope its hardware match
@@ -521,7 +562,10 @@ distinguishable rather than both reading as silence); anything that EVICTS
 consumes `DESIGN_407_memtier_registry.md` §8's one global importance ladder
 (cold second model, inactive layout/graph families, cold experts, idle sessions,
 active work last and never out of FCFS order — coldest-first within a class)
-instead of writing a local victim policy; and anything that decides at runtime
+instead of writing a local victim policy — that ladder is now EXECUTABLE rather
+than prose (`model_executor/short_term_offload_register.LadderRank` /
+`plan_spill`, #286), so a new consumer calls it instead of restating it, and a
+class added without a ladder rank fails at import; and anything that decides at runtime
 whether a path is worth its cost is an instance of `DESIGN_363_regime_controller.md`
 §20.1's worth-it autocheck rather than a new flag. Read those three before
 adding a cell, and register the answer back into them in the same merge.
