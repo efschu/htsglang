@@ -2619,6 +2619,66 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             "Restart without hicache_storage_backend to disable it.",
         )
 
+    def storage_capacity_stats(self) -> Optional[dict]:
+        """Capacity limits and on-disk usage of the attached backend, if any."""
+        if not self.enable_storage or self.cache_controller is None:
+            return None
+        backend = getattr(self.cache_controller, "storage_backend", None)
+        if backend is None or not hasattr(backend, "capacity_stats"):
+            return None
+        try:
+            return backend.capacity_stats()
+        except Exception:
+            logger.exception("Failed to read HiCache storage capacity stats.")
+            return None
+
+    def resize_storage_backend(
+        self,
+        max_size_bytes: Optional[int] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """Re-cap the attached storage backend without detaching it.
+
+        Runtime attach/detach are refused on this cache (see above) because
+        they would have to build or tear down the hybrid controller's storage
+        threads and per-component host-pool registrations while the tree is
+        live. Resize has neither problem: it only moves the backend evictor's
+        own byte counters and unlinks files, under the evictor's lock, so it is
+        supported here exactly as it is on HiRadixCache. Semantics -- grow is
+        immediate, shrink evicts LRU inline -- are documented on
+        ``LRUFileEvictor.set_limits``.
+        """
+        if not self.enable_storage or self.cache_controller is None:
+            return False, "HiCache storage backend is not enabled.", None
+
+        backend = getattr(self.cache_controller, "storage_backend", None)
+        if backend is None:
+            return False, "No HiCache storage backend is attached.", None
+
+        if not hasattr(backend, "resize"):
+            return (
+                False,
+                f"Storage backend {type(backend).__name__} does not support resize.",
+                None,
+            )
+
+        try:
+            stats = backend.resize(
+                max_size_bytes=max_size_bytes, min_free_bytes=min_free_bytes
+            )
+        except Exception as e:
+            logger.exception("Failed to resize HiCache storage backend.")
+            return False, f"Failed to resize HiCache storage backend: {e}", None
+
+        if stats is None:
+            return (
+                False,
+                f"Storage backend {type(backend).__name__} has no resizable "
+                f"capacity accounting.",
+                None,
+            )
+        return True, "Resized HiCache storage backend successfully.", stats
+
     def clear_storage_backend(self) -> bool:
         try:
             ok = self.cache_controller.clear_storage_backend()

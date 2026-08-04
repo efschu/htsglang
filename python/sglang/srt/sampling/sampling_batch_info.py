@@ -20,6 +20,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def uses_custom_logit_processor(req, enable_custom_logit_processor: bool) -> bool:
+    """Whether this request's custom logit processor may run.
+
+    ``--enable-custom-logit-processor`` gates CLIENT-supplied processors, whose
+    payload is deserialized from request input. Processors the server attached
+    itself (thinking budget, #540) carry ``custom_logit_processor_internal``
+    and are always honored: that string is produced from an in-tree class, not
+    from client input, and the marker that sets the flag is stripped from
+    client-supplied custom_params.
+    """
+    if req.custom_logit_processor is None:
+        return False
+    return enable_custom_logit_processor or getattr(
+        req, "custom_logit_processor_internal", False
+    )
+
+
 @dataclasses.dataclass
 class SamplingBatchInfo:
     # Basic batched sampling params
@@ -133,16 +150,16 @@ class SamplingBatchInfo:
                         logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            global_server_args.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
-        )  # then check the requests.
+        enable_clp = global_server_args.enable_custom_logit_processor
+        has_custom_logit_processor = any(
+            uses_custom_logit_processor(r, enable_clp) for r in reqs
+        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
             processor_dict = {}
             for i, r in enumerate(reqs):
-                if r.custom_logit_processor is None:
+                if not uses_custom_logit_processor(r, enable_clp):
                     continue
                 processor_str = r.custom_logit_processor
                 if processor_str not in processor_dict:

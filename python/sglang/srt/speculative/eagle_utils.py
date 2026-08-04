@@ -1008,6 +1008,23 @@ def eagle_sample(
             )
         )
 
+    # Apply custom logit processors (thinking budget, #540).
+    # EAGLE/MTP verify samples here instead of going through
+    # layers/sampler.py, so without this call every registered custom logit
+    # processor is silently inert under speculative decoding. Rows are
+    # request-major with draft_token_num rows per request; the helper repeats
+    # each request's params across its rows. State-based processors see the
+    # committed prefix only, so a budget can overshoot by at most
+    # draft_token_num tokens before the close is forced.
+    if sampling_info.has_custom_logit_processor:
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=verify_input.draft_token_num,
+        )
+
     # Apply grammar mask if provided
     if vocab_mask is not None:
         assert verify_input.grammar is not None

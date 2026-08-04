@@ -144,6 +144,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ResizeHiCacheStorageReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
@@ -1397,6 +1398,39 @@ async def hicache_storage_backend_status():
         "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
         "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
     }
+
+
+# example usage:
+# curl -s -X POST http://127.0.0.1:30000/hicache/storage-backend/resize \
+#  -H 'Content-Type: application/json' \
+#   -d '{"max_size_gb": 100, "min_free_gb": 20}'
+@app.api_route("/hicache/storage-backend/resize", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def resize_hicache_storage_backend(
+    obj: Annotated[ResizeHiCacheStorageReqInput, Body()],
+):
+    """Re-cap the attached HiCache storage backend without detaching it.
+
+    Growing takes effect immediately. Shrinking evicts LRU entries inline and
+    only returns once usage is back under the new cap, so a large shrink
+    delays the next batch for the duration of the unlinks. Unlike attach and
+    detach this does not require an idle scheduler.
+    """
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+
+    ret = await _global_state.tokenizer_manager.resize_hicache_storage(
+        max_size_gb=obj.max_size_gb,
+        min_free_gb=obj.min_free_gb,
+    )
+    return ORJSONResponse(
+        {
+            "success": ret.success,
+            "message": ret.message,
+            "stats": ret.stats,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])

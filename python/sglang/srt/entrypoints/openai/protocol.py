@@ -58,6 +58,7 @@ try:
 except:
     StructuralTag = Any
 
+from sglang.srt.sampling.thinking_budget import validate_thinking_budget
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -853,6 +854,15 @@ class ChatCompletionRequest(BaseModel):
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
 
+    # Maximum number of tokens the model may spend inside its thinking
+    # section, sent via extra_body={"thinking_budget": N}. None or -1 means no
+    # budget. Requires the server to run with --reasoning-parser; the marker
+    # token ids are derived from the deployed tokenizer and the built-in
+    # processor is attached server-side, so neither a client-supplied
+    # custom_logit_processor nor --enable-custom-logit-processor is needed.
+    # A budget the deployment cannot enforce is a 400, never a silent no-op.
+    thinking_budget: Optional[int] = None
+
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
     # and tool_call_constraint.
@@ -919,6 +929,13 @@ class ChatCompletionRequest(BaseModel):
                 'spill_class must be "preferred", "normal", "never" or omitted'
             )
         return v
+
+    @field_validator("thinking_budget")
+    @classmethod
+    def validate_thinking_budget_field(cls, v):
+        # Same contract as SamplingParams.verify and vLLM's
+        # validate_thinking_token_budget: -1 normalizes to "no budget".
+        return validate_thinking_budget(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -1047,6 +1064,7 @@ class ChatCompletionRequest(BaseModel):
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
+            "thinking_budget": self.thinking_budget,
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }

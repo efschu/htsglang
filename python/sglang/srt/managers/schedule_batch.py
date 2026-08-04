@@ -111,6 +111,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.thinking_budget import THINKING_BUDGET_INTERNAL_KEY
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -789,6 +790,17 @@ class Req(ReqDllmMixin):
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
+        # Thinking budget (#540): the tokenizer manager attaches the built-in
+        # ThinkingBudgetLogitProcessor itself, so such a request carries a
+        # processor without --enable-custom-logit-processor being set. The
+        # marker key is server-owned (stripped from client input in
+        # attach_thinking_budget), so it cannot be forged by a caller.
+        self.custom_logit_processor_internal = bool(
+            custom_logit_processor is not None
+            and isinstance(self.sampling_params.custom_params, dict)
+            and self.sampling_params.custom_params.get(THINKING_BUDGET_INTERNAL_KEY)
+            is True
+        )
         self.return_hidden_states = return_hidden_states
 
         # extra key for classifying the request (e.g. cache_salt)

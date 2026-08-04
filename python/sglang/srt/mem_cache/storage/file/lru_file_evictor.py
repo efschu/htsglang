@@ -101,16 +101,7 @@ class LRUFileEvictor:
         if not self._eviction_enabled:
             return
 
-        # Clamp max_size to the filesystem capacity so a too-large cap can't OOM tmpfs.
-        fs = self._fs_stats()
-        if fs is not None and self.max_size_bytes > 0:
-            safe_max = max(0, fs[0] - self.min_free_bytes)
-            if self.max_size_bytes > safe_max:
-                logger.warning(
-                    f"HiCacheFile max_size exceeds filesystem capacity; "
-                    f"clamping to {safe_max} B."
-                )
-                self.max_size_bytes = safe_max
+        self._clamp_max_size_to_fs()
 
         self._scan_existing_files()
         with self._lock:
@@ -146,6 +137,107 @@ class LRUFileEvictor:
             self.eviction_ratio = 0.9
         if not (0.0 < self.eviction_ratio <= 1.0):
             self.eviction_ratio = 0.9
+
+    def _clamp_max_size_to_fs(self) -> None:
+        """Clamp max_size to the filesystem capacity so a too-large cap can't OOM tmpfs."""
+        fs = self._fs_stats()
+        if fs is not None and self.max_size_bytes > 0:
+            safe_max = max(0, fs[0] - self.min_free_bytes)
+            if self.max_size_bytes > safe_max:
+                logger.warning(
+                    f"HiCacheFile max_size exceeds filesystem capacity; "
+                    f"clamping to {safe_max} B."
+                )
+                self.max_size_bytes = safe_max
+
+    def _stats_locked(self) -> dict:
+        """``stats()`` for callers already holding ``_lock``."""
+        return {
+            "configured": self._eviction_configured,
+            "enabled": self._eviction_enabled,
+            "is_storage_owner": self._is_storage_owner,
+            "max_size_bytes": self.max_size_bytes,
+            "min_free_bytes": self.min_free_bytes,
+            "eviction_ratio": self.eviction_ratio,
+            "used_bytes": self._total_bytes,
+            "num_entries": len(self._lru),
+        }
+
+    def stats(self) -> dict:
+        """Snapshot of the cap, the watermark, and current on-disk usage."""
+        with self._lock:
+            return self._stats_locked()
+
+    def set_limits(
+        self,
+        *,
+        max_size_bytes: Optional[int] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> dict:
+        """Re-cap a live evictor. ``None`` leaves that limit unchanged.
+
+        Growing only raises the ceiling: nothing is evicted and subsequent
+        writes simply have more room. Shrinking evicts LRU victims inline --
+        via the same ``_evict_locked`` path a write-time overflow uses, so the
+        post-shrink target is ``max_size * eviction_ratio`` -- and returns once
+        usage is back under the new cap. In-flight (reserved but uncommitted)
+        writes are never evicted, so a shrink concurrent with a backup may
+        legitimately land slightly above the target until those writes commit.
+
+        Raising limits on an evictor that booted *unconfigured* switches
+        eviction on. That evictor kept no LRU index (``reserve``/``touch`` were
+        no-ops), so the index is seeded from disk here before the first
+        eviction, exactly as ``__init__`` does.
+
+        Non-owner MLA ranks record the new limits but stay inert: rank 0 owns
+        the shared files and does all the evicting.
+        """
+        with self._lock:
+            if max_size_bytes is not None:
+                self.max_size_bytes = max(0, int(max_size_bytes))
+            if min_free_bytes is not None:
+                self.min_free_bytes = max(0, int(min_free_bytes))
+
+            was_enabled = self._eviction_enabled
+            self._eviction_configured = (
+                self.max_size_bytes > 0 or self.min_free_bytes > 0
+            )
+            self._eviction_enabled = self._eviction_configured and (
+                self._is_storage_owner
+            )
+
+            if not self._eviction_enabled:
+                # Either the caller lifted the cap entirely (back to unbounded
+                # storage) or this rank does not own the files. Nothing to evict.
+                if was_enabled and not self._eviction_configured:
+                    logger.info("HiCacheFile eviction disabled: storage is unbounded.")
+                result = self._stats_locked()
+                result["freed_bytes"] = 0
+                return result
+
+            self._clamp_max_size_to_fs()
+
+            if not was_enabled and not self._lru:
+                # Turning eviction on for the first time: adopt whatever this
+                # rank already wrote while it was running unbounded.
+                self._scan_existing_files()
+
+            before = self._total_bytes
+            if self.max_size_bytes > 0 and self._total_bytes > self.max_size_bytes:
+                self._evict_locked(0)
+            if self.min_free_bytes > 0:
+                self._enforce_free_space_locked(0)
+            freed = before - self._total_bytes
+
+            result = self._stats_locked()
+            result["freed_bytes"] = freed
+
+        logger.info(
+            f"HiCacheFile eviction re-capped: cap={self.max_size_bytes} B, "
+            f"min_free={self.min_free_bytes} B, freed={freed} B, "
+            f"now {result['used_bytes']} B ({result['num_entries']} entries)"
+        )
+        return result
 
     @property
     def enabled(self) -> bool:

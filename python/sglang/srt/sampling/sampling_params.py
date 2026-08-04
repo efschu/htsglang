@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Set, Union
 
 import msgspec
 
+from sglang.srt.sampling.thinking_budget import validate_thinking_budget
+
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:
     import re._parser as sre_parse
@@ -108,6 +110,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     spaces_between_special_tokens: bool = True
     no_stop_trim: bool = False
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    # Maximum number of tokens the model may spend inside its thinking
+    # section. None (or -1) means no budget. Requires the server to run with
+    # --reasoning-parser; the tokenizer manager resolves the marker token ids
+    # and attaches the built-in ThinkingBudgetLogitProcessor, so this path
+    # needs neither a client-supplied processor nor
+    # --enable-custom-logit-processor.
+    thinking_budget: Optional[int] = None
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
@@ -215,6 +224,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
                     f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+        # Raises for a malformed budget (bool, float, negative other than -1).
+        validate_thinking_budget(self.thinking_budget)
         if self.logit_bias is not None:
             for token_id in self.logit_bias:
                 if not 0 <= int(token_id) < vocab_size:
