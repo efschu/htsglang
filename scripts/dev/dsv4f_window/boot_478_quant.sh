@@ -80,6 +80,13 @@ BOOT_ARGS=(
   --trust-remote-code --enable-metrics
   --host 127.0.0.1 --port "$PORT"
 )
+# EXTRA_ARGS: window-time levers (e.g. --max-total-tokens) that the desk recipe
+# did not need. Kept as an explicit opt-in so the base recipe stays verbatim.
+if [ -n "${EXTRA_ARGS:-}" ]; then
+  # shellcheck disable=SC2206
+  BOOT_ARGS+=( ${EXTRA_ARGS} )
+  log "EXTRA_ARGS applied: ${EXTRA_ARGS}"
+fi
 assert_metrics_flag "${BOOT_ARGS[@]}"
 
 log "launching: ${FIRST_SHARD}"
@@ -108,7 +115,7 @@ PROBE_ARGS=(--port "$PORT" --arm "$ARM" --run "$RUN" --window-seconds "${WINDOW_
 "$PY" "$HERE/probes.py" chatprobe   "${PROBE_ARGS[@]}" --model "$(basename "$QUANT_DIR")"
 "$PY" "$HERE/probes.py" prefill     "${PROBE_ARGS[@]}"
 "$PY" "$HERE/probes.py" decode      "${PROBE_ARGS[@]}"
-"$PY" "$HERE/probes.py" determined  "${PROBE_ARGS[@]}"
+"$PY" "$HERE/probes.py" determined  "${PROBE_ARGS[@]}" --model "$(basename "$QUANT_DIR")"
 
 # expert_stats is armed in EVERY arm (free), so arm 4 is harvested here rather
 # than costing its own boot. Capture the dump BEFORE teardown -- the SIGTERM

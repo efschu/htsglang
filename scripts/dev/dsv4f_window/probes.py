@@ -168,7 +168,7 @@ def classify_rounds(
 
 
 def stream_bounded(
-    base: str, text: str, window_seconds: float, max_new_tokens: int = 100000,
+    base: str, text: str, window_seconds: float, max_new_tokens: int = 128,
     connect_timeout: float = 120.0,
 ) -> dict:
     """Stream a greedy generation and CUT IT OFF after ``window_seconds``.
@@ -552,7 +552,8 @@ def mode_decode(base: str, args) -> dict:
     rows = []
     for target in (args.context_tokens,):
         prompt = build_prompt(target)
-        rec = stream_bounded(base, prompt, window_seconds=args.window_seconds)
+        rec = stream_bounded(base, prompt, window_seconds=args.window_seconds,
+                             max_new_tokens=args.max_new_tokens)
         rec["context_tokens_target"] = target
         rows.append(rec)
         print(
@@ -576,7 +577,8 @@ def mode_avsa(base: str, args) -> dict:
     prompt = build_prompt(args.context_tokens)
     runs = []
     for i in range(3):  # run 0 is the discarded warmup
-        rec = stream_bounded(base, prompt, window_seconds=args.window_seconds)
+        rec = stream_bounded(base, prompt, window_seconds=args.window_seconds,
+                             max_new_tokens=args.max_new_tokens)
         rec["run_index"] = i
         rec["role"] = "warmup (DISCARDED)" if i == 0 else f"A{i}"
         runs.append(rec)
@@ -600,11 +602,34 @@ def mode_avsa(base: str, args) -> dict:
 
 
 def mode_determined(base: str, args) -> dict:
-    """The #478 quality gate. Fully-determined answers, greedy, scored."""
+    """The #478 quality gate. Fully-determined answers, greedy, scored.
+
+    Sent through ``/v1/chat/completions``, NOT native ``/generate``. This is the
+    one probe where that is right: a determined-answer prompt is an
+    INSTRUCTION, and an instruction handed to a base-completion endpoint gets
+    CONTINUED rather than obeyed. Measured on the 1a arm, which ran this over
+    /generate: 1 of 8 scored, and the failures were the model continuing web
+    boilerplate ("</p> <p>Your response must only contain the JSON object...")
+    or echoing the prompt back. That is a probe artefact and says nothing about
+    the checkpoint -- reporting it as a quality number would have been a
+    fabricated regression.
+
+    The measurement probes stay on /generate because chat carries no
+    meta_info; this one needs no meta_info, only the text.
+    """
     rows = []
     for spec in DETERMINED:
-        res = generate(base, spec["prompt"], spec["max_new_tokens"], timeout=args.timeout)
-        answer = res.get("text", "")
+        body = {
+            "model": args.model or "dsv4f",
+            "messages": [{"role": "user", "content": spec["prompt"]}],
+            "temperature": 0.0,
+            "max_tokens": spec["max_new_tokens"],
+        }
+        res = _post(base, "/v1/chat/completions", body, args.timeout)
+        try:
+            answer = res["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            answer = ""
         try:
             score, note = spec["scorer"](answer)
         except Exception as exc:  # noqa: BLE001 - a scorer never takes the arm down
