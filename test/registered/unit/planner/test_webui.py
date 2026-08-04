@@ -641,10 +641,15 @@ class TestNewHttpRoutes(WebUIFixture):
             return json.loads(r.read())
 
     def test_server_status_route(self):
-        body, ctype = self._get("/api/server_status")
+        with mock.patch.object(
+            webui, "_detect_external_endpoint", return_value=None
+        ):
+            body, ctype = self._get("/api/server_status")
         d = json.loads(body)
         self.assertTrue(d["ok"])
         self.assertFalse(d["running"])
+        self.assertIn("source", d)
+        self.assertEqual(d["source"], "supervisor")
 
     def test_reference_png_static_route(self):
         body, ctype = self._get("/assets/quality_chess_reference.png")
