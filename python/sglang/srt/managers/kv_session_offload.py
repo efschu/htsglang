@@ -908,6 +908,90 @@ def session_priority_key(req) -> Tuple[int, int, int]:
     return (spill_class_rank(req), fast, -seq)
 
 
+def spill_victim_candidates(
+    reqs,
+    fast_pressure: bool = False,
+    blocked: Optional[set] = None,
+) -> List[int]:
+    """Indices a spill may legitimately victimize, in no particular order.
+
+    Extracted from ``select_spill_victim`` so that the ORDER question (who is
+    picked) and the ELIGIBILITY question (who may be picked at all) can be
+    asked separately. Nothing else may re-derive eligibility: a second copy of
+    these rules is how a user regler quietly stops holding on one path while
+    still holding on another.
+
+    The rules, unchanged: fast-lane requests are never victims; a session with
+    spill class 'never' is never a victim; under plain decode-OOM pressure the
+    most-protected (oldest) normal session is tabu, resolved over the FULL
+    candidate set BEFORE the cooldown exclusion so a blocked oldest cannot
+    shift the tabu onto the second-oldest; the #236 cooldown can only ever
+    REMOVE candidates.
+    """
+    candidates = [
+        i
+        for i in range(len(reqs))
+        if not getattr(reqs[i], "is_fast_lane", False)
+        and spill_class_of(reqs[i]) != SPILL_CLASS_NEVER
+    ]
+    if not candidates:
+        return []
+    if not fast_pressure:
+        oldest = max(candidates, key=lambda i: session_priority_key(reqs[i]))
+        candidates = [i for i in candidates if i != oldest]
+        if not candidates:
+            return []
+    if blocked:
+        candidates = [i for i in candidates if i not in blocked]
+    return candidates
+
+
+def spec_back_only_victim(
+    reqs,
+    sizes: Optional[List[int]] = None,
+    need: int = 0,
+    fast_pressure: bool = False,
+    blocked: Optional[set] = None,
+) -> Optional[int]:
+    """Under speculative decoding, the back-most request IF it may be spilled.
+
+    WHY THIS EXISTS. Under EAGLE/MTP a request may only leave the batch from
+    the BACK (``spec_decline_non_back_spill`` carries the reasoning). When the
+    policy-chosen victim was not the back-most, ``try_spill`` used to decline
+    outright and hand the pressure to stock ``retract_decode`` -- which, under
+    spec, is back-only too (``_get_decode_retraction_order`` returns the
+    indices UNSORTED and the loop pops from the tail). So the back-most request
+    was evicted either way; the only thing the decline changed was HOW. Spill
+    keeps the session's work on host and it decodes on through the spill tick;
+    retraction throws the work away and the request re-prefills from scratch
+    when it is re-admitted.
+
+    That made speculative decoding silently cost the whole offload feature in
+    exactly the case the feature is for. This function closes it: when the
+    FCFS/minimal-eviction pick is unreachable under the back-only rule, offer
+    the back-most request instead -- but ONLY if it is a legitimate victim by
+    the SAME rules (``spill_victim_candidates``). Not a weakening: every
+    protection still holds, and the alternative for a protected back-most
+    request is unchanged (decline -> stock retraction, whose disregard for
+    those protections is a documented bound of speculative decoding, not
+    something this function introduces).
+
+    ``sizes``/``need`` are accepted for symmetry with ``select_spill_victim``
+    and are deliberately NOT used to reject: a partial spill that frees less
+    than the shortfall still frees real device tokens and still preserves the
+    work, which beats a retraction that frees the same slots and preserves
+    nothing.
+
+    Pure function of replicated batch state -> the same answer on every rank.
+    """
+    n = len(reqs)
+    if n == 0:
+        return None
+    back = n - 1
+    eligible = spill_victim_candidates(reqs, fast_pressure, blocked)
+    return back if back in eligible else None
+
+
 def select_spill_victim(
     reqs,
     sizes: Optional[List[int]] = None,
@@ -969,27 +1053,9 @@ def select_spill_victim(
     trade-off: default stays young-first as specified; the remainder is
     handled by the stock retraction fallback / an S2 multi-eviction).
     """
-    candidates = [
-        i
-        for i in range(len(reqs))
-        if not getattr(reqs[i], "is_fast_lane", False)
-        and spill_class_of(reqs[i]) != SPILL_CLASS_NEVER
-    ]
+    candidates = spill_victim_candidates(reqs, fast_pressure, blocked)
     if not candidates:
         return None
-    if not fast_pressure:
-        # Oldest normal is untouchable: drop the most-protected candidate.
-        # Resolved over the FULL candidate set, BEFORE the cooldown exclusion
-        # below -- a blocked oldest must not shift the tabu onto the
-        # second-oldest.
-        oldest = max(candidates, key=lambda i: session_priority_key(reqs[i]))
-        candidates = [i for i in candidates if i != oldest]
-        if not candidates:
-            return None
-    if blocked:
-        candidates = [i for i in candidates if i not in blocked]
-        if not candidates:
-            return None
     by_youth = sorted(candidates, key=lambda i: session_priority_key(reqs[i]))
     if sizes is not None and need > 0:
         for i in by_youth:
@@ -3365,15 +3431,46 @@ class KVSessionOffloadManager:
             batch.spec_algorithm is None or batch.spec_algorithm.is_none()
         )
         if spec_decline_non_back_spill(spec_active, idx, len(batch.reqs)):
-            logger.debug(
-                "kv-session-offload: spec active, victim rid=%s at idx=%d is not "
-                "the back-most request (n=%d); declining spill (back-only under "
-                "spec) -> stock retraction handles the pressure.",
+            # The FCFS/minimal-eviction pick is unreachable under the back-only
+            # rule. Stock retraction is back-only too, so the BACK-MOST request
+            # is the one that gets evicted either way -- the only open question
+            # is whether its work survives. Offer it to the spill (work kept on
+            # host, session decodes on through the tick) instead of declining
+            # into a retraction that frees the same slots and throws the work
+            # away. Eligibility is re-checked by the SAME rules, so a fast-lane
+            # or 'never' back-most request still declines.
+            alt = spec_back_only_victim(
+                batch.reqs,
+                sizes=sizes,
+                need=need,
+                fast_pressure=fast_pressure,
+                blocked=blocked,
+            )
+            if alt is None:
+                logger.debug(
+                    "kv-session-offload: spec active, victim rid=%s at idx=%d is "
+                    "not the back-most request (n=%d) and the back-most one may "
+                    "not be spilled; declining spill (back-only under spec) -> "
+                    "stock retraction handles the pressure.",
+                    req.rid,
+                    idx,
+                    len(batch.reqs),
+                )
+                return False
+            self._log(
+                "kv-session-offload: spec active, policy victim rid=%s at "
+                "idx=%d is not the back-most request (n=%d); spilling the "
+                "back-most rid=%s instead -- stock retraction would evict "
+                "exactly that request and lose its work.",
                 req.rid,
                 idx,
                 len(batch.reqs),
+                batch.reqs[alt].rid,
             )
-            return False
+            idx = alt
+            req = batch.reqs[idx]
+            if req.finished() or getattr(req, "to_finish", None) is not None:
+                return False
 
         # POST-VERIFY SNAPSHOT (robust MTP spill under overlap). The deferred-
         # commit hazard: a spec verify writes the just-accepted tokens' KV into

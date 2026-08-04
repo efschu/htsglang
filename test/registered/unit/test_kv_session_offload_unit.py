@@ -35,6 +35,8 @@ from sglang.srt.managers.kv_session_offload import (
     prefill_spill_owner_split,
     prefill_stage_tokens,
     select_spill_victim,
+    spec_back_only_victim,
+    spill_victim_candidates,
     sentinel_base,
     session_priority_key,
     spec_decline_non_back_spill,
@@ -255,6 +257,187 @@ def test_fast_lane_never_victim():
     reqs = [_FakeReq(1, fast=True), _FakeReq(2, fast=True)]
     assert select_spill_victim(reqs, fast_pressure=True) is None
     assert select_spill_victim(reqs, fast_pressure=False) is None
+
+
+def test_spec_back_only_victim_offers_the_back_when_it_is_eligible():
+    """#552: under spec, spill the request retraction would evict anyway.
+
+    THE HOLE THIS CLOSES. Under EAGLE/MTP a request may only leave the batch
+    from the BACK. When the FCFS/minimal-eviction pick was not the back-most,
+    ``try_spill`` declined and handed the pressure to stock ``retract_decode``
+    -- which under spec is ALSO back-only (``_get_decode_retraction_order``
+    returns the indices unsorted, the loop pops the tail). So the back-most
+    request was evicted either way. The decline changed only whether its work
+    survived: spill keeps it on host and the session decodes on through the
+    tick, retraction throws it away and the request re-prefills from scratch.
+    Speculative decoding therefore silently cost the whole offload feature in
+    the exact case the feature exists for.
+
+    Batch position is NOT arrival order, which is why this is reachable rather
+    than theoretical: a retracted request keeps its original ``kv_arrival_seq``
+    (scheduler ``_add_request_to_queue``) but is appended at the BACK when it
+    is re-admitted, so an old session can sit behind young ones.
+    """
+    # Old session at the back (post-retraction re-admission), young ones ahead:
+    # FCFS picks index 1 (youngest), which is not the back.
+    reqs = [_FakeReq(0), _FakeReq(9), _FakeReq(2)]
+    assert select_spill_victim(reqs) == 1
+    assert spec_decline_non_back_spill(True, 1, len(reqs)) is True
+    # ...and the back-most is a legitimate victim, so it is offered.
+    assert spec_back_only_victim(reqs) == 2
+
+
+def test_spec_back_only_victim_respects_every_protection():
+    """Not a weakening: the fallback re-checks the SAME eligibility rules."""
+    # fast-lane back-most: never a victim.
+    reqs = [_FakeReq(0), _FakeReq(9), _FakeReq(2, fast=True)]
+    assert spec_back_only_victim(reqs, fast_pressure=True) is None
+    assert spec_back_only_victim(reqs, fast_pressure=False) is None
+
+    # spill_class="never" back-most: never a victim.
+    reqs = [_FakeReq(0), _FakeReq(9), _FakeReq(2)]
+    reqs[2].spill_class = "never"
+    assert spec_back_only_victim(reqs) is None
+
+    # cooldown-blocked back-most: excluded (#236 can only ever remove).
+    reqs = [_FakeReq(0), _FakeReq(9), _FakeReq(2)]
+    assert spec_back_only_victim(reqs, blocked={2}) is None
+
+    # the oldest-normal tabu holds under plain decode-OOM even at the back...
+    reqs = [_FakeReq(9), _FakeReq(5), _FakeReq(0)]
+    assert spec_back_only_victim(reqs, fast_pressure=False) is None
+    # ...and fast beats FCFS, exactly as for select_spill_victim.
+    assert spec_back_only_victim(reqs, fast_pressure=True) == 2
+
+    # a sole running session never self-spills (no candidates at all).
+    assert spec_back_only_victim([_FakeReq(1)]) is None
+    assert spec_back_only_victim([]) is None
+
+
+def test_spill_victim_candidates_is_the_single_source_of_eligibility():
+    """The order question and the eligibility question must not drift apart:
+    every index select_spill_victim can return is an eligible candidate."""
+    reqs = [_FakeReq(0), _FakeReq(9), _FakeReq(2, fast=True), _FakeReq(4)]
+    reqs[0].spill_class = "never"
+    for fp in (False, True):
+        for blocked in (None, {1}, {1, 3}):
+            cands = spill_victim_candidates(reqs, fp, blocked)
+            got = select_spill_victim(reqs, fast_pressure=fp, blocked=blocked)
+            if got is not None:
+                assert got in cands, (fp, blocked, got, cands)
+            back = spec_back_only_victim(reqs, fast_pressure=fp, blocked=blocked)
+            if back is not None:
+                assert back == len(reqs) - 1 and back in cands
+
+
+class _BackOnlySpillReq:
+    """The request surface ``try_spill`` reads up to its decline points."""
+
+    def __init__(self, rid, arrival_seq, req_pool_idx):
+        self.rid = rid
+        self.kv_arrival_seq = arrival_seq
+        self.req_pool_idx = req_pool_idx
+        self.is_fast_lane = False
+        self.spill_class = None
+        self.to_finish = None
+        self.kv_committed_len = 128
+        self.kv_allocated_len = 128 + 4
+        self.kv_overallocated_freed = False
+        self.cache_protected_len = 0
+        self.output_ids = []
+        self.origin_input_ids = list(range(128))
+
+    def finished(self):
+        return False
+
+    def _cache_commit_len(self):
+        return self.kv_committed_len
+
+
+def _back_only_manager(log_sink):
+    """Manager carrying only what ``try_spill`` touches before it declines for
+    lack of host region space -- no GPU, no scheduler (bypasses __init__)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+
+    mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
+    mgr.spills = {}
+    mgr._free_regions = [0]
+    mgr._dest = None
+    mgr._iter_ct = 0
+    mgr._log = lambda fmt, *a: log_sink.append(fmt % a)
+    mgr.scheduler = SimpleNamespace(enable_overlap=False)
+    mgr._budget_armed = False
+    mgr._budget_cooldown = None
+    mgr._budget_counters = SimpleNamespace(
+        admission_declines=0,
+        pendulum_blocked=0,
+        pendulum_events=0,
+        note_exhaustion=lambda reason: None,
+    )
+    mgr.budget_session_cap = lambda: 0
+    mgr.mode = "plain"
+    mgr.S = 1
+    mgr.cp_prefix = [0, 1]
+    mgr.lo = 0
+    mgr.hi = 1
+    mgr.dcp_size = 1
+    mgr.dcp_rank = 0
+    mgr.block_size = 8
+    mgr.region_tokens = 4  # forces the LATE decline (owned tail > one region)
+    mgr.allocator = MagicMock()
+    row = torch.arange(256, dtype=torch.int32) + 1000
+    mgr.req_to_token_pool = SimpleNamespace(
+        req_to_token=row.unsqueeze(0).repeat(4, 1).contiguous()
+    )
+    return mgr
+
+
+def test_try_spill_under_spec_offers_the_back_most_instead_of_declining():
+    """#552 wiring: the back-only rule must not cost the feature its purpose.
+
+    Pre-fix, ``try_spill`` returned False the moment the policy victim was not
+    the back-most request under spec, handing the pressure to stock
+    ``retract_decode`` -- which is back-only too and therefore evicts THAT SAME
+    back-most request, minus its work. Post-fix the back-most is offered to the
+    spill instead, so the session's KV moves to host and it keeps decoding.
+
+    The batch below is the reachable shape, not a contrived one: a retracted
+    request keeps its original ``kv_arrival_seq`` but is appended at the BACK
+    when re-admitted, so an old session sits behind younger ones and FCFS picks
+    a middle index.
+
+    CAN-FAIL: revert the fallback in ``try_spill`` and this goes red -- the
+    manager logs nothing about the back-most request because it never gets
+    that far.
+    """
+    from types import SimpleNamespace
+
+    log = []
+    mgr = _back_only_manager(log)
+    reqs = [
+        _BackOnlySpillReq("r-a", arrival_seq=0, req_pool_idx=0),
+        _BackOnlySpillReq("r-young", arrival_seq=9, req_pool_idx=1),
+        _BackOnlySpillReq("r-readmitted-old", arrival_seq=2, req_pool_idx=2),
+    ]
+    # FCFS picks the youngest, which is NOT the back-most -> back-only fires.
+    assert select_spill_victim(reqs) == 1
+    batch = SimpleNamespace(
+        reqs=reqs,
+        seq_lens_cpu=torch.tensor([128, 128, 128], dtype=torch.int64),
+        spec_algorithm=SimpleNamespace(is_none=lambda: False),
+        batch_is_full=False,
+    )
+
+    # Still False: this fixture's host region is too small for the tail, so the
+    # spill declines LATER. What changed is WHICH request it got that far with.
+    assert mgr.try_spill(batch, fast_pressure=False, need=64) is False
+    joined = "\n".join(log)
+    assert "back-most" in joined, joined
+    assert "r-readmitted-old" in joined, joined
+    assert "r-young" in joined, joined
 
 
 def test_minimal_eviction_youngest_sufficient():

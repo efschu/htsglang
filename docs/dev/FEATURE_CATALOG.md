@@ -1652,6 +1652,32 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Equivalent-fallback family (#552): a decline is only worth its name when the
+fallback it hands off to does something DIFFERENT. `try_spill` declined
+outright whenever speculative decoding was active and the FCFS/minimal-eviction
+victim was not the back-most request (`spec_decline_non_back_spill`: under
+EAGLE/MTP a request may only leave the batch from the back), and handed the
+pressure to stock `retract_decode`. But stock retraction is back-only under
+spec too -- `_get_decode_retraction_order` returns the indices UNSORTED and the
+loop pops the tail -- so the back-most request was evicted either way. The
+decline changed nothing about WHO paid and everything about WHAT survived:
+spill keeps the session's KV on host and it decodes on through the spill tick,
+retraction throws the work away and the request re-prefills from scratch. So
+speculative decoding silently cost the whole offload feature in exactly the
+case the feature exists for, while every line read as a careful safety
+decision. The shape is reachable rather than theoretical because batch position
+is not arrival order: a retracted request keeps its `kv_arrival_seq` but is
+appended at the BACK on re-admission, so an old session sits behind younger
+ones and FCFS picks a middle index. Fixed by offering the back-most request to
+the spill when it is a legitimate victim by the SAME eligibility rules
+(`spill_victim_candidates`, extracted so ORDER and ELIGIBILITY are asked
+separately and no second copy of the rules can drift), declining only when it
+is protected. The rule: before writing a decline, state what the fallback will
+do -- if it is the same action with a worse outcome, the decline is a bug
+wearing a safety comment. Related: the ordering constraint itself cannot be
+lifted here, so FEATURES_VS_UPSTREAM's victim-order row now names it as a bound
+of speculative decoding instead of promising unconditional FCFS.
+
 Unpromoted-terminal-flag family (#552): a terminal signal that only ONE code
 path promotes is silently lost by every state that does not run that path.
 `Scheduler.abort_request` marks an in-flight request with `req.to_finish =
