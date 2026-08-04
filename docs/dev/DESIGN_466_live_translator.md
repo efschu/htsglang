@@ -4340,3 +4340,105 @@ turns into failed ones. The deadline is derived from the distribution the
 metrics endpoint now finally serves -- `--enable-metrics` was missing from the
 live boot until this restart, which is why the gate's gauge read had been
 answering 404 for two sessions.
+
+#### 17.8.21 Handover, 2026-08-04 (eighth session) — the family session answered the identity question
+
+**LIVE STATE.** Tenant PID **4036082**, booted from `/spinning/wt-466-translator`
+with `--enable-metrics` (it was MISSING from the restore boot before this
+session, which is why `/metrics` was empty and the gate's gauge read had been
+404ing for two sessions -- the restore script is the culprit and its owner has
+been told). Client is served from this worktree per request, so the page is
+live on merge; the server half needs a restart. Branch `feat/live-translator-466`.
+
+**THE HEADLINE, and it is not what the bundle was built for.** The family
+session produced the first GROUND-TRUTH speaker labels this project has ever
+had: the user tapped speaker buttons, so six of seven decisions carry
+`outcome: manual` -- a human assertion of who spoke, with the embedder's
+opinion recorded beside it. Those numbers say the identity problem is not a
+threshold problem:
+
+```
+  WITHIN-speaker  (user said "this is the same person"):  0.782, 0.670, -0.013
+  BETWEEN-speaker (user said "this is somebody else"):    0.609, 0.166, 0.119
+```
+
+The distributions OVERLAP. A same-speaker segment scored **-0.013** against
+its own centroid while a different-speaker segment scored **0.609**. No value
+of `match_threshold` separates these two sets -- 0.637 happens to sit between
+0.609 and 0.670, which is luck, not calibration. On 2-4 s of phone audio from
+real people, this embedder does not carry the decision. That is why the user
+was tapping buttons, and it is why the STICKY PIN is the load-bearing feature
+and the threshold work is second-order. Do not spend the next window
+re-deriving a threshold from this data; spend it on making the pin and the
+manual correction path excellent.
+
+Related and ugly: the -0.013 segment was ADMITTED as voice reference
+(`admitted_reference: True`) because a manual attribution admits. A segment
+that looks nothing like the speaker is now in their clone prompt.
+
+**THE CHILD, one sample and it is decisive against the cheap fix.** His turn
+came back as `es` at language confidence **1.000** on a 0.88 s segment, with
+the canonical Whisper hallucination as its text ("!Gracias por ver el
+video!"). A confidence GATE cannot reach a confident wrong answer. The pin
+prior cannot either as currently written, because it only consults the pin
+BELOW the confidence floor. The concrete proposal, data-backed: under a held
+pin whose speaker has a consistent language history, a SHORT segment
+(< ~1.5 s) that disagrees must not flip the direction on its own.
+
+**WHAT THE FAMILY SESSION COST US, honestly.** The overlap discard deleted a
+real utterance -- transcript line 6, `speaker-interjection`, "Hallo Lamina
+Mahl, es waere nett, wenn ich eine Unterschrift..." -- because the floor it
+lost to was that same hallucinated Spanish line. It is now **default OFF**
+(the default is a pinned assertion), it logs loudly when it fires, and it
+goes back on only with a trustworthy floor. The last turn of the session was
+NOT a discard: line 8 has a decision record and no translation, i.e. the
+synthesis wedge, and the metrics put a number on it --
+`translator_tts_first_audio_seconds_max = 193.36 s` for one unit against a
+5.4 s median.
+
+**DEPLOYED IN THIS SESSION:** per-stage deadlines (ASR 60 s, TTS unit 90 s,
+drain 300 s -- PROVISIONAL, and 90 s binds on the 193 s observation rather
+than sitting above the tail), worker CANCEL on expiry, one automatic re-drive
+outside the lock, `redrive`/`recover_unfinished` with recovery on WS attach,
+sticky pin, LID pin-prior, echo enrollment lock, UNKNOWN preset order (adults
+first), the direction invariant, the evidence record, `--enable-metrics`, the
+gate releasing its session. Client: mic-loss recovery, the `blocked`
+regression fix, the onset ramp, the rename control, `?raw=1`.
+
+**OPEN, IN ORDER, for whoever picks this up:**
+
+  1. The family evaluation above needs MORE SAMPLES before any threshold
+     decision -- n=3 per class. `scripts/translator/collect_family_session.py`
+     is read-only and produces every number in this section; run it against a
+     live session and it prints within/between, the LID table and whether the
+     new mechanisms bound at all.
+  2. THE ONSET RAMP IS INCOMPLETE. It fires only at a cursor re-anchor, and
+     the user reports the click persists at every turn start. Make it fire at
+     the first chunk of every turn, and check the `onsets` capture (peak, rms,
+     head samples in the debug upload) for whether the SYNTHESIS itself starts
+     with a transient -- if so, ramp the first ~10 ms server-side. The proof
+     is in the capture samples, not in reasoning.
+  3. OVER-FRAGMENTATION (user: the pipeline chops everything into pieces even
+     where context exists). Two fixes, both specified: coalesce queued
+     segments of the SAME speaker before MT/TTS -- backlog IS the signal that
+     context exists, so run only the FRONT item eager-small and bundle
+     everything waiting -- and give each MT call the last N source/target
+     lines as a context prefix (the radix cache makes a growing prefix nearly
+     free, and terminology stays stable across turns).
+  4. THE LOCK SPLIT (pipeline vs talker device), which the playback modes
+     depend on -- see §17.8.19 for why the hold mode is worse than eager until
+     synthesis can run ahead.
+  5. Playback modes (§17.8.19), the shadow arbiter and its double display
+     (§17.8.17), live partial transcripts.
+
+**PATHS.** Raw family harvest: `/tmp/family_raw.json`. Tenant log:
+`/tmp/466_tenant_restore.log` (narrow greps only, never dump it). Metrics:
+`http://192.168.0.101:30800/metrics`. Truth labels live in the decision log
+per session (`/api/translator/sessions/<id>/speaker-decisions`) -- `outcome:
+manual` is the human label and `candidates` is what the embedder thought.
+
+**INSTRUMENT GAP TO FIX EARLY:** the manual path does not record the `pin`
+field, because `assign_manual` returns before `_record_decision` is reached
+with it. The collector therefore reports "0 of 7 decisions with a pin held"
+for a session where the pin decided nearly everything. Believe `outcome:
+manual`, not the `pin` column, until that is fixed.
