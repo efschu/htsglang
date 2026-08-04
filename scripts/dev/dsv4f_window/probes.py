@@ -86,6 +86,15 @@ def _get(base: str, path: str, timeout: float = 15.0) -> dict:
     try:
         with urllib.request.urlopen(base + path, timeout=timeout) as resp:  # noqa: S310
             return {"status": resp.status, "body": resp.read().decode("utf-8", "replace")}
+    except urllib.error.HTTPError as exc:
+        # Report the REAL status. Collapsing this to 0 made a 503 "still
+        # initialising" indistinguishable from a dead socket, which is exactly
+        # the ambiguity that hid a premature-readiness bug for two boots.
+        return {
+            "status": exc.code,
+            "body": exc.read().decode("utf-8", "replace"),
+            "error": f"HTTP {exc.code}",
+        }
     except Exception as exc:  # noqa: BLE001
         return {"status": 0, "body": "", "error": str(exc)}
 

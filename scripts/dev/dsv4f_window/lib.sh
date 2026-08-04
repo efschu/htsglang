@@ -451,7 +451,18 @@ wait_ready() {
     local t0 i now
     t0="$(date +%s)"
     for i in $(seq 1 "$max_iters"); do
-        if curl -s -m 5 -o /dev/null "http://127.0.0.1:${port}/health_generate" 2>/dev/null; then
+        # MUST check the HTTP STATUS, not curl's exit code. curl exits 0 for
+        # 4xx/5xx, and sglang binds the port and answers 503 while the engine
+        # is still initialising -- so an exit-code test declares readiness the
+        # moment the socket is up. That cost two full ~6 minute loads in this
+        # window: the arm was declared ready, every probe was refused against a
+        # still-loading server, and the boot tore itself down having measured
+        # nothing. Require a literal 200, and require it from /health (cheap)
+        # rather than /health_generate (runs a real generation, and this server
+        # boots with --max-running-requests 1).
+        code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
+                 "http://127.0.0.1:${port}/health" 2>/dev/null || echo 000)"
+        if [ "$code" = "200" ]; then
             now=$(( $(date +%s) - t0 ))
             printf 'arm=%s port=%s ready_after_s=%d iters=%d utc=%s\n' \
                 "$arm" "$port" "$now" "$i" "$(utc)" | tee "$RUN/ready_${arm}.txt"
