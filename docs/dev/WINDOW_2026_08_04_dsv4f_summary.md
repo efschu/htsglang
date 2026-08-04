@@ -97,8 +97,13 @@ fire and ms/verify would silently have been ms/token under a different label.
 
 ## Open, with mechanism identified
 
-* **#470 Boot B**: `resident_fraction._from_flag()` falls back to the runtime context, which still holds the *target's* args during the draft build. Needs the draft args published into the context — affects DFLASH/EAGLE too.
-* **#462 F2**: one missing `LogitsProcessorOutput` branch in the BCG buffer layer. Deliberately not patched: its fields do not share a leading dimension, so a wrong mapping would not raise — it would yield silently wrong logits.
-* **#478 stream-trim budget model** — see above.
+All three code-side blockers below were closed after the window (#534/#535,
+branch `fix/534-535-followups`). **None of them has a card behind it**: what
+follows each entry is what the NEXT window has to measure before the item can
+be called done.
+
+* **#470 Boot B**: `resident_fraction._from_flag()` falls back to the runtime context, which still holds the *target's* args during the draft build. FIXED — `build_draft_tp_worker` now publishes the draft copy for the build (the restore already existed). Reach is the DFLASH/DSPARK builder only; the EAGLE family passes the target's `ServerArgs` object with no copy at all, so the same defect class is OPEN there. **Next window: Boot B unchanged, ready with `0.23,0.42,0.42` intact, then accept length + ms/verify + the ANALYSE_447 §2.4 idempotence comparison against `idem_reference_470_a_cut.json`.**
+* **#462 F2**: one missing `LogitsProcessorOutput` branch in the BCG buffer layer. Deliberately not patched: its fields do not share a leading dimension, so a wrong mapping would not raise — it would yield silently wrong logits. FIXED — an allowlist of the five per-token tensor fields, every other field refused by name, and a refusal when the present fields disagree on their leading dimension. A SECOND defect surfaced in the same layer: the shared buffer was sized from the graph key (the BATCH size) while the body emits `bs * num_tokens_per_bs` rows under a non-ragged verify. **Next window: the F2 arm reruns; the first check after a completed capture is byte-identical greedy output against the `462_eager` control (131.475 ms/round, floor 0.401 %), then the #494 crossing count against the 43/round desk figure.**
+* **#478 stream-trim budget model** — see above. FIXED — the trim's target is raised to `anon + pinned(all live ranks) + headroom` when that floor sits above the configured target, with the pinned term published cross-rank because `memory.current` is cgroup-wide. **Next window: rerun the UD-Q3_K_XL attempt as a falsifier repetition — the sawtooth (86.2 → 76.8 → 95.5 → 82.7 → 101.5 → 103.5 → 103.9) must NOT recur, and one floor-above-target warning must appear instead; plus a neutrality boot on the standing IQ3_XXS recipe, whose floor is below its target and whose load time must not move.**
 * ~~`RESIDENT_FRACTION_CUT` default of 0.383 should become **~0.23** (measured); at 0.383 rank 0 OOMs mid-build.~~ DONE (`boot_470_dspark.sh:59`).
 * The `geom_seq` determined scorer is too strict — it marks `2 4 8 16 32 64 128` wrong for wanting `32 64 128`, understating quality.
