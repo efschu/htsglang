@@ -79,6 +79,19 @@ TEXTS = {
         "No es mas rapido en absoluto. Para nada. Que pasa? "
         "Hola, soy Matthias y estoy de vacaciones aqui, como estas hoy?"
     ),
+    #: THE SHAPE THAT BROKE, added 2026-08-04 for #466 (d). The field package
+    #: `client-20260804T175817Z` carried two mid-turn underruns and both sat
+    #: immediately before the FINAL chunk of a long turn: turn acac91a3
+    #: (talk_ms 5114) re-anchored at cursor_lead_ms -241, turn 57e07979
+    #: (talk_ms 3469) at -1603. A turn of ~5 s of speech translates to ~8 s of
+    #: Spanish, which at the fit `steps = 14 + 0.7 x chars` needs ~100 frames
+    #: and therefore ~123 characters. The shorter texts above cannot reproduce
+    #: it: at RTF > 1 the buffer deficit grows with DURATION, so a turn has to
+    #: be long enough for the pre-roll to run out before the end.
+    "monologue": (
+        "Estamos de vacaciones aqui en la costa desde el martes pasado, "
+        "y manana por la manana queremos ir a la playa temprano. Hace calor."
+    ),
 }
 
 
@@ -193,7 +206,7 @@ def run_one(backend, torch, text: str, reference, seed: int, streaming: bool) ->
     }
 
 
-def force_runaway(backend, torch, reference) -> Dict:
+def force_runaway(backend, torch, reference, factors=(0.35, 0.80)) -> Dict:
     """Make every draw overrun, and watch the conflict resolve on real audio.
 
     The runaway is stochastic -- about one generation in ten -- so waiting for
@@ -216,7 +229,13 @@ def force_runaway(backend, torch, reference) -> Dict:
     original = backend.config
     results = {}
     try:
-        for name, factor in (("field", 0.35), ("field", 0.80)):
+        # The factors are a parameter rather than a constant because WHICH
+        # branch a factor reaches depends on the step RATE. The release point
+        # is where the pre-roll has been banked, and a faster talker banks it
+        # in fewer frames -- so a budget that sat below the release point at
+        # 10.9 steps/s can sit above it at 11.7. The two branches below are the
+        # thing being tested; the numbers that reach them are not fixed.
+        for name, factor in ((n, f) for f in factors for n in ("field",)):
             backend.config = dataclasses.replace(
                 original, step_budget_factor=factor, stream_within_unit=True
             )
@@ -264,13 +283,26 @@ def main() -> int:
     parser.add_argument("--texts", default="short,field,long")
     parser.add_argument("--runaway", action="store_true",
                         help="also run the forced-overrun arm")
+    parser.add_argument("--runaway-factors", default="0.35,0.80",
+                        help="step-budget factors to force an overrun at")
+    parser.add_argument(
+        "--code-predictor-loop", choices=("on", "off"), default="on",
+        help="run the code predictor as one unrolled loop (on) or as 15 "
+             "nested generate() calls (off). The step RATE is what decides "
+             "whether the schedule below stays ahead of the playback clock, "
+             "so this is the arm dimension for #466 (d); the emitter itself "
+             "is unchanged either way.",
+    )
     args = parser.parse_args()
 
     import torch
 
+    from sglang.srt.translator import code_predictor_loop
+
     reference = load_reference()
     backend = InProcessQwen3Tts(InProcessTtsConfig())
     backend.load()
+    code_predictor_loop.set_enabled(args.code_predictor_loop == "on")
 
     # JIT and allocator outliers, discarded exactly as the latency round did.
     for _ in range(args.warmup):
@@ -343,10 +375,14 @@ def main() -> int:
                 r["burst_chunks"] == r["stream_chunks"] for r in rows),
         }
 
-    runaway = force_runaway(backend, torch, reference) if args.runaway else {}
+    factors = tuple(float(f) for f in args.runaway_factors.split(","))
+    runaway = (force_runaway(backend, torch, reference, factors)
+               if args.runaway else {})
 
     Path(args.out).write_text(json.dumps(
-        {"summary": summary, "pairs": pairs, "records": records,
+        {"code_predictor_loop": args.code_predictor_loop,
+         "code_predictor_loop_calls": code_predictor_loop.loop_stats(),
+         "summary": summary, "pairs": pairs, "records": records,
          "forced_runaway": runaway}, indent=2))
     print(json.dumps(summary, indent=2))
     return 0

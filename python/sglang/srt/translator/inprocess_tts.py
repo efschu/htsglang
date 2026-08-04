@@ -198,6 +198,20 @@ class InProcessTtsConfig:
     #: exactly as it did before, which is what makes the burst path available
     #: as a control arm rather than only as a git revision.
     stream_within_unit: bool = True
+    #: Run the code predictor as one unrolled loop instead of 15 nested
+    #: `generate()` calls per talker step. The measured step is 72 % code
+    #: predictor and ~97 % per-invocation overhead, and the step RATE is what
+    #: decides whether playback gaps: at 12.5 frames/s consumed against
+    #: 10.5 steps/s produced the real-time factor is 1.20, so a long turn
+    #: drains its pre-roll and underruns before the last chunk -- which is what
+    #: the field showed on 2026-08-04. See `code_predictor_loop`.
+    #:
+    #: A flag, not a rewrite, for the same reason `stream_within_unit` is one:
+    #: it keeps the reference path available as a CONTROL ARM rather than only
+    #: as a git revision. Note the patch itself is installed on the predictor
+    #: class, so this field chooses the process's initial state; the arms of a
+    #: measurement flip `code_predictor_loop.set_enabled` instead.
+    unroll_code_predictor: bool = True
     #: Real-time factor assumed before anything has been measured in this
     #: process. 1.256 is the MEASURED value with the 27B saturated at its
     #: `max_running_requests` ceiling (MEASURE_TTS_LATENCY.md section 5), i.e.
@@ -714,9 +728,19 @@ class InProcessQwen3Tts:
         )
 
     def to_json(self) -> Dict[str, object]:
+        from sglang.srt.translator import code_predictor_loop
+
         return {
             "backend": self.name,
             "loaded": self._model is not None,
+            # Whether the unrolled predictor is actually carrying calls, not
+            # merely configured to. A fast path that quietly fell back looks
+            # identical to one that is running, which is how a measured
+            # speedup turns into an unmeasured regression.
+            "code_predictor_loop": {
+                "enabled": code_predictor_loop.is_enabled(),
+                **code_predictor_loop.loop_stats(),
+            },
             "languages": list(self._languages),
             "x_vector_only_mode": self.config.x_vector_only_mode,
             "geometry": {
@@ -736,6 +760,7 @@ class InProcessQwen3Tts:
             return
         import torch
 
+        from sglang.srt.translator import code_predictor_loop
         from sglang.srt.translator.qwen3_tts_compat import (
             ensure_qwen3_tts_importable,
             refresh_rotary_buffers,
@@ -748,6 +773,7 @@ class InProcessQwen3Tts:
         logger.info("qwen3-tts compat shims: %s", ", ".join(shims))
 
         from qwen_tts.core.models.modeling_qwen3_tts import (
+            Qwen3TTSTalkerCodePredictorModelForConditionalGeneration,
             Qwen3TTSTalkerForConditionalGeneration,
         )
         from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
@@ -758,6 +784,19 @@ class InProcessQwen3Tts:
         # CLASS before any generate call. See qwen3_tts_compat.
         if restore_cache_position(Qwen3TTSTalkerForConditionalGeneration):
             logger.info("restored cache_position on the talker for decode steps")
+
+        # 72 % of a talker step is the code predictor, and 15 of its 16 codec
+        # groups are produced by re-entering the whole of transformers'
+        # generation machinery. Installed on the CLASS, before any generate
+        # call, for the same reason as the shim above. See code_predictor_loop.
+        code_predictor_loop.set_enabled(self.config.unroll_code_predictor)
+        if code_predictor_loop.unroll_code_predictor(
+            Qwen3TTSTalkerCodePredictorModelForConditionalGeneration
+        ):
+            logger.info(
+                "code predictor loop installed (enabled=%s)",
+                self.config.unroll_code_predictor,
+            )
 
         dtype = getattr(torch, self.config.dtype)
         # NO `device_map`. transformers 5.x routes it through `accelerate`
