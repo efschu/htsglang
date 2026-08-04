@@ -196,6 +196,116 @@ render is wrong. Worth resolving before the reuse figure is quoted as a benefit.
 Note the server now defaults to `preserve_thinking: true`, so the per-request
 `false` in variant A is an override of that default, not of a bare server.
 
+## Follow-up: the preserve_thinking "inversion" was a broken control arm
+
+Outcome: **(c) probe-arm mix-up.** There is no render bug on either front.
+
+`probe_preserve_thinking.py:89-90` builds its control arm as
+
+```python
+if preserve:
+    body["chat_template_kwargs"] = {"preserve_thinking": True}
+```
+
+The "false" arm therefore sends **no kwarg at all**. That was a valid control
+only while the server had no default. This boot sets
+`--chat-template-default-kwargs '{"preserve_thinking": true}'`, so omission now
+**inherits true** and both arms ran with thinking preserved. The reported
+77.2 % vs 6.4 % spread cannot be attributed to the kwarg. Consistent with that,
+both arms rendered to within one token of each other (993 vs 992) — identical
+renders, so the spread was cache state, amplified by reading global
+`cached_tokens_total` counters on a shared server.
+
+### First-divergence matrix, both front paths against one raw generated stream
+
+Turn 1 was generated through `/generate` so the comparison uses the **raw**
+stream, not the reasoning parser's lossy split into
+`reasoning_content` + `content`. Turn-2 renders were produced offline
+(`CUDA_VISIBLE_DEVICES=99`) and tokenised against `p1 + raw_generation`.
+
+| path | preserve_thinking | render | first divergence | verdict |
+|---|---|---|---|---|
+| OpenAI (`reasoning_content`) | **true** | 363 tok | 345/345 (100 %) | **byte-exact** |
+| Anthropic (wrapped into content) | **true** | 363 tok | 345/345 (100 %) | **byte-exact** |
+| OpenAI | false | 55 tok | 29/345 (8.4 %) | diverges |
+| Anthropic | false | 55 tok | 29/345 (8.4 %) | diverges |
+
+At `true` the re-render reproduces the entire assistant turn — the whole think
+block and its `</think>` close — token for token; divergence occurs only at
+index 345 of 345, where turn 2 legitimately appends the next user turn. So
+hypothesis (b), a whitespace or re-render mismatch, is **refuted**. Hypothesis
+(c) is confirmed. Hypothesis (a) about thinking-off content was already excluded
+(one thinking block per turn, 1796-2032 characters).
+
+The two paths are equivalent because the Anthropic front prepends
+`wrap_reasoning_history(...)` (`openai/serving_chat.py:1722-1741`,
+`<think>` + text + `\n</think>`) as a **plain text block in the assistant
+content** (`anthropic/serving.py:464`, `:528-530`) rather than as
+`reasoning_content`. Both shapes render identically once the template keeps
+them.
+
+### The live default is protective, not harmful — do not flip it
+
+The template **strips** `<think>…</think>` out of assistant history unless
+`preserve_thinking` is set. That is what the `false` rows above show: the
+reusable prefix collapses from 100 % to **8.4 %**, i.e. to everything before the
+think block. Turning the default off would therefore *cause* the very
+prefix-reuse collapse that was suspected of it, on **both** fronts — and the
+Anthropic front cannot compensate per-request, because it does not forward
+`chat_template_kwargs` at all (measured live: 82 prompt tokens with the kwarg
+set to true and to false alike, while the OpenAI front gives 48 vs 82).
+
+This is consistent with the #541 battery's own measurement of 62.9 % against
+66.9 % for the two arms: byte-stable renders, near-equal reuse.
+
+**Recommendation: keep `preserve_thinking: true` as the server default.**
+
+### Two defects for the owning tickets
+
+* **The Anthropic front ignores `chat_template_kwargs`.** Measured live: 82
+  prompt tokens for both `true` and `false` on `/v1/messages`, against 48 vs 82
+  on `/v1/chat/completions`. #544's claim that the flag "works on both fronts"
+  does not hold for the per-request override; only the server default reaches
+  the Anthropic path. Behaviour there is fixed at "always preserve".
+* **`probe_preserve_thinking.py` is invalidated by the default it tests** and
+  must send the value explicitly in both arms, and read per-response usage
+  rather than global counters. A corrected version is
+  `scripts/dev/543_yarn/probe_preserve_thinking_corrected.py`. Note the
+  Anthropic front's usage block exposes only `input_tokens` / `output_tokens` —
+  no `cache_read_input_tokens` — so reuse cannot be measured per-response on
+  that front at all.
+
+## Follow-up: #545 resize endpoint cannot be exercised on this boot
+
+`POST /hicache/storage-backend/resize` returns **HTTP 400
+`admin_api_key_missing`**: "This endpoint requires admin API key, but this
+server was started without one (admin-api-key)." The boot command has no
+`--admin-api-key`, so #545's live-validation gap **stays open** and needs that
+flag added at the next restart. Not worked around here — no config changes were
+authorised in this window.
+
+### But the `max_size` cap was validated by accident, under real load
+
+While the #541 phase-2 battery ran, the disk tier filled fast — from 271 MB at
+boot to 39 GB within 19 minutes, then roughly 20 GB/min. Sampling `/spinning`
+free space showed the growth decelerating and then flattening:
+
+```
+11:48:32 free=224369M    11:49:32 free=215263M    11:50:52 free=211250M
+11:48:52 free=219733M    11:49:52 free=214414M    11:51:12 free=210628M
+11:49:12 free=216737M    11:50:12 free=213547M    11:51:32 free=210582M
+```
+
+The last interval moved 46 MB against 4636 MB at the start. **The 100Gi cap
+engages and holds**, with writes balanced by eviction rather than running the
+filesystem out of space. Worth knowing that without `max_size` this tier would
+have consumed the remaining ~250 GB in about 12 minutes.
+
+Two operational notes: the tier reached roughly 2 million files in a single flat
+directory, which is an inode and dirent-lookup concern worth its own look; and
+`du` over that directory takes tens of seconds, so monitor the filesystem with
+`df`, not `du`.
+
 ### Validation-script artifacts fixed after this run
 
 Section 3 first reported an empty answer. That was the probe's own
