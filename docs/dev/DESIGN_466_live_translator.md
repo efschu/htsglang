@@ -4272,3 +4272,71 @@ feature depends on the robustness cut narrowing that lock, and shipping it
 before then would produce a mode that waits for the user AND THEN waits for
 synthesis, which is worse than eager. Order matters here and it is not a
 preference.
+
+#### 17.8.20 The queue wedge, located — and the robustness cut it demands
+
+**The live report:** long speech split into two messages; the second got STT and
+its translation, then sat at "translating -- 2 more turns to come / 2 sentences
+still to speak" for MINUTES. User order: "das muss viel, VIEL robuster werden."
+
+**MY OWN GATE REPRODUCED IT, one run after the deploy.** `gate_bundle_b`:
+`turn 2: no audio reached playback within 90.0s`, with `audio max 24.9s` on the
+turns that did make it. Gate A on the same build passed with `first_audio` med
+5.40 s. So it is intermittent, it is in synthesis, and it is not the user's
+phone.
+
+**IT IS NOT THE §17.8.16 FILTER, and that was checked before anything else was
+theorised.** The tenant log contains **zero** interjection discards since the
+deploy (`grep -c interjection` = 0). A discarded interjection would look
+exactly like this from outside -- transcript line present, no audio -- so
+ruling it out first was the difference between a diagnosis and a story. The
+wedge also predates the bundle: the user hit it on the previous build.
+
+**THE MECHANISM, with anchors.** `_run_turn_locked` runs ASR, embedding, MT and
+SYNTHESIS inside `run_turn_multi`'s `self._turn_lock` (`session.py:1219-1233`).
+Synthesis itself is a task-plus-queue: `worker = asyncio.create_task(
+speech_worker())` (`:2278`), units are pushed, and the function ends with
+`speech.put_nowait(None); await worker` (`:2356-2357`). Inside, `speak()`
+iterates `async for piece in self.tts.synthesize(...)` with **no deadline of
+any kind**. One synthesis that never yields its next piece therefore parks the
+worker forever; `await worker` never returns; `_run_turn_locked` never returns;
+`_turn_lock` is never released; every later segment queues behind it and the
+session is dead in a state the UI renders as a spinner. There is no timeout, no
+watchdog, and no path by which the turn can ever be declared failed. "2
+sentences still to speak" is the `turn.speech` unit accounting frozen at the
+moment the worker stopped -- the count is honest, the state around it is not.
+
+MT is the ONE stage with a deadline (`--mt-timeout-s`, §17.8.15) and it is the
+one stage that has never wedged. That is not a coincidence, it is the whole
+argument.
+
+**THE CUT, in dependency order:**
+
+  1. PER-STAGE DEADLINES. `asyncio.wait_for` around ASR, around each
+     `synthesize()` unit, and around `await worker`. On expiry the turn is
+     marked failed LOUDLY with the stage named, the worker task is cancelled
+     (not just abandoned -- an abandoned task keeps the device), and exactly
+     ONE automatic `redrive()` follows. The retry button is the second
+     attempt's owner. Never again a non-terminal state with no deadline.
+  2. NO GLOBAL WEDGE. `_turn_lock` today serialises the whole chain; the only
+     thing that MUST serialise is the talker device. Split it: a pipeline lock
+     for attribution ordering, a talker lock for the device. MT of turn N+1
+     then overlaps TTS of turn N, which is a latency win as well as a
+     robustness one. The intermediate step, if the split proves too invasive
+     to gate in one window, is timeout-release with requeue -- strictly worse
+     but strictly better than now.
+  3. STATE HONESTY. Every non-terminal turn state carries a max age. The
+     client renders an overdue turn as "stuck -- try again?" rather than a
+     spinner that means nothing. This is the client half of (1) and it works
+     even if the server dies outright, which is the case (1) cannot cover.
+  4. THE WATCHDOG TICK. `recover_unfinished()` already exists and already runs
+     on attach; a periodic tick makes it cover the session nobody reconnects
+     to. Cheap, because the mechanism is built.
+
+**The measurement that has to come with it:** `audio max 24.9s` against a
+5.4 s median says the tail is long before it is infinite. A deadline picked
+above the real p99 protects nothing (#493), and one picked below it turns slow
+turns into failed ones. The deadline is derived from the distribution the
+metrics endpoint now finally serves -- `--enable-metrics` was missing from the
+live boot until this restart, which is why the gate's gauge read had been
+answering 404 for two sessions.
