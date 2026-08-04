@@ -4813,3 +4813,122 @@ with 12 tests and a control for every arm:
     where a pin was CERTAINLY held and it was the one recording `None`, which
     is why the collector reported "0 of 7 decisions with a pin held" for a
     session the pin decided almost entirely (§17.8.21 instrument gap, closed).
+
+#### 17.8.25 The uplink stops being PCM16 (G1 of the #466 gap list)
+
+The phone was sending raw PCM16 at 16 kHz -- about 256 kbit/s, continuously,
+for as long as the button is held -- while the server had been able to decode
+Opus since the transport was written (`audio.py`, `available_codecs`, and
+`/health` has been reporting `["opus", "pcm16"]` all along). The client offered
+`codecs: ["pcm16"]` as a literal, so the server's Opus branch was dead code
+that nothing could ever reach. Measured on the wire: **24.2 kbit/s against
+256 kbit/s, a factor of 10.6**, on the leg the user pays roaming for.
+
+**WEBCODECS, NOT MEDIARECORDER, AND THAT DECIDED THE FRAMING.** `MediaRecorder`
+is the more widely available Opus encoder in a browser, and it was rejected:
+it emits a WebM or Ogg CONTAINER on its own schedule, in blobs that do not
+align with frames or with turn boundaries. `AudioEncoder` emits one bare,
+self-delimiting Opus packet per frame with the default `opus.format` of
+`"opus"` -- no container, no `OpusHead` extradata. `OpusCodec.decode` hands its
+payload straight to `av.Packet` and a bare libopus decoder, which is exactly
+that. **Neither side had to move.** The question "which end adapts to the
+other" turned out to have the answer "neither", and that is why this is
+substantially a client-side change.
+
+Verified across the two implementations rather than reasoned about:
+`scripts/translator/probe_opus_uplink.py` drives a real Chromium with the
+client's own encoder configuration, takes the raw `EncodedAudioChunk` bytes out
+of the page, and decodes them with the server's own `OpusCodec`. Pitch,
+duration and bitrate all survive. Two Opus implementations agreeing is not
+something a test written on one side can establish.
+
+The client encodes at **16 kHz**, not at the capture rate. Opus is defined at
+48 kHz internally and its packets carry their own bandwidth, so the input rate
+is not a property of the wire, and feeding the encoder the frames the capture
+loop already produces means the PCM16 and Opus paths carry byte-identical audio
+up to the codec. That is what makes the WER comparison below a measurement of
+the codec instead of a measurement of two different resamplers.
+
+**THE DIRECTIONS ARE NOW SEPARATE, AND THIS WAS THE ONE STRUCTURAL CHANGE.**
+`_Connection` held ONE codec object and used it for both legs, which was only
+ever correct because both ends ran PCM16. The hello's `codecs` list has always
+meant "what the client can ENCODE", so an Opus offer used to switch the
+DOWNLINK as well -- and the page's playback path reads binary frames as
+little-endian PCM16 synchronously, so it would have rendered Opus packets as
+noise. So `codecs` now settles the uplink only; `ready.codec` reports it and a
+new `ready.downlink_codec` reports what the server will send. Additive, so a
+client that ignores it is unaffected, and every deployed client and harness
+script offers `["pcm16"]` and sees byte-identical behaviour.
+
+An Opus downlink remains unbuilt and is NOT free: it needs an `AudioDecoder`
+whose output arrives asynchronously, so turn attribution has to be queued
+alongside it, and it would put a lossy codec on the leg whose audio quality is
+under investigation (§17.8.24(b)). It belongs with the §19.5 ladder.
+
+**TWO DEFECTS FOUND BY BUILDING THE TESTS, both newly reachable.** With PCM16
+any even-length payload decodes to something; a compressed uplink can fail.
+
+  1. A decoder exception is not a `CodecError`, so it escaped the receive loop
+     and took the socket down. On a mobile link that turns one lost packet into
+     a reconnect. Now dropped, counted and logged.
+  2. **A zero-length binary frame is read by FFmpeg as END-OF-STREAM.** The
+     decoder enters draining state and answers every subsequent real packet
+     with EOF -- so one stray empty frame would end the uplink for the whole
+     session with the socket, the session and the segmenter all reporting
+     health. Refused in `OpusCodec.decode` and `reset()` on any failure, with
+     a can-fail control that measures the drained decoder rather than
+     asserting the paragraph.
+
+**EVERY FAILURE LANDS ON PCM16**, and there are four: no WebCodecs (it is
+secure-context only, so a page served over plain HTTP falls back and this is
+worth knowing before blaming the phone), Opus not supported by the encoder, a
+server that does not confirm Opus, and an encoder that faults mid-session. The
+third is the interesting one: the page is hot-deployable on its own, so a
+client running ahead of its server is a real state, and a server that reports
+no `downlink_codec` is one that would answer with Opus on both legs. The client
+detects that, takes the offer back and reconnects on PCM16 -- one reconnect,
+session and cursor intact -- rather than playing noise.
+
+**THE COST IS NOW AN INSTRUMENT, not an assumption.** `frame_bytes_sent`
+answered "did it send"; a total says nothing without the duration it
+accumulated over. The telemetry snapshot carries an `uplink` block
+(`bytes_per_second`, `kbit_per_second`, `open_ms`, `codec`) and every
+`turn.capture_end` carries the same numbers for that one turn. **The
+before/after evidence is read straight out of an uploaded package:** PCM16
+lands near 32000 B/s, Opus near 3000 B/s.
+
+##### The WER gate: how the before/after comparison is run
+
+`scripts/translator/asr_roundtrip_gate.py` scores WER of a WAV against the text
+that produced it. The comparison that matters here is CODEC-ONLY, and it does
+not need the live server -- which is the point, because a live A/B would
+confound the codec with the network, the segmenter and the recognizer's own
+variance across two different capture sessions.
+
+  1. **Take one 16 kHz mono speech WAV with known text.** The same file feeds
+     both arms; nothing else may differ.
+  2. **Arm A (before).** The file itself. PCM16 is lossless within
+     quantisation, so the uncompressed uplink IS the file.
+  3. **Arm B (after).** Push the same samples through the real codec path:
+     encode in Chromium with the client's configuration, decode with
+     `OpusCodec`, `resample` to 16 kHz, write the result.
+     `probe_opus_uplink.py` already performs exactly this trip and is where
+     that step belongs.
+  4. **Score both** with the same invocation, same model, same beam:
+
+         CUDA_VISIBLE_DEVICES=99 PYTHONPATH=<repo>/python \
+           /spinning/htsglang-gpu/.venv/bin/python \
+           scripts/translator/asr_roundtrip_gate.py \
+             --audio <arm>.wav --text "<the reference text>" \
+             --model large-v3-turbo --device cuda --compute-type int8_float16
+
+  5. **Read the DELTA, not the absolute.** Each arm's absolute WER carries the
+     recognizer's own error; only the difference is attributable to the codec.
+     Opus at 24 kbit/s on 16 kHz speech is expected to cost approximately
+     nothing on this metric. A delta above the gate's own 0.15 threshold means
+     the bitrate is too low for this recognizer, and the answer is the bitrate,
+     not the codec.
+  6. **The live confirmation comes after deployment** and is a different
+     question: that a real phone on real mobile data still produces usable
+     transcripts. Its instrument is the `uplink` telemetry block plus the
+     transcript, not this gate.
