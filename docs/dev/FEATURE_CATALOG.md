@@ -951,9 +951,25 @@ inferred. `--speculative-moe-runner-backend` reaches EVERY draft build — the
 `cross_algo_worker` and (new for #470) the shared DFLASH/DSPARK builder
 `draft_worker_common.py:155`; unset, it defaults to `--moe-runner-backend`
 (`overrides.py:2086`). Reaching the DFLASH/DSPARK builds is what puts an MXFP4
-DSpark head on `Mxfp4MarlinMoEMethod` on sm120. **DESK-WRITTEN — no DSpark arm
-has booted; `docs/dev/TICKET_470_dspark_boots.md` is the only evidence path,
-and its Boot A prices the ~21 % rank-0 residency cut the arm costs.** Two
+DSpark head on `Mxfp4MarlinMoEMethod` on sm120. **BOOT A MEASURED 2026-08-04,
+BOOT B NOT YET RUN** (`TICKET_470_RESULT_first_boot.md`): Boot A prices the
+rank-0 residency cut at ~1.3-1.4 % of decode ms/round for 10.21 GiB freed, and
+the measured cut is 0.485->**0.23**, not the ticket's unmeasured
+`RESIDENT_FRACTION_CUT=0.383` (which frees only ~4.1 GiB and OOMs rank 0
+mid-build). Boot B found four first-boot defects; the last of them --
+`build_draft_tp_worker` handed `draft_server_args` to `TpModelWorker` but never
+PUBLISHED it, so every reader that resolves through the process-wide context
+(`resident_fraction._from_flag()` first among them) validated a weight-TP=1
+draft build against the TARGET's 3-entry per-rank vectors -- is now fixed by
+publishing the copy for the duration of the build
+(`draft_worker_common.py`, restore already present in the `finally`). REACH: it
+covers the DFLASH/DSPARK builder only. `eagle_worker_v2.py:350`,
+`multi_layer_eagle_worker_v2.py:187` and `standalone_worker_v2.py:87` hand the
+TARGET's `ServerArgs` object straight to `TpModelWorker` with no draft copy at
+all, so there is nothing to publish there and the same class of defect is OPEN
+for them. Falsifier:
+`test/registered/unit/spec/test_draft_args_context_publication.py`, 8 hermetic,
+executed can-fail (publication removed -> 5 red). Two
 pre-boot blockers on any PACKED DSpark draft are cleared (#491, from the #490
 upstream sweep, `NOTE_490_pr33271_abgleich.md` §C): the fused-KV-projection
 support probe answers `False` for marlin/AWQ/GPTQ linears instead of raising

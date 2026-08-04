@@ -176,18 +176,11 @@ def build_draft_tp_worker(
     # sharding, and speculative_draft_solo_rank() resolves the host through
     # gpu_id_for_rank.
     #
-    # NECESSARY BUT NOT SUFFICIENT, measured 2026-08-04: this alone does NOT
-    # unblock the solo boot. resident_fraction._from_flag() falls back to the
-    # RUNTIME CONTEXT (get_server_args()) when no ServerArgs is handed to it,
-    # and the context still holds the TARGET's arguments during the draft
-    # build -- draft_server_args is passed to TpModelWorker but never
-    # published. So the validator keeps reading the target's 3-entry vector
-    # against a weight-TP=1 parallel state and refuses. Closing it means
-    # publishing the draft arguments into the context around the draft build,
-    # which changes the draft-copy contract for DFLASH and EAGLE as well and
-    # is deliberately NOT done here. Kept because the draft copy carrying
-    # target-shaped per-rank vectors is wrong regardless of which reader
-    # notices it first.
+    # NECESSARY BUT NOT SUFFICIENT on its own, measured 2026-08-04:
+    # resident_fraction._from_flag() falls back to the RUNTIME CONTEXT
+    # (get_server_args()) when no ServerArgs is handed to it, so neutralising
+    # the copy achieved nothing while the context still held the TARGET's
+    # arguments during the draft build. The publication below closes that half.
     if getattr(server_args, "speculative_draft_placement", None) == "solo":
         draft_server_args.override(
             "draft_worker.build.solo_unshard",
@@ -204,6 +197,34 @@ def build_draft_tp_worker(
 
     saved_server_args = get_server_args()
     try:
+        # #470 Boot B: PUBLISH the draft copy for the duration of the build.
+        #
+        # The copy above only reaches readers that are HANDED it. Everything
+        # that resolves configuration through the process-wide context --
+        # ``get_server_args()``, and every helper built on it -- kept reading
+        # the TARGET's arguments while the draft module graph was being built,
+        # which is how a weight-TP=1 draft build came to be validated against
+        # the target's 3-entry per-rank vectors and refused the boot with
+        #   "the resident-fraction vector has 3 entries (0.23,0.42,0.42)
+        #    but tensor parallelism is 1"
+        # (measured on hardware, TICKET_470_RESULT_first_boot.md §2).
+        #
+        # REACH, stated because this changes what DFLASH and DSPARK draft
+        # builds see: draft_server_args is a deepcopy of server_args that
+        # differs in EXACTLY the fields overridden above -- skip_tokenizer_init,
+        # the three attention-backend fields, context_length, and (solo only)
+        # the five per-rank vectors. Every context reader inside the build now
+        # sees those values instead of the target's, which is what the copy was
+        # made for; no other field changes. The restore in the ``finally``
+        # below already existed for exactly this shape of publication.
+        #
+        # EAGLE-family workers are NOT covered: eagle_worker_v2.py:350,
+        # multi_layer_eagle_worker_v2.py:187 and standalone_worker_v2.py:87
+        # pass the TARGET's ServerArgs object straight into TpModelWorker with
+        # no draft copy at all, so there is nothing to publish there. Giving
+        # them one is a separate change with its own boot evidence.
+        get_context().set_server_args(draft_server_args)
+
         # --speculative-moe-runner-backend applies to the DRAFT model's MoE
         # layers. The EAGLE-family workers already enter this context around
         # their model build; the self-drafting block models (DFLASH / DSPARK)

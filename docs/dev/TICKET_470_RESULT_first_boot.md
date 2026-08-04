@@ -190,3 +190,42 @@ that measures the intended thing.
 Next step is the draft-copy fix above, then Boot B unchanged. Everything else in
 the arm is now known to work: solo placement resolves, the draft GPU resolves to
 the 5090 by UUID through the CUDA ordinal, and the marlin backend is reachable.
+
+---
+
+## 4. FIXED AFTER THE WINDOW (#535/B1) — the draft args are now published
+
+`build_draft_tp_worker` publishes `draft_server_args` into the runtime context
+for the duration of the draft build. The restore already existed in the
+function's `finally`; only the publication was missing, which is why the
+neutralised copy changed nothing.
+
+REACH, stated rather than implied. `draft_server_args` is a `deepcopy` that
+differs from the target's in EXACTLY the fields overridden in that function:
+`skip_tokenizer_init`, the three attention-backend fields, `context_length`,
+and — under solo placement only — the five per-rank vectors. Every reader that
+resolves through `get_server_args()` inside the build now sees those values,
+which is what the copy was made for. **DFLASH is covered** (same builder).
+**EAGLE is not**: `eagle_worker_v2.py:350`,
+`multi_layer_eagle_worker_v2.py:187` and `standalone_worker_v2.py:87` pass the
+TARGET's `ServerArgs` object straight into `TpModelWorker` with no draft copy,
+so there is nothing to publish there — the same defect class is OPEN for them
+and giving them a copy is a separate change with its own boot evidence.
+
+Falsifier: `test/registered/unit/spec/test_draft_args_context_publication.py`,
+8 hermetic arms with no GPU. It pins the CONTRACT — what the context resolves
+to inside the build, that it is the same object `TpModelWorker` was handed,
+that the neutralised fields are the ones it resolves, that the target's args
+come back on both the normal and the exception path — plus the load-bearing
+arm: `resident_fraction_vector(tp_size=1)`, the exact call that refused Boot B,
+executed from inside the build. Its can-fail sibling runs the same call against
+the target's published args and asserts the `"3 entries"` ValueError, so a
+green result is not an artefact of `tp_size=1`. Executed can-fail: removing the
+publication turns 5 of the 8 red.
+
+**Not a Boot B result.** Nothing here has run on a card. The next window runs
+Boot B unchanged; the acceptance signal is a boot that reaches ready with
+`--rank-moe-resident-fraction 0.23,0.42,0.42` intact (NOT collapsed to a
+scalar, which would silently cut ranks 1 and 2 and invalidate the comparison
+against `a_cut`), and then an accept length and ms/verify. Only that answers
+R1.
