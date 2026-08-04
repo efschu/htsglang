@@ -3898,3 +3898,113 @@ never exit. Wait on a PID.
 `getSettings()` telemetry of the next phone connect (§19.8(b)), §19.9 -- all
 behind the DSV4F focus window, which takes serving and this tenant down for a
 while; its agent reboots the tenant at the end of that window.
+
+#### 17.8.16 Language before embedding, and one speaker at a time (user directive, eighth session)
+
+**The order, verbatim (2026-08-04):** "der größte hebel zu erkennen ob jemand
+anderes spricht ist die ausgangssprache erstmal. weil es kann auch jemand
+spanisch reinquatschen, wenn ich deutsch gerade spreche, dann muss
+selbstverständlich der spanisch erkannte teil, die spanische stimme, ignoriert
+werden. es soll nur ein sprecher gleichzeitig 'als audio rauskommen'."
+
+This reorders the whole identity stack. Until now the embedding decided who
+spoke and the language was a consequence; from here the language decides
+whether this is even the same speaker, and the embedding is what separates two
+people who share one.
+
+**WHAT THE CODE ALREADY GUARANTEES, AND WHAT IT DOES NOT.** The output half of
+the order is already true and needs no work: `run_turn_multi` holds
+`self._turn_lock` across recognition, MT *and* synthesis (`session.py:1219-1233`,
+with `_translate_and_speak` awaited inside `_run_turn_locked`), and `drain()`
+pops one segment at a time (`session.py:1191-1197`). Two speakers can therefore
+never be synthesized concurrently today, and any claim to have "built" that
+would be a claim on existing behaviour. What is NOT prevented is the other half:
+an interjection is QUEUED (`enqueue`, `session.py:1136-1150`) and spoken once
+the running turn ends. "Ignoriert werden" forbids exactly that replay. Rule 2 is
+therefore a DISCARD at the queue boundary, not a mutex.
+
+**RULE 1 MUST RUN BETWEEN STEP 1 AND STEP 2, AND TODAY NOTHING RUNS THERE.**
+Recognition is step 1 (`session.py:1336-1357`), identification step 2
+(`session.py:1361`), source resolution step 3 (`session.py:1383`). Enrollment
+happens inside step 2 -- `speakers.assign(...)` takes the audio and the text and
+moves the centroid (`session.py:1631-1637`). A language filter placed at step 3,
+where `_resolve_source` sits, would refuse the translation of a segment whose
+voice it had already folded into the pinned speaker's cluster. The filter goes
+BEFORE `_identify` or it protects only half of what it exists to protect.
+
+**THE FLOOR.** One concept serves both rules, and naming it once keeps them from
+being two mechanisms that disagree. The *floor language* is the language that
+currently holds the conversation: the sticky pin's language while a pin is held,
+and the running turn's resolved source while a turn is in flight. A segment
+resolved to a *different participant language* while the floor is held is by
+construction a different speaker -- no embedding is consulted, because the order
+says language comes first.
+
+**THE TRADE-OFF I DECIDED, AND IT NEEDS TO BE SEEN.** A floor that is held for
+as long as the pin is held would silence the app's own purpose: a DE speaker and
+an ES speaker alternating into one phone means every second turn is "the other
+language under a held pin". The order is about `reinquatschen` -- talking OVER
+someone -- so the discard is scoped to OVERLAP, which is a predicate the code can
+actually evaluate: `self._active_turn_id is not None` at `enqueue()` time is
+exactly "this segment was captured while another turn was being processed". It
+is stamped on the queued segment there (the only place the temporal relation is
+known) and acted on after recognition (the earliest place the language is
+known).
+
+  - segment OVERLAPS a running turn, other participant language
+      -> discarded. No TTS, no enrollment, no queueing. Transcript line
+         written and tagged, because a swallowed utterance is
+         indistinguishable from a broken microphone.
+  - segment does NOT overlap, other participant language, pin held
+      -> translated normally, but NOT enrolled into the pinned cluster, and
+         the UI says the pin is still on someone else. This is the ordinary
+         hand-over and must keep working.
+
+If the user wants the stricter reading -- a held pin silences the other language
+outright, overlap or not -- it is one predicate, but it should be his call and
+not a side effect of mine.
+
+**WHY THE NAIVE DIRECTION GUARD (item 3d) IS UNREACHABLE, CONFIRMED IN CODE.**
+`Conversation.targets_for` returns `participants - {src}` (`languages.py:360`)
+and `require_pair` refuses `src == tgt` before anything else
+(`languages.py:261-265`). "Detected language equals chosen target" can therefore
+never occur downstream: the target set is built by excluding the source. The
+defect the user sees is a WRONG `source`, and the only place to fix it is source
+resolution -- which is what rules 1 and 2 are. The direction bolt stays as an
+assertion that the invariant holds, not as a repair.
+
+**LID HARDENING, AND WHAT A CONFIDENCE GATE CANNOT DO.** `_resolve_source`
+(`session.py:1720-1735`) trusts the detected language at
+`language_confidence >= 0.5` and otherwise believes `profile.last_language` --
+which is how the TTS-echo cluster (speaker-4, `language es`, conf 0.026) routes
+German to German. Under the directive the order becomes: confident detection
+first, then the PIN's language, and `profile.last_language` only for a profile
+the user actually named or enrolled -- never a freshly minted automatic cluster,
+which is precisely the phantom this failure is made of.
+
+That fixes the echo. It does NOT necessarily fix the child. If the LID reports
+`es` for his German with HIGH confidence, no confidence gate can reach it and
+only a prior can. Text-LID over the decoded text was considered and is NOT the
+answer: Whisper decodes in the language it has already chosen, so a wrong
+decision produces wrong-language text as well -- line 2 of the live transcript,
+`"Und bingst du hási."`, is what a decode fighting its own language decision
+looks like. Whether a pin prior suffices or a session language lock is required
+is decided by the §2 measurement (his turns, with LID language and confidence
+per turn), not here.
+
+**THE HONEST LIMIT, STATED BECAUSE IT WILL BE FORGOTTEN.** Language separates
+speakers only ACROSS the pair. Two German speakers are invisible to every
+mechanism in this section, and the measured cosine threshold remains the only
+thing that separates them. That is why the threshold work stays in the bundle --
+demoted to the second line of defence, not dropped.
+
+**GATE ARMS, both with the control that proves they discriminate:**
+
+  (a) barge-in: a DE turn in flight, an ES segment injected while
+      `_active_turn_id` is set. Assert exactly one synthesis for the window,
+      the DE turn's audio uninterrupted, the ES segment tagged and never
+      spoken, and the pinned cluster's centroid unmoved. Control: the same
+      injection with the floor filter disabled must produce the second audio.
+  (b) the child: a DE segment at low LID confidence under a DE pin stays DE.
+      Control: the same segment with the pin released takes the old path and
+      routes wrongly, which is what proves the pin is what decided it.
