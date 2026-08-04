@@ -287,6 +287,41 @@ because the graph path and the eager path are the same weights driven two ways:
 Gate 1 is what makes this cut safe to ship quickly; without it the whole thing
 rests on an ear.
 
+#### 7.5a CORRECTION 2026-08-04 — gate 1 as written is NOT achievable, and the cut is still right
+
+Measured, not reasoned:
+`/spinning/gpu-battery-results/2026-08-04_488_slice2_graphs/`. Gate 1 asked for
+**identical** codec tokens against the eager reference. Against that pair,
+**23.3 % of tokens differ**. The gate was conflating two changes; decomposed:
+
+| pair | isolates | result |
+|---|---|---|
+| eager-dynamic vs eager-static | the padded cache + explicit mask | **differs**, 2.4e-2 relative (bf16) |
+| eager-static vs **graphed** | the capture | **bit-exact, 0.000000** |
+
+Capture changes nothing. The divergence is entirely the `StaticCache` + 4-D
+mask that capture *requires* — and `check_static_cache_semantics.py` settles
+what kind of difference that is by rerunning the same pair in float32:
+**1.4e-6 – 2.4e-6 relative** against fp32 eps 1.2e-7, i.e. 12-20 eps
+accumulated over 28 layers. **Reduction order, not semantics.** An explicit
+mask makes sdpa pick a different backend; at bf16 (eps 7.8e-3) a few ulp flips
+the code predictor's frequently near-tied argmax.
+
+The gate is split, and the replacement is **stronger** than the original for
+what capture can break:
+
+1. **capture gate** — graphed vs eager over the *same* static cache, and it
+   must be **bit-exact**. Exactness, not a tolerance.
+2. **semantics gate** — static+mask vs dynamic, in fp32, where the question
+   "same computation?" is answerable at all.
+3. **then** the listening arm, told in advance that the shipped path emits a
+   *different valid sample* at bf16, not a degraded one.
+
+The one-sentence lesson: a static cache is a **prerequisite** of graph capture
+and perturbs bf16 rounding on its own, before any graph exists. Any future gate
+that compares a graphed path to a dynamic-cache reference will fail for this
+reason and not for a real one.
+
 ### 7.6 fp8 (lever 3), priced — and correctly ranked third
 
 fp8 halves the per-step weight read: trunk 840 → 420 MiB, predictor 150 → 75 MiB,

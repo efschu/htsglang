@@ -25,6 +25,40 @@ graphs remove the 84.7 % launch gap and nothing else; only fusion touches the
 **Both arms get built and the crossover is reported either way.** If TRT loses,
 that is a result with numbers, not a reason to have skipped it.
 
+### 1a. MEASURED 2026-08-04 — the graphs rung, and what it leaves for TRT
+
+`/spinning/gpu-battery-results/2026-08-04_488_slice2_graphs/`. The table above
+was the hypothesis; this is the measurement, all rungs in one window on the
+5090 (400 W limit against a 575 W default — a lowered power target, so these
+numbers do not compare across power states):
+
+| stage | predicted | **measured** frame ms | **measured** RTF |
+|---|---|---|---|
+| today | 1.71 | 142.18 | **1.706** |
+| raw loop, no `generate()` | ~1.3 | 136.84 | **1.642** |
+| + CUDA graphs | ~0.26 | **14.64** | **0.176** |
+| + TRT fused engines | 0.05-0.10 | — | not yet built |
+
+Two corrections fall out, and both move the plan:
+
+* **The raw loop alone bought 1.04x, not the estimated ~1.3 RTF.** The 602
+  syncs per frame were not the cost. Slice 1's value was *enabling* capture — a
+  region that syncs cannot be captured at all — not speed. The estimate is
+  corrected on the record rather than dropped.
+* **The graphs rung beat its prediction (0.176 against ~0.26)**, because the
+  static cache also removes device work the eager path was doing (`DynamicCache`
+  concatenations and per-step mask construction): kernel time per frame fell
+  21.26 → 13.85 ms, not just the gap.
+
+**What this leaves for the TRT half, stated precisely.** The graphed frame is
+**94.6 % kernel** and the launch gap is 4.6-5.9 %. The 6.53x the precursor
+called recoverable has been collected in full; there is no overhead left to
+attack. What remains is exactly the residual §1 named: **13.85 ms of kernel
+against the 2.2 ms bandwidth floor**, ~6.3x of kernel *shape*. So the
+0.05-0.10 band stays arithmetically reachable, and fusion is now the **sole**
+remaining lever rather than one of two — which raises the value of the TRT lane
+relative to when both arms were open.
+
 Engine discipline, carried over from the video chain (#484 family):
 
 * **Two engines**, matching the two graphs already specified in
@@ -186,6 +220,33 @@ change ships with the next serving restart**. The pool does not wait for fp8.
 fp8 and TRT engine size return to being what they were before this section
 overstated them: **performance and quality levers, not existence conditions**.
 
+### 2.2c STATE CHECK 2026-08-04 (post-reboot boot) — the 400 MiB did NOT show up as free VRAM
+
+§2.2b predicted that raising `--rank-auto-reserve-mib` 3800 → 4200 on the two
+3080s would take their free VRAM 2951 → 3351 MiB (usable 2551 → 2951) and
+thereby admit a 2678 MiB bf16 talker. The reserve change **did** ship: the
+running boot carries `--rank-auto-reserve-mib 13000,4200,4200` (read from
+`/proc/1236/cmdline`). The free VRAM did not follow.
+
+Measured on the running boot, 2026-08-04:
+
+| card | free | usable (free − 400 corridor) | bf16 talker 2678 | verdict |
+|---|---|---|---|---|
+| 3080 #0 | **2957 MiB** | 2557 | −121 | **still does not fit** |
+| 3080 #2 | **2959 MiB** | 2559 | −119 | **still does not fit** |
+
+That is 6-8 MiB above the pre-change baseline, not 400. The shortfall is
+essentially unchanged from §2.2's original −127 MiB, so **the pool gate is not
+open** and the claim that it is should not be carried forward.
+
+What this does NOT establish is *why*: this is a different boot (post-reboot,
+KV pool 333254 tokens, `--rank-tp-ratio auto-performance`), so a clean
+before/after on the reserve knob alone was never taken. Two candidate readings
+— the reserve does not convert to free VRAM the way §2.2b assumed, or the pool
+sizing reclaimed it elsewhere — and picking between them is the first task of
+the pool work, ahead of any instance placement. Until then, item (3) of the
+queue is **blocked on 121 MiB**, not unblocked.
+
 Still to check honestly before any fp8 quantisation effort, per the brief: an
 sm86 TRT engine at bf16/fp16 may already land under 2551 MiB on its own, in
 which case the 3080s are reachable with neither fp8 nor a reserve change. That
@@ -306,9 +367,11 @@ extends fields on events that already exist.
 
 ## 5. Ordering, with the dependency that is easy to miss
 
-1. **Raw 15-step predictor loop** (removes 602 syncs/frame) — also the vehicle
-   for everything below.
-2. **CUDA graphs** — control arm, and the fallback if TRT slips.
+1. **Raw 15-step predictor loop** — DONE (slice 1). Worth 1.04x on its own; its
+   real job was making the region capturable.
+2. **CUDA graphs** — DONE (slice 2), **RTF 0.176, 9.71x**, gates green. Both
+   the control arm and, at 94.6 % kernel, the thing that leaves TRT nothing to
+   attack except kernel shape.
 3. **TRT engines** (predictor, then vocoder) — the set lane.
 4. **fp8** — no longer optional: §2.2 makes it the gate on the 3080s.
 5. **Talker pool** — needs 4 to reach more than one card.
