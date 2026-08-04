@@ -84,9 +84,48 @@ the shim is a NO-OP by construction: it only ever writes the value the front
 would have defaulted to anyway. `--no-thinking-shim` turns it off; there is no
 reason to before the live server is restarted onto #540.
 
+## The thinking ALIAS — asking a local agent to think (#541)
+
+The shim's mirror image. Claude Code cannot ask a subagent for extended
+thinking either: the frontmatter schema carries `model` and no thinking key, so
+once again the model string is the only client-side lever. For every id in
+`--local-model` the router therefore also answers to `<id>-think`:
+
+| the client sends | routed to | `model` on the wire | `thinking` on the wire |
+|---|---|---|---|
+| `Qwen3.6-27B` | local | unchanged | `{"type":"disabled"}` (shim, only if absent) |
+| `Qwen3.6-27B-think` | local | rewritten to `Qwen3.6-27B` | `{"type":"adaptive"}` (forced) |
+| `claude-*-think` | upstream | unchanged | untouched |
+
+Three properties worth stating because each one is a decision:
+
+* **Adaptive, not enabled.** `{"type":"enabled"}` fails protocol validation
+  without `budget_tokens >= 1024`; `adaptive` means "thinking on, the model
+  decides how much", which is the arm an A/B against the no-thinking default
+  actually wants.
+* **Forced, not filled in.** Unlike the shim the alias OVERWRITES an explicit
+  client value. Naming the alias is itself the request for thinking, and a
+  client default winning here would silently turn the thinking arm back into
+  the default arm with nothing in the log to say so.
+* **Rewritten on every path.** The local server has no `-think` checkpoint, so
+  `count_tokens` and friends get the id un-aliased too — but only
+  `/v1/messages` gets the `thinking` field, exactly like the shim.
+
+`/__router/stats` lists the aliases next to `local_models`, so the live
+instance can be checked for the feature without reading its code.
+
+The agent definition that uses it is `~/.claude/agents/local-model-think.md`
+(`model: Qwen3.6-27B-think`), the thinking twin of `local-model`. It needs a
+router that carries the alias; against an older router it fails with an
+unknown-model error rather than silently falling back.
+
+Requires a serving boot with a reasoning parser. The live INT8 boot has
+`--reasoning-parser qwen3`, verified in `/get_server_info`; without one the
+front answers 400 for any thinking-enabled request.
+
 ## Evidence
 
-`test/registered/unit/entrypoints/anthropic/test_router.py` — 17 tests, fully
+`test/registered/unit/entrypoints/anthropic/test_router.py` — 27 tests, fully
 hermetic: two mock aiohttp backends stand in for api.anthropic.com and the
 local front, each recording what it received. Pinned both ways: local model to
 the local backend / any other model upstream, no-model bodies upstream, path and
@@ -94,10 +133,15 @@ query preserved, auth headers forwarded intact, credentials absent from the log
 at DEBUG, shim applied / explicit value untouched / upstream body unmodified /
 `count_tokens` untouched, SSE pass-through from both backends, backend error
 status and body survived, unreachable backend gives an Anthropic-shaped 502,
-and the `/__router/stats` counters separate the two paths.
+and the `/__router/stats` counters separate the two paths. The alias adds
+eight: it reaches the local backend, rewrites the model, forces adaptive,
+overrides an explicit client value, un-aliases `count_tokens` without adding
+`thinking`, survives `--no-thinking-shim`, counts as local in the stats, and a
+`-think` suffix on an UNKNOWN model still goes upstream unmodified.
 
 Mutation-checked rather than assumed green: removing the shim assignment fails
-1 test, forcing `to_local = False` fails 10.
+1 test, forcing `to_local = False` fails 10, dropping the alias's forced
+`thinking` assignment fails 3, and dropping its model rewrite fails 2.
 
 `/__router/stats` is also the live evidence instrument — it is what shows that
 the parent kept talking to Anthropic (`upstream` counter climbing) while the
@@ -127,3 +171,31 @@ predates the front fix. Identical body, no `thinking` field, sent directly to
 block, `stop_reason: max_tokens`, no text content at all. Through the router:
 clean text. That is the agent-loop blocker in one pair of requests. It
 disappears on its own once 30030 is restarted onto the front fix.
+
+## Live acceptance of the alias, 2026-08-04 (#541)
+
+Same discipline as above: real requests, live 30030 boot, nothing restarted on
+the serving side. The boot carries `--reasoning-parser qwen3`
+(`/get_server_info`), which is the precondition for any thinking arm.
+
+Three bodies, identical apart from the field under test, straight at 30030:
+
+| `thinking` sent | `stop_reason` | output tokens | blocks returned |
+|---|---|---|---|
+| field absent | `max_tokens` | 200 (budget) | `thinking` only, no text |
+| `{"type":"disabled"}` | `end_turn` | 4 | `text` (`391`) |
+| `{"type":"adaptive"}` | `end_turn` | 200 | `thinking` + `text` |
+
+The first row is the pre-#540 front behaviour this router shims around, still
+present on the live boot — so the shim is NOT yet a no-op here.
+
+Then the same question through the router (30099), which is the alias proof:
+
+* `model: Qwen3.6-27B` → 4 output tokens, blocks `['text']`
+* `model: Qwen3.6-27B-think` → 300 output tokens, blocks `['thinking', …]`,
+  and the local front saw `model: Qwen3.6-27B`
+
+And inside the real agent harness (`claude -p --output-format stream-json`,
+identical prompt and tools, model id the only difference): arm A returned 0
+thinking tokens, arm B 63, both `rc=0`. Counted with the served checkpoint's
+own tokenizer, not estimated.
