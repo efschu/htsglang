@@ -371,6 +371,28 @@ class HiCacheStorage(ABC):
     def get_stats(self):
         return None
 
+    def capacity_stats(self) -> Optional[dict]:
+        """Current capacity limits and usage, or None if this backend has none.
+
+        Only backends that do their own on-disk capacity accounting (today:
+        ``file``) report here; backends whose capacity lives in an external
+        service return None.
+        """
+        return None
+
+    def resize(
+        self,
+        *,
+        max_size_bytes: Optional[int] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Change the capacity limits at runtime; ``None`` leaves one unchanged.
+
+        Returns post-resize ``capacity_stats`` (plus ``freed_bytes``) on
+        success, or None if this backend cannot be resized in place.
+        """
+        return None
+
 
 class MetadataCache:
     def __init__(self, ttl_seconds: float):
@@ -823,6 +845,23 @@ class HiCacheFile(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         return self._batch_io_v2(transfers, self._write_page)
+
+    def capacity_stats(self) -> Optional[dict]:
+        stats = self._evictor.stats()
+        stats["file_path"] = self.file_path
+        return stats
+
+    def resize(
+        self,
+        *,
+        max_size_bytes: Optional[int] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> Optional[dict]:
+        stats = self._evictor.set_limits(
+            max_size_bytes=max_size_bytes, min_free_bytes=min_free_bytes
+        )
+        stats["file_path"] = self.file_path
+        return stats
 
     def clear(self) -> bool:
         try:

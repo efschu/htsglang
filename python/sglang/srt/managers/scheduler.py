@@ -139,6 +139,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    ResizeHiCacheStorageReqInput,
+    ResizeHiCacheStorageReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -309,6 +311,9 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+# Runtime HiCache resize requests are expressed in GiB.
+_GIB = 1024**3
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -1763,6 +1768,7 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+                (ResizeHiCacheStorageReqInput, self.resize_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -4902,6 +4908,70 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def resize_hicache_storage_wrapped(
+        self, recv_req: ResizeHiCacheStorageReqInput
+    ) -> ResizeHiCacheStorageReqOutput:
+        if not self.enable_hierarchical_cache:
+            return ResizeHiCacheStorageReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+
+        if recv_req.max_size_gb is None and recv_req.min_free_gb is None:
+            return ResizeHiCacheStorageReqOutput(
+                success=False,
+                message="Nothing to resize: pass max_size_gb and/or min_free_gb.",
+            )
+        if recv_req.max_size_gb is not None and recv_req.max_size_gb <= 0:
+            return ResizeHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    f"max_size_gb must be > 0 (got {recv_req.max_size_gb}). "
+                    f"Use DELETE /hicache/storage-backend to remove the tier."
+                ),
+            )
+        if recv_req.min_free_gb is not None and recv_req.min_free_gb < 0:
+            return ResizeHiCacheStorageReqOutput(
+                success=False,
+                message=f"min_free_gb must be >= 0 (got {recv_req.min_free_gb}).",
+            )
+
+        if not hasattr(self.tree_cache, "resize_storage_backend"):
+            return ResizeHiCacheStorageReqOutput(
+                success=False,
+                message="Current tree_cache implementation does not support resize.",
+            )
+
+        # Unlike attach/detach, resize starts no threads and rebuilds no pools: it
+        # only re-caps the backend's own evictor, which locks against the backup and
+        # prefetch threads itself. So it deliberately does NOT demand an idle
+        # scheduler -- an operator can re-cap a busy server. A shrink still runs its
+        # unlinks inline here, delaying the next batch by that much.
+        max_size_bytes = (
+            None
+            if recv_req.max_size_gb is None
+            else int(recv_req.max_size_gb * _GIB)
+        )
+        min_free_bytes = (
+            None
+            if recv_req.min_free_gb is None
+            else int(recv_req.min_free_gb * _GIB)
+        )
+
+        try:
+            ok, msg, stats = self.tree_cache.resize_storage_backend(
+                max_size_bytes=max_size_bytes, min_free_bytes=min_free_bytes
+            )
+        except Exception as e:
+            logger.exception("Resize HiCache storage backend failed with exception.")
+            return ResizeHiCacheStorageReqOutput(success=False, message=str(e))
+
+        if ok:
+            logger.info(
+                f"Resized HiCache storage backend: max_size_gb={recv_req.max_size_gb} "
+                f"min_free_gb={recv_req.min_free_gb} -> {stats}"
+            )
+        return ResizeHiCacheStorageReqOutput(success=ok, message=msg, stats=stats)
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

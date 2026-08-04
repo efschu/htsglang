@@ -406,6 +406,29 @@ deliberately NOT patched — a reasoning parser moves text from `content` into
 Adding it to a measurement arm would silently move the numbers those arms
 exist to produce.
 
+**`preserve_thinking` is a STANDARD serving boot setting (#544).** Every boot
+that serves an agent carries:
+
+```
+--chat-template-default-kwargs '{"preserve_thinking": true}'
+```
+
+The flag sets server-wide defaults for `chat_template_kwargs`; per-request
+values still override it key by key. Without it the Qwen3.6 template drops
+prior-turn `<think>` blocks, so a multi-turn agent's rendered prompt stops
+being a prefix of what the model actually generated and the KV prefix cache
+misses — measured on the real tokenizer, the reusable prefix collapses from
+the entire previous turn to the leading framing (35 tokens to 17 on the
+two-turn probe in
+`test/registered/unit/entrypoints/openai/test_chat_template_default_kwargs_544.py`).
+Our Claude-Code Qwen subagents add a turn per tool roundtrip, so this is the
+difference between reusing the conversation and re-prefilling it every turn.
+The cost is that preserved think blocks grow the context permanently; the
+quality effect of keeping prior reasoning in-context is not yet measured
+(#541). Applies to both the OpenAI and Anthropic fronts — the Anthropic front
+funnels through `OpenAIServingChat`, so one flag covers both. Details in
+`docs/dev/NOTE_544_hicache_runtime_preserve_thinking.md`.
+
 `--enable-metrics` is required on **every** `sglang.launch_server` invocation
 on this rig, with no exceptions: measurements, smoke boots, one-off checks,
 every topology in section 4. Omitting it changes nothing about inference —
@@ -788,6 +811,66 @@ curl -s -X POST http://127.0.0.1:<port>/vram_budget \
   occupancy 0.85 (290582 live tokens), 10/10 correct recall, no device
   assert. Every commit additionally verifies each pool reached the new
   capacity and refuses loudly with the numbers if one did not.
+
+### 4.1.3 Disk HiCache tier (#544) and runtime re-capping (#545)
+
+A third cache tier on `/spinning`, so prefixes survive a server restart. Add
+to the 4.1 recipe:
+
+```bash
+mkdir -p /spinning/hicache
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/spinning/hicache   # MANDATORY
+
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-storage-backend file \
+  --hicache-mem-layout page_first_direct \
+  --hicache-io-backend direct \
+  --hicache-write-policy write_through \
+  --hicache-storage-prefetch-policy timeout \
+  --hicache-storage-backend-extra-config '{"max_size": "100Gi", "min_free_space": "20Gi"}'
+```
+
+Four things to get right, each of which fails quietly rather than loudly:
+
+- **The storage directory has no CLI flag.** `HiCacheFile` reads
+  `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` and otherwise defaults to
+  `/tmp/hicache`. Miss the export and 100 GiB of KV pages land on the
+  container's root filesystem.
+- **`page_first_direct` + `direct` are required for a hybrid GDN model**, not
+  stylistic: `MambaPoolHost` accepts only that layout (see the cu13 entry in
+  §2 for what happens otherwise).
+- **The cap is off by default.** Without `max_size` / `min_free_space` the
+  file backend's evictor is inert and the tier grows unbounded until the
+  volume fills. `min_free_space` is what protects the rest of `/spinning`.
+- **Size suffixes are decimal unless you write `i`.** `100G` is 93.1 GiB;
+  `100Gi` is 100 GiB. The runtime endpoint below takes GiB, so `100Gi` keeps
+  boot-time and runtime numbers meaning the same thing.
+
+**Re-capping a running server** — no restart, no idle requirement:
+
+```bash
+curl -s -X POST http://127.0.0.1:30030/hicache/storage-backend/resize \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -d '{"max_size_gb": 150}'          # optional: "min_free_gb"
+```
+
+Growing is immediate. Shrinking evicts LRU inline and returns only once usage
+is under the new cap, so a large shrink delays the next batch for the duration
+of the unlinks; in-flight writes are never evicted. `max_size_gb: 0` is
+rejected rather than treated as "unbounded" — detach and re-attach for that.
+The response carries the post-resize `used_bytes` / `num_entries` snapshot.
+
+**Not live on this model: attach and detach.** A hybrid GDN model gets a
+`UnifiedRadixCache`, whose `attach_storage_backend` / `detach_storage_backend`
+are stubs that always refuse; only resize was implementable there (it takes no
+thread lifecycle, just the evictor's lock). So the tier itself must be
+configured at boot — `PUT`/`DELETE /hicache/storage-backend` will not turn it
+on later. Both are live for non-hybrid models on `HiRadixCache`.
+
+`--enable-hierarchical-cache` is mutually exclusive with
+`--enable-kv-session-offload` and `--weightless-kv-host-spill-tokens` — each
+is its own host tier. Making them composable is task #547.
 
 ### 4.2 Co-location (several ranks on one physical GPU)
 

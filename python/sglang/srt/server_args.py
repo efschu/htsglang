@@ -2688,6 +2688,17 @@ class ServerArgs:
         Optional[str],
         "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",
     ] = None
+    chat_template_default_kwargs: A[
+        Optional[str],
+        "JSON object of default chat_template_kwargs applied to every chat "
+        "completion before rendering, e.g. '{\"preserve_thinking\": true}'. "
+        "Per-request chat_template_kwargs override these key by key. Use this "
+        "to make a template flag that only exists per request into a serving "
+        "default; 'preserve_thinking' in particular keeps prior-turn think "
+        "blocks in the rendered prompt so multi-turn prompts stay a byte-exact "
+        "prefix of what was generated, which is what lets the KV prefix cache "
+        "hit instead of re-prefilling the conversation on every turn.",
+    ] = None
     completion_template: A[
         Optional[str],
         "The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.",
@@ -5883,6 +5894,9 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+
+        # Validate the default chat-template kwargs JSON.
+        self._handle_chat_template_default_kwargs()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -13364,6 +13378,32 @@ class ServerArgs:
                 "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
                 f"(fa3/fa4), but got prefill backend {prefill_backend!r}. Other prefill-only "
                 "workloads and backends may be supported in a future change."
+            )
+
+    def _handle_chat_template_default_kwargs(self):
+        """Fail fast on a malformed --chat-template-default-kwargs payload.
+
+        Kept as a validation-only pass: the value stays the raw JSON string on
+        ServerArgs (so it round-trips through the CLI, /server_info and the
+        engine args unchanged) and is decoded once by the serving layer.
+        """
+        if self.chat_template_default_kwargs is None:
+            return
+        try:
+            parsed = json.loads(self.chat_template_default_kwargs)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"--chat-template-default-kwargs must be valid JSON: {e}"
+            ) from e
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "--chat-template-default-kwargs must be a JSON object, got "
+                f"{type(parsed).__name__}."
+            )
+        if not all(isinstance(k, str) for k in parsed):
+            raise ValueError(
+                "--chat-template-default-kwargs keys must be strings "
+                "(they are passed as keyword arguments to the chat template)."
             )
 
     def _handle_hicache(self):

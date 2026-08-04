@@ -1558,6 +1558,23 @@ class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class ResizeHiCacheStorageReqInput(BaseReq, kw_only=True):
+    """Re-cap the attached HiCache storage backend without detaching it.
+
+    Sizes are in GiB. A field left as None leaves that limit unchanged.
+    """
+
+    max_size_gb: Optional[float] = None
+    min_free_gb: Optional[float] = None
+
+
+class ResizeHiCacheStorageReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    # Post-resize capacity snapshot (per TP rank), None when the resize failed.
+    stats: Optional[Dict[str, Any]] = None
+
+
 class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
