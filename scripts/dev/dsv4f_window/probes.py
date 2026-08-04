@@ -479,6 +479,15 @@ def read_accept(meta_info: dict) -> dict:
     return {
         "spec_accept_length": meta_info.get("spec_accept_length"),
         "spec_verify_ct": meta_info.get("spec_verify_ct"),
+        # Fallback with named provenance: if the server did not attach
+        # spec_accept_length, derive it the way the server itself would
+        # (completion_tokens / spec_verify_ct, tokenizer_manager.py:2421)
+        # rather than reporting None and losing the arm's headline number.
+        "spec_accept_length_derived": (
+            round(meta_info["completion_tokens"] / meta_info["spec_verify_ct"], 4)
+            if meta_info.get("spec_verify_ct") and meta_info.get("completion_tokens")
+            else None
+        ),
         "completion_tokens": meta_info.get("completion_tokens"),
         "e2e_latency": meta_info.get("e2e_latency"),
         "prom_spec_ema_accept_len_provenance_only": meta_info.get(_EMA_KEY),
@@ -626,10 +635,14 @@ def mode_determined(base: str, args) -> dict:
             "max_tokens": spec["max_new_tokens"],
         }
         res = _post(base, "/v1/chat/completions", body, args.timeout)
+        # _post hands back the RAW body plus the status; it does not parse.
+        answer = ""
+        parse_error = None
         try:
-            answer = res["choices"][0]["message"]["content"] or ""
-        except (KeyError, IndexError, TypeError):
-            answer = ""
+            doc = json.loads(res.get("body") or "{}")
+            answer = doc["choices"][0]["message"]["content"] or ""
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+            parse_error = f"{type(exc).__name__}: {exc}"
         try:
             score, note = spec["scorer"](answer)
         except Exception as exc:  # noqa: BLE001 - a scorer never takes the arm down
@@ -640,11 +653,18 @@ def mode_determined(base: str, args) -> dict:
                 "score": score,
                 "note": note,
                 "answer": answer,
-                "http_code": res.get("http_code"),
-                "meta_info": res.get("meta_info"),
+                "http_code": res.get("status"),
+                "parse_error": parse_error,
             }
         )
-        print(f"  determined {spec['id']}: {score} {note}", flush=True)
+        # An unparsable or non-200 answer is an INSTRUMENT failure, not a
+        # quality result -- say which, so a broken endpoint can never be
+        # reported as a model regression.
+        if parse_error or res.get("status") != 200:
+            print(f"  determined {spec['id']}: INSTRUMENT FAILURE "
+                  f"status={res.get('status')} {parse_error or ''}", flush=True)
+        else:
+            print(f"  determined {spec['id']}: {score} {note}", flush=True)
     scored = [r["score"] for r in rows]
     return {
         "mode": "determined",
@@ -1130,6 +1150,11 @@ def main(argv: list[str]) -> int:
         help="wall-clock bound per decode point (10-20 s; GPU probes are bounded by TIME)",
     )
     ap.add_argument("--context-tokens", type=int, default=940)
+    # Sized so a bs=1 decode COMPLETES inside the time budget rather than being
+    # cut off: the speculative counters only exist on the final chunk, so a
+    # truncated stream can never yield a verify round. At the ~7 tok/s this
+    # checkpoint decodes at, 96 tokens lands around 14 s.
+    ap.add_argument("--max-new-tokens", type=int, default=96)
     ap.add_argument("--chat-probe-tokens", type=int, default=24)
     ap.add_argument(
         "--chat-template",
