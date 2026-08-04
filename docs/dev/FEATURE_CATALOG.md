@@ -1187,7 +1187,9 @@ Generalized loader (registry + family mapping tables), unsloth-UD, mixed-dtype
 fused GDN qkvz, MoE tensor mapping, vision/mmproj, sibling-config validation,
 DeepSeek-V2/3/4 class GGUF-safe (`.qweight` accessors, quantization_config
 drop, tokenizer route). Perf: batched MMVQ (default follows the WHEEL probe `_dequant_supports_out`,
-`gguf.py:342-345`), Q8 lm_head, K-quant MMVQ tuned to Q8_0 efficiency (TP=2
+`gguf.py:349` — corrected 2026-08-04, was cited as `:342-345`, which is only
+the env-var read and two blank lines above the actual call), Q8 lm_head,
+K-quant MMVQ tuned to Q8_0 efficiency (TP=2
 beats llama.cpp; wheel probe `ggml_mmvq_kq_tuned` + `SGLANG_GGUF_KQ_KERNEL` kill
 switch, `gguf.py:355-371` — when present it fully disables the #72 reroute,
 `:442`), graph-replay numeric safety for ALL quants — literally type-agnostic
@@ -1209,15 +1211,25 @@ loaders. The scale helper `ggml_cuda_e8m0_to_fp32_half` returns 2^(e-128) —
 already halved against the doubled lattice — and is bit-identical to the host
 reference, so dequant is compared EXACTLY, not within a tolerance. Kernel
 presence is a wheel property, probed via the `ggml_mxfp4_native` marker op (the
-#73 pattern, `gguf.py:272`) and evaluated ONCE at import (`:277`).
+#73 pattern, `gguf.py:272`) and evaluated ONCE at import (`:281`,
+`MXFP4_NATIVE = _mxfp4_kernels_present()` — corrected 2026-08-04, was cited as
+`:277`, which is `except Exception:` inside the probe function, not the
+module-level assignment).
 `SGLANG_GGUF_MXFP4_NATIVE=0` hands the checkpoint back to the repack —
 first-character test (`:265`), so `false`/`no`/`off` do NOT disable it. The
 "no-op on a native wheel" is a short-circuit, not a cheap pass: `_type_map()`
 returns `{}` before any tensor is read (`gguf_mxfp4_repack.py:113-115`). Second,
-undocumented lever: `SGLANG_GGUF_MXFP4_REPACK=0` (default 1, `environ.py:1776`)
-empties the same map (`:122-124`); combined with `NATIVE=0` or an old wheel it
-turns the checkpoint into a loud load-time refusal by tensor name (`:127-135`) —
-never a silent fallback. Native also widens MoE expert-offload coverage, since
+undocumented lever: `SGLANG_GGUF_MXFP4_REPACK=0` (default 1, `environ.py:1803`
+— corrected 2026-08-04, was cited as `:1776`, which is
+`SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT`, an unrelated flag) empties
+the same map (`repack_source_types()`, `gguf_mxfp4_repack.py:122-124` —
+citation now spelled out explicitly: the previous bare `:122-124` shorthand
+sat right after an `environ.py:NNNN` citation and so could be misread as
+belonging to that file, when the sentence's subject is actually still
+`gguf_mxfp4_repack.py`); combined with `NATIVE=0` or an old wheel it turns the
+checkpoint into a loud load-time refusal by tensor name (`_refuse()`,
+`gguf_mxfp4_repack.py:127-135`, spelled out for the same reason) — never a
+silent fallback. Native also widens MoE expert-offload coverage, since
 `MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES` (`gguf.py:292`). GPU-pending:
 `TICKET_398_mxfp4_validation.md`.
 **#479 traced the served checkpoint and found no untraced fallback.** The
