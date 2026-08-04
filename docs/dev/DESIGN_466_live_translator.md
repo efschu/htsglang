@@ -4205,3 +4205,70 @@ roster speaker button, so `pinnedSpeaker` stays null and `rearmPin()` is a
 no-op for the whole run. The mitigation is covered by reading the code and by
 the server-side consumption point it targets, not by a measurement. An arm that
 taps a speaker button and counts `speaker.arm` frames per turn is owed with it.
+
+#### 17.8.19 Three playback modes, one hold queue (user order, unbuilt)
+
+**The orders, verbatim (2026-08-04):** (1) "dieses pause-fenster kann auch
+genutzt werden um die analyse fortschreiten zu lassen und dann das end-audio,
+also das audio das danach weiter abgespielt wird/würde, noch auf fehler
+anpassen und korrigieren"; (2) "der modus muss das abspielen von sound so
+lange hinauszögern (nutze das zeitfenster weise), bis man tap to speak
+deaktiviert hat."
+
+**THE ARCHITECTURAL POINT, and it is not the obvious one.** These read like two
+playback conveniences. They are the same mechanism, and that mechanism is what
+makes SILENT REVISION possible at all.
+
+A chunk can be revised right up until it is committed to the audio clock --
+and committed does NOT mean heard. `schedule()` calls `source.start(cursor)`
+with a cursor that runs AHEAD of the playhead by the whole booked tail, so the
+moment a chunk is scheduled it is already unrevisable even though seconds of
+audio may still be in front of it. In eager mode the buffer between "arrived"
+and "scheduled" is therefore essentially EMPTY: there is nothing to correct
+silently, which is exactly why the guard needs the spoken "perdona, quería
+decir" prefix.
+
+Pause and hold-until-release do not merely delay audio. **They create the
+revision window** -- they move chunks from the clock into a queue where they
+are still text-shaped decisions rather than committed sound. That is the
+whole reason the two features belong to the guard and not to the UI.
+
+  eager (default)   arrive -> schedule immediately. Revision window ~0,
+                    corrections are audible and need the spoken prefix.
+  paused (button)   arrive -> hold. Everything unplayed is revisable; a
+                    correction inside the pause needs NO prefix, because
+                    nothing wrong was ever heard.
+  hold (mode)       arrive -> hold until tap-to-speak is released. The whole
+                    turn is revisable against the FINAL MT, and on release
+                    the corrected version plays at zero added latency,
+                    because synthesis ran eagerly the entire time.
+
+**ONE QUEUE, THREE TRIGGERS, and most of it already exists.** `keepAudio(turnId,
+samples, rate)` (`index.html:1074`) already buffers every chunk per turn -- it
+was built for the replay button, and it is the hold queue with a different
+consumer. `replay(entry)` already schedules a whole turn's chunks on demand.
+What is missing is a `held` flag consulted where `push()` decides to schedule,
+plus a per-turn drain on release. This must NOT become three implementations:
+the same predicate that answers "may this chunk go to the clock now" serves
+the pause button, the mode, and the §17.8.16 floor.
+
+**IT IS ALSO THE TURN-SCOPED ABORT TARGET.** `playback.live` is one flat list
+today, so `stopAll()` cuts every turn including one that should survive. The
+hold queue is per turn by construction, so building it is what makes "abort
+turn N, keep turn N+1" expressible -- the same structure, arrived at from the
+other side.
+
+**Revision is the server's half and belongs to #488.** The client can only
+replace chunks it has not scheduled; deciding that a re-synthesis is WARRANTED
+is the guard's job at its hook. The wire needs one addition: a chunk revision
+that names the turn and the unit index it supersedes, so the client can swap
+inside the queue rather than append.
+
+**Honest limit to state before it is built:** the hold mode wins its latency
+back only if synthesis really does run eagerly while the user is still
+speaking. Today the talker is BATCH and serialized behind `_turn_lock` -- the
+chunks the mode wants to buffer do not exist yet at release time. So this
+feature depends on the robustness cut narrowing that lock, and shipping it
+before then would produce a mode that waits for the user AND THEN waits for
+synthesis, which is worse than eager. Order matters here and it is not a
+preference.
