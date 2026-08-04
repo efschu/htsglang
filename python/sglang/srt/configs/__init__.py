@@ -33,6 +33,11 @@ from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
+from sglang.srt.configs.qwen3_tts import (
+    Qwen3TTSCodePredictorConfig,
+    Qwen3TTSConfig,
+    Qwen3TTSTalkerConfig,
+)
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
@@ -86,6 +91,9 @@ __all__ = [
     "MiniMaxM3VLConfig",
     "Step3p7Config",
     "Qwen3ASRConfig",
+    "Qwen3TTSConfig",
+    "Qwen3TTSTalkerConfig",
+    "Qwen3TTSCodePredictorConfig",
     "UnlimitedVLConfig",
     "ZayaConfig",
 ]
