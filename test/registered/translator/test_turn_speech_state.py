@@ -48,10 +48,10 @@ class InstantMt:
     def supported_languages(self):
         return ("a", "b")
 
-    async def translate(self, text, source, target):
+    async def translate(self, text, source, target, *, context=None):
         return THREE_SENTENCES
 
-    async def translate_stream(self, text, source, target):
+    async def translate_stream(self, text, source, target, *, context=None):
         # Word by word, as a streaming LLM arrives. Handing the accumulator
         # the whole string would close ONE unit and the FIFO assertion would
         # have nothing to order.

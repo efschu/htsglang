@@ -564,7 +564,19 @@ class TestIntraSegmentSpeakerSplit(unittest.IsolatedAsyncioTestCase):
 
 class TestQueueAndFailures(unittest.IsolatedAsyncioTestCase):
     async def test_queue_overrun_drops_the_oldest_turn(self):
-        session, _asr, _mt, _tts = make_session(max_queued_turns=1)
+        """The last-resort policy, with the bundler deliberately switched off.
+
+        Dropping is no longer what a backlog normally meets: waiting segments
+        are coalesced into one turn, so the overrun cannot be reached by
+        ordinary speech (see `test_coalesce_and_context.py`, which pins both
+        halves of that). The drop still has to work, because a bundle that is
+        full or a segment at a different sample rate cannot be folded -- and
+        because this is the behaviour every deployment before the bundler
+        had. Turning the bundler off is how the arm reaches it.
+        """
+        session, _asr, _mt, _tts = make_session(
+            max_queued_turns=1, coalesce_queued=False
+        )
         audio = conversation_audio(
             (VOICE_A_HZ, 1.0), (VOICE_B_HZ, 1.0), (VOICE_A_HZ, 1.0)
         )

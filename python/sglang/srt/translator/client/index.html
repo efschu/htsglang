@@ -724,6 +724,12 @@ class Playback {
     //: The turn whose audio is currently on the clock, so a stop can say on
     //: WHICH bubble it happened rather than only in the header.
     this.currentTurn = null;
+    //: The last turn whose FIRST buffer was ramped, and how often that has
+    //: happened. The re-anchor counter cannot stand in for this: a turn that
+    //: starts while the previous turn is still playing out never re-anchors,
+    //: and that is precisely the seam the user still hears.
+    this.rampedTurn = null;
+    this.turnStarts = 0;
   }
 
   /** Create and START the output context. MUST be called on a user gesture.
@@ -907,8 +913,21 @@ class Playback {
       // and "playback started" sound alike in a log and are not the same
       // event.
       const reanchor = this.cursor < now + 0.02;
-      if (reanchor) {
-        this.reanchors += 1;
+      // A TURN START is the other seam, and it is the one the user kept
+      // reporting after the re-anchor ramp shipped (§17.8.21 open item 2).
+      // The two are independent: the clock draining mid-turn is a re-anchor
+      // and is already covered, but a new turn that begins while the previous
+      // turn's tail is still scheduled joins the timeline with no gap at all
+      // -- so no re-anchor fires, and the first sample of a freshly
+      // synthesized waveform lands directly against the last sample of a
+      // different one. That step is a click and nothing was fading it.
+      const turnStart = this.currentTurn != null
+        && this.currentTurn !== this.rampedTurn;
+      if (turnStart) {
+        this.turnStarts += 1;
+        this.rampedTurn = this.currentTurn;
+      }
+      if (reanchor || turnStart) {
         // The first ~50 ms AS RENDERED, not as received: this is what the
         // browser is about to play, after the resampler. Peak and RMS
         // separate a full-scale step (a click) from a normal soft onset, and
@@ -926,6 +945,14 @@ class Playback {
         this.onset = {
           at: Math.round(now * 1000) / 1000,
           seam: this.scheduled > 0,
+          // WHICH seam this was, because the fix differs. A `turn_start`
+          // capture whose peak and head show a step is evidence the SYNTHESIS
+          // begins hot, which the client can only fade and the talker should
+          // not have emitted; a `reanchor` capture is the output clock, which
+          // is entirely the client's own.
+          reanchor: reanchor,
+          turn_start: turnStart,
+          turn_id: this.currentTurn,
           samples: window,
           peak: Math.round(peak * 1000) / 1000,
           rms: Math.round(Math.sqrt(window ? sum / window : 0) * 1000) / 1000,
@@ -937,6 +964,14 @@ class Playback {
         };
         this.onsets.push(this.onset);
         while (this.onsets.length > 8) this.onsets.shift();
+      }
+      // Only a re-anchor moves the cursor. A turn start that arrives while
+      // the previous turn is still scheduled must keep its place in the
+      // queue: re-anchoring it to `now + 0.05` would drop it ON TOP of audio
+      // that has not played yet, which is two voices at once -- a far worse
+      // defect than the click this whole block exists to remove.
+      if (reanchor) {
+        this.reanchors += 1;
         this.cursor = now + 0.05;
       }
       // ONSET RAMP (user report: "das knacken ist meist ganz am anfang des
@@ -946,11 +981,18 @@ class Playback {
       // that was fixed in §17.8.13, but at the START of a run rather than at
       // every seam, which is exactly where the user still hears it. A short
       // cosine-shaped ramp removes the step; 8 ms is below the ~20 ms where a
-      // fade becomes audible as a soft attack, and it is applied ONLY at a
-      // re-anchor, so continuous speech is untouched and no word is softened
-      // in the middle. `setValueCurveAtTime` gives the cosine shape; a linear
-      // ramp would leave a corner in the first derivative.
-      if (reanchor && ONSET_RAMP_S > 0) {
+      // fade becomes audible as a soft attack, and it is applied ONLY at the
+      // two seams -- a re-anchor and the first buffer of a turn -- so
+      // continuous speech is untouched and no word is softened in the middle.
+      // `setValueCurveAtTime` gives the cosine shape; a linear ramp would
+      // leave a corner in the first derivative.
+      //
+      // Shipping the re-anchor half alone did NOT stop the report ("das
+      // knacken ist meist ganz am anfang des gesprochenen" persisted), and
+      // the reason is structural rather than a tuning miss: a re-anchor only
+      // happens when the clock has already drained, and a turn that follows
+      // closely on the previous one never drains it.
+      if ((reanchor || turnStart) && ONSET_RAMP_S > 0) {
         const gain = ctx.createGain();
         const steps = 32;
         const curve = new Float32Array(steps);
@@ -1043,6 +1085,7 @@ class Playback {
       blocked: this.blocked,
       held_while_hidden: this.heldWhileHidden,
       reanchors: this.reanchors,
+      turn_starts: this.turnStarts,
       ramps: this.ramps,
       ramp_skipped: this.rampSkipped,
       onsets: this.onsets.slice(-4),

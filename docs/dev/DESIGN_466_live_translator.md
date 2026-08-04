@@ -4453,3 +4453,151 @@ field, because `assign_manual` returns before `_record_decision` is reached
 with it. The collector therefore reports "0 of 7 decisions with a pin held"
 for a session where the pin decided nearly everything. Believe `outcome:
 manual`, not the `pin` column, until that is fixed.
+
+#### 17.8.22 The backlog becomes context, and the second onset seam (ninth session)
+
+**FIRST, A LOSS, RECORDED HONESTLY.** The container rebooted between sessions
+and `/tmp` was wiped. `/tmp/family_raw.json` -- the raw harvest of the only
+ground-truth speaker session this project has ever had -- is **gone and
+unrecoverable**. The tenant restarted too, so the in-memory decision log that
+produced it went with it; `speaker-decisions` is served from session state,
+not from disk, so there is no second copy anywhere. What survives is what
+§17.8.21 wrote down: the six within/between scores, the child's `es` at
+confidence 1.000 on 0.88 s, the line-6 discard, and the 193.36 s
+`tts_first_audio` outlier. Those are enough to keep every decision that was
+taken on them, and not enough to re-derive anything new. n=3 per class cannot
+be recovered by re-reading; it can only be re-collected.
+`scripts/translator/collect_family_session.py` is still the instrument, and
+the next live session is the only way back to raw data.
+
+**THE OVER-FRAGMENTATION FIX IS AT ENQUEUE, NOT AT DRAIN, and that placement
+is the whole design.** The queue holds `Segment`s -- raw audio, before ASR --
+so at queue time there is no text, no speaker and no language to group by.
+Coalescing there looked impossible until the ordering was checked:
+`_split_at_speaker_changes` runs BEFORE recognition and cuts on embedding
+dispersion over fixed windows. So a bundle is not a bet that both halves came
+from one person; it is handed to a splitter that will separate them if they
+did not. Better than that, the splitter is GATED on
+`speaker_change_min_segment_s`: two 2 s pieces each sit under the gate and are
+waved through whole, while one 4 s bundle is examined. **Merging increases
+diarization scrutiny rather than risking it**, which is the opposite of the
+intuition that delayed this fix.
+
+`enqueue` now folds a new segment into the queue TAIL whenever something is
+already waiting (`_coalesce_into_tail`, session.py). The turn currently
+RUNNING is not in the queue and is never touched, so this cannot delay speech
+already on its way out -- it is exactly the "front item eager-small, bundle
+everything waiting" rule from §17.8.21, with "the front item" being the turn
+in flight. When the pipeline keeps up the queue is empty at every enqueue and
+the code path is inert, which is why the default is on.
+
+Two properties fell out that were not the goal:
+
+  * **The overrun drop stopped firing.** The old queue answered
+    `max_queued_turns` (2) by discarding the OLDEST waiting segment -- a whole
+    utterance, silently, precisely when the pipeline was already behind. Six
+    rapid segments used to cost four dropped turns; they now cost zero and
+    produce one bundle. The drop still exists for what cannot be folded (a
+    full bundle, a sample-rate mismatch) and `test_session.py` pins it with
+    the bundler explicitly off.
+  * A cap is mandatory, not decorative: `coalesce_max_s = 30 s`, so a long
+    backlog cannot grow one ASR call into `asr_timeout_s`.
+
+**THE MT CONTEXT WAS ALREADY THERE, AND IT WAS A LEAK.** The handover asked
+for a context prefix. `MtConfig.history_turns = 6` had been building one since
+the beginning -- on the `OpenAiMt` INSTANCE, which `launch.py` constructs once
+per process and hands to every session. So the last six turns of one
+conversation were prepended to the prompt of every other conversation on the
+box, in both directions, with no speaker or language tag, and only
+`sorted(translations)[0]` was ever recorded. Two conversations at once is a
+supported configuration; this made them read each other's sentences.
+
+The history is now owned by `TranslatorSession`, keyed by `(source, target)`,
+and passed to the backend per call (`translate_stream(..., context=...)`).
+`OpenAiMt` keeps no state at all, which is asserted structurally in the test
+because the failure mode is a field that quietly comes back. Keying by
+direction also retires the old one-target compromise: every target now feeds
+its own context instead of one of them feeding a shared deque. The prefix is
+replayed as real user/assistant pairs, byte-identical from call to call, so
+the radix cache on our own server serves all but the newest pair.
+
+**THE ONSET RAMP HAD A SECOND SEAM, which is why shipping the first half did
+not stop the report.** The ramp fired at a cursor re-anchor -- the output
+clock having drained. A turn that begins while the previous turn's tail is
+still scheduled never drains the clock, so no re-anchor fires, and the first
+sample of a freshly synthesized waveform is joined directly to the last sample
+of a different one. That step is a click and nothing was fading it. The client
+now ramps at either seam, tracking `rampedTurn` against `currentTurn`, and
+only a re-anchor still moves the cursor: re-anchoring a turn start would drop
+it on top of audio that has not played yet, which is two voices at once.
+
+`scripts/translator/probe_onset_ramp.py` grew the arms that make this
+falsifiable, all five green on the deployed client:
+
+```
+  (baseline)          ramps 1  reanchors 1  turn_starts 0
+  --turns             ramps 3  reanchors 1  turn_starts 3   <- pre-fix: 1
+  --same-turn         ramps 1  reanchors 1  turn_starts 1   <- no mid-word fading
+  --turns --sabotage  ramps 0  reanchors 1  turn_starts 3
+  --sabotage          ramps 0  reanchors 1  turn_starts 0
+```
+
+`--turns` is the arm that matters: three turns pushed back-to-back so the
+clock never drains, reaching three ramps against one re-anchor. The pre-fix
+client scores 1 there by construction. `--same-turn` is its control -- if it
+ever reached 3 the fix would be fading every buffer mid-word.
+
+**STILL NOT PROVEN, and it is the same honest gap as last time:** that the
+click is audibly gone. The gain node sits after the buffer, so the onset
+capture cannot see it. What IS new is the evidence path for the other half of
+the question: onset records now carry `reanchor`, `turn_start` and `turn_id`,
+so a debug upload from the phone will say whether a hot onset is the client's
+clock or a synthesis that begins with a transient. A `turn_start` capture with
+a step in `head` is the case for a server-side 10 ms fade, and it should be
+read before anyone writes one.
+
+**TESTS.** Hermetic suite **538 passed** (520 at handover, +18 new in
+`test/registered/translator/test_coalesce_and_context.py`), `CUDA_VISIBLE_DEVICES=99`,
+ruff and codespell clean. Both new mechanisms carry a sabotage proof: with
+`_coalesce_into_tail` forced to refuse and `_context_for` forced to return
+empty, 5 of the new arms fail. Two pre-existing tests were UPDATED rather than
+accommodated, because the feature deliberately changes what they asserted --
+`test_queue_overrun_drops_the_oldest_turn` now reaches the drop with the
+bundler off, and `test_a_turn_with_newer_speech_behind_it_does_not_retry`
+needs two separate turns, which is the exact thing the bundler removes.
+
+**DEPLOYMENT SPLIT, and it matters for who sees what.** The client is served
+from this worktree, so the onset-ramp fix is LIVE on the next page load. The
+coalescing and the MT context are server-side and need a tenant restart; the
+tenant (PID 3175, pinned to the 5090, `--enable-metrics`) was left running
+because the user may test at any moment. Nothing in the client change depends
+on the new server: it is local playback scheduling and touches no protocol
+field, so the new page is correct against the old server.
+
+**SIDE ITEM CLEARED.** `wireguard_server_setup.sh` ended its instructions with
+`python -m sglang.srt.translator.launch --host ... --port 30800`, which reads
+as a launch line and is not one -- a translator started that way answers
+`/health` and then fails every turn, because it has no ASR, no talker, no
+embedder and no MT endpoint. Replaced with the canonical launch as actually
+run, and with the two flags whose absence has already cost sessions spelled
+out: `--card-uuid` (NVML and torch disagree on ordering, and the index moves
+between boots) and `--enable-metrics` (without it `/metrics` is empty and
+every latency gate reads 404).
+
+**OPEN, IN ORDER, unchanged from §17.8.21 except for what this session
+closed:**
+
+  1. Lock split (pipeline vs talker device) and the watchdog tick -- the rest
+     of the robustness cut, and what the playback modes depend on.
+  2. The child short-segment rule: under a held pin with a consistent language
+     history, a segment under ~1.5 s must not flip the direction on its own.
+     A confidence gate cannot reach it -- the hallucination came at 1.000.
+  3. The polluted voice reference (the -0.013 segment sits in a clone prompt
+     because a manual attribution admits) and the `assign_manual` pin-field
+     fix, which returns before `_record_decision` and makes the collector
+     report "0 of 7 decisions with a pin held".
+  4. Playback modes (§17.8.19), the shadow arbiter and its double display
+     (§17.8.17), per-message speaker change plus a re-synthesis button, live
+     partial transcripts.
+  5. More ground-truth samples. The raw ones from the family session are gone;
+     the conclusions drawn from them stand and must not be re-derived.

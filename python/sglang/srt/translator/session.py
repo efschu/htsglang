@@ -189,6 +189,12 @@ class EventKind(str, enum.Enum):
     #: A name the LLM heard, waiting for the user to confirm it (§17.3).
     #: Never applied automatically -- the event IS the chip.
     SPEAKER_SUGGESTION = "speaker.suggestion"
+    #: Two queued segments became one bundle because the pipeline was behind
+    #: (§17.8.21 item 3). Journalled rather than only counted: when a turn's
+    #: transcript spans what the speaker experienced as two sentences, this is
+    #: the event that says why, and it is the only record that the pieces were
+    #: ever separate.
+    TURN_COALESCED = "turn.coalesced"
     ERROR = "error"
 
 
@@ -447,6 +453,33 @@ class TranslatorSession:
         #: The backlog after the last unit was queued. Generous: it may hold
         #: several units, and it is bounded by them rather than by one call.
         tts_drain_timeout_s: float = 300.0,
+        # OVER-FRAGMENTATION (§17.8.21 open item 3; user: "the pipeline chops
+        # everything into pieces even where context exists").
+        #
+        # THE SIGNAL IS THE BACKLOG, and that is the whole idea. A segment
+        # that is WAITING has already lost the latency argument -- it cannot
+        # be spoken until the turn ahead of it finishes -- so cutting it into
+        # its own turn buys nothing and costs everything: its own ASR call
+        # with no left context, its own MT call with no sentence around it,
+        # and its own synthesis call whose prosody restarts mid-thought. The
+        # turn that is RUNNING stays eager-small and is never touched; only
+        # what queues up behind it is bundled.
+        #
+        # Merging is safe against the two-speakers case rather than exposed to
+        # it: `_split_at_speaker_changes` runs BEFORE recognition and cuts on
+        # embedding dispersion across fixed windows, and it is gated on
+        # `speaker_change_min_segment_s`. A longer segment therefore gets MORE
+        # diarization scrutiny than the pieces would have got separately --
+        # each piece alone may sit under the gate and be waved through whole.
+        coalesce_queued: bool = True,
+        #: Cap on one bundle. Beyond this a new bundle starts instead, so a
+        #: long backlog cannot grow a single ASR call without bound and walk
+        #: into `asr_timeout_s`. 30 s is the window Whisper decodes natively
+        #: and two of the segmenter's own 15 s ceilings.
+        coalesce_max_s: float = 30.0,
+        #: How many previous turns are handed to MT as conversation context,
+        #: per session and per direction. 0 disables it.
+        mt_context_turns: int = 6,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # DEGRADE, do not refuse (§17.8.14). This used to be
@@ -592,6 +625,24 @@ class TranslatorSession:
         self._clock = clock
         self._queue: Deque[Segment] = deque()
         self._max_queued = max(1, max_queued_turns)
+        self.coalesce_queued = coalesce_queued
+        self.coalesce_max_s = coalesce_max_s
+        #: Segments folded into a waiting bundle instead of becoming their own
+        #: turn. Counted because "the pipeline stopped chopping" is otherwise
+        #: only observable as an absence.
+        self.segments_coalesced = 0
+        # MT CONTEXT, owned HERE and not by the backend (§17.8.21 item 3).
+        #
+        # It used to live on the `OpenAiMt` instance, which `launch.py`
+        # constructs ONCE per process and hands to every session -- so the
+        # last six turns of one conversation were prepended to the prompt of
+        # every other conversation on the box, in every direction, with no
+        # speaker or language tag on any of them. That is a wrong-context bug
+        # and a cross-session leak in the same deque. Context is per session
+        # and per DIRECTION because a de->es history is not usable context for
+        # an es->de call: the roles of the two languages are swapped.
+        self.mt_context_turns = max(0, mt_context_turns)
+        self._mt_context: Dict[Tuple[str, str], Deque[Tuple[str, str]]] = {}
         self._turn_lock = asyncio.Lock()
         #: The turn currently being translated/synthesized, or None. Kept so a
         #: stop can NAME what it abandoned; the client discards audio per
@@ -741,7 +792,13 @@ class TranslatorSession:
                 # One speaker at a time: a segment spoken over a running turn
                 # in the other participant language is dropped, not queued.
                 "overlap_discard": bool(self.overlap_discard),
+                # Segments waiting behind a running turn are bundled instead
+                # of each becoming its own turn, and MT sees the last N turns
+                # of THIS session in THIS direction.
+                "coalesce_queued": bool(self.coalesce_queued),
+                "mt_context_turns": int(self.mt_context_turns),
             },
+            "segments_coalesced": self.segments_coalesced,
         }
 
     # -- the written record (§17.2) -----------------------------------------
@@ -1219,8 +1276,73 @@ class TranslatorSession:
         self.touch()
         return self.segmenter.flush(SegmentReason.RELEASED)
 
+    def _coalesce_into_tail(self, segment: Segment) -> bool:
+        """Fold a segment into the bundle already waiting. True if folded.
+
+        Only ever touches the TAIL of the queue, and only when something is
+        already waiting there -- which is precisely the condition "the
+        pipeline is behind". The turn currently running is not in the queue
+        and is never affected, so this cannot delay speech that is already on
+        its way out; it can only stop speech that is stuck behind it from
+        being cut into needlessly small turns.
+
+        The pause between the two utterances is preserved rather than glued
+        over: the segmenter closes on `hangover_ms` of silence and opens on
+        `pre_roll_ms`, so both pieces already carry their own margins and a
+        plain concatenation keeps a real pause at the seam. That matters twice
+        -- the recognizer needs it to punctuate, and the speaker-change
+        splitter needs it as a window boundary it can cut on.
+        """
+        if not self.coalesce_queued or not self._queue:
+            return False
+        tail = self._queue[-1]
+        if tail.audio.sample_rate != segment.audio.sample_rate:
+            # Resampling here would hide a wire/pipeline rate disagreement
+            # that the caller needs to see as its own turn.
+            return False
+        if tail.duration_s + segment.duration_s > self.coalesce_max_s:
+            return False
+        merged = dataclasses.replace(
+            tail,
+            audio=tail.audio.concat(segment.audio),
+            # The bundle keeps the IDENTITY of its oldest member: `index` and
+            # `start_s` order the transcript and resume the client, and the
+            # bundle occupies the position the first segment claimed. The
+            # barge-in stamps are the tail's for the same reason -- they
+            # record what was running when the bundle STARTED waiting.
+            reason=segment.reason,
+        )
+        self._queue[-1] = merged
+        self.segments_coalesced += 1
+        self.journal.append(
+            EventKind.TURN_COALESCED,
+            {
+                "segment_index": segment.index,
+                "into_index": tail.index,
+                "duration_s": round(merged.duration_s, 2),
+                "queued": len(self._queue),
+            },
+        )
+        logger.info(
+            "session %s coalesced segment %d into waiting segment %d "
+            "(%.2f s bundled)",
+            self.session_id, segment.index, tail.index, merged.duration_s,
+        )
+        return True
+
     def enqueue(self, segment: Segment) -> bool:
         """Queue a segment for translation. False if it was dropped."""
+        # Stamp barge-in context BEFORE the merge attempt: a folded segment
+        # keeps the bundle's stamps, and this call is what makes the
+        # unfoldable case (rate mismatch, bundle full) identical to the old
+        # path rather than subtly different.
+        segment = dataclasses.replace(
+            segment,
+            overlapped_turn_id=self._active_turn_id,
+            overlapped_language=self._active_source,
+        )
+        if self._coalesce_into_tail(segment):
+            return True
         while len(self._queue) >= self._max_queued:
             stale = self._queue.popleft()
             self.turns_dropped += 1
@@ -1232,16 +1354,12 @@ class TranslatorSession:
                     "queued": len(self._queue),
                 },
             )
-        # Stamp the barge-in relation HERE. This is the only moment that knows
-        # whether a turn was already running when this audio closed; by the
-        # time the segment is dequeued that turn may be long finished. The
-        # LANGUAGE half of the decision cannot be made yet -- it needs
-        # recognition -- so the two halves are taken where each is available.
-        segment = dataclasses.replace(
-            segment,
-            overlapped_turn_id=self._active_turn_id,
-            overlapped_language=self._active_source,
-        )
+        # The barge-in relation was stamped at the top of this method. That is
+        # the only moment that knows whether a turn was already running when
+        # this audio closed; by the time the segment is dequeued that turn may
+        # be long finished. The LANGUAGE half of the decision cannot be made
+        # yet -- it needs recognition -- so the two halves are taken where
+        # each is available.
         self._queue.append(segment)
         return True
 
@@ -1711,13 +1829,15 @@ class TranslatorSession:
             if updated is not None:
                 self._emit_line(updated, update=True)
 
-            # Only the first target feeds the MT history: a multi-target fan-out
-            # would otherwise stack N assistant turns per user turn and skew the
-            # context window towards whichever language happened to sort first.
-            first_target = sorted(translations)[0]
-            remember = getattr(self.mt, "remember", None)
-            if callable(remember):
-                remember(transcript.text, translations[first_target])
+            # EVERY target feeds its OWN context now. The old code fed only
+            # `sorted(translations)[0]` into one shared deque, because that
+            # deque could not tell directions apart -- with two targets it
+            # would otherwise have stacked N assistant turns per user turn in
+            # whichever language happened to sort first. Keyed by direction,
+            # that compromise is unnecessary: each direction gets exactly its
+            # own turns and none of the other's.
+            for tgt, translated in translations.items():
+                self._remember_context(source, tgt, transcript.text, translated)
 
         self.turns_completed += 1
         await self._suggest_names(
@@ -2225,6 +2345,32 @@ class TranslatorSession:
             self.session_id, floor, transcript.language, transcript.text[:80],
         )
 
+    def _context_for(self, source: str, target: str) -> List[Tuple[str, str]]:
+        """The last N (source, target) pairs of THIS session, THIS direction.
+
+        Handed to the backend on every call rather than accumulated inside it,
+        so the prompt a session builds depends on that session alone. The
+        growing prefix is close to free against our own server: the turns are
+        replayed in the same order every time, so the radix cache matches all
+        but the newest pair, and the win is terminology and pronoun agreement
+        holding across turns instead of being re-guessed per utterance.
+        """
+        history = self._mt_context.get((source, target))
+        return list(history) if history else []
+
+    def _remember_context(
+        self, source: str, target: str, source_text: str, target_text: str
+    ) -> None:
+        if self.mt_context_turns <= 0:
+            return
+        if not source_text.strip() or not target_text.strip():
+            return
+        history = self._mt_context.get((source, target))
+        if history is None:
+            history = deque(maxlen=self.mt_context_turns)
+            self._mt_context[(source, target)] = history
+        history.append((source_text, target_text))
+
     def _mt_deltas(
         self,
         text: str,
@@ -2240,7 +2386,9 @@ class TranslatorSession:
         MT error into a silently empty translation.
         """
         if pretranslated is None:
-            return self.mt.translate_stream(text, source, target)
+            return self.mt.translate_stream(
+                text, source, target, context=self._context_for(source, target)
+            )
 
         async def once():
             yield pretranslated

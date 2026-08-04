@@ -239,17 +239,33 @@ class MtBackend(Protocol):
         """Languages, or ``None`` for an explicit unconstrained claim."""
 
     async def translate(
-        self, text: str, source: str, target: str
+        self,
+        text: str,
+        source: str,
+        target: str,
+        *,
+        context: Optional[Sequence[Tuple[str, str]]] = None,
     ) -> str: ...
 
     async def translate_stream(
-        self, text: str, source: str, target: str
+        self,
+        text: str,
+        source: str,
+        target: str,
+        *,
+        context: Optional[Sequence[Tuple[str, str]]] = None,
     ) -> AsyncIterator[str]:
         """Yield translated text incrementally, so TTS can start early.
 
         Implementations yield whatever the transport gives them; the caller
         (``session.py``) is responsible for regrouping into synthesizable
         units. Yielding once with the whole string is a valid implementation.
+
+        ``context`` is the conversation so far in THIS direction, oldest
+        first, as ``(source_text, target_text)`` pairs. It is passed per call
+        and never accumulated by the backend: one backend instance serves
+        every session in the process, so state kept here would be one
+        conversation's words leaking into another's prompt.
         """
         ...
 
@@ -413,20 +429,36 @@ class FakeMt:
         self._chunk_size = chunk_size
         self._fail_on = fail_on
         self.calls: List[Tuple[str, str, str]] = []
+        self.contexts: List[List[Tuple[str, str]]] = []
 
     def supported_languages(self) -> Optional[Iterable[str]]:
         return None if self._languages is None else tuple(self._languages)
 
-    async def translate(self, text: str, source: str, target: str) -> str:
+    async def translate(
+        self,
+        text: str,
+        source: str,
+        target: str,
+        *,
+        context: Optional[Sequence[Tuple[str, str]]] = None,
+    ) -> str:
         self.calls.append((text, source, target))
+        # Recorded so a test can assert what the SESSION built, which is the
+        # only place the per-direction context is decided.
+        self.contexts.append(list(context or ()))
         if self._fail_on is not None and self._fail_on in text:
             raise BackendError("mt", f"scripted failure on {self._fail_on!r}")
         return f"[{source}>{target}] {text}"
 
     async def translate_stream(
-        self, text: str, source: str, target: str
+        self,
+        text: str,
+        source: str,
+        target: str,
+        *,
+        context: Optional[Sequence[Tuple[str, str]]] = None,
     ) -> AsyncIterator[str]:
-        whole = await self.translate(text, source, target)
+        whole = await self.translate(text, source, target, context=context)
         if self._chunk_size <= 0:
             yield whole
             return

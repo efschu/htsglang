@@ -51,10 +51,10 @@ class InstantMt:
     def supported_languages(self):
         return self._languages
 
-    async def translate(self, text, source, target):
+    async def translate(self, text, source, target, *, context=None):
         return THREE_SENTENCES
 
-    async def translate_stream(self, text, source, target):
+    async def translate_stream(self, text, source, target, *, context=None):
         # Word by word, the way a real streaming LLM arrives: the accumulator
         # only closes a unit when it sees a sentence end, so handing it the
         # whole string at once would produce ONE unit and the test could not

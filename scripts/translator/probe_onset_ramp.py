@@ -1,19 +1,37 @@
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0
-"""The onset ramp binds at the start of a run, and nowhere else.
+"""The onset ramp binds at both seams, and nowhere else.
 
 User report: "das knacken ist meist ganz am anfang des gesprochenen, danach
 ist es meist knackfrei". A buffer that starts at a non-zero sample is a step
 from silence, and a step is a click. The fix is an 8 ms cosine fade applied
-only where a run STARTS -- at a cursor re-anchor -- so continuous speech is
-untouched and no word is softened mid-sentence.
+only where a run STARTS, so continuous speech is untouched and no word is
+softened mid-sentence.
 
-WHAT THIS ARM PROVES: that the ramp is applied exactly once for three pushes
-that form one run, that the two continuous pushes are NOT ramped, and that no
-curve was refused as scheduled-in-the-past. `--sabotage` sets the ramp length
-to 0, reproducing the pre-fix client: `ramps` must then stay 0 while
-`reanchors` still counts 1, which is what shows the arm is reading the ramp
-and not the re-anchor.
+THERE ARE TWO SEAMS, and shipping only the first did not stop the report.
+
+  * a CURSOR RE-ANCHOR -- the output clock drained and this buffer starts a
+    new run. Covered since the seventh session.
+  * a TURN START -- the first buffer of a new turn. A turn that begins while
+    the previous turn's tail is still scheduled never drains the clock, so no
+    re-anchor fires, and a freshly synthesized waveform is joined directly to
+    the last sample of a different one. That is the seam the user kept
+    hearing, and `--turns` is the arm for it.
+
+ARMS:
+
+  (none)        three pushes, one run, no turn identity: `ramps` == 1.
+  --turns       three pushes, three DIFFERENT turns, pushed back-to-back so
+                the clock never drains: `reanchors` stays 1 while
+                `turn_starts` and `ramps` reach 3. The pre-fix client scores
+                1 here, which is what makes this arm falsifiable.
+  --same-turn   THE CONTROL for `--turns`: the same three pushes under ONE
+                turn id must still ramp once. If this reached 3 the fix would
+                be fading every buffer mid-word.
+  --sabotage    sets the ramp length to 0, reproducing the pre-fix client:
+                `ramps` must stay 0 while `reanchors` and `turn_starts` still
+                count, which is what shows the arm reads the RAMP and not the
+                seam. Combines with the arms above.
 
 WHAT IT DOES NOT PROVE: that the click is audibly gone. The gain node sits
 AFTER the buffer, so the onset capture -- which samples the buffer -- cannot
@@ -32,17 +50,27 @@ from pathlib import Path
 CLIENT = Path("/spinning/wt-466-translator/python/sglang/srt/translator/client/index.html")
 STUB = """(() => { class D { constructor(){this.readyState=0;} send(){} close(){} addEventListener(){} }
 window.WebSocket = D; window.fetch = () => Promise.resolve(new Response("{}", {status:200, headers:{"content-type":"application/json"}})); })();"""
-PUSH = """(n) => { const rate=16000; const b=new Float32Array(Math.round(rate*0.3));
+# `turns` selects the turn identity per push: null (no identity, the original
+# arm), "one" (all three under one turn), or a distinct id per push. The
+# pushes are back-to-back on purpose -- 0.3 s of audio each against a clock
+# that advances microseconds -- so the cursor stays ahead and only the FIRST
+# push can ever re-anchor. Anything the later two ramp is a turn seam.
+PUSH = """([n, turns]) => { const rate=16000; const b=new Float32Array(Math.round(rate*0.3));
   for (let i=0;i<b.length;i++) b[i]=0.5;   // a hard step from silence: the click shape
-  for (let k=0;k<n;k++) playback.push(b, rate);
-  return {ramps: playback.ramps, reanchors: playback.reanchors, scheduled: playback.scheduled, skipped: playback.rampSkipped}; }"""
+  for (let k=0;k<n;k++) {
+    if (turns === "each") playback.currentTurn = "turn-" + k;
+    else if (turns === "one") playback.currentTurn = "turn-only";
+    playback.push(b, rate);
+  }
+  return {ramps: playback.ramps, reanchors: playback.reanchors, turn_starts: playback.turnStarts,
+          scheduled: playback.scheduled, skipped: playback.rampSkipped}; }"""
 def serve(d):
     h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(d))
     h.log_message = lambda *a, **k: None
     srv = socketserver.TCPServer(("127.0.0.1", 0), h)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1]
-async def main(sabotage):
+async def main(sabotage, turns):
     from playwright.async_api import async_playwright
     st = Path(tempfile.mkdtemp())
     shutil.copy(CLIENT, st / "index.html")
@@ -65,13 +93,22 @@ async def main(sabotage):
         if sabotage:
             await pg.evaluate("() => { ONSET_RAMP_S = 0; }")
             print("[probe] SABOTAGE: ramp length 0 (the pre-fix client)")
-        r = await pg.evaluate(PUSH, 3)
-        print("[probe] after 3 pushes:", r, "errors", errs)
+        r = await pg.evaluate(PUSH, [3, turns])
+        print(f"[probe] after 3 pushes (turns={turns}):", r, "errors", errs)
         await br.close()
     httpd.shutdown()
     shutil.rmtree(st, ignore_errors=True)
-    ok = (r["ramps"] == 0) if sabotage else (r["ramps"] >= 1)
+    # One re-anchor in every arm: the clock is cold at the first push and
+    # never drains afterwards. If this moves, the arm stopped isolating the
+    # turn seam and its ramp count means nothing.
+    expected_ramps = {None: 1, "one": 1, "each": 3}[turns]
+    expected_starts = {None: 0, "one": 1, "each": 3}[turns]
+    ok = (r["ramps"] == 0) if sabotage else (r["ramps"] == expected_ramps)
+    ok = ok and r["reanchors"] == 1 and r["turn_starts"] == expected_starts
     ok = ok and r["scheduled"] >= 3 and not errs and r["skipped"] == 0
+    print(f"[probe] expected ramps {0 if sabotage else expected_ramps}, "
+          f"turn_starts {expected_starts}")
     print("[probe]", "PASS" if ok else "FAIL")
     return 0 if ok else 1
-sys.exit(asyncio.run(main("--sabotage" in sys.argv)))
+_turns = "each" if "--turns" in sys.argv else ("one" if "--same-turn" in sys.argv else None)
+sys.exit(asyncio.run(main("--sabotage" in sys.argv, _turns)))
