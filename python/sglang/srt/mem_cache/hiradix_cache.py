@@ -786,6 +786,67 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    def storage_capacity_stats(self) -> Optional[dict]:
+        """Capacity limits and on-disk usage of the attached backend, if any."""
+        if not self.enable_storage:
+            return None
+        backend = self.cache_controller.storage_backend
+        if backend is None or not hasattr(backend, "capacity_stats"):
+            return None
+        try:
+            return backend.capacity_stats()
+        except Exception:
+            logger.exception("Failed to read HiCache storage capacity stats.")
+            return None
+
+    def resize_storage_backend(
+        self,
+        max_size_bytes: Optional[int] = None,
+        min_free_bytes: Optional[int] = None,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """Re-cap the attached storage backend without detaching it.
+
+        Growing takes effect immediately for subsequent writes. Shrinking
+        evicts LRU victims inline before returning, so the call blocks for as
+        long as the unlinks take; see ``LRUFileEvictor.set_limits`` for the
+        exact post-shrink target and the in-flight-write carve-out.
+
+        Unlike attach/detach this does not start or stop any thread and does
+        not touch the device or host tiers, so it does not require an idle
+        scheduler -- the evictor's own lock serializes it against the backup
+        and prefetch threads.
+        """
+        if not self.enable_storage:
+            return False, "HiCache storage backend is not enabled.", None
+
+        backend = self.cache_controller.storage_backend
+        if backend is None:
+            return False, "No HiCache storage backend is attached.", None
+
+        if not hasattr(backend, "resize"):
+            return (
+                False,
+                f"Storage backend {type(backend).__name__} does not support resize.",
+                None,
+            )
+
+        try:
+            stats = backend.resize(
+                max_size_bytes=max_size_bytes, min_free_bytes=min_free_bytes
+            )
+        except Exception as e:
+            logger.exception("Failed to resize HiCache storage backend.")
+            return False, f"Failed to resize HiCache storage backend: {e}", None
+
+        if stats is None:
+            return (
+                False,
+                f"Storage backend {type(backend).__name__} has no resizable "
+                f"capacity accounting.",
+                None,
+            )
+        return True, "Resized HiCache storage backend successfully.", stats
+
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed

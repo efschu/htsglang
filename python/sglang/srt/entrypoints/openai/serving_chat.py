@@ -157,6 +157,28 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     return img_max_dynamic_patch, vid_max_dynamic_patch
 
 
+def merge_chat_template_kwargs(
+    defaults: Dict[str, Any],
+    reasoning_effort: Optional[str],
+    request_kwargs: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Resolve the chat-template kwargs for one request.
+
+    Precedence, lowest to highest: the server-wide defaults from
+    ``--chat-template-default-kwargs``, the request's ``reasoning_effort``,
+    then the request's own ``chat_template_kwargs``. Per-request values win key
+    by key, so a serving default never silently overrides an explicit client
+    choice -- including the reasoning toggle the Anthropic front injects via
+    ``apply_reasoning_enabled``.
+    """
+    merged = dict(defaults)
+    if reasoning_effort is not None:
+        merged["reasoning_effort"] = reasoning_effort
+    if request_kwargs:
+        merged.update(request_kwargs)
+    return merged
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -186,6 +208,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     self.reasoning_parser,
                     e,
                 )
+
+        # Server-wide chat_template_kwargs defaults, decoded once. Validated in
+        # ServerArgs._handle_chat_template_default_kwargs, so json.loads is safe here.
+        raw_default_template_kwargs = getattr(
+            self.tokenizer_manager.server_args, "chat_template_default_kwargs", None
+        )
+        self.default_chat_template_kwargs: Dict[str, Any] = (
+            json.loads(raw_default_template_kwargs)
+            if isinstance(raw_default_template_kwargs, str)
+            and raw_default_template_kwargs
+            else {}
+        )
+        if self.default_chat_template_kwargs:
+            logger.info(
+                "Applying default chat_template_kwargs to every chat request: %s",
+                self.default_chat_template_kwargs,
+            )
 
         # Get default sampling parameters from model's generation config
         self.default_sampling_params = (
@@ -838,11 +877,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._handle_last_assistant_message(openai_compatible_messages, request)
             )
 
-            extra_template_kwargs = {}
-            if request.reasoning_effort is not None:
-                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
-            if request.chat_template_kwargs:
-                extra_template_kwargs.update(request.chat_template_kwargs)
+            extra_template_kwargs = merge_chat_template_kwargs(
+                self.default_chat_template_kwargs,
+                request.reasoning_effort,
+                request.chat_template_kwargs,
+            )
 
             rc = self.template_manager.reasoning_config
             if rc is not None and rc.effort_kwarg is not None:

@@ -60,6 +60,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    ResizeHiCacheStorageReqInput,
+    ResizeHiCacheStorageReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -119,6 +121,7 @@ _COMMUNICATOR_SPECS = [
     ("clear_hicache_storage", ClearHiCacheReqOutput),
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
+    ("resize_hicache_storage", ResizeHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
@@ -383,6 +386,27 @@ class TokenizerControlMixin:
                 hicache_storage_backend_extra_config=None,
             )
         return out
+
+    async def resize_hicache_storage(
+        self: TokenizerManager,
+        max_size_gb: Optional[float] = None,
+        min_free_gb: Optional[float] = None,
+    ) -> ResizeHiCacheStorageReqOutput:
+        """Re-cap the attached HiCache storage backend at runtime."""
+        self.auto_create_handle_loop()
+        results = await self.resize_hicache_storage_communicator(
+            ResizeHiCacheStorageReqInput(
+                max_size_gb=max_size_gb, min_free_gb=min_free_gb
+            )
+        )
+
+        all_success, all_message = FanOutCommunicator.merge_results(results)
+        # Report the first rank's snapshot: under pure TP every rank caps its own
+        # shard directory with the same limits, so they only differ in usage.
+        stats = results[0].stats if results else None
+        return ResizeHiCacheStorageReqOutput(
+            success=all_success, message=all_message, stats=stats
+        )
 
     async def start_profile(
         self: TokenizerManager,
