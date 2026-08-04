@@ -55,7 +55,7 @@ def _resolve_draft_attention_backend_fallback(
 
 
 def _refuse_unsupported_speculative_moe_backend(
-    *, server_args: ServerArgs, algo_label: str
+    *, server_args: ServerArgs, algo_label: str, gpu_id: Optional[int] = None
 ) -> None:
     """Refuse a draft MoE runner backend this rank's card cannot run, by name.
 
@@ -78,6 +78,30 @@ def _refuse_unsupported_speculative_moe_backend(
         return
     backend = get_speculative_moe_runner_backend()
     if not backend.is_marlin():
+        return
+
+    # #470: the shadow exemption the docstring above promises, which until now
+    # existed only in the docstring. Under solo placement every rank calls
+    # build_draft_tp_worker, but only the HOST builds real draft weights; the
+    # others build a shadow on ``meta`` and never reach a Marlin kernel.
+    # Refusing them made the guard's own recommended fix
+    # ("--speculative-draft-placement solo --speculative-draft-gpu <index>")
+    # impossible on exactly the heterogeneous rig it was written for: the
+    # 5090 host is fine, and the two SM86 shadows killed the boot during init.
+    # Found on hardware, TICKET_470 Boot B, 2026-08-04.
+    #
+    # ``_solo_is_shadow`` on the worker is "solo active and not host", but it
+    # is a property of an object that does not exist yet at build time. The
+    # same fact is available here from the placement flags plus this rank's
+    # gpu_id, which build_draft_tp_worker already receives.
+    placement = getattr(server_args, "speculative_draft_placement", None)
+    draft_gpu = getattr(server_args, "speculative_draft_gpu", None)
+    if (
+        placement == "solo"
+        and draft_gpu is not None
+        and gpu_id is not None
+        and int(gpu_id) != int(draft_gpu)
+    ):
         return
     from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
@@ -137,7 +161,7 @@ def build_draft_tp_worker(
     )
 
     _refuse_unsupported_speculative_moe_backend(
-        server_args=server_args, algo_label=algo_label
+        server_args=server_args, algo_label=algo_label, gpu_id=gpu_id
     )
 
     saved_server_args = get_server_args()
