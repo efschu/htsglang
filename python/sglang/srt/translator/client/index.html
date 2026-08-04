@@ -628,6 +628,24 @@ const FRAME_MS = 20;
 // BOUNDED BY BYTES, not only by entry count, because one enormous entry (a
 // stack trace, a stringified event) is exactly what a count-based ring fails
 // to protect against.
+/**
+ * The uplink cost block, or null if it is not up yet.
+ *
+ * A FUNCTION DECLARATION, and that is the whole reason it exists: `uplinkMeter`
+ * is a `const` defined far below, and `typeof` does NOT shield a const from its
+ * temporal dead zone -- it throws like any other read. A snapshot taken from
+ * the error hooks during boot is exactly the case where that would happen, and
+ * a diagnostics package that throws while being assembled is the one that was
+ * needed. Hoisted, so it is callable from anywhere, and it catches.
+ */
+function uplinkReport() {
+  try {
+    return uplinkMeter.report();
+  } catch (err) {
+    return null;
+  }
+}
+
 class Telemetry {
   constructor(limitBytes, limitEntries) {
     this.limitBytes = limitBytes || (3 << 20);   // ~3 MB, inside the 2-5 MB order
@@ -695,6 +713,10 @@ class Telemetry {
         online: nav.onLine === undefined ? null : nav.onLine,
         visibility: (typeof document !== "undefined") ? document.visibilityState : null,
       },
+      // WHAT THE UPLINK COST. Defined below this class, so it is read through
+      // a guard rather than assumed: a snapshot taken from an error hook
+      // during boot must still produce a package.
+      uplink: uplinkReport(),
       counters: this.counters,
       entries_dropped: this.dropped,
       entries_kept: this.entries.length,
@@ -1317,13 +1339,294 @@ function keepAudio(turnId, samples, rate) {
 }
 
 // ---------------------------------------------------------------------------
+// THE UPLINK CODEC.
+//
+// PCM16 at 16 kHz is ~256 kbit/s in one direction, continuously, for as long
+// as the button is held. On Spanish mobile data that is the single largest
+// cost this app has, and the server has been able to decode Opus since the
+// transport was written -- the client simply never offered it, so the branch
+// was dead. Opus at 24 kbit/s is a factor of ten, on the leg where the phone
+// is paying.
+//
+// WEBCODECS, NOT MEDIARECORDER. `MediaRecorder` can produce Opus and is more
+// widely available, but it produces a WebM or Ogg CONTAINER: a header, then
+// clusters, delivered on the recorder's own schedule in blobs that do not
+// align with anything. The server decodes bare packets (`av.Packet` into a
+// libopus decoder), so a container would have to be demuxed on one side or
+// the other, and the recorder's chunking would put turn boundaries inside a
+// cluster. `AudioEncoder` hands over exactly one self-delimiting Opus packet
+// per frame with no wrapper, which is what the server already reads, and it
+// takes the frames the capture loop below already produces. Chrome on Android
+// -- the only browser this app is deployed to -- has it.
+//
+// The encoder is fed the SAME 16 kHz frames the PCM16 path packs, deliberately
+// and not for convenience: keeping the decimation identical is what makes a
+// before/after word-error-rate comparison a measurement of the CODEC rather
+// than of two different resamplers.
+//
+// EVERY FAILURE LANDS ON PCM16. No WebCodecs, no Opus in WebCodecs, a server
+// that does not confirm Opus, or an encoder that faults mid-session: all four
+// end with the page sending PCM16, which is what it has always sent.
+// ---------------------------------------------------------------------------
+const UPLINK_BITRATE = 24000;          // bits/s, the whole point of the change
+
+function opusEncoderConfig() {
+  return {
+    codec: "opus",
+    sampleRate: PIPELINE_RATE,
+    numberOfChannels: 1,
+    bitrate: UPLINK_BITRATE,
+    // Matches FRAME_MS, so one captured frame is one Opus packet is one
+    // WebSocket frame. Nothing buffers, nothing straddles a turn boundary.
+    opus: { frameDuration: FRAME_MS * 1000 },
+  };
+}
+
+//: Tri-state on purpose. `null` means "not asked yet", and the offer is made
+//: only on a definite `true` -- an unresolved probe must not become an offer.
+let opusEncodeSupported = null;
+//: Set once a downgrade has happened, and never cleared for the life of the
+//: page. A codec that failed here will fail again, and a reconnect loop that
+//: re-offers Opus every time would be an infinite downgrade.
+let opusUplinkDisabled = false;
+
+/** What the hello may offer. Encode capability only; see the server's split. */
+function uplinkOffer() {
+  return (opusEncodeSupported === true && !opusUplinkDisabled)
+    ? ["opus", "pcm16"] : ["pcm16"];
+}
+
+/**
+ * Ask the browser, once, before the first hello.
+ *
+ * `isConfigSupported` is the only honest answer available: `"AudioEncoder" in
+ * window` says nothing about Opus, and Chrome ships the class on platforms
+ * where a given codec is not registered. Bounded by a race because a probe
+ * that never settles would hold the page off the socket for good, and a
+ * translator that does not connect is worse than one that connects expensively.
+ */
+function probeOpusUplink() {
+  const decide = (supported, reason) => {
+    opusEncodeSupported = !!supported;
+    tlog("uplink.probe", { supported: !!supported, reason: reason,
+                           bitrate: UPLINK_BITRATE, frame_ms: FRAME_MS,
+                           sample_rate: PIPELINE_RATE });
+    return opusEncodeSupported;
+  };
+  if (typeof AudioEncoder === "undefined"
+      || typeof AudioEncoder.isConfigSupported !== "function"
+      || typeof AudioData === "undefined") {
+    return Promise.resolve(decide(false, "no WebCodecs AudioEncoder"));
+  }
+  let probe;
+  try {
+    probe = AudioEncoder.isConfigSupported(opusEncoderConfig())
+      .then((answer) => decide(answer && answer.supported, "probed"))
+      .catch((err) => decide(false, "probe rejected: " + describe(err)));
+  } catch (err) {
+    return Promise.resolve(decide(false, "probe threw: " + describe(err)));
+  }
+  const timeout = new Promise((resolve) => setTimeout(
+    () => resolve(opusEncodeSupported === null
+      ? decide(false, "probe did not answer in 1500 ms") : opusEncodeSupported),
+    1500));
+  return Promise.race([probe, timeout]);
+}
+
+function describe(err) {
+  return String((err && (err.message || err.name)) || err).slice(0, 160);
+}
+
+// ---------------------------------------------------------------------------
+// Bytes actually put on the wire, and over how long the microphone was open.
+//
+// The existing `frame_bytes_sent` counter answers "did it send"; it cannot
+// answer "how expensive was it", because a total says nothing without the
+// duration it accumulated over. This carries the open time so the ratio is a
+// rate, and it is the field the before/after evidence for this change is read
+// out of -- PCM16 must land near 32000 B/s and Opus near 3000 B/s.
+// ---------------------------------------------------------------------------
+const uplinkMeter = {
+  codec: "pcm16",
+  bytes: 0, frames: 0, dropped: 0,
+  openMs: 0, openedAt: 0,
+  turnBytes: 0, turnFrames: 0, turnAt: 0,
+  setCodec(name) { this.codec = name; },
+  open() { this.openedAt = telemetry.now(); this.turnBytes = 0;
+           this.turnFrames = 0; this.turnAt = this.openedAt; },
+  close() {
+    if (this.openedAt) { this.openMs += telemetry.now() - this.openedAt; }
+    this.openedAt = 0;
+  },
+  sent(bytes) {
+    this.bytes += bytes; this.frames += 1;
+    this.turnBytes += bytes; this.turnFrames += 1;
+  },
+  drop() { this.dropped += 1; },
+  /** Open time including a turn still in progress. */
+  elapsedMs() {
+    return this.openMs + (this.openedAt ? telemetry.now() - this.openedAt : 0);
+  },
+  report() {
+    const ms = this.elapsedMs();
+    return {
+      codec: this.codec,
+      bytes_sent: this.bytes,
+      frames_sent: this.frames,
+      frames_dropped: this.dropped,
+      open_ms: ms,
+      bytes_per_second: ms > 0 ? Math.round(this.bytes * 1000 / ms) : 0,
+      kbit_per_second: ms > 0
+        ? Math.round(this.bytes * 8 / ms) : 0,
+      opus_supported: opusEncodeSupported,
+      opus_disabled: opusUplinkDisabled,
+    };
+  },
+  /** The same numbers for the turn that just ended, logged once per release. */
+  turnReport() {
+    const ms = Math.max(0, telemetry.now() - this.turnAt);
+    return {
+      codec: this.codec,
+      bytes: this.turnBytes,
+      frames: this.turnFrames,
+      ms: ms,
+      bytes_per_second: ms > 0 ? Math.round(this.turnBytes * 1000 / ms) : 0,
+    };
+  },
+};
+
+/** Little-endian PCM16 from float samples. Shared with the enrolment tap. */
+function packPcm16(samples) {
+  const pcm = new DataView(new ArrayBuffer(samples.length * 2));
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    pcm.setInt16(i * 2, s * 32767, true);
+  }
+  return pcm.buffer;
+}
+
+/** The floor. No dependency, always available, and what the server assumes. */
+class Pcm16Uplink {
+  constructor(send) { this.name = "pcm16"; this.send = send; }
+  setActive(active) { /* stateless: nothing survives a turn boundary */ }
+  frame(samples) { this.send(packPcm16(samples)); }
+  close() {}
+}
+
+/**
+ * Frames dropped on the floor, deliberately.
+ *
+ * Between deciding to downgrade and the reconnect that carries the new offer,
+ * the server is still expecting Opus. PCM16 handed to an Opus decoder is not a
+ * degraded turn, it is garbage that the recognizer will transcribe as words.
+ * So the gap is silent and counted rather than wrong.
+ */
+class StalledUplink {
+  constructor() { this.name = "stalled"; }
+  setActive(active) {}
+  frame(samples) { uplinkMeter.drop();
+                   telemetry.count("uplink_frames_dropped_stalled"); }
+  close() {}
+}
+
+class OpusUplink {
+  constructor(send, onFail) {
+    this.name = "opus";
+    this.send = send;
+    this.onFail = onFail;
+    this.open = false;
+    this.timestamp = 0;
+    this.encoder = new AudioEncoder({
+      output: (chunk) => this.emit(chunk),
+      error: (err) => this.fail("encoder error: " + describe(err)),
+    });
+    // Throws synchronously on a bad config, which the caller turns into a
+    // downgrade. `isConfigSupported` said yes, but a probe is not a promise.
+    this.encoder.configure(opusEncoderConfig());
+  }
+
+  setActive(active) {
+    this.open = active;
+    if (!active) {
+      // THE TAIL IS DROPPED, NOT FLUSHED, and that is the safe direction. An
+      // encoder holds about one frame; flushing it is asynchronous, so the
+      // packets would arrive after the `release` control message and be
+      // segmented into the NEXT turn -- a sentence ending in the first 20 ms
+      // of the following one. The PCM16 path already discards up to one frame
+      // of remainder at a turn boundary, so this loses no more than it did,
+      // and it cannot misattribute.
+      this.timestamp = 0;
+    }
+  }
+
+  emit(chunk) {
+    if (!this.open) {
+      telemetry.count("uplink_opus_frames_after_close");
+      return;
+    }
+    const buffer = new ArrayBuffer(chunk.byteLength);
+    chunk.copyTo(new Uint8Array(buffer));
+    // Raw Opus packets, one per frame, no container: exactly what
+    // `OpusCodec.decode` feeds to libopus on the other end.
+    this.send(buffer);
+  }
+
+  frame(samples) {
+    if (!this.open || !this.encoder) return;
+    let data;
+    try {
+      data = new AudioData({
+        format: "f32",
+        sampleRate: PIPELINE_RATE,
+        numberOfFrames: samples.length,
+        numberOfChannels: 1,
+        timestamp: this.timestamp,
+        // A copy is taken by the constructor, so the capture buffer stays the
+        // capture loop's own.
+        data: samples,
+      });
+    } catch (err) {
+      this.fail("AudioData rejected: " + describe(err));
+      return;
+    }
+    this.timestamp += Math.round(samples.length * 1e6 / PIPELINE_RATE);
+    try {
+      this.encoder.encode(data);
+    } catch (err) {
+      this.fail("encode threw: " + describe(err));
+    } finally {
+      data.close();
+    }
+  }
+
+  fail(reason) {
+    if (this.failed) return;
+    this.failed = true;
+    this.close();
+    this.onFail(reason);
+  }
+
+  close() {
+    this.open = false;
+    if (this.encoder) {
+      try { this.encoder.close(); } catch (err) { /* already closed */ }
+      this.encoder = null;
+    }
+  }
+}
+
+//: The live uplink. Replaced on every handshake, so a reconnect that lands on
+//: a different codec cannot leave the previous encoder wired to the socket.
+let uplink = new Pcm16Uplink(function () {});
+
+// ---------------------------------------------------------------------------
 // Microphone capture.
 //
 // The AudioWorklet is defined inline and loaded from a blob so the page stays
 // a single file. It hands raw float frames to the main thread, which
-// downsamples to the pipeline rate and packs PCM16. Downsampling here rather
-// than server-side keeps the uplink small, which is the whole game on mobile
-// data.
+// downsamples to the pipeline rate and hands each frame to the uplink codec
+// above. Downsampling here rather than server-side keeps the uplink small,
+// which is the whole game on mobile data.
 // ---------------------------------------------------------------------------
 const WORKLET_SOURCE = `
 class Tap extends AudioWorkletProcessor {
@@ -1353,8 +1656,12 @@ registerProcessor("tap", Tap);
 `;
 
 class Microphone {
-  constructor(onFrame, onLevel, onNote, onLost) {
-    this.onFrame = onFrame;
+  // NO SEND CALLBACK any more. Frames used to go straight from here to the
+  // socket through one; they now go to the uplink codec, which owns the send
+  // because an encoder answers asynchronously and cannot hand a packet back
+  // through a return value. Enrolment, which used to borrow that callback to
+  // divert the capture to itself, has `this.tap` instead.
+  constructor(onLevel, onNote, onLost) {
     this.onLevel = onLevel;
     this.onNote = onNote || function () {};
     //: Called when the capture is TAKEN AWAY, as a state change rather than a
@@ -1376,6 +1683,9 @@ class Microphone {
     this.chunks = 0;
     this.frames = 0;
     this.observedPeak = 0;
+    //: Set by enrolment for the duration of its capture, null otherwise. A
+    //: frame handed to the tap does NOT go to the uplink.
+    this.tap = null;
   }
 
   async start() {
@@ -1586,19 +1896,29 @@ class Microphone {
     const frame = Math.round(PIPELINE_RATE * FRAME_MS / 1000);
     let start = 0;
     for (; start + frame <= pending.length; start += frame) {
-      const pcm = new DataView(new ArrayBuffer(frame * 2));
-      for (let i = 0; i < frame; i++) {
-        const s = Math.max(-1, Math.min(1, pending[start + i]));
-        pcm.setInt16(i * 2, s * 32767, true);
-      }
+      // COUNTED HERE, at the capture side, and not where the bytes reach the
+      // socket. `sent()` answers "is the microphone producing anything", which
+      // is a question about the capture chain; an encoder that swallowed every
+      // frame must not be able to make that answer zero and send the watchdog
+      // after the wrong subsystem. What actually went out is `uplinkMeter`.
       this.frames = (this.frames || 0) + 1;
-      this.onFrame(pcm.buffer);
+      const samples = pending.subarray(start, start + frame);
+      // THE ENROLMENT TAP DIVERTS, IT DOES NOT DUPLICATE, and it is always
+      // PCM16. Enrolment posts its 15 seconds as base64 PCM16 over HTTP, to
+      // an endpoint that accepts no other encoding, and those frames were
+      // never meant to reach the socket -- the old code achieved both by
+      // swapping out the send callback, which stopped working the moment the
+      // uplink grew a codec of its own.
+      if (this.tap) this.tap(packPcm16(samples));
+      else uplink.frame(samples);
     }
     this.pending = pending.slice(start);
   }
 
   setOpen(open) {
     this.open = open;
+    uplink.setActive(open);
+    if (open) { uplinkMeter.open(); } else { uplinkMeter.close(); }
     if (!open) {
       this.carry = new Float32Array(0);
       this.pending = new Float32Array(0);
@@ -1658,9 +1978,18 @@ class Connection {
       // A new socket means a new timeline: anything still booked against the
       // old clock must not survive into it.
       playback.reset();
+      // The uplink is UNUSABLE until the handshake answers. The offer below is
+      // a question, and sending audio in either codec before the answer would
+      // be a guess -- Opus into a server that chose PCM16, or PCM16 into one
+      // that chose Opus, and the second is transcribed as words rather than
+      // failing. Nothing is captured before `ready` in practice (the button is
+      // disabled), but the invariant is held here rather than assumed there.
+      uplink = new StalledUplink();
       ws.send(JSON.stringify({
         kind: "hello",
-        codecs: ["pcm16"],
+        // What this page can ENCODE, which is what the field has always meant
+        // and what the server settles the uplink from.
+        codecs: uplinkOffer(),
         session_id: this.sessionId,
         resume_from: this.cursor,
         participants: this.participants,
@@ -1711,6 +2040,7 @@ class Connection {
     }
     if (event.kind === "ready") {
       this.attempt = 0;
+      this.applyUplinkCodec(event);
       // A cursor counts events of ONE session. If the server did not resume
       // the session we asked for -- the idle collector took it and minted a
       // new one -- then our cursor counts a conversation that no longer
@@ -1737,6 +2067,72 @@ class Connection {
       if (event.sample_rate) { this.wireRate = event.sample_rate; updateLink(); }
     }
     this.handlers.onEvent(event);
+  }
+
+  /**
+   * Install the uplink the server actually agreed to.
+   *
+   * TWO CONDITIONS, and the second is the one that is easy to miss. The server
+   * must have chosen Opus for the uplink AND must have said what it will send
+   * back. A server that reports no `downlink_codec` is one that still runs a
+   * single codec in both directions: it answered an Opus offer by switching
+   * BOTH legs, and the binary frames arriving here would be Opus packets read
+   * by `onBinary` as little-endian PCM -- noise out of the speaker, on a page
+   * whose audio quality is already under investigation. That is the exact
+   * failure a client deployed ahead of its server would produce, and this page
+   * is hot-deployable on its own (`index.html` is read from disk per request),
+   * so the case is real and not theoretical. It costs one reconnect.
+   */
+  applyUplinkCodec(event) {
+    const chosen = (event.codec && event.codec.name) || "pcm16";
+    const downlink = event.downlink_codec && event.downlink_codec.name;
+    tlog("uplink.negotiated", {
+      offered: uplinkOffer(), chosen: chosen, downlink: downlink || null,
+      bitrate: (event.codec && event.codec.bitrate_bps) || null,
+    });
+    if (chosen === "opus" && downlink !== "pcm16") {
+      this.downgradeUplink(
+        "the server chose opus without reporting a separate downlink codec, "
+        + "so its downlink would be opus as well");
+      return;
+    }
+    if (chosen === "opus") {
+      try {
+        uplink = new OpusUplink(
+          (buffer) => this.sendFrame(buffer),
+          (reason) => this.downgradeUplink(reason));
+      } catch (err) {
+        this.downgradeUplink("the opus encoder refused to start: "
+                             + describe(err));
+        return;
+      }
+    } else {
+      uplink = new Pcm16Uplink((buffer) => this.sendFrame(buffer));
+    }
+    uplinkMeter.setCodec(uplink.name);
+    // Re-arm if the microphone was already open across the reconnect.
+    uplink.setActive(microphone && microphone.open);
+    updateLink();
+  }
+
+  /**
+   * Give the Opus offer back and start again on PCM16.
+   *
+   * A reconnect rather than an in-place switch, because the server has already
+   * committed its decoder for this connection: there is no message that takes
+   * an offer back, and inventing one would be a protocol the server does not
+   * speak. The socket closes, the standard reconnect path runs, and the next
+   * hello offers PCM16 only -- the session, its cursor and its transcript all
+   * survive, which is the whole point of having a resume path.
+   */
+  downgradeUplink(reason) {
+    if (opusUplinkDisabled) return;
+    opusUplinkDisabled = true;
+    uplink = new StalledUplink();
+    uplinkMeter.setCodec("pcm16");
+    tlog("uplink.downgraded", { reason: String(reason).slice(0, 200) });
+    telemetry.count("uplink_downgraded_to_pcm16");
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.close();
   }
 
   onBinary(buffer) {
@@ -1817,8 +2213,12 @@ class Connection {
       // matters. The count still answers "was the phone sending at all".
       telemetry.count("frames_sent");
       telemetry.count("frame_bytes_sent", buffer.byteLength || 0);
+      // A total plus the time it accumulated over, which is what makes the
+      // codec change legible in an uploaded log instead of merely present.
+      uplinkMeter.sent(buffer.byteLength || 0);
     } else {
       telemetry.count("frames_dropped_socket_closed");
+      uplinkMeter.drop();
     }
   }
 
@@ -3065,7 +3465,6 @@ function applyParticipants() {
 // ---------------------------------------------------------------------------
 const connection = new Connection({ onEvent });
 const microphone = new Microphone(
-  (frame) => connection.sendFrame(frame),
   (peak) => { el("meter").firstElementChild.style.width =
                 Math.min(100, peak * 260) + "%"; },
   (text, bad) => sys(text, bad),
@@ -3272,6 +3671,11 @@ function updateLink() {
   if (open && connection.wireRate) {
     parts.push(Math.round(connection.wireRate / 100) / 10 + " kHz");
   }
+  // NAMED WHEN IT IS NOT THE DEFAULT. The compressed uplink is the one thing
+  // on this link the user could be asked about from a distance ("does it say
+  // opus?"), and a rung that changes silently is a rung nobody can report.
+  // PCM16 stays unlabelled so the chip reads exactly as it did before.
+  if (open && uplinkMeter.codec === "opus") parts.push("opus");
   el("link").textContent = parts.join(" · ");
 }
 
@@ -3411,6 +3815,10 @@ function endTalking() {
     frames_sent: sent,
     talk_ms: talkStartedAt ? telemetry.now() - talkStartedAt : null,
     mic: microphone.diagnostics ? microphone.diagnostics() : null,
+    // Per TURN, beside the session total in the snapshot. One turn is the unit
+    // the user actually pays for, and a per-turn number survives a session
+    // that mixed codecs across a reconnect, which a session average does not.
+    uplink: uplinkMeter.turnReport(),
   });
   microphone.setOpen(false);
   if (sent === 0) {
@@ -3880,13 +4288,12 @@ el("enroll").addEventListener("click", async () => {
   }
   const collected = [];
   const capture = (frame) => collected.push(new Uint8Array(frame));
-  const original = microphone.onFrame;
-  microphone.onFrame = capture;
+  microphone.tap = capture;
   microphone.setOpen(true);
   setState("recording", "enrolling");
   setTimeout(async () => {
     microphone.setOpen(false);
-    microphone.onFrame = original;
+    microphone.tap = null;
     setState("ready", "ready");
     let total = 0;
     collected.forEach((c) => (total += c.length));
@@ -4474,5 +4881,10 @@ el("gear").innerHTML = ICON.gear;
 el("sheetclose").innerHTML = ICON.close;
 updateLink();
 renderSpeakers([]);
-connection.connect();
+// THE PROBE RUNS BEFORE THE FIRST HELLO, not beside it. An offer is only made
+// on a definite answer, so a probe still in flight when the socket opens would
+// spend the first session -- often the only session -- on PCM16 and then
+// upgrade on a reconnect that may never come. It resolves in milliseconds and
+// is bounded at 1500 ms, and it can only resolve, never reject.
+probeOpusUplink().then(() => connection.connect());
 </script>

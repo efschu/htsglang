@@ -19,6 +19,15 @@ its participant languages, its codec offers and its resume cursor. The server
 answers ``ready`` with the negotiated codec, the language matrix and the
 journal position, then replays anything the client missed.
 
+The two directions carry SEPARATE codecs, negotiated from that one list. The
+``codecs`` offer has always meant "what the client can encode", so it decides
+the uplink; ``ready.codec`` reports what the uplink settled on and
+``ready.downlink_codec`` what the server will send. They differ in exactly the
+case this split exists for: a phone that can encode Opus (WebCodecs) but whose
+playback graph still reads raw PCM16. Answering such a client with Opus frames
+would be noise out of the speaker, which is what a single shared codec object
+did before.
+
 The uplink is deliberately dumb: the client streams audio frames and, in
 push-to-talk mode, sends ``release``. All turn logic lives here, because the
 phone is the component we cannot debug from a train in Spain.
@@ -382,13 +391,25 @@ class _Connection:
         self.service = service
         self.ws = websocket
         self.session: Optional[TranslatorSession] = None
-        self.codec: AudioCodec = Pcm16Codec()
+        # TWO CODECS, ONE NEGOTIATION. The two directions are not symmetric and
+        # were only ever handled by one object because both ends ran PCM16.
+        # The phone can ENCODE Opus (WebCodecs `AudioEncoder`) long before the
+        # page can DECODE it into the playback graph, and the hello's `codecs`
+        # list has always meant "what the client can encode" (audio.py). Using
+        # that list for the downlink too would answer an Opus uplink offer with
+        # Opus frames the page reads as raw PCM -- noise, not audio. So the
+        # negotiation drives the UPLINK, and the downlink stays on the codec
+        # the client is known to decode until a client proves otherwise.
+        self.uplink_codec: AudioCodec = Pcm16Codec()
+        self.downlink_codec: AudioCodec = Pcm16Codec()
         self.sent_seq = 0
         self._pump: Optional[asyncio.Task] = None
         #: The running drain, so a stop can cancel it (§19.12).
         self._drain_task: Optional[asyncio.Task] = None
         self._recovery: Optional[asyncio.Task] = None
         self._closing = False
+        #: Uplink frames the codec could not decode. Counted rather than fatal.
+        self._bad_uplink_frames = 0
 
     async def run(self) -> None:
         await self.ws.accept()
@@ -441,7 +462,9 @@ class _Connection:
             raise CodecError(f"expected a hello frame, got {hello.get('kind')!r}")
 
         offers = hello.get("codecs") or ["pcm16"]
-        self.codec = negotiate_codec(offers)
+        # The hello's `codecs` is the client's ENCODE capability, so it settles
+        # the uplink only. The downlink keeps the codec constructed above.
+        self.uplink_codec = negotiate_codec(offers)
         participants = hello.get("participants")
         session_id = hello.get("session_id")
         resume_from = int(hello.get("resume_from", 0))
@@ -460,7 +483,17 @@ class _Connection:
             {
                 "kind": "ready",
                 "session_id": self.session.session_id,
-                "codec": dataclasses.asdict(self.codec.info()),
+                # `codec` keeps its name and its meaning: the codec this
+                # connection expects on the UPLINK, which is what the client
+                # has to configure its encoder for.
+                "codec": dataclasses.asdict(self.uplink_codec.info()),
+                # ADDITIVE, and the interlock that makes the client safe to
+                # deploy on its own. A client that can encode Opus must not
+                # start doing so against a server that would answer with Opus
+                # on the downlink as well; the presence of this field is how it
+                # tells a split-aware server from one that is not, and its
+                # absence sends the client back to PCM16.
+                "downlink_codec": dataclasses.asdict(self.downlink_codec.info()),
                 "pipeline_sample_rate": PIPELINE_SAMPLE_RATE,
                 "languages": matrix.to_json(),
                 "state": self.session.state(),
@@ -550,7 +583,37 @@ class _Connection:
 
     async def _on_audio(self, payload: bytes) -> None:
         assert self.session is not None
-        chunk = self.codec.decode(payload)
+        # A SINGLE BAD FRAME MUST NOT END THE CONVERSATION. With PCM16 a
+        # damaged payload was almost unreachable -- any even-length byte string
+        # decodes to something. A compressed uplink is different: a truncated
+        # or reordered Opus packet makes the decoder raise, and that exception
+        # is not a `CodecError`, so it would escape the receive loop and take
+        # the socket down. On a Spanish mobile link that turns one lost packet
+        # into a reconnect. Opus decoders resynchronise on the next packet by
+        # design, so the frame is dropped and counted instead.
+        try:
+            chunk = self.uplink_codec.decode(payload)
+        except Exception as exc:  # noqa: BLE001 - any decoder failure
+            # RESET, AND THIS IS THE HALF THAT MATTERS. Dropping the frame is
+            # not enough: a decoder that has faulted can stay faulted, and
+            # FFmpeg's does after a zero-length packet -- it treats one as
+            # end-of-stream and answers every later packet with EOF. Without
+            # this line the session goes permanently deaf on the first bad
+            # frame, with a healthy socket and a healthy segmenter, which is
+            # the hardest shape of failure to diagnose from a phone.
+            self.uplink_codec.reset()
+            self._bad_uplink_frames += 1
+            if self._bad_uplink_frames == 1 or self._bad_uplink_frames % 100 == 0:
+                logger.warning(
+                    "session %s: dropped an undecodable %s uplink frame of %d "
+                    "bytes (%d so far): %s",
+                    self._sid(),
+                    self.uplink_codec.name,
+                    len(payload),
+                    self._bad_uplink_frames,
+                    exc,
+                )
+            return
         if chunk.sample_rate != PIPELINE_SAMPLE_RATE:
             chunk = resample(chunk, PIPELINE_SAMPLE_RATE)
         for segment in self.session.push_audio(chunk):
@@ -859,9 +922,9 @@ class _Connection:
             # samples at 24 kHz -- 1.5x too fast and a fifth too high. The
             # front-door harness could not see it because it decodes with the
             # codec and ignores this field; only a real client trusts it.
-            payload["sample_rate"] = self.codec.sample_rate
+            payload["sample_rate"] = self.downlink_codec.sample_rate
             await self._send(payload)
-            for frame in self.codec.encode(event.audio):
+            for frame in self.downlink_codec.encode(event.audio):
                 await self.ws.send_bytes(frame)
         elif event.kind is EventKind.TURN_AUDIO:
             payload["audio_evicted"] = True

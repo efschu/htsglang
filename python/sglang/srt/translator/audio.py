@@ -25,6 +25,29 @@ needs a real decoder (PyAV or an ``opuslib`` binding); when neither imports,
 :func:`available_codecs` simply does not offer it, and the negotiation lands
 on PCM16 rather than the session failing at the first audio frame.
 
+**Only the uplink runs on Opus today, and that asymmetry is deliberate.** Read
+the sentence above literally: the offer is what the client can ENCODE. A
+browser gets an Opus encoder (`AudioEncoder`) and an Opus decoder from the same
+WebCodecs API, but the client's playback graph is not a decoder -- it is a
+scheduler that reads raw PCM16 out of the binary frames synchronously and
+attributes them to a turn. Routing Opus into it would be noise, and rebuilding
+it asynchronously is the §19.5 downlink rung, which is unbuilt. So
+:class:`~sglang.srt.translator.server._Connection` negotiates the uplink from
+this list and keeps the downlink on PCM16. The saving is where the phone pays
+for it either way, and the untouched leg is the one whose timing is under
+investigation.
+
+**Framing is raw Opus packets, no container.** :meth:`OpusCodec.decode` hands
+the payload to ``av.Packet`` and a bare ``libopus`` decoder, which is exactly
+what a WebCodecs ``EncodedAudioChunk`` carries with the default
+``opus.format`` of ``"opus"``: one self-delimiting Opus packet per frame, TOC
+byte first, no Ogg or WebM wrapper and no ``OpusHead`` extradata. Nothing had
+to move to make the two ends meet, which is the reason this stayed a
+client-side change. The decoder is configured for 48 kHz output and Opus
+packets carry their own internal bandwidth, so the client is free to feed its
+encoder 16 kHz -- the packets decode to 48 kHz all the same and the caller
+resamples 3:1 to the pipeline rate.
+
 **Resampling.** Everything the pipeline does internally happens at 16 kHz
 (what the VAD and every ASR want); the synthesizer emits 22.05 or 24 kHz.
 Rather than pull in a resampling library, :func:`resample` does polyphase
@@ -237,6 +260,17 @@ class OpusCodec(AudioCodec):
         return self._encoder
 
     def decode(self, payload: bytes) -> AudioChunk:
+        # AN EMPTY PAYLOAD IS A FLUSH, NOT A SILENT NO-OP. FFmpeg reads a
+        # zero-length packet as end-of-stream: the decoder enters draining
+        # state, returns nothing, and then answers EVERY subsequent real
+        # packet with EOF. A single empty binary WebSocket frame -- which
+        # costs a client one stray `send(new ArrayBuffer(0))` -- would
+        # therefore kill the uplink for the rest of the session while the
+        # socket, the session and the segmenter all stayed healthy. Refused
+        # loudly so the caller resets rather than going quietly deaf.
+        if not payload:
+            raise CodecError("empty Opus payload: a zero-length packet would "
+                             "drain the decoder, not decode to silence")
         packet = self._av.Packet(payload)
         frames = self._get_decoder().decode(packet)
         if not frames:
