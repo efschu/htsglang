@@ -1652,6 +1652,35 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Unpromoted-terminal-flag family (#552): a terminal signal that only ONE code
+path promotes is silently lost by every state that does not run that path.
+`Scheduler.abort_request` marks an in-flight request with `req.to_finish =
+FINISH_ABORT()` ("abort method 3") and leaves the promotion to
+`finished_reason` to `Req.update_finish_state`, which runs only while
+processing a batch result -- fine for device-resident and host-spilled
+sessions, both of which still run a forward. A #224 PARKED session runs none:
+`_commit_park` pops it out of `mgr.spills` and its tick is suppressed. The
+reap loop in `kv_session_spill_destination.maybe_park_flow` nevertheless keyed
+on `req.finished()`, so the abort was dropped: the `ParkedSession` record, the
+retained device head, the req-pool slot, the radix tree lock and the remote
+blob all leaked, and the caller waited for a terminal chunk no path would ever
+emit. Note the abort DID reach the session -- `inflight_batches` extends with
+`parked_inflight_entries` on purpose -- which is why this reads as working
+code: the delivery was right and only the acceptance was missing. Fixed with
+`parked_session_ended` (finished OR `to_finish` pending) as the reap
+predicate, promotion of the flag inside `_release_parked_req`, and a
+single-request `stream_output` there, since nothing else can emit for a
+session that never forwards again. The rule: when a flag's promotion lives in
+one path, every state reachable WITHOUT that path needs its own promotion, and
+a reap predicate must test the signal the producer actually writes -- not the
+downstream field some other path derives from it. `test/registered/unit/
+test_kv_spill_destination_unit.py::test_parked_abort_via_to_finish_is_reaped`
+pins it and is can-fail against the pre-fix file; its neighbour
+`test_parked_abort_reaps_and_releases` stayed green throughout because it set
+`finished` directly -- a test that performs the step the real caller omits
+records the omission as expected behaviour (same trap as the incomplete-cache-
+key family above).
+
 Two-stage-error family (#505-B-01, fixed in #514): when ONE `try` spans two
 stages whose failures mean OPPOSITE things about where the bytes are, the
 handler is forced to lie about one of them. `RealMovementBackend.wave_in`
