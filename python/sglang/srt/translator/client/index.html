@@ -878,6 +878,14 @@ class Playback {
     //: and that is precisely the seam the user still hears.
     this.rampedTurn = null;
     this.turnStarts = 0;
+    //: The synthesis UNIT whose first buffer was ramped, as "turn#unit". A
+    //: turn is several units and each is its own `synthesize()` call, so each
+    //: one begins a fresh waveform -- the seam the user hears as noise at
+    //: "many word starts". Keyed as a string because the pair is the identity;
+    //: unit 0 of turn B is not unit 0 of turn A.
+    this.currentUnit = null;
+    this.rampedUnit = null;
+    this.unitStarts = 0;
   }
 
   /** Create and START the output context. MUST be called on a user gesture.
@@ -1077,7 +1085,20 @@ class Playback {
         this.turnStarts += 1;
         this.rampedTurn = this.currentTurn;
       }
-      if (reanchor || turnStart) {
+      // THE UNIT SEAM. Strictly finer than the turn seam and it subsumes it:
+      // the first unit of a turn is also a new unit, so a turn start ramps
+      // through this predicate too. Kept as two counters rather than one
+      // because they answer different questions -- "did a new turn begin" and
+      // "did the talker start a new clause" -- and the second is the one the
+      // user is reporting.
+      const unitKey = this.currentTurn == null ? null
+        : this.currentTurn + "#" + (this.currentUnit == null ? "" : this.currentUnit);
+      const unitStart = unitKey != null && unitKey !== this.rampedUnit;
+      if (unitStart) {
+        this.unitStarts += 1;
+        this.rampedUnit = unitKey;
+      }
+      if (reanchor || turnStart || unitStart) {
         // The first ~50 ms AS RENDERED, not as received: this is what the
         // browser is about to play, after the resampler. Peak and RMS
         // separate a full-scale step (a click) from a normal soft onset, and
@@ -1102,7 +1123,9 @@ class Playback {
           // is entirely the client's own.
           reanchor: reanchor,
           turn_start: turnStart,
+          unit_start: unitStart,
           turn_id: this.currentTurn,
+          unit_index: this.currentUnit,
           samples: window,
           peak: Math.round(peak * 1000) / 1000,
           rms: Math.round(Math.sqrt(window ? sum / window : 0) * 1000) / 1000,
@@ -1119,7 +1142,8 @@ class Playback {
         // separate "a click" from "a normal soft onset", and they are read off
         // the rendered samples rather than reasoned about.
         tlog("audio.seam", {
-          reanchor: reanchor, turn_start: turnStart, turn: this.currentTurn,
+          reanchor: reanchor, turn_start: turnStart, unit_start: unitStart,
+          turn: this.currentTurn, unit: this.currentUnit,
           at: this.onset.at, peak: this.onset.peak, rms: this.onset.rms,
           head: this.onset.head.slice(0, 8),
           cursor_lead_ms: Math.round((this.cursor - now) * 1000),
@@ -1152,7 +1176,7 @@ class Playback {
       // the reason is structural rather than a tuning miss: a re-anchor only
       // happens when the clock has already drained, and a turn that follows
       // closely on the previous one never drains it.
-      if ((reanchor || turnStart) && ONSET_RAMP_S > 0) {
+      if ((reanchor || turnStart || unitStart) && ONSET_RAMP_S > 0) {
         const gain = ctx.createGain();
         const steps = 32;
         const curve = new Float32Array(steps);
@@ -1248,6 +1272,7 @@ class Playback {
       held_while_hidden: this.heldWhileHidden,
       reanchors: this.reanchors,
       turn_starts: this.turnStarts,
+      unit_starts: this.unitStarts,
       ramps: this.ramps,
       ramp_skipped: this.rampSkipped,
       onsets: this.onsets.slice(-4),
@@ -1759,6 +1784,9 @@ class Connection {
     }
     telemetry.count("audio_frames_received");
     playback.currentTurn = turnId;
+    playback.currentUnit = (this.pendingAudio
+      && this.pendingAudio.unit_index !== undefined)
+      ? this.pendingAudio.unit_index : null;
     playback.push(samples, rate);
     setTurnState(turnId, "speaking");
     showStop();

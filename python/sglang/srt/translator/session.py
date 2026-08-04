@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import difflib
 import enum
 import logging
 import time
@@ -195,6 +196,12 @@ class EventKind(str, enum.Enum):
     #: the event that says why, and it is the only record that the pieces were
     #: ever separate.
     TURN_COALESCED = "turn.coalesced"
+    #: A short segment was refused the right to turn the conversation around
+    #: (§17.8.24). Journalled because the alternative is a direction that
+    #: silently did NOT change, which is indistinguishable from a detector
+    #: that happened to agree -- and the user needs to be able to see that a
+    #: rule acted, especially on the day it acts wrongly.
+    TURN_LANGUAGE_HELD = "turn.language_held"
     ERROR = "error"
 
 
@@ -224,6 +231,17 @@ class Event:
             out["sample_rate"] = self.audio.sample_rate
             out["samples"] = len(self.audio.samples)
         return out
+
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercase, strip punctuation and collapse spaces, for read-back match.
+
+    Punctuation is dropped because the recognizer invents its own and ours
+    came from an LLM; what survives both is the word sequence.
+    """
+    return " ".join(
+        "".join(ch for ch in text.lower() if ch.isalnum() or ch.isspace()).split()
+    )
 
 
 class Journal:
@@ -480,6 +498,29 @@ class TranslatorSession:
         #: How many previous turns are handed to MT as conversation context,
         #: per session and per direction. 0 disables it.
         mt_context_turns: int = 6,
+        # THE SHORT-SEGMENT FLIP RULE (§17.8.24). Measured, not guessed: the
+        # child's turn came back as `es` at language confidence 1.000 on a
+        # 0.88 s segment, carrying the canonical Whisper hallucination
+        # ("!Gracias por ver el video!"). A CONFIDENCE gate cannot reach a
+        # confident wrong answer, and the pin prior could not either, because
+        # it was only consulted BELOW the floor. So the predicate is duration
+        # plus history rather than confidence.
+        #:
+        #: 1.5 s sits above the 0.88 s observation and below any utterance
+        #: that carries enough speech to establish a language switch on its
+        #: own. A speaker who genuinely changes language does so in a sentence,
+        #: not in a syllable.
+        short_segment_flip_s: float = 1.5,
+        #: How many consecutive confident turns in one language before that
+        #: history is allowed to override a short contrary segment. Two, so a
+        #: single turn is never treated as a pattern, and a real switch costs
+        #: exactly one turn of inertia.
+        language_streak_min: int = 2,
+        #: Similarity above which an utterance counts as the user reading our
+        #: own output back. 0.80 on a normalized ratio: high enough that two
+        #: different sentences in one language do not collide, low enough to
+        #: survive ASR noise on a re-reading.
+        read_back_ratio: float = 0.80,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # DEGRADE, do not refuse (§17.8.14). This used to be
@@ -643,6 +684,17 @@ class TranslatorSession:
         # an es->de call: the roles of the two languages are swapped.
         self.mt_context_turns = max(0, mt_context_turns)
         self._mt_context: Dict[Tuple[str, str], Deque[Tuple[str, str]]] = {}
+        self.short_segment_flip_s = short_segment_flip_s
+        self.language_streak_min = max(1, language_streak_min)
+        self.read_back_ratio = read_back_ratio
+        #: What this session has SPOKEN, newest last, as (language, text). Our
+        #: own output read back into the microphone is not evidence about
+        #: which language the speaker speaks -- see `_is_read_back`.
+        self._spoken: Deque[Tuple[str, str]] = deque(maxlen=12)
+        #: Short segments that were refused the right to turn the conversation
+        #: around, and read-backs that were refused a history update.
+        self.flips_refused = 0
+        self.read_backs_seen = 0
         self._turn_lock = asyncio.Lock()
         #: The turn currently being translated/synthesized, or None. Kept so a
         #: stop can NAME what it abandoned; the client discards audio per
@@ -797,8 +849,15 @@ class TranslatorSession:
                 # of THIS session in THIS direction.
                 "coalesce_queued": bool(self.coalesce_queued),
                 "mt_context_turns": int(self.mt_context_turns),
+                # A short contrary segment cannot turn the conversation
+                # around under a held pin, and our own output read back does
+                # not rewrite the speaker's language history (§17.8.24).
+                "short_segment_flip_s": float(self.short_segment_flip_s),
+                "read_back_guard": True,
             },
             "segments_coalesced": self.segments_coalesced,
+            "flips_refused": self.flips_refused,
+            "read_backs_seen": self.read_backs_seen,
         }
 
     # -- the written record (§17.2) -----------------------------------------
@@ -1611,7 +1670,9 @@ class TranslatorSession:
         if floor is not None:
             self.interjections_discarded += 1
             self._log_discard(transcript, floor)
-            spoken = self._resolve_source(transcript)
+            spoken = self._resolve_source(
+                transcript, duration_s=segment.duration_s
+            )
             # The line IS written. A swallowed utterance is indistinguishable
             # from a broken microphone, and the person who was talked over
             # should be able to see what was said and repeat it.
@@ -1672,7 +1733,9 @@ class TranslatorSession:
 
         # 3. Which way does it go. Elimination over the conversation's
         #    participant set -- no pair is named anywhere in this file.
-        source = self._resolve_source(transcript, speaker_id)
+        source = self._resolve_source(
+            transcript, speaker_id, duration_s=segment.duration_s
+        )
         # Published for the barge-in comparison: a segment queued from here on
         # knows which language holds the floor.
         self._active_source = source
@@ -1838,6 +1901,11 @@ class TranslatorSession:
             # own turns and none of the other's.
             for tgt, translated in translations.items():
                 self._remember_context(source, tgt, transcript.text, translated)
+                # And remember that we SAID it, in that language. This is the
+                # only record that can tell a later utterance apart from our
+                # own words coming back through the microphone.
+                if translated.strip():
+                    self._spoken.append((tgt, translated))
 
         self.turns_completed += 1
         await self._suggest_names(
@@ -1906,6 +1974,9 @@ class TranslatorSession:
         self._last_embedding = None
         self._last_uncertain = False
         self._last_candidates = []
+        # Decided ONCE per turn, before either registry path, because both of
+        # them write language history and both were poisoned by it.
+        read_back = self._is_read_back(transcript.text)
         armed = self._armed_speaker
         if armed is not None:
             # STICKY: the pin is NOT spent here. It used to be -- "exactly one
@@ -1937,6 +2008,7 @@ class TranslatorSession:
                     embedding=embedding,
                     text=transcript.text,
                     language=transcript.language,
+                    read_back=read_back is not None,
                 )
             except KeyError:
                 logger.error(
@@ -1981,6 +2053,7 @@ class TranslatorSession:
             language_confidence=transcript.language_confidence,
             pin=self._armed_speaker,
             overlapped=segment.overlapped_turn_id is not None,
+            read_back=read_back is not None,
         )
         uncertain, candidates = self.speakers.uncertainty(ranked, profile.speaker_id)
         self._last_embedding = embedding
@@ -2248,7 +2321,8 @@ class TranslatorSession:
             return None
 
     def _resolve_source(
-        self, transcript: Transcript, speaker_id: Optional[str] = None
+        self, transcript: Transcript, speaker_id: Optional[str] = None,
+        duration_s: Optional[float] = None
     ) -> str:
         """Detected language, hardened against the two ways it goes wrong.
 
@@ -2279,6 +2353,58 @@ class TranslatorSession:
         for the child's German and means it, only the pin reaches it -- see
         the measurement this is waiting on.
         """
+        # THE SHORT-SEGMENT FLIP RULE, and it runs AHEAD of the confidence
+        # branch on purpose. Everything below trusts a confident answer, and
+        # the case this exists for is a confident WRONG one: 0.88 s of a
+        # child's German came back as `es` at confidence 1.000 with a
+        # hallucinated Spanish sentence attached. A gate placed after the
+        # confidence check could never have seen it.
+        #
+        # Deliberately narrow. It needs a pin HELD (the user has asserted who
+        # is speaking), a run of consecutive turns in one language (one turn
+        # is a coincidence), and a segment too short to carry a real language
+        # switch. Outside that intersection the detected language wins exactly
+        # as before -- alternating DE/ES into one phone is what this app is
+        # for, and a rule that made switching hard would break the product to
+        # protect an edge.
+        if duration_s is not None and duration_s < self.short_segment_flip_s:
+            held = self._armed_speaker
+            profile = None
+            if held:
+                try:
+                    profile = self.speakers.get(held)
+                except KeyError:
+                    profile = None
+            if (
+                profile is not None
+                and profile.last_language
+                and profile.language_streak >= self.language_streak_min
+                and transcript.language != profile.last_language
+            ):
+                self.flips_refused += 1
+                self.journal.append(
+                    EventKind.TURN_LANGUAGE_HELD,
+                    {
+                        "speaker_id": held,
+                        "detected": transcript.language,
+                        "detected_confidence": round(
+                            transcript.language_confidence, 3
+                        ),
+                        "held": profile.last_language,
+                        "streak": profile.language_streak,
+                        "duration_s": round(duration_s, 2),
+                        "text": transcript.text[:120],
+                    },
+                )
+                logger.info(
+                    "session %s refused a %.2fs segment the direction flip "
+                    "%s->%s: pin held on %s with a %d-turn %s history",
+                    self.session_id, duration_s, profile.last_language,
+                    transcript.language, held, profile.language_streak,
+                    profile.last_language,
+                )
+                return profile.last_language
+
         if transcript.language_confidence >= self.lid_confidence_floor:
             return transcript.language
         pinned = self.pinned_language()
@@ -2320,7 +2446,9 @@ class TranslatorSession:
         floor = segment.overlapped_language
         if not floor or segment.overlapped_turn_id is None:
             return None
-        spoken = self._resolve_source(transcript)
+        spoken = self._resolve_source(
+            transcript, duration_s=segment.duration_s
+        )
         if spoken == floor:
             return None
         # Only a language this conversation actually carries counts. A
@@ -2344,6 +2472,39 @@ class TranslatorSession:
             "thing to distrust",
             self.session_id, floor, transcript.language, transcript.text[:80],
         )
+
+    def _is_read_back(self, text: str) -> Optional[str]:
+        """Is this utterance our OWN output, spoken back into the microphone?
+
+        The user checks a translation by reading it aloud. That is a normal
+        and useful thing to do, and it used to rewrite his language history to
+        the TARGET language: after reading one Spanish line back, a German
+        speaker's `last_language` was `es`, and with a sticky pin held that
+        arms every later quiet utterance to be routed es->de and spoken back
+        at him in German (§17.8.23 found exactly this state live).
+
+        Returns the language we spoke it in, or None. Compared on a
+        normalized ratio rather than equality because it has been through a
+        loudspeaker, a room and a recognizer since we wrote it.
+        """
+        candidate = _normalize_for_match(text)
+        if len(candidate) < 12:
+            # Too short to be distinctive: "si", "ja", "hola" would match half
+            # the conversation and suppress real history updates.
+            return None
+        for language, spoken in reversed(self._spoken):
+            ratio = difflib.SequenceMatcher(
+                None, candidate, _normalize_for_match(spoken)
+            ).ratio()
+            if ratio >= self.read_back_ratio:
+                self.read_backs_seen += 1
+                logger.info(
+                    "session %s heard its own %s output read back "
+                    "(similarity %.2f); language history not updated",
+                    self.session_id, language, ratio,
+                )
+                return language
+        return None
 
     def _context_for(self, source: str, target: str) -> List[Tuple[str, str]]:
         """The last N (source, target) pairs of THIS session, THIS direction.
@@ -2505,8 +2666,18 @@ class TranslatorSession:
                     chunks.append(piece)
                     self.journal.append(
                         EventKind.TURN_AUDIO,
+                        # THE UNIT SEAM, published so the client can hear it.
+                        # Every unit is its OWN `synthesize()` call, so its
+                        # first sample is a fresh waveform butted against the
+                        # last sample of a different one -- a step, which is a
+                        # click. Units are clause-sized, which is why the user
+                        # reports the noise at "many word starts" rather than
+                        # once per turn. The client cannot fade a seam it
+                        # cannot see, and until now the only per-unit signal
+                        # was `turn.speech`, which does not ride with the
+                        # samples and cannot be aligned to a specific buffer.
                         {"turn_id": turn_id, "target": target,
-                         "speaker_id": speaker_id},
+                         "speaker_id": speaker_id, "unit_index": index},
                         audio=piece,
                     )
             announce(index, "spoken")

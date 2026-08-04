@@ -4709,3 +4709,107 @@ result looks exactly like a live outage and cost time to clear -- **probe MT
 through `OpenAiMt`, never through a hand-built body.** Verified against the live
 server through the real backend class: 0.33-0.50 s per call, streaming first
 token 0.16 s, and the new per-direction `context=` argument working end to end.
+
+#### 17.8.24 What the phone's own logs said, and the hypothesis they killed
+
+The telemetry button paid for itself within an hour of shipping. Two packages
+from the user's device (`/spinning/466-client-logs/`) settled four questions
+that had been argued from the server side for three sessions, and refuted the
+leading noise hypothesis -- mine -- with a measurement.
+
+**(a) FOUR FINDINGS.**
+
+  1. **He is on the new client.** The 09:11 package carries build
+     `8539fcfe00`, byte-exact the served `index.html` (`sha256(body)[:10]`,
+     server.py:1338); the 09:00 package carried `45d4e01728`. So the reload
+     happened and the persisting symptoms are NOT a stale cache. This is the
+     question that decides between debugging and asking for a refresh, and it
+     is now answerable in one line instead of guessed.
+  2. **`unit_index` is inert in production until the tenant restarts.** Every
+     one of the 7 captured seams reports `unit=None`, and `turn_starts ==
+     unit_starts == 6`. The client half of the unit-seam ramp is live; the
+     server half was added AFTER the running tenant booted (08:42:04), so the
+     seam degenerates to the turn seam. A client-side feature whose server
+     half is missing looks exactly like a feature that does not work --
+     the build id is what tells them apart.
+  3. **Synthesis is 64 % of the wall clock, and everything else is noise in
+     the accounting.** Six turns, server events timestamped on his device:
+
+     ```
+       ASR                     0.36 s    0.9 %
+       embedding               0.28 s    0.7 %
+       MT                      2.02 s    5.2 %
+       synthesis -> 1st audio 25.10 s     64 %
+       turn total             39.17 s
+     ```
+
+     ASR + embedding + MT together are 2.66 s of 39.17 s. First audio lands
+     2.94-6.26 s after synthesis starts, every turn. The two multi-unit turns
+     show the clause hole directly: unit 1 begins synthesizing the instant
+     unit 0 stops speaking, so turn `61222fd7` spans 8.49 s of audio inside a
+     12.33 s turn. **The client is not implicated at all** -- 1512 buffers
+     pushed, 1512 scheduled, 0 dropped, never blocked, `ramp_skipped` 0.
+  4. **THE SEAM RAMP IS NOT THE NOISE FIX, and this is a refutation of the
+     hypothesis this session was built on.** All 7 seams report `peak`
+     0.000-0.005 with `head: [0,0,0,0,0,0,0,0]`: the first 50 ms of every
+     unit is DIGITAL SILENCE. There is no step discontinuity at a unit
+     boundary, so there is nothing there for a fade to remove. The ramp is
+     harmless and remains correct for the case where audio does start hot,
+     but it does not answer the user's report and must not be counted as
+     having done so.
+
+**(b) THE NEW LEADING HYPOTHESIS IS CAPTURE-SIDE: the microphone is
+clipping.** `?raw=1` is refuted in the same breath -- the effective track
+settings read `raw_capture: False`, `noiseSuppression: True`,
+`autoGainControl: True`, `echoCancellation: True`, so nothing was disabled.
+But **`peak` is 1.000 in BOTH packages**: full scale, with AGC engaged. That
+is a direct distortion source on the way in, and it is worse than it first
+looks, because the voice-clone reference slices are cut from that same
+capture (`speakers._maybe_admit_reference`). A clipped reference makes the
+SYNTHESIZED voice harsh as well, which fits a report of noise that follows
+the user's own voice rather than the playback clock. The next step is
+therefore capture-side and it is measurement first: report the pre-AGC and
+post-AGC peak separately, and count clipped samples per turn, before touching
+a constraint. Do not "fix" the gain blind -- `raw_capture` exists and turning
+it on trades clipping for hiss.
+
+**(c) OPEN, IN ORDER.**
+
+  1. **The lock split** (§17.8.20 item 2). Still the open half of the wedge:
+     `synthesis did not finish within 300s` plus an auto-redrive were observed
+     live this session, and `_turn_lock` still spans ASR through TTS, so one
+     stuck synthesis serialises every following turn's identification.
+  2. **A tenant restart, bundled.** Three server-side changes are committed
+     and waiting on one restart: `unit_index` on `turn.audio` (finding 2), the
+     short-segment language rule and the read-back guard (below). Nothing
+     needs a second restart if they go together.
+  3. Capture-side clipping instrumentation (b), then the playback modes,
+     the shadow arbiter, per-message speaker change, live partials.
+
+**SHIPPED IN THIS CHECKPOINT.** The loaded gun found in §17.8.23 is unloaded,
+with 12 tests and a control for every arm:
+
+  * A SHORT segment (< `short_segment_flip_s`, 1.5 s) cannot turn the
+    conversation around on its own, but only under a held pin AND a run of at
+    least `language_streak_min` consecutive turns in one language. The check
+    runs AHEAD of the confidence branch on purpose -- the case it exists for
+    scored confidence 1.000. Controls: a long segment still flips, no pin
+    still flips, a one-turn history still flips, and the whole rule switches
+    off. Journalled as `turn.language_held`, because a direction that
+    silently did not change is indistinguishable from a detector that
+    happened to agree.
+  * READ-BACK no longer rewrites language history. Our own output spoken back
+    into the microphone is not evidence about which language the speaker
+    speaks; that is precisely how `speaker-1.last_language` became `es` for a
+    German speaker. Matched on a normalized similarity ratio because it has
+    been through a loudspeaker, a room and a recognizer since we wrote it.
+    Controls: a different sentence in the same language is NOT a read-back
+    (otherwise a real Spanish speaker could never build a history), a short
+    utterance never is, and without the flag the history still moves.
+  * `SpeakerProfile.language_streak` makes "consistent history" a fact rather
+    than an adjective, and resets to 1 on a genuine switch so switching costs
+    exactly one turn of inertia.
+  * `assign_manual` now records the pin it acted on. It is the one outcome
+    where a pin was CERTAINLY held and it was the one recording `None`, which
+    is why the collector reported "0 of 7 decisions with a pin held" for a
+    session the pin decided almost entirely (§17.8.21 instrument gap, closed).

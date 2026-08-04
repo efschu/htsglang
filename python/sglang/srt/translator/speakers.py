@@ -109,6 +109,13 @@ class SpeakerProfile:
     #: ASR hint and as the fallback when a later segment's language ID is
     #: uncertain -- people do not usually switch language mid-conversation.
     last_language: Optional[str] = None
+    #: How many CONSECUTIVE confident observations agree with
+    #: ``last_language``. One turn in a language is a coincidence; a run of
+    #: them is a fact about this speaker, and the difference decides whether a
+    #: short contrary segment is allowed to turn the conversation around
+    #: (§17.8.24). Reset to 1 whenever the language changes, so a genuine
+    #: switch costs exactly one turn of inertia rather than being locked out.
+    language_streak: int = 0
     last_seen: float = 0.0
     references: List[_ReferenceItem] = dataclasses.field(default_factory=list)
 
@@ -545,6 +552,7 @@ class SpeakerRegistry:
         embedding: Optional[SpeakerEmbedding] = None,
         text: str = "",
         language: Optional[str] = None,
+        read_back: bool = False,
     ) -> Tuple[SpeakerProfile, bool]:
         """Attribute a segment to a speaker the user named (§17.5).
 
@@ -581,7 +589,11 @@ class SpeakerRegistry:
                 profile.observations = 1
             else:
                 self._fold(profile, embedding)
-        if language:
+        if language and not read_back:
+            if language == profile.last_language:
+                profile.language_streak += 1
+            else:
+                profile.language_streak = 1
             profile.last_language = language
         admitted = self._maybe_admit_reference(
             profile, audio, text, language, similarity=1.0, enforce_identity=False
@@ -589,6 +601,12 @@ class SpeakerRegistry:
         self._record_decision(
             profile=profile,
             outcome="manual",
+            # THE PIN, recorded at last. `assign_manual` is only ever reached
+            # with an armed speaker, so this is the one outcome where a pin was
+            # CERTAINLY held -- and it was the one outcome recording `None`,
+            # which made the collector report "0 of 7 decisions with a pin
+            # held" for a session the pin decided almost entirely.
+            pin=profile.speaker_id,
             best_id=would_have,
             best_sim=would_have_sim,
             candidates=candidates,
@@ -610,6 +628,7 @@ class SpeakerRegistry:
         language_confidence: float = 1.0,
         pin: Optional[str] = None,
         overlapped: bool = False,
+        read_back: bool = False,
     ) -> Tuple[SpeakerProfile, float, bool]:
         """Match or create a speaker, and maybe admit the audio as reference.
 
@@ -690,7 +709,20 @@ class SpeakerRegistry:
             best_sim = 1.0
 
         profile.last_seen = now
-        if language and language_confidence >= 0.5:
+        # READ-BACK POISONING (§17.8.24). `read_back` means this utterance is
+        # the system's OWN previous output, spoken back into the microphone --
+        # the user checking a translation by reading it aloud, which is a
+        # normal thing to do and which used to rewrite his language history to
+        # the TARGET language. That is how `speaker-1.last_language` became
+        # `es` for a German speaker, and with a sticky pin held it arms every
+        # later quiet utterance to be routed es->de and spoken back at him in
+        # German. Our own words are not evidence about which language this
+        # person speaks.
+        if language and language_confidence >= 0.5 and not read_back:
+            if language == profile.last_language:
+                profile.language_streak += 1
+            else:
+                profile.language_streak = 1
             profile.last_language = language
 
         # ENROLLMENT LOCK FOR THE TTS ECHO (§17.8.16). Our own synthesis comes

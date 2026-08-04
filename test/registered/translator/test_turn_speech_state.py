@@ -175,6 +175,35 @@ class TestTurnSpeechState(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(min(audio_at), first_synth)
         self.assertLess(max(audio_at), last_spoken)
 
+    async def test_every_audio_frame_names_its_synthesis_unit(self):
+        """The unit seam has to be visible in the samples' own event.
+
+        Each unit is its own `synthesize()` call, so its first sample is a
+        fresh waveform butted against the last sample of a different one --
+        a step, i.e. a click, and units are clause-sized, which is why the
+        user hears it at "many word starts". The client fades that seam, and
+        it can only do so if the AUDIO event says which unit it belongs to:
+        `turn.speech` carries the unit index but does not ride with the
+        samples, so it cannot be aligned to a specific buffer.
+        """
+        events = await run_one_turn(build())
+        audio = [e for e in events if e.kind is EventKind.TURN_AUDIO]
+        self.assertTrue(audio, "no audio was produced -- this proves nothing")
+        for event in audio:
+            self.assertIn("unit_index", event.payload)
+            self.assertIsInstance(event.payload["unit_index"], int)
+        # THE ARM THAT MATTERS: a multi-clause turn must show more than one
+        # unit, or the seam being faded would not exist in this fixture and
+        # the assertion above would be vacuous.
+        indices = sorted({e.payload["unit_index"] for e in audio})
+        self.assertGreater(
+            len(indices), 1,
+            f"expected several synthesis units in a three-sentence turn, "
+            f"got {indices}",
+        )
+        self.assertEqual(indices, list(range(len(indices))),
+                         f"unit indices are not contiguous from zero: {indices}")
+
     async def test_reading_mode_announces_nothing(self):
         """The can-fail half: no synthesis, so no state to announce.
 

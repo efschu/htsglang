@@ -25,6 +25,12 @@ ARMS:
                 the clock never drains: `reanchors` stays 1 while
                 `turn_starts` and `ramps` reach 3. The pre-fix client scores
                 1 here, which is what makes this arm falsifiable.
+  --units       ONE turn, three synthesis UNITS -- the real shape of a turn,
+                since every clause is its own `synthesize()` call and so its
+                own fresh waveform. `turn_starts` stays 1 while `unit_starts`
+                and `ramps` reach 3. This is the arm for the user's report of
+                noise at "many word starts": before the unit seam existed the
+                client scored 1 ramp here and faded nothing between clauses.
   --same-turn   THE CONTROL for `--turns`: the same three pushes under ONE
                 turn id must still ramp once. If this reached 3 the fix would
                 be fading every buffer mid-word.
@@ -40,6 +46,7 @@ that is the honest state of this fix until he says so.
 """
 import asyncio
 import functools
+import os
 import http.server
 import shutil
 import socketserver
@@ -47,7 +54,9 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-CLIENT = Path("/spinning/wt-466-translator/python/sglang/srt/translator/client/index.html")
+CLIENT = Path(os.environ.get(
+    "ONSET_PROBE_CLIENT",
+    "/spinning/wt-466-translator/python/sglang/srt/translator/client/index.html"))
 STUB = """(() => { class D { constructor(){this.readyState=0;} send(){} close(){} addEventListener(){} }
 window.WebSocket = D; window.fetch = () => Promise.resolve(new Response("{}", {status:200, headers:{"content-type":"application/json"}})); })();"""
 # `turns` selects the turn identity per push: null (no identity, the original
@@ -58,11 +67,13 @@ window.WebSocket = D; window.fetch = () => Promise.resolve(new Response("{}", {s
 PUSH = """([n, turns]) => { const rate=16000; const b=new Float32Array(Math.round(rate*0.3));
   for (let i=0;i<b.length;i++) b[i]=0.5;   // a hard step from silence: the click shape
   for (let k=0;k<n;k++) {
-    if (turns === "each") playback.currentTurn = "turn-" + k;
-    else if (turns === "one") playback.currentTurn = "turn-only";
+    if (turns === "each") { playback.currentTurn = "turn-" + k; playback.currentUnit = 0; }
+    else if (turns === "one") { playback.currentTurn = "turn-only"; playback.currentUnit = 0; }
+    else if (turns === "units") { playback.currentTurn = "turn-only"; playback.currentUnit = k; }
     playback.push(b, rate);
   }
   return {ramps: playback.ramps, reanchors: playback.reanchors, turn_starts: playback.turnStarts,
+          unit_starts: playback.unitStarts,
           scheduled: playback.scheduled, skipped: playback.rampSkipped}; }"""
 def serve(d):
     h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(d))
@@ -101,14 +112,19 @@ async def main(sabotage, turns):
     # One re-anchor in every arm: the clock is cold at the first push and
     # never drains afterwards. If this moves, the arm stopped isolating the
     # turn seam and its ramp count means nothing.
-    expected_ramps = {None: 1, "one": 1, "each": 3}[turns]
-    expected_starts = {None: 0, "one": 1, "each": 3}[turns]
+    expected_ramps = {None: 1, "one": 1, "each": 3, "units": 3}[turns]
+    expected_turns = {None: 0, "one": 1, "each": 3, "units": 1}[turns]
+    expected_units = {None: 0, "one": 1, "each": 3, "units": 3}[turns]
     ok = (r["ramps"] == 0) if sabotage else (r["ramps"] == expected_ramps)
-    ok = ok and r["reanchors"] == 1 and r["turn_starts"] == expected_starts
+    ok = (ok and r["reanchors"] == 1
+          and r["turn_starts"] == expected_turns
+          and r["unit_starts"] == expected_units)
     ok = ok and r["scheduled"] >= 3 and not errs and r["skipped"] == 0
     print(f"[probe] expected ramps {0 if sabotage else expected_ramps}, "
-          f"turn_starts {expected_starts}")
+          f"turn_starts {expected_turns}, unit_starts {expected_units}")
     print("[probe]", "PASS" if ok else "FAIL")
     return 0 if ok else 1
-_turns = "each" if "--turns" in sys.argv else ("one" if "--same-turn" in sys.argv else None)
+_turns = ("units" if "--units" in sys.argv
+          else "each" if "--turns" in sys.argv
+          else "one" if "--same-turn" in sys.argv else None)
 sys.exit(asyncio.run(main("--sabotage" in sys.argv, _turns)))
