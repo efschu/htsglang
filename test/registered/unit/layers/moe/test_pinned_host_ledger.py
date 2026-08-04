@@ -104,6 +104,37 @@ class PinnedHostLedgerTest(CustomTestCase):
         pinned_host_ledger.clear_pinned_bytes()
         self.assertIsNone(pinned_host_ledger.total_pinned_bytes())
 
+    def test_the_staging_layer_boundary_actually_publishes(self):
+        """Execution smoke for the WIRING, not the module.
+
+        A ledger nothing writes to reads as 'no publisher' forever, and the
+        trim would then keep its pre-#534 arithmetic on exactly the boot the
+        fix is for. So this drives the real producer hook -- and with the
+        staging TRACE switch off, because the trim is a different consumer and
+        must not depend on a debug flag being on.
+        """
+        from unittest import mock
+
+        from sglang.srt.layers.moe import expert_offload
+
+        expert_offload.reset_streaming_staging_ledger()
+        self.addCleanup(expert_offload.reset_streaming_staging_ledger)
+        expert_offload.streaming_staging_ledger().record(pinned=5 << 30)
+
+        from sglang.srt.environ import envs
+
+        with mock.patch.object(
+            envs.SGLANG_MOE_STAGING_TRACE, "get", lambda: False
+        ):
+            expert_offload.log_streaming_staging_layer("layer0", mock.MagicMock())
+
+        self.assertEqual(pinned_host_ledger.total_pinned_bytes(), 5 << 30)
+
+    def test_can_fail_an_unpublished_ledger_reads_as_absent(self):
+        """Spread precondition for the arm above: the assertion discriminates
+        only because the same read returns None when nobody published."""
+        self.assertIsNone(pinned_host_ledger.total_pinned_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()
