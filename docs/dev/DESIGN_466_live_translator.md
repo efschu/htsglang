@@ -4008,3 +4008,73 @@ demoted to the second line of defence, not dropped.
   (b) the child: a DE segment at low LID confidence under a DE pin stays DE.
       Control: the same segment with the pin released takes the old path and
       routes wrongly, which is what proves the pin is what decided it.
+
+#### 17.8.17 The LLM arbiter, and why only half of it belongs in the restart bundle
+
+**The idea, verbatim (user, 2026-08-04):** "das qwen3.6 modell sollte doch auch
+mit gutem briefing aus den gemessenen daten und dem übergebenen transkript von
+bisher viel besser entscheiden können wer gerade spricht?"
+
+**Architecture, as ordered:** three stages, not a replacement. Rules first (pin,
+the §17.8.16 language filter, an unambiguous cosine) decide with no latency at
+all. Only inside a DOUBT BAND -- language does not separate, LID and embedding
+disagree, or the child class -- does a structured evidence package go to Qwen
+over the fast lane: LID language and confidence, cosine to EVERY known cluster,
+pin state, overlap flag, and the last N transcript lines WITH their speaker
+labels. Fixed answer schema (`speaker_id` | `NEW` | `DISCARD` plus one sentence
+of reasoning), hard token ceiling, timeout falling back to the rule decision.
+Shadow mode first: the arbiter judges, the judgement is logged, the rules still
+decide, and authority is granted only against a measured hit rate.
+
+**MY CALL ON TIMING: the bundle carries the EVIDENCE RECORD, the arbiter is the
+cut immediately after. The split is a dependency, not a preference.**
+
+The doubt band cannot be defined honestly today. Its edges are exactly the
+numbers §2 is being measured for -- the within-speaker cosine distribution on
+the NEW signal path, after the language filter and the sticky pin have changed
+which segments even reach the comparison. An arbiter shipped against the old
+0.637 bar would be invoked on the wrong set of turns, and its hit rate would
+then be measured against a band nobody can defend. That is the §493 class:
+a mechanism whose threshold never binds where it was supposed to.
+
+What DOES belong in the bundle, and would be built for §2 regardless, is the
+evidence record itself: the per-decision log extended with LID language and
+confidence, cosine against every cluster (not just the nearest), pin state,
+overlap flag, and the transcript window. It is the measurement instrument for
+the threshold AND the exact payload the arbiter will later be handed, so
+building it once serves both. Shipping it in the bundle means the arbiter cut
+starts with real data instead of a fresh instrument.
+
+**Three integration constraints, recorded now because each is a silent defect
+later:**
+
+  1. THE ARBITER MUST NOT TOUCH THE MT HISTORY. `mt.remember` is called per
+     translated turn (`session.py:1499-1501`) and the backend carries a rolling
+     six-turn context (`mt.py:200-217, 235-236`). An arbiter prompt issued
+     through the translating path would inject speaker-attribution reasoning
+     into the conversation context and degrade every following translation.
+     It needs a history-free call, and `translate()` is not it.
+  2. IT SITS IN THE CRITICAL PATH, because attribution precedes translation.
+     Bounded only: the fast lane answers `mt_first_token` in 0.13-0.37 s
+     measured, so a capped arbiter call is affordable *inside the doubt band*
+     and nowhere else. A timeout is an instrument failure with its own state,
+     never a blocked turn.
+  3. ONE RUNTIME. The arbiter is a call into the same INT8 serving lane the
+     tenant already uses (`launch.py:351-352`, `lane:fast`) -- no second
+     engine, no sidecar.
+
+**What shadow mode is measured against.** Later truth already exists in the
+code and needs no new capture: `resolve_line` (a user re-attributing a line),
+`merge_speakers`, and a name typed onto a cluster are all explicit human
+corrections, and a pin change is a weaker one. The hit rate is the arbiter's
+judgement compared against the correction that came after it -- which is why
+the judgement has to be logged at decision time with the evidence it saw, not
+reconstructed.
+
+**The honest risk, named before it is built.** This is the ANALYSE_532 class
+"bound decision with delivered material", which is where this model is strong.
+It is also the class that produces PLAUSIBLE WRONG answers: an arbiter handed
+four clusters and a transcript will always name one, and it will sound
+reasonable doing it. Shadow mode is not caution theatre here -- it is the only
+way to tell those two apart before the thing has authority over what the user
+hears.
