@@ -4405,6 +4405,17 @@ first), the direction invariant, the evidence record, `--enable-metrics`, the
 gate releasing its session. Client: mic-loss recovery, the `blocked`
 regression fix, the onset ramp, the rename control, `?raw=1`.
 
+**GATE ON THE DEPLOYED BUILD: 2x PASS**, tenant PID 4036082, client
+`58c37e81de` (`gate_robust_a.log`, `gate_robust_b.log`). Four turns each with
+the reload arm and the stop arm (`frames after stop 0, quiet 20.17 s`), the
+auto-scroll arm green, console clean. Medians: `mt_first_token` 0.15 s,
+`first_audio` 5.68 s / 6.04 s. Both runs RELEASED their session on the way out
+(`released session ...`), which is the slot leak closed and visible. Live
+capabilities read back off the socket: `{'speaker_merge': True,
+'partial_participants': True, 'sticky_pin': True, 'overlap_discard': False}` --
+the discard is off in production, as intended after it deleted real speech.
+Hermetic suite 520 passed, ruff and codespell clean.
+
 **OPEN, IN ORDER, for whoever picks this up:**
 
   1. The family evaluation above needs MORE SAMPLES before any threshold
