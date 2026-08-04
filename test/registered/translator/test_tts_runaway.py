@@ -387,5 +387,170 @@ class TestBusyStaysTrueWhileTheThreadLives(unittest.IsolatedAsyncioTestCase):
             release.set()
 
 
+class TestTheTextIsWhatBoundsTheDecode(unittest.TestCase):
+    """The second field round (2026-08-04, package client-20260804T141043Z).
+
+    The ceiling and the wall clock above bounded the DAMAGE and did nothing
+    about the cause: 119 s of synthesized audio for 13.6 s of user speech, two
+    units pinned at the 70 s clock, `since_release_ms` 70683 and 70917.
+
+    Reproduced off the phone with `scripts/translator/probe_tts_runaway.py` on
+    CPU, and the reproduction killed the leading hypothesis on the way. The
+    suspicion was a speaker merge, which had concatenated two profiles' clone
+    references into one 7.74 s buffer just before the two bad turns. It is not
+    that: in the log the first runaway unit entered `synthesizing` 496 ms
+    BEFORE the merge frame was sent, nine units synthesized after the merge
+    were healthy, and in the probe the two-speaker arms were the healthiest of
+    the four (0 of 3 versus 1 of 3 for a single speaker). The reference is not
+    the variable.
+
+    What it is: the talker fails to emit its codec EOS on roughly one
+    generation in ten, and the failure has two shapes -- one that keeps
+    decoding to any ceiling offered (311 steps of continuous babble, measured
+    per-second RMS 0.02-0.046 throughout, for the word "Gracias.") and one that
+    does emit EOS eventually after producing far more than the text needs
+    (102 steps for the same word against a 19-step median, the tail exactly
+    zero). Neither is reachable by a constant token ceiling or a wall clock,
+    because neither knows how much audio the TEXT is worth.
+    """
+
+    #: Measured with the probe on this checkpoint, Spanish clauses, shipped
+    #: sampling: characters -> observed talker steps.
+    MEASURED = {
+        8: [11, 16, 16, 18, 19, 22, 22, 24, 28],     # "Gracias.", healthy runs
+        63: [55, 56, 60],
+        123: [89, 101, 110],
+    }
+
+    @staticmethod
+    def _detached() -> InProcessQwen3Tts:
+        """A real instance without a checkpoint.
+
+        Only the codec's frame rate is read off the geometry, and it is the one
+        number this file already asserts against (12.5 steps per second of
+        audio, measured on the live service), so a stand-in carrying that one
+        field keeps the test hermetic without pretending to be the checkpoint.
+        """
+        tts = object.__new__(InProcessQwen3Tts)
+        tts.config = InProcessTtsConfig()
+        tts.sample_rate = tts.config.sample_rate
+        tts.geometry = type(
+            "Geometry", (), {"frame_rate_hz": MEASURED_STEPS_PER_SECOND}
+        )()
+        return tts
+
+    def test_the_budget_clears_every_healthy_generation_measured(self):
+        tts = self._detached()
+        for chars, samples in self.MEASURED.items():
+            budget = tts.step_budget("x" * chars)
+            self.assertGreater(
+                budget,
+                max(samples),
+                f"a {chars}-character clause was measured at up to "
+                f"{max(samples)} steps and the budget is {budget} -- a budget "
+                "below real speech truncates the translation, which is a worse "
+                "defect than the one it fixes",
+            )
+
+    def test_the_budget_cuts_the_failures_that_were_measured(self):
+        tts = self._detached()
+        # The two observed failures for the 8-character word.
+        budget = tts.step_budget("Gracias.")
+        for observed in (102, 311):
+            self.assertLess(
+                budget,
+                observed,
+                f"{observed} steps for one word must not be inside the budget",
+            )
+
+    def test_the_budget_grows_with_the_text_and_never_leaves_the_ceiling(self):
+        tts = self._detached()
+        self.assertLess(tts.step_budget("hola"), tts.step_budget("hola " * 20))
+        self.assertLessEqual(
+            tts.step_budget("x" * 100000),
+            tts.config.max_new_tokens,
+            "the text-derived budget must stay under the absolute ceiling",
+        )
+        self.assertGreaterEqual(tts.step_budget(""), 8)
+
+    def test_a_runaway_is_redrawn_and_the_healthy_draw_is_kept(self):
+        """The retry is what makes this a repair rather than a shorter leash."""
+        tts = self._detached()
+        rate = tts.sample_rate
+        budget = tts.step_budget("Gracias.")
+        runaway = np.full(int(budget / 12.5 * rate), 0.05, dtype=np.float32)
+        healthy = np.full(int(20 / 12.5 * rate), 0.05, dtype=np.float32)
+        drawn = []
+
+        def fake(text, language, reference, reference_text, max_new_tokens):
+            drawn.append(max_new_tokens)
+            return runaway if len(drawn) == 1 else healthy
+
+        tts._generate_once = fake
+        out = tts._generate("Gracias.", "es", None, "")
+        self.assertEqual(len(drawn), 2, "the runaway draw was not re-drawn")
+        self.assertEqual(drawn, [budget, budget],
+                         "both draws must carry the text's budget")
+        self.assertEqual(len(out), len(healthy),
+                         "the healthy re-draw is the one the listener hears")
+
+    def test_a_healthy_generation_is_drawn_once_and_returned_unchanged(self):
+        """The control: nothing about a normal turn may change."""
+        tts = self._detached()
+        speech = np.full(int(1.5 * tts.sample_rate), 0.05, dtype=np.float32)
+        drawn = []
+
+        def fake(text, language, reference, reference_text, max_new_tokens):
+            drawn.append(max_new_tokens)
+            return speech
+
+        tts._generate_once = fake
+        out = tts._generate("Gracias.", "es", None, "")
+        self.assertEqual(len(drawn), 1, "a healthy draw must not be repeated")
+        np.testing.assert_array_equal(out, speech)
+
+    def test_both_draws_failing_still_returns_the_words(self):
+        """A truncated utterance opens with the speech; babble is in the tail."""
+        tts = self._detached()
+        budget = tts.step_budget("Gracias.")
+        runaway = np.full(int(budget / 12.5 * tts.sample_rate), 0.05, dtype=np.float32)
+        calls = []
+
+        def fake(text, language, reference, reference_text, max_new_tokens):
+            calls.append(max_new_tokens)
+            return runaway
+
+        tts._generate_once = fake
+        out = tts._generate("Gracias.", "es", None, "")
+        self.assertEqual(len(calls), tts.config.runaway_retries + 1)
+        self.assertEqual(len(out), len(runaway))
+
+    def test_trailing_digital_silence_is_cut_and_the_speech_is_not(self):
+        tts = self._detached()
+        rate = tts.sample_rate
+        speech = np.full(int(2.0 * rate), 0.05, dtype=np.float32)
+        # The measured shape: two seconds of speech, five of exact zero.
+        padded = np.concatenate([speech, np.zeros(int(5.0 * rate), dtype=np.float32)])
+        out = tts.trim_trailing_silence(padded)
+        kept_tail = (len(out) - len(speech)) / rate
+        self.assertAlmostEqual(kept_tail, tts.config.trailing_silence_keep_s, places=3)
+        np.testing.assert_array_equal(out[: len(speech)], speech)
+
+    def test_leading_and_interior_silence_survive(self):
+        """Timing inside the utterance is not this method's business."""
+        tts = self._detached()
+        rate = tts.sample_rate
+        lead = np.zeros(int(1.0 * rate), dtype=np.float32)
+        gap = np.zeros(int(0.5 * rate), dtype=np.float32)
+        word = np.full(int(0.5 * rate), 0.05, dtype=np.float32)
+        out = tts.trim_trailing_silence(np.concatenate([lead, word, gap, word]))
+        self.assertEqual(len(out), len(lead) + len(word) + len(gap) + len(word))
+
+    def test_an_entirely_silent_result_is_left_for_the_session_gate(self):
+        tts = self._detached()
+        quiet = np.zeros(int(1.0 * tts.sample_rate), dtype=np.float32)
+        np.testing.assert_array_equal(tts.trim_trailing_silence(quiet), quiet)
+
+
 if __name__ == "__main__":
     unittest.main()

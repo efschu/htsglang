@@ -37,6 +37,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import math
 import time
 from pathlib import Path
 from typing import AsyncIterator, Dict, Iterable, List, Optional, Sequence
@@ -87,6 +88,10 @@ class InProcessTtsConfig:
     #: codec EOS -- which happens, and twice did on 2026-08-04 -- therefore
     #: could not finish inside the deadline no matter how healthy the card
     #: was, so the deadline could only ever abandon it, never catch it.
+    #:
+    #: Since 2026-08-04 this is the ABSOLUTE ceiling rather than the operating
+    #: bound: what a generation may actually spend is derived from the text by
+    #: `step_budget`, and this is the line that budget can never cross.
     max_new_tokens: int = 800
     #: Wall-clock ceiling for one `generate_voice_clone` call, held well below
     #: `session.tts_unit_timeout_s` (90 s) so a runaway synthesis returns a
@@ -98,6 +103,56 @@ class InProcessTtsConfig:
     max_generation_seconds: float = 70.0
     temperature: float = 0.9
     top_p: float = 0.9
+    #: Nucleus/top-k/sampling switch, exposed so the decode can be MEASURED
+    #: rather than argued about. `None` means "leave it to the checkpoint's own
+    #: generation_config.json", which is what this module did implicitly before
+    #: these fields existed: top_k 50, and the package's `pick()` only falls
+    #: back when the caller passes None (qwen3_tts_model.py:332-338). Motivated
+    #: by the runaway investigation of 2026-08-04, where the question "does the
+    #: talker terminate under the sampling we ship" could not be answered
+    #: without editing the module.
+    top_k: Optional[int] = None
+    do_sample: bool = True
+    #: WHAT THE TEXT NEEDS, in talker steps. The talker decodes one codec frame
+    #: per step, and how many frames a clause needs is a property of the TEXT,
+    #: not a constant -- which is what `max_new_tokens` above is, and why it
+    #: could only ever bound the damage.
+    #:
+    #: Measured on this checkpoint with `scripts/translator/probe_tts_runaway.py`
+    #: on 2026-08-04, Spanish clauses at the shipped sampling: 8 characters ->
+    #: 19 steps (median of 10), 63 -> 55/56/60, 123 -> 101. Those three points
+    #: sit on `steps = 14 + 0.7 * characters` to within a step, and at the
+    #: codec's 12.5 Hz that slope is 17.9 characters per second of speech --
+    #: a normal speaking rate, which is the sanity check that this is measuring
+    #: speech and not an artefact.
+    step_budget_base: int = 14
+    step_budget_per_char: float = 0.7
+    #: How far past what the text needs a generation may run before it is
+    #: treated as a runaway. 2.5x is chosen against the MEASURED spread rather
+    #: than as a round number: across 18 healthy generations the widest was
+    #: 30 steps against a 19-step median for the same text (1.6x), so 2.5x
+    #: clears every healthy sample by a margin while cutting the observed
+    #: failures -- 102 steps for an 8-character word (5.2x) and the 311-step
+    #: run that never emitted EOS at all -- long before the user hears them.
+    #: Raise it if a legitimate clause is ever truncated; that event is logged
+    #: with the numbers needed to justify the new value.
+    step_budget_factor: float = 2.5
+    #: A generation that hits its budget is re-drawn this many times. The
+    #: failure is stochastic and rare (1 in 10 generations over-produced in the
+    #: 2026-08-04 sweep, and the field session lost 2 units of ~16), so one
+    #: fresh draw is expected to leave roughly 1 in 100 units truncated, and it
+    #: costs one extra short generation only on a unit that was already wrong.
+    runaway_retries: int = 1
+    #: Trailing digital silence is CUT from the finished waveform. The
+    #: over-produced tail measured on 2026-08-04 was exactly that -- per-second
+    #: RMS [0.0, 0.046, 0.033, 0.0, 0.0, 0.0, 0.0, 0.0] for a one-word clause,
+    #: i.e. two seconds of speech followed by five of digital zero -- and the
+    #: session-level silence gate cannot see it, because that gate reads the
+    #: PEAK of the whole turn and the speech at the front keeps the peak high.
+    #: `trailing_silence_keep_s` leaves a short natural release rather than
+    #: butting the next unit against the last spoken sample.
+    trailing_silence_peak: float = 1e-3
+    trailing_silence_keep_s: float = 0.2
     #: Park every audio module after a turn. Costs a restore on the next turn
     #: and frees ~2 GB between conversations; the right default for a tenant
     #: sharing a card with a 27B model.
@@ -459,12 +514,114 @@ class InProcessQwen3Tts:
         generation_config.max_time = self.config.max_generation_seconds
         return True
 
+    def step_budget(self, text: str) -> int:
+        """Talker steps this text may legitimately need.
+
+        THE RUNAWAY (2026-08-04, package client-20260804T141043Z). One session
+        synthesized 119 s of audio for 13.6 s of user speech, and two units ran
+        until the 70 s wall-clock ceiling stopped them -- the user heard the
+        right word, then dead air, and had to press stop. Reproduced off the
+        phone with `scripts/translator/probe_tts_runaway.py`: the talker fails
+        to emit its codec EOS on roughly one generation in ten, independently of
+        the reference (the two-speaker "merged reference" arms were the
+        healthiest of the four), and the failure is not binary -- a run that
+        emitted EOS after 102 steps for the word "Gracias." is the same defect
+        as one that never emitted it.
+
+        Neither existing guard can catch that, and neither is meant to.
+        `max_new_tokens` is a constant, so it says the same thing about one word
+        as about a full sentence; `max_generation_seconds` is a wall clock, so
+        it bounds how long the damage lasts, not whether it happens. The only
+        thing that knows how much audio is correct here is the text, so that is
+        what this bounds against.
+
+        Deliberately NOT a safety margin on top of a guess: the coefficients are
+        measured on this checkpoint (see the config fields), and the factor is
+        checked against the spread of healthy generations rather than picked.
+        """
+        needed = self.config.step_budget_base + self.config.step_budget_per_char * len(text)
+        budget = int(math.ceil(needed * self.config.step_budget_factor))
+        # Never above the absolute ceiling, and never so small that the floor
+        # term alone could truncate a one-word clause.
+        return max(8, min(self.config.max_new_tokens, budget))
+
+    def trim_trailing_silence(self, waveform: np.ndarray) -> np.ndarray:
+        """Cut digital silence off the END of a finished utterance.
+
+        The over-production measured on 2026-08-04 was silence, not babble: the
+        talker keeps spending steps after the words are done instead of emitting
+        EOS, and the codec renders those steps as zeros. Playing them costs the
+        listener the whole wait, and the next unit cannot start because one
+        talker serves the session -- so the dead air is paid twice.
+
+        Only the tail is touched. Leading and interior silence carry timing that
+        belongs to the utterance, and a trim that reached into them would be a
+        prosody edit rather than a repair.
+        """
+        keep = int(self.config.trailing_silence_keep_s * self.sample_rate)
+        loud = np.flatnonzero(np.abs(waveform) >= self.config.trailing_silence_peak)
+        if not loud.size:
+            # Entirely silent: not this method's call. The session-level
+            # non-silence gate exists for that and reports it as a failure,
+            # which a quietly emptied buffer here would hide.
+            return waveform
+        end = min(len(waveform), int(loud[-1]) + 1 + keep)
+        return waveform[:end]
+
     def _generate(
         self,
         text: str,
         language: str,
         reference: AudioChunk,
         reference_text: Optional[str],
+    ) -> np.ndarray:
+        """Synthesize one unit, re-drawing a generation that ran away.
+
+        The retry is what makes this a repair rather than a shorter leash: a
+        generation that hits the text's budget did not stop on its own, the
+        failure is a stochastic property of one draw, and a fresh draw is
+        overwhelmingly likely to be healthy. A truncated attempt is kept only if
+        every draw failed -- and it still opens with the correct words, because
+        the runaway is in the tail.
+        """
+        budget = self.step_budget(text)
+        attempt = 0
+        waveform = None
+        while True:
+            waveform = self._generate_once(
+                text, language, reference, reference_text, budget
+            )
+            frames = len(waveform) / self.sample_rate * self.geometry.frame_rate_hz
+            # One frame of slack: the codec's output length is a multiple of its
+            # hop, so an exact comparison against the budget would be a
+            # coin flip on rounding.
+            if frames < budget - 1 or attempt >= self.config.runaway_retries:
+                break
+            attempt += 1
+            logger.warning(
+                "talker did not stop by itself: %.0f steps for %d characters "
+                "(budget %d, %.2fs of audio); re-drawing (attempt %d of %d)",
+                frames, len(text), budget,
+                len(waveform) / self.sample_rate, attempt,
+                self.config.runaway_retries,
+            )
+        trimmed = self.trim_trailing_silence(waveform)
+        if len(trimmed) != len(waveform):
+            logger.info(
+                "trimmed %.2fs of trailing silence from a %.2fs utterance "
+                "(%d characters)",
+                (len(waveform) - len(trimmed)) / self.sample_rate,
+                len(waveform) / self.sample_rate, len(text),
+            )
+        return trimmed
+
+    def _generate_once(
+        self,
+        text: str,
+        language: str,
+        reference: AudioChunk,
+        reference_text: Optional[str],
+        max_new_tokens: int,
     ) -> np.ndarray:
         import torch
 
@@ -488,10 +645,14 @@ class InProcessQwen3Tts:
                 ref_text=[reference_text or ""],
                 x_vector_only_mode=self.config.x_vector_only_mode,
                 non_streaming_mode=True,
-                max_new_tokens=self.config.max_new_tokens,
-                do_sample=True,
+                # The TEXT's budget, not the module constant. `max_new_tokens`
+                # in the config remains the absolute ceiling and `step_budget`
+                # never exceeds it.
+                max_new_tokens=max_new_tokens,
+                do_sample=self.config.do_sample,
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
+                top_k=self.config.top_k,
             )
         return self._to_waveform(output)
 
