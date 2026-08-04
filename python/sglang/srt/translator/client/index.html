@@ -270,7 +270,16 @@
     flex:1 1 auto; min-width:0; min-height:46px; font-size:14.5px; gap:7px;
   }
   /* Room for the delete control, so a long name never runs under it. */
-  #speakers .sp > button.who { padding-right:36px; }
+  /* `touch-action:none` FROM THE START, not once the drag is recognised.
+     The global button rule sets `manipulation`, which still lets the browser
+     claim the gesture as a pan: a few pixels of finger travel during the
+     600 ms hold started a scroll, fired `pointercancel`, and the hold timer
+     was cleared -- so the merge drag could never begin on a real finger. The
+     headless gate missed it by construction, because MOUSE pointers are never
+     cancelled by scrolling (`probe_roster_touch.py` is the arm that can).
+     Safe here: this button is a tap target in a fixed footer, not inside
+     anything the user needs to scroll. */
+  #speakers .sp > button.who { padding-right:36px; touch-action:none; }
   #speakers .sp > button.who .lbl { overflow:hidden; text-overflow:ellipsis;
                                     white-space:nowrap; }
   #speakers > button.add { flex:0 0 auto; min-width:52px; }
@@ -683,6 +692,10 @@ class Playback {
     //: They exist so a stop can cut what is ALREADY playing (user order).
     this.live = [];
     this.stops = 0;
+    //: Frames refused because the page was hidden. Counted rather than
+    //: silently dropped: it is what the return-to-foreground notice is built
+    //: from, and it separates "nothing was sent" from "we refused to speak".
+    this.heldWhileHidden = 0;
     //: The turn whose audio is currently on the clock, so a stop can say on
     //: WHICH bubble it happened rather than only in the header.
     this.currentTurn = null;
@@ -806,6 +819,23 @@ class Playback {
   schedule(float32, rate) {
     const ctx = this.ensure();
     if (!ctx) return false;
+    // HIDDEN MEANS SILENT (user order 2026-08-04). The context-state guard
+    // below is not enough: Android keeps the AudioContext RUNNING for a
+    // backgrounded PWA that holds a wake lock, so a translation that arrived
+    // while the phone was in a pocket was scheduled normally and spoken to
+    // nobody -- or, worse, minutes later. The page's own visibility is the
+    // only signal that says whether a listener is there.
+    //
+    // Deliberately unconditional, including while listening is ON: a
+    // translation that surfaces late is worse than one that never sounds,
+    // because it arrives detached from the exchange it belongs to. It is not
+    // lost -- the transcript already carries the text, and `heldWhileHidden`
+    // is what tells the user on return.
+    if (typeof document !== "undefined" && document.hidden) {
+      this.heldWhileHidden += 1;
+      this.blocked = true;
+      return false;
+    }
     if (ctx.state !== "running") {
       // Do NOT schedule into a stopped clock. `currentTime` is frozen while
       // the context is suspended, so every buffer would be booked against the
@@ -1499,6 +1529,12 @@ function paintUnread(hasNew) {
  * reflow from rotation, a font finishing load, the on-screen keyboard
  * changing the viewport.
  */
+//: Last 40 drag-gesture steps. On `window` deliberately: this exists to be
+//: read off a REAL DEVICE (debug upload, remote inspector), and a
+//: script-scope const is reachable from neither.
+window.dragLog = [];
+const dragLog = window.dragLog;
+
 let streamResize = null;
 function watchStream() {
   const box = streamBox();
@@ -1925,7 +1961,18 @@ function bindSpeakerHold(cell, button, speaker) {
     return landed;
   };
 
+  // Drag telemetry, on the page's own diagnostics. The gesture failed on a
+  // real phone while every headless arm passed, and there was no way to ask
+  // the device WHICH step it got to. Now there is.
+  const note = (step, extra) => {
+    dragLog.push(Object.assign(
+      {at: Math.round(performance.now()), step, speaker: speaker.speaker_id},
+      extra || {}
+    ));
+    while (dragLog.length > 40) dragLog.shift();
+  };
   button.addEventListener("pointerdown", (event) => {
+    note("pointerdown", {type: event.pointerType});
     if (hold) clearTimeout(hold);
     hold = setTimeout(() => {
       hold = null;
@@ -3762,14 +3809,28 @@ fetch(BASE + "api/translator/languages").then((r) => r.json()).then((info) => {
 }).catch(() => sys("could not read the language set", true));
 
 document.addEventListener("visibilitychange", () => {
-  // Backgrounding a PWA suspends its AudioContext on Android. Nothing here can
-  // prevent that; the reconnect path picks the conversation back up when the
-  // page returns. Lock-screen operation needs a native client.
-  if (!document.hidden) {
-    acquireWakeLock();
-    if (connection.ws && connection.ws.readyState !== WebSocket.OPEN) {
-      connection.connect();
-    }
+  // Backgrounding a PWA suspends its AudioContext on Android -- SOMETIMES.
+  // With a wake lock held it can keep running, which is how a phone in a
+  // pocket spoke translations nobody was there for, and how a backlog fired
+  // on return. The rule (user order 2026-08-04) is simple and enforced at
+  // both ends: hidden means nothing plays AND nothing stays queued.
+  if (document.hidden) {
+    const cut = playback.stopAll();
+    if (cut) playback.heldWhileHidden += cut;
+    return;
+  }
+  acquireWakeLock();
+  if (connection.ws && connection.ws.readyState !== WebSocket.OPEN) {
+    connection.connect();
+  }
+  // Say what was withheld, once, as TEXT. The translations themselves are
+  // already in the transcript above -- what the user needs is to know that
+  // they happened while the screen was off, not to hear them now, detached
+  // from the exchange they belonged to.
+  if (playback.heldWhileHidden > 0) {
+    sys("some translations arrived while the screen was off — they are in "
+        + "the transcript, and were not spoken", false);
+    playback.heldWhileHidden = 0;
   }
 });
 
