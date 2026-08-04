@@ -452,6 +452,111 @@ def reference_divergence(talker, frames: int = 4, seed: int = 488) -> dict:
     }
 
 
+def gate_loaded_model(model, frames: int = 3, keep_installed: bool = False) -> dict:
+    """THE HANDOFF ENTRY POINT: gate the install seam inside a LIVE tenant.
+
+    Takes an already-loaded ``Qwen3TTSModel`` wrapper -- the thing
+    ``InProcessQwen3Tts._model`` holds -- and proves, in that process, on those
+    weights, that installing the graph driver changes nothing about what the
+    code predictor computes. No second copy of the model, no server restart,
+    no conversation state touched, no audio synthesised.
+
+    Safe to call in the live tenant, and each of those is a property, not a
+    hope: it allocates ~60 MiB (fifteen graphs sharing one pool, a 16-slot
+    scratch cache and a 4096-frame uniform pool), it runs a handful of frames,
+    and unless ``keep_installed=True`` it puts the reference ``generate`` back
+    before returning.
+
+    The sampling is not a parameter. It is read from the reference's own
+    ``subtalker_*`` defaults (:func:`reference_subtalker_defaults`), because
+    the one way to get this wrong is to pass the tenant's ``temperature/top_p``
+    -- which belong to the trunk, not the predictor.
+    """
+    import torch
+
+    from sglang.srt.models.qwen3_tts_graph_driver import (
+        GraphedPredictorFrame,
+        reference_subtalker_defaults,
+    )
+
+    inner = getattr(model, "model", model)
+    talker = getattr(inner, "talker", None)
+    if talker is None:
+        raise ValueError(
+            "no .talker on the given model; expected the reference "
+            "Qwen3TTSModel wrapper (see translator/inprocess_tts.py)"
+        )
+    predictor = talker.code_predictor
+    groups = talker.config.num_code_groups
+    device = next(predictor.parameters()).device
+    dtype = next(predictor.parameters()).dtype
+    hidden = predictor.model.config.hidden_size
+    vocab = predictor.lm_head[0].out_features
+
+    sampling = reference_subtalker_defaults(model)
+    report: Dict[str, object] = {
+        "sampling_read_from_reference": dict(sampling),
+        "corridor_before": corridor_report(),
+    }
+
+    free_before = torch.cuda.mem_get_info(device.index or 0)[0] / (1024 * 1024)
+    driver = GraphedPredictorFrame.install(talker, model=model, **sampling)
+    free_after = torch.cuda.mem_get_info(device.index or 0)[0] / (1024 * 1024)
+    report["vram"] = {
+        "allocator_delta_mib": driver.vram_cost_mib(),
+        "card_free_before_mib": round(free_before, 1),
+        "card_free_after_mib": round(free_after, 1),
+        "card_delta_mib": round(free_before - free_after, 1),
+    }
+
+    try:
+        generator = torch.Generator(device="cpu").manual_seed(488)
+        mismatches = 0
+        total = 0
+        for _ in range(frames):
+            prompt = torch.randn(1, 2, hidden, generator=generator).to(
+                device=device, dtype=dtype
+            )
+            uniforms = torch.rand(1, groups - 1, generator=generator).to(device=device)
+            with torch.inference_mode():
+                eager = _eager_static_frame(
+                    talker, prompt, uniforms,
+                    {"do_sample": sampling["do_sample"], **{
+                        k: sampling[k] for k in ("temperature", "top_k", "top_p")
+                    }}, vocab,
+                )
+                # Through the INSTALLED seam, i.e. exactly the call the
+                # reference makes -- not the driver object directly.
+                graphed = predictor.generate(
+                    inputs_embeds=prompt, max_new_tokens=groups - 1,
+                    uniforms=uniforms, output_hidden_states=True,
+                    return_dict_in_generate=True, **sampling,
+                ).sequences
+            total += eager.numel()
+            mismatches += int((eager != graphed).sum())
+        report["capture_gate"] = {
+            "frames": frames,
+            "tokens_compared": total,
+            "mismatches": mismatches,
+            "identical": mismatches == 0,
+        }
+        report["sampling_fallbacks"] = driver.sampling_fallbacks
+        report["passed"] = mismatches == 0 and driver.sampling_fallbacks == 0
+    finally:
+        if not keep_installed:
+            driver.uninstall()
+            release()
+    report["installed_on_return"] = keep_installed
+    report["corridor_after"] = corridor_report()
+    report["verdict"] = (
+        "INSTALL SEAM GREEN -- the graphed predictor is bit-identical to the "
+        "eager path on this instance's own weights."
+        if report["passed"]
+        else "REFUSED -- the installed seam diverged; do not wire this in."
+    )
+    return report
+
+
 def trunk_gate(talker, steps: int = 8) -> dict:
     """Three trunk arms, and each pair answers a different question.
 
@@ -697,6 +802,13 @@ def main(argv=None) -> int:
         "--skip-ladder", action="store_true",
         help="run only the identity gate (cheap, for iterating on correctness)",
     )
+    parser.add_argument(
+        "--install-seam-only", action="store_true",
+        help=(
+            "run only gate_loaded_model against a standalone copy -- the same "
+            "check agent 8 runs in-process against the live tenant"
+        ),
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -761,6 +873,18 @@ def _run(args, profiler, report) -> int:
 
     phases: List[dict] = []
     enforce_corridor("weights_loaded", phases)
+
+    if args.install_seam_only:
+        report["install_seam"] = gate_loaded_model(tts._model)
+        report["verdict"] = report["install_seam"]["verdict"]
+        report["power_state_after"] = power_state()
+        report["corridor_after"] = corridor_report()
+        text = json.dumps(report, indent=2)
+        print(text)
+        if args.json:
+            pathlib.Path(args.json).write_text(text + "\n", encoding="utf-8")
+        logger.info("%s", report["verdict"])
+        return 0 if report["install_seam"]["passed"] else 1
 
     logger.info("gate 1: predictor capture, graphed vs eager over the same cache")
     report["identity_gate"] = identity_gate(talker, frames=args.frames)

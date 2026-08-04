@@ -265,6 +265,30 @@ The standing corridor keeps 400 MiB free, so the budget for this cut is
 No new weights: the driver reuses the modules the tenant already holds. The
 242 MiB is the whole ask, and it leaves ~2963 MiB of corridor untouched.
 
+#### 7.4a CORRECTED 2026-08-04 — the table above understates the cut by 4.9x
+
+Measured on the real geometry, not estimated
+(`scripts/dev/488_talker_profile/measure_graphed_footprint.py`): the graphs cut
+costs **1184 MiB**, not 242 — predictor graphs **183.5 MiB** against ~60
+estimated, trunk graph plus its 1024-slot static cache **1000.5 MiB** against
+~181 estimated. Identical to the decimal on sm86 and sm120, so the cost is
+allocator- and shape-driven rather than architectural.
+
+Where the table went wrong is instructive: it counted the static cache
+(117.4 MiB, correct) and then added a flat "generous" 64 MiB for the graph
+pool. But a captured region **retains every intermediate**, including the
+per-layer expanded-KV copies GQA produces, so the pool scales with the cache it
+captures rather than with the batch-1 activation size. Measured at three slot
+counts (1024 / 256 / 64 → 1000.5 / 262.3 / 77.8 MiB) the trunk term fits
+
+> **0.96 MiB per slot + 16 MiB**, i.e. ~8.8x the 0.109 MiB/slot cache itself.
+
+Consequences are carried in `DESIGN_488 §2.2f-§2.2g`: slot count is the
+dominant VRAM knob of the feature, 1024 slots is the wrong default for a ~3.2 s
+clause, and right-sizing it is worth 738 MiB — six times the pool's entire
+original 121 MiB shortfall. The 1024 default stands only until the real
+`generate_icl_prompt` prompt length is measured.
+
 ### 7.5 The quality gate — voice is the product
 
 A listening test is the final gate, not the only one, because "sounds fine" is

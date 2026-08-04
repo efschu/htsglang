@@ -212,6 +212,127 @@ def refuse_unless_graph_safe(cache) -> None:
             )
 
 
+def reference_subtalker_defaults(model) -> dict:
+    """The sampling the reference actually applies to the CODE PREDICTOR.
+
+    Read out of ``generate_voice_clone``'s own signature rather than written
+    down here, because writing it down is how the following trap gets sprung.
+
+    THE TRAP, and it is live in this deployment. The tenant synthesizes with
+    ``do_sample=True, temperature=0.9, top_p=0.9``
+    (``inprocess_tts.py:358-360``). Those are the **trunk's** knobs. The code
+    predictor is driven by a *separate* set, ``subtalker_*``
+    (``modeling_qwen3_tts.py:1674-1677``), which the tenant does not pass at
+    all and which therefore keep the reference's defaults
+    (``:2036-2039``): ``top_k=50, top_p=1.0, temperature=0.9``.
+
+    Capturing the tenant's ``top_p=0.9`` into the predictor graph would apply
+    a warper the reference never applies -- a permanent, silent change to
+    every frame's sampling, visible only as timbre. Hence: read the signature,
+    do not remember the numbers.
+    """
+    import inspect  # noqa: PLC0415
+
+    generate_voice_clone = getattr(model, "generate_voice_clone", None)
+    if generate_voice_clone is None:
+        inner = getattr(model, "model", None)
+        generate_voice_clone = getattr(inner, "generate_voice_clone", None)
+    if generate_voice_clone is None:
+        raise GraphCaptureRefusal(
+            "no generate_voice_clone on the given model, so the predictor's "
+            "sampling defaults cannot be read from the reference. Refusing to "
+            "guess them: a wrong warper is silent."
+        )
+    parameters = inspect.signature(generate_voice_clone).parameters
+    wanted = {
+        "do_sample": "subtalker_dosample",
+        "top_k": "subtalker_top_k",
+        "top_p": "subtalker_top_p",
+        "temperature": "subtalker_temperature",
+    }
+    defaults = {}
+    for name, source in wanted.items():
+        parameter = parameters.get(source)
+        if parameter is None or parameter.default is inspect.Parameter.empty:
+            raise GraphCaptureRefusal(
+                f"generate_voice_clone has no default for '{source}'; this "
+                f"reference version does not match what the capture was "
+                f"written against. Refusing rather than guessing."
+            )
+        defaults[name] = parameter.default
+    return defaults
+
+
+class UniformPool:
+    """Pre-drawn sampling entropy that a captured graph can advance by itself.
+
+    A replayed graph cannot draw randomness: whatever ``torch.multinomial``
+    consumed at capture time is baked, so every frame would sample identically.
+    The fix is to make the draw an *input* -- but feeding one uniform per
+    residual group from the host would be fifteen tiny launches per frame,
+    which is the cost this whole slice exists to delete.
+
+    So the pool lives on the device and the cursor advances **inside** the last
+    step's graph. Per frame that is two extra device ops total, and the host
+    does nothing at all.
+
+    Wrap-around is deliberate and documented rather than prevented: after
+    ``frames`` frames the cursor returns to 0 and the same uniform *values* are
+    reused. That is not a repeated output -- the logits they are applied to are
+    different -- and at the default 4096 frames a wrap is ~100 clauses apart.
+    :meth:`reseed` is offered for a caller that wants to cut even that.
+    """
+
+    def __init__(self, frames: int, groups: int, device, seed: Optional[int] = None):
+        if frames < 1:
+            raise ValueError(f"frames={frames} leaves no entropy to draw from")
+        self.frames = frames
+        self.groups = groups
+        self.device = device
+        # Drawn on the CPU and moved: torch.randn/rand on the device is not
+        # arch-identical across cards, and a pool that differs per GPU makes
+        # two ranks of the same model incomparable.
+        self.pool = torch.empty(frames, groups, dtype=torch.float32, device=device)
+        self.cursor = torch.zeros(1, dtype=torch.long, device=device)
+        self.reseed(seed)
+
+    def reseed(self, seed: Optional[int] = None) -> None:
+        generator = torch.Generator(device="cpu")
+        if seed is not None:
+            generator.manual_seed(seed)
+        self.pool.copy_(
+            torch.rand(self.frames, self.groups, generator=generator, dtype=torch.float32)
+        )
+        self.cursor.zero_()
+
+    def draw(self, group: int) -> torch.Tensor:
+        """The uniform for ``group`` of the frame the cursor points at, (1, 1).
+
+        Pure device ops so it can live inside a captured region: the cursor is
+        a device tensor, and ``index_select`` reads through it at replay time
+        rather than at capture time.
+        """
+        return self.pool.index_select(0, self.cursor).narrow(1, group, 1)
+
+    def advance(self) -> None:
+        """Step to the next frame. Captured, so it fires on every replay."""
+        self.cursor.add_(1)
+        self.cursor.remainder_(self.frames)
+
+    def load_frame(self, uniforms: torch.Tensor) -> None:
+        """Put caller-supplied uniforms under the cursor. Used by the gates.
+
+        Lets one captured body serve both paths: production reads pre-drawn
+        entropy, and the identity gate writes its own draws into the same slot
+        so the eager and graphed arms are driven by identical numbers.
+        """
+        self.cursor.zero_()
+        self.pool[0].copy_(uniforms.reshape(-1)[: self.groups])
+
+    def cost_mib(self) -> float:
+        return (self.pool.numel() * 4 + self.cursor.numel() * 8) / (1024 * 1024)
+
+
 def reset_cache_positions(cache) -> None:
     """Rewind a static cache to slot 0 without touching its contents.
 
@@ -369,11 +490,95 @@ class GraphedPredictorFrame(FastCodePredictor):
         self.cache = None
         self.steps: List[CapturedStep] = []
         self._order: Optional[_OrderedReplay] = None
+        self.uniforms: Optional[UniformPool] = None
+        self.capture_cost_mib: float = 0.0
+        #: Times a call arrived with sampling the graph was not captured for
+        #: and was served by the reference instead. Non-zero means the tenant
+        #: is running the eager path and the speedup is NOT being delivered --
+        #: exposed so telemetry can say so out loud.
+        self.sampling_fallbacks: int = 0
         #: Sampling knobs are baked at capture time, not per call. A graph
         #: cannot branch, so `do_sample` and the warper thresholds are part of
         #: what was captured; changing them requires a re-capture, and
         #: :meth:`generate` refuses a mismatch rather than ignoring it.
         self.captured_sampling: Optional[tuple] = None
+
+    # -- installation -------------------------------------------------------
+
+    @classmethod
+    def install(
+        cls,
+        talker,
+        *,
+        do_sample: bool,
+        temperature: Optional[float],
+        top_k: Optional[int],
+        top_p: Optional[float],
+        model=None,
+        pool_frames: int = 4096,
+        seed: Optional[int] = None,
+        validate_against_reference: bool = True,
+    ) -> "GraphedPredictorFrame":
+        """Capture, then swap ``code_predictor.generate`` for the replay path.
+
+        The four sampling values are **required keyword arguments with no
+        defaults**, on purpose. A graph bakes its warpers, so these are not
+        configuration -- they are part of what was compiled, and a default
+        here would let a caller install a graph that samples differently from
+        the model it is standing in for, forever, silently.
+
+        ``validate_against_reference`` additionally checks them against
+        ``generate_voice_clone``'s own ``subtalker_*`` defaults and refuses at
+        INSTALL time on a mismatch. That check exists because of a specific
+        confusion this deployment invites: the tenant passes
+        ``temperature=0.9, top_p=0.9``, and those are the **trunk's** knobs,
+        not the predictor's (see :func:`reference_subtalker_defaults`). Passing
+        them here would be the natural mistake, and catching it at load is
+        worth more than catching it on the first turn.
+
+        Pass ``model`` (the ``Qwen3TTSModel`` wrapper) when the talker is not
+        itself the object carrying ``generate_voice_clone``.
+
+        Returns the driver; :meth:`uninstall` puts the reference back without a
+        restart, which is the operator's way out.
+        """
+        requested = {
+            "do_sample": do_sample, "temperature": temperature,
+            "top_k": top_k, "top_p": top_p,
+        }
+        if validate_against_reference:
+            defaults = reference_subtalker_defaults(model if model is not None else talker)
+            if requested != defaults:
+                raise GraphCaptureRefusal(
+                    f"the sampling asked for {requested} but the reference "
+                    f"applies {defaults} to the code predictor "
+                    f"(generate_voice_clone's subtalker_* defaults). Capturing "
+                    f"the former would bake a warper the reference never "
+                    f"applies -- a permanent, silent change to every frame, "
+                    f"visible only as timbre. Note the trap: the tenant's own "
+                    f"temperature/top_p are the TRUNK's, not the predictor's. "
+                    f"Pass validate_against_reference=False only if the caller "
+                    f"genuinely overrides subtalker_* at every call site."
+                )
+
+        predictor = talker.code_predictor
+        driver = cls(predictor, talker.config.num_code_groups)
+        driver.capture(
+            do_sample=do_sample, temperature=temperature, top_k=top_k,
+            top_p=top_p, pool_frames=pool_frames, seed=seed,
+        )
+        driver.original_generate = predictor.generate
+        predictor.generate = driver.generate  # type: ignore[method-assign]
+        logger.info(
+            "#488: code_predictor.generate replaced by %d captured graphs "
+            "(sampling %s, VRAM +%.1f MiB incl. a %d-frame uniform pool)",
+            len(driver.steps), requested, driver.vram_cost_mib(), pool_frames,
+        )
+        return driver
+
+    def vram_cost_mib(self) -> float:
+        """What installing this driver costs, for the handoff's budget line."""
+        return round(self.capture_cost_mib, 2)
 
     # -- capture ------------------------------------------------------------
 
@@ -383,8 +588,15 @@ class GraphedPredictorFrame(FastCodePredictor):
         temperature: Optional[float] = None,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        pool_frames: int = 4096,
+        seed: Optional[int] = None,
     ) -> "GraphedPredictorFrame":
         from transformers import StaticCache  # noqa: PLC0415
+
+        before = torch.cuda.memory_allocated(self.device)
+        self.uniforms = UniformPool(
+            pool_frames, self.num_code_groups - 1, self.device, seed=seed
+        )
 
         predictor = self.predictor
         model = predictor.model
@@ -413,7 +625,6 @@ class GraphedPredictorFrame(FastCodePredictor):
                     device=self.device, dtype=self.dtype,
                 ),
                 "token_in": torch.zeros(1, 1, device=self.device, dtype=torch.long),
-                "uniform": torch.zeros(1, 1, device=self.device, dtype=torch.float32),
                 "cache_position": torch.arange(
                     cache_start, valid_len, device=self.device, dtype=torch.long
                 ),
@@ -454,8 +665,14 @@ class GraphedPredictorFrame(FastCodePredictor):
                 last = outputs.last_hidden_state[:, -1:, :]
                 logits = predictor.lm_head[head_index](last)[:, -1, :]
                 token = self._sample(
-                    logits, buffers["uniform"], do_sample, temperature, top_k, top_p
+                    logits, self.uniforms.draw(position),
+                    do_sample, temperature, top_k, top_p,
                 )
+                if position == len(self.schedule) - 1:
+                    # The frame is complete: step the pool. Captured, so the
+                    # next replay of step 0 already reads fresh entropy and
+                    # the host never touches the cursor.
+                    self.uniforms.advance()
                 return {"token": token, "logits": logits}
 
             step = _capture(f"predictor_step_{position}", body, buffers, pool=pool)
@@ -464,10 +681,17 @@ class GraphedPredictorFrame(FastCodePredictor):
 
         self._order = _OrderedReplay(self.steps)
         self.captured_sampling = (do_sample, temperature, top_k, top_p)
+        # Capture consumed pool entries during warmup; rewind so a run starts
+        # at a known point and two runs are comparable.
+        self.uniforms.cursor.zero_()
+        self.capture_cost_mib = round(
+            (torch.cuda.memory_allocated(self.device) - before) / (1024 * 1024), 2
+        )
         logger.info(
             "#488: captured %d predictor step graphs over a %d-slot static "
-            "scratch cache (shared pool)",
-            len(self.steps), self.scratch_slots,
+            "scratch cache (shared pool), sampling=%s, VRAM +%.1f MiB",
+            len(self.steps), self.scratch_slots, self.captured_sampling,
+            self.capture_cost_mib,
         )
         return self
 
@@ -540,11 +764,28 @@ class GraphedPredictorFrame(FastCodePredictor):
             temperature, top_k, top_p,
         )
         if do_sample is not None and requested != self.captured_sampling:
-            raise GraphCaptureRefusal(
-                f"sampling parameters {requested} differ from the captured "
-                f"{self.captured_sampling}. A graph cannot re-branch: the "
-                f"warpers are baked in. Re-capture instead of silently "
-                f"sampling with the wrong thresholds."
+            # FALL BACK, do not raise -- and this is a deliberate exception to
+            # the fail-fast rule used everywhere else in this module. Fail-fast
+            # is right when continuing would produce WRONG output; here the
+            # reference path produces RIGHT output, just slower. Raising would
+            # break a live turn mid-conversation to protect against something
+            # the fallback already prevents. It is loud (a warning naming both
+            # tuples, once) and it is counted, so a tenant silently running
+            # eager shows up in telemetry as a number rather than as a
+            # mysterious absence of speedup.
+            self.sampling_fallbacks += 1
+            if self.sampling_fallbacks == 1:
+                logger.warning(
+                    "#488: sampling %s differs from the captured %s -- the "
+                    "graph bakes its warpers, so this call and any like it "
+                    "are served by the reference path (correct, ~10x slower). "
+                    "Re-capture with these values to get the speedup back.",
+                    requested, self.captured_sampling,
+                )
+            return self.original_generate(
+                inputs_embeds=inputs_embeds, max_new_tokens=max_new_tokens,
+                do_sample=do_sample, top_p=top_p, top_k=top_k,
+                temperature=temperature, **ignored,
             )
         wanted = max_new_tokens or (self.num_code_groups - 1)
         if wanted != len(self.steps):
@@ -560,14 +801,17 @@ class GraphedPredictorFrame(FastCodePredictor):
         # a rewind would cost per frame are exactly the kind of host-side
         # residue this slice exists to delete.
         self._order.rewind()
+        if uniforms is not None:
+            # Gate path: drive the graph from the caller's draws so the eager
+            # arm can be driven from the same ones. Production passes nothing
+            # and the pool advances itself inside the graph.
+            self.uniforms.load_frame(uniforms)
         codes: List[torch.Tensor] = []
         for position, step in enumerate(self.steps):
             if position == 0:
                 step.inputs["hidden"].copy_(inputs_embeds)
             else:
                 step.inputs["token_in"].copy_(codes[-1])
-            if uniforms is not None:
-                step.inputs["uniform"].copy_(uniforms[:, position : position + 1])
             self._order.replay(position)
             # The output buffer is overwritten by the NEXT replay of this same
             # step, i.e. on the next frame -- not by any replay within this

@@ -1,5 +1,69 @@
 # DESIGN #488 — TRT lane, talker pool, and the revision guard
 
+## 0. RESUME HERE — state at the 2026-08-04 session checkpoint
+
+Written at a forced session end. Everything below this section is the design;
+this section is where the work stands and what to pick up.
+
+**Landed and pushed** (branch `feat/talker-lane-488`):
+
+| slice | state | evidence |
+|---|---|---|
+| slice 1, raw predictor loop | committed | worth 1.04x alone; its job was enabling capture |
+| slice 2, CUDA graphs | committed, **RTF 1.706 → 0.176, 9.71x** | `/spinning/gpu-battery-results/2026-08-04_488_slice2_graphs/` |
+| pool-gate mechanism | committed | §2.2d — the reserve worked, the baseline was the false premise |
+| Step A install seam | **built, smoke-green, committed** | §4b; `smoke_install_seam.py`, six properties |
+| graph-overhead decomposition | **measured, committed** | §2.2f |
+
+**The number that changed the plan, and where it stands.** `ANALYSE_488 §7.4`
+budgeted the graphs cut at ~242 MiB. Measured on real geometry: **1184 MiB**
+(predictor 183.5, trunk 1000.5 at 1024 slots) — 4.9x the estimate, identical on
+sm86 and sm120.
+
+The discriminator that explains it **has been run** and is complete: trunk cost
+is **linear in cache slots**, measured at 1024 / 256 / 64 → 1000.5 / 262.3 /
+77.8 MiB, fitting `0.96 MiB per slot + 16 MiB` against a static cache of only
+0.109 MiB per slot. Capture retains every per-layer expanded-KV intermediate
+instead of freeing it, so the cut costs ~8.8x the cache it captures. Slot count
+is therefore the dominant VRAM knob of the whole feature, and 1024 is the wrong
+default — see §2.2f. Nothing about this is still open to measurement; what is
+open is the *choice*, below.
+
+**Open, in the agreed order:**
+
+1. **Trunk slot count.** Blocked on one unmeasured quantity: the real prompt
+   length from `generate_icl_prompt` (reference-audio codes + text). Needed
+   value is `max prompt tokens + max frames per clause`. Measure it, then the
+   law in §2.2f prices the choice directly. Worth 738 MiB between 1024 and 256.
+2. **Step A tenant wiring** — artifact is ready (§4b: sampling arguments,
+   refusal/fallback table, 183.5 MiB measured, in-process gate
+   `gate_loaded_model`). Tenant is **not** to be touched by this strand; the
+   wiring waits on the translator strand's latency diagnosis so before/after is
+   measured on their instrument.
+3. **Pool decision** — price table and three unblock paths are in §2.2g;
+   recommendation is path 2 (quantise the instance) plus a right-sized trunk
+   cache, *not* raising the serving reserve. Needs a go/no-go before building.
+4. **Dispatcher** with the turn-scoped cancel acceptance gate (§2.3), which is
+   a hard gate and is co-owned with the translator strand.
+5. **TRT lane promotion** — `video_enhance/engine_cache.py` → `srt/trt_lane/`,
+   byte-identical video acceptance as the regression proof, talker engine as
+   first consumer. Not started. §1a records what graphs left for it: the frame
+   is 94.6 % kernel, so fusion is the sole remaining lever.
+
+**Two traps recorded so a successor does not re-spring them.**
+
+* **Read the tree that actually ran.** The serving venv's editable install
+  points at `/spinning/htsglang-gpu`, which is a **detached HEAD from
+  2026-07-13** that cannot even parse the running cmdline. The live server runs
+  `/spinning/wt-530-serving/python` via `PYTHONPATH` in `/proc/<pid>/environ`.
+  Reading the editable-install path would have produced a confident wrong
+  answer about the reserve. Always resolve the tree from `/proc/<pid>/environ`
+  plus `cwd`, never from the venv.
+* **The predictor's sampling is not the tenant's.** The tenant passes
+  `temperature=0.9, top_p=0.9`; those drive the **trunk**. The code predictor
+  keeps `subtalker_*` defaults `top_k=50, top_p=1.0, temperature=0.9`. §4b.
+
+
 Written 2026-08-04, after the precursor measurement
 (`/spinning/gpu-battery-results/2026-08-04_488_precursor/RESULTS.md`:
 OVERHEAD-BOUND confirmed, 84.7 % launch gap, recoverable factor 6.53x).
@@ -307,7 +371,32 @@ min-reducing ranks, which is not established (`_apply_token_constraints`
 min-reduces token capacity across ranks, and the 5090 rank has both a larger
 budget and a larger weight shard). Worth measuring before spending.
 
-### 2.2e CONSEQUENCE — slice 2 devalued this pool by ~10x, and it should be deprioritised
+### 2.2e RETRACTED 2026-08-04 — the "slice 2 devalued the pool" verdict was cut on one axis
+
+**The verdict below is withdrawn. It is kept, not deleted, because the way it
+was wrong is more instructive than the conclusion was.**
+
+It priced the pool on a single axis — the latency of *one* synthesis — found
+that graphs had already collected most of that win, and concluded the pool was
+now worth ~10x less. The axis it never checked: a turn is **not one
+synthesis**. `session.py:1852-1871` already splits a turn into clauses and
+enqueues them, so a pool parallelises *within* a turn. On that axis graphs and
+the pool **compose multiplicatively** — graphs make each clause ~10x cheaper,
+the pool overlaps N clauses — and a pool that is worthless for one clause is
+worth close to Nx on a multi-clause turn. Turn latency is what the user
+experiences; single-clause latency is not.
+
+**The rule this cost, stated so it is reusable:** a building block is devalued
+only after checking **every** axis it is used on, not the first one. A speedup
+on axis A does not retire a mechanism that also serves axis B. Concretely here:
+"faster per clause" (graphs) and "more clauses at once" (pool) are orthogonal,
+and orthogonal levers multiply. Same failure mode as reading a conclusion off a
+sample narrower than the question.
+
+The correct pricing, with the graph overhead now measured rather than
+estimated, is §2.2f. The paragraph below is the retracted one.
+
+#### (retracted) CONSEQUENCE — slice 2 devalued this pool by ~10x, and it should be deprioritised
 
 The pool's justification was head-of-line blocking: `inprocess_tts.py:124-134`,
 a turn arriving mid-synthesis *"pays the whole of that synthesis, a median
@@ -325,6 +414,88 @@ before slice 2.
 leave the pool unbuilt, and revisit only if concurrent speakers become a real
 requirement. The 121 MiB is no longer a blocker to route around; it is a price
 signal on something that stopped being worth buying.
+
+*(end of retracted paragraph)*
+
+### 2.2f THE REAL PRICE — graph overhead MEASURED, and it is 5x the estimate
+
+`ANALYSE_488 §7.4` budgeted the whole graphs cut at ~242 MiB, of which ~64 MiB
+for the trunk graph pool. Measured on the real geometry
+(`scripts/dev/488_talker_profile/measure_graphed_footprint.py`, artefacts in
+`/spinning/gpu-battery-results/2026-08-04_488_slice2_graphs/`):
+
+| term | measured | estimate | ratio |
+|---|---|---|---|
+| 15 predictor graphs + 16-slot scratch + uniform pool | **183.5 MiB** | ~60 | 3.1x |
+| trunk graph + 1024-slot static cache | **1000.5 MiB** | ~117 + 64 | 5.5x |
+| **total** | **1184.0 MiB** | ~242 | **4.9x** |
+
+Identical on sm86 and sm120 to the decimal, so the overhead is allocator- and
+shape-driven, not architecture-driven — one number prices both cards.
+
+**The trunk term is linear in cache slots**, measured at three points
+(1024 → 1000.5, 256 → 262.3, 64 → 77.8 MiB), fitting
+
+> **trunk overhead ≈ 0.96 MiB per slot + 16 MiB**
+
+against a static cache that is only **0.109 MiB per slot**. So capture costs
+~8.8x the cache it is capturing, because a captured region retains every
+intermediate — including the per-layer expanded-KV copies GQA makes — instead
+of freeing them. That is the mechanism, and it makes **slot count the dominant
+VRAM knob of the whole cut**.
+
+**Consequence: 1024 slots is the wrong default.** It buys 85 s of audio at
+12 Hz for a workload whose clause is ~3.2 s, and costs 738 MiB more than 256
+slots. The right value is `max prompt tokens + max frames per clause`, and the
+prompt length has NOT been measured yet (`generate_icl_prompt` carries
+reference-audio codes plus text), so the default is not fixed here — the law
+above lets any choice be priced once that number exists. Until then 1024 stands
+as the safe upper bound, with its price named.
+
+**Instance footprint, composed** (2678 MiB eager base measured in the
+precursor, overhead measured here), against a 3080's usable 2557 MiB
+(2957 free − 400 corridor):
+
+| instance form | MiB | vs 2557 |
+|---|---|---|
+| eager, no graphs | 2678 | −121 |
+| + predictor graphs (Step A) | 2862 | −305 |
+| + trunk graph @ 64 slots | 2939 | −382 |
+| + trunk graph @ 256 slots | 3124 | −567 |
+| + trunk graph @ 1024 slots | 3862 | −1305 |
+
+So the honest correction to §2.2c: the gap is not 121 MiB. **A fully graphed
+instance misses a 3080 by 567 MiB at 256 slots** — the graphs cut, which is
+what makes a pool member fast enough to be worth pooling, is also what put it
+out of reach. Note also that an *eager* pool member is not a workaround: at
+RTF 1.7 it is a straggler, and §2.3's in-order assembly makes one straggler
+stall everything behind it.
+
+### 2.2g THREE WAYS TO UNBLOCK, priced against the measured numbers
+
+| # | path | closes | cost | verdict |
+|---|---|---|---|---|
+| 1 | raise the 3080 reserve | 1:1 in MiB | 567 MiB ⇒ reserve 4200→4770, ≈18,100 KV tokens (~5.4 % of the 333254 pool) | works, but spends a **shared serving** resource on a **per-tenant** feature |
+| 2 | quantise the talker (fp8/int8 weights) | ~872 MiB (checkpoint 1745→~873) | instance @256 slots → **2252 MiB, fits with 305 MiB spare**; needs a prosody quality gate | **cheapest correct route**: it shrinks the thing that does not fit instead of taxing the thing that works |
+| 3 | second instance on the 5090 | — | graphed @256 = 3124 MiB against 3463 free ⇒ leaves 339 MiB, **below the 400 corridor** | does not fit *today*; depends on the tenant's own size, which moved 4524 → 5916 MiB this session |
+
+**Recommendation.** If the pool is wanted — and per §2.2e it is, on the
+turn-latency axis — the route is **shrink the instance, not the serving pool**:
+path 2, combined with a right-sized trunk cache. Two supporting facts make this
+the clear ordering:
+
+* right-sizing the trunk cache alone (1024 → 256) is worth **738 MiB**, which
+  is **six times the entire original 121 MiB gap**. The cheapest MiB available
+  is the one this cut spent by accident, and it is recovered by choosing a
+  number rather than by building anything.
+* path 1 is the easiest to *implement* (one flag) and the worst to *own*: it
+  permanently converts serving KV capacity into talker headroom, and §2.2d
+  showed how badly that knob's effects get misremembered between sessions.
+
+fp8 therefore returns to the plan not as a speed lever (`ANALYSE_488 §7.6`
+correctly ranked that third) but as **the pool's enabling condition** — which
+is what §2.2 originally claimed before §2.2b withdrew it. The difference is
+that it is now backed by measured numbers on both sides.
 
 Still to check honestly before any fp8 quantisation effort, per the brief: an
 sm86 TRT engine at bf16/fp16 may already land under 2551 MiB on its own, in
@@ -349,6 +520,44 @@ toward the 5090 at the next restart, #364 GDN idle vacate, #286 parking.
   and is small; it is passed with the work item. Each instance holds its own
   speaker encoder anyway (part of the 2678 MiB), so nothing is shared by
   pointer across processes.
+* **TURN-SCOPED CANCEL — a HARD acceptance gate, not a nice-to-have.** The
+  revision guard (§3.3) can invalidate a turn *while the pool is mid-flight on
+  its clauses*, and the pool is precisely what makes that likely: N instances
+  running ahead means more speculative work exists at the moment a correction
+  lands. Cancel must therefore be **turn-scoped and complete**, in all three
+  places a clause of that turn can be:
+  * **running** — the in-flight unit on each instance is aborted;
+  * **queued** — every queued unit carrying that `turn_id` is invalidated
+    before it is claimed;
+  * **already delivered** — `turn.speech.abort {turn_id}` (§4) makes the client
+    drop that turn's audio, and only that turn's.
+
+  Then the clause pipeline **refills with the corrected clauses**, and in-order
+  assembly continues across the seam: the reorder buffer must not emit a
+  corrected chunk before the correction prefix, and must never emit a chunk of
+  the abandoned generation at all.
+
+  **Acceptance criterion, stated so it can fail:** take a multi-clause turn,
+  inject a material correction mid-synthesis while at least two instances hold
+  clauses of it, and require (a) **no audio whatsoever** reaches the client
+  from any discarded clause, (b) the corrected turn arrives **complete and in
+  order**, prefix first, (c) **no orphan chunk** survives into the next turn,
+  and (d) no `unit_index` gap or repeat in the emitted sequence. All four are
+  observable on the existing turn log plus the client's received sequence, so
+  this is a test, not an inspection.
+
+  **Why drop-and-refill rather than salvage:** at RTF 0.176 a discarded clause
+  costs ~0.5 s of GPU time that was going to be idle anyway. Salvaging partial
+  audio across a meaning change is complex, risks emitting a fragment of a
+  sentence the speaker did not mean, and buys back something nearly free.
+  Correct semantics beat recovered work here, and the arithmetic says so rather
+  than taste.
+
+  Ownership: the trigger side (deciding a correction is material, stamping
+  `turn_id`) belongs to the translator strand; the queue/instance/reorder side
+  is this one. The gate above is written to be runnable by whichever side holds
+  the harness, and neither half is testable alone.
+
 * **Straggler rule**: a 3080 instance is ~2.4x slower than the 5090 on weight
   bandwidth alone. In-order assembly means a slow instance holding chunk *n*
   stalls everything behind it. So the dispatcher must be **head-biased**: the
@@ -443,6 +652,97 @@ decision/turn log: `clauses_streamed`, `prefix_match` (stage-1 outcome),
 
 The abort channel is the one genuinely new protocol element; everything else
 extends fields on events that already exist.
+
+## 4b. STEP A HANDOFF — the install seam, ready for the tenant
+
+Built and executed 2026-08-04. **The tenant is not touched by this work**; what
+follows is the artifact the wiring consumes, so the wiring is a two-line change
+made by whoever owns the tenant, after their latency diagnosis has established
+the before-picture.
+
+**What it is.** `GraphedPredictorFrame.install()` swaps
+`talker.code_predictor.generate` for fifteen captured graphs. Nothing else
+changes: `generate_voice_clone`, the prompt builder, the trunk loop and the
+codec are untouched, because the reference reads `.sequences` off the result
+and gets the same shape it always did.
+
+**Measured effect** (`2026-08-04_488_slice2_graphs/RESULTS.md`): frame
+142.18 → 47.64 ms, **RTF 1.706 → 0.572, 2.98x**; a 5511 ms clause becomes
+**~1850 ms**. The remaining 3.3x needs Step B (the trunk graph + decode
+driver), which is a bigger cut and unlocks intra-clause streaming.
+
+**Sampling arguments — required, and the one way to get this wrong.**
+
+```python
+driver = GraphedPredictorFrame.install(
+    talker, model=tts._model,          # model= is what the defaults are read from
+    do_sample=True, top_k=50, top_p=1.0, temperature=0.9,
+)
+```
+
+Those four are **required keyword arguments with no defaults**, because a graph
+bakes its warpers: they are part of what was compiled, not configuration. And
+they are **not** the tenant's `temperature=0.9, top_p=0.9`
+(`inprocess_tts.py:358-360`) — those are the **trunk's** knobs. The code
+predictor is driven by `subtalker_*`, which the tenant does not pass and which
+therefore keep the reference's own defaults (`modeling_qwen3_tts.py:2036-2039`):
+`top_k=50, top_p=1.0, temperature=0.9`. Installing the tenant's `top_p=0.9`
+would apply a warper the reference never applies — permanent, silent, audible
+only as timbre. `install()` reads the reference's signature and **refuses at
+load time** on a mismatch, naming both tuples; the refusal is pinned by a test.
+
+**Refusal and fallback behaviour, stated exactly:**
+
+| condition | behaviour | why |
+|---|---|---|
+| install-time sampling ≠ reference `subtalker_*` defaults | **raises** `GraphCaptureRefusal` | load-time, before any audio; a wrong warper is silent forever |
+| a call arrives with sampling the graph was not captured for | **falls back** to the reference `generate`, warns once, increments `driver.sampling_fallbacks` | the reference output is *correct*, just ~10x slower — raising would break a live turn to prevent something the fallback already prevents |
+| `generate()` before `capture()` | raises | otherwise the eager path's timings get reported as the graphed arm's |
+| replay out of capture order (shared pool) | raises | returns another graph's live intermediates as plausible numbers |
+
+`driver.sampling_fallbacks > 0` means the tenant is silently running eager and
+**not** getting the speedup — expose it in telemetry rather than wondering why
+the latency table did not move. `driver.uninstall()` restores the reference
+without a restart; that is the operator's way out.
+
+**VRAM cost — measured, not estimated: 183.5 MiB.** Identical on sm86 and
+sm120. Covers the fifteen graphs (one shared pool), the 16-slot scratch cache
+and a 4096-frame uniform pool (0.24 MiB). Step B would add the trunk term,
+which is `0.96 MiB × slots + 16 MiB` — see §2.2f, and note that its default
+slot count is an open, priced decision rather than a settled one.
+
+**Why a uniform pool exists at all.** A replayed graph cannot draw randomness —
+whatever entropy was consumed at capture is baked, so every frame would sample
+identically. The pool is device-resident and its cursor advances **inside** the
+last step's graph, so per frame the host does nothing. Wrap-around after 4096
+frames reuses uniform *values* against different logits (not a repeated
+output); `reseed()` is available for a caller that wants to cut even that.
+
+**Gate script, runnable in the live tenant.**
+
+```python
+from validate_graphs import gate_loaded_model
+report = gate_loaded_model(tts._model)      # keep_installed=False by default
+```
+
+In-process against the weights already loaded: no second copy, no restart, no
+conversation state touched, no audio synthesised. It reads the sampling from
+the reference itself (so it cannot be handed the wrong values), installs,
+compares the graphed tokens against the eager path over several frames, reports
+VRAM delta and the rig-wide corridor before and after, and **uninstalls before
+returning** unless asked not to. Green means bit-identical on that instance's
+own weights.
+
+**Execution evidence, because desk-written code is unvalidated.**
+`scripts/dev/488_talker_profile/smoke_install_seam.py` runs the whole seam on a
+randomly-initialised model of the same class for ~50 MiB, and proves six
+properties: capture works, the pool advances inside the graph (identical input
+⇒ *different* tokens, which a baked draw would break), explicit uniforms
+reproduce the eager path **bit-exactly**, the seam is live, `uninstall()`
+restores it, and the sampling-trap refusal fires. **Green on 2026-08-04.** The
+full-weights in-process gate is `gate_loaded_model`, and it runs where the
+weights already are — the tenant — rather than paying 2.7 GiB to load a second
+copy on a contended card.
 
 ## 5. Ordering, with the dependency that is easy to miss
 

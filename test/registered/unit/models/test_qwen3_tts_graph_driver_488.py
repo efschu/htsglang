@@ -40,6 +40,7 @@ from sglang.srt.models.qwen3_tts_graph_driver import (
     decode_mask,
     predictor_cache_lengths,
     refuse_unless_graph_safe,
+    reference_subtalker_defaults as refs,
     reset_cache_positions,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -194,6 +195,165 @@ class TestOrderedReplay(CustomTestCase):
         order.rewind()
         order.replay(0)
         self.assertEqual(steps[0].replays, 2)
+
+
+class TestUniformPool(CustomTestCase):
+    """Sampling entropy a captured graph can advance without the host."""
+
+    def _pool(self, frames=4, groups=3):
+        from sglang.srt.models.qwen3_tts_graph_driver import UniformPool
+
+        return UniformPool(frames, groups, device="cpu", seed=488)
+
+    def test_draw_has_the_shape_the_sampler_expects(self):
+        pool = self._pool()
+        self.assertEqual(tuple(pool.draw(0).shape), (1, 1))
+
+    def test_draw_reads_the_frame_under_the_cursor(self):
+        pool = self._pool()
+        self.assertAlmostEqual(float(pool.draw(2)), float(pool.pool[0, 2]))
+        pool.advance()
+        self.assertAlmostEqual(float(pool.draw(2)), float(pool.pool[1, 2]))
+
+    def test_cursor_wraps_instead_of_running_off_the_pool(self):
+        # Wrap is the documented behaviour; an unwrapped cursor would index
+        # out of bounds inside a captured graph, where it cannot raise.
+        pool = self._pool(frames=3)
+        for _ in range(3):
+            pool.advance()
+        self.assertEqual(int(pool.cursor), 0)
+
+    def test_cursor_advances_in_place(self):
+        # The graph captured this exact address; rebinding it would leave the
+        # replay reading a tensor nobody updates any more.
+        pool = self._pool()
+        original = pool.cursor
+        pool.advance()
+        self.assertIs(pool.cursor, original)
+
+    def test_load_frame_rewinds_and_overwrites(self):
+        pool = self._pool(frames=4, groups=3)
+        pool.advance()
+        pool.load_frame(torch.tensor([[0.1, 0.2, 0.3]]))
+        self.assertEqual(int(pool.cursor), 0)
+        self.assertAlmostEqual(float(pool.draw(1)), 0.2, places=6)
+
+    def test_reseed_changes_the_draws(self):
+        pool = self._pool()
+        before = pool.pool.clone()
+        pool.reseed(seed=999)
+        self.assertFalse(torch.equal(before, pool.pool))
+
+    def test_empty_pool_refuses(self):
+        from sglang.srt.models.qwen3_tts_graph_driver import UniformPool
+
+        with self.assertRaises(ValueError):
+            UniformPool(0, 3, device="cpu")
+
+
+class _FakeTalkerModel:
+    """Carries only the signature the defaults are read out of."""
+
+    def generate_voice_clone(
+        self, text=None, subtalker_dosample: bool = True,
+        subtalker_top_k: int = 50, subtalker_top_p: float = 1.0,
+        subtalker_temperature: float = 0.9,
+    ):
+        raise NotImplementedError
+
+
+class TestReferenceSubtalkerDefaults(CustomTestCase):
+    """The predictor's sampling is read from the reference, never remembered."""
+
+    def test_reads_the_signature(self):
+        defaults = refs(_FakeTalkerModel())
+        self.assertEqual(
+            defaults,
+            {"do_sample": True, "top_k": 50, "top_p": 1.0, "temperature": 0.9},
+        )
+
+    def test_refuses_a_model_without_generate_voice_clone(self):
+        with self.assertRaises(GraphCaptureRefusal):
+            refs(object())
+
+    def test_refuses_when_the_reference_lost_a_default(self):
+        class Drifted:
+            def generate_voice_clone(self, subtalker_dosample=True):
+                raise NotImplementedError
+
+        with self.assertRaises(GraphCaptureRefusal) as caught:
+            refs(Drifted())
+        self.assertIn("subtalker_top_k", str(caught.exception))
+
+
+class TestInstallSamplingValidation(CustomTestCase):
+    """THE TRAP, pinned: the tenant's temperature/top_p are the TRUNK's."""
+
+    def test_the_tenants_trunk_values_are_refused(self):
+        # inprocess_tts.py:358-360 passes temperature=0.9, top_p=0.9. Those
+        # drive the trunk. The predictor keeps top_p=1.0, top_k=50. Installing
+        # the former would bake a warper the reference never applies -- silent,
+        # permanent, audible only as timbre. This is the can-fail proof.
+        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+
+        with self.assertRaises(GraphCaptureRefusal) as caught:
+            GraphedPredictorFrame.install(
+                talker=object(), model=_FakeTalkerModel(),
+                do_sample=True, temperature=0.9, top_k=50, top_p=0.9,
+            )
+        message = str(caught.exception)
+        self.assertIn("0.9", message)
+        self.assertIn("TRUNK", message)
+
+    def test_missing_sampling_arguments_are_a_type_error(self):
+        # Required keyword arguments with no defaults: a graph bakes its
+        # warpers, so these are part of what was compiled, not configuration.
+        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+
+        with self.assertRaises(TypeError):
+            GraphedPredictorFrame.install(talker=object())
+
+
+class TestSamplingFallback(CustomTestCase):
+    """A mismatch must serve correct audio, loudly and counted -- not raise."""
+
+    def _driver(self):
+        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+
+        driver = GraphedPredictorFrame.__new__(GraphedPredictorFrame)
+        driver.steps = ["one captured step"]
+        driver.captured_sampling = (True, 0.9, 50, 1.0)
+        driver.sampling_fallbacks = 0
+        driver.calls = []
+        driver.original_generate = lambda **kwargs: driver.calls.append(kwargs)
+        return driver
+
+    def test_mismatch_falls_back_to_the_reference_and_counts(self):
+        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+
+        driver = self._driver()
+        GraphedPredictorFrame.generate(
+            driver, torch.zeros(1, 2, 4), do_sample=True,
+            temperature=0.9, top_k=50, top_p=0.9,
+        )
+        self.assertEqual(driver.sampling_fallbacks, 1)
+        self.assertEqual(len(driver.calls), 1)
+        self.assertEqual(driver.calls[0]["top_p"], 0.9)
+
+    def test_fallback_does_not_raise(self):
+        """Deliberate exception to fail-fast: the reference output is CORRECT.
+
+        Raising would break a live turn to protect against something the
+        fallback already prevents.
+        """
+        from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+
+        driver = self._driver()
+        for _ in range(3):
+            GraphedPredictorFrame.generate(
+                driver, torch.zeros(1, 2, 4), do_sample=False,
+            )
+        self.assertEqual(driver.sampling_fallbacks, 3)
 
 
 class TestReplayBeforeCapture(CustomTestCase):
