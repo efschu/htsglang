@@ -665,17 +665,25 @@ class AnthropicServing:
             #   disabled -> neither budget_tokens nor display allowed
             #   adaptive -> budget_tokens forbidden, display optional
             # So by the time we get here ``budget_tokens`` can only be
-            # set on ``enabled``. The local backend has no equivalent
-            # hard-cap knob, so we log a WARNING instead of rejecting —
-            # the Anthropic SDK would have accepted the request and we
-            # mirror that. Operators see the unenforced budget in logs.
+            # set on ``enabled``. It maps onto the OpenAI front's
+            # ``thinking_budget`` (#540), which caps the thinking section at
+            # that many tokens via the built-in thinking budget logit
+            # processor. Enforcement needs the marker tokens, i.e. a
+            # configured ``--reasoning-parser``; without one there is nothing
+            # to cap, so the budget stays accept-and-log as before rather
+            # than 400-ing a request the Anthropic SDK would have accepted.
             if anthropic_request.thinking.budget_tokens is not None:
-                logger.warning(
-                    "Anthropic thinking.budget_tokens=%d is accepted for "
-                    "SDK compatibility but the local backend has no "
-                    "equivalent hard-cap knob — the budget is not enforced",
-                    anthropic_request.thinking.budget_tokens,
-                )
+                if getattr(self.openai_serving_chat, "reasoning_parser", None):
+                    chat_request.thinking_budget = (
+                        anthropic_request.thinking.budget_tokens
+                    )
+                else:
+                    logger.warning(
+                        "Anthropic thinking.budget_tokens=%d is accepted for "
+                        "SDK compatibility but this model has no reasoning "
+                        "parser configured — the budget is not enforced",
+                        anthropic_request.thinking.budget_tokens,
+                    )
             # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
             # because the local backend has no auto-throttle equivalent.
             # Anything other than ``disabled`` enables reasoning.

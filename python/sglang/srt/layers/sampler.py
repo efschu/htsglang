@@ -826,11 +826,17 @@ def apply_custom_logit_processor(
         )
         batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
 
+        # Row layout of the masked selection is request-major:
+        # num_tokens_in_batch consecutive rows belong to one request. Repeat
+        # each request's params so a processor that indexes rows positionally
+        # (e.g. ThinkingBudgetLogitProcessor) hits every row of its request
+        # instead of only the first one.
+        params = [sampling_batch_info.custom_params[i] for i in batch_indices]
+        if num_tokens_in_batch > 1:
+            params = [p for p in params for _ in range(num_tokens_in_batch)]
+
         # Apply the processor to the logits
-        logits[batch_mask] = processor(
-            logits[batch_mask],
-            [sampling_batch_info.custom_params[i] for i in batch_indices],
-        )
+        logits[batch_mask] = processor(logits[batch_mask], params)
 
         logger.debug(
             f"Custom logit processor {processor.__class__.__name__} is applied."

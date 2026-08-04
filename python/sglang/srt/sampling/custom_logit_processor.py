@@ -8,6 +8,14 @@ import dill
 import orjson
 import torch
 
+from sglang.srt.sampling.thinking_budget import (
+    THINKING_BUDGET_KEY,
+    THINKING_BUDGET_TOKEN_IDS_KEY,
+    ThinkingBudgetTokenIds,
+    ThinkingBudgetUnsupportedError,
+    validate_thinking_budget,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -59,11 +67,51 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
 
 
 class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
-    """A logit processor that controls the length of thinking."""
+    """Caps the length of the thinking section of a reasoning model.
 
-    THINKING_START_TOKEN_ID: int
-    THINKING_END_TOKEN_ID: int
-    NEW_LINE_TOKEN_ID: int
+    Once the section started by the model's thinking-start marker has produced
+    ``thinking_budget`` tokens, the next sampled token is forced: first a
+    newline (so the close lands on its own line), then the thinking-end marker.
+
+    Token ids come from ``custom_params["thinking_budget_token_ids"]``, which
+    the tokenizer manager derives from the tokenizer that actually serves the
+    request (see ``sglang/srt/sampling/thinking_budget.py``). The class-level
+    constants below are the legacy per-model fallback for callers that
+    instantiate a subclass outside the server; when a checkpoint's tokenizer
+    disagrees with them the budget would be silently ignored, which is exactly
+    the defect behind sgl-project/sglang#25536 and #20274. Server-side requests
+    therefore always carry derived ids, and a request that asks for a budget
+    with no ids available raises instead of quietly doing nothing.
+    """
+
+    THINKING_START_TOKEN_ID: Optional[int] = None
+    THINKING_END_TOKEN_ID: Optional[int] = None
+    NEW_LINE_TOKEN_ID: Optional[int] = None
+
+    def _resolve_token_ids(
+        self, param_dict: Dict[str, Any]
+    ) -> "ThinkingBudgetTokenIds":
+        derived = ThinkingBudgetTokenIds.parse_param_list(
+            param_dict.get(THINKING_BUDGET_TOKEN_IDS_KEY)
+        )
+        if derived is not None:
+            return derived
+
+        if self.THINKING_START_TOKEN_ID is None or self.THINKING_END_TOKEN_ID is None:
+            raise ThinkingBudgetUnsupportedError(
+                f"{type(self).__name__} was asked to enforce a thinking budget "
+                "but the request carries no tokenizer-derived marker ids "
+                f"('{THINKING_BUDGET_TOKEN_IDS_KEY}') and this class defines no "
+                "fallback ids. Refusing rather than silently ignoring the "
+                "budget."
+            )
+        return ThinkingBudgetTokenIds(
+            start=self.THINKING_START_TOKEN_ID,
+            end=self.THINKING_END_TOKEN_ID,
+            newline=self.NEW_LINE_TOKEN_ID,
+            start_str="",
+            end_str="",
+        )
 
     def __call__(self, logits, custom_param_list: list[dict[str, Any]]):
         if custom_param_list is None or not custom_param_list:
@@ -72,27 +120,24 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             if param_dict is None:
                 continue
 
-            thinking_budget: int | None = param_dict.get("thinking_budget")
-
-            # Skip if thinking_budget is unset, or not an integer, or negative
-            if (
-                thinking_budget is None
-                or not isinstance(thinking_budget, int)
-                or thinking_budget < 0
-            ):
+            # A malformed value is a client error, not a reason to drop the
+            # budget on the floor: validate_thinking_budget raises.
+            thinking_budget = validate_thinking_budget(
+                param_dict.get(THINKING_BUDGET_KEY)
+            )
+            if thinking_budget is None:
                 continue
+
+            token_ids = self._resolve_token_ids(param_dict)
             req: Req = param_dict.get("__req__")
             cur_ids: list[int] = [*req.origin_input_ids, *req.output_ids]
 
             # Check if out of thinking stage
-            if (
-                self.THINKING_START_TOKEN_ID not in cur_ids
-                or self.THINKING_END_TOKEN_ID in cur_ids
-            ):
+            if token_ids.start not in cur_ids or token_ids.end in cur_ids:
                 continue
 
             # Find the index of the thinking start token
-            start_index = cur_ids.index(self.THINKING_START_TOKEN_ID)
+            start_index = cur_ids.index(token_ids.start)
 
             # Count the number of tokens after the thinking start token
             num_tokens_after_start = len(cur_ids) - start_index - 1
@@ -101,40 +146,54 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
                 continue
 
             # Ensure new line token before thinking end token
-            if not req.output_ids or req.output_ids[-1] != self.NEW_LINE_TOKEN_ID:
+            if token_ids.newline is not None and (
+                not req.output_ids or req.output_ids[-1] != token_ids.newline
+            ):
                 logits[i, :] = -float("inf")
-                logits[i, self.NEW_LINE_TOKEN_ID] = 0.0
+                logits[i, token_ids.newline] = 0.0
                 continue
 
             # Assign highest probability to the thinking end token
             logits[i, :] = -float("inf")
-            logits[i, self.THINKING_END_TOKEN_ID] = 0.0
+            logits[i, token_ids.end] = 0.0
 
         return logits
 
 
 class Glm4MoeThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
-    """A logit processor that controls the length of thinking for GLM-4.5 / GLM-4.6 / GLM-4.5V / GLM-4.6V models."""
+    """Thinking budget for GLM-4.5 / GLM-4.6 / GLM-4.5V / GLM-4.6V models.
 
-    THINKING_START_TOKEN_ID: int = 151350
-    THINKING_END_TOKEN_ID: int = 151351
-    NEW_LINE_TOKEN_ID: int = 198
+    The ids below are a fallback only; server-side requests use ids derived
+    from the deployed tokenizer.
+    """
+
+    THINKING_START_TOKEN_ID: Optional[int] = 151350
+    THINKING_END_TOKEN_ID: Optional[int] = 151351
+    NEW_LINE_TOKEN_ID: Optional[int] = 198
 
 
 class Qwen3ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
-    """A logit processor that controls the length of thinking for Qwen3 models."""
+    """Thinking budget for Qwen3 models.
 
-    THINKING_START_TOKEN_ID: int = 151667
-    THINKING_END_TOKEN_ID: int = 151668
-    NEW_LINE_TOKEN_ID: int = 198
+    The ids below are a fallback only; server-side requests use ids derived
+    from the deployed tokenizer.
+    """
+
+    THINKING_START_TOKEN_ID: Optional[int] = 151667
+    THINKING_END_TOKEN_ID: Optional[int] = 151668
+    NEW_LINE_TOKEN_ID: Optional[int] = 198
 
 
 class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
-    """A logit processor that controls the length of thinking for DeepSeek-R1 models."""
+    """Thinking budget for DeepSeek-R1 models.
 
-    THINKING_START_TOKEN_ID: int = 128798
-    THINKING_END_TOKEN_ID: int = 128799
-    NEW_LINE_TOKEN_ID: int = 201
+    The ids below are a fallback only; server-side requests use ids derived
+    from the deployed tokenizer.
+    """
+
+    THINKING_START_TOKEN_ID: Optional[int] = 128798
+    THINKING_END_TOKEN_ID: Optional[int] = 128799
+    NEW_LINE_TOKEN_ID: Optional[int] = 201
 
 
 # Adapted from DeepSeek's implementation: https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/ngram_norepeat.py

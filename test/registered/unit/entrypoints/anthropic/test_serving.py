@@ -677,9 +677,8 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [False])
 
     def test_request_thinking_enabled_with_budget_tokens_logs_warning(self):
-        """SDK shape: ``enabled`` requires ``budget_tokens``. We accept it
-        (the SDK would), but log a WARNING because the local backend has
-        no equivalent hard-cap knob — the budget is not enforced."""
+        """No reasoning parser configured: nothing to cap, so the budget is
+        accepted (the SDK would) and logged as unenforced."""
         import logging
 
         serving = self._serving()
@@ -689,12 +688,42 @@ class TestAnthropicServing(unittest.TestCase):
         with self.assertLogs(
             "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
         ) as log:
-            serving._convert_to_chat_completion_request(request)
+            chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        self.assertIsNone(chat_request.thinking_budget)
         self.assertTrue(
             any("budget_tokens=2048" in r and "not enforced" in r for r in log.output),
             f"expected unenforced-budget warning: {log.output}",
         )
+
+    def test_request_thinking_budget_tokens_is_enforced_with_reasoning_parser(self):
+        """#540: on a reasoning model, ``budget_tokens`` maps onto the OpenAI
+        front's ``thinking_budget`` and is actually enforced."""
+        serving = self._serving()
+        serving.openai_serving_chat.reasoning_parser = "qwen3"
+        request = self._anthropic_request(
+            thinking={"type": "enabled", "budget_tokens": 2048}, stream=False
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        self.assertEqual(chat_request.thinking_budget, 2048)
+        self.assertEqual(
+            chat_request.to_sampling_params(stop=[], model_generation_config={})[
+                "thinking_budget"
+            ],
+            2048,
+        )
+
+    def test_request_thinking_adaptive_carries_no_budget(self):
+        """``adaptive`` is enabled-without-budget: the SDK forbids
+        ``budget_tokens`` there and the local backend has no auto-throttle,
+        so nothing is capped."""
+        serving = self._serving()
+        serving.openai_serving_chat.reasoning_parser = "qwen3"
+        request = self._anthropic_request(thinking={"type": "adaptive"}, stream=False)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        self.assertIsNone(chat_request.thinking_budget)
 
     def test_request_thinking_enabled_requires_budget_tokens(self):
         """SDK requires ``budget_tokens`` for ``type=enabled`` — Pydantic 400."""

@@ -111,6 +111,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.thinking_budget import attach_thinking_budget
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -1198,6 +1199,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            # Thinking budget (#540): resolve the marker token ids from this
+            # deployment's tokenizer and attach the built-in processor. Raises
+            # ThinkingBudgetUnsupportedError (-> 400) when the budget cannot be
+            # enforced, instead of running the request with it ignored.
+            custom_logit_processor = attach_thinking_budget(
+                sampling_params,
+                obj.custom_logit_processor,
+                self.tokenizer,
+                self.server_args.reasoning_parser,
+                self.server_args.model_path,
+            )
+
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -1230,7 +1243,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
                 session_params=session_params,
-                custom_logit_processor=obj.custom_logit_processor,
+                custom_logit_processor=custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,

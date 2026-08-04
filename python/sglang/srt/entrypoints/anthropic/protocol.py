@@ -327,11 +327,17 @@ class AnthropicThinkingParam(BaseModel):
 
     The serving layer treats ``adaptive`` identically to ``enabled``
     because the local OpenAI-compatible backend has no auto-throttle
-    equivalent. ``budget_tokens`` is accepted on ``enabled`` for SDK
-    compatibility but the backend has no hard-cap knob to honor it; the
-    serving layer logs a WARNING so operators see that the requested
-    budget is not enforced. ``display="omitted"`` is accepted but
-    similarly cannot suppress reasoning mid-stream and is logged.
+    equivalent. That is also why ``adaptive`` carries no budget: the SDK
+    forbids ``budget_tokens`` there, and enabled-without-budget is the
+    correct local semantics — reasoning runs to its natural end.
+
+    ``budget_tokens`` on ``enabled`` IS enforced when the model has a
+    reasoning parser configured: it maps onto the OpenAI front's
+    ``thinking_budget``, which caps the thinking section at that many
+    tokens (#540). On a model without a reasoning parser there are no
+    markers to cap, so the value is accept-and-log as before.
+    ``display="omitted"`` is accepted but cannot suppress reasoning
+    mid-stream and is logged.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
