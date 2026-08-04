@@ -349,6 +349,15 @@ class HibernateIdentity520Test(unittest.TestCase):
                 "(draft_worker_common.py:129) -- never the object the park "
                 "reads"
             ),
+            "draft_worker.build.solo_unshard": (
+                "#470: same draft_server_args copy as draft_worker.build, "
+                "given its own source name rather than reusing the generic "
+                "one -- it neutralises the target's per-rank sharding "
+                "vectors (rank_tp_ratio and siblings) on the unsharded solo "
+                "draft, which is placement bookkeeping for a copy the park "
+                "never reads, not a change to what identifies the loaded "
+                "checkpoint"
+            ),
         }
         identity_fields = set(
             hibernate._model_identity(ServerArgs(model_path="dummy"))

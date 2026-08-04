@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Targeted logging config for the #462 F2 arm. Consumed via",
+    "SGLANG_LOGGING_CONFIG_PATH (srt/utils/common.py:2685-2693, a plain",
+    "logging.config.dictConfig). Root stays at INFO so the boot log keeps its",
+    "normal shape; ONLY the breakable-graph module drops to DEBUG, which is",
+    "what emits 'Break graph due to function: _moe_offload_fetch_step'",
+    "(breakable_cuda_graph.py:230, logger = getLogger(__name__) at :43).",
+    "That line is TICKET_462 §3's SECOND, independent count of the 43",
+    "crossings/step -- the first comes from summarise.py's crossings/round.",
+    "Two independent counts of the same event is the point; a global",
+    "--log-level debug would deliver it too, but at the cost of drowning the",
+    "boot log in unrelated DEBUG from every other module."
+  ],
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "std": {
+      "format": "[%(asctime)s] %(message)s",
+      "datefmt": "%Y-%m-%d %H:%M:%S"
+    }
+  },
+  "handlers": {
+    "console": {
+      "class": "logging.StreamHandler",
+      "formatter": "std",
+      "stream": "ext://sys.stdout"
+    }
+  },
+  "root": {
+    "level": "INFO",
+    "handlers": ["console"]
+  },
+  "loggers": {
+    "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph": {
+      "level": "DEBUG",
+      "handlers": ["console"],
+      "propagate": false
+    }
+  }
+}

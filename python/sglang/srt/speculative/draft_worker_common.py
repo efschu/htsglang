@@ -55,7 +55,7 @@ def _resolve_draft_attention_backend_fallback(
 
 
 def _refuse_unsupported_speculative_moe_backend(
-    *, server_args: ServerArgs, algo_label: str
+    *, server_args: ServerArgs, algo_label: str, tp_rank: Optional[int] = None
 ) -> None:
     """Refuse a draft MoE runner backend this rank's card cannot run, by name.
 
@@ -79,6 +79,32 @@ def _refuse_unsupported_speculative_moe_backend(
     backend = get_speculative_moe_runner_backend()
     if not backend.is_marlin():
         return
+
+    # #470: the shadow exemption the docstring above promises, which until now
+    # existed only in the docstring. Under solo placement every rank calls
+    # build_draft_tp_worker, but only the HOST builds real draft weights; the
+    # others build a shadow on ``meta`` and never reach a Marlin kernel.
+    # Refusing them made the guard's own recommended fix
+    # ("--speculative-draft-placement solo --speculative-draft-gpu <index>")
+    # impossible on exactly the heterogeneous rig it was written for: the
+    # 5090 host is fine, and the two SM86 shadows killed the boot during init.
+    # Found on hardware, TICKET_470 Boot B, 2026-08-04.
+    #
+    # The axis is TP RANK, not gpu_id: the workers' own host predicate is
+    # ``tp_rank == speculative_draft_solo_rank()`` (eagle_worker_v2.py:328),
+    # and speculative_draft_solo_rank() resolves --speculative-draft-gpu
+    # through the same gpu_id_for_rank mapping the schedulers use. A first
+    # attempt at this fix compared gpu_id against speculative_draft_gpu and did
+    # NOT work on hardware, because gpu_id inside a worker process is not the
+    # global CUDA ordinal that flag names.
+    if getattr(server_args, "speculative_draft_placement", None) == "solo" and (
+        tp_rank is not None
+    ):
+        try:
+            if int(tp_rank) != int(server_args.speculative_draft_solo_rank()):
+                return
+        except (AttributeError, TypeError, ValueError):
+            pass  # cannot resolve the host rank -> fall through and refuse
     from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
     if is_sm90_supported() or is_sm120_supported():
@@ -136,8 +162,44 @@ def build_draft_tp_worker(
         context_length=target_model_config.context_len,
     )
 
+    # #470 first boot: under solo placement the draft module graph is built
+    # inside a weight-TP=1 override (model_runner.py:2088-2112), but this copy
+    # still carries the TARGET's per-rank vectors, which are sized to the
+    # target's tp_size. The resident-fraction validator reads the CURRENT
+    # parallel state's tp_size -- 1 in that context -- and refused the boot:
+    #   "the resident-fraction vector has 3 entries (0.23,0.42,0.42) but
+    #    tensor parallelism is 1"
+    # The draft is unsharded and its experts are not placed by the target's
+    # offload tier, so none of these vectors mean anything to it. Neutralise
+    # them on the draft copy rather than leaving a config the draft cannot
+    # validate. rank_gpu_id is deliberately KEPT: it is placement, not
+    # sharding, and speculative_draft_solo_rank() resolves the host through
+    # gpu_id_for_rank.
+    #
+    # NECESSARY BUT NOT SUFFICIENT, measured 2026-08-04: this alone does NOT
+    # unblock the solo boot. resident_fraction._from_flag() falls back to the
+    # RUNTIME CONTEXT (get_server_args()) when no ServerArgs is handed to it,
+    # and the context still holds the TARGET's arguments during the draft
+    # build -- draft_server_args is passed to TpModelWorker but never
+    # published. So the validator keeps reading the target's 3-entry vector
+    # against a weight-TP=1 parallel state and refuses. Closing it means
+    # publishing the draft arguments into the context around the draft build,
+    # which changes the draft-copy contract for DFLASH and EAGLE as well and
+    # is deliberately NOT done here. Kept because the draft copy carrying
+    # target-shaped per-rank vectors is wrong regardless of which reader
+    # notices it first.
+    if getattr(server_args, "speculative_draft_placement", None) == "solo":
+        draft_server_args.override(
+            "draft_worker.build.solo_unshard",
+            rank_moe_resident_fraction=None,
+            rank_moe_ratio=None,
+            rank_kv_ratio=None,
+            rank_tp_ratio=None,
+            rank_auto_reserve_mib=None,
+        )
+
     _refuse_unsupported_speculative_moe_backend(
-        server_args=server_args, algo_label=algo_label
+        server_args=server_args, algo_label=algo_label, tp_rank=tp_rank
     )
 
     saved_server_args = get_server_args()
