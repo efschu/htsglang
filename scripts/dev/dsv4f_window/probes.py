@@ -1184,9 +1184,17 @@ def main(argv: list[str]) -> int:
     base = f"http://{args.host}:{args.port}"
     os.makedirs(args.run, exist_ok=True)
 
-    health = _get(base, "/health_generate", timeout=10.0)
+    # /health, NOT /health_generate. The latter runs a REAL generation, and
+    # this server boots with --max-running-requests 1, so the readiness call
+    # that wait_ready already made can still be occupying the only slot when
+    # the probes start. Measured on the 1a baseline arm: the server was alive
+    # and idle in uvicorn (py-spy confirmed) while five consecutive
+    # /health_generate probes returned 0, the whole arm was skipped, and the
+    # boot was torn down having produced nothing. /health is a cheap liveness
+    # check and cannot queue behind a generation.
+    health = _get(base, "/health", timeout=30.0)
     if health["status"] != 200:
-        print(f"REFUSED: {base}/health_generate answered {health['status']}", file=sys.stderr)
+        print(f"REFUSED: {base}/health answered {health['status']}", file=sys.stderr)
         return 2
 
     if args.mode == "all":
