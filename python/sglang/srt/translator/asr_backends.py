@@ -205,6 +205,7 @@ class FasterWhisperAsr:
         self._restrict = list(self._deployment_languages)
         self._beam_size = beam_size
         self._vad_filter = vad_filter
+        self._device = device
         self._model = WhisperModel(
             model,
             device=device,
@@ -312,6 +313,116 @@ class FasterWhisperAsr:
     def set_restrict_languages(self, codes: Sequence[str]) -> None:
         """Narrow language identification at runtime, from the routing table."""
         self._restrict = [str(c).lower() for c in codes]
+
+    # -- #546 idle park -----------------------------------------------------
+
+    def park_route(self) -> "CtranslateWhisperParkRoute":
+        """This recognizer as a ledger-parkable asset."""
+        return CtranslateWhisperParkRoute(self._model, device=self._device)
+
+    def register_with_ledger(self, ledger, name: str = "asr") -> object:
+        """Join the ``audio_modules`` asset class through the park route.
+
+        The recognizer is the single largest idle holder in the tenant (~1.5
+        GiB at ``int8_float16``) and was invisible to the ledger, because the
+        ledger's tensor route only sees torch modules. An asset the register
+        cannot see is an asset no arbitration can spend -- the same reason the
+        codec's registration was fixed in rung B.
+        """
+        return ledger.register_route(name, self.park_route())
+
+
+class CtranslateWhisperParkRoute:
+    """Park route for a CTranslate2 recognizer (:class:`ParkRoute`).
+
+    CTranslate2 allocates outside torch entirely, so the ledger's tensor route
+    -- detach, copy to host, replace with meta -- cannot reach these weights,
+    and ``torch.cuda.empty_cache()`` will never return them either. What
+    CTranslate2 does have is a first-class host spill of its own:
+
+        ``Whisper.unload_model(to_cpu=True)``   weights to host memory,
+                                                device storage released
+        ``Whisper.load_model()``                weights back to the device
+        ``Whisper.model_is_loaded``             which side they are on
+
+    That is the same three-question contract the ledger asks of every asset,
+    so the recognizer joins the SAME ``audio_modules`` class through this
+    adapter instead of growing a second park mechanism beside it. Which is
+    also what makes the arrangement survive #488: when the native lane
+    replaces a backend, it replaces the route, not the state machine.
+
+    SIZING. CTranslate2 reports no footprint, so the size is the MEASURED free-
+    memory delta around the unload -- the same answer #286 reached for graph
+    families, whose driver-side footprint is likewise only knowable from a
+    pause delta (``_StateRecord.paused_bytes``). Until a first park has
+    happened the size is 0, which the register reads as UNKNOWN, never as
+    free.
+    """
+
+    def __init__(self, model: object, device: str = "cuda") -> None:
+        #: The faster-whisper wrapper's inner CTranslate2 handle, or the
+        #: handle itself when one is passed directly (tests, other wrappers).
+        self._ct2 = getattr(model, "model", model)
+        self._device = "cuda:0" if str(device).startswith("cuda") else str(device)
+        self._measured_bytes = 0
+        for method in ("unload_model", "load_model"):
+            if not hasattr(self._ct2, method):
+                raise BackendError(
+                    "asr",
+                    f"the recognizer handle {type(self._ct2).__name__} has no "
+                    f"{method!r}; it cannot be parked, and registering it as "
+                    "parkable would promise the register memory it can never "
+                    "reclaim",
+                )
+
+    @property
+    def device(self) -> Optional[str]:
+        return self._device
+
+    @property
+    def loaded(self) -> bool:
+        return bool(getattr(self._ct2, "model_is_loaded", True))
+
+    def size_bytes(self) -> int:
+        return 0 if not self.loaded else self._measured_bytes
+
+    def park(self) -> int:
+        if not self.loaded:
+            return 0
+        before = _device_free_bytes()
+        # to_cpu=True, not a bare unload: the weights stay in host memory so
+        # the restore is a PCIe copy rather than a re-read of 1.5 GiB from
+        # disk plus a re-quantization. That is the whole difference between a
+        # sub-second wake and a boot.
+        self._ct2.unload_model(to_cpu=True)
+        after = _device_free_bytes()
+        if before is not None and after is not None and after > before:
+            self._measured_bytes = int(after - before)
+        return self._measured_bytes
+
+    def restore(self) -> None:
+        if self.loaded:
+            return
+        # keep_cache=True: the host copy stays, so a later park does not have
+        # to move the weights out again -- only release the device side.
+        self._ct2.load_model(keep_cache=True)
+
+
+def _device_free_bytes() -> Optional[int]:
+    """Free bytes on the current device, or None where that is unknowable.
+
+    Deliberately not fatal anywhere: on a desk with no CUDA this returns None
+    and the caller reports an unknown size, which is the honest answer.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info()
+        return int(free)
+    except Exception:  # noqa: BLE001 - see docstring
+        return None
 
 
 class NemoStreamingAsr:

@@ -617,6 +617,11 @@ Non-obvious points, each load-bearing:
   coexistence that holds under load. Ask every co-tenant for its declared
   budget; if it does not publish one, that is the finding to report, not a
   number to guess.
+  **#546 made this trap sharper for the translator specifically.** With the
+  idle park on (default), that tenant spends most of its life at a few hundred
+  MiB and is entitled to jump back to its full 7500 at the first utterance, so
+  a reserve sized from a parked `nvidia-smi` reading OOMs the first
+  conversation. Keep sizing against the declared budget; see section 15.
 
 Validate with CUDA graphs and speculative decoding ON (the defaults above) —
 eager-only validation hides graph-replay bugs.
@@ -5070,3 +5075,104 @@ short, take it at tenant `sessions: 0`, and reuse the same port so the tenant's
 do not validate the model name — `{"model": "default"}` and
 `{"model": "claude-sonnet-4-5"}` both answer 200 and echo the name back — so
 `--mt-model default` survives any checkpoint change on the same port.
+
+## 15. The #466 translator tenant: idle park (#546)
+
+**What changed.** The translator no longer holds its VRAM around the clock.
+After a threshold's worth of silence it spills every audio asset to host RAM
+and hands the pages back to the driver; the first request restores them.
+ON by default. Design and rationale: `docs/dev/NOTE_546_translator_idle_park.md`.
+
+### 15.1 Boot
+
+The reference command with the park flags at their defaults (i.e. exactly the
+old command — the feature needs no flag to be on):
+
+```
+python -m sglang.srt.translator.launch \
+  --host 192.168.0.101 --port 30800 --participants de,es \
+  --asr faster-whisper --asr-device cuda --asr-compute-type int8_float16 \
+  --tts inprocess --tts-device cuda:0 --tts-dtype bfloat16 \
+  --embedder onnx \
+  --embedder-model /spinning/llm_stuff/translator-models/embedder/wespeaker_resnet34_LM.onnx \
+  --preset-voice-dir /spinning/llm_stuff/translator-models/preset-voices \
+  --mt-base-url http://127.0.0.1:30030/v1 --mt-model default --enable-metrics
+```
+
+Knobs, in the order you would actually reach for them:
+
+| flag | default | reach for it when |
+|---|---|---|
+| `--never-park` | off | debugging a latency complaint; pins the tenant resident, beats every other knob |
+| `--idle-park-floor-s` | 120 | the card is wanted back sooner (lower) or conversations have long pauses (raise) |
+| `--idle-park-dwell-s` | 180 | park/wake is cycling more often than you want |
+| `--idle-park-gap-margin` | 4.0 | it parked inside a conversation (raise) |
+| `--idle-park-break-even` | 20.0 | the wake is measured slow and you want it to park less |
+| `--no-idle-park` | on | turning the feature off entirely |
+| `--residency-event-url` | "" | a consumer should be POSTed the park/wake events (#553) |
+
+### 15.2 Reading the state
+
+```
+curl -s localhost:30800/api/translator/health | jq .idle_park
+curl -s localhost:30800/metrics | grep -E 'translator_(assets_parked|parked_mib|idle_seconds|park_threshold_seconds|last_wake_ms|last_first_serve_ms)'
+```
+
+`idle_park.terms` explains the current threshold term by term, so "why has it
+not parked yet" is answerable without a debugger. `state` is one of
+`resident | parking | parked | restoring`.
+
+Park and wake also leave a grep-able marker in the journal:
+
+```
+journalctl -u <unit> | grep RESIDENCY_EVENT
+```
+
+carrying tenant, event (`park_complete` / `wake_start` / `wake_complete`) and
+per-card MiB with the card's **NVML** identity — not the torch ordinal, which
+on this rig names a different card (§6.1).
+
+### 15.3 What a healthy park looks like in nvidia-smi
+
+A parked tenant does NOT drop to zero. The CUDA context and the cuBLAS/cuDNN
+workspaces belong to the process and only exiting it returns them, so expect
+
+```
+~5916 MiB resident   ->   a few hundred MiB parked
+```
+
+A few hundred MiB against the translator's PID is a successful park, not a
+failed one. Zero would mean the process died.
+
+Two things to check rather than assume:
+
+* **the second park must return the same amount as the first.** Idle it, wake
+  it, idle it again past the dwell: `used_memory` must come back to the SAME
+  parked baseline. Anything lingering across the cycle is a leak, not a
+  rounding error.
+* **wake latency is TWO numbers.** `translator_last_first_serve_ms` is what a
+  user pays (the recognizer is back and the turn can start);
+  `translator_last_wake_ms` is the full stack including the codec, which
+  restores behind the running turn. Quoting only the second overstates the
+  cost; quoting only the first hides how long the card stays half-claimed.
+
+### 15.4 Consequence for the co-tenant's reserve
+
+The coexistence rule in §4.1 is unchanged and still binding: **size the
+serving engine's `--rank-auto-reserve-mib` against the tenant's DECLARED
+budget, never against a momentary `nvidia-smi`.** The idle park makes that
+trap sharper, not milder — the tenant now spends most of its life at a few
+hundred MiB and is entitled to jump back to 7500 at the first utterance. A
+reserve sized from a parked observation will OOM the first conversation.
+
+What the park is for is the OTHER direction: it makes the idle memory
+genuinely available to a consumer that can give it back on demand. Building
+that consumer is #553; until it exists the freed memory is simply free.
+
+### 15.5 If a wake ever hangs
+
+`ensure_awake` has a 120 s deadlock detector and raises rather than hanging
+forever, so the symptom is a turn failing with a `WakeTimeout` in the
+translator log, not a silent stall. The state is left `parked`, and the next
+request retries the wake from scratch — a failed park or wake never leaves the
+tenant in a half-moved state a turn could run against.

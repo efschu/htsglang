@@ -144,9 +144,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--mt-thinking", action="store_true",
         help=(
             "let a reasoning-capable MT model think out loud. OFF by default, "
-            "and measured: Qwen3.6-27B-FP8 answered a German->Spanish request "
-            "with \"Here's a thinking process: 1. Analyze User Input...\" and "
-            "ran into the token limit before producing a translation. The "
+            "and the OFF is sent EXPLICITLY on every request rather than left "
+            "to the served checkpoint's chat-template default. Measured: "
+            "Qwen3.6-27B-FP8 answered a German->Spanish request with \"Here's "
+            "a thinking process: 1. Analyze User Input...\" and ran into the "
+            "token limit before producing a translation; the #541 A/B put "
+            "thinking at 2.5x wall and 3.7x tokens for equal quality. The "
             "chain of thought is not separable downstream -- it would be read "
             "aloud in the target voice."
         ),
@@ -174,6 +177,67 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--silero-model", type=Path, default=None)
     parser.add_argument("--hangover-ms", type=int, default=550)
     parser.add_argument("--log-level", default="INFO")
+    # -- #546 idle park ----------------------------------------------------
+    # ON by default for this deployment: the tenant shares a card with the
+    # serving engine and is idle almost all of the time. The threshold is
+    # derived from the traffic (see idle_park.py); these knobs bound it.
+    parser.add_argument(
+        "--idle-park", dest="idle_park", action="store_true", default=True,
+        help="give the audio assets' VRAM back to the driver while nobody is "
+             "talking, spilling the weights to host RAM, and restore them on "
+             "the first request. ON by default. The park threshold is NOT a "
+             "plain timer: it is the larger of --idle-park-floor-s, the "
+             "recent inter-arrival p95 times --idle-park-gap-margin, and "
+             "--idle-park-break-even times the MEASURED restore latency, "
+             "clamped to --idle-park-ceiling-s",
+    )
+    parser.add_argument(
+        "--no-idle-park", dest="idle_park", action="store_false",
+        help="keep every audio asset resident for the life of the process",
+    )
+    parser.add_argument(
+        "--never-park", action="store_true",
+        help="hard override: nothing ever parks, whatever --idle-park says. "
+             "For pinning the tenant resident while debugging a latency "
+             "complaint, without having to reason about which knob wins",
+    )
+    parser.add_argument(
+        "--idle-park-floor-s", type=float, default=120.0,
+        help="absolute minimum silence before a park may be considered. The "
+             "term that binds on a fresh process, before any inter-arrival "
+             "gap or restore latency has been measured",
+    )
+    parser.add_argument(
+        "--idle-park-ceiling-s", type=float, default=900.0,
+        help="upper bound on the whole threshold, so one long mid-"
+             "conversation pause cannot push the adaptive term out to hours",
+    )
+    parser.add_argument(
+        "--idle-park-gap-margin", type=float, default=4.0,
+        help="multiple of the recent inter-arrival p95 the idle span must "
+             "clear. This is what stops a park firing INSIDE a conversation, "
+             "where gaps of a few seconds are normal",
+    )
+    parser.add_argument(
+        "--idle-park-break-even", type=float, default=20.0,
+        help="multiple of the MEASURED restore latency the idle span must "
+             "also clear, so parking is only done when the expected idle "
+             "time amortizes the park plus the restore",
+    )
+    parser.add_argument(
+        "--idle-park-dwell-s", type=float, default=180.0,
+        help="anti-flap: no park may start within this long after a wake "
+             "completes, whatever the threshold computes",
+    )
+    parser.add_argument(
+        "--residency-event-url", default="",
+        help="POST every park/wake residency event to this URL as JSON "
+             "(tenant, event, per-card NVML identity and MiB). The log marker "
+             "RESIDENCY_EVENT is always written regardless; this is the "
+             "cross-process route for a consumer that reacts to the freed "
+             "memory (#553)",
+    )
+
     parser.add_argument(
         "--enable-metrics", action="store_true",
         help="serve Prometheus metrics on /metrics: per-stage turn latencies "
@@ -239,8 +303,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         TranslatorConfig,
         TtsConfig,
     )
+    from sglang.srt.translator.idle_park import IdleParkConfig, IdleParkController
+    from sglang.srt.translator.ledger import AudioAssetLedger
     from sglang.srt.translator.mt import MtConfig, OpenAiMt
     from sglang.srt.translator.server import Stack, TranslatorService, build_app
+
+    idle_park_config = IdleParkConfig(
+        enabled=args.idle_park,
+        never_park=args.never_park,
+        floor_s=args.idle_park_floor_s,
+        ceiling_s=args.idle_park_ceiling_s,
+        gap_margin=args.idle_park_gap_margin,
+        break_even=args.idle_park_break_even,
+        dwell_s=args.idle_park_dwell_s,
+    )
+    try:
+        idle_park_config.validate()
+    except ValueError as exc:
+        raise SystemExit(f"idle-park configuration is not usable: {exc}") from exc
+
+    if args.residency_event_url:
+        from sglang.srt.translator import residency
+
+        residency.add_sink(residency.http_sink(args.residency_event_url))
+        logger.info("residency events POST to %s", args.residency_event_url)
+
+    # ONE ledger for the whole tenant, built before any backend, so the
+    # recognizer and the synthesizer land in the same asset class and one
+    # park covers both. Two ledgers would be two victim lists, which is the
+    # arrangement the one-runtime rule exists to prevent.
+    ledger = AudioAssetLedger()
 
     participants = tuple(p.strip() for p in args.participants.split(",") if p.strip())
     mt_languages = tuple(
@@ -268,6 +360,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default_participants=participants,
         host=args.host,
         port=args.port,
+        idle_park=idle_park_config,
     )
 
     # ASR
@@ -302,6 +395,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # disagree about which revision is being measured.
             download_root=args.asr_cache,
         )
+        if args.asr_device.startswith("cuda"):
+            # The largest single idle holder in the tenant, and until #546 the
+            # one the ledger could not see: CTranslate2 allocates outside
+            # torch. It joins the same asset class through its own park route.
+            try:
+                asr.register_with_ledger(ledger)
+            except Exception as exc:  # noqa: BLE001 - never fatal at boot
+                logger.warning(
+                    "the recognizer could not be registered as parkable (%s); "
+                    "it will stay resident while the tenant is idle", exc,
+                )
     elif args.asr == "nemo":
         from sglang.srt.translator.asr_backends import NemoStreamingAsr
 
@@ -324,7 +428,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dtype=args.tts_dtype,
                 sample_rate=args.tts_sample_rate,
                 min_reference_seconds=args.min_reference_seconds,
-            )
+            ),
+            ledger=ledger,
         )
         # Load here rather than lazily on the first turn: the checkpoint takes
         # seconds and, more importantly, the weight verification and the two
@@ -351,10 +456,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Thinking is suppressed through the chat template rather than filtered out
     # of the answer: a reasoning model's output has no reliable marker the
-    # translator could strip, and anything left in the string is spoken.
+    # translator could strip, and anything left in the string is spoken. The
+    # flag itself is now set by the MT client on EVERY request (MtConfig
+    # .enable_thinking) instead of being an absent key here -- an absent key
+    # leaves the decision to whichever chat template the served checkpoint
+    # ships, which this tenant does not control.
     extra_body: Dict[str, object] = {}
-    if not args.mt_thinking:
-        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
     # EVERY translator call is latency-critical: a person is waiting mid
     # sentence. The server's priority lanes (protocol.py) put this traffic
     # ahead of bulk co-tenants -- eval prefills and the like -- which is the
@@ -377,12 +484,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             model=args.mt_model,
             languages=mt_languages,
             extra_body=extra_body,
+            enable_thinking=args.mt_thinking,
             **({} if args.mt_timeout_s is None
                else {"timeout_s": args.mt_timeout_s}),
         )
     )
 
-    service = TranslatorService(config, Stack(asr=asr, embedder=embedder, mt=mt, tts=tts))
+    stack = Stack(asr=asr, embedder=embedder, mt=mt, tts=tts)
+    # The busy probe, not the idle clock, is what protects a running turn: a
+    # turn announces itself when it starts, and a long synthesis would
+    # otherwise look like silence to a clock that only sees arrivals.
+    controller = IdleParkController(
+        ledger,
+        idle_park_config,
+        busy_probe=lambda: bool(getattr(stack.tts, "busy", False)),
+    )
+    service = TranslatorService(config, stack, idle_park=controller)
     app = build_app(service)
 
     # BEFORE the readiness line and before the port opens, in that order. The
@@ -408,6 +525,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # warmup looks identical to one that did it, right up to the 15 s
             # the user waits for their first sentence.
             logger.warning("talker warmup did not run (%s)", report["reason"])
+
+    # The warmup touched every weight; the idle clock starts from HERE, not
+    # from process start, or the tenant could park before it has served
+    # anything at all.
+    controller.notify_activity()
+    if controller.config.active() and ledger.names():
+        threshold, _terms = controller.threshold()
+        logger.info(
+            "idle park armed over %d ledgered asset(s) (%.1f MiB resident); "
+            "first park after %.0fs of silence, dwell %.0fs",
+            len(ledger.names()),
+            ledger.to_json()["resident_mib"],
+            threshold,
+            controller.config.dwell_s,
+        )
+    else:
+        logger.info(
+            "idle park is OFF (%s); the tenant holds its VRAM for the life "
+            "of the process",
+            "never-park" if controller.config.never_park
+            else "disabled" if not controller.config.enabled
+            else "no ledgered assets",
+        )
 
     languages = service.languages()
     logger.info(

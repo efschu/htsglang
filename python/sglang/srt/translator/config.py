@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, Optional, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
+    from sglang.srt.translator.idle_park import IdleParkConfig
 
 __all__ = [
     "TranslatorConfig",
@@ -32,6 +35,15 @@ __all__ = [
     "DiarizationConfig",
     "TranslatorConfigError",
 ]
+
+
+def _default_idle_park() -> "IdleParkConfig":
+    """Imported lazily: ``idle_park`` imports the ledger, the ledger imports
+    torch on its movement path, and this module must stay importable on a desk
+    that has neither."""
+    from sglang.srt.translator.idle_park import IdleParkConfig
+
+    return IdleParkConfig()
 
 
 class TranslatorConfigError(ValueError):
@@ -121,6 +133,16 @@ class TranslatorConfig:
     max_sessions: int = 8
     host: str = "127.0.0.1"
     port: int = 30800
+    #: #546: give the VRAM back while nobody is talking. ON by default for
+    #: this deployment -- the tenant shares a card with the serving engine and
+    #: its duty cycle is a conversation an hour at best. Independent of
+    #: ``session_idle_timeout_s``, which collects SESSIONS: a parked tenant
+    #: keeps every session, its speakers and its transcript. See
+    #: :mod:`sglang.srt.translator.idle_park` for why the park threshold is
+    #: derived from the traffic rather than being this timeout's twin.
+    idle_park: "IdleParkConfig" = dataclasses.field(
+        default_factory=lambda: _default_idle_park()
+    )
 
     def total_budget_mib(self) -> int:
         return self.asr.budget_mib + self.tts.budget_mib + self.diarization.budget_mib
@@ -153,3 +175,7 @@ class TranslatorConfig:
         ):
             if budget <= 0:
                 raise TranslatorConfigError(f"{name}.budget_mib must be positive")
+        try:
+            self.idle_park.validate()
+        except ValueError as exc:
+            raise TranslatorConfigError(str(exc)) from exc

@@ -58,6 +58,8 @@ from sglang.srt.translator.audio import (
     resample,
 )
 from sglang.srt.translator.backends import AudioChunk
+from sglang.srt.translator.idle_park import IdleParkController, ParkState
+from sglang.srt.translator.ledger import DEFAULT_WAKE_RANKS, FALLBACK_WAKE_RANK
 from sglang.srt.translator.config import TranslatorConfig
 from sglang.srt.translator import metrics
 from sglang.srt.translator.languages import (
@@ -137,10 +139,16 @@ class TranslatorService:
         config: TranslatorConfig,
         stack: Stack,
         voice_pool: Optional[VoicePool] = None,
+        idle_park: Optional["IdleParkController"] = None,
     ) -> None:
         config.validate()
         self.config = config
         self.stack = stack
+        #: #546. None when the deployment has no ledgered assets at all (the
+        #: all-fake hermetic boot), in which case every hook below is a cheap
+        #: attribute test and the behaviour is exactly what it was.
+        self.idle_park = idle_park
+        self._wake_task = None
         self.voice_mode = VoiceMode.parse(config.tts.voice_mode)
         # The pool is loaded once, at startup, and SHARED across sessions --
         # but each session keeps its own sticky assignment, so two concurrent
@@ -354,7 +362,84 @@ class TranslatorService:
                 "tts": getattr(self.stack.tts, "name", "unknown"),
                 "embedder": getattr(self.stack.embedder, "name", "unknown"),
             },
+            # The declared budget above is what this tenant is ENTITLED to
+            # (the runbook's coexistence rule sizes co-tenants against it).
+            # This says how much of it is on the card right now, which is the
+            # number #553 acts on and an operator reads to explain a
+            # surprisingly low nvidia-smi.
+            "idle_park": (
+                None if self.idle_park is None else self.idle_park.to_json()
+            ),
         }
+
+    # -- #546 idle park -----------------------------------------------------
+
+    def notify_activity(self) -> None:
+        """Announce one ARRIVAL to the idle-park controller.
+
+        An arrival is a TURN or a real REST request, never a raw audio frame.
+        The distinction is the whole inter-arrival signal: frames arrive every
+        few tens of milliseconds while a microphone is open, so counting them
+        would fill the controller's gap ring with millisecond gaps and leave
+        the p95 term permanently at zero -- the policy would silently collapse
+        back into the fixed timer it exists to replace.
+
+        It also decides what "idle" means, and turns are the right unit: a
+        forgotten open microphone streaming silence is idle, and must park.
+        The first frame after that still wakes the tenant (``prefetch_wake``),
+        so nothing is lost by not counting frames.
+        """
+        if self.idle_park is not None:
+            self.idle_park.notify_activity()
+
+    async def ensure_awake(self, stage: str = "asr") -> float:
+        """Wait for the assets ``stage`` needs. Returns the waited ms.
+
+        Staged, not a barrier: a turn is released as soon as the RECOGNIZER
+        is resident, because that is the first thing it uses and the talker
+        cannot be reached until the recognition and the translation have
+        happened. The rest of the stack keeps restoring behind it. See
+        ``idle_park.IdleParkController.ensure_awake``.
+
+        The wait runs in the default executor: the event loop serves every
+        other session and must not stop for a PCIe copy.
+        """
+        controller = self.idle_park
+        if controller is None:
+            return 0.0
+        controller.notify_activity()
+        if controller.state is ParkState.RESIDENT:
+            return 0.0
+        self.prefetch_wake()
+        rank = DEFAULT_WAKE_RANKS.get(stage, FALLBACK_WAKE_RANK)
+        return await asyncio.get_running_loop().run_in_executor(
+            None, controller.ensure_awake, rank
+        )
+
+    def prefetch_wake(self):
+        """Start the staged restore in the background, at most one at a time.
+
+        Returns the in-flight task, or None when nothing is parked. Sharing
+        ONE task is what makes this callable per audio frame: a hundred frames
+        during one restore produce one restore and ninety-nine awaits of it,
+        not a hundred executor jobs contending for the same ledger lock.
+
+        Deliberately does NOT count as an arrival -- see ``notify_activity``.
+        A frame starts the restore early; only a turn moves the idle clock.
+        """
+        controller = self.idle_park
+        if controller is None:
+            return None
+        if controller.state is ParkState.RESIDENT:
+            return None
+        loop = asyncio.get_running_loop()
+        if self._wake_task is not None and not self._wake_task.done():
+            return self._wake_task
+        # The executor Future is kept as-is rather than wrapped in a Task:
+        # run_in_executor already returns an awaitable that several coroutines
+        # may await, and create_task() over it raises (it wants a coroutine).
+        self._wake_task = loop.run_in_executor(None, controller.ensure_awake)
+        return self._wake_task
 
     def open_session(
         self,
@@ -536,6 +621,13 @@ class _Connection:
 
     async def _on_audio(self, payload: bytes) -> None:
         assert self.session is not None
+        # #546: the FIRST frame of an utterance is the wake signal, not the
+        # finished segment. Starting the restore here overlaps it with the
+        # speaking, so by the time the segmenter closes a segment the models
+        # are usually already back and the wake costs the user nothing. The
+        # drain still awaits the wake, so a very short utterance is correct
+        # rather than fast.
+        self.service.prefetch_wake()
         chunk = self.codec.decode(payload)
         if chunk.sample_rate != PIPELINE_SAMPLE_RATE:
             chunk = resample(chunk, PIPELINE_SAMPLE_RATE)
@@ -800,6 +892,13 @@ class _Connection:
     async def _drain_guarded(self) -> None:
         assert self.session is not None
         try:
+            # The one place a turn may NOT proceed against parked weights.
+            # Everything upstream (the prefetch on the first frame) is an
+            # optimisation; this await is the correctness gate -- and it is a
+            # gate on the RECOGNIZER only, which is what the turn's first
+            # stage needs. The talker restores while the recognition and the
+            # translation hop run, which is seconds of cover.
+            await self.service.ensure_awake(stage="asr")
             await self.session.drain()
         except asyncio.CancelledError:
             # A stop, not a fault. Nothing to report and nothing to repair:
@@ -884,15 +983,49 @@ def build_app(service: TranslatorService) -> FastAPI:
                     len(dropped), ", ".join(dropped),
                 )
 
+    async def _idle_park_forever() -> None:
+        """Ask the #546 controller, on a cadence, whether to give the VRAM back.
+
+        A SEPARATE task from the session collector even though both are
+        timers, because they answer to different clocks and must not learn to
+        share one: collection drops sessions at 300 s, parking releases memory
+        on a threshold derived from the traffic. Merging them would make one
+        cadence a hidden input to the other's policy.
+
+        The tick is a fraction of the floor, so the park lands within ~12 % of
+        the threshold rather than up to a whole collector period late, and it
+        is never faster than a second -- the decision reads a percentile, not
+        a stopwatch.
+        """
+        controller = service.idle_park
+        if controller is None:
+            return
+        period = max(1.0, min(15.0, controller.config.floor_s / 8.0))
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(period)
+            try:
+                # The park itself is blocking (host copies, empty_cache), so
+                # it runs off the loop. Nothing else may stall while ~6 GiB
+                # crosses PCIe.
+                decision = await loop.run_in_executor(None, controller.tick)
+            except Exception:  # noqa: BLE001 - a sweeper must not die
+                logger.exception("idle park tick failed")
+                continue
+            if decision.parked:
+                logger.info("idle park: %s", json.dumps(decision.to_json()))
+
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
         collector = asyncio.create_task(_collect_forever())
+        parker = asyncio.create_task(_idle_park_forever())
         try:
             yield
         finally:
-            collector.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await collector
+            for task in (collector, parker):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     app = FastAPI(
         title="htsglang live translator", version="1", lifespan=lifespan
@@ -945,6 +1078,73 @@ def build_app(service: TranslatorService) -> FastAPI:
         _journal_depth_max,
     )
 
+    # #546. Four series, because "is it parked" alone cannot answer the two
+    # questions an operator actually has: is the memory available right now
+    # (parked + parked_mib), and is the policy behaving (idle vs threshold,
+    # wake latency). A gauge that only says "parked" makes a thrashing
+    # controller look identical to a stable one.
+    def _park_state() -> float:
+        controller = service.idle_park
+        return 1.0 if controller is not None and controller.parked else 0.0
+
+    def _parked_mib() -> float:
+        controller = service.idle_park
+        if controller is None or not controller.parked:
+            return 0.0
+        return controller.last_freed_bytes / (1 << 20)
+
+    def _idle_seconds() -> float:
+        controller = service.idle_park
+        return 0.0 if controller is None else controller.idle_seconds()
+
+    def _park_threshold_seconds() -> float:
+        controller = service.idle_park
+        return 0.0 if controller is None else controller.threshold()[0]
+
+    def _last_wake_ms() -> float:
+        controller = service.idle_park
+        if controller is None or controller.last_wake_ms is None:
+            return 0.0
+        return controller.last_wake_ms
+
+    metrics.register_depths(
+        "translator_assets_parked",
+        "1 while the audio assets are spilled to host RAM (#546).",
+        _park_state,
+    )
+    metrics.register_depths(
+        "translator_parked_mib",
+        "MiB of device memory currently handed back by the idle park.",
+        _parked_mib,
+    )
+    metrics.register_depths(
+        "translator_idle_seconds",
+        "Seconds since the last request reached the tenant.",
+        _idle_seconds,
+    )
+    metrics.register_depths(
+        "translator_park_threshold_seconds",
+        "Current adaptive idle threshold a park has to clear.",
+        _park_threshold_seconds,
+    )
+    def _last_first_serve_ms() -> float:
+        controller = service.idle_park
+        if controller is None or controller.last_first_serve_ms is None:
+            return 0.0
+        return controller.last_first_serve_ms
+
+    metrics.register_depths(
+        "translator_last_wake_ms",
+        "Milliseconds the most recent wake took to restore the FULL stack.",
+        _last_wake_ms,
+    )
+    metrics.register_depths(
+        "translator_last_first_serve_ms",
+        "Milliseconds until the most recent wake could serve a request "
+        "(first need rank resident). The latency a user actually pays.",
+        _last_first_serve_ms,
+    )
+
     @app.get("/api/translator/languages")
     async def languages() -> JSONResponse:
         return JSONResponse(service.languages())
@@ -979,6 +1179,13 @@ def build_app(service: TranslatorService) -> FastAPI:
 
     @app.post("/api/translator/sessions")
     async def create_session(body: Dict[str, Any]) -> JSONResponse:
+        # Opening a conversation is the earliest honest signal that models
+        # will be needed. The wake is started, not awaited: nothing in this
+        # handler touches a weight, and making session creation wait for a
+        # PCIe copy would move the latency from where it is hidden (behind
+        # the first utterance) to where it is felt.
+        service.notify_activity()
+        service.prefetch_wake()
         try:
             session = service.open_session(
                 body.get("participants"), body.get("session_id")
@@ -1002,6 +1209,8 @@ def build_app(service: TranslatorService) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if audio.sample_rate != PIPELINE_SAMPLE_RATE:
             audio = resample(audio, PIPELINE_SAMPLE_RATE)
+        # Enrolment runs the speaker encoder, which is a ledgered asset.
+        await service.ensure_awake(stage="speaker_encoder")
         speaker_id = await session.enroll_speaker(
             label=str(body.get("label", "user")),
             audio=audio,

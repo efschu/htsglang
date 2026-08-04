@@ -2322,6 +2322,28 @@ took, because DESIGN_333 §2.3's Class-3 scheduler does not exist yet. Every
 model it loads is an in-process `nn.Module` registered as the `audio_modules`
 asset class in the #286 ledger (parkable, evictable): ONE RUNTIME, no second
 serving engine.
+**Idle park (#546, `translator/idle_park.py`, NOTE_546)**: the tenant hands its
+~5.9 GiB back to the DRIVER while nobody is talking and restores on the first
+request. Movement is the existing `audio_modules` ledger — plus a park ROUTE
+(`ParkRoute`) so the CTranslate2 recognizer, which allocates outside torch and
+was therefore invisible to the register, joins the SAME class through
+`unload_model(to_cpu=True)` / `load_model(keep_cache=True)`; the route is also
+the seam a #488 native-lane backend registers through. Host copies are
+page-locked at park time (the leg nobody waits through) and the pages leave the
+caching allocator via `empty_cache` — NOT the #330 VMM decommit, which is for
+an arena this tenant does not have. **The park is not on a timer**: the
+threshold is `clamp(max(floor, p95(recent inter-arrival gaps) x margin,
+break_even x MEASURED restore), floor, ceiling)` with an independent post-wake
+dwell — the `SpillTickController` shape, because a fixed timeout small enough
+to reclaim after a conversation also fires inside one. Gaps that span a park
+are excluded from the percentile, or the feature would disable itself the
+first time it worked. The wake is STAGED in pipeline need order (ASR -> talker
+-> codec) with each waiter released at its own rank, and `wake_start` is
+emitted BEFORE the first byte moves, carrying per-card NVML-resolved MiB — the
+event contract #553 (elastic co-residency) will react to. Latency is reported
+SPLIT: time-to-first-serve vs time-to-full-restore. `--never-park` is the hard
+override. GPU verification of the nvidia-smi drop and the wake numbers is
+BOOT-PENDING (NOTE_546 §6).
 **The language pair is never in the code**: the supported set is derived at
 runtime as ASR x MT x TTS (`/api/translator/languages` also returns the
 per-stage sets, so a missing language is attributable to a checkpoint rather
