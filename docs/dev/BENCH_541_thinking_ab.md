@@ -43,6 +43,14 @@ The run was stopped after 9 of 16 runs on the user's instruction, to restart
 serving with disk hicache and `preserve_thinking` on. The remaining reps were
 not run.
 
+**Phase 2 (§9) then ran 3 of a planned 24 runs against that new boot before
+being wound down.** It settled exactly one thing, and it is the one that
+mattered: with HiCache and `preserve_thinking` the reuse gap between arms
+closes (66.9 % vs 62.9 %), so the arm difference is finally readable — and on
+the one complete pair, thinking cost **2.5x wall time and 3.7x tokens for
+identical, flawless quality**. One pair is not a result; it is the first clean
+one.
+
 ---
 
 ## 1. Mechanism proof, before any measurement
@@ -276,11 +284,103 @@ All four are stored with their transcripts under
 
 ---
 
-## 9. Follow-up
+## 9. Phase 2 — the HiCache + preserve_thinking boot
 
-1. **Re-run the full battery on the hicache + `preserve_thinking` boot**, at
-   least 3 reps per cell. Prompts, runner, graders and ground truth are
-   reusable unchanged.
+Serving was restarted between the two phases. Phase 2 ran against a materially
+different boot and is **not** poolable with phase 1.
+
+| | phase 1 | phase 2 |
+|---|---|---|
+| serving identity | pid 1236 | **pid/pgid 115747**, start-jiffies 230066160 |
+| disk HiCache | none | 100 GB, `file` backend, `/spinning/hicache` |
+| `preserve_thinking` | off | **server default** (`chat_template_default_kwargs`) |
+| absent `thinking` field | produced a thinking block (pre-#540) | **== disabled** (#540 live) |
+
+All four config facts were live-verified from `/get_server_info` before launch,
+not taken on report. The thinking mechanism was re-proven on the new boot,
+because #540 changes what an absent field means:
+
+| `thinking` sent | stop_reason | out tok | blocks |
+|---|---|---|---|
+| absent | `end_turn` | 4 | `text` |
+| `disabled` | `end_turn` | 4 | `text` |
+| `adaptive` | `max_tokens` | 150 | `thinking` |
+
+That is the inverse of phase 1's first row: the router's shim is now a genuine
+no-op, and arm A is unaffected either way. Both router aliases were re-verified
+end to end against the new boot before any run.
+
+Phase 2 was ordered rep-round-robin (every rep sweeps all four tasks, A and B
+adjacent) precisely because phase 1's task-major order lost T4's B arm when it
+was stopped. It was stopped after 3 of 24 runs on a wind-down instruction.
+
+| run | arm | rc | wall s | prompt | cached | reuse | gen | thinking | turns | tools |
+|---|---|---|---|---|---|---|---|---|---|---|
+| P2-T1-A-r1 | A | 0 | **197** | 604 542 | 404 662 | **66.9 %** | 3 951 | 0 | 40 | 32 |
+| P2-T1-B-r1 | B | 0 | **485** | 1 124 801 | 707 486 | **62.9 %** | 14 675 | 4 758 (32 %) | 70 | 55 |
+| P2-T2-A-r1 | A | 124 | 600 (DNF) | 994 863 | 464 379 | 46.7 % | 4 941 | 0 | 59 | 52 |
+
+### The one thing phase 2 settled
+
+**The caching handicap is gone, and the thinking cost is real.** Reuse is now
+66.9 % against 62.9 % — a 4-point gap, against phase 1's 8-point gap at a much
+lower level (48.5 % vs 40.3 %). With reuse essentially matched, the arm gap on
+the T1 pair is no longer attributable to the serving path:
+
+* arm B took **2.5x the wall time** (485 s vs 197 s)
+* arm B spent **3.7x the generated tokens** (14 675 vs 3 951)
+* arm B took **1.75x the turns** (70 vs 40)
+* **for identical, flawless quality** — both arms 10/10 modules, 94 verified
+  interface names, zero wrong claims
+
+Only 4 758 of arm B's 14 675 generated tokens are thinking. The other ~9 900
+are ordinary output: thinking did not merely add a reasoning surcharge, it made
+the agent take more turns and write more, with nothing to show for it on this
+task class.
+
+Arm B's behaviour on T1 also changed sharply between boots — phase 1: 134 s /
+3 132 generated / 222 thinking tokens; phase 2: 485 s / 14 675 / 4 758. The
+plausible mechanism is `preserve_thinking` itself: prior-turn reasoning now
+stays in context, which invites more reasoning in each following turn, a
+compounding effect. **This is a hypothesis, not a finding** — it rests on one
+pair per phase.
+
+### What phase 2 did not settle
+
+* **n = 1 per arm.** Three runs of a planned 24. The phase-1 noise floor
+  (179 s vs 600 s DNF, same task, same arm) has not been re-measured on this
+  boot and there is no reason to assume it shrank.
+* **T2 flipped without any arm involved.** The rigmon sweep succeeded at 578 s
+  in phase 1 and DNF'd at 600 s in phase 2, both in arm A. That task sits on
+  the budget boundary, and it is further noise-floor evidence, not a
+  boot-quality statement.
+* **Co-tenancy was live.** Sampling during phase 2 showed foreign traffic on
+  the server (`running=2.0`, `queue=1.0`). The runner gates on an idle server
+  at run START only, so a co-tenant request mid-run lands in that run's
+  `/metrics` delta. Phase 1 had the same exposure with fewer active agents.
+* **The inverted `preserve_thinking` probe result** reported by the coordinator
+  (true = 6.4 % vs false = 77.2 % reuse on a two-turn probe) was under
+  investigation and is unresolved. It does not touch quality grading, and the
+  per-run reuse figures above are what would let it be separated later.
+
+### Recorded operational fault
+
+`P2-T2-A-r1` hit its cap and its `run_arm.sh` produced no status file for
+roughly two minutes afterwards, while the process itself had already exited.
+The status file did appear later and the run was recovered intact from its
+860 KB stream transcript. Nothing was lost, but a run is not safe to declare
+missing on the absence of its status file alone — the transcript is the
+authority.
+
+---
+
+## 10. Follow-up
+
+1. **Finish the phase-2 battery** (3 of 24 runs done): 4 tasks x 2 arms x 3
+   reps on the pgid-115747 boot. Prompts, runner, graders and ground truth are
+   reusable unchanged; `battery2.sh` carries the rep-round-robin order.
+   Re-measure the A-vs-A noise floor on this boot first — the phase-1 figure
+   does not transfer.
 2. **Run `probe_preserve_thinking.py`** on an idle server to settle whether the
    per-request route through the Anthropic front works, independently of the
    server default.
