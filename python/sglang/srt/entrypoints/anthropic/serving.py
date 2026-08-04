@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.anthropic.protocol import (
+    KNOWN_CONTENT_BLOCK_TAGS,
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
@@ -35,6 +36,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     MessageDeltaEvent,
     MessageStartEvent,
     MessageStopEvent,
+    PingEvent,
     SignatureDelta,
     TextBlock,
     TextDelta,
@@ -65,11 +67,21 @@ logger = logging.getLogger(__name__)
 # on the wire; ``content_filter`` and ``abort`` have no perfect mapping
 # so they fall through to the ``end_turn`` default with a WARNING at the
 # call site so operators don't lose the safety/abort signal in logs.
+# ``stop_sequence`` is the fourth Anthropic stop reason and is NOT reachable
+# from an OpenAI finish_reason: the backend reports a stop-string hit as plain
+# ``"stop"`` and carries the matched string out of band in
+# ``matched_stop`` (``openai/protocol.py:1107`` non-streaming,
+# ``:1169`` streaming). ``_resolve_stop_sequence`` below turns that into the
+# Anthropic pair (stop_reason="stop_sequence", stop_sequence="<the string>").
 STOP_REASON_MAP = {
     "stop": "end_turn",
     "length": "max_tokens",
     "tool_calls": "tool_use",
 }
+
+# Cadence for keep-alive ``ping`` events on an otherwise silent stream.
+# Module-level so tests can shorten it; read at runtime, never captured.
+PING_INTERVAL_SECONDS = 5.0
 
 ERROR_TYPE_MAP = {
     400: "invalid_request_error",
@@ -131,6 +143,64 @@ def _anthropic_usage_from_openai(
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
         )
     return AnthropicUsage(**usage_fields)
+
+
+def _resolve_stop_sequence(
+    matched_stop: Any,
+    stop_sequences: Optional[list[str]],
+    accumulated_text: Optional[str] = None,
+) -> Optional[str]:
+    """Return the caller's stop sequence that ended this completion, if any.
+
+    Primary source is the backend's ``matched_stop``. It is
+    ``Union[None, int, str]``: an ``int`` is a stop TOKEN id (no Anthropic
+    equivalent — ``stop_sequences`` is a string API) and only a ``str`` can
+    be a stop sequence. The string is additionally required to be one the
+    CALLER asked for: the chat template contributes its own stop strings to
+    the same OpenAI ``stop`` list, and an EOS-ish template stop is an
+    ``end_turn``, not a ``stop_sequence``.
+
+    ``accumulated_text`` drives a fallback for backends that report no
+    ``matched_stop`` at all. LIMITATION, stated because it is easy to
+    mistake for a guarantee: SGLang strips the matched stop string from the
+    emitted text unless ``no_stop_trim`` is set, so the suffix probe
+    normally finds nothing and correctly returns None. It only rescues the
+    no-trim configuration; it is not a substitute for ``matched_stop``.
+    """
+    if not stop_sequences:
+        return None
+    if isinstance(matched_stop, str) and matched_stop in stop_sequences:
+        return matched_stop
+    if accumulated_text:
+        for sequence in stop_sequences:
+            if sequence and accumulated_text.endswith(sequence):
+                return sequence
+    return None
+
+
+def _anthropic_tool_use_id(backend_id: Optional[str]) -> str:
+    """Normalise a backend tool-call id to Anthropic's ``toolu_`` form.
+
+    Anthropic tool_use ids are ``toolu_...``; the OpenAI-compatible backend
+    mints ``call_...``. Clients that validate the prefix (and transcripts
+    replayed into a real Anthropic endpoint) reject the raw backend id, so
+    the OUTBOUND id is normalised in both the streaming and non-streaming
+    paths.
+
+    The round trip holds because the rewrite is outbound-only and
+    deterministic: whatever id we emit is echoed back verbatim on
+    ``tool_result.tool_use_id`` and forwarded to the backend as the
+    ``tool_call_id`` unchanged (``_convert_to_chat_completion_request``
+    never rewrites an INBOUND id), so older clients and replayed
+    transcripts carrying arbitrary id strings keep working.
+    """
+    if not backend_id:
+        return f"toolu_{uuid.uuid4().hex}"
+    if backend_id.startswith("toolu_"):
+        return backend_id
+    if backend_id.startswith("call_"):
+        return f"toolu_{backend_id[len('call_'):]}"
+    return f"toolu_{backend_id}"
 
 
 def _extract_system_text(
@@ -360,14 +430,27 @@ class AnthropicServing:
             """Re-wrap prior-turn thinking blocks in the parser's own tokens.
 
             ``redacted_thinking`` carries encrypted bytes that no local
-            parser can interpret, so we raise rather than silently drop it.
+            parser can interpret. It is SKIPPED with a warning rather than
+            raised on: a client that replays its own transcript ships the
+            redacted block back on every subsequent turn, so raising turns
+            one opaque block into a permanently 400-ing conversation. Same
+            degrade-per-block rule as unknown content types — the dropped
+            content is prior-turn reasoning the model does not need.
             On non-reasoning models (no detector configured) the rewrap is
             best-effort: we log a warning and drop the thinking text so a
             history echo doesn't 400 the whole request — the prior thinking
             is opaque context the model didn't need anyway.
             """
-            if any(block.type == "redacted_thinking" for block in blocks):
-                raise ValueError("Anthropic redacted_thinking history is not supported")
+            redacted_count = sum(
+                1 for block in blocks if block.type == "redacted_thinking"
+            )
+            if redacted_count:
+                logger.warning(
+                    "Skipping %d redacted_thinking block(s) in assistant "
+                    "history: the payload is encrypted and no local "
+                    "reasoning parser can interpret it",
+                    redacted_count,
+                )
 
             thinking_parts = [
                 block.thinking
@@ -512,6 +595,20 @@ class AnthropicServing:
                             }
                         )
 
+                elif block.type not in KNOWN_CONTENT_BLOCK_TAGS:
+                    # Forward compatibility (see UnknownContentBlock in
+                    # protocol.py): Anthropic adds block types over time, so
+                    # an unmodelled type degrades THIS BLOCK, never the whole
+                    # conversation. One warning naming the type so operators
+                    # can see what a client is sending that we drop.
+                    logger.warning(
+                        "Skipping unsupported Anthropic content block type "
+                        "%r in a %r message; the rest of the conversation is "
+                        "converted normally",
+                        block.type,
+                        msg.role,
+                    )
+
             # Attach tool calls to assistant messages
             if tool_calls:
                 openai_msg["tool_calls"] = tool_calls
@@ -594,6 +691,32 @@ class AnthropicServing:
                     "emitted to the client"
                 )
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
+        else:
+            # Anthropic semantics: extended thinking is OFF BY DEFAULT. An
+            # absent ``thinking`` field means the same as
+            # ``{"type":"disabled"}`` — it is NOT "leave the server default
+            # alone". Without this branch a boot carrying
+            # ``--reasoning-parser qwen3`` answers every plain request with a
+            # leading ``thinking`` block that eats the whole ``max_tokens``
+            # budget, so a Claude Code tool round trip never gets emitted.
+            #
+            # This DELIBERATELY overrides the server-level reasoning-parser
+            # default, and only on the Anthropic front: the OpenAI front
+            # reads its own ``chat_template_kwargs``/``reasoning_effort``
+            # and never passes through here, so its behaviour is unchanged.
+            try:
+                self.openai_serving_chat.apply_reasoning_enabled(chat_request, False)
+            except ValueError as e:
+                # An always-on reasoning parser cannot be disabled. Explicit
+                # ``{"type":"disabled"}`` still surfaces that as a 400 (the
+                # caller asked for something the model cannot do), but an
+                # ABSENT field is not a request — refusing here would 400
+                # every plain message on such a model. Warn and serve.
+                logger.warning(
+                    "Anthropic default thinking-off could not be applied: %s "
+                    "— serving with the model's reasoning default instead",
+                    e,
+                )
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
         # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
@@ -758,8 +881,20 @@ class AnthropicServing:
             return self._convert_openai_error_response(response)
 
         # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
-        return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
+        anthropic_response = self._convert_response(
+            response, stop_sequences=anthropic_request.stop_sequences
+        )
+        payload = anthropic_response.model_dump(exclude_none=True)
+        # ``exclude_none`` is kept: it drops the optional cache/usage fields
+        # the local backend never populates, which would otherwise be pure
+        # null noise on every response. The ONE exception is
+        # ``stop_sequence``: the Anthropic Message object documents it as
+        # always present (null when no stop sequence fired) and strict SDK
+        # parsers type it as ``Optional[str]``, for which a MISSING key is a
+        # schema violation. ``stop_reason`` is always set by
+        # ``_convert_response`` and needs no such repair.
+        payload.setdefault("stop_sequence", None)
+        return JSONResponse(content=payload)
 
     async def _handle_streaming(
         self,
@@ -827,11 +962,14 @@ class AnthropicServing:
         content_block_type: Optional[str] = None
         captured_thinking_signature: str = ""
         finish_reason: Optional[str] = None
+        matched_stop: Any = None
+        accumulated_text: list[str] = []
         final_usage: Optional[AnthropicUsage] = None
         message_started = False
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
+        stop_sequences = anthropic_request.stop_sequences
 
         def _message_start_event(usage) -> MessageStartEvent:
             return MessageStartEvent(
@@ -853,6 +991,22 @@ class AnthropicServing:
                 event.model_dump_json(exclude_none=True),
                 event.type,
             )
+
+        def _emit_message_start(event: MessageStartEvent) -> str:
+            """Serialise message_start with the spec's explicit nulls.
+
+            The shared ``_emit`` uses ``exclude_none=True``, which is right
+            for every other event but drops ``stop_reason`` and
+            ``stop_sequence`` from the embedded Message. Anthropic's
+            ``message_start`` carries both as explicit ``null`` — the
+            message has not stopped yet — and strict SDK clients type them
+            as required-but-nullable, so a missing key is a schema
+            violation. Repaired here only, not by widening ``_emit``.
+            """
+            payload = event.model_dump(exclude_none=True)
+            payload["message"]["stop_reason"] = None
+            payload["message"]["stop_sequence"] = None
+            return _wrap_sse_event(json.dumps(payload), event.type)
 
         def _close_content_block_events() -> list[AnthropicStreamEvent]:
             nonlocal content_block_index, content_block_open
@@ -919,7 +1073,7 @@ class AnthropicServing:
             if message_started:
                 return []
             message_started = True
-            return [_emit(_message_start_event(usage))]
+            return [_emit_message_start(_message_start_event(usage))]
 
         def _build_error_event(error_type: str, message: str) -> ErrorEvent:
             return ErrorEvent(
@@ -985,9 +1139,60 @@ class AnthropicServing:
                 yield frame
             return
 
+        # message_start goes out IMMEDIATELY, before the first backend chunk.
+        # It used to be withheld until usage was known so the client would
+        # never see ``input_tokens=0``; the cost was that a client saw
+        # nothing at all for the whole prefill — no message id, no model,
+        # no signal the request was even accepted. The real API resolves
+        # this the other way round: ship message_start at once with the
+        # usage known at that stage and CORRECT the totals in the closing
+        # ``message_delta``, which now carries input_tokens as well as
+        # output_tokens (see the ``chunk.usage`` handler below).
+        for frame in _ensure_message_started(None):
+            yield frame
+
+        async def _iter_lines_with_pings() -> AsyncGenerator[tuple[str, Any], None]:
+            """Yield ``("line", str)`` per upstream chunk and ``("ping", None)``
+            while the backend is silent.
+
+            ``__anext__`` is driven through a TASK so a slow backend can be
+            waited on with a timeout without losing the pending read: a bare
+            ``asyncio.wait_for`` would cancel the coroutine and drop whatever
+            chunk it was about to deliver. The task survives the timeout, a
+            ping goes out, and the SAME task is awaited again — no polling,
+            no sleep loop, no duplicated or dropped chunks.
+
+            The ``finally`` matters for client disconnects: closing the outer
+            generator throws ``GeneratorExit`` at a yield, which unwinds
+            through here and cancels the orphaned read instead of leaving it
+            pending on the event loop.
+            """
+            pending: Optional[asyncio.Task] = None
+            try:
+                while True:
+                    if pending is None:
+                        pending = asyncio.ensure_future(stream_iter.__anext__())
+                    done, _ = await asyncio.wait(
+                        {pending}, timeout=PING_INTERVAL_SECONDS
+                    )
+                    if not done:
+                        yield ("ping", None)
+                        continue
+                    task, pending = pending, None
+                    try:
+                        line = task.result()
+                    except StopAsyncIteration:
+                        return
+                    yield ("line", line)
+            finally:
+                if pending is not None and not pending.done():
+                    pending.cancel()
+
+        line_iter = _iter_lines_with_pings().__aiter__()
+
         while True:
             try:
-                sse_line = await stream_iter.__anext__()
+                kind, payload = await line_iter.__anext__()
             except StopAsyncIteration:
                 break
             except asyncio.CancelledError:
@@ -1009,6 +1214,14 @@ class AnthropicServing:
                     yield frame
                 return
 
+            if kind == "ping":
+                # Keep-alive only. Anthropic's own stream interleaves these
+                # and SDK clients ignore them; proxies and browsers use them
+                # to keep an idle connection from being reaped mid-prefill.
+                yield _emit(PingEvent())
+                continue
+
+            sse_line = payload
             if not sse_line.startswith("data: "):
                 continue
 
@@ -1049,9 +1262,24 @@ class AnthropicServing:
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
+
+                # Same stop-sequence upgrade as the non-streaming path.
+                matched_sequence: Optional[str] = None
+                if effective_finish == "stop":
+                    matched_sequence = _resolve_stop_sequence(
+                        matched_stop,
+                        stop_sequences,
+                        "".join(accumulated_text) if accumulated_text else None,
+                    )
+                    if matched_sequence is not None:
+                        stop_reason = "stop_sequence"
+
                 yield _emit(
                     MessageDeltaEvent(
-                        delta=AnthropicMessageEndDelta(stop_reason=stop_reason),
+                        delta=AnthropicMessageEndDelta(
+                            stop_reason=stop_reason,
+                            stop_sequence=matched_sequence,
+                        ),
                         usage=final_usage or AnthropicUsage(output_tokens=0),
                     )
                 )
@@ -1091,9 +1319,15 @@ class AnthropicServing:
                 return
 
             if chunk.usage is not None:
+                # ``include_input=True`` because message_start now ships
+                # before usage is known: message_delta is the event that
+                # CORRECTS the totals, so it has to carry input_tokens too.
+                # The field is optional on AnthropicUsage and clients read
+                # the last value they saw, so this is a correction, not a
+                # duplicate.
                 final_usage = _anthropic_usage_from_openai(
                     chunk.usage,
-                    include_input=False,
+                    include_input=True,
                     include_output=True,
                 )
 
@@ -1114,28 +1348,19 @@ class AnthropicServing:
             # one-token reply. Fall through to the delta handlers below.
             if choice.finish_reason is not None:
                 finish_reason = choice.finish_reason
+            # The backend reports WHICH stop string ended the completion out
+            # of band, on the same chunk as the finish reason.
+            if getattr(choice, "matched_stop", None) is not None:
+                matched_stop = choice.matched_stop
 
             delta = choice.delta
 
-            # Defer message_start until the first chunk carrying real prompt
-            # usage or content. OpenAI streams emit a role-only chunk before
-            # usage is available; emitting message_start there would ship
-            # input_tokens=0 to the client.
             has_delta_payload = bool(
                 delta.reasoning_content
                 or delta.tool_calls
                 or (delta.content is not None and delta.content != "")
                 or chunk.usage
             )
-            # The finish_reason chunk should also flip message_started so a
-            # zero-content completion (the path that previously fired the
-            # 'Backend produced no content' error) emits the standard
-            # message_start before [DONE] closes the stream.
-            if (
-                has_delta_payload or choice.finish_reason is not None
-            ) and not message_started:
-                yield _emit(_message_start_event(chunk.usage))
-                message_started = True
 
             if (
                 not has_delta_payload
@@ -1173,7 +1398,7 @@ class AnthropicServing:
                         for event in _ensure_content_block_events(
                             "tool_use",
                             ToolUseBlock(
-                                id=tc_id or f"toolu_{uuid.uuid4().hex}",
+                                id=_anthropic_tool_use_id(tc_id),
                                 name=tc_func.name,
                                 input={},
                             ),
@@ -1230,9 +1455,15 @@ class AnthropicServing:
                     )
                 )
                 had_content_delta = True
+                # Kept only to feed the stop-sequence suffix fallback in
+                # ``_resolve_stop_sequence``; never re-emitted.
+                if stop_sequences:
+                    accumulated_text.append(delta.content)
 
     def _convert_response(
-        self, response: ChatCompletionResponse
+        self,
+        response: ChatCompletionResponse,
+        stop_sequences: Optional[list[str]] = None,
     ) -> AnthropicMessagesResponse:
         """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
         if not response.choices:
@@ -1276,7 +1507,7 @@ class AnthropicServing:
 
                 content.append(
                     ToolUseBlock(
-                        id=tool_call.id,
+                        id=_anthropic_tool_use_id(tool_call.id),
                         name=tool_call.function.name,
                         input=tool_input,
                     )
@@ -1291,6 +1522,20 @@ class AnthropicServing:
             )
         stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
 
+        # A caller-supplied stop sequence upgrades ``end_turn`` to the
+        # ``stop_sequence`` reason and fills the ``stop_sequence`` field.
+        # Only the natural-stop case can be a stop sequence: ``length`` and
+        # ``tool_calls`` ended the completion for a different reason.
+        matched_sequence: Optional[str] = None
+        if finish_reason == "stop":
+            matched_sequence = _resolve_stop_sequence(
+                getattr(choice, "matched_stop", None),
+                stop_sequences,
+                choice.message.content,
+            )
+            if matched_sequence is not None:
+                stop_reason = "stop_sequence"
+
         # Anthropic requires ``content`` to contain at least one block.
         # Empty string completions (max_tokens=1 stop, content filter, etc.)
         # would otherwise ship ``content=[]`` and break strict SDK parsers.
@@ -1302,6 +1547,7 @@ class AnthropicServing:
             content=content,
             model=response.model,
             stop_reason=stop_reason,
+            stop_sequence=matched_sequence,
             usage=_anthropic_usage_from_openai(
                 response.usage,
                 include_input=True,

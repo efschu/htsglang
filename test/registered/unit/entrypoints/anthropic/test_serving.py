@@ -264,7 +264,7 @@ class TestAnthropicServing(unittest.TestCase):
         ]
         self.assertEqual(sig_deltas, [])
 
-    def test_stream_usage_subtracts_cache_read_and_omits_final_input_tokens(self):
+    def test_stream_usage_subtracts_cache_read_and_corrects_in_message_delta(self):
         usage = {
             "prompt_tokens": 10,
             "completion_tokens": 0,
@@ -296,11 +296,12 @@ class TestAnthropicServing(unittest.TestCase):
             0
         ]
 
-        self.assertEqual(message_start["message"]["usage"]["input_tokens"], 6)
-        self.assertEqual(
-            message_start["message"]["usage"]["cache_read_input_tokens"], 4
-        )
-        self.assertNotIn("input_tokens", message_delta["usage"])
+        # message_start now goes out before the backend reports usage, so it
+        # carries the zero placeholder; message_delta is the correction event
+        # and carries BOTH the cache-adjusted input_tokens and output_tokens.
+        self.assertEqual(message_start["message"]["usage"]["input_tokens"], 0)
+        self.assertEqual(message_delta["usage"]["input_tokens"], 6)
+        self.assertEqual(message_delta["usage"]["cache_read_input_tokens"], 4)
         self.assertEqual(message_delta["usage"]["output_tokens"], 2)
 
     def test_non_streaming_usage_subtracts_cache_read_tokens(self):
@@ -548,8 +549,11 @@ class TestAnthropicServing(unittest.TestCase):
         events = asyncio.run(
             _collect_anthropic_events(serving, self._anthropic_request())
         )
-        message_start = next(e for e in events if e["type"] == "message_start")
-        usage_out = message_start["message"]["usage"]
+        # Since the liveness fix, message_start ships before usage is known;
+        # message_delta carries the corrected totals (see serving.py's
+        # ``include_input=True`` comment on the chunk.usage handler).
+        message_delta = next(e for e in events if e["type"] == "message_delta")
+        usage_out = message_delta["usage"]
         self.assertEqual(usage_out["input_tokens"], 0)
         self.assertEqual(usage_out["cache_read_input_tokens"], 10)
 
@@ -567,8 +571,8 @@ class TestAnthropicServing(unittest.TestCase):
         events = asyncio.run(
             _collect_anthropic_events(serving, self._anthropic_request())
         )
-        message_start = next(e for e in events if e["type"] == "message_start")
-        usage_out = message_start["message"]["usage"]
+        message_delta = next(e for e in events if e["type"] == "message_delta")
+        usage_out = message_delta["usage"]
         self.assertEqual(usage_out["input_tokens"], 5)
         self.assertNotIn("cache_read_input_tokens", usage_out)
 
@@ -855,8 +859,13 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("ponder", joined)
         self.assertNotIn("<think>\nponder\n</think>\nponder", joined)
 
-    def test_redacted_thinking_history_is_rejected(self):
-        """``redacted_thinking`` cannot be rendered by local parsers."""
+    def test_redacted_thinking_history_is_skipped_with_warning(self):
+        """``redacted_thinking`` degrades per block, never per conversation.
+
+        The payload is encrypted and no local parser can read it, but a
+        client replaying its own transcript ships it back every turn — so
+        raising would permanently 400 that conversation.
+        """
         serving = self._serving()
         request = self._anthropic_request(
             stream=False,
@@ -865,12 +874,18 @@ class TestAnthropicServing(unittest.TestCase):
                     "role": "assistant",
                     "content": [
                         {"type": "redacted_thinking", "data": "opaque"},
+                        {"type": "text", "text": "visible answer"},
                     ],
                 },
             ],
         )
-        with self.assertRaises(ValueError):
-            serving._convert_to_chat_completion_request(request)
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
+        ) as log:
+            chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertTrue(any("redacted_thinking" in line for line in log.output))
+        # The rest of the turn survives.
+        self.assertEqual(chat_request.messages[-1].content, "visible answer")
 
     def test_stream_text_then_thinking_closes_text_block(self):
         """Text deltas followed by reasoning_content must close the text block before opening thinking."""

@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Discriminator,
     Field,
     NonNegativeInt,
@@ -108,18 +109,77 @@ class RedactedThinkingBlock(BaseModel):
     data: Optional[str] = None
 
 
+class UnknownContentBlock(BaseModel):
+    """Forward-compatible fallback for content-block types we do not model.
+
+    Anthropic keeps adding block types (``document``, ``mcp_tool_use``,
+    ``server_tool_use``, ``web_search_tool_result``, ...). A CLOSED
+    discriminated union answers 400 for the whole request on the first
+    unknown tag, which kills an entire conversation — including all the
+    turns the server could have served — over one block it merely does not
+    understand. A forward-compatible front must degrade PER BLOCK, not per
+    conversation, so unknown tags land here verbatim (``extra="allow"``
+    keeps the original fields for logging) and the serving layer skips them
+    with one warning naming the type.
+
+    This is deliberately NOT a catch-all for malformed KNOWN blocks: the
+    discriminator below routes any known tag to its precise model, so a
+    ``{"type":"text"}`` without ``text`` still produces the exact Pydantic
+    validation error instead of silently degrading to "unknown".
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+
+
+# The eight tags this front models precisely. Anything else is routed to
+# UnknownContentBlock by ``_content_block_discriminator``.
+KNOWN_CONTENT_BLOCK_TAGS = frozenset(
+    {
+        "text",
+        "image",
+        "tool_use",
+        "tool_result",
+        "tool_reference",
+        "search_result",
+        "thinking",
+        "redacted_thinking",
+    }
+)
+
+
+def _content_block_discriminator(v) -> str:
+    """Route a content block to its variant tag, unknown types included.
+
+    Pydantic's ``Field(discriminator=...)`` cannot express a catch-all
+    member — an unlisted tag is a validation error by construction. A
+    callable ``Discriminator`` can, because it maps the raw value to a tag
+    we control, so every unmodelled ``type`` collapses onto the single
+    ``"unknown"`` member. Same mechanism as ``_tool_discriminator`` above.
+    """
+    if isinstance(v, dict):
+        t = v.get("type")
+    else:
+        t = getattr(v, "type", None)
+    if isinstance(t, str) and t in KNOWN_CONTENT_BLOCK_TAGS:
+        return t
+    return "unknown"
+
+
 AnthropicContentBlock = Annotated[
     Union[
-        TextBlock,
-        ImageBlock,
-        ToolUseBlock,
-        ToolResultBlock,
-        ToolReferenceBlock,
-        SearchResultBlock,
-        ThinkingBlock,
-        RedactedThinkingBlock,
+        Annotated[TextBlock, Tag("text")],
+        Annotated[ImageBlock, Tag("image")],
+        Annotated[ToolUseBlock, Tag("tool_use")],
+        Annotated[ToolResultBlock, Tag("tool_result")],
+        Annotated[ToolReferenceBlock, Tag("tool_reference")],
+        Annotated[SearchResultBlock, Tag("search_result")],
+        Annotated[ThinkingBlock, Tag("thinking")],
+        Annotated[RedactedThinkingBlock, Tag("redacted_thinking")],
+        Annotated[UnknownContentBlock, Tag("unknown")],
     ],
-    Field(discriminator="type"),
+    Discriminator(_content_block_discriminator),
 ]
 
 
