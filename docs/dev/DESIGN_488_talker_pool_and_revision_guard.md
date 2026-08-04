@@ -239,13 +239,92 @@ That is 6-8 MiB above the pre-change baseline, not 400. The shortfall is
 essentially unchanged from §2.2's original −127 MiB, so **the pool gate is not
 open** and the claim that it is should not be carried forward.
 
-What this does NOT establish is *why*: this is a different boot (post-reboot,
-KV pool 333254 tokens, `--rank-tp-ratio auto-performance`), so a clean
-before/after on the reserve knob alone was never taken. Two candidate readings
-— the reserve does not convert to free VRAM the way §2.2b assumed, or the pool
-sizing reclaimed it elsewhere — and picking between them is the first task of
-the pool work, ahead of any instance placement. Until then, item (3) of the
-queue is **blocked on 121 MiB**, not unblocked.
+### 2.2d MECHANISM RESOLVED 2026-08-04 — the reserve worked; the BASELINE was the false premise
+
+Traced through the code that actually ran (`/spinning/wt-530-serving/python`,
+reached via `PYTHONPATH` in `/proc/1236/environ` — *not* the `htsglang-gpu`
+tree, which is a detached HEAD from 2026-07-13 that cannot even parse this
+cmdline) and confirmed against the boot log.
+
+**The reserve did enter the arithmetic, exactly as designed.** The boot logged:
+
+> `derived memory budgets [19607, 16280, 16280] MiB from NVML totals`
+> `(reserve per GPU: {0: 13000, 1: 4200, 2: 4200} MiB).`
+
+`budget = NVML_total − reserve`, split across ranks on that GPU
+(`server_args.py:9113-9134`), converted once to a per-rank fraction
+(`:9915-9934`), and consumed as the KV-pool ceiling
+(`model_runner_kv_cache_mixin.py:558-589`). So 20480 − 4200 = 16280 for each
+3080. Nothing is wrong with the knob.
+
+**What the knob does NOT do is cap allocation, and every rank overshoots it:**
+
+| rank | total | reserve | budget | actually resident | overshoot |
+|---|---|---|---|---|---|
+| 3080 rank 1 | 20480 | 4200 | 16280 | 16966 | **+686** |
+| 3080 rank 2 | 20480 | 4200 | 16280 | 16964 | **+684** |
+| 5090 rank 0 | 32607 | 13000 | 19607 | 22570 | **+2963** |
+
+This is documented behaviour, not a defect, and it was on record in this repo
+before §2.2b was written — `server_args.py:10758-10763`: *"this value shapes the
+rank BUDGET ... **It does NOT cap any runtime allocation.**"*, and
+`docs/dev/NOTE_493_indexer_prefill_transient.md` §3, which measured the same
+class of surprise on a different model. The unbudgeted terms it names are the
+CUDA context, NCCL buffers, the flashinfer workspace, graph capture, and
+per-layer prefill scratch.
+
+**But the overshoot is a CONSTANT, not a function of the reserve** — which is
+what settles the puzzle. Free VRAM is
+`total − (budget + overshoot) − driver`, so free moves **1:1** with the
+reserve. Reconstructing the counterfactual with the same 686 MiB overshoot:
+
+* reserve 3800 → budget 16680 → free **2557 MiB**
+* reserve 4200 → budget 16280 → free **2957 MiB** ✓ (observed)
+
+So the 400 MiB *did* materialise. The false premise is §2.2b's **baseline**:
+the "2951 MiB free at reserve 3800" it reasoned from is within 6 MiB of
+today's post-change reading, which is what a number measured on a boot that
+*already* carried 4200 looks like.
+
+**Honest limit on that conclusion.** The pre-reboot boot's log did not survive
+the container restart (`/tmp` holds only this boot's `w537_*` files), so the
+alternative reading — the old boot really did have 2951 free at 3800, and the
+new boot's overshoot happens to be ~400 MiB larger — cannot be excluded from
+surviving evidence. It does not matter for any decision, because both readings
+give the same present state and the same lever.
+
+**The lever, priced.** Free moves 1:1 with the reserve, and KV budget moves
+1:1 against it. At the model's 32 KiB per token on a rank's own shard:
+
+| 3080 reserve | free | usable (−400) | bf16 talker 2678 | KV cost |
+|---|---|---|---|---|
+| 4200 (today) | 2957 | 2557 | **−121** | — |
+| 4400 | 3157 | 2757 | +79 (tight) | ≈ −6,400 tok |
+| 4600 | 3357 | 2957 | +279 | ≈ −12,800 tok |
+
+Against a 333254-token pool that is 1.9 % / 3.8 % — *if* the 3080s are the
+min-reducing ranks, which is not established (`_apply_token_constraints`
+min-reduces token capacity across ranks, and the 5090 rank has both a larger
+budget and a larger weight shard). Worth measuring before spending.
+
+### 2.2e CONSEQUENCE — slice 2 devalued this pool by ~10x, and it should be deprioritised
+
+The pool's justification was head-of-line blocking: `inprocess_tts.py:124-134`,
+a turn arriving mid-synthesis *"pays the whole of that synthesis, a median
+4.8 s"*. Slice 2 measured the token loop at **9.71x faster** (RTF 1.706 →
+0.176), which turns that median into roughly **half a second**, and lets a
+single instance sustain ~5.7x real-time audio.
+
+So the pool's remaining value is **multi-user concurrency, not single-user
+latency** — and the live use case driving this work (the DE↔ES translator) is
+one user. Spending 6,400-12,800 tokens of a shared serving resource to place a
+second talker on a 3080 now buys about a tenth of what it would have bought
+before slice 2.
+
+**Recommendation: do not spend the KV tokens.** Leave the reserve at 4200,
+leave the pool unbuilt, and revisit only if concurrent speakers become a real
+requirement. The 121 MiB is no longer a blocker to route around; it is a price
+signal on something that stopped being worth buying.
 
 Still to check honestly before any fp8 quantisation effort, per the brief: an
 sm86 TRT engine at bf16/fp16 may already land under 2551 MiB on its own, in
