@@ -37,6 +37,37 @@ def _cuda_major() -> int:
 
 # direct+page_first_direct routes to transfer_kv_all_layer_direct_lf_pf, which on
 # CUDA 13 throws (cudaErrorInvalidValue) instead of falling back. M3 uses kernel+layer_first.
+# NOT a production defect -- this skip is a TEST-SHAPE artifact, measured under
+# #544 (2026-08-04, cu13 wheel, sgl_kernel 0.4.4, RTX 3080).
+#
+# `cudaMemcpyBatchAsync` has two contract requirements that this test violates
+# and that production satisfies:
+#   * the host side must be PINNED. `_run_device_to_host_copy` sets
+#     `pin_memory = io_backend == "kernel"`, so the direct arm allocates
+#     PAGEABLE host memory, while every production host pool defaults to
+#     `pin_memory=True` (pool_host/mha.py:97, memory_pool_host.py:85).
+#   * the stream must not be the legacy NULL stream. The test copies on the
+#     default stream; production copies inside
+#     `with device_module.stream(self.write_stream)`
+#     (managers/cache_controller.py:276, :742-749).
+#
+# Measured matrix on this rig, transfer_kv_all_layer_direct_lf_pf via
+# MHATokenToKVPoolHost(layout="page_first_direct"):
+#   pageable + default stream -> cudaMemcpyBatchAsync failIdx=SIZE_MAX invalid argument
+#   pageable + side stream    -> CUDA error: invalid argument
+#   pinned   + default stream -> cudaMemcpyBatchAsync failIdx=SIZE_MAX invalid argument
+#   pinned   + side stream    -> OK          <- the production shape
+#
+# So the route is sound and #544's disk HiCache tier boots on it; MambaPoolHost
+# in fact REQUIRES it (raises unless layout == "page_first_direct",
+# memory_pool_host.py:96-100), so a GDN hybrid has no alternative layout.
+#
+# Closing #441(b)'s flip half needs this test made production-shaped (pin the
+# host pool and copy on a side stream), not merely unskipped -- unskipping alone
+# leaves it red for the reasons above. Its sibling
+# test_device_to_host_kernel_page_first still segfaults on BOTH wheels via a
+# different path (transfer_kv_all_layer_lf_ph) and owes its own ticket, so this
+# file cannot go green until both are addressed.
 _DIRECT_PF_BATCHCOPY_BROKEN_CUDA13 = _cuda_major() >= 13
 
 

@@ -47,9 +47,11 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --hicache-storage-backend file \
   --hicache-size "$HICACHE_HOST_GB" \
   --hicache-write-policy write_through \
-  --hicache-mem-layout page_first \
-  --hicache-io-backend kernel \
-  ${PRESERVE_THINKING_FLAG:-} \
+  --hicache-storage-prefetch-policy timeout \
+  --hicache-storage-backend-extra-config '{"max_size": "100Gi", "min_free_space": "20Gi"}' \
+  --hicache-mem-layout page_first_direct \
+  --hicache-io-backend direct \
+  --chat-template-default-kwargs '{"preserve_thinking": true}' \
   --enable-metrics --trust-remote-code \
   --host 127.0.0.1 --port 30030 \
   > "$LOG" 2>&1 &
