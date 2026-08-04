@@ -49,6 +49,49 @@ Engine discipline, carried over from the video chain (#484 family):
   member. TRT engines are not portable across compute capability, and §2 shows
   the 3080s are exactly where the pool wants to go.
 
+## 1b. CORRECTION 2026-08-04 — TRT is built as a fork lane (#337), not a talker side path
+
+§1's engine discipline stands; its *placement* was wrong. The standing user
+order is **#337** (static TRT rungs: precompiled engines as a registry in the
+fork, granularly selectable, offloadable through the **#407** tier registry,
+hot/cold ± compression, graphs-vs-TRT crossover per regime, sm86 honesty) plus
+**#469** (RIFE-TRT as a second backend track). The talker engines are the
+**first production consumer** of that lane, not a private path beside it.
+
+**The foundation already exists and must be promoted, not duplicated.**
+`video_enhance/engine_cache.py` (261 lines) already implements exactly the
+discipline §1 listed, and implements it well:
+
+* `EngineKey` = `nvml_uuid | device_name | driver | trt_version | onnx_sha256 |
+  precision | ShapeTriplet(min/opt/max) | builder flags` (`:80-111`) — the
+  arch-separation §1 asked for is already structural, not a convention;
+* `Provenance` manifests with source-artifact url/sha256/bytes/fetched_at
+  (`:123-132`), and **an engine file with no manifest is treated as absent,
+  not as usable** (`:19-23`);
+* atomic writes (`_atomic_write_bytes`, `:247`).
+
+Adjusted plan for the TRT half:
+
+1. **Promote** the engine cache to a fork-level module (`srt/trt_lane/`), with
+   `video_enhance` becoming its first *existing* consumer rather than its
+   owner. Byte-identical behaviour for the video chain is the acceptance
+   condition — this is a move plus a seam, not a rewrite.
+2. **Add what #337 needs on top**: a selectable rung registry (granular
+   per-consumer engine choice), **#286 ledger registration** so a loaded engine
+   is a parkable asset class like every other VRAM tenant, and **#407 tier
+   registry** integration for hot/cold placement ± compression.
+3. **Crossover as a first-class output**, per regime: graphs vs TRT measured
+   and reported, not asserted. §1's ladder is the hypothesis under test.
+4. **sm86 honesty**: separate engines per compute capability, and where an
+   engine cannot be built or does not pay on sm86, that is reported by name
+   rather than silently falling back.
+5. The talker's two engines (predictor step, vocoder chunk) are then declared
+   as consumers of this lane; RIFE/SR (#469) attach to the same machinery
+   afterwards.
+
+Ordering is unchanged: **graphs first** — the 6.53x is on the table and needs
+none of this. The TRT half is cut as lane infrastructure from its first line.
+
 ## 2. Talker pool — replication across cards, with an honest per-card verdict
 
 The user's proposal composes exactly with the refutation already on record:
@@ -85,6 +128,72 @@ until the gap closes. It is now a **prerequisite for the pool**: without fp8 (or
 an equivalently sized TRT engine) the 3080s are unreachable and the pool cannot
 exist. That is a stronger reason to build it than the speed argument was, and it
 should be scheduled as such.
+
+### 2.2b CORRECTION 2026-08-04 — the 127 MiB is a rebooking, and fp8 is NOT the gate
+
+The user is right that the miss is not a wall: the card is filled by *our own*
+server, so the question is which knob hands back 300-400 MiB. §2.2's "fp8 is
+the gate" is withdrawn. What replaces it is narrower than the brief hoped,
+because two of the named levers do not reach this boot — read at source rather
+than assumed.
+
+**#330 runtime VRAM dial: NOT reachable on the running server.** Two
+independent blockers:
+
+1. `--enable-vram-dial` is a **boot flag**, and the deployed launch line does
+   not carry it (`/proc/3953200/cmdline`, read 2026-08-04). Without it
+   `build_kv_capacity_runtime` is never called and `POST /vram_budget` has no
+   runtime behind it. So the "no restart" property does not apply *to this
+   instance* — enabling it is itself a restart.
+2. Even with the flag, the dial requires **weighted uneven DCP**:
+   `if not uneven_dcp_active(dcp_size): raise KvCapacityError`
+   (`managers/vram_dial.py:1110`), i.e. `--rank-kv-ratio` non-`coupled` or the
+   `SGLANG_UNEVEN_DCP` + `_WEIGHTED` env pair. The boot has
+   `--rank-tp-ratio auto-performance --rank-gpu-id 0,1,2` and **no
+   `--rank-kv-ratio`**, so the predicate is false.
+
+It also refuses under 11 named combinations (`vram_dial.py:1045-1086`), of
+which **dual-group lane** is one — worth noting because §4 of ANALYSE_488
+already found the lane is not the pool host either.
+
+**The knob that does reach it is already in the launch line.**
+`--rank-auto-reserve-mib 13000,3800,3800` is the #332 per-card reserve, and the
+two 3080 entries are the two cards in question. Raising them
+**3800 → 4200** hands back ~400 MiB per 3080 at the next serving restart, with
+no new flag, no new code and no dependence on the dial's DCP precondition.
+That is the cheapest correct form of the rebooking.
+
+**The honest price, in tokens.** Served model geometry: 64 layers of which
+**16 are full attention** (`full_attention_interval 4`), 4 kv heads, head_dim
+256, `--kv-cache-dtype fp8_e4m3` = 1 byte:
+
+> 16 x 4 x 256 x 2 (K+V) x 1 B = **32 KiB per token** on a rank's own shard
+> (heads are replicated under the DCP token-shard geometry; the 48 GDN layers
+> carry per-sequence state, not per-token KV, and are unaffected).
+
+| rebooked | tokens lost on that rank |
+|---|---|
+| 300 MiB | **9,600** |
+| 400 MiB | **12,800** |
+
+For scale: 12,800 tokens is ~4.9 % of one 262144-token context, on a boot with
+`--max-running-requests 4`. The global effect depends on the token vector, so
+the per-rank figure is the honest one to quote.
+
+**Consequence for the plan.** bf16 talker instances (2678 MiB) fit on the 3080s
+(2551 MiB usable → 2951 after a 400 MiB rebooking) **as soon as the reserve
+change ships with the next serving restart**. The pool does not wait for fp8.
+fp8 and TRT engine size return to being what they were before this section
+overstated them: **performance and quality levers, not existence conditions**.
+
+Still to check honestly before any fp8 quantisation effort, per the brief: an
+sm86 TRT engine at bf16/fp16 may already land under 2551 MiB on its own, in
+which case the 3080s are reachable with neither fp8 nor a reserve change. That
+is a measurement on the built engine, not a prediction.
+
+Secondary and complementary levers, unchanged from the brief and NOT priced
+here because the reserve route is cheaper: `--rank-kv-ratio` shifting KV mass
+toward the 5090 at the next restart, #364 GDN idle vacate, #286 parking.
 
 ### 2.3 Pool mechanics
 
