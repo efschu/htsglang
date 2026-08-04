@@ -80,9 +80,12 @@ class InProcessTtsConfig:
     max_new_tokens: int = 2048
     temperature: float = 0.9
     top_p: float = 0.9
-    #: Park every audio module after a turn. Costs a restore on the next turn
-    #: and frees ~2 GB between conversations; the right default for a tenant
-    #: sharing a card with a 27B model.
+    #: Park every audio module after EVERY turn. SUPERSEDED by #546's idle
+    #: park and left off: parking after each turn pays a restore inside every
+    #: conversation, which is the exact thrash the #546 controller's
+    #: inter-arrival threshold exists to avoid. It also bypasses that
+    #: controller's state machine, so the two must not both be on -- the
+    #: launcher never sets this, and nothing else should either.
     park_when_idle: bool = False
 
 

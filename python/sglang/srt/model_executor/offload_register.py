@@ -1122,6 +1122,37 @@ class OffloadRegister:
             item.last_access_s = self._clock()
             self.stats.wave_ins += 1
 
+    def mark_parked(self, item_id: str, parked: bool) -> None:
+        """Record that a CLASS-OWNED mover has already moved an item's bytes.
+
+        Not a second park path: this moves no byte and applies no policy. It
+        exists for the ``wired=True`` classes whose route lives outside this
+        module (the #466 translator's audio ledger is the first), where the
+        decision and the movement both belong to the owner and only the
+        ACCOUNTING belongs here.
+
+        Why the accounting cannot be skipped: ``_parked_bytes_locked`` is what
+        the class fraction cap and every planner that prices this class read.
+        Without this call an idle tenant whose weights are in host RAM still
+        reads as fully resident, so the one ladder #286 exists to unify would
+        be arbitrating on a number that is wrong in exactly the state the park
+        was performed to reach.
+
+        Unknown ids are ignored rather than raised: an adapter that registers
+        conditionally (no register configured at construction time, one
+        configured later) must not turn a bookkeeping call into an outage.
+        """
+        with self._lock:
+            item = self._items.get(item_id)
+            if item is None or item.parked == bool(parked):
+                return
+            item.parked = bool(parked)
+            item.last_access_s = self._clock()
+            if parked:
+                self.stats.parks += 1
+            else:
+                self.stats.wave_ins += 1
+
     # --- internals ----------------------------------------------------------
     def _parked_bytes_locked(self, offload_class: Optional[str] = None) -> int:
         return sum(
@@ -1321,6 +1352,14 @@ def maybe_touch_item(item_id: str) -> None:
     reg = get_global_register()
     if reg is not None:
         reg.touch(item_id)
+
+
+def maybe_mark_parked(item_id: str, parked: bool) -> None:
+    """Adapter entry point: record a class-owned mover's park/restore iff the
+    feature flag is on. See :meth:`OffloadRegister.mark_parked`."""
+    reg = get_global_register()
+    if reg is not None:
+        reg.mark_parked(item_id, parked)
 
 
 def maybe_refresh_item_sizes() -> int:

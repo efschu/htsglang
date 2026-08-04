@@ -102,10 +102,25 @@ class MtConfig:
     #: Declared language set. ``None`` = unconstrained (a large multilingual
     #: LLM). Setting it narrows the advertised system language set.
     languages: Optional[Sequence[str]] = None
-    #: Extra body fields (e.g. ``{"chat_template_kwargs": {"enable_thinking":
-    #: False}}``) -- thinking output would be a disaster in this stage, so a
-    #: reasoning-capable model must be told to skip it here.
+    #: Extra body fields for options this client does not name (sampling,
+    #: adapters, routing hints). NOT the place for thinking -- see below.
     extra_body: Dict[str, object] = dataclasses.field(default_factory=dict)
+    #: Thinking, sent EXPLICITLY on every request rather than left to the
+    #: template's default.
+    #:
+    #: Two independent reasons, and each alone is sufficient. Correctness: a
+    #: reasoning model's chain of thought has no reliable marker this stage
+    #: could strip, and anything left in the string is READ ALOUD in the
+    #: speaker's own voice. Latency: the #541 A/B measured thinking on
+    #: Qwen3.6 at 2.5x wall and 3.7x tokens for equal quality, and every call
+    #: here has a person waiting mid-sentence.
+    #:
+    #: Explicit rather than default because a default is a property of
+    #: whichever chat template the served checkpoint happens to ship, and this
+    #: tenant does not control that -- the checkpoint behind ``--mt-model
+    #: default`` can change under it at any restart (runbook §14). A field
+    #: that is always on the wire cannot be flipped by someone else's file.
+    enable_thinking: bool = False
 
 
 def build_prompt(source: str, target: str) -> str:
@@ -273,6 +288,19 @@ class OpenAiMt:
             "stream": stream,
         }
         body.update(self.config.extra_body)
+        return self._with_thinking_flag(body)
+
+    def _with_thinking_flag(self, body: Dict[str, object]) -> Dict[str, object]:
+        """Stamp ``chat_template_kwargs.enable_thinking`` on EVERY request.
+
+        Applied last, and merged into whatever ``extra_body`` already put in
+        ``chat_template_kwargs`` rather than replacing it, so an operator can
+        pass other template kwargs without either side losing. The thinking
+        key itself is this config field's to set: see ``MtConfig``.
+        """
+        kwargs = dict(body.get("chat_template_kwargs") or {})
+        kwargs["enable_thinking"] = bool(self.config.enable_thinking)
+        body["chat_template_kwargs"] = kwargs
         return body
 
     async def translate(
@@ -325,6 +353,10 @@ class OpenAiMt:
             "stream": False,
         }
         body.update(self.config.extra_body)
+        # The ask path is a call to the same reasoning-capable model, so it
+        # carries the same flag. A second body builder that forgot it is
+        # exactly how "always" becomes "usually".
+        self._with_thinking_flag(body)
         try:
             response = await self._http().post("/chat/completions", json=body)
             response.raise_for_status()
