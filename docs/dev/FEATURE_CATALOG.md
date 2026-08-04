@@ -1228,7 +1228,10 @@ undocumented lever: `SGLANG_GGUF_MXFP4_REPACK=0` (default 1, `environ.py:1776`)
 empties the same map (`:122-124`); combined with `NATIVE=0` or an old wheel it
 turns the checkpoint into a loud load-time refusal by tensor name (`:127-135`) —
 never a silent fallback. Native also widens MoE expert-offload coverage, since
-`MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES` (`gguf.py:292`). GPU-pending:
+`MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES` (`gguf.py:292`). **Merged AND
+installed** in the serving venv since 2026-08-03 12:37 (`direct_url.json`
+names the pinned wheel, sha `67f03cfa`; the `ggml_mxfp4_native` hasattr probe
+returns `True` live) — GPU gates still PENDING under window #537:
 `TICKET_398_mxfp4_validation.md`.
 **#479 traced the served checkpoint and found no untraced fallback.** The
 active UD-IQ3_XXS driver carries exactly two type-39 tensors,
