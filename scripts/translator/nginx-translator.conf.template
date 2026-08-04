@@ -1,0 +1,127 @@
+# Copyright 2025 SGLang Team
+# Licensed under the Apache License, Version 2.0
+#
+# nginx location block for the #466 translator, for the EXISTING reverse proxy.
+#
+# Placeholders in ${...} form, per the rig-env convention -- no real domain,
+# address or certificate path belongs in this repository. Render with:
+#
+#   source /root/rig-env.sh
+#   envsubst < scripts/translator/nginx-translator.conf.template > /tmp/translator.conf
+#
+# then the OPERATOR installs it in the proxy container. This file is a
+# deliverable to be reviewed and applied by hand, not something to be pushed
+# automatically into a container that serves a dozen other sites.
+#
+# WHY THIS EXISTS: Android Chrome refuses getUserMedia on a plain-http
+# non-loopback origin, so the PWA cannot reach the microphone over the bare
+# tunnel address. Serving it through the existing proxy gives it a real
+# certificate and a real hostname, which makes it a secure context with no
+# phone-side workaround at all. This replaces the chrome://flags path, which
+# stays documented as a fallback only.
+#
+# It follows the house style already in the proxy: Certbot-managed
+# certificates, the shared options-ssl-nginx.conf include, upgrade headers on
+# every proxied location, proxy_buffering off, and a port-80 server that
+# redirects the known host and answers 444 to everything else.
+#
+# TWO SETTINGS THAT ARE NOT COSMETIC:
+#   * proxy_read_timeout on the WebSocket location. The default 60 s kills a
+#     conversation during any pause longer than a minute; the socket is
+#     long-lived by design and the client's own ping is what proves liveness.
+#   * proxy_buffering off. Buffered synthesized audio arrives in bursts and
+#     destroys the streaming playback the whole latency budget is built on.
+
+server {
+    server_name ${TRANSLATOR_DOMAIN};
+    listen [::]:443 ssl http2;
+    listen 443 ssl http2;
+    ssl_certificate ${TRANSLATOR_TLS_FULLCHAIN}; # managed by Certbot
+    ssl_certificate_key ${TRANSLATOR_TLS_PRIVKEY}; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Audio uploads: the enrollment endpoint posts a base64 PCM clip. The
+    # default 1 MB limit truncates anything past a few seconds.
+    client_max_body_size 32m;
+
+    # The live conversation socket. Long-lived, bidirectional, unbuffered.
+    location /api/translator/stream {
+        proxy_pass http://${TRANSLATOR_UPSTREAM}:${TRANSLATOR_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # A conversation can sit idle between turns for a long time. The
+        # client pings, but nginx must not reap the socket before it does.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    # The PWA itself. EXACT match, not a prefix: `location /` would be a
+    # catch-all, and a catch-all is only harmless as long as the upstream is
+    # the translator's own port. The moment this template is pointed at the
+    # runtime -- which is exactly what someone will try when the translator
+    # moves onto a lane -- a catch-all publishes /hibernate and /vram_budget
+    # to the internet behind a valid certificate. Whitelist the translator's
+    # own endpoints instead; anything not listed gets 404 from nginx and never
+    # reaches the upstream. (#506 audit, 2026-08-03.)
+    location = / {
+        proxy_pass http://${TRANSLATOR_UPSTREAM}:${TRANSLATOR_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+        proxy_buffering off;
+    }
+
+    # The rest of the translator's surface, enumerated. Add a line here when
+    # an endpoint is added -- the cost of forgetting is a 404, which is the
+    # right direction to fail.
+    location /api/translator/ {
+        proxy_pass http://${TRANSLATOR_UPSTREAM}:${TRANSLATOR_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+        proxy_buffering off;
+        client_max_body_size 32m;
+    }
+
+    # PWA assets served from the page root (manifest, icons, service worker).
+    location ~ ^/(manifest\.webmanifest|favicon\.ico|sw\.js|icon-[0-9]+\.png)$ {
+        proxy_pass http://${TRANSLATOR_UPSTREAM}:${TRANSLATOR_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+    }
+
+    # Everything else is not ours. Explicit, so a future endpoint is a
+    # deliberate addition rather than something that silently became public.
+    location / {
+        return 404;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${TRANSLATOR_DOMAIN};
+    if ($host = ${TRANSLATOR_DOMAIN}) {
+        return 301 https://$host$request_uri;
+    }
+    return 444;
+}

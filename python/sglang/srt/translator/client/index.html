@@ -1,0 +1,3815 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>live translator</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0b0d12" id="themecolor">
+<!--
+  The whole client: one file, no build system, no external asset.
+
+  It must load over the tunnel with no internet route available, which rules
+  out every CDN and every bundler output. It also has to survive a mobile
+  network that drops: the connection layer at the bottom reconnects with
+  backoff and resumes the journal from the last sequence it processed, so a
+  dropout costs the current utterance and nothing else.
+
+  Microphone capture goes through getUserMedia with echo cancellation, gain
+  control and noise suppression enabled. That is the reason this is a browser
+  client rather than a native one for the MVP: it dissolves the loudspeaker to
+  microphone feedback loop that half-duplex playback would otherwise create,
+  for free, on every platform.
+
+  SURFACE (design 19.3). The layout follows what the established mobile live
+  translators converged on, because those patterns are not taste -- they are
+  what survives being used outdoors, one-handed, by two people sharing one
+  phone:
+
+    * two large language buttons with a swap control, never a multi-select
+      list in the header (Google Translate, DeepL, iTranslate all do this);
+    * one conversation stream of bubbles, sided by language, coloured per
+      speaker, with the translation as the large text and the original kept
+      underneath so it stays verifiable;
+    * one unmistakable speaking control at the thumb, with the recording
+      state visible without reading a word;
+    * everything that is not needed mid-conversation -- modes, routing,
+      enrolment, diagnostics, reset -- behind one settings sheet.
+
+  Nothing was dropped in the move: tap-toggle, per-speaker buttons, the
+  uncertainty badges with their candidates, long-press rename and delete,
+  name-suggestion chips, the bilingual transcript with auto-scroll, the queue
+  and connection state, the null-frame and sound-blocked notices and the build
+  identity are all still here, rearranged.
+-->
+<style>
+  /* ---------------------------------------------------------------------
+     Tokens. Two themes, because this app is used outdoors in daylight and
+     again at a table in the evening; one of the two is unreadable in the
+     other's conditions. The light theme is deliberately high-contrast rather
+     than pretty -- it has to win against the sun.
+     --------------------------------------------------------------------- */
+  :root {
+    --bg:#0b0d12; --surface:#151922; --surface2:#1d2330; --line:#2a3242;
+    --fg:#f2f5fa; --dim:#98a3b8; --accent:#4da3ff; --accent-ink:#04203f;
+    --ok:#35c26b; --warn:#ffb020; --bad:#ff6060;
+    --radius:16px; --tap:52px;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg:#eef1f6; --surface:#ffffff; --surface2:#e4e9f2; --line:#c3ccdc;
+    --fg:#0d1219; --dim:#4d576e; --accent:#0a56c4; --accent-ink:#ffffff;
+    --ok:#0c7a3c; --warn:#8a5000; --bad:#b81f1f;
+    color-scheme: light;
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display:flex; flex-direction:column; height:100dvh;
+    overscroll-behavior:none; -webkit-text-size-adjust:100%;
+  }
+  /* Every control is a touch target first. The long-press hardening is kept
+     from the previous surface: Android reads a long press on a normal element
+     as "select text", which cancels the press and leaves the user holding a
+     selection handle instead of recording. All four properties are needed. */
+  button, .tap {
+    font:inherit; color:var(--fg); background:var(--surface2);
+    border:1px solid var(--line); border-radius:12px;
+    min-height:var(--tap); padding:0 14px; cursor:pointer;
+    touch-action:manipulation; user-select:none; -webkit-user-select:none;
+    -webkit-touch-callout:none;
+    display:inline-flex; align-items:center; justify-content:center; gap:8px;
+  }
+  button:active { filter:brightness(1.25); }
+  button[disabled] { opacity:.45; }
+  button.icon { min-width:var(--tap); padding:0; }
+  button.ghost { background:transparent; }
+  button.small { min-height:38px; padding:0 10px; font-size:14px; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button.primary { background:var(--accent); color:var(--accent-ink);
+                   border-color:var(--accent); font-weight:600; }
+  svg { width:22px; height:22px; flex:0 0 auto; display:block; }
+  .grow { flex:1; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .wrap { flex-wrap:wrap; }
+
+  /* --- header ---------------------------------------------------------- */
+  header { display:flex; gap:8px; align-items:center; padding:8px 10px;
+           padding-top:calc(8px + env(safe-area-inset-top));
+           border-bottom:1px solid var(--line); background:var(--surface); }
+  /* The state pill truncates rather than pushing the settings button off the
+     screen: a long state word must never cost the user a control. */
+  .pill { display:inline-flex; align-items:center; gap:7px; height:34px;
+          padding:0 11px; border-radius:17px; background:var(--surface2);
+          font-size:13px; font-weight:600; letter-spacing:.01em;
+          white-space:nowrap; min-width:0; overflow:hidden;
+          /* The STATE never truncates -- it is the one word the header
+             exists for. The link reading yields instead; it was the state
+             that shrank to "spea..." while "2 ms - 16 kHz" kept its room. */
+          flex:0 0 auto; }
+  .pill > span { overflow:hidden; text-overflow:ellipsis; }
+  #link { flex:0 1 auto; }
+  .pill.quiet { font-weight:400; color:var(--dim); }
+  #dot { width:9px; height:9px; border-radius:50%; background:var(--dim);
+         flex:0 0 auto; }
+  body[data-state="ready"]      #dot { background:var(--ok); }
+  body[data-state="speaking"]   #dot { background:var(--ok); }
+  body[data-state="recording"]  #dot { background:var(--bad);
+                                       animation:pulse 1.1s infinite; }
+  body[data-state="working"]    #dot,
+  body[data-state="queued"]     #dot,
+  body[data-state="connecting"] #dot { background:var(--warn);
+                                       animation:pulse 1.4s infinite; }
+  body[data-state="offline"]    #dot,
+  body[data-state="blocked"]    #dot,
+  body[data-state="nomic"]      #dot { background:var(--bad); }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+
+  /* --- banners --------------------------------------------------------- */
+  .banner { display:none; padding:10px 12px; font-size:13.5px; line-height:1.4;
+            border-bottom:1px solid var(--line); }
+  .banner.on { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  #demo { background:#4a3a12; color:#ffd479; }
+  :root[data-theme="light"] #demo { background:#fff3cd; color:#5c4400; }
+  #demo b { color:inherit; font-weight:700; }
+  #blocked { background:var(--bad); color:#fff; }
+  #blocked button { background:#fff; color:#000; border-color:#fff;
+                    min-height:40px; font-weight:600; }
+
+  /* --- language bar ---------------------------------------------------- */
+  /* The pattern every established client uses: the two languages ARE the
+     control, side by side, with a swap between them. The old header
+     multi-select is gone; picking a language is a full-width sheet with rows
+     big enough to hit while walking. */
+  #langbar { display:flex; gap:8px; align-items:stretch; padding:10px;
+             border-bottom:1px solid var(--line); background:var(--surface); }
+  /* Scoped to the bar on purpose: `lang` is also the per-bubble language
+     chip, and an unscoped rule stretched every one of those into a 58 px
+     block across the conversation. */
+  #langbar .lang {
+    flex:1 1 0; min-width:0; min-height:58px; border-radius:14px;
+    background:var(--surface2); border:1px solid var(--line);
+    display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:1px; padding:6px 8px;
+  }
+  #langbar .lang .name { font-size:17px; font-weight:650; max-width:100%;
+                overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #langbar .lang .code { font-size:11px; color:var(--dim); letter-spacing:.12em;
+                text-transform:uppercase; }
+  #langbar .lang.mine { border-color:var(--accent); }
+  #langbar .lang.mine .code { color:var(--accent); }
+  #langbar .swap, #langbar .addlang { flex:0 0 auto; min-width:46px;
+                                      border-radius:14px; }
+
+  /* --- conversation ---------------------------------------------------- */
+  main {
+    flex:1; min-height:0; overflow-y:auto; -webkit-overflow-scrolling:touch;
+    padding:12px 10px 4px; display:flex; flex-direction:column; gap:10px;
+  }
+  .line {
+    max-width:92%; align-self:flex-start; background:var(--surface);
+    border:1px solid var(--line); border-left:4px solid var(--sp,var(--dim));
+    border-radius:4px var(--radius) var(--radius) var(--radius);
+    padding:9px 12px 10px;
+  }
+  .line[data-side="right"] {
+    align-self:flex-end; border-left:1px solid var(--line);
+    border-right:4px solid var(--sp,var(--dim));
+    border-radius:var(--radius) 4px var(--radius) var(--radius);
+    background:var(--surface2);
+  }
+  .line .meta { display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+                font-size:12px; color:var(--dim); margin-bottom:5px; }
+  .avatar { width:20px; height:20px; border-radius:50%; flex:0 0 auto;
+            background:var(--sp,var(--dim)); color:#000; font-size:11px;
+            font-weight:700; display:inline-flex; align-items:center;
+            justify-content:center; font-style:normal; }
+  .line .who { font-weight:650; color:var(--fg); font-size:12.5px; }
+  .tag { font-size:10.5px; letter-spacing:.1em; text-transform:uppercase;
+         padding:2px 6px; border-radius:6px; background:var(--surface2);
+         border:1px solid var(--line); color:var(--dim); }
+  .line[data-side="right"] .tag { background:var(--surface); }
+  .tag.warn { color:var(--warn); border-color:var(--warn); }
+  .tag.ok { color:var(--ok); border-color:var(--ok); }
+  /* The translation is the large text -- it is what the listener consumes.
+     The original stays underneath, because it is the only thing the speaker
+     can check the translation against; hiding it made the record
+     unverifiable. Per line it can be folded away (design 17.2). */
+  .line .dst { font-size:20px; line-height:1.35; font-weight:600; }
+  .line .dst .tr { margin-top:2px; }
+  .line .dst .tr .code { font-size:11px; color:var(--dim); font-weight:600;
+                         letter-spacing:.1em; text-transform:uppercase;
+                         margin-right:6px; }
+  .line .dst.waiting { font-size:14px; font-weight:500; color:var(--warn);
+                       font-style:italic; }
+  .line .src { font-size:14.5px; color:var(--dim); margin-top:6px;
+               padding-top:6px; border-top:1px dashed var(--line); }
+  .line.folded .src { display:none; }
+  .line.notice { align-self:center; max-width:100%; background:transparent;
+                 border:0; color:var(--dim); font-size:12.5px;
+                 font-style:italic; text-align:center; padding:2px 8px; }
+  .line.borrowed .who::after { content:" \00b7 borrowed voice";
+                               color:var(--warn); font-weight:400; }
+  .line .cands { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+  .cand { font-size:13px; min-height:40px; padding:0 11px; border-radius:20px;
+          background:var(--surface2); }
+  .cand.new { border-style:dashed; }
+  .line .tools { display:flex; gap:6px; margin-top:8px; }
+  .line .tools:empty { display:none; }
+  .line .tools button { min-height:36px; padding:0 10px; font-size:12.5px;
+                        background:transparent; color:var(--dim); }
+  .line .tools svg { width:16px; height:16px; }
+  /* An uncertain attribution is visible on the line itself, not only in the
+     candidate row: the rail goes dashed, so a scrollback can be skimmed for
+     the ones the machine was unsure about. */
+  .line.uncertain { border-left-style:dashed; }
+  .line.uncertain[data-side="right"] { border-left-style:solid;
+                                       border-right-style:dashed; }
+
+  /* --- the "you are not at the bottom" hint ---------------------------- */
+  /* A zero-height flow slot so the pill can hover over the last rows of the
+     transcript WITHOUT taking layout from it: the moment it appeared as a
+     normal block it would shorten the scroll box, which is the exact thing
+     `pinBottom()` exists to repair. Deliberately small -- it is a hint that
+     something arrived while the reader was reading further up, not an alert. */
+  #unreadwrap { position:relative; height:0; }
+  #unread { position:absolute; left:50%; bottom:8px; transform:translateX(-50%);
+            min-height:32px; padding:0 12px; font-size:12.5px; font-weight:600;
+            border-radius:16px; background:var(--accent); color:var(--accent-ink);
+            border:0; box-shadow:0 2px 10px rgba(0,0,0,.35); z-index:5;
+            white-space:nowrap; }
+  #unread[hidden] { display:none; }
+
+  /* --- suggestion chips, toasts ---------------------------------------- */
+  #chips, #toasts { display:flex; flex-direction:column; gap:6px; padding:0 10px; }
+  #chips:not(:empty), #toasts:not(:empty) { padding-bottom:8px; }
+  .chip, .toast { display:flex; gap:8px; align-items:center; font-size:13.5px;
+                  border-radius:12px; padding:8px 10px; line-height:1.35; }
+  .chip { background:var(--surface2); border:1px solid var(--accent); }
+  .chip .text { flex:1; min-width:0; }
+  .chip button { min-height:38px; padding:0 12px; font-size:13px; }
+  .toast { background:var(--surface2); border:1px solid var(--line);
+           color:var(--dim); }
+  .toast.err { border-color:var(--bad); color:var(--fg); }
+  .toast .text { flex:1; min-width:0; }
+  .toast button { min-height:32px; min-width:32px; padding:0 8px;
+                  background:transparent; border:0; color:var(--dim); }
+
+  /* --- footer: the speaking controls ----------------------------------- */
+  footer { padding:8px 10px calc(10px + env(safe-area-inset-bottom));
+           border-top:1px solid var(--line); background:var(--surface);
+           display:flex; flex-direction:column; gap:8px; }
+  /* One roster entry is a CELL, not a bare button: the delete control has to
+     be a button of its own and a button inside a button is not markup. The
+     cell also gives the drop highlight something to sit on that is not the
+     tap target itself. */
+  #speakers { position:relative; display:flex; gap:6px; flex-wrap:wrap; }
+  #speakers .sp { position:relative; flex:1 1 auto; min-width:96px;
+                  display:flex; }
+  #speakers .sp > button.who, #speakers > button.add {
+    flex:1 1 auto; min-width:0; min-height:46px; font-size:14.5px; gap:7px;
+  }
+  /* Room for the delete control, so a long name never runs under it. */
+  #speakers .sp > button.who { padding-right:36px; }
+  #speakers .sp > button.who .lbl { overflow:hidden; text-overflow:ellipsis;
+                                    white-space:nowrap; }
+  #speakers > button.add { flex:0 0 auto; min-width:52px; }
+  #speakers button.armed { border-color:var(--accent); color:var(--accent); }
+  #speakers button .avatar { width:18px; height:18px; font-size:10px; }
+  /* Deliberately NOT a long press: the long press is the merge drag, and one
+     gesture must not mean two destructive things. 30px is under the 52px tap
+     minimum on purpose -- it is guarded by a confirmation and it must not
+     compete with the speak button it sits on. */
+  #speakers .sp > button.x {
+    position:absolute; right:3px; top:50%; transform:translateY(-50%);
+    min-height:30px; min-width:30px; padding:0; border:0; border-radius:50%;
+    background:transparent; color:var(--dim); font-size:15px; line-height:1;
+    display:flex; align-items:center; justify-content:center;
+  }
+  #speakers .sp > button.x:active { color:var(--bad); background:var(--surface2); }
+  /* The drag: every OTHER entry is a visible drop zone, and the one under the
+     finger is the one that would win. A merge is destructive, so the target
+     is never left to be guessed at. */
+  #speakers .sp.dragging { opacity:.55; }
+  #speakers .sp.dragging > button.who { border-color:var(--accent); }
+  #speakers .sp.dropzone > button.who { border-style:dashed;
+                                        border-color:var(--dim); }
+  #speakers .sp.droptarget > button.who { border-style:solid;
+    border-color:var(--ok); color:var(--ok); background:var(--surface2); }
+  #speakers.merging .sp, #speakers.merging .sp > button { touch-action:none; }
+  /* TAKES NO LAYOUT, and that is the point. As a flow row it pushed the
+     footer taller mid-gesture, which moved the drop targets out from under
+     the finger already on its way to one -- caught by `probe_roster.py`,
+     whose target coordinates are measured before the lift exactly as a user's
+     aim is. It floats above the row instead. */
+  #speakers .mergehint { position:absolute; left:0; right:0; bottom:100%;
+    margin-bottom:4px; font-size:12px; color:var(--accent);
+    text-align:center; pointer-events:none; }
+  #talk { width:100%; min-height:76px; font-size:19px; font-weight:650;
+          border-radius:18px; }
+  #talk svg { width:26px; height:26px; }
+  #talk.live, #speakers button.live {
+    background:#8c2438; border-color:#e0607a; color:#fff;
+    animation:pulse 1.1s infinite;
+  }
+  #activity { visibility:hidden; min-height:22px; font-size:13px;
+              font-weight:600; color:var(--warn); display:flex;
+              align-items:center; gap:7px; letter-spacing:.01em; }
+  #activity.on { visibility:visible; }
+  #activity.speaking { color:var(--ok); }
+  #activity::before { content:""; width:8px; height:8px; border-radius:50%;
+                      background:currentColor; flex:0 0 auto;
+                      animation:pulse 1.2s infinite; }
+  .line .work.warn { color:var(--warn); border-color:var(--warn); }
+  .line .work.ok { color:var(--ok); border-color:var(--ok); }
+  /* A clause that is still growing gets a caret, so a line that stops
+     mid-sentence reads as "more is coming" rather than as a truncation. */
+  .line .tr.growing .txt::after { content:"\258f"; color:var(--accent);
+                                  animation:pulse .9s infinite; }
+  #meter { height:6px; border-radius:3px; background:var(--surface2);
+           overflow:hidden; }
+  #meter > i { display:block; height:100%; width:0; background:var(--accent);
+               transition:width .06s linear; }
+  /* The stop control. Round, amber, and floating clear of the footer so it
+     shares no edge with the talk button -- shape, colour and position all
+     differ, which is what keeps a blind tap unambiguous. It is only in the
+     DOM's flow when there is something to stop. */
+  /* While it is on screen the chip and toast rows keep clear of it: the
+     screenshots caught the circle sitting on top of a suggestion chip's
+     "name" button, which is a mis-tap waiting to happen in exactly the moment
+     the user is reaching for the stop. */
+  body.playing #chips, body.playing #toasts { padding-right:96px; }
+  #stopplay { position:fixed; right:14px; z-index:15;
+              bottom:calc(158px + env(safe-area-inset-bottom));
+              width:74px; height:74px; border-radius:50%; padding:0;
+              background:#f5a623; border:3px solid var(--bg);
+              color:#1a1206; box-shadow:0 6px 18px rgba(0,0,0,.45);
+              display:none; }
+  #stopplay.on { display:inline-flex; }
+  #stopplay svg { width:30px; height:30px; }
+  :root[data-theme="light"] #stopplay {
+    box-shadow:0 6px 18px rgba(0,0,0,.28);
+  }
+  /* The muted state is a colour AND a glyph, never colour alone. */
+  #mute.muted { color:var(--warn); border-color:var(--warn);
+                background:var(--surface2); }
+  .line.stopped .stopmark { color:var(--warn); border-color:var(--warn); }
+
+  /* --- sheets and modal ------------------------------------------------ */
+  #scrim { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none;
+           z-index:20; }
+  #scrim.on { display:block; }
+  .sheet { position:fixed; left:0; right:0; bottom:0; z-index:21;
+           max-height:88dvh; display:none; flex-direction:column;
+           background:var(--bg); border-top:1px solid var(--line);
+           border-radius:20px 20px 0 0; }
+  .sheet.on { display:flex; }
+  .sheet header { border-radius:20px 20px 0 0; padding-top:8px; }
+  .sheet .body { overflow-y:auto; padding:12px 12px
+                 calc(16px + env(safe-area-inset-bottom)); }
+  .pane { display:none; }
+  .pane.on { display:block; }
+  .group { margin-bottom:18px; }
+  .group > h3 { margin:0 0 8px; font-size:12px; letter-spacing:.1em;
+                text-transform:uppercase; color:var(--dim); font-weight:700; }
+  .group > p { margin:8px 2px 0; font-size:12.5px; color:var(--dim);
+               line-height:1.4; }
+  .group > p.warn { color:var(--warn); }
+  .seg { display:flex; gap:0; border:1px solid var(--line);
+         border-radius:12px; overflow:hidden; }
+  .seg button { flex:1 1 0; border:0; border-radius:0; background:transparent;
+                font-size:14.5px; }
+  .seg button + button { border-left:1px solid var(--line); }
+  .seg button.on { background:var(--accent); color:var(--accent-ink);
+                   font-weight:650; }
+  .listrow { display:flex; width:100%; align-items:center; gap:10px;
+             min-height:56px; text-align:left; justify-content:flex-start;
+             margin-bottom:6px; }
+  .listrow .name { flex:1; min-width:0; overflow:hidden;
+                   text-overflow:ellipsis; white-space:nowrap; }
+  .listrow .code { font-size:11px; color:var(--dim); letter-spacing:.12em;
+                   text-transform:uppercase; }
+  .listrow .why { font-size:11.5px; color:var(--warn); }
+  .listrow.on { border-color:var(--accent); }
+  select, input[type="text"] {
+    font:inherit; color:var(--fg); background:var(--surface2);
+    border:1px solid var(--line); border-radius:12px; min-height:var(--tap);
+    padding:0 10px; width:100%;
+  }
+  .pair { display:flex; gap:6px; align-items:center; margin-bottom:6px; }
+  .pair select { flex:1; min-width:0; }
+  .pair .arrows { color:var(--dim); font-size:17px; }
+  option:disabled { color:var(--dim); }
+  #diag { font:11px/1.5 ui-monospace, Menlo, Consolas, monospace;
+          color:var(--dim); word-break:break-all; }
+  #modal { position:fixed; inset:0; z-index:30; display:none;
+           align-items:center; justify-content:center; padding:20px;
+           background:rgba(0,0,0,.6); }
+  #modal.on { display:flex; }
+  #modal .box { width:100%; max-width:420px; background:var(--bg);
+                border:1px solid var(--line); border-radius:18px; padding:16px; }
+  #modal h3 { margin:0 0 8px; font-size:17px; }
+  #modal p { margin:0 0 12px; font-size:14px; color:var(--dim);
+             line-height:1.45; }
+  #modal .actions { display:flex; gap:8px; margin-top:14px; }
+  #modal .actions button { flex:1; }
+</style>
+
+<header>
+  <span class="pill"><i id="dot"></i><span id="status">starting</span></span>
+  <span class="pill quiet" id="link" title="link">&mdash;</span>
+  <span class="grow"></span>
+  <!-- The mute toggle sits in the header because it is a CONVERSATION mode,
+       not a per-turn action: a phone passed around a quiet table stays silent
+       for the rest of the evening. It is the same server state as the reading
+       mode (output.mode) -- one concept, one control, never two toggles that
+       do the same thing. -->
+  <button class="icon ghost" id="mute" aria-label="speak translations aloud"></button>
+  <button class="icon ghost" id="theme" aria-label="light or dark"></button>
+  <button class="icon ghost" id="gear" aria-label="settings"></button>
+</header>
+
+<div class="banner" id="demo"></div>
+<!-- The sound-blocked notice is a BANNER WITH AN ACTION, not a sentence in a
+     log. A mobile browser refuses to start an output context outside a user
+     gesture, and the only cure is a tap -- so the notice carries the tap. -->
+<div class="banner" id="blocked">
+  <span class="grow">the browser is blocking sound output</span>
+  <button id="unblock">enable sound</button>
+</div>
+
+<nav id="langbar"></nav>
+
+<!-- The conversation, as the reader scrolls it (design 17.2). Fed by
+     transcript.line / transcript.update and by the live turn events, restored
+     whole on reconnect, and ended only by an explicit clear. One stream: the
+     live turn and its durable line are THE SAME bubble, keyed by turn id, so
+     nothing is said twice on screen. -->
+<main id="transcript"></main>
+
+<!-- Shown only while the reader is NOT being followed, i.e. they scrolled up
+     themselves. Without it, deliberately reading back means new speech lands
+     silently off-screen and the app looks frozen. A tap returns to the live
+     end and resumes following. -->
+<div id="unreadwrap"><button id="unread" hidden>new message &#8595;</button></div>
+
+<div id="chips"></div>
+<div id="toasts"></div>
+
+<footer>
+  <!-- What is still being said, where it stays visible while recording. The
+       space is reserved even when empty: a strip that appears and disappears
+       would move the talk button under a thumb already on its way. -->
+  <div id="activity"></div>
+  <!-- One tap-to-speak button per known speaker (design 17.5). Tapping one
+       attributes the utterance directly and skips identification. The general
+       button stays large underneath. -->
+  <div id="speakers"></div>
+  <button id="talk" disabled><span class="ico"></span><span class="lbl">tap to speak</span></button>
+  <div id="meter"><i></i></div>
+</footer>
+
+<!-- Stop the playback (user order). Deliberately NOT shaped like the talk
+     control: a circle against a full-width bar, amber against the surface
+     colour, and anchored clear of the talk button's rectangle -- it appears
+     only while something is being spoken, and the one thing it must never be
+     is a button somebody hits when they meant to speak. Large enough to be
+     found without looking. -->
+<button id="stopplay" aria-label="stop speaking"></button>
+
+<div id="scrim"></div>
+<section class="sheet" id="sheet">
+  <header>
+    <span class="pill" id="sheettitle">settings</span>
+    <span class="grow"></span>
+    <button class="icon ghost" id="sheetclose" aria-label="close"></button>
+  </header>
+  <div class="body">
+    <div class="pane" id="pane-settings">
+      <div class="group">
+        <h3>turn taking</h3>
+        <div class="seg" id="segmode">
+          <button data-value="ptt" class="on">tap to speak</button>
+          <button data-value="vad">automatic</button>
+        </div>
+      </div>
+      <!-- The output mode used to have a segmented control here as well as
+           the header toggle. Two controls for one server state is how a UI
+           starts disagreeing with itself, so this pane explains the mode and
+           the header owns it. -->
+      <div class="group">
+        <h3>sound</h3>
+        <p id="outputnote"></p>
+      </div>
+      <div class="group">
+        <h3>voice</h3>
+        <div class="seg" id="segvoice">
+          <button data-value="clone" class="on">own voices</button>
+          <button data-value="preset">preset voices</button>
+        </div>
+        <button class="listrow" id="enroll" style="margin-top:8px">
+          <span class="name">enrol my voice</span>
+          <span class="code">15 s</span>
+        </button>
+      </div>
+      <div class="group">
+        <h3>routing</h3>
+        <div class="seg" id="segroute">
+          <button data-value="auto" class="on">automatic</button>
+          <button data-value="manual">language pairs</button>
+        </div>
+        <div id="routing" style="display:none; margin-top:10px">
+          <div id="pairs"></div>
+          <div class="row" style="margin-top:6px">
+            <button class="small" id="addpair">add a pair</button>
+            <button class="small primary" id="applypairs">apply</button>
+          </div>
+          <p id="routingnote"></p>
+        </div>
+      </div>
+      <div class="group">
+        <h3>transcript</h3>
+        <div class="row wrap">
+          <button class="small" id="copytranscript">copy</button>
+          <button class="small danger" id="cleartranscript">clear</button>
+        </div>
+      </div>
+      <div class="group">
+        <h3>reset</h3>
+        <button class="danger" id="reset" style="width:100%">
+          reset the conversation
+        </button>
+        <p>Ends this session and deletes every speaker profile, voice
+           reference and name with it. Deliberately far from the speaking
+           controls.</p>
+      </div>
+      <div class="group">
+        <h3>diagnostics</h3>
+        <div id="diag">build ? | capture not started</div>
+      </div>
+    </div>
+    <div class="pane" id="pane-language"></div>
+    <div class="pane" id="pane-speaker"></div>
+  </div>
+</section>
+
+<div id="modal"></div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Configuration derived from the page, never hardcoded.
+// ---------------------------------------------------------------------------
+// Everything is addressed RELATIVE to where the page was served from, so the
+// same file works at the site root and under a reverse-proxy path prefix
+// (/translate/). The prefix is stripped by nginx, so the backend still sees
+// its own paths; only the client has to know where it lives.
+const BASE = location.pathname.replace(/[^/]*$/, "");
+const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://")
+  + location.host + BASE + "api/translator/stream";
+// Substituted by the server when it serves this file. Without it there is no
+// way to tell a fixed client from a cached one, and every diagnosis is a
+// guess about which code the phone is actually executing.
+const CLIENT_BUILD = "__CLIENT_BUILD__";
+const PIPELINE_RATE = 16000;   // confirmed by the server on handshake
+const FRAME_MS = 20;
+
+const el = (id) => document.getElementById(id);
+const streamBox = () => el("transcript");
+
+// Inline, because the page has no route to any asset host. Nothing here is an
+// emoji: a glyph that renders as a different picture per platform is not an
+// icon, it is a guess.
+const ICON = {
+  mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg>',
+  stop: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+  // Sliders rather than a cogwheel: a cog drawn at 22 px with a 2 px stroke
+  // is indistinguishable from the sun beside it, which is what the first
+  // screenshots showed.
+  gear: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 12h4M12 12h8M4 17h12M20 17h0"/><circle cx="16" cy="7" r="2.1"/><circle cx="10" cy="12" r="2.1"/><circle cx="18" cy="17" r="2.1"/></svg>',
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  swap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v13M7 4L4 7M7 4l3 3"/><path d="M17 20V7M17 20l3-3M17 20l-3-3"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
+  play: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l10-6.5z"/></svg>',
+  speaker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M16 9a4.2 4.2 0 0 1 0 6"/><path d="M18.7 6a8 8 0 0 1 0 12"/></svg>',
+  muted: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M16.5 9.5l5 5M21.5 9.5l-5 5"/></svg>',
+  eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2.5 12S6 6 12 6s9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="2.6"/></svg>',
+  sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>',
+  moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>',
+};
+
+// ---------------------------------------------------------------------------
+// Theme. prefers-color-scheme decides until the user says otherwise; the
+// choice then sticks, because the reason to override it (bright sun, dark
+// restaurant) outlives one page load.
+// ---------------------------------------------------------------------------
+function applyTheme(name) {
+  document.documentElement.dataset.theme = name;
+  el("theme").innerHTML = name === "light" ? ICON.moon : ICON.sun;
+  const meta = el("themecolor");
+  if (meta) meta.setAttribute("content", name === "light" ? "#eef1f6" : "#0b0d12");
+}
+function initTheme() {
+  let stored = null;
+  try { stored = localStorage.getItem("translator.theme"); } catch (err) { /* private mode */ }
+  const dark = !window.matchMedia
+    || !window.matchMedia("(prefers-color-scheme: light)").matches;
+  applyTheme(stored || (dark ? "dark" : "light"));
+}
+
+// ---------------------------------------------------------------------------
+// State line. One vocabulary for every state the person can be in, so the
+// header never has to be read twice: the dot carries the colour, the word
+// carries the detail.
+// ---------------------------------------------------------------------------
+let uiState = "connecting";
+function setState(name, text) {
+  uiState = name;
+  document.body.dataset.state = name;
+  el("status").textContent = text || name;
+}
+/** Back-compatible shim: the old surface's status writer. */
+function setStatus(text, cls) {
+  const map = { on: "ready", wait: "connecting", err: "offline" };
+  setState(map[cls] || "offline", text);
+}
+
+/** A transient message with a reason. Errors stay until dismissed. */
+function sys(text, bad) {
+  const node = document.createElement("div");
+  node.className = "toast" + (bad ? " err" : "");
+  const span = document.createElement("span");
+  span.className = "text";
+  span.textContent = text;
+  const close = document.createElement("button");
+  close.innerHTML = ICON.close;
+  close.setAttribute("aria-label", "dismiss");
+  close.onclick = () => node.remove();
+  node.append(span, close);
+  el("toasts").appendChild(node);
+  while (el("toasts").children.length > 4) el("toasts").firstElementChild.remove();
+  pinBottom();
+  if (!bad) setTimeout(() => node.remove(), 9000);
+}
+
+// ---------------------------------------------------------------------------
+// Playback queue.
+//
+// Synthesized audio arrives as a sequence of binary frames. Scheduling each
+// one at "now" would produce clicks between chunks, so every buffer is
+// scheduled at the end of the previous one on a shared clock. A gap of more
+// than a few hundred milliseconds resets the clock, otherwise a long pause
+// would leave the queue scheduling into the past.
+// ---------------------------------------------------------------------------
+class Playback {
+  constructor() {
+    this.ctx = null;
+    this.cursor = 0;
+    // Counted separately on purpose. "Frames arrived", "frames were
+    // scheduled" and "the output clock is running" are three different
+    // claims, and a phone that plays nothing while the server sent 53 audio
+    // events is telling us which of them broke -- but only if they are
+    // counted apart. They were not, which is why that phone could not be
+    // diagnosed from here.
+    this.pushed = 0;
+    this.scheduled = 0;
+    this.errors = [];
+    this.lastResume = "none";
+    this.blocked = false;
+    this.dropped = 0;
+    this.skippedReplay = 0;
+    //: Sources already booked on the output clock, with the time each ends.
+    //: They exist so a stop can cut what is ALREADY playing (user order).
+    this.live = [];
+    this.stops = 0;
+    //: The turn whose audio is currently on the clock, so a stop can say on
+    //: WHICH bubble it happened rather than only in the header.
+    this.currentTurn = null;
+  }
+
+  /** Create and START the output context. MUST be called on a user gesture.
+   *
+   * A mobile browser lets any script CREATE an AudioContext and refuses to
+   * start its clock outside a gesture. A context created when the first
+   * audio frame arrives -- seconds after the tap -- is therefore born
+   * suspended, `resume()` there is not honoured, every buffer is scheduled
+   * against a clock that never advances, and nothing is heard and nothing is
+   * thrown. Unlocking has to happen on the tap, BEFORE any await, because
+   * awaiting getUserMedia consumes the activation that makes it legal.
+   */
+  unlock() {
+    const ctx = this.ensure();
+    if (!ctx) return null;
+    try {
+      // Starting a one-sample buffer is what makes the browser commit.
+      const buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+    } catch (err) {
+      this.errors.push("unlock: " + err);
+    }
+    return ctx;
+  }
+
+  ensure() {
+    if (!this.ctx) {
+      try {
+        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      } catch (err) {
+        this.errors.push("create: " + err);
+        return null;
+      }
+    }
+    if (this.ctx.state === "suspended") {
+      // The promise is READ, not ignored: a rejected resume is the whole
+      // diagnosis, and dropping it on the floor is what made this invisible.
+      this.lastResume = "requested";
+      this.ctx.resume().then(
+        () => { this.lastResume = "resolved"; },
+        (err) => { this.lastResume = "rejected: " + err; }
+      );
+    }
+    return this.ctx;
+  }
+
+  /** Forget any schedule made against an old clock. */
+  reset() { this.cursor = 0; this.forget(); }
+
+  /** Drop the handles to buffers that have already been heard.
+   *
+   * Every scheduled source is retained so it can be stopped again; without
+   * this the list would grow for the length of the conversation. A source
+   * whose end time is behind the clock cannot be stopped any more anyway.
+   */
+  forget() {
+    if (!this.ctx) { this.live = []; return; }
+    const now = this.ctx.currentTime;
+    this.live = (this.live || []).filter((entry) => entry.endsAt > now);
+  }
+
+  /** Wire rate -> context rate, CONTINUOUS across frames.
+   *
+   *  Linear, and deliberately so: the artefact being removed is a full-scale
+   *  discontinuity, and interpolation quality is a second-order question
+   *  next to that. What matters is that state carries across calls, so the
+   *  stream is resampled as one signal rather than as a sequence of islands.
+   *
+   *  The read position is DERIVED from the global output index rather than
+   *  accumulated. Adding the ratio to a running position drifts, and the
+   *  drift differs between one long call and many short ones -- at a 48 kHz
+   *  context (a phone) the ratio is 1/3 and the rounding is systematic, which
+   *  produced an 0.086 residual until this was derived instead. Framed and
+   *  whole now render bit-identically at 16/22.05/32/44.1/48 kHz out.
+   *
+   *  Equal rates are a pass-through, which is what keeps this rate-agnostic:
+   *  when the §19.5 ladder moves the uplink to 48 kHz on a 48 kHz context,
+   *  this stops doing anything without being rebuilt.
+   */
+  resample(float32, inRate, outRate) {
+    if (inRate === outRate) return float32;
+    if (this._rsRate !== inRate || this._rsOut !== outRate) {
+      this._rsRate = inRate; this._rsOut = outRate;
+      this._rsK = 0; this._rsConsumed = 0; this._rsPrev = 0; this._rsPrimed = false;
+    }
+    const ratio = inRate / outRate;
+    if (!this._rsPrimed) {
+      this._rsPrev = float32.length ? float32[0] : 0;
+      this._rsPrimed = true;
+    }
+    const out = [];
+    while (true) {
+      const pos = this._rsK * ratio - this._rsConsumed;
+      const i = Math.floor(pos);
+      if (i + 1 >= float32.length) break;
+      const f = pos - i;
+      const s0 = (i < 0) ? this._rsPrev : float32[i];
+      out.push(s0 * (1 - f) + float32[i + 1] * f);
+      this._rsK += 1;
+    }
+    this._rsConsumed += float32.length;
+    if (float32.length) this._rsPrev = float32[float32.length - 1];
+    return Float32Array.from(out);
+  }
+
+  /** Forget the interpolation state. Called wherever the stream BREAKS --
+   *  a stop, or a fresh context -- because carrying `prev` across a
+   *  discontinuity would smear the old tail into the new opening sample.
+   */
+  resetResampler() {
+    this._rsK = 0; this._rsConsumed = 0; this._rsPrev = 0; this._rsPrimed = false;
+  }
+
+  /** Put samples on the output clock. Shared by live audio and by replay. */
+  schedule(float32, rate) {
+    const ctx = this.ensure();
+    if (!ctx) return false;
+    if (ctx.state !== "running") {
+      // Do NOT schedule into a stopped clock. `currentTime` is frozen while
+      // the context is suspended, so every buffer would be booked against the
+      // very start of the timeline and the whole backlog would fire the
+      // instant the context resumes -- seconds of overlapping speech at the
+      // first tap, which is indistinguishable from noise. Dropping is the
+      // honest choice: nobody could have heard it anyway.
+      this.blocked = true;
+      return false;
+    }
+    try {
+      // Hand the browser samples that ALREADY sit at the context rate. Built
+      // per 20 ms frame at the WIRE rate, every frame was resampled as an
+      // island with no neighbours, and the resampler invented its edges:
+      // measured in an OfflineAudioContext, the residual against the same
+      // signal rendered as one buffer peaked at 0.49 against a 0.5 signal --
+      // a full-scale transient 50 times a second -- with EXACTLY zero energy
+      // between the edges (scripts/translator/probe_resample_seam.py). That
+      // is the crackle the user reports at the start of speech. Rendering the
+      // same comparison at 16k->16k gives a residual of 0.0, which is what
+      // proves the mechanism is resampling and not scheduling.
+      const samples = this.resample(float32, rate, ctx.sampleRate);
+      // A frame can be entirely consumed as interpolation context without
+      // yielding an output sample yet. That is normal and not a drop.
+      if (!samples.length) return true;
+      const buffer = ctx.createBuffer(1, samples.length, ctx.sampleRate);
+      buffer.copyToChannel(samples, 0);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      const now = ctx.currentTime;
+      if (this.cursor < now + 0.02) this.cursor = now + 0.05;
+      source.start(this.cursor);
+      this.cursor += buffer.duration;
+      // Kept so the whole queue can be silenced on one tap. A buffer that is
+      // already scheduled plays whatever happens to the socket, so "stop"
+      // without these handles could only ever stop the NEXT chunk -- which,
+      // for a listener who has heard enough, is not stopping.
+      this.forget();
+      (this.live = this.live || []).push({ source: source, endsAt: this.cursor });
+      return true;
+    } catch (err) {
+      this.errors.push("push: " + err);
+      return false;
+    }
+  }
+
+  push(float32, rate) {
+    this.pushed += 1;
+    if (this.schedule(float32, rate)) this.scheduled += 1;
+    else this.dropped += 1;
+  }
+
+  /** Silence everything scheduled, now. Local and immediate by design.
+   *
+   * The stop frame goes to the server as well, so no further audio is
+   * produced for the turn -- but the audio ALREADY on the output clock is
+   * the part the listener is hearing, and waiting for a round trip to cut it
+   * would make the button feel broken on exactly the connection where it
+   * matters most. The two halves are independent: this one always works,
+   * even offline.
+   */
+  stopAll() {
+    const stopped = (this.live || []).length;
+    for (const entry of this.live || []) {
+      try { entry.source.stop(); } catch (err) { /* already finished */ }
+      try { entry.source.disconnect(); } catch (err) { /* already detached */ }
+    }
+    this.live = [];
+    // Back to "nothing is booked", so the next turn schedules against the
+    // real clock rather than behind the tail we just cut away.
+    this.cursor = this.ctx ? this.ctx.currentTime : 0;
+    this.resetResampler();
+    this.stops += 1;
+    return stopped;
+  }
+
+  /** Play a turn's audio again, on demand (design 19.6). Deliberately not
+   *  routed through push(): these frames are not new arrivals and must not
+   *  move the counters that say what the SERVER delivered. */
+  replay(entry) {
+    if (!entry || !entry.chunks.length) return false;
+    this.unlock();
+    let ok = false;
+    for (const chunk of entry.chunks) {
+      if (this.schedule(chunk, entry.rate)) ok = true;
+    }
+    return ok;
+  }
+
+  /** Everything a log reader needs to tell "not sent" from "not played". */
+  diagnostics() {
+    return {
+      state: this.ctx ? this.ctx.state : "none",
+      current_time: this.ctx ? Math.round(this.ctx.currentTime * 1000) / 1000 : 0,
+      rate: this.ctx ? this.ctx.sampleRate : 0,
+      pushed: this.pushed,
+      scheduled: this.scheduled,
+      dropped: this.dropped,
+      skipped_replay: this.skippedReplay,
+      stops: this.stops,
+      last_resume: this.lastResume,
+      blocked: this.blocked,
+      errors: this.errors.slice(-3),
+    };
+  }
+
+  get busy() { return this.ctx && this.cursor > this.ctx.currentTime; }
+
+  /** Seconds of speech still booked on the output clock.
+   *
+   * This is exact and entirely local -- the schedule IS the answer, so
+   * "still speaking for about four seconds" needs no server frame and stays
+   * right even if the connection drops mid-turn.
+   */
+  get remaining() {
+    if (!this.ctx) return 0;
+    return Math.max(0, this.cursor - this.ctx.currentTime);
+  }
+}
+const playback = new Playback();
+
+// Audio kept per turn so a line can be played again (design 19.6). Replayed
+// journal frames are STORED but never scheduled, which is what makes the
+// replay button work after a reload without ever speaking history uninvited.
+const audioStore = new Map();
+const AUDIO_KEEP_TURNS = 24;
+
+function keepAudio(turnId, samples, rate) {
+  if (!turnId) return;
+  let entry = audioStore.get(turnId);
+  if (!entry) {
+    entry = { rate: rate, chunks: [] };
+    audioStore.set(turnId, entry);
+    while (audioStore.size > AUDIO_KEEP_TURNS) {
+      audioStore.delete(audioStore.keys().next().value);
+    }
+  }
+  entry.rate = rate;
+  entry.chunks.push(samples);
+  markReplayable(turnId);
+}
+
+// ---------------------------------------------------------------------------
+// Microphone capture.
+//
+// The AudioWorklet is defined inline and loaded from a blob so the page stays
+// a single file. It hands raw float frames to the main thread, which
+// downsamples to the pipeline rate and packs PCM16. Downsampling here rather
+// than server-side keeps the uplink small, which is the whole game on mobile
+// data.
+// ---------------------------------------------------------------------------
+const WORKLET_SOURCE = `
+class Tap extends AudioWorkletProcessor {
+  constructor() { super(); this.calls = 0; this.empty = 0; }
+  process(inputs) {
+    this.calls++;
+    const first = inputs[0] || [];
+    const ch = first[0];
+    if (ch) {
+      this.port.postMessage(new Float32Array(ch));
+    } else {
+      this.empty++;
+    }
+    // Liveness, not data. "process() is running but hands me nothing" and
+    // "process() is never called" look identical from the main thread, and
+    // they have completely different causes.
+    if (this.calls === 1 || this.calls === 20 || this.calls % 200 === 0) {
+      this.port.postMessage({
+        tap: true, calls: this.calls, empty: this.empty,
+        inputs: inputs.length, channels: first.length,
+      });
+    }
+    return true;
+  }
+}
+registerProcessor("tap", Tap);
+`;
+
+class Microphone {
+  constructor(onFrame, onLevel, onNote) {
+    this.onFrame = onFrame;
+    this.onLevel = onLevel;
+    this.onNote = onNote || function () {};
+    this.ctx = null;
+    this.node = null;
+    this.stream = null;
+    this.source = null;
+    this.script = null;
+    this.carry = new Float32Array(0);
+    this.pending = new Float32Array(0);
+    this.open = false;
+    this.path = "worklet";
+    this.tapCalls = 0;
+    this.tapEmpty = 0;
+    this.tapChannels = 0;
+    this.chunks = 0;
+    this.frames = 0;
+    this.observedPeak = 0;
+  }
+
+  async start() {
+    if (this.ctx) return;
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // These three are why the client is a browser: they remove the
+        // loudspeaker-into-microphone feedback loop for half-duplex playback
+        // without any work on our side.
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // RESUME, and do not assume it worked. This context is created AFTER an
+    // await on getUserMedia -- on the first press that await also spans the
+    // Android permission dialog -- so the user gesture that allowed audio has
+    // already expired and Chrome starts the context SUSPENDED. A suspended
+    // context never calls the worklet's process(), so no frame is ever
+    // produced, nothing is ever sent, and the whole app looks dead while the
+    // socket, the session and the server are all healthy. That is exactly
+    // what happened on the first real phone test: nine WebSocket connections,
+    // two sessions, and not one segment.
+    await this.ctx.resume();
+    const blob = new Blob([WORKLET_SOURCE], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    await this.ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    this.source = this.ctx.createMediaStreamSource(this.stream);
+    this.node = new AudioWorkletNode(this.ctx, "tap");
+    this.node.port.onmessage = (event) => this.handle(event.data);
+    this.source.connect(this.node);
+    // A zero-gain sink keeps the graph alive without echoing to the speaker.
+    this.sink = this.ctx.createGain();
+    this.sink.gain.value = 0;
+    this.node.connect(this.sink).connect(this.ctx.destination);
+    this.watchTrack();
+  }
+
+  /** Everything about the capture chain a log reader would need. */
+  diagnostics() {
+    const track = this.stream ? this.stream.getAudioTracks()[0] : null;
+    const settings = track && track.getSettings ? track.getSettings() : {};
+    return {
+      build: CLIENT_BUILD,
+      context_state: this.ctx ? this.ctx.state : "none",
+      context_rate: this.ctx ? this.ctx.sampleRate : 0,
+      track_rate: settings.sampleRate || 0,
+      track_channels: settings.channelCount || 0,
+      track_state: track ? track.readyState : "none",
+      track_muted: track ? track.muted : null,
+      track_enabled: track ? track.enabled : null,
+      track_label: track ? String(track.label).slice(0, 60) : "",
+      // We REQUEST echo cancellation, noise suppression and gain control
+      // below, but a plain `true` in a constraint dictionary is "ideal", not
+      // "exact" -- a browser is free to ignore it and say nothing. The user
+      // reports his own voice is still noisy, so what was requested is not
+      // evidence; what the track actually got is. Reported so the answer
+      // comes from his device rather than from our source.
+      track_echo_cancellation: settings.echoCancellation === undefined
+        ? null : settings.echoCancellation,
+      track_noise_suppression: settings.noiseSuppression === undefined
+        ? null : settings.noiseSuppression,
+      track_auto_gain: settings.autoGainControl === undefined
+        ? null : settings.autoGainControl,
+      worklet_calls: this.tapCalls,
+      worklet_empty: this.tapEmpty,
+      worklet_channels: this.tapChannels,
+      chunks: this.chunks,
+      frames: this.frames || 0,
+      peak: Math.round(this.observedPeak * 1000) / 1000,
+      path: this.path,
+    };
+  }
+
+  watchTrack() {
+    const track = this.stream ? this.stream.getAudioTracks()[0] : null;
+    if (!track) return;
+    // Android hands the microphone to a phone call or another app by MUTING
+    // the track rather than ending it, and a muted track delivers no audio
+    // while every other indicator stays healthy.
+    track.onmute = () => this.onNote("microphone muted by the system", true);
+    track.onunmute = () => this.onNote("microphone unmuted", false);
+    track.onended = () => this.onNote("microphone track ended", true);
+  }
+
+  /** Deprecated, universally supported, and the point is that it works. */
+  startFallback() {
+    if (this.path !== "worklet" || !this.ctx || !this.source) return;
+    this.path = "scriptprocessor";
+    // RETIRE THE WORKLET FIRST. Nothing used to disconnect it, and the word
+    // "disconnect" appeared nowhere in this file. A worklet that was merely
+    // SLOW to start -- more than the 400 ms watchdog, which is ordinary on a
+    // cold phone -- therefore kept delivering after the fallback engaged, and
+    // both paths called handle(): two interleaved copies of the microphone
+    // packed into one uplink stream.
+    //
+    // That is not a lost turn, it is a corrupted one, and it corrupts
+    // everything computed downstream from the audio at once: recognition gets
+    // garbled speech, the language decision flips on it, the speaker
+    // embedding lands somewhere new every utterance, and the clone reference
+    // is built from the mess -- which is heard as a noisy voice that changes
+    // from turn to turn. One defect, four symptoms.
+    if (this.node) {
+      try { this.node.disconnect(); } catch (err) { /* already detached */ }
+      this.node.port.onmessage = null;
+      this.node = null;
+    }
+    if (this.sink) {
+      try { this.sink.disconnect(); } catch (err) { /* already detached */ }
+      this.sink = null;
+    }
+    const size = 2048;
+    this.script = this.ctx.createScriptProcessor(size, 1, 1);
+    this.script.onaudioprocess = (event) => {
+      this.handle(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+    this.source.connect(this.script);
+    const mute = this.ctx.createGain();
+    mute.gain.value = 0;
+    this.script.connect(mute).connect(this.ctx.destination);
+    this.onNote("switched capture to the ScriptProcessor fallback", false);
+  }
+
+  handle(chunk) {
+    if (chunk && chunk.tap) {
+      this.tapCalls = chunk.calls;
+      this.tapEmpty = chunk.empty;
+      this.tapChannels = chunk.channels;
+      return;
+    }
+    this.chunks = (this.chunks || 0) + 1;
+    let peak = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      const v = Math.abs(chunk[i]);
+      if (v > peak) peak = v;
+    }
+    this.onLevel(peak);
+    if (peak > (this.observedPeak || 0)) this.observedPeak = peak;
+    if (!this.open) return;
+
+    const ratio = this.ctx.sampleRate / PIPELINE_RATE;
+    const merged = new Float32Array(this.carry.length + chunk.length);
+    merged.set(this.carry, 0);
+    merged.set(chunk, this.carry.length);
+
+    const outLength = Math.floor(merged.length / ratio);
+    const out = new Float32Array(outLength);
+    for (let i = 0; i < outLength; i++) {
+      // Box-average decimation. The browser already band-limited the signal
+      // at its own rate and speech energy above 8 kHz is not what the
+      // recognizer uses, so a full polyphase filter would be cost without an
+      // audible return on the uplink.
+      const start = Math.floor(i * ratio);
+      const end = Math.min(merged.length, Math.floor((i + 1) * ratio));
+      let sum = 0;
+      for (let j = start; j < end; j++) sum += merged[j];
+      out[i] = end > start ? sum / (end - start) : 0;
+    }
+    this.carry = merged.slice(Math.floor(outLength * ratio));
+
+    // ACCUMULATE the downsampled output across calls. This line is the whole
+    // bug the first three phone tests were spent on: `out` used to be packed
+    // into frames and then dropped, while only the INPUT remainder was
+    // carried. A worklet quantum is 128 samples; at the 48 kHz Android picks,
+    // that is ~42 samples at the pipeline rate, and a 20 ms frame needs 320.
+    // So `start + frame <= out.length` was false on every single call and not
+    // one frame was ever produced -- with the microphone open, the context
+    // running and the worklet delivering (the phone reported 400 worklet
+    // calls and 537 chunks against 0 frames, which is what finally located
+    // it). Nothing on the server could see this, and the front-door harness
+    // cannot: it pushes PCM straight into the socket and never runs a line of
+    // this file.
+    const held = this.pending || new Float32Array(0);
+    const pending = new Float32Array(held.length + out.length);
+    pending.set(held, 0);
+    pending.set(out, held.length);
+
+    const frame = Math.round(PIPELINE_RATE * FRAME_MS / 1000);
+    let start = 0;
+    for (; start + frame <= pending.length; start += frame) {
+      const pcm = new DataView(new ArrayBuffer(frame * 2));
+      for (let i = 0; i < frame; i++) {
+        const s = Math.max(-1, Math.min(1, pending[start + i]));
+        pcm.setInt16(i * 2, s * 32767, true);
+      }
+      this.frames = (this.frames || 0) + 1;
+      this.onFrame(pcm.buffer);
+    }
+    this.pending = pending.slice(start);
+  }
+
+  setOpen(open) {
+    this.open = open;
+    if (!open) {
+      this.carry = new Float32Array(0);
+      this.pending = new Float32Array(0);
+      return;
+    }
+    this.frames = 0;
+    // Android suspends the capture context whenever the page is backgrounded,
+    // and resuming it is not automatic on return. Cheap to repeat, silent to
+    // omit.
+    if (this.ctx && this.ctx.state !== "running") this.ctx.resume();
+  }
+
+  /** Frames handed to the sender since the last setOpen(true). */
+  sent() {
+    return this.frames || 0;
+  }
+
+  stop() {
+    if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
+    if (this.ctx) this.ctx.close();
+    this.ctx = null; this.node = null; this.stream = null; this.open = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Connection with resume.
+//
+// The session id and the journal cursor live here and survive the socket.
+// Reconnect is not error handling: on a mobile network it is the normal case,
+// so the backoff is short at first and the resume cursor is always sent.
+// ---------------------------------------------------------------------------
+class Connection {
+  constructor(handlers) {
+    this.handlers = handlers;
+    this.ws = null;
+    this.sessionId = sessionStorage.getItem("translator.session") || null;
+    this.cursor = Number(sessionStorage.getItem("translator.cursor") || 0);
+    this.participants = null;
+    this.attempt = 0;
+    this.closedByUser = false;
+    this.pendingAudio = null;   // the turn a binary frame belongs to
+    this.pingSentAt = 0;
+    this.rttMs = null;
+    this.wireRate = 0;
+  }
+
+  connect() {
+    this.closedByUser = false;
+    setState("connecting", "connecting");
+    const ws = new WebSocket(WS_URL);
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
+
+    ws.onopen = () => {
+      // A new socket means a new timeline: anything still booked against the
+      // old clock must not survive into it.
+      playback.reset();
+      ws.send(JSON.stringify({
+        kind: "hello",
+        codecs: ["pcm16"],
+        session_id: this.sessionId,
+        resume_from: this.cursor,
+        participants: this.participants,
+      }));
+    };
+
+    ws.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        this.onControl(JSON.parse(event.data));
+      } else {
+        this.onBinary(event.data);
+      }
+    };
+
+    ws.onclose = () => {
+      updateLink();
+      if (this.closedByUser) { setState("offline", "closed"); return; }
+      const delay = Math.min(500 * Math.pow(1.7, this.attempt++), 15000);
+      setState("connecting",
+               "reconnecting in " + Math.round(delay / 100) / 10 + "s");
+      setTimeout(() => this.connect(), delay);
+    };
+
+    ws.onerror = () => { /* onclose does the work; avoid a double retry */ };
+  }
+
+  onControl(event) {
+    if (typeof event.seq === "number") {
+      this.cursor = Math.max(this.cursor, event.seq + 1);
+      sessionStorage.setItem("translator.cursor", String(this.cursor));
+    }
+    if (event.kind === "ready") {
+      this.attempt = 0;
+      // A cursor counts events of ONE session. If the server did not resume
+      // the session we asked for -- the idle collector took it and minted a
+      // new one -- then our cursor counts a conversation that no longer
+      // exists, and sending it again would ask the new session to skip past
+      // everything it is about to say. Drop it with the session it belonged
+      // to, before it is stored again below.
+      if (event.session_id !== this.sessionId || !event.resumed) {
+        this.cursor = 0;
+        sessionStorage.setItem("translator.cursor", "0");
+      }
+      this.sessionId = event.session_id;
+      sessionStorage.setItem("translator.session", this.sessionId);
+      setState("ready", event.resumed ? "resumed" : "ready");
+      updateLink();
+      this.ping();
+    }
+    if (event.kind === "pong") {
+      this.rttMs = Math.max(0, Date.now() - this.pingSentAt);
+      updateLink();
+      return;
+    }
+    if (event.audio_follows) {
+      this.pendingAudio = event;
+      if (event.sample_rate) { this.wireRate = event.sample_rate; updateLink(); }
+    }
+    this.handlers.onEvent(event);
+  }
+
+  onBinary(buffer) {
+    const view = new DataView(buffer);
+    const samples = new Float32Array(buffer.byteLength / 2);
+    for (let i = 0; i < samples.length; i++) {
+      samples[i] = view.getInt16(i * 2, true) / 32768;
+    }
+    const rate = (this.pendingAudio && this.pendingAudio.sample_rate)
+      || PIPELINE_RATE;
+    const turnId = this.pendingAudio ? this.pendingAudio.turn_id : null;
+    // History must not be spoken. A freshly loaded page resumes from cursor
+    // zero, so the journal answers with every turn.audio the conversation
+    // ever produced; playing those is the whole conversation at once at the
+    // first tap. The transcript already carries the text, and the server
+    // marks what is replay, so this is a decision and not a guess. The
+    // samples are still KEPT: that is what makes the per-line replay button
+    // work on a page that has just been reloaded.
+    if (this.pendingAudio && this.pendingAudio.replayed) {
+      playback.skippedReplay += 1;
+      keepAudio(turnId, samples, rate);
+      return;
+    }
+    // A turn the listener already cut off must not resume because more of its
+    // audio was still in flight. The stop is remembered per turn, so the rest
+    // of the frames are kept for the replay button and never scheduled.
+    if (stoppedTurns.has(turnId)) {
+      keepAudio(turnId, samples, rate);
+      playback.skippedReplay += 1;
+      return;
+    }
+    keepAudio(turnId, samples, rate);
+    playback.currentTurn = turnId;
+    playback.push(samples, rate);
+    setTurnState(turnId, "speaking");
+    showStop();
+    if (uiState !== "recording") setState("speaking", "speaking");
+    // Audio arrived and the output is not running: say it, once, in words the
+    // person can act on. Silence here is the failure that cost five rounds --
+    // the server sent every frame and the phone reported nothing wrong.
+    if (playback.blocked && !this.warnedBlocked) {
+      this.warnedBlocked = true;
+      el("blocked").classList.add("on");
+      setState("blocked", "sound blocked");
+      reportCapture("playback-blocked");
+    }
+  }
+
+  ping() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.pingSentAt = Date.now();
+    this.sendControl({ kind: "ping" });
+  }
+
+  sendFrame(buffer) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(buffer);
+  }
+
+  sendControl(payload) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(payload));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The conversation stream.
+//
+// ONE list. A turn's live events and its durable transcript line address the
+// SAME bubble, keyed by turn id, so the reader is never shown the same
+// sentence twice in two panels -- which is what the previous surface did.
+//
+// Every one of these renders SERVER state. The client owns none of it: a
+// reconnect replays the record, and a correction is a round trip, so two
+// devices in the same session never disagree about who said what.
+// ---------------------------------------------------------------------------
+const bubbles = new Map();      // turn_id -> node
+const lineNodes = new Map();    // line_id -> node
+const lineData = new Map();     // line_id -> the server's line payload
+let knownSpeakers = [];
+
+/** A stable colour per speaker, so the eye can follow one voice down the
+ *  scrollback without reading a single name.
+ *
+ * A plain string hash was tried first and it is what the screenshots caught:
+ * `speaker-1`, `speaker-2` and `speaker-3` differ by one character, so their
+ * hues landed within a few degrees of each other and all three rails came out
+ * the same green. The minted ids carry an ordinal -- use it, and the first
+ * speakers of a conversation are maximally far apart by construction.
+ */
+const SPEAKER_HUES = [140, 205, 32, 320, 265, 95, 15, 175];
+function speakerColor(speakerId) {
+  const key = String(speakerId || "?");
+  const ordinal = key.match(/(\d+)\s*$/);
+  let index;
+  if (ordinal) {
+    index = (parseInt(ordinal[1], 10) - 1) % SPEAKER_HUES.length;
+  } else {
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+      hash = (hash * 131 + key.charCodeAt(i)) | 0;
+    }
+    index = Math.abs(hash) % SPEAKER_HUES.length;
+  }
+  return "hsl(" + SPEAKER_HUES[(index + SPEAKER_HUES.length) % SPEAKER_HUES.length]
+    + " 72% 58%)";
+}
+
+function initials(label) {
+  const text = String(label || "?").trim();
+  const match = text.match(/[\p{L}\p{N}]/u);
+  return match ? match[0].toUpperCase() : "?";
+}
+
+function speakerLabel(speakerId) {
+  const known = knownSpeakers.find((s) => s.speaker_id === speakerId);
+  return (known && known.label) || speakerId || "";
+}
+
+/** Follow new lines unless the reader has deliberately scrolled up.
+ *
+ * `following` is STATE that remembers what the READER last did, and that is
+ * the whole fix for the defect the auto-scroll arm caught (newest line 95 px
+ * below the fold as soon as the transcript overflowed). The previous shape
+ * sampled `atBottom()` at APPEND time and scrolled once. But a bubble keeps
+ * GROWING after it is appended -- `turn.queued` writes a waiting notice,
+ * every `turn.translation` partial adds a clause, the final event replaces
+ * the accumulation, `turn.voice` un-hides a tag -- and none of those paths
+ * scrolls at all. The reading taken at append time is stale by the time the
+ * bubble reaches its final height.
+ *
+ * Re-measuring at growth time cannot replace the flag either: the growth is
+ * precisely what pushed the content past the fold, so a measurement taken
+ * after it always says "not at the bottom" and would latch the follow off on
+ * the first long turn. Only a flag written by the SCROLL event -- the one
+ * signal that is actually the reader's -- survives the growth.
+ */
+let following = true;
+const FOLLOW_SLACK_PX = 60;
+function atBottom() {
+  const box = streamBox();
+  return box.scrollHeight - box.scrollTop - box.clientHeight < FOLLOW_SLACK_PX;
+}
+function scrollToEnd() {
+  const box = streamBox();
+  box.scrollTop = box.scrollHeight;
+}
+function follow() {
+  if (following) scrollToEnd();
+}
+/** Re-pin after something OUTSIDE the stream changed its height.
+ *
+ * A chip or a toast appearing shortens the scroll box, and the newest bubble
+ * -- the one the reader is waiting for -- slides out of view without any
+ * scroll event to react to. Caught in the state screenshots: a queued turn
+ * was hidden behind the suggestion chip that arrived after it.
+ */
+function pinBottom() {
+  if (!following) return;
+  requestAnimationFrame(scrollToEnd);
+}
+
+/** The unread hint, which exists only while the reader is not being followed. */
+function paintUnread(hasNew) {
+  const pill = el("unread");
+  if (!pill) return;
+  if (following) { pill.hidden = true; return; }
+  if (hasNew) pill.hidden = false;
+}
+
+/** Follow the stream by WATCHING it, not by scrolling at the append sites.
+ *
+ * A MutationObserver over the subtree catches every way a bubble grows,
+ * including the ones added later by code that never heard of this function --
+ * which is how the original defect got in, one event handler at a time. The
+ * ResizeObserver covers the growth that leaves no mutation behind at all: a
+ * reflow from rotation, a font finishing load, the on-screen keyboard
+ * changing the viewport.
+ */
+let streamResize = null;
+function watchStream() {
+  const box = streamBox();
+  box.addEventListener("scroll", () => {
+    // The reader's own verdict, and the only writer of `following` that turns
+    // it back on. Our own scroll lands at the very bottom and therefore
+    // re-affirms `true`, so this cannot fight the observer below.
+    const now = atBottom();
+    if (now === following) return;
+    following = now;
+    paintUnread(false);
+  }, { passive: true });
+  const restick = () => {
+    if (following) scrollToEnd();
+    else paintUnread(true);
+  };
+  new MutationObserver(restick).observe(box, {
+    childList: true, subtree: true, characterData: true,
+  });
+  if (window.ResizeObserver) {
+    // Observing the box measures the VIEWPORT, not the content, so each
+    // bubble is observed as it is created (see `bubbleFor`); the box entry
+    // covers the container shrinking under a banner or the keyboard.
+    streamResize = new ResizeObserver(() => { if (following) scrollToEnd(); });
+    streamResize.observe(box);
+  }
+  el("unread").onclick = () => {
+    following = true;
+    scrollToEnd();
+    paintUnread(false);
+  };
+}
+
+/** The bubble for a turn, created on whichever event mentions it first.
+ *
+ * The class list is load-bearing beyond styling: `line` is what the
+ * acceptance gate counts to prove a transcript entry appeared live, and
+ * `turn` + `dst.waiting` is what it reads to prove the queue was announced.
+ */
+function bubbleFor(turnId) {
+  let node = bubbles.get(turnId);
+  if (node) return node;
+  node = document.createElement("article");
+  node.className = "line turn";
+  node.dataset.turn = turnId;
+  node.innerHTML =
+    '<div class="meta"><i class="avatar">?</i><span class="who"></span>'
+    + '<span class="tag lang"></span><span class="tag badge" hidden></span>'
+    + '<span class="tag voice" hidden></span>'
+    + '<span class="tag stopmark" hidden>stopped</span>'
+    + '<span class="tag work" hidden></span></div>'
+    + '<div class="dst"></div><div class="src"></div>'
+    + '<div class="cands" hidden></div><div class="tools"></div>';
+  node.addEventListener("click", (event) => {
+    if (event.target.closest("button")) return;
+    replayTurn(node.dataset.turn);
+  });
+  bubbles.set(turnId, node);
+  streamBox().appendChild(node);
+  // Every LATER growth of this bubble is caught by the observers in
+  // `watchStream`; this call is only the immediate one, so the newest line is
+  // on screen within the same frame rather than one observer callback later.
+  follow();
+  if (streamResize) streamResize.observe(node);
+  return node;
+}
+
+function setSide(node, language) {
+  const index = slots.indexOf(language);
+  node.dataset.side = index === 1 ? "right" : "left";
+}
+
+function paintSpeaker(node, speakerId, label) {
+  const shown = label || speakerLabel(speakerId) || speakerId || "";
+  node.style.setProperty("--sp", speakerColor(speakerId));
+  node.querySelector(".avatar").textContent = initials(shown);
+  node.querySelector(".who").textContent = shown;
+}
+
+/** Render one durable transcript line (design 17.2/17.3/17.4). */
+function renderLine(line) {
+  if (!line) return;
+  lineData.set(line.line_id, line);
+
+  if (line.kind === "notice") {
+    let node = lineNodes.get(line.line_id);
+    if (!node) {
+      node = document.createElement("div");
+      node.className = "line notice";
+      lineNodes.set(line.line_id, node);
+      streamBox().appendChild(node);
+    }
+    node.textContent = line.text;
+    follow();
+    return;
+  }
+
+  // Bind to the bubble the live events already created for this turn, so the
+  // sentence is not shown twice.
+  let node = lineNodes.get(line.line_id)
+    || (line.turn_id ? bubbles.get(line.turn_id) : null);
+  if (!node) {
+    node = bubbleFor(line.turn_id || ("line:" + line.line_id));
+  }
+  node.dataset.line = line.line_id;
+  lineNodes.set(line.line_id, node);
+  if (line.turn_id) bubbles.set(line.turn_id, node);
+
+  node.classList.toggle("uncertain", line.confidence === "uncertain");
+  // The line knows a name the button row does not: ask the session, once.
+  if (rosterLags(line)) refreshRoster();
+  paintSpeaker(node, line.speaker_id, line.speaker_label);
+  setSide(node, line.source_language);
+  node.querySelector(".lang").textContent = line.source_language || "";
+  node.querySelector(".src").textContent = line.source_text || "";
+
+  const stopmark = node.querySelector(".stopmark");
+  if (stopmark) stopmark.hidden = !node.classList.contains("stopped");
+  const badge = node.querySelector(".badge");
+  if (line.confidence === "uncertain") {
+    badge.hidden = false;
+    badge.className = "tag badge warn";
+    badge.textContent = "who spoke?";
+  } else if (line.origin === "manual") {
+    badge.hidden = false;
+    badge.className = "tag badge ok";
+    badge.textContent = "you said so";
+  } else if (line.resolved_by) {
+    badge.hidden = false;
+    badge.className = "tag badge ok";
+    badge.textContent = "resolved";
+  } else {
+    badge.hidden = true;
+  }
+
+  const dst = node.querySelector(".dst");
+  const targets = Object.keys(line.translations || {}).sort();
+  if (targets.length) {
+    dst.className = "dst";
+    dst.innerHTML = "";
+    for (const target of targets) {
+      const row = document.createElement("div");
+      row.className = "tr";
+      const code = document.createElement("span");
+      code.className = "code";
+      code.textContent = target;
+      const text = document.createElement("span");
+      text.textContent = line.translations[target];
+      row.append(code, text);
+      dst.appendChild(row);
+    }
+  } else if (!dst.textContent) {
+    dst.className = "dst waiting";
+    dst.textContent = "translating";
+  }
+
+  // The top-3 candidates, ranked by the similarity the assignment itself
+  // used (design 17.4). A tap resolves the line; nothing is folded into a
+  // centroid before that.
+  const cands = node.querySelector(".cands");
+  cands.innerHTML = "";
+  if (line.confidence === "uncertain" && (line.candidates || []).length) {
+    cands.hidden = false;
+    for (const candidate of line.candidates) {
+      const button = document.createElement("button");
+      button.className = "cand" + (candidate.new ? " new" : "");
+      button.textContent = (candidate.new
+        ? candidate.label + " (new)" : candidate.label)
+        + "  " + candidate.similarity;
+      button.onclick = (event) => {
+        event.stopPropagation();
+        connection.sendControl({
+          kind: "line.resolve", line_id: line.line_id,
+          speaker_id: candidate.new ? null : candidate.speaker_id,
+        });
+      };
+      cands.appendChild(button);
+    }
+  } else {
+    cands.hidden = true;
+  }
+
+  renderTools(node, line);
+  follow();
+}
+
+/** Per-line controls: replay, fold the original away, undo a resolution. */
+function renderTools(node, line) {
+  const tools = node.querySelector(".tools");
+  tools.innerHTML = "";
+  const turnId = node.dataset.turn;
+  if (turnId && audioStore.has(turnId)) {
+    const play = document.createElement("button");
+    play.innerHTML = ICON.play + "<span>replay</span>";
+    play.onclick = (event) => { event.stopPropagation(); replayTurn(turnId); };
+    tools.appendChild(play);
+  }
+  if (node.querySelector(".src").textContent) {
+    const fold = document.createElement("button");
+    const folded = node.classList.contains("folded");
+    // Icon only: this control repeats on every bubble, and a worded button
+    // per line turned the scrollback into a column of "hide original".
+    fold.innerHTML = ICON.eye;
+    fold.title = folded ? "show the original" : "hide the original";
+    fold.setAttribute("aria-label", fold.title);
+    fold.onclick = (event) => {
+      event.stopPropagation();
+      node.classList.toggle("folded");
+      renderTools(node, line);
+    };
+    tools.appendChild(fold);
+  }
+  // A resolution is a human decision and must be undoable (design 17.0.4).
+  if (line && line.resolved_by === "user") {
+    const undo = document.createElement("button");
+    undo.textContent = "undo";
+    undo.onclick = (event) => {
+      event.stopPropagation();
+      connection.sendControl({ kind: "line.undo", line_id: line.line_id });
+    };
+    tools.appendChild(undo);
+  }
+}
+
+function markReplayable(turnId) {
+  const node = bubbles.get(turnId);
+  if (!node) return;
+  const line = node.dataset.line ? lineData.get(Number(node.dataset.line)) : null;
+  renderTools(node, line);
+}
+
+function replayTurn(turnId) {
+  const entry = audioStore.get(turnId);
+  if (!entry) return;
+  if (!playback.replay(entry)) {
+    sys("the browser is not letting this page make a sound yet", true);
+    el("blocked").classList.add("on");
+  }
+}
+
+function clearStream() {
+  // The nodes go with the innerHTML, and so must their resize observations --
+  // an observer holding detached elements keeps them alive for nothing.
+  if (streamResize) {
+    for (const node of bubbles.values()) streamResize.unobserve(node);
+  }
+  streamBox().innerHTML = "";
+  bubbles.clear();
+  lineNodes.clear();
+  lineData.clear();
+  // An empty stream is at its end by definition; leaving `following` off here
+  // would strand the reader off the live end of the NEXT conversation.
+  following = true;
+  paintUnread(false);
+}
+
+function applyTranscript(payload) {
+  if (!payload.lines) return;
+  if (payload.replace) clearStream();
+  for (const line of payload.lines) renderLine(line);
+  // A restore lands the reader at the live end regardless of where they were
+  // before the reconnect: the scroll position they had belonged to a DOM that
+  // no longer exists.
+  following = true;
+  scrollToEnd();
+  paintUnread(false);
+}
+
+/** The transcript as text, for copy/share (design 19.6). */
+function transcriptText() {
+  const out = [];
+  const ids = Array.from(lineData.keys()).sort((a, b) => a - b);
+  for (const id of ids) {
+    const line = lineData.get(id);
+    if (line.kind === "notice") { out.push("-- " + line.text); continue; }
+    out.push((line.speaker_label || line.speaker_id) + " ["
+      + line.source_language + "]: " + line.source_text);
+    for (const target of Object.keys(line.translations || {}).sort()) {
+      out.push("    [" + target + "] " + line.translations[target]);
+    }
+  }
+  return out.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Speaker row (design 17.5) and name chips (17.3).
+// ---------------------------------------------------------------------------
+/** What the CONNECTED server can do, from its own state frame.
+ *
+ * This page is served from the worktree and re-read per request, so a
+ * client-side change is live the moment it is merged, while its server half
+ * waits for a tenant restart. In that window a gesture whose control the
+ * server does not understand would look like the app ignoring the user. The
+ * capability is therefore asked for rather than assumed, and an older server
+ * that does not send the key leaves the gesture unbound until it is restarted
+ * -- with no second client deploy needed to switch it on.
+ */
+let serverSupports = {};
+
+function renderSpeakers(speakers) {
+  knownSpeakers = speakers || [];
+  const row = el("speakers");
+  row.innerHTML = "";
+  for (const speaker of knownSpeakers) {
+    const cell = document.createElement("div");
+    cell.className = "sp";
+    cell.dataset.speaker = speaker.speaker_id;
+    const shown = speaker.label || speaker.speaker_id;
+
+    const button = document.createElement("button");
+    button.className = "who";
+    button.dataset.speaker = speaker.speaker_id;
+    const dot = document.createElement("i");
+    dot.className = "avatar";
+    dot.style.background = speakerColor(speaker.speaker_id);
+    dot.textContent = initials(shown);
+    const label = document.createElement("span");
+    label.className = "lbl";
+    label.textContent = shown;
+    button.append(dot, label);
+    bindTalkButton(button, speaker.speaker_id);
+    bindSpeakerHold(cell, button, speaker);
+
+    // Delete, on the main page, at the entry itself (user order 2026-08-03:
+    // "man muss speaker direkt dort loeschen koennen auf der hauptseite").
+    // It was only reachable through a long press into a sheet, which is a
+    // gesture nobody finds and which now belongs to the merge drag.
+    const kill = document.createElement("button");
+    kill.className = "x";
+    kill.textContent = "×";
+    kill.title = "delete " + shown;
+    kill.setAttribute("aria-label", "delete " + shown);
+    kill.onclick = (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      confirmDeleteSpeaker(speaker);
+    };
+    // The cell is inside the talk row; a stray press on the delete control
+    // must never reach the speak button underneath it.
+    kill.addEventListener("pointerdown", (e) => e.stopPropagation());
+    kill.addEventListener("pointerup", (e) => e.stopPropagation());
+
+    cell.append(button, kill);
+    row.appendChild(cell);
+  }
+  const add = document.createElement("button");
+  add.className = "add";
+  add.innerHTML = ICON.plus;
+  add.setAttribute("aria-label", "somebody new is speaking");
+  add.onclick = openAddSpeakerSheet;
+  row.appendChild(add);
+}
+
+/** Delete one speaker, from the roster, with a confirmation.
+ *
+ * The transcript is explicitly NOT touched: the server keeps every line this
+ * speaker said, under the name it had at the time (`speakers.remove`, whose
+ * docstring argues the case). Saying so in the confirmation matters -- "their
+ * voice is lost" reads as "the conversation is lost" if nobody says otherwise.
+ */
+async function confirmDeleteSpeaker(speaker) {
+  const shown = speaker.label || speaker.speaker_id;
+  const ok = await askConfirm(
+    "delete " + shown + "?",
+    "Their voice reference and their preset voice are released. Everything "
+    + "they said stays in the transcript.", "delete");
+  if (!ok) return;
+  connection.sendControl({
+    kind: "speaker.delete", speaker_id: speaker.speaker_id,
+  });
+}
+
+/** Long press on a roster entry: lift it, and drop it on somebody to merge.
+ *
+ * MERGE IS DESTRUCTIVE, so the gesture is deliberately the slow one and the
+ * drop is confirmed. Delete keeps the explicit control instead of sharing the
+ * press: one gesture must not mean two irreversible things.
+ *
+ * Released without having moved onto another entry, the long press still
+ * opens the speaker sheet, which is where renaming lives and where it stays.
+ * That is why the sheet is opened on RELEASE rather than when the timer
+ * fires: the same press has to be able to become a drag.
+ */
+function bindSpeakerHold(cell, button, speaker) {
+  const row = el("speakers");
+  const canMerge = !!serverSupports.speaker_merge;
+  let hold = null;
+  let dragging = false;
+  let target = null;
+
+  const cellAt = (x, y) => {
+    const node = document.elementFromPoint(x, y);
+    const found = node && node.closest ? node.closest("#speakers .sp") : null;
+    return found && found !== cell ? found : null;
+  };
+  const paint = (next) => {
+    if (target === next) return;
+    if (target) target.classList.remove("droptarget");
+    target = next;
+    if (target) target.classList.add("droptarget");
+  };
+  const lift = () => {
+    dragging = true;
+    row.classList.add("merging");
+    cell.classList.add("dragging");
+    for (const other of row.querySelectorAll(".sp")) {
+      if (other !== cell) other.classList.add("dropzone");
+    }
+    const hint = document.createElement("div");
+    hint.className = "mergehint";
+    hint.textContent = "drop on another speaker to merge them";
+    row.appendChild(hint);
+  };
+  const drop = () => {
+    row.classList.remove("merging");
+    cell.classList.remove("dragging");
+    for (const other of row.querySelectorAll(".sp")) {
+      other.classList.remove("dropzone", "droptarget");
+    }
+    for (const hint of row.querySelectorAll(".mergehint")) hint.remove();
+    const landed = target;
+    target = null;
+    dragging = false;
+    return landed;
+  };
+
+  button.addEventListener("pointerdown", (event) => {
+    if (hold) clearTimeout(hold);
+    hold = setTimeout(() => {
+      hold = null;
+      // Consume the press either way: neither the sheet nor a merge gesture
+      // may also start a turn.
+      button.dataset.renamed = "1";
+      if (!canMerge) {
+        // No server half yet: the long press keeps doing what it always did.
+        openSpeakerSheet(speaker);
+        return;
+      }
+      lift();
+      // Without capture the move events stop the moment the finger leaves
+      // this button, which is the first thing a drag does.
+      try { button.setPointerCapture(event.pointerId); } catch (err) { /* none */ }
+    }, 600);
+  });
+  button.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    event.preventDefault();
+    paint(cellAt(event.clientX, event.clientY));
+  });
+  button.addEventListener("pointerup", (event) => {
+    if (hold) { clearTimeout(hold); hold = null; return; }
+    if (!dragging) return;
+    event.preventDefault();
+    paint(cellAt(event.clientX, event.clientY));
+    const landed = drop();
+    try { button.releasePointerCapture(event.pointerId); } catch (err) { /* none */ }
+    if (!landed) { openSpeakerSheet(speaker); return; }
+    confirmMergeSpeakers(landed.dataset.speaker, speaker);
+  });
+  for (const type of ["pointercancel", "pointerleave"]) {
+    button.addEventListener(type, () => {
+      if (hold) { clearTimeout(hold); hold = null; }
+      // A cancelled drag must clear its highlights; leaving them would make
+      // the row look armed for a merge that is not happening.
+      if (dragging) drop();
+    });
+  }
+}
+
+/** Confirm and send a merge. Destructive and irreversible, so it says so. */
+async function confirmMergeSpeakers(targetId, source) {
+  const target = knownSpeakers.find((s) => s.speaker_id === targetId);
+  if (!target || targetId === source.speaker_id) return;
+  const sourceName = source.label || source.speaker_id;
+  const targetName = target.label || target.speaker_id;
+  const ok = await askConfirm(
+    "merge into " + targetName + "?",
+    sourceName + " and " + targetName + " become one speaker, called "
+    + targetName + ". Everything " + sourceName + " said is re-attributed to "
+    + targetName + ". This cannot be undone.", "merge");
+  if (!ok) return;
+  connection.sendControl({
+    kind: "speaker.merge", target_id: targetId, source_id: source.speaker_id,
+  });
+}
+
+/** Ask the session for the roster, coalescing a burst into one request.
+ *
+ * THE FIELD DEFECT THIS EXISTS FOR (2026-08-03): a self-introduction was
+ * applied server-side, the transcript lines came back relabelled "Matthias",
+ * and the speaker buttons underneath still said `speaker-1` until a reload.
+ * The bubbles render the line payload, which carries `speaker_label`; the
+ * button row renders the SESSION STATE, and nothing was asking for it again.
+ *
+ * The fix is deliberately not "read the name off the line": that would give
+ * the roster a second source and let the two disagree. The line is used only
+ * as a HINT that something changed -- the answer still comes from `state()`,
+ * which is the one place a name lives. It therefore also works for any server
+ * path that relabels a speaker without emitting a roster frame at all.
+ */
+let rosterRefresh = null;
+function refreshRoster() {
+  if (rosterRefresh) return;
+  rosterRefresh = setTimeout(() => {
+    rosterRefresh = null;
+    connection.sendControl({ kind: "state" });
+  }, 150);
+}
+
+/** Does this line disagree with the roster about who its speaker is? */
+function rosterLags(line) {
+  if (!line || !line.speaker_id) return false;
+  const known = knownSpeakers.find((s) => s.speaker_id === line.speaker_id);
+  if (!known) return true;                       // a voice with no button yet
+  const label = line.speaker_label || line.speaker_id;
+  const shown = known.label || known.speaker_id;
+  return label !== shown;
+}
+
+function markArmed(speakerId) {
+  // Queried rather than walked over `children`: a roster entry is a cell that
+  // CONTAINS the speak button since the delete control arrived, so the armed
+  // class belongs on the button, one level down.
+  for (const button of el("speakers").querySelectorAll("button.who")) {
+    button.classList.toggle("armed", button.dataset.speaker === speakerId);
+  }
+}
+
+function chip(suggestion) {
+  const node = document.createElement("div");
+  node.className = "chip";
+  const text = document.createElement("span");
+  text.className = "text";
+  const who = suggestion.speaker_id || "somebody";
+  node.appendChild(text);
+  if (suggestion.applied) {
+    // Already in force: a self-introduction leaves nothing to decide, so the
+    // only useful control is taking it back.
+    text.textContent = "named " + who + " “" + suggestion.name + "”";
+    const undo = document.createElement("button");
+    undo.className = "small";
+    undo.textContent = "undo";
+    undo.onclick = () => {
+      connection.sendControl({
+        kind: "name.undo", suggestion_id: suggestion.suggestion_id,
+      });
+      node.remove();
+    };
+    node.appendChild(undo);
+    el("chips").appendChild(node);
+    pinBottom();
+    setTimeout(() => node.remove(), 20000);
+    return;
+  }
+  text.textContent = "“" + suggestion.name + "” — " + who + "?";
+  const yes = document.createElement("button");
+  yes.className = "small primary";
+  yes.textContent = "name";
+  yes.onclick = () => {
+    connection.sendControl({
+      kind: "suggestion.confirm", suggestion_id: suggestion.suggestion_id,
+    });
+    node.remove();
+  };
+  const no = document.createElement("button");
+  no.className = "small";
+  no.textContent = "no";
+  no.onclick = () => {
+    connection.sendControl({
+      kind: "suggestion.discard", suggestion_id: suggestion.suggestion_id,
+    });
+    node.remove();
+  };
+  node.append(yes, no);
+  el("chips").appendChild(node);
+  pinBottom();
+}
+
+// ---------------------------------------------------------------------------
+// Sheets and dialogs. Everything that is not needed while talking lives here.
+// ---------------------------------------------------------------------------
+function openSheet(pane, title) {
+  for (const node of document.querySelectorAll("#sheet .pane")) {
+    node.classList.toggle("on", node.id === "pane-" + pane);
+  }
+  el("sheettitle").textContent = title;
+  el("sheet").classList.add("on");
+  el("scrim").classList.add("on");
+}
+function closeSheet() {
+  el("sheet").classList.remove("on");
+  el("scrim").classList.remove("on");
+}
+
+/** A confirmation that NAMES what is lost. Used wherever data goes away. */
+function askConfirm(title, body, confirmLabel) {
+  return new Promise((resolve) => {
+    const box = document.createElement("div");
+    box.className = "box";
+    const head = document.createElement("h3");
+    head.textContent = title;
+    const para = document.createElement("p");
+    para.textContent = body;
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const cancel = document.createElement("button");
+    cancel.textContent = "cancel";
+    const ok = document.createElement("button");
+    ok.className = "danger";
+    ok.textContent = confirmLabel || "continue";
+    const done = (value) => { el("modal").classList.remove("on");
+                              el("modal").innerHTML = ""; resolve(value); };
+    cancel.onclick = () => done(false);
+    ok.onclick = () => done(true);
+    actions.append(cancel, ok);
+    box.append(head, para, actions);
+    el("modal").innerHTML = "";
+    el("modal").appendChild(box);
+    el("modal").classList.add("on");
+  });
+}
+
+/** One text field, on a phone-sized dialog rather than a browser prompt. */
+function askText(title, body, value, okLabel) {
+  return new Promise((resolve) => {
+    const box = document.createElement("div");
+    box.className = "box";
+    const head = document.createElement("h3");
+    head.textContent = title;
+    const para = document.createElement("p");
+    para.textContent = body;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = value || "";
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const cancel = document.createElement("button");
+    cancel.textContent = "cancel";
+    const ok = document.createElement("button");
+    ok.className = "primary";
+    ok.textContent = okLabel || "save";
+    const done = (result) => { el("modal").classList.remove("on");
+                               el("modal").innerHTML = ""; resolve(result); };
+    cancel.onclick = () => done(null);
+    ok.onclick = () => done(input.value.trim());
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") done(input.value.trim());
+    });
+    actions.append(cancel, ok);
+    box.append(head, para, input, actions);
+    el("modal").innerHTML = "";
+    el("modal").appendChild(box);
+    el("modal").classList.add("on");
+    setTimeout(() => input.focus(), 30);
+  });
+}
+
+/** Rename or delete any speaker, automatic or manual (design 17.5b).
+ *
+ * A typed name outranks every suggestion and is never overwritten by the
+ * automatic path.
+ */
+function openSpeakerSheet(speaker) {
+  const pane = el("pane-speaker");
+  pane.innerHTML = "";
+  const group = document.createElement("div");
+  group.className = "group";
+  const head = document.createElement("h3");
+  head.textContent = speaker.label || speaker.speaker_id;
+  group.appendChild(head);
+
+  const facts = document.createElement("p");
+  facts.textContent = (speaker.observations || 0) + " utterances, "
+    + (speaker.reference_seconds || 0) + " s of voice reference"
+    + (speaker.clonable ? ", clonable" : ", not clonable yet");
+  group.appendChild(facts);
+
+  const rename = document.createElement("button");
+  rename.className = "listrow";
+  rename.innerHTML = "<span class='name'>give this speaker a name</span>";
+  rename.onclick = async () => {
+    closeSheet();
+    const name = await askText(
+      "name", "Applies to every line this speaker has already said, and to "
+      + "all new ones.", speaker.label || "");
+    if (name === null || !name) return;
+    connection.sendControl({
+      kind: "speaker.name", speaker_id: speaker.speaker_id, label: name,
+    });
+  };
+
+  // The same delete as the "x" on the roster entry, deliberately one
+  // implementation: two copies of a destructive confirmation drift, and the
+  // one nobody reads is the one that stops warning about the right thing.
+  const remove = document.createElement("button");
+  remove.className = "listrow danger";
+  remove.innerHTML = "<span class='name'>delete this speaker</span>";
+  remove.onclick = () => {
+    closeSheet();
+    confirmDeleteSpeaker(speaker);
+  };
+
+  group.append(rename, remove);
+  pane.appendChild(group);
+  openSheet("speaker", "speaker");
+}
+
+/** The "+" button: declare somebody new, with their voice class.
+ *
+ * The class is asked for because the user knows it and the F0 heuristic only
+ * guesses -- and it is needed BEFORE the first utterance, which is when a
+ * preset voice has to be picked. Without it a new speaker has to talk once
+ * before sounding right.
+ */
+function openAddSpeakerSheet() {
+  const pane = el("pane-speaker");
+  pane.innerHTML = "";
+  const group = document.createElement("div");
+  group.className = "group";
+  const head = document.createElement("h3");
+  head.textContent = "voice class";
+  const note = document.createElement("p");
+  note.textContent = "The preset pool is built from these four, and the "
+    + "choice is needed before the first word is spoken.";
+  group.append(head, note);
+
+  const name = document.createElement("input");
+  name.type = "text";
+  name.placeholder = "name (optional)";
+  name.style.margin = "10px 0";
+  group.appendChild(name);
+
+  for (const voiceClass of ["man", "woman", "boy", "girl"]) {
+    const button = document.createElement("button");
+    button.className = "listrow";
+    const label = document.createElement("span");
+    label.className = "name";
+    label.textContent = voiceClass;
+    button.appendChild(label);
+    button.onclick = () => {
+      connection.sendControl({
+        kind: "speaker.add", voice_class: voiceClass,
+        label: name.value.trim() || null,
+      });
+      closeSheet();
+    };
+    group.appendChild(button);
+  }
+  pane.appendChild(group);
+  openSheet("speaker", "new speaker");
+}
+
+// ---------------------------------------------------------------------------
+// Languages: two big buttons and a swap, the pattern every established mobile
+// translator settled on. The old header multi-select is gone.
+//
+// The conversation still carries a SET of participant languages -- three or
+// more is expressible and fans out -- so the bar renders one button per
+// participant with an add control; the first two are the pair the bubbles are
+// sided by.
+// ---------------------------------------------------------------------------
+const catalogue = { bidirectional: [], selectable: [], all: [] };
+let slots = [];
+
+/** Does the CONNECTED server accept a participant language it cannot speak?
+ *
+ * It used not to: `TranslatorSession.__init__` called
+ * `conversation.validate_against(matrix)`, which raises on the FIRST
+ * unservable direction -- so a text-only participant did not degrade, it
+ * refused to open the conversation at all and took every other language the
+ * user had picked with it. The picker therefore showed every language and
+ * said what was missing rather than offering a tap that produced a dead
+ * session.
+ *
+ * The server now degrades instead (`direction_report`): the session opens on
+ * the directions it can serve and tags the rest with `turn.unrouted`. This is
+ * asked of the server rather than hardcoded for the same reason the merge
+ * gesture is -- this page is live on merge while its server half waits for a
+ * restart, and a picker that offers a language the RUNNING server still
+ * refuses would produce exactly the dead session it was written to avoid.
+ */
+function partialParticipantsSupported() {
+  return !!(serverSupports && serverSupports.partial_participants);
+}
+
+/** The picker's data source, in ONE shape, from whatever the server sends.
+ *
+ * Today the capability report carries `selectable` with `as_source` /
+ * `as_target` / `usable` / `reason`; a per-stage frame is being added on the
+ * server side. Both are folded here so the list itself never has to know
+ * which one it got -- and an explicit `stages` block, when it arrives, wins
+ * over the derived flags.
+ */
+function normalizeLanguages(info) {
+  const byCode = new Map();
+  const add = (raw, fallbackUsable) => {
+    if (!raw || !raw.code) return;
+    const stages = raw.stages || {};
+    const asr = stages.asr !== undefined ? !!stages.asr : !!raw.as_source;
+    const tts = stages.tts !== undefined ? !!stages.tts : !!raw.as_target;
+    const usable = raw.usable !== undefined ? !!raw.usable : !!fallbackUsable;
+    const previous = byCode.get(raw.code);
+    byCode.set(raw.code, {
+      code: raw.code,
+      endonym: raw.endonym || (previous && previous.endonym) || raw.code,
+      english: raw.english || (previous && previous.english) || "",
+      asr: asr || (previous ? previous.asr : false),
+      tts: tts || (previous ? previous.tts : false),
+      usable: usable || (previous ? previous.usable : false),
+      reason: raw.reason || (previous && previous.reason) || "",
+    });
+  };
+  for (const entry of info.selectable || []) add(entry, false);
+  // A bidirectional language is by definition usable in both directions, so
+  // it is folded in even if it never appeared in `selectable`.
+  for (const entry of info.bidirectional || []) {
+    add({ ...entry, as_source: true, as_target: true, usable: true }, true);
+  }
+  return Array.from(byCode.values()).sort(
+    (a, b) => a.endonym.localeCompare(b.endonym)
+  );
+}
+
+function languageEntry(code) {
+  return catalogue.all.find((entry) => entry.code === code) || null;
+}
+
+function endonymOf(code) {
+  const found = languageEntry(code);
+  return (found && found.endonym) || code;
+}
+
+/** Languages this device picked before, most recent first (Google/DeepL do
+ *  this, and with a three-figure list it is the difference between two taps
+ *  and a scroll). Device-local: it is a convenience, not conversation state. */
+function recentLanguages() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("translator.recent") || "[]");
+    return Array.isArray(raw) ? raw.filter((c) => typeof c === "string") : [];
+  } catch (err) {
+    return [];
+  }
+}
+function rememberLanguage(code) {
+  try {
+    const list = [code].concat(recentLanguages().filter((c) => c !== code));
+    localStorage.setItem("translator.recent", JSON.stringify(list.slice(0, 6)));
+  } catch (err) { /* private mode; the list is a convenience */ }
+}
+
+function renderLangBar() {
+  const bar = el("langbar");
+  bar.innerHTML = "";
+  slots.forEach((code, index) => {
+    const button = document.createElement("button");
+    button.className = "lang" + (index === 1 ? " mine" : "");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = endonymOf(code);
+    const tag = document.createElement("span");
+    tag.className = "code";
+    tag.textContent = code;
+    button.append(name, tag);
+    button.onclick = () => openLanguageSheet(index);
+    bar.appendChild(button);
+    if (index === 0 && slots.length > 1) {
+      const swap = document.createElement("button");
+      swap.className = "swap ghost";
+      swap.innerHTML = ICON.swap;
+      swap.setAttribute("aria-label", "swap sides");
+      // Purely local: the server holds a set, so the order is only which side
+      // of the stream a language's bubbles land on. Instant, no reconnect.
+      swap.onclick = () => {
+        const first = slots[0];
+        slots[0] = slots[1];
+        slots[1] = first;
+        renderLangBar();
+        resideBubbles();
+      };
+      bar.appendChild(swap);
+    }
+  });
+  if (slots.length < 4) {
+    const add = document.createElement("button");
+    add.className = "addlang ghost";
+    add.innerHTML = ICON.plus;
+    add.setAttribute("aria-label", "add a language");
+    add.onclick = () => openLanguageSheet(-1);
+    bar.appendChild(add);
+  }
+}
+
+function resideBubbles() {
+  for (const node of streamBox().querySelectorAll(".line[data-line]")) {
+    const line = lineData.get(Number(node.dataset.line));
+    if (line) setSide(node, line.source_language);
+  }
+}
+
+/** The language picker: every language the deployment knows, searchable.
+ *
+ * The two big buttons stay -- that is the pattern every established mobile
+ * translator settled on -- but the LIST behind them is now the full
+ * capability report rather than the bidirectional pair. At a hundred entries
+ * a plain list is unusable on a phone, so it carries what Google and DeepL
+ * carry: a search field, and the languages this device used before at the
+ * top.
+ *
+ * Nothing is hidden. A language this deployment cannot hear or cannot speak
+ * is LISTED, with the missing stage named on the row -- "text only" is a fact
+ * the user is entitled to before choosing, not a surprise afterwards.
+ */
+function openLanguageSheet(index) {
+  const pane = el("pane-language");
+  pane.innerHTML = "";
+
+  const group = document.createElement("div");
+  group.className = "group";
+  const note = document.createElement("p");
+  note.textContent = "Changing the conversation languages starts a fresh "
+    + "session, because the routing is decided when the session opens.";
+  group.appendChild(note);
+
+  const search = document.createElement("input");
+  search.type = "text";
+  search.placeholder = "search " + catalogue.all.length + " languages";
+  search.setAttribute("aria-label", "search languages");
+  search.style.margin = "8px 0";
+  group.appendChild(search);
+
+  const list = document.createElement("div");
+  group.appendChild(list);
+
+  const row = (entry, recent) => {
+    const button = document.createElement("button");
+    const chosen = slots[index] === entry.code;
+    const taken = slots.indexOf(entry.code) >= 0 && !chosen;
+    const speakable = entry.tts;
+    const hearable = entry.asr;
+    // A language that cannot be a participant here is shown and explained,
+    // never silently dropped -- "es is not in the list" is unactionable.
+    const partial = partialParticipantsSupported();
+    const blocked = taken || (!entry.usable && !partial);
+    button.className = "listrow" + (chosen ? " on" : "");
+    button.disabled = taken;
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = entry.endonym
+      + (entry.english && entry.english !== entry.endonym
+         ? "  \u00b7  " + entry.english : "");
+    button.appendChild(name);
+    if (taken) {
+      const why = document.createElement("span");
+      why.className = "why";
+      why.textContent = "already in the conversation";
+      button.appendChild(why);
+    } else if (!speakable || !hearable) {
+      const why = document.createElement("span");
+      why.className = "why";
+      why.textContent = !speakable && !hearable ? "text only, and not heard"
+        : (!speakable ? "text only for this direction"
+                      : "cannot be recognised from speech");
+      button.appendChild(why);
+    }
+    if (recent) {
+      const tag = document.createElement("span");
+      tag.className = "code";
+      tag.textContent = "recent";
+      button.appendChild(tag);
+    }
+    const code = document.createElement("span");
+    code.className = "code";
+    code.textContent = entry.code;
+    button.appendChild(code);
+    button.onclick = () => {
+      if (blocked) {
+        // Named refusal, with the deployment's own reason. On a server that
+        // does not degrade, applying it would not fall back to text -- the
+        // session would refuse to open, and every other language chosen with
+        // it would go too.
+        sys(entry.endonym + " cannot be a conversation language on this "
+            + "deployment yet: " + (entry.reason || "a stage is missing")
+            + ". It is still available as a translation target in the "
+            + "language pairs.", true);
+        return;
+      }
+      if (!entry.usable && partial) {
+        // Chosen with a stage missing, on a server that degrades. Said BEFORE
+        // the first turn, because the alternative is a bubble that silently
+        // never gets a translation and a user who reads that as a hang.
+        sys(entry.endonym + " joins as far as this deployment goes: "
+            + (entry.reason || "a stage is missing")
+            + ". Turns it cannot serve are marked in the transcript.", false);
+      }
+      rememberLanguage(entry.code);
+      if (index < 0) slots.push(entry.code);
+      else slots[index] = entry.code;
+      closeSheet();
+      applyParticipants();
+    };
+    return button;
+  };
+
+  const heading = (text) => {
+    const head = document.createElement("h3");
+    head.textContent = text;
+    head.style.marginTop = "14px";
+    return head;
+  };
+
+  const paint = () => {
+    const needle = search.value.trim().toLowerCase();
+    const matches = (entry) => !needle
+      || entry.code.toLowerCase().indexOf(needle) >= 0
+      || entry.endonym.toLowerCase().indexOf(needle) >= 0
+      || String(entry.english).toLowerCase().indexOf(needle) >= 0;
+    list.innerHTML = "";
+    const shown = catalogue.all.filter(matches);
+    const recent = recentLanguages()
+      .map(languageEntry)
+      .filter((entry) => entry && matches(entry));
+    if (recent.length && !needle) {
+      list.appendChild(heading("recent"));
+      for (const entry of recent) list.appendChild(row(entry, true));
+      list.appendChild(heading("all languages"));
+    }
+    if (!shown.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No language matches " + search.value.trim() + ".";
+      list.appendChild(empty);
+      return;
+    }
+    for (const entry of shown) list.appendChild(row(entry, false));
+  };
+  search.addEventListener("input", paint);
+  paint();
+
+  if (index >= 0 && slots.length > 2) {
+    const remove = document.createElement("button");
+    remove.className = "listrow danger";
+    remove.innerHTML = "<span class='name'>remove this language</span>";
+    remove.onclick = () => {
+      slots.splice(index, 1);
+      closeSheet();
+      applyParticipants();
+    };
+    group.appendChild(remove);
+  }
+  pane.appendChild(group);
+  openSheet("language", index < 0 ? "add a language" : "language");
+}
+
+/** A participant change is a new conversation: reconnect with the new set. */
+function applyParticipants() {
+  renderLangBar();
+  if (slots.length < 2) { sys("pick at least two languages", true); return; }
+  connection.participants = slots.slice();
+  sys("languages: " + slots.join(", ") + " — reconnecting");
+  connection.sessionId = null;
+  connection.cursor = 0;
+  sessionStorage.setItem("translator.cursor", "0");
+  if (connection.ws) connection.ws.close();
+}
+
+// ---------------------------------------------------------------------------
+// Wiring.
+// ---------------------------------------------------------------------------
+const connection = new Connection({ onEvent });
+const microphone = new Microphone(
+  (frame) => connection.sendFrame(frame),
+  (peak) => { el("meter").firstElementChild.style.width =
+                Math.min(100, peak * 260) + "%"; },
+  (text, bad) => sys(text, bad),
+);
+
+// ---------------------------------------------------------------------------
+// Stopping the playback (user order).
+//
+// Two halves that do not depend on each other. The LOCAL half cuts what is
+// already on the output clock and is instant; the REMOTE half asks the server
+// to stop producing the rest of the turn. If the socket is down, the local
+// half still works -- which is the case that decides whether this button is
+// trusted.
+// ---------------------------------------------------------------------------
+//: Named by the server side, which is building the other half: it discards
+//: the frames it has planned, cancels the queue, aborts a running synthesis
+//: and answers with an ack. Kept as ONE constant, and the client's half is
+//: complete and useful before that half lands -- the local cut does not
+//: depend on it.
+const STOP_FRAME_KIND = "playback.stop";
+//: Turns whose playback the listener cut. Their remaining audio is kept for
+//: the replay button and never scheduled.
+const stoppedTurns = new Set();
+//: Set while a stop frame the server may not know yet is in flight, so its
+//: protocol complaint is not shown to the user as a fault of theirs.
+let stopFramePending = 0;
+//: The server's stop counter. Monotonic, and the cheap way to tell a frame
+//: that was already in flight when the stop happened from a fresh one.
+let stopEpoch = 0;
+
+function showStop() {
+  if (outputMode === "silent") return;
+  el("stopplay").classList.add("on");
+  document.body.classList.add("playing");
+}
+/** A conversation that has been reset or cleared has nothing left to resume. */
+function forgetStops() { stoppedTurns.clear(); }
+function hideStop() {
+  el("stopplay").classList.remove("on");
+  document.body.classList.remove("playing");
+}
+
+// ---------------------------------------------------------------------------
+// What each turn is DOING, on the bubble and above the thumb (user order).
+//
+// The complaint this answers: "you think it has long finished, then five
+// seconds later speech comes out -- while you are already talking again."
+// Full duplex is wanted; being invisible is not. So the state of every
+// unfinished turn is on its own line AND summarised in a strip that sits
+// inside the footer, which is the one region that stays in view while
+// recording.
+//
+// The seconds come from the OUTPUT CLOCK, not from the server: the schedule
+// already holds exactly how much speech is left, so the number is right
+// without a frame, and stays right if the socket drops mid-turn.
+// ---------------------------------------------------------------------------
+const turnWork = new Map();     // turn_id -> "translating"|"synthesizing"|...
+//: turn_id -> {units, spoken}. Fed by the server's per-unit speech states
+//: when they are live, and by the clause partials before that, so the count
+//: of sentences still to come is a count rather than an impression.
+const turnUnits = new Map();
+
+function noteUnit(turnId, unitIndex, spoken) {
+  if (!turnId) return;
+  let entry = turnUnits.get(turnId);
+  if (!entry) { entry = { units: 0, spoken: 0 }; turnUnits.set(turnId, entry); }
+  if (typeof unitIndex === "number") {
+    entry.units = Math.max(entry.units, unitIndex + 1);
+  } else {
+    entry.units += 1;
+  }
+  if (spoken) entry.spoken += 1;
+}
+
+/** Units named but not yet spoken, across every unfinished turn. */
+function outstandingUnits() {
+  let pending = 0;
+  for (const [turnId, entry] of turnUnits) {
+    if (!turnWork.has(turnId)) continue;
+    pending += Math.max(0, entry.units - entry.spoken);
+  }
+  return pending;
+}
+const WORK_LABEL = {
+  translating: "translating",
+  queued: "queued",
+  synthesizing: "being spoken",
+  speaking: "speaking",
+};
+
+function setTurnState(turnId, state) {
+  if (!turnId) return;
+  const was = turnWork.get(turnId);
+  // A turn never walks backwards: a late partial must not pull a turn that is
+  // already speaking back to "being spoken".
+  const rank = { translating: 0, queued: 1, synthesizing: 2, speaking: 3,
+                 done: 4 };
+  if (was && (rank[state] || 0) < (rank[was] || 0) && state !== "done") return;
+  if (state === "done") { turnWork.delete(turnId); turnUnits.delete(turnId); }
+  else turnWork.set(turnId, state);
+  const node = bubbles.get(turnId);
+  if (node) {
+    const badge = node.querySelector(".work");
+    if (badge) {
+      badge.hidden = state === "done";
+      badge.textContent = WORK_LABEL[state] || state;
+      badge.className = "tag work" + (state === "speaking" ? " ok" : " warn");
+    }
+  }
+  paintActivity();
+}
+
+/** The strip above the speaking controls: what is still coming, and for how
+ *  long. Its space is reserved even when empty, so it can never shift the
+ *  talk button under a thumb that is already moving. */
+function paintActivity() {
+  const strip = el("activity");
+  if (!strip) return;
+  const remaining = playback.remaining;
+  const speaking = playback.currentTurn && remaining > 0.15;
+  const others = Array.from(turnWork.keys())
+    .filter((id) => id !== playback.currentTurn).length;
+  const parts = [];
+  if (speaking) {
+    parts.push("speaking, about " + Math.max(1, Math.round(remaining)) + " s left");
+  } else if (turnWork.size) {
+    const active = turnWork.get(playback.currentTurn)
+      || turnWork.values().next().value;
+    parts.push(WORK_LABEL[active] || active);
+  }
+  if (others > 0) {
+    parts.push(others + " more turn" + (others === 1 ? "" : "s") + " to come");
+  }
+  const pending = outstandingUnits();
+  if (pending > 1) {
+    parts.push(pending + " sentences still to speak");
+  }
+  if (!parts.length) {
+    strip.classList.remove("on");
+    strip.textContent = "";
+    return;
+  }
+  strip.classList.add("on");
+  strip.classList.toggle("speaking", !!speaking);
+  strip.textContent = parts.join(" \u00b7 ");
+}
+
+/** Record on the line that its audio was cut short.
+ *
+ * On the bubble, not only in the header: the record must say which turn was
+ * cut, or a scrollback read later is misleading. Idempotent, because three
+ * paths reach it -- the local tap, the server's ack, and the journalled
+ * event that replays on a reconnect.
+ */
+function markStopped(turnId) {
+  if (!turnId) return;
+  stoppedTurns.add(turnId);
+  const node = bubbles.get(turnId);
+  if (!node) return;
+  node.classList.add("stopped");
+  const mark = node.querySelector(".stopmark");
+  if (mark) mark.hidden = false;
+  setTurnState(turnId, "done");
+  const line = node.dataset.line ? lineData.get(Number(node.dataset.line)) : null;
+  renderTools(node, line);
+}
+
+function stopPlayback() {
+  const turnId = playback.currentTurn;
+  const cut = playback.stopAll();
+  hideStop();
+  playback.currentTurn = null;
+  // Our own guess at which turn was speaking; the ack corrects it if the
+  // server aborted a different one.
+  markStopped(turnId);
+  setState(uiState === "recording" ? "recording" : "ready",
+           uiState === "recording" ? "recording" : "stopped");
+  // The remote half. Sent after the local cut, never before it. The server
+  // discards its queue, aborts the running synthesis and answers with an ack
+  // carrying the turn it aborted and how many queued turns went with it.
+  stopFramePending += 1;
+  connection.sendControl({ kind: STOP_FRAME_KIND, reason: "user" });
+  reportCapture("playback-stopped");
+  return cut;
+}
+
+el("stopplay").innerHTML = ICON.stop;
+el("stopplay").addEventListener("contextmenu", (e) => e.preventDefault());
+el("stopplay").onclick = stopPlayback;
+
+function updateLink() {
+  const open = connection.ws && connection.ws.readyState === WebSocket.OPEN;
+  const parts = [];
+  if (!open) parts.push("offline");
+  else if (connection.rttMs === null) parts.push("linked");
+  else parts.push(connection.rttMs + " ms");
+  if (open && connection.wireRate) {
+    parts.push(Math.round(connection.wireRate / 100) / 10 + " kHz");
+  }
+  el("link").textContent = parts.join(" · ");
+}
+
+/** Show the capture chain on screen AND put it in the server log.
+ *
+ * Both, deliberately: the person holding the phone cannot read the server
+ * log, and the person reading the log cannot see the phone. A defect that
+ * lives between the microphone and the socket is invisible to each of them
+ * alone -- which is exactly how the first two phone tests were spent.
+ */
+/** Three-valued: on, off, or "the browser would not say". */
+function flag(value) {
+  if (value === null || value === undefined) return "?";
+  return value ? "on" : "OFF";
+}
+
+function reportCapture(reason) {
+  const d = microphone.diagnostics();
+  d.reason = reason;
+  // The OUTPUT half. Capture telemetry alone cannot distinguish "the server
+  // sent no audio" from "the phone never played it", and that ambiguity is
+  // exactly what a real device kept running into: 53 audio events sent, no
+  // sound, and nothing in any log that could say which end was at fault.
+  const p = playback.diagnostics();
+  const box = el("diag");
+  if (box) {
+    box.textContent =
+      "build " + d.build + " | " + d.path + " | ctx " + d.context_state + " @" +
+      d.context_rate + " | track " + d.track_state +
+      (d.track_muted ? " MUTED" : "") + " @" + d.track_rate +
+      // What the track GOT, not what was asked for. A constraint dictionary
+      // with plain `true` is "ideal", so a browser may drop echo
+      // cancellation silently -- and then the answer to "why is my voice
+      // noisy" is on the device, not in our source.
+      " | aec " + flag(d.track_echo_cancellation) +
+      " ns " + flag(d.track_noise_suppression) +
+      " agc " + flag(d.track_auto_gain) +
+      " | worklet " + d.worklet_calls + " (" + d.worklet_empty + " empty, ch " +
+      d.worklet_channels + ") | chunks " + d.chunks + " | frames " + d.frames +
+      " | peak " + d.peak +
+      " || out " + p.state + " @" + p.rate + " t=" + p.current_time +
+      " pushed " + p.pushed + "/" + p.scheduled +
+      " dropped " + p.dropped + " replay-skipped " + p.skipped_replay +
+      " resume " + p.last_resume + (p.blocked ? " BLOCKED" : "");
+  }
+  connection.sendControl({ kind: "diag", capture: d, playback: p });
+  return d;
+}
+
+const talk = el("talk");
+let holding = false;
+let silentCapture = null;
+
+function setButtonLive(node, live) {
+  node.classList.toggle("live", live);
+  const label = node.querySelector(".lbl");
+  if (!label) return;
+  if (live) {
+    if (!node.dataset.idle) node.dataset.idle = label.textContent;
+    label.textContent = "tap to stop";
+  } else if (node.dataset.idle) {
+    label.textContent = node.dataset.idle;
+  }
+  const ico = node.querySelector(".ico");
+  if (ico) ico.innerHTML = live ? ICON.stop : ICON.mic;
+}
+
+async function beginTalking() {
+  if (holding) return;
+  holding = true;
+  // Output is unlocked HERE, before the first await. `await microphone.start()`
+  // ends the gesture's transient activation, and an output context started
+  // after that point stays suspended on a phone -- audio is pushed, nothing
+  // throws, nothing is heard. This line used to sit after the await.
+  playback.unlock();
+  try {
+    await microphone.start();
+  } catch (err) {
+    // A refused or unavailable microphone must SAY so. Without this the flag
+    // stayed true, the button never lit, and every later press was a silent
+    // no-op -- indistinguishable from a broken server.
+    holding = false;
+    sys("microphone unavailable: " + (err && err.message ? err.message : err),
+        true);
+    setState("nomic", "no microphone");
+    return;
+  }
+  playback.unlock();          // again, now that permission cannot be pending
+  acquireWakeLock();          // keep the screen alive for the conversation
+  microphone.setOpen(true);
+  setState("recording", "recording");
+  // If the capture graph is not actually producing frames, say so rather than
+  // recording nothing in a lit-up button. 700 ms is several worklet quanta at
+  // any sample rate the browser picks.
+  clearTimeout(silentCapture);
+  // Two stages. The first is early enough to still rescue the turn by
+  // switching capture paths; the second reports whatever the outcome was.
+  silentCapture = setTimeout(() => {
+    if (!holding) return;
+    const d = reportCapture("watchdog-400ms");
+    if (d.chunks === 0) {
+      // Nothing has reached the main thread at all. Whether the worklet is
+      // not running or is running empty, the ScriptProcessor path does not
+      // depend on either, so try it rather than losing the turn.
+      microphone.startFallback();
+    }
+    silentCapture = setTimeout(() => {
+      if (holding && microphone.sent() === 0) {
+        const after = reportCapture("watchdog-1500ms");
+        sys("no audio is arriving from the microphone (path " + after.path +
+            ", worklet calls " + after.worklet_calls + ", chunks " +
+            after.chunks + ")", true);
+        setState("nomic", "no microphone audio");
+      }
+    }, 1100);
+  }, 400);
+}
+
+function endTalking() {
+  if (!holding) return;
+  holding = false;
+  clearTimeout(silentCapture);
+  const sent = microphone.sent();
+  microphone.setOpen(false);
+  if (sent === 0) {
+    // A release with no audio produces no segment and therefore no turn. The
+    // server cannot distinguish it from a user who said nothing, so the
+    // client is the only place this can be reported.
+    reportCapture("release-empty");
+    sys("released without any audio -- nothing was sent for this turn", true);
+    setState("ready", "ready");
+  } else {
+    reportCapture("release-ok");
+    setState("working", "translating");
+  }
+  connection.sendControl({ kind: "release" });
+}
+
+/** Tap to speak, tap again to stop (user order, replaces press-and-hold).
+ *
+ * Holding was the original design and it lost to the platform: on Android a
+ * long press on any element is the text-selection gesture, so the press was
+ * cancelled mid-utterance and the user was left holding a selection handle.
+ * Tapping sidesteps the gesture entirely; the CSS hardening above stays
+ * anyway, because a button that can be "selected" is a bug in either model.
+ *
+ * A speaker button ARMS the server first (design 17.5), so the utterance
+ * skips identification rather than being identified and then overruled --
+ * overruling would still have folded the segment into the wrong centroid on
+ * the way past. The arming lasts exactly one utterance; the server clears it.
+ */
+let activeButton = null;
+let startedAt = 0;
+const MIN_TURN_MS = 300;
+
+function toggleTalk(node, speakerId) {
+  if (activeButton && activeButton !== node) {
+    // Switching speaker mid-recording ends the current turn rather than
+    // silently reattributing it.
+    stopTalk();
+  }
+  if (activeButton === node) {
+    if (Date.now() - startedAt < MIN_TURN_MS) {
+      // Named, not silent: a stray double tap would otherwise send an empty
+      // turn and look like the app ignoring the press.
+      sys("that was a double tap, still recording", false);
+      return;
+    }
+    stopTalk();
+    return;
+  }
+  if (speakerId) {
+    connection.sendControl({ kind: "speaker.arm", speaker_id: speakerId });
+  }
+  activeButton = node;
+  startedAt = Date.now();
+  setButtonLive(node, true);
+  beginTalking();
+}
+
+function stopTalk() {
+  const node = activeButton;
+  activeButton = null;
+  if (node) setButtonLive(node, false);
+  markArmed(null);
+  endTalking();
+}
+
+function bindTalkButton(node, speakerId) {
+  // Pointer events only, and the context menu is refused: both halves of the
+  // long-press gesture have to be closed or Android reopens it.
+  node.addEventListener("contextmenu", (e) => e.preventDefault());
+  node.addEventListener("selectstart", (e) => e.preventDefault());
+  node.addEventListener("pointerup", (e) => {
+    e.preventDefault();
+    if (node.dataset.renamed === "1") { node.dataset.renamed = "0"; return; }
+    toggleTalk(node, speakerId);
+  });
+}
+
+bindTalkButton(talk, null);
+talk.querySelector(".ico").innerHTML = ICON.mic;
+
+// ---------------------------------------------------------------------------
+// Segmented controls. Each one owns exactly one server-side setting and shows
+// the server's answer, so a refused switch snaps back visibly rather than
+// leaving the UI claiming something the session is not doing.
+// ---------------------------------------------------------------------------
+function segValue(id) {
+  const on = el(id).querySelector("button.on");
+  return on ? on.dataset.value : null;
+}
+function segSet(id, value) {
+  for (const button of el(id).children) {
+    button.classList.toggle("on", button.dataset.value === value);
+  }
+}
+function segBind(id, handler) {
+  for (const button of el(id).children) {
+    button.onclick = () => {
+      const previous = segValue(id);
+      if (previous === button.dataset.value) return;
+      segSet(id, button.dataset.value);
+      handler(button.dataset.value, previous);
+    };
+  }
+}
+
+segBind("segmode", async (value) => {
+  if (value === "vad") {
+    try {
+      await microphone.start();
+    } catch (err) {
+      sys("microphone unavailable: " + (err && err.message ? err.message : err),
+          true);
+      setState("nomic", "no microphone");
+      segSet("segmode", "ptt");
+      return;
+    }
+    playback.ensure();
+    acquireWakeLock();
+    microphone.setOpen(true);         // server-side VAD segments the stream
+    setTimeout(() => {
+      if (microphone.sent() === 0) {
+        sys("listening, but no audio is arriving from the microphone", true);
+        setState("nomic", "no microphone audio");
+      }
+    }, 1000);
+    talk.querySelector(".lbl").textContent = "listening (automatic)";
+    talk.disabled = true;
+  } else {
+    stopTalk();
+    microphone.setOpen(false);
+    talk.querySelector(".lbl").textContent = "tap to speak";
+    talk.dataset.idle = "tap to speak";
+    talk.disabled = false;
+  }
+});
+
+// Voice mode. Applies to the live session immediately; the server refuses
+// preset mode when no pool is loaded and the refusal is shown rather than
+// swallowed, because a toggle that appears to work and does not is worse than
+// one that is greyed out.
+segBind("segvoice", async (mode, previous) => {
+  if (!connection.sessionId) {
+    sys("no session yet", true); segSet("segvoice", previous); return;
+  }
+  try {
+    const response = await fetch(
+      BASE + "api/translator/sessions/" + connection.sessionId + "/voice",
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mode }) });
+    if (response.ok) {
+      sys("voice: " + mode);
+    } else {
+      const detail = await response.json().catch(() => ({}));
+      sys("voice mode refused: " + (detail.detail || response.status), true);
+      segSet("segvoice", previous);
+    }
+  } catch (err) {
+    sys("voice mode failed: " + err, true);
+    segSet("segvoice", previous);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Silence, which is the SAME THING as the reading mode (design 17.1).
+//
+// Checked at the code before being merged into one control rather than
+// assumed from the two orders' wording: `session.py:1505` reads the session's
+// output mode, and `speak()` returns at `session.py:1538` -- before the
+// `tts.synthesize` call at :1553. So in `silent` the synthesis is never
+// computed, which is exactly what the mute order asks for, and everything
+// upstream of it (recognition, identification, routing, translation, the
+// reference buffers) keeps running. One server state, therefore one control.
+//
+// It survives a reload because it lives in `state()` (`session.py:545`) and
+// this client renders that state on every handshake -- it is not stored here.
+// ---------------------------------------------------------------------------
+let outputMode = "voice";
+
+function setOutputMode(mode, tell) {
+  outputMode = mode === "silent" ? "silent" : "voice";
+  const muted = outputMode === "silent";
+  const button = el("mute");
+  button.innerHTML = muted ? ICON.muted : ICON.speaker;
+  button.classList.toggle("muted", muted);
+  button.setAttribute("aria-label",
+    muted ? "translations are written only" : "translations are spoken aloud");
+  button.title = muted ? "muted - tap to speak translations aloud"
+                       : "spoken aloud - tap to mute";
+  const note = el("outputnote");
+  if (note) {
+    note.textContent = muted
+      ? "Muted. The whole pipeline still runs and only the synthesis is "
+        + "skipped, so the transcript and the voice references keep filling. "
+        + "The speaker icon in the header switches it back."
+      : "Translations are spoken aloud. The speaker icon in the header mutes "
+        + "them; muting skips the synthesis entirely rather than turning the "
+        + "volume down, so nothing is computed that nobody will hear.";
+  }
+  if (muted) {
+    // Nothing further will be synthesized, but a turn already on the clock
+    // would keep talking through the switch -- which reads as a mute that
+    // does not mute.
+    playback.stopAll();
+    hideStop();
+  }
+  if (tell) {
+    sys(muted ? "muted: translations are written, not spoken"
+              : "translations are spoken again");
+  }
+}
+
+el("mute").onclick = () => {
+  const next = outputMode === "silent" ? "voice" : "silent";
+  // Painted immediately, then corrected by the server's own answer if it
+  // refuses -- the control must not feel dead for a round trip.
+  setOutputMode(next, false);
+  connection.sendControl({ kind: "output.mode", mode: next });
+};
+
+segBind("segroute", async (value) => {
+  const manual = value === "manual";
+  el("routing").style.display = manual ? "block" : "none";
+  if (manual && !routing.rows.length) {
+    routing.rows.push({ a: "", b: "" });
+    renderPairs();
+  }
+  if (!manual) await sendPairs([]);
+});
+
+el("gear").onclick = () => openSheet("settings", "settings");
+el("sheetclose").onclick = closeSheet;
+el("scrim").onclick = closeSheet;
+el("theme").onclick = () => {
+  const next = document.documentElement.dataset.theme === "light"
+    ? "dark" : "light";
+  applyTheme(next);
+  try { localStorage.setItem("translator.theme", next); } catch (err) { /* private mode */ }
+};
+el("unblock").onclick = () => {
+  // The tap IS the fix: an output context may only start on a user gesture.
+  playback.unlock();
+  playback.blocked = false;
+  connection.warnedBlocked = false;
+  el("blocked").classList.remove("on");
+  setState("ready", "ready");
+};
+
+el("copytranscript").onclick = async () => {
+  const text = transcriptText();
+  if (!text) { sys("nothing to copy yet"); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    sys("transcript copied");
+  } catch (err) {
+    // Clipboard access can be refused; a selectable field is the fallback
+    // that always works.
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.cssText = "position:fixed;opacity:0";
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (inner) { ok = false; }
+    area.remove();
+    sys(ok ? "transcript copied" : "the browser refused the clipboard", !ok);
+  }
+};
+
+el("cleartranscript").onclick = async () => {
+  closeSheet();
+  const ok = await askConfirm(
+    "clear the transcript?",
+    "Every line of this conversation is deleted on the server. The speakers, "
+    + "their names and their voice references stay.", "clear");
+  if (!ok) return;
+  connection.sendControl({ kind: "transcript.clear" });
+};
+
+// The reset (design 19.3b). Effective on the SERVER, not only on screen:
+// dropping the session takes the transcript, every speaker profile with its
+// references and names, and any queued turn with it, and the reconnect that
+// follows mints a fresh session id.
+el("reset").onclick = async () => {
+  closeSheet();
+  const ok = await askConfirm(
+    "reset the conversation?",
+    "This deletes the transcript, every speaker with their names and voice "
+    + "references, and any turn still waiting. A new session starts "
+    + "immediately. It cannot be undone.", "reset");
+  if (!ok) return;
+  const id = connection.sessionId;
+  // Stop the reconnect from racing the delete: the socket closing would
+  // otherwise re-create the very session we are removing.
+  connection.closedByUser = true;
+  if (connection.ws) { try { connection.ws.close(); } catch (err) { /* gone */ } }
+  if (id) {
+    try {
+      await fetch(BASE + "api/translator/sessions/" + id, { method: "DELETE" });
+    } catch (err) {
+      sys("the server did not confirm the reset: " + err, true);
+    }
+  }
+  clearStream();
+  el("chips").innerHTML = "";
+  audioStore.clear();
+  forgetStops();
+  playback.stopAll();
+  hideStop();
+  renderSpeakers([]);
+  connection.sessionId = null;
+  connection.cursor = 0;
+  sessionStorage.removeItem("translator.session");
+  sessionStorage.setItem("translator.cursor", "0");
+  sys("reset: a new conversation has started");
+  connection.connect();
+};
+
+// Screen-off operation is the known PWA wall: Android suspends a backgrounded
+// page's AudioContext and no web API overrides that. A wake lock keeps the
+// screen on while the app is in use, which makes screen-on the MVP's stated
+// constraint rather than an unexplained failure. Losing the lock is not an
+// error -- it is released automatically when the page hides.
+let wakeLock = null;
+async function acquireWakeLock() {
+  if (!("wakeLock" in navigator) || wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch (err) {
+    sys("screen wake lock unavailable; the screen may sleep mid-conversation");
+  }
+}
+
+el("enroll").addEventListener("click", async () => {
+  closeSheet();
+  sys("enrolment: speak for 15 seconds, starting now");
+  try {
+    await microphone.start();
+  } catch (err) {
+    sys("microphone unavailable: " + (err && err.message ? err.message : err),
+        true);
+    return;
+  }
+  const collected = [];
+  const capture = (frame) => collected.push(new Uint8Array(frame));
+  const original = microphone.onFrame;
+  microphone.onFrame = capture;
+  microphone.setOpen(true);
+  setState("recording", "enrolling");
+  setTimeout(async () => {
+    microphone.setOpen(false);
+    microphone.onFrame = original;
+    setState("ready", "ready");
+    let total = 0;
+    collected.forEach((c) => (total += c.length));
+    const merged = new Uint8Array(total);
+    let at = 0;
+    for (const c of collected) { merged.set(c, at); at += c.length; }
+    let binary = "";
+    for (let i = 0; i < merged.length; i++) binary += String.fromCharCode(merged[i]);
+    try {
+      const response = await fetch(
+        BASE + "api/translator/enroll/" + connection.sessionId,
+        { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            label: "user",
+            audio: { encoding: "pcm16", sample_rate: PIPELINE_RATE,
+                     data: btoa(binary) },
+          }) });
+      sys(response.ok ? "enrolled your voice" : "enrolment failed",
+          !response.ok);
+    } catch (err) {
+      sys("enrolment failed: " + err, true);
+    }
+  }, 15000);
+});
+
+// Fake backends must announce themselves. A tester who does not know the
+// recognizer is a stub reads the resulting nonsense as "the translator is
+// broken", which wastes their time and mine. The banner names exactly which
+// stages are stubbed rather than saying "demo mode", because a partially real
+// stack is the normal state during bring-up.
+function announceFakeBackends(backends) {
+  const stubbed = Object.entries(backends || {})
+    .filter(([, name]) => String(name).startsWith("fake"))
+    .map(([stage]) => stage);
+  if (!stubbed.length) return;
+  const box = el("demo");
+  box.innerHTML =
+    "<b>Transport test build.</b> These stages are stubs, not real models: "
+    + "<b>" + stubbed.join(", ") + "</b>. "
+    + "Connection, tap-to-talk, reconnect and the UI are real and worth "
+    + "testing. Transcripts and audio are placeholders — nonsense output "
+    + "here is expected and is not a translator fault.";
+  box.classList.add("on");
+}
+
+// ---------------------------------------------------------------------------
+// Routing: a set of UNORDERED language pairs.
+// ---------------------------------------------------------------------------
+// One row is one relationship, both directions. A language appearing in two
+// rows FANS OUT -- the utterance is rendered in both, played one after the
+// other -- which is why the note below turns into a latency warning rather
+// than an error: fan-out is what the user asked for, it just costs a second
+// synthesis per extra target.
+//
+// The dropdowns are built from the capability endpoint's `selectable` list, so
+// a language this deployment cannot run appears GREYED OUT WITH ITS REASON
+// instead of quietly missing. "es is not in the list" is unactionable;
+// "es -- TTS cannot speak it" tells the user which checkpoint is the problem.
+const routing = { rows: [] };
+
+function languageOptions(select, chosen) {
+  select.innerHTML = "";
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "—";
+  select.appendChild(blank);
+  for (const entry of catalogue.selectable) {
+    const option = document.createElement("option");
+    option.value = entry.code;
+    option.textContent = entry.endonym + " (" + entry.code + ")"
+      + (entry.usable ? "" : " — " + entry.reason);
+    option.disabled = !entry.usable;
+    option.selected = entry.code === chosen;
+    select.appendChild(option);
+  }
+}
+
+function renderPairs() {
+  const box = el("pairs");
+  box.innerHTML = "";
+  routing.rows.forEach((row, index) => {
+    const line = document.createElement("div");
+    line.className = "pair";
+    const left = document.createElement("select");
+    const arrows = document.createElement("span");
+    arrows.className = "arrows";
+    arrows.textContent = "↔";
+    const right = document.createElement("select");
+    languageOptions(left, row.a);
+    languageOptions(right, row.b);
+    left.addEventListener("change", () => { row.a = left.value; describeRouting(); });
+    right.addEventListener("change", () => { row.b = right.value; describeRouting(); });
+    const drop = document.createElement("button");
+    drop.className = "small";
+    drop.textContent = "−";
+    drop.title = "remove this pair";
+    drop.addEventListener("click", () => {
+      routing.rows.splice(index, 1);
+      renderPairs();
+    });
+    line.append(left, arrows, right, drop);
+    box.appendChild(line);
+  });
+  describeRouting();
+}
+
+function describeRouting() {
+  const note = el("routingnote");
+  const counts = {};
+  let complete = 0;
+  for (const row of routing.rows) {
+    if (!row.a || !row.b || row.a === row.b) continue;
+    complete += 1;
+    counts[row.a] = (counts[row.a] || 0) + 1;
+    counts[row.b] = (counts[row.b] || 0) + 1;
+  }
+  const fanned = Object.entries(counts).filter(([, n]) => n > 1);
+  if (!complete) {
+    note.className = "";
+    note.textContent = "No complete pair yet. With none applied the system "
+      + "routes automatically over the conversation languages.";
+    return;
+  }
+  if (!fanned.length) {
+    note.className = "";
+    note.textContent = complete + " pair" + (complete === 1 ? "" : "s")
+      + ", both directions each.";
+    return;
+  }
+  note.className = "warn";
+  note.textContent = fanned
+    .map(([code, n]) => code + " → " + n + " languages")
+    .join("; ")
+    + ". Each extra target is a second translation and synthesis, played "
+    + "after the first — so a turn takes noticeably longer than with a "
+    + "single pair.";
+}
+
+el("addpair").addEventListener("click", () => {
+  routing.rows.push({ a: "", b: "" });
+  renderPairs();
+});
+
+el("applypairs").addEventListener("click", async () => {
+  const pairs = routing.rows
+    .filter((row) => row.a && row.b && row.a !== row.b)
+    .map((row) => ({ a: row.a, b: row.b }));
+  await sendPairs(pairs);
+});
+
+async function sendPairs(pairs) {
+  if (!connection.sessionId) { sys("not connected yet", true); return; }
+  try {
+    const response = await fetch(
+      BASE + "api/translator/sessions/" + connection.sessionId + "/routing",
+      { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pairs }) });
+    if (!response.ok) {
+      let detail = "routing rejected";
+      try { detail = (await response.json()).detail || detail; } catch (err) { /* no body */ }
+      sys(detail, true);
+      return;
+    }
+    const state = await response.json();
+    sys(state.routing_mode === "manual"
+      ? "routing: " + state.routing_pairs.map((p) => p.a + "↔" + p.b).join(", ")
+      : "routing: automatic");
+  } catch (err) {
+    sys("routing failed: " + err, true);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server state -> surface. Everything the session holds is rendered from the
+// session, so a reconnect or a second device shows what is actually in force
+// rather than what this page last set.
+// ---------------------------------------------------------------------------
+function applyState(state) {
+  if (!state) return;
+  // Read BEFORE the roster is painted: the merge drag is only bound when the
+  // running server can carry it out (see `serverSupports`).
+  if (state.supports) serverSupports = state.supports;
+  if (state.speakers) renderSpeakers(state.speakers);
+  if (state.armed_speaker !== undefined) markArmed(state.armed_speaker);
+  if (state.voice_mode) segSet("segvoice", state.voice_mode);
+  if (state.output_mode) setOutputMode(state.output_mode, false);
+  if (state.routing_mode) {
+    segSet("segroute", state.routing_mode);
+    el("routing").style.display = state.routing_mode === "manual"
+      ? "block" : "none";
+    if (state.routing_mode === "manual" && Array.isArray(state.routing_pairs)) {
+      routing.rows = state.routing_pairs.map((p) => ({ a: p.a, b: p.b }));
+      renderPairs();
+    }
+  }
+  if (Array.isArray(state.participants) && state.participants.length) {
+    // Keep the user's chosen order for languages that are still there; a
+    // swap must not be undone by every state frame.
+    const kept = slots.filter((code) => state.participants.indexOf(code) >= 0);
+    for (const code of state.participants) {
+      if (kept.indexOf(code) < 0) kept.push(code);
+    }
+    if (kept.join(",") !== slots.join(",")) {
+      slots = kept;
+      renderLangBar();
+      resideBubbles();
+    }
+  }
+}
+
+function onEvent(event) {
+  switch (event.kind) {
+    case "ready":
+    case "state":
+    case "session.ready":
+    case "session.state":
+      applyState(event.state);
+      break;
+    case "transcript":
+      applyTranscript({ lines: event.lines, replace: true });
+      break;
+    case "transcript.line":
+    case "transcript.update":
+    case "line.resolved":
+      renderLine(event.line);
+      break;
+    case "transcript.cleared":
+      clearStream();
+      forgetStops();
+      sys("transcript cleared");
+      break;
+    case "speaker.suggestion":
+      chip(event);
+      // An `applied` suggestion is a rename that already happened (design
+      // 17.3b: a self-introduction applies rather than queueing). The event
+      // carries no roster, so the roster is asked for.
+      if (event.applied) refreshRoster();
+      break;
+    case "suggestion.applied":
+      refreshRoster();
+      break;
+    case "speaker.deleted":
+      sys("deleted " + (event.label || event.speaker_id)
+          + " (" + event.reference_seconds_released + "s of voice reference)",
+          false);
+      applyState(event.state);
+      break;
+    case "speaker.merged":
+      // The reattributed lines arrive as ordinary transcript updates and have
+      // already repainted themselves; this only says what happened and takes
+      // the new roster. Said out loud because a merge is destructive and the
+      // count is the one number that tells the user it did what they meant.
+      sys("merged into " + (event.label || event.target_id) + " — "
+          + event.lines_reattributed + " line"
+          + (event.lines_reattributed === 1 ? "" : "s") + " re-attributed",
+          false);
+      applyState(event.state);
+      break;
+    case "speaker.added":
+    case "name.undone":
+      applyState(event.state);
+      if (!event.state) refreshRoster();
+      break;
+    // Whatever the server side settles on for "this speaker changed", it
+    // lands here: with a roster it is applied, without one it is asked for.
+    case "speaker.updated":
+    case "speaker.renamed":
+      if (event.state) applyState(event.state);
+      else refreshRoster();
+      break;
+    case "speaker.named":
+      refreshRoster();
+      break;
+    case "speaker.armed":
+      markArmed(event.speaker_id);
+      break;
+    case "output.mode":
+      // The server's answer is the truth; the optimistic paint above is only
+      // a guess until this arrives, and a refusal corrects it here.
+      setOutputMode(event.mode, event.mode !== outputMode);
+      break;
+    case "turn.opened":
+      setState("working", "translating");
+      setTurnState(event.turn_id, "translating");
+      break;
+    // Per-unit synthesis state, one frame per transition in the worker. It
+    // REFINES what the clock and the clause partials already show -- it does
+    // not replace them, because the clock is the only thing that knows when
+    // the listener has actually heard the tail, and it keeps working when
+    // this frame does not arrive at all.
+    case "turn.speech": {
+      const spoken = event.state === "spoken";
+      noteUnit(event.turn_id, event.unit_index, spoken);
+      if (event.state === "queued") setTurnState(event.turn_id, "queued");
+      else if (event.state === "synthesizing") {
+        setTurnState(event.turn_id, "synthesizing");
+      } else if (spoken && !playback.busy) {
+        // The server has handed over the last unit and nothing is left on the
+        // clock: only then is the turn finished from where the listener sits.
+        const entry = turnUnits.get(event.turn_id);
+        if (entry && entry.spoken >= entry.units) {
+          setTurnState(event.turn_id, "done");
+        }
+      }
+      paintActivity();
+      break;
+    }
+    case "turn.transcript": {
+      if (event.empty) {
+        sys("nothing was recognised in that turn (" + event.reason + ")", true);
+        setState("ready", "ready");
+        break;
+      }
+      const node = bubbleFor(event.turn_id);
+      node.querySelector(".src").textContent = event.text;
+      node.querySelector(".lang").textContent = event.language || "";
+      node.dataset.lang = event.language;
+      setSide(node, event.language);
+      renderTools(node, null);
+      break;
+    }
+    case "turn.speaker": {
+      const node = bubbleFor(event.turn_id);
+      node.dataset.speaker = event.speaker_id;
+      // A voice the row does not know yet gets a button, so the correction
+      // is available on the very next utterance rather than a turn later.
+      if (!knownSpeakers.some((sp) => sp.speaker_id === event.speaker_id)) {
+        // Optimistic, so the correction is available on the very next
+        // utterance -- and then reconciled against the session, which stays
+        // the only authority on who exists and what they are called.
+        renderSpeakers(
+          knownSpeakers.concat([{ speaker_id: event.speaker_id, label: null }])
+        );
+        refreshRoster();
+      }
+      paintSpeaker(node, event.speaker_id, null);
+      break;
+    }
+    case "turn.voice": {
+      const node = bubbleFor(event.turn_id);
+      const tag = node.querySelector(".voice");
+      tag.hidden = false;
+      if (event.output_mode === "silent") {
+        tag.textContent = "reading mode";
+      } else {
+        tag.textContent = event.mode === "preset"
+          ? (event.preset_label || event.preset) : "own voice";
+      }
+      // A downgrade or a shared base voice is a real quality change and the
+      // listener is told, rather than left to wonder why someone sounds
+      // different from last turn.
+      if (event.downgraded) node.classList.add("borrowed");
+      if (event.notice) sys(event.notice, true);
+      break;
+    }
+    case "turn.queued": {
+      // One synthesizer serves every conversation, so a turn can be waiting
+      // rather than working. Saying which is the whole point: a queue nobody
+      // can see is indistinguishable from a translator that has frozen.
+      // Written into the translation slot, so the translation itself clears
+      // it -- no timer, no second event to miss.
+      const dst = bubbleFor(event.turn_id).querySelector(".dst");
+      if (!dst.textContent) {
+        dst.textContent = "waiting - another turn is being spoken";
+        dst.className = "dst waiting";
+      }
+      // Short on purpose: the header pill shares one row with the
+      // settings control, and a sentence there costs the user a button.
+      setState("queued", "queued");
+      setTurnState(event.turn_id, "queued");
+      break;
+    }
+    case "turn.translation": {
+      // PARTIALS ARE THE POINT, and this line used to be `if (event.partial)
+      // break;` -- inherited from the surface before the server decoupled its
+      // text. The server emits one event per clause as the translation is
+      // produced, 2.6 to 5.8 s ahead of the audio, and every one of them was
+      // dropped: the bubble sat on "translating" until the FINAL event, which
+      // the server only sends after the audio worker has drained. So the user
+      // watched a placeholder until the sentence had already been spoken --
+      // the text was early and the screen was late.
+      //
+      // A partial carries ONE clause, not the text so far, so they are
+      // accumulated in the order they arrive; the final non-partial carries
+      // the whole joined text and replaces the accumulation, which keeps the
+      // server the authority on the finished line.
+      if (event.empty) {
+        sys("not translated: " + event.reason, true);
+        setState("ready", "ready");
+        break;
+      }
+      const node = bubbleFor(event.turn_id);
+      const dst = node.querySelector(".dst");
+      if (dst.classList.contains("waiting")) { dst.textContent = ""; }
+      dst.className = "dst";
+      let row = dst.querySelector('[data-target="' + event.target + '"]');
+      if (!row) {
+        row = document.createElement("div");
+        row.className = "tr";
+        row.dataset.target = event.target || "";
+        const code = document.createElement("span");
+        code.className = "code";
+        code.textContent = event.target || "";
+        const text = document.createElement("span");
+        text.className = "txt";
+        row.append(code, text);
+        dst.appendChild(row);
+      }
+      const txt = row.querySelector(".txt");
+      if (event.partial) {
+        // Joined with a space, the same way the server joins its pieces for
+        // the final event, so the growing line and the finished one read
+        // identically rather than reflowing at the end.
+        const grown = (row.dataset.partial ? row.dataset.partial + " " : "")
+          + String(event.text || "").trim();
+        row.dataset.partial = grown;
+        txt.textContent = grown;
+        row.classList.add("growing");
+        noteUnit(event.turn_id, null, false);
+        // The talker is already working on the first clause by the time its
+        // text lands, so this is "being spoken", not "still translating".
+        setTurnState(event.turn_id, "synthesizing");
+      } else {
+        txt.textContent = event.text;
+        row.classList.remove("growing");
+        delete row.dataset.partial;
+      }
+      break;
+    }
+    case "turn.unrouted": {
+      // The turn was understood and deliberately not translated. Saying so is
+      // the difference between a configuration problem and a dead app.
+      const node = bubbleFor(event.turn_id);
+      const dst = node.querySelector(".dst");
+      dst.className = "dst waiting";
+      dst.textContent = "not translated — " + (event.reason || "no route");
+      setTurnState(event.turn_id, "done");
+      break;
+    }
+    case "turn.done": {
+      if (event.fallback_voice) bubbleFor(event.turn_id).classList.add("borrowed");
+      // `turn.done` means the SERVER is finished, not that the listener has
+      // heard it: the tail is still on the output clock. The ticker retires
+      // the turn when the clock actually drains -- which is the whole point
+      // of the order, because "it looked finished and then kept talking" is
+      // exactly this gap.
+      setTurnState(event.turn_id,
+                   playback.busy ? "speaking" : "done");
+      if (uiState !== "recording") {
+        setState(playback.busy ? "speaking" : "ready",
+                 playback.busy ? "speaking" : "ready");
+      }
+      break;
+    }
+    case "turn.dropped":
+      sys("dropped a queued turn (" + event.reason + ")", true);
+      setTurnState(event.turn_id, "done");
+      break;
+    case "resume.gap":
+      sys("some turns were lost while offline", true);
+      break;
+    // The ACK. Confirmation, not precondition: the audio was already cut when
+    // the frame went out, so nothing here has to happen for the button to
+    // have worked. What it adds is the server's own account -- which turn it
+    // aborted (ours was a guess from the last frame seen) and how many queued
+    // turns went with it, which is a real loss and therefore said out loud.
+    case "playback.stop.ack":
+      stopFramePending = Math.max(0, stopFramePending - 1);
+      stopEpoch = Math.max(stopEpoch, Number(event.stop_epoch) || 0);
+      markStopped(event.aborted_turn_id);
+      if (event.dropped_queued) {
+        sys("stopped: " + event.dropped_queued + " queued turn"
+            + (event.dropped_queued === 1 ? "" : "s") + " dropped with it");
+      }
+      break;
+    // The journalled event. Unlike the ack this REPLAYS, so it also arrives
+    // on a reconnect -- which is what makes a stop survive in the record
+    // rather than being something only the tab that did it remembers.
+    case "playback.stopped":
+      stopEpoch = Math.max(stopEpoch, Number(event.stop_epoch) || 0);
+      markStopped(event.aborted_turn_id);
+      break;
+    case "error":
+      // A protocol complaint about the stop frame is OUR problem, not the
+      // user's: the client half shipped first, and the local cut already
+      // happened. Swallow exactly one such complaint per frame sent, and
+      // nothing else -- an error that is merely inconvenient must still be
+      // shown, or this becomes the hole every later defect hides in.
+      if (event.stage === "protocol" && stopFramePending > 0
+          && String(event.message || "").indexOf(STOP_FRAME_KIND) >= 0) {
+        stopFramePending -= 1;
+        break;
+      }
+      sys(event.stage + ": " + event.message, true);
+      break;
+  }
+}
+
+// The language set is filled from the server's runtime-derived capability
+// report. No language is written into this page: what the deployment can do
+// is whatever the intersection of its backends says it can do.
+fetch(BASE + "api/translator/languages").then((r) => r.json()).then((info) => {
+  announceFakeBackends(info.backends);
+  catalogue.bidirectional = info.bidirectional || [];
+  catalogue.selectable = info.selectable || [];
+  // ONE normalized list feeds the picker, whatever shape the capability
+  // report arrives in. Every language any stage knows is in it -- the picker
+  // marks what is missing rather than hiding the entry, because "es is not in
+  // the list" is unactionable and "es -- TTS cannot speak it" is not.
+  catalogue.all = normalizeLanguages(info);
+  slots = (info.default_participants || []).slice();
+  renderLangBar();
+  if (!info.default_participants_supported) {
+    sys("default pair unsupported: " + info.default_participants_error, true);
+  }
+  talk.disabled = false;
+}).catch(() => sys("could not read the language set", true));
+
+document.addEventListener("visibilitychange", () => {
+  // Backgrounding a PWA suspends its AudioContext on Android. Nothing here can
+  // prevent that; the reconnect path picks the conversation back up when the
+  // page returns. Lock-screen operation needs a native client.
+  if (!document.hidden) {
+    acquireWakeLock();
+    if (connection.ws && connection.ws.readyState !== WebSocket.OPEN) {
+      connection.connect();
+    }
+  }
+});
+
+// The speaking state has no event of its own -- the output clock is the only
+// thing that knows when the last buffer has been heard. Polled, cheaply,
+// rather than guessed from a timer per turn.
+let tick = 0;
+setInterval(() => {
+  tick += 1;
+  if (uiState === "speaking" && !playback.busy) setState("ready", "ready");
+  // A turn is finished when the LISTENER has heard it, which only the output
+  // clock knows. `turn.done` arrives while the tail is still scheduled, and
+  // treating that as finished is precisely the "it looked done and then kept
+  // talking" the order is about.
+  if (!playback.busy) {
+    for (const [turnId, state] of Array.from(turnWork)) {
+      if (state === "speaking") setTurnState(turnId, "done");
+    }
+    playback.currentTurn = null;
+  }
+  paintActivity();
+  // The stop control exists exactly as long as there is something to stop --
+  // including while the microphone is open, because a listener who starts
+  // talking over the playback is precisely the person who wants it cut.
+  if (playback.busy && outputMode !== "silent") showStop();
+  else hideStop();
+  // The link measurement is a background reading, not a heartbeat: once every
+  // fifth tick is plenty and keeps the socket quiet.
+  if (tick % 5 === 0 && (uiState === "ready" || uiState === "speaking")) {
+    connection.ping();
+  }
+}, 1000);
+
+initTheme();
+watchStream();
+setOutputMode("voice", false);
+paintActivity();
+el("gear").innerHTML = ICON.gear;
+el("sheetclose").innerHTML = ICON.close;
+updateLink();
+renderSpeakers([]);
+connection.connect();
+</script>

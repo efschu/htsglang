@@ -2200,6 +2200,85 @@ its own port (`registry/adapters/class1_srt.py:220-241`, `build_argv` at
 `:279-290`) and its demotion actuator refuses an engine it did not start
 (`:411-415`); the #274 dual-group lane is a second GROUP over the SAME tensors
 by `data_ptr` identity (`dual_group_lane.py:15-27`), not a second model.
+Live speech-to-speech translator (#466, `srt/translator/`, DESIGN_466):
+voice-preserving cascade — VAD/turn segmenter -> streaming ASR with in-pass
+language ID -> speaker embedding + incremental clustering -> MT **through our
+own OpenAI endpoint** (the dogfood hop; nothing imports `srt` internals) ->
+zero-shot cross-lingual cloning TTS. Own process, own CUDA context, NVML-UUID
+card pin, absolute MiB budget — the same Class-3 escape hatch `video_enhance`
+took, because DESIGN_333 §2.3's Class-3 scheduler does not exist yet. Every
+model it loads is an in-process `nn.Module` registered as the `audio_modules`
+asset class in the #286 ledger (parkable, evictable): ONE RUNTIME, no second
+serving engine.
+**The language pair is never in the code**: the supported set is derived at
+runtime as ASR x MT x TTS (`/api/translator/languages` also returns the
+per-stage sets, so a missing language is attributable to a checkpoint rather
+than merely absent), and routing is elimination over a conversation's
+participant set — falsified both behaviourally (`ja<->fr` drives the same
+code) and by AST inspection of the deciding modules. Voice is a per-session
+mode: `clone` (each speaker's own voice from a two-slot reference buffer —
+fixed 6 s enrollment anchor + rolling 6 s recent prompt, recency-decayed
+quality scoring) or `preset` (sticky, F0-class-matched artificial voice from
+an 18-voice pool; on exhaustion a shared base voice with a deterministic
+semitone offset and a named notice, never a silent duplicate). Preset is also
+the auto-downgrade for an unclonable speaker — preferred over borrowing
+another participant's voice, which would attribute words to the wrong person.
+Reconnect is first-class: append-only journal with monotonic sequence numbers,
+byte-budgeted audio eviction that keeps the *events*, explicit `resume.gap`,
+and a session that outlives its socket so the reference buffers survive a
+roaming dropout. Client is a single-file PWA (no build, no external asset;
+getUserMedia AEC/NS/AGC is what dissolves the half-duplex feedback loop).
+Real TTS is Qwen3-TTS-12Hz-0.6B driven IN PROCESS (`inprocess_tts.py`,
+rung B of DESIGN_466 §12) -- the vLLM-Omni HTTP sidecar is REVOKED under the
+one-runtime law, and the `transformers` pin that appeared to force a second
+venv turned out to be conservative: seven measured 4.57->5.12 drifts, all in
+`qwen3_tts_compat.py`. Two of them are the kind worth knowing about, because
+neither fails loudly: 5.x stopped creating `cache_position` (which the talker
+branches on to tell prefill from decode, so every decode step got
+cache-length M-RoPE positions for a one-token query), and `from_pretrained`
+reported loading 478 tensors while loading NONE -- a randomly initialised
+talker in front of a trained vocoder emits fluent babble that no cheap signal
+distinguishes from a working model, so `verify_and_load_weights` compares a
+strided sample of every tensor against the checkpoint BYTES on every load and
+refuses to run rather than sound plausible. The language set is read from the
+checkpoint's own `talker_config.codec_language_id`. Transport is Opus ~24 kbps
+(measured 23.8 kbps) with a pcm16 floor. Segments are re-cut at intra-segment
+speaker changes BEFORE recognition, so two people in one VAD segment cannot
+poison each other's reference buffer. Manual routing is a set of UNORDERED
+language pairs: one row routes both directions, two rows sharing a language
+FAN OUT (one utterance rendered into every partner language, sequentially
+tagged), a repeated pair deduplicates, capability refusal is named per pair
+and per direction, and the table's languages become the recognizer's
+constrained-detection candidate set -- the source language is still
+identified, never configured, and a weak decision resolves to the best in-set
+language TAGGED rather than discarded. Desk state: 273 hermetic tests under
+`CUDA_VISIBLE_DEVICES=99` plus a live boot smoke, and an executed audio-out
+run -- real German reference clip -> Spanish in that voice, 3.76 s against
+the reference implementation's own 3.85 s for the same checkpoint and
+direction, Opus round trip 20.8 kbps. Acceptance is a **headless real-client
+gate** (`scripts/translator/client_gate.py`): Chromium with a fake microphone
+fed real speech, against the PUBLIC URL, tapping the DOM, asserting what a
+person sees — it exists because four consecutive defects were invisible to a
+protocol-level harness. It doubles as the latency instrument by reading the
+per-stage `Stopwatch` the server already ships on `turn.done`. **First audio
+decomposed** (idle tenant, median over 5 real turns): ASR 0.09 s, embedding
+0.02 s, MT-to-first-token 0.30 s, **TTS first clause 3.36 s** = 3.95 s total,
+so 85 % is one non-incremental clause synthesis at RTF 1.23 and the
+recognition side is not the latency. **Contention is measured, not assumed**
+(`contention_probe.py` drives a second conversation): ASR and MT are
+unaffected by a second stream, but one `asyncio.Lock` serialises all
+synthesis, so a co-running conversation costs a median +4.8 s. Since RTF > 1
+already for ONE conversation, the queue is correct and the capacity is one
+conversation — what was added is that the queue is now **visible**:
+`turn.queued` fires before the wait, the client says "another turn is being
+spoken" in that turn's translation slot, and `tts_wait_ms` splits queueing
+from compute per turn through a `ContextVar` (an attribute would report
+whichever turn finished last, i.e. be wrong exactly when it matters). Open:
+an ASR intelligibility round trip, and shortening the first synthesized unit
+(DESIGN_466 §18.4). End-to-end S2ST was surveyed and **rejected on evidence** — no
+open-weight model does DE<->ES with speaker preservation (Hibiki fr->en only,
+StreamSpeech X->en, Seamless fixed synthetic voice, Qwen3-Omni three preset
+voices) — so the cascade is the only architecture meeting the requirement.
 
 ## 14. Dashboard
 Guided config wizard whose refusals each cite their source and which never emits

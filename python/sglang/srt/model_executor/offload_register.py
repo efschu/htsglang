@@ -133,6 +133,15 @@ OFFLOAD_CLASSES = (
     # ``KvPressureLadder.on_pressure_boundary``, never by the phase or
     # admission planners.
     "kv_shadow",
+    # #466/#488: in-process audio modules of the live-translator tenant -- the
+    # TTS talker trunk, its residual code predictor, the 12 Hz codec decoder
+    # and the speaker encoder. They are ordinary resident weight blocks with
+    # no captured addresses, so the plain tensor route applies. They are
+    # registered here rather than tracked privately because the user order of
+    # 2026-08-03 is that EVERY asset lives under one runtime and one ledger:
+    # a component whose VRAM the register cannot see makes every cross-asset
+    # arbitration decision silently wrong.
+    "audio_modules",
 )
 
 OFFLOAD_POLICIES = ("resident", "ram", "auto")
