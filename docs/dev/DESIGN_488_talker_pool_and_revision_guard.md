@@ -144,7 +144,7 @@ produces the tail and `mt_total_ms` is stamped), running **beside** playback:
 2. **Only on divergence, ask Qwen on the fast lane** whether the difference is
    *material*. Word reordering, a synonym, a moved adverb — not a break. A
    changed subject, a negation, a reversed clause relation — a break. The prompt
-   returns a strict verdict token plus the corrected text; anything unparseable
+   returns a strict verdict token plus the corrected text; anything unparsable
    is treated as "no break" (a false repair is worse than a missed one: it
    interrupts audio the user is understanding).
 
