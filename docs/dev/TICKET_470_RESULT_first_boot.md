@@ -8,7 +8,7 @@ Desk prediction: `NOTE_470_residency_cut_price.md`.
 
 ---
 
-## 1. Boot A — the residency cut is FREE within measurement
+## 1. Boot A — the residency cut costs ~1.4 % of decode ms/round (see the revision below)
 
 The ticket's R1 gate is whether the residency cut costs more than the draft arm
 returns. Boot A prices the cut. Both sub-arms ran to completion with full probe
@@ -24,8 +24,9 @@ sets.
 | chatprobe | template applied | template applied |
 
 **Delta = +1.41 %, against a governing floor of 6.443 %** (the larger of the two
-arms' own floors, which is the rule the boot script itself states). The cut is
-**not resolvable above the noise**.
+arms' own floors, which is the rule the boot script itself states). By that rule
+alone the cut is not resolvable above the noise — but `a_base`'s floor was later
+shown to be an outlier, so see the revision in this section before quoting that.
 
 ### The cut landed exactly as designed
 
@@ -67,14 +68,30 @@ window. Scored honestly:
 
 ### What this means for R1
 
-The cost side of the gate is **~0 within measurement**. R1 is therefore NOT
-refuted on cost — any positive return from the draft arm clears it. The gate now
+The cost side of the gate is **small — ~1.4 %, see the revision below**. R1 is
+therefore NOT refuted on cost — any positive return from the draft arm clears it. The gate now
 hangs entirely on Boot B, which did not run.
 
-Caveat worth naming: the two floors differ 20x (6.443 % vs 0.33 %). A floor that
-loose on `a_base` deserves suspicion — it was the arm that also ran three
-1000-token accept generations — so the +1.41 % is best read as "no effect large
-enough to see", not as a precise zero.
+### REVISED after the #462 eager control (same window)
+
+The two floors differ 20x (6.443 % vs 0.33 %), and the later arms settled the
+question. `462_eager` ran the SAME configuration as `a_base` in this window and
+measured 131.475 ms/round against a_base's 131.353 — **0.09 % apart across two
+independent boots** — with floors of 0.33 %, 0.40 % and 0.72 % on three other
+arms.
+
+So 6.443 % is an outlier (a_base was also the arm that ran three 1000-token
+accept generations), and the real measurement band here is well under half a
+percent.
+
+**Revised reading: the cut most likely costs ~1.3-1.4 % of decode ms/round —
+small, but REAL rather than zero.** The "+1.41 % inside a 6.443 % floor, not
+resolvable" statement above is what the gating rule produces mechanically from
+a_base's own floor, and it is retained as the formally-defensible bound. The
+better-supported estimate is a small real cost.
+
+This does not change the R1 conclusion: ~1.4 % is small enough that any positive
+return from a working draft arm clears the gate.
 
 ---
 
@@ -137,9 +154,21 @@ The draft is unsharded and its experts are not placed by the target's offload
 tier, so it should not consult the target's per-rank MoE vectors at all. The fix
 is to neutralise them in the draft `ServerArgs` copy — alongside the other
 per-rank vectors that have the same problem by construction
-(`rank_gpu_id`, `rank_tp_ratio`, `rank_auto_reserve_mib`, `rank_moe_ratio`,
-`rank_kv_ratio`) — but that is an architectural change to the draft-copy
-contract and was not made under window time pressure.
+(`rank_tp_ratio`, `rank_auto_reserve_mib`, `rank_moe_ratio`, `rank_kv_ratio`).
+
+That neutralisation WAS implemented and committed — and it is **necessary but
+not sufficient**, which the second boot proved. `resident_fraction._from_flag()`
+falls back to the RUNTIME CONTEXT (`get_server_args()`) when no ServerArgs is
+handed to it, and the context still holds the TARGET's arguments during the
+draft build: `draft_server_args` is passed to `TpModelWorker` but never
+published. So the validator kept reading the target's 3-entry vector against a
+weight-TP=1 parallel state and refused identically.
+
+Closing it means publishing the draft arguments into the runtime context around
+the draft build, which changes the draft-copy contract for DFLASH and EAGLE too.
+Deliberately not done against a restore deadline. The copy-level fix is kept
+because a draft copy carrying target-shaped per-rank vectors is wrong regardless
+of which reader notices first.
 
 **Explicitly rejected workaround:** passing a single scalar resident fraction.
 The error message suggests it and it would boot, but 0.23 everywhere also cuts

@@ -45,7 +45,12 @@ EXPECT_CROSSINGS="${EXPECT_CROSSINGS:-43}"
 
 case "$ARM_KIND" in
   eager)
-    GRAPH_FLAGS=(--cuda-graph-backend-decode=disabled --cuda-graph-backend-prefill=disabled)
+    # --disable-cuda-graph, NOT --cuda-graph-backend-*=disabled. The offload
+    # path's own guard demands that exact flag by name and refused the boot:
+    # "MoE expert-offload / routing-trace ... requires --disable-cuda-graph".
+    # It is also what the proven base recipe uses, so the control arm is the
+    # recipe unmodified -- which is what a control should be.
+    GRAPH_FLAGS=(--disable-cuda-graph)
     ROUTE_ON=0; PROBE_ON=0
     ;;
   f2)
