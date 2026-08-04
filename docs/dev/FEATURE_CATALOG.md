@@ -533,9 +533,30 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   DeepSeek-V4 the prefill half is already satisfied: the BCG-incompatibility
   rule set rewrites prefill to `disabled` (`server_args.py:8281-8309`). Both
   spellings of the refuted path still refuse.
-  **DESK-WRITTEN, NEVER EXECUTED — no boot, no replay, no ms/verify figure
-  exists, and F1's 5.3–8.4x is a Qwen3.6-35B-A3B ceiling that is NOT a DSV4F
-  number.** F2 (per-layer break cost, decomposed) is the first measurement of
+  **BOOT-ATTEMPTED 2026-08-04, still no measurement.** The route's
+  CONFIGURATION path is proven end to end on hardware --
+  `validate_breakable_boot` passes and the boot reaches graph capture
+  (`TICKET_462_RESULT_f2_blocked.md`) -- and it then died in the BCG buffer
+  layer, which handled four output shapes and not the `LogitsProcessorOutput`
+  a decode forward returns. That branch now exists
+  (`breakable_cuda_graph_backend.py`, `_LPO_TOKEN_DIM_FIELDS`): an ALLOWLIST of
+  the five per-token tensor fields, every other field refused BY NAME rather
+  than mapped, and a refusal when the present fields disagree on their leading
+  dimension -- the prefill shape where `next_token_logits` is per-SEQUENCE
+  (`prefill_cuda_graph_runner.py:1194`) cannot reach it, because a prefill BCG
+  captures the layer-model body and runs the logits processor eagerly
+  (`:1103-1130`). Same change fixed the shared buffer's ROW BUDGET: it was
+  sized from `shape_key.size`, which for a decode runner is the BATCH size
+  while the body emits `bs * num_tokens_per_bs` rows under a non-ragged
+  speculative verify (`decode_cuda_graph_runner.py:682`) -- one row per
+  sequence for a per-token output, i.e. every draft position but the first
+  truncated with no error. Tests:
+  `test/registered/unit/model_executor/test_bcg_logits_output_buffer_462.py`,
+  18 hermetic, TWO executed can-fail mutations (leading-dim refusal removed ->
+  red; row budget taken from the graph key -> red).
+  **NO REPLAY, NO ms/verify FIGURE EXISTS, and F1's 5.3-8.4x is a
+  Qwen3.6-35B-A3B ceiling that is NOT a DSV4F number.** F2 (per-layer break
+  cost, decomposed) is the first measurement of
   the next window and gates default-on; **its instrument now exists (#494, §16
   break-cost probe)**, so F2 is a measurement ticket rather than an
   implementation one — the crossing cost is read off
