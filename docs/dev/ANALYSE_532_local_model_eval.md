@@ -239,6 +239,33 @@ defect report against `FEATURE_CATALOG.md` §6 that should be fixed on the line.
 Every task also pays a fixed cold start of ~22 k prompt tokens for the harness
 system prompt before it reads anything.
 
+### Ladder additions from #541 (2026-08-04, real open tasks, both thinking arms)
+
+New rows measured on real open work rather than retro-bugs, and measured in
+BOTH thinking modes (`thinking: disabled` vs `adaptive`). Full write-up:
+`BENCH_541_thinking_ab.md`. The graded claims were re-verified against the tree
+by hand.
+
+| task class | evidence | tier | note |
+|---|---|---|---|
+| **Module inventory of a named directory slice** (purpose + public interface + importers, tool-verified) | #538 slice `registry/` 10 modules: BOTH arms 0 wrong out of 94/92 interface names and 33/32 importer claims, 193 s / 134 s. Slice `rigmon/` 16 modules, thinking-off arm: 159 names and 51/53 importer claims correct, 578 s | **Tier 1** | the strongest class yet measured, stronger than B4. It is B4's shape — named target, verify with grep — scaled from one section to a whole directory |
+| **Catalog-vs-code citation audit, section not seen before** | #541 T3, FEATURE_CATALOG §16, 19 citations: 17/19, 18/19, 15/19 verdicts correct across three completed runs; one run DNF | **Tier 1**, with the error direction named | every error in every run was FALSE-NEGATIVE — a stale citation waved through. Zero fabricated defects. So the output is safe to act on positively and must not be trusted as an all-clear |
+| **Bounded code analysis of an open question with a named subsystem** (find the flag, trace the path, state the effect, recommend) | #541 T4, #533 warmup, thinking-off arm: all 12 file:line claims exact, correct scoping, recommendation grounded in the code's own recorded measurement, 253 s | **Tier 1** — an upgrade | #532 put "diagnosis when the file is named" in Tier 2 because b316/b527 chose the wrong fix. When the task asks for ANALYSIS AND A RECOMMENDATION rather than a patch, that failure mode does not appear. Delegate the analysis; the #532 rule "never the decision about what to change" still holds for edits |
+
+**Thinking on vs off does not move the tier for any class measured.** Quality
+was a tie on the inventory sweeps (both arms flawless), a wash on the audit
+(the arm-B spread 18/19→15/19 is as wide as the arm gap), and the thinking arm
+lost one run outright to a timeout. What thinking demonstrably changes is cost,
+and it self-doses: 72 % / 56 % of generated tokens on the judgement audit
+against 7 % / 9 % on the mechanical sweeps.
+
+**Two caveats bound all of the above, both measured:** the A-vs-A noise floor
+in this battery spanned "solved in 179 s" to "DNF at 600 s" on the same task in
+the same arm, and the thinking arm ran without `preserve_thinking`, which costs
+it prefix reuse (48.5 % vs 40.3 % on the one pair with the counter wired up).
+Arm-B wall times are therefore not model signal. Quality numbers are unaffected
+by both.
+
 ---
 
 ## 5. Radix reuse in the agentic loop
