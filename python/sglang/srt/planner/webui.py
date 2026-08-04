@@ -1516,11 +1516,46 @@ def server_restart_payload(payload: dict) -> dict:
 
 
 def server_status_payload(payload: Optional[dict] = None) -> dict:
+    """Return supervisor status; when supervisor is not running, fall back to
+    auto-detecting an externally-started sglang server (same detection path
+    as landing_snapshot_payload) so the dashboard reflects the real state."""
     sup = _supervisor()
     try:
-        return {"ok": True, "running": sup.is_running(), "status": sup.status()}
+        running = sup.is_running()
+        status = sup.status()
     except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "error": str(e)}
+
+    if running:
+        return {
+            "ok": True,
+            "running": True,
+            "status": status,
+            "source": "supervisor",
+        }
+
+    # Supervisor not running -- try to detect an externally-started server,
+    # mirroring the fallback in landing_snapshot_payload.
+    det = _detect_external_endpoint()
+    if det:
+        from sglang.srt.planner import server_state as _sstate
+
+        ss = _sstate.resolve(det).to_json()
+        return {
+            "ok": True,
+            "running": True,
+            "status": status,
+            "source": "external",
+            "endpoint": det,
+            "server_state": ss,
+        }
+
+    return {
+        "ok": True,
+        "running": False,
+        "status": status,
+        "source": "supervisor",
+    }
 
 
 def download_targets_payload(payload: dict) -> dict:
@@ -10850,15 +10885,21 @@ function renderLandingStrip(s){
   // different energy, and a single "whichever is active" figure silently
   // changed meaning under the reader mid-run. Each is undefined while its own
   // phase is idle -> '--' and a FROZEN graph (no divide-by-zero junk).
-  const jtokDec=(watts!=null&&dec!=null&&dec>EPS)?watts/dec:null;
-  const jtokPfx=(watts!=null&&pfx!=null&&pfx>EPS)?watts/pfx:null;
+  // Instant rate can hit 0 between counter jumps even under load; fall back
+  // to the median when the instant is below EPS (#560).
+  const medDec=((s&&s.rate_medians)?s.rate_medians.decode_tok_s:null);
+  const medPfx=((s&&s.rate_medians)?s.rate_medians.prefill_tok_s:null);
+  const decTok=(dec!=null&&dec>EPS)?dec:((medDec&&medDec.median!=null&&medDec.median>EPS)?medDec.median:null);
+  const pfxTok=(pfx!=null&&pfx>EPS)?pfx:((medPfx&&medPfx.median!=null&&medPfx.median>EPS)?medPfx.median:null);
+  const jtokDec=(watts!=null&&decTok!=null&&decTok>EPS)?watts/decTok:null;
+  const jtokPfx=(watts!=null&&pfxTok!=null&&pfxTok>EPS)?watts/pfxTok:null;
   const kwh1M=(j)=>(j==null?null:j/3.6);   // J/token -> kWh per 1M tokens
   if(jtokDec!=null) stripPush('st_j',t,jtokDec);
   if(jtokPfx!=null) stripPush('st_jp',t,jtokPfx);
   // live cost per phase (ct / 1M tok at the shared kWh price)
   const priceCt=getKwhPriceCt();
-  const decCt=(watts!=null&&dec!=null&&dec>EPS)?jPerTokToCtPer1M(watts/dec,priceCt):null;
-  const pfxCt=(watts!=null&&pfx!=null&&pfx>EPS)?jPerTokToCtPer1M(watts/pfx,priceCt):null;
+  const decCt=(watts!=null&&decTok!=null&&decTok>EPS)?jPerTokToCtPer1M(watts/decTok,priceCt):null;
+  const pfxCt=(watts!=null&&pfxTok!=null&&pfxTok>EPS)?jPerTokToCtPer1M(watts/pfxTok,priceCt):null;
   if(decCt!=null) stripPush('st_cost',t,decCt);
   // SAVED tile: #147 accumulator = host-RAM + disk tiers ONLY (the pipeline
   // already excludes the device/VRAM hot tier). Activity graph = tok/s served
@@ -11921,8 +11962,13 @@ function renderLivePanel(s, envelope){
   let watts=null;
   for(const g of s.gpus) if(g.power_watts!=null) watts=(watts||0)+g.power_watts;
   const EPS=0.05;
-  let tokS=null;
-  if(dec!=null&&dec>EPS) tokS=dec; else if(pfx!=null&&pfx>EPS) tokS=pfx;
+  let tokS=null, tokSIsMedian=false;
+  const decMed=((s&&s.rate_medians)?s.rate_medians.decode_tok_s:null);
+  const pfxMed=((s&&s.rate_medians)?s.rate_medians.prefill_tok_s:null);
+  if(dec!=null&&dec>EPS) tokS=dec;
+  else if(pfx!=null&&pfx>EPS) tokS=pfx;
+  else if(decMed&&decMed.median!=null&&decMed.median>EPS) tokS=decMed.median, tokSIsMedian=true;
+  else if(pfxMed&&pfxMed.median!=null&&pfxMed.median>EPS) tokS=pfxMed.median, tokSIsMedian=true;
   const tpwTotal=(tokS!=null&&watts)?tokS/watts:null;
   stripPush('lv_dec',s.t,dec); stripPush('lv_pfx',s.t,pfx);
   stripPush('lv_tpw',s.t,tpwTotal);
@@ -11948,7 +11994,7 @@ function renderLivePanel(s, envelope){
    +liveTile('tokens per watt (total)',
       n2(tpwTotal)+'<small> tok/W</small>',
       (watts!=null?Math.round(watts)+' W across '+s.gpus.length+' cards':'-- W')
-      +(tokS!=null?(' &middot; '+n1(tokS)+' tok/s'):' &middot; idle'), 'lv_tpw')
+      +(tokS!=null?(' &middot; '+n1(tokS)+' tok/s'+(tokSIsMedian?' (median)':'')):' &middot; idle'), 'lv_tpw')
    +liveTile('energy per token',
       (tpwTotal?n1(1/tpwTotal):(noMetrics?NA:'&ndash;'))+'<small> J/tok</small>',
       tpwTotal?'at the current phase rate'
