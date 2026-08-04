@@ -57,6 +57,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import pathlib
 import sys
 import time
 from typing import Callable, Dict, List, Optional
@@ -71,6 +72,41 @@ _MIN_SEPARATION = 0.40
 _MAX_GPU_BOUND_GAP = 0.35
 #: Per-arm wall deadline. Bounded waits only.
 _ARM_DEADLINE_S = 60.0
+#: Whole-run deadline, so the caller can promise the operator a number.
+_RUN_DEADLINE_S = 360.0
+#: Transient the calibration arms allocate: two 4096^2 fp16 operands plus the
+#: matmul output. Measured, not guessed -- see ``_CALIB_SHAPE``.
+_CALIB_SHAPE = (2048, 2048)
+_CALIB_MIB = 3 * _CALIB_SHAPE[0] * _CALIB_SHAPE[1] * 2 / (1024 * 1024)
+#: The standing VRAM corridor: at least this much must remain free on the card
+#: AFTER our transient. Non-negotiable -- the tenant on this card is serving a
+#: live conversation while this runs.
+_MIN_FREE_MIB_AFTER = 400.0
+#: What a STANDALONE second copy costs: 1745 MiB of checkpoint (measured from
+#: the safetensors header) plus CUDA context, cuBLAS workspaces, the codec and
+#: the speaker encoder. Only the standalone entry point pays this; the
+#: in-process one reuses the tenant's already-resident modules.
+_STANDALONE_FOOTPRINT_MIB = 2600.0
+
+
+def check_headroom(free_mib: float, need_mib: float = _CALIB_MIB) -> Optional[str]:
+    """``None`` when there is room, else the refusal text.
+
+    Pure, so the arithmetic is testable without a card. The instrument is run
+    INSIDE a process that is serving a live conversation: an OOM here is not a
+    failed measurement, it is a dropped turn in front of the user.
+    """
+    remaining = free_mib - need_mib
+    if remaining < _MIN_FREE_MIB_AFTER:
+        return (
+            f"only {free_mib:.0f} MiB free on the card; the calibration arms "
+            f"need {need_mib:.0f} MiB and the standing corridor requires "
+            f"{_MIN_FREE_MIB_AFTER:.0f} MiB to remain free afterwards "
+            f"({remaining:.0f} MiB would). Refusing: this runs inside a "
+            f"process serving a live conversation, where an OOM is a dropped "
+            f"turn, not a failed measurement."
+        )
+    return None
 
 
 @dataclasses.dataclass
@@ -313,8 +349,8 @@ def _calibration_arms(device: str) -> Dict[str, ArmResult]:
     def run_gpu_bound() -> ArmResult:
         # ~64 MiB of fp16 operands; large enough to be unambiguously
         # kernel-bound, small enough that a contended card still has room.
-        a = torch.randn(4096, 4096, device=device, dtype=torch.float16)
-        b = torch.randn(4096, 4096, device=device, dtype=torch.float16)
+        a = torch.randn(*_CALIB_SHAPE, device=device, dtype=torch.float16)
+        b = torch.randn(*_CALIB_SHAPE, device=device, dtype=torch.float16)
 
         def body() -> None:
             for _ in range(4):
@@ -324,7 +360,7 @@ def _calibration_arms(device: str) -> Dict[str, ArmResult]:
             "calib_gpu_bound",
             body,
             iterations=20,
-            note="4x 4096^3 fp16 matmul -- kernels must cover the wall clock",
+            note="4x 2048^3 fp16 matmul -- kernels must cover the wall clock",
         )
 
     def run_launch_bound() -> ArmResult:
@@ -376,6 +412,26 @@ def profile_loaded_model(model, device: Optional[str] = None) -> dict:
     hidden = trunk.config.hidden_size
 
     report: Dict[str, object] = {"device": device, "dtype": str(dtype)}
+
+    # Headroom precondition, BEFORE anything is allocated. On 2026-08-04 the
+    # 5090 carried rank 0 (22436 MiB) plus this tenant (5910 MiB) with 3605 MiB
+    # free, so the 96 MiB calibration transient is comfortable -- but the
+    # margin is a fact about that moment, not a property of the box, so it is
+    # re-read every run.
+    free_bytes, total_bytes = torch.cuda.mem_get_info(torch.device(device).index or 0)
+    free_mib = free_bytes / (1024 * 1024)
+    report["headroom"] = {
+        "free_mib": round(free_mib, 1),
+        "total_mib": round(total_bytes / (1024 * 1024), 1),
+        "calibration_transient_mib": round(_CALIB_MIB, 1),
+        "corridor_floor_mib": _MIN_FREE_MIB_AFTER,
+    }
+    refusal = check_headroom(free_mib)
+    if refusal is not None:
+        report["verdict"] = "REFUSED -- " + refusal
+        return report
+
+    run_deadline = time.monotonic() + _RUN_DEADLINE_S
     arms = _calibration_arms(device)
 
     discrimination = check_discrimination(
@@ -408,22 +464,31 @@ def profile_loaded_model(model, device: Optional[str] = None) -> dict:
                 return_dict_in_generate=True,
             )
 
-    arms["trunk_step"] = _profile_region(
-        "trunk_step", trunk_step, iterations=30,
-        note="one 28-layer trunk forward, batch 1, one position = one frame",
+    measurement_arms = (
+        ("trunk_step", trunk_step, 30,
+         "one 28-layer trunk forward, batch 1, one position = one frame"),
+        ("predictor_step", predictor_step, 30,
+         "one 5-layer code-predictor forward = one residual group"),
+        ("predictor_generate", predictor_generate, 10,
+         "the HF generate() envelope the reference re-enters per frame"),
     )
-    arms["predictor_step"] = _profile_region(
-        "predictor_step", predictor_step, iterations=30,
-        note="one 5-layer code-predictor forward = one residual group",
-    )
-    try:
-        arms["predictor_generate"] = _profile_region(
-            "predictor_generate", predictor_generate, iterations=10,
-            note="the HF generate() envelope the reference re-enters per frame",
+    for name, fn, iterations, note in measurement_arms:
+        if time.monotonic() > run_deadline:
+            report[f"{name}_skipped"] = "run deadline reached"
+            continue
+        try:
+            arms[name] = _profile_region(name, fn, iterations=iterations, note=note)
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            logger.warning("%s arm failed: %s", name, exc)
+            report[f"{name}_error"] = str(exc)
+
+    if "trunk_step" not in arms or "predictor_step" not in arms:
+        report["verdict"] = (
+            "REFUSED -- the trunk and predictor step arms are both required "
+            "and at least one did not run; see the *_error entries."
         )
-    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-        logger.warning("predictor_generate arm failed: %s", exc)
-        report["predictor_generate_error"] = str(exc)
+        report["arms"] = {k: v.to_json() for k, v in arms.items()}
+        return report
 
     # The frame arm is derived rather than run, because running it needs the
     # real prompt state. Stated as a derivation so nobody reads it as measured.
@@ -500,12 +565,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    # STANDALONE ONLY: this path loads its OWN copy of the talker onto a card
+    # that is already carrying a serving rank and a live tenant, so the
+    # headroom check has to happen BEFORE the weights land -- the in-process
+    # entry point checks after, because there is nothing to load there.
+    import torch  # noqa: PLC0415
+
+    free_bytes, _ = torch.cuda.mem_get_info(0)
+    free_mib = free_bytes / (1024 * 1024)
+    need_mib = _STANDALONE_FOOTPRINT_MIB + _CALIB_MIB
+    if free_mib - need_mib < _MIN_FREE_MIB_AFTER:
+        logger.error(
+            "REFUSED: %.0f MiB free, a standalone copy needs ~%.0f MiB and the "
+            "corridor requires %.0f MiB to remain. Use the in-process entry "
+            "point (profile_loaded_model) inside the tenant instead.",
+            free_mib, need_mib, _MIN_FREE_MIB_AFTER,
+        )
+        return 2
+    logger.info(
+        "headroom ok: %.0f MiB free, standalone copy needs ~%.0f MiB",
+        free_mib, need_mib,
+    )
+
     from sglang.srt.translator.inprocess_tts import (  # noqa: PLC0415
         InProcessQwen3Tts,
         InProcessTtsConfig,
     )
 
-    tts = InProcessQwen3Tts(InProcessTtsConfig(model_dir=args.model_dir))
+    tts = InProcessQwen3Tts(
+        InProcessTtsConfig(model_dir=pathlib.Path(args.model_dir))
+    )
     tts.load()
     report = profile_loaded_model(tts._model)
     text = json.dumps(report, indent=2)

@@ -171,7 +171,144 @@ solo on the 5090 and at `--rank-tp-ratio 5,3,3 --rank-gpu-id <5090>,<3080a>,
 decomposition), against a same-window A-vs-A floor. The prediction under test is
 that the TP=3 arm is **slower**, by the §4 table.
 
-## 7. Scope of slice 1 (this change)
+## 7. The tenant-module cut, priced against the live turn (2026-08-04)
+
+New measurement from the live tenant: **TTS start → first audio 5511 ms of a
+6076 ms turn (91 %)**; ASR 124, diarisation 60, MT first token 240. Over seven
+turns TTS ran 4814-7620 ms.
+
+Two desk findings change the shape of the plan, both read from code rather than
+assumed.
+
+### 7.1 Clause-wise overlap with the MT stream is ALREADY BUILT
+
+`translator/session.py:1852-1871` already runs a FIFO `speech_worker`: the MT
+delta stream is regrouped by `SentenceAccumulator`, each unit is announced
+`queued` (`:1858`) and handed to `speak()` (`:1793`), which starts its own
+`tts_start` clock per unit. So the 5511 ms is **one clause**, not the turn.
+
+The remaining latency is therefore INTRA-clause, and its cause is named in the
+module's own docstring (`inprocess_tts.py:22-27`): *"no true incremental
+streaming. The reference generates a whole utterance and then decodes it. We
+chunk the finished waveform ... the first-audio latency is whole-utterance, not
+first-frame."*
+
+Lever (2) as briefed is thus already discharged at the clause boundary. What is
+left is emitting audio DURING a clause — and that is not an independent lever:
+
+### 7.2 Levers (1) and (2) are one piece of work, and the codec already supports it
+
+`core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py:886` —
+`chunked_decode(codes, chunk_size=300, left_context_size=25)`, with the left
+context discarded on emit (`:894`). Incremental vocoding is a supported
+operation on this codec today; nothing needs porting.
+
+What blocks it is the same thing that blocks graph capture: the reference drives
+the frame loop inside `generate_voice_clone`, so there is no point at which a
+caller can (a) replay a captured graph or (b) take partial codes. **One
+hand-written decode driver buys both**, and that is the cut:
+
+* build the prompt with the reference's OWN `generate_icl_prompt`
+  (`modeling_qwen3_tts.py:1968`) — unchanged, so the hardest-to-verify 1596-line
+  surface is not reimplemented;
+* prefill eager, once per clause;
+* then per frame: trunk graph replay → sample → 15 predictor graph replays →
+  sum embeddings → next frame;
+* every K frames, `chunked_decode` the accumulated codes with 25 frames of left
+  context and yield the new tail.
+
+**Coupling worth stating: streaming only helps once RTF < 1.** At today's 1.23
+an intra-clause stream underruns — the player would starve. So the graphs must
+land first, or land together. They are not orderable independently.
+
+### 7.3 The two graphs, concretely
+
+| # | graph | shape | contents |
+|---|---|---|---|
+| 1 | trunk decode step | `(1,1,1024)` embeds in, `(1,1,1024)` out, position as a device tensor | all 28 layers over a **static** KV cache |
+| 2 | predictor step | `(1,1,1024)` in, `(1,2048)` logits out, 17-slot static scratch | all 5 layers + one head |
+
+Graph 2 is captured **15 times, once per residual group** — shape-identical, but
+each group uses its own `lm_head[g]` and `codec_embedding[g]`, and a graph
+cannot switch which `nn.Linear` runs. The alternative (stack the 15 heads and
+embeddings into indexed tables, one graph) is rejected on cost: it needs a
+120 MiB re-layout of tensors that are already resident, against ~60 MiB of extra
+graph pools. Simpler and cheaper to capture fifteen.
+
+**Stays eager**, all of it off the per-frame path: prompt build and prefill
+(once per clause, dynamic length), speaker encoder and mel (once per turn), and
+`chunked_decode` (once per emitted chunk, and convolutional).
+
+**The one hard constraint**: a captured region may not sync to the host, so the
+sampled token must never leave the device. Today's `do_sample=True, top_p=0.9`
+goes through HF's warper; it has to be replaced with a hand-written top-p that
+consumes a **pre-drawn uniform tensor**. That is the main correctness surface of
+the cut, and §7.5 gates it.
+
+### 7.4 VRAM fixed costs on the 5090, measured 2026-08-04
+
+Card total 32607 MiB. Resident: rank 0 (pid 3953294) **22436**, translator
+tenant (pid 3954713) **5910**, driver/context remainder ~139. **Free: 3605 MiB.**
+The standing corridor keeps 400 MiB free, so the budget for this cut is
+**3205 MiB**.
+
+| line item | MiB | note |
+|---|---|---|
+| static trunk KV cache, 1024 positions | 117.4 | 28 layers x 8 kv x 128 x 1024 x 2 x 2 B; replaces a DynamicCache of the same order at full length, so most of this is not new |
+| predictor scratch cache, 17 slots | 0.3 | 5 x 8 x 128 x 17 x 2 x 2 B |
+| trunk graph pool | 64 | generous; batch-1/seq-1 intermediates are ~2 MiB, the rest is rounding and workspace |
+| 15 predictor graph pools | 60 | ~4 MiB each |
+| pre-drawn uniforms for on-device sampling | 0.1 | 2048 frames x 16 groups x 4 B |
+| codec chunked decode working set | 0 | a 24-frame chunk is SMALLER than today's whole-utterance decode; counted as zero rather than as the saving it is |
+| **total** | **~242** | **7.5 % of the 3205 MiB budget** |
+
+No new weights: the driver reuses the modules the tenant already holds. The
+242 MiB is the whole ask, and it leaves ~2963 MiB of corridor untouched.
+
+### 7.5 The quality gate — voice is the product
+
+A listening test is the final gate, not the only one, because "sounds fine" is
+exactly the signal that failed this project before (a degenerate encoder scored
+0.986 from garbage). The cut admits a **stronger, machine-checkable** gate,
+because the graph path and the eager path are the same weights driven two ways:
+
+1. **Code-token identity.** Same prompt, same pre-drawn uniform tensor → the
+   graph driver must emit the **identical codec token sequence** as the eager
+   reference, all 16 groups, every frame. Not "close": identical. This catches
+   the sampling rewrite, the static-cache swap and the graph capture in one
+   assertion, before any audio exists.
+2. **Waveform equivalence across the chunk seam.** Whole-utterance decode vs
+   `chunked_decode` at the chosen chunk size must agree to the codec's own
+   left-context tolerance. Falsifier: drop `left_context_size` to 0 and the
+   gate must go red at the seams.
+3. **Then** the listening arm against the eager path, artefacts under
+   `/spinning/gpu-battery-results/`.
+
+Gate 1 is what makes this cut safe to ship quickly; without it the whole thing
+rests on an ear.
+
+### 7.6 fp8 (lever 3), priced — and correctly ranked third
+
+fp8 halves the per-step weight read: trunk 840 → 420 MiB, predictor 150 → 75 MiB,
+moving the RTF **floor** from 0.022 to ~0.012 on the 5090. But the floor is not
+where we will be: after the graphs cut the path still runs reference modules,
+so expect the kernel term to be a minority of the remaining time. fp8 then buys
+roughly 10-20 % end to end, not 2x — and it costs a mandatory quality gate on a
+0.6 B model whose product IS prosody.
+
+Verdict: correctly third, and **do not start it before the precursor and the
+graphs cut have landed** — its gain is unreadable until the overhead gap is
+closed, and if the graphs cut reaches the target it may never be needed.
+
+### 7.7 SM contention against rank 0 (lever 5) — already instrumented
+
+No separate instrument needed. The precursor's `calib_gpu_bound` arm IS a
+contention meter: a known-kernel-bound region whose gap fraction rises only when
+something else holds the SMs. It is already wired as a refusal
+(`_MAX_GPU_BOUND_GAP = 0.35`), so every profile run reports the contention
+number as a side effect of deciding whether it may testify at all.
+
+## 8. Scope of slice 1 (this change)
 
 Landed and hermetically proven (`CUDA_VISIBLE_DEVICES=99`, 13/13):
 

@@ -116,6 +116,37 @@ class TestDiscriminationGate(CustomTestCase):
         self.assertGreater(verdict.separation, 0.0)
 
 
+class TestHeadroomGate(CustomTestCase):
+    """The corridor precondition. This runs INSIDE a process serving a live
+    conversation, so an OOM here is a dropped turn in front of the user."""
+
+    def test_the_measured_2026_08_04_headroom_passes(self):
+        """3605 MiB free on the 5090, rank 0 at 22436 and the tenant at 5910."""
+        self.assertIsNone(prof.check_headroom(3605.0))
+
+    def test_the_calibration_transient_is_under_100_mib(self):
+        """A precondition on the precondition: a gate that needed gigabytes
+        would never pass on this card and would silently never run."""
+        self.assertLess(prof._CALIB_MIB, 100.0)
+
+    def test_refuses_when_the_corridor_would_be_broken(self):
+        """CAN-FAIL ARM. Derived from the constants rather than hardcoded: the
+        transient was resized once already (96 -> 24 MiB) and a fixture pinned
+        to the old value stopped exercising this branch silently."""
+        refusal = prof.check_headroom(prof._CALIB_MIB + prof._MIN_FREE_MIB_AFTER - 1.0)
+        self.assertIsNotNone(refusal)
+        self.assertIn("corridor", refusal)
+        self.assertIn("dropped turn", refusal)
+
+    def test_the_floor_is_what_binds_not_merely_fitting(self):
+        """REACH INCLUDES PARAMETERS: a gate that only checked 'does it fit'
+        would pass at 100 MiB free, which is exactly the corridor violation
+        the rule exists to prevent."""
+        self.assertGreater(prof._CALIB_MIB, 0.0)
+        self.assertIsNone(prof.check_headroom(prof._CALIB_MIB + 401.0))
+        self.assertIsNotNone(prof.check_headroom(prof._CALIB_MIB + 399.0))
+
+
 class TestVerdictWording(CustomTestCase):
     """The script must be able to report the premise FALSIFIED, not only
     confirmed -- otherwise it is not a test of anything."""
