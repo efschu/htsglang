@@ -60,6 +60,15 @@ fi
 log "preserved SERVING holder line:"
 cat "$HOLDER_BACKUP" >&2
 
+# --- 2b. stop OUR heartbeat BEFORE booting, not after ----------------------
+# Ordering defect found at restore time. w530_boot.sh REFUSES if $ARB/holder is
+# younger than 300s ("arb holder is live"), and our heartbeat rewrites it every
+# 30s -- so booting the serving instance while our heartbeat still runs is a
+# guaranteed refusal. The standing rule is "stop the heartbeat BEFORE
+# releasing"; stopping it here satisfies that and unblocks the boot, since the
+# release itself is step 6. w530_boot.sh then claims its own holder.
+arb_heartbeat_stop
+
 # --- 3. boot INT8 serving via its own recipe -------------------------------
 [ -x "$W530_BOOT" ] || [ -r "$W530_BOOT" ] || die "serving recipe not found: $W530_BOOT"
 log "booting INT8-W8A8 serving via $W530_BOOT (it claims its own holder + heartbeat)"
@@ -79,12 +88,26 @@ log "smoke 2/3: MT probe through the serving engine (the translator's backend)"
 MT_OUT="$RUN/restore_mt_probe.json"
 curl -s -m 120 -X POST "http://127.0.0.1:${INT8_PORT}/v1/chat/completions" \
      -H 'Content-Type: application/json' \
-     -d '{"model":"Qwen3.6-27B","temperature":0,"max_tokens":64,"messages":[{"role":"system","content":"You are a translation engine. Reply with the translation only, no commentary."},{"role":"user","content":"Translate to Spanish: The train leaves at seven in the morning."}]}' \
+     -d '{"model":"Qwen3.6-27B","temperature":0,"max_tokens":512,"chat_template_kwargs":{"enable_thinking":false},"messages":[{"role":"system","content":"You are a translation engine. Reply with the translation only, no commentary."},{"role":"user","content":"Translate to Spanish: The train leaves at seven in the morning."}]}' \
      -o "$MT_OUT" -w 'mt http=%{http_code}\n' >&2
 "$PY" - "$MT_OUT" <<'PYEOF' || die "the MT probe did not return a usable translation -- the translator tenant would be broken"
 import json, sys
 doc = json.load(open(sys.argv[1]))
-text = (doc["choices"][0]["message"].get("content") or "").strip()
+msg = doc["choices"][0]["message"]
+text = (msg.get("content") or "").strip()
+# A thinking model with a small token budget spends the whole budget in
+# reasoning_content and returns an EMPTY content with finish_reason "length".
+# That is a probe artefact, not a broken engine -- it happened on the first
+# restore attempt at max_tokens=64 and would have reported a perfectly healthy
+# serving instance as broken. The budget is now 512 with thinking off; if the
+# answer still lands in reasoning only, say which failure this is.
+if not text and (msg.get("reasoning_content") or "").strip():
+    raise SystemExit(
+        "PROBE ARTEFACT, not an engine fault: the answer is in reasoning_content "
+        f"and content is empty (finish_reason="
+        f"{doc['choices'][0].get('finish_reason')!r}). Raise max_tokens or "
+        "disable thinking; do not report the engine broken on this alone."
+    )
 print(f"MT probe answer: {text!r}")
 if not text:
     raise SystemExit("empty MT answer")
@@ -107,8 +130,8 @@ else
     log "Do NOT report the window closed until that passes."
 fi
 
-# --- 5. stop OUR heartbeat BEFORE releasing --------------------------------
-arb_heartbeat_stop
+# --- 5. heartbeat already stopped in step 2b (see the note there) ----------
+arb_heartbeat_stop   # idempotent; the stop file is already in place
 
 # --- 6. restore the SERVING holder line, byte for byte ---------------------
 # w530_boot.sh wrote its own holder line in step 3. The user's rig convention
