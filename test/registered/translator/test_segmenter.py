@@ -208,5 +208,205 @@ class TestEnergyVad(unittest.TestCase):
         self.assertFalse(vad.is_speech(quiet, RATE))
 
 
+class TestTheTapAtTheEndOfATurn(unittest.TestCase):
+    """The finger on the display, heard in the output (user report 2026-08-04).
+
+    The button is tap-to-start / tap-to-stop, so the turn ends with a finger
+    hitting the phone that is holding the microphone. The impulse reaches the
+    recognizer and, worse, the audio admitted to that speaker's clone
+    reference, where it is re-heard in every later turn they voice. The client
+    cannot cut it: audio streams continuously, so the tail frames are already
+    sent by the time the release handler runs.
+
+    The field number that sets the level test: package
+    client-20260804T140542Z reports `microphone.peak` 0.592 while the session
+    was only speech and 1 (saturated) after, so the transient sits at ~1.7x the
+    loudest speech.
+
+    Every test here feeds REAL audio through the real flush path; the scripted
+    VAD only decides which frames are active, so a detection failure and a trim
+    failure stay distinguishable.
+    """
+
+    BODY_PEAK = 0.30
+
+    def _utterance(self, body_ms=600, pause_ms=150, burst_ms=40, burst_peak=1.0,
+                   pause_peak=0.001):
+        """Speech, then a pause, then the tap. Any part can be turned off."""
+        rng = np.random.default_rng(7)
+
+        def noise(ms, peak):
+            n = int(RATE * ms / 1000)
+            if n <= 0:
+                return np.zeros(0, dtype=np.float32)
+            raw = rng.standard_normal(n).astype(np.float32)
+            return (raw / max(float(np.abs(raw).max()), 1e-9) * peak).astype(np.float32)
+
+        return np.concatenate([
+            noise(body_ms, self.BODY_PEAK),
+            noise(pause_ms, pause_peak),
+            noise(burst_ms, burst_peak),
+        ])
+
+    def _released(self, samples, config=None, reason=SegmentReason.RELEASED):
+        frames = len(samples) // int(RATE * FRAME_MS / 1000)
+        vad = ScriptedVad([True] * frames)
+        seg = TurnSegmenter(config or _config(), vad)
+        seg.feed(AudioChunk(samples[: frames * int(RATE * FRAME_MS / 1000)], RATE))
+        return seg.flush(reason)
+
+    def test_the_tap_is_cut_and_the_speech_is_kept(self):
+        samples = self._utterance()
+        segment = self._released(samples)
+        self.assertIsNotNone(segment)
+        removed_ms = (len(samples) - len(segment.audio.samples)) / RATE * 1000
+        # Within one analysis frame of the 40 ms burst.
+        self.assertAlmostEqual(removed_ms, 40, delta=10)
+        self.assertLessEqual(
+            float(np.abs(segment.audio.samples).max()), self.BODY_PEAK + 1e-6,
+            "the saturating impulse is still in the audio handed to the "
+            "recognizer and to the clone reference",
+        )
+
+    def test_a_turn_without_a_transient_is_byte_identical(self):
+        """The control the whole design has to earn.
+
+        Same audio through the same path, once with the trim able to fire and
+        once with it made impossible, and the two must be the same samples.
+        """
+        samples = self._utterance(burst_ms=0)
+        live = self._released(samples)
+        disabled = self._released(samples, _config(tap_trim_burst_ratio=1e9))
+        self.assertIsNotNone(live)
+        np.testing.assert_array_equal(live.audio.samples, disabled.audio.samples)
+        self.assertEqual(len(live.audio.samples) % int(RATE * FRAME_MS / 1000), 0)
+
+    def test_a_tap_with_no_pause_before_it_keeps_the_last_phoneme(self):
+        """No quiet boundary, no cut -- the case that would eat a final sound.
+
+        A user who taps the instant a word ends leaves the transient sitting
+        directly against speech. Cutting on loudness alone would take the end
+        of the word with it, so the rule requires a boundary and this turn is
+        left exactly as it arrived.
+        """
+        samples = self._utterance(pause_ms=0)
+        live = self._released(samples)
+        disabled = self._released(samples, _config(tap_trim_burst_ratio=1e9))
+        np.testing.assert_array_equal(live.audio.samples, disabled.audio.samples)
+
+    def test_a_loud_tail_that_is_not_louder_than_the_speech_is_kept(self):
+        """1.2x the speech peak is under the 1.4x the field measured at 1.7x."""
+        samples = self._utterance(burst_peak=self.BODY_PEAK * 1.2)
+        live = self._released(samples)
+        disabled = self._released(samples, _config(tap_trim_burst_ratio=1e9))
+        np.testing.assert_array_equal(live.audio.samples, disabled.audio.samples)
+
+    def test_a_segment_that_closed_on_a_pause_is_never_trimmed(self):
+        """Only a RELEASE ends with a finger on the display."""
+        samples = self._utterance()
+        live = self._released(samples, reason=SegmentReason.PAUSE)
+        # Whole frames only: the segmenter consumes 20 ms at a time.
+        frame = int(RATE * FRAME_MS / 1000)
+        self.assertEqual(len(live.audio.samples), len(samples) // frame * frame)
+
+    def test_too_little_speech_to_judge_a_level_means_no_cut(self):
+        samples = self._utterance(body_ms=100, pause_ms=60, burst_ms=40)
+        live = self._released(samples)
+        disabled = self._released(samples, _config(tap_trim_burst_ratio=1e9))
+        np.testing.assert_array_equal(live.audio.samples, disabled.audio.samples)
+
+    def test_the_length_policy_is_not_re_applied_after_the_cut(self):
+        """A turn that WAS an utterance does not stop being one.
+
+        `min_utterance_ms` answers "did the speaker say anything", and it was
+        answered on the audio the speaker produced. Removing a noise they did
+        not produce must not retroactively unmake that.
+        """
+        # 780 ms of whole frames reach `_close`, which admits them; the cut
+        # then leaves ~740 ms, i.e. BELOW the threshold that admitted them.
+        config = _config(min_utterance_ms=760)
+        samples = self._utterance(body_ms=600, pause_ms=150, burst_ms=40)
+        segment = self._released(samples, config)
+        self.assertIsNotNone(segment, "the turn was dropped by its own tap")
+        self.assertLess(segment.audio.duration_s, 0.76)
+
+    def test_the_finding_carries_the_numbers_the_log_needs(self):
+        from sglang.srt.translator.segmenter import find_tail_transient
+
+        samples = self._utterance()
+        found = find_tail_transient(AudioChunk(samples, RATE), _config())
+        self.assertIsNotNone(found)
+        self.assertAlmostEqual(found.duration_s, 0.04, delta=0.01)
+        self.assertAlmostEqual(found.peak, 1.0, delta=0.01)
+        self.assertAlmostEqual(found.body_peak, self.BODY_PEAK, delta=0.01)
+        self.assertGreater(found.body_rms, 0.0)
+        self.assertAlmostEqual(
+            found.cut_at_s, (len(samples) - int(RATE * 0.04)) / RATE, delta=0.01
+        )
+
+    def test_a_decaying_click_is_cut_from_its_onset(self):
+        """The shape a real tap has, and the one that caught a real bug.
+
+        A mechanical click decays, so its own last milliseconds are quieter
+        than the boundary threshold. Taking the LAST quiet frame in the window
+        therefore put the cut behind the transient and left it in the audio --
+        which the constant-amplitude burst in the tests above cannot show,
+        because it has no decay. Measured on a preset voice with a synthetic
+        click, the tail ran 0.2748, 0.0351, 0.0052 RMS per 10 ms against a
+        0.0167 threshold. The analysis anchors on the loudest frame instead.
+        """
+        rng = np.random.default_rng(5)
+
+        def noise(ms, peak):
+            n = int(RATE * ms / 1000)
+            raw = rng.standard_normal(n).astype(np.float32)
+            return (raw / float(np.abs(raw).max()) * peak).astype(np.float32)
+
+        click = noise(40, 1.0) * np.exp(-np.linspace(0, 6, int(RATE * 0.04)))
+        samples = np.concatenate([
+            noise(600, self.BODY_PEAK), noise(150, 0.001),
+            click.astype(np.float32),
+        ])
+        segment = self._released(samples)
+        removed_ms = (len(samples) // 320 * 320 - len(segment.audio.samples)) / RATE * 1000
+        self.assertAlmostEqual(removed_ms, 40, delta=10)
+        self.assertLessEqual(
+            float(np.abs(segment.audio.samples).max()), self.BODY_PEAK + 1e-6,
+            "the decaying click survived the trim",
+        )
+
+    def test_the_start_tap_is_measured_and_not_cut(self):
+        """The other end of the same button, deliberately observed only.
+
+        Cutting at the head would risk the attack that `pre_roll_ms` exists to
+        protect, and there is no field evidence that it happens, so the finding
+        is logged and the audio is untouched.
+        """
+        rng = np.random.default_rng(11)
+
+        def noise(ms, peak):
+            n = int(RATE * ms / 1000)
+            raw = rng.standard_normal(n).astype(np.float32)
+            return (raw / float(np.abs(raw).max()) * peak).astype(np.float32)
+
+        samples = np.concatenate([
+            noise(40, 1.0),                    # the tap
+            noise(150, 0.001),                 # the pause before speaking
+            noise(600, self.BODY_PEAK),        # the utterance
+        ])
+        with self.assertLogs("sglang.srt.translator.segmenter", "INFO") as logs:
+            live = self._released(samples)
+        self.assertTrue(any("OPENS with a" in line for line in logs.output),
+                        "the start transient was not even measured")
+        disabled = self._released(samples, _config(tap_trim_burst_ratio=1e9))
+        np.testing.assert_array_equal(live.audio.samples, disabled.audio.samples)
+
+    def test_a_quiet_tail_with_no_burst_is_not_a_transient(self):
+        from sglang.srt.translator.segmenter import find_tail_transient
+
+        samples = self._utterance(burst_ms=0, pause_ms=200)
+        self.assertIsNone(find_tail_transient(AudioChunk(samples, RATE), _config()))
+
+
 if __name__ == "__main__":
     unittest.main()

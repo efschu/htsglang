@@ -35,6 +35,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import enum
+import logging
 import math
 from typing import Deque, Iterable, List, Optional, Protocol, runtime_checkable
 
@@ -42,13 +43,17 @@ import numpy as np
 
 from sglang.srt.translator.backends import AudioChunk
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "Vad",
     "EnergyVad",
     "SegmenterConfig",
     "Segment",
     "SegmentReason",
+    "TapTransient",
     "TurnSegmenter",
+    "find_tail_transient",
 ]
 
 
@@ -155,6 +160,52 @@ class SegmenterConfig:
     min_utterance_ms: int = 400
     max_utterance_s: float = 15.0
 
+    # -- the tap transient (user report, 2026-08-04) -------------------------
+    #
+    # The button is tap-to-start / tap-to-stop, and the finger hitting the
+    # display is audible in the output at the end of a turn: the phone's own
+    # body conducts the click into its microphone. It is in the recognizer's
+    # input and, worse, in the audio admitted to the speaker's clone reference,
+    # where one saturating impulse is heard in every later turn that speaker
+    # voices. The client cannot cut it -- audio is streamed continuously, so by
+    # the time the release handler runs the tail frames are already sent -- and
+    # buying the room to cut it client-side would mean holding every turn's
+    # uplink back by that window on a mobile link. So it is cut here, once,
+    # where the released segment is born and before either consumer sees it.
+    #
+    #: How far back from the release the transient may be looked for. This is a
+    #: MAXIMUM look-back, not a blind window: inside it, audio is only ever cut
+    #: after a quiet boundary and only if it is louder than the speech itself
+    #: (both conditions below). A tap is a mechanical impulse whose energy in a
+    #: phone body is gone in tens of milliseconds; 250 ms covers that impulse
+    #: plus the touch-to-handler latency (pointerdown, click, `endTalking`, the
+    #: release frame) plus the 20 ms frame quantisation, with margin. Because
+    #: nothing is cut without a boundary, a generous window costs nothing when
+    #: there is no transient.
+    tap_trim_window_ms: int = 250
+    #: A frame is a boundary when its RMS falls below this fraction of the
+    #: utterance's median. A pause before the thumb reaches the button sits far
+    #: below it; a dip between syllables inside continuous speech does not,
+    #: which is what keeps the last phoneme when the user taps without pausing.
+    tap_trim_quiet_ratio: float = 0.25
+    #: What is cut must PEAK above this multiple of the loudest speech in the
+    #: same utterance -- like against like, peak against peak. Measured in the
+    #: field: package client-20260804T140542Z reports `microphone.peak` 0.592
+    #: while the session was only speech, and 1 (saturated) afterwards, so the
+    #: real transient sits at ~1.7x the loudest thing the speaker said. 1.4
+    #: keeps margin below that measurement while remaining impossible for
+    #: ordinary speech to reach: the reference is the maximum of the body, so a
+    #: speech tail would have to be louder than everything else in the same
+    #: utterance to qualify.
+    tap_trim_burst_ratio: float = 1.4
+    #: Resolution of the analysis, half the segmenter frame, so the cut lands
+    #: within 10 ms of the boundary it found.
+    tap_trim_frame_ms: int = 10
+    #: Speech needed BEFORE the window before a level can be judged at all.
+    #: Below this there is no reliable "loudest speech" to compare against and
+    #: nothing is cut.
+    tap_trim_min_body_ms: int = 200
+
     def frame_samples(self) -> int:
         return int(self.sample_rate * self.frame_ms / 1000)
 
@@ -188,6 +239,102 @@ class Segment:
     @property
     def duration_s(self) -> float:
         return self.audio.duration_s
+
+
+@dataclasses.dataclass(frozen=True)
+class TapTransient:
+    """A burst at the end of an utterance that is louder than the utterance.
+
+    Returned rather than acted on directly so the caller can log what it cut,
+    which is the only way the window and the ratios above ever get better
+    numbers than the two the field gave them.
+    """
+
+    #: Where the cut lands, in seconds from the start of the segment.
+    cut_at_s: float
+    #: How much audio is removed.
+    duration_s: float
+    #: Peak of the removed part, and of the speech it is compared against.
+    peak: float
+    body_peak: float
+    body_rms: float
+
+
+def find_tail_transient(
+    audio: AudioChunk, config: SegmenterConfig
+) -> Optional[TapTransient]:
+    """Find the tap at the end of a released utterance, or return None.
+
+    TWO INDEPENDENT CONDITIONS, both required, because the cost of a false
+    positive is a swallowed final phoneme and the cost of a false negative is
+    only that the tap survives one more turn:
+
+    1. a QUIET BOUNDARY inside the window -- the pause between the last word
+       and the thumb landing. Without one, the tail is continuous speech and
+       nothing is cut, which is the case the user taps immediately after a
+       word;
+    2. what follows that boundary must PEAK above the loudest speech in the
+       same utterance by `tap_trim_burst_ratio`. Speech cannot outrank its own
+       maximum, so this admits impulses and rejects speech by construction.
+
+    Pure and side-effect free: it reads audio and returns a finding.
+    """
+    samples = np.asarray(audio.samples, dtype=np.float32)
+    rate = audio.sample_rate
+    frame = max(1, int(rate * config.tap_trim_frame_ms / 1000))
+    window = int(rate * config.tap_trim_window_ms / 1000)
+    body_end = len(samples) - window
+    if body_end < int(rate * config.tap_trim_min_body_ms / 1000):
+        # Not enough speech before the window to know what "loud" means here.
+        return None
+
+    body = samples[:body_end]
+    body_peak = float(np.abs(body).max())
+    frames = body[: len(body) // frame * frame].reshape(-1, frame)
+    if not frames.size:
+        return None
+    body_rms = float(np.median(np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))))
+    if body_rms <= 0.0 or body_peak <= 0.0:
+        return None
+
+    tail = samples[body_end:]
+    count = len(tail) // frame
+    if count < 2:
+        return None
+    tail_frames = tail[: count * frame].reshape(-1, frame)
+    tail_rms = np.sqrt(np.mean(tail_frames.astype(np.float64) ** 2, axis=1))
+    tail_peak = np.abs(tail_frames).max(axis=1)
+
+    # ANCHOR ON THE LOUDEST FRAME, then look for the boundary BEFORE it. Taking
+    # the last quiet frame in the window instead is wrong on the real signal
+    # and was caught on one: a mechanical click decays, so its own tail is
+    # quieter than the threshold and became the "boundary", which put the cut
+    # behind the transient and left it in the audio (measured on a preset voice
+    # with a synthetic click: tail RMS per 10 ms ran 0.2748, 0.0351, 0.0052
+    # against a 0.0167 threshold).
+    loudest = int(np.argmax(tail_peak))
+    if float(tail_peak[loudest]) < config.tap_trim_burst_ratio * body_peak:
+        # Nothing in the window outranks the speech: no impulse to remove.
+        return None
+    quiet = np.flatnonzero(
+        tail_rms[:loudest] <= config.tap_trim_quiet_ratio * body_rms
+    )
+    if not quiet.size:
+        # The burst runs straight out of speech with no pause in between. That
+        # is the user tapping the instant a word ends, and cutting there would
+        # take the last phoneme with it.
+        return None
+
+    cut = body_end + (int(quiet[-1]) + 1) * frame
+    burst = samples[cut:]
+    peak = float(np.abs(burst).max()) if burst.size else 0.0
+    return TapTransient(
+        cut_at_s=cut / rate,
+        duration_s=len(burst) / rate,
+        peak=peak,
+        body_peak=body_peak,
+        body_rms=body_rms,
+    )
 
 
 class _State(enum.Enum):
@@ -282,7 +429,58 @@ class TurnSegmenter:
         if self._state is not _State.SPEAKING:
             self._active.clear()
             return None
-        return self._close(reason)
+        segment = self._close(reason)
+        if segment is None or reason is not SegmentReason.RELEASED:
+            # Only a RELEASE ends with a finger on the display. A segment that
+            # closed on a pause or on the length valve ends in silence or
+            # mid-clause, and looking for a tap there would be looking for
+            # something that cannot be present.
+            return segment
+        return self._without_tap_transient(segment)
+
+    def _without_tap_transient(self, segment: Segment) -> Segment:
+        """Cut the tap that ended the turn, and say what was cut.
+
+        The length policy is NOT re-applied afterwards, on purpose: whether
+        there was an utterance at all was decided in `_close` on the audio the
+        speaker produced, and removing a noise the speaker did not produce must
+        not retroactively unmake that decision.
+        """
+        # THE START TAP, MEASURED AND NOT CUT. The same tap-to-start button
+        # produces the same impulse at the other end of the turn, and the same
+        # rule finds it: run the analysis over the REVERSED samples and a burst
+        # behind a quiet boundary at the front is what it reports. It is only
+        # reachable at all when speech begins within `pre_roll_ms` of the tap,
+        # because `onset_ms` refuses to open a segment on an impulse -- and
+        # unlike the release there is no field evidence that it happens, while
+        # cutting at the head would risk the attack the pre-roll exists to
+        # protect. So this logs and does nothing, and the next field session
+        # decides whether it is worth cutting.
+        head = find_tail_transient(
+            AudioChunk(segment.audio.samples[::-1].copy(), segment.audio.sample_rate),
+            self.config,
+        )
+        if head is not None:
+            logger.info(
+                "segment %d OPENS with a %.0f ms transient at peak %.3f against "
+                "a speech peak of %.3f -- measured only, not cut",
+                segment.index, head.duration_s * 1000.0, head.peak, head.body_peak,
+            )
+        found = find_tail_transient(segment.audio, self.config)
+        if found is None:
+            return segment
+        kept = segment.audio.samples[: int(found.cut_at_s * segment.audio.sample_rate)]
+        logger.info(
+            "cut a %.0f ms transient off the end of segment %d: peak %.3f "
+            "against a speech peak of %.3f (median RMS %.4f), %.2fs of %.2fs "
+            "kept",
+            found.duration_s * 1000.0, segment.index, found.peak,
+            found.body_peak, found.body_rms,
+            len(kept) / segment.audio.sample_rate, segment.audio.duration_s,
+        )
+        return dataclasses.replace(
+            segment, audio=AudioChunk(kept, segment.audio.sample_rate)
+        )
 
     # -- internals ----------------------------------------------------------
 
