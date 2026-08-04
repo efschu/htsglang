@@ -447,6 +447,12 @@
        for the rest of the evening. It is the same server state as the reading
        mode (output.mode) -- one concept, one control, never two toggles that
        do the same thing. -->
+  <!-- SEND LOGS sits in the header, labelled and accented rather than hidden
+       behind the gear, because it is pressed at the worst moment: something
+       just went wrong, on a phone, possibly on a train, and the person
+       pressing it is not going to hunt through a settings sheet. User order:
+       "die website braucht quasi ganz oben ein button". -->
+  <button class="primary" id="sendlogs">send logs</button>
   <button class="icon ghost" id="mute" aria-label="speak translations aloud"></button>
   <button class="icon ghost" id="theme" aria-label="light or dark"></button>
   <button class="icon ghost" id="gear" aria-label="settings"></button>
@@ -597,6 +603,148 @@ const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://")
 const CLIENT_BUILD = "__CLIENT_BUILD__";
 const PIPELINE_RATE = 16000;   // confirmed by the server on handshake
 const FRAME_MS = 20;
+
+// ---------------------------------------------------------------------------
+// TELEMETRY -- the standing ring buffer.
+// ---------------------------------------------------------------------------
+// User order, verbatim (2026-08-04): "die website braucht quasi ganz oben ein
+// button, wo ich alle lokalen handy logdaten an den server uebertraegt ... so
+// stochern wir die ganze zeit doch nur blind herum."
+//
+// He is right, and the shape of the fix follows from WHY he is right. Every
+// diagnosis so far has been server-side: the journal knows what the server
+// did and knows nothing about what the phone did with it. Whether a chunk was
+// scheduled or dropped, what the microphone track actually negotiated, which
+// console error fired at load -- all of that lives for a few seconds in a
+// browser we cannot attach to, on the other side of a tunnel, and is gone.
+//
+// STANDING, not started on demand. The interesting failures happen BEFORE
+// anyone thinks to press a button: a load-time exception, a constraint the
+// browser silently refused, the first turn of a session. A buffer that starts
+// when the button is pressed records the aftermath and misses the event. So
+// this is constructed here, at the top of the script, before the first class
+// is defined, and the console/error hooks are installed on the next line.
+//
+// BOUNDED BY BYTES, not only by entry count, because one enormous entry (a
+// stack trace, a stringified event) is exactly what a count-based ring fails
+// to protect against.
+class Telemetry {
+  constructor(limitBytes, limitEntries) {
+    this.limitBytes = limitBytes || (3 << 20);   // ~3 MB, inside the 2-5 MB order
+    this.limitEntries = limitEntries || 8000;
+    this.entries = [];
+    this.bytes = 0;
+    this.dropped = 0;
+    this.t0 = Date.now();
+    this.counters = {};
+  }
+
+  /** Monotonic-ish ms since page load, which is what correlates with audio. */
+  now() {
+    return Math.round(
+      (typeof performance !== "undefined" && performance.now)
+        ? performance.now() : (Date.now() - this.t0)
+    );
+  }
+
+  add(kind, data) {
+    let entry;
+    try {
+      entry = { t: this.now(), k: kind, d: data === undefined ? null : data };
+      // Serialize NOW: a live object mutated later would make the log lie
+      // about the moment it claims to describe, and a cyclic one would throw
+      // at upload time -- the one moment the log must not fail.
+      const text = JSON.stringify(entry);
+      entry = JSON.parse(text);
+      this.bytes += text.length;
+    } catch (err) {
+      entry = { t: this.now(), k: kind, d: "<unserializable>" };
+      this.bytes += 64;
+    }
+    this.entries.push(entry);
+    while (this.entries.length > this.limitEntries || this.bytes > this.limitBytes) {
+      const gone = this.entries.shift();
+      if (!gone) break;
+      this.dropped += 1;
+      try { this.bytes -= JSON.stringify(gone).length; } catch (e) { this.bytes -= 64; }
+      if (this.bytes < 0) this.bytes = 0;
+    }
+  }
+
+  /** A counter for things too frequent to log one by one (audio frames). */
+  count(name, by) {
+    this.counters[name] = (this.counters[name] || 0) + (by === undefined ? 1 : by);
+  }
+
+  /** Everything a reader on the other end needs, assembled at press time. */
+  snapshot(extra) {
+    const nav = (typeof navigator !== "undefined") ? navigator : {};
+    return Object.assign({
+      client_build: CLIENT_BUILD,
+      captured_at: new Date().toISOString(),
+      page_age_ms: this.now(),
+      url: String(location.href),
+      device: {
+        user_agent: String(nav.userAgent || ""),
+        languages: (nav.languages || []).slice(0, 6),
+        platform: String(nav.platform || ""),
+        hardware_concurrency: nav.hardwareConcurrency || 0,
+        device_memory: nav.deviceMemory || 0,
+        screen: (typeof screen !== "undefined")
+          ? [screen.width, screen.height, devicePixelRatio || 1] : null,
+        online: nav.onLine === undefined ? null : nav.onLine,
+        visibility: (typeof document !== "undefined") ? document.visibilityState : null,
+      },
+      counters: this.counters,
+      entries_dropped: this.dropped,
+      entries_kept: this.entries.length,
+      approx_bytes: this.bytes,
+      entries: this.entries,
+    }, extra || {});
+  }
+}
+
+const telemetry = new Telemetry();
+function tlog(kind, data) { telemetry.add(kind, data); }
+
+// Installed IMMEDIATELY, ahead of every other definition in this file, so a
+// syntax or reference error in the code below is itself captured rather than
+// silently ending the script. This is the single most useful thing the buffer
+// can hold and it is only available from here.
+(function installErrorHooks() {
+  const real = {
+    error: console.error ? console.error.bind(console) : function () {},
+    warn: console.warn ? console.warn.bind(console) : function () {},
+  };
+  function shorten(args) {
+    return Array.prototype.slice.call(args, 0, 6).map(function (a) {
+      if (a instanceof Error) return String(a.message) + " | " + String(a.stack || "").slice(0, 600);
+      if (typeof a === "string") return a.slice(0, 600);
+      try { return JSON.parse(JSON.stringify(a)); } catch (e) { return String(a).slice(0, 300); }
+    });
+  }
+  console.error = function () { tlog("console.error", shorten(arguments)); real.error.apply(null, arguments); };
+  console.warn = function () { tlog("console.warn", shorten(arguments)); real.warn.apply(null, arguments); };
+  window.addEventListener("error", function (event) {
+    tlog("window.error", {
+      message: String(event.message || ""),
+      source: String(event.filename || "").slice(-80),
+      line: event.lineno || 0, col: event.colno || 0,
+      stack: event.error && event.error.stack ? String(event.error.stack).slice(0, 800) : null,
+    });
+  });
+  window.addEventListener("unhandledrejection", function (event) {
+    const reason = event.reason;
+    tlog("unhandled.rejection", {
+      message: reason && reason.message ? String(reason.message) : String(reason).slice(0, 300),
+      stack: reason && reason.stack ? String(reason.stack).slice(0, 800) : null,
+    });
+  });
+  document.addEventListener("visibilitychange", function () {
+    tlog("visibility", document.visibilityState);
+  });
+})();
+tlog("boot", { build: CLIENT_BUILD, ws_url: WS_URL, base: BASE });
 
 const el = (id) => document.getElementById(id);
 const streamBox = () => el("transcript");
@@ -882,6 +1030,8 @@ class Playback {
       // first tap, which is indistinguishable from noise. Dropping is the
       // honest choice: nobody could have heard it anyway.
       this.blocked = true;
+      telemetry.count("audio_dropped_context_not_running");
+      tlog("audio.blocked", { ctx_state: ctx.state });
       return false;
     }
     try {
@@ -964,6 +1114,16 @@ class Playback {
         };
         this.onsets.push(this.onset);
         while (this.onsets.length > 8) this.onsets.shift();
+        // A SEAM, which is the only audio event worth one entry each: the
+        // continuous case is counted below instead. peak/rms/head are what
+        // separate "a click" from "a normal soft onset", and they are read off
+        // the rendered samples rather than reasoned about.
+        tlog("audio.seam", {
+          reanchor: reanchor, turn_start: turnStart, turn: this.currentTurn,
+          at: this.onset.at, peak: this.onset.peak, rms: this.onset.rms,
+          head: this.onset.head.slice(0, 8),
+          cursor_lead_ms: Math.round((this.cursor - now) * 1000),
+        });
       }
       // Only a re-anchor moves the cursor. A turn start that arrives while
       // the previous turn is still scheduled must keep its place in the
@@ -1013,6 +1173,7 @@ class Playback {
         source.connect(ctx.destination);
       }
       source.start(this.cursor);
+      telemetry.count("audio_buffers_scheduled");
       this.cursor += buffer.duration;
       // Kept so the whole queue can be silenced on one tap. A buffer that is
       // already scheduled plays whatever happens to the socket, so "stop"
@@ -1023,6 +1184,7 @@ class Playback {
       return true;
     } catch (err) {
       this.errors.push("push: " + err);
+      tlog("audio.schedule_error", String(err).slice(0, 300));
       return false;
     }
   }
@@ -1244,6 +1406,13 @@ class Microphone {
     this.sink.gain.value = 0;
     this.node.connect(this.sink).connect(this.ctx.destination);
     this.watchTrack();
+    // THE NOISE QUESTION, answered from the device. `noiseSuppression: !raw`
+    // is only what was ASKED for, and a constraint dictionary is advisory --
+    // the browser may refuse it silently. What the track actually negotiated
+    // is the evidence, and `?raw=1` deliberately turns NS and AGC OFF, which
+    // is itself a live candidate for a hiss report from a user who may be on
+    // a bookmarked debug URL without knowing it.
+    tlog("mic.ready", this.diagnostics());
   }
 
   /** Everything about the capture chain a log reader would need. */
@@ -1459,6 +1628,8 @@ class Connection {
     this.ws = ws;
 
     ws.onopen = () => {
+      tlog("ws.open", { attempt: this.attempt, resume_from: this.cursor,
+                        session_id: this.sessionId });
       // A new socket means a new timeline: anything still booked against the
       // old clock must not survive into it.
       playback.reset();
@@ -1479,7 +1650,10 @@ class Connection {
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      tlog("ws.close", { code: event && event.code, reason:
+                         String((event && event.reason) || "").slice(0, 120),
+                         by_user: this.closedByUser, attempt: this.attempt });
       updateLink();
       if (this.closedByUser) { setState("offline", "closed"); return; }
       const delay = Math.min(500 * Math.pow(1.7, this.attempt++), 15000);
@@ -1488,10 +1662,24 @@ class Connection {
       setTimeout(() => this.connect(), delay);
     };
 
-    ws.onerror = () => { /* onclose does the work; avoid a double retry */ };
+    ws.onerror = () => {
+      // onclose does the retry; this only records that the socket faulted,
+      // which is the difference between "server closed us" and "network died".
+      tlog("ws.error", { ready_state: ws.readyState });
+    };
   }
 
   onControl(event) {
+    // Every control event, because they are the server's side of the same
+    // timeline and the whole point is to lay the two against each other.
+    // Payload is NOT copied wholesale -- a transcript line would blow the
+    // ring in a few turns and the text is already in the server journal.
+    tlog("ctl", { kind: event.kind, seq: event.seq,
+                  turn: event.turn_id || null,
+                  unit: event.unit_index === undefined ? null : event.unit_index,
+                  state: event.state || null,
+                  replayed: !!event.replayed,
+                  audio_follows: !!event.audio_follows });
     if (typeof event.seq === "number") {
       this.cursor = Math.max(this.cursor, event.seq + 1);
       sessionStorage.setItem("translator.cursor", String(this.cursor));
@@ -1556,6 +1744,20 @@ class Connection {
       return;
     }
     keepAudio(turnId, samples, rate);
+    // FIRST AUDIO FOR THIS TURN, timed on the DEVICE. The server records when
+    // it handed the bytes to the socket; only the phone knows when they
+    // arrived and whether they were then played. The gap between the two is
+    // the delivery leg, and it has never been measured.
+    if (!this.firstAudioAt) this.firstAudioAt = {};
+    if (!this.firstAudioAt[turnId]) {
+      this.firstAudioAt[turnId] = telemetry.now();
+      tlog("turn.first_audio_received", {
+        turn: turnId, rate: rate, samples: samples.length,
+        since_release_ms: (this.lastReleaseAt
+          ? telemetry.now() - this.lastReleaseAt : null),
+      });
+    }
+    telemetry.count("audio_frames_received");
     playback.currentTurn = turnId;
     playback.push(samples, rate);
     setTurnState(turnId, "speaking");
@@ -1579,12 +1781,28 @@ class Connection {
   }
 
   sendFrame(buffer) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(buffer);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(buffer);
+      // COUNTED, not logged. Frames arrive 50 times a second; one entry each
+      // would evict everything else in the ring within a minute, which is the
+      // failure mode that makes a telemetry buffer useless exactly when it
+      // matters. The count still answers "was the phone sending at all".
+      telemetry.count("frames_sent");
+      telemetry.count("frame_bytes_sent", buffer.byteLength || 0);
+    } else {
+      telemetry.count("frames_dropped_socket_closed");
+    }
   }
 
   sendControl(payload) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(payload));
+      if (payload.kind !== "ping" && payload.kind !== "ack") {
+        tlog("ctl.sent", { kind: payload.kind });
+      }
+    } else {
+      tlog("ctl.unsent", { kind: payload.kind, ready:
+                           this.ws ? this.ws.readyState : "none" });
     }
   }
 }
@@ -3099,6 +3317,8 @@ function setButtonLive(node, live) {
 async function beginTalking() {
   if (holding) return;
   holding = true;
+  talkStartedAt = telemetry.now();
+  tlog("turn.capture_start", { ctx_state: playback.ctx ? playback.ctx.state : "none" });
   // Output is unlocked HERE, before the first await. `await microphone.start()`
   // ends the gesture's transient activation, and an output context started
   // after that point stays suspended on a phone -- audio is pushed, nothing
@@ -3147,11 +3367,23 @@ async function beginTalking() {
   }, 400);
 }
 
+let talkStartedAt = null;
+
 function endTalking() {
   if (!holding) return;
   holding = false;
   clearTimeout(silentCapture);
   const sent = microphone.sent();
+  // THE CAPTURE END, timed on the device. Every later per-turn timestamp is
+  // measured against this one, because it is the moment the user stopped
+  // talking and started waiting -- which is the latency they actually feel,
+  // and the only end of it the server cannot see.
+  connection.lastReleaseAt = telemetry.now();
+  tlog("turn.capture_end", {
+    frames_sent: sent,
+    talk_ms: talkStartedAt ? telemetry.now() - talkStartedAt : null,
+    mic: microphone.diagnostics ? microphone.diagnostics() : null,
+  });
   microphone.setOpen(false);
   if (sent === 0) {
     // A release with no audio produces no segment and therefore no turn. The
@@ -3460,6 +3692,49 @@ segBind("segroute", async (value) => {
   }
   if (!manual) await sendPairs([]);
 });
+
+/** Ship the ring buffer to the server and SAY where it landed.
+ *
+ * The path comes back in the response and is shown to the user, because the
+ * person pressing this button is usually on a phone talking to somebody who
+ * is reading the server -- "it's uploaded" is not actionable, "it is at
+ * /path/x.json" is. Failures are shown just as loudly: a telemetry upload
+ * that silently does nothing is worse than no button, since it converts a
+ * missing diagnosis into a false belief that one exists.
+ */
+async function sendLogs() {
+  const button = el("sendlogs");
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "sending...";
+  try {
+    const payload = telemetry.snapshot({
+      session_id: connection ? connection.sessionId : null,
+      cursor: connection ? connection.cursor : null,
+      playback: playback ? playback.debug() : null,
+      microphone: (typeof microphone !== "undefined" && microphone.diagnostics)
+        ? microphone.diagnostics() : null,
+    });
+    const body = JSON.stringify(payload);
+    const response = await fetch(BASE + "api/translator/client-logs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: body,
+    });
+    if (!response.ok) throw new Error("server said " + response.status);
+    const answer = await response.json();
+    button.textContent = "sent";
+    sys("logs uploaded (" + Math.round(body.length / 1024) + " kB): "
+        + (answer.path || "stored"), false);
+    tlog("telemetry.uploaded", { bytes: body.length, path: answer.path || null });
+  } catch (err) {
+    button.textContent = "failed";
+    sys("log upload failed: " + (err && err.message ? err.message : err), true);
+  } finally {
+    setTimeout(() => { button.disabled = false; button.textContent = was; }, 2500);
+  }
+}
+el("sendlogs").onclick = sendLogs;
 
 el("gear").onclick = () => openSheet("settings", "settings");
 el("sheetclose").onclick = closeSheet;

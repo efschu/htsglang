@@ -40,11 +40,12 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from sglang.srt.translator.audio import (
@@ -873,6 +874,18 @@ class _Connection:
         await self.ws.send_text(json.dumps(payload, ensure_ascii=False))
 
 
+#: Where phone telemetry lands. DELIBERATELY NOT /tmp: this container's /tmp
+#: was wiped by a reboot on 2026-08-04 and took the only raw copy of the
+#: family session's ground-truth labels with it. A diagnosis store that does
+#: not survive a reboot is a diagnosis store that will be empty the one time
+#: it is needed.
+CLIENT_LOG_DIR = os.environ.get(
+    "TRANSLATOR_CLIENT_LOG_DIR", "/spinning/466-client-logs"
+)
+#: Matches the client's own ring budget with headroom for the envelope.
+CLIENT_LOG_MAX_BYTES = 8 << 20
+
+
 def build_app(service: TranslatorService) -> FastAPI:
     """Wire the service into a FastAPI app."""
 
@@ -965,6 +978,64 @@ def build_app(service: TranslatorService) -> FastAPI:
     @app.get("/api/translator/health")
     async def health() -> JSONResponse:
         return JSONResponse(service.health())
+
+    @app.post("/api/translator/client-logs")
+    async def client_logs(request: Request) -> JSONResponse:
+        """Store one telemetry package from a phone, and say where.
+
+        THE PHONE IS THE COMPONENT WE CANNOT DEBUG (module docstring, and it
+        has cost the project several sessions of guessing). The journal knows
+        what the server did; it does not know whether a chunk was scheduled or
+        dropped, what the microphone track actually negotiated, or which
+        console error fired at load. This endpoint is the other half.
+
+        NOT under /sessions/{id}: a client whose session never opened -- the
+        exact case where the log matters most -- has no session id to post
+        under. The id travels INSIDE the package when there is one.
+
+        The response carries the absolute path because the person pressing the
+        button is usually reading it aloud to whoever is on the server.
+        """
+        raw = await request.body()
+        if len(raw) > CLIENT_LOG_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"telemetry package is {len(raw)} bytes, over the "
+                    f"{CLIENT_LOG_MAX_BYTES} byte limit"
+                ),
+            )
+        try:
+            payload = json.loads(raw)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"not JSON: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="expected a JSON object")
+
+        directory = Path(CLIENT_LOG_DIR)
+        directory.mkdir(parents=True, exist_ok=True)
+        session_id = str(payload.get("session_id") or "nosession")
+        # Sanitized because it lands in a FILENAME and arrives from a client.
+        session_id = "".join(
+            ch for ch in session_id if ch.isalnum() or ch in "-_"
+        )[:32] or "nosession"
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        path = directory / f"client-{stamp}-{session_id}.json"
+        payload["received_at"] = time.time()
+        payload["received_bytes"] = len(raw)
+        path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+        logger.info(
+            "stored client telemetry from session %s (%d bytes) at %s",
+            session_id, len(raw), path,
+        )
+        return JSONResponse({
+            "stored": True,
+            "path": str(path),
+            "bytes": len(raw),
+            "entries": len(payload.get("entries") or ()),
+        })
 
     @app.get("/metrics")
     async def metrics_endpoint() -> Response:
