@@ -1652,6 +1652,39 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Unreachable-interop family (#547): interop code written FOR a pair the boot
+refuses is not interop, it is a claim. `force_host_write_through` (#242) exists
+so a kv-session-offload budget demotion hands its prefix over losslessly under
+HiCache — the donating insert is exempted from HiCache's hit-count
+write-through heuristic, which would otherwise drop exactly the leaves the
+session just produced while the same finish frees their device slots. It has
+ONE producer (`kv_session_offload._budget_demote`) and its readers are the
+prefix caches, whose host tier only exists when hierarchical caching is
+initialised (`mem_cache/registry.py`) — and `server_args` refuses
+`--enable-kv-session-offload` together with `--enable-hierarchical-cache`. So
+the mechanism cannot fire, while FEATURES_VS_UPSTREAM stated flatly that "the
+hand-over is lossless under HiCache", i.e. described behaviour no boot can
+reach. Two lessons, both cheap to apply: a seam whose producer and consumer
+sit on opposite sides of a mutual exclusion is dead by construction and a grep
+for its writers proves it in seconds; and a feature table sentence in the
+present indicative is a claim that something RUNS, so "written for" and
+"observed" need different words. The refusal itself was the other half of the
+problem — it read "each is its own host tier", a description of the two
+features rather than a reason for the exclusion, leaving a reader unable to
+tell a physical impossibility from an unbuilt piece. Reading the tree settles
+it: the host buffers are two independent `MHATokenToKVPoolHost` objects, the
+key spaces are disjoint (kvso addresses host rows by sentinel slot ids above
+the device allocator's range, HiCache by page indices and hash keys), and
+neither module reads the other's state; what is missing is a JOINT pinned-host-
+RAM budget (each validates its own alone, and over-committing pinned memory
+invokes the OOM killer rather than swapping) and a MEASUREMENT of the
+contention between kvso's in-critical-path spill copies and HiCache's
+backup/prefetch transfers. The refusal now says exactly that, and
+`test/registered/unit/server_args/test_kvso_hicache_exclusion_547.py` pins both
+halves — six of its tests go red against the old one-sentence refusal, and the
+structural half goes red the moment the seam gains a producer or a reader
+outside the layer that makes the reasoning true.
+
 Equivalent-fallback family (#552): a decline is only worth its name when the
 fallback it hands off to does something DIFFERENT. `try_spill` declined
 outright whenever speculative decoding was active and the FCFS/minimal-eviction
