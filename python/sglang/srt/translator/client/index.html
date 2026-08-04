@@ -973,6 +973,25 @@ class Playback {
     this.currentUnit = null;
     this.rampedUnit = null;
     this.unitStarts = 0;
+    //: THE CHUNK SEAM (user report 2026-08-04: "ganz leichte knackser meist
+    //: bei wortanfängen"). The onset instrument above fires only at a
+    //: re-anchor, a turn start or a unit start -- 4 events in the session that
+    //: report came from, against 35 audio buffers. The other 31 boundaries
+    //: were never sampled, and they are the ones that changed: since streaming
+    //: shipped, consecutive chunks come from two DIFFERENT decodes of a
+    //: growing prefix rather than from one sliced waveform, so they need not
+    //: join. This measures every ordinary boundary on the DEVICE, which is the
+    //: only place the click is a fact rather than a model.
+    //:
+    //: Kept as a ratio to the local signal, not as an absolute step: the same
+    //: step is inaudible under a vowel and a click at a word onset, and "at
+    //: word starts" is precisely what the user reports. An average would hide
+    //: it -- one bad seam in twenty is what is heard -- so the WORST is kept
+    //: alongside the count.
+    this.lastSample = null;
+    this.chunkSeams = 0;
+    this.worstChunkSeam = 0;
+    this.loudChunkSeams = 0;
     //: THE CAPTURE HOLD (self-hearing incident, 2026-08-04). The phone is used
     //: half-duplex -- tap, speak German, tap again -- and the Spanish synthesis
     //: of the PREVIOUS turn began playing out of the loudspeaker while capture
@@ -1070,6 +1089,10 @@ class Playback {
    */
   reset() {
     this.cursor = 0;
+    // No buffer precedes the first one on a fresh clock, so there is no seam
+    // to measure across the reset. Leaving the old sample here would report
+    // the step between two unrelated timelines as a chunk seam.
+    this.lastSample = null;
     this.holdReset += this.discardHeld();
     this.forget();
   }
@@ -1332,6 +1355,42 @@ class Playback {
       } else {
         source.connect(ctx.destination);
       }
+      // THE CHUNK SEAM, measured on every ordinary boundary (see the
+      // constructor). Only when the cursor was NOT moved: after a re-anchor
+      // this buffer does not abut the previous one, the gap is the artefact
+      // and the step across it is not defined.
+      if (!reanchor && this.lastSample !== null && samples.length) {
+        const step = Math.abs(samples[0] - this.lastSample);
+        // 10 ms of local signal. Long enough to be an amplitude rather than
+        // one sample, short enough to still be the word onset and not the
+        // vowel that follows it.
+        const w = Math.min(samples.length, Math.round(ctx.sampleRate * 0.01));
+        let sum = 0;
+        for (let i = 0; i < w; i++) sum += samples[i] * samples[i];
+        const local = Math.sqrt(w ? sum / w : 0);
+        // Silence has no seam: a step of zero between two zeros is not an
+        // artefact, and dividing by a near-zero local level would report one.
+        if (local > 1e-4) {
+          const rel = step / local;
+          this.chunkSeams += 1;
+          if (rel > this.worstChunkSeam) this.worstChunkSeam = Math.round(rel * 100) / 100;
+          // A step comparable to the local RMS is a discontinuity the ear can
+          // find; well below it, the waveform was moving that fast anyway.
+          // Logged individually because the whole question is WHICH seams are
+          // audible, and an aggregate cannot answer it.
+          if (rel >= 1.0) {
+            this.loudChunkSeams += 1;
+            tlog("audio.chunk_seam", {
+              turn: this.currentTurn, unit: this.currentUnit,
+              step: Math.round(step * 1000) / 1000,
+              local: Math.round(local * 1000) / 1000,
+              rel: Math.round(rel * 100) / 100,
+              at: Math.round(now * 1000) / 1000,
+            });
+          }
+        }
+      }
+      this.lastSample = samples[samples.length - 1];
       source.start(this.cursor);
       telemetry.count("audio_buffers_scheduled");
       this.cursor += buffer.duration;
@@ -1556,6 +1615,9 @@ class Playback {
       unit_starts: this.unitStarts,
       ramps: this.ramps,
       ramp_skipped: this.rampSkipped,
+      chunk_seams: this.chunkSeams,
+      worst_chunk_seam: this.worstChunkSeam,
+      loud_chunk_seams: this.loudChunkSeams,
       onsets: this.onsets.slice(-4),
       errors: this.errors.slice(-3),
     };
