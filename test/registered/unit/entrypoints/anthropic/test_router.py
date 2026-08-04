@@ -12,9 +12,14 @@ import unittest
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestServer
 
-from sglang.srt.entrypoints.anthropic.router import STATS_PATH, create_app
+from sglang.srt.entrypoints.anthropic.router import (
+    STATS_PATH,
+    THINKING_ALIAS_SUFFIX,
+    create_app,
+)
 
 LOCAL_MODEL = "Qwen3.6-27B"
+THINKING_ALIAS = LOCAL_MODEL + THINKING_ALIAS_SUFFIX
 REMOTE_MODEL = "claude-opus-4-6"
 
 
@@ -180,7 +185,14 @@ class RouterTestCase(AioHTTPTestCase):
             self.local["requests"][0]["body"]["thinking"], {"type": "disabled"}
         )
 
-    async def test_explicit_thinking_is_never_rewritten(self):
+    async def test_explicit_thinking_is_overridden_to_disabled(self):
+        """The plain local id is ALWAYS the no-thinking arm.
+
+        Claude Code attaches its own thinking config to subagent requests;
+        honoring it made the local model think despite the no-thinking policy
+        (live incident 2026-08-04: "Thought for 14s" + stray </think> in
+        text). The -think alias is the only route to the thinking arm.
+        """
         await self.client.post(
             "/v1/messages",
             json=self._body(
@@ -189,7 +201,7 @@ class RouterTestCase(AioHTTPTestCase):
         )
         self.assertEqual(
             self.local["requests"][0]["body"]["thinking"],
-            {"type": "enabled", "budget_tokens": 1024},
+            {"type": "disabled"},
         )
 
     async def test_upstream_bodies_are_byte_identical(self):
@@ -215,6 +227,79 @@ class RouterTestCase(AioHTTPTestCase):
         finally:
             await server.close()
         self.assertNotIn("thinking", self.local["requests"][0]["body"])
+
+    # ---------- the thinking alias ----------
+
+    async def test_thinking_alias_reaches_the_local_front(self):
+        resp = await self.client.post("/v1/messages", json=self._body(THINKING_ALIAS))
+        self.assertEqual((await resp.json())["backend"], "local")
+        self.assertEqual(self.upstream["requests"], [])
+
+    async def test_thinking_alias_rewrites_the_model_to_the_real_id(self):
+        """The local front has no ``-think`` checkpoint to serve."""
+        await self.client.post("/v1/messages", json=self._body(THINKING_ALIAS))
+        self.assertEqual(self.local["requests"][0]["body"]["model"], LOCAL_MODEL)
+
+    async def test_thinking_alias_forces_adaptive_thinking(self):
+        await self.client.post("/v1/messages", json=self._body(THINKING_ALIAS))
+        self.assertEqual(
+            self.local["requests"][0]["body"]["thinking"], {"type": "adaptive"}
+        )
+
+    async def test_thinking_alias_overrides_an_explicit_client_value(self):
+        """Naming the alias IS the request for thinking.
+
+        Claude Code sends ``disabled`` of its own accord on some paths; if that
+        won here the thinking arm would silently be the default arm.
+        """
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(THINKING_ALIAS, thinking={"type": "disabled"}),
+        )
+        self.assertEqual(
+            self.local["requests"][0]["body"]["thinking"], {"type": "adaptive"}
+        )
+
+    async def test_thinking_alias_un_aliases_count_tokens_without_thinking(self):
+        await self.client.post(
+            "/v1/messages/count_tokens", json=self._body(THINKING_ALIAS)
+        )
+        got = self.local["requests"][0]["body"]
+        self.assertEqual(got["model"], LOCAL_MODEL)
+        self.assertNotIn("thinking", got)
+
+    async def test_thinking_alias_of_an_unknown_model_goes_upstream(self):
+        """The suffix is only meaningful on a configured local id."""
+        await self.client.post(
+            "/v1/messages", json=self._body(REMOTE_MODEL + THINKING_ALIAS_SUFFIX)
+        )
+        self.assertEqual(len(self.upstream["requests"]), 1)
+        self.assertEqual(self.local["requests"], [])
+        self.assertEqual(
+            self.upstream["requests"][0]["body"]["model"],
+            REMOTE_MODEL + THINKING_ALIAS_SUFFIX,
+        )
+
+    async def test_thinking_alias_ignores_the_shim_switch(self):
+        """``--no-thinking-shim`` disables the default-arm fill-in only."""
+        app = create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            apply_shim=False,
+        )
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            from aiohttp.test_utils import TestClient
+
+            async with TestClient(server) as client:
+                await client.post("/v1/messages", json=self._body(THINKING_ALIAS))
+        finally:
+            await server.close()
+        self.assertEqual(
+            self.local["requests"][0]["body"]["thinking"], {"type": "adaptive"}
+        )
 
     async def test_shim_does_not_touch_count_tokens(self):
         await self.client.post(
@@ -270,6 +355,13 @@ class RouterTestCase(AioHTTPTestCase):
         self.assertEqual(stats["local"], 1)
         self.assertEqual(stats["upstream"], 2)
         self.assertEqual(stats["local_models"], [LOCAL_MODEL])
+        self.assertEqual(stats["thinking_aliases"], [THINKING_ALIAS])
+
+    async def test_thinking_alias_counts_as_a_local_request(self):
+        await self.client.post("/v1/messages", json=self._body(THINKING_ALIAS))
+        stats = await (await self.client.get(STATS_PATH)).json()
+        self.assertEqual(stats["local"], 1)
+        self.assertEqual(stats["upstream"], 0)
 
     async def test_stats_path_is_not_proxied(self):
         await self.client.get(STATS_PATH)
