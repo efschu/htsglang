@@ -110,6 +110,43 @@ from sglang.srt.translator.voices import (
 
 logger = logging.getLogger(__name__)
 
+#: The turn had a speaker we could not identify, and we did not invent one.
+#:
+#: Returned by `_identify` when the registry is EMPTY -- so there is nobody to
+#: fall back to -- and the segment cannot be embedded, either because it is
+#: shorter than the embedder's `min_seconds` or because the embedder failed.
+#: Structurally that is the first utterance of a session.
+#:
+#: IT IS NOT AN ID. No profile carries this key and `SpeakerRegistry.get` will
+#: raise `KeyError` for it, which is correct: there is nothing to get. Every
+#: consumer must therefore ask whether the speaker is ATTRIBUTED before it
+#: reaches for a profile, and `if speaker_id` is not that question -- a
+#: non-empty sentinel is truthy, which is exactly how #573 crashed a live turn.
+#: `is_attributed()` is that question.
+#:
+#: The value is kept as it was rather than improved: journals and transcripts
+#: already on disk carry this string, and changing it would silently reclassify
+#: them.
+UNATTRIBUTED_SPEAKER_ID = "speaker-unknown"
+
+#: What the user sees instead of the raw sentinel. The app's chrome is
+#: lowercase English ("who spoke?", "translating", "undo") while only the
+#: transcript CONTENT is German or Spanish, and there is no client-side
+#: localisation table to emit a token into -- `speakerLabel()` falls back to
+#: the raw id. So this matches the chrome it sits in.
+UNATTRIBUTED_SPEAKER_LABEL = "unknown speaker"
+
+
+def is_attributed(speaker_id: Optional[str]) -> bool:
+    """Is this a speaker id that a profile can actually be fetched for?
+
+    The one predicate every `speakers.get()` caller on the turn path needs.
+    Written as a function rather than an inline comparison so that the next
+    consumer of `_identify`'s result finds it by name instead of rediscovering
+    the sentinel the way #573 did.
+    """
+    return bool(speaker_id) and speaker_id != UNATTRIBUTED_SPEAKER_ID
+
 #: Backoff between MT attempts, in seconds. Sized to bridge the co-tenancy
 #: windows this rig produces rather than to be polite: the MT server shares
 #: its cards with the talker and with whatever else is running, and a long
@@ -864,9 +901,18 @@ class TranslatorSession:
     # -- the written record (§17.2) -----------------------------------------
 
     def _speaker_label(self, speaker_id: str) -> str:
-        """Confirmed name if there is one, else the id itself."""
+        """Confirmed name if there is one, else the id itself.
+
+        The unattributed sentinel gets WORDS instead. The client renders
+        `speaker_label` and falls back to the raw `speaker_id` when it is
+        empty (`speakerLabel()` in index.html), so without this case the
+        bubble would be captioned with the literal string `speaker-unknown` --
+        an internal token shown to a user as if it were a name.
+        """
         if not speaker_id:
             return ""
+        if speaker_id == UNATTRIBUTED_SPEAKER_ID:
+            return UNATTRIBUTED_SPEAKER_LABEL
         try:
             profile = self.speakers.get(speaker_id)
         except KeyError:
@@ -1724,10 +1770,22 @@ class TranslatorSession:
                 "similarity": round(similarity, 3),
                 "reference_admitted": admitted,
                 "manual": manual,
+                # `is_attributed`, not `if speaker_id`. The sentinel is a
+                # non-empty string and therefore TRUTHY, so the old guard let
+                # it through to `speakers.get`, which raised `KeyError` and
+                # killed the whole turn on the first utterance of a session
+                # (#573, live twice on 2026-08-04).
+                #
+                # Zero for an unattributed speaker is a FACT, not a fallback:
+                # there is no profile, so there is no reference buffer, so
+                # there are no reference seconds. An id that is attributed but
+                # missing is a different matter and still raises -- that would
+                # be a broken invariant, and turning it into a silent zero is
+                # the failure mode this change exists to remove.
                 "reference_seconds": round(
                     self.speakers.get(speaker_id).reference_seconds(), 2
                 )
-                if speaker_id
+                if is_attributed(speaker_id)
                 else 0.0,
             },
         )
@@ -2031,17 +2089,34 @@ class TranslatorSession:
             if profiles:
                 recent = max(profiles, key=lambda p: p.last_seen)
                 return recent.speaker_id, 0.0, False, False
-            # Nobody known yet and nothing embeddable: mint a provisional id
-            # so the turn still has a speaker to attach to.
-            return "speaker-unknown", 0.0, False, False
+            # Nobody known yet and nothing embeddable. NOTHING IS MINTED here:
+            # the turn is marked UNATTRIBUTED and carries on without a profile.
+            # (The previous comment claimed this minted a provisional id. It
+            # never did, and #573 is what that cost -- consumers believed the
+            # comment, treated the sentinel as an id, and `speakers.get` killed
+            # the turn.)
+            #
+            # Not minting is the decision, not an omission. `create_speaker` is
+            # available and needs no embedding, so a profile COULD be made --
+            # but a segment we could not even embed would enter the roster with
+            # no centroid, in a registry whose entire purpose is matching, and
+            # the user's standing complaint is precisely that this feature
+            # opens speakers it should not (#565). Manufacturing that symptom
+            # to avoid a crash is the wrong trade; the crash is fixed where it
+            # was, at the consumer.
+            return UNATTRIBUTED_SPEAKER_ID, 0.0, False, False
         try:
             embedding = await self.embedder.embed(segment.audio)
         except BackendError:
+            # The embedder is down rather than the segment being unusable, but
+            # the outcome is the same: nothing to match against and, with an
+            # empty registry, nobody to fall back to. Same rule as above --
+            # unattributed, and no profile invented.
             profiles = self.speakers.profiles()
             if profiles:
                 recent = max(profiles, key=lambda p: p.last_seen)
                 return recent.speaker_id, 0.0, False, False
-            return "speaker-unknown", 0.0, False, False
+            return UNATTRIBUTED_SPEAKER_ID, 0.0, False, False
         # Ranked BEFORE the assignment, against the centroids the assignment
         # is about to decide on. Ranking afterwards would score the segment
         # against a centroid it had already moved.
