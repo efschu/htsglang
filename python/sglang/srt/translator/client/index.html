@@ -855,6 +855,17 @@ function sys(text, bad) {
 // than a few hundred milliseconds resets the clock, otherwise a long pause
 // would leave the queue scheduling into the past.
 // ---------------------------------------------------------------------------
+
+// Ceiling for the capture hold queue, in SAMPLES at whatever rate the server
+// sends. 120 s at 48 kHz -- the highest rate any browser hands this page --
+// so the bound is generous at every wire rate the pipeline can pick (16 kHz
+// today, PIPELINE_RATE). It is a leak guard, not a policy: a half-duplex turn
+// is seconds long, so reaching this means the hold flag is stuck, and growing
+// an unbounded array on a phone is the wrong way to find that out. Entries
+// hold REFERENCES to the same Float32Arrays `audioStore` already keeps for the
+// replay button, so a held buffer costs a queue slot, not a copy.
+const PLAYBACK_HOLD_MAX_SAMPLES = 48000 * 120;
+
 class Playback {
   constructor() {
     this.ctx = null;
@@ -908,6 +919,41 @@ class Playback {
     this.currentUnit = null;
     this.rampedUnit = null;
     this.unitStarts = 0;
+    //: THE CAPTURE HOLD (self-hearing incident, 2026-08-04). The phone is used
+    //: half-duplex -- tap, speak German, tap again -- and the Spanish synthesis
+    //: of the PREVIOUS turn began playing out of the loudspeaker while capture
+    //: was still open: telemetry client-20260804T140017Z has capture_start at
+    //: 10420 ms, first_audio_received at 18466 ms and capture_end at 19793 ms,
+    //: and the same overlap again in the next turn. The microphone recorded the
+    //: phone's own Spanish, the server recognised it as Spanish, and the user's
+    //: own translation came back at them as a fresh German turn.
+    //:
+    //: `microphone.track_echo_cancellation` was TRUE for the whole session and
+    //: cannot cover this. Browser AEC subtracts what the PLATFORM routed to the
+    //: speaker; samples rendered by this page's own AudioContext graph are
+    //: never handed to it as a reference signal, so it has nothing to subtract
+    //: and reports success while doing nothing.
+    //:
+    //: The order (user, verbatim): the Spanish audio "müsste in der zeit warten
+    //: mit dem abspielen". Capture wins, playback DEFERS -- the microphone is
+    //: not gated, nothing is ducked and nothing is thrown away. Arriving
+    //: buffers wait here in arrival order and are drained through schedule()
+    //: when capture ends, so seams, onsets and ramps run on exactly the
+    //: sequence they would have seen live.
+    this.captureHold = false;
+    this.holdQueue = [];        //: {samples, rate, turn, unit, counted}
+    this.heldSamples = 0;
+    this.holdStartedAt = null;
+    //: Deferred, drained, refused at the cap, thrown away by the stop button,
+    //: thrown away because the timeline was reset. Five counters because they
+    //: are five different stories in a log, and a turn the user never heard
+    //: has to be attributable to exactly one of them. Distinct from
+    //: `heldWhileHidden`, which is the unrelated screen-off rule and DROPS.
+    this.holdDeferred = 0;
+    this.holdDrained = 0;
+    this.holdDropped = 0;
+    this.holdDiscarded = 0;
+    this.holdReset = 0;
   }
 
   /** Create and START the output context. MUST be called on a user gesture.
@@ -957,8 +1003,22 @@ class Playback {
     return this.ctx;
   }
 
-  /** Forget any schedule made against an old clock. */
-  reset() { this.cursor = 0; this.forget(); }
+  /** Forget any schedule made against an old clock.
+   *
+   * The capture hold queue goes with it. A reconnect means seconds of dead
+   * link at least, and the server answers a resumed socket with the journal --
+   * those frames arrive marked as replayed and are deliberately not spoken.
+   * Speaking the pre-reconnect remainder afterwards would put it back into the
+   * conversation detached from the exchange it belonged to, which is the same
+   * call the screen-off rule already makes. The hold FLAG is not touched here:
+   * it belongs to the capture, not to the socket, and the user may still be
+   * talking.
+   */
+  reset() {
+    this.cursor = 0;
+    this.holdReset += this.discardHeld();
+    this.forget();
+  }
 
   /** Drop the handles to buffers that have already been heard.
    *
@@ -1237,8 +1297,118 @@ class Playback {
 
   push(float32, rate) {
     this.pushed += 1;
+    // The gate. Audio that arrives with no capture open -- the normal case,
+    // and every turn before the user ever taps -- takes the branch below and
+    // is scheduled exactly as before.
+    if (this.captureHold) { this.defer(float32, rate, true); return; }
     if (this.schedule(float32, rate)) this.scheduled += 1;
     else this.dropped += 1;
+  }
+
+  /** Park one buffer until capture ends. Returns false only if the cap
+   *  refused it, in which case it is gone and has been counted as gone.
+   *
+   * `counted` says whether this buffer belongs to the pushed/scheduled/dropped
+   * ledger, which describes what the SERVER delivered. Live arrivals do;
+   * replays do not, and marking them keeps the invariant
+   * `pushed === scheduled + dropped + <live entries still queued>` readable in
+   * a snapshot taken mid-hold.
+   *
+   * The turn and unit are captured HERE, at arrival. schedule() reads them off
+   * the instance to decide whether a buffer opens a new waveform and therefore
+   * needs an onset ramp; draining a queue that spans two turns under whatever
+   * `currentTurn` happens to be at release time would ramp the wrong seam and
+   * leave the real one clicking.
+   */
+  defer(samples, rate, counted) {
+    if (this.heldSamples + samples.length > PLAYBACK_HOLD_MAX_SAMPLES) {
+      // Refused, not silently swallowed: a queue that hit a two-minute ceiling
+      // is a stuck hold flag, and the counter is how the next telemetry
+      // package says so instead of the user just missing a translation.
+      this.holdDropped += 1;
+      if (counted) this.dropped += 1;
+      telemetry.count("audio_dropped_hold_full");
+      return false;
+    }
+    this.holdQueue.push({
+      samples: samples, rate: rate,
+      turn: this.currentTurn, unit: this.currentUnit, counted: !!counted,
+    });
+    this.heldSamples += samples.length;
+    this.holdDeferred += 1;
+    telemetry.count("audio_buffers_held_for_capture");
+    return true;
+  }
+
+  /** Engage the hold. Called from beginTalking(), on the tap.
+   *
+   * Deliberately AFTER unlock(): the gesture is the only thing that can start
+   * the output clock on a phone, and a hold engaged in its place would drain,
+   * minutes later, into a context the browser never committed.
+   *
+   * Audio ALREADY booked on the clock when this runs keeps playing, and that
+   * is the intended behaviour rather than an oversight: the user tapped to
+   * talk over a sentence that had already started, cutting it would destroy a
+   * translation nobody cancelled, and the stop button is one tap away and does
+   * exactly that. The residual self-hearing is bounded by the tail that was
+   * already scheduled at capture_start -- `remaining` measures it exactly, and
+   * the timeline in the next package shows it.
+   */
+  holdForCapture() {
+    if (this.captureHold) return;
+    this.captureHold = true;
+    this.holdStartedAt = telemetry.now();
+  }
+
+  /** Release the hold and play what waited, in arrival order.
+   *
+   * Drained THROUGH schedule() on purpose: the resampler carries state across
+   * consecutive frames, and the re-anchor test, the turn seam and the unit
+   * seam all live in there. Order is preserved exactly, so the resampler sees
+   * the same sample sequence it would have seen without the hold.
+   */
+  releaseCaptureHold() {
+    this.captureHold = false;
+    const queue = this.holdQueue;
+    const heldMs = this.holdStartedAt == null
+      ? null : telemetry.now() - this.holdStartedAt;
+    this.holdStartedAt = null;
+    // A release with an empty queue is the common case -- the user talked and
+    // nothing came back in the meantime. It is a no-op and says nothing, so
+    // the drain event in the timeline always means audio actually waited.
+    if (!queue.length) return 0;
+    this.holdQueue = [];
+    this.heldSamples = 0;
+    const turn = this.currentTurn;
+    const unit = this.currentUnit;
+    let played = 0;
+    for (const item of queue) {
+      this.currentTurn = item.turn;
+      this.currentUnit = item.unit;
+      const ok = this.schedule(item.samples, item.rate);
+      if (item.counted) { if (ok) this.scheduled += 1; else this.dropped += 1; }
+      if (ok) played += 1;
+    }
+    // The gate is transparent to the rest of the page: what was current before
+    // the drain is current after it. The header and the stop button read
+    // `currentTurn`, and they must not see the walk through the queue.
+    this.currentTurn = turn;
+    this.currentUnit = unit;
+    this.holdDrained += played;
+    tlog("audio.hold_released", {
+      buffers: queue.length, played: played, hold_ms: heldMs,
+      samples: queue.reduce((n, it) => n + it.samples.length, 0),
+      dropped_at_cap: this.holdDropped,
+    });
+    return played;
+  }
+
+  /** Throw the hold queue away and say how much went. Callers attribute it. */
+  discardHeld() {
+    const n = this.holdQueue.length;
+    this.holdQueue = [];
+    this.heldSamples = 0;
+    return n;
   }
 
   /** Silence everything scheduled, now. Local and immediate by design.
@@ -1257,6 +1427,13 @@ class Playback {
       try { entry.source.disconnect(); } catch (err) { /* already detached */ }
     }
     this.live = [];
+    // The capture hold queue is part of "everything", and this is the reason
+    // the discard exists at all: with the gate in place, a stop pressed WHILE
+    // talking would otherwise cut only what was audible and leave the deferred
+    // buffers to burst out of the speaker the moment the talk button is
+    // released -- the cancelled turn, played back at the user, into an open
+    // microphone. Counted rather than dropped quietly.
+    this.holdDiscarded += this.discardHeld();
     // Back to "nothing is booked", so the next turn schedules against the
     // real clock rather than behind the tail we just cut away.
     this.cursor = this.ctx ? this.ctx.currentTime : 0;
@@ -1271,6 +1448,23 @@ class Playback {
   replay(entry) {
     if (!entry || !entry.chunks.length) return false;
     this.unlock();
+    // HELD LIKE LIVE AUDIO (decision, self-hearing incident 2026-08-04). The
+    // acoustic mechanism does not care where the samples came from: a replay
+    // tapped while the microphone is open is loudspeaker output recorded by
+    // that microphone, and it is the worst case of it -- clean, already
+    // synthesized Spanish, which is exactly what the recogniser transcribes
+    // best. The alternative reading, that a replay is an explicit user request
+    // and should therefore win, was rejected: the user cannot hold two
+    // intentions at once, and the tap that opened capture is the more recent
+    // one. Queued uncounted, because replay must not move the counters that
+    // say what the SERVER delivered.
+    if (this.captureHold) {
+      let queued = false;
+      for (const chunk of entry.chunks) {
+        if (this.defer(chunk, entry.rate, false)) queued = true;
+      }
+      return queued;
+    }
     let ok = false;
     for (const chunk of entry.chunks) {
       if (this.schedule(chunk, entry.rate)) ok = true;
@@ -1292,6 +1486,17 @@ class Playback {
       last_resume: this.lastResume,
       blocked: this.blocked,
       held_while_hidden: this.heldWhileHidden,
+      // The capture hold. `hold_active` and `hold_queued` are the state at the
+      // moment of the snapshot; the rest are session totals. A package where
+      // hold_deferred is non-zero and hold_drained matches it is the proof
+      // that the gate held audio and then played it, which is the whole claim.
+      hold_active: this.captureHold,
+      hold_queued: this.holdQueue.length,
+      hold_deferred: this.holdDeferred,
+      hold_drained: this.holdDrained,
+      hold_dropped: this.holdDropped,
+      hold_discarded: this.holdDiscarded,
+      hold_reset: this.holdReset,
       reanchors: this.reanchors,
       turn_starts: this.turnStarts,
       unit_starts: this.unitStarts,
@@ -3756,6 +3961,13 @@ async function beginTalking() {
   // after that point stays suspended on a phone -- audio is pushed, nothing
   // throws, nothing is heard. This line used to sit after the await.
   playback.unlock();
+  // THE CAPTURE HOLD, engaged here and released in endTalking(). After the
+  // unlock above, which needs the gesture, and BEFORE the await: getUserMedia
+  // can take hundreds of milliseconds on a cold permission prompt, and a
+  // translation that lands inside that window is exactly the audio that must
+  // not reach the loudspeaker while the microphone is coming up. See the
+  // Playback constructor for the incident this closes.
+  playback.holdForCapture();
   try {
     await microphone.start();
   } catch (err) {
@@ -3763,6 +3975,11 @@ async function beginTalking() {
     // stayed true, the button never lit, and every later press was a silent
     // no-op -- indistinguishable from a broken server.
     holding = false;
+    // No capture means nothing to protect, so the hold is released on this
+    // path too. Leaving it engaged would park every later translation behind a
+    // flag no release can ever clear -- silence with a full queue, which is
+    // the failure mode the cap counter exists to name.
+    playback.releaseCaptureHold();
     sys("microphone unavailable: " + (err && err.message ? err.message : err),
         true);
     setState("nomic", "no microphone");
@@ -3821,6 +4038,11 @@ function endTalking() {
     uplink: uplinkMeter.turnReport(),
   });
   microphone.setOpen(false);
+  // Capture is closed, so the loudspeaker is free again: play whatever arrived
+  // while it was open, in arrival order. After setOpen(false) rather than
+  // before it, so no drained buffer can reach a microphone that is still
+  // forwarding frames upstream.
+  playback.releaseCaptureHold();
   if (sent === 0) {
     // A release with no audio produces no segment and therefore no turn. The
     // server cannot distinguish it from a user who said nothing, so the
