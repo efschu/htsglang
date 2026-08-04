@@ -1948,6 +1948,31 @@ class ServerArgs:
             "active --speculative-algorithm; hard error otherwise.",
         ),
     ] = False
+    kv_session_offload_resume_under_spec: A[
+        bool,
+        Arg(
+            help="kv-session-offload (Step 2): let a spilled session under "
+            "speculative decoding WAVE BACK to device and rejoin the LIVE spec "
+            "decode batch, instead of being held on host through completion. "
+            "Default OFF, and that default is a NAMED decision, not an "
+            "oversight: with an active --speculative-algorithm the restore path "
+            "currently keeps a spilled session on host to completion because "
+            "that is the validated, crash-free route (spill -> host decode -> "
+            "finish). The resume path is BUILT -- the draft-KV share spills and "
+            "restores inside the session's residency bundle, the seed is "
+            "republished into the future map, and the host-finish guard lifts "
+            "at both of its sites -- but it has not been observed rejoining a "
+            "live spec batch on hardware, so it stays opt-in until it has. "
+            "Turning it ON also DISABLES the PS2 deep prefill spill "
+            "(--kv-session-offload-prefill): a born-spilled prompt never wrote "
+            "the draft KV that the rejoined session's drafter would attend, so "
+            "the two are mutually exclusive by construction and the boot says "
+            "so. Env twin: SGLANG_KVSO_RESUME=1 (legacy alias KVSO_RESUME=1, "
+            "deprecated); either source turning it on is enough. Requires "
+            "--enable-kv-session-offload and an active --speculative-algorithm; "
+            "hard error otherwise.",
+        ),
+    ] = False
     kv_session_offload_mtp_resident_slices: A[
         int,
         Arg(
@@ -6533,6 +6558,25 @@ class ServerArgs:
                     "--kv-session-offload-park-timeout-iters must be >= 1; "
                     f"got {self.kv_session_offload_park_timeout_iters}."
                 )
+        # #552: the env twin ORs into the flag ONCE, here, BEFORE the
+        # feature-disabled return -- so that everything downstream (this
+        # validation block, the boot log, the effective-args dump the operator
+        # reads back) sees one truth instead of each site re-deriving it from
+        # os.environ, and so arming it without the feature is REJECTED rather
+        # than silently ignored. `resume_under_spec_enabled()` reads the same
+        # OR at runtime for processes that never saw these args.
+        if envs.SGLANG_KVSO_RESUME.get():
+            self.kv_session_offload_resume_under_spec = True
+        if self.kv_session_offload_resume_under_spec and (
+            not self.enable_kv_session_offload
+        ):
+            raise ValueError(
+                "--kv-session-offload-resume-under-spec (or "
+                "SGLANG_KVSO_RESUME=1) is a sub-mode of "
+                "--enable-kv-session-offload: it lifts the host-finish guard "
+                "on a SPILLED session, and with the feature off nothing spills, "
+                "so the flag would silently do nothing."
+            )
         if not self.enable_kv_session_offload:
             return
         if self.kv_session_offload_host_ram_gib < 0:
@@ -6600,6 +6644,37 @@ class ServerArgs:
                 f"(0 disables the cap); got "
                 f"{self.kv_session_offload_mtp_resident_slices}."
             )
+        # The env twin was already OR-ed into the flag above (before the
+        # feature-disabled return), so this block reads the flag only.
+        if self.kv_session_offload_resume_under_spec:
+            # Waving a spilled session back INTO a live spec batch only means
+            # anything when there is a spec batch. Fail fast at arg-parse: the
+            # alternative is a flag that silently does nothing, which is how a
+            # boot arm ends up "testing" a path it never armed.
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--kv-session-offload-resume-under-spec (or "
+                    "SGLANG_KVSO_RESUME=1) requires an active "
+                    "--speculative-algorithm: it lifts the host-finish guard so "
+                    "a spilled session rejoins the LIVE spec decode batch, and "
+                    "with no spec algorithm there is no such batch and no guard "
+                    "to lift. None is configured."
+                )
+            if self.kv_session_offload_prefill:
+                # Not a policy choice -- a placement fact. See
+                # kv_session_offload.prefill_spill_deep_reject_reason: a
+                # born-spilled prompt never wrote the draft KV that the
+                # rejoined session's drafter attends, so PS2 and resume cannot
+                # both be on. Naming it here beats a runtime decline nobody
+                # reads.
+                raise ValueError(
+                    "--kv-session-offload-resume-under-spec cannot be combined "
+                    "with --kv-session-offload-prefill (PS2 deep prefill "
+                    "spill): a session that waves back rejoins the live spec "
+                    "batch and its drafter attends the prompt positions, which "
+                    "a born-spilled prefill never wrote. Drop one of the two "
+                    "(PS1 born-spilled admission is unaffected either way)."
+                )
         if self.kv_session_offload_spec_in_tick:
             # Step 2 Phase 1: running the drafter in the spill tick is only
             # meaningful when the server actually has a speculative algorithm to

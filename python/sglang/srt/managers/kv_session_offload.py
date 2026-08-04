@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.admission_limiter import (
     current_admission_limiter,
     spill_session_cap,
@@ -501,12 +502,32 @@ def spill_decouple_enabled() -> bool:
 
 
 def resume_under_spec_enabled() -> bool:
-    """Bring-up gate for ON-DEVICE MTP RESUME (lift the host-finish guard so a
-    spilled spec session waves back and rejoins the LIVE spec decode batch,
-    instead of finishing on host). Default OFF keeps the validated host-finish
-    path. Set KVSO_RESUME=1 to opt into the resume path (draft-KV bundle +
-    spec-in-spill-tick). Mirrors KVSO_ALLOW_SPEC's staged-bring-up role."""
-    return os.environ.get("KVSO_RESUME", "0") == "1"
+    """ON-DEVICE MTP RESUME gate: lift the host-finish guard so a spilled spec
+    session waves back and rejoins the LIVE spec decode batch, instead of
+    finishing on host. Default OFF keeps the validated host-finish path; the
+    reasoning for that default lives in the flag's help text, which is the
+    surface an operator can actually find.
+
+    TWO SOURCES, OR-ed: ``--kv-session-offload-resume-under-spec`` and its env
+    twin ``SGLANG_KVSO_RESUME`` (legacy alias ``KVSO_RESUME``). The OR is
+    deliberate rather than a precedence rule -- there is no meaningful "off
+    beats on" here, and a boot-matrix arm that exports the env must not be
+    silently overruled by the flag's default. Neither set -> False -> every
+    caller takes the byte-identical pre-flag path.
+
+    Env FIRST so the predicate keeps working in a process that has no runtime
+    context yet (unit tests, a worker before ``set_server_args``); the server
+    arg is read defensively for the same reason."""
+    if envs.SGLANG_KVSO_RESUME.get():
+        return True
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        return bool(
+            getattr(get_server_args(), "kv_session_offload_resume_under_spec", False)
+        )
+    except Exception:  # noqa: BLE001 -- no runtime context: env is the answer
+        return False
 
 
 def draft_kv_verify_enabled() -> bool:
