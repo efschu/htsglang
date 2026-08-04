@@ -157,8 +157,40 @@ class TestSpeakerButtonsInSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(liar.calls, calls_before + 1)
         self.assertIsNotNone(session.speakers.get(new_id).centroid)
 
-    async def test_arming_lasts_exactly_one_utterance(self):
+    async def test_a_sticky_pin_answers_every_segment_until_released(self):
+        """The §17.8.16 semantic: the pin is NOT spent on one utterance.
+
+        This is the phantom flood, in miniature. Two voices, one pin: under
+        the old one-shot arming the second segment went through diarization
+        and minted whatever the cosine said, which in a real conversation is
+        a new speaker per segment. Held, both lines belong to the pinned
+        speaker and both are manual.
+        """
         session, _asr, _mt, _tts = make_session()
+        new_id = session.add_speaker()
+        session.arm_speaker(new_id)
+        await run_conversation(
+            session, [conversation_audio((VOICE_A_HZ, 1.2), (VOICE_B_HZ, 1.2))]
+        )
+        lines = session.transcript.lines()
+        self.assertGreaterEqual(len(lines), 2)
+        for line in lines[:2]:
+            self.assertEqual(line.speaker_id, new_id)
+            self.assertEqual(line.origin, ORIGIN_MANUAL)
+        # Still held: only the user takes it back.
+        self.assertEqual(session.armed_speaker, new_id)
+        self.assertIsNone(session.arm_speaker(None))
+
+    async def test_arming_lasts_exactly_one_utterance_without_the_sticky_pin(self):
+        """The pre-§17.8.16 behaviour, kept switchable and kept pinned.
+
+        Rewritten rather than deleted: what this test is ABOUT -- that the
+        button overrides identification for the utterance it was pressed for,
+        and that identification takes over again afterwards -- is unchanged.
+        Only how long the override lasts is now a decision, so the old answer
+        is asserted against the flag that selects it.
+        """
+        session, _asr, _mt, _tts = make_session(sticky_pin=False)
         new_id = session.add_speaker()
         session.arm_speaker(new_id)
         await run_conversation(
@@ -209,8 +241,18 @@ class TestSpeakerButtonsInSession(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(e.get("armed_speaker") == new_id for e in events))
 
         await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.2))])
-        # ...and the consumption is visible too, so a client can unlight the
-        # button from server state rather than guessing.
+        # A STICKY pin is not consumed, so there is nothing to unlight and the
+        # state still names it. The consumption event belongs to the one-shot
+        # mode and is asserted there.
+        self.assertEqual(session.state()["armed_speaker"], new_id)
+
+    async def test_the_journal_shows_the_consumption_without_the_sticky_pin(self):
+        session, _asr, _mt, _tts = make_session(sticky_pin=False)
+        new_id = session.add_speaker()
+        session.arm_speaker(new_id)
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.2))])
+        # The client can unlight the button from server state rather than
+        # guessing -- which is what this half was always about.
         consumed = [
             event.payload
             for event in session.journal.since(0)[0]
@@ -218,6 +260,7 @@ class TestSpeakerButtonsInSession(unittest.IsolatedAsyncioTestCase):
             and event.payload.get("consumed_by") == new_id
         ]
         self.assertTrue(consumed)
+        self.assertIsNone(session.armed_speaker)
 
     async def test_the_speaker_event_says_who_decided(self):
         session, _asr, _mt, _tts = make_session()
@@ -359,6 +402,11 @@ class TestSpeakerMerge(unittest.IsolatedAsyncioTestCase):
         attributes an utterance directly, so the same tone can be pushed into
         two separate profiles. That is the same END STATE the threshold
         produces on a real split, and it is deterministic.
+
+        The pin is RELEASED before returning. Under the sticky pin (§17.8.16)
+        it would otherwise still be held, and every follow-up segment in the
+        tests below would land on the pinned speaker by design -- which would
+        make them measure the pin instead of the merge they exist for.
         """
         session, _asr, _mt, _tts = make_session()
         first = session.add_speaker("Matthias")
@@ -367,6 +415,7 @@ class TestSpeakerMerge(unittest.IsolatedAsyncioTestCase):
         second = session.add_speaker()
         session.arm_speaker(second)
         await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.4))])
+        session.arm_speaker(None)
         return session, first, second
 
     async def test_without_the_merge_the_next_segment_lands_on_the_wrong_cluster(self):

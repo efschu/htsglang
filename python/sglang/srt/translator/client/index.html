@@ -717,6 +717,10 @@ class Playback {
     this.reanchors = 0;
     this.onset = null;
     this.onsets = [];
+    //: Onset ramps applied, and the rare case where the curve could not be
+    //: scheduled because the start time had already passed.
+    this.ramps = 0;
+    this.rampSkipped = 0;
     //: The turn whose audio is currently on the clock, so a stop can say on
     //: WHICH bubble it happened rather than only in the header.
     this.currentTurn = null;
@@ -893,7 +897,6 @@ class Playback {
       buffer.copyToChannel(samples, 0);
       const source = ctx.createBufferSource();
       source.buffer = buffer;
-      source.connect(ctx.destination);
       const now = ctx.currentTime;
       // THE ONSET INSTRUMENT (user report: a rare click at the start of
       // speech). Two numbers, and they answer different questions. A
@@ -935,6 +938,37 @@ class Playback {
         this.onsets.push(this.onset);
         while (this.onsets.length > 8) this.onsets.shift();
         this.cursor = now + 0.05;
+      }
+      // ONSET RAMP (user report: "das knacken ist meist ganz am anfang des
+      // gesprochenen, danach ist es meist knackfrei"). A buffer starting at a
+      // non-zero sample is a step discontinuity from silence, and a step is a
+      // click -- it is the same artefact class as the per-frame resampling
+      // that was fixed in §17.8.13, but at the START of a run rather than at
+      // every seam, which is exactly where the user still hears it. A short
+      // cosine-shaped ramp removes the step; 8 ms is below the ~20 ms where a
+      // fade becomes audible as a soft attack, and it is applied ONLY at a
+      // re-anchor, so continuous speech is untouched and no word is softened
+      // in the middle. `setValueCurveAtTime` gives the cosine shape; a linear
+      // ramp would leave a corner in the first derivative.
+      if (reanchor && ONSET_RAMP_S > 0) {
+        const gain = ctx.createGain();
+        const steps = 32;
+        const curve = new Float32Array(steps);
+        for (let i = 0; i < steps; i++) {
+          curve[i] = 0.5 - 0.5 * Math.cos((Math.PI * i) / (steps - 1));
+        }
+        try {
+          gain.gain.setValueCurveAtTime(curve, this.cursor, ONSET_RAMP_S);
+        } catch (err) {
+          // A curve scheduled in the past throws; a hard start is still
+          // better than no audio, and the counter says it happened.
+          this.rampSkipped += 1;
+        }
+        source.connect(gain);
+        gain.connect(ctx.destination);
+        this.ramps += 1;
+      } else {
+        source.connect(ctx.destination);
       }
       source.start(this.cursor);
       this.cursor += buffer.duration;
@@ -1009,6 +1043,8 @@ class Playback {
       blocked: this.blocked,
       held_while_hidden: this.heldWhileHidden,
       reanchors: this.reanchors,
+      ramps: this.ramps,
+      ramp_skipped: this.rampSkipped,
       onsets: this.onsets.slice(-4),
       errors: this.errors.slice(-3),
     };
@@ -2761,6 +2797,12 @@ const microphone = new Microphone(
 //: and answers with an ack. Kept as ONE constant, and the client's half is
 //: complete and useful before that half lands -- the local cut does not
 //: depend on it.
+//: Length of the fade applied at the start of a playback run. Below the
+//: ~20 ms at which a fade becomes audible as a soft attack, and long enough
+//: to remove the step discontinuity that makes the click. Settable to 0 from
+//: the console, which is what the can-fail arm does.
+let ONSET_RAMP_S = 0.008;
+
 const STOP_FRAME_KIND = "playback.stop";
 //: Turns whose playback the listener cut. Their remaining audio is kept for
 //: the replay button and never scheduled.
@@ -3124,6 +3166,12 @@ let pinRearms = 0;
 
 function rearmPin() {
   if (!pinnedSpeaker) return;
+  // STAND DOWN against a server that holds the pin itself. This mitigation
+  // existed only because the arming was consumed per segment; where the
+  // server announces `sticky_pin`, re-sending is redundant traffic that would
+  // also mask a regression in the server-side hold. Same capability mechanism
+  // as the merge gesture -- an older server omits the key and keeps this.
+  if (serverSupports.sticky_pin) return;
   connection.sendControl({ kind: "speaker.arm", speaker_id: pinnedSpeaker });
   markArmed(pinnedSpeaker);
   pinRearms += 1;

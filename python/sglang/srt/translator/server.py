@@ -386,6 +386,7 @@ class _Connection:
         self._pump: Optional[asyncio.Task] = None
         #: The running drain, so a stop can cancel it (§19.12).
         self._drain_task: Optional[asyncio.Task] = None
+        self._recovery: Optional[asyncio.Task] = None
         self._closing = False
 
     async def run(self) -> None:
@@ -394,6 +395,18 @@ class _Connection:
             await self._handshake()
             self.session.attach()
             self._pump = asyncio.create_task(self._journal_pump())
+            # ORPHAN RECOVERY, at the one moment a client is there to hear the
+            # result. A turn interrupted between recognition and audio leaves
+            # a message reading "translating" that nothing will ever finish --
+            # measured live: the socket dropped mid-turn, the server completed
+            # MT and synthesis into a closed connection, and the reconnecting
+            # page resumed the journal with the words but no audio and no
+            # terminal state. Started as a task so the recovery never delays
+            # the handshake; the pump is already running, so its events reach
+            # this client.
+            self._recovery = asyncio.create_task(
+                self.session.recover_unfinished()
+            )
             await self._receive_loop()
         except WebSocketDisconnect:
             logger.info("client disconnected from session %s", self._sid())

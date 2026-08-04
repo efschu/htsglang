@@ -175,6 +175,15 @@ class Segment:
     index: int
     #: Seconds of audio consumed by the segmenter before this segment started.
     start_s: float
+    #: The turn that was already being processed when this segment was queued,
+    #: or None. Stamped at `Session.enqueue` because that is the only place the
+    #: temporal relation is known, and read after recognition because that is
+    #: the earliest the LANGUAGE is known. Together those two facts are the
+    #: barge-in predicate: somebody talked over somebody else.
+    overlapped_turn_id: Optional[str] = None
+    #: The source language of that turn, so the comparison does not have to
+    #: reach back into state that may already have moved on.
+    overlapped_language: Optional[str] = None
 
     @property
     def duration_s(self) -> float:

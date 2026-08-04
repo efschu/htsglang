@@ -232,6 +232,14 @@ class SpeakerRegistryConfig:
     #: marked uncertain, because that is the range where the embedder cannot
     #: separate "same person" from "different person".
     uncertain_floor: float = 0.583
+    #: Below this language-identification confidence a segment may still be
+    #: TRANSLATED, but it may never become somebody's voice reference. Our own
+    #: TTS coming back through the microphone scored 0.026 and enrolled itself
+    #: as a speaker carrying the user's cloned voice; clean speech from a
+    #: person does not look like that. 0.30 sits between the two populations
+    #: and well below the 0.5 the routing path already trusts, so it refuses
+    #: the echo class without touching any decision a real utterance makes.
+    enrollment_language_confidence: float = 0.30
     #: Within-speaker p05 from the same sweep. Used for auto-resolution: a
     #: stored embedding that later scores above this against an updated
     #: centroid is no longer ambiguous.
@@ -600,6 +608,8 @@ class SpeakerRegistry:
         text: str = "",
         language: Optional[str] = None,
         language_confidence: float = 1.0,
+        pin: Optional[str] = None,
+        overlapped: bool = False,
     ) -> Tuple[SpeakerProfile, float, bool]:
         """Match or create a speaker, and maybe admit the audio as reference.
 
@@ -683,9 +693,34 @@ class SpeakerRegistry:
         if language and language_confidence >= 0.5:
             profile.last_language = language
 
+        # ENROLLMENT LOCK FOR THE TTS ECHO (§17.8.16). Our own synthesis comes
+        # back through the microphone, and it enrolled itself: `speaker-4`,
+        # language `es`, language confidence 0.026, carrying the user's own
+        # cloned voice and then routing German to German through it. Two
+        # independent conditions keep it out of any reference buffer, and
+        # both are properties the echo has and real speech does not.
+        #
+        #   - it is captured WHILE we are speaking (`overlapped`), which is
+        #     the same barge-in stamp the language filter reads;
+        #   - the identifier is not confident about it, because a loudspeaker
+        #     played back through a phone microphone is not clean speech.
+        #
+        # A wrongly refused reference costs one slice of clone material and is
+        # recovered on the next utterance. A wrongly ADMITTED echo becomes the
+        # voice, permanently, and there is no path back from that.
+        echo_suspect = overlapped or (
+            language_confidence < self.config.enrollment_language_confidence
+        )
+        if echo_suspect:
+            logger.info(
+                "reference refused for %s: echo-suspect (overlapped=%s "
+                "lang_conf=%.3f < %.3f)",
+                profile.speaker_id, overlapped, language_confidence,
+                self.config.enrollment_language_confidence,
+            )
         admitted = (
             False
-            if guessed
+            if (guessed or echo_suspect)
             else self._maybe_admit_reference(
                 profile, audio, text, language, best_sim
             )
@@ -702,6 +737,8 @@ class SpeakerRegistry:
             language_confidence=language_confidence,
             duration_s=audio.duration_s,
             at=now,
+            pin=pin,
+            overlapped=overlapped,
         )
         return profile, best_sim, admitted
 
@@ -719,6 +756,8 @@ class SpeakerRegistry:
         language_confidence: float,
         duration_s: float,
         at: float,
+        pin: Optional[str] = None,
+        overlapped: bool = False,
     ) -> None:
         """Persist WHY this turn was attributed the way it was.
 
@@ -752,6 +791,15 @@ class SpeakerRegistry:
             "language": language or "",
             "language_confidence": round(float(language_confidence), 3),
             "segment_s": round(float(duration_s), 2),
+            # THE EVIDENCE RECORD (§17.8.17). These two turn the log from "who
+            # won" into something a threshold can be re-derived from and an
+            # arbiter can later be handed: whether the user had pinned anyone
+            # at the moment of the decision, and whether this segment was
+            # spoken over a running turn. Without them a low cosine cannot be
+            # told apart from a low cosine measured on somebody talking over
+            # somebody else, and those two want opposite conclusions.
+            "pin": pin,
+            "overlapped": bool(overlapped),
         }
         self.decisions.append(record)
         logger.info(
