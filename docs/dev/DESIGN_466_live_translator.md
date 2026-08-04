@@ -3898,3 +3898,918 @@ never exit. Wait on a PID.
 `getSettings()` telemetry of the next phone connect (§19.8(b)), §19.9 -- all
 behind the DSV4F focus window, which takes serving and this tenant down for a
 while; its agent reboots the tenant at the end of that window.
+
+#### 17.8.16 Language before embedding, and one speaker at a time (user directive, eighth session)
+
+**The order, verbatim (2026-08-04):** "der größte hebel zu erkennen ob jemand
+anderes spricht ist die ausgangssprache erstmal. weil es kann auch jemand
+spanisch reinquatschen, wenn ich deutsch gerade spreche, dann muss
+selbstverständlich der spanisch erkannte teil, die spanische stimme, ignoriert
+werden. es soll nur ein sprecher gleichzeitig 'als audio rauskommen'."
+
+This reorders the whole identity stack. Until now the embedding decided who
+spoke and the language was a consequence; from here the language decides
+whether this is even the same speaker, and the embedding is what separates two
+people who share one.
+
+**WHAT THE CODE ALREADY GUARANTEES, AND WHAT IT DOES NOT.** The output half of
+the order is already true and needs no work: `run_turn_multi` holds
+`self._turn_lock` across recognition, MT *and* synthesis (`session.py:1219-1233`,
+with `_translate_and_speak` awaited inside `_run_turn_locked`), and `drain()`
+pops one segment at a time (`session.py:1191-1197`). Two speakers can therefore
+never be synthesized concurrently today, and any claim to have "built" that
+would be a claim on existing behaviour. What is NOT prevented is the other half:
+an interjection is QUEUED (`enqueue`, `session.py:1136-1150`) and spoken once
+the running turn ends. "Ignoriert werden" forbids exactly that replay. Rule 2 is
+therefore a DISCARD at the queue boundary, not a mutex.
+
+**RULE 1 MUST RUN BETWEEN STEP 1 AND STEP 2, AND TODAY NOTHING RUNS THERE.**
+Recognition is step 1 (`session.py:1336-1357`), identification step 2
+(`session.py:1361`), source resolution step 3 (`session.py:1383`). Enrollment
+happens inside step 2 -- `speakers.assign(...)` takes the audio and the text and
+moves the centroid (`session.py:1631-1637`). A language filter placed at step 3,
+where `_resolve_source` sits, would refuse the translation of a segment whose
+voice it had already folded into the pinned speaker's cluster. The filter goes
+BEFORE `_identify` or it protects only half of what it exists to protect.
+
+**THE FLOOR.** One concept serves both rules, and naming it once keeps them from
+being two mechanisms that disagree. The *floor language* is the language that
+currently holds the conversation: the sticky pin's language while a pin is held,
+and the running turn's resolved source while a turn is in flight. A segment
+resolved to a *different participant language* while the floor is held is by
+construction a different speaker -- no embedding is consulted, because the order
+says language comes first.
+
+**THE TRADE-OFF I DECIDED, AND IT NEEDS TO BE SEEN.** A floor that is held for
+as long as the pin is held would silence the app's own purpose: a DE speaker and
+an ES speaker alternating into one phone means every second turn is "the other
+language under a held pin". The order is about `reinquatschen` -- talking OVER
+someone -- so the discard is scoped to OVERLAP, which is a predicate the code can
+actually evaluate: `self._active_turn_id is not None` at `enqueue()` time is
+exactly "this segment was captured while another turn was being processed". It
+is stamped on the queued segment there (the only place the temporal relation is
+known) and acted on after recognition (the earliest place the language is
+known).
+
+  - segment OVERLAPS a running turn, other participant language
+      -> discarded. No TTS, no enrollment, no queueing. Transcript line
+         written and tagged, because a swallowed utterance is
+         indistinguishable from a broken microphone.
+  - segment does NOT overlap, other participant language, pin held
+      -> translated normally, but NOT enrolled into the pinned cluster, and
+         the UI says the pin is still on someone else. This is the ordinary
+         hand-over and must keep working.
+
+If the user wants the stricter reading -- a held pin silences the other language
+outright, overlap or not -- it is one predicate, but it should be his call and
+not a side effect of mine.
+
+**WHY THE NAIVE DIRECTION GUARD (item 3d) IS UNREACHABLE, CONFIRMED IN CODE.**
+`Conversation.targets_for` returns `participants - {src}` (`languages.py:360`)
+and `require_pair` refuses `src == tgt` before anything else
+(`languages.py:261-265`). "Detected language equals chosen target" can therefore
+never occur downstream: the target set is built by excluding the source. The
+defect the user sees is a WRONG `source`, and the only place to fix it is source
+resolution -- which is what rules 1 and 2 are. The direction bolt stays as an
+assertion that the invariant holds, not as a repair.
+
+**LID HARDENING, AND WHAT A CONFIDENCE GATE CANNOT DO.** `_resolve_source`
+(`session.py:1720-1735`) trusts the detected language at
+`language_confidence >= 0.5` and otherwise believes `profile.last_language` --
+which is how the TTS-echo cluster (speaker-4, `language es`, conf 0.026) routes
+German to German. Under the directive the order becomes: confident detection
+first, then the PIN's language, and `profile.last_language` only for a profile
+the user actually named or enrolled -- never a freshly minted automatic cluster,
+which is precisely the phantom this failure is made of.
+
+That fixes the echo. It does NOT necessarily fix the child. If the LID reports
+`es` for his German with HIGH confidence, no confidence gate can reach it and
+only a prior can. Text-LID over the decoded text was considered and is NOT the
+answer: Whisper decodes in the language it has already chosen, so a wrong
+decision produces wrong-language text as well -- line 2 of the live transcript,
+`"Und bingst du hási."`, is what a decode fighting its own language decision
+looks like. Whether a pin prior suffices or a session language lock is required
+is decided by the §2 measurement (his turns, with LID language and confidence
+per turn), not here.
+
+**THE HONEST LIMIT, STATED BECAUSE IT WILL BE FORGOTTEN.** Language separates
+speakers only ACROSS the pair. Two German speakers are invisible to every
+mechanism in this section, and the measured cosine threshold remains the only
+thing that separates them. That is why the threshold work stays in the bundle --
+demoted to the second line of defence, not dropped.
+
+**GATE ARMS, both with the control that proves they discriminate:**
+
+  (a) barge-in: a DE turn in flight, an ES segment injected while
+      `_active_turn_id` is set. Assert exactly one synthesis for the window,
+      the DE turn's audio uninterrupted, the ES segment tagged and never
+      spoken, and the pinned cluster's centroid unmoved. Control: the same
+      injection with the floor filter disabled must produce the second audio.
+  (b) the child: a DE segment at low LID confidence under a DE pin stays DE.
+      Control: the same segment with the pin released takes the old path and
+      routes wrongly, which is what proves the pin is what decided it.
+
+#### 17.8.17 The LLM arbiter, and why only half of it belongs in the restart bundle
+
+**The idea, verbatim (user, 2026-08-04):** "das qwen3.6 modell sollte doch auch
+mit gutem briefing aus den gemessenen daten und dem übergebenen transkript von
+bisher viel besser entscheiden können wer gerade spricht?"
+
+**Architecture, as ordered:** three stages, not a replacement. Rules first (pin,
+the §17.8.16 language filter, an unambiguous cosine) decide with no latency at
+all. Only inside a DOUBT BAND -- language does not separate, LID and embedding
+disagree, or the child class -- does a structured evidence package go to Qwen
+over the fast lane: LID language and confidence, cosine to EVERY known cluster,
+pin state, overlap flag, and the last N transcript lines WITH their speaker
+labels. Fixed answer schema (`speaker_id` | `NEW` | `DISCARD` plus one sentence
+of reasoning), hard token ceiling, timeout falling back to the rule decision.
+Shadow mode first: the arbiter judges, the judgement is logged, the rules still
+decide, and authority is granted only against a measured hit rate.
+
+**MY CALL ON TIMING: the bundle carries the EVIDENCE RECORD, the arbiter is the
+cut immediately after. The split is a dependency, not a preference.**
+
+The doubt band cannot be defined honestly today. Its edges are exactly the
+numbers §2 is being measured for -- the within-speaker cosine distribution on
+the NEW signal path, after the language filter and the sticky pin have changed
+which segments even reach the comparison. An arbiter shipped against the old
+0.637 bar would be invoked on the wrong set of turns, and its hit rate would
+then be measured against a band nobody can defend. That is the §493 class:
+a mechanism whose threshold never binds where it was supposed to.
+
+What DOES belong in the bundle, and would be built for §2 regardless, is the
+evidence record itself: the per-decision log extended with LID language and
+confidence, cosine against every cluster (not just the nearest), pin state,
+overlap flag, and the transcript window. It is the measurement instrument for
+the threshold AND the exact payload the arbiter will later be handed, so
+building it once serves both. Shipping it in the bundle means the arbiter cut
+starts with real data instead of a fresh instrument.
+
+**Three integration constraints, recorded now because each is a silent defect
+later:**
+
+  1. THE ARBITER MUST NOT TOUCH THE MT HISTORY. `mt.remember` is called per
+     translated turn (`session.py:1499-1501`) and the backend carries a rolling
+     six-turn context (`mt.py:200-217, 235-236`). An arbiter prompt issued
+     through the translating path would inject speaker-attribution reasoning
+     into the conversation context and degrade every following translation.
+     It needs a history-free call, and `translate()` is not it.
+  2. IT SITS IN THE CRITICAL PATH, because attribution precedes translation.
+     Bounded only: the fast lane answers `mt_first_token` in 0.13-0.37 s
+     measured, so a capped arbiter call is affordable *inside the doubt band*
+     and nowhere else. A timeout is an instrument failure with its own state,
+     never a blocked turn.
+  3. ONE RUNTIME. The arbiter is a call into the same INT8 serving lane the
+     tenant already uses (`launch.py:351-352`, `lane:fast`) -- no second
+     engine, no sidecar.
+
+**What shadow mode is measured against.** Later truth already exists in the
+code and needs no new capture: `resolve_line` (a user re-attributing a line),
+`merge_speakers`, and a name typed onto a cluster are all explicit human
+corrections, and a pin change is a weaker one. The hit rate is the arbiter's
+judgement compared against the correction that came after it -- which is why
+the judgement has to be logged at decision time with the evidence it saw, not
+reconstructed.
+
+**The honest risk, named before it is built.** This is the ANALYSE_532 class
+"bound decision with delivered material", which is where this model is strong.
+It is also the class that produces PLAUSIBLE WRONG answers: an arbiter handed
+four clusters and a transcript will always name one, and it will sound
+reasonable doing it. Shadow mode is not caution theatre here -- it is the only
+way to tell those two apart before the thing has authority over what the user
+hears.
+
+#### 17.8.18 The client cut that came out of a live outage (eighth session)
+
+**The outage, and it was not the build.** The user could not record: "ich drücke
+auf aufnehmen, aber nix passiert". The service was healthy throughout --
+`/api/translator/health` ok, and a one-turn gate against the PUBLIC url on the
+deployed client `7fac5ae666` passed end to end (asr 0.15 s, mt_first_token
+0.21 s, 236 audio frames, own-voice clone, console clean). What the server saw
+was a session `attached: 1` whose decision log had four entries and then
+stopped: the socket was alive and no audio was arriving.
+
+**The mechanism, and it is a trap the UI builds itself.** Continuous mode
+DISABLES the speak button on purpose (`talk.disabled = true`,
+`index.html:3067`). Android takes the microphone away in two shapes -- it MUTES
+the track (a call, another app taking audio focus) or it ENDS it -- and the old
+handler answered both with a single line of text (`track.onmute/onended` called
+only `onNote`, `index.html:1115-1124`). Every other indicator stayed healthy.
+So the user was left listening to nothing with a record button that does
+nothing, and no path back. `probe_mic_recovery.py` reproduces exactly that
+state under `--sabotage-recovery` (disabled True, mode vad, capture open) and
+goes green on the fix, for both `mute` and `ended`.
+
+A mute keeps the capture chain and hands the controls back; an END tears the
+chain down, because `start()` returns early while `this.ctx` exists and would
+otherwise rebuild nothing and "capture" from a track that no longer exists.
+
+**THE HIDDEN GATE HAD A REGRESSION IN IT, and the arm found it.** `schedule()`
+set `this.blocked = true` while withholding audio from a hidden page. `blocked`
+means one specific thing -- the browser refused to start the output clock and
+only a tap releases it -- and the page acts on it with a red banner, a "sound
+blocked" header and a capture report (`index.html:1393-1397`), cleared only by
+the unblock button. Every brief backgrounding therefore raised a false autoplay
+alarm the user had to dismiss. Withholding on purpose now has its own counter.
+
+**FOUR WAYS TO DRIVE VISIBILITY WERE TRIED AND ALL FOUR FAILED. Do not spend
+the time again.** On this host: `Emulation.setPageVisibilityOverride` does not
+exist in Chromium 151; `Page.setWebLifecycleState("frozen")` leaves
+`visibilityState: "visible"`; activating a second tab does nothing in headless;
+`Browser.setWindowBounds({windowState: "minimized"})` likewise. Headed Chromium
+under Xvfb has the real semantics and cannot run here -- Xvfb crashes in
+`libEGL_nvidia`. `probe_hidden_gate.py` therefore drives the DOCUMENT contract
+(override plus a real `visibilitychange`), which exercises every line this cut
+owns, and says in its own docstring that it does NOT prove Android fires the
+event for a backgrounded PWA holding a wake lock. That premise is confirmed
+only by `held_while_hidden` arriving from a real phone in a debug upload. Until
+then it is reasoned, not measured.
+
+**RENAME HAD BECOME UNREACHABLE, and it was our own merge feature that did it.**
+Naming a speaker lived behind the 600 ms long press into the sheet, and
+`bindSpeakerHold` opens that sheet only `if (!canMerge)` (`index.html:2045`).
+Since the restart that announced `speaker_merge`, the only surviving path to a
+rename was to start a merge drag and drop it on empty space. A capability
+shipped for one feature silently removed the affordance of another -- worth
+remembering as a shape, not just as this instance. There is now a pencil on the
+roster entry beside the delete control, and one implementation of the prompt
+behind both entry points.
+
+**NS AND AGC: a documented compromise, made testable from the phone.** All
+three filters were on. The same track feeds the recognizer (wants clean), the
+speaker embedding and the voice clone (want UNCOLOURED) -- and noise
+suppression plus automatic gain are exactly colouring. They cannot be separated
+at the source: one track serves all three, and a second capture with different
+constraints is unreliable on Android and doubles the cost. `?raw=1` drops NS and
+AGC for a session so the user can A/B it against his own voice. Echo
+cancellation is never dropped: it is what keeps our own TTS out of the
+microphone, and the TTS echo enrolling itself as speaker-4 is a live defect.
+
+**Also in the cut:** the re-arm mitigation (the pin is put back on every
+`turn.opened` and `turn.transcript`, documented as a RACE that reduces the
+phantom flood and does not replace the server-side sticky pin -- the re-arm can
+land after the next segment is already inside `_identify`), and the onset
+instrument (a re-anchor of the output cursor is the seam a start-of-speech click
+would live on; the last few are kept with peak, RMS and the leading rendered
+samples, and ride out in the debug upload).
+
+**Gates:** `probe_mic_recovery.py` PASS for `mute` and `ended`, FAIL on all five
+assertions under `--sabotage-recovery`; `probe_hidden_gate.py` PASS, FAIL on all
+four under `--sabotage-gate`; `probe_roster_touch.py`, `probe_roster.py`,
+`probe_autoscroll.py` all PASS with their sabotage controls still red. Live
+`client_gate.py` **2x PASS on client `55ec9fe802`** against the public url, 4
+turns each with the reload arm and the stop arm (`aborted_turn_id
+20e0a2b60738`, frames after stop 0, quiet 20.16 s), console clean. Medians:
+`mt_first_token` 0.22 s, `first_audio` 5.06 s. Screenshot of the roster with the
+rename control recorded.
+
+**Instrument gap, named:** the gate's metrics read answered `404` on both runs
+(`gauges {'error': 'HTTP Error 404: Not Found'}`). Diagnostic only and never
+asserted, but `--metrics-url` no longer points at anything and should be fixed
+or dropped rather than left printing an error every run.
+
+**GATE STATUS ON THE DEPLOYED BUILD, AND IT IS THE NEIGHBOUR AGAIN.** The
+2x PASS above is on `55ec9fe802`. The `?raw=1` capture switch landed after it,
+making the served build `ac5163c54a`, so it was re-gated -- and went
+**2 PASS / 3 FAIL** (`raw_a` FAIL, `raw_b` PASS, `raw_c` PASS, `raw_d` FAIL,
+`raw_e` FAIL). Every failure is the same single assertion and it is not in this
+cut:
+
+```
+   - turn 2: 1 of 2 streamed clauses arrived AFTER the first audio frame
+     (§19.13: text must not wait for audio); margins [2.2]
+```
+
+It fires when synthesis is unusually FAST: the failing turns recorded
+`tts_first_audio 1.04 s` against a 5.02-6.62 s median in the same run, so the
+second streamed clause lost a race it normally wins by seconds. `tts_first_audio`
+across these five runs spans **1.04-6.62 s for one identical clip**, which is
+not a property of a client that only counts frames.
+
+The cause is known and was announced: the #488 talker agent is running a ~6 min
+TTS profiling call inside this same tenant. This is §17.8.13 repeating verbatim
+-- "gating in that state measures the neighbour, not the build". The delta
+between the 2x-green build and the flaking one is two lines (`?raw=1` plus one
+diagnostics field, default behaviour unchanged) and cannot reorder clauses
+against audio.
+
+So: **`ac5163c54a` is NOT claimed as gated.** The hermetic arms are unaffected
+because they never touch the GPU -- mic recovery, hidden gate, roster touch,
+roster and auto-scroll are all green on exactly this file with their sabotage
+controls still red. The live 2x is owed once the profiling call is out of the
+tenant, and it is the first thing the next window does.
+
+**And the re-arm is NOT covered by the live gate**, which is worth stating
+plainly rather than leaving to be discovered: `client_gate.py` never taps a
+roster speaker button, so `pinnedSpeaker` stays null and `rearmPin()` is a
+no-op for the whole run. The mitigation is covered by reading the code and by
+the server-side consumption point it targets, not by a measurement. An arm that
+taps a speaker button and counts `speaker.arm` frames per turn is owed with it.
+
+#### 17.8.19 Three playback modes, one hold queue (user order, unbuilt)
+
+**The orders, verbatim (2026-08-04):** (1) "dieses pause-fenster kann auch
+genutzt werden um die analyse fortschreiten zu lassen und dann das end-audio,
+also das audio das danach weiter abgespielt wird/würde, noch auf fehler
+anpassen und korrigieren"; (2) "der modus muss das abspielen von sound so
+lange hinauszögern (nutze das zeitfenster weise), bis man tap to speak
+deaktiviert hat."
+
+**THE ARCHITECTURAL POINT, and it is not the obvious one.** These read like two
+playback conveniences. They are the same mechanism, and that mechanism is what
+makes SILENT REVISION possible at all.
+
+A chunk can be revised right up until it is committed to the audio clock --
+and committed does NOT mean heard. `schedule()` calls `source.start(cursor)`
+with a cursor that runs AHEAD of the playhead by the whole booked tail, so the
+moment a chunk is scheduled it is already unrevisable even though seconds of
+audio may still be in front of it. In eager mode the buffer between "arrived"
+and "scheduled" is therefore essentially EMPTY: there is nothing to correct
+silently, which is exactly why the guard needs the spoken "perdona, quería
+decir" prefix.
+
+Pause and hold-until-release do not merely delay audio. **They create the
+revision window** -- they move chunks from the clock into a queue where they
+are still text-shaped decisions rather than committed sound. That is the
+whole reason the two features belong to the guard and not to the UI.
+
+  eager (default)   arrive -> schedule immediately. Revision window ~0,
+                    corrections are audible and need the spoken prefix.
+  paused (button)   arrive -> hold. Everything unplayed is revisable; a
+                    correction inside the pause needs NO prefix, because
+                    nothing wrong was ever heard.
+  hold (mode)       arrive -> hold until tap-to-speak is released. The whole
+                    turn is revisable against the FINAL MT, and on release
+                    the corrected version plays at zero added latency,
+                    because synthesis ran eagerly the entire time.
+
+**ONE QUEUE, THREE TRIGGERS, and most of it already exists.** `keepAudio(turnId,
+samples, rate)` (`index.html:1074`) already buffers every chunk per turn -- it
+was built for the replay button, and it is the hold queue with a different
+consumer. `replay(entry)` already schedules a whole turn's chunks on demand.
+What is missing is a `held` flag consulted where `push()` decides to schedule,
+plus a per-turn drain on release. This must NOT become three implementations:
+the same predicate that answers "may this chunk go to the clock now" serves
+the pause button, the mode, and the §17.8.16 floor.
+
+**IT IS ALSO THE TURN-SCOPED ABORT TARGET.** `playback.live` is one flat list
+today, so `stopAll()` cuts every turn including one that should survive. The
+hold queue is per turn by construction, so building it is what makes "abort
+turn N, keep turn N+1" expressible -- the same structure, arrived at from the
+other side.
+
+**Revision is the server's half and belongs to #488.** The client can only
+replace chunks it has not scheduled; deciding that a re-synthesis is WARRANTED
+is the guard's job at its hook. The wire needs one addition: a chunk revision
+that names the turn and the unit index it supersedes, so the client can swap
+inside the queue rather than append.
+
+**Honest limit to state before it is built:** the hold mode wins its latency
+back only if synthesis really does run eagerly while the user is still
+speaking. Today the talker is BATCH and serialized behind `_turn_lock` -- the
+chunks the mode wants to buffer do not exist yet at release time. So this
+feature depends on the robustness cut narrowing that lock, and shipping it
+before then would produce a mode that waits for the user AND THEN waits for
+synthesis, which is worse than eager. Order matters here and it is not a
+preference.
+
+#### 17.8.20 The queue wedge, located — and the robustness cut it demands
+
+**The live report:** long speech split into two messages; the second got STT and
+its translation, then sat at "translating -- 2 more turns to come / 2 sentences
+still to speak" for MINUTES. User order: "das muss viel, VIEL robuster werden."
+
+**MY OWN GATE REPRODUCED IT, one run after the deploy.** `gate_bundle_b`:
+`turn 2: no audio reached playback within 90.0s`, with `audio max 24.9s` on the
+turns that did make it. Gate A on the same build passed with `first_audio` med
+5.40 s. So it is intermittent, it is in synthesis, and it is not the user's
+phone.
+
+**IT IS NOT THE §17.8.16 FILTER, and that was checked before anything else was
+theorised.** The tenant log contains **zero** interjection discards since the
+deploy (`grep -c interjection` = 0). A discarded interjection would look
+exactly like this from outside -- transcript line present, no audio -- so
+ruling it out first was the difference between a diagnosis and a story. The
+wedge also predates the bundle: the user hit it on the previous build.
+
+**THE MECHANISM, with anchors.** `_run_turn_locked` runs ASR, embedding, MT and
+SYNTHESIS inside `run_turn_multi`'s `self._turn_lock` (`session.py:1219-1233`).
+Synthesis itself is a task-plus-queue: `worker = asyncio.create_task(
+speech_worker())` (`:2278`), units are pushed, and the function ends with
+`speech.put_nowait(None); await worker` (`:2356-2357`). Inside, `speak()`
+iterates `async for piece in self.tts.synthesize(...)` with **no deadline of
+any kind**. One synthesis that never yields its next piece therefore parks the
+worker forever; `await worker` never returns; `_run_turn_locked` never returns;
+`_turn_lock` is never released; every later segment queues behind it and the
+session is dead in a state the UI renders as a spinner. There is no timeout, no
+watchdog, and no path by which the turn can ever be declared failed. "2
+sentences still to speak" is the `turn.speech` unit accounting frozen at the
+moment the worker stopped -- the count is honest, the state around it is not.
+
+MT is the ONE stage with a deadline (`--mt-timeout-s`, §17.8.15) and it is the
+one stage that has never wedged. That is not a coincidence, it is the whole
+argument.
+
+**THE CUT, in dependency order:**
+
+  1. PER-STAGE DEADLINES. `asyncio.wait_for` around ASR, around each
+     `synthesize()` unit, and around `await worker`. On expiry the turn is
+     marked failed LOUDLY with the stage named, the worker task is cancelled
+     (not just abandoned -- an abandoned task keeps the device), and exactly
+     ONE automatic `redrive()` follows. The retry button is the second
+     attempt's owner. Never again a non-terminal state with no deadline.
+  2. NO GLOBAL WEDGE. `_turn_lock` today serialises the whole chain; the only
+     thing that MUST serialise is the talker device. Split it: a pipeline lock
+     for attribution ordering, a talker lock for the device. MT of turn N+1
+     then overlaps TTS of turn N, which is a latency win as well as a
+     robustness one. The intermediate step, if the split proves too invasive
+     to gate in one window, is timeout-release with requeue -- strictly worse
+     but strictly better than now.
+  3. STATE HONESTY. Every non-terminal turn state carries a max age. The
+     client renders an overdue turn as "stuck -- try again?" rather than a
+     spinner that means nothing. This is the client half of (1) and it works
+     even if the server dies outright, which is the case (1) cannot cover.
+  4. THE WATCHDOG TICK. `recover_unfinished()` already exists and already runs
+     on attach; a periodic tick makes it cover the session nobody reconnects
+     to. Cheap, because the mechanism is built.
+
+**The measurement that has to come with it:** `audio max 24.9s` against a
+5.4 s median says the tail is long before it is infinite. A deadline picked
+above the real p99 protects nothing (#493), and one picked below it turns slow
+turns into failed ones. The deadline is derived from the distribution the
+metrics endpoint now finally serves -- `--enable-metrics` was missing from the
+live boot until this restart, which is why the gate's gauge read had been
+answering 404 for two sessions.
+
+#### 17.8.21 Handover, 2026-08-04 (eighth session) — the family session answered the identity question
+
+**LIVE STATE.** Tenant PID **4036082**, booted from `/spinning/wt-466-translator`
+with `--enable-metrics` (it was MISSING from the restore boot before this
+session, which is why `/metrics` was empty and the gate's gauge read had been
+404ing for two sessions -- the restore script is the culprit and its owner has
+been told). Client is served from this worktree per request, so the page is
+live on merge; the server half needs a restart. Branch `feat/live-translator-466`.
+
+**THE HEADLINE, and it is not what the bundle was built for.** The family
+session produced the first GROUND-TRUTH speaker labels this project has ever
+had: the user tapped speaker buttons, so six of seven decisions carry
+`outcome: manual` -- a human assertion of who spoke, with the embedder's
+opinion recorded beside it. Those numbers say the identity problem is not a
+threshold problem:
+
+```
+  WITHIN-speaker  (user said "this is the same person"):  0.782, 0.670, -0.013
+  BETWEEN-speaker (user said "this is somebody else"):    0.609, 0.166, 0.119
+```
+
+The distributions OVERLAP. A same-speaker segment scored **-0.013** against
+its own centroid while a different-speaker segment scored **0.609**. No value
+of `match_threshold` separates these two sets -- 0.637 happens to sit between
+0.609 and 0.670, which is luck, not calibration. On 2-4 s of phone audio from
+real people, this embedder does not carry the decision. That is why the user
+was tapping buttons, and it is why the STICKY PIN is the load-bearing feature
+and the threshold work is second-order. Do not spend the next window
+re-deriving a threshold from this data; spend it on making the pin and the
+manual correction path excellent.
+
+Related and ugly: the -0.013 segment was ADMITTED as voice reference
+(`admitted_reference: True`) because a manual attribution admits. A segment
+that looks nothing like the speaker is now in their clone prompt.
+
+**THE CHILD, one sample and it is decisive against the cheap fix.** His turn
+came back as `es` at language confidence **1.000** on a 0.88 s segment, with
+the canonical Whisper hallucination as its text ("!Gracias por ver el
+video!"). A confidence GATE cannot reach a confident wrong answer. The pin
+prior cannot either as currently written, because it only consults the pin
+BELOW the confidence floor. The concrete proposal, data-backed: under a held
+pin whose speaker has a consistent language history, a SHORT segment
+(< ~1.5 s) that disagrees must not flip the direction on its own.
+
+**WHAT THE FAMILY SESSION COST US, honestly.** The overlap discard deleted a
+real utterance -- transcript line 6, `speaker-interjection`, "Hallo Lamina
+Mahl, es waere nett, wenn ich eine Unterschrift..." -- because the floor it
+lost to was that same hallucinated Spanish line. It is now **default OFF**
+(the default is a pinned assertion), it logs loudly when it fires, and it
+goes back on only with a trustworthy floor. The last turn of the session was
+NOT a discard: line 8 has a decision record and no translation, i.e. the
+synthesis wedge, and the metrics put a number on it --
+`translator_tts_first_audio_seconds_max = 193.36 s` for one unit against a
+5.4 s median.
+
+**DEPLOYED IN THIS SESSION:** per-stage deadlines (ASR 60 s, TTS unit 90 s,
+drain 300 s -- PROVISIONAL, and 90 s binds on the 193 s observation rather
+than sitting above the tail), worker CANCEL on expiry, one automatic re-drive
+outside the lock, `redrive`/`recover_unfinished` with recovery on WS attach,
+sticky pin, LID pin-prior, echo enrollment lock, UNKNOWN preset order (adults
+first), the direction invariant, the evidence record, `--enable-metrics`, the
+gate releasing its session. Client: mic-loss recovery, the `blocked`
+regression fix, the onset ramp, the rename control, `?raw=1`.
+
+**GATE ON THE DEPLOYED BUILD: 2x PASS**, tenant PID 4036082, client
+`58c37e81de` (`gate_robust_a.log`, `gate_robust_b.log`). Four turns each with
+the reload arm and the stop arm (`frames after stop 0, quiet 20.17 s`), the
+auto-scroll arm green, console clean. Medians: `mt_first_token` 0.15 s,
+`first_audio` 5.68 s / 6.04 s. Both runs RELEASED their session on the way out
+(`released session ...`), which is the slot leak closed and visible. Live
+capabilities read back off the socket: `{'speaker_merge': True,
+'partial_participants': True, 'sticky_pin': True, 'overlap_discard': False}` --
+the discard is off in production, as intended after it deleted real speech.
+Hermetic suite 520 passed, ruff and codespell clean.
+
+**OPEN, IN ORDER, for whoever picks this up:**
+
+  1. The family evaluation above needs MORE SAMPLES before any threshold
+     decision -- n=3 per class. `scripts/translator/collect_family_session.py`
+     is read-only and produces every number in this section; run it against a
+     live session and it prints within/between, the LID table and whether the
+     new mechanisms bound at all.
+  2. THE ONSET RAMP IS INCOMPLETE. It fires only at a cursor re-anchor, and
+     the user reports the click persists at every turn start. Make it fire at
+     the first chunk of every turn, and check the `onsets` capture (peak, rms,
+     head samples in the debug upload) for whether the SYNTHESIS itself starts
+     with a transient -- if so, ramp the first ~10 ms server-side. The proof
+     is in the capture samples, not in reasoning.
+  3. OVER-FRAGMENTATION (user: the pipeline chops everything into pieces even
+     where context exists). Two fixes, both specified: coalesce queued
+     segments of the SAME speaker before MT/TTS -- backlog IS the signal that
+     context exists, so run only the FRONT item eager-small and bundle
+     everything waiting -- and give each MT call the last N source/target
+     lines as a context prefix (the radix cache makes a growing prefix nearly
+     free, and terminology stays stable across turns).
+  4. THE LOCK SPLIT (pipeline vs talker device), which the playback modes
+     depend on -- see §17.8.19 for why the hold mode is worse than eager until
+     synthesis can run ahead.
+  5. Playback modes (§17.8.19), the shadow arbiter and its double display
+     (§17.8.17), live partial transcripts.
+
+**PATHS.** Raw family harvest: `/tmp/family_raw.json`. Tenant log:
+`/tmp/466_tenant_restore.log` (narrow greps only, never dump it). Metrics:
+`http://192.168.0.101:30800/metrics`. Truth labels live in the decision log
+per session (`/api/translator/sessions/<id>/speaker-decisions`) -- `outcome:
+manual` is the human label and `candidates` is what the embedder thought.
+
+**INSTRUMENT GAP TO FIX EARLY:** the manual path does not record the `pin`
+field, because `assign_manual` returns before `_record_decision` is reached
+with it. The collector therefore reports "0 of 7 decisions with a pin held"
+for a session where the pin decided nearly everything. Believe `outcome:
+manual`, not the `pin` column, until that is fixed.
+
+#### 17.8.22 The backlog becomes context, and the second onset seam (ninth session)
+
+**FIRST, A LOSS, RECORDED HONESTLY.** The container rebooted between sessions
+and `/tmp` was wiped. `/tmp/family_raw.json` -- the raw harvest of the only
+ground-truth speaker session this project has ever had -- is **gone and
+unrecoverable**. The tenant restarted too, so the in-memory decision log that
+produced it went with it; `speaker-decisions` is served from session state,
+not from disk, so there is no second copy anywhere. What survives is what
+§17.8.21 wrote down: the six within/between scores, the child's `es` at
+confidence 1.000 on 0.88 s, the line-6 discard, and the 193.36 s
+`tts_first_audio` outlier. Those are enough to keep every decision that was
+taken on them, and not enough to re-derive anything new. n=3 per class cannot
+be recovered by re-reading; it can only be re-collected.
+`scripts/translator/collect_family_session.py` is still the instrument, and
+the next live session is the only way back to raw data.
+
+**THE OVER-FRAGMENTATION FIX IS AT ENQUEUE, NOT AT DRAIN, and that placement
+is the whole design.** The queue holds `Segment`s -- raw audio, before ASR --
+so at queue time there is no text, no speaker and no language to group by.
+Coalescing there looked impossible until the ordering was checked:
+`_split_at_speaker_changes` runs BEFORE recognition and cuts on embedding
+dispersion over fixed windows. So a bundle is not a bet that both halves came
+from one person; it is handed to a splitter that will separate them if they
+did not. Better than that, the splitter is GATED on
+`speaker_change_min_segment_s`: two 2 s pieces each sit under the gate and are
+waved through whole, while one 4 s bundle is examined. **Merging increases
+diarization scrutiny rather than risking it**, which is the opposite of the
+intuition that delayed this fix.
+
+`enqueue` now folds a new segment into the queue TAIL whenever something is
+already waiting (`_coalesce_into_tail`, session.py). The turn currently
+RUNNING is not in the queue and is never touched, so this cannot delay speech
+already on its way out -- it is exactly the "front item eager-small, bundle
+everything waiting" rule from §17.8.21, with "the front item" being the turn
+in flight. When the pipeline keeps up the queue is empty at every enqueue and
+the code path is inert, which is why the default is on.
+
+Two properties fell out that were not the goal:
+
+  * **The overrun drop stopped firing.** The old queue answered
+    `max_queued_turns` (2) by discarding the OLDEST waiting segment -- a whole
+    utterance, silently, precisely when the pipeline was already behind. Six
+    rapid segments used to cost four dropped turns; they now cost zero and
+    produce one bundle. The drop still exists for what cannot be folded (a
+    full bundle, a sample-rate mismatch) and `test_session.py` pins it with
+    the bundler explicitly off.
+  * A cap is mandatory, not decorative: `coalesce_max_s = 30 s`, so a long
+    backlog cannot grow one ASR call into `asr_timeout_s`.
+
+**THE MT CONTEXT WAS ALREADY THERE, AND IT WAS A LEAK.** The handover asked
+for a context prefix. `MtConfig.history_turns = 6` had been building one since
+the beginning -- on the `OpenAiMt` INSTANCE, which `launch.py` constructs once
+per process and hands to every session. So the last six turns of one
+conversation were prepended to the prompt of every other conversation on the
+box, in both directions, with no speaker or language tag, and only
+`sorted(translations)[0]` was ever recorded. Two conversations at once is a
+supported configuration; this made them read each other's sentences.
+
+The history is now owned by `TranslatorSession`, keyed by `(source, target)`,
+and passed to the backend per call (`translate_stream(..., context=...)`).
+`OpenAiMt` keeps no state at all, which is asserted structurally in the test
+because the failure mode is a field that quietly comes back. Keying by
+direction also retires the old one-target compromise: every target now feeds
+its own context instead of one of them feeding a shared deque. The prefix is
+replayed as real user/assistant pairs, byte-identical from call to call, so
+the radix cache on our own server serves all but the newest pair.
+
+**THE ONSET RAMP HAD A SECOND SEAM, which is why shipping the first half did
+not stop the report.** The ramp fired at a cursor re-anchor -- the output
+clock having drained. A turn that begins while the previous turn's tail is
+still scheduled never drains the clock, so no re-anchor fires, and the first
+sample of a freshly synthesized waveform is joined directly to the last sample
+of a different one. That step is a click and nothing was fading it. The client
+now ramps at either seam, tracking `rampedTurn` against `currentTurn`, and
+only a re-anchor still moves the cursor: re-anchoring a turn start would drop
+it on top of audio that has not played yet, which is two voices at once.
+
+`scripts/translator/probe_onset_ramp.py` grew the arms that make this
+falsifiable, all five green on the deployed client:
+
+```
+  (baseline)          ramps 1  reanchors 1  turn_starts 0
+  --turns             ramps 3  reanchors 1  turn_starts 3   <- pre-fix: 1
+  --same-turn         ramps 1  reanchors 1  turn_starts 1   <- no mid-word fading
+  --turns --sabotage  ramps 0  reanchors 1  turn_starts 3
+  --sabotage          ramps 0  reanchors 1  turn_starts 0
+```
+
+`--turns` is the arm that matters: three turns pushed back-to-back so the
+clock never drains, reaching three ramps against one re-anchor. The pre-fix
+client scores 1 there by construction. `--same-turn` is its control -- if it
+ever reached 3 the fix would be fading every buffer mid-word.
+
+**STILL NOT PROVEN, and it is the same honest gap as last time:** that the
+click is audibly gone. The gain node sits after the buffer, so the onset
+capture cannot see it. What IS new is the evidence path for the other half of
+the question: onset records now carry `reanchor`, `turn_start` and `turn_id`,
+so a debug upload from the phone will say whether a hot onset is the client's
+clock or a synthesis that begins with a transient. A `turn_start` capture with
+a step in `head` is the case for a server-side 10 ms fade, and it should be
+read before anyone writes one.
+
+**TESTS.** Hermetic suite **538 passed** (520 at handover, +18 new in
+`test/registered/translator/test_coalesce_and_context.py`), `CUDA_VISIBLE_DEVICES=99`,
+ruff and codespell clean. Both new mechanisms carry a sabotage proof: with
+`_coalesce_into_tail` forced to refuse and `_context_for` forced to return
+empty, 5 of the new arms fail. Two pre-existing tests were UPDATED rather than
+accommodated, because the feature deliberately changes what they asserted --
+`test_queue_overrun_drops_the_oldest_turn` now reaches the drop with the
+bundler off, and `test_a_turn_with_newer_speech_behind_it_does_not_retry`
+needs two separate turns, which is the exact thing the bundler removes.
+
+**DEPLOYMENT SPLIT, and it matters for who sees what.** The client is served
+from this worktree, so the onset-ramp fix is LIVE on the next page load. The
+coalescing and the MT context are server-side and need a tenant restart; the
+tenant (PID 3175, pinned to the 5090, `--enable-metrics`) was left running
+because the user may test at any moment. Nothing in the client change depends
+on the new server: it is local playback scheduling and touches no protocol
+field, so the new page is correct against the old server.
+
+**SIDE ITEM CLEARED.** `wireguard_server_setup.sh` ended its instructions with
+`python -m sglang.srt.translator.launch --host ... --port 30800`, which reads
+as a launch line and is not one -- a translator started that way answers
+`/health` and then fails every turn, because it has no ASR, no talker, no
+embedder and no MT endpoint. Replaced with the canonical launch as actually
+run, and with the two flags whose absence has already cost sessions spelled
+out: `--card-uuid` (NVML and torch disagree on ordering, and the index moves
+between boots) and `--enable-metrics` (without it `/metrics` is empty and
+every latency gate reads 404).
+
+**OPEN, IN ORDER, unchanged from §17.8.21 except for what this session
+closed:**
+
+  1. Lock split (pipeline vs talker device) and the watchdog tick -- the rest
+     of the robustness cut, and what the playback modes depend on.
+  2. The child short-segment rule: under a held pin with a consistent language
+     history, a segment under ~1.5 s must not flip the direction on its own.
+     A confidence gate cannot reach it -- the hallucination came at 1.000.
+  3. The polluted voice reference (the -0.013 segment sits in a clone prompt
+     because a manual attribution admits) and the `assign_manual` pin-field
+     fix, which returns before `_record_decision` and makes the collector
+     report "0 of 7 decisions with a pin held".
+  4. Playback modes (§17.8.19), the shadow arbiter and its double display
+     (§17.8.17), per-message speaker change plus a re-synthesis button, live
+     partial transcripts.
+  5. More ground-truth samples. The raw ones from the family session are gone;
+     the conclusions drawn from them stand and must not be re-derived.
+
+#### 17.8.23 The deploy flip, the button that died on first press, and where the seconds actually are
+
+**THE DEPLOY RULE, and it is now mandatory.** In this worktree the client file
+IS the deployment: the tenant serves `client/index.html` from the tree on every
+request, so every intermediate save goes live to a phone that may be in the
+user's hand right now. That is how a telemetry button reached the user with a
+call to `playback.debug()`, a method that does not exist -- the page parsed, the
+gate was green, and the handler had never once been executed.
+
+From here on:
+
+  1. Edit `client/index.dev.html`, never the served file.
+  2. Gate the candidate, including the CLICK proof below.
+  3. Flip atomically: `cp index.dev.html .index.flip.tmp && mv -f .index.flip.tmp
+     index.html`. A `mv` within one filesystem is atomic, so no request can ever
+     see a half-written page.
+  4. Re-run the gate against the SERVED file. The flip is not the proof; the
+     served file passing is.
+
+**"THE PAGE PARSES" IS NOT "THE FEATURE WORKS".** The previous gate loaded the
+page and asserted no console errors. It could not have caught this: the failing
+line only runs when a human presses a button. The rule that follows is the
+`desk-written-never-executed` rule with a sharper edge -- **for anything behind
+a gesture, the execution smoke must BE the gesture.**
+`scripts/translator/probe_log_upload.py` does that: it serves a candidate,
+proxies `POST /api/translator/client-logs` to the live tenant, issues a real
+`page.click("#sendlogs")`, and passes only when a FILE EXISTS on the server and
+the success text the user would read is on screen. Three arms, all exercised:
+
+```
+  candidate (fixed)   toast "logs uploaded (2 kB): /spinning/466-client-logs/..."
+                      button "sent", proxied 200, 7 entries on disk   PASS
+  --sabotage          toast "log upload failed: server said 404"      PASS
+                      (a silent failure here is the defect itself)
+  served file (bug)   button "failed", nothing proxied, no file       FAIL
+```
+
+That third arm is what makes the other two mean something: the harness
+reproduces the user's bug before the fix and clears it after.
+
+**WHERE THE SECONDS ARE.** The user's session (`e746151f2a58`, four turns) with
+every stage summed from `/metrics`, snapshotted to
+`/spinning/466-client-logs/evidence/`:
+
+```
+  stage              sum over 4 turns    max      share
+  ASR                       0.78 s      0.45 s     1.4 %
+  embedding                 0.35 s      0.16 s     0.6 %
+  MT first token            1.13 s      0.38 s
+  MT total                  3.05 s      1.65 s     5.4 %
+  TTS first audio          23.85 s      6.19 s
+  end-to-end first audio   26.73 s      7.04 s
+  turn total               56.10 s     36.40 s
+  queue depth max                0
+  talker wait                 0.00 s
+```
+
+Read it in one line: **ASR, embedding and MT together are under 8 % of the wall
+clock. Everything else is synthesis.** Every turn pays ~6 s before its first
+sample, and that is the number the user experiences as "sound segments many
+seconds apart". The decision-record timestamps agree -- identification gaps of
+35.98 s, 6.85 s, 6.31 s, i.e. one long turn followed by the ~6 s floor.
+
+Ruled OUT, each with its own evidence rather than by argument:
+
+  * **Coalescing.** Not deployed on that tenant at all (zero log hits), and
+    `queue_depth_max = 0` in both that session and every one since -- there has
+    never been a backlog for it to bind on. It cannot be the cause of a delay
+    and it is not "waiting instead of starting". Live capability now reads
+    `coalesce_queued: True, mt_context_turns: 6` with `segments_coalesced: 0`.
+  * **Cold talker.** `--warmup` defaults to TRUE and no `--no-warmup` was
+    passed, so the boot warmed. Turn 1's 36 s is a 15 s utterance (it hit
+    `max_utterance_s`), not a cold start.
+  * **Queue overrun, interjection discard, routing invariant, stage timeouts,
+    talker contention:** all zero on that session.
+
+**AND ONE THING THAT IS NOT RULED OUT -- the wedge is live.** On the restarted
+tenant the log carries `synthesis did not finish within 300s` and
+`auto-redriving line 2 after a stage deadline`, with `total_seconds_max` of
+90.47 s on a two-turn window. So §17.8.20's mechanism is still firing in the
+field; the deadlines added last session are containing it rather than
+preventing it, which is exactly what they were for. **The lock split (§17.8.20
+item 2) is therefore not a latency nicety, it is the open half of this bug**:
+one wedged synthesis still stalls every following turn's identification,
+because `_turn_lock` spans ASR through TTS.
+
+**DE->DE: not present in the records.** All four turns routed correctly --
+three `de->es`, one `es->de` whose source text is genuinely Spanish
+("Adicional, se ha eliminado el desbordamiento silencioso...") at confidence
+1.000. What the user experienced as being echoed in German is a ROUND TRIP: he
+read the Spanish output back into the microphone and the system dutifully
+translated it home. Not a routing fault -- but the gun is now loaded for the
+real one, and this is the finding to act on: `speaker-1.last_language` is now
+**`es`** with a sticky pin held on that speaker, and `_resolve_source` consults
+the pin whenever LID falls below `lid_confidence_floor`. The next quiet or
+short German utterance from him resolves to `es` and gets spoken back in
+German. That is open item (4) and it is no longer hypothetical.
+
+**THE MT THINKING TRAP, re-derived and closed.** Probing the MT backend by hand
+returned an empty translation after 5.7 s and 512 tokens of pure
+`reasoning_content`. That is NOT the production path: `--mt-thinking` defaults
+off and `launch.py` sends `chat_template_kwargs.enable_thinking = False`, which
+answers the same prompt in 0.35 s and 9 tokens. Recorded because the raw-curl
+result looks exactly like a live outage and cost time to clear -- **probe MT
+through `OpenAiMt`, never through a hand-built body.** Verified against the live
+server through the real backend class: 0.33-0.50 s per call, streaming first
+token 0.16 s, and the new per-direction `context=` argument working end to end.
+
+#### 17.8.24 What the phone's own logs said, and the hypothesis they killed
+
+The telemetry button paid for itself within an hour of shipping. Two packages
+from the user's device (`/spinning/466-client-logs/`) settled four questions
+that had been argued from the server side for three sessions, and refuted the
+leading noise hypothesis -- mine -- with a measurement.
+
+**(a) FOUR FINDINGS.**
+
+  1. **He is on the new client.** The 09:11 package carries build
+     `8539fcfe00`, byte-exact the served `index.html` (`sha256(body)[:10]`,
+     server.py:1338); the 09:00 package carried `45d4e01728`. So the reload
+     happened and the persisting symptoms are NOT a stale cache. This is the
+     question that decides between debugging and asking for a refresh, and it
+     is now answerable in one line instead of guessed.
+  2. **`unit_index` is inert in production until the tenant restarts.** Every
+     one of the 7 captured seams reports `unit=None`, and `turn_starts ==
+     unit_starts == 6`. The client half of the unit-seam ramp is live; the
+     server half was added AFTER the running tenant booted (08:42:04), so the
+     seam degenerates to the turn seam. A client-side feature whose server
+     half is missing looks exactly like a feature that does not work --
+     the build id is what tells them apart.
+  3. **Synthesis is 64 % of the wall clock, and everything else is noise in
+     the accounting.** Six turns, server events timestamped on his device:
+
+     ```
+       ASR                     0.36 s    0.9 %
+       embedding               0.28 s    0.7 %
+       MT                      2.02 s    5.2 %
+       synthesis -> 1st audio 25.10 s     64 %
+       turn total             39.17 s
+     ```
+
+     ASR + embedding + MT together are 2.66 s of 39.17 s. First audio lands
+     2.94-6.26 s after synthesis starts, every turn. The two multi-unit turns
+     show the clause hole directly: unit 1 begins synthesizing the instant
+     unit 0 stops speaking, so turn `61222fd7` spans 8.49 s of audio inside a
+     12.33 s turn. **The client is not implicated at all** -- 1512 buffers
+     pushed, 1512 scheduled, 0 dropped, never blocked, `ramp_skipped` 0.
+  4. **THE SEAM RAMP IS NOT THE NOISE FIX, and this is a refutation of the
+     hypothesis this session was built on.** All 7 seams report `peak`
+     0.000-0.005 with `head: [0,0,0,0,0,0,0,0]`: the first 50 ms of every
+     unit is DIGITAL SILENCE. There is no step discontinuity at a unit
+     boundary, so there is nothing there for a fade to remove. The ramp is
+     harmless and remains correct for the case where audio does start hot,
+     but it does not answer the user's report and must not be counted as
+     having done so.
+
+**(b) THE NEW LEADING HYPOTHESIS IS CAPTURE-SIDE: the microphone is
+clipping.** `?raw=1` is refuted in the same breath -- the effective track
+settings read `raw_capture: False`, `noiseSuppression: True`,
+`autoGainControl: True`, `echoCancellation: True`, so nothing was disabled.
+But **`peak` is 1.000 in BOTH packages**: full scale, with AGC engaged. That
+is a direct distortion source on the way in, and it is worse than it first
+looks, because the voice-clone reference slices are cut from that same
+capture (`speakers._maybe_admit_reference`). A clipped reference makes the
+SYNTHESIZED voice harsh as well, which fits a report of noise that follows
+the user's own voice rather than the playback clock. The next step is
+therefore capture-side and it is measurement first: report the pre-AGC and
+post-AGC peak separately, and count clipped samples per turn, before touching
+a constraint. Do not "fix" the gain blind -- `raw_capture` exists and turning
+it on trades clipping for hiss.
+
+**(c) OPEN, IN ORDER.**
+
+  1. **The lock split** (§17.8.20 item 2). Still the open half of the wedge:
+     `synthesis did not finish within 300s` plus an auto-redrive were observed
+     live this session, and `_turn_lock` still spans ASR through TTS, so one
+     stuck synthesis serialises every following turn's identification.
+  2. **A tenant restart, bundled.** Three server-side changes are committed
+     and waiting on one restart: `unit_index` on `turn.audio` (finding 2), the
+     short-segment language rule and the read-back guard (below). Nothing
+     needs a second restart if they go together.
+  3. Capture-side clipping instrumentation (b), then the playback modes,
+     the shadow arbiter, per-message speaker change, live partials.
+
+**SHIPPED IN THIS CHECKPOINT.** The loaded gun found in §17.8.23 is unloaded,
+with 12 tests and a control for every arm:
+
+  * A SHORT segment (< `short_segment_flip_s`, 1.5 s) cannot turn the
+    conversation around on its own, but only under a held pin AND a run of at
+    least `language_streak_min` consecutive turns in one language. The check
+    runs AHEAD of the confidence branch on purpose -- the case it exists for
+    scored confidence 1.000. Controls: a long segment still flips, no pin
+    still flips, a one-turn history still flips, and the whole rule switches
+    off. Journalled as `turn.language_held`, because a direction that
+    silently did not change is indistinguishable from a detector that
+    happened to agree.
+  * READ-BACK no longer rewrites language history. Our own output spoken back
+    into the microphone is not evidence about which language the speaker
+    speaks; that is precisely how `speaker-1.last_language` became `es` for a
+    German speaker. Matched on a normalized similarity ratio because it has
+    been through a loudspeaker, a room and a recognizer since we wrote it.
+    Controls: a different sentence in the same language is NOT a read-back
+    (otherwise a real Spanish speaker could never build a history), a short
+    utterance never is, and without the flag the history still moves.
+  * `SpeakerProfile.language_streak` makes "consistent history" a fact rather
+    than an adjective, and resets to 1 on a genuine switch so switching costs
+    exactly one turn of inertia.
+  * `assign_manual` now records the pin it acted on. It is the one outcome
+    where a pin was CERTAINLY held and it was the one recording `None`, which
+    is why the collector reported "0 of 7 decisions with a pin held" for a
+    session the pin decided almost entirely (§17.8.21 instrument gap, closed).

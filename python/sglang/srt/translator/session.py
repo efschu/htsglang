@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import difflib
 import enum
 import logging
 import time
@@ -189,6 +190,18 @@ class EventKind(str, enum.Enum):
     #: A name the LLM heard, waiting for the user to confirm it (§17.3).
     #: Never applied automatically -- the event IS the chip.
     SPEAKER_SUGGESTION = "speaker.suggestion"
+    #: Two queued segments became one bundle because the pipeline was behind
+    #: (§17.8.21 item 3). Journalled rather than only counted: when a turn's
+    #: transcript spans what the speaker experienced as two sentences, this is
+    #: the event that says why, and it is the only record that the pieces were
+    #: ever separate.
+    TURN_COALESCED = "turn.coalesced"
+    #: A short segment was refused the right to turn the conversation around
+    #: (§17.8.24). Journalled because the alternative is a direction that
+    #: silently did NOT change, which is indistinguishable from a detector
+    #: that happened to agree -- and the user needs to be able to see that a
+    #: rule acted, especially on the day it acts wrongly.
+    TURN_LANGUAGE_HELD = "turn.language_held"
     ERROR = "error"
 
 
@@ -218,6 +231,17 @@ class Event:
             out["sample_rate"] = self.audio.sample_rate
             out["samples"] = len(self.audio.samples)
         return out
+
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercase, strip punctuation and collapse spaces, for read-back match.
+
+    Punctuation is dropped because the recognizer invents its own and ours
+    came from an LLM; what survives both is the word sequence.
+    """
+    return " ".join(
+        "".join(ch for ch in text.lower() if ch.isalnum() or ch.isspace()).split()
+    )
 
 
 class Journal:
@@ -406,6 +430,97 @@ class TranslatorSession:
         #: dither floor, so it separates the two populations
         #: without sitting near either.
         silence_peak_floor: float = 1e-3,
+        #: The pin survives segment boundaries (§17.8.16). Off restores the
+        #: one-utterance arming, which is kept switchable because it is the
+        #: behaviour every existing pin test was written against.
+        sticky_pin: bool = True,
+        #: Language identification below this is not trusted on its own.
+        lid_confidence_floor: float = 0.5,
+        #: Drop a segment spoken OVER a running turn in the other participant
+        #: language, instead of queueing it to be spoken afterwards.
+        #:
+        #: DEFAULT OFF AFTER THE FIRST FIELD RUN, and the reason is a measured
+        #: false positive rather than caution. In the family session it
+        #: discarded line 6 -- "Hallo Lamina Mahl, es waere nett, wenn ich
+        #: eine Unterschrift..." -- a real German sentence from a real person.
+        #: The floor it lost to was line 5, `es`, "!Gracias por ver el video!":
+        #: a 0.88 s segment carrying the canonical Whisper hallucination, at
+        #: language confidence 1.000. So the rule worked exactly as designed
+        #: and still destroyed an utterance, because the LANGUAGE THAT HELD
+        #: THE FLOOR WAS FABRICATED. A filter whose input can be invented must
+        #: not have destructive authority; it goes back on when the floor is
+        #: trustworthy (a minimum floor-segment duration, and a hallucination
+        #: check on the transcript that establishes it), and the calibration
+        #: is the next window's, not a guess today.
+        overlap_discard: bool = False,
+        # PER-STAGE DEADLINES (§17.8.20). Every stage that can block gets one,
+        # because the one stage that already had a deadline -- MT -- is the
+        # one stage that has never wedged the session.
+        #
+        # PROVISIONAL AND LABELLED AS SUCH. 90 s is ~3x the worst
+        # `tts_first_audio` seen so far (24.9 s in gate_bundle_b, against a
+        # 5.4 s median), chosen deliberately WIDE: a deadline that fires late
+        # beats today's infinity by classes, while one set under the real tail
+        # turns slow turns into failed ones. The #493 trap here is a threshold
+        # that never binds, and the answer to it is the calibration follow-up,
+        # not a tighter guess today -- `--enable-metrics` only started serving
+        # the distribution at this restart. Recalibrate to p99 once a few
+        # hours of it exist.
+        asr_timeout_s: float = 60.0,
+        tts_unit_timeout_s: float = 90.0,
+        #: The backlog after the last unit was queued. Generous: it may hold
+        #: several units, and it is bounded by them rather than by one call.
+        tts_drain_timeout_s: float = 300.0,
+        # OVER-FRAGMENTATION (§17.8.21 open item 3; user: "the pipeline chops
+        # everything into pieces even where context exists").
+        #
+        # THE SIGNAL IS THE BACKLOG, and that is the whole idea. A segment
+        # that is WAITING has already lost the latency argument -- it cannot
+        # be spoken until the turn ahead of it finishes -- so cutting it into
+        # its own turn buys nothing and costs everything: its own ASR call
+        # with no left context, its own MT call with no sentence around it,
+        # and its own synthesis call whose prosody restarts mid-thought. The
+        # turn that is RUNNING stays eager-small and is never touched; only
+        # what queues up behind it is bundled.
+        #
+        # Merging is safe against the two-speakers case rather than exposed to
+        # it: `_split_at_speaker_changes` runs BEFORE recognition and cuts on
+        # embedding dispersion across fixed windows, and it is gated on
+        # `speaker_change_min_segment_s`. A longer segment therefore gets MORE
+        # diarization scrutiny than the pieces would have got separately --
+        # each piece alone may sit under the gate and be waved through whole.
+        coalesce_queued: bool = True,
+        #: Cap on one bundle. Beyond this a new bundle starts instead, so a
+        #: long backlog cannot grow a single ASR call without bound and walk
+        #: into `asr_timeout_s`. 30 s is the window Whisper decodes natively
+        #: and two of the segmenter's own 15 s ceilings.
+        coalesce_max_s: float = 30.0,
+        #: How many previous turns are handed to MT as conversation context,
+        #: per session and per direction. 0 disables it.
+        mt_context_turns: int = 6,
+        # THE SHORT-SEGMENT FLIP RULE (§17.8.24). Measured, not guessed: the
+        # child's turn came back as `es` at language confidence 1.000 on a
+        # 0.88 s segment, carrying the canonical Whisper hallucination
+        # ("!Gracias por ver el video!"). A CONFIDENCE gate cannot reach a
+        # confident wrong answer, and the pin prior could not either, because
+        # it was only consulted BELOW the floor. So the predicate is duration
+        # plus history rather than confidence.
+        #:
+        #: 1.5 s sits above the 0.88 s observation and below any utterance
+        #: that carries enough speech to establish a language switch on its
+        #: own. A speaker who genuinely changes language does so in a sentence,
+        #: not in a syllable.
+        short_segment_flip_s: float = 1.5,
+        #: How many consecutive confident turns in one language before that
+        #: history is allowed to override a short contrary segment. Two, so a
+        #: single turn is never treated as a pattern, and a real switch costs
+        #: exactly one turn of inertia.
+        language_streak_min: int = 2,
+        #: Similarity above which an utterance counts as the user reading our
+        #: own output back. 0.80 on a normalized ratio: high enough that two
+        #: different sentences in one language do not collide, low enough to
+        #: survive ASR noise on a re-reading.
+        read_back_ratio: float = 0.80,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # DEGRADE, do not refuse (§17.8.14). This used to be
@@ -489,9 +604,44 @@ class TranslatorSession:
         # Reading mode (§17.1). Orthogonal to voice_mode: `silent` decides
         # WHETHER anything is spoken, `voice_mode` decides in WHOSE voice.
         self.output_mode = output_mode
-        # The speaker button the user armed for the NEXT utterance (§17.5).
-        # One utterance only; consumed at identification.
+        # The speaker button the user armed (§17.5). Historically consumed at
+        # identification -- one utterance and gone. Under a STICKY PIN it is
+        # held until the user releases it; see `sticky_pin`.
         self._armed_speaker: Optional[str] = None
+        #: STICKY PIN (user order 2026-08-04). The arming used to be spent on
+        #: the first segment (`_identify` cleared it whatever happened next),
+        #: so a five-segment conversation pinned one segment and let
+        #: diarization mint phantom speakers for the other four -- which is
+        #: the phantom flood the user reported. Held, the pin decides
+        #: attribution for every segment until it is released, and diarization
+        #: is demoted to collecting reference material and to WARNING when a
+        #: segment looks nothing like the pinned speaker.
+        self.sticky_pin = sticky_pin
+        #: Source language of the turn being processed, so a segment captured
+        #: DURING it can be compared against it (the §17.8.16 floor).
+        self._active_source: Optional[str] = None
+        #: Below this, the language identifier's answer is not trusted on its
+        #: own and the pin's language wins. The child case is the reason the
+        #: pin comes before `profile.last_language`: a four-year-old speaking
+        #: clear German is reported as Spanish, and the phantom cluster that
+        #: `last_language` would consult is exactly the thing being escaped.
+        self.lid_confidence_floor = lid_confidence_floor
+        self.overlap_discard = overlap_discard
+        #: Segments refused because somebody talked over a running turn.
+        self.interjections_discarded = 0
+        self.asr_timeout_s = asr_timeout_s
+        self.tts_unit_timeout_s = tts_unit_timeout_s
+        self.tts_drain_timeout_s = tts_drain_timeout_s
+        #: Lines whose turn died on a deadline, waiting for their ONE
+        #: automatic re-drive. Drained outside the turn lock -- `redrive`
+        #: takes that lock itself, so retrying from inside would deadlock the
+        #: session in a new and more interesting way than the bug being fixed.
+        self._redrive_queue: List[int] = []
+        #: Lines already retried once. The second attempt belongs to the user
+        #: and their button: an unbounded automatic retry against a talker
+        #: that is genuinely stuck is just the wedge with extra steps.
+        self._redrive_attempted: set = set()
+        self.stage_timeouts = 0
         # Uncertainty bookkeeping (§17.4). The embedding of every unresolved
         # ambiguous line is kept so a tap can fold it into the chosen speaker
         # -- and ONLY a tap can, which is why it is parked here instead of
@@ -516,6 +666,35 @@ class TranslatorSession:
         self._clock = clock
         self._queue: Deque[Segment] = deque()
         self._max_queued = max(1, max_queued_turns)
+        self.coalesce_queued = coalesce_queued
+        self.coalesce_max_s = coalesce_max_s
+        #: Segments folded into a waiting bundle instead of becoming their own
+        #: turn. Counted because "the pipeline stopped chopping" is otherwise
+        #: only observable as an absence.
+        self.segments_coalesced = 0
+        # MT CONTEXT, owned HERE and not by the backend (§17.8.21 item 3).
+        #
+        # It used to live on the `OpenAiMt` instance, which `launch.py`
+        # constructs ONCE per process and hands to every session -- so the
+        # last six turns of one conversation were prepended to the prompt of
+        # every other conversation on the box, in every direction, with no
+        # speaker or language tag on any of them. That is a wrong-context bug
+        # and a cross-session leak in the same deque. Context is per session
+        # and per DIRECTION because a de->es history is not usable context for
+        # an es->de call: the roles of the two languages are swapped.
+        self.mt_context_turns = max(0, mt_context_turns)
+        self._mt_context: Dict[Tuple[str, str], Deque[Tuple[str, str]]] = {}
+        self.short_segment_flip_s = short_segment_flip_s
+        self.language_streak_min = max(1, language_streak_min)
+        self.read_back_ratio = read_back_ratio
+        #: What this session has SPOKEN, newest last, as (language, text). Our
+        #: own output read back into the microphone is not evidence about
+        #: which language the speaker speaks -- see `_is_read_back`.
+        self._spoken: Deque[Tuple[str, str]] = deque(maxlen=12)
+        #: Short segments that were refused the right to turn the conversation
+        #: around, and read-backs that were refused a history update.
+        self.flips_refused = 0
+        self.read_backs_seen = 0
         self._turn_lock = asyncio.Lock()
         #: The turn currently being translated/synthesized, or None. Kept so a
         #: stop can NAME what it abandoned; the client discards audio per
@@ -655,7 +834,30 @@ class TranslatorSession:
                 # directions it cannot. The client constant
                 # PARTIAL_PARTICIPANTS_SUPPORTED was waiting on exactly this.
                 "partial_participants": True,
+                # The pin survives segment boundaries here, so the client's
+                # re-arm mitigation is redundant and should stand down: it
+                # re-sent `speaker.arm` on every turn boundary to paper over
+                # the per-segment consumption this replaces. Announced rather
+                # than assumed, because the page is served independently of
+                # the server it talks to.
+                "sticky_pin": bool(self.sticky_pin),
+                # One speaker at a time: a segment spoken over a running turn
+                # in the other participant language is dropped, not queued.
+                "overlap_discard": bool(self.overlap_discard),
+                # Segments waiting behind a running turn are bundled instead
+                # of each becoming its own turn, and MT sees the last N turns
+                # of THIS session in THIS direction.
+                "coalesce_queued": bool(self.coalesce_queued),
+                "mt_context_turns": int(self.mt_context_turns),
+                # A short contrary segment cannot turn the conversation
+                # around under a held pin, and our own output read back does
+                # not rewrite the speaker's language history (§17.8.24).
+                "short_segment_flip_s": float(self.short_segment_flip_s),
+                "read_back_guard": True,
             },
+            "segments_coalesced": self.segments_coalesced,
+            "flips_refused": self.flips_refused,
+            "read_backs_seen": self.read_backs_seen,
         }
 
     # -- the written record (§17.2) -----------------------------------------
@@ -1133,8 +1335,73 @@ class TranslatorSession:
         self.touch()
         return self.segmenter.flush(SegmentReason.RELEASED)
 
+    def _coalesce_into_tail(self, segment: Segment) -> bool:
+        """Fold a segment into the bundle already waiting. True if folded.
+
+        Only ever touches the TAIL of the queue, and only when something is
+        already waiting there -- which is precisely the condition "the
+        pipeline is behind". The turn currently running is not in the queue
+        and is never affected, so this cannot delay speech that is already on
+        its way out; it can only stop speech that is stuck behind it from
+        being cut into needlessly small turns.
+
+        The pause between the two utterances is preserved rather than glued
+        over: the segmenter closes on `hangover_ms` of silence and opens on
+        `pre_roll_ms`, so both pieces already carry their own margins and a
+        plain concatenation keeps a real pause at the seam. That matters twice
+        -- the recognizer needs it to punctuate, and the speaker-change
+        splitter needs it as a window boundary it can cut on.
+        """
+        if not self.coalesce_queued or not self._queue:
+            return False
+        tail = self._queue[-1]
+        if tail.audio.sample_rate != segment.audio.sample_rate:
+            # Resampling here would hide a wire/pipeline rate disagreement
+            # that the caller needs to see as its own turn.
+            return False
+        if tail.duration_s + segment.duration_s > self.coalesce_max_s:
+            return False
+        merged = dataclasses.replace(
+            tail,
+            audio=tail.audio.concat(segment.audio),
+            # The bundle keeps the IDENTITY of its oldest member: `index` and
+            # `start_s` order the transcript and resume the client, and the
+            # bundle occupies the position the first segment claimed. The
+            # barge-in stamps are the tail's for the same reason -- they
+            # record what was running when the bundle STARTED waiting.
+            reason=segment.reason,
+        )
+        self._queue[-1] = merged
+        self.segments_coalesced += 1
+        self.journal.append(
+            EventKind.TURN_COALESCED,
+            {
+                "segment_index": segment.index,
+                "into_index": tail.index,
+                "duration_s": round(merged.duration_s, 2),
+                "queued": len(self._queue),
+            },
+        )
+        logger.info(
+            "session %s coalesced segment %d into waiting segment %d "
+            "(%.2f s bundled)",
+            self.session_id, segment.index, tail.index, merged.duration_s,
+        )
+        return True
+
     def enqueue(self, segment: Segment) -> bool:
         """Queue a segment for translation. False if it was dropped."""
+        # Stamp barge-in context BEFORE the merge attempt: a folded segment
+        # keeps the bundle's stamps, and this call is what makes the
+        # unfoldable case (rate mismatch, bundle full) identical to the old
+        # path rather than subtly different.
+        segment = dataclasses.replace(
+            segment,
+            overlapped_turn_id=self._active_turn_id,
+            overlapped_language=self._active_source,
+        )
+        if self._coalesce_into_tail(segment):
+            return True
         while len(self._queue) >= self._max_queued:
             stale = self._queue.popleft()
             self.turns_dropped += 1
@@ -1146,6 +1413,12 @@ class TranslatorSession:
                     "queued": len(self._queue),
                 },
             )
+        # The barge-in relation was stamped at the top of this method. That is
+        # the only moment that knows whether a turn was already running when
+        # this audio closed; by the time the segment is dequeued that turn may
+        # be long finished. The LANGUAGE half of the decision cannot be made
+        # yet -- it needs recognition -- so the two halves are taken where
+        # each is available.
         self._queue.append(segment)
         return True
 
@@ -1216,21 +1489,44 @@ class TranslatorSession:
         ASR produces one run-on utterance whose halves are in different
         languages, and no amount of later attribution repairs that.
         """
+        results: List[TurnResult] = []
         async with self._turn_lock:
             try:
                 pieces = await self._split_at_speaker_changes(segment)
-                results: List[TurnResult] = []
                 for piece in pieces:
                     result = await self._run_turn_locked(piece)
                     if result is not None:
                         results.append(result)
-                return results
             finally:
                 # Cleared on the way out however we leave -- return, error, or
                 # the cancellation a stop delivers. A stale active turn would
                 # make the NEXT stop name a turn that finished long ago.
                 self._active_turn_id = None
                 self._turn_audio = None
+                self._active_source = None
+        # ONE automatic retry, and it runs HERE -- outside the lock. `redrive`
+        # takes `_turn_lock` itself, so retrying from inside the turn would
+        # deadlock the session in a newer and more interesting way than the
+        # bug this fixes. The second attempt belongs to the user's button:
+        # retrying without bound against a talker that is genuinely stuck is
+        # the wedge again with extra steps.
+        while self._redrive_queue:
+            line_id = self._redrive_queue.pop(0)
+            if line_id in self._redrive_attempted:
+                continue
+            self._redrive_attempted.add(line_id)
+            try:
+                logger.info(
+                    "session %s auto-redriving line %s after a stage deadline",
+                    self.session_id, line_id,
+                )
+                await self.redrive(line_id)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                logger.error(
+                    "session %s auto-redrive of line %s failed: %s",
+                    self.session_id, line_id, exc,
+                )
+        return results
 
     async def _split_at_speaker_changes(self, segment: Segment) -> List[Segment]:
         """Re-cut a segment wherever the voice changes inside it.
@@ -1334,7 +1630,14 @@ class TranslatorSession:
         #    from pinning the result, because pinning would make the direction
         #    routing a configuration rather than an observation.
         try:
-            transcript = await self._recognize(segment)
+            async with asyncio.timeout(self.asr_timeout_s):
+                transcript = await self._recognize(segment)
+        except TimeoutError:
+            self.stage_timeouts += 1
+            return self._fail(
+                turn_id, "asr",
+                f"recognition did not return within {self.asr_timeout_s:.0f}s",
+            )
         except BackendError as exc:
             return self._fail(turn_id, "asr", str(exc))
         watch.asr_ms = (self._clock() - t0) * 1000.0
@@ -1355,6 +1658,56 @@ class TranslatorSession:
                 "language_confidence": round(transcript.language_confidence, 3),
             },
         )
+
+        # 1b. LANGUAGE BEFORE EMBEDDING (§17.8.16). Somebody talking over a
+        #     running turn, in the other participant language, is somebody
+        #     else -- and the order is to ignore them, not to queue them and
+        #     speak them afterwards. This sits between recognition and
+        #     identification because identification ENROLLS: run later, it
+        #     would already have folded the interloper into the pinned
+        #     speaker's cluster.
+        floor = self._foreign_interjection(segment, transcript)
+        if floor is not None:
+            self.interjections_discarded += 1
+            self._log_discard(transcript, floor)
+            spoken = self._resolve_source(
+                transcript, duration_s=segment.duration_s
+            )
+            # The line IS written. A swallowed utterance is indistinguishable
+            # from a broken microphone, and the person who was talked over
+            # should be able to see what was said and repeat it.
+            line = self.transcript.append(
+                turn_id=turn_id,
+                speaker_id="speaker-interjection",
+                speaker_label="(other speaker)",
+                source_language=spoken,
+                source_text=transcript.text,
+                origin=ORIGIN_AUTO,
+                confidence=CONFIDENCE_UNCERTAIN,
+            )
+            self._emit_line(line)
+            self.journal.append(
+                EventKind.TURN_UNROUTED,
+                {
+                    "turn_id": turn_id,
+                    "speaker_id": None,
+                    "source": spoken,
+                    "text": transcript.text,
+                    "reason": (
+                        f"spoken over a turn already running in {floor!r}; "
+                        "one speaker at a time"
+                    ),
+                    "interjection": True,
+                    "floor_language": floor,
+                    "over_turn_id": segment.overlapped_turn_id,
+                },
+            )
+            self.journal.append(
+                EventKind.TURN_DONE,
+                {"turn_id": turn_id, "empty": True, "reason": "interjection",
+                 "source": spoken},
+            )
+            return None
 
         # 2. Who said it.
         t_embed = self._clock()
@@ -1380,7 +1733,12 @@ class TranslatorSession:
 
         # 3. Which way does it go. Elimination over the conversation's
         #    participant set -- no pair is named anywhere in this file.
-        source = self._resolve_source(transcript, speaker_id)
+        source = self._resolve_source(
+            transcript, speaker_id, duration_s=segment.duration_s
+        )
+        # Published for the barge-in comparison: a segment queued from here on
+        # knows which language holds the floor.
+        self._active_source = source
 
         # The written record gets its line HERE, before routing and before
         # translation. A turn that is never routed (no rule for its language)
@@ -1444,6 +1802,26 @@ class TranslatorSession:
         audio_out: Dict[str, AudioChunk] = {}
         used_fallback = False
         first_audio_at: Optional[float] = None
+        #: A stage answered "not in time" rather than "no". Only interesting
+        #: if the turn ends up with NOTHING -- see the enqueue below.
+        retryable_failure = False
+
+        # THE DIRECTION INVARIANT, as an assertion rather than a repair
+        # (§17.8.16). "Detected language equals chosen target" cannot happen:
+        # `targets_for` returns `participants - {src}` (languages.py:360) and
+        # `require_pair` refuses `src == tgt` first (languages.py:261-265), so
+        # a guard here would never fire and the real defect is always a wrong
+        # SOURCE. Kept as a loud check because the two predicates it depends
+        # on live in another module and a future routing table could break it
+        # silently -- which would send a German turn to German and look, from
+        # the outside, exactly like the bug this bundle is about.
+        if source in targets:
+            logger.error(
+                "routing invariant violated in session %s: source %r is among "
+                "its own targets %s -- refusing the self-direction",
+                self.session_id, source, list(targets),
+            )
+            targets = tuple(t for t in targets if t != source)
 
         for target in targets:
             try:
@@ -1475,6 +1853,17 @@ class TranslatorSession:
                 )
             except BackendError as exc:
                 self._fail(turn_id, exc.stage, str(exc), close=False)
+                # ONLY the synthesis stage. Each stage owns its own retry
+                # policy, and MT's is deliberate and already guarded: it
+                # refuses to restart a stream that has delivered tokens,
+                # because the user would read and hear those clauses twice
+                # (`test_a_stream_that_already_spoke_is_not_restarted`). An
+                # automatic re-drive on an MT failure reintroduces exactly
+                # that retry through the recovery door -- measured, not
+                # reasoned: it turned that pin red. The re-drive exists for
+                # the stage that had NO policy at all.
+                if exc.stage == "tts" and getattr(exc, "retryable", False):
+                    retryable_failure = True
                 continue
             translations[target] = text
             if audio is not None:
@@ -1482,6 +1871,17 @@ class TranslatorSession:
             used_fallback = used_fallback or fallback
             if marks is not None and (first_audio_at is None or marks < first_audio_at):
                 first_audio_at = marks
+
+        # THE ONE AUTOMATIC RE-DRIVE, and only for a turn that produced
+        # NOTHING. A turn whose failure came after some text was already
+        # delivered must not be re-driven: it would re-emit clauses the user
+        # has read and re-speak audio they have heard, which is worse than a
+        # partial turn. That is the same reasoning the MT retry guard uses
+        # one level down (`first_token_at is not None`), and getting it wrong
+        # here was caught by `test_a_stream_that_already_spoke_is_not_restarted`
+        # -- the retry it forbids came back in through the recovery path.
+        if retryable_failure and not translations:
+            self._redrive_queue.append(line.line_id)
 
         if first_audio_at is not None:
             watch.first_audio_ms = (first_audio_at - t0) * 1000.0
@@ -1492,13 +1892,20 @@ class TranslatorSession:
             if updated is not None:
                 self._emit_line(updated, update=True)
 
-            # Only the first target feeds the MT history: a multi-target fan-out
-            # would otherwise stack N assistant turns per user turn and skew the
-            # context window towards whichever language happened to sort first.
-            first_target = sorted(translations)[0]
-            remember = getattr(self.mt, "remember", None)
-            if callable(remember):
-                remember(transcript.text, translations[first_target])
+            # EVERY target feeds its OWN context now. The old code fed only
+            # `sorted(translations)[0]` into one shared deque, because that
+            # deque could not tell directions apart -- with two targets it
+            # would otherwise have stacked N assistant turns per user turn in
+            # whichever language happened to sort first. Keyed by direction,
+            # that compromise is unnecessary: each direction gets exactly its
+            # own turns and none of the other's.
+            for tgt, translated in translations.items():
+                self._remember_context(source, tgt, transcript.text, translated)
+                # And remember that we SAID it, in that language. This is the
+                # only record that can tell a later utterance apart from our
+                # own words coming back through the microphone.
+                if translated.strip():
+                    self._spoken.append((tgt, translated))
 
         self.turns_completed += 1
         await self._suggest_names(
@@ -1567,15 +1974,24 @@ class TranslatorSession:
         self._last_embedding = None
         self._last_uncertain = False
         self._last_candidates = []
+        # Decided ONCE per turn, before either registry path, because both of
+        # them write language history and both were poisoned by it.
+        read_back = self._is_read_back(transcript.text)
         armed = self._armed_speaker
         if armed is not None:
-            # Spent on this utterance whatever happens next, which is what
-            # "exactly one utterance" means: the button overrides
-            # IDENTIFICATION, and identification is happening right now.
-            self._armed_speaker = None
-            self.journal.append(
-                EventKind.SESSION_STATE, {"armed_speaker": None, "consumed_by": armed}
-            )
+            # STICKY: the pin is NOT spent here. It used to be -- "exactly one
+            # utterance" -- and that is the mechanism behind the phantom
+            # flood: the user pins himself, says five things, and four of them
+            # are diarized from scratch against a bar calibrated on preset
+            # voices. Held, the pin answers every segment until released, and
+            # the embedding below is still computed so the cluster keeps
+            # learning his voice and so a wild deviation can be reported.
+            if not self.sticky_pin:
+                self._armed_speaker = None
+                self.journal.append(
+                    EventKind.SESSION_STATE,
+                    {"armed_speaker": None, "consumed_by": armed},
+                )
             embedding = None
             try:
                 if segment.duration_s >= getattr(self.embedder, "min_seconds", 0.0):
@@ -1592,6 +2008,7 @@ class TranslatorSession:
                     embedding=embedding,
                     text=transcript.text,
                     language=transcript.language,
+                    read_back=read_back is not None,
                 )
             except KeyError:
                 logger.error(
@@ -1634,6 +2051,9 @@ class TranslatorSession:
             text=transcript.text,
             language=transcript.language,
             language_confidence=transcript.language_confidence,
+            pin=self._armed_speaker,
+            overlapped=segment.overlapped_turn_id is not None,
+            read_back=read_back is not None,
         )
         uncertain, candidates = self.speakers.uncertainty(ranked, profile.speaker_id)
         self._last_embedding = embedding
@@ -1658,6 +2078,180 @@ class TranslatorSession:
             partners = self.routing_table.partners_for(source)
             return partners or None
         return self.conversation.targets_for(source)
+
+    def unfinished_lines(self) -> List[TranscriptLine]:
+        """Lines that were recognised and never finished.
+
+        A line exists from the moment the words are known -- before routing,
+        before MT, before a single sample is synthesized (see where it is
+        appended in `_run_turn_locked`). That is the right order for a
+        transcript and it is why an interrupted turn leaves a VISIBLE message
+        with no translation and no audio: exactly what the user reported as
+        "beim zweiten turn hat nur die stt funktioniert ... status der
+        nachricht sagt translating".
+
+        `turn.unrouted` turns are deliberately NOT in here: they finished, and
+        their emptiness is a decision rather than an interruption.
+        """
+        unrouted = {
+            event.payload.get("turn_id")
+            for event in self.journal.since(0)[0]
+            if event.kind is EventKind.TURN_UNROUTED
+        }
+        return [
+            line
+            for line in self.transcript.lines()
+            if line.kind == "utterance"
+            and not line.translations
+            and line.turn_id
+            and line.turn_id not in unrouted
+        ]
+
+    async def redrive(
+        self, line_id: int, *, from_stage: str = "auto", speak: bool = True
+    ) -> Dict[str, object]:
+        """Run the rest of the chain for a message that already has its words.
+
+        ONE MECHANISM, THREE CALLERS, and that is the point of building it
+        this way rather than three times:
+
+          - RESUME/ORPHAN RECOVERY. A turn interrupted between recognition and
+            audio (a dropped socket, a restart, a synthesis that never came
+            back) is just a message whose remaining stages were never run.
+            There is nothing special about it to recover -- it is re-driven.
+          - "SPEAK IT AGAIN" on a message. The words are on file; the user
+            wants the audio once more, or for the first time.
+          - "CHANGE SPEAKER, and say it in their voice". The attribution moves
+            first, then this runs with the new speaker's voice.
+
+        `from_stage` selects where to re-enter. `auto` reuses the existing
+        translation when there is one and only synthesizes -- MT is the
+        expensive-but-done part and repeating it would also change the words
+        under a user who has already read them. `mt` forces the full chain,
+        which is what a message with no translation needs.
+
+        Deliberately holds the same `_turn_lock` as a live turn: one speaker
+        at a time is a session-wide invariant (§17.8.16), and a re-drive that
+        spoke over a running turn would break it from the side door.
+        """
+        line = self.transcript.get(line_id)
+        if line is None:
+            raise KeyError(f"no transcript line {line_id}")
+        if not line.source_text.strip():
+            raise ValueError(f"line {line_id} has no recognised words to re-drive")
+
+        source = line.source_language
+        targets = self._targets_for(source) or ()
+        stage = from_stage
+        if stage == "auto":
+            stage = "tts" if line.translations else "mt"
+
+        async with self._turn_lock:
+            turn_id = line.turn_id or uuid.uuid4().hex[:12]
+            self._active_turn_id = turn_id
+            self._active_source = source
+            t0 = self._clock()
+            watch = Stopwatch(segment_closed_at=t0)
+            self.journal.append(
+                EventKind.TURN_OPENED,
+                {
+                    "turn_id": turn_id,
+                    "segment_index": -1,
+                    "duration_s": 0.0,
+                    "reason": "redrive",
+                    "redrive": True,
+                    "from_stage": stage,
+                    "line_id": line_id,
+                },
+            )
+            transcript = Transcript(
+                text=line.source_text, language=source, language_confidence=1.0
+            )
+            translations: Dict[str, str] = dict(line.translations)
+            spoke = False
+            try:
+                for target in targets:
+                    try:
+                        self.matrix.require_pair(source, target)
+                    except LanguageError:
+                        continue
+                    if not speak and target in translations:
+                        continue
+                    # Words already agreed with the reader are re-spoken as
+                    # they stand; a message with none runs the full chain.
+                    already = (
+                        translations.get(target) if stage == "tts" else None
+                    )
+                    try:
+                        text, _audio, _fb, _marks = await self._translate_and_speak(
+                            turn_id, transcript, source, target,
+                            line.speaker_id, watch, pretranslated=already,
+                        )
+                    except BackendError as exc:
+                        self._fail(turn_id, exc.stage, str(exc), close=False)
+                        continue
+                    translations[target] = text
+                    spoke = True
+            finally:
+                self._active_turn_id = None
+                self._active_source = None
+                self._turn_audio = None
+
+            if translations and translations != line.translations:
+                updated = self.transcript.set_translations(line_id, translations)
+                if updated is not None:
+                    self._emit_line(updated, update=True)
+            self.journal.append(
+                EventKind.TURN_DONE,
+                {
+                    "turn_id": turn_id,
+                    "redrive": True,
+                    "line_id": line_id,
+                    "source": source,
+                    "targets": sorted(translations),
+                    "timings": watch.to_json(),
+                },
+            )
+        return {
+            "line_id": line_id,
+            "turn_id": turn_id,
+            "from_stage": stage,
+            "targets": sorted(translations),
+            "spoke": bool(spoke),
+        }
+
+    async def recover_unfinished(self) -> List[Dict[str, object]]:
+        """Re-drive every message left mid-chain. Called on resume.
+
+        THE ORPHAN CLASS, closed at the mechanism rather than at each of its
+        causes. A turn can be interrupted by a dropped socket, by a restart,
+        or by a synthesis that never returned, and in every case the message
+        sits in the transcript saying "translating" forever -- there is no
+        worker left that intends to finish it. The rule is: never a silent
+        permanent state. Either it is driven to completion or it is reported.
+        """
+        results = []
+        for line in self.unfinished_lines():
+            try:
+                results.append(await self.redrive(line.line_id))
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                logger.error(
+                    "session %s could not recover line %s: %s",
+                    self.session_id, line.line_id, exc,
+                )
+                self.journal.append(
+                    EventKind.ERROR,
+                    {
+                        "turn_id": line.turn_id,
+                        "line_id": line.line_id,
+                        "stage": "redrive",
+                        "message": str(exc),
+                        # Named so the client can offer the button rather than
+                        # leaving the message in a state nothing will change.
+                        "recoverable": True,
+                    },
+                )
+        return results
 
     def set_routing_pairs(self, pairs: Sequence[Tuple[str, str]]) -> None:
         """Replace the manual routing table. Empty restores auto mode.
@@ -1717,22 +2311,250 @@ class TranslatorSession:
             return tuple(self.routing_table.languages())
         return tuple(sorted(self.conversation.participants))
 
-    def _resolve_source(self, transcript: Transcript, speaker_id: str) -> str:
-        """Detected language, with a low-confidence fallback to speaker history.
+    def pinned_language(self) -> Optional[str]:
+        """The language of the pinned speaker, if there is one and it knows."""
+        if not self._armed_speaker:
+            return None
+        try:
+            return self.speakers.get(self._armed_speaker).last_language
+        except KeyError:
+            return None
+
+    def _resolve_source(
+        self, transcript: Transcript, speaker_id: Optional[str] = None,
+        duration_s: Optional[float] = None
+    ) -> str:
+        """Detected language, hardened against the two ways it goes wrong.
 
         People do not usually switch language mid-conversation, so when the
-        identifier is unsure the speaker's last confident language is a better
-        estimate than a coin flip -- and a coin flip here sends the
-        translation in the wrong direction, which is the single most confusing
-        failure the user can experience.
+        identifier is unsure, history beats a coin flip -- and a coin flip
+        here sends the translation in the wrong direction, which is the single
+        most confusing failure the user can experience.
+
+        THE ORDER CHANGED (§17.8.16) and both changes are field defects:
+
+        1. THE PIN COMES FIRST. `profile.last_language` used to be consulted
+           straight away, and the profile it consulted could be a phantom --
+           the TTS echo enrolled itself as `speaker-4` carrying `es` at
+           confidence 0.026, and German then routed to German through it. A
+           pinned speaker is the user's own statement about who is talking,
+           and it outranks any cluster the system minted for itself.
+        2. HISTORY STAYS, and the reason it is safe is worth writing down
+           because it was nearly "fixed" out of existence: `last_language` is
+           only ever WRITTEN at confidence >= 0.5 (`speakers.assign`), so it
+           cannot carry an echo's 0.026 answer in the first place. Restricting
+           it to enrolled profiles looked like echo protection and was
+           actually a regression -- it discards the ordinary continuity that
+           keeps an unconfident turn pointing the right way, which
+           `test_low_confidence_falls_back_to_the_speaker_history` pins.
+
+        What this CANNOT fix, stated because a confidence gate looks like it
+        should: a high-confidence misdetection. If the identifier says `es`
+        for the child's German and means it, only the pin reaches it -- see
+        the measurement this is waiting on.
         """
-        if transcript.language_confidence >= 0.5:
+        # THE SHORT-SEGMENT FLIP RULE, and it runs AHEAD of the confidence
+        # branch on purpose. Everything below trusts a confident answer, and
+        # the case this exists for is a confident WRONG one: 0.88 s of a
+        # child's German came back as `es` at confidence 1.000 with a
+        # hallucinated Spanish sentence attached. A gate placed after the
+        # confidence check could never have seen it.
+        #
+        # Deliberately narrow. It needs a pin HELD (the user has asserted who
+        # is speaking), a run of consecutive turns in one language (one turn
+        # is a coincidence), and a segment too short to carry a real language
+        # switch. Outside that intersection the detected language wins exactly
+        # as before -- alternating DE/ES into one phone is what this app is
+        # for, and a rule that made switching hard would break the product to
+        # protect an edge.
+        if duration_s is not None and duration_s < self.short_segment_flip_s:
+            held = self._armed_speaker
+            profile = None
+            if held:
+                try:
+                    profile = self.speakers.get(held)
+                except KeyError:
+                    profile = None
+            if (
+                profile is not None
+                and profile.last_language
+                and profile.language_streak >= self.language_streak_min
+                and transcript.language != profile.last_language
+            ):
+                self.flips_refused += 1
+                self.journal.append(
+                    EventKind.TURN_LANGUAGE_HELD,
+                    {
+                        "speaker_id": held,
+                        "detected": transcript.language,
+                        "detected_confidence": round(
+                            transcript.language_confidence, 3
+                        ),
+                        "held": profile.last_language,
+                        "streak": profile.language_streak,
+                        "duration_s": round(duration_s, 2),
+                        "text": transcript.text[:120],
+                    },
+                )
+                logger.info(
+                    "session %s refused a %.2fs segment the direction flip "
+                    "%s->%s: pin held on %s with a %d-turn %s history",
+                    self.session_id, duration_s, profile.last_language,
+                    transcript.language, held, profile.language_streak,
+                    profile.last_language,
+                )
+                return profile.last_language
+
+        if transcript.language_confidence >= self.lid_confidence_floor:
             return transcript.language
-        try:
-            profile = self.speakers.get(speaker_id)
-        except KeyError:
-            return transcript.language
-        return profile.last_language or transcript.language
+        pinned = self.pinned_language()
+        if pinned:
+            return pinned
+        if speaker_id:
+            try:
+                profile = self.speakers.get(speaker_id)
+            except KeyError:
+                return transcript.language
+            return profile.last_language or transcript.language
+        return transcript.language
+
+    def _foreign_interjection(
+        self, segment: Segment, transcript: Transcript
+    ) -> Optional[str]:
+        """The language the floor is held in, when this segment fights it.
+
+        THE ORDER, verbatim: "es kann auch jemand spanisch reinquatschen, wenn
+        ich deutsch gerade spreche, dann muss selbstverständlich der spanisch
+        erkannte teil ... ignoriert werden". Language is the first
+        discriminator, ahead of any embedding: inside a two-language
+        conversation, a segment in the OTHER participant language spoken over
+        a running turn is somebody else, and no cosine is needed to know it.
+
+        Scoped to OVERLAP on purpose. A floor held for as long as a pin is
+        held would silence the alternating DE/ES conversation this app exists
+        for -- the order is about talking OVER someone, not about taking
+        turns. `overlapped_turn_id` is stamped at `enqueue`, which is the only
+        place that relation is known.
+
+        Returns the floor language when this segment is an interjection, else
+        None. Deliberately called BEFORE identification: `_identify` enrolls,
+        and a filter that ran afterwards would already have folded the
+        interloper's voice into the pinned speaker's cluster.
+        """
+        if not self.overlap_discard:
+            return None
+        floor = segment.overlapped_language
+        if not floor or segment.overlapped_turn_id is None:
+            return None
+        spoken = self._resolve_source(
+            transcript, duration_s=segment.duration_s
+        )
+        if spoken == floor:
+            return None
+        # Only a language this conversation actually carries counts. A
+        # misdetection into a third language is a recognition problem and
+        # must not be re-labelled as a second speaker.
+        if spoken not in self.conversation.participants:
+            return None
+        return floor
+
+    def _log_discard(self, transcript: Transcript, floor: str) -> None:
+        """A destructive decision must leave a trace outside the journal.
+
+        The first false positive was found by reading the TRANSCRIPT and
+        noticing a `speaker-interjection` line -- the log said nothing at all,
+        which is how a filter that silently deletes speech should never
+        behave.
+        """
+        logger.warning(
+            "session %s DISCARDED an interjection: floor=%s spoken=%s "
+            "text=%r -- if this was a real turn, the floor language is the "
+            "thing to distrust",
+            self.session_id, floor, transcript.language, transcript.text[:80],
+        )
+
+    def _is_read_back(self, text: str) -> Optional[str]:
+        """Is this utterance our OWN output, spoken back into the microphone?
+
+        The user checks a translation by reading it aloud. That is a normal
+        and useful thing to do, and it used to rewrite his language history to
+        the TARGET language: after reading one Spanish line back, a German
+        speaker's `last_language` was `es`, and with a sticky pin held that
+        arms every later quiet utterance to be routed es->de and spoken back
+        at him in German (§17.8.23 found exactly this state live).
+
+        Returns the language we spoke it in, or None. Compared on a
+        normalized ratio rather than equality because it has been through a
+        loudspeaker, a room and a recognizer since we wrote it.
+        """
+        candidate = _normalize_for_match(text)
+        if len(candidate) < 12:
+            # Too short to be distinctive: "si", "ja", "hola" would match half
+            # the conversation and suppress real history updates.
+            return None
+        for language, spoken in reversed(self._spoken):
+            ratio = difflib.SequenceMatcher(
+                None, candidate, _normalize_for_match(spoken)
+            ).ratio()
+            if ratio >= self.read_back_ratio:
+                self.read_backs_seen += 1
+                logger.info(
+                    "session %s heard its own %s output read back "
+                    "(similarity %.2f); language history not updated",
+                    self.session_id, language, ratio,
+                )
+                return language
+        return None
+
+    def _context_for(self, source: str, target: str) -> List[Tuple[str, str]]:
+        """The last N (source, target) pairs of THIS session, THIS direction.
+
+        Handed to the backend on every call rather than accumulated inside it,
+        so the prompt a session builds depends on that session alone. The
+        growing prefix is close to free against our own server: the turns are
+        replayed in the same order every time, so the radix cache matches all
+        but the newest pair, and the win is terminology and pronoun agreement
+        holding across turns instead of being re-guessed per utterance.
+        """
+        history = self._mt_context.get((source, target))
+        return list(history) if history else []
+
+    def _remember_context(
+        self, source: str, target: str, source_text: str, target_text: str
+    ) -> None:
+        if self.mt_context_turns <= 0:
+            return
+        if not source_text.strip() or not target_text.strip():
+            return
+        history = self._mt_context.get((source, target))
+        if history is None:
+            history = deque(maxlen=self.mt_context_turns)
+            self._mt_context[(source, target)] = history
+        history.append((source_text, target_text))
+
+    def _mt_deltas(
+        self,
+        text: str,
+        source: str,
+        target: str,
+        pretranslated: Optional[str],
+    ):
+        """The translation stream, or a one-shot stand-in for known words.
+
+        Kept as a factory rather than a value because the caller re-enters it
+        per retry attempt: a generator already consumed by a failed attempt
+        would yield nothing on the next one, which would turn a recoverable
+        MT error into a silently empty translation.
+        """
+        if pretranslated is None:
+            return self.mt.translate_stream(
+                text, source, target, context=self._context_for(source, target)
+            )
+
+        async def once():
+            yield pretranslated
+
+        return once()
 
     async def _translate_and_speak(
         self,
@@ -1742,7 +2564,16 @@ class TranslatorSession:
         target: str,
         speaker_id: str,
         watch: Stopwatch,
+        pretranslated: Optional[str] = None,
     ) -> Tuple[str, Optional[AudioChunk], bool, Optional[float]]:
+        """``pretranslated`` skips MT and synthesizes the given words.
+
+        For a re-drive of a message the reader has ALREADY SEEN: repeating MT
+        would spend the call again and, worse, could come back with different
+        wording than the text on screen. The synthesis path below is entered
+        unchanged, so a re-spoken message goes through the same voice
+        selection, the same clause worker and the same events as a live one.
+        """
         # Reading mode (§17.1): everything up to here has already run -- the
         # recognizer, the speaker assignment and its reference admission, the
         # routing decision -- and everything after MT still runs. Only the
@@ -1816,19 +2647,39 @@ class TranslatorSession:
             # point is to name the interval BEFORE any audio exists, which is
             # the one the user sits through.
             announce(index, "synthesizing")
-            async for piece in self.tts.synthesize(
-                unit, target, reference, reference_text, voice.backend_voice_id
-            ):
-                if first_audio_at is None:
-                    first_audio_at = self._clock()
-                    watch.tts_first_audio_ms = (first_audio_at - tts_start) * 1000.0
-                    watch.tts_wait_ms = TTS_QUEUE_WAIT_S.get() * 1000.0
-                chunks.append(piece)
-                self.journal.append(
-                    EventKind.TURN_AUDIO,
-                    {"turn_id": turn_id, "target": target, "speaker_id": speaker_id},
-                    audio=piece,
-                )
+            # Per UNIT, not per turn: a turn may hold several units and a
+            # per-turn budget would let the first one eat all of it. The
+            # deadline covers the whole stream of one unit, so a talker that
+            # yields a first chunk and then stalls is caught too -- which the
+            # live report ("2 sentences still to speak") is a case of.
+            async with asyncio.timeout(self.tts_unit_timeout_s):
+                async for piece in self.tts.synthesize(
+                    unit, target, reference, reference_text,
+                    voice.backend_voice_id,
+                ):
+                    if first_audio_at is None:
+                        first_audio_at = self._clock()
+                        watch.tts_first_audio_ms = (
+                            first_audio_at - tts_start
+                        ) * 1000.0
+                        watch.tts_wait_ms = TTS_QUEUE_WAIT_S.get() * 1000.0
+                    chunks.append(piece)
+                    self.journal.append(
+                        EventKind.TURN_AUDIO,
+                        # THE UNIT SEAM, published so the client can hear it.
+                        # Every unit is its OWN `synthesize()` call, so its
+                        # first sample is a fresh waveform butted against the
+                        # last sample of a different one -- a step, which is a
+                        # click. Units are clause-sized, which is why the user
+                        # reports the noise at "many word starts" rather than
+                        # once per turn. The client cannot fade a seam it
+                        # cannot see, and until now the only per-unit signal
+                        # was `turn.speech`, which does not ride with the
+                        # samples and cannot be aligned to a specific buffer.
+                        {"turn_id": turn_id, "target": target,
+                         "speaker_id": speaker_id, "unit_index": index},
+                        audio=piece,
+                    )
             announce(index, "spoken")
 
         # TEXT MUST NOT WAIT FOR AUDIO (§19.13, user field report: "the
@@ -1873,8 +2724,8 @@ class TranslatorSession:
             attempt = 0
             while True:
                 try:
-                    async for delta in self.mt.translate_stream(
-                        transcript.text, source, target
+                    async for delta in self._mt_deltas(
+                        transcript.text, source, target, pretranslated
                     ):
                         if first_token_at is None:
                             first_token_at = self._clock()
@@ -1947,7 +2798,29 @@ class TranslatorSession:
             # what changed is when the TEXT became visible, not what the turn
             # eventually contains.
             speech.put_nowait(None)
-            await worker
+            # THE WEDGE (§17.8.20). This await had no deadline, and one
+            # synthesis that never yields its next piece parked the worker
+            # forever: the await never returned, `_turn_lock` was never
+            # released, and every later segment queued behind it in a state
+            # the UI draws as a spinner. The timeout raises, the handler below
+            # CANCELS the worker (abandoning it would keep the card busy), and
+            # the turn dies loudly instead of silently.
+            # Scoped to the DRAIN alone. Wrapping the whole block would also
+            # catch MT's own timeout and convert it into a tts failure,
+            # bypassing the MT retry -- caught by
+            # `test_a_stream_that_already_spoke_is_not_restarted`.
+            try:
+                async with asyncio.timeout(self.tts_drain_timeout_s):
+                    await worker
+            except TimeoutError as exc:
+                self.stage_timeouts += 1
+                worker.cancel()
+                raise BackendError(
+                    "tts",
+                    f"synthesis did not finish within "
+                    f"{self.tts_drain_timeout_s:.0f}s",
+                    retryable=True,
+                ) from exc
         except BaseException:
             # Includes the CancelledError a playback.stop delivers: the
             # worker holds the talker's lock, so leaving it running would

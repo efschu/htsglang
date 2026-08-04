@@ -547,11 +547,11 @@ class VoicePool:
             if p.voice_class.matches(voice_class) and p.voice_id not in taken
         ]
         if own_class:
-            chosen, variant = sorted(own_class, key=lambda p: p.voice_id)[0], 0
+            chosen, variant = sorted(own_class, key=self._order(voice_class))[0], 0
         else:
             any_class = [p for p in self._presets if p.voice_id not in taken]
             if any_class:
-                chosen, variant = sorted(any_class, key=lambda p: p.voice_id)[0], 0
+                chosen, variant = sorted(any_class, key=self._order(voice_class))[0], 0
             else:
                 pool = [
                     p for p in self._presets if p.voice_class.matches(voice_class)
@@ -581,6 +581,39 @@ class VoicePool:
                 )
         self._assigned[speaker_id] = (chosen.voice_id, variant)
         return chosen, variant
+
+    #: Which classes an UNKNOWN speaker is served from, in order. Adults
+    #: first, and this is a fix rather than a preference: `matches()` is true
+    #: whenever EITHER side is UNKNOWN (see its definition), so an
+    #: unclassified speaker's "own class" list is the WHOLE pool -- and
+    #: sorting that by `voice_id` puts `boy-01` and `girl-01` ahead of
+    #: `man-01` for no reason beyond the alphabet. The user heard exactly
+    #: that: adults answered in children's voices. When the classifier has
+    #: said nothing, an adult voice is the better bet for an adult
+    #: conversation, and a child who lands on an adult preset is corrected by
+    #: one tap on the roster.
+    _UNKNOWN_ORDER = {
+        VoiceClass.MAN: 0,
+        VoiceClass.WOMAN: 1,
+        VoiceClass.BOY: 2,
+        VoiceClass.GIRL: 3,
+        VoiceClass.CHILD: 3,
+        VoiceClass.UNKNOWN: 4,
+    }
+
+    @classmethod
+    def _order(cls, voice_class: VoiceClass):
+        """Sort key for preset allocation.
+
+        Identical to the old `voice_id` sort for every class the classifier
+        actually names -- the pool is already grouped by class there, so the
+        rank is constant within the candidate list and the alphabet decides,
+        as before. It only bites for UNKNOWN, where the candidate list spans
+        every class at once.
+        """
+        if voice_class is not VoiceClass.UNKNOWN:
+            return lambda p: (0, p.voice_id)
+        return lambda p: (cls._UNKNOWN_ORDER.get(p.voice_class, 4), p.voice_id)
 
     @classmethod
     def variant_shift(cls, variant_index: int) -> float:

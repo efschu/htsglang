@@ -30,6 +30,13 @@ German gender agreement on a referent named two turns ago), which is exactly
 where a context-free sentence translator embarrasses itself in a live
 exchange. The history is bounded because it is also the only part of this
 stage whose cost grows.
+
+That history is PASSED IN, per call, and this module keeps none of it.
+``launch.py`` builds one :class:`OpenAiMt` for the whole process and hands the
+same instance to every session, so a deque owned here is not "the
+conversation" -- it is all conversations on the box interleaved, in both
+directions, untagged. The owner is ``TranslatorSession``, which keys it by
+``(source, target)``; see its ``_context_for``.
 """
 
 from __future__ import annotations
@@ -37,8 +44,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-from collections import deque
-from typing import AsyncIterator, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import AsyncIterator, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -90,8 +96,9 @@ class MtConfig:
     #: Per-request timeout. A translation that has not arrived in this long has
     #: already missed the conversation; failing fast lets the session say so.
     timeout_s: float = 20.0
-    #: How many previous turns to include as context. 0 disables history.
-    history_turns: int = 6
+    # NO history knob here on purpose. Conversation context is per session and
+    # per direction, so it is owned by `TranslatorSession.mt_context_turns`;
+    # one shared backend instance cannot hold it without mixing conversations.
     #: Declared language set. ``None`` = unconstrained (a large multilingual
     #: LLM). Setting it narrows the advertised system language set.
     languages: Optional[Sequence[str]] = None
@@ -197,10 +204,6 @@ class OpenAiMt:
         self.config = config or MtConfig()
         self._client = client
         self._owns_client = client is None
-        self._history: Deque[Tuple[str, str]] = deque(
-            maxlen=max(self.config.history_turns, 0) or 1
-        )
-        self._history_enabled = self.config.history_turns > 0
 
     def supported_languages(self) -> Optional[Iterable[str]]:
         cfg = self.config.languages
@@ -210,11 +213,6 @@ class OpenAiMt:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
             self._client = None
-
-    def remember(self, source_text: str, target_text: str) -> None:
-        """Record a completed turn for the next turn's context."""
-        if self._history_enabled:
-            self._history.append((source_text, target_text))
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -228,21 +226,47 @@ class OpenAiMt:
             )
         return self._client
 
-    def _messages(self, text: str, source: str, target: str) -> List[Dict[str, str]]:
+    def _messages(
+        self,
+        text: str,
+        source: str,
+        target: str,
+        context: Optional[Sequence[Tuple[str, str]]] = None,
+    ) -> List[Dict[str, str]]:
+        """The prompt: system rules, the conversation so far, then the turn.
+
+        The prior turns are replayed as real user/assistant pairs rather than
+        pasted into the system message, for two reasons. The model has been
+        trained to continue a dialogue in exactly this shape, so it copies the
+        established terminology instead of describing it; and the prefix is
+        byte-identical from one call to the next, which is what lets the radix
+        cache on our own server serve all but the newest pair for free.
+
+        The caller owns the history. See `TranslatorSession._context_for`:
+        one backend instance serves every session in this process, so a deque
+        kept here would put one conversation's sentences into another's
+        prompt.
+        """
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": build_prompt(source, target)}
         ]
-        if self._history_enabled:
-            for src_text, tgt_text in self._history:
-                messages.append({"role": "user", "content": src_text})
-                messages.append({"role": "assistant", "content": tgt_text})
+        for src_text, tgt_text in context or ():
+            messages.append({"role": "user", "content": src_text})
+            messages.append({"role": "assistant", "content": tgt_text})
         messages.append({"role": "user", "content": text})
         return messages
 
-    def _body(self, text: str, source: str, target: str, stream: bool) -> Dict:
+    def _body(
+        self,
+        text: str,
+        source: str,
+        target: str,
+        stream: bool,
+        context: Optional[Sequence[Tuple[str, str]]] = None,
+    ) -> Dict:
         body: Dict[str, object] = {
             "model": self.config.model,
-            "messages": self._messages(text, source, target),
+            "messages": self._messages(text, source, target, context),
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
             "max_tokens": self.config.max_tokens,
@@ -251,13 +275,21 @@ class OpenAiMt:
         body.update(self.config.extra_body)
         return body
 
-    async def translate(self, text: str, source: str, target: str) -> str:
+    async def translate(
+        self,
+        text: str,
+        source: str,
+        target: str,
+        *,
+        context: Optional[Sequence[Tuple[str, str]]] = None,
+    ) -> str:
         text = text.strip()
         if not text:
             return ""
         try:
             response = await self._http().post(
-                "/chat/completions", json=self._body(text, source, target, False)
+                "/chat/completions",
+                json=self._body(text, source, target, False, context),
             )
             response.raise_for_status()
             payload = response.json()
@@ -311,12 +343,17 @@ class OpenAiMt:
             raise BackendError("mt", f"unexpected response shape: {exc}")
 
     async def translate_stream(
-        self, text: str, source: str, target: str
+        self,
+        text: str,
+        source: str,
+        target: str,
+        *,
+        context: Optional[Sequence[Tuple[str, str]]] = None,
     ) -> AsyncIterator[str]:
         text = text.strip()
         if not text:
             return
-        body = self._body(text, source, target, True)
+        body = self._body(text, source, target, True, context)
         try:
             async with self._http().stream(
                 "POST", "/chat/completions", json=body

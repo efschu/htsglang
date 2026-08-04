@@ -90,8 +90,30 @@ Remaining, outside this script:
   2. Point a dynamic-DNS name at the home IP and put it in the phone's
      Endpoint field. A bare IP will break the moment the ISP rotates it,
      which it will do while abroad.
-  3. Bind the translator to the tunnel address, never 0.0.0.0:
-       python -m sglang.srt.translator.launch --host ${WG_SERVER_ADDR%%/*} --port 30800
+  3. Bind the translator to the tunnel address, never 0.0.0.0. That is the
+     only thing this script has an opinion about -- the line below is the
+     CANONICAL tenant launch, and --host is the one flag it contributes.
+     Do not trim it down to a --host/--port pair: a translator started
+     without its backends answers /health and then fails every turn.
+
+       cd /spinning/wt-466-translator && \\
+       PYTHONPATH=/spinning/wt-466-translator/python \\
+       /spinning/htsglang-gpu/.venv/bin/python -m sglang.srt.translator.launch \\
+         --host ${WG_SERVER_ADDR%%/*} --port 30800 --participants de,es \\
+         --card-uuid GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d \\
+         --asr faster-whisper --asr-device cuda --asr-compute-type int8_float16 \\
+         --tts inprocess --tts-device cuda:0 --tts-dtype bfloat16 \\
+         --embedder onnx \\
+         --embedder-model /spinning/llm_stuff/translator-models/embedder/wespeaker_resnet34_LM.onnx \\
+         --preset-voice-dir /spinning/llm_stuff/translator-models/preset-voices \\
+         --mt-base-url http://127.0.0.1:30030/v1 --mt-model default \\
+         --enable-metrics
+
+     --card-uuid pins the talker to the 5090 by UUID rather than by index,
+     because NVML and torch do not agree on ordering and the index moves
+     between boots. --enable-metrics is not optional in practice: without it
+     /metrics is empty and every latency gate reads 404, which is how two
+     sessions were spent measuring nothing.
 EOF
 }
 

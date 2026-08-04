@@ -109,6 +109,13 @@ class SpeakerProfile:
     #: ASR hint and as the fallback when a later segment's language ID is
     #: uncertain -- people do not usually switch language mid-conversation.
     last_language: Optional[str] = None
+    #: How many CONSECUTIVE confident observations agree with
+    #: ``last_language``. One turn in a language is a coincidence; a run of
+    #: them is a fact about this speaker, and the difference decides whether a
+    #: short contrary segment is allowed to turn the conversation around
+    #: (§17.8.24). Reset to 1 whenever the language changes, so a genuine
+    #: switch costs exactly one turn of inertia rather than being locked out.
+    language_streak: int = 0
     last_seen: float = 0.0
     references: List[_ReferenceItem] = dataclasses.field(default_factory=list)
 
@@ -232,6 +239,14 @@ class SpeakerRegistryConfig:
     #: marked uncertain, because that is the range where the embedder cannot
     #: separate "same person" from "different person".
     uncertain_floor: float = 0.583
+    #: Below this language-identification confidence a segment may still be
+    #: TRANSLATED, but it may never become somebody's voice reference. Our own
+    #: TTS coming back through the microphone scored 0.026 and enrolled itself
+    #: as a speaker carrying the user's cloned voice; clean speech from a
+    #: person does not look like that. 0.30 sits between the two populations
+    #: and well below the 0.5 the routing path already trusts, so it refuses
+    #: the echo class without touching any decision a real utterance makes.
+    enrollment_language_confidence: float = 0.30
     #: Within-speaker p05 from the same sweep. Used for auto-resolution: a
     #: stored embedding that later scores above this against an updated
     #: centroid is no longer ambiguous.
@@ -537,6 +552,7 @@ class SpeakerRegistry:
         embedding: Optional[SpeakerEmbedding] = None,
         text: str = "",
         language: Optional[str] = None,
+        read_back: bool = False,
     ) -> Tuple[SpeakerProfile, bool]:
         """Attribute a segment to a speaker the user named (§17.5).
 
@@ -573,7 +589,11 @@ class SpeakerRegistry:
                 profile.observations = 1
             else:
                 self._fold(profile, embedding)
-        if language:
+        if language and not read_back:
+            if language == profile.last_language:
+                profile.language_streak += 1
+            else:
+                profile.language_streak = 1
             profile.last_language = language
         admitted = self._maybe_admit_reference(
             profile, audio, text, language, similarity=1.0, enforce_identity=False
@@ -581,6 +601,12 @@ class SpeakerRegistry:
         self._record_decision(
             profile=profile,
             outcome="manual",
+            # THE PIN, recorded at last. `assign_manual` is only ever reached
+            # with an armed speaker, so this is the one outcome where a pin was
+            # CERTAINLY held -- and it was the one outcome recording `None`,
+            # which made the collector report "0 of 7 decisions with a pin
+            # held" for a session the pin decided almost entirely.
+            pin=profile.speaker_id,
             best_id=would_have,
             best_sim=would_have_sim,
             candidates=candidates,
@@ -600,6 +626,9 @@ class SpeakerRegistry:
         text: str = "",
         language: Optional[str] = None,
         language_confidence: float = 1.0,
+        pin: Optional[str] = None,
+        overlapped: bool = False,
+        read_back: bool = False,
     ) -> Tuple[SpeakerProfile, float, bool]:
         """Match or create a speaker, and maybe admit the audio as reference.
 
@@ -680,12 +709,50 @@ class SpeakerRegistry:
             best_sim = 1.0
 
         profile.last_seen = now
-        if language and language_confidence >= 0.5:
+        # READ-BACK POISONING (§17.8.24). `read_back` means this utterance is
+        # the system's OWN previous output, spoken back into the microphone --
+        # the user checking a translation by reading it aloud, which is a
+        # normal thing to do and which used to rewrite his language history to
+        # the TARGET language. That is how `speaker-1.last_language` became
+        # `es` for a German speaker, and with a sticky pin held it arms every
+        # later quiet utterance to be routed es->de and spoken back at him in
+        # German. Our own words are not evidence about which language this
+        # person speaks.
+        if language and language_confidence >= 0.5 and not read_back:
+            if language == profile.last_language:
+                profile.language_streak += 1
+            else:
+                profile.language_streak = 1
             profile.last_language = language
 
+        # ENROLLMENT LOCK FOR THE TTS ECHO (§17.8.16). Our own synthesis comes
+        # back through the microphone, and it enrolled itself: `speaker-4`,
+        # language `es`, language confidence 0.026, carrying the user's own
+        # cloned voice and then routing German to German through it. Two
+        # independent conditions keep it out of any reference buffer, and
+        # both are properties the echo has and real speech does not.
+        #
+        #   - it is captured WHILE we are speaking (`overlapped`), which is
+        #     the same barge-in stamp the language filter reads;
+        #   - the identifier is not confident about it, because a loudspeaker
+        #     played back through a phone microphone is not clean speech.
+        #
+        # A wrongly refused reference costs one slice of clone material and is
+        # recovered on the next utterance. A wrongly ADMITTED echo becomes the
+        # voice, permanently, and there is no path back from that.
+        echo_suspect = overlapped or (
+            language_confidence < self.config.enrollment_language_confidence
+        )
+        if echo_suspect:
+            logger.info(
+                "reference refused for %s: echo-suspect (overlapped=%s "
+                "lang_conf=%.3f < %.3f)",
+                profile.speaker_id, overlapped, language_confidence,
+                self.config.enrollment_language_confidence,
+            )
         admitted = (
             False
-            if guessed
+            if (guessed or echo_suspect)
             else self._maybe_admit_reference(
                 profile, audio, text, language, best_sim
             )
@@ -702,6 +769,8 @@ class SpeakerRegistry:
             language_confidence=language_confidence,
             duration_s=audio.duration_s,
             at=now,
+            pin=pin,
+            overlapped=overlapped,
         )
         return profile, best_sim, admitted
 
@@ -719,6 +788,8 @@ class SpeakerRegistry:
         language_confidence: float,
         duration_s: float,
         at: float,
+        pin: Optional[str] = None,
+        overlapped: bool = False,
     ) -> None:
         """Persist WHY this turn was attributed the way it was.
 
@@ -752,6 +823,15 @@ class SpeakerRegistry:
             "language": language or "",
             "language_confidence": round(float(language_confidence), 3),
             "segment_s": round(float(duration_s), 2),
+            # THE EVIDENCE RECORD (§17.8.17). These two turn the log from "who
+            # won" into something a threshold can be re-derived from and an
+            # arbiter can later be handed: whether the user had pinned anyone
+            # at the moment of the decision, and whether this segment was
+            # spoken over a running turn. Without them a low cosine cannot be
+            # told apart from a low cosine measured on somebody talking over
+            # somebody else, and those two want opposite conclusions.
+            "pin": pin,
+            "overlapped": bool(overlapped),
         }
         self.decisions.append(record)
         logger.info(

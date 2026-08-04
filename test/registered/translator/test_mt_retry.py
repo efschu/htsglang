@@ -64,10 +64,10 @@ class FlakyMt:
     def supported_languages(self):
         return ("a", "b")
 
-    async def translate(self, text, source, target):
+    async def translate(self, text, source, target, *, context=None):
         return SENTENCE
 
-    async def translate_stream(self, text, source, target):
+    async def translate_stream(self, text, source, target, *, context=None):
         self.attempts += 1
         if self.failures > 0:
             self.failures -= 1
@@ -81,8 +81,8 @@ class FlakyMt:
             yield word + " "
 
 
-def build(mt):
-    session, _asr, _mt, _tts = make_session()
+def build(mt, **kwargs):
+    session, _asr, _mt, _tts = make_session(**kwargs)
     session.mt = mt
     return session
 
@@ -170,7 +170,13 @@ class TestMtRetry(unittest.IsolatedAsyncioTestCase):
         Asserting a total would fail on the second half for being correct.
         """
         mt = FlakyMt(failures=99)
-        session = build(mt)
+        # Coalescing OFF, and that is the point of the setup rather than a
+        # workaround: this arm needs TWO turns, one waiting behind the other,
+        # and the whole purpose of the bundler is to make a waiting segment
+        # stop being a separate turn. The retry policy it exercises is not
+        # affected -- the guard reads "is anything still queued", which a
+        # bundle answers the same way a second segment does.
+        session = build(mt, coalesce_queued=False)
         audio = conversation_audio((VOICE_A_HZ, 2.0))
         segments = session.push_audio(audio)
         self.assertTrue(segments)
