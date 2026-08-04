@@ -135,6 +135,11 @@ if [ "$WITH_DRAFT" = "1" ]; then
       --speculative-draft-placement solo
       --speculative-draft-gpu "$DRAFT_GPU"
       --speculative-moe-runner-backend marlin
+      # The draft head is safetensors; the TARGET is GGUF. Unset, this flag
+      # inherits --load-format (server_args.py:3268-3273 says so), so the draft
+      # loader was handed a directory while expecting a single .gguf file and
+      # refused with "... is not a file." Name the draft's own format.
+      --speculative-draft-load-format "${DRAFT_LOAD_FORMAT:-auto}"
       --speculative-dspark-block-size 5
       --speculative-num-draft-tokens 6
       --speculative-num-steps 1
