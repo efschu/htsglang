@@ -2164,7 +2164,41 @@ and a sliding-window in/out fps accounting exposed on the job status for the
 **The Anthropic Messages front is complete enough to back a Claude Code agent
 loop** (#530): `POST /v1/messages` (`http_server.py:2578`) plus
 `POST /v1/messages/count_tokens` (`:2588`), SSE deltas in Anthropic event
-shape, and NO model-name validation — an unknown id is echoed back
+shape, and NO model-name validation — an unknown id is echoed back.
+**Protocol conformance is enforced at the HTTP boundary, not only in the
+handler** (#540, `docs/dev/TICKET_540_anthropic_front_conformance.md`): seven
+divergences from the real Messages API are closed and each is pinned by a
+test that FAILS on the pre-#540 tree (17 failed / 7 passed before, 20 passed
+after — matrix in the ticket). (1) Extended thinking is OFF unless the request
+carries `thinking` — the absent case explicitly calls
+`apply_reasoning_enabled(chat_request, False)` (`anthropic/serving.py:708`),
+deliberately overriding the server-level `--reasoning-parser` default ON THIS
+FRONT ONLY; the OpenAI front is untouched. One named divergence: on an
+always-on reasoning parser the override degrades to a WARNING instead of the
+400 that an explicit `{"type":"disabled"}` still raises
+(`serving_chat.py:1722` is the predicate). (2) Unknown content-block types are
+forward-compatible — the union is a callable `Discriminator` with an
+`extra="allow"` catch-all (`anthropic/protocol.py:152`), so `document`,
+`mcp_tool_use`, `server_tool_use`, `web_search_tool_result` and anything
+Anthropic adds later degrade PER BLOCK with one warning instead of 400-ing the
+whole conversation; malformed KNOWN tags keep their precise validation error.
+(3) `redacted_thinking` in history is skipped with a warning, same rule.
+(4) `stop_reason:"stop_sequence"` + `stop_sequence` are populated from the
+backend's `matched_stop` in both streaming and non-streaming, and ONLY when
+the matched string is one the caller asked for (a chat-template stop stays
+`end_turn`). (5) `message_start` ships before the backend produces anything
+and `message_delta` carries the corrected `input_tokens`; `ping` frames go out
+every `PING_INTERVAL_SECONDS` (5.0) through a task-based read that neither
+polls nor drops chunks. (6) Outgoing `tool_use.id` is normalised to `toolu_`
+in both paths while INBOUND ids are never rewritten, so the id we emit is the
+id we accept and legacy transcripts keep working. (7) `message_start.message`
+carries explicit `stop_reason: null` / `stop_sequence: null`.
+Still deliberately absent: `/v1/messages/batches`, `anthropic-beta` header
+handling, Anthropic server-tool execution. NOT yet live-boot proven — #540 is
+hermetic (mocked backend, `CUDA_VISIBLE_DEVICES=99`); the prediction that a
+real `claude` CLI no longer needs `MAX_THINKING_TOKENS=0` on a
+`--reasoning-parser` boot is UNMEASURED and named as such in the ticket.
+The model-name property is unchanged by #540
 (`{"model":"claude-sonnet-4-5"}` and `{"model":"default"}` both answer 200).
 That last property is what makes a checkpoint switch invisible to clients that
 pin a name, the #466 translator's `--mt-model default` included. Reach, stated
@@ -2174,7 +2208,10 @@ LiteLLM-class OpenAI translation proxy is needed for this — but two client-sid
 settings are load-bearing and are NOT defaults: `MAX_THINKING_TOKENS=0`,
 because Claude Code requests an Anthropic `thinking` block and a boot without
 `--reasoning-parser` answers `400 Anthropic thinking is not supported for
-models without a reasoning parser`; and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, because
+models without a reasoning parser` — that refusal is UNCHANGED by #540, which
+only fixes the opposite case (a boot WITH a parser no longer forces a thinking
+block onto requests that never asked for one); and
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, because
 the default 32000-token completion request plus the ~20k-token system prompt
 overruns a 32k-context boot. Claude Code itself has NO per-subagent endpoint
 binding (the subagent frontmatter schema carries no `baseUrl`/`provider`/`env`
