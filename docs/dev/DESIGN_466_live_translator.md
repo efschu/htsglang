@@ -4601,3 +4601,111 @@ closed:**
      partial transcripts.
   5. More ground-truth samples. The raw ones from the family session are gone;
      the conclusions drawn from them stand and must not be re-derived.
+
+#### 17.8.23 The deploy flip, the button that died on first press, and where the seconds actually are
+
+**THE DEPLOY RULE, and it is now mandatory.** In this worktree the client file
+IS the deployment: the tenant serves `client/index.html` from the tree on every
+request, so every intermediate save goes live to a phone that may be in the
+user's hand right now. That is how a telemetry button reached the user with a
+call to `playback.debug()`, a method that does not exist -- the page parsed, the
+gate was green, and the handler had never once been executed.
+
+From here on:
+
+  1. Edit `client/index.dev.html`, never the served file.
+  2. Gate the candidate, including the CLICK proof below.
+  3. Flip atomically: `cp index.dev.html .index.flip.tmp && mv -f .index.flip.tmp
+     index.html`. A `mv` within one filesystem is atomic, so no request can ever
+     see a half-written page.
+  4. Re-run the gate against the SERVED file. The flip is not the proof; the
+     served file passing is.
+
+**"THE PAGE PARSES" IS NOT "THE FEATURE WORKS".** The previous gate loaded the
+page and asserted no console errors. It could not have caught this: the failing
+line only runs when a human presses a button. The rule that follows is the
+`desk-written-never-executed` rule with a sharper edge -- **for anything behind
+a gesture, the execution smoke must BE the gesture.**
+`scripts/translator/probe_log_upload.py` does that: it serves a candidate,
+proxies `POST /api/translator/client-logs` to the live tenant, issues a real
+`page.click("#sendlogs")`, and passes only when a FILE EXISTS on the server and
+the success text the user would read is on screen. Three arms, all exercised:
+
+```
+  candidate (fixed)   toast "logs uploaded (2 kB): /spinning/466-client-logs/..."
+                      button "sent", proxied 200, 7 entries on disk   PASS
+  --sabotage          toast "log upload failed: server said 404"      PASS
+                      (a silent failure here is the defect itself)
+  served file (bug)   button "failed", nothing proxied, no file       FAIL
+```
+
+That third arm is what makes the other two mean something: the harness
+reproduces the user's bug before the fix and clears it after.
+
+**WHERE THE SECONDS ARE.** The user's session (`e746151f2a58`, four turns) with
+every stage summed from `/metrics`, snapshotted to
+`/spinning/466-client-logs/evidence/`:
+
+```
+  stage              sum over 4 turns    max      share
+  ASR                       0.78 s      0.45 s     1.4 %
+  embedding                 0.35 s      0.16 s     0.6 %
+  MT first token            1.13 s      0.38 s
+  MT total                  3.05 s      1.65 s     5.4 %
+  TTS first audio          23.85 s      6.19 s
+  end-to-end first audio   26.73 s      7.04 s
+  turn total               56.10 s     36.40 s
+  queue depth max                0
+  talker wait                 0.00 s
+```
+
+Read it in one line: **ASR, embedding and MT together are under 8 % of the wall
+clock. Everything else is synthesis.** Every turn pays ~6 s before its first
+sample, and that is the number the user experiences as "sound segments many
+seconds apart". The decision-record timestamps agree -- identification gaps of
+35.98 s, 6.85 s, 6.31 s, i.e. one long turn followed by the ~6 s floor.
+
+Ruled OUT, each with its own evidence rather than by argument:
+
+  * **Coalescing.** Not deployed on that tenant at all (zero log hits), and
+    `queue_depth_max = 0` in both that session and every one since -- there has
+    never been a backlog for it to bind on. It cannot be the cause of a delay
+    and it is not "waiting instead of starting". Live capability now reads
+    `coalesce_queued: True, mt_context_turns: 6` with `segments_coalesced: 0`.
+  * **Cold talker.** `--warmup` defaults to TRUE and no `--no-warmup` was
+    passed, so the boot warmed. Turn 1's 36 s is a 15 s utterance (it hit
+    `max_utterance_s`), not a cold start.
+  * **Queue overrun, interjection discard, routing invariant, stage timeouts,
+    talker contention:** all zero on that session.
+
+**AND ONE THING THAT IS NOT RULED OUT -- the wedge is live.** On the restarted
+tenant the log carries `synthesis did not finish within 300s` and
+`auto-redriving line 2 after a stage deadline`, with `total_seconds_max` of
+90.47 s on a two-turn window. So §17.8.20's mechanism is still firing in the
+field; the deadlines added last session are containing it rather than
+preventing it, which is exactly what they were for. **The lock split (§17.8.20
+item 2) is therefore not a latency nicety, it is the open half of this bug**:
+one wedged synthesis still stalls every following turn's identification,
+because `_turn_lock` spans ASR through TTS.
+
+**DE->DE: not present in the records.** All four turns routed correctly --
+three `de->es`, one `es->de` whose source text is genuinely Spanish
+("Adicional, se ha eliminado el desbordamiento silencioso...") at confidence
+1.000. What the user experienced as being echoed in German is a ROUND TRIP: he
+read the Spanish output back into the microphone and the system dutifully
+translated it home. Not a routing fault -- but the gun is now loaded for the
+real one, and this is the finding to act on: `speaker-1.last_language` is now
+**`es`** with a sticky pin held on that speaker, and `_resolve_source` consults
+the pin whenever LID falls below `lid_confidence_floor`. The next quiet or
+short German utterance from him resolves to `es` and gets spoken back in
+German. That is open item (4) and it is no longer hypothetical.
+
+**THE MT THINKING TRAP, re-derived and closed.** Probing the MT backend by hand
+returned an empty translation after 5.7 s and 512 tokens of pure
+`reasoning_content`. That is NOT the production path: `--mt-thinking` defaults
+off and `launch.py` sends `chat_template_kwargs.enable_thinking = False`, which
+answers the same prompt in 0.35 s and 9 tokens. Recorded because the raw-curl
+result looks exactly like a live outage and cost time to clear -- **probe MT
+through `OpenAiMt`, never through a hand-built body.** Verified against the live
+server through the real backend class: 0.33-0.50 s per call, streaming first
+token 0.16 s, and the new per-direction `context=` argument working end to end.
