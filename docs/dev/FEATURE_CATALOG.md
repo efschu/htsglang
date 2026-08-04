@@ -991,11 +991,11 @@ A card holds ONLY KV + attention (no weights): chunked prefill/extend, fp8/int4
 worker KV, DCP comm fusion, graph-captured streaming decode, host-tier KV
 spill, chain spec — but SPEC AND THE STREAMING BLOCK LOOP DO NOT COMBINE:
 `--weightless-kv-chunked-block-size` / `--weightless-kv-host-spill-tokens` are
-refused together with a speculative algorithm (`server_args.py:6330`), two
+refused together with a speculative algorithm (`server_args.py:6356`), two
 capture axes nobody composed. Chain spec further requires the EAGLE family
-(:6274), `--speculative-draft-placement solo` (:6288) with solo rank ==
-`--weightless-kv-head-rank` (:6304), and no `--speculative-adaptive` (:6316).
-Lane topology: `dcp_size == tp_size >= 2`, no PP/DP-attn/EP (:6069-6088).
+(:6300), `--speculative-draft-placement solo` (:6314) with solo rank ==
+`--weightless-kv-head-rank` (:6330), and no `--speculative-adaptive` (:6342).
+Lane topology: `dcp_size == tp_size >= 2`, no PP/DP-attn/EP (:6104-6114).
 **Live session handover without server stop** + draft
 re-sharder as its own spec type: MERGED and GPU-gate-passed
 (`POST /session_handover`, five-phase at session scope, hard GDN-blob gate
