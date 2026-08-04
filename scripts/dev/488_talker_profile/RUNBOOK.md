@@ -51,6 +51,17 @@ open("/spinning/gpu-battery-results/488_precursor.json", "w").write(
 back and before the user resumes. The talker is warm, idle, and nobody is
 mid-turn. Cost then is ~6 min of an idle talker rather than ~6 min of a busy one.
 
+## Identifying the process during a VRAM triage
+
+The standalone path renames itself **`sglang::488-talker-profile-GUEST`** in
+both `/proc/<pid>/comm` (truncated to `sglang::488-tal`) and
+`/proc/<pid>/cmdline`, so `ps`, `top`, `py-spy` and `nvidia-smi` all attribute
+it on sight. "GUEST" is deliberate: it answers the second triage question —
+this process is a visitor on a card it does not own, and it is expected to
+disappear on its own.
+
+The in-process path needs no marker: it runs inside the tenant's own pid.
+
 ## Abort path
 
 * **Self-limiting.** Every arm is bounded by iteration count *and* wall clock;

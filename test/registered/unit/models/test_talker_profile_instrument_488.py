@@ -147,6 +147,38 @@ class TestHeadroomGate(CustomTestCase):
         self.assertIsNotNone(prof.check_headroom(prof._CALIB_MIB + 399.0))
 
 
+class TestProcessMarker(CustomTestCase):
+    """A standalone run puts ~2.6 GiB on a card a live tenant is using. On
+    2026-08-04 an unattributed pid cost minutes of VRAM triage -- this run.
+    The marker is what makes the next one a seconds-long question."""
+
+    def test_the_tag_names_the_ticket_and_says_guest(self):
+        self.assertIn("488", prof.PROCESS_TAG)
+        self.assertIn("GUEST", prof.PROCESS_TAG)
+
+    def test_the_tag_survives_comm_truncation_recognisably(self):
+        """The kernel truncates /proc/<pid>/comm to 15 bytes. The ticket
+        number has to be inside that window or `top` shows nothing useful."""
+        self.assertIn("488", prof.PROCESS_TAG.encode()[:15].decode())
+
+    def test_tagging_actually_binds(self):
+        """BINDS-PROOF, not 'the mechanism exists' (#493 lesson): run it and
+        read the result back out of /proc."""
+        prof._tag_process()
+        with open("/proc/self/comm", encoding="utf-8") as handle:
+            comm = handle.read().strip()
+        self.assertEqual(comm, prof.PROCESS_TAG[:15])
+        with open("/proc/self/cmdline", "rb") as handle:
+            argv0 = handle.read().split(b"\0")[0].decode()
+        self.assertEqual(argv0, prof.PROCESS_TAG)
+
+    def test_tagging_never_raises(self):
+        """It is a diagnostic aid; a profiling run must not die because a
+        process-title library is missing."""
+        prof._tag_process()
+        prof._tag_process()
+
+
 class TestVerdictWording(CustomTestCase):
     """The script must be able to report the premise FALSIFIED, not only
     confirmed -- otherwise it is not a test of anything."""

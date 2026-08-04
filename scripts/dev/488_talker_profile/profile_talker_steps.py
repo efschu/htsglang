@@ -555,6 +555,39 @@ def _verdict(arms: Dict[str, ArmResult]) -> str:
     )
 
 
+#: What this process calls itself in `ps` / `py-spy` output. Deliberately
+#: carries the ticket AND the word GUEST: the two questions a triage asks are
+#: "whose is this" and "is it supposed to be on this card".
+PROCESS_TAG = "sglang::488-talker-profile-GUEST"
+
+
+def _tag_process() -> None:
+    """Rename this process so a VRAM triage can attribute it immediately.
+
+    Best-effort by design: it is a diagnostic aid, and a profiling run must
+    not die because a process-title library is missing. Both mechanisms are
+    tried because they show up in different tools -- ``setproctitle`` rewrites
+    argv (``ps``, ``/proc/<pid>/cmdline``), ``prctl`` sets the comm name
+    (``/proc/<pid>/comm``, ``top``), and ``nvidia-smi`` resolves names through
+    the former.
+    """
+    try:
+        import setproctitle  # noqa: PLC0415
+
+        setproctitle.setproctitle(PROCESS_TAG)
+    except Exception:  # noqa: BLE001 - diagnostic only
+        pass
+    try:
+        import ctypes  # noqa: PLC0415
+
+        # PR_SET_NAME = 15; the kernel truncates comm to 15 bytes + NUL.
+        ctypes.CDLL("libc.so.6").prctl(
+            15, PROCESS_TAG.encode()[:15] + b"\0", 0, 0, 0
+        )
+    except Exception:  # noqa: BLE001 - diagnostic only
+        pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -565,6 +598,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    # PROCESS MARKER, before anything slow happens. This path puts a SECOND
+    # copy of the talker on a card that a live tenant and a serving rank are
+    # already using, so a triage looking at `nvidia-smi` sees an unexplained
+    # ~2.6 GiB and an unfamiliar pid. On 2026-08-04 that cost minutes of
+    # triage on pid 4020715 -- this run. A process whose argv says what it is
+    # gets attributed in seconds instead.
+    _tag_process()
 
     # STANDALONE ONLY: this path loads its OWN copy of the talker onto a card
     # that is already carrying a serving rank and a live tenant, so the
