@@ -118,6 +118,10 @@
                                        animation:pulse 1.1s infinite; }
   body[data-state="working"]    #dot,
   body[data-state="queued"]     #dot,
+  /* Synthesis is the same kind of state as the two above it -- the system owes
+     the user something and is working on it -- so it carries the same colour
+     rather than minting a fourth meaning for a dot that has three. */
+  body[data-state="synthesizing"] #dot,
   body[data-state="connecting"] #dot { background:var(--warn);
                                        animation:pulse 1.4s infinite; }
   body[data-state="offline"]    #dot,
@@ -821,6 +825,56 @@ function setState(name, text) {
   uiState = name;
   document.body.dataset.state = name;
   el("status").textContent = text || name;
+}
+
+//: The turn the header pill is currently following. Several turns are in
+//: flight at once and the pill is ONE line, so without this a progress event
+//: belonging to an older turn repaints the header for a newer one.
+let pillTurn = null;
+
+/** The pill's state for "the words exist, the voice does not yet".
+ *
+ * THE MEASURED GAP (2026-08-04, package client-20260804T140636Z): translation
+ * at 101454 ms, queued and synthesizing at 101522, first audio at 110834. For
+ * 9.3 s the header said "translating" about a turn whose translation had been
+ * finished for 68 ms -- and in the stalled turn of the same session that span
+ * ran past 70 s. What the person is waiting for there is the voice, not the
+ * text, and the pill is the only thing that says which.
+ *
+ * WHY `turn.speech` "synthesizing" AND NOT `turn.translation`. A translation
+ * event is emitted PER CLAUSE as a partial (see the `turn.translation` case
+ * and the comment above it), so a three-clause turn fires three of them and
+ * the first arrives while the translator is still working. Moving the pill on
+ * that would take it off "translating" before translating is done, which is
+ * the same lie with the sign flipped. `turn.speech` "synthesizing" is emitted
+ * by the server immediately BEFORE it calls the synthesizer, for the express
+ * purpose of naming the interval in which no audio exists yet, so it is the
+ * event this state belongs to.
+ *
+ * ONLY THE NEWEST TURN, AND ONLY OVER TWO STATES. `pillTurn` keeps a late
+ * event from an older turn from repainting a newer turn's header, and the
+ * whitelist keeps this out of every state that outranks it: audible playback
+ * is a stronger truth than a synthesis that has not produced a sample yet
+ * (and a multi-unit turn announces the next unit WHILE the previous one is
+ * still playing, so refining "speaking" here would flicker once per clause),
+ * an open microphone owns the pill, and offline / blocked / nomic are
+ * failures that a routine progress event must never paint over.
+ *
+ * Not covered, deliberately: a LATER unit that stalls after an earlier one has
+ * already been heard leaves the pill on "ready", because the per-turn work map
+ * cannot represent it -- `setTurnState` refuses to walk a turn backwards from
+ * "speaking" to "synthesizing", which is correct for the bubble badge. The
+ * activity strip already names that case in words ("N sentences still to
+ * speak"), and bending the rank guard to also serve the header would trade a
+ * correct rule for a second display.
+ */
+function pillSynthesizing(turnId) {
+  if (!turnId || turnId !== pillTurn) return;
+  if (uiState !== "working" && uiState !== "queued") return;
+  // The same word as the bubble badge rather than a second vocabulary for one
+  // state, and short because the pill shares its row with the settings
+  // control (see the `turn.queued` case).
+  setState("synthesizing", WORK_LABEL.synthesizing);
 }
 /** Back-compatible shim: the old surface's status writer. */
 function setStatus(text, cls) {
@@ -4052,6 +4106,11 @@ function endTalking() {
     setState("ready", "ready");
   } else {
     reportCapture("release-ok");
+    // The pill now belongs to the turn this release is about to open, and to
+    // no older one: without dropping the claim here, a unit of the PREVIOUS
+    // turn entering synthesis would repaint the header to "being spoken"
+    // while the turn the user just spoke is still being translated.
+    pillTurn = null;
     setState("working", "translating");
   }
   connection.sendControl({ kind: "release" });
@@ -4798,6 +4857,9 @@ function onEvent(event) {
       setOutputMode(event.mode, event.mode !== outputMode);
       break;
     case "turn.opened":
+      // The header now follows THIS turn: it is the newest thing the user is
+      // waiting for, and every later progress event is checked against it.
+      pillTurn = event.turn_id;
       setState("working", "translating");
       setTurnState(event.turn_id, "translating");
       // The arming the server just consumed is put back, so the NEXT segment
@@ -4816,6 +4878,9 @@ function onEvent(event) {
       if (event.state === "queued") setTurnState(event.turn_id, "queued");
       else if (event.state === "synthesizing") {
         setTurnState(event.turn_id, "synthesizing");
+        // The header, not only the bubble. This is the event that names the
+        // wait for a voice; see `pillSynthesizing`.
+        pillSynthesizing(event.turn_id);
       } else if (spoken && !playback.busy) {
         // The server has handed over the last unit and nothing is left on the
         // clock: only then is the turn finished from where the listener sits.
