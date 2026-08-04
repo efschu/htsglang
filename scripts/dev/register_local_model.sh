@@ -14,12 +14,23 @@
 #   <agent-dir>/local-model.md                      the agent definition
 #   ~/.config/htsglang/local_model_agent.env        defaults for the wrapper
 #
-# The agent definition is a NAMED FALLBACK, and the file says so in its own
-# body: Claude Code cannot bind a subagent's own inference to a foreign
-# endpoint (no baseUrl/provider/env key in the subagent frontmatter schema;
-# every ANTHROPIC_*_BASE_URL is process-global). The agent therefore drives
-# the local model through scripts/dev/local_model_agent.sh, which starts a
-# separate `claude` process with a process-scoped environment.
+# The agent definition binds the subagent's OWN inference loop to the local
+# checkpoint, via the frontmatter `model:` field. An earlier version of this
+# script asserted that this was impossible; that claim was REFUTED on the wire
+# (2026-08-04, Claude Code 2.1.221): a subagent declaring a non-Claude model
+# string sends that string in the `model` field of its own request bodies,
+# while the parent session's requests in the same process still carry
+# `claude-*`. A model-routing proxy at ANTHROPIC_BASE_URL then splits the two
+# legs. See /root/claude-code-qwen-patch/README.md; the evidence command is
+# /root/claude-code-qwen-patch/check_cli_version.sh.
+#
+# The proxy is a PRECONDITION, not an optimisation: without it, the subagent's
+# requests go to api.anthropic.com carrying a model id Anthropic does not
+# serve. This script probes for the proxy and says so in the generated file.
+#
+# scripts/dev/local_model_agent.sh remains as the no-proxy fallback: it starts
+# a separate `claude` process whose whole environment points at the local
+# server.
 
 set -euo pipefail
 
@@ -38,6 +49,11 @@ AGENT_DIR="${HOME:-/root}/.claude/agents"
 CONF_DIR="${HOME:-/root}/.config/htsglang"
 MAX_TOKENS=4096
 ALLOW_UNREAD_AGENT_DIR=0
+# The model-routing proxy that makes the frontmatter `model:` field work.
+# Probed, never assumed: a missing proxy is the one failure mode that turns
+# this agent from "runs locally" into "sends an unknown model id to Anthropic".
+PROXY_URL="http://127.0.0.1:8787"
+PROXY_DIR="/root/claude-code-qwen-patch"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,7 +65,8 @@ while [[ $# -gt 0 ]]; do
         --conf-dir)      CONF_DIR="$2"; shift 2 ;;
         -t|--max-tokens) MAX_TOKENS="$2"; shift 2 ;;
         --allow-unread-agent-dir) ALLOW_UNREAD_AGENT_DIR=1; shift ;;
-        -h|--help)       sed -n '1,25p' "$0"; exit 0 ;;
+        --proxy-url)     PROXY_URL="$2"; shift 2 ;;
+        -h|--help)       sed -n '1,32p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -150,6 +167,34 @@ if [ -n "$MISSING" ]; then
     } >&2
 fi
 
+# The routing proxy is what makes the frontmatter `model:` field reach the
+# local server instead of api.anthropic.com. Probe it; never assume it. A
+# session running WITHOUT the proxy sends the local model id to Anthropic and
+# gets an error, which is a confusing failure to debug from inside an agent.
+PROXY_STATE="absent"
+PROXY_JSON="$(curl -sS -m 5 "$PROXY_URL/__ccqp/health" 2>/dev/null || true)"
+if printf '%s' "$PROXY_JSON" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'; then
+    if printf '%s' "$PROXY_JSON" | grep -qF "\"$MODEL_ID\""; then
+        PROXY_STATE="ready"
+    else
+        PROXY_STATE="running-without-this-model"
+        {
+            echo "register_local_model: WARNING -- proxy at $PROXY_URL is up but"
+            echo "  does not list '$MODEL_ID' in local_models, so this agent's"
+            echo "  requests would be forwarded to Anthropic. Set CCQP_LOCAL_MODELS"
+            echo "  (or config.json) to '$MODEL_ID' and restart it."
+        } >&2
+    fi
+else
+    {
+        echo "register_local_model: WARNING -- no routing proxy at $PROXY_URL."
+        echo "  The agent file is still written, but the subagent's own inference"
+        echo "  will NOT reach $BASE_URL until the proxy runs and the session is"
+        echo "  started with ANTHROPIC_BASE_URL=$PROXY_URL."
+        echo "  Start it with: $PROXY_DIR/ccqp.sh start"
+    } >&2
+fi
+
 mkdir -p "$AGENT_DIR" "$CONF_DIR"
 
 cat > "$CONF_DIR/local_model_agent.env" <<EOF
@@ -171,9 +216,9 @@ SHORT_NAME="$(basename "$MODEL_ID")"
 cat > "$AGENT_DIR/local-model.md" <<EOF
 ---
 name: local-model
-description: Runs a prompt on the LOCAL htsglang server ($SHORT_NAME) instead of the Anthropic API. Use for bulk/cheap/offline reasoning that should not leave the rig, for dogfooding the served checkpoint, and for any determined-answer probe against the live serving instance.
+description: Runs on the LOCAL htsglang server ($SHORT_NAME) instead of the Anthropic API -- this agent's OWN inference loop executes on the rig. Use for bulk/cheap/offline reasoning that should not leave the rig, for dogfooding the served checkpoint, and for any determined-answer probe against the live serving instance.
 tools: Bash, Read, Grep, Glob
-model: haiku
+model: $MODEL_ID
 ---
 
 Generated by \`scripts/dev/register_local_model.sh\` from the live server at
@@ -191,6 +236,7 @@ Currently served:
 | Anthropic Messages front | present (HTTP $MSG_CODE on POST /v1/messages) |
 | reasoning parser | $REASONING |
 | tool-call parser | $TOOLCALL |
+| routing proxy | $PROXY_URL (\`$PROXY_STATE\`) |
 ${PARSER_WARNING:+
 > **WARNING: $PARSER_WARNING.** This boot returns the chain-of-thought as raw
 > text inside \`content\` and/or hands back tool calls as unparsed strings, so
@@ -201,39 +247,60 @@ ${PARSER_WARNING:+
 
 ## What you are
 
-You are a THIN DRIVER. Your own inference does not run on the local model and
-cannot be made to: Claude Code has no per-subagent endpoint binding. The
-subagent frontmatter schema is closed
-(\`name/description/tools/disallowedTools/model/permissionMode/maxTurns/skills/
-mcpServers/hooks/memory/background/effort/isolation/color/initialPrompt\`) and
-carries no \`baseUrl\`/\`provider\`/\`env\` key; \`CLAUDE_CODE_SUBAGENT_MODEL\` only
-remaps the model NAME on the endpoint the session already uses; and every
-\`ANTHROPIC_*_BASE_URL\` is a process-global environment variable, so setting
-one in \`settings.json\` would reroute the PARENT session too. This agent is the
-named fallback for that gap, not a workaround pretending to be the feature.
+YOUR OWN inference runs on \`$MODEL_ID\` on this rig. Not a driver, not a
+wrapper: the frontmatter \`model:\` field above puts that id into the \`model\`
+field of every request your agent loop makes, and the routing proxy at
+$PROXY_URL forwards exactly those requests to $BASE_URL while the parent
+session's \`claude-*\` requests still go to Anthropic.
 
-The real local-model inference happens in a SEPARATE \`claude\` process that
-this agent starts, with a process-scoped environment. That process is a full
-Claude Code agent loop -- it is not a single completion call.
+An earlier version of this file claimed this was impossible. That claim was
+REFUTED on the wire on 2026-08-04 against Claude Code 2.1.221: two model ids
+were observed leaving one process, \`$MODEL_ID\` from the subagent and
+\`claude-*\` from the parent. No binary patch is involved. The mechanism, the
+proxy and the evidence command live in $PROXY_DIR/README.md.
 
-## How to run the local model
+PRECONDITION: the session must run with \`ANTHROPIC_BASE_URL=$PROXY_URL\` and
+that proxy must list \`$MODEL_ID\` in its local model map. This file records the
+proxy state at generation time as \`$PROXY_STATE\` in the table above. If it
+says anything other than \`ready\`, or if your first request fails with an
+unknown-model error from Anthropic, the proxy is the thing to fix:
+
+\`\`\`bash
+$PROXY_DIR/ccqp.sh start && $PROXY_DIR/ccqp.sh health
+\`\`\`
+
+Rules for your own work:
+- Report what you actually produced. A success message is not evidence.
+- Never present an answer as coming from the local model unless it did.
+- If the endpoint fails, report the exact HTTP status. Do not silently
+  substitute reasoning from another model.
+- You are a 27B-class local model: take bounded, well-specified tasks. Long
+  agentic chains and image work are not yours (the checkpoint is text-only;
+  image content blocks return HTTP 500).
+
+## Driving the local model from ANOTHER agent
+
+Any agent -- including one running on Anthropic -- can reach this checkpoint
+without the proxy, in a separate process with a process-scoped environment:
 
 \`\`\`bash
 $REPO_ROOT/scripts/dev/local_model_agent.sh -- "<your prompt>"
 \`\`\`
 
 Options: \`-b BASE_URL\`, \`-m MODEL\`, \`-t MAX_OUTPUT_TOKENS\`, \`-T TIMEOUT_SECONDS\`,
-\`--allow-tools "Read,Grep"\` (default: no tools, pure reasoning).
+\`--allow-tools "Read,Grep"\` (default: no tools, pure reasoning). Always pass a
+bounded \`-T\`; never wait unbounded on the rig.
 
-Rules:
-- Always pass a bounded \`-T\`; never wait unbounded on the rig.
-- Quote the local model's answer VERBATIM in your report and name the model id
-  you got it from. A success message is not evidence -- the answer text is.
-- If the wrapper fails, report the exact HTTP status/stderr. Do not fall back
-  to answering from your own model and present it as the local model's answer.
-- For a raw single-shot completion without an agent loop, call the endpoint
-  directly instead:
-  \`curl -sS $BASE_URL/v1/messages -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -d '{"model":"$MODEL_ID","max_tokens":256,"messages":[{"role":"user","content":"..."}]}'\`
+For a raw single-shot completion without an agent loop, call the endpoint
+directly:
+
+\`\`\`bash
+curl -sS $BASE_URL/v1/messages -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -d '{"model":"$MODEL_ID","max_tokens":256,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"..."}]}'
+\`\`\`
+
+\`thinking:{"type":"disabled"}\` is not optional on the current build: without
+it the \`$REASONING\` reasoning parser emits a thinking block first and can spend
+the whole \`max_tokens\` budget on it.
 EOF
 
 echo "register_local_model: wrote $CONF_DIR/local_model_agent.env"
