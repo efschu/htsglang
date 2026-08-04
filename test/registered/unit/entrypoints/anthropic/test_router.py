@@ -185,7 +185,14 @@ class RouterTestCase(AioHTTPTestCase):
             self.local["requests"][0]["body"]["thinking"], {"type": "disabled"}
         )
 
-    async def test_explicit_thinking_is_never_rewritten(self):
+    async def test_explicit_thinking_is_overridden_to_disabled(self):
+        """The plain local id is ALWAYS the no-thinking arm.
+
+        Claude Code attaches its own thinking config to subagent requests;
+        honoring it made the local model think despite the no-thinking policy
+        (live incident 2026-08-04: "Thought for 14s" + stray </think> in
+        text). The -think alias is the only route to the thinking arm.
+        """
         await self.client.post(
             "/v1/messages",
             json=self._body(
@@ -194,7 +201,7 @@ class RouterTestCase(AioHTTPTestCase):
         )
         self.assertEqual(
             self.local["requests"][0]["body"]["thinking"],
-            {"type": "enabled", "budget_tokens": 1024},
+            {"type": "disabled"},
         )
 
     async def test_upstream_bodies_are_byte_identical(self):

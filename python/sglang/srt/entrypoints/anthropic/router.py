@@ -113,16 +113,20 @@ def _request_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
 
 
 def _apply_thinking_shim(body: bytes) -> bytes:
-    """Fill in ``thinking: disabled`` when the client omitted the field.
+    """Force ``thinking: disabled`` on the plain local-model route.
 
-    Returns the body unchanged if it is not a JSON object or already carries
-    ``thinking`` -- an explicit ``enabled`` from the client is never touched.
+    This OVERWRITES a client-supplied ``thinking`` value. Claude Code attaches
+    its own thinking config to subagent requests, so a fill-in-only shim let
+    the local model think despite the no-thinking policy (observed live:
+    "Thought for 14s" blocks and a stray ``</think>`` in visible text). The
+    ``-think`` alias is the only route to the thinking arm; the plain id must
+    always be the no-thinking arm, or the two arms become indistinguishable.
     """
     try:
         payload = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         return body
-    if not isinstance(payload, dict) or "thinking" in payload:
+    if not isinstance(payload, dict):
         return body
     payload["thinking"] = {"type": "disabled"}
     return json.dumps(payload).encode()
