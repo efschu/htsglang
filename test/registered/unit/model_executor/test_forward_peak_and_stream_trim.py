@@ -211,7 +211,7 @@ class TestProgressCoupledTrim(_EnvMixin, CustomTestCase):
 class _CgroupWithPinnedInTheFileBucket:
     """A cgroup whose ``file`` bucket holds page cache AND the pinned pool.
 
-    That is the whole defect (#534, measured 2026-08-04): CUDA pinned host
+    That is the whole defect (#537, measured 2026-08-04): CUDA pinned host
     memory is charged to ``file``, so ``memory.current`` cannot tell the two
     apart, while ``memory.reclaim`` can only ever take the page-cache half.
     """
@@ -241,7 +241,7 @@ class _CgroupWithPinnedInTheFileBucket:
 def _driven_by(cgroup, *, pinned_visible=True, anon_visible=True):
     """Wire a ProgressCoupledTrim to ``cgroup``.
 
-    ``pinned_visible=False`` reproduces the module's PRE-#534 world model --
+    ``pinned_visible=False`` reproduces the module's PRE-#537 world model --
     the pinned pool assumed anonymous and therefore invisible in the file
     bucket -- against otherwise identical inputs. That is the can-fail arm.
     ``anon_visible=False`` is a cgroup whose ``memory.stat`` cannot be read.
@@ -275,7 +275,7 @@ def _driven_by(cgroup, *, pinned_visible=True, anon_visible=True):
 
 
 class TestStreamTrimBudgetModel(_EnvMixin, CustomTestCase):
-    """#534: the trim's target must sit above the bytes reclaim cannot take.
+    """#537: the trim's target must sit above the bytes reclaim cannot take.
 
     Geometry taken from the UD-Q3_K_XL boot that died on it
     (``docs/dev/ANALYSE_478_RESULT_q3kxl_refused.md``): a ~104 GiB ceiling, a
@@ -298,7 +298,7 @@ class TestStreamTrimBudgetModel(_EnvMixin, CustomTestCase):
         )
         self.assertEqual(cg.current, 104 * GIB)
         t = self._armed_trim()
-        # What the pre-#534 arithmetic would have asked for, stated so the
+        # What the pre-#537 arithmetic would have asked for, stated so the
         # over-ask is visible rather than implied.
         unfixed_ask = cg.current - t.target_bytes
         self.assertEqual(unfixed_ask, 14 * GIB)
@@ -353,7 +353,7 @@ class TestStreamTrimBudgetModel(_EnvMixin, CustomTestCase):
 
     def test_neutral_when_the_floor_sits_below_the_configured_target(self):
         """Behavioural neutrality for every boot without a large pinned pool:
-        the arithmetic is exactly ``current - target``, as before #534."""
+        the arithmetic is exactly ``current - target``, as before #537."""
         cg = _CgroupWithPinnedInTheFileBucket(anon_gib=15, pinned_gib=0, cache_gib=85)
         t = self._armed_trim()
         with _driven_by(cg):
@@ -368,7 +368,7 @@ class TestStreamTrimBudgetModel(_EnvMixin, CustomTestCase):
         with _driven_by(cg, anon_visible=False):
             t.maybe_trim()
         self.assertIsNone(t.floor_bytes)
-        self.assertEqual(cg.asks, [14 * GIB], "pre-#534 arithmetic, unchanged")
+        self.assertEqual(cg.asks, [14 * GIB], "pre-#537 arithmetic, unchanged")
 
     def test_headroom_is_added_to_the_floor_when_the_operator_asks_for_it(self):
         cg = _CgroupWithPinnedInTheFileBucket(anon_gib=15, pinned_gib=80, cache_gib=9)

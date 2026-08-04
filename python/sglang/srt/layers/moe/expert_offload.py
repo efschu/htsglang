@@ -1677,7 +1677,7 @@ def log_streaming_staging_layer(label: str, plan: "ExpertStagingPlan") -> None:
 
     ledger = _STAGING_LEDGER
     ledger.record(layers=1)
-    # #534: publish the pinned figure where the GGUF stream trim can read it.
+    # #537: publish the pinned figure where the GGUF stream trim can read it.
     # The trim compares against the CGROUP's memory.current, which spans every
     # rank process, so a per-process ledger read would under-state the
     # unreclaimable floor by (ranks - 1) pools. Unconditional -- not behind

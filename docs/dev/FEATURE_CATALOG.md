@@ -2546,7 +2546,7 @@ with its own measured counter-number (`scripts/dsv4/cachetrim.sh:295`).
 The in-process successor is the progress-coupled GGUF stream trim
 (`model_loader/gguf_shards.ProgressCoupledTrim`, off unless
 `SGLANG_GGUF_STREAM_TRIM_SOFT_GIB` is set). Its budget model was WRONG until
-#534 and the correction is worth carrying: **CUDA pinned host memory is
+#537 and the correction is worth carrying: **CUDA pinned host memory is
 accounted in the cgroup's `file` bucket, not `anon`** (measured 2026-08-04 --
 49.66 GiB of offload pinned pool against `anon` steady at 14.6 GiB), so
 `memory.current` hides it inside what looks like reclaimable page cache. The

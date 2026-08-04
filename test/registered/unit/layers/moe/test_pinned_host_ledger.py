@@ -1,4 +1,4 @@
-"""#534: the cross-process pinned-host-bytes ledger.
+"""#537: the cross-process pinned-host-bytes ledger.
 
 Its only consumer is the GGUF stream trim, which compares against the CGROUP's
 ``memory.current`` -- a figure that spans every rank process. The window of
@@ -45,7 +45,7 @@ class PinnedHostLedgerTest(CustomTestCase):
 
     def test_unknown_is_not_zero_before_anyone_publishes(self):
         """The #218 provenance rule: absent and empty are different states,
-        and the trim keeps its pre-#534 arithmetic on 'absent'."""
+        and the trim keeps its pre-#537 arithmetic on 'absent'."""
         self.assertIsNone(pinned_host_ledger.total_pinned_bytes())
 
     def test_round_trip_of_this_process(self):
@@ -108,7 +108,7 @@ class PinnedHostLedgerTest(CustomTestCase):
         """Execution smoke for the WIRING, not the module.
 
         A ledger nothing writes to reads as 'no publisher' forever, and the
-        trim would then keep its pre-#534 arithmetic on exactly the boot the
+        trim would then keep its pre-#537 arithmetic on exactly the boot the
         fix is for. So this drives the real producer hook -- and with the
         staging TRACE switch off, because the trim is a different consumer and
         must not depend on a debug flag being on.

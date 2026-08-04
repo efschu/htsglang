@@ -13,7 +13,7 @@
 # ==============================================================================
 """Cross-process publication of the pinned HOST bytes each rank is holding.
 
-Why a shared file and not just the in-process ledger (#534): the reader is the
+Why a shared file and not just the in-process ledger (#537): the reader is the
 GGUF stream trim (``model_loader/gguf_shards.ProgressCoupledTrim``), and the
 quantity it has to compare against is ``memory.current`` of the **cgroup** --
 which spans every rank process, not just this one. Window 2026-08-04 measured

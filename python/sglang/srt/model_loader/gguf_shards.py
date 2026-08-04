@@ -485,7 +485,7 @@ class ProgressCoupledTrim:
     load, not a wrong one. WITH swap configured that argument fails, so this
     refuses to act.
 
-    CORRECTION (#534, measured 2026-08-04). The paragraph above is right that
+    CORRECTION (#537, measured 2026-08-04). The paragraph above is right that
     the pinned pool is out of reach of reclaim, and WRONG about where the
     kernel files it. It assumed the pool is ANONYMOUS -- and therefore that
     ``memory.current`` minus the reclaimable part is a meaningful trim target.
@@ -596,7 +596,7 @@ class ProgressCoupledTrim:
         """Bytes ``memory.reclaim`` provably cannot take, plus the headroom.
 
         ``None`` when ``anon`` is unreadable, which keeps the caller on the
-        pre-#534 arithmetic rather than guessing a floor. An unknown PINNED
+        pre-#537 arithmetic rather than guessing a floor. An unknown PINNED
         term is different and is taken as zero: that is the ordinary state of a
         boot with no expert offload, where ``anon`` alone IS the floor, and
         returning ``None`` there would drop a correction that is right.
@@ -646,7 +646,7 @@ class ProgressCoupledTrim:
         current = self._current()
         if current is None or current <= self.soft_bytes:
             return
-        # #534: `current` includes the pinned host pool, which the kernel files
+        # #537: `current` includes the pinned host pool, which the kernel files
         # under `file` but reclaim can never take. Asking for `current - target`
         # therefore over-asks by exactly the unreclaimable bytes and, once the
         # floor passes the target, never stops asking. Ask for what can be

@@ -84,9 +84,9 @@ class BoundingDefaultValuePinTest(CustomTestCase):
         )
 
     def test_gguf_stream_trim_headroom_is_off_and_therefore_inert(self):
-        """#534. Evidence tier: none, deliberately -- the term ships at 0.0.
+        """#537. Evidence tier: none, deliberately -- the term ships at 0.0.
 
-        The #534 fix raises the trim's target to the UNRECLAIMABLE floor
+        The #537 fix raises the trim's target to the UNRECLAIMABLE floor
         (``anon`` + the pinned host pool, which the kernel files under ``file``
         where ``memory.current`` cannot tell it from page cache). That floor is
         a physical statement and needs no calibration. This headroom is the one
@@ -95,7 +95,7 @@ class BoundingDefaultValuePinTest(CustomTestCase):
         that only a GPU window can take.
 
         It therefore ships INERT: at 0.0 the trim may still drive page cache
-        down to the floor exactly as it did before #534, and the fix's
+        down to the floor exactly as it did before #537, and the fix's
         behaviour comes entirely from the floor. Arming it is a deliberate act
         with a red test attached, and the measurement belongs in this message
         when it exists (``gguf_shards.ProgressCoupledTrim._effective_target``).
@@ -104,7 +104,7 @@ class BoundingDefaultValuePinTest(CustomTestCase):
             envs.SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB.get(),
             0.0,
             "SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB is no longer 0.0. It is the "
-            "only policy term in the #534 trim budget; arming it needs the "
+            "only policy term in the #537 trim budget; arming it needs the "
             "measured load-time read-ahead working set, not a desk number -- "
             "record the measurement in this pin in the same change",
         )

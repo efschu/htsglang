@@ -97,7 +97,7 @@ fire and ms/verify would silently have been ms/token under a different label.
 
 ## Open, with mechanism identified
 
-All three code-side blockers below were closed after the window (#534/#535,
+All three code-side blockers below were closed after the window (#537/#535,
 branch `fix/534-535-followups`). **None of them has a card behind it**: what
 follows each entry is what the NEXT window has to measure before the item can
 be called done.

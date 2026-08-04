@@ -82,7 +82,7 @@ figure from the offload ledger (which it has, `pinned_bytes`) to compute
 `target = pinned + anon + headroom` rather than treating `current` as if it
 were mostly reclaimable.
 
-### FIXED AFTER THE WINDOW (#534), still unproven on a card
+### FIXED AFTER THE WINDOW (#537), still unproven on a card
 
 `ProgressCoupledTrim` now computes an unreclaimable floor and raises its target
 to it whenever the floor sits above the configured target:
@@ -106,7 +106,7 @@ Falsifiers (hermetic, `CUDA_VISIBLE_DEVICES=99`):
 (`TestStreamTrimBudgetModel`, 7 arms) drives the trim against a cgroup model
 whose `file` bucket holds page cache AND the pinned pool. Fixed, it drains the
 reclaimable part once and goes quiet (`trims == 1` over ten calls); with the
-pinned pool made invisible again — the pre-#534 world model, same code path —
+pinned pool made invisible again — the pre-#537 world model, same code path —
 it asks on every call forever and is still asking for 10 GiB that no longer
 exist. `test/registered/unit/layers/moe/test_pinned_host_ledger.py` (8 arms)
 pins the cross-rank sum and the dead-rank skip. Executed can-fail: mutating the
