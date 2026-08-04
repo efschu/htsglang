@@ -988,10 +988,21 @@ class Playback {
     //: word starts" is precisely what the user reports. An average would hide
     //: it -- one bad seam in twenty is what is heard -- so the WORST is kept
     //: alongside the count.
+    //: A RATIO ALONE IS NOT AUDIBILITY, which the first field package proved:
+    //: all four seams this flagged as loud had absolute steps of 0.0004 to
+    //: 0.045 in near-silence, where dividing by a tiny local RMS makes any
+    //: ratio reachable. A step of 0.0004 is inaudible however large the ratio
+    //: is. Audibility needs BOTH -- a step comparable to its surroundings AND
+    //: a step big enough to hear -- so both are required below and both are
+    //: kept in the record.
     this.lastSample = null;
     this.chunkSeams = 0;
     this.worstChunkSeam = 0;
     this.loudChunkSeams = 0;
+    //: The worst seam WITH ITS CONTEXT, not just its score. A scalar high-water
+    //: mark says a loud seam happened somewhere, which costs a round trip and
+    //: a field session to localise -- twice, so far.
+    this.worstChunkSeamAt = null;
     //: THE CAPTURE HOLD (self-hearing incident, 2026-08-04). The phone is used
     //: half-duplex -- tap, speak German, tap again -- and the Spanish synthesis
     //: of the PREVIOUS turn began playing out of the loudspeaker while capture
@@ -1091,7 +1102,9 @@ class Playback {
     this.cursor = 0;
     // No buffer precedes the first one on a fresh clock, so there is no seam
     // to measure across the reset. Leaving the old sample here would report
-    // the step between two unrelated timelines as a chunk seam.
+    // the step between two unrelated timelines as a chunk seam. The worst
+    // seam SURVIVES the reset: it is the session's high-water mark, and a
+    // reconnect mid-session must not erase what was already observed.
     this.lastSample = null;
     this.holdReset += this.discardHeld();
     this.forget();
@@ -1288,6 +1301,23 @@ class Playback {
           samples: window,
           peak: Math.round(peak * 1000) / 1000,
           rms: Math.round(Math.sqrt(window ? sum / window : 0) * 1000) / 1000,
+          // WHETHER A RAMP WAS APPLIED TO THIS BUFFER, because `head` below
+          // cannot show it: the samples are read here, ~50 lines before the
+          // GainNode that carries the fade is created, so `head` is always
+          // PRE-RAMP. That is why a head can start at its peak while
+          // `ramps` counts the buffer as ramped -- the two describe different
+          // signals, and reading them as one contradiction cost a round.
+          //
+          // Recorded rather than resolved by tapping the output: reading back
+          // what the browser actually rendered needs an AnalyserNode or an
+          // AudioWorklet in the playback path, on a phone, in the one code
+          // path whose failure is silence. The reconstruction is exact --
+          // rendered = head x the known cosine curve over ONSET_RAMP_S -- and
+          // its cost is stated rather than hidden: a browser that ignored
+          // `setValueCurveAtTime` would be invisible here. `ramp_skipped`
+          // counts the one such failure the client can actually detect.
+          ramped: ONSET_RAMP_S > 0,
+          ramp_s: ONSET_RAMP_S,
           // A click is a discontinuity from SILENCE, so the first samples are
           // the evidence. Sixteen of them is a few hundred microseconds and
           // fits in a debug upload.
@@ -1373,20 +1403,43 @@ class Playback {
         if (local > 1e-4) {
           const rel = step / local;
           this.chunkSeams += 1;
-          if (rel > this.worstChunkSeam) this.worstChunkSeam = Math.round(rel * 100) / 100;
-          // A step comparable to the local RMS is a discontinuity the ear can
-          // find; well below it, the waveform was moving that fast anyway.
-          // Logged individually because the whole question is WHICH seams are
-          // audible, and an aggregate cannot answer it.
-          if (rel >= 1.0) {
+          // A ramp on a CONTIGUOUS buffer is its own event: a turn or unit
+          // start that does not re-anchor joins the timeline seamlessly and
+          // then has a fade-in applied to it, which is a dip in the middle of
+          // continuous audio rather than a clean onset. Recorded because the
+          // head below is sampled BEFORE the gain node exists.
+          const ramped = (turnStart || unitStart) && ONSET_RAMP_S > 0;
+          const record = {
+            turn: this.currentTurn, unit: this.currentUnit,
+            // Six decimals, not three. Rounding to three logged the first
+            // field package's seams as "step 0, local 0, rel 1.28" -- a ratio
+            // with both its operands displayed as zero, which is unreadable
+            // exactly where the quiet-passage seams live.
+            step: Math.round(step * 1e6) / 1e6,
+            local: Math.round(local * 1e6) / 1e6,
+            rel: Math.round(rel * 100) / 100,
+            at: Math.round(now * 1000) / 1000,
+            ramped: ramped,
+            // The samples that produced the step, so a flagged seam can be
+            // looked at rather than inferred. Pre-ramp; multiply by the
+            // known curve to get what was rendered (see `ramped`).
+            head: Array.from(samples.slice(0, 8),
+                             (v) => Math.round(v * 1e6) / 1e6),
+            last: Math.round(this.lastSample * 1e6) / 1e6,
+          };
+          if (rel > this.worstChunkSeam) {
+            this.worstChunkSeam = Math.round(rel * 100) / 100;
+            this.worstChunkSeamAt = record;
+          }
+          // BOTH conditions. `rel >= 1` says the step is large for its
+          // surroundings; `step >= CHUNK_SEAM_AUDIBLE` says it is large
+          // enough to hear at all. 0.002 is about -54 dBFS -- below a
+          // conservative floor for a transient audible over a phone
+          // loudspeaker in a room, and ~60x the 16-bit LSB, so it cannot be
+          // dither. Without it this counter reports near-silence as loud.
+          if (rel >= 1.0 && step >= CHUNK_SEAM_AUDIBLE) {
             this.loudChunkSeams += 1;
-            tlog("audio.chunk_seam", {
-              turn: this.currentTurn, unit: this.currentUnit,
-              step: Math.round(step * 1000) / 1000,
-              local: Math.round(local * 1000) / 1000,
-              rel: Math.round(rel * 100) / 100,
-              at: Math.round(now * 1000) / 1000,
-            });
+            tlog("audio.chunk_seam", record);
           }
         }
       }
@@ -1618,6 +1671,9 @@ class Playback {
       chunk_seams: this.chunkSeams,
       worst_chunk_seam: this.worstChunkSeam,
       loud_chunk_seams: this.loudChunkSeams,
+      //: WITH its turn, unit, time and samples. The scalar above only says a
+      //: seam happened somewhere, which has now cost two field packages.
+      worst_chunk_seam_at: this.worstChunkSeamAt,
       onsets: this.onsets.slice(-4),
       errors: this.errors.slice(-3),
     };
@@ -3811,6 +3867,15 @@ const microphone = new Microphone(
 //: to remove the step discontinuity that makes the click. Settable to 0 from
 //: the console, which is what the can-fail arm does.
 let ONSET_RAMP_S = 0.008;
+
+//: Absolute step below which a chunk seam cannot be heard, whatever its ratio
+//: to the local signal. About -54 dBFS, and ~60x the 16-bit LSB so it cannot
+//: be dither. It exists because the first field package flagged four seams as
+//: loud whose steps were 0.0004 to 0.045 in near-silence: dividing a tiny step
+//: by a tinier local RMS reaches any ratio you like, and reporting that as an
+//: audible artefact sent a whole round of investigation after nothing.
+//: Settable from the console, which is what a can-fail arm would use.
+let CHUNK_SEAM_AUDIBLE = 0.002;
 
 const STOP_FRAME_KIND = "playback.stop";
 //: Turns whose playback the listener cut. Their remaining audio is kept for
