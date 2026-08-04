@@ -1516,11 +1516,46 @@ def server_restart_payload(payload: dict) -> dict:
 
 
 def server_status_payload(payload: Optional[dict] = None) -> dict:
+    """Return supervisor status; when supervisor is not running, fall back to
+    auto-detecting an externally-started sglang server (same detection path
+    as landing_snapshot_payload) so the dashboard reflects the real state."""
     sup = _supervisor()
     try:
-        return {"ok": True, "running": sup.is_running(), "status": sup.status()}
+        running = sup.is_running()
+        status = sup.status()
     except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "error": str(e)}
+
+    if running:
+        return {
+            "ok": True,
+            "running": True,
+            "status": status,
+            "source": "supervisor",
+        }
+
+    # Supervisor not running -- try to detect an externally-started server,
+    # mirroring the fallback in landing_snapshot_payload.
+    det = _detect_external_endpoint()
+    if det:
+        from sglang.srt.planner import server_state as _sstate
+
+        ss = _sstate.resolve(det).to_json()
+        return {
+            "ok": True,
+            "running": True,
+            "status": status,
+            "source": "external",
+            "endpoint": det,
+            "server_state": ss,
+        }
+
+    return {
+        "ok": True,
+        "running": False,
+        "status": status,
+        "source": "supervisor",
+    }
 
 
 def download_targets_payload(payload: dict) -> dict:
