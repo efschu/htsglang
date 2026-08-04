@@ -414,7 +414,39 @@ class TranslatorSession:
         lid_confidence_floor: float = 0.5,
         #: Drop a segment spoken OVER a running turn in the other participant
         #: language, instead of queueing it to be spoken afterwards.
-        overlap_discard: bool = True,
+        #:
+        #: DEFAULT OFF AFTER THE FIRST FIELD RUN, and the reason is a measured
+        #: false positive rather than caution. In the family session it
+        #: discarded line 6 -- "Hallo Lamina Mahl, es waere nett, wenn ich
+        #: eine Unterschrift..." -- a real German sentence from a real person.
+        #: The floor it lost to was line 5, `es`, "!Gracias por ver el video!":
+        #: a 0.88 s segment carrying the canonical Whisper hallucination, at
+        #: language confidence 1.000. So the rule worked exactly as designed
+        #: and still destroyed an utterance, because the LANGUAGE THAT HELD
+        #: THE FLOOR WAS FABRICATED. A filter whose input can be invented must
+        #: not have destructive authority; it goes back on when the floor is
+        #: trustworthy (a minimum floor-segment duration, and a hallucination
+        #: check on the transcript that establishes it), and the calibration
+        #: is the next window's, not a guess today.
+        overlap_discard: bool = False,
+        # PER-STAGE DEADLINES (§17.8.20). Every stage that can block gets one,
+        # because the one stage that already had a deadline -- MT -- is the
+        # one stage that has never wedged the session.
+        #
+        # PROVISIONAL AND LABELLED AS SUCH. 90 s is ~3x the worst
+        # `tts_first_audio` seen so far (24.9 s in gate_bundle_b, against a
+        # 5.4 s median), chosen deliberately WIDE: a deadline that fires late
+        # beats today's infinity by classes, while one set under the real tail
+        # turns slow turns into failed ones. The #493 trap here is a threshold
+        # that never binds, and the answer to it is the calibration follow-up,
+        # not a tighter guess today -- `--enable-metrics` only started serving
+        # the distribution at this restart. Recalibrate to p99 once a few
+        # hours of it exist.
+        asr_timeout_s: float = 60.0,
+        tts_unit_timeout_s: float = 90.0,
+        #: The backlog after the last unit was queued. Generous: it may hold
+        #: several units, and it is bounded by them rather than by one call.
+        tts_drain_timeout_s: float = 300.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # DEGRADE, do not refuse (§17.8.14). This used to be
@@ -523,6 +555,19 @@ class TranslatorSession:
         self.overlap_discard = overlap_discard
         #: Segments refused because somebody talked over a running turn.
         self.interjections_discarded = 0
+        self.asr_timeout_s = asr_timeout_s
+        self.tts_unit_timeout_s = tts_unit_timeout_s
+        self.tts_drain_timeout_s = tts_drain_timeout_s
+        #: Lines whose turn died on a deadline, waiting for their ONE
+        #: automatic re-drive. Drained outside the turn lock -- `redrive`
+        #: takes that lock itself, so retrying from inside would deadlock the
+        #: session in a new and more interesting way than the bug being fixed.
+        self._redrive_queue: List[int] = []
+        #: Lines already retried once. The second attempt belongs to the user
+        #: and their button: an unbounded automatic retry against a talker
+        #: that is genuinely stuck is just the wedge with extra steps.
+        self._redrive_attempted: set = set()
+        self.stage_timeouts = 0
         # Uncertainty bookkeeping (§17.4). The embedding of every unresolved
         # ambiguous line is kept so a tap can fold it into the chosen speaker
         # -- and ONLY a tap can, which is why it is parked here instead of
@@ -1267,15 +1312,14 @@ class TranslatorSession:
         ASR produces one run-on utterance whose halves are in different
         languages, and no amount of later attribution repairs that.
         """
+        results: List[TurnResult] = []
         async with self._turn_lock:
             try:
                 pieces = await self._split_at_speaker_changes(segment)
-                results: List[TurnResult] = []
                 for piece in pieces:
                     result = await self._run_turn_locked(piece)
                     if result is not None:
                         results.append(result)
-                return results
             finally:
                 # Cleared on the way out however we leave -- return, error, or
                 # the cancellation a stop delivers. A stale active turn would
@@ -1283,6 +1327,29 @@ class TranslatorSession:
                 self._active_turn_id = None
                 self._turn_audio = None
                 self._active_source = None
+        # ONE automatic retry, and it runs HERE -- outside the lock. `redrive`
+        # takes `_turn_lock` itself, so retrying from inside the turn would
+        # deadlock the session in a newer and more interesting way than the
+        # bug this fixes. The second attempt belongs to the user's button:
+        # retrying without bound against a talker that is genuinely stuck is
+        # the wedge again with extra steps.
+        while self._redrive_queue:
+            line_id = self._redrive_queue.pop(0)
+            if line_id in self._redrive_attempted:
+                continue
+            self._redrive_attempted.add(line_id)
+            try:
+                logger.info(
+                    "session %s auto-redriving line %s after a stage deadline",
+                    self.session_id, line_id,
+                )
+                await self.redrive(line_id)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                logger.error(
+                    "session %s auto-redrive of line %s failed: %s",
+                    self.session_id, line_id, exc,
+                )
+        return results
 
     async def _split_at_speaker_changes(self, segment: Segment) -> List[Segment]:
         """Re-cut a segment wherever the voice changes inside it.
@@ -1386,7 +1453,14 @@ class TranslatorSession:
         #    from pinning the result, because pinning would make the direction
         #    routing a configuration rather than an observation.
         try:
-            transcript = await self._recognize(segment)
+            async with asyncio.timeout(self.asr_timeout_s):
+                transcript = await self._recognize(segment)
+        except TimeoutError:
+            self.stage_timeouts += 1
+            return self._fail(
+                turn_id, "asr",
+                f"recognition did not return within {self.asr_timeout_s:.0f}s",
+            )
         except BackendError as exc:
             return self._fail(turn_id, "asr", str(exc))
         watch.asr_ms = (self._clock() - t0) * 1000.0
@@ -1418,6 +1492,7 @@ class TranslatorSession:
         floor = self._foreign_interjection(segment, transcript)
         if floor is not None:
             self.interjections_discarded += 1
+            self._log_discard(transcript, floor)
             spoken = self._resolve_source(transcript)
             # The line IS written. A swallowed utterance is indistinguishable
             # from a broken microphone, and the person who was talked over
@@ -1546,6 +1621,9 @@ class TranslatorSession:
         audio_out: Dict[str, AudioChunk] = {}
         used_fallback = False
         first_audio_at: Optional[float] = None
+        #: A stage answered "not in time" rather than "no". Only interesting
+        #: if the turn ends up with NOTHING -- see the enqueue below.
+        retryable_failure = False
 
         # THE DIRECTION INVARIANT, as an assertion rather than a repair
         # (§17.8.16). "Detected language equals chosen target" cannot happen:
@@ -1594,6 +1672,17 @@ class TranslatorSession:
                 )
             except BackendError as exc:
                 self._fail(turn_id, exc.stage, str(exc), close=False)
+                # ONLY the synthesis stage. Each stage owns its own retry
+                # policy, and MT's is deliberate and already guarded: it
+                # refuses to restart a stream that has delivered tokens,
+                # because the user would read and hear those clauses twice
+                # (`test_a_stream_that_already_spoke_is_not_restarted`). An
+                # automatic re-drive on an MT failure reintroduces exactly
+                # that retry through the recovery door -- measured, not
+                # reasoned: it turned that pin red. The re-drive exists for
+                # the stage that had NO policy at all.
+                if exc.stage == "tts" and getattr(exc, "retryable", False):
+                    retryable_failure = True
                 continue
             translations[target] = text
             if audio is not None:
@@ -1601,6 +1690,17 @@ class TranslatorSession:
             used_fallback = used_fallback or fallback
             if marks is not None and (first_audio_at is None or marks < first_audio_at):
                 first_audio_at = marks
+
+        # THE ONE AUTOMATIC RE-DRIVE, and only for a turn that produced
+        # NOTHING. A turn whose failure came after some text was already
+        # delivered must not be re-driven: it would re-emit clauses the user
+        # has read and re-speak audio they have heard, which is worse than a
+        # partial turn. That is the same reasoning the MT retry guard uses
+        # one level down (`first_token_at is not None`), and getting it wrong
+        # here was caught by `test_a_stream_that_already_spoke_is_not_restarted`
+        # -- the retry it forbids came back in through the recovery path.
+        if retryable_failure and not translations:
+            self._redrive_queue.append(line.line_id)
 
         if first_audio_at is not None:
             watch.first_audio_ms = (first_audio_at - t0) * 1000.0
@@ -2110,6 +2210,21 @@ class TranslatorSession:
             return None
         return floor
 
+    def _log_discard(self, transcript: Transcript, floor: str) -> None:
+        """A destructive decision must leave a trace outside the journal.
+
+        The first false positive was found by reading the TRANSCRIPT and
+        noticing a `speaker-interjection` line -- the log said nothing at all,
+        which is how a filter that silently deletes speech should never
+        behave.
+        """
+        logger.warning(
+            "session %s DISCARDED an interjection: floor=%s spoken=%s "
+            "text=%r -- if this was a real turn, the floor language is the "
+            "thing to distrust",
+            self.session_id, floor, transcript.language, transcript.text[:80],
+        )
+
     def _mt_deltas(
         self,
         text: str,
@@ -2223,19 +2338,29 @@ class TranslatorSession:
             # point is to name the interval BEFORE any audio exists, which is
             # the one the user sits through.
             announce(index, "synthesizing")
-            async for piece in self.tts.synthesize(
-                unit, target, reference, reference_text, voice.backend_voice_id
-            ):
-                if first_audio_at is None:
-                    first_audio_at = self._clock()
-                    watch.tts_first_audio_ms = (first_audio_at - tts_start) * 1000.0
-                    watch.tts_wait_ms = TTS_QUEUE_WAIT_S.get() * 1000.0
-                chunks.append(piece)
-                self.journal.append(
-                    EventKind.TURN_AUDIO,
-                    {"turn_id": turn_id, "target": target, "speaker_id": speaker_id},
-                    audio=piece,
-                )
+            # Per UNIT, not per turn: a turn may hold several units and a
+            # per-turn budget would let the first one eat all of it. The
+            # deadline covers the whole stream of one unit, so a talker that
+            # yields a first chunk and then stalls is caught too -- which the
+            # live report ("2 sentences still to speak") is a case of.
+            async with asyncio.timeout(self.tts_unit_timeout_s):
+                async for piece in self.tts.synthesize(
+                    unit, target, reference, reference_text,
+                    voice.backend_voice_id,
+                ):
+                    if first_audio_at is None:
+                        first_audio_at = self._clock()
+                        watch.tts_first_audio_ms = (
+                            first_audio_at - tts_start
+                        ) * 1000.0
+                        watch.tts_wait_ms = TTS_QUEUE_WAIT_S.get() * 1000.0
+                    chunks.append(piece)
+                    self.journal.append(
+                        EventKind.TURN_AUDIO,
+                        {"turn_id": turn_id, "target": target,
+                         "speaker_id": speaker_id},
+                        audio=piece,
+                    )
             announce(index, "spoken")
 
         # TEXT MUST NOT WAIT FOR AUDIO (§19.13, user field report: "the
@@ -2354,7 +2479,29 @@ class TranslatorSession:
             # what changed is when the TEXT became visible, not what the turn
             # eventually contains.
             speech.put_nowait(None)
-            await worker
+            # THE WEDGE (§17.8.20). This await had no deadline, and one
+            # synthesis that never yields its next piece parked the worker
+            # forever: the await never returned, `_turn_lock` was never
+            # released, and every later segment queued behind it in a state
+            # the UI draws as a spinner. The timeout raises, the handler below
+            # CANCELS the worker (abandoning it would keep the card busy), and
+            # the turn dies loudly instead of silently.
+            # Scoped to the DRAIN alone. Wrapping the whole block would also
+            # catch MT's own timeout and convert it into a tts failure,
+            # bypassing the MT retry -- caught by
+            # `test_a_stream_that_already_spoke_is_not_restarted`.
+            try:
+                async with asyncio.timeout(self.tts_drain_timeout_s):
+                    await worker
+            except TimeoutError as exc:
+                self.stage_timeouts += 1
+                worker.cancel()
+                raise BackendError(
+                    "tts",
+                    f"synthesis did not finish within "
+                    f"{self.tts_drain_timeout_s:.0f}s",
+                    retryable=True,
+                ) from exc
         except BaseException:
             # Includes the CancelledError a playback.stop delivers: the
             # worker holds the talker's lock, so leaving it running would

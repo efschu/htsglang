@@ -936,7 +936,15 @@ async def run_gate(args) -> tuple:
                     f"{alive}, not OPEN"
                 )
 
+        # Give the slot back before tearing the browser down, while the page
+        # can still tell us which session it holds.
+        try:
+            sid = await page.evaluate("() => connection.sessionId || null")
+        except Exception:  # noqa: BLE001 - cleanup must never fail a run
+            sid = None
         await browser.close()
+    if sid:
+        release_session(args.url, sid)
     return report(failures, results, console, build), results
 
 
@@ -1029,6 +1037,26 @@ def report(failures, results, console, build) -> int:
         return 1
     print("[gate] PASS")
     return 0
+
+
+def release_session(url: str, session_id: str) -> None:
+    """Give the slot back. A harness that allocates and never frees will
+    eventually lock the OWNER out of his own translator -- four gate runs took
+    the count to 5 of 8."""
+    if not session_id:
+        return
+    import urllib.error
+    import urllib.request
+
+    base = url if url.endswith("/") else url + "/"
+    target = f"{base}api/translator/sessions/{session_id}"
+    request = urllib.request.Request(target, method="DELETE")
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            response.read()
+        print(f"[gate] released session {session_id}")
+    except Exception as exc:  # noqa: BLE001 - never fail a run on cleanup
+        print(f"[gate] could not release session {session_id}: {exc}")
 
 
 def main() -> int:

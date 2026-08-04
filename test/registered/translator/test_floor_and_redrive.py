@@ -54,7 +54,11 @@ class TestTheFloor(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_the_other_language_over_a_running_turn_is_ignored(self):
-        session, _asr, _mt, _tts = make_session()
+        # Explicitly ON: the mechanism is correct and is default-OFF after it
+        # destroyed a real utterance in the field, because the floor language
+        # it trusted came from a Whisper hallucination. The rule itself still
+        # has to keep working for the day the floor becomes trustworthy.
+        session, _asr, _mt, _tts = make_session(overlap_discard=True)
         segment = self._segment(session, LANG_A, over="t-running")
         transcript = Transcript(text="hola", language=LANG_B,
                                 language_confidence=0.99)
@@ -63,7 +67,7 @@ class TestTheFloor(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_same_language_over_a_running_turn_is_not_an_interjection(self):
         """The person who holds the floor may keep talking."""
-        session, _asr, _mt, _tts = make_session()
+        session, _asr, _mt, _tts = make_session(overlap_discard=True)
         segment = self._segment(session, LANG_A, over="t-running")
         transcript = Transcript(text="und weiter", language=LANG_A,
                                 language_confidence=0.99)
@@ -76,21 +80,23 @@ class TestTheFloor(unittest.IsolatedAsyncioTestCase):
         were held by the pin rather than by an actually-running turn, every
         second turn of a real conversation would be discarded.
         """
-        session, _asr, _mt, _tts = make_session()
+        session, _asr, _mt, _tts = make_session(overlap_discard=True)
         segment = self._segment(session, LANG_A, over=None)
         transcript = Transcript(text="hola", language=LANG_B,
                                 language_confidence=0.99)
         self.assertIsNone(session._foreign_interjection(segment, transcript))
 
-    async def test_the_discard_can_be_switched_off(self):
-        session, _asr, _mt, _tts = make_session(overlap_discard=False)
+    async def test_the_discard_is_off_by_default_after_the_field_run(self):
+        """The default itself is now the assertion: it deleted real speech."""
+        session, _asr, _mt, _tts = make_session()
+        self.assertFalse(session.overlap_discard)
         segment = self._segment(session, LANG_A, over="t-running")
         transcript = Transcript(text="hola", language=LANG_B,
                                 language_confidence=0.99)
         self.assertIsNone(session._foreign_interjection(segment, transcript))
 
     async def test_a_third_language_is_a_recognition_problem_not_a_speaker(self):
-        session, _asr, _mt, _tts = make_session()
+        session, _asr, _mt, _tts = make_session(overlap_discard=True)
         segment = self._segment(session, LANG_A, over="t-running")
         transcript = Transcript(text="bonjour", language="fr",
                                 language_confidence=0.99)
@@ -291,3 +297,88 @@ class TestRedrive(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HangingTts:
+    """A talker that accepts a unit and then never yields anything.
+
+    This is the live defect, reduced: the synthesis does not fail, it simply
+    never returns. Nothing downstream can distinguish that from slow work
+    without a deadline, which is exactly why the session used to wait forever.
+    """
+
+    languages = (LANG_A, LANG_B)
+    sample_rate = 16000
+    busy = False
+    min_reference_seconds = 0.0
+
+    def __init__(self):
+        self.calls = 0
+
+    async def synthesize(self, *args, **kwargs):
+        import asyncio
+
+        self.calls += 1
+        await asyncio.Event().wait()   # never set, on purpose
+        yield  # pragma: no cover - unreachable, keeps this an async generator
+
+
+class TestTheWedge(unittest.IsolatedAsyncioTestCase):
+    """A synthesis that never returns must not take the session with it."""
+
+    async def test_a_hanging_synthesis_fails_the_turn_instead_of_the_session(self):
+        session, _asr, _mt, good_tts = make_session()
+        session.tts = HangingTts()
+        session.tts_unit_timeout_s = 0.3
+        session.tts_drain_timeout_s = 0.6
+        floor = session.journal.next_seq
+
+        # Without the deadline this call never returns and the test hangs --
+        # which is the failure mode being fixed, so the arm asserts it by
+        # completing at all.
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.4))])
+
+        errors = [
+            event.payload
+            for event in session.journal.since(floor)[0]
+            if event.kind is EventKind.ERROR
+        ]
+        self.assertTrue(errors, "the turn died silently instead of loudly")
+        self.assertTrue(
+            any(e.get("stage") == "tts" for e in errors),
+            f"the failure did not name the stage: {errors}",
+        )
+
+    async def test_the_session_still_works_after_a_hanging_turn(self):
+        """THE ANTI-WEDGE ASSERTION. A failed turn must not be a dead session.
+
+        This is the property the user lost: everything behind the stuck turn
+        stayed in "translating" forever because `_turn_lock` was never
+        released.
+        """
+        session, _asr, _mt, good_tts = make_session()
+        session.tts = HangingTts()
+        session.tts_unit_timeout_s = 0.3
+        session.tts_drain_timeout_s = 0.6
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.4))])
+
+        # The talker recovers; the session must too.
+        session.tts = good_tts
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.4))])
+        self.assertTrue(
+            session.transcript.lines()[-1].translations,
+            "the session was still wedged after the stuck turn timed out",
+        )
+
+    async def test_the_deadline_does_not_fire_on_a_healthy_turn(self):
+        """The control: a threshold that fires on everything protects nothing."""
+        session, _asr, _mt, _tts = make_session()
+        floor = session.journal.next_seq
+        await run_conversation(session, [conversation_audio((VOICE_A_HZ, 1.4))])
+        errors = [
+            event.payload
+            for event in session.journal.since(floor)[0]
+            if event.kind is EventKind.ERROR
+        ]
+        self.assertEqual(errors, [], "a healthy turn tripped the deadline")
+        self.assertEqual(session.stage_timeouts, 0)

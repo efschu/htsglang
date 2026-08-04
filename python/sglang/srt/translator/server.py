@@ -1238,6 +1238,15 @@ def build_app(service: TranslatorService) -> FastAPI:
 
     @app.delete("/api/translator/sessions/{session_id}")
     async def close_session(session_id: str) -> JSONResponse:
+        """Give a session slot back.
+
+        This route was here all along; what was missing was a CALLER. Four
+        gate runs left four sessions at `turns 0` and took the count to 5 of
+        8 -- at 8 the USER cannot open one, i.e. a test harness locking the
+        owner out of his own translator. `client_gate.py` now releases what it
+        allocated (`release_session`). Worth remembering as a shape: the
+        capability existed, the discipline did not.
+        """
         return JSONResponse({"closed": service.sessions.close(session_id)})
 
     @app.websocket("/api/translator/stream")
