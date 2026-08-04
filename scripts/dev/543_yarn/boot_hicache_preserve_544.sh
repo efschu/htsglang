@@ -7,7 +7,7 @@
 # Delta against the live boot (PID 1236):
 #   + --enable-hierarchical-cache --hicache-storage-backend file
 #   + SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/spinning/hicache
-#   + --hicache-size (explicit host L2 cap instead of the 2.0 ratio)
+#   + --hicache-ratio 2 (host L2; NOT --hicache-size, see the note below)
 #   + preserve_thinking server default        <- flag name from feat/hicache-runtime-544
 #   + #540 thinking budget (merged into this tree)
 # Everything else, including the parser flags, context 262144 and NEXTN MTP,
@@ -19,7 +19,10 @@ VENV=${VENV:-/spinning/htsglang-gpu/.venv}
 MODEL=${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8}
 LOG=${LOG:-/tmp/w544_serving.log}
 HICACHE_DIR=${HICACHE_DIR:-/spinning/hicache}
-HICACHE_HOST_GB=${HICACHE_HOST_GB:-24}
+# NOTE: --hicache-size is PER POOL PER RANK (memory_pool_host.py:121-126). On TP=3
+# with a hybrid model that is KV + Mamba x 3 ranks = 6x the number. 24 asked for
+# 144 GB of pinned host RAM on a 98 GB box and the OOM killer took rank 0.
+# Use the ratio instead: 2 x device pool, about 33 GB pinned node-wide.
 
 mkdir -p "$HICACHE_DIR"
 
@@ -45,7 +48,7 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --enable-fast-lane --retraction-policy priority \
   --enable-hierarchical-cache \
   --hicache-storage-backend file \
-  --hicache-size "$HICACHE_HOST_GB" \
+  --hicache-ratio 2 \
   --hicache-write-policy write_through \
   --hicache-storage-prefetch-policy timeout \
   --hicache-storage-backend-extra-config '{"max_size": "100Gi", "min_free_space": "20Gi"}' \

@@ -18,7 +18,7 @@ for k in ("context_length","max_total_num_tokens","enable_hierarchical_cache",
           "hicache_storage_backend","hicache_size","hicache_write_policy",
           "speculative_algorithm","max_running_requests","reasoning_parser",
           "tool_call_parser","enable_kv_session_offload"):
-    print(f"  {k} = {d.get(k,\"<absent>\")}")
+    print("  %s = %s" % (k, d.get(k, "absent")))
 print("  preserve_thinking-ish:", {k:v for k,v in d.items() if "preserve" in k or "thinking" in k})'
 
 say "2 boot markers (grep only, bounded)"
@@ -26,7 +26,7 @@ head -c 900000 "$LOG" | grep -aE "HiCacheFile storage directory|storage backend|
 
 say "3 short-context sanity"
 curl -s -m 90 "$B/v1/chat/completions" -H 'content-type: application/json' -d '{
- "model":"Qwen3.6-27B","max_tokens":60,"temperature":0,
+ "model":"Qwen3.6-27B","max_tokens":400,"temperature":0,
  "messages":[{"role":"user","content":"Name the capital of Portugal, then compute 17*23. Answer in one short line."}]}' \
  | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d["choices"][0]["message"]; print("  answer:", (m.get("content") or "").strip()[:200])'
 
