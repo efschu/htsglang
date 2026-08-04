@@ -733,7 +733,7 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   GGUF checkpoints only (`if self.load_format != "gguf": raise`,
   `server_args.py:13204`), pure single-node TP (`hibernate.py:106-123`), and a
   per-rank NVML-UUID recheck on restore (`if live_uuid !=
-  rank_meta["nvml_uuid"]: raise RuntimeError`, `:568`).
+  rank_meta["nvml_uuid"]: raise RuntimeError`, `:642`).
   `--enable-weights-disk-backup` and `--hibernate-dir` require each other in
   both directions (`server_args.py:13191-13199`).
   Plus suspend-to-RAM (memory saver; reaches the legacy hybrid-SWA `SWAKVPool`
@@ -1802,7 +1802,7 @@ Fix: the identity reads through `launch_view` (`arg_groups/overrides.py`) --
 `resolved_view` plus the un-applied writes of `IDENTITY_TRANSPARENT_SOURCES`.
 A source is identity-TRANSPARENT when it RE-DERIVES a field from state the
 fingerprint already pins (the rank's card, re-checked by NVML UUID at
-`hibernate.py:568` and presence-gated at match time in
+`hibernate.py:642` and presence-gated at match time in
 `_manifest_cards_present`; the checkpoint at `model_path`). A source that
 changes WHAT IS LOADED is deliberately absent and must keep showing through --
 `model_runner.update_weights` is the case #499 argued must never be normalized
