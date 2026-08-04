@@ -4167,3 +4167,41 @@ rename control recorded.
 (`gauges {'error': 'HTTP Error 404: Not Found'}`). Diagnostic only and never
 asserted, but `--metrics-url` no longer points at anything and should be fixed
 or dropped rather than left printing an error every run.
+
+**GATE STATUS ON THE DEPLOYED BUILD, AND IT IS THE NEIGHBOUR AGAIN.** The
+2x PASS above is on `55ec9fe802`. The `?raw=1` capture switch landed after it,
+making the served build `ac5163c54a`, so it was re-gated -- and went
+**2 PASS / 3 FAIL** (`raw_a` FAIL, `raw_b` PASS, `raw_c` PASS, `raw_d` FAIL,
+`raw_e` FAIL). Every failure is the same single assertion and it is not in this
+cut:
+
+```
+   - turn 2: 1 of 2 streamed clauses arrived AFTER the first audio frame
+     (§19.13: text must not wait for audio); margins [2.2]
+```
+
+It fires when synthesis is unusually FAST: the failing turns recorded
+`tts_first_audio 1.04 s` against a 5.02-6.62 s median in the same run, so the
+second streamed clause lost a race it normally wins by seconds. `tts_first_audio`
+across these five runs spans **1.04-6.62 s for one identical clip**, which is
+not a property of a client that only counts frames.
+
+The cause is known and was announced: the #488 talker agent is running a ~6 min
+TTS profiling call inside this same tenant. This is §17.8.13 repeating verbatim
+-- "gating in that state measures the neighbour, not the build". The delta
+between the 2x-green build and the flaking one is two lines (`?raw=1` plus one
+diagnostics field, default behaviour unchanged) and cannot reorder clauses
+against audio.
+
+So: **`ac5163c54a` is NOT claimed as gated.** The hermetic arms are unaffected
+because they never touch the GPU -- mic recovery, hidden gate, roster touch,
+roster and auto-scroll are all green on exactly this file with their sabotage
+controls still red. The live 2x is owed once the profiling call is out of the
+tenant, and it is the first thing the next window does.
+
+**And the re-arm is NOT covered by the live gate**, which is worth stating
+plainly rather than leaving to be discovered: `client_gate.py` never taps a
+roster speaker button, so `pinnedSpeaker` stays null and `rearmPin()` is a
+no-op for the whole run. The mitigation is covered by reading the code and by
+the server-side consumption point it targets, not by a measurement. An arm that
+taps a speaker button and counts `speaker.arm` frames per turn is owed with it.
