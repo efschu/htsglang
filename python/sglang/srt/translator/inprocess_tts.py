@@ -34,6 +34,7 @@ victim under pressure.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import time
@@ -77,7 +78,24 @@ class InProcessTtsConfig:
     #: and the client see a stream. Not true incremental synthesis -- see the
     #: module docstring.
     emit_chunk_seconds: float = 0.4
-    max_new_tokens: int = 2048
+    #: Ceiling on talker decode steps for ONE unit. Measured on this
+    #: checkpoint on 2026-08-04: the talker decodes at 12.5 steps/s and a
+    #: normal clause costs ~85 steps, so 800 is a ~10x headroom over anything
+    #: a unit legitimately needs. The previous 2048 was not a ceiling but a
+    #: trap: at the measured rate it is ~164 s of decoding, nearly twice
+    #: `session.tts_unit_timeout_s` (90 s). A talker that never emits its
+    #: codec EOS -- which happens, and twice did on 2026-08-04 -- therefore
+    #: could not finish inside the deadline no matter how healthy the card
+    #: was, so the deadline could only ever abandon it, never catch it.
+    max_new_tokens: int = 800
+    #: Wall-clock ceiling for one `generate_voice_clone` call, held well below
+    #: `session.tts_unit_timeout_s` (90 s) so a runaway synthesis returns a
+    #: short waveform BY ITSELF before the session gives up on it. The token
+    #: ceiling above cannot do this job alone: it bounds STEPS, and the time a
+    #: step costs is not ours to promise while a 27B model shares the card.
+    #: See `_generate` for why a deadline that lives only in the event loop is
+    #: not enough.
+    max_generation_seconds: float = 70.0
     temperature: float = 0.9
     top_p: float = 0.9
     #: Park every audio module after a turn. Costs a restore on the next turn
@@ -117,6 +135,7 @@ class InProcessQwen3Tts:
         }
         self._model = None
         self._lock = asyncio.Lock()
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
     # -- capability ---------------------------------------------------------
 
@@ -313,11 +332,9 @@ class InProcessQwen3Tts:
         # One turn at a time: the modules are shared mutable state and a
         # second concurrent generate would interleave KV caches.
         queued_at = time.monotonic()
-        async with self._lock:
-            TTS_QUEUE_WAIT_S.set(time.monotonic() - queued_at)
-            waveform = await asyncio.get_running_loop().run_in_executor(
-                None, self._generate, text, language, reference, reference_text
-            )
+        waveform = await self._generate_under_lock(
+            text, language, reference, reference_text, queued_at
+        )
 
         chunk = max(1, int(self.config.emit_chunk_seconds * self.sample_rate))
         for start in range(0, len(waveform), chunk):
@@ -325,6 +342,122 @@ class InProcessQwen3Tts:
 
         if self.config.park_when_idle:
             self.park()
+
+    async def _generate_under_lock(
+        self,
+        text: str,
+        language: str,
+        reference: AudioChunk,
+        reference_text: Optional[str],
+        queued_at: float,
+    ) -> np.ndarray:
+        """Run one synthesis, holding the talker until the THREAD is done.
+
+        THE LIE (2026-08-04 12:51). The lock used to be an ``async with``
+        around ``await run_in_executor``. That reads as "held for the whole
+        synthesis", and it is not: a future handed back by the executor cannot
+        be cancelled once its thread has started, so when the session's unit
+        deadline cancelled the await, the context manager released the lock
+        while the talker kept decoding. ``busy`` -- which is just
+        ``self._lock.locked()`` -- then reported free. One second later the
+        automatic redrive believed it and called ``generate_voice_clone`` on
+        the same module tree, which is exactly the interleaving the comment in
+        ``synthesize`` forbids. Two generations then shared the card and each
+        halved the other's rate (measured: 12.5 steps/s alone, 10.7 with the
+        overlap), so the redrive missed its deadline too.
+
+        The repair is to make lock ownership follow the FUTURE rather than
+        this coroutine: the done callback is the only place that releases, so
+        the lock outlives any cancellation of the await and ``busy`` stays
+        true for exactly as long as a thread is still inside the talker.
+        """
+        await self._lock.acquire()
+        try:
+            TTS_QUEUE_WAIT_S.set(time.monotonic() - queued_at)
+            loop = asyncio.get_running_loop()
+            pending = self._talker_executor().submit(
+                self._generate, text, language, reference, reference_text
+            )
+        except BaseException:
+            # Nothing was submitted, so no callback will ever fire: this is
+            # the one path that has to release the lock itself.
+            self._lock.release()
+            raise
+        # Fires on the worker thread the moment `_generate` returns or raises,
+        # including long after this coroutine was cancelled. Exactly once per
+        # submit, so the lock cannot be released twice.
+        pending.add_done_callback(
+            lambda _finished: loop.call_soon_threadsafe(self._release_talker)
+        )
+        return await asyncio.wrap_future(pending, loop=loop)
+
+    def _release_talker(self) -> None:
+        if self._lock.locked():
+            self._lock.release()
+
+    def _talker_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """The ONE thread every synthesis runs on.
+
+        Owned here rather than borrowed from the loop's default executor. That
+        pool has several threads, so two callers that both believed the talker
+        was free could genuinely be inside `generate_voice_clone` at the same
+        time, on the same module tree -- the interleaving `synthesize` warns
+        about. With a single worker the serialization is structural: the
+        second generation cannot start before the first returns, whatever the
+        lock happens to think.
+
+        Built on demand so an instance raised with `object.__new__` -- how the
+        hermetic tests avoid loading a checkpoint -- needs no extra wiring.
+        """
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="inprocess-tts"
+            )
+            self._executor = executor
+        return executor
+
+    def arm_generation_deadline(self, model: object) -> bool:
+        """Bound the talker's decode loop by wall-clock time. True if armed.
+
+        WHY NOT `stopping_criteria=`. The obvious spelling --
+        ``generate_voice_clone(stopping_criteria=StoppingCriteriaList([
+        MaxTimeCriteria(...)]))`` -- is silently dropped, which is worse than
+        rejected. The value survives ``Qwen3TTSModel._merge_generate_kwargs``
+        (``merged = dict(kwargs)``, inference/qwen3_tts_model.py:339) and
+        reaches ``Qwen3TTSForConditionalGeneration.generate``, where the
+        arguments actually handed to the talker are assembled as a CLOSED dict
+        literal (``talker_kwargs``, core/models/modeling_qwen3_tts.py:2044)
+        that never splats ``**kwargs``. So the criteria are accepted, carried
+        two frames, and thrown away, and the synthesis runs unbounded anyway.
+
+        ``generation_config.max_time`` is the same mechanism reached from the
+        side the closed dict cannot block: transformers builds precisely a
+        ``MaxTimeCriteria`` from it (generation/utils.py:1315) on every
+        ``generate`` call, and ``talker_kwargs`` sets no ``max_time`` that
+        could override it. Re-armed per call rather than once at load, because
+        the clock starts when the criterion is CONSTRUCTED and a stale config
+        is the kind of thing a checkpoint reload would leave behind.
+
+        A talker cut off by time returns the frames it has: the reference
+        keeps the full length when no codec EOS is present
+        (``effective_lengths``, modeling_qwen3_tts.py:2287), so this yields a
+        short utterance rather than an empty one.
+        """
+        talker = getattr(getattr(model, "model", None), "talker", None)
+        generation_config = getattr(talker, "generation_config", None)
+        if generation_config is None:
+            # Never fail a turn over a checkpoint layout change: an unarmed
+            # talker is still caught by the session deadline, just rudely.
+            logger.warning(
+                "could not arm the talker generation deadline: no "
+                "generation_config on the talker; synthesis is bounded only "
+                "by max_new_tokens=%d",
+                self.config.max_new_tokens,
+            )
+            return False
+        generation_config.max_time = self.config.max_generation_seconds
+        return True
 
     def _generate(
         self,
@@ -338,6 +471,7 @@ class InProcessQwen3Tts:
         if self._model is None:
             self.load()
         self.ensure_resident()
+        self.arm_generation_deadline(self._model)
 
         reference_np = np.asarray(reference.samples, dtype=np.float32)
         # The wrapper builds the voice-clone prompt itself from (audio, sr).

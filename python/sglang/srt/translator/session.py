@@ -2810,15 +2810,30 @@ class TranslatorSession:
             # bypassing the MT retry -- caught by
             # `test_a_stream_that_already_spoke_is_not_restarted`.
             try:
-                async with asyncio.timeout(self.tts_drain_timeout_s):
+                async with asyncio.timeout(self.tts_drain_timeout_s) as drain:
                     await worker
             except TimeoutError as exc:
                 self.stage_timeouts += 1
                 worker.cancel()
+                # WHOSE DEADLINE (2026-08-04). A unit's own timeout
+                # (`tts_unit_timeout_s`, raised inside `worker`) is also a
+                # TimeoutError and also arrives here, through `await worker`.
+                # Reporting the drain constant for it named a budget that had
+                # not elapsed: two 90 s aborts were both logged as "did not
+                # finish within 300s", and the investigation spent its first
+                # hour looking for a 300 s stall that had never happened. A
+                # deadline message that names the wrong deadline is worse than
+                # no message, so ask the drain whether it was the one that
+                # fired instead of assuming it was.
+                elapsed_budget = (
+                    self.tts_drain_timeout_s
+                    if drain.expired()
+                    else self.tts_unit_timeout_s
+                )
                 raise BackendError(
                     "tts",
                     f"synthesis did not finish within "
-                    f"{self.tts_drain_timeout_s:.0f}s",
+                    f"{elapsed_budget:.0f}s",
                     retryable=True,
                 ) from exc
         except BaseException:
