@@ -100,5 +100,5 @@ fire and ms/verify would silently have been ms/token under a different label.
 * **#470 Boot B**: `resident_fraction._from_flag()` falls back to the runtime context, which still holds the *target's* args during the draft build. Needs the draft args published into the context — affects DFLASH/EAGLE too.
 * **#462 F2**: one missing `LogitsProcessorOutput` branch in the BCG buffer layer. Deliberately not patched: its fields do not share a leading dimension, so a wrong mapping would not raise — it would yield silently wrong logits.
 * **#478 stream-trim budget model** — see above.
-* `RESIDENT_FRACTION_CUT` default of 0.383 should become **~0.23** (measured); at 0.383 rank 0 OOMs mid-build.
+* ~~`RESIDENT_FRACTION_CUT` default of 0.383 should become **~0.23** (measured); at 0.383 rank 0 OOMs mid-build.~~ DONE (`boot_470_dspark.sh:59`).
 * The `geom_seq` determined scorer is too strict — it marks `2 4 8 16 32 64 128` wrong for wanting `32 64 128`, understating quality.

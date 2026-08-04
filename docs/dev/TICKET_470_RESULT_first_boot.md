@@ -58,7 +58,8 @@ window. Scored honestly:
   `RESIDENT_FRACTION_CUT=0.383`, would have freed only ~4.1 GiB against a
   10.12 GiB head and OOM'd rank 0 partway through the draft build. That default
   is arithmetic from ANALYSE_463 §4.4 and TICKET_470 §7.6 flags it as
-  unmeasured; **it is now measured and should be corrected to ~0.23.**
+  unmeasured; **it is now measured and the script default IS corrected to
+  0.23** (`boot_470_dspark.sh:59`), with the measurement in the comment.
 * **The predicted perf consequence did NOT appear.** The note argued rank 0
   would become the pacesetter because it holds the biggest shard, the lowest hit
   rate (0.7794), and loses 42 % of its resident set over a PCIe link with no
