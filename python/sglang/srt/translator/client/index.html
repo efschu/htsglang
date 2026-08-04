@@ -279,7 +279,7 @@
      cancelled by scrolling (`probe_roster_touch.py` is the arm that can).
      Safe here: this button is a tap target in a fixed footer, not inside
      anything the user needs to scroll. */
-  #speakers .sp > button.who { padding-right:36px; touch-action:none; }
+  #speakers .sp > button.who { padding-right:62px; touch-action:none; }
   #speakers .sp > button.who .lbl { overflow:hidden; text-overflow:ellipsis;
                                     white-space:nowrap; }
   #speakers > button.add { flex:0 0 auto; min-width:52px; }
@@ -296,6 +296,20 @@
     display:flex; align-items:center; justify-content:center;
   }
   #speakers .sp > button.x:active { color:var(--bad); background:var(--surface2); }
+  /* RENAME, and it needs its own control because the gesture it used to live
+     behind is gone. Naming a speaker was only ever reachable through the
+     600 ms long press into the sheet, and that press now means the merge drag
+     -- `bindSpeakerHold` opens the sheet only `if (!canMerge)`, so on a server
+     that announces `speaker_merge` the sheet is reachable exclusively by
+     starting a drag and dropping it on nobody. That is not an affordance.
+     Same shape as the delete control, one slot to its left. */
+  #speakers .sp > button.ren {
+    position:absolute; right:32px; top:50%; transform:translateY(-50%);
+    min-height:30px; min-width:30px; padding:0; border:0; border-radius:50%;
+    background:transparent; color:var(--dim); font-size:13px; line-height:1;
+    display:flex; align-items:center; justify-content:center;
+  }
+  #speakers .sp > button.ren:active { color:var(--fg); background:var(--surface2); }
   /* The drag: every OTHER entry is a visible drop zone, and the one under the
      finger is the one that would win. A merge is destructive, so the target
      is never left to be guessed at. */
@@ -696,6 +710,13 @@ class Playback {
     //: silently dropped: it is what the return-to-foreground notice is built
     //: from, and it separates "nothing was sent" from "we refused to speak".
     this.heldWhileHidden = 0;
+    //: Onset instrument (§17.8.16 client cut). A re-anchor is the seam a
+    //: start-of-speech click would live on, and the last few are kept with the
+    //: rendered samples so the answer comes off the DEVICE rather than out of
+    //: a local reproduction that has never clicked.
+    this.reanchors = 0;
+    this.onset = null;
+    this.onsets = [];
     //: The turn whose audio is currently on the clock, so a stop can say on
     //: WHICH bubble it happened rather than only in the header.
     this.currentTurn = null;
@@ -831,9 +852,16 @@ class Playback {
     // because it arrives detached from the exchange it belongs to. It is not
     // lost -- the transcript already carries the text, and `heldWhileHidden`
     // is what tells the user on return.
+    // NOT `blocked`. That flag means one specific thing -- the browser refused
+    // to start the output clock and only a tap can release it -- and the page
+    // acts on it: a red banner, the header switched to "sound blocked", and a
+    // capture report. Reusing it here raised that alarm every time the phone
+    // was briefly backgrounded, which is a false report of an autoplay
+    // refusal that only the unblock button could clear. Withholding audio on
+    // purpose is a different state and gets its own counter; the return-to-
+    // foreground notice is what tells the user, once, in words.
     if (typeof document !== "undefined" && document.hidden) {
       this.heldWhileHidden += 1;
-      this.blocked = true;
       return false;
     }
     if (ctx.state !== "running") {
@@ -867,7 +895,47 @@ class Playback {
       source.buffer = buffer;
       source.connect(ctx.destination);
       const now = ctx.currentTime;
-      if (this.cursor < now + 0.02) this.cursor = now + 0.05;
+      // THE ONSET INSTRUMENT (user report: a rare click at the start of
+      // speech). Two numbers, and they answer different questions. A
+      // RE-ANCHOR here means the output clock had drained -- everything
+      // booked has already played and this buffer starts a new run, which is
+      // the seam an onset artefact would live on. Counted separately from the
+      // very first buffer of the session, because "the queue ran dry mid-turn"
+      // and "playback started" sound alike in a log and are not the same
+      // event.
+      const reanchor = this.cursor < now + 0.02;
+      if (reanchor) {
+        this.reanchors += 1;
+        // The first ~50 ms AS RENDERED, not as received: this is what the
+        // browser is about to play, after the resampler. Peak and RMS
+        // separate a full-scale step (a click) from a normal soft onset, and
+        // the leading samples are kept raw because a step is visible in them
+        // and in nothing else. Sampled only at a seam, so it costs nothing
+        // during continuous speech.
+        const window = Math.min(samples.length, Math.round(ctx.sampleRate * 0.05));
+        let peak = 0, sum = 0;
+        for (let i = 0; i < window; i++) {
+          const v = samples[i];
+          const a = Math.abs(v);
+          if (a > peak) peak = a;
+          sum += v * v;
+        }
+        this.onset = {
+          at: Math.round(now * 1000) / 1000,
+          seam: this.scheduled > 0,
+          samples: window,
+          peak: Math.round(peak * 1000) / 1000,
+          rms: Math.round(Math.sqrt(window ? sum / window : 0) * 1000) / 1000,
+          // A click is a discontinuity from SILENCE, so the first samples are
+          // the evidence. Sixteen of them is a few hundred microseconds and
+          // fits in a debug upload.
+          head: Array.from(samples.slice(0, 16),
+                           (v) => Math.round(v * 1000) / 1000),
+        };
+        this.onsets.push(this.onset);
+        while (this.onsets.length > 8) this.onsets.shift();
+        this.cursor = now + 0.05;
+      }
       source.start(this.cursor);
       this.cursor += buffer.duration;
       // Kept so the whole queue can be silenced on one tap. A buffer that is
@@ -939,6 +1007,9 @@ class Playback {
       stops: this.stops,
       last_resume: this.lastResume,
       blocked: this.blocked,
+      held_while_hidden: this.heldWhileHidden,
+      reanchors: this.reanchors,
+      onsets: this.onsets.slice(-4),
       errors: this.errors.slice(-3),
     };
   }
@@ -1016,10 +1087,14 @@ registerProcessor("tap", Tap);
 `;
 
 class Microphone {
-  constructor(onFrame, onLevel, onNote) {
+  constructor(onFrame, onLevel, onNote, onLost) {
     this.onFrame = onFrame;
     this.onLevel = onLevel;
     this.onNote = onNote || function () {};
+    //: Called when the capture is TAKEN AWAY, as a state change rather than a
+    //: message. A note alone was what the page used to do, and it left the UI
+    //: claiming to listen with its record button disabled -- see `micLost`.
+    this.onLost = onLost || function () {};
     this.ctx = null;
     this.node = null;
     this.stream = null;
@@ -1039,14 +1114,30 @@ class Microphone {
 
   async start() {
     if (this.ctx) return;
+    // NS AND AGC ARE A MEASURABLE QUESTION NOW, not a settled one. All three
+    // filters were switched on together because they remove the
+    // loudspeaker-into-microphone feedback loop for free. But the SAME track
+    // feeds three consumers with opposite interests: the recognizer wants a
+    // clean signal, while the speaker embedding and the voice clone want the
+    // voice UNCOLOURED -- and noise suppression plus automatic gain are
+    // exactly colouring. They cannot be separated at the source: one
+    // `getUserMedia` track serves all three, and a second capture with
+    // different constraints is unreliable on Android and doubles the cost.
+    //
+    // So the compromise is documented rather than hidden, and made testable
+    // from the device: `?raw=1` drops NS and AGC for a session so the user can
+    // A/B it on his own phone against his own voice. ECHO CANCELLATION IS
+    // NEVER DROPPED -- it is what keeps our own TTS out of the microphone, and
+    // the TTS echo enrolling itself as a speaker is a live defect, not a
+    // hypothetical one. What the track actually GOT is reported either way
+    // (`diagnostics()`), because a constraint is a wish and not a setting.
+    const raw = new URLSearchParams(location.search).get("raw") === "1";
+    this.rawCapture = raw;
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        // These three are why the client is a browser: they remove the
-        // loudspeaker-into-microphone feedback loop for half-duplex playback
-        // without any work on our side.
         echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
+        noiseSuppression: !raw,
+        autoGainControl: !raw,
         channelCount: 1,
       },
     });
@@ -1102,6 +1193,8 @@ class Microphone {
         ? null : settings.noiseSuppression,
       track_auto_gain: settings.autoGainControl === undefined
         ? null : settings.autoGainControl,
+      //: Which capture profile was ASKED for, beside what the track got.
+      raw_capture: !!this.rawCapture,
       worklet_calls: this.tapCalls,
       worklet_empty: this.tapEmpty,
       worklet_channels: this.tapChannels,
@@ -1118,9 +1211,11 @@ class Microphone {
     // Android hands the microphone to a phone call or another app by MUTING
     // the track rather than ending it, and a muted track delivers no audio
     // while every other indicator stays healthy.
-    track.onmute = () => this.onNote("microphone muted by the system", true);
-    track.onunmute = () => this.onNote("microphone unmuted", false);
-    track.onended = () => this.onNote("microphone track ended", true);
+    // Both are handed UP as a loss, not written out as a sentence. The note
+    // was all this did, and a note cannot re-enable a disabled button.
+    track.onmute = () => this.onLost("muted");
+    track.onunmute = () => this.onNote("the microphone is available again", false);
+    track.onended = () => this.onLost("ended");
   }
 
   /** Deprecated, universally supported, and the point is that it works. */
@@ -1877,7 +1972,27 @@ function renderSpeakers(speakers) {
     kill.addEventListener("pointerdown", (e) => e.stopPropagation());
     kill.addEventListener("pointerup", (e) => e.stopPropagation());
 
-    cell.append(button, kill);
+    // Rename, on the main page (user order 2026-08-04). It had become
+    // unreachable: naming lived behind the 600 ms long press into the sheet,
+    // and `bindSpeakerHold` opens that sheet only `if (!canMerge)` -- so on a
+    // server announcing `speaker_merge`, which is every server since the last
+    // restart, the only surviving path was to start a merge drag and drop it
+    // on empty space. A capability shipped for one feature silently removed
+    // the affordance of another.
+    const ren = document.createElement("button");
+    ren.className = "ren";
+    ren.textContent = "✎";
+    ren.title = "rename " + shown;
+    ren.setAttribute("aria-label", "rename " + shown);
+    ren.onclick = (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      promptRenameSpeaker(speaker);
+    };
+    ren.addEventListener("pointerdown", (e) => e.stopPropagation());
+    ren.addEventListener("pointerup", (e) => e.stopPropagation());
+
+    cell.append(button, ren, kill);
     row.appendChild(cell);
   }
   const add = document.createElement("button");
@@ -2208,6 +2323,22 @@ function askText(title, body, value, okLabel) {
  * A typed name outranks every suggestion and is never overwritten by the
  * automatic path.
  */
+/** Ask for a name and send it. ONE implementation, two entry points.
+ *
+ * The sheet row and the roster's pencil both land here, for the same reason
+ * the delete control has one implementation: two copies of a dialog drift,
+ * and the copy nobody reads is the one that stops saying the right thing.
+ */
+async function promptRenameSpeaker(speaker) {
+  const name = await askText(
+    "name", "Applies to every line this speaker has already said, and to "
+    + "all new ones.", speaker.label || "");
+  if (name === null || !name) return;
+  connection.sendControl({
+    kind: "speaker.name", speaker_id: speaker.speaker_id, label: name,
+  });
+}
+
 function openSpeakerSheet(speaker) {
   const pane = el("pane-speaker");
   pane.innerHTML = "";
@@ -2226,15 +2357,9 @@ function openSpeakerSheet(speaker) {
   const rename = document.createElement("button");
   rename.className = "listrow";
   rename.innerHTML = "<span class='name'>give this speaker a name</span>";
-  rename.onclick = async () => {
+  rename.onclick = () => {
     closeSheet();
-    const name = await askText(
-      "name", "Applies to every line this speaker has already said, and to "
-      + "all new ones.", speaker.label || "");
-    if (name === null || !name) return;
-    connection.sendControl({
-      kind: "speaker.name", speaker_id: speaker.speaker_id, label: name,
-    });
+    promptRenameSpeaker(speaker);
   };
 
   // The same delete as the "x" on the roster entry, deliberately one
@@ -2619,6 +2744,7 @@ const microphone = new Microphone(
   (peak) => { el("meter").firstElementChild.style.width =
                 Math.min(100, peak * 260) + "%"; },
   (text, bad) => sys(text, bad),
+  (kind) => micLost(kind),
 );
 
 // ---------------------------------------------------------------------------
@@ -2834,6 +2960,9 @@ function flag(value) {
 function reportCapture(reason) {
   const d = microphone.diagnostics();
   d.reason = reason;
+  //: How often the pin had to be put back. A high count against few turns is
+  //: the per-segment consumption being visible from the client side.
+  d.pin_rearms = pinRearms;
   // The OUTPUT half. Capture telemetry alone cannot distinguish "the server
   // sent no audio" from "the phone never played it", and that ambiguity is
   // exactly what a real device kept running into: 53 audio events sent, no
@@ -2970,6 +3099,36 @@ let activeButton = null;
 let startedAt = 0;
 const MIN_TURN_MS = 300;
 
+/** The speaker the user last pinned by tapping their button, held here.
+ *
+ * RE-ARM MITIGATION, and it is a race, not a fix. The server consumes an
+ * arming PER SEGMENT (`session.py:1575`: `_armed_speaker` is cleared inside
+ * `_identify`, whatever happens next), so a conversation of five segments
+ * spends the pin on the first one and lets diarization mint phantom speakers
+ * for the other four. Re-sending the arming at each turn boundary keeps the
+ * pin alive across those boundaries and visibly reduces the flood.
+ *
+ * What it CANNOT do: close the window. The re-arm is sent when a turn opens
+ * on the wire, and the next segment may already be inside `_identify` by the
+ * time it lands -- there is no ordering between them. The real fix is the
+ * server-side sticky pin, where the pin survives the segment boundary because
+ * it is never consumed. This is what mitigates the symptom until that ships.
+ *
+ * Second honest limit: while the pin is held, a genuine OTHER speaker is
+ * attributed to the pinned one as well. That is the sticky-pin semantic the
+ * user asked for, and the §17.8.16 language filter is what will separate the
+ * other-language case -- server-side, not here.
+ */
+let pinnedSpeaker = null;
+let pinRearms = 0;
+
+function rearmPin() {
+  if (!pinnedSpeaker) return;
+  connection.sendControl({ kind: "speaker.arm", speaker_id: pinnedSpeaker });
+  markArmed(pinnedSpeaker);
+  pinRearms += 1;
+}
+
 function toggleTalk(node, speakerId) {
   if (activeButton && activeButton !== node) {
     // Switching speaker mid-recording ends the current turn rather than
@@ -2988,6 +3147,7 @@ function toggleTalk(node, speakerId) {
   }
   if (speakerId) {
     connection.sendControl({ kind: "speaker.arm", speaker_id: speakerId });
+    pinnedSpeaker = speakerId;
   }
   activeButton = node;
   startedAt = Date.now();
@@ -2998,6 +3158,9 @@ function toggleTalk(node, speakerId) {
 function stopTalk() {
   const node = activeButton;
   activeButton = null;
+  // The pin is released by the same tap that ends the turn. Holding it past
+  // the end would keep re-arming a speaker the user has stopped being.
+  pinnedSpeaker = null;
   if (node) setButtonLive(node, false);
   markArmed(null);
   endTalking();
@@ -3073,6 +3236,46 @@ segBind("segmode", async (value) => {
     talk.disabled = false;
   }
 });
+
+/** The capture was taken away mid-session, and the UI must stop claiming it.
+ *
+ * THE LIVE FAILURE OF 2026-08-04, and the reason this is a state transition
+ * rather than a toast. Android takes the microphone in two shapes: it MUTES
+ * the track (an incoming call, another app claiming audio focus) or it ENDS
+ * it. Both leave every other indicator healthy -- the socket is open, the
+ * session is alive, the AudioContext is running -- so nothing else on the
+ * page notices. In continuous mode the speak button is deliberately DISABLED
+ * while listening (`talk.disabled = true` above), so what the user was left
+ * with was: no audio reaching the server, and a record button that does
+ * nothing when pressed. The server-side evidence was a session `attached: 1`
+ * whose decision log simply stopped. The old handler answered all of that
+ * with one line of text.
+ *
+ * A mute can recover on its own, an end cannot -- the track is gone and only
+ * a fresh `getUserMedia` produces another. So a mute keeps the capture chain
+ * and only hands the controls back; an end tears the chain down, because
+ * `start()` returns early while `this.ctx` exists and would otherwise rebuild
+ * nothing and "capture" from a track that no longer exists.
+ */
+function micLost(kind) {
+  const wasListening = segValue("segmode") === "vad";
+  microphone.setOpen(false);
+  if (kind === "ended") microphone.stop();
+  if (activeButton) stopTalk();
+  // Continuous mode cannot continue without a microphone, and leaving the
+  // control in "vad" would show a mode the page is not in.
+  if (wasListening) segSet("segmode", "ptt");
+  talk.querySelector(".lbl").textContent = "tap to speak";
+  talk.dataset.idle = "tap to speak";
+  talk.disabled = false;
+  setState("nomic", kind === "muted" ? "microphone muted" : "microphone lost");
+  sys(kind === "muted"
+        ? "the system took the microphone -- a call or another app. Tap to "
+          + "speak once it is free again"
+        : "the microphone was disconnected. Tap to speak to pick it up again",
+      true);
+  reportCapture("microphone-" + kind);
+}
 
 // Voice mode. Applies to the live session immediately; the server refuses
 // preset mode when no pool is loaded and the refusal is shown rather than
@@ -3574,6 +3777,10 @@ function onEvent(event) {
     case "turn.opened":
       setState("working", "translating");
       setTurnState(event.turn_id, "translating");
+      // The arming the server just consumed is put back, so the NEXT segment
+      // is still the pinned speaker's. See `pinnedSpeaker` for why this is a
+      // mitigation and not the fix.
+      rearmPin();
       break;
     // Per-unit synthesis state, one frame per transition in the worker. It
     // REFINES what the clock and the clause partials already show -- it does
@@ -3603,6 +3810,7 @@ function onEvent(event) {
         setState("ready", "ready");
         break;
       }
+      rearmPin();
       const node = bubbleFor(event.turn_id);
       node.querySelector(".src").textContent = event.text;
       node.querySelector(".lang").textContent = event.language || "";

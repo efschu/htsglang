@@ -4078,3 +4078,92 @@ four clusters and a transcript will always name one, and it will sound
 reasonable doing it. Shadow mode is not caution theatre here -- it is the only
 way to tell those two apart before the thing has authority over what the user
 hears.
+
+#### 17.8.18 The client cut that came out of a live outage (eighth session)
+
+**The outage, and it was not the build.** The user could not record: "ich drücke
+auf aufnehmen, aber nix passiert". The service was healthy throughout --
+`/api/translator/health` ok, and a one-turn gate against the PUBLIC url on the
+deployed client `7fac5ae666` passed end to end (asr 0.15 s, mt_first_token
+0.21 s, 236 audio frames, own-voice clone, console clean). What the server saw
+was a session `attached: 1` whose decision log had four entries and then
+stopped: the socket was alive and no audio was arriving.
+
+**The mechanism, and it is a trap the UI builds itself.** Continuous mode
+DISABLES the speak button on purpose (`talk.disabled = true`,
+`index.html:3067`). Android takes the microphone away in two shapes -- it MUTES
+the track (a call, another app taking audio focus) or it ENDS it -- and the old
+handler answered both with a single line of text (`track.onmute/onended` called
+only `onNote`, `index.html:1115-1124`). Every other indicator stayed healthy.
+So the user was left listening to nothing with a record button that does
+nothing, and no path back. `probe_mic_recovery.py` reproduces exactly that
+state under `--sabotage-recovery` (disabled True, mode vad, capture open) and
+goes green on the fix, for both `mute` and `ended`.
+
+A mute keeps the capture chain and hands the controls back; an END tears the
+chain down, because `start()` returns early while `this.ctx` exists and would
+otherwise rebuild nothing and "capture" from a track that no longer exists.
+
+**THE HIDDEN GATE HAD A REGRESSION IN IT, and the arm found it.** `schedule()`
+set `this.blocked = true` while withholding audio from a hidden page. `blocked`
+means one specific thing -- the browser refused to start the output clock and
+only a tap releases it -- and the page acts on it with a red banner, a "sound
+blocked" header and a capture report (`index.html:1393-1397`), cleared only by
+the unblock button. Every brief backgrounding therefore raised a false autoplay
+alarm the user had to dismiss. Withholding on purpose now has its own counter.
+
+**FOUR WAYS TO DRIVE VISIBILITY WERE TRIED AND ALL FOUR FAILED. Do not spend
+the time again.** On this host: `Emulation.setPageVisibilityOverride` does not
+exist in Chromium 151; `Page.setWebLifecycleState("frozen")` leaves
+`visibilityState: "visible"`; activating a second tab does nothing in headless;
+`Browser.setWindowBounds({windowState: "minimized"})` likewise. Headed Chromium
+under Xvfb has the real semantics and cannot run here -- Xvfb crashes in
+`libEGL_nvidia`. `probe_hidden_gate.py` therefore drives the DOCUMENT contract
+(override plus a real `visibilitychange`), which exercises every line this cut
+owns, and says in its own docstring that it does NOT prove Android fires the
+event for a backgrounded PWA holding a wake lock. That premise is confirmed
+only by `held_while_hidden` arriving from a real phone in a debug upload. Until
+then it is reasoned, not measured.
+
+**RENAME HAD BECOME UNREACHABLE, and it was our own merge feature that did it.**
+Naming a speaker lived behind the 600 ms long press into the sheet, and
+`bindSpeakerHold` opens that sheet only `if (!canMerge)` (`index.html:2045`).
+Since the restart that announced `speaker_merge`, the only surviving path to a
+rename was to start a merge drag and drop it on empty space. A capability
+shipped for one feature silently removed the affordance of another -- worth
+remembering as a shape, not just as this instance. There is now a pencil on the
+roster entry beside the delete control, and one implementation of the prompt
+behind both entry points.
+
+**NS AND AGC: a documented compromise, made testable from the phone.** All
+three filters were on. The same track feeds the recognizer (wants clean), the
+speaker embedding and the voice clone (want UNCOLOURED) -- and noise
+suppression plus automatic gain are exactly colouring. They cannot be separated
+at the source: one track serves all three, and a second capture with different
+constraints is unreliable on Android and doubles the cost. `?raw=1` drops NS and
+AGC for a session so the user can A/B it against his own voice. Echo
+cancellation is never dropped: it is what keeps our own TTS out of the
+microphone, and the TTS echo enrolling itself as speaker-4 is a live defect.
+
+**Also in the cut:** the re-arm mitigation (the pin is put back on every
+`turn.opened` and `turn.transcript`, documented as a RACE that reduces the
+phantom flood and does not replace the server-side sticky pin -- the re-arm can
+land after the next segment is already inside `_identify`), and the onset
+instrument (a re-anchor of the output cursor is the seam a start-of-speech click
+would live on; the last few are kept with peak, RMS and the leading rendered
+samples, and ride out in the debug upload).
+
+**Gates:** `probe_mic_recovery.py` PASS for `mute` and `ended`, FAIL on all five
+assertions under `--sabotage-recovery`; `probe_hidden_gate.py` PASS, FAIL on all
+four under `--sabotage-gate`; `probe_roster_touch.py`, `probe_roster.py`,
+`probe_autoscroll.py` all PASS with their sabotage controls still red. Live
+`client_gate.py` **2x PASS on client `55ec9fe802`** against the public url, 4
+turns each with the reload arm and the stop arm (`aborted_turn_id
+20e0a2b60738`, frames after stop 0, quiet 20.16 s), console clean. Medians:
+`mt_first_token` 0.22 s, `first_audio` 5.06 s. Screenshot of the roster with the
+rename control recorded.
+
+**Instrument gap, named:** the gate's metrics read answered `404` on both runs
+(`gauges {'error': 'HTTP Error 404: Not Found'}`). Diagnostic only and never
+asserted, but `--metrics-url` no longer points at anything and should be fixed
+or dropped rather than left printing an error every run.
