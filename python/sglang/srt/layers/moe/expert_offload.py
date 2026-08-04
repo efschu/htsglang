@@ -102,6 +102,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.layers.moe import pinned_host_ledger
 from sglang.srt.utils.break_cost_clock import break_cost_phase
 
 # --- M-C routing trace ------------------------------------------------------
@@ -1676,6 +1677,13 @@ def log_streaming_staging_layer(label: str, plan: "ExpertStagingPlan") -> None:
 
     ledger = _STAGING_LEDGER
     ledger.record(layers=1)
+    # #534: publish the pinned figure where the GGUF stream trim can read it.
+    # The trim compares against the CGROUP's memory.current, which spans every
+    # rank process, so a per-process ledger read would under-state the
+    # unreclaimable floor by (ranks - 1) pools. Unconditional -- not behind
+    # SGLANG_MOE_STAGING_TRACE -- because the trim is a different consumer from
+    # the trace line below and must not depend on a debug switch being on.
+    pinned_host_ledger.publish_pinned_bytes(ledger.pinned_bytes)
     if not envs.SGLANG_MOE_STAGING_TRACE.get():
         return
     logging.getLogger(__name__).info(

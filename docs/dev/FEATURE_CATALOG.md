@@ -2506,6 +2506,22 @@ forward_peak.py judges the VRAM corridor AT PEAK rather than idle — wired into
 (`forward_peak.py:150-155`), and that variable has no `environ.py` entry (#505-D11).
 cachetrim with --ready-url self-retirement, which refuses a missing ready signal
 with its own measured counter-number (`scripts/dsv4/cachetrim.sh:295`).
+The in-process successor is the progress-coupled GGUF stream trim
+(`model_loader/gguf_shards.ProgressCoupledTrim`, off unless
+`SGLANG_GGUF_STREAM_TRIM_SOFT_GIB` is set). Its budget model was WRONG until
+#534 and the correction is worth carrying: **CUDA pinned host memory is
+accounted in the cgroup's `file` bucket, not `anon`** (measured 2026-08-04 --
+49.66 GiB of offload pinned pool against `anon` steady at 14.6 GiB), so
+`memory.current` hides it inside what looks like reclaimable page cache. The
+old `ask = current - target` therefore over-asked by exactly the unreclaimable
+bytes and, once `anon + pinned` passed the target, never stopped asking --
+evicting the loader's own read-ahead as fast as it was created
+(`ANALYSE_478_RESULT_q3kxl_refused.md`). The target is now raised to that floor
+when it sits above the configured one, with the pinned term summed over every
+LIVE rank through `layers/moe/pinned_host_ledger.py` (`memory.current` is
+cgroup-wide, so a per-process read would correct by less than a third on a
+TP=3 boot). `SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB` is the only policy term and
+ships at 0.0, pinned inert in `test_bounding_default_value_pins.py`.
 expert_stats (router distribution + hit rate). CollectiveClock gives compute vs wait
 per rank for **plain-prefill forwards on the target runner only**, and only on cuda
 with `pp_size == 1` (`managers/scheduler_components/metrics_reporter.py:341-352`,
