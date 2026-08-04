@@ -52,7 +52,7 @@ class CountingTts:
         return self._languages
 
     async def synthesize(self, text, language, reference, reference_text=None,
-                         voice_id=None):
+                         voice_id=None, pacing=None):
         self.calls.append({"text": text, "language": language,
                            "voice_id": voice_id})
         if self.fail:

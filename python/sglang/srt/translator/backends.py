@@ -150,6 +150,85 @@ class AudioChunk:
         return cls(np.zeros(int(seconds * sample_rate), dtype=np.float32), sample_rate)
 
 
+@dataclasses.dataclass
+class TurnPacing:
+    """What one TURN's units share when audio is emitted incrementally.
+
+    A synthesizer that streams has to answer "how much audio is still owed?"
+    before it may release its first chunk, and the answer is not a property of
+    the unit it was handed. One talker serves the whole session and the units
+    of a turn are synthesized back to back, so the listener hears ONE
+    continuous stream whose deficit accumulates across clause boundaries.
+    Sizing a pre-roll against the current unit alone banks enough audio to
+    reach the end of that clause and exactly nothing for the next one, which
+    lands the gap at the seam instead of removing it.
+
+    Mutable and shared on purpose: the session appends to it as MT produces
+    further clauses, and the synthesizer reads the latest value on every
+    decode step until it commits. That is what lets a clause arriving during
+    the pre-roll still lengthen it.
+
+    Written from the talker's worker thread and read from the event loop
+    without a lock. Every field is a single machine word written by one
+    writer, and the consequence of reading a stale one is a pre-roll a few
+    frames off -- against a lock held across a decode step, which is 93 ms of
+    the card.
+    """
+
+    #: WHICH turn this is, and WHICH generation of it. Carried so a synthesis
+    #: in flight can be IDENTIFIED rather than only counted. `abort_playback`
+    #: already reports an `aborted_turn_id`, and the client already discards
+    #: audio per `turn_id`, so stopping one turn is a NARROWING of that path
+    #: rather than a second mechanism -- but only if the thing doing the
+    #: emitting knows which turn it emits for. One field now, a refactor later.
+    #:
+    #: `generation` separates a re-synthesis of a turn from its original.
+    #: Nothing in the synthesizer is keyed by `turn_id` -- no cache, no
+    #: registry, no per-turn state outliving one call -- so a second
+    #: generation of the same turn is simply a second `TurnPacing` with a
+    #: higher `generation`, and the two cannot be mistaken for one another.
+    turn_id: Optional[str] = None
+    target: Optional[str] = None
+    generation: int = 0
+    #: Characters of this turn's units that are queued but not yet handed to
+    #: the synthesizer. Characters rather than seconds because that is the
+    #: variable the measured fit is expressed in: `steps = 14 + 0.7 x chars`.
+    pending_chars: int = 0
+    #: THE POINT OF NO RETURN, and there is exactly one of it. Audio already
+    #: sent cannot be recalled, only superseded, so every decision that assumes
+    #: the listener has heard nothing yet reads this one flag: the re-draw of a
+    #: runaway generation today, and anything that would replace a turn's audio
+    #: later. The emitter sets it at the moment a chunk becomes reachable and
+    #: never clears it, because a boundary that can move is not a boundary.
+    started: bool = False
+    #: Audio seconds emitted for this turn so far, across all its units.
+    emitted_audio_s: float = 0.0
+    #: Stop emitting for THIS turn. Read by the emitter before every chunk, so
+    #: setting it stops audio at the source without cancelling the talker
+    #: thread -- which cannot be cancelled once inside `generate_voice_clone`
+    #: anyway, and whose remaining work is harmless once nothing it produces
+    #: reaches the wire. NOTHING SETS IT TODAY: it exists so that stopping one
+    #: turn is an assignment rather than a new path through the synthesizer.
+    cancelled: bool = False
+
+    def note_queued(self, text: str) -> None:
+        self.pending_chars += len(text)
+
+    def note_started(self, text: str) -> None:
+        """This unit has left the queue and is now the one being generated."""
+        self.pending_chars = max(0, self.pending_chars - len(text))
+
+    def cancel(self) -> None:
+        """Abandon what this turn has not yet emitted.
+
+        Deliberately not an undo. What was sent stays sent and `started` stays
+        true; the caller names the dead `turn_id` and the client drops the
+        frames it already holds for it, which is the contract `abort_playback`
+        documents and the reason that contract is enough per turn.
+        """
+        self.cancelled = True
+
+
 @dataclasses.dataclass(frozen=True)
 class Transcript:
     """One recognized utterance.
@@ -290,8 +369,15 @@ class TtsBackend(Protocol):
         reference: AudioChunk,
         reference_text: Optional[str] = None,
         voice_id: Optional[str] = None,
+        pacing: Optional[TurnPacing] = None,
     ) -> AsyncIterator[AudioChunk]:
         """Stream synthesized audio for ``text`` in ``reference``'s voice.
+
+        ``pacing`` carries the TURN this unit belongs to (see ``TurnPacing``).
+        Backends that emit a finished waveform ignore it; a backend that emits
+        incrementally needs it to know how much audio the turn still owes
+        before it may release its first chunk. Optional so that a backend
+        which does not stream needs no change at all.
 
         ``voice_id`` names a voice the backend already holds -- a preset
         registered once with a serving-side voice registry. When set, the
@@ -502,6 +588,7 @@ class FakeTts:
         reference: AudioChunk,
         reference_text: Optional[str] = None,
         voice_id: Optional[str] = None,
+        pacing: Optional[TurnPacing] = None,
     ) -> AsyncIterator[AudioChunk]:
         self.calls.append((text, language, reference.duration_s, reference_text))
         self.voice_ids.append(voice_id)
@@ -518,5 +605,9 @@ class FakeTts:
         emitted = 0.0
         while emitted < total:
             span = min(self._chunk_seconds, total - emitted)
-            yield AudioChunk(_tone(pitch, span, self.sample_rate), self.sample_rate)
+            chunk = AudioChunk(_tone(pitch, span, self.sample_rate), self.sample_rate)
+            if pacing is not None:
+                pacing.started = True
+                pacing.emitted_audio_s += chunk.duration_s
+            yield chunk
             emitted += span

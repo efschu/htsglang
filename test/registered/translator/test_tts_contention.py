@@ -62,7 +62,8 @@ def detached_backend(generate_seconds: float = SYNTHESIS_S) -> InProcessQwen3Tts
     tts._model = object()
     tts._lock = asyncio.Lock()
 
-    def _generate(text, language, reference, reference_text):
+    def _generate(text, language, reference, reference_text,
+                  sink=None, pacing=None):
         # The real one blocks a worker thread; this one blocks for a known
         # time so the wait a second caller measures has a value to compare to.
         import time as _time

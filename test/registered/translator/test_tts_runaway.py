@@ -289,7 +289,8 @@ class TestBusyStaysTrueWhileTheThreadLives(unittest.IsolatedAsyncioTestCase):
         tts.peak_inside = 0
         guard = threading.Lock()
 
-        def _generate(text, language, reference, reference_text):
+        def _generate(text, language, reference, reference_text,
+                      sink=None, pacing=None):
             # Stands in for a talker that has not reached its EOS yet: this
             # thread cannot be cancelled from the event loop, exactly like the
             # real one.
@@ -482,7 +483,8 @@ class TestTheTextIsWhatBoundsTheDecode(unittest.TestCase):
         healthy = np.full(int(20 / 12.5 * rate), 0.05, dtype=np.float32)
         drawn = []
 
-        def fake(text, language, reference, reference_text, max_new_tokens):
+        def fake(text, language, reference, reference_text, max_new_tokens,
+                 emitter=None):
             drawn.append(max_new_tokens)
             return runaway if len(drawn) == 1 else healthy
 
@@ -500,7 +502,8 @@ class TestTheTextIsWhatBoundsTheDecode(unittest.TestCase):
         speech = np.full(int(1.5 * tts.sample_rate), 0.05, dtype=np.float32)
         drawn = []
 
-        def fake(text, language, reference, reference_text, max_new_tokens):
+        def fake(text, language, reference, reference_text, max_new_tokens,
+                 emitter=None):
             drawn.append(max_new_tokens)
             return speech
 
@@ -516,7 +519,8 @@ class TestTheTextIsWhatBoundsTheDecode(unittest.TestCase):
         runaway = np.full(int(budget / 12.5 * tts.sample_rate), 0.05, dtype=np.float32)
         calls = []
 
-        def fake(text, language, reference, reference_text, max_new_tokens):
+        def fake(text, language, reference, reference_text, max_new_tokens,
+                 emitter=None):
             calls.append(max_new_tokens)
             return runaway
 

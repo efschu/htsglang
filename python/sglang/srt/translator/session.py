@@ -61,6 +61,7 @@ from sglang.srt.translator.backends import (
     AudioChunk,
     BackendError,
     Transcript,
+    TurnPacing,
 )
 from sglang.srt.translator.languages import (
     ConversationLanguages,
@@ -2614,6 +2615,14 @@ class TranslatorSession:
         # that never stops.
         will_speak = not silent and reference is not None
         unit_index = 0
+        # WHAT THE TURN STILL OWES, shared by every unit of it. A synthesizer
+        # that emits audio incrementally cannot size its pre-roll from the unit
+        # it was handed: the units of a turn are synthesized back to back on
+        # one talker, so the listener hears a single stream whose deficit
+        # accrues across the clause boundaries. Kept up to date as MT produces
+        # further clauses, so a clause that arrives during the pre-roll still
+        # lengthens it. Backends that emit a finished waveform ignore it.
+        pacing = TurnPacing(turn_id=turn_id, target=target)
 
         def announce(index: int, state: str) -> None:
             self.journal.append(
@@ -2647,6 +2656,11 @@ class TranslatorSession:
             # point is to name the interval BEFORE any audio exists, which is
             # the one the user sits through.
             announce(index, "synthesizing")
+            # This unit has left the queue and is now the one being generated,
+            # so it stops counting as pending and starts counting as the
+            # synthesizer's own text. Done here rather than in `enqueue_speech`
+            # because the two are separated by the whole depth of the backlog.
+            pacing.note_started(unit)
             # Per UNIT, not per turn: a turn may hold several units and a
             # per-turn budget would let the first one eat all of it. The
             # deadline covers the whole stream of one unit, so a talker that
@@ -2655,7 +2669,7 @@ class TranslatorSession:
             async with asyncio.timeout(self.tts_unit_timeout_s):
                 async for piece in self.tts.synthesize(
                     unit, target, reference, reference_text,
-                    voice.backend_voice_id,
+                    voice.backend_voice_id, pacing,
                 ):
                     if first_audio_at is None:
                         first_audio_at = self._clock()
@@ -2710,6 +2724,7 @@ class TranslatorSession:
             index = unit_index
             unit_index += 1
             announce(index, "queued")
+            pacing.note_queued(unit)
             speech.put_nowait((index, unit))
 
         async def speech_worker() -> None:

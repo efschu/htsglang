@@ -74,7 +74,8 @@ class SlowTts:
     def busy(self):
         return self._lock.locked()
 
-    async def synthesize(self, text, language, reference, reference_text, voice_id):
+    async def synthesize(self, text, language, reference, reference_text,
+                         voice_id, pacing=None):
         async with self._lock:
             await asyncio.sleep(self._delay_s)
             async for piece in self._inner.synthesize(
