@@ -55,7 +55,7 @@ def _resolve_draft_attention_backend_fallback(
 
 
 def _refuse_unsupported_speculative_moe_backend(
-    *, server_args: ServerArgs, algo_label: str, gpu_id: Optional[int] = None
+    *, server_args: ServerArgs, algo_label: str, tp_rank: Optional[int] = None
 ) -> None:
     """Refuse a draft MoE runner backend this rank's card cannot run, by name.
 
@@ -90,19 +90,21 @@ def _refuse_unsupported_speculative_moe_backend(
     # 5090 host is fine, and the two SM86 shadows killed the boot during init.
     # Found on hardware, TICKET_470 Boot B, 2026-08-04.
     #
-    # ``_solo_is_shadow`` on the worker is "solo active and not host", but it
-    # is a property of an object that does not exist yet at build time. The
-    # same fact is available here from the placement flags plus this rank's
-    # gpu_id, which build_draft_tp_worker already receives.
-    placement = getattr(server_args, "speculative_draft_placement", None)
-    draft_gpu = getattr(server_args, "speculative_draft_gpu", None)
-    if (
-        placement == "solo"
-        and draft_gpu is not None
-        and gpu_id is not None
-        and int(gpu_id) != int(draft_gpu)
+    # The axis is TP RANK, not gpu_id: the workers' own host predicate is
+    # ``tp_rank == speculative_draft_solo_rank()`` (eagle_worker_v2.py:328),
+    # and speculative_draft_solo_rank() resolves --speculative-draft-gpu
+    # through the same gpu_id_for_rank mapping the schedulers use. A first
+    # attempt at this fix compared gpu_id against speculative_draft_gpu and did
+    # NOT work on hardware, because gpu_id inside a worker process is not the
+    # global CUDA ordinal that flag names.
+    if getattr(server_args, "speculative_draft_placement", None) == "solo" and (
+        tp_rank is not None
     ):
-        return
+        try:
+            if int(tp_rank) != int(server_args.speculative_draft_solo_rank()):
+                return
+        except (AttributeError, TypeError, ValueError):
+            pass  # cannot resolve the host rank -> fall through and refuse
     from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
     if is_sm90_supported() or is_sm120_supported():
@@ -161,7 +163,7 @@ def build_draft_tp_worker(
     )
 
     _refuse_unsupported_speculative_moe_backend(
-        server_args=server_args, algo_label=algo_label, gpu_id=gpu_id
+        server_args=server_args, algo_label=algo_label, tp_rank=tp_rank
     )
 
     saved_server_args = get_server_args()
