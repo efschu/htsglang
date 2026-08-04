@@ -5,6 +5,34 @@ build (`CUDA_VISIBLE_DEVICES=99`). No `/spinning/gpu-arb/` window was taken and
 no kernel has executed. Nothing in this document may be cited as a measurement
 until the corresponding section is filled in from a real run.
 
+> **Correction 2026-08-04 — the wheel IS installed.** The #398 merge message
+> and the header above both say the wheel was built but not installed. That
+> stopped being true on 2026-08-03 12:37. Proof, not inference:
+> `/spinning/htsglang-gpu/.venv/.../sglang_kernel-0.4.4.dist-info/direct_url.json`
+> reads `file:///spinning/wt-398-wheel/...whl` with
+> `sha256=67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664`,
+> i.e. exactly the pinned #398 wheel, and
+> `CUDA_VISIBLE_DEVICES=99 python -c "import sgl_kernel, torch;
+> print(hasattr(torch.ops.sgl_kernel,'ggml_mxfp4_native'))"` prints `True`.
+> Consequence: `MXFP4_NATIVE` is True in the serving venv, so MXFP4 is in
+> `DEQUANT_/MMVQ_/MMQ_QUANT_TYPES` and the load-time repack is already a no-op
+> unless a boot sets `SGLANG_GGUF_MXFP4_NATIVE=0`. Sections 1-5 stay PENDING —
+> installed is not measured — but the "repack arm" in §2/§5 is no longer the
+> default and must be produced with the env kill switch, not by doing nothing.
+>
+> **The gate could not run, and that was invisible.** With the wheel installed,
+> `test_gguf_mxfp4_native.py` did not fail — it *aborted the interpreter*
+> (`Fatal Python error: Aborted`) at the first `_FakeNativeOp` block. The
+> helper probed `hasattr(torch.ops.sgl_kernel, "ggml_mxfp4_native")` before
+> anything had imported `sgl_kernel`; torch registers ops when the extension
+> `.so` loads, not when the namespace is touched, so the probe answered
+> "absent" on a wheel that carries the op, the fake schema was defined, and the
+> real `.so` loading afterwards registered the same schema twice — a C++ abort,
+> not a catchable exception. Fixed by importing `sgl_kernel` before the probe
+> (`test_gguf_mxfp4_native.py:179-192`). Falsifier: abort unfixed / 16 passed
+> fixed, and the collision reproduces in four lines outside pytest
+> (define fake -> `import sgl_kernel` -> abort).
+
 What #398 shipped (source): a complete GGUF MXFP4 (ggml type 39) kernel set in
 `sgl-kernel/csrc/quantization/gguf/` — dequantize, dense MMVQ, dense MMQ, MoE
 MMVQ, MoE MMQ, plus the `ggml_moe_get_block_size` registration and a
@@ -255,3 +283,75 @@ ms/verify delta          : PENDING
   loader instead of `get_int_b1` (the 17-byte stride);
 * a shard whose element count is a multiple of 32 but not 256 producing
   garbage at the tail → the dequant guard is not doing its job.
+
+---
+
+## 7 — Continuation note (2026-08-04, branch `feat/398-mxfp4-native`)
+
+Written so a successor can continue without this session's memory.
+
+### What stands
+
+Both stages of the original two-stage plan are **already merged** on
+`integration/r3-probe-next2` (merge `08bde23da7`); do not rebuild them.
+
+| piece | where | state |
+|---|---|---|
+| `block_mxfp4` struct, E8M0 + 32x fp4-e2m1 | `sgl-kernel/csrc/quantization/gguf/ggml-common.h` | done |
+| `dequantize_block_mxfp4` | `.../dequantize.cuh` | done |
+| `vec_dot_mxfp4_q8_1`, MMVQ | `.../vecdotq.cuh`, `.../mmvq.cuh` | done (stage 2) |
+| MMQ tile (`MMQ_X/Y_MXFP4 = 4/32`, `NWARPS_MXFP4 = 4`) | `.../mmq.cuh` | done (stage 2) |
+| MoE MMVQ / MMQ | `.../moe_vec.cuh`, `.../moe.cuh` | done (stage 2) |
+| capability marker `ggml_mxfp4_native` | `.../common_extension.cc` | done |
+| python gate `MXFP4_NATIVE` | `python/sglang/srt/layers/quantization/gguf.py:250-285` | done |
+| repack hand-off (identity on native) | `python/sglang/srt/model_loader/gguf_mxfp4_repack.py` | done |
+
+The gate is a pure registration probe — `hasattr(torch.ops.sgl_kernel,
+"ggml_mxfp4_native")` at `gguf.py:276`, never a call. That matters twice: it is
+why #518's dispatch-key defect does **not** block MXFP4 (only ops that are
+actually *called* with no tensor were affected), and it is why the probe must
+never run before `sgl_kernel` is imported (see the correction at the top).
+
+### What is next, in order
+
+1. **Gate A on GPU** (§1) — 14 CUDA tests, both arches, in window #537. They
+   are the only thing standing between "installed" and "proven". Currently
+   `SKIPPED: no CUDA device` off-GPU.
+2. **Gate B** (§2) — native vs repack on the two live IQ3_XXS MXFP4 tensors.
+   The repack arm now needs `SGLANG_GGUF_MXFP4_NATIVE=0` explicitly.
+3. **#512/#518 rebuild** — `TICKET_511_kernel_bundle_wheel.md`, still NOT
+   BUILT. Preconditions were re-checked 2026-08-04 and are **not met**: the
+   translator/DSV4F boot is live on all three cards and 5 processes map
+   `sgl_kernel`. Neither defect blocks MXFP4 (#512 needs a >2 GiB per-rank
+   per-layer expert tensor, out of reach at TP=3; #518 is worked around by the
+   `_ggml_moe_get_block_size` python mirror), so this is not on the critical
+   path for #398 — but the runbook §2.1 pin still names the pre-#512/#518
+   wheel, and that pin is what a fresh install would restore.
+4. Gates C-E (§3-§5) only after A and B are green.
+
+### Reference values and fixtures that already exist
+
+* `test/registered/unit/quantization/mxfp4_real_rows.npy` — real
+  `blk.26.ffn_down_exps` bytes; the block layout was taken from the actual GGUF
+  file, not from documentation (the #372 lesson), and `test_real_tensor_rows`
+  gates the kernel against a host decode of exactly those bytes.
+* Host reference decoder + `e8m0_to_fp32_half` live in
+  `test_gguf_mxfp4_native.py`; the dequant gates are **exact**, zero tolerance —
+  a table lookup times a power of two has no rounding to hide behind.
+* Derived (not inherited) MMVQ/MMQ tolerances: `activation_quant_sigma()` at
+  `SIGMA_MULTIPLIER=8`, from #511. The old atol=1.5/rtol=3e1 predicate accepted
+  an all-zero and a sign-flipped output; two tests now execute that refuted
+  predicate so the regression cannot come back quietly.
+* Byte accounting, already pinned by a test: MXFP4 17 B/32 values (4.250 bpw)
+  vs Q5_0 repack 22 B (5.500 bpw) — repack reads 29.4 % more, native 22.7 %
+  fewer.
+
+### Build state
+
+No rebuild was performed or needed on this branch: the change is test-only, and
+the installed wheel (sha `67f03cfa`) already carries every #398 kernel. Hermetic
+results, `CUDA_VISIBLE_DEVICES=99`, `PYTHONPATH=<worktree>/python`:
+`test_gguf_mxfp4_native.py` 16 passed (was: interpreter abort);
+`test_gguf_mxfp4_cuda.py` + `test_gguf_mxfp4_dsv4f_moe_479.py` +
+`test_gguf_mxfp4_bridge.py` 30 passed, 24 subtests, 14 skipped (all 14 are the
+GPU-only Gate-A cases). `ruff` and `codespell` clean on the changed file.

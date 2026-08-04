@@ -178,6 +178,19 @@ class _FakeNativeOp:
 
     def __enter__(self):
         self._lib = None
+        # Load the wheel's operator table BEFORE probing. torch registers ops
+        # when the extension .so is loaded, not when the namespace is first
+        # touched, so probing an unimported sgl_kernel reports "absent" even on
+        # a wheel that carries the op. Defining the fake on that answer and
+        # letting the real .so load afterwards registers the same schema twice,
+        # which aborts the process in C++ rather than raising -- the whole file
+        # died at the first such block once the #398 wheel was actually
+        # installed. Importing first makes the probe below answer about the
+        # wheel on disk.
+        try:
+            import sgl_kernel  # noqa: F401
+        except Exception:
+            pass  # no wheel at all -- the fake is exactly what this block wants
         if hasattr(torch.ops.sgl_kernel, "ggml_mxfp4_native"):
             return self  # real wheel already has it
         self._lib = torch.library.Library("sgl_kernel", "FRAGMENT")
