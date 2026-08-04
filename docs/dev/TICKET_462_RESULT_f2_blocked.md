@@ -69,6 +69,65 @@ to write against a restore deadline with no reference output to check against.
 The correct sequence is a desk pass over `LogitsProcessorOutput`'s field
 semantics plus a byte-identity falsifier against the eager control, then a boot.
 
+### WRITTEN AFTER THE WINDOW (#535/B2), with the desk pass first
+
+The contract was derived from code, not from the dataclass comments:
+
+* `DecodeCudaGraphRunner.execute` is the only consumer of a decode replay
+  output and slices `next_token_logits`, `full_logits`, `hidden_states` and
+  `cross_aux_hidden_states` with the SAME `[: raw_num_token]`
+  (`decode_cuda_graph_runner.py:2112-2144`). That is the downstream statement
+  that the four share a leading dimension here.
+* They share it because `_get_pruned_states` sets `pruned_states =
+  hidden_states` and `sample_indices = None` in `decode_or_idle` /
+  `target_verify` / `draft_extend_v2` (`logits_processor.py:585-596`) — the
+  sampled logits are never gathered down to one row per sequence.
+* The one place the fields genuinely DISAGREE is prefill:
+  `prefill_cuda_graph_runner.py:1194` slices `next_token_logits` by `raw_bs`
+  while `hidden_states` goes by `raw_num_tokens`. That case cannot reach this
+  branch — with a prefill BCG the runner captures the LAYER MODEL body (a bare
+  tensor) and runs the LM head and logits processor eagerly outside the graph
+  (`:1103-1130`).
+* Parts 2 and 3 of the dataclass (the sampler's logprob fields, the
+  prefill-only input-logprob fields) and `customized_info` are host-side and
+  never rewritten by a replay. They are REFUSED by name, not passed through:
+  a replay buffer would serve them frozen at capture-time content with the
+  right type and no exception.
+
+So the branch is an allowlist of five per-token tensor fields
+(`_LPO_TOKEN_DIM_FIELDS`), a by-name refusal for everything else, and a refusal
+when the present fields disagree on their leading dimension. Nothing is
+guessed; the underdetermined case raises.
+
+**A second, independent defect was found in the same layer and fixed with it.**
+The shared output buffer was sized from `shape_key.size`, which for a decode
+runner is the BATCH size (`_capture_graph_size`,
+`decode_cuda_graph_runner.py:682`), while the body's output is indexed by
+TOKENS — `bs * num_tokens_per_bs` under a non-ragged speculative verify. One
+row per sequence for a per-token output truncates every draft position but the
+first, with no error, on exactly the F2 arm. The budget now takes the body's
+own leading dimension where it is larger; captures run largest-first, so the
+first one sets the high-water mark, and a later shape that needed more refuses
+instead of truncating.
+
+Tests: `test/registered/unit/model_executor/test_bcg_logits_output_buffer_462.py`,
+18 hermetic arms — per-field value round-trip (a swapped mapping between two
+same-shaped fields is caught on VALUES, which shape checks cannot do), the
+disagreement refusal with its spread precondition, the by-name refusals, the
+row budget, neutrality for the four pre-existing output shapes, and a
+mock-side capture→store→replay smoke that ends on a discrimination check
+(the stored outputs must be VIEWS onto the shared buffer, or a replay would
+serve capture-time logits). TWO executed can-fail mutations: removing the
+leading-dim refusal → red; taking the row budget from the graph key → red.
+
+**Still not a measurement.** No boot, no replay on a card, no crossing count,
+no F2 verdict. `43 crossings/round` remains an unverified desk figure. The next
+window's falsifier is the F2 arm rerun: the capture must now complete, and the
+first thing to check after it does is that the breakable arm's greedy output is
+byte-identical to the `462_eager` control (131.475 ms/round, floor 0.401 %) —
+identical text is what rules out the wrong-rows failure this branch was held
+back for, and it is a stronger check than any shape assertion.
+
 ### What is now known that was not known before
 
 * The breakable route's **configuration** path is sound end to end:

@@ -484,6 +484,37 @@ class ProgressCoupledTrim:
     loader re-reads from disk if it needs it again. Worst case is a slower
     load, not a wrong one. WITH swap configured that argument fails, so this
     refuses to act.
+
+    CORRECTION (#537, measured 2026-08-04). The paragraph above is right that
+    the pinned pool is out of reach of reclaim, and WRONG about where the
+    kernel files it. It assumed the pool is ANONYMOUS -- and therefore that
+    ``memory.current`` minus the reclaimable part is a meaningful trim target.
+    It is not: **CUDA pinned host memory is accounted in the cgroup's ``file``
+    bucket**, measured on the 2026-08-04 window's control arm, whose offload
+    ledger reported 20.78 + 14.44 + 14.44 = 49.66 GiB of pinned pool while
+    ``rammon`` showed ``anon`` steady at 14.6 GiB. The consequence is a defect
+    in this class's model of its own budget, not in the safety argument:
+
+    * ``maybe_trim`` used to compute ``ask = current - target`` and treat every
+      one of those bytes as reclaimable;
+    * ``memory.reclaim`` can only take clean page cache;
+    * so once ``anon + pinned`` rises above ``target``, the target is
+      unsatisfiable at any setting, the trim asks again on every single call,
+      and it evicts the loader's own read-ahead as fast as the loader creates
+      it. Attempt 1 of the UD-Q3_K_XL boot traced exactly that sawtooth
+      (GiB: 86.2 -> 76.8 -> 95.5 -> 82.7 -> 101.5 -> 103.5 -> 103.9 -> killed)
+      with the marks set ABOVE the desk-predicted floor.
+
+    The fix is :meth:`_floor_bytes`: the target is raised to the unreclaimable
+    floor (``anon`` from ``memory.stat`` + the pinned pool summed over every
+    live rank via :mod:`sglang.srt.layers.moe.pinned_host_ledger` + an operator
+    headroom) whenever that floor sits above the configured target. The trim
+    then asks only for bytes that can actually be given back, and goes quiet
+    instead of fighting the loader once nothing is left. Whenever the floor is
+    BELOW the configured target -- every boot with no pinned pool, and every
+    boot whose pool is small next to its marks -- the arithmetic is unchanged.
+
+    Full write-up: ``docs/dev/ANALYSE_478_RESULT_q3kxl_refused.md``.
     """
 
     def __init__(self) -> None:
@@ -492,9 +523,17 @@ class ProgressCoupledTrim:
         self.soft_bytes = int(envs.SGLANG_GGUF_STREAM_TRIM_SOFT_GIB.get() * (1 << 30))
         target_gib = envs.SGLANG_GGUF_STREAM_TRIM_TARGET_GIB.get()
         self.target_bytes = int(target_gib * (1 << 30)) if target_gib else 0
+        self.headroom_bytes = int(
+            envs.SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB.get() * (1 << 30)
+        )
         self.enabled = self.soft_bytes > 0
         self.trims = 0
         self.bytes_reclaimed = 0
+        #: Last computed unreclaimable floor, and whether it overrode the
+        #: configured target. Read by tests and by the load-summary log.
+        self.floor_bytes: Optional[int] = None
+        self.floor_overrode_target = False
+        self._floor_warned = False
         if self.enabled and not self._swapless():
             logger.warning(
                 "GGUF stream: SGLANG_GGUF_STREAM_TRIM_SOFT_GIB is set but this "
@@ -526,13 +565,93 @@ class ProgressCoupledTrim:
         except (OSError, ValueError):
             return None
 
+    @staticmethod
+    def _anon() -> Optional[int]:
+        """Anonymous bytes charged to the cgroup, from ``memory.stat``.
+
+        Anon is the half of the unreclaimable floor the kernel does report
+        honestly on a swapless box. The other half -- the pinned host pool --
+        hides inside ``file`` and has to come from the offload ledger.
+        """
+        try:
+            with open(f"{_CGROUP}/memory.stat") as fh:
+                for line in fh:
+                    if line.startswith("anon "):
+                        return int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        return None
+
+    @staticmethod
+    def _pinned() -> Optional[int]:
+        """Pinned host bytes held by every live rank, or ``None`` if unknown."""
+        try:
+            from sglang.srt.layers.moe.pinned_host_ledger import total_pinned_bytes
+
+            return total_pinned_bytes()
+        except Exception:  # noqa: BLE001 - an optimisation must never raise here
+            return None
+
+    def _floor_bytes(self) -> Optional[int]:
+        """Bytes ``memory.reclaim`` provably cannot take, plus the headroom.
+
+        ``None`` when ``anon`` is unreadable, which keeps the caller on the
+        pre-#537 arithmetic rather than guessing a floor. An unknown PINNED
+        term is different and is taken as zero: that is the ordinary state of a
+        boot with no expert offload, where ``anon`` alone IS the floor, and
+        returning ``None`` there would drop a correction that is right.
+        """
+        anon = self._anon()
+        if anon is None:
+            return None
+        pinned = self._pinned()
+        if pinned is None:
+            # No rank has published a pinned pool. That is the ordinary state
+            # for a boot without expert offload, where anon alone is the floor.
+            pinned = 0
+        return anon + pinned + self.headroom_bytes
+
+    def _effective_target(self) -> int:
+        """The configured target, raised to the unreclaimable floor if needed.
+
+        NOTE for anyone tempted to subtract something here: the headroom term
+        is the ONLY slack, it is an explicit operator knob
+        (``SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB``) and it defaults to 0. No
+        implicit safety factor is applied on top of the floor -- the floor is a
+        physical statement about what reclaim can reach, not a policy.
+        """
+        target = self.target_bytes
+        floor = self._floor_bytes()
+        self.floor_bytes = floor
+        self.floor_overrode_target = floor is not None and floor > target
+        if not self.floor_overrode_target:
+            return target
+        if not self._floor_warned:
+            self._floor_warned = True
+            logger.warning(
+                "GGUF stream: the unreclaimable floor (anon + pinned host pool "
+                "+ headroom) is %.1f GiB, above the configured trim target of "
+                "%.1f GiB. cgroup reclaim cannot take pinned pages, so the "
+                "configured target is unreachable; trimming to the floor "
+                "instead. Raise SGLANG_GGUF_STREAM_TRIM_TARGET_GIB above the "
+                "floor to make the marks meaningful again.",
+                floor / (1 << 30),
+                target / (1 << 30),
+            )
+        return floor
+
     def maybe_trim(self) -> None:
         if not self.enabled:
             return
         current = self._current()
         if current is None or current <= self.soft_bytes:
             return
-        ask = current - self.target_bytes
+        # #537: `current` includes the pinned host pool, which the kernel files
+        # under `file` but reclaim can never take. Asking for `current - target`
+        # therefore over-asks by exactly the unreclaimable bytes and, once the
+        # floor passes the target, never stops asking. Ask for what can be
+        # given back.
+        ask = current - self._effective_target()
         if ask <= 0:
             return
         try:

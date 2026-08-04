@@ -82,6 +82,45 @@ figure from the offload ledger (which it has, `pinned_bytes`) to compute
 `target = pinned + anon + headroom` rather than treating `current` as if it
 were mostly reclaimable.
 
+### FIXED AFTER THE WINDOW (#537), still unproven on a card
+
+`ProgressCoupledTrim` now computes an unreclaimable floor and raises its target
+to it whenever the floor sits above the configured target:
+
+* `anon` from `memory.stat` — the half of the floor the kernel does report;
+* the pinned pool summed over every LIVE rank, published through
+  `layers/moe/pinned_host_ledger.py`. Per-process would not have been enough:
+  the trim compares against the CGROUP's `memory.current`, which spans all
+  three rank processes, so rank 1 reading only its own 14.44 GiB would have
+  corrected the floor by less than a third of the measured 49.66 GiB;
+* plus `SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB`, the only policy term, shipped at
+  **0.0** because calibrating it needs a load-time page-cache measurement this
+  window could not take. Pinned as inert.
+
+The comment at `gguf_shards.py:479-486` is corrected in place rather than
+deleted: the safety argument it makes is right, the anonymous-accounting
+assumption under it is the documented error, and both are now stated.
+
+Falsifiers (hermetic, `CUDA_VISIBLE_DEVICES=99`):
+`test/registered/unit/model_executor/test_forward_peak_and_stream_trim.py`
+(`TestStreamTrimBudgetModel`, 7 arms) drives the trim against a cgroup model
+whose `file` bucket holds page cache AND the pinned pool. Fixed, it drains the
+reclaimable part once and goes quiet (`trims == 1` over ten calls); with the
+pinned pool made invisible again — the pre-#537 world model, same code path —
+it asks on every call forever and is still asking for 10 GiB that no longer
+exist. `test/registered/unit/layers/moe/test_pinned_host_ledger.py` (8 arms)
+pins the cross-rank sum and the dead-rank skip. Executed can-fail: mutating the
+floor override out turns the suite red.
+
+**What this does NOT establish:** that the Q3_K_XL boot now survives. The
+mechanism correction removes a defect that made the trim harmful; §"What would
+actually be required" above is unchanged, and the arm is still expected to be
+capacity-refused. The GPU-window falsifier is the same command that produced
+the sawtooth: re-run the UD-Q3_K_XL attempt and read the `memory.current`
+trace. Fixed, it must NOT sawtooth — the trim goes quiet at the floor and the
+OOM (if it still comes) arrives from the load transient, not from the trim
+fighting the loader.
+
 ## What would actually be required
 
 Not tuning. The checkpoint needs either

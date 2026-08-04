@@ -48,16 +48,20 @@ QUANT_DIR="$GGUF_ROOT/UD-IQ3_XXS"
 FIRST_SHARD="$QUANT_DIR/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
 [ -f "$FIRST_SHARD" ] || die "first shard not found: $FIRST_SHARD"
 
-# The residency cut. TICKET_470 §0: hosting a ~10.5-11 GiB draft means cutting
-# rank 0's resident expert set by roughly 21 % (~1040 Q3_K experts, ~25 per
-# layer of rank 0's 119-of-256 shard). 0.485 x 0.79 = 0.383.
+# The residency cut. NOW MEASURED (window 2026-08-04, Boot A --
+# TICKET_470_RESULT_first_boot.md §1): 0.485 -> 0.23 on rank 0 frees 10.21 GiB
+# against a DSpark head that needs 10.12 GiB, and costs ~1.3-1.4 % of decode
+# ms/round. Ranks 1 and 2 stay at 0.42 -- the cut is asymmetric by design, and
+# a scalar here would silently cut them too and invalidate the comparison
+# against a_cut.
 #
-# THIS IS ARITHMETIC FROM THE TICKET, NOT A MEASUREMENT. TICKET_470 §7.6 says
-# so itself: "Whether ~11 GiB is the right ask at all. It is arithmetic
-# (ANALYSE_463 §4.4), not a measurement". Override it from the GGUF footprint
-# analysis before the window:
-#     RESIDENT_FRACTION_CUT=0.NNN,0.42,0.42
-RESIDENT_FRACTION_CUT="${RESIDENT_FRACTION_CUT:-0.383,0.42,0.42}"
+# The previous default, 0.383, was ARITHMETIC FROM THE TICKET (0.485 x 0.79,
+# ANALYSE_463 §4.4; TICKET_470 §7.6 flagged it as unmeasured). Measurement put
+# rank 0's resident set ~5 GiB below the desk model, so 0.383 frees only
+# ~4.1 GiB of the 10.12 GiB needed and OOMs rank 0 partway through the draft
+# build. It is replaced rather than kept as a fallback: a value that cannot
+# boot is not a safe default.
+RESIDENT_FRACTION_CUT="${RESIDENT_FRACTION_CUT:-0.23,0.42,0.42}"
 
 case "$SUBARM" in
   a_base)

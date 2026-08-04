@@ -12,6 +12,7 @@ The property that matters most for both is that they are INERT unless asked
 for -- they sit on the forward path and the load path respectively.
 """
 
+import contextlib
 import json
 import os
 import tempfile
@@ -28,6 +29,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
+GIB = 1 << 30
 
 
 class _EnvMixin:
@@ -203,6 +206,181 @@ class TestProgressCoupledTrim(_EnvMixin, CustomTestCase):
             t.maybe_trim()
         self.assertFalse(t.enabled)
         self.assertEqual(t.trims, 0)
+
+
+class _CgroupWithPinnedInTheFileBucket:
+    """A cgroup whose ``file`` bucket holds page cache AND the pinned pool.
+
+    That is the whole defect (#537, measured 2026-08-04): CUDA pinned host
+    memory is charged to ``file``, so ``memory.current`` cannot tell the two
+    apart, while ``memory.reclaim`` can only ever take the page-cache half.
+    """
+
+    def __init__(self, *, anon_gib, pinned_gib, cache_gib):
+        self.anon = int(anon_gib * GIB)
+        self.pinned = int(pinned_gib * GIB)
+        self.cache = int(cache_gib * GIB)
+        self.asks = []
+
+    @property
+    def current(self):
+        return self.anon + self.pinned + self.cache
+
+    @property
+    def reclaimable(self):
+        return self.cache
+
+    def reclaim(self, ask):
+        self.asks.append(int(ask))
+        taken = min(int(ask), self.cache)
+        self.cache -= taken
+        return taken
+
+
+@contextlib.contextmanager
+def _driven_by(cgroup, *, pinned_visible=True, anon_visible=True):
+    """Wire a ProgressCoupledTrim to ``cgroup``.
+
+    ``pinned_visible=False`` reproduces the module's PRE-#537 world model --
+    the pinned pool assumed anonymous and therefore invisible in the file
+    bucket -- against otherwise identical inputs. That is the can-fail arm.
+    ``anon_visible=False`` is a cgroup whose ``memory.stat`` cannot be read.
+    """
+
+    class _ReclaimFile:
+        def write(self, payload):
+            cgroup.reclaim(int(payload))
+            return len(payload)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    with mock.patch.object(
+        ProgressCoupledTrim, "_current", staticmethod(lambda: cgroup.current)
+    ), mock.patch.object(
+        ProgressCoupledTrim,
+        "_anon",
+        staticmethod(lambda: cgroup.anon if anon_visible else None),
+    ), mock.patch.object(
+        ProgressCoupledTrim,
+        "_pinned",
+        staticmethod(lambda: cgroup.pinned if pinned_visible else 0),
+    ), mock.patch(
+        "builtins.open", lambda *a, **k: _ReclaimFile()
+    ):
+        yield
+
+
+class TestStreamTrimBudgetModel(_EnvMixin, CustomTestCase):
+    """#537: the trim's target must sit above the bytes reclaim cannot take.
+
+    Geometry taken from the UD-Q3_K_XL boot that died on it
+    (``docs/dev/ANALYSE_478_RESULT_q3kxl_refused.md``): a ~104 GiB ceiling, a
+    pinned expert pool far larger than the runtime's anon, and marks that the
+    desk note had already raised ABOVE the predicted floor and that still lost.
+    """
+
+    def _armed_trim(self, *, soft=96, target=90, headroom=None):
+        self._set("SGLANG_GGUF_STREAM_TRIM_SOFT_GIB", soft)
+        self._set("SGLANG_GGUF_STREAM_TRIM_TARGET_GIB", target)
+        self._set("SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB", headroom)
+        with mock.patch.object(
+            ProgressCoupledTrim, "_swapless", staticmethod(lambda: True)
+        ):
+            return ProgressCoupledTrim()
+
+    def test_ask_is_capped_at_what_reclaim_can_actually_give_back(self):
+        cg = _CgroupWithPinnedInTheFileBucket(
+            anon_gib=15, pinned_gib=85, cache_gib=4
+        )
+        self.assertEqual(cg.current, 104 * GIB)
+        t = self._armed_trim()
+        # What the pre-#537 arithmetic would have asked for, stated so the
+        # over-ask is visible rather than implied.
+        unfixed_ask = cg.current - t.target_bytes
+        self.assertEqual(unfixed_ask, 14 * GIB)
+        self.assertGreater(unfixed_ask, cg.reclaimable)
+
+        with _driven_by(cg):
+            t.maybe_trim()
+
+        self.assertEqual(cg.asks, [4 * GIB], "ask = current - unreclaimable floor")
+        self.assertTrue(t.floor_overrode_target)
+        self.assertEqual(t.floor_bytes, 100 * GIB)
+
+    def test_it_converges_instead_of_asking_on_every_call(self):
+        """The falsifier. Unfixed the target is unsatisfiable, so the trim
+        never stops asking and keeps evicting the loader's read-ahead; fixed it
+        drains the reclaimable part once and then goes quiet.
+        """
+        cg = _CgroupWithPinnedInTheFileBucket(
+            anon_gib=15, pinned_gib=85, cache_gib=10
+        )
+        t = self._armed_trim()
+        with _driven_by(cg):
+            for _ in range(10):
+                t.maybe_trim()
+
+        self.assertEqual(cg.cache, 0, "the reclaimable part is given back once")
+        self.assertEqual(t.trims, 1, "and then the trim stops asking")
+        # The unfixed arithmetic at the SAME converged state still wants
+        # 10 GiB that no longer exist -- which is why it never stopped.
+        self.assertEqual(cg.current - t.target_bytes, 10 * GIB)
+        self.assertEqual(cg.reclaimable, 0)
+
+    def test_can_fail_when_the_pinned_pool_stays_invisible(self):
+        """Same inputs, pinned pool assumed anonymous (the documented error).
+
+        This must be RED behaviour: the trim reverts to permanent reclaim
+        pressure. It proves the pinned term is load-bearing and that the
+        convergence above is not an artefact of the harness.
+        """
+        cg = _CgroupWithPinnedInTheFileBucket(
+            anon_gib=15, pinned_gib=85, cache_gib=10
+        )
+        t = self._armed_trim()
+        with _driven_by(cg, pinned_visible=False):
+            for _ in range(10):
+                t.maybe_trim()
+
+        self.assertEqual(cg.cache, 0)
+        self.assertEqual(t.trims, 10, "asks on every call, forever")
+        self.assertFalse(t.floor_overrode_target)
+        self.assertEqual(cg.asks[-1], 10 * GIB, "still asking for what is gone")
+
+    def test_neutral_when_the_floor_sits_below_the_configured_target(self):
+        """Behavioural neutrality for every boot without a large pinned pool:
+        the arithmetic is exactly ``current - target``, as before #537."""
+        cg = _CgroupWithPinnedInTheFileBucket(anon_gib=15, pinned_gib=0, cache_gib=85)
+        t = self._armed_trim()
+        with _driven_by(cg):
+            t.maybe_trim()
+        self.assertEqual(cg.asks, [10 * GIB])
+        self.assertFalse(t.floor_overrode_target)
+
+    def test_neutral_when_the_cgroup_cannot_report_anon(self):
+        """An unreadable memory.stat must not invent a floor."""
+        cg = _CgroupWithPinnedInTheFileBucket(anon_gib=15, pinned_gib=85, cache_gib=4)
+        t = self._armed_trim()
+        with _driven_by(cg, anon_visible=False):
+            t.maybe_trim()
+        self.assertIsNone(t.floor_bytes)
+        self.assertEqual(cg.asks, [14 * GIB], "pre-#537 arithmetic, unchanged")
+
+    def test_headroom_is_added_to_the_floor_when_the_operator_asks_for_it(self):
+        cg = _CgroupWithPinnedInTheFileBucket(anon_gib=15, pinned_gib=80, cache_gib=9)
+        t = self._armed_trim(headroom=3)
+        with _driven_by(cg):
+            t.maybe_trim()
+        self.assertEqual(t.floor_bytes, 98 * GIB)
+        self.assertEqual(cg.asks, [6 * GIB])
+
+    def test_headroom_defaults_to_zero_so_the_formula_adds_no_desk_number(self):
+        t = self._armed_trim()
+        self.assertEqual(t.headroom_bytes, 0)
 
 
 if __name__ == "__main__":

@@ -533,9 +533,30 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   DeepSeek-V4 the prefill half is already satisfied: the BCG-incompatibility
   rule set rewrites prefill to `disabled` (`server_args.py:8281-8309`). Both
   spellings of the refuted path still refuse.
-  **DESK-WRITTEN, NEVER EXECUTED — no boot, no replay, no ms/verify figure
-  exists, and F1's 5.3–8.4x is a Qwen3.6-35B-A3B ceiling that is NOT a DSV4F
-  number.** F2 (per-layer break cost, decomposed) is the first measurement of
+  **BOOT-ATTEMPTED 2026-08-04, still no measurement.** The route's
+  CONFIGURATION path is proven end to end on hardware --
+  `validate_breakable_boot` passes and the boot reaches graph capture
+  (`TICKET_462_RESULT_f2_blocked.md`) -- and it then died in the BCG buffer
+  layer, which handled four output shapes and not the `LogitsProcessorOutput`
+  a decode forward returns. That branch now exists
+  (`breakable_cuda_graph_backend.py`, `_LPO_TOKEN_DIM_FIELDS`): an ALLOWLIST of
+  the five per-token tensor fields, every other field refused BY NAME rather
+  than mapped, and a refusal when the present fields disagree on their leading
+  dimension -- the prefill shape where `next_token_logits` is per-SEQUENCE
+  (`prefill_cuda_graph_runner.py:1194`) cannot reach it, because a prefill BCG
+  captures the layer-model body and runs the logits processor eagerly
+  (`:1103-1130`). Same change fixed the shared buffer's ROW BUDGET: it was
+  sized from `shape_key.size`, which for a decode runner is the BATCH size
+  while the body emits `bs * num_tokens_per_bs` rows under a non-ragged
+  speculative verify (`decode_cuda_graph_runner.py:682`) -- one row per
+  sequence for a per-token output, i.e. every draft position but the first
+  truncated with no error. Tests:
+  `test/registered/unit/model_executor/test_bcg_logits_output_buffer_462.py`,
+  18 hermetic, TWO executed can-fail mutations (leading-dim refusal removed ->
+  red; row budget taken from the graph key -> red).
+  **NO REPLAY, NO ms/verify FIGURE EXISTS, and F1's 5.3-8.4x is a
+  Qwen3.6-35B-A3B ceiling that is NOT a DSV4F number.** F2 (per-layer break
+  cost, decomposed) is the first measurement of
   the next window and gates default-on; **its instrument now exists (#494, §16
   break-cost probe)**, so F2 is a measurement ticket rather than an
   implementation one — the crossing cost is read off
@@ -951,9 +972,25 @@ inferred. `--speculative-moe-runner-backend` reaches EVERY draft build — the
 `cross_algo_worker` and (new for #470) the shared DFLASH/DSPARK builder
 `draft_worker_common.py:155`; unset, it defaults to `--moe-runner-backend`
 (`overrides.py:2086`). Reaching the DFLASH/DSPARK builds is what puts an MXFP4
-DSpark head on `Mxfp4MarlinMoEMethod` on sm120. **DESK-WRITTEN — no DSpark arm
-has booted; `docs/dev/TICKET_470_dspark_boots.md` is the only evidence path,
-and its Boot A prices the ~21 % rank-0 residency cut the arm costs.** Two
+DSpark head on `Mxfp4MarlinMoEMethod` on sm120. **BOOT A MEASURED 2026-08-04,
+BOOT B NOT YET RUN** (`TICKET_470_RESULT_first_boot.md`): Boot A prices the
+rank-0 residency cut at ~1.3-1.4 % of decode ms/round for 10.21 GiB freed, and
+the measured cut is 0.485->**0.23**, not the ticket's unmeasured
+`RESIDENT_FRACTION_CUT=0.383` (which frees only ~4.1 GiB and OOMs rank 0
+mid-build). Boot B found four first-boot defects; the last of them --
+`build_draft_tp_worker` handed `draft_server_args` to `TpModelWorker` but never
+PUBLISHED it, so every reader that resolves through the process-wide context
+(`resident_fraction._from_flag()` first among them) validated a weight-TP=1
+draft build against the TARGET's 3-entry per-rank vectors -- is now fixed by
+publishing the copy for the duration of the build
+(`draft_worker_common.py`, restore already present in the `finally`). REACH: it
+covers the DFLASH/DSPARK builder only. `eagle_worker_v2.py:350`,
+`multi_layer_eagle_worker_v2.py:187` and `standalone_worker_v2.py:87` hand the
+TARGET's `ServerArgs` object straight to `TpModelWorker` with no draft copy at
+all, so there is nothing to publish there and the same class of defect is OPEN
+for them. Falsifier:
+`test/registered/unit/spec/test_draft_args_context_publication.py`, 8 hermetic,
+executed can-fail (publication removed -> 5 red). Two
 pre-boot blockers on any PACKED DSpark draft are cleared (#491, from the #490
 upstream sweep, `NOTE_490_pr33271_abgleich.md` §C): the fused-KV-projection
 support probe answers `False` for marlin/AWQ/GPTQ linears instead of raising
@@ -2506,6 +2543,22 @@ forward_peak.py judges the VRAM corridor AT PEAK rather than idle — wired into
 (`forward_peak.py:150-155`), and that variable has no `environ.py` entry (#505-D11).
 cachetrim with --ready-url self-retirement, which refuses a missing ready signal
 with its own measured counter-number (`scripts/dsv4/cachetrim.sh:295`).
+The in-process successor is the progress-coupled GGUF stream trim
+(`model_loader/gguf_shards.ProgressCoupledTrim`, off unless
+`SGLANG_GGUF_STREAM_TRIM_SOFT_GIB` is set). Its budget model was WRONG until
+#537 and the correction is worth carrying: **CUDA pinned host memory is
+accounted in the cgroup's `file` bucket, not `anon`** (measured 2026-08-04 --
+49.66 GiB of offload pinned pool against `anon` steady at 14.6 GiB), so
+`memory.current` hides it inside what looks like reclaimable page cache. The
+old `ask = current - target` therefore over-asked by exactly the unreclaimable
+bytes and, once `anon + pinned` passed the target, never stopped asking --
+evicting the loader's own read-ahead as fast as it was created
+(`ANALYSE_478_RESULT_q3kxl_refused.md`). The target is now raised to that floor
+when it sits above the configured one, with the pinned term summed over every
+LIVE rank through `layers/moe/pinned_host_ledger.py` (`memory.current` is
+cgroup-wide, so a per-process read would correct by less than a third on a
+TP=3 boot). `SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB` is the only policy term and
+ships at 0.0, pinned inert in `test_bounding_default_value_pins.py`.
 expert_stats (router distribution + hit rate). CollectiveClock gives compute vs wait
 per rank for **plain-prefill forwards on the target runner only**, and only on cuda
 with `pp_size == 1` (`managers/scheduler_components/metrics_reporter.py:341-352`,

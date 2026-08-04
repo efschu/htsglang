@@ -1825,6 +1825,18 @@ class Envs:
     SGLANG_GGUF_STREAM_TRIM_SOFT_GIB = EnvFloat(0.0)
     #: Reclaim down to about here once the soft watermark is crossed.
     SGLANG_GGUF_STREAM_TRIM_TARGET_GIB = EnvFloat(0.0)
+    # Slack above the UNRECLAIMABLE floor (#537). The trim's target is raised
+    # to `anon + pinned host pool + this` whenever that sits above the
+    # configured target, because cgroup reclaim cannot take either term --
+    # CUDA pinned host memory is filed under `file`, not `anon`, so
+    # memory.current hides it (49.66 GiB of pool against anon 14.6 GiB,
+    # measured 2026-08-04). This term buys the loader's own read-ahead room
+    # inside that budget. 0.0 (default) = no slack, i.e. the trim is allowed to
+    # drive page cache down to the floor exactly as it did before #537;
+    # calibrating it needs a load-time page-cache measurement, not a desk
+    # number, so it ships INERT and pinned as such in
+    # test_bounding_default_value_pins.py.
+    SGLANG_GGUF_STREAM_TRIM_HEADROOM_GIB = EnvFloat(0.0)
 
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
