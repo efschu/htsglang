@@ -2447,7 +2447,7 @@ consumer (`memtier/registry.py:34-36` "no consumer is wired to it yet",
 ever passed in `bootstrap.py`), and the #286
 short-term register's `CapacityLedger` is real but unreachable
 (`OffloadRegister` always falls back to `CpuFakeMovementBackend`, which counts
-ids and no bytes, `offload_register.py:563`). Both are therefore drawn as
+ids and no bytes, `offload_register.py:572`). Both are therefore drawn as
 ABSENT rows with that reason, as are the NVMe expert tier (#389, design only),
 hibernate staging (a state, not a live gauge), and every unconfigured remote
 tier. The cumulative ledgers are deliberately NOT used as occupancy
@@ -2457,11 +2457,11 @@ denominator — and the row says it is the DASHBOARD host's. Provenance is #218'
 `measured`/`absent` with no "probably" tier; the token-valued HiCache-L2 row is
 excluded from the byte sum by name rather than blended into it.
 Self-update installs in any serve mode; **switching + auto-rollback need
-`--serve-supervised`** (`webui.py:3632`, `self_update.py:659-688`), and the
+`--serve-supervised`** (`webui.py:3628`, `self_update.py:659-688`), and the
 health gate is HTTP 200 on `/` (`self_update.py:691-712`, #505-D8). GitHub
 result posting is opt-in per-use PAT, redacted from every error path
-(`github_share.py:97-105`); env-value redaction keys on five NAME suffixes
-(`:89`) — since #505-D3 that is a second layer on top of the shared scrub, not
+(`github_share.py:415-420`); env-value redaction keys on five NAME suffixes
+(`:115`) — since #505-D3 that is a second layer on top of the shared scrub, not
 the only redaction.
 **Live-rate baselines are PER TARGET KEY, #533.** The delta state
 `live_metrics.snapshot` needs between polls used to live in one module-global
@@ -2641,7 +2641,7 @@ with `pp_size == 1` (`managers/scheduler_components/metrics_reporter.py:341-352`
 The measured-KV-budget stale-boot trap (`rigmon/kvbudget.py:16-22`, ~4x shifts from
 boot order alone) applies only when the feature is switched on —
 `SGLANG_MEASURED_KV_BUDGET` defaults to False (`environ.py:373`, consumed at
-`uneven_perf.py:2617`); the benchmark harness clears the file per point regardless
+`uneven_perf.py:2642`); the benchmark harness clears the file per point regardless
 (`planner/runner.py:203`, `:231-238`).
 **Transients need a transient-rate sampler (#493):** a 1 Hz `nvidia-smi` loop
 undersamples a sub-second prefill excursion by ~12x, so its minimum is a LOWER
@@ -2695,10 +2695,10 @@ all. The GPU re-measurement is not yet run.
 
 **The s12 decode parser reads both spec modes (#459).** `RE_DECODE` required the
 accept block the scheduler writes only when speculation is ON
-(`metrics_reporter.py:968-972`, `:1018`) and allowed nothing between it and the
+(`metrics_reporter.py:968-972`, `:1020`) and allowed nothing between it and the
 graph flag, so a spec-off boot parsed ZERO decode ticks and s12 reported 0/0 --
-and so did a spec-ON CAP_ACCEPT boot, whose `cap len:` (`:1020`) sits in
-between, and any boot under `LOG_FORWARD_ITERS` (`:962`). Four missed shapes,
+and so did a spec-ON CAP_ACCEPT boot, whose `cap len:` (`:1022`) sits in
+between, and any boot under `LOG_FORWARD_ITERS` (`:964`). Four missed shapes,
 three of them not in the ticket. `accept_len` / `accept_rate` are now `None`,
 never `0.0`, and `spec: bool` names the shape; all three tick aggregators
 (s12/s14/s16) report `ticks_with_accept`.
