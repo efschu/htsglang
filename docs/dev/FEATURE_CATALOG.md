@@ -2239,11 +2239,24 @@ fix: `"thinking":{"type":"disabled"}` is filled in on locally-routed
 never touching upstream traffic or `count_tokens`, and a NO-OP by construction
 once the serving process carries the absent-means-disabled front fix, since it
 only writes what the front now defaults to (`--no-thinking-shim` to disable).
-17 hermetic tests against two mock backends
+19 hermetic tests against two mock backends
 (`test/registered/unit/entrypoints/anthropic/test_router.py`), mutation-checked:
 dropping the shim fails 1, forcing everything upstream fails 10. `/__router/stats`
 counts local vs upstream and is the evidence instrument for "the parent never
-left the API". The verification exists because the first version wrote to
+left the API". One header is deliberately NOT forwarded verbatim: `Accept-Encoding`
+is pinned to `identity` when the client omits it, because the response is passed
+through undecompressed and aiohttp would otherwise add its own `gzip, deflate`
+and hand gzip to a client that never advertised it (found by probing, not by
+reading — a plain `curl` got binary where the error envelope belonged); a client
+that DOES send the header has its value forwarded. Unlike #540's front work this
+IS live-boot proven (runbook §"Live acceptance"): a real `claude -p` 2.1.221
+through the router solved a subagent task requiring a `Read` round trip,
+`generation_tokens_total` on 30030 moved +106, and the decision log shows the
+split in order — parent turns on `claude-fable-5` upstream, the subagent's two
+`Qwen3.6-27B` turns local, parent's closing turn upstream. The same run measured
+the shim's necessity against the un-fixed live boot: the identical body sent
+direct to 30030 spent its whole 40-token budget on a `thinking` block
+(`stop_reason: max_tokens`, zero text), through the router it answered. The verification exists because the first version wrote to
 `$REPO_ROOT/.claude/agents`, which for a worktree is read by no session: the
 agent type appeared in no agent list while the script reported a successful
 write, and the wrapper round-trip could not catch it because the wrapper reads

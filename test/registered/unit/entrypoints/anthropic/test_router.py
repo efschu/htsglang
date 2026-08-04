@@ -135,6 +135,30 @@ class RouterTestCase(AioHTTPTestCase):
         self.assertEqual(headers["anthropic-version"], "2023-06-01")
         self.assertEqual(headers["anthropic-beta"], "tools-2024-04-04")
 
+    async def test_absent_accept_encoding_becomes_identity(self):
+        """Never hand back a content coding the client did not advertise.
+
+        The response body is forwarded without decompression, so aiohttp's
+        default ``Accept-Encoding: gzip, deflate`` would have made the proxy
+        return gzip to a client that never asked for it.
+        """
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(REMOTE_MODEL),
+            skip_auto_headers=["Accept-Encoding"],
+        )
+        headers = self.upstream["requests"][0]["headers"]
+        self.assertEqual(headers["Accept-Encoding"], "identity")
+
+    async def test_client_accept_encoding_is_forwarded_untouched(self):
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(REMOTE_MODEL),
+            headers={"Accept-Encoding": "gzip"},
+        )
+        headers = self.upstream["requests"][0]["headers"]
+        self.assertEqual(headers["Accept-Encoding"], "gzip")
+
     async def test_credentials_are_never_logged(self):
         with self.assertLogs(
             "sglang.srt.entrypoints.anthropic.router", level="DEBUG"

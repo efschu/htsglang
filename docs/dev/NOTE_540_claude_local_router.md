@@ -38,6 +38,15 @@ response body byte-for-byte (`auto_decompress=False`), streaming included. No
 header value is ever logged, at any level; the log line carries the method,
 path, decision and model id only.
 
+One header is NOT purely forwarded, and the reason is the byte-for-byte
+response: `Accept-Encoding` is pinned to `identity` when the client omitted it.
+aiohttp otherwise adds its own `gzip, deflate`, and since we do not decompress,
+the proxy would hand a gzipped body to a client that never advertised gzip.
+This was found by probing rather than by reading — a plain `curl` through the
+first version got binary garbage where the error envelope should have been. A
+client that DOES send `Accept-Encoding` has its value forwarded untouched and
+gets the encoded bytes it asked for.
+
 ## The `--agents` recipe
 
 In a SEPARATE process from any running session:
@@ -94,3 +103,27 @@ Mutation-checked rather than assumed green: removing the shim assignment fails
 the parent kept talking to Anthropic (`upstream` counter climbing) while the
 subagent ran locally (`local` counter climbing), alongside the
 `sglang:generation_tokens_total` delta on 30030.
+
+## Live acceptance, 2026-08-04
+
+Not hermetic-only. A real `claude -p` (2.1.221) was driven through the router
+against the live 30030 boot, in a separate process; the running session and the
+server were untouched. The `--agents` payload was the recipe above, the task
+was "read /tmp/acceptance_540.txt and report line 1 verbatim".
+
+* The subagent returned the marker `HTSGLANG_ACCEPTANCE_LINE_ONE_MARKER_7Q4Z`,
+  which it could only obtain through a `Read` tool round trip.
+* `sglang:generation_tokens_total{priority="0"}` went 14820 -> 14926 on 30030
+  (+106), so the local server really did the generating.
+* The router's decision log is the split itself, in order: two parent turns on
+  `claude-fable-5` -> upstream, then two turns on `Qwen3.6-27B` -> local (the
+  request that returned `tool_use`, and the one carrying the `tool_result`),
+  then the parent's closing turn -> upstream. Counters `local: 3, upstream: 5`
+  including the two hand probes.
+
+The same run also demonstrated WHY the shim exists, against a server that
+predates the front fix. Identical body, no `thinking` field, sent directly to
+30030 (bypassing the router): the entire 40-token budget went to a `thinking`
+block, `stop_reason: max_tokens`, no text content at all. Through the router:
+clean text. That is the agent-loop blocker in one pair of requests. It
+disappears on its own once 30030 is restarted onto the front fix.

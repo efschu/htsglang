@@ -78,6 +78,22 @@ def _filter_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
     return {k: v for k, v in headers if k.lower() not in _HOP_BY_HOP}
 
 
+def _request_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
+    """Client headers, plus a pinned Accept-Encoding.
+
+    We forward the response body without decompressing it, so the content
+    coding the client asked for is the one it gets. But aiohttp adds its own
+    ``Accept-Encoding: gzip, deflate`` when the header is absent, which would
+    make us hand a gzipped body to a client that never advertised gzip.
+    Pinning ``identity`` in that case keeps the pass-through honest; a client
+    that DID ask has its own value forwarded untouched.
+    """
+    out = _filter_headers(headers)
+    if not any(k.lower() == "accept-encoding" for k in out):
+        out["Accept-Encoding"] = "identity"
+    return out
+
+
 def _apply_thinking_shim(body: bytes) -> bytes:
     """Fill in ``thinking: disabled`` when the client omitted the field.
 
@@ -167,7 +183,7 @@ def create_app(
         )
 
         url = base + request.raw_path
-        headers = _filter_headers(request.headers.items())
+        headers = _request_headers(request.headers.items())
 
         try:
             async with request.app[SESSION].request(
