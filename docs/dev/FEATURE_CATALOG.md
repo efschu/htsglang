@@ -2221,7 +2221,29 @@ starts a separate `claude` process with a process-scoped environment, and
 `scripts/dev/register_local_model.sh` regenerates the USER-GLOBAL
 `~/.claude/agents/local-model.md` from `GET /v1/models` so the entry follows a
 serving switch, then VERIFIES the file at the path that is actually read and
-prints it. The verification exists because the first version wrote to
+prints it. **The MIXED case — one process, parent turns on Anthropic and a
+single subagent on the rig — is served by a split proxy, not by the client**
+(#540, `entrypoints/anthropic/router.py`, started by
+`scripts/dev/claude_local_router.sh`, runbook
+`docs/dev/NOTE_540_claude_local_router.md`): it listens on 127.0.0.1:30099,
+forwards everything verbatim (path, query, all headers including the bearer,
+response bytes undecompressed, SSE streamed) to api.anthropic.com EXCEPT
+requests whose `model` is in `--local-model`, which go to 30030. The routing
+key exists because Claude Code passes the `"model"` string from `--agents` to
+the wire UNVALIDATED, so naming a local id in an agent definition is the whole
+binding. With no `-m` the id is resolved from `GET /v1/models`, so the router
+follows a checkpoint switch. No header value is logged at any level. It carries
+ONE body edit, a compatibility shim for a server that predates the #540 front
+fix: `"thinking":{"type":"disabled"}` is filled in on locally-routed
+`/v1/messages` bodies that omit the field — never rewriting an explicit value,
+never touching upstream traffic or `count_tokens`, and a NO-OP by construction
+once the serving process carries the absent-means-disabled front fix, since it
+only writes what the front now defaults to (`--no-thinking-shim` to disable).
+17 hermetic tests against two mock backends
+(`test/registered/unit/entrypoints/anthropic/test_router.py`), mutation-checked:
+dropping the shim fails 1, forcing everything upstream fails 10. `/__router/stats`
+counts local vs upstream and is the evidence instrument for "the parent never
+left the API". The verification exists because the first version wrote to
 `$REPO_ROOT/.claude/agents`, which for a worktree is read by no session: the
 agent type appeared in no agent list while the script reported a successful
 write, and the wrapper round-trip could not catch it because the wrapper reads
