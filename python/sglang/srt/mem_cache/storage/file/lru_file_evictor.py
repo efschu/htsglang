@@ -313,6 +313,13 @@ class LRUFileEvictor:
                 self._evict_locked(0)
             if self.min_free_bytes > 0:
                 self._enforce_free_space_locked(0)
+            else:
+                # No watermark left to breach: drop any latched write stop so
+                # stats() does not keep reporting a stop nothing can clear.
+                self._write_stopped = False
+            # Re-cap changed the watermark, so the watchdog's last verdict is
+            # stale; let the next call probe instead of trusting its interval.
+            self._last_free_probe = 0.0
             freed = before - self._total_bytes
 
             result = self._stats_locked()
