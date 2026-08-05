@@ -3726,9 +3726,7 @@ class ServerArgs:
     speculative_ngram_capacity: A[
         int,
         "The cache capacity for ngram speculative decoding.",
-    ] = (
-        10 * 1000 * 1000
-    )
+    ] = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: A[
         Optional[str],
         "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
@@ -6469,7 +6467,7 @@ class ServerArgs:
             # it shares the host pool, admission reduce, and off-batch tick.
             # Reject the flag standalone rather than silently ignore it.
             raise ValueError(
-                "--kv-session-offload-prefill requires " "--enable-kv-session-offload."
+                "--kv-session-offload-prefill requires --enable-kv-session-offload."
             )
         if self.kv_session_offload_host_ram_gib and (
             not self.enable_kv_session_offload
@@ -8477,8 +8475,10 @@ class ServerArgs:
             ),
             (
                 "OOT platform without piecewise support",
-                lambda: current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph(),
+                lambda: (
+                    current_platform.is_out_of_tree()
+                    and not current_platform.support_piecewise_cuda_graph()
+                ),
             ),
             (
                 "MoE A2A backend",
@@ -8487,14 +8487,18 @@ class ServerArgs:
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+                ),
             ),
             (
                 "GGUF quantization",
-                lambda: self.load_format == "gguf"
-                or _resolved_view(self).quantization == "gguf"
-                or check_gguf_file(self.model_path),
+                lambda: (
+                    self.load_format == "gguf"
+                    or _resolved_view(self).quantization == "gguf"
+                    or check_gguf_file(self.model_path)
+                ),
             ),
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
             (
@@ -8509,8 +8513,10 @@ class ServerArgs:
             ("symmetric memory", lambda: self.enable_symm_mem),
             (
                 "expert distribution recorder",
-                lambda: self.enable_eplb
-                or self.expert_distribution_recorder_mode is not None,
+                lambda: (
+                    self.enable_eplb
+                    or self.expert_distribution_recorder_mode is not None
+                ),
             ),
             (
                 "context parallel (attn_cp_size > 1)",
@@ -8758,8 +8764,7 @@ class ServerArgs:
             )
         if any(g < 0 for g in part_gpus):
             raise ValueError(
-                f"--dual-group-lane-part-gpu-id must be non-negative, got "
-                f"{part_gpus}."
+                f"--dual-group-lane-part-gpu-id must be non-negative, got {part_gpus}."
             )
         if self.rank_gpu_id is None:
             raise ValueError(
@@ -9392,7 +9397,7 @@ class ServerArgs:
                 stage_vectors.append([b // g for b in stage_budgets])
             if any(vec != stage_vectors[0] for vec in stage_vectors[1:]):
                 per_stage = "; ".join(
-                    f"stage {s}: cards {budgets[s * self.tp_size:(s + 1) * self.tp_size]} "
+                    f"stage {s}: cards {budgets[s * self.tp_size : (s + 1) * self.tp_size]} "
                     f"MiB -> {vec}"
                     for s, vec in enumerate(stage_vectors)
                 )
@@ -9445,7 +9450,7 @@ class ServerArgs:
             return
         self.rank_tp_ratio = weights
         logger.info(
-            "--rank-tp-ratio auto: derived weights %s from memory budgets " "%s MiB.",
+            "--rank-tp-ratio auto: derived weights %s from memory budgets %s MiB.",
             weights,
             budgets,
         )
@@ -9817,11 +9822,11 @@ class ServerArgs:
             )
         elif self.dual_group_lane_budget_mib is not None:
             raise ValueError(
-                "--dual-group-lane-budget-mib only applies with " "--dual-group-lane."
+                "--dual-group-lane-budget-mib only applies with --dual-group-lane."
             )
         elif self.dual_group_lane_part_gpu_id is not None:
             raise ValueError(
-                "--dual-group-lane-part-gpu-id only applies with " "--dual-group-lane."
+                "--dual-group-lane-part-gpu-id only applies with --dual-group-lane."
             )
         elif self.dual_group_lane_pairing:
             raise ValueError(
@@ -10043,7 +10048,7 @@ class ServerArgs:
                     f"({len(self.rank_gpu_memory_mib)}) must equal the "
                     f"number of placed ranks ({placed_ranks}"
                     + (
-                        f" = --pp-size {self.pp_size} x --tp-size " f"{self.tp_size}"
+                        f" = --pp-size {self.pp_size} x --tp-size {self.tp_size}"
                         if self.pp_size > 1
                         else f" = --tp-size {self.tp_size}"
                     )
@@ -10072,8 +10077,7 @@ class ServerArgs:
             )
         if self.nnodes > 1:
             raise ValueError(
-                f"--rank-gpu-id is single-node only (current: "
-                f"--nnodes {self.nnodes})."
+                f"--rank-gpu-id is single-node only (current: --nnodes {self.nnodes})."
             )
 
         # Conflicting flags.
@@ -10540,11 +10544,99 @@ class ServerArgs:
             logger.debug("Could not estimate the adaptive ladder demand: %s", e)
             return None
 
+    #: Set once a ledger REFUSAL has been named, so the explanation appears
+    #: per process rather than once per GPU per call.
+    _ledger_reserve_refusal_named = False
+
+    def runtime_reserve_mib(self, gpu_mem, card_uuid: Optional[str] = None):
+        """The per-GPU runtime/activation reserve, and where it came from.
+
+        Returns ``(mib, source)`` with source one of ``"ledger"``,
+        ``"heuristic:no-ledger"``, ``"heuristic:not-asked"`` or
+        ``"heuristic:ledger-refused"``.
+
+        #590. This is the payout path for #586. The measured per-card
+        footprints existed and never reached KV pool sizing, because the two
+        places that could have applied them both miss on the recipe this rig
+        actually boots:
+
+          * ``_profile_available_bytes`` DOES call the ledger-aware
+            ``activation_reserve_mb`` -- but only behind
+            ``post_capture_kv_active``, and ``dcp_size > 1`` makes that False,
+            so on the uneven-DCP path the subtraction never runs;
+          * ``derived_rank_auto_reserve_mib``, which is then the only thing
+            shaping the budget, read the raw heuristic.
+
+        Window 6 measured the consequence: pinned and ``auto`` produced pools
+        identical to 26 tokens per rank across a tree WITH the ledger and a
+        tree WITHOUT it. The +22 % that window won came from ``auto``
+        replacing the pins, and none of it from the ledger.
+
+        THE THREE CASES ARE DELIBERATELY DISTINCT:
+
+        ``no ledger module in the tree``
+            The production serving tree has no ``mem_ledger`` package at all.
+            Silent heuristic, byte-identical to before -- an ImportError is
+            not a refusal, it is an older tree, and it must not start logging
+            about a feature it does not carry.
+        ``caller supplied no card identity``
+            Also silent. Every legacy caller and the planner call this
+            without a UUID; a footprint is per-card, so with no card there is
+            no question to refuse. Keeps those paths byte-identical too.
+        ``ledger present, card identified, no footprint resolves``
+            NAMED, once per process, with the card that missed. This is the
+            case the #586 refusal discipline is about: falling back silently
+            to a formula that was falsified on this very rig is how 3968 MiB
+            survived as long as it did.
+        """
+        if not card_uuid:
+            return self.mamba_pre_capture_reserve_mb(gpu_mem), "heuristic:not-asked"
+        try:
+            from sglang.srt.mem_ledger.activation import (
+                profile_from_server_args,
+                resolve_phase_footprint,
+            )
+            from sglang.srt.mem_ledger.calibration import live_fingerprint
+            from sglang.srt.mem_ledger.engine import _model_architectures
+        except ImportError:
+            return self.mamba_pre_capture_reserve_mb(gpu_mem), "heuristic:no-ledger"
+        footprint = None
+        try:
+            live = live_fingerprint()
+            footprint = resolve_phase_footprint(
+                card_uuid,
+                hw_fingerprint=live[0] if live else None,
+                profile=profile_from_server_args(self, _model_architectures(self)),
+            )
+        except Exception as e:  # pragma: no cover - NVML/config availability
+            logger.debug("ledger reserve lookup failed for %s: %s", card_uuid, e)
+        if footprint is not None:
+            return float(footprint.activation_mib), "ledger"
+        heuristic = self.mamba_pre_capture_reserve_mb(gpu_mem)
+        if not ServerArgs._ledger_reserve_refusal_named:
+            ServerArgs._ledger_reserve_refusal_named = True
+            logger.warning(
+                "VRAM ledger REFUSED to price the activation reserve for card "
+                "%s: no phase footprint is calibrated for this hardware "
+                "fingerprint and activation profile. Falling back to the "
+                "INHERITED heuristic (%.0f MiB per GPU), which was falsified "
+                "on 2026-08-05 -- it books more than the binding card was "
+                "measured to have free while completing a deep prefill, and "
+                "the KV pool pays the difference. This fallback keeps an "
+                "unprobed rig bootable; it is not a second opinion. Run "
+                "scripts/vram_ledger/probe_activation.py once for this "
+                "configuration to replace it with a measurement.",
+                card_uuid,
+                heuristic,
+            )
+        return heuristic, "heuristic:ledger-refused"
+
     def derived_rank_auto_reserve_mib(
         self,
         gpu_mem,
         colocated_ranks: int = 1,
         hosts_solo_draft: bool = False,
+        card_uuid: Optional[str] = None,
     ) -> int:
         """--rank-auto-reserve-mib 'auto' (#68): derive the per-GPU headroom
         from the actual demand instead of a flat constant.
@@ -10582,7 +10674,7 @@ class ServerArgs:
         # Resolve the same capacity-tier defaults the stock path applies
         # later (idempotent), so chunked_prefill_size / decode max_bs exist.
         self._apply_gpu_mem_capacity_defaults(gpu_mem)
-        runtime_reserve = self.mamba_pre_capture_reserve_mb(gpu_mem)
+        runtime_reserve, _ = self.runtime_reserve_mib(gpu_mem, card_uuid=card_uuid)
         capture_tokens = self.speculative_capture_tokens()
         ladder_mib = 0
         if hosts_solo_draft:
@@ -11093,12 +11185,34 @@ class ServerArgs:
         and the #265 fundability reference cannot drift apart (#313).
         """
         ladder_gpu = self.ladder_reserve_gpu_id()
+        # #590: the card identity is what lets the ledger price this GPU's
+        # activation instead of the falsified heuristic. Resolved here because
+        # this is the one place that already knows WHICH physical GPU each
+        # demand belongs to. A resolution failure is not fatal: the reserve
+        # falls back exactly as before (see runtime_reserve_mib).
+        uuid_by_gpu = self._reserve_card_uuids(list(counts))
         return {
             gpu_id: self.derived_rank_auto_reserve_mib(
-                gpu_mem, cnt, hosts_solo_draft=(gpu_id == ladder_gpu)
+                gpu_mem,
+                cnt,
+                hosts_solo_draft=(gpu_id == ladder_gpu),
+                card_uuid=uuid_by_gpu.get(gpu_id),
             )
             for gpu_id, cnt in counts.items()
         }
+
+    def _reserve_card_uuids(self, gpu_ids) -> Dict[int, str]:
+        """``{physical gpu id: NVML UUID}``, or ``{}`` when unresolvable.
+
+        Never raises: without identities the reserve simply stays on the
+        heuristic it used before #590, which is the pre-existing behaviour.
+        """
+        try:
+            cards = _resolve_rank_gpu_cards(list(gpu_ids))
+            return {ordinal: c.uuid for ordinal, c in cards.items() if c.uuid}
+        except Exception as e:  # pragma: no cover - NVML availability
+            logger.debug("could not resolve card UUIDs for the reserve: %s", e)
+            return {}
 
     def _derived_reserve_demand_per_gpu(self, counts) -> Dict[int, int]:
         """``{physical gpu id: derived_rank_auto_reserve_mib}`` for the GPUs
@@ -11191,12 +11305,24 @@ class ServerArgs:
         free-memory floor stay at 271 MiB. A transient is capped where it is
         allocated, which is why the indexer term below has its own knob.
         """
+        # #590: same card identity as the installed reserve, so this note
+        # itemizes the number that was actually derived. Reading the heuristic
+        # here while the reserve came from the ledger would print a capture
+        # term that is the difference between two different models.
+        uuid = (
+            self._reserve_card_uuids([gpu_id]).get(gpu_id)
+            if gpu_id is not None
+            else None
+        )
         derived = self.derived_rank_auto_reserve_mib(
-            gpu_mem, colocated_ranks, hosts_solo_draft=hosts_solo_draft
+            gpu_mem,
+            colocated_ranks,
+            hosts_solo_draft=hosts_solo_draft,
+            card_uuid=uuid,
         )
         if pinned_mib >= derived:
             return None
-        runtime_reserve = self.mamba_pre_capture_reserve_mb(gpu_mem)
+        runtime_reserve, _ = self.runtime_reserve_mib(gpu_mem, card_uuid=uuid)
         ladder = (
             self.ladder_reserve_demand(colocated_ranks) if hosts_solo_draft else None
         )
@@ -11208,7 +11334,7 @@ class ServerArgs:
         capture_reserve = derived - runtime_reserve - ladder_mib
         scratch = self.gdn_prefill_scratch_mib(head_share)
         scratch_note = (
-            "not applicable (no GDN/linear-attention layers in this " "checkpoint)"
+            "not applicable (no GDN/linear-attention layers in this checkpoint)"
             if scratch is None
             else (
                 f"{scratch:.0f} MiB per layer at "
@@ -11285,12 +11411,15 @@ class ServerArgs:
         colocated = sum(1 for g in rank_gpu_ids if g == gpu_id)
         try:
             gpu_mem = get_device_memory_capacity(self.device)
+            uuid = self._reserve_card_uuids([gpu_id]).get(gpu_id)
             derived = self.derived_rank_auto_reserve_mib(
                 gpu_mem,
                 colocated,
                 hosts_solo_draft=(gpu_id == self.ladder_reserve_gpu_id()),
+                card_uuid=uuid,
             )
-            runtime_reserve = self.mamba_pre_capture_reserve_mb(gpu_mem)
+            # #590: itemize the number that was derived, not a second model.
+            runtime_reserve, _ = self.runtime_reserve_mib(gpu_mem, card_uuid=uuid)
         except Exception as e:  # pragma: no cover - advisory only
             logger.debug("Could not derive the reserve for the boot note: %s", e)
             return None
@@ -11430,9 +11559,9 @@ class ServerArgs:
                 )
                 decode_cuda_graph_config.bs = self._generate_cpu_graph_batch_sizes()
 
-            assert (
-                self.torch_compile_max_bs > 0
-            ), "cuda_graph_config[decode].bs should contain positive batch sizes"
+            assert self.torch_compile_max_bs > 0, (
+                "cuda_graph_config[decode].bs should contain positive batch sizes"
+            )
             decode_cuda_graph_config.max_bs = self.torch_compile_max_bs
 
         if prefill_cuda_graph_config.max_bs is None:
@@ -11972,9 +12101,9 @@ class ServerArgs:
                     self._set_default_dsa_backends(None)
 
                 if self.enable_prefill_cp:
-                    assert (
-                        self.disaggregation_mode != "decode"
-                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                    assert self.disaggregation_mode != "decode", (
+                        "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                    )
                 if (
                     self.enable_dsa_cache_layer_split
                     and self.disaggregation_mode != "prefill"
@@ -12151,9 +12280,9 @@ class ServerArgs:
             # (arg_groups/overrides.py: _gpt_oss_overrides).
 
             if resolved_view(self).moe_runner_backend == "triton_kernel":
-                assert (
-                    self._resolved().ep_size == 1
-                ), "Triton kernel MoE is only supported when ep_size == 1"
+                assert self._resolved().ep_size == 1, (
+                    "Triton kernel MoE is only supported when ep_size == 1"
+                )
 
         elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
             if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
@@ -12219,7 +12348,9 @@ class ServerArgs:
                 "ascend",
                 "trtllm_mha",
                 "intel_xpu",
-            }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
+            }, (
+                f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
+            )
             # The moe_runner_backend selection moved to the override registry
             # (arg_groups/overrides.py: _llama4_overrides).
         # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
@@ -12254,9 +12385,9 @@ class ServerArgs:
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
                 accepted_backends = ["fa3", "triton", "trtllm_mha"]
                 attention_backend = resolved_view(self).attention_backend
-                assert (
-                    attention_backend in accepted_backends
-                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+                assert attention_backend in accepted_backends, (
+                    f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+                )
         elif model_arch in ["Olmo2ForCausalLM"]:
             # disable_hybrid_swa_memory + attention backend selection moved to
             # the override registry (arg_groups/overrides.py: _olmo2_overrides).
@@ -12265,9 +12396,9 @@ class ServerArgs:
             # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
             # but Olmo3 does.
             attention_backend = resolved_view(self).attention_backend
-            assert (
-                attention_backend != "flashinfer"
-            ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+            assert attention_backend != "flashinfer", (
+                "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+            )
 
             logger.info(
                 f"Using {attention_backend} as attention backend for {model_arch}."
@@ -12350,26 +12481,26 @@ class ServerArgs:
 
     def _validate_mamba_no_buffer(self, view, model_arch: str):
         assert view.page_size in (1, None), "no_buffer only supports page_size=1."
-        assert (
-            view.disable_overlap_schedule
-        ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
-        assert (
-            view.attention_backend != "trtllm_mha"
-        ), "no_buffer do not support trtllm_mha attention backend."
+        assert view.disable_overlap_schedule, (
+            "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
+        )
+        assert view.attention_backend != "trtllm_mha", (
+            "no_buffer do not support trtllm_mha attention backend."
+        )
 
     def _validate_mamba_extra_buffer(self, view, model_arch: str):
         from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 
-        assert supports_mamba_cache_extra_buffer(
-            view, model_arch
-        ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
-        assert (
-            is_cuda() or is_musa() or is_npu()
-        ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+        assert supports_mamba_cache_extra_buffer(view, model_arch), (
+            f"extra_buffer is not supported for {model_arch}; use no_buffer."
+        )
+        assert is_cuda() or is_musa() or is_npu(), (
+            "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+        )
         if view.speculative_num_draft_tokens is not None:
-            assert (
-                view.mamba_radix_cache_strategy != "extra_buffer_lazy"
-            ), "extra_buffer_lazy unsupported with spec."
+            assert view.mamba_radix_cache_strategy != "extra_buffer_lazy", (
+                "extra_buffer_lazy unsupported with spec."
+            )
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
@@ -12641,9 +12772,9 @@ class ServerArgs:
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            assert (
-                self.speculative_algorithm is None
-            ), "Speculative decoding is currently not supported with Flex Attention backend"
+            assert self.speculative_algorithm is None, (
+                "Speculative decoding is currently not supported with Flex Attention backend"
+            )
 
         # Whisper's encoder token padding conflicts with prefix caching.
         # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
@@ -13097,40 +13228,40 @@ class ServerArgs:
         view = self._resolved()
         if view.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
-            assert (
-                self.tp_size % view.attn_cp_size == 0
-            ), "tp_size must be divisible by attn_cp_size"
-            assert (
-                self.tp_size % (self.dp_size * view.attn_cp_size) == 0
-            ), "tp_size must be divisible by dp_size * attn_cp_size"
+            assert self.tp_size % view.attn_cp_size == 0, (
+                "tp_size must be divisible by attn_cp_size"
+            )
+            assert self.tp_size % (self.dp_size * view.attn_cp_size) == 0, (
+                "tp_size must be divisible by dp_size * attn_cp_size"
+            )
 
-            assert (
-                not self.enable_aiter_allreduce_fusion
-            ), "Aiter allreduce fusion is not supported with context parallelism"
+            assert not self.enable_aiter_allreduce_fusion, (
+                "Aiter allreduce fusion is not supported with context parallelism"
+            )
 
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
-            assert (
-                self.tp_size % self.moe_dp_size == 0
-            ), "tp_size must be divisible by moe_dp_size"
-            assert (
-                view.ep_size * self.moe_dp_size <= self.tp_size
-            ), "ep_size * moe_dp_size must be less than or equal to tp_size"
+            assert self.tp_size % self.moe_dp_size == 0, (
+                "tp_size must be divisible by moe_dp_size"
+            )
+            assert view.ep_size * self.moe_dp_size <= self.tp_size, (
+                "ep_size * moe_dp_size must be less than or equal to tp_size"
+            )
             assert self.pp_size == 1, "PP is not supported with context parallelism"
 
             if view.ep_size > 1:
-                assert (
-                    view.ep_size * self.moe_dp_size == self.tp_size
-                ), "ep_size * moe_dp_size must be equal to tp_size"
+                assert view.ep_size * self.moe_dp_size == self.tp_size, (
+                    "ep_size * moe_dp_size must be equal to tp_size"
+                )
 
-            assert (
-                not self.enable_aiter_allreduce_fusion
-            ), "Aiter allreduce fusion is not supported with context parallelism"
+            assert not self.enable_aiter_allreduce_fusion, (
+                "Aiter allreduce fusion is not supported with context parallelism"
+            )
 
         if view.attn_cp_size != self.moe_dp_size:
-            assert (
-                self.moe_dp_size == 1
-            ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+            assert self.moe_dp_size == 1, (
+                "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+            )
 
         from sglang.srt.layers.cp.base import init_cp_strategy
 
@@ -13203,22 +13334,30 @@ class ServerArgs:
                 "modelopt_fp8",
                 "modelopt_mixed",
                 None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            ], (
+                f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            )
             assert view.ep_size in [
                 1,
                 self.tp_size,
-            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            ], (
+                "The expert parallel size must be 1 or the same as the tensor parallel size"
+            )
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
             # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
             assert (
                 view.quantization in ["modelopt_fp4", "modelopt_mixed"]
                 or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
+            ), (
+                f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), or hybrid NVFP4 models."
+            )
             assert view.ep_size in [
                 1,
                 self.tp_size,
-            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            ], (
+                "The expert parallel size must be 1 or the same as the tensor parallel size"
+            )
             assert view.moe_a2a_backend in [
                 "none",
                 "deepep",
@@ -13238,7 +13377,9 @@ class ServerArgs:
                 "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            ], (
+                f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            )
 
         if view.moe_runner_backend == "flashinfer_trtllm_routed":
             assert view.quantization in [
@@ -13247,7 +13388,9 @@ class ServerArgs:
                 "modelopt_fp4",
                 "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            ], (
+                f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            )
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
@@ -13265,9 +13408,9 @@ class ServerArgs:
             "fp8",
             "mxfp8",
         ]:
-            assert (
-                resolved_view(self).ep_size == 1
-            ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+            assert resolved_view(self).ep_size == 1, (
+                "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+            )
 
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL
@@ -13425,13 +13568,15 @@ class ServerArgs:
                     f"Wrong value of {fuse_mode=}, the NPU only support 1 or 2."
                 )
             elif fuse_mode == 2:
-                assert (
-                    resolved_view(self).quantization == "modelslim"
-                ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
+                assert resolved_view(self).quantization == "modelslim", (
+                    "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
+                )
         if a2a_backend == "flashinfer":
             assert (
                 resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
-            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+            ), (
+                "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+            )
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -13449,7 +13594,9 @@ class ServerArgs:
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
                 "flashinfer_trtllm_routed",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
+            ], (
+                "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
+            )
 
         if a2a_backend == "mori":
             if self.deepep_mode == "auto":
@@ -13498,7 +13645,9 @@ class ServerArgs:
                 assert self.eplb_algorithm in [
                     "elasticity_aware",
                     "elasticity_aware_hierarchical",
-                ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+                ], (
+                    "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+                )
 
             assert self.pp_size == 1, "PP size should be set to 1 under elastic EP"
 
@@ -13507,9 +13656,9 @@ class ServerArgs:
                     self.mooncake_ib_device
                 )
         if self.elastic_ep_rejoin:
-            assert (
-                self.elastic_ep_backend is not None
-            ), "Elastic EP rejoin requires elastic_ep_backend to be set."
+            assert self.elastic_ep_backend is not None, (
+                "Elastic EP rejoin requires elastic_ep_backend to be set."
+            )
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -13559,9 +13708,7 @@ class ServerArgs:
             return None
         candidates = [os.path.join(model_path, "config.json")]
         if model_path.endswith(".gguf"):
-            candidates.append(
-                os.path.join(os.path.dirname(model_path), "config.json")
-            )
+            candidates.append(os.path.join(os.path.dirname(model_path), "config.json"))
         for candidate in candidates:
             if os.path.isfile(candidate):
                 return candidate
@@ -14508,11 +14655,10 @@ class ServerArgs:
         if not self.enable_unified_memory:
             return
         assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
+            "--enable-unified-memory is not yet compatible with PD disaggregation."
         )
         assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
+            "--enable-unified-memory is not yet compatible with speculative decoding."
         )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
@@ -14757,8 +14903,7 @@ class ServerArgs:
             self.workbench_tuner_queue
         ):
             raise ValueError(
-                f"--workbench-tuner-queue {self.workbench_tuner_queue!r} is not "
-                "a file."
+                f"--workbench-tuner-queue {self.workbench_tuner_queue!r} is not a file."
             )
         if self.workbench_arb_dir and not os.path.isdir(self.workbench_arb_dir):
             raise ValueError(
@@ -15550,9 +15695,9 @@ class ServerArgs:
             # validation runs at an early legacy slot); fall back to the SSM
             # default of 1 instead of comparing None against an int below.
             page_size = resolved_view(self).page_size or 1
-            assert (
-                max(chunk_size, page_size) % min(chunk_size, page_size) == 0
-            ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
+            assert max(chunk_size, page_size) % min(chunk_size, page_size) == 0, (
+                f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
+            )
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
 
@@ -15574,9 +15719,9 @@ class ServerArgs:
 
     def check_server_args(self):
         # Check parallel size constraints
-        assert (
-            self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        assert (self.tp_size * self.pp_size) % self.nnodes == 0, (
+            "tp_size must be divisible by number of nodes"
+        )
 
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1
@@ -15596,7 +15741,9 @@ class ServerArgs:
         if self.pp_size > 1:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            ), (
+                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
@@ -15624,32 +15771,32 @@ class ServerArgs:
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:
-            assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+            assert not self.enable_mixed_chunk, (
+                "enable_mixed_chunk is required for speculative decoding"
+            )
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
         if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
-            assert (
-                self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
+            assert self.chunked_prefill_size % self.page_size == 0, (
+                "chunked_prefill_size must be divisible by page_size"
+            )
 
         # Check pdmux
         if self.enable_pdmux:
-            assert (
-                self.pp_size == 1
-            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-            assert (
-                self.chunked_prefill_size == -1
-            ), "PD-Multiplexing is not compatible with chunked prefill."
-            assert (
-                self.disaggregation_mode == "null"
-            ), "PD-Multiplexing is not compatible with disaggregation mode."
-            assert (
-                self.disable_overlap_schedule
-            ), "PD-Multiplexing is not compatible with overlap schedule."
+            assert self.pp_size == 1, (
+                "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
+            )
+            assert self.chunked_prefill_size == -1, (
+                "PD-Multiplexing is not compatible with chunked prefill."
+            )
+            assert self.disaggregation_mode == "null", (
+                "PD-Multiplexing is not compatible with disaggregation mode."
+            )
+            assert self.disable_overlap_schedule, (
+                "PD-Multiplexing is not compatible with overlap schedule."
+            )
 
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch
@@ -15707,7 +15854,9 @@ class ServerArgs:
             assert self.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            ], (
+                f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            )
             if self.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
@@ -15738,9 +15887,9 @@ class ServerArgs:
 
         run_post_process_pass(self, _hisparse_validation)
 
-        assert (
-            self.schedule_conservativeness >= 0
-        ), "schedule_conservativeness must be non-negative"
+        assert self.schedule_conservativeness >= 0, (
+            "schedule_conservativeness must be non-negative"
+        )
 
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
@@ -15855,9 +16004,9 @@ class ServerArgs:
                                 pinned=False,
                             )
                     elif isinstance(lora_path, dict):
-                        assert (
-                            "lora_name" in lora_path and "lora_path" in lora_path
-                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                        assert "lora_name" in lora_path and "lora_path" in lora_path, (
+                            f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                        )
                         lora_ref = LoRARef(
                             lora_id=LoRARef.deterministic_id(
                                 lora_path["lora_name"], lora_path["lora_path"]
@@ -15902,14 +16051,16 @@ class ServerArgs:
                     lora_target_modules=set(self.lora_target_modules),
                 )
                 if "all" in self.lora_target_modules:
-                    assert (
-                        len(self.lora_target_modules) == 1
-                    ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                    assert len(self.lora_target_modules) == 1, (
+                        "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                    )
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
                 self.max_lora_rank and self.lora_target_modules
-            ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+            ), (
+                "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+            )
 
             # Validate max_loaded_loras
             if self.max_loaded_loras is not None:
@@ -15931,9 +16082,9 @@ class ServerArgs:
             if self.lora_use_virtual_experts:
                 logger.info("Virtual expert computation enabled.")
 
-            assert (
-                self.lora_drain_wait_threshold >= 0.0
-            ), "--lora-drain-wait-threshold must be non-negative."
+            assert self.lora_drain_wait_threshold >= 0.0, (
+                "--lora-drain-wait-threshold must be non-negative."
+            )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:
@@ -15945,43 +16096,45 @@ class ServerArgs:
             "tse",
             "default",
             "custom",
-        ], f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
+        ], (
+            f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
+        )
 
         if rule == "tse":
-            assert (
-                len(buckets_rule) == 4
-            ), f"{arg_name} TSE rule requires exactly 4 parameters: ['tse', middle, base, count], got {len(buckets_rule)}"
+            assert len(buckets_rule) == 4, (
+                f"{arg_name} TSE rule requires exactly 4 parameters: ['tse', middle, base, count], got {len(buckets_rule)}"
+            )
             try:
                 middle = float(buckets_rule[1])
                 base = float(buckets_rule[2])
                 count = int(buckets_rule[3])
             except (ValueError, IndexError):
-                assert (
-                    False
-                ), f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
+                assert False, (
+                    f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
+                )
             assert base > 1, f"{arg_name} TSE base must be larger than 1, got: {base}"
             assert count > 0, f"{arg_name} TSE count must be positive, got: {count}"
             assert middle > 0, f"{arg_name} TSE middle must be positive, got: {middle}"
 
         elif rule == "default":
-            assert (
-                len(buckets_rule) == 1
-            ), f"{arg_name} default rule should only have one parameter: ['default'], got {len(buckets_rule)}"
+            assert len(buckets_rule) == 1, (
+                f"{arg_name} default rule should only have one parameter: ['default'], got {len(buckets_rule)}"
+            )
 
         elif rule == "custom":
-            assert (
-                len(buckets_rule) >= 2
-            ), f"{arg_name} custom rule requires at least one bucket value: ['custom', value1, ...]"
+            assert len(buckets_rule) >= 2, (
+                f"{arg_name} custom rule requires at least one bucket value: ['custom', value1, ...]"
+            )
             try:
                 bucket_values = [float(x) for x in buckets_rule[1:]]
             except ValueError:
                 assert False, f"{arg_name} custom rule bucket values must be numeric"
-            assert len(set(bucket_values)) == len(
-                bucket_values
-            ), f"{arg_name} custom rule bucket values should not contain duplicates"
-            assert all(
-                val >= 0 for val in bucket_values
-            ), f"{arg_name} custom rule bucket values should be non-negative"
+            assert len(set(bucket_values)) == len(bucket_values), (
+                f"{arg_name} custom rule bucket values should not contain duplicates"
+            )
+            assert all(val >= 0 for val in bucket_values), (
+                f"{arg_name} custom rule bucket values should be non-negative"
+            )
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         vision_config = getattr(model_config.hf_config, "vision_config", None)
