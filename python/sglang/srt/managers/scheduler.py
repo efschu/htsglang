@@ -2878,29 +2878,63 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                last_hash = last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
-                match_end = req._compute_max_prefix_len(
-                    len(req.full_untruncated_fill_ids)
-                )
-                new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+        if not self.enable_hicache_storage:
+            return
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        last_host_node = req.last_host_node
+        # RANK-LOCAL: `backuped` means "full KV present in THIS rank's host
+        # pool", and uneven DCP gives the ranks host pools of different sizes,
+        # so it can be true here and false on a peer for the same node.
+        locally_eligible = (
+            last_host_node.backuped or last_host_node is self.tree_cache.root_node
+        )
+        # #580: when the tree cache decides prefetch participation by group
+        # vote, skipping the call here would leave the peers alone in that
+        # collective. Call unconditionally and let the vote decide; the local
+        # verdict rides along as `locally_eligible`. Tree caches without the
+        # predicate (and even-TP HiCache, where it is False) keep the plain
+        # local gate and the byte-identical call below.
+        group_decides = getattr(
+            self.tree_cache, "prefetch_participation_is_collective", None
+        )
+        group_decides = bool(group_decides is not None and group_decides())
+        if not locally_eligible and not group_decides:
+            return
 
-                prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
-                    else None
-                )
-                self.tree_cache.prefetch_from_storage(
-                    req.rid,
-                    last_host_node,
-                    new_input_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
+        if locally_eligible:
+            last_hash = last_host_node.get_last_hash_value()
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+            new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+
+            prefix_keys = (
+                last_host_node.get_prefix_hash_values(last_host_node.parent)
+                if self.tree_cache.hicache_storage_pass_prefix_keys
+                else None
+            )
+        else:
+            # Ineligible here: enter the vote carrying nothing. The empty token
+            # list keeps every derived length at 0 on this rank, and the vote
+            # will be negative, so no rank registers a prefetch.
+            last_hash, new_input_tokens, prefix_keys = None, [], None
+
+        if group_decides:
+            self.tree_cache.prefetch_from_storage(
+                req.rid,
+                last_host_node,
+                new_input_tokens,
+                last_hash,
+                prefix_keys,
+                locally_eligible=locally_eligible,
+            )
+        else:
+            self.tree_cache.prefetch_from_storage(
+                req.rid,
+                last_host_node,
+                new_input_tokens,
+                last_hash,
+                prefix_keys,
+            )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
