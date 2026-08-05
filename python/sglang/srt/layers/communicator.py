@@ -168,12 +168,120 @@ def _fused_rmsnorm_fp8_per_token_quant(
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
+# ---------------------------------------------------------------------------
+# #583: the ALL-REDUCE FUSION ARCH TERM is ONE GROUP-WIDE decision.
+#
+# `is_sm90_supported()` / `is_sm100_supported()` query THIS RANK's device. The
+# value they return gates `should_fuse_mlp_allreduce_with_next_layer`, and a
+# True there SKIPS `postprocess_layer` -- i.e. it removes a collective from
+# that layer. So a per-rank answer is a rank-local predicate deciding whether
+# a group collective is entered: ranks that fuse issue one fewer all-reduce
+# per layer than ranks that do not, the ranks stop pairing up, and (because
+# the mispaired payloads are often the same size) they compute garbage
+# silently before anything hangs. That is the #583 family exactly.
+#
+# On a homogeneous cluster every rank answers the same and the defect is
+# invisible. On a heterogeneous one straddling the sm90 boundary -- an sm89
+# and an sm90 card in the same TP group -- it is live.
+#
+# So the arch term is decided ONCE, collectively: every rank contributes its
+# own capability, the MINIMUM rules, and if one rank lacks the arch then NO
+# rank fuses. Never a mixture. Same shape and same reasoning as
+# `decide_spec_kernel_backend` in speculative/eagle_utils.py.
+# ---------------------------------------------------------------------------
+
+_AR_FUSION_ARCH: Optional[bool] = None
+
+
+def local_ar_fusion_arch_supported() -> bool:
+    """Whether THIS rank's device has the fusion arch. Rank-local."""
+    return bool(is_sm90_supported() or is_sm100_supported())
+
+
+def set_ar_fusion_arch(value: bool) -> None:
+    """Record the group's decision. Idempotent for the same value; a second,
+    DIFFERENT value is refused, because two disagreeing decisions in one
+    process mean the collective ran twice with different inputs."""
+    global _AR_FUSION_ARCH
+    value = bool(value)
+    if _AR_FUSION_ARCH is not None and _AR_FUSION_ARCH != value:
+        raise RuntimeError(
+            f"all-reduce fusion arch already decided as {_AR_FUSION_ARCH!r}; "
+            f"refusing to change it to {value!r} mid-process."
+        )
+    _AR_FUSION_ARCH = value
+
+
+def reset_ar_fusion_arch() -> None:
+    """Test-only: clear the decision."""
+    global _AR_FUSION_ARCH
+    _AR_FUSION_ARCH = None
+
+
+def ar_fusion_arch_supported() -> bool:
+    """The GROUP's answer, or this rank's own when no decision was made.
+
+    The fallback is correct where it is reachable -- a single rank, or a unit
+    test -- and it is not a silent per-rank restoration on a real TP boot,
+    because `decide_ar_fusion_arch` runs unconditionally at the end of
+    `init_torch_distributed` on every rank.
+    """
+    if _AR_FUSION_ARCH is None:
+        return local_ar_fusion_arch_supported()
+    return _AR_FUSION_ARCH
+
+
+def decide_ar_fusion_arch(tp_group=None) -> bool:
+    """COLLECTIVE. Agree the fusion arch term across the TP group by MIN.
+
+    Runs on the CPU (gloo) group, so it does not depend on a device
+    communicator being up. MUST be called on every rank the same number of
+    times. Warn-never-raise on the plumbing: if the group is unavailable the
+    local value stands, which is what a single-rank boot wants anyway.
+    """
+    local_ok = local_ar_fusion_arch_supported()
+    group_ok = local_ok
+    try:
+        if tp_group is None:
+            from sglang.srt.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+        if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+            flag = torch.tensor([1 if local_ok else 0], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=tp_group.cpu_group
+            )
+            group_ok = bool(flag[0].item())
+            if group_ok != local_ok:
+                logging.info(
+                    "all-reduce fusion arch: this rank reports %s but the TP "
+                    "group minimum is %s -- following the group. A mixed "
+                    "group must not fuse on some ranks only: that removes a "
+                    "collective from the fusing ranks' layers (#583).",
+                    local_ok,
+                    group_ok,
+                )
+    except Exception as exc:  # noqa: BLE001 - never block boot on the probe
+        logging.warning(
+            "all-reduce fusion arch: group decision unavailable (%s: %s); "
+            "falling back to this rank's local capability %s",
+            type(exc).__name__,
+            exc,
+            local_ok,
+        )
+        group_ok = local_ok
+    set_ar_fusion_arch(group_ok)
+    return group_ok
+
+
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
         # Ref: https://github.com/sgl-project/sglang/issues/17237
         _is_cuda
-        and (is_sm90_supported() or is_sm100_supported())
+        # #583: the GROUP's arch answer, never this rank's own -- see
+        # decide_ar_fusion_arch for why a per-rank answer desyncs the group.
+        and ar_fusion_arch_supported()
         and _is_flashinfer_available
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE

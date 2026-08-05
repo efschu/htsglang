@@ -77,6 +77,7 @@ __all__ = [
     "Divergence",
     "census",
     "census_enabled",
+    "census_heartbeat",
     "census_interval",
     "format_local_census",
 ]
@@ -87,15 +88,33 @@ ENV_ENABLE = "SGLANG_COLLECTIVE_CENSUS"
 #: Scheduler iterations between cross-rank comparisons.
 ENV_INTERVAL = "SGLANG_COLLECTIVE_CENSUS_INTERVAL"
 
+#: Scheduler iterations between coarse local heartbeats.
+ENV_HEARTBEAT = "SGLANG_COLLECTIVE_CENSUS_HEARTBEAT"
+
 #: Default cadence. At the production iteration rate this is a comparison
 #: every couple of seconds -- an order of magnitude inside the ~30 s spin
 #: deadline, so a divergence is named well before it aborts, while the cost
 #: stays one small ``all_gather_object`` per interval.
 DEFAULT_INTERVAL = 50
 
+#: Coarse heartbeat cadence. Deliberately far apart: its job is to prove over
+#: a long boot that the detector is STILL ticking, not to report anything the
+#: comparison would not already have escalated. One modulo on a counter that
+#: is incremented anyway, so the hot path is untouched.
+DEFAULT_HEARTBEAT = 10000
+
 
 def census_enabled() -> bool:
     return os.environ.get(ENV_ENABLE, "1") not in ("0", "false", "False")
+
+
+def census_heartbeat() -> int:
+    """Local-snapshot heartbeat cadence, in scheduler iterations. Non-positive
+    disables the heartbeat only."""
+    try:
+        return int(os.environ.get(ENV_HEARTBEAT, DEFAULT_HEARTBEAT))
+    except ValueError:
+        return DEFAULT_HEARTBEAT
 
 
 def census_interval() -> int:
@@ -141,6 +160,12 @@ class CollectiveCensus:
         self.comparisons = 0
         #: Number of comparisons that found a divergence.
         self.divergences_seen = 0
+        #: Arming is announced once, from the first TICK rather than at
+        #: import: an import-time line proves only that the module loaded,
+        #: while a line from the tick proves the wired production path is
+        #: actually reached on this flagset. Silence from an instrument that
+        #: is silent when healthy is otherwise unfalsifiable (#380).
+        self._armed_announced = False
 
     # -- hot path -------------------------------------------------------
 
@@ -169,6 +194,27 @@ class CollectiveCensus:
 
     def due(self, interval: int) -> bool:
         return interval > 0 and self._round % interval == 0
+
+    def announce_armed_once(self, rank: int, interval: int, heartbeat: int) -> None:
+        """One INFO line per scheduler rank, the first time the tick runs."""
+        if self._armed_announced:
+            return
+        self._armed_announced = True
+        logger.info(
+            "collective census armed (rank %d): interval=%d iterations, "
+            "heartbeat=%d, families tracked=%d (%s). Counting is always on; "
+            "the cross-rank comparison runs on the gloo tp_cpu_group and "
+            "reports only when the ranks disagree.",
+            rank,
+            interval,
+            heartbeat,
+            len(self._counts),
+            ", ".join(sorted(self._counts)) or "none yet",
+        )
+
+    def heartbeat(self, rank: int) -> None:
+        """Coarse proof-of-life carrying this rank's local counts."""
+        logger.info("%s", format_local_census(rank))
 
     def compare_across_ranks(
         self, group, world_size: int, rank: int
