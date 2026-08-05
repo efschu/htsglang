@@ -57,7 +57,9 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+# ~25s: TestGlooReproduction spawns three child interpreters that each import
+# sglang and stand up a real gloo group.
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 #: Payload posted by the peers in the production crash: the kv-pressure
 #: ladder consensus proposal, four (v, -v) int64 pairs.
