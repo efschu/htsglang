@@ -65,8 +65,18 @@ class _SoloHostConfigurator:
 
 
 def _capacity_server_args(capacity: bool, solo_rank=None):
+    # The install gate reads `uneven_kv_derived_mode`, not the capacity flag
+    # directly -- ServerArgs grew that wrapper ("either derived mode, i.e.
+    # the vector is computed after profiling rather than pinned") after this
+    # stub was written, and the stub kept answering only the old name. The
+    # relation is reproduced here rather than hardcoded to `capacity`, so a
+    # future speed-mode case cannot silently take the wrong branch.
+    speed = False
     return SimpleNamespace(
         uneven_kv_capacity_mode=lambda: capacity,
+        uneven_kv_speed_mode=lambda: speed,
+        uneven_kv_derived_mode=lambda: capacity or speed,
+        rank_kv_ratio=None,
         speculative_draft_solo_active=lambda: solo_rank is not None,
         speculative_draft_solo_rank=lambda: solo_rank,
     )
