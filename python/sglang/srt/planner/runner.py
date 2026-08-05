@@ -475,12 +475,14 @@ def own_vram_gate(
                     continue
                 handle = nvml.nvmlDeviceGetHandleByIndex(i)
                 for proc in nvml.nvmlDeviceGetComputeRunningProcesses(handle) or []:
+                    used = getattr(proc, "usedGpuMemory", None)
+                    # NVML reports None when the caller may not see the value
+                    # (another user's process under a restricted driver mode).
                     entry = {
                         "gpu": i,
                         "pid": int(getattr(proc, "pid", 0)),
-                        "used_mib": int(
-                            (getattr(proc, "usedGpuMemory", 0) or 0) / 2**20
-                        ),
+                        "used_mib": int(used / 2**20) if used is not None else 0,
+                        "used_known": used is not None,
                     }
                     (holding if entry["pid"] in own else foreign).append(entry)
         except Exception as e:

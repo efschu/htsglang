@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 
 MIB = 1024 * 1024
 
+#: Guard to ensure the "v2 carve-out unavailable" warning fires at most once
+#: per process. A future driver update may restore v2 support without a restart,
+#: but within one process lifecycle the absence cause does not change.
+_nv2_warning_emitted: bool = False
+
 
 class NvmlUnavailableError(RuntimeError):
     """NVML cannot answer: the binding is missing, or the driver is not loaded."""
@@ -163,23 +168,60 @@ def _decode(value: object) -> str:
 def _memory_info(pynvml, handle):
     """``(total_bytes, reserved_bytes)`` for one card.
 
-    The reserved figure exists only in NVML's v2 memory struct. It is read
-    here rather than derived, because the two obvious derivations are both
-    wrong: ``total - used - free`` cancels to ~0 on the v2 struct (v2 already
-    excludes the carve-out from ``used``), and comparing the v1 and v2 structs
-    only works while something is allocated. A driver or binding too old for
-    v2 reports 0, which keeps the old, carve-out-blind behaviour instead of
-    refusing a boot over a field that is merely unavailable.
+    The reserved figure (driver carve-out) exists only in NVML's v2 memory
+    struct. Two distinct absence cases:
+
+    * (a) No v2 support -- the pynvml binding lacks ``nvmlMemory_v2`` or the
+      v2 call raises. Returns ``(total, 0)`` and emits a one-time ``logger.warning``
+      per process. Budgets are carve-out-blind in this mode; the warning makes
+      that visible instead of silent.
+    * (b) v2 struct exists but lacks the ``reserved`` attribute. This is a
+      data error, not an old driver. Raises ``RuntimeError`` naming the struct
+      type and the missing field -- the mem_ledger contract treats ``reserved``
+      as REQUIRED when v2 is available, and the producer must not be softer
+      than the consumer.
+
+    A driver that reports a valid v2 struct with ``reserved`` returns it
+    directly with no warning.
     """
+    global _nv2_warning_emitted
+
     total = int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
     version = getattr(pynvml, "nvmlMemory_v2", None)
     if version is None:
+        if not _nv2_warning_emitted:
+            _nv2_warning_emitted = True
+            logger.warning(
+                "NVML v2 memory struct unavailable (pynvml binding lacks "
+                "nvmlMemory_v2). Carve-out detection is disabled: memory "
+                "budgets are carve-out-blind and overstate allocatable VRAM "
+                "by the driver carve-out (size varies by card and driver). "
+                "Upgrade nvidia-ml-py to restore the carve-out term."
+            )
         return total, 0
     try:
         v2 = pynvml.nvmlDeviceGetMemoryInfo(handle, version=version)
     except Exception:  # pragma: no cover - driver/binding without v2
+        if not _nv2_warning_emitted:
+            _nv2_warning_emitted = True
+            logger.warning(
+                "NVML v2 memory query raised an exception. Carve-out "
+                "detection is disabled: memory budgets are carve-out-blind "
+                "and overstate allocatable VRAM by the driver carve-out "
+                "(size varies by card and driver). The driver or binding "
+                "may not support nvmlMemory_v2."
+            )
         return total, 0
-    return total, int(getattr(v2, "reserved", 0))
+
+    reserved = getattr(v2, "reserved", None)
+    if reserved is None:
+        raise RuntimeError(
+            "NVML v2 memory struct is present but lacks the required 'reserved' "
+            "field. The struct type is nvmlMemory_v2; this indicates a mismatch "
+            "between the binding and the driver. The mem_ledger contract requires "
+            "this field when v2 is available."
+        )
+    return total, int(reserved)
 
 
 def list_devices() -> list[DeviceInfo]:
