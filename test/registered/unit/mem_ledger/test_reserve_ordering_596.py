@@ -30,6 +30,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 GPU_MEM = 20480
 FULL_DEMAND_MIB = 3182  # what the ledger prices this card at, window 8 desk check
 FALLBACK_MIB = 1958  # what #590 installed instead, and what OOMed
+#: #602: the external headroom the user asked for. The installed reserve has to
+#: carry it as well, because whatever this function leaves out is handed to the
+#: KV pool -- which is how --rank-user-reserve-mib came to be parsed, logged and
+#: then spent.
+USER_RESERVE_MIB = 1024
 
 
 class _WindowEightStub:
@@ -49,6 +54,12 @@ class _WindowEightStub:
         self.tp_size = 3
         self.profile_resolved_at_build = None
         self.capacity_defaults_calls = 0
+        # #602: the reserve decision reads both of these. They are the real
+        # fields, and user_reserve_mib_per_gpu below is the real method, so
+        # the user reserve reaches the assertion the same way it reaches a
+        # boot rather than through a value this stub hands over.
+        self.rank_gpu_id = [1, 1, 1]
+        self.rank_user_reserve_mib = USER_RESERVE_MIB
 
     # -- the real methods under test -------------------------------------
     def ledger_full_demand_per_gpu(self, gpu_mem=None):
@@ -56,6 +67,9 @@ class _WindowEightStub:
 
     def reserve_demand_per_gpu(self, gpu_mem, counts):
         return ServerArgs.reserve_demand_per_gpu(self, gpu_mem, counts)
+
+    def user_reserve_mib_per_gpu(self, rank_gpu_id):
+        return ServerArgs.user_reserve_mib_per_gpu(self, rank_gpu_id)
 
     # -- the seam ---------------------------------------------------------
     def _apply_gpu_mem_capacity_defaults(self, gpu_mem):
@@ -143,11 +157,19 @@ class TestReserveIsDecidedFromTheResolvedProfile(unittest.TestCase):
 
         self.assertEqual(
             out,
-            {1: FULL_DEMAND_MIB},
-            "the installed reserve is not the full-model number; with the "
-            "profile unresolved at decision time this is window 8 again",
+            {1: FULL_DEMAND_MIB + USER_RESERVE_MIB},
+            "the installed reserve is not the full-model number plus the "
+            "user's external headroom; with the profile unresolved at "
+            "decision time this is window 8 again, and dropping the headroom "
+            "is #602",
         )
         self.assertNotEqual(out[1], FALLBACK_MIB)
+        self.assertNotEqual(
+            out[1],
+            FULL_DEMAND_MIB,
+            "the full demand alone means --rank-user-reserve-mib was parsed "
+            "and then ignored, which spends the user's free VRAM on KV",
+        )
 
     def test_the_profile_was_resolved_before_the_footprint_was_looked_up(self):
         """Names the mechanism, so a future refactor that reorders it fails

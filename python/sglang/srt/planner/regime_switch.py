@@ -1466,9 +1466,24 @@ def regime_report_for_plan(
     )
 
     if corridor_mib is None:
-        from sglang.srt.uneven_perf import planner_corridor_mib
+        # #602: deliberately NOT planner_corridor_mib(), which is now 0
+        # because the fundability gate's demand carries the NVML carve-out and
+        # the user reserve as terms. This consumer does not use that demand --
+        # `committed` below is weights + mamba + capacity.overhead_mib + KV
+        # against the NOMINAL card total, and none of those three include
+        # either quantity. Inheriting the 0 would let a residency rung commit
+        # the whole board, carve-out and user headroom included.
+        #
+        # So this keeps the floor it has always used, unchanged and now
+        # explicit. It is a known debt, not an endorsement: the right number
+        # here is this card's carve-out plus its user reserve, which needs
+        # both plumbed into `hardware`/`inputs` and a window to validate the
+        # #274 residency path (regime_controller is 'off' in production, so
+        # this call site is not on the boot being fixed).
+        from sglang.srt.registry.ledger import DEFAULT_CORRIDOR_BYTES
+        from sglang.srt.registry.ledger import MIB as _LEDGER_MIB
 
-        corridor_mib = planner_corridor_mib()
+        corridor_mib = int(DEFAULT_CORRIDOR_BYTES // _LEDGER_MIB)
 
     totals: List[float] = []
     committed: List[float] = []

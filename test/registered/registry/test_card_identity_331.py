@@ -194,6 +194,13 @@ class IdentityMapTest(unittest.TestCase):
                 "pci_bus_id": BDF_5090,
                 "name": "NVIDIA GeForce RTX 5090",
                 "total_mib": 32 * 1024,
+                # #602: the identity now also carries how much of that total
+                # the driver keeps. This fixture builds the card without the
+                # NVML v2 field, so it reports 0 reserved and the whole board
+                # as allocatable -- which is the documented behaviour when a
+                # driver does not answer, not a default we chose.
+                "reserved_mib": 0,
+                "allocatable_mib": 32 * 1024,
             },
         )
 

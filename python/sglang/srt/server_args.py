@@ -11109,6 +11109,7 @@ class ServerArgs:
                 uuid=card.uuid,
                 name=card.name,
                 total_mib=card.total_mib,
+                reserved_mib=getattr(card, "reserved_mib", 0),
             )
             for ordinal, card in sorted(cards_by_ordinal.items())
         ]
@@ -11305,15 +11306,32 @@ class ServerArgs:
         # rather than handing back a short number that looks complete.
         full = self.ledger_full_demand_per_gpu(gpu_mem)
         if full is not None and all(g in full for g in counts):
+            # #602: the user reserve belongs in this number too. What is
+            # returned here is subtracted from the card to form the rank
+            # budget, so anything left out of it is handed to the KV pool.
+            # The gated ledger path has always added it
+            # (_vram_ledger_non_kv_per_gpu), this one did not, and production
+            # runs THIS one -- so --rank-user-reserve-mib was parsed, logged
+            # and then ignored, and the external free space it promises was
+            # spent on KV. With an exact demand model the omission lands free
+            # VRAM at minus the driver carve-out, i.e. it cannot be absorbed
+            # by being careful elsewhere.
+            # The per-rank list, not counts' keys: this helper validates its
+            # argument's length against --rank-user-reserve-mib, so it has to
+            # see the same rank vector _build_card_ledgers gives it.
+            user_reserve = self.user_reserve_mib_per_gpu(list(self.rank_gpu_id))
+            demand = {g: int(full[g]) + int(user_reserve.get(g, 0)) for g in counts}
             logger.info(
                 "--rank-auto-reserve-mib auto: FULL per-card demand from the "
                 "VRAM ledger %s MiB (activation + measured graph capture + "
                 "ladder + GDN/indexer scratch + attention workspace + "
-                "hardware residual + parent context; weights and the mamba "
-                "pool are funded by the rank budget and excluded here).",
-                {g: full[g] for g in sorted(counts)},
+                "hardware residual + parent context + NVML driver carve-out, "
+                "plus the user reserve %s MiB; weights and the mamba pool are "
+                "funded by the rank budget and excluded here).",
+                {g: demand[g] for g in sorted(counts)},
+                {g: int(user_reserve.get(g, 0)) for g in sorted(counts)},
             )
-            return {g: int(full[g]) for g in counts}
+            return demand
 
         ladder_gpu = self.ladder_reserve_gpu_id()
         # #590: the card identity is what lets the ledger price this GPU's

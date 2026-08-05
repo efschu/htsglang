@@ -5954,34 +5954,39 @@ _PHASE_TUNES = (_PHASE_PREFILL, _PHASE_DECODE)
 
 
 def planner_corridor_mib() -> int:
-    """#330's absolutely-free corridor, in MiB, as the planner prices it.
+    """Extra free MiB the planner demands ON TOP of the reserve demand. Zero.
 
-    AUDIT_434 class ``POLICY``: a deliberate rig-independent rule ("at least
-    this much VRAM stays unallocated on every card"), not a constant fitted on
-    the reference rig -- it is the same number on a 3080 and on a 5090, and it
-    is a choice about how much room a boot must leave, not a measurement of
-    anything. There is exactly one definition of it on this rig,
-    ``registry.ledger.DEFAULT_CORRIDOR_BYTES`` (#330), and this reads that one
-    rather than restating 400; the ledger daemon already exposes it as
-    ``--corridor-mib``, and the override seam for the planner's use of it is
-    ``SGLANG_PLANNER_CORRIDOR_MIB``.
+    This used to return #330's 400 MiB and it must not any more (#602). The
+    400 was standing in for two quantities the demand model did not carry:
+    the NVML driver carve-out and the user's external headroom. Both are now
+    first-class terms -- ``TERM_NVML_CARVE_OUT`` is read from the driver, and
+    ``--rank-user-reserve-mib`` is added by ``reserve_demand_per_gpu`` -- so
+    the fundability comparison in ``_unfundable_reason`` already means exactly
+    "this rank leaves the user their MiB". Concretely, with both inside the
+    demand, ``residual_free - demand`` IS ``real NVML free - user reserve``,
+    because ``residual_free`` is computed against the nominal card total and
+    the carve-out is now subtracted on the other side of that subtraction.
 
-    Why the planner needs it at all: the fundability gate compares a rank's
-    predicted residual free VRAM against the derived reserve DEMAND, i.e.
-    against the modelled non-budget posts. Clearing that demand exactly means
-    a boot that allocates every last modelled byte and leaves nothing -- the
-    #424 window measured 87 MiB free on the 5090 at one such operating point
-    and 286-316 MiB at another, and both were treated as corridor breaches by
-    hand. Pricing the corridor here is what turns that hand judgement into
-    something the plan log states before the boot.
+    Adding a constant here would therefore no longer be a corridor. It would
+    be a pad on top of a number the user chose, which is the thing the reserve
+    semantics forbid: a reserve is the user's external free space, and any
+    extra margin the code invents is either an unbooked KV pool giveaway or a
+    missing term wearing a disguise. The 400 also survives as a RELEASE
+    criterion nowhere -- it remains only as the reservation daemon's separate
+    emergency floor (``registry.ledger.DEFAULT_CORRIDOR_BYTES``, exposed as
+    ``--corridor-mib``), which answers a different question and is not read
+    here any more.
+
+    ``SGLANG_PLANNER_CORRIDOR_MIB`` stays as an experiment seam, so a window
+    can ask "what would an extra N MiB of slack have cost in context" without
+    a code change. It is not a knob production is expected to set.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.registry.ledger import DEFAULT_CORRIDOR_BYTES, MIB
 
     override = envs.SGLANG_PLANNER_CORRIDOR_MIB.get()
     if override is not None:
         return max(int(override), 0)
-    return int(DEFAULT_CORRIDOR_BYTES // MIB)
+    return 0
 
 
 def _phase_solve_owns_kv_ratio(server_args, model, tune: str) -> bool:
@@ -6751,15 +6756,17 @@ def apply_auto_performance(server_args) -> None:
         return None
 
     def _corridor_note(res: Optional[List[float]]) -> Optional[str]:
-        """Advisory text for ranks that clear the demand but land inside
-        #330's absolutely-free corridor, or None.
+        """Advisory text for ranks that clear the demand by less than the
+        experiment seam's extra slack, or None.
 
-        Reported, never binding. The demand is a MODEL of the non-budget
-        posts and the corridor is what a boot must leave beyond them; a
-        candidate sitting between the two is one the operator may still want
-        (#354's 16,1,1 booted and served at 87 MiB free on the 5090), but it
-        is not one anybody should choose without being told. #424 made that
-        call by hand off a post-boot number; this states it before the boot.
+        Silent in production: ``planner_corridor_mib()`` is 0 unless
+        ``SGLANG_PLANNER_CORRIDOR_MIB`` is set, because since #602 the demand
+        itself carries the driver carve-out and the user's headroom, and
+        clearing it already means the user keeps their MiB. What is left here
+        is a way for a window to ask what an extra margin would have cost.
+        The BINDING check is ``_unfundable_reason``; this never was one, and a
+        note that reads like a floor is how the 400 came to be treated as a
+        release criterion it was never fit to be.
         """
         if res is None or _fund_demand is None or _fund_corridor <= 0:
             return None
@@ -6775,7 +6782,8 @@ def apply_auto_performance(server_args) -> None:
             + ", ".join(
                 f"rank {r} predicted free-after-boot {m} MiB" for r, m in tight
             )
-            + f" < the {_fund_corridor} MiB absolutely-free corridor of #330)"
+            + f" < the {_fund_corridor} MiB of extra slack requested via "
+            "SGLANG_PLANNER_CORRIDOR_MIB, on top of the reserve demand)"
         )
 
     _fund_base = _residual(base_plan)

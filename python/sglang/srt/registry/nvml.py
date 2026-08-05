@@ -74,15 +74,39 @@ class DeviceInfo:
     name: str
     total_bytes: int
     pci_bus_id: str
+    #: Bytes the driver holds back out of ``total_bytes`` and never hands to an
+    #: allocation. NVML reports it only through the v2 memory struct; ``0``
+    #: means the driver did not report it (see :func:`_memory_info`).
+    reserved_bytes: int = 0
 
     @property
     def total_mib(self) -> int:
         return self.total_bytes // MIB
 
+    @property
+    def reserved_mib(self) -> int:
+        return self.reserved_bytes // MIB
+
+    @property
+    def allocatable_mib(self) -> int:
+        """Card total MINUS the driver carve-out: the largest MiB any set of
+        processes can ever hold on this card at once.
+
+        This, not :attr:`total_mib`, is the capacity a memory budget may spend.
+        Budgeting against ``total_mib`` overcommits every card by the carve-out
+        (measured 425 MiB on a 20 GiB RTX 3080, 518 on a 32 GiB RTX 5090), and
+        the overcommit is invisible in the obvious check because NVML subtracts
+        the carve-out from BOTH ``used`` and ``free`` in the v2 struct -- so
+        ``total - used - free`` reads ~0 and the shortfall only appears when an
+        allocation that the budget said would fit does not.
+        """
+        return (self.total_bytes - self.reserved_bytes) // MIB
+
     def describe(self) -> str:
         return (
             f"nvml[{self.index}] {self.name} {self.total_mib} MiB "
-            f"{self.pci_bus_id} {self.uuid}"
+            f"({self.allocatable_mib} MiB allocatable, {self.reserved_mib} MiB "
+            f"driver-reserved) {self.pci_bus_id} {self.uuid}"
         )
 
 
@@ -136,6 +160,28 @@ def _decode(value: object) -> str:
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
 
+def _memory_info(pynvml, handle):
+    """``(total_bytes, reserved_bytes)`` for one card.
+
+    The reserved figure exists only in NVML's v2 memory struct. It is read
+    here rather than derived, because the two obvious derivations are both
+    wrong: ``total - used - free`` cancels to ~0 on the v2 struct (v2 already
+    excludes the carve-out from ``used``), and comparing the v1 and v2 structs
+    only works while something is allocated. A driver or binding too old for
+    v2 reports 0, which keeps the old, carve-out-blind behaviour instead of
+    refusing a boot over a field that is merely unavailable.
+    """
+    total = int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+    version = getattr(pynvml, "nvmlMemory_v2", None)
+    if version is None:
+        return total, 0
+    try:
+        v2 = pynvml.nvmlDeviceGetMemoryInfo(handle, version=version)
+    except Exception:  # pragma: no cover - driver/binding without v2
+        return total, 0
+    return total, int(getattr(v2, "reserved", 0))
+
+
 def list_devices() -> list[DeviceInfo]:
     """Every physical GPU, in NVML index order.
 
@@ -147,13 +193,14 @@ def list_devices() -> list[DeviceInfo]:
         devices: list[DeviceInfo] = []
         for index in range(pynvml.nvmlDeviceGetCount()):
             handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            total_bytes, reserved_bytes = _memory_info(pynvml, handle)
             devices.append(
                 DeviceInfo(
                     index=index,
                     uuid=_decode(pynvml.nvmlDeviceGetUUID(handle)),
                     name=_decode(pynvml.nvmlDeviceGetName(handle)),
-                    total_bytes=int(mem.total),
+                    total_bytes=total_bytes,
+                    reserved_bytes=reserved_bytes,
                     pci_bus_id=_decode(pynvml.nvmlDeviceGetPciInfo(handle).busId),
                 )
             )
@@ -445,16 +492,28 @@ class CardIdentity:
     name: str
     total_bytes: int
     cuda_ordinal: int | None = None
+    #: See :attr:`DeviceInfo.reserved_bytes`.
+    reserved_bytes: int = 0
 
     @property
     def total_mib(self) -> int:
         return self.total_bytes // MIB
 
+    @property
+    def reserved_mib(self) -> int:
+        return self.reserved_bytes // MIB
+
+    @property
+    def allocatable_mib(self) -> int:
+        """See :attr:`DeviceInfo.allocatable_mib`."""
+        return (self.total_bytes - self.reserved_bytes) // MIB
+
     def describe(self) -> str:
         cuda = "-" if self.cuda_ordinal is None else str(self.cuda_ordinal)
         return (
             f"uuid={self.uuid}  nvml={self.nvml_index}  cuda={cuda}  "
-            f"bdf={self.pci_bus_id}  {self.name} {self.total_mib} MiB"
+            f"bdf={self.pci_bus_id}  {self.name} {self.total_mib} MiB "
+            f"({self.allocatable_mib} MiB allocatable)"
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -465,6 +524,8 @@ class CardIdentity:
             "pci_bus_id": self.pci_bus_id,
             "name": self.name,
             "total_mib": self.total_mib,
+            "reserved_mib": self.reserved_mib,
+            "allocatable_mib": self.allocatable_mib,
         }
 
 
@@ -755,6 +816,7 @@ def identity_map(
                 pci_bus_id=info.pci_bus_id,
                 name=info.name,
                 total_bytes=info.total_bytes,
+                reserved_bytes=info.reserved_bytes,
                 cuda_ordinal=normalized.get(_normalize_bdf(info.pci_bus_id)),
             )
             for info in infos

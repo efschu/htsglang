@@ -81,7 +81,7 @@ USER_RESERVE_TERM = "user reserve (external)"
 
 
 class Provenance(str, enum.Enum):
-    """Where a term's number comes from. There are exactly three kinds.
+    """Where a term's number comes from. There are exactly four kinds.
 
     ``MODELED``
         Derived from configuration and model geometry alone: shard bytes, KV
@@ -96,6 +96,14 @@ class Provenance(str, enum.Enum):
         hardware fingerprint; invalidated when the fingerprint changes. Never
         a literal, never carried across a driver or wheel change.
 
+    ``REPORTED``
+        The driver states the number outright and this ledger copies it. Not
+        ``CALIBRATED``: nothing is probed, nothing is cached, and there is no
+        fingerprint to invalidate -- the value is read fresh from NVML on
+        every boot, so it follows a driver update or a resizable-BAR change
+        by itself. Distinguished from ``MODELED`` because no formula of ours
+        produces it and none should be invented if the driver stops answering.
+
     ``DECLARED``
         A co-resident tenant's own ledger, folded in whole. The tenant is
         responsible for the provenance of its lines; this ledger only records
@@ -105,6 +113,7 @@ class Provenance(str, enum.Enum):
 
     MODELED = "modeled"
     CALIBRATED = "calibrated"
+    REPORTED = "reported"
     DECLARED = "declared"
 
 

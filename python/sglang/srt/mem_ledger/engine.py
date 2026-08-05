@@ -92,6 +92,7 @@ TERM_HARDWARE_RESIDUAL = "hardware residual (per process)"
 TERM_PARENT_CONTEXT = "parent/tokenizer CUDA context"
 TERM_NCCL_BUFFERS = "NCCL communicator buffers"
 TERM_ATTN_WORKSPACE = "attention workspaces (capped)"
+TERM_NVML_CARVE_OUT = "NVML driver carve-out (not allocatable)"
 
 #: Terms the RANK BUDGET already funds, i.e. terms that live INSIDE
 #: ``--rank-gpu-memory-mib`` rather than outside it.
@@ -152,6 +153,11 @@ class CardFacts:
     uuid: str
     name: str
     total_mib: int
+    #: MiB the driver holds back out of ``total_mib`` and never allocates, as
+    #: NVML's v2 memory struct reports it. Booked as its own ledger term rather
+    #: than quietly subtracted from ``total_mib``, so a card whose driver does
+    #: not report it (0) is visibly different from one that reports none.
+    reserved_mib: int = 0
 
     def describe(self) -> str:
         return f"GPU {self.gpu_id} ({self.name}, NVML total {self.total_mib} MiB)"
@@ -1084,6 +1090,31 @@ def build_card_ledgers(
                         fingerprint=calibration.fingerprint,
                     )
                 )
+
+        # -- the part of the card that is never allocatable -------------------
+        # Charged ONCE per card, not once per rank: it is one reservation the
+        # driver makes against the board, not a per-process cost. Without this
+        # row the ledger spends MiB that no allocation can ever obtain, which
+        # is #602: every card was budgeted against its nominal NVML total and
+        # came up short by exactly this figure.
+        if card.reserved_mib:
+            terms.append(
+                LedgerTerm(
+                    name=TERM_NVML_CARVE_OUT,
+                    mib=card.reserved_mib,
+                    provenance=Provenance.REPORTED,
+                    derivation=(
+                        f"NVML v2 memory struct on {card.name} reports "
+                        f"{card.reserved_mib} MiB reserved out of "
+                        f"{card.total_mib} MiB total, leaving "
+                        f"{card.total_mib - card.reserved_mib} MiB "
+                        "allocatable. Read from the driver, not modelled: it "
+                        "varies with card, driver and resizable-BAR state. "
+                        "NVML also subtracts it from both 'used' and 'free', "
+                        "so it cannot be recovered from total-used-free"
+                    ),
+                )
+            )
 
         # -- co-resident tenants ---------------------------------------------
         for t in tenant_terms.get(card.gpu_id, ()):
