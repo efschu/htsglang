@@ -94,22 +94,29 @@ case "$RECIPE" in
     # Headline cell: kvso x NEXTN speculation. Needs KVSO_ALLOW_SPEC=1
     # (server_args.py:6620) and, for resume-under-spec, KVSO_RESUME=1
     # (kv_session_offload.py:503). Both are opt-in bring-up gates, not refusals.
+    # KVSO_ALLOW_SPEC stays an env: it is the spill x spec bring-up gate and has
+    # no flag. Resume-under-spec is now a FIRST-CLASS FLAG (#552), so it is
+    # spelled as a flag here and the legacy KVSO_RESUME env is deliberately NOT
+    # exported -- if the run then needs the alias to work, the new flag's
+    # env-OR is broken and the flag would be documenting a lie (ticket #552's
+    # own can-fail criterion).
     export KVSO_ALLOW_SPEC=1
-    export KVSO_RESUME=1
     ARGS=("${COMMON[@]}" "${PRESSURE[@]}" "${KVSO[@]}"
           --speculative-algorithm NEXTN --speculative-num-steps 3
           --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
           --kv-session-offload-spec-in-tick
+          --kv-session-offload-resume-under-spec
           --kv-pressure-ladder auto --max-running-requests-ceiling 16)
     ;;
   K3)
     # Spill-graph path on top of the K2 recipe.
     export KVSO_ALLOW_SPEC=1
-    export KVSO_RESUME=1
     export SGLANG_KVSO_SPILL_GRAPH=1
     ARGS=("${COMMON[@]}" "${PRESSURE[@]}" "${KVSO[@]}"
           --speculative-algorithm NEXTN --speculative-num-steps 3
-          --speculative-eagle-topk 1 --speculative-num-draft-tokens 4)
+          --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+          --kv-session-offload-resume-under-spec
+          --kv-pressure-ladder auto --max-running-requests-ceiling 16)
     ;;
   K4)
     # Budget / cadence / fast-lane knobs. Budgets are BOOT flags, hence a
