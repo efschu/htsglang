@@ -964,6 +964,15 @@ class BarlinkDeviceTransport:
     # CUDA call returned a sticky "unspecified launch failure" -- the crash
     # surfaced inside a Triton load_binary and named a kernel that was only
     # the victim. The host turns the word into DeviceCollectiveAborted.
+    #: #517 phase 2 defaults, at CLASS level on purpose. The abort-poll
+    #: state has to answer for every construction path -- including the ones
+    #: that never run ``__init__`` (the #583 suite builds transports through
+    #: ``__new__`` to exercise the guard without a device). A hot path whose
+    #: first statement can raise AttributeError is not a hot path, and
+    #: "off unless armed" is the correct default for both fields anyway.
+    _abort_poll_active = False
+    _abort_code_seen = 0
+
     _TIMEOUT_CYCLES = 60_000_000_000
 
     def __init__(
@@ -1033,6 +1042,24 @@ class BarlinkDeviceTransport:
         self._captured_launches = False
         self._boundary_checks = 0
         self._registered_in_gate = False
+        #: #517 phase 2. Set once the watchdog thread owns the abort-word
+        #: read, which is what makes the serving hot path free: with this
+        #: True, ``check_aborted`` is two attribute loads and NO CUDA call at
+        #: all in the steady state. Armed in ``_arm_status_poll`` only when a
+        #: watchdog is actually running -- otherwise the transport keeps the
+        #: in-line blocking read, because a word nobody reads is not a guard.
+        self._abort_poll_active = False
+        #: Sticky, host-side mirror of the device abort word. Written only by
+        #: the watchdog poll (0 -> non-zero, never back), read by the hot
+        #: path. Sticky on the device already, so a plain attribute needs no
+        #: lock: the only transition is one-way and a late read of it is the
+        #: same value.
+        self._abort_code_seen = 0
+        #: Private stream for the poll. The whole point: a D2H issued here is
+        #: ordered against nothing on the compute stream, so waiting for it
+        #: does not wait for the model. Created lazily with the poll arm.
+        self._abort_poll_stream = None
+        self._abort_poll_dst = None
         # Per-rank RS+AG ownership weights, proportional to the measured
         # PCIe link bandwidth of each rank (heterogeneous 8x/4x links!).
         # Override/skip the measurement with SGLANG_BARLINK_RSAG_SHARES.
@@ -1069,6 +1096,10 @@ class BarlinkDeviceTransport:
         # that only ever run inside a replayed graph, at the replay boundary.
         barlink_abort_gate.register(self)
         self._registered_in_gate = True
+        # #517 phase 2: hand the abort-word read to the watchdog thread, so
+        # the serving path stops paying a stream synchronization per
+        # collective. Registration first -- the poll walks the gate registry.
+        self._arm_status_poll()
         _info_once(
             "barlink device transport up: %d ranks, GPU-driven collectives "
             "(CUDA-graph capturable).",
@@ -1386,20 +1417,117 @@ class BarlinkDeviceTransport:
         else:
             self._unchecked_launches += 1
 
+    def _arm_status_poll(self) -> None:
+        """Hand the abort-word read to the watchdog thread (#517 phase 2).
+
+        Called once from bring-up. Whether it takes effect is
+        ``barlink_abort_gate.should_poll_status`` -- one definition, tested
+        directly -- and it says no when no watchdog is running, because the
+        alternative to an in-line read is not "no read", it is "no guard".
+
+        The private stream is the mechanism. A D2H issued on it is ordered
+        against nothing the compute stream is doing, so the watchdog can WAIT
+        for its own copy without waiting for the model -- which is exactly the
+        property the in-line read could never have, and the reason
+        ``check_aborted``'s docstring used to reject a thread ("that read
+        queues behind whatever is on the stream"). That objection is about a
+        read issued on the COMPUTE stream; it does not survive a private one.
+        """
+        if self._seq_dev is None:
+            return
+        watchdog = barlink_liveness.ensure_watchdog()
+        if not barlink_abort_gate.should_poll_status(
+            bool(getattr(self._seq_dev, "is_cuda", False)),
+            watchdog is not None,
+        ):
+            return
+        try:
+            self._abort_poll_stream = torch.cuda.Stream(device=self.device)
+            self._abort_poll_dst = torch.zeros(
+                1, dtype=self._seq_dev.dtype, pin_memory=True
+            )
+        except Exception as e:  # noqa: BLE001 - degrade to the in-line read
+            logger.warning(
+                "barlink device transport: no watchdog abort poll (%s); "
+                "keeping the in-line read.",
+                e,
+            )
+            self._abort_poll_stream = None
+            self._abort_poll_dst = None
+            return
+        self._abort_poll_active = True
+
+    def poll_status_word(self) -> bool:
+        """One watchdog read of the abort word. Returns True once tripped.
+
+        Runs on the WATCHDOG thread, never on the serving path. The gate
+        excludes it for the duration of a CUDA-graph capture
+        (``barlink_abort_gate.pause_polling``), because torch captures in
+        global mode, where a synchronizing call in any thread of the process
+        invalidates the capture.
+
+        Sticky in both directions of the word's life: the device word only
+        ever goes 0 -> non-zero, and this mirror only ever follows it once, so
+        a poll after a trip is a no-op and the hot path's view can never go
+        backwards.
+        """
+        if not self._abort_poll_active or self._seq_dev is None:
+            return bool(self._abort_code_seen)
+        if self._abort_code_seen:
+            return True
+        with torch.cuda.stream(self._abort_poll_stream):
+            self._abort_poll_dst.copy_(self._seq_dev[1:2], non_blocking=True)
+        # Waits for THIS copy on THIS stream only -- not for the model.
+        self._abort_poll_stream.synchronize()
+        code = int(self._abort_poll_dst[0])
+        if code:
+            self._abort_code_seen = code
+            return True
+        return False
+
     def check_aborted(self, where: str) -> None:
         """Raise if a spin kernel took its abort path. Called by the gate.
 
-        Reading the abort word is a device read: it synchronizes the current
-        stream, and inside a stream capture it is not merely expensive but
-        illegal. So this returns immediately during a capture; the next host
-        point for a captured collective is the graph replay boundary, which
-        ``barlink_abort_gate.check_after_graph_replay`` drives.
+        COST (#517 phase 2). In the steady state this is TWO attribute loads
+        and no CUDA call at all: the watchdog thread owns the read, and the
+        hot path only looks at the flag it publishes. That is the whole fix
+        for the bs=1 host overhead -- the previous shape of this function
+        read the device word in line, which synchronizes the current stream,
+        and under the overlap scheduler that means giving up the run-ahead the
+        scheduler exists to build. Task #600 measured it at 11 of 14 py-spy
+        samples inside this function and ~7 ms of a 46.5 ms round.
 
-        The word is sticky -- the kernels only ever write a non-zero code and
-        the only host write is the ``torch.zeros`` at bring-up -- so a late
-        read of a set bit is the same bit. That is what makes honouring
-        ``check_every()`` safe: it trades reporting latency, not detection.
+        WHY A THREAD IS SOUND HERE, against the note this function used to
+        carry. The old objection was that a watchdog "would read the same
+        device word, that read queues behind whatever is on the stream, and
+        the thing on the stream is exactly the kernel it is meant to report
+        on". That is true of a read issued on the COMPUTE stream. The poll
+        issues its copy on a PRIVATE stream, which is ordered against nothing
+        the model is doing, so it observes the word as it stands and waits
+        only for its own four bytes. The word is sticky, so "as it stands" is
+        all the guard ever needed: a trip observed late is the same trip.
+
+        DETECTION LATENCY is therefore bounded in TIME rather than in checks:
+        one poll interval (``ENV_POLL_MS``, default 10 ms) plus the copy,
+        after which the next collective or replay boundary raises. The old
+        check-count bound (``ENV_MAX_LAG``) asked the wrong question at bs=1,
+        where being many checks ahead of the device is the healthy state.
+
+        Fallbacks keep the guard: with no watchdog running,
+        ``_abort_poll_active`` stays False and this is the pre-#517 in-line
+        read verbatim, including ``check_every()`` and the capture skip.
         """
+        if self._abort_poll_active:
+            # THE HOT PATH. Two attribute loads. No CUDA call, no env read,
+            # no counter -- see the class field docs for why the flag alone
+            # is sufficient (sticky word, one-way mirror).
+            if not self._abort_code_seen:
+                return
+            if not barlink_abort_gate.abort_check_enabled():
+                return
+            self._unchecked_launches = 0
+            self._raise_aborted(where, int(self._abort_code_seen))
+
         from sglang.srt.distributed.device_communicators.barlink import (
             graph_capture_running,
         )
@@ -1424,6 +1552,12 @@ class BarlinkDeviceTransport:
         code = int(self._seq_dev[1].item())
         if code == 0:
             return
+        self._raise_aborted(where, code)
+
+    def _raise_aborted(self, where: str, code: int) -> None:
+        """The report. ONE definition, because #517 phase 2 added a second
+        caller (the watchdog-fed fast path) and two copies of a diagnostic
+        this precise would drift the moment either is edited."""
         kernel = _ABORT_KERNELS.get(code, f"unknown abort code {code}")
         raise DeviceCollectiveAborted(
             f"barlink device collective aborted at {where}: rank "
