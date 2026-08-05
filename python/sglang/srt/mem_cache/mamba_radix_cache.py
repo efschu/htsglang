@@ -653,6 +653,22 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
                 mamba_ping_pong_track_buffer_to_keep = None
 
+            if mamba_value is None:
+                # CACHE-INSERT degradation: the int8 checkpoint pool could not
+                # yield a slot (see `_alloc_mamba_slot`). Skip the insert and
+                # release the KV exactly like the `is_insert=False` path does --
+                # the state is simply not cached, the request still finishes.
+                self.token_to_kv_pool_allocator.free(
+                    page_aligned_kv_indices[req.cache_protected_len :]
+                )
+                # `mamba_exist=True` + no ping-pong slot to keep, i.e. the
+                # request's active mamba slot goes back to the pool.
+                self.req_to_token_pool.free_mamba_cache(
+                    req, mamba_ping_pong_track_buffer_to_keep=None
+                )
+                self.dec_lock_ref(req.last_node)
+                return
+
             result = self.insert(
                 InsertParams(
                     key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
@@ -758,27 +774,46 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Donate the mamba index to the radix cache instead of copying.
         # This avoids a data copy that would race with the forward stream.
+        # Checkpoint donation is a CACHE-INSERT path: a mamba slot that cannot be
+        # served degrades to "do not cache this state this step" (the request
+        # keeps computing and simply misses the cache later). Every allocation
+        # that can fail is done BEFORE any request-visible mutation, so a skip
+        # never leaves the ping-pong buffer half-swapped.
         if self.int8_ckpt_pool is not None:
             # int8 path: quantize the to-be-cached active state into an int8 slot
             # (strategy-agnostic donate hook).
             if self.enable_mamba_extra_buffer:
                 new_slot = self._alloc_mamba_slot()
+                ckpt_slot = None if new_slot is None else self._alloc_int8_ckpt_slot()
+                if ckpt_slot is None:
+                    if new_slot is not None:
+                        self.req_to_token_pool.mamba_allocator.free(new_slot)
+                    return _skip_cache_unfinished_req(req)
                 src_active = self.req_to_token_pool.donate_mamba_ping_pong_slot(
                     req, new_slot
                 )
-                mamba_value_donated = self._commit_int8_checkpoint(src_active)
+                self.int8_ckpt_pool.store_from_active(
+                    self.req_to_token_pool.mamba_pool, src_active, ckpt_slot
+                )
+                mamba_value_donated = ckpt_slot
                 self.req_to_token_pool.mamba_allocator.free(src_active)
             else:
                 mamba_value_donated = self._commit_int8_checkpoint(
                     req.mamba_pool_idx.view(-1)
                 )
+                if mamba_value_donated is None:
+                    return _skip_cache_unfinished_req(req)
         elif self.enable_mamba_extra_buffer:
             new_slot = self._alloc_mamba_slot()
+            if new_slot is None:
+                return _skip_cache_unfinished_req(req)
             mamba_value_donated = self.req_to_token_pool.donate_mamba_ping_pong_slot(
                 req, new_slot
             )
         else:
             mamba_value_donated = self._alloc_mamba_slot()
+            if mamba_value_donated is None:
+                return _skip_cache_unfinished_req(req)
             # mamba_pool is a pure PHYSICAL store; translate both slot ids
             # virtual->physical (identity for the non-unified memory pool) before the copy.
             translate = self.req_to_token_pool.translate_mamba_indices
@@ -1126,14 +1161,48 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
-        """Allocate one mamba pool slot, evicting if necessary."""
+    def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+        """Allocate one mamba pool slot, evicting if necessary.
+
+        Returns ``None`` when the pool is exhausted AND eviction cannot free a
+        slot. That happens when every cached mamba state belongs to a running
+        request: `evict_mamba` walks the LRU through `get_lru_no_lock`, which
+        skips every node with `mamba_lock_ref > 0`, so it evicts nothing and
+        returns 0. This is a legitimate transient runtime state, not a bug --
+        it used to `assert` and kill the scheduler process. Callers MUST handle
+        `None`; for cache-insert paths the correct degradation is to skip
+        caching this state (a later cache miss), never to crash.
+
+        Rank-uniform without a collective: `max_mamba_cache_size` is min-reduced
+        across ranks at startup (see `_sync_uneven_mamba_cache_size`), the
+        schedulers are replicated and see the identical request stream, so the
+        pool reaches exhaustion on every rank in the same step and all ranks
+        take the same degrade branch.
+        """
         slot = self.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+            if slot is None:
+                self._log_mamba_slot_starvation("mamba")
         return slot
+
+    def _log_mamba_slot_starvation(self, pool_name: str) -> None:
+        """Rate-limited warning for an unservable mamba slot request."""
+        self._mamba_starvation_count = getattr(self, "_mamba_starvation_count", 0) + 1
+        count = self._mamba_starvation_count
+        # Log the first few, then powers of ten -- a starved pool can hit this
+        # every step and must not flood the scheduler log.
+        if count <= 3 or count % 1000 == 0:
+            logger.warning(
+                "%s slot pool exhausted and nothing evictable (all cached states "
+                "are locked by running requests): skipping this cache insert. "
+                "occurrence=%d mamba_evictable=%d mamba_protected=%d",
+                pool_name,
+                count,
+                self.mamba_evictable_size(),
+                self.mamba_protected_size(),
+            )
 
     @property
     def int8_ckpt_pool(self):
@@ -1142,21 +1211,33 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         bf16 pool -> ~2x cached-prefix capacity at fixed memory."""
         return getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
 
-    def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
-        """Allocate one int8 checkpoint slot, evicting cached states if the pool is full."""
+    def _alloc_int8_ckpt_slot(self) -> Optional[torch.Tensor]:
+        """Allocate one int8 checkpoint slot, evicting cached states if the pool is full.
+
+        Returns ``None`` when exhausted with nothing evictable (see
+        `_alloc_mamba_slot`); callers skip the cache insert instead of crashing.
+        """
         slot = self.int8_ckpt_pool.alloc(1)
         if slot is None:
             self.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.int8_ckpt_pool.alloc(1)
-            assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
+            if slot is None:
+                self._log_mamba_slot_starvation("int8 mamba checkpoint")
         return slot
 
-    def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
+    def _commit_int8_checkpoint(
+        self, active_slots: torch.Tensor
+    ) -> Optional[torch.Tensor]:
         """Quantize the active-pool state at ``active_slots`` into a fresh int8
         checkpoint slot and return that slot. Strategy-agnostic donate hook: both
         no_buffer (copy_from) and extra_buffer (ping-pong) converge here. The caller
-        frees ``active_slots`` separately."""
+        frees ``active_slots`` separately.
+
+        Returns ``None`` when the checkpoint pool cannot yield a slot; the caller
+        must then skip the cache insert."""
         ckpt_slot = self._alloc_int8_ckpt_slot()
+        if ckpt_slot is None:
+            return None
         self.int8_ckpt_pool.store_from_active(
             self.req_to_token_pool.mamba_pool, active_slots, ckpt_slot
         )
@@ -1300,7 +1381,26 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.evict(EvictParams(num_tokens=0, mamba_num=1))
                     dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                     self.dec_lock_ref(last_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
+                if dst_index is None:
+                    # REQUIRED-allocation path: this slot would hold the
+                    # request's OWN resumed state, so "skip caching" is not an
+                    # option. Degrade to a full cache MISS instead of killing the
+                    # scheduler: report a zero-length match so the request
+                    # re-prefills from scratch and gets its mamba slot through
+                    # the normal admission path, which already defers a request
+                    # when `rem_mamba_slots` is exhausted. Reusing the KV prefix
+                    # without the matching mamba state would be silently wrong,
+                    # so the full-KV match is dropped as well.
+                    self._log_mamba_slot_starvation("mamba (prefix-resume COW)")
+                    return MatchResult(
+                        device_indices=torch.empty(
+                            (0,), dtype=torch.int64, device=self.device
+                        ),
+                        last_device_node=self.root_node,
+                        last_host_node=self.root_node,
+                        best_match_node=self.root_node,
+                        mamba_branching_seqlen=None,
+                    )
                 req.mamba_pool_idx = dst_index[0]
             req.mamba_cow_src_index = last_node.mamba_value
             req.mamba_needs_clear = False
