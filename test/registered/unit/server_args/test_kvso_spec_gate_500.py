@@ -139,5 +139,118 @@ class TestKvsoSpecGateIsLegible(unittest.TestCase):
         )
 
 
+class TestResumeUnderSpecIsAFirstClassSurface(unittest.TestCase):
+    """#552: the on-device MTP resume path must be reachable from ``--help``.
+
+    Before this posten the path existed and was gated on a bare ``KVSO_RESUME``
+    env read inside ``kv_session_offload.resume_under_spec_enabled``. That
+    string appeared NOWHERE in ``server_args.py`` -- not in a flag, not in a
+    help text, not in a validation message -- so an operator reading ``--help``
+    could not discover, arm, or even learn of the mechanism. A path nobody can
+    find is not an opt-in; it is a path that only its author can run, which is
+    precisely how a built mechanism decays into an unvalidated one.
+
+    CAN-FAIL PROOF: delete the flag and every test here goes red; keep the flag
+    but drop the env OR in ``_handle_kv_session_offload`` and
+    ``test_the_env_twin_arms_the_flag`` / ``test_the_legacy_alias_still_arms_it``
+    go red; drop either fail-fast and its test goes red.
+    """
+
+    def _resume_args(self, **over):
+        kw = dict(
+            enable_kv_session_offload=True,
+            speculative_algorithm="NEXTN",
+            kv_session_offload_resume_under_spec=True,
+        )
+        kw.update(over)
+        return make_args(**kw)
+
+    def _no_resume_env(self):
+        return patch.dict(
+            os.environ, {"KVSO_ALLOW_SPEC": "1", "SGLANG_KVSO_RESUME": "0"}
+        )
+
+    def test_the_flag_exists_and_is_discoverable(self):
+        help_text = _flag_help("--kv-session-offload-resume-under-spec")
+        self.assertTrue(help_text)
+        # It must name its env twin, so the two surfaces are known to be one.
+        self.assertIn("SGLANG_KVSO_RESUME", help_text)
+        # ...and it must say the default is a decision, not an omission.
+        self.assertIn("NAMED decision", help_text)
+
+    def test_the_default_is_off(self):
+        self.assertIs(make_args().kv_session_offload_resume_under_spec, False)
+        with self._no_resume_env():
+            args = make_args(
+                enable_kv_session_offload=True, speculative_algorithm="NEXTN"
+            )
+            args._handle_kv_session_offload()
+            self.assertIs(args.kv_session_offload_resume_under_spec, False)
+
+    def test_the_env_twin_arms_the_flag(self):
+        with patch.dict(
+            os.environ, {"KVSO_ALLOW_SPEC": "1", "SGLANG_KVSO_RESUME": "1"}
+        ):
+            args = make_args(
+                enable_kv_session_offload=True, speculative_algorithm="NEXTN"
+            )
+            args._handle_kv_session_offload()
+            self.assertIs(args.kv_session_offload_resume_under_spec, True)
+
+    def test_the_legacy_alias_still_arms_it(self):
+        """Existing boot-matrix arms and tickets export the bare name."""
+        env = dict(os.environ)
+        env.pop("SGLANG_KVSO_RESUME", None)
+        env["KVSO_ALLOW_SPEC"] = "1"
+        env["KVSO_RESUME"] = "1"
+        with patch.dict(os.environ, env, clear=True):
+            args = make_args(
+                enable_kv_session_offload=True, speculative_algorithm="NEXTN"
+            )
+            args._handle_kv_session_offload()
+            self.assertIs(args.kv_session_offload_resume_under_spec, True)
+
+    def test_arming_it_without_the_feature_is_rejected(self):
+        with self._no_resume_env():
+            args = make_args(
+                enable_kv_session_offload=False,
+                kv_session_offload_resume_under_spec=True,
+            )
+            with self.assertRaises(ValueError) as cm:
+                args._handle_kv_session_offload()
+            self.assertIn("sub-mode of --enable-kv-session-offload", str(cm.exception))
+
+    def test_arming_it_without_speculation_is_rejected(self):
+        with self._no_resume_env():
+            args = self._resume_args(speculative_algorithm=None)
+            with self.assertRaises(ValueError) as cm:
+                args._handle_kv_session_offload()
+            self.assertIn(
+                "requires an active --speculative-algorithm", str(cm.exception)
+            )
+
+    def test_resume_and_ps2_deep_prefill_are_rejected_together(self):
+        """A placement fact, not a policy: a born-spilled prompt never wrote
+        the draft KV that the rejoined session's drafter attends."""
+        with self._no_resume_env():
+            args = self._resume_args(kv_session_offload_prefill=True)
+            with self.assertRaises(ValueError) as cm:
+                args._handle_kv_session_offload()
+            self.assertIn("--kv-session-offload-prefill", str(cm.exception))
+
+    def test_the_runtime_predicate_agrees_with_the_flag(self):
+        """The gate the runtime reads and the flag the operator sets must be
+        the same switch -- otherwise --help documents a lie."""
+        from sglang.srt.managers.kv_session_offload import resume_under_spec_enabled
+
+        env = dict(os.environ)
+        env.pop("SGLANG_KVSO_RESUME", None)
+        env.pop("KVSO_RESUME", None)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertIs(resume_under_spec_enabled(), False)
+        with patch.dict(os.environ, {"SGLANG_KVSO_RESUME": "1"}):
+            self.assertIs(resume_under_spec_enabled(), True)
+
+
 if __name__ == "__main__":
     unittest.main()

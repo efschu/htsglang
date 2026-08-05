@@ -359,6 +359,15 @@ class Envs:
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
+    # #552 env twin of --kv-session-offload-resume-under-spec: let a spilled
+    # session under speculative decoding wave back and rejoin the LIVE spec
+    # decode batch instead of finishing on host. Either source turning it on
+    # is enough (the flag ORs them), so a boot-matrix arm can arm it without
+    # rewriting its command line. The bare `KVSO_RESUME` spelling predates the
+    # flag and stays as a deprecated alias so existing arms and tickets keep
+    # working. Default OFF is a named decision -- see the flag's help text.
+    SGLANG_KVSO_RESUME = EnvBoolWithAlias(False, deprecated_name="KVSO_RESUME")
+
     # #330 --enable-vram-dial: physical commit chunk of the VMM-backed KV
     # pool in MiB. Smaller chunks = finer dial-down release granularity but
     # more driver handles (boot maps pool_bytes / chunk handles per rank).
