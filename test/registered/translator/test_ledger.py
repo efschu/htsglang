@@ -218,5 +218,123 @@ class TestMultiModulePolicy(unittest.TestCase):
         self.assertGreater(ledger.to_json()["resident_mib"], 0.0)
 
 
+class _RotaryLike(nn.Module):
+    """A module shaped like the failure: a NON-PERSISTENT buffer beside a
+    normal weight. ``inv_freq`` in the translator's rotary modules is
+    registered exactly this way (``qwen3_tts_compat`` documents why), which is
+    what makes it absent from ``state_dict()``."""
+
+    def __init__(self, dim=8):
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(dim, dtype=torch.float32))
+        self.register_buffer(
+            "inv_freq",
+            1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)),
+            persistent=False,
+        )
+        self.register_buffer("running", torch.ones(dim), persistent=True)
+
+
+class _Nested(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rot = _RotaryLike()
+        self.head = nn.Linear(8, 4)
+
+
+class TestNonPersistentBuffersSurviveAParkRound(unittest.TestCase):
+    """#568: a park/restore round must not silently replace a buffer with
+    uninitialised memory.
+
+    THE DEFECT. ``park`` captured ``module.state_dict()``, which by definition
+    OMITS non-persistent buffers, and ``restore`` did ``to_empty(device=...)``
+    followed by ``load_state_dict(..., strict=True)``. ``to_empty`` DOES
+    re-materialise every buffer, including the non-persistent ones -- with
+    whatever was in that memory -- and the strict load then fills only the keys
+    the state dict has. So each non-persistent buffer came back as garbage,
+    while park and restore both reported success and the measured restore
+    latency looked healthy.
+
+    For the translator that buffer is the rotary ``inv_freq``: garbage there
+    gives NaN cos/sin, NaN attention scores, NaN logits, and the first thing
+    anyone sees is "probability tensor contains inf, nan or element < 0" from
+    ``torch.multinomial`` -- one park and thirty layers from the cause. The
+    LOAD path already had a repair for exactly this failure
+    (``qwen3_tts_compat.refresh_rotary_buffers``); the RESTORE path never had
+    an equivalent, and nothing connected the two.
+
+    These tests assert CORRECTNESS AFTER RESTORE -- the values -- rather than
+    how many such buffers a model happens to have, which is a property of the
+    model and not a constant worth pinning.
+
+    CAN-FAIL: drop the non-persistent capture in ``park`` (or the write-back in
+    ``restore``) and every test here goes red, because ``to_empty`` leaves the
+    buffer holding whatever the allocator handed out.
+    """
+
+    def _ledger_with(self, module, name="rot"):
+        ledger = AudioAssetLedger(tenant_id="t-568", pin_host_copies=False)
+        ledger.register(name, module)
+        return ledger
+
+    def test_a_non_persistent_buffer_comes_back_bit_identical(self):
+        module = _RotaryLike()
+        expected = module.inv_freq.detach().clone()
+        # The premise, asserted rather than assumed: it really is absent from
+        # the state dict, so load_state_dict cannot be what restores it.
+        self.assertNotIn("inv_freq", module.state_dict())
+
+        ledger = self._ledger_with(module)
+        ledger.park("rot")
+        self.assertTrue(ledger.get("rot").parked)
+        ledger.restore("rot")
+
+        self.assertTrue(
+            torch.equal(module.inv_freq, expected),
+            "the non-persistent buffer did not survive the park round",
+        )
+        self.assertTrue(torch.isfinite(module.inv_freq).all())
+
+    def test_it_stays_non_persistent_so_a_second_round_still_works(self):
+        module = _RotaryLike()
+        expected = module.inv_freq.detach().clone()
+        ledger = self._ledger_with(module)
+        for _ in range(2):
+            ledger.park("rot")
+            ledger.restore("rot")
+        self.assertNotIn("inv_freq", module.state_dict())
+        self.assertTrue(torch.equal(module.inv_freq, expected))
+
+    def test_nested_submodule_buffers_are_restored_too(self):
+        """The write-back has to find the owning submodule, not just the root."""
+        module = _Nested()
+        expected = module.rot.inv_freq.detach().clone()
+        ledger = self._ledger_with(module, name="nested")
+        ledger.park("nested")
+        ledger.restore("nested")
+        self.assertTrue(torch.equal(module.rot.inv_freq, expected))
+
+    def test_persistent_state_is_unaffected(self):
+        """The fix must not disturb what already worked."""
+        module = _RotaryLike()
+        w = module.weight.detach().clone()
+        r = module.running.detach().clone()
+        ledger = self._ledger_with(module)
+        ledger.park("rot")
+        ledger.restore("rot")
+        self.assertTrue(torch.equal(module.weight.detach(), w))
+        self.assertTrue(torch.equal(module.running, r))
+
+    def test_a_module_without_non_persistent_buffers_is_unchanged(self):
+        """Byte-identical to the pre-fix path when there is nothing to carry."""
+        module = tiny_module()
+        before = {k: v.detach().clone() for k, v in module.state_dict().items()}
+        ledger = self._ledger_with(module, name="plain")
+        ledger.park("plain")
+        ledger.restore("plain")
+        for k, v in module.state_dict().items():
+            self.assertTrue(torch.equal(v, before[k]))
+
+
 if __name__ == "__main__":
     unittest.main()

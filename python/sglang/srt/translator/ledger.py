@@ -154,6 +154,12 @@ class AudioAsset:
     parked_bytes: int = 0
     #: Host-resident copies while parked. Empty when resident.
     _cpu_state: Dict[str, object] = dataclasses.field(default_factory=dict)
+    #: Host copies of the NON-PERSISTENT buffers, which ``state_dict()`` omits
+    #: by definition and ``load_state_dict`` therefore cannot restore. Kept
+    #: separately rather than merged into ``_cpu_state`` because the restore
+    #: uses ``strict=True``, and a strict load handed a key the module does not
+    #: expect in its state dict raises.
+    _cpu_nonpersistent: Dict[str, object] = dataclasses.field(default_factory=dict)
     _device: Optional[str] = None
 
     @property
@@ -409,7 +415,37 @@ class AudioAssetLedger:
                     device = str(tensor.device)
                 state[key] = self._to_host(tensor)
                 freed += int(tensor.nbytes)
+            # NON-PERSISTENT BUFFERS. `state_dict()` omits them BY DEFINITION,
+            # so the restore's `load_state_dict` cannot bring them back, while
+            # `to_empty()` DOES re-materialise them -- as uninitialised memory.
+            # A park/restore round therefore replaced every such buffer with
+            # garbage while reporting success. For the translator's rotary
+            # `inv_freq` that means NaN cos/sin, NaN attention scores, NaN
+            # logits, and the first visible symptom is "probability tensor
+            # contains inf, nan or element < 0" from torch.multinomial, thirty
+            # layers and one park away from the cause (the same failure
+            # qwen3_tts_compat.refresh_rotary_buffers was written for on the
+            # LOAD path -- the restore path never had an equivalent).
+            #
+            # Carried verbatim rather than recomputed: recomputation is a
+            # per-module repair someone has to remember to write for each new
+            # buffer, while copying the bytes is correct for every module the
+            # ledger will ever be handed, and is byte-exact besides. Counted at
+            # runtime -- how many there are is a property of the model, not a
+            # constant worth asserting.
+            persistent = set(state)
+            nonpersistent = {}
+            for key, tensor in sorted(module.named_buffers()):
+                if key in persistent or not torch.is_tensor(tensor):
+                    continue
+                if tensor.device.type == "meta":
+                    continue
+                if device is None:
+                    device = str(tensor.device)
+                nonpersistent[key] = self._to_host(tensor)
+                freed += int(tensor.nbytes)
             asset._cpu_state = state
+            asset._cpu_nonpersistent = nonpersistent
             asset._device = device
             # Replace the live tensors with meta-device placeholders so the
             # VRAM is genuinely released rather than merely copied. Assigning
@@ -500,6 +536,22 @@ class AudioAssetLedger:
                 },
                 strict=True,
             )
+            # ...and the buffers no state dict can carry. `to_empty()` above
+            # gave each of them a correctly shaped tensor full of whatever was
+            # in that memory; without this they stay that way. Written through
+            # `register_buffer(persistent=False)` so the flag survives the
+            # round trip and a second park still finds them here.
+            for key, host in asset._cpu_nonpersistent.items():
+                owner, _, leaf = key.rpartition(".")
+                target_module = module.get_submodule(owner) if owner else module
+                target_module.register_buffer(
+                    leaf,
+                    host.to(
+                        target,
+                        non_blocking=bool(getattr(host, "is_pinned", bool)()),
+                    ),
+                    persistent=False,
+                )
             if str(target).startswith("cuda"):
                 # The pinned copies above are ASYNCHRONOUS. Without this the
                 # clock would stop before the bytes have landed, so the
@@ -510,6 +562,7 @@ class AudioAssetLedger:
                 # not read a half-copied weight.
                 torch.cuda.synchronize()
             asset._cpu_state = {}
+            asset._cpu_nonpersistent = {}
             asset.parked = False
             asset.parked_bytes = 0
             elapsed_ms = (self._clock() - started) * 1000.0
