@@ -290,6 +290,40 @@ class TestFreeSpaceWatchdog(_TmpDirCase):
             len(calls), 2, f"watchdog probed statvfs {len(calls)} times in a burst"
         )
 
+    def test_watchdog_is_reentrant_safe_under_concurrent_writers(self):
+        """The latch is read and written under a non-reentrant lock: no deadlock.
+
+        reserve() consults the watchdog before taking the evictor lock, and the
+        watchdog takes that same lock itself. Drive both from several threads at
+        once; a nesting mistake would hang here rather than fail a comparison.
+        """
+        import threading
+
+        d = os.path.join(self.tmp, "watchdog_threads")
+        os.makedirs(d, exist_ok=True)
+        b = _make_backend(d, max_size="8Mi", min_free="1Mi")
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(25):
+                    b.check_disk_space(force=(i % 5 == 0))
+                    b.set(_key(n * 32 + i), _t(1024))
+            except Exception as e:  # pragma: no cover - only on a real failure
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertFalse([t for t in threads if t.is_alive()], "watchdog deadlocked")
+        self.assertEqual(errors, [])
+        # Accounting survived the concurrency: no negative or lost bytes.
+        stats = b._evictor.stats()
+        self.assertGreaterEqual(stats["used_bytes"], 0)
+        self.assertLessEqual(stats["used_bytes"], stats["max_size_bytes"])
+
     def test_watchdog_inert_without_min_free(self):
         d = os.path.join(self.tmp, "watchdog_off")
         os.makedirs(d, exist_ok=True)

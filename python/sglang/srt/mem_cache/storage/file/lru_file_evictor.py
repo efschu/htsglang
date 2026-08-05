@@ -373,9 +373,12 @@ class LRUFileEvictor:
             )
             return False
         # Latched by the watchdog: refuse cheaply and silently (it already said
-        # so, once and loudly) rather than warning per page.
+        # so, once and loudly) rather than warning per page. Advisory only --
+        # the authoritative watermark check is _enforce_free_space_locked below,
+        # under the lock, so a page that races the latch is still refused there.
         if not self.check_free_space():
-            self._refused_since_stop += 1
+            with self._lock:
+                self._refused_since_stop += 1
             return False
 
         with self._lock:
@@ -511,17 +514,29 @@ class LRUFileEvictor:
         evicting this rank's own pages, and if that fails logs ONE error and
         latches writes off -- upstream then sees plain cache misses instead of a
         filling disk. The latch releases once free space recovers with margin.
+
+        The latch is an advisory fast path, not the authority: ``reserve`` still
+        runs ``_enforce_free_space_locked`` under the lock for every admitted
+        page, so a page that races a latch being set is refused there anyway.
+        The lock is dropped across the ``statvfs`` probe so a slow filesystem
+        cannot block writers.
         """
         if self.min_free_bytes <= 0 or not self._eviction_enabled:
             return True
-        now = time.monotonic()
-        if not force and (now - self._last_free_probe) < _FREE_SPACE_PROBE_INTERVAL_S:
-            return not self._write_stopped
-        self._last_free_probe = now
+        with self._lock:
+            now = time.monotonic()
+            if (
+                not force
+                and (now - self._last_free_probe) < _FREE_SPACE_PROBE_INTERVAL_S
+            ):
+                return not self._write_stopped
+            self._last_free_probe = now
 
         fs = self._fs_stats()
         if fs is None:
-            return not self._write_stopped  # cannot probe: leave the latch as is
+            # Cannot probe: leave the latch as it is.
+            with self._lock:
+                return not self._write_stopped
         free = fs[1]
 
         if free >= self.min_free_bytes:
