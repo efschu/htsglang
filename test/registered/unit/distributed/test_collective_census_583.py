@@ -38,6 +38,7 @@ from sglang.srt.distributed import collective_census as cc  # noqa: E402
 from sglang.srt.distributed.collective_census import (  # noqa: E402
     CollectiveCensus,
     census_enabled,
+    census_heartbeat,
     census_interval,
     format_local_census,
 )
@@ -194,6 +195,42 @@ class CollectiveCensusTest(unittest.TestCase):
     def test_the_local_dump_is_honest_when_nothing_was_counted(self):
         cc._CENSUS._counts.clear()
         self.assertIn("no collectives counted", format_local_census(rank=0))
+
+    # -- the instrument must be able to PROVE it is live (#380) -----------
+
+    def test_the_arming_line_is_emitted_exactly_once(self):
+        """A boot log with no census line cannot distinguish "armed and
+        healthy" from "never wired". The arming line closes that, and it must
+        not repeat once per iteration."""
+        c = CollectiveCensus()
+        c.bump("tp.all_reduce")
+        with mock.patch.object(cc.logger, "info") as info:
+            for _ in range(5):
+                c.next_round()
+                c.announce_armed_once(rank=1, interval=50, heartbeat=10000)
+        self.assertEqual(info.call_count, 1)
+        text = info.call_args[0][0] % info.call_args[0][1:]
+        self.assertIn("collective census armed", text)
+        self.assertIn("rank 1", text)
+        self.assertIn("interval=50", text)
+        self.assertIn("families tracked=1", text)
+
+    def test_the_heartbeat_rides_the_same_counter_and_is_coarse(self):
+        c = CollectiveCensus()
+        fired = []
+        for _ in range(20):
+            c.next_round()
+            if c.due(10):
+                fired.append(True)
+        self.assertEqual(len(fired), 2)
+
+    def test_heartbeat_default_is_coarse_and_overridable(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(census_heartbeat(), cc.DEFAULT_HEARTBEAT)
+        with mock.patch.dict("os.environ", {cc.ENV_HEARTBEAT: "7"}):
+            self.assertEqual(census_heartbeat(), 7)
+        with mock.patch.dict("os.environ", {cc.ENV_HEARTBEAT: "junk"}):
+            self.assertEqual(census_heartbeat(), cc.DEFAULT_HEARTBEAT)
 
 
 if __name__ == "__main__":

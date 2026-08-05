@@ -68,6 +68,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.collective_census import (  # noqa: E402
     census,
     census_enabled,
+    census_heartbeat,
     census_interval,
 )
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -325,6 +326,7 @@ _GIB = 1024**3
 _CENSUS = census()
 _CENSUS_ON = census_enabled()
 _CENSUS_INTERVAL = census_interval()
+_CENSUS_HEARTBEAT = census_heartbeat()
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -3313,6 +3315,14 @@ class Scheduler(
         try:
             c = _CENSUS
             c.next_round()
+            # Announced from HERE, not at import: an import-time line proves
+            # only that the module loaded, while this one proves the wired
+            # path is reached on the production flagset. An instrument that
+            # is silent when healthy and silent when unwired cannot be told
+            # apart from a dead one (#380).
+            c.announce_armed_once(self.tp_rank, _CENSUS_INTERVAL, _CENSUS_HEARTBEAT)
+            if c.due(_CENSUS_HEARTBEAT):
+                c.heartbeat(self.tp_rank)
             if not c.due(_CENSUS_INTERVAL):
                 return
             grp = getattr(self, "tp_cpu_group", None)
