@@ -103,9 +103,13 @@ fi
 
 case "$ARM" in
   baseline)  DEFAULT_MINUTES=12 ;;
+  # The dual-acceptance arm. One window, two verdicts: barlink's abort path
+  # under the crash regime (#583) AND the mamba pool floor's live proof (#581,
+  # pin budget under real ack latency, no assert deaths).
+  soak)      DEFAULT_MINUTES=20 ;;
   blocking)  DEFAULT_MINUTES=15 ;;
   sanitizer) DEFAULT_MINUTES=25 ;;
-  *) echo "unknown arm: $ARM (baseline|blocking|sanitizer)" >&2; exit 2 ;;
+  *) echo "unknown arm: $ARM (baseline|soak|blocking|sanitizer)" >&2; exit 2 ;;
 esac
 MINUTES="${MINUTES:-$DEFAULT_MINUTES}"
 
@@ -237,41 +241,111 @@ echo "== ready, starting mixed load ==" | tee -a "$LOG"
 # streaming decode running alongside. That is what interleaves eager prefill
 # with full-graph decode at high frequency -- the mix the desk analysis
 # identified as the one no NCCL/gloo boot ever exercised.
-PORT="$PORT" MINUTES="$MINUTES" "$PY" - <<'LOAD' 2>&1 | tee -a "$LOG"
-import json, os, random, threading, time, urllib.request
+PORT="$PORT" MINUTES="$MINUTES" SRVLOG="$LOG" \
+MAMBA_LO="${MAMBA_LO:-0.20}" MAMBA_HI="${MAMBA_HI:-0.35}" \
+MAMBA_VALVE="${MAMBA_VALVE:-0.88}" \
+"$PY" - <<'LOAD' 2>&1 | tee -a "$LOG"
+import json, os, random, re, statistics, threading, time, urllib.request
 
 port = os.environ["PORT"]
 deadline = time.time() + int(os.environ["MINUTES"]) * 60 - 90
 url = f"http://127.0.0.1:{port}/v1/chat/completions"
+srvlog = os.environ["SRVLOG"]
+band_lo = float(os.environ["MAMBA_LO"])
+band_hi = float(os.environ["MAMBA_HI"])
+valve_mark = float(os.environ["MAMBA_VALVE"])
 random.seed(583)
 stop = threading.Event()
 errors = []
 
+# --- regime instrumentation ------------------------------------------------
+# The 2026-08-05 window failed because the load ran at mamba usage 1.00 while
+# the crash boot ran at 0.25-0.28. An arm outside that band is not measuring
+# the crash, so the band is sampled, reported, and defended -- not assumed.
+mamba_samples: list[float] = []
+running_samples: list[int] = []
+valve_engaged = [0]
+_mamba_re = re.compile(r"mamba usage: ([0-9.]+)")
+_running_re = re.compile(r"#running-req: (\d+)")
+
+
+def sampler():
+    """Track the regime from the server's own log lines."""
+    while not stop.is_set() and time.time() < deadline:
+        try:
+            with open(srvlog, "rb") as fh:
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - 200_000))
+                tail = fh.read().decode("utf-8", "replace")
+            m = _mamba_re.findall(tail)
+            r = _running_re.findall(tail)
+            if m:
+                mamba_samples.append(float(m[-1]))
+            if r:
+                running_samples.append(int(r[-1]))
+        except Exception:                   # noqa: BLE001 - never kill the load
+            pass
+        time.sleep(2)
+
+
+def over_band() -> bool:
+    """Safety valve, set at NEAR-SATURATION -- deliberately not at band_hi.
+
+    Measured from the two logs rather than guessed (2026-08-05): the crash boot
+    itself ran mamba usage median 0.25 but PEAKED AT 0.80, while the arm that
+    died ran a lower median (0.18) and saturated at 1.00. So the transient
+    excursion is part of the regime under test and must not be throttled --
+    only saturation is the failure. A valve at band_hi would have suppressed
+    the very spikes the crash exhibited and would have flagged the crash boot
+    itself as out of regime.
+
+    If the #581 pool floor works this should engage rarely; engaging often is
+    itself the finding, which is why it is counted rather than hidden.
+    """
+    if mamba_samples and mamba_samples[-1] > valve_mark:
+        valve_engaged[0] += 1
+        return True
+    return False
+
+# A FIXED pool of distinct long prefixes, shared by all sessions.
+#
+# This is the correction the 2026-08-05 window forced. What consumes mamba
+# state is the number of DISTINCT cached prefixes, not the request rate and not
+# the token count -- the mamba radix cache holds one state per cached prefix
+# (mamba_radix_cache_strategy='extra_buffer'). The first harness gave every
+# session its own forever-growing conversation, so distinct prefixes grew
+# without bound and mamba usage went to 1.00, killing both arms on allocation
+# asserts before barlink was ever stressed.
+#
+# Bounding the POOL bounds the mamba footprint directly, while each request
+# still carries a large cached-token count (the long shared prefix) plus a
+# fresh chunk to prefill -- which is exactly the crash boot's shape:
+# #new-token 600-2000 against #cached-token 40-80k, 3-4 running, ~2 queued.
+PREFIX_POOL = 6
+POOL = [
+    f"Topic {k}. " + "Explain cache coherence and memory ordering. " * 90
+    for k in range(PREFIX_POOL)
+]
+
+
 def session(idx: int):
-    # A growing conversation: each turn re-sends the whole history, so the
-    # cached-token count climbs into the tens of thousands exactly as in the
-    # crash log, while each turn still adds a fresh chunk to prefill.
-    #
-    # BOUNDED ON PURPOSE (2026-08-05 window). An unbounded version of this
-    # loop drove `mamba usage` to 1.00 and killed both arms on mamba
-    # allocation asserts long before any barlink deadline was approached --
-    # first "Not enough space for mamba ping pong idx", then, with
-    # --max-mamba-cache-size 96, "Not enough space for mamba cache". Neither
-    # is a barlink fault and both masked what this harness measures. The crash
-    # boot ran at mamba usage 0.25-0.28 with 3-4 running requests, so the load
-    # has to stay in THAT regime: distinct long prefixes are what consume
-    # mamba states, so each session recycles its prefix instead of growing one
-    # forever. Watch the "mamba usage" field in the log -- if it climbs past
-    # ~0.5 the arm is measuring the wrong thing.
-    base = f"Session {idx}. Explain memory coherence. " + "Detail. " * 120
-    history = [{"role": "user", "content": base}]
     turns = 0
     while not stop.is_set() and time.time() < deadline:
         turns += 1
-        if turns % 6 == 0:
-            # Recycle: drop back to the seed prefix so the number of distinct
-            # cached prefixes (and therefore mamba states) stays bounded.
-            history = [{"role": "user", "content": base}]
+        # Cycle through the shared pool: the set of distinct prefixes stays at
+        # PREFIX_POOL forever, so the mamba footprint is flat over the soak.
+        base = POOL[(idx + turns) % PREFIX_POOL]
+        history = [{"role": "user", "content": base}]
+        # A short bounded tail keeps each turn's fresh-prefill chunk in the
+        # crash's 600-2000 token range without extending the cached prefix.
+        for _ in range(random.choice([1, 2, 3])):
+            history.append({"role": "assistant", "content": "Understood."})
+            history.append({"role": "user",
+                            "content": "Continue in more detail. " * 60})
+        if over_band():
+            # Back off instead of piling on. Counted, never silent.
+            time.sleep(3)
+            continue
         body = json.dumps({
             "model": "Qwen3.6-27B-583",
             "messages": history,
@@ -283,19 +357,15 @@ def session(idx: int):
             url, data=body, headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
-                out = json.loads(resp.read())
-            text = out["choices"][0]["message"]["content"]
-            history.append({"role": "assistant", "content": text})
-            history.append({"role": "user",
-                            "content": "Continue in more detail. " * 200})
-            if len(history) > 9:            # keep the prefix long but bounded
-                history = history[:1] + history[-6:]
+                json.loads(resp.read())
         except Exception as exc:            # noqa: BLE001 - report, keep load on
             errors.append(f"session {idx}: {exc!r}")
             if len(errors) > 40:
                 stop.set()
             time.sleep(2)
 
+
+threading.Thread(target=sampler, daemon=True).start()
 threads = [threading.Thread(target=session, args=(i,), daemon=True)
            for i in range(4)]
 for t in threads:
@@ -309,6 +379,37 @@ for t in threads:
 print(f"== load finished, {len(errors)} request errors ==")
 for e in errors[:20]:
     print("  ", e)
+
+# --- regime report: the arm's own validity evidence -------------------------
+if mamba_samples:
+    lo, hi = min(mamba_samples), max(mamba_samples)
+    med = statistics.median(mamba_samples)
+    # Reference, measured from the logs themselves, not from memory:
+    #   crash boot 5   median 0.25  max 0.80  (the regime to reproduce)
+    #   rejected arm 2 median 0.18  max 1.00  (saturated -> assert death)
+    # The MEDIAN decides validity; SATURATION decides failure.
+    print(f"== MAMBA BAND: min={lo:.2f} median={med:.2f} max={hi:.2f} "
+          f"(valid median {band_lo:.2f}-{band_hi:.2f}; crash boot was "
+          f"median 0.25 / max 0.80) ==")
+    if hi >= 0.95:
+        print(f"== REGIME FAIL: saturated at {hi:.2f}. That is what killed the "
+              f"2026-08-05 arms. Valve engaged {valve_engaged[0]}x. Lower "
+              f"PREFIX_POOL or raise --max-mamba-cache-size; do not trust "
+              f"this arm's barlink verdict. ==")
+    elif med > band_hi:
+        print(f"== REGIME WARNING: median {med:.2f} above {band_hi:.2f} -- "
+              f"heavier than the crash boot. Lower PREFIX_POOL. ==")
+    elif med < band_lo:
+        print(f"== REGIME WARNING: median {med:.2f} below {band_lo:.2f} -- the "
+              f"load is too light to represent the crash. Raise PREFIX_POOL. ==")
+    else:
+        print(f"== REGIME OK: median {med:.2f} matches the crash boot's 0.25, "
+              f"peak {hi:.2f} stayed clear of saturation. ==")
+else:
+    print("== REGIME UNKNOWN: no 'mamba usage' lines parsed from the log. ==")
+if running_samples:
+    print(f"== RUNNING-REQ: median={statistics.median(running_samples):.1f} "
+          f"max={max(running_samples)} (crash boot ran 3-4) ==")
 LOAD
 
 kill -INT $SERVER_PID 2>/dev/null
@@ -318,6 +419,29 @@ wait $SERVER_PID 2>/dev/null
 # Verdict.
 # ---------------------------------------------------------------------------
 echo "================ VERDICT (arm=$ARM) ================" | tee -a "$LOG"
+
+# --- acceptance 2: the mamba pool floor (#581) -----------------------------
+# The soak doubles as this fix's live proof. Its acceptance is negative
+# evidence -- the asserts that killed the 2026-08-05 arms must not reappear --
+# plus the regime report above showing the run actually stayed loaded.
+echo "---- #581 mamba pool floor ----" | tee -a "$LOG"
+MAMBA_ASSERTS=$(grep -cE "Not enough space for mamba (ping pong idx|cache)" "$LOG")
+if [[ "$MAMBA_ASSERTS" -gt 0 ]]; then
+  echo "FAIL: $MAMBA_ASSERTS mamba allocation assert(s) still killed the run." | tee -a "$LOG"
+  grep -E "Not enough space for mamba" "$LOG" | sort -u | head -5 | tee -a "$LOG"
+else
+  echo "PASS: no mamba allocation assert. Both asserts that killed the" | tee -a "$LOG"
+  echo "2026-08-05 arms (ping-pong idx, mamba cache) stayed clear." | tee -a "$LOG"
+fi
+grep -E "MAMBA BAND|REGIME |RUNNING-REQ" "$LOG" | tail -4 | tee -a "$LOG"
+# Pin-budget evidence, once #581 lands its log markers. Absence is reported
+# rather than assumed to be silence: a soak that logged nothing about pins has
+# not proven the pin budget, whatever else it proved.
+PIN_LINES=$(grep -ciE "mamba.*(pin|floor|admission)" "$LOG")
+echo "pin/floor/admission log lines observed: $PIN_LINES" | tee -a "$LOG"
+[[ "$PIN_LINES" -eq 0 ]] && echo "NOTE: no pin-budget lines -- pin behaviour UNPROVEN by this arm." | tee -a "$LOG"
+
+echo "---- #583 barlink ----" | tee -a "$LOG"
 if grep -q "DeviceCollectiveAborted" "$LOG"; then
   echo "TRIGGER REPRODUCED, and named. The #583 fix converted the context kill" | tee -a "$LOG"
   echo "into a structured abort. The kernel/rank in the message below is the" | tee -a "$LOG"
