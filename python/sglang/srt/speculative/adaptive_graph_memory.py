@@ -431,6 +431,15 @@ class LadderRungPost:
     rung: int
     workspace_mib: int
     capture_mib: int
+    #: MiB per captured token this post was priced at. The inherited value is
+    #: the literal 2 (#68); a calibrated rig supplies a measured coefficient
+    #: instead. Recorded per post so a ledger line can say which it used.
+    mib_per_captured_token: float = 2.0
+    #: True when ``mib_per_captured_token`` came from a measurement. False
+    #: means the post carries the inherited estimate, which the 2026-08-05
+    #: window measured 3.3-3.8x LOW -- an under-charge, i.e. the direction
+    #: that OOMs. A caller that must not under-charge has to check this.
+    measured: bool = False
 
     @property
     def total_mib(self) -> int:
@@ -458,6 +467,17 @@ class LadderReserveDemand:
     boot_rung: int
     margin_mib: int
     resident: bool
+
+    @property
+    def estimate_only(self) -> bool:
+        """True when ANY post was priced at the inherited 2 MiB/token rather
+        than a measured coefficient.
+
+        The ledger refuses on this: an estimate-only ladder demand is an
+        under-charge of unknown size in the direction that OOMs. The legacy
+        reserve path keeps using it, unchanged, and says so.
+        """
+        return any(not p.measured for p in self.posts)
 
     @property
     def peak(self) -> Optional[LadderRungPost]:
@@ -499,7 +519,9 @@ class LadderReserveDemand:
 
 
 def estimate_ladder_reserve_demand(
-    server_args: ServerArgs, colocated_ranks: int = 1
+    server_args: ServerArgs,
+    colocated_ranks: int = 1,
+    capture_mib_per_token: Optional[float] = None,
 ) -> Optional[LadderReserveDemand]:
     """The ladder's own reserve demand, or None when there is no ladder.
 
@@ -541,15 +563,27 @@ def estimate_ladder_reserve_demand(
         # i.e. long after this estimate); mirror the same rule here so the
         # reserve does not silently miss 1.6 GiB per rung.
         workspace_mib = max(workspace_mib, 2048)
+    # #586: price the rung's capture pool at a MEASURED MiB-per-captured-token
+    # coefficient when the rig has one. The inherited literal 2 (#68) was
+    # measured 3.3-3.8x low on 2026-08-05, and every rung inherits that error.
+    # When nothing is calibrated the literal stands -- the legacy reserve path
+    # must keep booting -- but the post is marked estimate-only so the ledger
+    # can refuse rather than silently carry an under-charge.
+    coefficient = float(capture_mib_per_token) if capture_mib_per_token else 2.0
+    measured = bool(capture_mib_per_token)
     posts = tuple(
         LadderRungPost(
             rung=k,
             workspace_mib=workspace_mib,
-            capture_mib=(
-                server_args.speculative_capture_tokens(num_draft_tokens=k + 1)
-                * 2
-                * colocated_ranks
+            capture_mib=int(
+                math.ceil(
+                    server_args.speculative_capture_tokens(num_draft_tokens=k + 1)
+                    * coefficient
+                    * colocated_ranks
+                )
             ),
+            mib_per_captured_token=coefficient,
+            measured=measured,
         )
         for k in built
     )

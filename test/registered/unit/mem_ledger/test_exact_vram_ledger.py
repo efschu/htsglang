@@ -107,6 +107,10 @@ def production_inputs(**overrides):
         # decode max_bs 8 x a NEXTN-3 capture multiplier of 12 = 96 captured
         # tokens per rank; both drivers are configuration.
         capture_tokens_per_rank=[96] * n,
+        # Calibrated capture: the term refuses without one (#586), because the
+        # captured-tokens x 2 MiB estimate was measured 3.3-3.8x low and an
+        # under-charge is the direction that OOMs.
+        capture_mib_per_rank=[640.0] * n,
         mamba_pool_mib_per_rank=[900.0] * n,
         chunked_prefill_size=CHUNKED_PREFILL,
         phase_footprint_fingerprint="deadbeefcafe",
@@ -160,7 +164,7 @@ def test_user_reserve_never_funds_internal_demand():
     """The decree, as an assertion: doubling an internal term must not change
     the user reserve, and raising the user reserve must not change demand."""
     base = production_ledgers()[0]
-    bigger_demand = production_ledgers(capture_tokens_per_rank=[192] * TP_SIZE)[0]
+    bigger_demand = production_ledgers(capture_mib_per_rank=[1280.0] * TP_SIZE)[0]
     assert bigger_demand.user_reserve_mib == base.user_reserve_mib
     assert bigger_demand.demand_mib > base.demand_mib
 
@@ -467,7 +471,7 @@ def test_a_calibrated_term_without_a_fingerprint_is_rejected():
     "term_name,driver,changed",
     [
         (TERM_ACTIVATION, "activation_mib_per_rank", [9000.0] * TP_SIZE),
-        (TERM_GRAPH_CAPTURE, "capture_tokens_per_rank", [192] * TP_SIZE),
+        (TERM_GRAPH_CAPTURE, "capture_mib_per_rank", [1280.0] * TP_SIZE),
         (TERM_MAMBA_POOL, "mamba_pool_mib_per_rank", [1800.0] * TP_SIZE),
     ],
 )

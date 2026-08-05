@@ -164,20 +164,36 @@ def test_a_calibrated_term_without_a_fingerprint_is_rejected():
 # --- capture: the under-charge -----------------------------------------------
 
 
-def test_measured_capture_overrides_the_token_estimate():
-    est = ledger(1766.0).term(TERM_GRAPH_CAPTURE)
+def test_measured_capture_is_used_when_calibrated():
     meas = ledger(1766.0, capture_mib=[640.0]).term(TERM_GRAPH_CAPTURE)
-    assert est.mib == 192  # 96 captured tokens x 2 MiB
     assert meas.mib == 640
     assert meas.provenance is Provenance.CALIBRATED
-    assert meas.mib > est.mib * 3, "the window measured the estimate 3.3-3.8x low"
+    # 96 captured tokens x 2 MiB = 192 was the estimate; the window measured
+    # 640, i.e. the estimate was 3.3x low.
+    assert meas.mib > 192 * 3
 
 
-def test_the_token_estimate_declares_that_it_is_known_low():
-    """While the estimate is still reachable it must say so -- an
-    under-charge that does not announce itself is how a boot OOMs."""
-    term = ledger(1766.0).term(TERM_GRAPH_CAPTURE)
-    assert "KNOWN LOW" in term.derivation
+def test_uncalibrated_capture_refuses_rather_than_under_charging():
+    """The token estimate is NOT a fallback. It is 3.3-3.8x low, and an
+    under-charge is the direction that OOMs a boot rather than merely costing
+    KV pool -- so the ledger must refuse, exactly as it does for activation."""
+    x = ledger(1766.0, capture_mib=None)
+    assert x.term(TERM_GRAPH_CAPTURE) is None
+    assert x.unbounded
+    assert not x.fits
+    joined = " ".join(x.unbounded)
+    assert "does NOT fall back" in joined
+    assert "192 MiB" in joined  # it names the estimate it refuses
+    assert "under-charge is the direction that OOMs" in joined
+
+
+def test_capture_and_activation_refuse_together_on_an_uncalibrated_rig():
+    """Both terms come from the same footprint, so a rig with no calibration
+    must refuse for both reasons, not silently satisfy one of them."""
+    x = ledger(None, capture_mib=None)
+    joined = " ".join(x.unbounded)
+    assert TERM_ACTIVATION in joined
+    assert TERM_GRAPH_CAPTURE in joined
 
 
 # --- the profile key --------------------------------------------------------
