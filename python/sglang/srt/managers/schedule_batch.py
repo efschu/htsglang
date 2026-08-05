@@ -1856,6 +1856,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
 
+    # #583 (desync site 2): this iteration's RANK-UNIFORM pool headroom, set
+    # by the scheduler from `Scheduler.uniform_min_avail()` before any
+    # decode-mem decision is taken. `None` means "not supplied" -- the local
+    # value is then used, which is correct for a single rank and for tests,
+    # and is the same fallback shape `uniform_min_avail` itself documents.
+    # See `check_decode_mem` for why a decision must never read the local
+    # `available_size()` under uneven DCP/TP.
+    uniform_avail_floor: Optional[int] = None
+
     # Batch configs
     model_config: ModelConfig = None
     enable_overlap: bool = False
@@ -2765,10 +2774,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
+    def decode_mem_avail(self) -> int:
+        """The headroom a decode-mem decision is allowed to read.
+
+        #583 (desync site 2). ``token_to_kv_pool_allocator.available_size()``
+        is a RANK-LOCAL quantity: under uneven DCP/TP the ranks own weighted
+        shares of the token pool (this rig boots [332656, 177832, 177832]),
+        so the same replicated token demand sits above one rank's headroom
+        and below another's. Any BRANCH decided from it splits the group --
+        the rank-local-test-before-a-group-collective family.
+
+        #603 closed that for the decision of WHETHER to retract, by reducing
+        once per iteration in ``Scheduler._update_uniform_pool_budget`` and
+        comparing against the reduced value. It did not reach the decision of
+        HOW MANY requests to retract, which ``retract_decode`` takes from
+        ``check_decode_mem`` in a loop, nor the last-survivor test that can
+        empty the batch outright. Those are the two call sites this closes.
+
+        The reduced value is the group MINIMUM, so it is <= every rank's own
+        headroom: the loop below therefore never under-retracts (it cannot
+        leave a rank short and OOM it), and every rank pops the same victims
+        in the same order and stops on the same iteration. No collective is
+        taken here -- the reduce already happened, once, pre-branch.
+        """
+        floor = self.uniform_avail_floor
+        if floor is None:
+            return int(self.token_to_kv_pool_allocator.available_size())
+        return int(floor)
+
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        # Eviction stays LOCAL and unconditional: it is the side effect that
+        # actually frees the space. Only the COMPARISON moves to the reduced
+        # value, exactly as the #603 call site in the scheduler does it.
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        return self.decode_mem_avail() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs, offload_kv: bool = True):
         retracted_reqs = retract_all(
