@@ -18,7 +18,10 @@ set -u
 WT=/spinning/wt-spill-matrix
 VENV=/spinning/htsglang-gpu/.venv
 MODEL_INT8=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8
-MODEL_GGUF=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-MTP-Q3_K_M-GGUF
+# The GGUF path must be the SHARD FILE, not its directory: with
+# --load-format gguf the loader does a file check and refuses a directory with
+# "<path> is not a file" (model_loader/loader.py:2208). Cost one boot to find.
+MODEL_GGUF=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-MTP-Q3_K_M-GGUF/Qwen3.6-27B-Q3_K_M.gguf
 
 RECIPE=${1:?usage: boot.sh <K0|K1|K2|K3|K4|L1|C1>}
 PORT=${PORT:-30041}
