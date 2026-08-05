@@ -234,9 +234,22 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     the boot, and a joint that is only ever read is not a joint that works. NVML
     and the calibration are injected; everything between them is production
     code, including the itemization the boot logs.
+
+    THE LAUNCH RUNS ON BARLINK, and that is load-bearing rather than incidental
+    (#598). #595 gave the NCCL communicator buffers a term that is UNBOUNDED
+    until somebody measures them, and no seam populates that measurement from
+    ServerArgs -- so from that point on this production path REFUSED for every
+    launch, and this test went red with it. It is resolvable in exactly one
+    way today: on a barlink-owned group no PyNccl communicator is constructed
+    at all, so the term prices 0 with the skip condition as its derivation.
+    Setting the switch here therefore also pins that the group description
+    reaches the ledger through the real ``DemandInputs.from_server_args``,
+    which nothing else exercises end to end.
     """
     import sglang.srt.server_args as sa
     from sglang.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
+
+    monkeypatch.setenv("SGLANG_BARLINK", "1")
 
     class Card:
         def __init__(self, ordinal, uuid, name, total):
@@ -317,10 +330,18 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
 
 
 def test_the_boot_path_refuses_an_overcommitted_card(monkeypatch):
-    """The refusal is reachable from the boot, not only from the unit."""
+    """The refusal is reachable from the boot, not only from the unit.
+
+    Barlink-owned for the same reason as the test above: the refusal under
+    test is an OVERCOMMIT (the card is too small), and it can only be observed
+    once the unrelated #595 NCCL refusal is out of the way. Verdicts of
+    different kinds must not stand in for each other.
+    """
     import sglang.srt.server_args as sa
     from sglang.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
     from sglang.srt.mem_ledger.terms import LedgerOvercommit
+
+    monkeypatch.setenv("SGLANG_BARLINK", "1")
 
     class Card:
         cuda_ordinal = 1

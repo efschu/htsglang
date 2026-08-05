@@ -437,6 +437,31 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     )
 
 
+def should_build_barlink(world_size: int) -> bool:
+    """Whether GroupCoordinator should CONSTRUCT a barlink communicator for a
+    group of this size, i.e. whether barlink OWNS that group's transport.
+
+    Module-level for the same reason as the two predicates below: one
+    definition. `GroupCoordinator.__init__` calls it, and so does the VRAM
+    ledger's NCCL term (`sglang.srt.mem_ledger.nccl_transport`), which has to
+    answer "does this launch build an NCCL communicator at all?" at ARGUMENT
+    PARSE time, long before any GroupCoordinator exists. A ledger that
+    re-implemented `envs.SGLANG_BARLINK.get() and world_size > 1` would keep
+    pricing an NCCL term at 0 after this condition changed -- an under-charge
+    that surfaces as an OOM, which is the exact failure class the ledger
+    exists to remove.
+
+    `barlink_comm is not None` is equivalent to this predicate rather than
+    merely implied by it: the constructor below is not wrapped in a
+    try/except, so a failure aborts the boot instead of silently leaving the
+    attribute None.
+
+    RANK-UNIFORM: both inputs (an env var that must be identical on every rank,
+    and a group size every rank derives from the same CLI) are launch-uniform.
+    """
+    return bool(envs.SGLANG_BARLINK.get()) and world_size > 1
+
+
 def should_build_pynccl(
     use_pynccl: bool, world_size: int, barlink_active: bool
 ) -> bool:
@@ -719,7 +744,7 @@ class GroupCoordinator:
         # for every group, so this adds no process group and no new
         # collective beyond barlink's own startup calibration.
         self.barlink_comm: Optional[Any] = None
-        if envs.SGLANG_BARLINK.get() and self.world_size > 1:
+        if should_build_barlink(self.world_size):
             from sglang.srt.distributed.device_communicators.barlink import (
                 BarlinkCommunicator,
             )
