@@ -752,6 +752,17 @@ class Envs:
     # model. 0 = derive. For A/B arms that need K held constant, not for
     # production tuning.
     SGLANG_TP_AR_PIPELINE_SLICES = EnvInt(0)
+    # Deferred join (task #597). Issues a layer's all-reduce on the comm
+    # stream at the site that already owned it and joins at the first
+    # consumer, so the transfer runs under everything in between. Independent
+    # of SGLANG_TP_AR_PIPELINE: that one hides a collective under the
+    # producing GEMM, this one under the issue-to-join window. Window 8
+    # showed the production model's dominant all-reduce is the MoE layer's
+    # own reduce, which the in-call hook never sees. RANK-UNIFORM.
+    SGLANG_TP_AR_PIPELINE_DEFERRED = EnvBool(False)
+    # Minimum token count for the deferred issue. Below it the collective is
+    # too small for the handle bookkeeping to pay for itself.
+    SGLANG_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS = EnvInt(256)
     # Number of independent UCX contexts/workers per rank for the collective
     # plane (task #266). 2 splits the flat exchange's peers over the two
     # workers by the symmetric (rank + peer) % ways rule, so no rank has all

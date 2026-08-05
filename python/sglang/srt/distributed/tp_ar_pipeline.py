@@ -109,6 +109,14 @@ __all__ = [
     "tp_ar_pipeline_enabled",
     "tp_ar_pipeline_stats",
     "pipelined_row_all_reduce",
+    # Deferred join (task #597)
+    "DEFERRED_HANDLE_ATTR",
+    "has_deferred_handle",
+    "issue_deferred_all_reduce",
+    "join_deferred",
+    "note_reduce_site",
+    "set_deferred_backend_for_test",
+    "tp_ar_deferred_enabled",
 ]
 
 #: Collective-clock family for the all-reduces this module issues on the side
@@ -122,6 +130,21 @@ CLOCK_FAMILY_WIRE = "tp.all_reduce.pipe_wire"
 #: is recorded on the COMPUTE stream and brackets the point where compute
 #: blocks until the last slice's transfer has landed.
 CLOCK_FAMILY_JOIN = "tp.ar_pipeline.join"
+
+#: Collective-clock family for the DEFERRED join (task #597): the point where
+#: a consumer blocks on an all-reduce that was issued in an earlier call. Kept
+#: apart from CLOCK_FAMILY_JOIN because the two answer different questions --
+#: the in-call join measures what one layer's own GEMM failed to hide, this
+#: one measures what the whole window between issue and consumption failed to
+#: hide.
+CLOCK_FAMILY_DEFERRED_JOIN = "tp.ar_pipeline.deferred_join"
+
+#: Attribute under which a pending deferred all-reduce rides on its tensor.
+#: The handle travels with the DATA rather than in a side table because the
+#: tensor is what gets passed from the producing layer to the communicator;
+#: a side table would need a key that survives every reshape and rename on
+#: the way. Mirrors the established ``_barlink_ar_handle`` pattern.
+DEFERRED_HANDLE_ATTR = "_tp_ar_pipeline_handle"
 
 #: Bytes for the small-message probe used to separate per-collective latency
 #: from per-byte wire cost. Small enough to be latency-dominated on any link
@@ -278,10 +301,25 @@ class _State:
     logged_shapes: set = dataclasses.field(default_factory=set)
     events: _EventPool = dataclasses.field(default_factory=_EventPool)
     comm_stream: Optional["torch.cuda.Stream"] = None
+    # -- deferred join (task #597) --------------------------------------
+    deferred_issued: int = 0
+    deferred_joined: int = 0
+    deferred_declined: int = 0
+    #: Times a tensor still carrying an unjoined handle arrived at a site
+    #: that performs its own all-reduce. MUST stay 0: it is the
+    #: double-reduce precondition. See :func:`note_reduce_site`.
+    deferred_reduce_site_hits: int = 0
+    #: Accumulated issue-to-join window (the compute the deferred transfer
+    #: had available to hide under). This is the ceiling input the runsheet
+    #: needs; sampled without ever synchronizing on the hot path.
+    window_samples: int = 0
+    window_total_ms: float = 0.0
+    pending_window: Optional[tuple] = None
 
 
 _STATE = _State()
 _ENABLED: Optional[bool] = None
+_DEFERRED_ENABLED: Optional[bool] = None
 
 
 def tp_ar_pipeline_enabled() -> bool:
@@ -292,11 +330,26 @@ def tp_ar_pipeline_enabled() -> bool:
     return _ENABLED
 
 
+def tp_ar_deferred_enabled() -> bool:
+    """Read once. Independent of the in-call pipeline flag.
+
+    The two are separate levers on purpose: the in-call pipeline (#588)
+    hides a collective under the producing GEMM, the deferred join (#597)
+    hides it under everything between the producer and the first consumer.
+    A run may want either, both, or neither.
+    """
+    global _DEFERRED_ENABLED
+    if _DEFERRED_ENABLED is None:
+        _DEFERRED_ENABLED = bool(envs.SGLANG_TP_AR_PIPELINE_DEFERRED.get())
+    return _DEFERRED_ENABLED
+
+
 def reset_tp_ar_pipeline_state() -> None:
-    """Drop the cached flag, calibration and counters. Tests only."""
-    global _STATE, _ENABLED
+    """Drop the cached flags, calibration and counters. Tests only."""
+    global _STATE, _ENABLED, _DEFERRED_ENABLED
     _STATE = _State()
     _ENABLED = None
+    _DEFERRED_ENABLED = None
 
 
 def tp_ar_pipeline_stats() -> dict:
@@ -306,6 +359,16 @@ def tp_ar_pipeline_stats() -> dict:
     this is the cheapest way to see that before trusting a delta.
     """
     return {
+        "deferred_issued": _STATE.deferred_issued,
+        "deferred_joined": _STATE.deferred_joined,
+        "deferred_declined": _STATE.deferred_declined,
+        "deferred_reduce_site_hits": _STATE.deferred_reduce_site_hits,
+        "deferred_window_samples": _STATE.window_samples,
+        "deferred_window_mean_ms": (
+            0.0
+            if _STATE.window_samples == 0
+            else _STATE.window_total_ms / _STATE.window_samples
+        ),
         "calls_pipelined": _STATE.calls_pipelined,
         "calls_unsliced": _STATE.calls_unsliced,
         "slices_issued": _STATE.slices_issued,
@@ -566,3 +629,282 @@ def pipelined_row_all_reduce(
     return _run_sliced(
         input_parallel, apply_fn, all_reduce_fn, slice_bounds(num_tokens, num_slices)
     )
+
+
+# ==========================================================================
+# Deferred join (task #597)
+# ==========================================================================
+#
+# WHY THIS IS A DIFFERENT LEVER FROM #588
+# ---------------------------------------
+# #588 hides a collective under the GEMM that produced it, inside one call.
+# Window 8 then showed that on the production model the dominant family --
+# tp.all_reduce, 932.2 ms over 129 calls of a 96k-token prefill -- is NOT
+# issued by a row-parallel linear at all: it is the MoE layer's own reduce of
+# ``final_hidden_states``, and the row linears that could have been hooked
+# defer their reduce to the LayerCommunicator. The in-call hook therefore
+# fired zero times.
+#
+# This lever moves the SAME single reduction earlier in wall-clock time
+# instead of moving it somewhere else: the producer issues it on the comm
+# stream and returns immediately, and the first consumer joins. Nothing is
+# added and nothing is removed, so the reduction still happens exactly once.
+#
+# THE RECOMPUTED CEILING
+# ----------------------
+# Let W be the compute between the issue and the join -- everything the
+# producing call still does after the reduce point, the layer plumbing, and
+# whatever the consumer runs before it first reads the tensor. Let G be the
+# producer compute that a token-sliced issue can additionally interleave (0
+# when the producer is not sliced), and T_ar = L + P/B the collective.
+#
+#     baseline  = G + W + T_ar          (reduce is exposed, then W runs)
+#     pipelined = max(G + W, G/K + K*L + P/B)
+#     saving    = min(G*(1 - 1/K) + W - (K-1)*L,  T_ar)
+#
+# Two things changed against #588, where the bound was G alone:
+#
+#   1. The overlap partner grew from "the layer's own GEMM" to "G + W". W is
+#      strictly additional, so this ceiling is HIGHER by construction.
+#   2. The saving is now also capped by T_ar itself -- once the whole
+#      collective is hidden there is nothing left to win, no matter how large
+#      W is. #588 could never reach that cap; this lever can.
+#
+# W is NOT predictable from the source: it depends on which consumer joins
+# first, which depends on the model's layer order and on flags that move the
+# reduce point (fuse_mlp_allreduce, reduce-scatter modes). So the code
+# MEASURES it -- see the window meter below -- and the runsheet reads the
+# ceiling off that measurement instead of trusting an estimate.
+#
+# The K-optimum is unchanged: W does not depend on K, so minimizing
+# ``G/K + K*L`` still gives ``K* = sqrt(G/L)`` and derive_num_slices is
+# reused verbatim. Where the producer is not sliced, G = 0 and K = 1 is the
+# correct answer -- splitting a bare transfer that has no interleaved compute
+# only adds K launch latencies. That is a property of the lever, not a
+# limitation of the implementation.
+#
+# WHY DOUBLE-REDUCE CANNOT HAPPEN HERE
+# ------------------------------------
+# The issue is only ever taken at a site that ALREADY performed the
+# reduction, so no downstream site was reducing that tensor before and none
+# starts now. The dangerous variant -- issuing early at a producer whose
+# reduce is owned by the communicator, which would require SUPPRESSING the
+# communicator's reduce -- is deliberately out of scope. :func:`note_reduce_site`
+# is planted at every all-reduce site in the communicator anyway: it counts
+# any pending handle arriving at a reducing site, and that counter staying at
+# zero is the invariant the falsifier test pins.
+
+
+@dataclasses.dataclass
+class _DeferredHandle:
+    """A reduction in flight on the comm stream.
+
+    ``done`` is what the consumer waits on. ``issued_at`` is recorded on the
+    COMPUTE stream at issue time and pairs with a join-time event to measure
+    W without a host sync.
+    """
+
+    done_events: List["torch.cuda.Event"]
+    issued_at: Optional["torch.cuda.Event"]
+    num_slices: int
+
+
+def has_deferred_handle(tensor) -> bool:
+    return getattr(tensor, DEFERRED_HANDLE_ATTR, None) is not None
+
+
+class _CudaBackend:
+    """The device calls the deferred path needs, in one place.
+
+    Extracted so the issue/join CONTRACT -- issued once, joined once, no
+    reducing site ever sees a pending handle, values correct -- can be tested
+    without a GPU. The stream ORDERING those calls set up is a device
+    property and stays a runsheet item, exactly as the GEMM's bitwise
+    behaviour did in #588. Production always uses this class; the seam costs
+    one ``is None`` check per issue.
+    """
+
+    @staticmethod
+    def capturing() -> bool:
+        return torch.cuda.is_current_stream_capturing()
+
+    @staticmethod
+    def current_stream(device):
+        return torch.cuda.current_stream(device)
+
+    @staticmethod
+    def comm_stream(device):
+        return _comm_stream(device)
+
+    @staticmethod
+    def stream_ctx(stream):
+        return torch.cuda.stream(stream)
+
+    @staticmethod
+    def timing_event():
+        return torch.cuda.Event(enable_timing=True)
+
+    @staticmethod
+    def record_stream(tensor, stream) -> None:
+        tensor.record_stream(stream)
+
+    @staticmethod
+    def usable(tensor) -> bool:
+        return bool(tensor.is_cuda) and torch.cuda.is_available()
+
+
+_BACKEND = _CudaBackend
+_TEST_BACKEND = None
+
+
+def set_deferred_backend_for_test(backend) -> None:
+    """Install a stand-in for the device calls. Tests only; None restores."""
+    global _TEST_BACKEND
+    _TEST_BACKEND = backend
+
+
+def _backend():
+    return _TEST_BACKEND if _TEST_BACKEND is not None else _BACKEND
+
+
+def _sample_window(issued_at, joined_at) -> None:
+    """Accumulate one issue-to-join measurement, never synchronizing.
+
+    The pair is parked and read on a LATER call, by which time the GPU has
+    long passed both events. A pair that is not ready yet is simply dropped
+    in favour of the newer one: this is a ceiling estimate over many layers,
+    not an audit trail.
+    """
+    pending = _STATE.pending_window
+    if pending is not None:
+        start, end = pending
+        if end.query():
+            _STATE.window_samples += 1
+            _STATE.window_total_ms += start.elapsed_time(end)
+    _STATE.pending_window = (issued_at, joined_at)
+
+
+def issue_deferred_all_reduce(
+    tensor: torch.Tensor,
+    all_reduce_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Start ``all_reduce_fn(tensor)`` on the comm stream; join later.
+
+    Returns the tensor tagged with a pending handle. The caller MUST NOT read
+    the values again before a :func:`join_deferred`; it may only pass the
+    tensor on. The reduction is in-place from the caller's point of view --
+    an out-of-place backend result is copied back on the comm stream so the
+    identity of the returned tensor never depends on which backend ran.
+
+    Declines (returning an ordinary, already-reduced tensor) whenever the
+    device path is unavailable or a capture is active. Every decline
+    condition is group-uniform, so ranks decline together.
+    """
+    backend = _backend()
+    if not backend.usable(tensor):
+        _STATE.deferred_declined += 1
+        return all_reduce_fn(tensor)
+    if backend.capturing():
+        # A side-stream collective cannot be captured, and a replayed graph
+        # would never run this Python. Eager only, exactly as in #588.
+        _STATE.deferred_declined += 1
+        return all_reduce_fn(tensor)
+    if has_deferred_handle(tensor):
+        # Already in flight. Issuing twice would reduce twice; this is the
+        # in-process half of the invariant note_reduce_site pins.
+        _STATE.deferred_reduce_site_hits += 1
+        return join_deferred(tensor)
+
+    compute_stream = backend.current_stream(tensor.device)
+    comm_stream = backend.comm_stream(tensor.device)
+    clock = collective_clock()
+
+    ready = backend.timing_event()
+    ready.record(compute_stream)
+    # Allocated and written on the compute stream, reduced on the comm
+    # stream: the allocator must not recycle it on the compute stream's last
+    # use alone.
+    backend.record_stream(tensor, comm_stream)
+
+    issued_at = backend.timing_event()
+    issued_at.record(compute_stream)
+
+    with backend.stream_ctx(comm_stream):
+        comm_stream.wait_event(ready)
+        with clock.label_scope(CLOCK_FAMILY_WIRE):
+            reduced = all_reduce_fn(tensor)
+        if reduced.data_ptr() != tensor.data_ptr():
+            tensor.copy_(reduced)
+        done = backend.timing_event()
+        done.record(comm_stream)
+
+    setattr(
+        tensor,
+        DEFERRED_HANDLE_ATTR,
+        _DeferredHandle(done_events=[done], issued_at=issued_at, num_slices=1),
+    )
+    _STATE.deferred_issued += 1
+    return tensor
+
+
+def join_deferred(tensor):
+    """Complete a pending deferred reduction, if this tensor carries one.
+
+    Idempotent and cheap: one ``getattr`` when there is nothing pending,
+    which is what every call on the default path pays. Safe to call at every
+    consumer entry point, and that is how it is used -- whichever consumer
+    runs first joins, the rest see a cleared handle.
+    """
+    handle = getattr(tensor, DEFERRED_HANDLE_ATTR, None)
+    if handle is None:
+        return tensor
+    # Clear FIRST: a join that raised half-way must not leave a handle that
+    # a later consumer would wait on a second time.
+    try:
+        delattr(tensor, DEFERRED_HANDLE_ATTR)
+    except AttributeError:
+        pass
+
+    backend = _backend()
+    compute_stream = backend.current_stream(tensor.device)
+    clock = collective_clock()
+    if clock.armed:
+        with clock.span(CLOCK_FAMILY_DEFERRED_JOIN):
+            for event in handle.done_events:
+                compute_stream.wait_event(event)
+    else:
+        for event in handle.done_events:
+            compute_stream.wait_event(event)
+
+    if handle.issued_at is not None:
+        joined_at = backend.timing_event()
+        joined_at.record(compute_stream)
+        _sample_window(handle.issued_at, joined_at)
+
+    _STATE.deferred_joined += 1
+    return tensor
+
+
+def note_reduce_site(tensor):
+    """Guard planted at every all-reduce site that could double-reduce.
+
+    A tensor arriving here with a pending handle would be reduced a second
+    time -- silently, with a plausible-looking result. The construction above
+    makes that impossible (the issue is only taken where the reduction was
+    already owned), so this counter is expected to stay at zero forever; it
+    exists so that a future change which moves the issue to a producer whose
+    reduce belongs to the communicator FAILS LOUDLY in the test suite instead
+    of quietly returning doubled activations.
+
+    Joins as well as counts, so that even in that unintended case the data is
+    consistent rather than racing.
+    """
+    if getattr(tensor, DEFERRED_HANDLE_ATTR, None) is None:
+        return tensor
+    _STATE.deferred_reduce_site_hits += 1
+    logger.warning(
+        "tp_ar_pipeline: a deferred all-reduce handle reached an all-reduce "
+        "site; the reduction is about to be applied twice. This is a bug in "
+        "the issue/join placement, not a tuning problem."
+    )
+    return join_deferred(tensor)
