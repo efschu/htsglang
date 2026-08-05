@@ -66,13 +66,19 @@ stop_arm() {
 run_arm() {
   local arm="$1"; shift
   boot "$arm" "$@" || return 1
-  "$VENV/bin/python" "$WT/tests/prefill_graphs/content_gate.py" record \
-      --port $PORT --out "$OUT/${arm}_gate.json" || return 1
+  if [ "${GATE:-1}" = "1" ]; then
+    "$VENV/bin/python" "$WT/tests/prefill_graphs/content_gate.py" record \
+        --port $PORT --out "$OUT/${arm}_gate.json" || return 1
+  fi
+  # Every perf point is a SUSTAINED ~5 s window of back-to-back draws with a
+  # discarded warmup, scored on aggregate tok/s, with SM clock and P-state
+  # sampled during the measured window. A lone short draw on idle cards would
+  # measure the clock ramp, not the code (#483).
   # SIZES is per-stage: the NCCL stage sweeps the length axis, the barlink
   # stage only needs the two points the 2x2 is stated over.
   for sz in ${SIZES:-256 900 1900}; do
     "$VENV/bin/python" "$WT/tests/prefill_graphs/prefill_perf.py" \
-        --port $PORT --tokens $sz --n 12 --seed 4242 \
+        --port $PORT --tokens $sz --seconds 5 --warmup-seconds 2 --seed 4242 \
         --out "$OUT/${arm}_perf_${sz}.json" || return 1
   done
   if [ "${CONC:-1}" = "1" ]; then
@@ -82,7 +88,8 @@ run_arm() {
     # bound (the 68-75% collective share of the prefill window, #252) -- and
     # it is the regime the barlink hypothesis is really about.
     "$VENV/bin/python" "$WT/tests/prefill_graphs/prefill_perf.py" \
-        --port $PORT --tokens 256 --n 24 --seed 777 --concurrency 4 \
+        --port $PORT --tokens 256 --seconds 5 --warmup-seconds 2 --seed 777 \
+        --concurrency 4 \
         --out "$OUT/${arm}_perf_256c4.json" || return 1
   fi
   stop_arm "$arm"
@@ -175,37 +182,54 @@ out = sys.argv[1]
 
 
 def med(arm, sz):
+    """Aggregate tok/s over the sustained window, plus its evidence."""
     p = f"{out}/{arm}_perf_{sz}.json"
     if not os.path.exists(p):
-        return None, None
+        return None
     d = json.load(open(p))
     if d["cached_tokens_total"]:
         print(f"  !! {arm}/{sz}: cache hits present, number is contaminated")
-    # Under concurrency the per-request rate understates throughput, so the
-    # aggregate is the honest column there.
-    if d.get("concurrency", 1) > 1:
-        return d["aggregate_tok_s"], d["wall_seconds"]
-    return st.median(d["prefill_tok_s_all"]), None
+    if d["window_seconds"] < 4.0:
+        print(f"  !! {arm}/{sz}: window only {d['window_seconds']:.2f}s -- "
+              f"below the ~5s sustained standard, treat as indicative")
+    return d
+
+
+def band(d):
+    c = d.get("clocks") or {}
+    if not c:
+        return "no clock telemetry"
+    return " ".join(
+        f"g{i}:{v['sm_min']}-{v['sm_max']}/{'|'.join(v['pstates'])}"
+        for i, v in c.items()
+    )
 
 
 def block(label, e1, e2, g, sizes):
     print(f"\n=== {label} ===")
+    print("Each point: aggregate tok/s over a sustained window. "
+          "'win' = window seconds / draws aggregated.")
     for sz in sizes:
-        a, _ = med(e1, sz)
-        b, _ = med(e2, sz)
-        c, _ = med(g, sz)
+        a, b, c = med(e1, sz), med(e2, sz), med(g, sz)
         if a is None or c is None:
             continue
+        av, cv = a["aggregate_tok_s"], c["aggregate_tok_s"]
+        print(f"\n  [{sz}]  win {a['window_seconds']:.1f}s/{a['draws']}draws "
+              f"(eager)  {c['window_seconds']:.1f}s/{c['draws']}draws (graphs)")
+        print(f"        clocks eager  {band(a)}")
+        print(f"        clocks graphs {band(c)}")
         if b is None:
-            print(f"{sz:>6}: eager {a:8.1f}  graphs {c:8.1f}  "
-                  f"delta {(c/a-1)*100:+.1f}%  (NO FLOOR -- second eager boot missing)")
+            print(f"        eager {av:8.1f}  graphs {cv:8.1f}  "
+                  f"delta {(cv/av-1)*100:+.1f}%  (NO FLOOR -- E2 missing)")
             continue
-        noise = (b / a - 1) * 100
-        emean = (a + b) / 2
-        delta = (c / emean - 1) * 100
+        bv = b["aggregate_tok_s"]
+        noise = (bv / av - 1) * 100
+        emean = (av + bv) / 2
+        delta = (cv / emean - 1) * 100
         verdict = "INSIDE NOISE" if abs(delta) <= abs(noise) else "outside noise"
-        print(f"{sz:>6}: eager {a:8.1f}/{b:8.1f}  graphs {c:8.1f}  "
-              f"floor {noise:+6.1f}%  delta {delta:+6.1f}%  -> {verdict}")
+        print(f"        eager {av:8.1f} / {bv:8.1f}   graphs {cv:8.1f}")
+        print(f"        eager floor {noise:+6.2f}%   graph delta {delta:+6.2f}%"
+              f"   -> {verdict}")
 
 
 block("NCCL", "E1", "E2", "G", ("256", "900", "1900", "256c4"))
@@ -217,13 +241,14 @@ print("\n=== HYPOTHESIS: does the graph delta improve under barlink? ===")
 print("(prefill-graph delta under NCCL vs under barlink, same point;")
 print(" each compared against its OWN transport's eager floor)")
 for sz in ("1900", "256c4"):
-    n_e1, _ = med("E1", sz); n_e2, _ = med("E2", sz); n_g, _ = med("G", sz)
-    b_e1, _ = med("BE1", sz); b_e2, _ = med("BE2", sz); b_g, _ = med("BG", sz)
+    n_e1, n_e2, n_g = med("E1", sz), med("E2", sz), med("G", sz)
+    b_e1, b_e2, b_g = med("BE1", sz), med("BE2", sz), med("BG", sz)
     if None in (n_e1, n_g, b_e1, b_g):
         print(f"{sz:>6}: barlink arms absent -- hypothesis UNTESTED at this point")
         continue
-    nd = (n_g / ((n_e1 + n_e2) / 2 if n_e2 else n_e1) - 1) * 100
-    bd = (b_g / ((b_e1 + b_e2) / 2 if b_e2 else b_e1) - 1) * 100
+    A = lambda d: d["aggregate_tok_s"]
+    nd = (A(n_g) / ((A(n_e1) + A(n_e2)) / 2 if n_e2 else A(n_e1)) - 1) * 100
+    bd = (A(b_g) / ((A(b_e1) + A(b_e2)) / 2 if b_e2 else A(b_e1)) - 1) * 100
     print(f"{sz:>6}: NCCL {nd:+.1f}%   barlink {bd:+.1f}%   swing {bd - nd:+.1f} pp")
 print("\nA swing only supports the hypothesis if it exceeds BOTH transports'")
 print("eager floors; otherwise it is noise wearing a mechanism story.")

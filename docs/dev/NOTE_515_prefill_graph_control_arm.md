@@ -161,16 +161,83 @@ expected reason there is nothing to win.
 Capture is not free either: 31.1 s and 1.03 GB on the production recipe,
 leaving 1.74 GB avail where eager had 4.00 GB.
 
+## 5a. Window 3 — the floor closes, and the throughput claim is WITHDRAWN
+
+Artifacts: `/spinning/gpu-battery-results/2026-08-05_prefill_graphs_w3/`.
+Arms E1 (eager), E2 (eager, identical flags), G (graphs), pinned
+`--random-seed 12345`. Perf points rebuilt to the sustained standard: warmup
+discarded, ~5 s measured window of back-to-back draws, scored on aggregate
+tok/s, with SM clock and P-state sampled *during* each measured window.
+
+**Content — the missing control, now taken, and it holds.**
+
+| comparison | result |
+|---|---|
+| **E1 vs E2 (boot-to-boot floor)** | **PASS — 8/8 byte-identical** |
+| E1 vs G | FAIL — 4/8 text, 3/8 logprob-only |
+| E2 vs G | FAIL — 4/8 text, 3/8 logprob-only, *same prompts, same char offsets* |
+
+Two independent eager boots are byte-identical, and the graph boot diverges
+from **both** of them at identical positions. §4's divergence is real,
+reproducible and attributable to the prefill graph backend — not boot noise.
+This is the control `NOTE_452` §2 experiment 2 asked for, and it passes.
+
+**Throughput — withdrawn as confounded.** The raw numbers looked like a clean
+negative (256: -4.3 %, 900: -1.8 %, 1900: -3.0 % against eager floors of
+0.6 %, 0.8 %, 0.4 %). The clock telemetry that the same directive required
+then falsified the reading. The 3080 median SM clock decays **monotonically
+with arm order**, and G ran last every time:
+
+| point | E1 | E2 | G |
+|---|---|---|---|
+| 256 | 1886 MHz | 1838 (-2.6 %) | 1774 (-6.0 %) |
+| 900 | 1898 | 1830 (-3.6 %) | 1762 (-7.1 %) |
+| 1900 | 1875 | 1822 (-2.8 %) | 1740 (-7.2 %) |
+| 256c4 | 1860 | 1804 (-3.0 %) | 1740 (-6.5 %) |
+
+That is a thermal-soak signature on 200 W-capped 3080s, perfectly aligned with
+run order, and it is larger than every throughput delta measured. Worse for a
+naive reading: G's *throughput* deficit (-4.0/-2.1/-3.2 %) is consistently
+**smaller** than its *clock* deficit (-6.0/-7.1/-7.2 %), so per-MHz the graph
+arm is not behind at all. The experiment cannot support a directional claim in
+either direction, and the §5 sentence "no measurable gain" now rests on window
+2, not on this one.
+
+The 256c4 point is separately unusable: its eager floor is +9.1 % (E1 1511.8
+vs E2 1649.6), swamping any effect.
+
+**Fix for the follow-up window:** interleave the arms (E, G, E, G, E, G)
+instead of running them in blocks, so thermal drift is spread across both
+treatments rather than aliased onto one, and report per-arm clock medians
+alongside every number. Block order plus a power-capped card is not a
+recoverable design.
+
+**ED / GD did not run.** Both determinism arms failed to boot: OOM during
+capture, `boot_ED.log` showing `avail mem=0.05 GB` on TP1 followed by
+`multimem all-gather disabled (CUDA driver error: out of memory)`.
+`--enable-deterministic-inference` sets
+`enforce_disable_flashinfer_allreduce_fusion` and evidently shifts the capture
+footprint enough to exceed the `5500,3800,3800` reserve. The determinism
+question in §6a is therefore still open, and needs a larger reserve on the
+3080s rather than a code change.
+
 ## 6. What is still missing
 
-The **boot-to-boot content floor**. §4 compares an eager boot against a graph
-boot; the A-vs-A floors were taken *within* each boot. If two eager boots
-already disagree, the 4/8 is boot noise and §4 must be withdrawn.
-`NOTE_452_desync_boot_refutation.md` §2 experiment 2 flags this same gap.
-`tests/prefill_graphs/window3_boot_floor.sh` runs it (eager, eager, graphs;
-pinned `--random-seed`) and also takes the perf probe at 256/900/1900 tokens,
-since the short-prompt regime — where launch-train tightening could plausibly
-pay against the 68-75 % collective share from #252 — is unmeasured.
+~~The boot-to-boot content floor.~~ **CLOSED by §5a**: E1 vs E2 passed 8/8
+byte-identical and the graph arm diverges from both eager boots identically.
+The content result stands, and it is clock-independent — byte-identity does
+not care what frequency the cards ran at, which is precisely why it survived
+the confound that took down the throughput number.
+
+Still open:
+
+* **A throughput answer at all.** §5a withdrew window 3's; window 2's survives
+  only as "no measurable gain", and both need the interleaved-arm redesign.
+* **The determinism pair**, blocked on capture OOM (§5a), needs a larger 3080
+  reserve.
+* **The barlink row** (§6a), blocked on `BARLINK_VERDICT` — barlink-583's
+  first soak was a null result (thousands of collectives carried, deadlines
+  never approached, abort path unexercised), so the row stays UNTESTED.
 
 Weak supporting evidence meanwhile: the restored production server (a
 different boot, radix + hicache on) reproduced the eager arm's prompt#0
