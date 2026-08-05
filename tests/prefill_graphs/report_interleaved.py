@@ -79,6 +79,20 @@ def main() -> int:
     print(f"\neager replicates: {e_arms or 'NONE'}")
     print(f"graph replicates: {g_arms or 'NONE'}")
     print(f"pairs: {pairs or 'NONE'}")
+    # Transport is a per-run property; if the arms disagree, the comparison is
+    # void regardless of how clean the numbers look.
+    tps = set()
+    for a in e_arms + g_arms:
+        for pt in POINTS:
+            d = load(out, a, pt)
+            if d:
+                tps.add(d.get("transport", "unstamped"))
+    print(f"transport: {', '.join(sorted(tps)) or 'unknown'}")
+    if len(tps) > 1:
+        print("  ABORT: arms used DIFFERENT transports -- not comparable.")
+        return 1
+    if tps == {"unstamped"}:
+        print("  WARNING: artifacts predate transport stamping; confirm by hand.")
     if not pairs:
         print("\nNot enough arms to report. Nothing claimed.")
         return 1

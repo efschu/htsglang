@@ -26,7 +26,12 @@ WT=/spinning/wt-prefill-graphs
 VENV=/spinning/htsglang-gpu/.venv
 OUT=${OUT:-/spinning/gpu-battery-results/2026-08-05_prefill_graphs_w4}
 PORT=30043
-RESERVE="${RESERVE:-5500,3800,3800}"
+# Matches the production default as of 2026-08-05. The 3080 term was raised
+# 3800 -> 4200 because the boot's own demand model derives 4160 MiB
+# (activation + graph capture + GDN prefill scratch) and warned that 3800 was
+# 360 MiB short with the 96-slot mamba pool. Booting the arms at the stale
+# 3800 would measure a differently-sized KV pool than production runs.
+RESERVE="${RESERVE:-5500,4200,4200}"
 REPS="${REPS:-3}"
 
 mkdir -p "$OUT"
@@ -35,6 +40,26 @@ export PYTHONPATH="$WT/python"
 export SGLANG_UNEVEN_DCP=1
 export SGLANG_UNEVEN_DCP_WEIGHTED=1
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+
+# TRANSPORT is set EXPLICITLY, never inherited. Production now exports
+# SGLANG_BARLINK=1 (user decision 2026-08-05: production runs barlink, usage is
+# the soak), so a script that merely stayed silent would pick the transport up
+# from whatever shell launched it -- and an arm that silently switched
+# transport would not be comparable with window 3, nor necessarily with its own
+# pair partner. Both failure modes are silent, which is why this is explicit.
+#
+# Default is nccl: window 4 answers the PREFILL-GRAPH question, and it must
+# hold the transport fixed at window 3's value to be comparable with it.
+# TRANSPORT=barlink runs the other half of the 2x2 (see NOTE_515 section 6a).
+TRANSPORT="${TRANSPORT:-nccl}"
+case "$TRANSPORT" in
+  nccl)    unset SGLANG_BARLINK ;;
+  barlink) export SGLANG_BARLINK=1 ;;
+  *) echo "TRANSPORT must be nccl or barlink, got '$TRANSPORT'"; exit 2 ;;
+esac
+export PREFILL_GRAPHS_TRANSPORT="$TRANSPORT"   # stamped into every artifact
+echo "transport=$TRANSPORT (SGLANG_BARLINK=${SGLANG_BARLINK:-unset})"
+echo "$TRANSPORT" > "$OUT/transport.txt"
 
 boot() {
   local arm="$1"; shift
@@ -128,5 +153,10 @@ cat <<'HDR'
   drift between arms -- that is its whole job. It is NOT a clock argument:
   clock and power are diagnostic annotation only (see report notes).
 HDR
+echo "  TRANSPORT for every arm in this run: $TRANSPORT (SGLANG_BARLINK=${SGLANG_BARLINK:-unset})"
+echo "  RESERVE for every arm in this run:   $RESERVE"
+echo "  Production as of 2026-08-05 runs TRANSPORT=barlink; an nccl run answers"
+echo "  the prefill-graph question in isolation and is comparable with window 3,"
+echo "  but is NOT by itself a production rollout argument."
 
 "$VENV/bin/python" "$WT/tests/prefill_graphs/report_interleaved.py" "$OUT"

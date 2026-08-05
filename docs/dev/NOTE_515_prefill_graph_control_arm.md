@@ -255,7 +255,7 @@ GB between pool end and capture begin, ED 2.48 -> 0.30 GB, a 1649 MiB extra
 demand against 1664 MiB derived, with identical KV pools.
 
 The follow-up window must therefore boot with
-**`RESERVE="7164,5464,5464"`** (= 5500+1664, 3800+1664, 3800+1664). No code
+**`RESERVE="7164,5864,5864"`** (= 5500+1664, 4200+1664, 4200+1664, rebased on the current production 3080 term of 4200). No code
 change is needed. See `TICKET_prefill_graphs_window4.md` Part B, which also
 records the one thing the VRAM ledger cannot express yet: `engine.py:293` reads
 `SGLANG_FLASHINFER_WORKSPACE_SIZE` at ledger-build time, but the backend
@@ -353,10 +353,27 @@ Note the content axis does not get a free pass here either: the barlink row
 has its own content gate, because a transport change is exactly the kind of
 thing that moves reduction order.
 
+**Production moved to barlink on 2026-08-05** (user decision: production runs
+barlink, usage is the soak). That does not change the design, but it changes
+what the NCCL row is worth. Windows 1-4 all measure NCCL, which keeps them
+mutually comparable and keeps the prefill-graph variable isolated -- but it
+means the NCCL row is no longer a statement about the configuration production
+runs. The decision-relevant cell is now barlink x prefill-graphs, and it still
+lacks its own eager floor. Any recommendation drawn from the NCCL row must say
+which transport it was measured on; §7 does.
+
+Because the transport is now something a shell can inject,
+`window4_interleaved.sh` sets it explicitly rather than inheriting it, stamps
+it into every artifact, and the reporter aborts if the arms disagree. An arm
+that silently switched transport would produce a clean-looking number that
+answered a different question.
+
 ## 7. Recommendation
 
 Do not enable the prefill graph backend on the production recipe **under
-NCCL**. It cannot pass a content-identity gate, and it buys nothing measurable
+NCCL** -- and note that as of 2026-08-05 production no longer runs NCCL, so
+this recommendation now constrains a configuration production has left behind.
+The barlink cell is unmeasured. It cannot pass a content-identity gate, and it buys nothing measurable
 in the regime production actually runs. The current `disabled` state is right
 for the wrong reason — worth knowing, because the reason is one upstream rule
 away from flipping.

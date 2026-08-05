@@ -50,6 +50,7 @@ cache can turn the measurement into a cache-hit benchmark.
 
 import argparse
 import json
+import os
 import random
 import statistics
 import subprocess
@@ -251,6 +252,11 @@ def main() -> None:
     result = {
         "tokens_arg": args.tokens,
         "concurrency": args.concurrency,
+        # Stamped so an artifact can never be read without knowing which
+        # collective transport produced it. Production runs barlink as of
+        # 2026-08-05, so "which transport" is no longer a safe assumption.
+        "transport": os.environ.get("PREFILL_GRAPHS_TRANSPORT", "unstamped"),
+        "sglang_barlink_env": os.environ.get("SGLANG_BARLINK", "unset"),
         "prompts_per_pass": args.prompts,
         "passes": args.passes,
         # The fixed unit of work. Identical across arms by construction.

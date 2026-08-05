@@ -28,8 +28,45 @@ that is its only job.
     STAGE unused; run directly:
     bash tests/prefill_graphs/window4_interleaved.sh
 
-Defaults: `REPS=3`, `RESERVE=5500,3800,3800`, port 30043, artifacts to
-`/spinning/gpu-battery-results/2026-08-05_prefill_graphs_w4/`.
+Defaults: `REPS=3`, `TRANSPORT=nccl`, `RESERVE=5500,4200,4200`, port 30043,
+artifacts to `/spinning/gpu-battery-results/2026-08-05_prefill_graphs_w4/`.
+
+### Transport -- decided explicitly, not inherited
+
+Production now exports `SGLANG_BARLINK=1` (user decision 2026-08-05:
+production runs barlink, usage is the soak). That changes this ticket in two
+ways, and the first one is a live hazard:
+
+1. **The NCCL arms MUST unset it per-arm.** The earlier revision of
+   `window4_interleaved.sh` never mentioned `SGLANG_BARLINK`, so it would have
+   inherited the transport from whatever shell launched it. An arm that
+   silently ran barlink would not be comparable with window 3, and a run
+   launched from a production-flavoured shell would have compared
+   prefill-graph-on-barlink against window 3's prefill-graph-on-NCCL while
+   reporting it as a prefill-graph result. Both failure modes are silent.
+   The script now sets `TRANSPORT` explicitly (`nccl` default -> `unset
+   SGLANG_BARLINK`; `barlink` -> `export SGLANG_BARLINK=1`), refuses any other
+   value, stamps the transport into **every** artifact JSON, writes
+   `transport.txt`, prints it in the report header, and the reporter **aborts**
+   if the arms disagree. Verified by fixture: a mixed-transport artifact set
+   exits 1 with "arms used DIFFERENT transports -- not comparable".
+
+2. **Window 4's answer is therefore about NCCL, and production no longer runs
+   NCCL.** This is deliberate -- holding the transport at window 3's value is
+   what makes the prefill-graph variable isolated and the two windows
+   comparable. But it must be said plainly in the writeup: an NCCL-only result
+   is **not by itself a production rollout argument** any more. The
+   decision-relevant cell for today's production is barlink x prefill-graphs,
+   which is the `TRANSPORT=barlink` half of the 2x2 and still needs its own
+   eager floor. Same command, `TRANSPORT=barlink`.
+
+### Reserve -- rebased on the current production value
+
+Production raised the 3080 term `3800 -> 4200` on 2026-08-05: its own demand
+model derives 4160 MiB (activation + graph capture + GDN prefill scratch) and
+warned that 3800 was 360 MiB short with the 96-slot mamba pool. Booting the
+arms at the stale 3800 would have sized a different KV pool than production
+runs, so the default here follows production at `5500,4200,4200`.
 
 **Arms** -- interleaved, alternating, so neither treatment owns the cool end:
 
@@ -55,6 +92,7 @@ costs a minute per arm.
 
 **Time plan (minutes, not tens of minutes)**
 
+
 | item | count | each | total |
 |---|---|---|---|
 | boots | 6 | ~40 s eager / ~70 s graphs | ~5.5 min |
@@ -69,7 +107,8 @@ at boot, so an A/B needs separate processes. The measurement itself is ~2 min.
 
 **Acceptances**
 
-* Report header prints the measured power caps.
+* Report header prints the measured power caps AND the transport of every arm.
+* All arms report the same `transport`; the reporter aborts otherwise.
 * Each point reports `ms_per_prefill` per arm plus paired deltas `G_i` vs `E_i`.
 * `cached_tokens_total == 0` everywhere, else the point is INVALID.
 * Verdict per point is one of REPORTABLE / INSIDE FLOOR / INVALID / NO FLOOR.
@@ -118,10 +157,16 @@ so nothing else moved.
 
 ### The reserve the follow-up window must boot with
 
-    RESERVE="7164,5464,5464"     # = 5500+1664, 3800+1664, 3800+1664
+    RESERVE="7164,5864,5864"     # = 5500+1664, 4200+1664, 4200+1664
 
-    RESERVE="7164,5464,5464" REPS=1 GATE=1 \
+    TRANSPORT=nccl RESERVE="7164,5864,5864" REPS=1 \
       bash tests/prefill_graphs/window4_interleaved.sh   # ED/GD variant
+
+Rebased on the current production baseline: the 3080 term is 4200, not the
+3800 this ticket first assumed, so the determinism vector is 4200+1664 = 5864
+rather than 5464. The two corrections are independent -- 4200 fixes a
+previously-diagnosed activation/capture/scratch shortfall, and +1664 is the
+deterministic workspace delta on top of it.
 
 with `--enable-deterministic-inference` added to both arms. Acceptance: both
 arms reach health 200, and the content gate answers whether deterministic
@@ -157,7 +202,7 @@ backend's own rule, plus the inputs that drive it.
         SGLANG_FLASHINFER_WORKSPACE_SIZE  otherwise (default 384 MiB)
 
 and `TERM_ATTN_WORKSPACE.inputs` gains `enable_deterministic_inference` and
-`model_config.hf_config.architectures`. Until that lands, the 7164/5464/5464
+`model_config.hf_config.architectures`. Until that lands, the 7164/5864/5864
 vector above is derived by hand from the same rule and should be passed
 explicitly rather than trusted to `auto`.
 
