@@ -16,6 +16,7 @@ an allocation the budget promised would fit does not.
 The number is READ, not modelled and not probed -- see Provenance.REPORTED.
 """
 
+import types
 import unittest
 
 from sglang.srt.mem_ledger.engine import (
@@ -27,6 +28,7 @@ from sglang.srt.mem_ledger.engine import (
 )
 from sglang.srt.mem_ledger.terms import Provenance
 from sglang.srt.registry.nvml import DeviceInfo
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -194,6 +196,125 @@ class TestThePlannerCorridorIsNoLongerAConstant(unittest.TestCase):
             self.assertEqual(planner_corridor_mib(), 256)
         finally:
             del os.environ["SGLANG_PLANNER_CORRIDOR_MIB"]
+
+
+class _ReserveStub:
+    """A ServerArgs at the moment the reserve is decided, wired to the REAL
+    ledger and the REAL reserve_demand_per_gpu.
+
+    Nothing here supplies the two quantities under test: the carve-out comes
+    out of ``build_card_ledgers`` from the card's own reserved_mib, and the
+    user reserve comes out of ``ServerArgs.user_reserve_mib_per_gpu``. So if
+    either carrier is removed from production code, this stub cannot paper
+    over it -- which is the point of pinning the invariant here.
+    """
+
+    def __init__(self, user_reserve_mib=1024, reserved_mib=RTX_3080_RESERVED_MIB):
+        self.chunked_prefill_size = 2048
+        self.cuda_graph_config = types.SimpleNamespace(
+            decode=types.SimpleNamespace(max_bs=24, bs=None)
+        )
+        self.tp_size = 1
+        self.rank_gpu_id = [1]
+        self.rank_user_reserve_mib = user_reserve_mib
+        self._reserved_mib = reserved_mib
+
+    def _apply_gpu_mem_capacity_defaults(self, gpu_mem):
+        pass
+
+    def _widen_decode_capture_to_session_ceiling(self, decode_cfg):
+        pass
+
+    def ledger_full_demand_per_gpu(self, gpu_mem=None):
+        """The ledger's own demand for this card, exactly as the real wrapper
+        would return it: ``{gpu_id: demand_outside_budget_mib(ledger)}``.
+
+        Stubbed at this seam rather than one layer lower because the real
+        wrapper refuses whenever any term is unbounded, and the hardware
+        residual is unbounded without a calibration matching this rig's
+        fingerprint -- which a hermetic test cannot supply and should not
+        fake. The carve-out still reaches the assertions THROUGH this value
+        (it is a term inside that ledger), so both carriers remain delta-
+        provable against the real ``reserve_demand_per_gpu``.
+        """
+        return {
+            1: int(demand_outside_budget_mib(ledger(self._reserved_mib)))
+        }
+
+    def reserve_demand_per_gpu(self, gpu_mem, counts):
+        return ServerArgs.reserve_demand_per_gpu(self, gpu_mem, counts)
+
+    def user_reserve_mib_per_gpu(self, rank_gpu_id):
+        return ServerArgs.user_reserve_mib_per_gpu(self, rank_gpu_id)
+
+
+class TestTheCorridorZeroIsCoupledToTheDemand(unittest.TestCase):
+    """THE PIN for planner_corridor_mib() == 0.
+
+    The zero is correct ONLY while the reserve demand carries both the NVML
+    carve-out and the user reserve. If a future change takes either back out,
+    this class goes red -- so the defect surfaces in a test run rather than in
+    a boot that quietly serves under the user's floor again.
+
+    The repair when it does go red is to put the term back, NOT to make the
+    corridor non-zero: a constant there cannot know a card's carve-out or the
+    user's number, and would double-count on any card still carrying them.
+    """
+
+    def setUp(self):
+        ServerArgs._full_demand_refusal_named = False
+
+    def test_carrier_one_the_demand_moves_with_the_user_reserve(self):
+        at_1024 = _ReserveStub(user_reserve_mib=1024).reserve_demand_per_gpu(
+            RTX_3080_TOTAL_MIB, {1: 1}
+        )
+        at_2048 = _ReserveStub(user_reserve_mib=2048).reserve_demand_per_gpu(
+            RTX_3080_TOTAL_MIB, {1: 1}
+        )
+        self.assertEqual(
+            at_2048[1] - at_1024[1],
+            1024,
+            "the reserve demand does not move with --rank-user-reserve-mib, "
+            "so the user's headroom is being spent on KV and a corridor of 0 "
+            "no longer protects it (#602)",
+        )
+
+    def test_carrier_two_the_demand_moves_with_the_carve_out(self):
+        small = _ReserveStub(reserved_mib=RTX_3080_RESERVED_MIB).reserve_demand_per_gpu(
+            RTX_3080_TOTAL_MIB, {1: 1}
+        )
+        large = _ReserveStub(reserved_mib=RTX_5090_RESERVED_MIB).reserve_demand_per_gpu(
+            RTX_3080_TOTAL_MIB, {1: 1}
+        )
+        self.assertEqual(
+            large[1] - small[1],
+            RTX_5090_RESERVED_MIB - RTX_3080_RESERVED_MIB,
+            "the reserve demand does not move with the NVML carve-out, so the "
+            "budget is spending memory no allocation can obtain and a "
+            "corridor of 0 no longer protects it (#602)",
+        )
+
+    def test_and_therefore_the_corridor_adds_nothing(self):
+        """Stated as one assertion so the coupling is not separable: the zero
+        is a CONSEQUENCE of the two carriers above, not an independent
+        policy choice."""
+        from sglang.srt.uneven_perf import planner_corridor_mib
+
+        stub = _ReserveStub()
+        demand = stub.reserve_demand_per_gpu(RTX_3080_TOTAL_MIB, {1: 1})[1]
+        bare = int(demand_outside_budget_mib(ledger(RTX_3080_RESERVED_MIB)))
+        self.assertEqual(
+            demand - bare,
+            1024,
+            "the user reserve is the only thing reserve_demand_per_gpu should "
+            "add on top of the ledger demand",
+        )
+        self.assertEqual(
+            planner_corridor_mib(),
+            0,
+            "with both quantities inside the demand, any extra corridor "
+            "double-counts them -- the forbidden pad",
+        )
 
 
 if __name__ == "__main__":

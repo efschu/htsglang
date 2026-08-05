@@ -5980,6 +5980,26 @@ def planner_corridor_mib() -> int:
     ``SGLANG_PLANNER_CORRIDOR_MIB`` stays as an experiment seam, so a window
     can ask "what would an extra N MiB of slack have cost in context" without
     a code change. It is not a knob production is expected to set.
+
+    THE INVARIANT THIS ZERO DEPENDS ON, stated because the zero is only
+    correct while it holds:
+
+        the reserve demand carries BOTH the NVML carve-out
+        (``TERM_NVML_CARVE_OUT``, charged per card in ``build_card_ledgers``)
+        AND the user reserve (added in ``ServerArgs.reserve_demand_per_gpu``)
+
+    If either is ever taken back out of the demand, this must NOT be "fixed"
+    by making this function non-zero again. That would restore the exact
+    defect of #602 in mirror image: a constant here cannot know a card's
+    carve-out (425 MiB on a 3080, 518 on a 5090) and cannot know what the user
+    asked for, so it would be wrong on both counts and would double-count on
+    any card where the demand still carried them. Put the term back where it
+    belongs instead. DOUBLE-COUNTING PROHIBITION: carve-out and user reserve
+    are charged in exactly one place each, and it is not here.
+
+    ``test_nvml_carve_out_602.TestTheCorridorZeroIsCoupledToTheDemand`` pins
+    the invariant, so removing a carrier turns a test red rather than only a
+    boot.
     """
     from sglang.srt.environ import envs
 
