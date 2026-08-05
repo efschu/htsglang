@@ -44,7 +44,7 @@ class _WindowEightStub:
     def __init__(self):
         self.chunked_prefill_size = None
         self.cuda_graph_config = types.SimpleNamespace(
-            decode=types.SimpleNamespace(max_bs=None)
+            decode=types.SimpleNamespace(max_bs=None, bs=None)
         )
         self.tp_size = 3
         self.profile_resolved_at_build = None
@@ -65,6 +65,12 @@ class _WindowEightStub:
             self.chunked_prefill_size = 2048
         if self.cuda_graph_config.decode.max_bs is None:
             self.cuda_graph_config.decode.max_bs = 24
+
+    def _widen_decode_capture_to_session_ceiling(self, decode_cfg):
+        """Inert by default, which is production: the widening returns early
+        unless --max-running-requests-ceiling is set. The ceiling test below
+        binds the REAL implementation instead."""
+        self.widen_calls = getattr(self, "widen_calls", 0) + 1
 
     def _build_card_ledgers(self):
         resolved = (
@@ -231,3 +237,41 @@ class TestWhyNotTheOtherTwoDirections(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheSessionCeilingWideningIsAlsoApplied(unittest.TestCase):
+    """The tier default is not the final max_bs.
+
+    ``_widen_decode_capture_to_session_ceiling`` can raise it, and it lives in
+    _handle_gpu_memory_settings -- AFTER the reserve is decided. On this rig
+    the widening is inert (max_running_requests_ceiling is None), which is why
+    the reference profile's decode_max_bs=24 matched. On a config that sets the
+    ceiling it is not inert, and a reserve keyed on the tier value would be
+    under-booking capture at the size the boot actually captures.
+    """
+
+    def setUp(self):
+        ServerArgs._full_demand_refusal_named = False
+
+    def test_the_ceiling_widening_runs_before_the_footprint_lookup(self):
+        stub = _WindowEightStub()
+        # bs stays None: the widening is for the case where the operator has
+        # NOT pinned the captured list. A pinned list is their call and the
+        # real guard returns early on it.
+        stub.max_running_requests_ceiling = 64
+        stub.cuda_graph_max_bs_decode = None
+        stub.dp_size = 1
+        stub.enable_dp_attention = False
+        stub.device = "cuda"
+        # Bind the REAL widening, so this pins the production behaviour and
+        # not a stand-in for it.
+        stub._widen_decode_capture_to_session_ceiling = lambda cfg: (
+            ServerArgs._widen_decode_capture_to_session_ceiling(stub, cfg)
+        )
+        stub.reserve_demand_per_gpu(GPU_MEM, {1: 1})
+        self.assertEqual(
+            stub.cuda_graph_config.decode.max_bs,
+            64,
+            "the reserve was priced against the tier default while the boot "
+            "would capture at the session ceiling",
+        )

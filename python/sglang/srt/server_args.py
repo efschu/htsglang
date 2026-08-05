@@ -11211,6 +11211,15 @@ class ServerArgs:
         # dependency that is load-bearing, to fix a digest.
         if gpu_mem is not None:
             self._apply_gpu_mem_capacity_defaults(gpu_mem)
+            # The tier default is not yet the FINAL max_bs: the session
+            # ceiling can still widen it, and that widening lives in
+            # _handle_gpu_memory_settings, i.e. after the reserve is decided.
+            # Without this the profile would be keyed on the tier value while
+            # the boot captures at the widened one -- the same defect this
+            # function fixes, one layer down, on any config that sets
+            # --max-running-requests-ceiling. Idempotent: it returns early
+            # once max_bs already covers the ceiling.
+            self._widen_decode_capture_to_session_ceiling(self.cuda_graph_config.decode)
         try:
             ledgers = self._build_card_ledgers()
         except Exception as e:  # pragma: no cover - NVML/config availability
