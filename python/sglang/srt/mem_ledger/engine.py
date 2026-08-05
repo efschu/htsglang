@@ -1131,7 +1131,30 @@ def build_card_ledgers(
                 ranks=ranks,
             )
         )
+    # #605: the MODELED side of the reconciliation, written wherever a boot
+    # builds its ledger. Placed HERE, at the one function that constructs
+    # them, and deliberately NOT at a caller: the first cut sat in
+    # enforce_boot_contract, which only the --enable-vram-ledger path reaches,
+    # so the production boot of 2026-08-05 21:11 wrote its marks and no
+    # ledger. A dump that depends on which reserve path a flagset takes is a
+    # dump that is missing exactly when someone finally looks.
+    _dump_modeled_ledger(ledgers)
     return ledgers
+
+
+def _dump_modeled_ledger(ledgers: Sequence[CardVramLedger]) -> None:
+    """Hand the built ledger to the flight recorder. Never raises.
+
+    Import is local and the whole body is guarded: constructing a ledger must
+    not acquire a new way to fail, least of all one that only fires on the
+    boots where the recorder is armed.
+    """
+    try:
+        from sglang.srt.mem_ledger import flight_recorder
+
+        flight_recorder.dump_ledger(ledgers)
+    except Exception as e:  # pragma: no cover - never fail a boot over a dump
+        logger.warning("could not hand the modeled ledger to the recorder: %s", e)
 
 
 def demand_outside_budget_mib(ledger: CardVramLedger) -> int:

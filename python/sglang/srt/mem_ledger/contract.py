@@ -76,49 +76,10 @@ def enforce_boot_contract(
             totals["demand_mib"],
             totals["kv_pool_mib"],
         )
-    # #605: persist what the boot MODELED, beside what the flight recorder
-    # MEASURES. Without this the two halves of the comparison never exist at
-    # the same time -- the ledger is logged and gone, the marks arrive later,
-    # and reconciling them means re-deriving the model from a log file. No-op
-    # unless the recorder is armed.
-    _dump_for_reconciliation(ledgers)
-
     bad = [x for x in ledgers if not x.fits]
     if bad:
         raise LedgerOvercommit(bad)
     return list(ledgers)
-
-
-def _dump_for_reconciliation(ledgers: Sequence[CardVramLedger]) -> None:
-    """Write the modeled ledger into the flight-recorder directory.
-
-    Written BEFORE the fit/refuse verdict, for the same reason the itemization
-    is printed first: a boot that refuses is exactly the one whose model a
-    reader wants to inspect.
-    """
-    try:
-        import json
-        import os
-
-        from sglang.srt.mem_ledger import flight_recorder
-
-        directory = os.environ.get(flight_recorder.DIR_ENV)
-        if not directory:
-            return
-        os.makedirs(directory, exist_ok=True)
-        boot = flight_recorder.boot_id()
-        path = os.path.join(directory, f"ledger_{boot}.json")
-        payload = {
-            "boot_id": boot,
-            "cards": [x.to_json() for x in ledgers],
-        }
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(payload, f, indent=1)
-        os.replace(tmp, path)
-        logger.info("VRAM ledger for reconciliation written to %s", path)
-    except Exception as e:  # pragma: no cover - never let a dump fail a boot
-        logger.warning("could not write the ledger for reconciliation: %s", e)
 
 
 def kv_pool_mib_per_rank(

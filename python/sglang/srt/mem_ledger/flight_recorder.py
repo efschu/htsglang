@@ -97,6 +97,8 @@ __all__ = [
     "read_marks",
     "list_boots",
     "boot_id",
+    "publish_boot_id",
+    "dump_ledger",
     "phase_deltas",
     "python_site",
     "python_stack",
@@ -113,6 +115,11 @@ MIB = 1 << 20
 #: ``1``/``all`` arms every rank; a comma-separated rank list arms only those,
 #: which is how a first measurement boot keeps its host-RAM cost to one rank.
 TRACE_ENV = "SGLANG_VRAM_FLIGHT_TRACE"
+
+#: Carries the boot id from the launcher to every rank it spawns. Set by
+#: :func:`publish_boot_id` and inherited through the environment, which is the
+#: only channel the launcher and its children share before the ranks exist.
+BOOT_ID_ENV = "SGLANG_VRAM_FLIGHT_BOOT_ID"
 
 #: Directory for the phase-mark log (source 1) and any snapshot dumps. Absent,
 #: every entry point in this module returns immediately and allocates nothing.
@@ -265,23 +272,59 @@ def is_recording_phases() -> bool:
 
 
 _boot_id: Optional[str] = None
+_ledger_build_index: int = 0
+
+
+def _self_identity() -> str:
+    try:
+        import psutil
+
+        me = psutil.Process()
+        return f"{me.pid}-{int(me.create_time())}"
+    except Exception:  # pragma: no cover - psutil absence / permissions
+        return f"{os.getpid()}-{int(time.time())}"
+
+
+def publish_boot_id() -> str:
+    """Fix this boot's id from the LAUNCHER and hand it to the ranks.
+
+    THE LAUNCHER AND THE RANKS MUST AGREE, and before #605's first real boot
+    they did not. A rank derives the id from its parent (the launcher), which
+    is right; the launcher deriving it the same way would name ITS parent --
+    the shell -- so the modeled ledger, which is built during argument
+    resolution in the launcher, would have been filed under a different id
+    than the marks. Reconciliation matches the two by id, so it would have
+    found nothing even once the dump landed in the right place.
+
+    Publishing through the environment removes the guesswork: children inherit
+    it, and the value equals what the parent-based derivation produces, so a
+    rank spawned by an older launcher still agrees.
+    """
+    global _boot_id
+    existing = os.environ.get(BOOT_ID_ENV)
+    if existing:
+        _boot_id = existing
+        return existing
+    _boot_id = _self_identity()
+    os.environ[BOOT_ID_ENV] = _boot_id
+    return _boot_id
 
 
 def boot_id() -> str:
-    """An id shared by every rank of ONE boot, distinct across boots.
+    """An id shared by every process of ONE boot, distinct across boots.
 
-    Derived from the LAUNCHER (this process's parent) rather than from this
-    process: the ranks are its children, so its pid and start time are the one
-    thing they agree on without a collective. A per-process uuid would tag each
-    rank's file with a different id and make cross-rank reading impossible,
-    which is the opposite of what the id is for.
-
-    Falls back to this process's own identity when the parent cannot be read;
-    a per-rank id still separates BOOTS within a rank's file, which is the
-    property :func:`read_marks` depends on.
+    Read from :data:`BOOT_ID_ENV` when the launcher published one. Otherwise
+    derived from this process's PARENT, because the callers that need it
+    without a published id are the ranks, whose parent IS the launcher. A
+    per-process uuid would tag each rank's file differently and make
+    cross-rank reading impossible, which is the opposite of what the id is for.
     """
     global _boot_id
     if _boot_id is not None:
+        return _boot_id
+    published = os.environ.get(BOOT_ID_ENV)
+    if published:
+        _boot_id = published
         return _boot_id
     try:
         import psutil
@@ -291,6 +334,44 @@ def boot_id() -> str:
     except Exception:  # pragma: no cover - psutil absence / permissions
         _boot_id = f"self{os.getpid()}-{int(time.time())}"
     return _boot_id
+
+
+def dump_ledger(ledgers) -> Optional[str]:
+    """Write the MODELED per-card ledger beside the measured marks.
+
+    Called from ``engine.build_card_ledgers``, i.e. wherever a boot builds a
+    ledger at all, rather than from a caller on one reserve path. No-op unless
+    the recorder is armed.
+
+    Rebuilt ledgers OVERWRITE: argument resolution can construct the ledger
+    several times while it derives the reserve, and the last construction is
+    the one closest to what the boot runs. ``build_index`` records how many
+    times it happened, so a reader can tell a single derivation from a loop.
+    """
+    global _ledger_build_index
+    directory = os.environ.get(DIR_ENV)
+    if not directory:
+        return None
+    _ledger_build_index += 1
+    boot = publish_boot_id()
+    try:
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"ledger_{boot}.json")
+        payload = {
+            "boot_id": boot,
+            "build_index": _ledger_build_index,
+            "pid": os.getpid(),
+            "wall": time.time(),
+            "cards": [x.to_json() for x in ledgers],
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=1)
+        os.replace(tmp, path)
+        return path
+    except OSError as e:  # pragma: no cover - filesystem differences
+        logger.warning("VRAM flight recorder could not write the ledger: %s", e)
+        return None
 
 
 def cuda_initialized() -> bool:
