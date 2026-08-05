@@ -130,6 +130,32 @@ continuation past character 45, exactly where the graph arm diverged. Two
 differently-configured eager boots agreeing there is suggestive, not a
 control.
 
+The same script also runs an `--enable-deterministic-inference` pair, which is
+a sharper test of §4's mechanism than it first appears. Deterministic
+inference is legal under BCG — it appears in the tc_piecewise rule list
+(server_args.py:8455) but *not* in the breakable one (:8487) — and it sets
+`enforce_disable_flashinfer_allreduce_fusion = True` (:11515), i.e. it pins
+the collective reduction order. §4 claims the padding epsilon is *amplified by
+the collective path*. So:
+
+* if graphs and eager agree under determinism, the amplification story is
+  confirmed and a byte-strict content gate on this recipe is reachable;
+* if they still diverge, the epsilon is entering before the collectives
+  (padded shapes selecting different GEMM tiles), the gate can only ever be
+  distribution-level, and §7 hardens from a recommendation into a conclusion.
+
+## 8. Untested, and deliberately not shipped
+
+Everything above exercises **text-only** batches. `can_run_graph`
+(`runner/prefill_cuda_graph_runner.py:615`) has no multimodal per-batch guard,
+so forcing `--cuda-graph-backend-prefill` on a multimodal model would also
+send image/video batches through the captured path — which is exactly what the
+upstream rule calls a fault. A `contains_mm_inputs()` guard there
+(`forward_batch_info.py:1019` already provides the predicate) would turn that
+footgun into a safe text-only fast path. It is *not* implemented here: with no
+measurable throughput to win (§5), shipping a guard for a path nobody should
+turn on would be untested code defending an unused door.
+
 ## 7. Recommendation
 
 Do not enable the prefill graph backend on the production recipe. It cannot
