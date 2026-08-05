@@ -1843,6 +1843,20 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+def _group_world_size() -> int:
+    """TP world size, or 1 when the group is not up yet.
+
+    #583 follow-up. Used only to decide whether a MISSING rank-uniform value
+    is survivable (single rank) or must be refused (a group). Never raises:
+    a probe that can itself fail would just move the silent-default problem
+    one level down.
+    """
+    try:
+        return int(get_parallel().tp_size or 1)
+    except Exception:  # noqa: BLE001 - no parallel context yet == single rank
+        return 1
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2798,9 +2812,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         taken here -- the reduce already happened, once, pre-branch.
         """
         floor = self.uniform_avail_floor
-        if floor is None:
-            return int(self.token_to_kv_pool_allocator.available_size())
-        return int(floor)
+        if floor is not None:
+            return int(floor)
+        # #583 follow-up: the fallback must NOT silently reinstate the defect.
+        #
+        # This used to `return available_size()` whenever the floor was
+        # unset, justified as "correct for a single rank and for tests". It
+        # is -- but on a MULTI-RANK boot it is the original rank-local
+        # predicate, restored silently by any path that forgets to set the
+        # floor. A default that quietly means something else on the
+        # configuration that matters is the getattr-default trap (#606): the
+        # protection would still be present in the source and absent at
+        # runtime, and nothing would say so.
+        #
+        # So: single rank keeps the local value (there is nothing to diverge
+        # from), and a group refuses loudly instead of guessing.
+        if _group_world_size() > 1:
+            raise RuntimeError(
+                "decode_mem_avail() was reached with uniform_avail_floor "
+                "unset on a multi-rank boot. Falling back to this rank's "
+                "local available_size() here would restore the exact "
+                "rank-local decode-mem predicate #583/#603 removed, and the "
+                "ranks would silently retract different numbers of requests. "
+                "Scheduler.update_running_batch must set "
+                "batch.uniform_avail_floor = self.uniform_min_avail() before "
+                "any decode-mem decision."
+            )
+        return int(self.token_to_kv_pool_allocator.available_size())
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
