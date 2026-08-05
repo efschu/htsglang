@@ -3240,6 +3240,66 @@ class Scheduler(
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+    def _update_uniform_pool_budget(self) -> None:
+        """MIN-reduce this iteration's pool headroom across the TP group.
+
+        The rank-uniform counterpart to ``token_to_kv_pool_allocator.
+        available_size()``, which under uneven DCP/TP differs per rank
+        because the pools do (weighted ownership). Anything that decides a
+        BRANCH from the local value can split the group across branches that
+        carry different collectives -- the rank-local-test-before-a-group-
+        collective family.
+
+        COST, named exactly: ONE MIN ``all_reduce`` of a ONE-element int64
+        CPU tensor -- 8 bytes -- on ``tp_cpu_group``, i.e. the gloo CPU group,
+        NOT the device group and not BAR1. It therefore neither touches the
+        BAR1 aperture nor serialises with the forward stream; it is a host
+        synchronisation point once per scheduler iteration. World size 1 takes
+        no collective at all and is byte-identical to the previous path.
+
+        (The offload variant packs two elements, because it also reduces
+        available+evictable for the prefill admission budget. This path needs
+        only the decode-mem quantity, so it reduces one.)
+
+        When the offload manager is active it has ALREADY done exactly this
+        reduce for this iteration (``update_dcp_admission_state``), so the
+        value is read from there rather than reduced a second time -- two
+        reduces would be two chances for the counts to diverge, which is the
+        failure this is closing.
+
+        Valid for the whole iteration, on the same argument the offload
+        version documents: between here and the decode-mem check the
+        scheduler only builds batches from offsets and defers real allocation
+        to the forward, so the snapshot still holds.
+        """
+        kvso = self.kv_session_offload
+        if kvso is not None:
+            self._uniform_min_avail = int(kvso.dcp_min_avail())
+            return
+
+        alloc = self.token_to_kv_pool_allocator
+        local_avail = int(alloc.available_size())
+        grp = getattr(self, "tp_cpu_group", None)
+        if grp is None or torch.distributed.get_world_size(grp) <= 1:
+            self._uniform_min_avail = local_avail
+            return
+        t = torch.tensor([local_avail], dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+        self._uniform_min_avail = int(t[0].item())
+
+    def uniform_min_avail(self) -> int:
+        """This iteration's rank-uniform available_size.
+
+        Falls back to the live local value when the reduce has not run yet
+        (construction, tests, single rank) -- the same shape as
+        ``dcp_min_avail``, and for the same reason: a decision must never
+        read a value that silently means something else.
+        """
+        v = getattr(self, "_uniform_min_avail", None)
+        if v is None:
+            return int(self.token_to_kv_pool_allocator.available_size())
+        return int(v)
+
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
@@ -3358,6 +3418,32 @@ class Scheduler(
             # split the ranks across branches with mismatched collective counts.
             # See update_dcp_admission_state for the full rationale.
             self.kv_session_offload.update_dcp_admission_state()
+
+        # #603: the SAME reduce for the path without the offload manager.
+        #
+        # The block above has always been correct, and it was correct for a
+        # reason that has nothing to do with session offload: under uneven
+        # DCP/TP the per-rank pools differ, so any decision read off a LOCAL
+        # available_size can flip on the binding rank while the others still
+        # fit -- and the two groups then take branches carrying different
+        # collectives. The guard `kv_session_offload is not None` was
+        # orthogonal to that; it merely happened to be the feature whose
+        # development surfaced the divergence.
+        #
+        # With `--enable-kv-session-offload` OFF (the production default) the
+        # protection was therefore absent and `check_decode_mem` decided
+        # rank-locally. That is the 2026-08-05 19:41 abort: ranks 0/1 entered
+        # the decode collective inside run_batch while rank 2, having decided
+        # to retract, went round to recv_requests -- the BAR1 spin kernels on
+        # 0/1 then waited ~30 s for a peer that was never coming and took
+        # their abort path. Exactly the shape update_dcp_admission_state's
+        # docstring predicts ("observed in recv_requests one iteration
+        # later").
+        #
+        # Unconditional and pre-branch, like the call above: every rank
+        # reaches this line exactly once per iteration, so the collective
+        # count stays rank-uniform no matter which branch is taken later.
+        self._update_uniform_pool_budget()
 
         # #297 phase-boundary KV resharding: same lazy-build and cadence
         # discipline as the #287 block below. Built FIRST so the pressure
@@ -4113,7 +4199,22 @@ class Scheduler(
                 # branch-count divergence.
                 kv_full_retract_flag = False
         else:
-            kv_full_retract_flag = not batch.check_decode_mem()
+            # #603: the same RANK-UNIFORM decision as the branch above, on the
+            # path that runs when session offload is off. `check_decode_mem`
+            # compares the LOCAL available_size against the replicated token
+            # demand; under uneven DCP the local side differs per rank, so
+            # near the pool boundary the binding rank retracts while the
+            # others do not -> divergent batch -> divergent branch -> the
+            # ranks stop agreeing on which collectives run. The eviction side
+            # effect is kept (it is what frees the space); only the COMPARISON
+            # moves to the reduced value.
+            #
+            # Pre-evict reduced value on purpose, exactly as the offload
+            # branch documents: in the regime where this decision is close,
+            # eviction frees ~nothing, so it is both exact and uniform.
+            num_tokens_next = batch.new_tokens_required_next_decode()
+            evict_from_tree_cache(self.tree_cache, num_tokens_next)
+            kv_full_retract_flag = self.uniform_min_avail() < num_tokens_next
         if kv_full_retract_flag:
             # #287 THROTTLE BEFORE RETRACT. Retraction still runs -- it is the
             # only thing that frees tokens for the step that is about to
