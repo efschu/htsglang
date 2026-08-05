@@ -3,7 +3,7 @@
 Status: DESIGN, no code. Branch `feat/exact-vram-ledger` (design only; the
 implementation gets its own branch per slice).
 
-This document is written against the mandate plus six addenda. Addenda 3 and 4
+This document is written against the mandate plus seven addenda. Addenda 3 and 4
 are recorded as R6, R7 and R9 because each names an ERROR CLASS the design must
 be structurally unable to commit -- not a behaviour it should prefer. That
 distinction drives the falsifiers: several are deliberately PAIRS, because a
@@ -51,7 +51,7 @@ reimplements a carrier instead of driving it has failed the mandate.
 
 ## 2. Requirements
 
-Requirements R1-R11. Each carries a falsifier: a concrete situation that must produce a
+Requirements R1-R12. Each carries a falsifier: a concrete situation that must produce a
 specific observable, and which the current design would fail if the
 requirement were dropped.
 
@@ -533,6 +533,62 @@ seconds-scale move against and "seconds" then looks unconditionally bad. That
 column is a REQUIREMENT, not an optimisation, and a design review that finds it
 missing fails the slice regardless of how the comparator behaves.
 
+### R12 -- (Addendum 7) The KV token vector shifts with FILL LEVEL, both ways
+
+*User requirement, 2026-08-05, triggered by the production prefill finding that
+collective WAIT ran 2-3x compute:* "at the bottom end, maximum performance is
+always applied; optimal memory distribution and compute utilization at all
+times."
+
+This is R6 (re-solve the cut) applied to the one vector that is currently
+frozen at boot, and it is the first requirement here with a measured cost
+attached rather than a hypothetical one.
+
+**(a) The KV token-shard vector is not a boot constant.** At LOW occupancy the
+planner selects the PERFORMANCE-optimal vector: KV concentrated so that DCP
+prefix-gathers are minimal. This is not a micro-optimisation. Production showed
+all three ranks waiting 1.2 s+ on a 74k-cached prefill, and the gather share
+grows with cached context, so at low fill the spread vector buys capacity
+nobody is using and pays for it in a collective floor on every prefill. Task
+#588 decomposes that measurement; R12 is what the planner does with it.
+
+**(b) The shift is CONTINUOUS and BIDIRECTIONAL.** As occupancy rises the
+vector moves toward the capacity-optimal spread; as occupancy falls it moves
+back. Both legs are required.
+
+This generalises #287's KV pressure ladder, and the generalisation is precisely
+the removal of its trigger-on-pressure-only design: a ladder that only fires
+when memory gets tight can never take the low-fill performance win, because low
+fill is not a pressure event. **Refusing the return leg is the "surplus sits
+idle" failure in vector form** -- the capacity is released but the performance
+it was blocking is never reclaimed.
+
+**(c) Carriers, all present in tree:**
+- `#287` pressure-ladder stages (the mechanism; its trigger condition is what
+  widens);
+- `#297` phase-boundary KV resharding -- delta move measured at <1 s
+  (`DESIGN_297_kv_resharding.md:83`, and the TEIL_HOT rung in
+  `registry/rungs.py` prices it at "<1 s, one dial re-raise");
+- `#363`/`#578` regime controller as the actuator, now that slice 0 binds its
+  feed.
+
+Priced on the **movement-bound** axis (R9) under R11's gates: need-driven
+(an occupancy change is the trigger), hidden where possible, and comparative
+(R11e -- a sub-second reshard that removes a 1.2 s per-prefill floor pays for
+itself in two prefills, which is exactly the comparison R11e exists to make).
+
+*Falsifier F12a.* Near-empty occupancy, long-prefix workload: the solver must
+propose the CONCENTRATED vector, and the measured gather share must drop.
+Proposing the boot vector is a fail.
+
+*Falsifier F12b.* Synthetic fill past the capacity knee: it must propose the
+spread.
+
+*Falsifier F12c (the return leg, and the one a pressure-only design fails).* On
+drain, it must propose the move BACK to the concentrated vector. A ladder that
+only reacts to pressure passes F12b and fails this one -- which is why the
+falsifier is the pair, as with F7 and F4.
+
 ### R8 -- Every decision is explainable after the fact
 
 Any configuration the planner chooses must be reconstructible: the candidates
@@ -582,6 +638,7 @@ by "what unblocks the most" and by risk, cheapest proof first.
 | 4b | Per-knob flip pricing; split capture vs restore; fix the WARM rung | R9 (i)-(iv), R5 two-term | hermetic: F9, F9b, F9d, F9e, F5b |
 | 4c | Pre-capture + park the planner stair; host-RAM ledger term | R9 (iii), R1b | hermetic: F9d; GPU: measured restore band |
 | 4d | Phase-dependent weight residency: express + price (no execution) | R10 (a), (b), overlap pricing | hermetic: F10 planning half |
+| 4e | Fill-level-driven KV token vector (both legs) | R12 | hermetic: F12a/b/c; GPU: gather-share drop (#588) |
 | 5 | Actuation; BUILD elastic co-residency (#553); EXTEND weight streaming to layer/slice | R6 execution, tenant events, R10 (c) | GPU: live re-cut under load; F10 execution, F10b byte-identity, F10c refill |
 | 6 | Explainability surface | R8 | hermetic + a live boot |
 
