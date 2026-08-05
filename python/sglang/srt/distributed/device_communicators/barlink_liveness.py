@@ -610,17 +610,51 @@ class PeerWatchdog:
             self.trips += 1
         return dead
 
+    def poll_abort_words(self) -> int:
+        """The #517 phase-2 duty: read every BAR1/device transport's sticky
+        abort word so the SERVING path never has to.
+
+        It lives on this thread because this thread already exists, is
+        already awake on a timer, and is already the process's answer to
+        "somebody has to be outside the collective". The read itself is a
+        four-byte D2H on the transport's private stream, so waiting for it
+        waits for nothing the model is doing.
+
+        Split out from ``probe_once`` deliberately: peer liveness is a
+        host-only fact on a slow cadence, the abort word is a device read on a
+        fast one, and folding them would tie the report latency of each to the
+        other's natural interval.
+        """
+        from sglang.srt.distributed.device_communicators import barlink_abort_gate
+
+        return barlink_abort_gate.poll_status_words()
+
     def _run(self) -> None:
+        # Two duties, two cadences. The loop ticks at the FASTER one (the
+        # abort poll, ~10 ms) and runs the peer probe every Nth tick, so the
+        # abort report stays bounded in time without turning the liveness
+        # probe -- which reads /proc -- into a 100 Hz job.
+        from sglang.srt.distributed.device_communicators import barlink_abort_gate
+
+        next_probe = 0.0
         while not self._stop.is_set():
+            now = time.monotonic()
             try:
-                if self.probe_once():
-                    # The fact does not change back. Keep the thread alive so
-                    # a window registered later still gets tripped, but stop
-                    # re-logging: trip() is idempotent.
-                    pass
+                if now >= next_probe:
+                    next_probe = now + max(self._interval, 0.05)
+                    if self.probe_once():
+                        # The fact does not change back. Keep the thread alive
+                        # so a window registered later still gets tripped, but
+                        # stop re-logging: trip() is idempotent.
+                        pass
             except Exception:  # pragma: no cover - a watchdog must not die
                 logger.exception("barlink peer watchdog probe failed")
-            self._stop.wait(max(self._interval, 0.05))
+            try:
+                self.poll_abort_words()
+            except Exception:  # pragma: no cover - a watchdog must not die
+                logger.exception("barlink abort-word poll failed")
+            tick = barlink_abort_gate.poll_interval_s()
+            self._stop.wait(max(min(tick, max(self._interval, 0.05)), 0.001))
 
 
 def ensure_watchdog() -> Optional[PeerWatchdog]:

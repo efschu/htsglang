@@ -107,7 +107,36 @@ ENV_DEFER = "SGLANG_BARLINK_BAR1_ABORT_DEFER"
 #: whenever the host is more than four checks ahead of the device; the
 #: falsifier for that is a never-ready event in
 #: ``test_barlink_bar1_abort_deferred_517.py``.
+#:
+#: SUPERSEDED IN THE STEADY STATE (#517 phase 2), and the reason is the
+#: measurement this bound produced. A check-COUNT bound presumes that "the
+#: host is far ahead of the device" is a fault precursor. Under the overlap
+#: scheduler at bs=1 it is the DESIGN: the host is always more than four
+#: checks ahead, so this bound bound EVERY round, and the forced
+#: ``event.synchronize()`` became the round's dominant host cost (11/14 py-spy
+#: samples, task #600). The bound now lives in TIME (``ENV_POLL_MS``) and on
+#: the watchdog thread. This knob still governs the legacy hot-path deferred
+#: read, which is what a transport falls back to when the watchdog is not
+#: running -- see ``should_poll_status``.
 ENV_MAX_LAG = "SGLANG_BARLINK_BAR1_ABORT_MAX_LAG"
+
+#: How often the WATCHDOG thread reads the status word, in milliseconds
+#: (#517 phase 2). This is the bound that replaced ``ENV_MAX_LAG`` in the
+#: steady state, and the unit change is the whole point: a check-COUNT bound
+#: asks "how many collectives may run unverified", which at bs=1 is the wrong
+#: question, because the overlap scheduler runs the host ahead of the device
+#: BY DESIGN. Being N checks ahead is the healthy state there, so a
+#: check-count bound fires on every round and turns the guard into a
+#: per-round stream synchronization -- measured at bs=1 as 11 of 14 py-spy
+#: samples inside ``check_aborted`` and ~7 ms of a 46.5 ms round (task #600).
+#:
+#: A TIME bound asks the question the guard actually promises to answer: how
+#: long may a tripped kernel stay unreported. That is independent of how far
+#: ahead the host is, so the steady state costs the hot path nothing at all.
+#: Default 10 ms: two orders of magnitude below the round time, so a report
+#: still lands inside the round that produced it, and far above the cost of
+#: the poll itself (one 4-byte D2H on a private stream).
+ENV_POLL_MS = "SGLANG_BARLINK_BAR1_ABORT_POLL_MS"
 
 #: Whether the CUDA-graph replay boundary checks. Separate from ENV_ENABLE
 #: because it is the one check that can cost a synchronization the host would
@@ -165,6 +194,110 @@ def max_lag() -> int:
     except ValueError:
         logger.warning("%s=%r is not an integer; using 4.", ENV_MAX_LAG, raw)
         return 4
+
+
+def poll_interval_s() -> float:
+    """Seconds between two watchdog reads of the status word."""
+    raw = os.environ.get(ENV_POLL_MS)
+    if raw is None:
+        return 0.010
+    try:
+        return max(float(raw), 0.0) / 1000.0
+    except ValueError:
+        logger.warning("%s=%r is not a number; using 10 ms.", ENV_POLL_MS, raw)
+        return 0.010
+
+
+#: Guards the watchdog's device reads against a CUDA-graph capture running in
+#: ANOTHER thread. Torch captures with ``cudaStreamCaptureModeGlobal``, under
+#: which a synchronizing CUDA call in any thread of the process invalidates
+#: the capture -- so the poll may not merely be skipped on a best-effort
+#: check, it has to be EXCLUDED for the duration. The lock does that: a
+#: capture cannot begin until an in-flight poll has finished, and no poll can
+#: begin while one is open.
+_capture_lock = threading.Lock()
+_capture_depth = 0
+
+
+class _PausePolling:
+    """Context manager form of the capture exclusion. Reentrant per process."""
+
+    def __enter__(self) -> "_PausePolling":
+        global _capture_depth
+        with _capture_lock:
+            _capture_depth += 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        global _capture_depth
+        with _capture_lock:
+            _capture_depth -= 1
+        return None
+
+
+def pause_polling() -> _PausePolling:
+    """Exclude the watchdog's device reads for the duration of a capture.
+
+    Entered by ``parallel_state.graph_capture`` -- the ONE context manager
+    that surrounds every CUDA-graph capture in this process, so there is one
+    definition of "a capture is happening" rather than a per-backend guess.
+    ``barlink.graph_capture_running()`` cannot serve here: it asks whether the
+    CALLING THREAD's current stream is capturing, and the watchdog is a
+    different thread, where the honest answer is always False.
+    """
+    return _PausePolling()
+
+
+def polling_paused() -> bool:
+    with _capture_lock:
+        return _capture_depth > 0
+
+
+def poll_status_words() -> int:
+    """One watchdog pass over every live BAR1 transport's status word.
+
+    Returns the number of transports that reported a trip on THIS pass. Each
+    transport reads its own word on its own private stream, so the read is
+    ordered against nothing the compute stream is doing -- which is what makes
+    it free for the hot path. The word is sticky, so a poll that observes it
+    late observes the same bit.
+
+    Never raises: the raise belongs on the serving path, where the op, the
+    byte count and the rank context are known. The poll only flips a flag.
+    """
+    if not _transports:
+        return 0
+    if not abort_check_enabled():
+        return 0
+    if polling_paused():
+        return 0
+    tripped = 0
+    for transport in registered():
+        poll = getattr(transport, "poll_status_word", None)
+        if poll is None:
+            continue
+        try:
+            if poll():
+                tripped += 1
+        except Exception:  # pragma: no cover - a watchdog must not die
+            logger.exception("barlink-BAR1 status poll failed")
+    return tripped
+
+
+def should_poll_status(status_is_cuda: bool, watchdog_running: bool) -> bool:
+    """Whether THIS transport hands its status read to the watchdog thread.
+
+    Module-level and importable on purpose -- the single definition of the
+    decision, the same pattern as ``should_defer_status`` and
+    ``parallel_state.should_build_pynccl``.
+
+    Both inputs are load-bearing. A status word that is not on a device has no
+    synchronization to avoid, so the direct read stays (cheaper AND stricter).
+    A watchdog that is NOT running would leave the word unread by anyone, so
+    the transport must keep the deferred hot-path read instead -- the guard
+    degrades to the #517-phase-1 behaviour rather than to blindness.
+    """
+    return bool(status_is_cuda) and bool(watchdog_running)
 
 
 def should_defer_status(status_is_cuda: bool, defer_on: bool) -> bool:
@@ -254,6 +387,7 @@ __all__ = [
     "ENV_ENABLE",
     "ENV_EVERY",
     "ENV_MAX_LAG",
+    "ENV_POLL_MS",
     "ENV_REPLAY",
     "abort_check_enabled",
     "check_aborts",
@@ -261,10 +395,15 @@ __all__ = [
     "check_every",
     "defer_enabled",
     "max_lag",
+    "pause_polling",
+    "poll_interval_s",
+    "poll_status_words",
+    "polling_paused",
     "register",
     "registered",
     "replay_check_enabled",
     "reset_for_test",
     "should_defer_status",
+    "should_poll_status",
     "unregister",
 ]

@@ -2642,7 +2642,19 @@ def graph_capture(stream=None):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
+    # #517 phase 2: exclude the barlink watchdog's abort-word poll for the
+    # duration of the capture. Torch captures in cudaStreamCaptureModeGlobal,
+    # under which a synchronizing CUDA call in ANY thread of the process
+    # invalidates the capture -- so the poll may not merely check a flag and
+    # hope, it has to be locked out. This is the one context manager that
+    # surrounds every capture in the process, which is why the exclusion is
+    # stated here and not guessed per backend.
+    # (barlink.graph_capture_running() cannot serve: it answers for the
+    # CALLING thread's stream, and the watchdog is a different thread.)
+    from sglang.srt.distributed.device_communicators import barlink_abort_gate
+
     with (
+        barlink_abort_gate.pause_polling(),
         get_tp_group().graph_capture(stream=stream) as context,
         get_pp_group().graph_capture(context),
     ):
