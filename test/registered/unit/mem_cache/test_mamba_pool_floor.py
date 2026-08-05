@@ -402,7 +402,8 @@ class _PinHarness:
     def __init__(self, tree, pool, pin_budget=None):
         self.tree = tree
         tree.ongoing_write_through = {}
-        tree._write_through_pinned = set()
+        tree._write_through_pinned = {}
+        tree._write_through_inflight = {}
         tree._mamba_pin_budget_cached = pin_budget
         # `_mamba_pin_budget` is a property on HiMambaRadixCache and cannot be
         # bound onto a foreign instance; mirror the resolved value instead.
@@ -422,8 +423,13 @@ class _PinHarness:
     def pin(self, node):
         """What `write_backup` does for a node it decides to back up."""
         self.tree.ongoing_write_through[node.id] = node
+        self.tree._write_through_inflight[node.id] = (
+            self.tree._write_through_inflight.get(node.id, 0) + 1
+        )
         self.tree.inc_lock_ref(node)
-        self.tree._write_through_pinned.add(node.id)
+        self.tree._write_through_pinned[node.id] = (
+            self.tree._write_through_pinned.get(node.id, 0) + 1
+        )
 
 
 class TestWriteThroughPinAccounting(unittest.TestCase):
@@ -481,7 +487,7 @@ class TestWriteThroughPinAccounting(unittest.TestCase):
             tree._drain_acked_write(node.id)
 
         self.assertGreater(tree.mamba_evictable_size(), 0)
-        self.assertEqual(tree._write_through_pinned, set())
+        self.assertEqual(tree._write_through_pinned, {})
         self.assertEqual(tree.ongoing_write_through, {})
 
     def test_write_back_drain_also_releases_the_pin(self):
@@ -515,7 +521,7 @@ class TestWriteThroughPinAccounting(unittest.TestCase):
             tree._forget_write_through(node)
 
         self.assertEqual(tree.mamba_protected_size(), 0)
-        self.assertEqual(tree._write_through_pinned, set())
+        self.assertEqual(tree._write_through_pinned, {})
         self.assertEqual(tree.ongoing_write_through, {})
 
     def test_forget_is_idempotent(self):

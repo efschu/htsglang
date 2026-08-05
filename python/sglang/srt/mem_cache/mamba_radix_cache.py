@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.runtime_context import get_server_args
 
@@ -64,6 +65,13 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import floor_to_interval, is_on_inter
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+
+
+def _skipped_ids(params: Optional[DecLockRefParams], component: ComponentType):
+    """Node ids whose `component` lock the paired acquire did NOT take."""
+    if params is None:
+        return ()
+    return params.skip_lock_node_ids.get(component, ())
 
 
 class TreeNode:
@@ -1054,12 +1062,24 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return IncLockRefResult()
 
+        result = IncLockRefResult()
+
         # protect mamba value in current node if it exists
         if node.mamba_value is not None:
             if node.mamba_lock_ref == 0:
                 self.mamba_evictable_size_ -= len(node.mamba_value)
                 self.mamba_protected_size_ += len(node.mamba_value)
             node.mamba_lock_ref += 1
+        else:
+            # INVARIANT: a release may only decrement refs this acquire took.
+            # A mamba TOMBSTONE takes no mamba ref here, and the node can gain
+            # a mamba value while this lock is held (an insert re-attaches a
+            # checkpoint; in the hierarchical subclass a load-back revives one
+            # and takes its OWN pin). Recording the skip lets the paired
+            # release leave that value's ref alone instead of consuming it.
+            result.skip_lock_node_ids.setdefault(ComponentType.MAMBA, set()).add(
+                node.id
+            )
 
         while node != self.root_node:
             # lock full from node to root
@@ -1071,7 +1091,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.full_protected_size_ += len(node.value)
             node.full_lock_ref += 1
             node = node.parent
-        return IncLockRefResult()
+        return result
 
     def dec_lock_ref(
         self, node: TreeNode, params: Optional[DecLockRefParams] = None
@@ -1084,7 +1104,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return DecLockRefResult()
 
-        if node.mamba_value is not None:
+        # A node in the skip set was a mamba tombstone when the paired acquire
+        # ran, so no mamba ref was taken for it and none may be released here.
+        skipped_mamba = node.id in _skipped_ids(params, ComponentType.MAMBA)
+        if node.mamba_value is not None and not skipped_mamba:
             assert (
                 node.mamba_lock_ref > 0
             ), f"dec_lock_ref on node with {node.mamba_lock_ref=}, {node.id=}"

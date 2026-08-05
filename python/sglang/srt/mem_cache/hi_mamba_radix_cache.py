@@ -39,12 +39,14 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
     LRUList,
     MambaRadixCache,
     TreeNode,
+    _skipped_ids,
     get_last_access_time,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -198,6 +200,8 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self.ongoing_write_through = {}
         self.ongoing_load_back = {}
+        # Outstanding load-back pins per node id (see _release_load_back_pin).
+        self._load_back_pins: dict[int, int] = {}
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         # #581 write-through pin accounting. `write_backup` takes an
@@ -209,8 +213,13 @@ class HiMambaRadixCache(MambaRadixCache):
         # authoritative record of which nodes still owe a `dec_lock_ref`, so
         # that (a) both drain paths release exactly the pins that were taken
         # and (b) removing a node can reconcile a pin whose ack will never
-        # arrive.
-        self._write_through_pinned: set[int] = set()
+        # arrive. It COUNTS pins per node id rather than holding a bare id:
+        # two backups of the same node in flight take two refs, and a registry
+        # that cannot represent the second silently strands it (#581).
+        self._write_through_pinned: dict[int, int] = {}
+        # Queued D->H copies per node id; the node stays in
+        # `ongoing_write_through` until the last one is acked.
+        self._write_through_inflight: dict[int, int] = {}
         self._mamba_pin_budget_cached: Optional[int] = None
         self._mamba_pin_skipped = 0
         # track per-request tokens loaded from storage (L3 hits)
@@ -239,9 +248,11 @@ class HiMambaRadixCache(MambaRadixCache):
         self.mamba_pool_host.clear()
         self.ongoing_write_through = {}
         self.ongoing_load_back = {}
+        self._load_back_pins = {}
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
-        self._write_through_pinned = set()
+        self._write_through_pinned = {}
+        self._write_through_inflight = {}
         self._mamba_pin_skipped = 0
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_full_device_leaves.clear()
@@ -306,20 +317,41 @@ class HiMambaRadixCache(MambaRadixCache):
         reconciliation (`ongoing_write_through.pop(n.id, None)`); the mamba
         variant had no such path, which is one of the ways the #581 pinned set
         ratcheted upward and never came back down.
+
+        Every pin the node still holds is released here, not just one.
         """
-        if node.id in self._write_through_pinned:
-            self._write_through_pinned.discard(node.id)
+        for _ in range(self._write_through_pinned.pop(node.id, 0)):
             self.dec_lock_ref(node)
+        self._write_through_inflight.pop(node.id, None)
         self.ongoing_write_through.pop(node.id, None)
 
     def _drain_acked_write(self, ack_id: int) -> None:
         """Complete one acked write-through: unregister, release the pin,
-        and hand the node on to the storage tier if enabled."""
-        backuped_node = self.ongoing_write_through.pop(ack_id)
-        self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-        if ack_id in self._write_through_pinned:
-            self._write_through_pinned.discard(ack_id)
+        and hand the node on to the storage tier if enabled.
+
+        One ack completes exactly ONE queued copy: the node stays registered
+        while further copies of it are still in flight, and its pin count
+        drops by one -- never to zero while pins remain outstanding.
+        """
+        backuped_node = self.ongoing_write_through.get(ack_id)
+        if backuped_node is None:
+            # The node left the tree while this copy was in flight;
+            # `_forget_write_through` already released its pins.
+            return
+        remaining = self._write_through_inflight.get(ack_id, 1) - 1
+        if remaining > 0:
+            self._write_through_inflight[ack_id] = remaining
+        else:
+            self._write_through_inflight.pop(ack_id, None)
+            del self.ongoing_write_through[ack_id]
+        pins = self._write_through_pinned.get(ack_id, 0)
+        if pins > 0:
+            if pins > 1:
+                self._write_through_pinned[ack_id] = pins - 1
+            else:
+                del self._write_through_pinned[ack_id]
             self.dec_lock_ref(backuped_node)
+        self._record_store_event(backuped_node, medium=StorageMedium.CPU)
         if self.enable_storage:
             self.write_backup_storage(backuped_node)
 
@@ -381,13 +413,18 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.mamba_backup_commit(node, extra_pools)
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
+            self._write_through_inflight[node.id] = (
+                self._write_through_inflight.get(node.id, 0) + 1
+            )
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
                 # Record the pin so BOTH drain paths (and node removal)
                 # release exactly what was taken -- see _drain_acked_write /
                 # _forget_write_through.
-                self._write_through_pinned.add(node.id)
+                self._write_through_pinned[node.id] = (
+                    self._write_through_pinned.get(node.id, 0) + 1
+                )
         else:
             return 0
 
@@ -486,7 +523,15 @@ class HiMambaRadixCache(MambaRadixCache):
         self._update_leaf_status(ancestor_node)
 
         self.inc_lock_ref(last_hit_node)
+        # INVARIANT: `ongoing_load_back` must be able to hold EVERY pin taken
+        # here, one per queued load. It is keyed by node id, so a second load
+        # of the same node while the first is still in flight would otherwise
+        # overwrite the entry: two `inc_lock_ref`s, one `dec_lock_ref`, and the
+        # surplus ref -- with it the mamba slot -- stranded forever (#581).
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        self._load_back_pins[last_hit_node.id] = (
+            self._load_back_pins.get(last_hit_node.id, 0) + 1
+        )
 
         return full_device_indices
 
@@ -575,6 +620,21 @@ class HiMambaRadixCache(MambaRadixCache):
                 self._drain_acked_write(ack_id)
             finish_count -= 1
 
+    def _release_load_back_pin(self, ack_id: int) -> TreeNode:
+        """Consume one load-back pin for `ack_id` and return its node.
+
+        The node stays registered until its LAST outstanding load is acked, so
+        one ack releases exactly one pin.
+        """
+        node = self.ongoing_load_back[ack_id]
+        remaining = self._load_back_pins[ack_id] - 1
+        if remaining > 0:
+            self._load_back_pins[ack_id] = remaining
+        else:
+            del self._load_back_pins[ack_id]
+            del self.ongoing_load_back[ack_id]
+        return node
+
     def loading_check(self):
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
@@ -597,7 +657,7 @@ class HiMambaRadixCache(MambaRadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                end_node = self.ongoing_load_back.pop(ack_id)
+                end_node = self._release_load_back_pin(ack_id)
                 self.dec_lock_ref(end_node)
             finish_count -= 1
 
@@ -1335,18 +1395,37 @@ class HiMambaRadixCache(MambaRadixCache):
         super().sanity_check()
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+        """Acquire the locks for `node`.
+
+        Every component this acquire SKIPS (mamba tombstone, host-evicted KV)
+        is recorded in `skip_lock_node_ids`, because `load_back` can revive
+        exactly those components while this lock is held -- and then take its
+        own pin on them. Without the record, the paired release consumes the
+        load-back's pin instead of its own (#581): the state under an
+        in-flight H2D copy becomes evictable, is evicted, and has to be loaded
+        back again, which is how the same node ends up re-registered in
+        `ongoing_load_back` and strands a ref there.
+        """
         if self.disable:
             return IncLockRefResult(delta=0)
 
+        result = IncLockRefResult(delta=0)
         delta = 0
         if node.mamba_value is not None:
             if node.mamba_lock_ref == 0:
                 self.mamba_evictable_size_ -= len(node.mamba_value)
                 self.mamba_protected_size_ += len(node.mamba_value)
             node.mamba_lock_ref += 1
+        else:
+            result.skip_lock_node_ids.setdefault(ComponentType.MAMBA, set()).add(
+                node.id
+            )
 
         while node != self.root_node:
             if node.evicted:
+                result.skip_lock_node_ids.setdefault(ComponentType.FULL, set()).add(
+                    node.id
+                )
                 node = node.parent
                 continue
 
@@ -1360,7 +1439,8 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.evictable_full_device_leaves.discard(node)
             node.full_lock_ref += 1
             node = node.parent
-        return IncLockRefResult(delta=delta)
+        result.delta = delta
+        return result
 
     def dec_lock_ref(
         self, node: TreeNode, params: Optional[DecLockRefParams] = None
@@ -1370,14 +1450,24 @@ class HiMambaRadixCache(MambaRadixCache):
 
         delta = 0
 
-        if node.mamba_value is not None and node.mamba_lock_ref > 0:
+        # Release exactly what the paired acquire took: a node it skipped
+        # (tombstone / evicted at acquire time) keeps whatever ref it has
+        # gained since, even though it now looks lockable.
+        skipped_mamba = node.id in _skipped_ids(params, ComponentType.MAMBA)
+        skipped_full = _skipped_ids(params, ComponentType.FULL)
+
+        if (
+            not skipped_mamba
+            and node.mamba_value is not None
+            and node.mamba_lock_ref > 0
+        ):
             if node.mamba_lock_ref == 1:
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 self.mamba_protected_size_ -= len(node.mamba_value)
             node.mamba_lock_ref -= 1
 
         while node != self.root_node:
-            if node.evicted:
+            if node.evicted or node.id in skipped_full:
                 node = node.parent
                 continue
 
