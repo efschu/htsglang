@@ -354,6 +354,44 @@ def test_select_card_prefers_uuid(mb):
     )
 
 
+# --------------------------------------------------------------------------
+# pytest entry points for the can-fail twins
+# --------------------------------------------------------------------------
+#
+# pytest collects `test_*` only, so without these four wrappers a pytest run
+# would execute 10 of the 14 checks and silently drop every can-fail twin --
+# exactly the half that proves the guards are not inert. The standalone runner
+# calls the underlying functions directly; these exist so the two entry points
+# cover the same 14 things.
+
+
+def test_CANFAIL_stream_stored_at_construction(mb):
+    import pytest
+
+    with pytest.raises(AssertionError):
+        canfail_stream_stored_at_construction(mb)
+
+
+def test_CANFAIL_timing_alone_cannot_detect_an_empty_graph(mb):
+    import pytest
+
+    with pytest.raises(AssertionError):
+        canfail_graph_verification_without_the_check(mb)
+
+
+def test_CANFAIL_guard_without_a_floor(mb):
+    import pytest
+
+    with pytest.raises(AssertionError):
+        canfail_guard_with_no_floor(mb)
+
+
+def test_CANFAIL_signature_conformance_catches_a_bad_kwarg(mb, tmp_plan):
+    # This twin is a positive assertion: the check must CATCH the bad kwarg, so
+    # it passes rather than raises.
+    canfail_signature_conformance_catches_a_bad_kwarg(mb, tmp_plan)
+
+
 def main() -> int:
     import tempfile
 
