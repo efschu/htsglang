@@ -434,12 +434,47 @@ else
   echo "2026-08-05 arms (ping-pong idx, mamba cache) stayed clear." | tee -a "$LOG"
 fi
 grep -E "MAMBA BAND|REGIME |RUNNING-REQ" "$LOG" | tail -4 | tee -a "$LOG"
-# Pin-budget evidence, once #581 lands its log markers. Absence is reported
-# rather than assumed to be silence: a soak that logged nothing about pins has
-# not proven the pin budget, whatever else it proved.
-PIN_LINES=$(grep -ciE "mamba.*(pin|floor|admission)" "$LOG")
-echo "pin/floor/admission log lines observed: $PIN_LINES" | tee -a "$LOG"
-[[ "$PIN_LINES" -eq 0 ]] && echo "NOTE: no pin-budget lines -- pin behaviour UNPROVEN by this arm." | tee -a "$LOG"
+
+# Telemetry markers pinned VERBATIM from ee8d1b5127, not matched by a loose
+# pattern. A loose grep would pass on unrelated text and, worse, would keep
+# passing if the strings were reworded -- which is exactly when the pin has to
+# fail. Sources:
+#   hi_mamba_radix_cache.py  "mamba write-through pin budget reached (%d in
+#                             flight, budget=%d, pool=%d): ..."
+#   memory_pool.py           "%s slot pool exhausted and nothing evictable
+#                             ...: deferring this batch of %d request(s)."
+#   mamba_component.py       "%s slot pool exhausted and nothing evictable
+#                             ...: skipping this cache insert."
+# The last two carry the new mamba_evictable= / mamba_protected= fields.
+PIN_BUDGET=$(grep -cF "mamba write-through pin budget reached" "$LOG")
+# "deferring this batch" and NOT "...batch of": the format string wraps between
+# those two words in memory_pool.py, so only the shorter fragment is contiguous
+# in the source. The longer form matches the formatted log line but could not
+# be verified against the source, which is what the pin-fidelity check does.
+DEFER=$(grep -cF "deferring this batch" "$LOG")
+SKIP_INSERT=$(grep -cF "skipping this cache insert" "$LOG")
+EVICT_FIELDS=$(grep -cF "mamba_evictable=" "$LOG")
+FLOOR_LINE=$(grep -cF "pinned checkpoint" "$LOG")
+echo "pin-budget-reached=$PIN_BUDGET  defer-batch=$DEFER  skip-insert=$SKIP_INSERT" | tee -a "$LOG"
+echo "starvation-log field 'mamba_evictable=' seen $EVICT_FIELDS x; floor derivation line seen $FLOOR_LINE x" | tee -a "$LOG"
+
+# The pin budget is PROVEN only by observing it engage under real ack latency.
+# Silence is not proof, so silence is reported as such rather than as a pass.
+if [[ "$PIN_BUDGET" -gt 0 ]]; then
+  echo "PIN BUDGET EXERCISED: the write-through budget engaged and backed off" | tee -a "$LOG"
+  echo "instead of pinning the slot. This is the #581 behaviour under load:" | tee -a "$LOG"
+  grep -F "mamba write-through pin budget reached" "$LOG" | tail -3 | tee -a "$LOG"
+else
+  echo "PIN BUDGET NOT EXERCISED: no budget-reached line in this arm, so pin" | tee -a "$LOG"
+  echo "behaviour under real ack latency remains UNPROVEN. The arm can still" | tee -a "$LOG"
+  echo "carry the no-assert-death verdict, but not the pin-budget one." | tee -a "$LOG"
+fi
+if [[ "$DEFER" -gt 0 || "$SKIP_INSERT" -gt 0 ]]; then
+  echo "NOTE: starvation back-off fired (defer=$DEFER skip=$SKIP_INSERT). Under" | tee -a "$LOG"
+  echo "#581 these are GRACEFUL paths, not deaths -- the point is that the run" | tee -a "$LOG"
+  echo "continued. Cross-check against the assert count above." | tee -a "$LOG"
+  grep -F "mamba_evictable=" "$LOG" | tail -2 | tee -a "$LOG"
+fi
 
 echo "---- #583 barlink ----" | tee -a "$LOG"
 if grep -q "DeviceCollectiveAborted" "$LOG"; then
