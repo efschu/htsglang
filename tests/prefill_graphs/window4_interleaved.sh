@@ -33,6 +33,11 @@ PORT=30043
 # 3800 would measure a differently-sized KV pool than production runs.
 RESERVE="${RESERVE:-5500,4200,4200}"
 REPS="${REPS:-3}"
+# Extra flags appended to BOTH arms of every pair, so the treatment stays the
+# prefill backend alone. Used for the determinism variant
+# (EXTRA=--enable-deterministic-inference), which must go to eager and graphs
+# alike or the pair is measuring two things at once.
+EXTRA="${EXTRA:-}"
 
 mkdir -p "$OUT"
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
@@ -128,8 +133,8 @@ run_arm() {
 # E, G, E, G, E, G -- alternating, so neither treatment owns the cool end.
 for i in $(seq 1 "$REPS"); do
   G=0; [ "$i" = "1" ] && G=1   # content gate on the first pair only
-  GATE=$G run_arm "E${i}" || { stop_arm "E${i}"; exit 1; }
-  GATE=$G run_arm "G${i}" --cuda-graph-backend-prefill breakable \
+  GATE=$G run_arm "E${i}" ${EXTRA} || { stop_arm "E${i}"; exit 1; }
+  GATE=$G run_arm "G${i}" ${EXTRA} --cuda-graph-backend-prefill breakable \
       || { stop_arm "G${i}"; exit 1; }
 done
 
@@ -155,6 +160,7 @@ cat <<'HDR'
 HDR
 echo "  TRANSPORT for every arm in this run: $TRANSPORT (SGLANG_BARLINK=${SGLANG_BARLINK:-unset})"
 echo "  RESERVE for every arm in this run:   $RESERVE"
+echo "  EXTRA flags on every arm:            ${EXTRA:-none}"
 echo "  Production as of 2026-08-05 runs TRANSPORT=barlink; an nccl run answers"
 echo "  the prefill-graph question in isolation and is comparable with window 3,"
 echo "  but is NOT by itself a production rollout argument."

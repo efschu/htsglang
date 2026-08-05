@@ -264,6 +264,46 @@ rewrites that variable afterwards, so `TERM_ATTN_WORKSPACE` does not move when
 replicating the backend's own rule, plus that flag in the term's declared
 inputs.
 
+## 5b. Window 4 — barlink, and the hypothesis is CONFIRMED with a regime split
+
+Artifacts: `/spinning/gpu-battery-results/2026-08-05_prefill_graphs_w4/` and
+`..._w4det/`. `TRANSPORT=barlink` (production's transport), interleaved
+E,G,E,G,E,G, ms per fixed unit of work, `RESERVE=5500,4200,4200`. All 8 arms
+booted and completed; **no barlink fault fired** — a clean soak point for #583.
+
+| point | eager | graphs | paired delta | A-vs-A floor | verdict |
+|---|---|---|---|---|---|
+| 1900, single-stream | 1196.3 ms | 1320.6 ms | **+10.25 %** (slower) | 0.12 % | REPORTABLE |
+| 256 x4 concurrent | 230.1 ms | 219.0 ms | **-4.62 %** (faster) | 1.99 % | REPORTABLE |
+
+All three pairs agree in sign at both points, and both deltas clear their own
+floor by a wide margin (85x and 2.3x respectively).
+
+**The user's hypothesis holds, and only in the regime it predicted.** A
+captured prefill pays exactly where the work is launch-train bound — many
+small prefills with several in flight — and it loses badly where the work is
+GEMM bound. That is the mechanism stated in §6a, now measured: with barlink's
+device-side collectives inside the captured graph, the concurrent short-prompt
+point turns a real -4.6 %, while the single long prefill has no launch overhead
+to recover and pays the bucket-padding and capture cost instead.
+
+Note the +10.25 % at 1900 is far larger than bucket padding alone can explain
+(a 1974-token prefill pads into the 2048 bucket, ~3.7 % waste), so something
+else in the captured long-prefill path costs on top. Not localised here.
+
+**Determinism arms (`_w4det`, `RESERVE=7164,5864,5864`).** Both booted first
+try, which validates the §5a derivation end to end — the derived vector was
+right, no padding and no second attempt. Same directional split (+7.44 % at
+1900, -6.31 % at 256c4), but `REPS=1`, so **no A-vs-A floor and therefore no
+verdict** on those two numbers. What determinism does answer: it did **not**
+close the content divergence — 1/8 text with it, 1/8 without.
+
+**Content under barlink: 1/8 text divergence** (char 124), against 4/8 under
+NCCL in §5a. Read with care — window 4 ran the content gate on pair 1 only, so
+there is **no barlink eager-vs-eager content floor**. The NCCL floor passed
+(§5a), but that says nothing about barlink's boot-to-boot determinism. The 1/8
+is not yet distinguishable from barlink boot noise.
+
 ## 6. What is still missing
 
 ~~The boot-to-boot content floor.~~ **CLOSED by §5a**: E1 vs E2 passed 8/8
@@ -370,10 +410,23 @@ answered a different question.
 
 ## 7. Recommendation
 
-Do not enable the prefill graph backend on the production recipe **under
-NCCL** -- and note that as of 2026-08-05 production no longer runs NCCL, so
-this recommendation now constrains a configuration production has left behind.
-The barlink cell is unmeasured. It cannot pass a content-identity gate, and it buys nothing measurable
+**Superseded by §5b for barlink.** The recommendation below was reached under
+NCCL, and window 4 has since measured the barlink cell that actually matters.
+
+The answer is not "on" or "off" but **workload-dependent**: under barlink a
+captured prefill is worth -4.6 % on the concurrent short-prompt regime and
+costs +10.3 % on long single-stream prefill. A blanket flag is the wrong shape
+for that. What production would want is the graph engaged only for batches in
+the launch-bound regime -- which the runner can already express, since
+`can_run_graph` is a per-batch decision (`prefill_cuda_graph_runner.py:615`).
+Enabling the backend globally on the production recipe would trade a 10 % loss
+on long prefills for a 4.6 % win on short concurrent ones, and production's
+traffic mix decides whether that is a gain at all. It has not been measured.
+
+The content divergence remains unresolved and is the other blocker (§5b: 1/8
+under barlink, but with no barlink content floor yet).
+
+Under NCCL specifically: It cannot pass a content-identity gate, and it buys nothing measurable
 in the regime production actually runs. The current `disabled` state is right
 for the wrong reason — worth knowing, because the reason is one upstream rule
 away from flipping.
