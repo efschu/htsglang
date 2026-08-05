@@ -200,6 +200,19 @@ class HiMambaRadixCache(MambaRadixCache):
         self.ongoing_load_back = {}
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        # #581 write-through pin accounting. `write_backup` takes an
+        # `inc_lock_ref` for the duration of the D->H copy; on a node that
+        # carries a mamba checkpoint that lock ALSO makes the state slot
+        # unevictable (`mamba_lock_ref`), so a backlog of in-flight backups is
+        # indistinguishable from "every cached state belongs to a running
+        # request" as far as `evict_mamba` is concerned. This set is the
+        # authoritative record of which nodes still owe a `dec_lock_ref`, so
+        # that (a) both drain paths release exactly the pins that were taken
+        # and (b) removing a node can reconcile a pin whose ack will never
+        # arrive.
+        self._write_through_pinned: set[int] = set()
+        self._mamba_pin_budget_cached: Optional[int] = None
+        self._mamba_pin_skipped = 0
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -228,6 +241,8 @@ class HiMambaRadixCache(MambaRadixCache):
         self.ongoing_load_back = {}
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        self._write_through_pinned = set()
+        self._mamba_pin_skipped = 0
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_full_device_leaves.clear()
         self.evictable_full_host_leaves.clear()
@@ -238,6 +253,75 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_pool_host.available_size(),
         )
         super().reset()
+
+    @property
+    def _mamba_pin_budget(self) -> int:
+        """Max number of mamba checkpoints that may be pinned by in-flight
+        host write-throughs at once.
+
+        The release side of a write-through pin is bounded only by the ack
+        drain rate (and, under TP, by the SLOWEST rank -- `writing_check`
+        min-reduces the ack count across the group). The take side is bounded
+        by nothing at all, and with `--hicache-write-policy write_through` the
+        write-through threshold is 1, i.e. EVERY inserted checkpoint is pinned
+        the moment it is created. Without a cap the pinned set therefore grows
+        until it owns the whole pool, at which point `evict_mamba` can free
+        nothing and a REQUIRED allocation (the active slot or the ping-pong
+        buffer) has nowhere to go -- the #581 crash family, and the reason
+        raising `--max-mamba-cache-size` only buys time.
+
+        The budget is the pool above the hard floor: caching may use every
+        slot that the running set does not structurally require, and not one
+        more. This makes pin-induced starvation impossible by construction,
+        independent of any drain rate.
+        """
+        if self._mamba_pin_budget_cached is None:
+            from sglang.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
+            from sglang.srt.runtime_context import get_server_args
+
+            server_args = get_server_args()
+            pool_size = self.req_to_token_pool.mamba_pool.size
+            floor = mamba_hard_floor(
+                server_args, server_args.max_running_requests or 1
+            )
+            self._mamba_pin_budget_cached = max(0, pool_size - floor)
+        return self._mamba_pin_budget_cached
+
+    def _mamba_pins_held(self) -> int:
+        """Number of currently pinned nodes that hold a mamba checkpoint."""
+        count = 0
+        for node_id in self._write_through_pinned:
+            node = self.ongoing_write_through.get(node_id)
+            if node is not None and node.mamba_value is not None:
+                count += 1
+        return count
+
+    def _forget_write_through(self, node: TreeNode) -> None:
+        """Reconcile a node that is leaving the tree with the write-through
+        bookkeeping.
+
+        A node removed while its D->H copy is still in flight will never be
+        popped by the ack drain, so its pin -- and with it the mamba slot --
+        would be held forever. `HiRadixCache` performs the equivalent
+        reconciliation (`ongoing_write_through.pop(n.id, None)`); the mamba
+        variant had no such path, which is one of the ways the #581 pinned set
+        ratcheted upward and never came back down.
+        """
+        if node.id in self._write_through_pinned:
+            self._write_through_pinned.discard(node.id)
+            self.dec_lock_ref(node)
+        self.ongoing_write_through.pop(node.id, None)
+
+    def _drain_acked_write(self, ack_id: int) -> None:
+        """Complete one acked write-through: unregister, release the pin,
+        and hand the node on to the storage tier if enabled."""
+        backuped_node = self.ongoing_write_through.pop(ack_id)
+        self._record_store_event(backuped_node, medium=StorageMedium.CPU)
+        if ack_id in self._write_through_pinned:
+            self._write_through_pinned.discard(ack_id)
+            self.dec_lock_ref(backuped_node)
+        if self.enable_storage:
+            self.write_backup_storage(backuped_node)
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
@@ -252,6 +336,31 @@ class HiMambaRadixCache(MambaRadixCache):
         if node.mamba_value is not None and node.mamba_host_value is not None:
             if self.mamba_host_lru_list.in_list(node):
                 self.mamba_host_lru_list.reset_node_mru(node)
+
+        # #581 pin budget: a write-through pin on a mamba checkpoint makes its
+        # state slot unevictable until the ack drains. Beyond the budget, skip
+        # the backup entirely rather than pin another slot -- the state stays
+        # cached on the device and stays EVICTABLE, so the pool can always
+        # serve the running set's required allocations. Backing off here costs
+        # at most a host-tier miss; not backing off costs the scheduler.
+        if (
+            not write_back
+            and node.mamba_value is not None
+            and self._mamba_pins_held() >= self._mamba_pin_budget
+        ):
+            self._mamba_pin_skipped += 1
+            if self._mamba_pin_skipped <= 3 or self._mamba_pin_skipped % 1000 == 0:
+                logger.warning(
+                    "mamba write-through pin budget reached (%d in flight, "
+                    "budget=%d, pool=%d): skipping host backup of this "
+                    "checkpoint to keep the state slot evictable. "
+                    "occurrence=%d",
+                    self._mamba_pins_held(),
+                    self._mamba_pin_budget,
+                    self.req_to_token_pool.mamba_pool.size,
+                    self._mamba_pin_skipped,
+                )
+            return 0
 
         extra_pools = self.mamba_backup_transfers(node)
         host_indices = self.cache_controller.write(
@@ -275,6 +384,10 @@ class HiMambaRadixCache(MambaRadixCache):
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
+                # Record the pin so BOTH drain paths (and node removal)
+                # release exactly what was taken -- see _drain_acked_write /
+                # _forget_write_through.
+                self._write_through_pinned.add(node.id)
         else:
             return 0
 
@@ -427,12 +540,11 @@ class HiMambaRadixCache(MambaRadixCache):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
-                        self._record_store_event(
-                            backuped_node, medium=StorageMedium.CPU
-                        )
-                        if self.enable_storage:
-                            self.write_backup_storage(backuped_node)
+                        # This dict is shared with the write-THROUGH path,
+                        # whose entries each hold an inc_lock_ref. Draining
+                        # them here without the matching dec_lock_ref leaked
+                        # the lock -- and with it the mamba slot -- forever.
+                        self._drain_acked_write(ack_id)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -460,11 +572,7 @@ class HiMambaRadixCache(MambaRadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
-                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self.dec_lock_ref(backuped_node)
-                if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+                self._drain_acked_write(ack_id)
             finish_count -= 1
 
     def loading_check(self):
@@ -617,6 +725,9 @@ class HiMambaRadixCache(MambaRadixCache):
             node.mamba_host_value = None
 
         node.value = None
+        # The node leaves the tree here; any in-flight write-through ack for
+        # it will never be matched, so release its pin now (#581).
+        self._forget_write_through(node)
         self._discard_from_leaf_sets(node)
 
         parent = node.parent
@@ -675,6 +786,8 @@ class HiMambaRadixCache(MambaRadixCache):
         v = parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
+        # Leaving the tree: reconcile any in-flight write-through pin (#581).
+        self._forget_write_through(node)
         self._discard_from_leaf_sets(node)
 
         if (
