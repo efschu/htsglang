@@ -252,6 +252,26 @@ class TestFreeSpaceWatchdog(_TmpDirCase):
         self.assertFalse(b._evictor.write_stopped)
         self.assertTrue(b.set(_key(3), _t(4096)))
 
+    def test_watchdog_holds_the_latch_inside_the_hysteresis_band(self):
+        """Barely back above min_free is not a recovery: no write/stop flapping."""
+        d = os.path.join(self.tmp, "watchdog_band")
+        os.makedirs(d, exist_ok=True)
+        min_free = 1024 * 1024 * 1024
+        b = _make_backend(d, max_size="8Mi", min_free=str(min_free))
+        with mock.patch("os.statvfs", self._statvfs_with_free(min_free // 64)):
+            b.check_disk_space(force=True)
+        self.assertTrue(b._evictor.write_stopped)
+
+        # 1% above the watermark: still stopped (release needs 5% margin).
+        with mock.patch("os.statvfs", self._statvfs_with_free(int(min_free * 1.01))):
+            self.assertFalse(b.check_disk_space(force=True))
+            self.assertTrue(b._evictor.write_stopped)
+
+        # 10% above: released.
+        with mock.patch("os.statvfs", self._statvfs_with_free(int(min_free * 1.10))):
+            self.assertTrue(b.check_disk_space(force=True))
+            self.assertFalse(b._evictor.write_stopped)
+
     def test_watchdog_is_rate_limited(self):
         d = os.path.join(self.tmp, "watchdog_rate")
         os.makedirs(d, exist_ok=True)

@@ -520,7 +520,9 @@ class LRUFileEvictor:
         if free >= self.min_free_bytes:
             with self._lock:
                 self._release_write_stop_locked(free)
-            return True
+                # Inside the hysteresis band (above min_free, below the recovery
+                # margin) the latch is still set and writes stay refused.
+                return not self._write_stopped
 
         # Below the watermark: first try to buy the space back from our own LRU.
         with self._lock:
