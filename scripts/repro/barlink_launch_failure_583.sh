@@ -118,10 +118,41 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG="$OUTDIR/583_${ARM}_${STAMP}.log"
 
 # ---------------------------------------------------------------------------
+# AUTO-TARGETING. The harness solves its own load parameters from the crash
+# reference's ABSOLUTE regime -- it does not ask a human for numbers.
+#
+# REFERENCE defaults to the BARLINK crash (boot5), not merely the most recent
+# crash log. boot6 is the mamba ping-pong crash and SATURATED its pool (64/64);
+# targeting it would build a harness that deliberately saturates, which this
+# harness's own regime gate scores as REGIME FAIL. derive_soak_target.py warns
+# when a reference saturates, so this choice is checked rather than trusted.
+#
+# MAMBA_CACHE / PREFIX_POOL / SESSIONS remain settable as documented OVERRIDES
+# for special cases. They are not the primary interface: an env knob is the
+# same human guess as a hand edit, and hand-picked values are what produced
+# both failed arms on 2026-08-05.
+# ---------------------------------------------------------------------------
+REFERENCE="${REFERENCE:-/spinning/spill-night-20260804/results/CRASH_20260805_boot5_barlink_full.log}"
+DERIVER="$(dirname "$0")/derive_soak_target.py"
+if [[ -f "$REFERENCE" && -f "$DERIVER" ]]; then
+  "$PY" "$DERIVER" "$REFERENCE" | tee -a "$LOG"
+  if DERIVED="$("$PY" "$DERIVER" --shell "$REFERENCE" 2>/dev/null)"; then
+    eval "$(sed 's/^/DERIVED_/' <<<"$DERIVED")"
+  fi
+fi
+MAMBA_CACHE="${MAMBA_CACHE:-${DERIVED_MAMBA_CACHE:-96}}"
+PREFIX_POOL="${PREFIX_POOL:-${DERIVED_PREFIX_POOL:-6}}"
+SESSIONS="${SESSIONS:-${DERIVED_SESSIONS:-4}}"
+echo "== load targeting: MAMBA_CACHE=$MAMBA_CACHE PREFIX_POOL=$PREFIX_POOL SESSIONS=$SESSIONS ==" | tee -a "$LOG"
+
+# ---------------------------------------------------------------------------
 # Physical GPU identity via NVML -- never a hardcoded index. NVML/nvidia-smi
 # enumeration and torch's CUDA order can and do diverge on this rig.
 # ---------------------------------------------------------------------------
-echo "== NVML physical inventory ==" | tee "$LOG"
+# tee -a, NOT tee: the auto-targeting block above already wrote the derivation
+# into this log, and truncating here would erase the record of how the arm was
+# aimed -- which is the first thing anyone reading a verdict needs.
+echo "== NVML physical inventory ==" | tee -a "$LOG"
 "$PY" - <<'NVML' 2>&1 | tee -a "$LOG"
 import pynvml
 pynvml.nvmlInit()
@@ -178,7 +209,13 @@ BOOT=(
   # exists to measure. That assert killing the scheduler is a separate defect
   # -- the merged "Mamba slot starvation must not kill the scheduler" fix does
   # not cover this allocation site.
-  --max-mamba-cache-size 96
+  # Default 96 = production. Set MAMBA_CACHE=64 to match the CRASH BOOT, which
+  # is what regime fidelity needs: the 2026-08-05 soak ran ~16 slots of 96
+  # (fraction 0.17) while the crash ran ~16 slots of 64 (fraction 0.25). The
+  # absolute load was the SAME; only the denominator differed. Comparing
+  # fractions across different pool sizes is the trap -- 0.17 there and 0.25
+  # here describe identical occupancy.
+  --max-mamba-cache-size "$MAMBA_CACHE"
   # EAGLE, exactly as the crash boot's server_args recorded it
   # (speculative_algorithm='EAGLE', speculative_draft_model_path=None -- Qwen3.6
   # carries its own MTP head, so no draft model is needed). NOT "NEXTN": that
@@ -242,6 +279,7 @@ echo "== ready, starting mixed load ==" | tee -a "$LOG"
 # with full-graph decode at high frequency -- the mix the desk analysis
 # identified as the one no NCCL/gloo boot ever exercised.
 PORT="$PORT" MINUTES="$MINUTES" SRVLOG="$LOG" \
+PREFIX_POOL="$PREFIX_POOL" SESSIONS="$SESSIONS" \
 MAMBA_LO="${MAMBA_LO:-0.20}" MAMBA_HI="${MAMBA_HI:-0.35}" \
 MAMBA_VALVE="${MAMBA_VALVE:-0.88}" \
 "$PY" - <<'LOAD' 2>&1 | tee -a "$LOG"
@@ -321,7 +359,8 @@ def over_band() -> bool:
 # still carries a large cached-token count (the long shared prefix) plus a
 # fresh chunk to prefill -- which is exactly the crash boot's shape:
 # #new-token 600-2000 against #cached-token 40-80k, 3-4 running, ~2 queued.
-PREFIX_POOL = 6
+PREFIX_POOL = int(os.environ["PREFIX_POOL"])
+SESSIONS = int(os.environ["SESSIONS"])
 POOL = [
     f"Topic {k}. " + "Explain cache coherence and memory ordering. " * 90
     for k in range(PREFIX_POOL)
@@ -367,7 +406,7 @@ def session(idx: int):
 
 threading.Thread(target=sampler, daemon=True).start()
 threads = [threading.Thread(target=session, args=(i,), daemon=True)
-           for i in range(4)]
+           for i in range(SESSIONS)]
 for t in threads:
     t.start()
 while any(t.is_alive() for t in threads) and time.time() < deadline:
