@@ -8,7 +8,7 @@ import threading
 import time
 from contextlib import contextmanager
 from multiprocessing import Process
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import psutil
 
@@ -185,6 +185,10 @@ class SubprocessWatchdog:
         self._interval = interval
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def processes_with_names(self) -> List[Tuple[Process, str]]:
+        """Tracked (process, name) pairs, for external liveness checks."""
+        return list(zip(self._processes, self._names))
 
     def start(self) -> None:
         if self._thread is not None or not self._processes:
