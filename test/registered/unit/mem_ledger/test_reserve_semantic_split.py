@@ -1,0 +1,344 @@
+"""The semantic split of the reserve flags, and the calibration cache.
+
+Hermetic. No GPU, no NVML: every test here is about what the FLAGS mean, which
+is decided at parse time and must therefore be decidable without hardware.
+"""
+
+import json
+import os
+
+import pytest
+
+from sglang.srt.mem_ledger.calibration import (
+    VRAM_CALIBRATION_VERSION,
+    CalibrationProfile,
+    CardResidual,
+    calibration_cache_path,
+    calibration_fingerprint,
+    load_calibration,
+    save_calibration,
+)
+from sglang.srt.mem_ledger.terms import DEFAULT_USER_RESERVE_MIB
+from sglang.srt.server_args import ServerArgs
+
+MODEL = "/nonexistent/model"
+
+
+def make_args(**kwargs):
+    """A ServerArgs shell for flag-semantics checks only.
+
+    ``__post_init__`` is bypassed deliberately: this file tests the reserve
+    flags' MEANING, and dragging a full arg resolution (which reads a
+    checkpoint) into that would make the test about the checkpoint.
+    """
+    args = ServerArgs.__new__(ServerArgs)
+    defaults = dict(
+        model_path=MODEL,
+        rank_auto_reserve_mib="auto",
+        rank_user_reserve_mib=DEFAULT_USER_RESERVE_MIB,
+        enable_vram_ledger=False,
+    )
+    defaults.update(kwargs)
+    for key, value in defaults.items():
+        setattr(args, key, value)
+    return args
+
+
+# --- the decreed default ----------------------------------------------------
+
+
+def test_user_reserve_defaults_to_1024_mib_per_card():
+    assert DEFAULT_USER_RESERVE_MIB == 1024
+    field = ServerArgs.__dataclass_fields__["rank_user_reserve_mib"]
+    assert field.default == DEFAULT_USER_RESERVE_MIB
+
+
+def test_ledger_is_off_by_default_so_existing_recipes_are_unchanged():
+    field = ServerArgs.__dataclass_fields__["enable_vram_ledger"]
+    assert field.default is False
+
+
+# --- the split is enforced, never silently merged --------------------------
+
+
+def test_user_reserve_without_the_ledger_is_refused_not_ignored():
+    args = make_args(rank_user_reserve_mib=4096, enable_vram_ledger=False)
+    with pytest.raises(ValueError) as excinfo:
+        args._check_vram_ledger_flags()
+    assert "does nothing without --enable-vram-ledger" in str(excinfo.value)
+
+
+def test_the_two_reserve_semantics_cannot_be_combined():
+    args = make_args(rank_auto_reserve_mib="5500,3800,3800", enable_vram_ledger=True)
+    with pytest.raises(ValueError) as excinfo:
+        args._check_vram_ledger_flags()
+    message = str(excinfo.value)
+    assert "mean different things" in message
+    # The message must teach the migration, since the runbook value is exactly
+    # the conflated vector that motivated the split.
+    assert "--rank-user-reserve-mib" in message
+    assert "5500,3800,3800" in message
+
+
+def test_pinned_legacy_reserve_still_boots_but_is_deprecated(caplog):
+    args = make_args(rank_auto_reserve_mib="5500,3800,3800")
+    with caplog.at_level("WARNING"):
+        args._check_vram_ledger_flags()  # must NOT raise: recipes keep booting
+    assert any("DEPRECATED" in r.message for r in caplog.records)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "conflates two different quantities" in text
+    assert "This boot proceeds unchanged" in text
+
+
+def test_default_path_emits_no_deprecation_and_no_error(caplog):
+    args = make_args()
+    with caplog.at_level("WARNING"):
+        args._check_vram_ledger_flags()
+    assert not [r for r in caplog.records if "DEPRECATED" in r.message]
+
+
+# --- per-card resolution ----------------------------------------------------
+
+
+def test_scalar_user_reserve_applies_to_every_card():
+    args = make_args(rank_user_reserve_mib=2048, enable_vram_ledger=True)
+    assert args.user_reserve_mib_per_gpu([0, 1, 2]) == {0: 2048, 1: 2048, 2: 2048}
+
+
+def test_per_rank_user_reserve_collapses_to_the_largest_per_card():
+    """The headroom belongs to the card: two co-located ranks asking for
+    different amounts of free memory are asking for the same bytes twice."""
+    args = make_args(rank_user_reserve_mib="512,2048,1024", enable_vram_ledger=True)
+    assert args.user_reserve_mib_per_gpu([0, 0, 1]) == {0: 2048, 1: 1024}
+
+
+def test_user_reserve_length_mismatch_is_refused():
+    args = make_args(rank_user_reserve_mib="512,2048", enable_vram_ledger=True)
+    with pytest.raises(ValueError) as excinfo:
+        args.user_reserve_mib_per_gpu([0, 1, 2])
+    assert "2 entries but 3 ranks" in str(excinfo.value)
+
+
+def test_negative_user_reserve_is_refused():
+    args = make_args(rank_user_reserve_mib="-1", enable_vram_ledger=True)
+    with pytest.raises(ValueError):
+        args.user_reserve_mib_per_gpu([0])
+
+
+# --- calibration cache: keyed, versioned, never silently reused -------------
+
+
+def _profile(fingerprint):
+    return CalibrationProfile(
+        fingerprint=fingerprint,
+        driver="580.00",
+        build="torch2.9+cuda13",
+        cards=(
+            CardResidual(
+                uuid="GPU-a",
+                name="RTX 3080",
+                cuda_context_bytes=300 << 20,
+                allocator_granularity_bytes=8 << 20,
+                lazy_workspace_bytes=100 << 20,
+            ),
+        ),
+    )
+
+
+def _inventory():
+    return ([{"uuid": "GPU-a", "cuda_index": 0, "name": "RTX 3080"}], "580.00")
+
+
+def test_fingerprint_changes_with_card_set_driver_and_build():
+    base = calibration_fingerprint(["a", "b"], "580.00", "torch2.9")
+    assert calibration_fingerprint(["a", "b", "c"], "580.00", "torch2.9") != base
+    assert calibration_fingerprint(["a", "b"], "581.00", "torch2.9") != base
+    assert calibration_fingerprint(["a", "b"], "580.00", "torch3.0") != base
+    # Order must not matter: the card SET is the input, not its enumeration.
+    assert calibration_fingerprint(["b", "a"], "580.00", "torch2.9") == base
+
+
+def test_calibration_roundtrips_under_its_own_fingerprint(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
+    )
+    fingerprint, _gpus, _driver = __import__(
+        "sglang.srt.mem_ledger.calibration", fromlist=["live_fingerprint"]
+    ).live_fingerprint(inventory=_inventory())
+    save_calibration(_profile(fingerprint), cache_dir=str(tmp_path))
+    loaded = load_calibration(cache_dir=str(tmp_path), inventory=_inventory())
+    assert loaded is not None
+    assert loaded.residual("GPU-a").total_mib == 408
+
+
+def test_a_calibration_from_another_rig_is_a_miss(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
+    )
+    save_calibration(_profile("someoneelse"), cache_dir=str(tmp_path))
+    assert load_calibration(cache_dir=str(tmp_path), inventory=_inventory()) is None
+
+
+def test_a_version_bump_invalidates_rather_than_reinterprets(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
+    )
+    calib = __import__(
+        "sglang.srt.mem_ledger.calibration", fromlist=["live_fingerprint"]
+    )
+    fingerprint, _gpus, _driver = calib.live_fingerprint(inventory=_inventory())
+    path = calibration_cache_path(fingerprint, str(tmp_path))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = _profile(fingerprint).to_json()
+    payload["version"] = VRAM_CALIBRATION_VERSION + 1
+    with open(path, "w") as f:
+        json.dump(payload, f)
+    assert load_calibration(cache_dir=str(tmp_path), inventory=_inventory()) is None
+
+
+# --- the boot path actually runs -------------------------------------------
+
+
+def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
+    """EXECUTION SMOKE for the wiring, not just for the ledger.
+
+    ``_vram_ledger_non_kv_per_gpu`` is the one function that joins the ledger to
+    the boot, and a joint that is only ever read is not a joint that works. NVML
+    and the calibration are injected; everything between them is production
+    code, including the itemization the boot logs.
+    """
+    import sglang.srt.server_args as sa
+    from sglang.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
+
+    class Card:
+        def __init__(self, ordinal, uuid, name, total):
+            self.cuda_ordinal = ordinal
+            self.nvml_index = ordinal
+            self.uuid = uuid
+            self.pci_bus_id = f"0000:0{ordinal}:00.0"
+            self.name = name
+            self.total_mib = total
+            self.free_mib = total
+
+    cards = {
+        0: Card(0, "GPU-5090", "RTX 5090", 32768),
+        1: Card(1, "GPU-3080-a", "RTX 3080", 20480),
+    }
+    monkeypatch.setattr(
+        sa, "_resolve_rank_gpu_cards", lambda ids: {i: cards[i] for i in set(ids)}
+    )
+    monkeypatch.setattr(
+        "sglang.srt.mem_ledger.calibration.load_calibration",
+        lambda **kw: CalibrationProfile(
+            fingerprint="fp0",
+            driver="580",
+            build="torch2.9",
+            cards=tuple(
+                CardResidual(
+                    uuid=c.uuid,
+                    name=c.name,
+                    cuda_context_bytes=300 << 20,
+                    allocator_granularity_bytes=8 << 20,
+                    lazy_workspace_bytes=100 << 20,
+                )
+                for c in cards.values()
+            ),
+        ),
+    )
+
+    args = make_args(
+        enable_vram_ledger=True,
+        rank_gpu_id=[0, 1],
+        chunked_prefill_size=2048,
+        context_length=None,
+        max_running_requests=4,
+        tp_size=2,
+        pp_size=1,
+        max_prefill_tokens=16384,
+        disaggregation_mode="null",
+        speculative_num_draft_tokens=None,
+    )
+    # The demand derivations that need a checkpoint are the ones a hermetic
+    # test cannot supply; stub exactly those and let the rest run for real.
+    monkeypatch.setattr(type(args), "mamba_pre_capture_reserve_mb", lambda s, m: 3968.0)
+    monkeypatch.setattr(type(args), "speculative_capture_tokens", lambda s, n=None: 96)
+    monkeypatch.setattr(type(args), "gdn_prefill_scratch_mib", lambda s, share: None)
+    monkeypatch.setattr(type(args), "dsv4_indexer_prefill_scratch_mib", lambda s: None)
+    monkeypatch.setattr(type(args), "ladder_reserve_gpu_id", lambda s: None)
+
+    from collections import Counter
+
+    with caplog.at_level("INFO"):
+        non_kv = args._vram_ledger_non_kv_per_gpu(Counter([0, 1]))
+
+    # 1024 user reserve + 3968 activation + 192 capture + 384 flashinfer
+    # workspace (read from SGLANG_FLASHINFER_WORKSPACE_SIZE, not stubbed --
+    # this term is exactly the "allocated lazily after KV sizing" pool the old
+    # reserve text named and no budget charged) + 408 hardware residual.
+    assert non_kv == {0: 5976, 1: 5976}
+    text = caplog.text
+    assert "attention workspaces (capped)" in text
+    assert "SGLANG_FLASHINFER_WORKSPACE_SIZE" in text
+    assert "VRAM ledger for GPU 0 (RTX 5090" in text
+    assert "user reserve (external)" in text
+    assert "calibrated@fp0" in text
+    assert "VRAM ledger totals" in text
+
+
+def test_the_boot_path_refuses_an_overcommitted_card(monkeypatch):
+    """The refusal is reachable from the boot, not only from the unit."""
+    import sglang.srt.server_args as sa
+    from sglang.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
+    from sglang.srt.mem_ledger.terms import LedgerOvercommit
+
+    class Card:
+        cuda_ordinal = 1
+        nvml_index = 1
+        uuid = "GPU-3080-a"
+        pci_bus_id = "0000:01:00.0"
+        name = "RTX 3080"
+        total_mib = 20480
+        free_mib = 20480
+
+    monkeypatch.setattr(sa, "_resolve_rank_gpu_cards", lambda ids: {1: Card()})
+    monkeypatch.setattr(
+        "sglang.srt.mem_ledger.calibration.load_calibration",
+        lambda **kw: CalibrationProfile(
+            fingerprint="fp0",
+            driver="580",
+            build="torch2.9",
+            cards=(
+                CardResidual(
+                    uuid="GPU-3080-a",
+                    name="RTX 3080",
+                    cuda_context_bytes=300 << 20,
+                    allocator_granularity_bytes=8 << 20,
+                    lazy_workspace_bytes=100 << 20,
+                ),
+            ),
+        ),
+    )
+    args = make_args(
+        enable_vram_ledger=True,
+        rank_gpu_id=[1, 1, 1],
+        chunked_prefill_size=8192,
+        context_length=None,
+        max_running_requests=4,
+        tp_size=3,
+        pp_size=1,
+        max_prefill_tokens=16384,
+        disaggregation_mode="null",
+        speculative_num_draft_tokens=None,
+    )
+    monkeypatch.setattr(type(args), "mamba_pre_capture_reserve_mb", lambda s, m: 8000.0)
+    monkeypatch.setattr(type(args), "speculative_capture_tokens", lambda s, n=None: 512)
+    monkeypatch.setattr(type(args), "gdn_prefill_scratch_mib", lambda s, share: None)
+    monkeypatch.setattr(type(args), "dsv4_indexer_prefill_scratch_mib", lambda s: None)
+    monkeypatch.setattr(type(args), "ladder_reserve_gpu_id", lambda s: None)
+
+    from collections import Counter
+
+    with pytest.raises(LedgerOvercommit) as excinfo:
+        args._vram_ledger_non_kv_per_gpu(Counter([1, 1, 1]))
+    assert "OVERCOMMITTED by" in str(excinfo.value)
+    assert "runtime activation + metadata" in str(excinfo.value)
