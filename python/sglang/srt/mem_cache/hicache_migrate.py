@@ -180,12 +180,12 @@ def store_path(directory: str, name: str) -> str:
     The backend writes pages into 2-hex-prefix shard subdirectories (#558), so
     a migration must produce that layout too -- otherwise the handover output
     lands flat and the next boot pays the flat-directory cost this store was
-    sharded to avoid. ``HiCacheFile`` owns the rule; import it rather than
-    restate it, so the two layouts cannot drift apart.
+    sharded to avoid. ``hicache_storage.page_shard`` owns the rule; import
+    it rather than restate it, so the two layouts cannot drift apart.
     """
-    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+    from sglang.srt.mem_cache.hicache_storage import page_shard
 
-    return os.path.join(directory, HiCacheFile._shard_of(name), name)
+    return os.path.join(directory, page_shard(name), name)
 
 
 def scan_store(directory: str) -> List[StoreEntry]:

@@ -434,6 +434,30 @@ class MetadataCache:
             self.cache.clear()
 
 
+# Shard directories the page files spread over: the first two hex characters
+# of the key. Page keys are sha256 hex digests, so the first byte spreads
+# uniformly over 256 subdirectories. Stems that do not start with two lowercase
+# hex characters -- only ever synthetic keys -- share one shard.
+_SHARD_HEX = "0123456789abcdef"
+_SHARD_FALLBACK = "zz"
+
+
+def page_shard(stem: str) -> str:
+    """Shard subdirectory a page file with this key stem belongs in.
+
+    Everything that touches the on-disk store must agree on this rule: the
+    backend, and the offline geometry migration in ``hicache_migrate``. Before
+    sharding, every page landed directly in the storage directory -- the
+    incident of task #558 left 11.7 million entries in one flat directory,
+    which cost ~114 s to scan at startup and turned every existence sweep into
+    a full-directory walk.
+    """
+    prefix = stem[:2]
+    if len(prefix) == 2 and all(c in _SHARD_HEX for c in prefix):
+        return prefix
+    return _SHARD_FALLBACK
+
+
 class HiCacheFile(HiCacheStorage):
 
     def __init__(
@@ -484,7 +508,7 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
             self.kv_config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
-        # Shard directories created so far (see _shard_of): keeps the write path
+        # Shard directories created so far (see page_shard): keeps the write path
         # to one makedirs per shard instead of one per page.
         self._known_shards: set[str] = set()
 
@@ -582,30 +606,9 @@ class HiCacheFile(HiCacheStorage):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
 
-    # Number of 2-hex-prefix shard directories the page files spread over.
-    _SHARD_FANOUT_HEX = "0123456789abcdef"
-    # Stems that do not start with two lowercase hex characters (only ever
-    # synthetic keys -- real page keys are sha256 hex) share one shard.
-    _SHARD_FALLBACK = "zz"
-
-    @classmethod
-    def _shard_of(cls, stem: str) -> str:
-        """Shard directory for a key stem: its first two hex characters.
-
-        Page keys are sha256 hex digests, so the first byte spreads uniformly
-        over 256 subdirectories. Without this every page landed directly in the
-        storage directory: the incident of task #558 left 11.7 million entries
-        in one flat directory, which cost ~114 s to scan at startup and turned
-        every existence sweep into a full-directory walk.
-        """
-        prefix = stem[:2]
-        if len(prefix) == 2 and all(c in cls._SHARD_FANOUT_HEX for c in prefix):
-            return prefix
-        return cls._SHARD_FALLBACK
-
     def _sharded_path(self, stem: str) -> str:
         """Path a NEW file for ``stem`` is written to."""
-        return os.path.join(self.file_path, self._shard_of(stem), f"{stem}.bin")
+        return os.path.join(self.file_path, page_shard(stem), f"{stem}.bin")
 
     def _flat_path(self, stem: str) -> str:
         """Pre-sharding path for ``stem`` (read-only compatibility)."""
