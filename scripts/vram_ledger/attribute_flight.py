@@ -43,6 +43,46 @@ from sglang.srt.mem_ledger.flight_recorder import (  # noqa: E402
     read_marks,
     resident_attribution,
 )
+from sglang.srt.mem_ledger.reconcile import reconcile  # noqa: E402
+
+
+def _reconcile(args) -> int:
+    import glob
+    import json
+
+    by_rank = read_marks(args.directory, boot=args.boot)
+    if not by_rank:
+        print(f"No flight marks under {args.directory}.")
+        return 1
+    boot = next(iter(by_rank.values()))[0].get("boot_id")
+    path = os.path.join(args.directory, f"ledger_{boot}.json")
+    if not os.path.exists(path):
+        found = sorted(glob.glob(os.path.join(args.directory, "ledger_*.json")))
+        print(f"No modeled ledger for boot {boot} at {path}.")
+        if found:
+            print(
+                "Ledgers present for other boots: "
+                + ", ".join(os.path.basename(f) for f in found)
+            )
+        print(
+            "The ledger is written by enforce_boot_contract when the recorder "
+            "is armed; a boot that refused before that point leaves marks "
+            "without one."
+        )
+        return 1
+    with open(path) as f:
+        payload = json.load(f)
+    results = reconcile(payload, by_rank)
+    if not results:
+        print("The ledger names no card whose rank left marks.")
+        return 1
+    for result in results:
+        print()
+        print(result.render())
+    print("\nOVERPREDICTION BY CARD (modeled - measured):")
+    for result in results:
+        print(f"  rank {result.rank} {result.card}: {result.overprediction_mib:+d} MiB")
+    return 0
 
 
 def _boots(args) -> int:
@@ -149,6 +189,13 @@ def main(argv=None) -> int:
     p = sub.add_parser("boots", help="which boots this directory holds")
     p.add_argument("directory")
     p.set_defaults(func=_boots)
+
+    p = sub.add_parser(
+        "reconcile", help="modeled ledger terms against the measured boot posts"
+    )
+    p.add_argument("directory")
+    p.add_argument("--boot", default=None, help="which boot (default: the latest)")
+    p.set_defaults(func=_reconcile)
 
     p = sub.add_parser("snapshot", help="per-callsite bytes from a trace dump")
     p.add_argument("path")
