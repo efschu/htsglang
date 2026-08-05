@@ -11085,6 +11085,138 @@ class ServerArgs:
                 self.rank_auto_reserve_mib,
             )
 
+    def _build_card_ledgers(self):
+        """The per-card VRAM ledgers for this launch, labelled and ready.
+
+        Shared so the gated ledger path and the #593 full-demand reserve read
+        the SAME ledger. Two constructions would be two answers, and the whole
+        point of the ledger is that there is one.
+        """
+        import dataclasses as _dc
+
+        from sglang.srt.mem_ledger.calibration import load_calibration
+        from sglang.srt.mem_ledger.engine import (
+            CardFacts,
+            DemandInputs,
+            build_card_ledgers,
+        )
+
+        rank_gpu_id = list(self.rank_gpu_id)
+        cards_by_ordinal = _resolve_rank_gpu_cards(rank_gpu_id)
+        cards = [
+            CardFacts(
+                gpu_id=ordinal,
+                uuid=card.uuid,
+                name=card.name,
+                total_mib=card.total_mib,
+            )
+            for ordinal, card in sorted(cards_by_ordinal.items())
+        ]
+        gpu_total_mib = {c.gpu_id: c.total_mib for c in cards}
+        user_reserve = self.user_reserve_mib_per_gpu(rank_gpu_id)
+        inputs = DemandInputs.from_server_args(
+            self,
+            rank_gpu_id=rank_gpu_id,
+            gpu_total_mib=gpu_total_mib,
+            weight_mib_per_rank=[0] * len(rank_gpu_id),
+            card_uuid_by_gpu={c.gpu_id: c.uuid for c in cards},
+        )
+        ledgers = build_card_ledgers(
+            inputs,
+            cards=cards,
+            rank_gpu_id=rank_gpu_id,
+            user_reserve_mib=user_reserve,
+            calibration=load_calibration(),
+        )
+        return [
+            _dc.replace(
+                x,
+                residual_label="weight shards + KV pool (residual)",
+                residual_note=(
+                    "total - user reserve - demand. The weight shards are not "
+                    "a term above because their size depends on the shard "
+                    "ratio, which is derived FROM this number; they and the KV "
+                    "pool share this residual, and the profiling step splits "
+                    "it once the ratio exists. Surplus flows here rather than "
+                    "sitting idle"
+                ),
+            )
+            for x in ledgers
+        ]
+
+    #: Set once the full-demand reserve has named a refusal, so the term list
+    #: appears per process rather than once per GPU per call.
+    _full_demand_refusal_named = False
+
+    def ledger_full_demand_per_gpu(self) -> Optional[Dict[int, int]]:
+        """``{gpu id: full non-KV demand MiB}`` from the card ledgers, or None.
+
+        #593. The reserve this feeds is what stands between the KV pool and a
+        CUDA OOM, so it has to be the WHOLE non-KV demand, not one term of it.
+
+        WHAT WENT WRONG WITHOUT THIS. #590 routed the reserve onto the ledger's
+        ACTIVATION footprint alone. That looked like a payout -- the binding
+        3080 went from a flat 3968 MiB heuristic to its measured 1766 -- and
+        the window-7 boot then died in graph capture on exactly that card, with
+        113 MiB free. The heuristic had never been an activation estimate; it
+        was a catch-all that happened to cover capture, workspaces and context
+        too. Replacing a catch-all with one honest term is a REDUCTION, and the
+        2202 MiB it freed went straight into the KV pool.
+
+        Worse, the better the measurement the harder it fails: the window-6
+        dumps put the real activation transient at 429 MiB, so ingesting
+        MEASURED_PEAK would have shrunk the reserve further still.
+
+        So the number here is ``demand_outside_budget_mib``: activation, CUDA
+        graph capture (measured, not the 2 MiB/token coefficient), the draft
+        ladder, GDN prefill scratch, DSV4 indexer scratch, the attention
+        workspace, the hardware residual and the parent CUDA context. Weights
+        and the mamba pool are excluded because the rank budget funds them --
+        charging them here would reserve them twice.
+
+        ``None`` means "do not use this path", for three distinct reasons, and
+        the caller keeps its previous behaviour in all three:
+          * the mem_ledger package is not in the tree (production today);
+          * the ledger could not be built at all (no NVML, no card facts);
+          * at least one term is UNBOUNDED -- neither measured nor bounded.
+        The third names the offending terms once per process. A partial sum
+        that looked complete is precisely what produced the window-7 OOM, so
+        an unpriced term refuses the path instead of quietly summing the rest.
+        """
+        try:
+            from sglang.srt.mem_ledger.engine import demand_outside_budget_mib
+        except ImportError:
+            return None
+        try:
+            ledgers = self._build_card_ledgers()
+        except Exception as e:  # pragma: no cover - NVML/config availability
+            logger.debug("full-demand reserve unavailable (%s)", e)
+            return None
+        if not ledgers:
+            return None
+        unbounded = []
+        for x in ledgers:
+            for term in x.unbounded:
+                unbounded.append(f"{x.card}: {term}")
+        if unbounded:
+            if not ServerArgs._full_demand_refusal_named:
+                ServerArgs._full_demand_refusal_named = True
+                logger.warning(
+                    "VRAM ledger REFUSES to price the full per-card reserve: "
+                    "%d term(s) are neither measured nor bounded -- %s. "
+                    "Falling back to the inherited reserve model. This is a "
+                    "refusal and not a partial sum ON PURPOSE: summing the "
+                    "priced terms and omitting the rest yields a number that "
+                    "looks complete and is short, which is what emptied the "
+                    "binding card during graph capture on 2026-08-05. Run "
+                    "scripts/vram_ledger/probe_activation.py for this "
+                    "configuration to price the missing term(s).",
+                    len(unbounded),
+                    "; ".join(sorted(unbounded)),
+                )
+            return None
+        return {x.gpu_id: int(demand_outside_budget_mib(x)) for x in ledgers}
+
     def _vram_ledger_non_kv_per_gpu(self, counts) -> Dict[int, int]:
         """``{physical gpu id: MiB that is NOT the rank budget}``, from the
         exact ledger, after printing it and refusing an overcommitted card.
@@ -11102,63 +11234,10 @@ class ServerArgs:
         residual, co-resident tenants) IS charged here, exactly, which is the
         whole difference to the reserve it replaces.
         """
-        from sglang.srt.mem_ledger.calibration import load_calibration
         from sglang.srt.mem_ledger.contract import enforce_boot_contract
-        from sglang.srt.mem_ledger.engine import (
-            CardFacts,
-            DemandInputs,
-            build_card_ledgers,
-            demand_outside_budget_mib,
-        )
+        from sglang.srt.mem_ledger.engine import demand_outside_budget_mib
 
-        rank_gpu_id = list(self.rank_gpu_id)
-        cards_by_ordinal = _resolve_rank_gpu_cards(rank_gpu_id)
-        cards = [
-            CardFacts(
-                gpu_id=ordinal,
-                uuid=card.uuid,
-                name=card.name,
-                total_mib=card.total_mib,
-            )
-            for ordinal, card in sorted(cards_by_ordinal.items())
-        ]
-        gpu_total_mib = {c.gpu_id: c.total_mib for c in cards}
-        user_reserve = self.user_reserve_mib_per_gpu(rank_gpu_id)
-
-        inputs = DemandInputs.from_server_args(
-            self,
-            rank_gpu_id=rank_gpu_id,
-            gpu_total_mib=gpu_total_mib,
-            # Not a placeholder: see the docstring. The residual is labelled
-            # "rank budget", so these bytes are accounted for, not dropped.
-            weight_mib_per_rank=[0] * len(rank_gpu_id),
-            # Without this the phase-footprint lookup has no card identity and
-            # every activation term resolves to "uncalibrated", i.e. every boot
-            # refuses. Found by the boot-path smoke, not by review.
-            card_uuid_by_gpu={c.gpu_id: c.uuid for c in cards},
-        )
-        ledgers = build_card_ledgers(
-            inputs,
-            cards=cards,
-            rank_gpu_id=rank_gpu_id,
-            user_reserve_mib=user_reserve,
-            calibration=load_calibration(),
-        )
-        ledgers = [
-            dataclasses.replace(
-                x,
-                residual_label="weight shards + KV pool (residual)",
-                residual_note=(
-                    "total - user reserve - demand. The weight shards are not "
-                    "a term above because their size depends on the shard "
-                    "ratio, which is derived FROM this number; they and the KV "
-                    "pool share this residual, and the profiling step splits "
-                    "it once the ratio exists. Surplus flows here rather than "
-                    "sitting idle"
-                ),
-            )
-            for x in ledgers
-        ]
+        ledgers = self._build_card_ledgers()
         enforce_boot_contract(ledgers)
         out: Dict[int, int] = {}
         for x in ledgers:
@@ -11184,6 +11263,25 @@ class ServerArgs:
         own demand, so the installed reserve, the pinned-reserve advisory
         and the #265 fundability reference cannot drift apart (#313).
         """
+        # #593: prefer the FULL per-card demand -- activation AND capture AND
+        # the workspace/scratch/context terms -- over the per-term
+        # substitution #590 installed here. That substitution replaced a
+        # catch-all heuristic with one honest term and under-reserved the
+        # binding card by ~2.2 GiB, which is the window-7 OOM. All or nothing:
+        # if the ledger cannot price every term it returns None and refuses,
+        # rather than handing back a short number that looks complete.
+        full = self.ledger_full_demand_per_gpu()
+        if full is not None and all(g in full for g in counts):
+            logger.info(
+                "--rank-auto-reserve-mib auto: FULL per-card demand from the "
+                "VRAM ledger %s MiB (activation + measured graph capture + "
+                "ladder + GDN/indexer scratch + attention workspace + "
+                "hardware residual + parent context; weights and the mamba "
+                "pool are funded by the rank budget and excluded here).",
+                {g: full[g] for g in sorted(counts)},
+            )
+            return {g: int(full[g]) for g in counts}
+
         ladder_gpu = self.ladder_reserve_gpu_id()
         # #590: the card identity is what lets the ledger price this GPU's
         # activation instead of the falsified heuristic. Resolved here because

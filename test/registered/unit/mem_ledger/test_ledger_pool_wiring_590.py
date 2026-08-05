@@ -70,6 +70,17 @@ class _Stub:
     def derived_rank_auto_reserve_mib(self, *args, **kwargs):
         return ServerArgs.derived_rank_auto_reserve_mib(self, *args, **kwargs)
 
+    def ledger_full_demand_per_gpu(self):
+        """No full-demand model here, on purpose.
+
+        #593 put the FULL per-card demand in front of this path, and these
+        tests pin the per-term substitution BEHIND it -- which is still the
+        live behaviour whenever the full model refuses or is unavailable (the
+        production tree today). Returning None selects that fallback, so what
+        this file proves stays true of the boots it describes.
+        """
+        return None
+
 
 def runtime_reserve(stub, gpu_mem=20480, card_uuid=None):
     return ServerArgs.runtime_reserve_mib(stub, gpu_mem, card_uuid=card_uuid)
@@ -213,7 +224,6 @@ class TestLegacyPathsAreByteIdentical(unittest.TestCase):
     def test_no_ledger_module_is_silent_heuristic(self):
         stub = _Stub()
         with LedgerModules(absent=True):
-
             with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
                 mib, source = runtime_reserve(stub, card_uuid=CARD)
         self.assertEqual((mib, source), (HEURISTIC_MIB, "heuristic:no-ledger"))
