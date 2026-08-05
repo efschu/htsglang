@@ -73,6 +73,7 @@ __all__ = [
     "TERM_PARENT_CONTEXT",
     "TERM_ATTN_WORKSPACE",
     "BUDGET_FUNDED_TERMS",
+    "TERM_NCCL_BUFFERS",
     "demand_outside_budget_mib",
 ]
 
@@ -85,6 +86,7 @@ TERM_INDEXER_SCRATCH = "DSV4 indexer prefill scratch"
 TERM_MAMBA_POOL = "mamba/GDN state pool"
 TERM_HARDWARE_RESIDUAL = "hardware residual (per process)"
 TERM_PARENT_CONTEXT = "parent/tokenizer CUDA context"
+TERM_NCCL_BUFFERS = "NCCL communicator buffers"
 TERM_ATTN_WORKSPACE = "attention workspaces (capped)"
 
 #: Terms the RANK BUDGET already funds, i.e. terms that live INSIDE
@@ -103,6 +105,27 @@ TERM_ATTN_WORKSPACE = "attention workspaces (capped)"
 #: capture pool and the workspaces are allocated after the KV pool is sized,
 #: and the prefill scratch lands on top of both at runtime.
 BUDGET_FUNDED_TERMS = frozenset({TERM_WEIGHTS, TERM_MAMBA_POOL})
+
+#: trtllm_mla's fixed private workspace. Quoted from
+#: python/sglang/srt/layers/attention/trtllm_mla_backend.py, where
+#: DEFAULT_WORKSPACE_SIZE_MB = 150 and workspace_size = that * 1024 * 1024.
+#: Named here so the ledger row can cite the site instead of appearing to
+#: invent a constant of its own.
+TRTLLM_MLA_WORKSPACE_MIB = 150
+
+#: The backends whose private workspace is a fixed constant. Anything not
+#: here and not flashinfer becomes UNBOUNDED rather than zero.
+_FIXED_BACKEND_WORKSPACE_MIB = {}
+
+#: trtllm_mha's fallback workspace, from
+#: python/sglang/srt/layers/attention/trtllm_mha_backend.py
+#: (DEFAULT_WORKSPACE_SIZE_MB = 512, used unless
+#: SGLANG_FLASHINFER_WORKSPACE_SIZE is set explicitly).
+TRTLLM_MHA_WORKSPACE_MIB = 512
+
+_FIXED_BACKEND_WORKSPACE_MIB.update(
+    {"trtllm_mla": TRTLLM_MLA_WORKSPACE_MIB, "trtllm_mha": TRTLLM_MHA_WORKSPACE_MIB}
+)
 
 #: The stock per-captured-token graph coefficient, from
 #: ``_handle_gpu_memory_settings``. Named rather than inlined so the ledger row
@@ -211,6 +234,19 @@ class DemandInputs:
     #: True when a parent/tokenizer process binds a CUDA context on the cards
     #: (#237/#403). The SIZE of that context is a hardware residual.
     parent_binds_cuda_context: bool = False
+    #: Active attention backend name, e.g. "flashinfer" or "trtllm_mla".
+    #: Production always sets this from ServerArgs; "" means "not stated" and
+    #: keeps the pre-#595 flashinfer-only accounting, so existing callers and
+    #: the rig that runs flashinfer are byte-identical.
+    attention_backend: str = ""
+    #: ``{gpu id: measured NCCL communicator bytes, MiB}``. None until a boot
+    #: measures it -- see TERM_NCCL_BUFFERS for why it cannot be derived.
+    nccl_buffer_mib_per_gpu: Optional[Mapping[int, float]] = None
+    #: What the measurement above is valid FOR: the communicator set this
+    #: launch builds. A measured NCCL figure is only reusable while this is
+    #: unchanged, which is why it is carried with the number instead of being
+    #: keyed on the hardware fingerprint alone.
+    nccl_signature: str = ""
 
     def rank_count(self) -> int:
         return len(self.weight_mib_per_rank)
@@ -708,8 +744,23 @@ def build_card_ledgers(
         # of the #493 rule -- a transient with a binding cap is fundable at the
         # cap, and only there.
         ws_parts: List[str] = []
+        # #595 (b): price the ACTIVE backend's private workspace.
+        #
+        # Every attention backend allocates its own scratch at init, and until
+        # now only flashinfer's was a term. That is not a small omission for a
+        # rig on another backend: trtllm_mla alone takes a fixed 150 MiB
+        # (DEFAULT_WORKSPACE_SIZE_MB, layers/attention/trtllm_mla_backend.py),
+        # which on a 20 GiB card is most of a corridor.
+        #
+        # "" means the caller did not state a backend. That keeps the
+        # pre-#595 accounting for existing callers and for this rig, which
+        # runs flashinfer; production fills it from ServerArgs. A NAMED
+        # backend nobody has priced becomes UNBOUNDED below rather than a
+        # silent zero, because a zero there is indistinguishable from "this
+        # backend allocates nothing" and no backend allocates nothing.
+        backend = (inputs.attention_backend or "").strip().lower()
         ws_mib = 0
-        if inputs.flashinfer_workspace_mib:
+        if backend in ("", "flashinfer") and inputs.flashinfer_workspace_mib:
             ws_mib += inputs.flashinfer_workspace_mib * n_co
             detail = (
                 inputs.flashinfer_workspace_note
@@ -717,6 +768,22 @@ def build_card_ledgers(
                 "(SGLANG_FLASHINFER_WORKSPACE_SIZE)"
             )
             ws_parts.append(f"flashinfer float workspace {detail}")
+        elif backend in _FIXED_BACKEND_WORKSPACE_MIB:
+            fixed = _FIXED_BACKEND_WORKSPACE_MIB[backend]
+            ws_mib += fixed * n_co
+            ws_parts.append(
+                f"{backend} workspace {fixed} MiB/rank "
+                "(DEFAULT_WORKSPACE_SIZE_MB in that backend's module)"
+            )
+        elif backend not in ("", "flashinfer"):
+            unbounded.append(
+                f"{TERM_ATTN_WORKSPACE} on {card.name}: attention backend "
+                f"{backend!r} is active and its private workspace is not "
+                "priced here. Every backend allocates scratch at init; "
+                "charging zero would be a guess that this one does not. Add "
+                "its size to the ledger's backend table (see "
+                "TRTLLM_MLA_WORKSPACE_MIB) or run with flashinfer."
+            )
         if inputs.attn_scratch_budget_mib:
             ws_mib += inputs.attn_scratch_budget_mib * n_co
             ws_parts.append(
@@ -751,6 +818,69 @@ def build_card_ledgers(
             )
 
         # -- hardware residual, CALIBRATED (never a literal) ------------------
+        # #595 (a): NCCL communicator buffers.
+        #
+        # WHY THIS CANNOT BE DERIVED. Nothing in the Python layer sizes them:
+        # a grep for NCCL_BUFFSIZE finds only the Ascend/HCCL equivalents and
+        # a window-register call. libnccl allocates its transport buffers
+        # inside ncclCommInitRank, from NCCL_BUFFSIZE x channels x peers plus
+        # algorithm-specific staging, none of which this process chooses. So
+        # the only honest source is a measurement taken around communicator
+        # init, and until one exists this term is UNBOUNDED -- which makes the
+        # full-demand reserve refuse, correctly, rather than book a zero for
+        # memory that is demonstrably allocated.
+        #
+        # WHY IT IS NOT KEYED ON THE HARDWARE FINGERPRINT ALONE, which is the
+        # design question this term had to answer. The buffers are allocated
+        # per COMMUNICATOR and scale with that communicator's peer count and
+        # channel count, and one launch builds several (TP, DCP, world). Those
+        # come from tp_size/dcp_size/pp_size -- configuration, not hardware --
+        # while the calibration fingerprint covers card set, driver and wheel.
+        # A value keyed on the fingerprint alone would therefore be served
+        # across TP degrees that allocate different amounts, which is the
+        # cross-attribution #589 already cost a window on. Hence the measured
+        # value travels with nccl_signature and is usable only while that is
+        # unchanged. Allocation happens at init and does not grow with
+        # per-call message size, so a POINT value is sound within one
+        # signature; if a measurement ever shows drift within a signature the
+        # term must become a bound instead.
+        #
+        # THIS RIG ALWAYS PAYS IT. Custom all-reduce is disabled for
+        # --rank-gpu-id on heterogeneous cards (different NVML totals) and the
+        # boot falls back to NCCL for TP collectives, as the window-8 log
+        # states. So on exactly the configuration whose reserve keeps coming
+        # up short, these buffers are present and were charged to nothing.
+        nccl_mib = (inputs.nccl_buffer_mib_per_gpu or {}).get(card.gpu_id)
+        if nccl_mib is None:
+            unbounded.append(
+                f"{TERM_NCCL_BUFFERS} on {card.name}: allocated inside "
+                "libnccl at communicator init and never sized by this "
+                "process, so there is nothing to derive. Measure it once for "
+                "this communicator set (VRAM delta around communicator init, "
+                "or the NCCL_DEBUG=INFO alloc lines) and pass it as "
+                "nccl_buffer_mib_per_gpu with its nccl_signature."
+            )
+        else:
+            terms.append(
+                LedgerTerm(
+                    name=TERM_NCCL_BUFFERS,
+                    mib=int(math.ceil(float(nccl_mib))) * n_co,
+                    provenance=Provenance.CALIBRATED,
+                    derivation=(
+                        f"measured on {card.name}: {float(nccl_mib):.0f} MiB "
+                        f"per rank process x {n_co} on this card, for the "
+                        f"communicator set "
+                        f"{inputs.nccl_signature or '<unstated>'}"
+                    ),
+                    inputs=("nccl_buffer_mib_per_gpu", "nccl_signature"),
+                    bounded_by=(
+                        "the measured communicator set; NCCL allocates at "
+                        "init and does not grow with per-call message size"
+                    ),
+                    fingerprint=inputs.nccl_signature,
+                )
+            )
+
         residual = residual_by_uuid.get(card.uuid)
         processes = n_co + (1 if inputs.parent_binds_cuda_context else 0)
         if residual is None:

@@ -49,9 +49,15 @@ UUID_5090 = "GPU-bbbbbbbb-0000-0000-0000-000000000002"
 UUID_3080_B = "GPU-cccccccc-0000-0000-0000-000000000003"
 
 RIG = [
-    DeviceInfo(0, UUID_3080_A, "NVIDIA GeForce RTX 3080", 20480 * MIB, "00000000:01:00.0"),
-    DeviceInfo(1, UUID_5090, "NVIDIA GeForce RTX 5090", 32768 * MIB, "00000000:2D:00.0"),
-    DeviceInfo(2, UUID_3080_B, "NVIDIA GeForce RTX 3080", 20480 * MIB, "00000000:41:00.0"),
+    DeviceInfo(
+        0, UUID_3080_A, "NVIDIA GeForce RTX 3080", 20480 * MIB, "00000000:01:00.0"
+    ),
+    DeviceInfo(
+        1, UUID_5090, "NVIDIA GeForce RTX 5090", 32768 * MIB, "00000000:2D:00.0"
+    ),
+    DeviceInfo(
+        2, UUID_3080_B, "NVIDIA GeForce RTX 3080", 20480 * MIB, "00000000:41:00.0"
+    ),
 ]
 DRIVER = "580.65.06"
 
@@ -112,11 +118,13 @@ def _fake_torch_stats(monkeypatch, state):
         ap,
         "reset_peaks",
         lambda i=0: (
-            fake_reset(i),
-            setattr(ap, "_peak_floor_bytes", int(state["allocated_bytes"])),
-        )[0]
-        if ap.is_armed()
-        else None,
+            (
+                fake_reset(i),
+                setattr(ap, "_peak_floor_bytes", int(state["allocated_bytes"])),
+            )[0]
+            if ap.is_armed()
+            else None
+        ),
     )
     return calls
 
@@ -279,7 +287,10 @@ def test_the_per_rank_fingerprint_is_actually_different(monkeypatch):
     whole = cal.rig_fingerprint()[0]
     per_rank = {
         cal.live_fingerprint(
-            inventory=([{"uuid": d.uuid, "name": d.name, "total_mib": d.total_mib}], DRIVER)
+            inventory=(
+                [{"uuid": d.uuid, "name": d.name, "total_mib": d.total_mib}],
+                DRIVER,
+            )
         )[0]
         for d in RIG
     }
