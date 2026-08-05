@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     is_shm_available,
     is_xpu,
 )
+from sglang.srt.distributed.collective_census import census, census_enabled
 from sglang.srt.utils.collective_clock import collective_clock
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
@@ -90,6 +91,11 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # except the ones the per-rank prefill line already times, so the cost on all
 # other collectives is the `armed` attribute read below.
 _COLLECTIVE_CLOCK = collective_clock()
+
+# #583 collective census: resolved once at import so the hot-path guard is a
+# module-global bool read, not an environment lookup per collective.
+_CENSUS = census()
+_CENSUS_ON = census_enabled()
 
 
 def collective_clock_families(group_name: str) -> Tuple[str, str, str, str]:
@@ -1147,6 +1153,12 @@ class GroupCoordinator:
             with _COLLECTIVE_CLOCK.span(self._clock_family_all_reduce):
                 return self.all_reduce(input_)
 
+        # #583 collective census. Placed AFTER the clock's re-entry guard so
+        # every collective is counted exactly once: the armed path re-enters
+        # with the clock disarmed and falls through to here.
+        if _CENSUS_ON:
+            _CENSUS.bump(self._clock_family_all_reduce)
+
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
@@ -1577,6 +1589,8 @@ class GroupCoordinator:
             # See all_reduce for why this re-enters.
             with _COLLECTIVE_CLOCK.span(self._clock_family_reduce_scatterv):
                 return self.reduce_scatterv(input_, output=output, sizes=sizes)
+        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+            _CENSUS.bump(self._clock_family_reduce_scatterv)
         if self.barlink_comm is not None:
             self._barlink_unsupported("reduce_scatterv")
         world_size = self.world_size
@@ -1715,6 +1729,8 @@ class GroupCoordinator:
                 return self.all_gather(
                     input_, dim=dim, output_tensor_list=output_tensor_list
                 )
+        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+            _CENSUS.bump(self._clock_family_all_gather)
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -1808,6 +1824,8 @@ class GroupCoordinator:
             # See all_reduce for why this re-enters.
             with _COLLECTIVE_CLOCK.span(self._clock_family_all_gatherv):
                 return self.all_gatherv(input_, sizes=sizes, output=output)
+        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+            _CENSUS.bump(self._clock_family_all_gatherv)
         if self.barlink_comm is not None:
             self._barlink_unsupported("all_gatherv")
         world_size = self.world_size
