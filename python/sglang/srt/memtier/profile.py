@@ -596,13 +596,82 @@ def collect_local_facts(
     )
 
 
-def _host_memory_bytes() -> Tuple[Optional[int], Optional[int]]:
-    """``(MemTotal, MemAvailable)`` in bytes, or ``(None, None)``.
+def honest_host_memory_bytes(
+    meminfo_total: Optional[int],
+    meminfo_available: Optional[int],
+    cgroup_max: Optional[int],
+    cgroup_anon: Optional[int],
+    cgroup_kernel: Optional[int],
+) -> Tuple[Optional[int], Optional[int]]:
+    """``(total, available)`` a PINNED allocation may believe, or ``(None, None)``.
 
-    ``/proc/meminfo`` rather than ``psutil`` on purpose: DESIGN_407 §2.9 counts
-    eight unrelated ``psutil.virtual_memory()`` call sites with no owner, and
-    this module is meant to become that owner rather than the ninth.
+    WHY THIS IS NOT JUST ``/proc/meminfo``. Inside a container ``/proc/meminfo``
+    is synthesised by lxcfs and is not a description of what this process may
+    have. Two ways it lies, both observed on this rig:
+
+    * ``MemAvailable`` can EXCEED ``MemTotal`` -- an arithmetic impossibility on
+      a real machine, so any guard comparing a request against it is comparing
+      against a number that does not denote anything;
+    * with ``memory.max`` unlimited it reports the HOST's figures, which
+      over-promise on a box whose RAM other containers are also spending.
+
+    ``/sys/fs/cgroup`` is the honest source: ``memory.max`` is the hard ceiling
+    this process group will be killed at, and ``memory.stat``'s ``anon`` is what
+    is genuinely resident and unreclaimable, as opposed to ``file`` (page cache),
+    which a pinning allocation can reclaim.
+
+    The rules, in order:
+
+    1. A FINITE ``memory.max`` is the ceiling, whatever ``/proc/meminfo`` says
+       (and never above ``MemTotal`` when that is known and smaller -- the
+       kernel cannot hand out RAM the machine does not have). Available is that
+       ceiling minus what is anonymously resident and minus kernel memory; page
+       cache is deliberately NOT subtracted, since it is reclaimable and
+       subtracting it would refuse boots that would have succeeded.
+    2. With no finite limit, ``MemTotal`` is the ceiling and ``MemAvailable``
+       the estimate -- but CLAMPED to the ceiling, which is the whole fix for
+       the impossible reading, and clamped again by the cgroup's own resident
+       accounting when it is readable, so the number never promises memory this
+       cgroup has already spent.
+    3. Anything that cannot be established stays ``None`` rather than being
+       guessed. A caller that cannot get a number must say so, not invent one.
+
+    Pure: every input is passed in, so the decision is testable without a
+    container, a cgroup, or a particular machine.
     """
+    total: Optional[int] = None
+    if cgroup_max is not None and cgroup_max > 0:
+        total = cgroup_max
+        if meminfo_total is not None and meminfo_total > 0:
+            total = min(total, meminfo_total)
+    elif meminfo_total is not None and meminfo_total > 0:
+        total = meminfo_total
+    if total is None:
+        return None, None
+
+    resident = 0
+    have_resident = False
+    for part in (cgroup_anon, cgroup_kernel):
+        if part is not None and part >= 0:
+            resident += int(part)
+            have_resident = True
+
+    if cgroup_max is not None and cgroup_max > 0:
+        if not have_resident:
+            # A ceiling with no usage accounting tells us nothing about how much
+            # of it is still free; refuse to guess.
+            return total, None
+        return total, max(0, total - resident)
+
+    if meminfo_available is None:
+        return total, (max(0, total - resident) if have_resident else None)
+    available = min(int(meminfo_available), total)
+    if have_resident:
+        available = min(available, max(0, total - resident))
+    return total, max(0, available)
+
+
+def _read_meminfo() -> Tuple[Optional[int], Optional[int]]:
     values: Dict[str, int] = {}
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as handle:
@@ -613,6 +682,69 @@ def _host_memory_bytes() -> Tuple[Optional[int], Optional[int]]:
     except OSError:
         return None, None
     return values.get("MemTotal"), values.get("MemAvailable")
+
+
+def _read_cgroup_memory() -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """``(memory.max, anon, kernel)`` from cgroup v2, any of them ``None``.
+
+    ``memory.max`` reads ``"max"`` when unlimited, which becomes ``None`` here:
+    "no ceiling I can name" rather than a number. cgroup v1 and a missing
+    cgroupfs both fall out as all-``None``, so the caller degrades to
+    ``/proc/meminfo`` on those.
+    """
+    root = "/sys/fs/cgroup"
+    limit: Optional[int] = None
+    try:
+        with open(f"{root}/memory.max", "r", encoding="utf-8") as handle:
+            raw = handle.read().strip()
+        limit = None if raw == "max" else int(raw)
+    except (OSError, ValueError):
+        limit = None
+    anon: Optional[int] = None
+    kernel: Optional[int] = None
+    try:
+        with open(f"{root}/memory.stat", "r", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, rest = line.partition(" ")
+                if key == "anon":
+                    anon = int(rest.strip())
+                elif key == "kernel":
+                    kernel = int(rest.strip())
+    except (OSError, ValueError):
+        pass
+    return limit, anon, kernel
+
+
+def host_memory_bytes_for_pinning() -> Tuple[Optional[int], Optional[int]]:
+    """Public name for :func:`_host_memory_bytes`.
+
+    The #407 charter makes this module the OWNER of the host-memory number, so
+    consumers that must size a PINNED pool ask here instead of adding another
+    ``psutil.virtual_memory()`` call site. It is deliberately the whole pair --
+    a caller that only wants "available" still has to look at the ceiling it is
+    a fraction of.
+    """
+    return _host_memory_bytes()
+
+
+def _host_memory_bytes() -> Tuple[Optional[int], Optional[int]]:
+    """``(total, available)`` in bytes, or ``(None, None)``.
+
+    ``/proc/meminfo`` plus ``/sys/fs/cgroup`` rather than ``psutil`` on purpose:
+    DESIGN_407 §2.9 counts eight unrelated ``psutil.virtual_memory()`` call
+    sites with no owner, and this module is meant to become that owner rather
+    than the ninth. :func:`honest_host_memory_bytes` carries the reasoning for
+    why the cgroup has to be consulted at all.
+    """
+    meminfo_total, meminfo_available = _read_meminfo()
+    cgroup_max, cgroup_anon, cgroup_kernel = _read_cgroup_memory()
+    return honest_host_memory_bytes(
+        meminfo_total,
+        meminfo_available,
+        cgroup_max,
+        cgroup_anon,
+        cgroup_kernel,
+    )
 
 
 def nvml_card_facts() -> Tuple[CardFact, ...]:

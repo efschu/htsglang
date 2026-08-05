@@ -41,6 +41,8 @@ from sglang.srt.memtier.profile import (
     bind_device_tiers,
     bundled_profile,
     collect_local_facts,
+    honest_host_memory_bytes,
+    host_memory_bytes_for_pinning,
     load_profile,
     profile_from_json,
 )
@@ -387,6 +389,110 @@ class LocalFactsTest(unittest.TestCase):
         self.assertEqual(len(facts.filesystems), 1)
         self.assertGreater(facts.filesystems[0].total_bytes, 0)
         self.assertEqual(facts.cards, ())
+
+
+GIB = 1024**3
+
+
+class TestHonestHostMemory(unittest.TestCase):
+    """#551: the host-memory number a PINNED pool is sized against must not
+    come from a source that can state an impossibility.
+
+    Inside a container ``/proc/meminfo`` is synthesised by lxcfs and does not
+    describe what this process may have. Two lies, both seen on this rig:
+    ``MemAvailable`` can EXCEED ``MemTotal`` -- an arithmetic impossibility, so
+    a guard comparing a request against it compares against a number that
+    denotes nothing -- and with ``memory.max`` unlimited it reports the HOST's
+    figures on a box other containers are also spending. ``/sys/fs/cgroup`` is
+    the honest source. That matters here and not merely in principle, because
+    an over-commit of PINNED memory is the OOM killer choosing a victim, not a
+    swap.
+
+    Every input is passed in, so none of this asserts anything about the
+    machine the test runs on (directive #434).
+
+    CAN-FAIL: drop the clamp in ``honest_host_memory_bytes`` and
+    ``test_the_impossible_meminfo_reading_is_clamped`` goes red; prefer
+    ``/proc/meminfo`` over a finite ``memory.max`` and
+    ``test_a_finite_cgroup_limit_wins`` goes red.
+    """
+
+    def test_the_impossible_meminfo_reading_is_clamped(self):
+        """MemAvailable > MemTotal, no cgroup limit: the observed lxcfs bug."""
+        total, available = honest_host_memory_bytes(
+            meminfo_total=120 * GIB,
+            meminfo_available=125 * GIB,  # impossible on a real machine
+            cgroup_max=None,
+            cgroup_anon=None,
+            cgroup_kernel=None,
+        )
+        self.assertEqual(total, 120 * GIB)
+        self.assertEqual(available, 120 * GIB)
+        self.assertLessEqual(available, total)
+
+    def test_a_finite_cgroup_limit_wins_over_meminfo(self):
+        """The ceiling this process group is killed at beats the host's."""
+        total, available = honest_host_memory_bytes(
+            meminfo_total=120 * GIB,
+            meminfo_available=118 * GIB,
+            cgroup_max=32 * GIB,
+            cgroup_anon=2 * GIB,
+            cgroup_kernel=1 * GIB,
+        )
+        self.assertEqual(total, 32 * GIB)
+        # page cache is reclaimable and deliberately NOT subtracted
+        self.assertEqual(available, 29 * GIB)
+
+    def test_a_limit_above_the_machine_is_capped_by_the_machine(self):
+        total, _ = honest_host_memory_bytes(
+            meminfo_total=64 * GIB,
+            meminfo_available=60 * GIB,
+            cgroup_max=1024 * GIB,
+            cgroup_anon=0,
+            cgroup_kernel=0,
+        )
+        self.assertEqual(total, 64 * GIB)
+
+    def test_resident_accounting_also_bounds_the_unlimited_case(self):
+        """No ceiling, but the cgroup knows what it already spent."""
+        _total, available = honest_host_memory_bytes(
+            meminfo_total=120 * GIB,
+            meminfo_available=118 * GIB,
+            cgroup_max=None,
+            cgroup_anon=100 * GIB,
+            cgroup_kernel=2 * GIB,
+        )
+        self.assertEqual(available, 18 * GIB)
+
+    def test_an_unestablishable_number_stays_none(self):
+        """A caller that cannot get a number must be told so, not handed a
+        guess -- the guard then skips rather than refusing a good boot."""
+        self.assertEqual(
+            honest_host_memory_bytes(None, None, None, None, None), (None, None)
+        )
+        # a ceiling with no usage accounting says nothing about what is free
+        self.assertEqual(
+            honest_host_memory_bytes(None, None, 32 * GIB, None, None),
+            (32 * GIB, None),
+        )
+
+    def test_available_is_never_negative(self):
+        _total, available = honest_host_memory_bytes(
+            meminfo_total=8 * GIB,
+            meminfo_available=8 * GIB,
+            cgroup_max=8 * GIB,
+            cgroup_anon=9 * GIB,  # over the ceiling: accounting skew
+            cgroup_kernel=1 * GIB,
+        )
+        self.assertEqual(available, 0)
+
+    def test_the_live_path_runs_on_this_machine(self):
+        """Executes the real reader -- the guard against desk-written code."""
+        total, available = host_memory_bytes_for_pinning()
+        self.assertIsNotNone(total)
+        self.assertGreater(total, 0)
+        if available is not None:
+            self.assertLessEqual(available, total)
 
 
 if __name__ == "__main__":

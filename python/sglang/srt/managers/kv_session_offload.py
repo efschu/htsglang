@@ -5746,6 +5746,28 @@ class KVSessionOffloadManager:
             slot.region,
         )
 
+    def live_offload_reqs(self):
+        """Every LIVE session this manager owns outside the running batch:
+        host-resident spills AND #224-parked ones.
+
+        ``self.spills`` alone is not that set -- ``_commit_park`` pops a parked
+        session out of it while the session stays alive and keeps its req-pool
+        slot, its radix tree lock and its GDN/Mamba state slot. A consumer that
+        enumerates through ``spills`` therefore sees a parked session as
+        ABSENT, and "absent" is indistinguishable from "gone" unless the
+        consumer knows to ask here. That mistake is not hypothetical: the #364
+        GDN slot ladder treats an id it cannot find as a dead session and drops
+        its exported state blob.
+
+        Rank-uniform: park and spill decisions are replicated, so every rank
+        enumerates the same sessions in the same iteration."""
+        reqs = [slot.req for slot in self.spills.values() if slot.req is not None]
+        if getattr(self, "_dest", None) is not None:
+            from sglang.srt.managers.kv_session_spill_destination import parked_reqs
+
+            reqs.extend(parked_reqs(self))
+        return reqs
+
     def inflight_batches(self):
         """For abort scanning: every spilled session is running too (also in
         the window between spill and first tick, before a batch exists)."""

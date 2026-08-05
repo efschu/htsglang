@@ -1652,6 +1652,30 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Absent-means-dead family (#551): an inventory built from one container, and a
+consumer that reads "not in the inventory" as "gone". The #364 GDN slot ladder
+enumerated live offload sessions through `kv_session_offload.spills`, and
+`GdnSlotRuntime.on_round` drops the exported state blob of any parked id it
+cannot find ("a parked session that died while parked leaves a blob nobody will
+ever ask for"). But `_commit_park` POPS a #224-parked session out of `spills`
+while the session stays alive and keeps its req-pool slot, its radix lock and
+its Mamba/GDN state slot. So a session whose GDN state had been exported, and
+which then parked its KV to the next tier, had that blob discarded; it later
+unparks, restores its KV, resumes, and continues with recurrent state that no
+longer exists -- no crash, no log, wrong tokens. The comment was not wrong, its
+PREMISE was: absence meant "dead" only while every live session was in
+`spills`. Fixed with `KVSessionOffloadManager.live_offload_reqs()` (spilled AND
+parked) as the single enumeration, mirroring what `inflight_batches` already
+had to do for abort scanning -- a second consumer making the same mistake is
+the signal that the container, not the consumer, was the wrong abstraction. The
+rule: when a lifecycle can move an object between containers, "enumerate the
+live set" must be a method on the owner, never a field read at the call site;
+and any code that deletes on absence has to name which container's absence it
+means. Note the neighbouring `inflight_batches` had ALREADY been taught about
+parked sessions for abort scanning -- so the knowledge existed in the module
+and the second consumer simply never received it, which is what a missing
+accessor costs.
+
 Unreachable-interop family (#547): interop code written FOR a pair the boot
 refuses is not interop, it is a claim. `force_host_write_through` (#242) exists
 so a kv-session-offload budget demotion hands its prefix over losslessly under

@@ -1335,12 +1335,25 @@ def park_instead_of_demote(mgr, slot) -> bool:
     return True
 
 
+def parked_reqs(mgr) -> List[Any]:
+    """The requests of currently PARKED sessions.
+
+    A parked session is live and still owns device-side bookkeeping -- its
+    req-pool slot, its radix tree lock and, notably, its GDN/Mamba state slot
+    -- but ``_commit_park`` popped it out of ``mgr.spills``, so anything that
+    enumerates live offload sessions through ``spills`` alone does not see it.
+    Every such consumer must go through here (or through
+    :meth:`KVSessionOffloadManager.live_offload_reqs`) instead.
+    """
+    ctl: Optional[SpillDestinationController] = mgr._dest
+    if ctl is None:
+        return []
+    return [rec.slot.req for rec in ctl.parked.values()]
+
+
 def parked_inflight_entries(mgr) -> List[Any]:
     """Parked sessions for the manager's abort scanning (they are in no
     real batch while parked)."""
     from types import SimpleNamespace
 
-    ctl: Optional[SpillDestinationController] = mgr._dest
-    if ctl is None:
-        return []
-    return [SimpleNamespace(reqs=[rec.slot.req]) for rec in ctl.parked.values()]
+    return [SimpleNamespace(reqs=[req]) for req in parked_reqs(mgr)]
