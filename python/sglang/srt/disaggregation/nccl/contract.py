@@ -280,14 +280,34 @@ def identity_from_args(server_args: Any, kv_args: Any) -> TransportIdentity:
             row_ownership = (int(bounds[0]), int(bounds[1]), int(bounds[2]))
     except Exception:  # noqa: BLE001 - absent plan/module is "not sharded"
         row_ownership = None
+    # Contractually required geometry: PD transfers break silently with 0 if
+    # these are missing. A zero total_kv_head_num means the destination cannot
+    # reconstruct the head layout, so a missing field is a configuration error,
+    # not a "0 is fine" fallback.
+    _tk = getattr(kv_args, "total_kv_head_num", None)
+    if _tk is None:
+        raise ValueError(
+            "kv_args is missing 'total_kv_head_num': the model was not "
+            "configured with KV head count, and PD cannot build a valid "
+            "transport identity. Ensure the model loader populates this "
+            "field on the KVArgs object."
+        )
+    _hd = getattr(kv_args, "head_dim", None)
+    if _hd is None:
+        raise ValueError(
+            "kv_args is missing 'head_dim': the model was not configured "
+            "with head dimension, and PD cannot build a valid transport "
+            "identity. Ensure the model loader populates this field on "
+            "the KVArgs object."
+        )
     return TransportIdentity(
         model_identity_hash=compute_model_identity_hash(server_args),
         kv_dtype=str(getattr(server_args, "kv_cache_dtype", "auto") or "auto").lower(),
         page_size=int(getattr(server_args, "page_size", 1) or 1),
         tp_size=int(getattr(server_args, "tp_size", 1) or 1),
         pp_size=int(getattr(server_args, "pp_size", 1) or 1),
-        total_kv_head_num=int(getattr(kv_args, "total_kv_head_num", 0) or 0),
-        head_dim=int(getattr(kv_args, "head_dim", 0) or 0),
+        total_kv_head_num=int(_tk),
+        head_dim=int(_hd),
         state_types=state_types,
         dcp_size=dcp_size,
         row_ownership=row_ownership,

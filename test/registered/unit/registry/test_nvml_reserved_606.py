@@ -296,3 +296,30 @@ class TestOwnVramGateUsedKnown(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# FIX blast-radius: http_api.py reserved_bytes default 0 → None
+# ---------------------------------------------------------------------------
+
+
+class TestHttpApiReservedBytesNone(unittest.TestCase):
+    """The http_api.py caller now passes ``None`` instead of ``0`` for missing
+    reserved_bytes. The ``coerce_bytes`` function in rungs.py handles ``None``
+    the same way as ``0`` (both map to 0), so the functional behaviour does not
+    change -- but the semantic distinction is preserved."""
+
+    def test_coerce_bytes_handles_none_same_as_zero(self):
+        """Regression: coerce_bytes(None) must equal coerce_bytes(0)."""
+        from sglang.srt.registry.rungs import coerce_bytes
+
+        self.assertEqual(coerce_bytes(None), coerce_bytes(0))
+        self.assertEqual(coerce_bytes(None), 0)
+
+    def test_rung_of_accepts_none_reserved_bytes(self):
+        """rung_of must not crash when reserved_bytes is None."""
+        from sglang.srt.registry.rungs import rung_of
+
+        result = rung_of("COLD", ever_staged=False, reserved_bytes=None)
+        # With None/0 and ever_staged=False, the engine is REGISTERED.
+        self.assertEqual(result, "REGISTERED")
