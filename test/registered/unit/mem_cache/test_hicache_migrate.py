@@ -25,7 +25,8 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.hicache_migrate import (
+from sglang.srt.mem_cache.hicache_migrate import (  # noqa: I001
+    store_path,
     MambaBlobSpec,
     StoreEntry,
     conv_extents,
@@ -95,6 +96,18 @@ def _mamba_blob(spec: MambaBlobSpec) -> bytes:
     n = spec.total_bytes // 2
     t = torch.arange(n, dtype=torch.int32).to(torch.int16)
     return t.numpy().tobytes()
+
+
+def _store_names(directory):
+    """Every page file name under ``directory``, shard subdirectories included."""
+    names = []
+    for entry in os.listdir(directory):
+        path = os.path.join(directory, entry)
+        if os.path.isdir(path):
+            names.extend(os.listdir(path))
+        elif entry.endswith(".bin"):
+            names.append(entry)
+    return names
 
 
 class TestStoreFilenameAlgebra(unittest.TestCase):
@@ -196,14 +209,14 @@ class TestMigrationIsAPermutation(unittest.TestCase):
             execute_plan(plan)
             for name, data in kv_bytes.items():
                 key = name.split("_")[0]
-                out = os.path.join(dst, f"{key}_{_SUFFIX}.bin")
+                out = store_path(dst, f"{key}_{_SUFFIX}.bin")
                 self.assertTrue(os.path.exists(out), out)
                 with open(out, "rb") as f:
                     self.assertEqual(f.read(), data)
                 # Exactly one shared KV file per page, no per-rank copies.
                 for r in range(3):
                     self.assertFalse(
-                        os.path.exists(os.path.join(dst, f"{key}_{_SUFFIX}_{r}_3.bin"))
+                        os.path.exists(store_path(dst, f"{key}_{_SUFFIX}_{r}_3.bin"))
                     )
 
     def test_mamba_shards_partition_the_source_bytes_exactly(self):
@@ -227,7 +240,7 @@ class TestMigrationIsAPermutation(unittest.TestCase):
             covered = bytearray(_SPEC.total_bytes)
             seen = bytearray(_SPEC.total_bytes)
             for rank in range(3):
-                out = os.path.join(dst, f"deadbeef.mamba_{_SUFFIX}_{rank}_3.bin")
+                out = store_path(dst, f"deadbeef.mamba_{_SUFFIX}_{rank}_3.bin")
                 with open(out, "rb") as f:
                     got = f.read()
                 extents = temporal_extents(_SPEC, ratios, rank) + conv_extents(
@@ -265,7 +278,7 @@ class TestMigrationIsAPermutation(unittest.TestCase):
                 # independently computed (heads, conv_dim) pair.
                 self.assertEqual(shard.num_heads, heads)
                 self.assertEqual(shard.conv_dim, conv)
-                out = os.path.join(dst, f"deadbeef.mamba_{_SUFFIX}_{rank}_3.bin")
+                out = store_path(dst, f"deadbeef.mamba_{_SUFFIX}_{rank}_3.bin")
                 self.assertEqual(os.path.getsize(out), shard.total_bytes)
 
     def test_draft_pages_are_skipped_not_migrated(self):
@@ -423,12 +436,12 @@ class TestRoundTrip(unittest.TestCase):
             rev = verify_plan(back)
 
             self.assertEqual(
-                sorted(os.listdir(c)),
+                sorted(_store_names(c)),
                 sorted(original),
                 "round trip did not reproduce the original key set",
             )
             for name, data in original.items():
-                with open(os.path.join(c, name), "rb") as f:
+                with open(store_path(c, name), "rb") as f:
                     self.assertEqual(
                         f.read(), data, f"{name} is not byte-identical after the trip"
                     )
@@ -487,14 +500,14 @@ class TestReverseMigration(unittest.TestCase):
             execute_plan(plan)
             for i in range(4):
                 self.assertTrue(
-                    os.path.exists(os.path.join(c, f"{i:016x}_{_SUFFIX}_0_1.bin")),
+                    os.path.exists(store_path(c, f"{i:016x}_{_SUFFIX}_0_1.bin")),
                     "a TP=1 boot looks for the _0_1 suffix",
                 )
 
     def test_missing_rank_blob_is_fatal_not_a_partial_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, b = self._tp3_store(tmp)
-            os.remove(os.path.join(b, f"deadbeef.mamba_{_SUFFIX}_2_3.bin"))
+            os.remove(store_path(b, f"deadbeef.mamba_{_SUFFIX}_2_3.bin"))
             with self.assertRaises(ValueError) as cm:
                 plan_reverse_migration(
                     scan_store(b),
@@ -576,7 +589,7 @@ class TestReverseMigration(unittest.TestCase):
             )
             execute_plan(plan)
             verify_plan(plan)
-            target = os.path.join(c, f"deadbeef.mamba_{_SUFFIX}_0_1.bin")
+            target = store_path(c, f"deadbeef.mamba_{_SUFFIX}_0_1.bin")
             with open(target, "r+b") as f:
                 f.seek(_SPEC.total_bytes // 2)
                 f.write(b"\xff")

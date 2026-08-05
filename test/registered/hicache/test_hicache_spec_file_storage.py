@@ -38,10 +38,13 @@ class TestHiCacheSpecFileStorage(HiCacheSpecStorageMixin, CustomTestCase):
 
     @classmethod
     def _count_file_storage_pages(cls):
-        try:
-            filenames = os.listdir(cls.temp_dir)
-        except FileNotFoundError:
-            return 0, 0
+        # The file backend writes into 2-hex shard subdirectories (#558), so
+        # count recursively; a store written by an older build is still flat.
+        filenames = [
+            name
+            for _dirpath, _dirnames, names in os.walk(cls.temp_dir)
+            for name in names
+        ]
 
         target_pages = 0
         draft_pages = 0

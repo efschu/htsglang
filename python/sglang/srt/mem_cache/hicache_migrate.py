@@ -174,10 +174,35 @@ def parse_store_filename(path: str, size: int = 0) -> Optional[StoreEntry]:
     )
 
 
+def store_path(directory: str, name: str) -> str:
+    """Where a store file called ``name`` belongs under ``directory``.
+
+    The backend writes pages into 2-hex-prefix shard subdirectories (#558), so
+    a migration must produce that layout too -- otherwise the handover output
+    lands flat and the next boot pays the flat-directory cost this store was
+    sharded to avoid. ``HiCacheFile`` owns the rule; import it rather than
+    restate it, so the two layouts cannot drift apart.
+    """
+    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
+    return os.path.join(directory, HiCacheFile._shard_of(name), name)
+
+
 def scan_store(directory: str) -> List[StoreEntry]:
+    """Every page file under ``directory``: sharded, flat, or a mix of both.
+
+    Stores written before sharding are flat, and read-through means a live
+    store can hold both layouts at once.
+    """
     entries = []
+    paths = []
     for name in sorted(os.listdir(directory)):
         p = os.path.join(directory, name)
+        if os.path.isdir(p):
+            paths.extend(os.path.join(p, sub) for sub in sorted(os.listdir(p)))
+        else:
+            paths.append(p)
+    for p in paths:
         if not os.path.isfile(p):
             continue
         e = parse_store_filename(p, os.path.getsize(p))
@@ -535,7 +560,7 @@ def plan_migration(
         if e.is_kv:
             for rank in range(target_tp_size):
                 name = target_kv_name(e, base, dcp_owner_mode, rank, target_tp_size)
-                plan.append((os.path.join(target_dir, name), [(e.path, 0, e.size)]))
+                plan.append((store_path(target_dir, name), [(e.path, 0, e.size)]))
                 if dcp_owner_mode:
                     # One shared file for every rank; emitting it once is the
                     # whole point of the rank-less key.
@@ -564,7 +589,7 @@ def plan_migration(
                     )
                 ]
                 name = target_mamba_name(e, base, rank, target_tp_size)
-                plan.append((os.path.join(target_dir, name), extents))
+                plan.append((store_path(target_dir, name), extents))
             continue
         if e.pool == DRAFT_POOL:
             if draft_spec is None and not draft_key_rewrite:
@@ -581,7 +606,7 @@ def plan_migration(
                 for rank in range(target_tp_size):
                     name = target_draft_name(e, base, rank, target_tp_size)
                     plan.append(
-                        (os.path.join(target_dir, name), [(e.path, 0, e.size)])
+                        (store_path(target_dir, name), [(e.path, 0, e.size)])
                     )
                 continue
             if e.size != draft_spec.total_bytes:
@@ -601,7 +626,7 @@ def plan_migration(
                     for off, length in draft_extents(draft_spec, target_ratios, rank)
                 ]
                 name = target_draft_name(e, base, rank, target_tp_size)
-                plan.append((os.path.join(target_dir, name), extents))
+                plan.append((store_path(target_dir, name), extents))
             continue
         raise ValueError(
             f"unhandled component pool '{e.pool}' in {os.path.basename(e.path)}"
@@ -667,7 +692,7 @@ def plan_reverse_migration(
             name = target_kv_name(
                 e, e.suffix_rest, target_dcp_owner_mode, target_tp_rank, target_tp_size
             )
-            plan.append((os.path.join(target_dir, name), [(e.path, 0, e.size)]))
+            plan.append((store_path(target_dir, name), [(e.path, 0, e.size)]))
             continue
         if e.pool == MAMBA_POOL:
             if mamba_spec is None:
@@ -728,7 +753,7 @@ def plan_reverse_migration(
             )
         extents = [(group[rank].path, off, length) for rank, off, length in layout]
         name = target_mamba_name(group[0], base, target_tp_rank, target_tp_size)
-        plan.append((os.path.join(target_dir, name), extents))
+        plan.append((store_path(target_dir, name), extents))
 
     if draft_groups:
         from sglang.srt.mem_cache.draft_migrate import draft_reverse_extents
@@ -769,7 +794,7 @@ def plan_reverse_migration(
                     )
                 plan.append(
                     (
-                        os.path.join(target_dir, name),
+                        store_path(target_dir, name),
                         [(group[0].path, 0, group[0].size)],
                     )
                 )
@@ -788,7 +813,7 @@ def plan_reverse_migration(
                 (group[rank].path, off, length)
                 for rank, off, length in draft_layout
             ]
-            plan.append((os.path.join(target_dir, name), extents))
+            plan.append((store_path(target_dir, name), extents))
     return plan
 
 
@@ -813,9 +838,10 @@ def _rank_of(entry: StoreEntry, tp_size: int) -> int:
 def execute_plan(plan: MigrationPlan, *, chunk: int = 1 << 22) -> Dict[str, int]:
     """Materialize the plan. Pure byte copies; a single-extent whole-file entry
     is copied as a file so KV migration stays a cheap rename-equivalent."""
-    os.makedirs(os.path.dirname(plan[0][0]), exist_ok=True) if plan else None
     stats = {"files": 0, "bytes": 0}
     for target, extents in plan:
+        # One directory per shard, so create each target's own parent.
+        os.makedirs(os.path.dirname(target), exist_ok=True)
         if len(extents) == 1 and extents[0][1] == 0:
             src, _, length = extents[0]
             if length == os.path.getsize(src):
