@@ -88,6 +88,15 @@ t0=$(date +%s)
 t1=$(date +%s)
 if [ $((t1 - t0)) -le 12 ]; then ok "ready returned in $((t1 - t0))s (bounded)"; else bad "ready hung $((t1 - t0))s"; fi
 
+echo "== 5b. run_arm.sh refuses to touch a card without the locks =="
+# Can-fail by construction: this must REFUSE here, because the smoke runs with
+# no locks held. If it ever passes, the guard is gone.
+if bash "$HERE/run_arm.sh" K1 H1 2>&1 | grep -q 'REFUSING'; then
+    ok "run_arm refuses without card locks"
+else
+    bad "run_arm did NOT refuse without card locks"
+fi
+
 echo "== 6. every recipe through the REAL server-args validator =="
 # This is the point of the whole file: find out which recipes the code refuses
 # BEFORE the window, and record the refusal text as a matrix result.

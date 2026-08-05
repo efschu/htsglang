@@ -31,6 +31,10 @@ export PYTHONPATH="$WT/python"
 export SGLANG_UNEVEN_DCP=1
 export SGLANG_UNEVEN_DCP_WEIGHTED=1
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+# Diagnostic-only and explicitly byte-identical when the adaptive regulator is
+# off (kv_session_offload.py:520-528). It is the ONLY per-tick observable of a
+# spilled session's host tail draining, so every kvso arm arms it.
+export SGLANG_KVSO_TICK_TRACE=${SGLANG_KVSO_TICK_TRACE:-1}
 
 # --- common spine (shared by every recipe) --------------------------------
 # Matches production on: model, TP=3 + rank-gpu-id, auto-performance ratio,
@@ -40,7 +44,7 @@ COMMON=(
     --served-model-name Qwen3.6-27B
     --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance
     --rank-auto-reserve-mib 5500,3800,3800
-    --kv-cache-dtype fp8_e4m3 --context-length 262144
+    --kv-cache-dtype fp8_e4m3 --context-length "${CTX:-262144}"
     --max-running-requests 4
     --enable-metrics --trust-remote-code
     --host 127.0.0.1 --port "$PORT"
@@ -54,10 +58,16 @@ PRESSURE=(--max-total-tokens "$MTT")
 # kvso spine. NOTE: no --enable-hierarchical-cache anywhere in the K recipes --
 # server_args.py:6679 refuses the pair outright (matrix S1). This is why the
 # HOT arm cannot reuse the production recipe.
+# NOTE on the host RAM budget: it is a PHYSICAL CEILING that silently caps the
+# effective max_spills. Measured in K1: --context-length 262144 with 16 GiB
+# yields a 174763-token region and the log says "effective max_spills reduced
+# 3 -> 1". Multi-session FCFS (H5) therefore needs either a much bigger budget
+# or a smaller context, because region_tokens scales with --context-length.
+# CTX=32768 shrinks the region 8x so three spill slots fit in the same budget.
 KVSO=(
     --enable-kv-session-offload
-    --kv-session-offload-host-ram-gib 16
-    --kv-session-offload-max-spills 3
+    --kv-session-offload-host-ram-gib "${HOSTGIB:-16}"
+    --kv-session-offload-max-spills "${MAXSPILLS:-3}"
 )
 
 case "$RECIPE" in

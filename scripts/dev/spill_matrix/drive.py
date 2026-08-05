@@ -36,9 +36,19 @@ SIGNALS = {
     # --- HOT / kvso -------------------------------------------------------
     "H1": [("armed", r"kv-session-offload \(S4\) armed: mode=")],          # :2435
     "H2": [("spill", r"kv-session-offload SPILL\(partial\): rid=")],       # :3747
-    "H3": [("tick", r"kv-session-offload tick build: rid=")],              # :3895
-    "H4": [("restore", r"restored to device"),                            # :5276
-           ("waveback", r"kv-session-offload \(P1\): wave-back THRESHOLD armed")],  # :2454
+    # H3/H4 signals CORRECTED after the K1 run. The first choices were wrong in
+    # a way worth recording, because both would have reported a working feature
+    # as broken:
+    #   * "tick build: rid=" (:3895) is an ERROR path ("has no output token
+    #     yet"), so a healthy tick never emits it;
+    #   * "wave-back THRESHOLD armed" (:2454) only fires when
+    #     --kv-session-offload-wave-back-min-free-tokens is NON-default, so at
+    #     the default 0 its absence means nothing at all.
+    # The real per-tick observable is the restore-gate trace at :4465, which
+    # needs SGLANG_KVSO_TICK_TRACE=1 and reports the host tail draining
+    # (boundary advancing towards L) once every 16 iterations.
+    "H3": [("restoregate", r"kv-session-offload restore-gate: iter=\d+ L=\d+ boundary=\d+")],
+    "H4": [("restore", r"restored to device")],                           # :5276
     "H5": [("spill", r"kv-session-offload SPILL\(partial\): rid=.*arrival_seq=")],
     "H6": [("draftkv", r"kv-session-offload: draft-KV bundle armed")],     # :2175
     "H7": [("restore", r"restored to device")],
@@ -108,8 +118,21 @@ def cmd_chat(port, prompt, max_tokens=64):
 
 
 def _prompts(n):
-    """Distinct, long-ish prompts: distinct so sessions do not share a radix
-    prefix (a shared prefix would hide the pressure we are trying to build)."""
+    """Distinct, long prompts.
+
+    Distinct so sessions do not share a radix prefix -- a shared prefix would be
+    served from the radix cache and hide the very pressure we are building.
+
+    LENGTH MATTERS AND IS THE POINT. K1 measured this the hard way: 4 streams of
+    ~570 KV tokens against an 8192-token pool produced no pressure and therefore
+    no spill, and a missing spill then looks exactly like a broken spill. Each
+    prompt is padded to roughly SPILL_PROMPT_WORDS words of DISTINCT filler
+    (distinct per stream, so the pad cannot be prefix-shared either), so that
+    streams x (prompt + generation) genuinely exceeds --max-total-tokens.
+    """
+    import os as _os
+
+    pad_words = int(_os.environ.get("SPILL_PROMPT_WORDS", "900"))
     base = (
         "Write a detailed technical explanation, at least 400 words, about "
         "topic number {i}: {t}. Be specific and structured."
@@ -124,7 +147,17 @@ def _prompts(n):
         "filesystem journaling and crash consistency",
         "branch prediction in out-of-order cores",
     ]
-    return [base.format(i=i, t=topics[i % len(topics)]) for i in range(n)]
+    out = []
+    for i in range(n):
+        # Per-stream distinct filler: the stream index is woven into every
+        # sentence so no two prompts share a usable radix prefix.
+        pad = " ".join(
+            f"context-{i}-token-{j} notes on subsystem {j % 17} of stream {i};"
+            for j in range(pad_words)
+        )
+        out.append(base.format(i=i, t=topics[i % len(topics)])
+                   + "\n\nBackground material to take into account:\n" + pad)
+    return out
 
 
 def cmd_load(port, n, seconds, out=None):
@@ -133,9 +166,22 @@ def cmd_load(port, n, seconds, out=None):
     prompts = _prompts(n)
     results, t0 = {}, time.time()
 
+    import os as _os
+    max_tok = int(_os.environ.get("SPILL_MAX_TOKENS", "512"))
+    # SPILL_MIXED=1 makes stream 0 far longer than the rest. This is what a
+    # RESTORE needs: the short streams finish, KV pressure falls, and a still
+    # living spilled session can wave back. With uniform lengths every session
+    # simply host-ticks to completion and no restore is ever required -- which
+    # is correct behaviour, but leaves the restore path unobserved.
+    mixed = _os.environ.get("SPILL_MIXED", "0") == "1"
+    long_mult = int(_os.environ.get("SPILL_LONG_MULT", "8"))
+
+    def _budget(i):
+        return max_tok * long_mult if (mixed and i == 0) else max_tok
+
     def one(i):
         try:
-            return i, _greedy(port, prompts[i], 512), None
+            return i, _greedy(port, prompts[i], _budget(i)), None
         except Exception as e:                      # a failed stream is data
             return i, None, repr(e)
 
