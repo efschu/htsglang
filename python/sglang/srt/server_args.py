@@ -11148,7 +11148,7 @@ class ServerArgs:
     #: appears per process rather than once per GPU per call.
     _full_demand_refusal_named = False
 
-    def ledger_full_demand_per_gpu(self) -> Optional[Dict[int, int]]:
+    def ledger_full_demand_per_gpu(self, gpu_mem=None) -> Optional[Dict[int, int]]:
         """``{gpu id: full non-KV demand MiB}`` from the card ledgers, or None.
 
         #593. The reserve this feeds is what stands between the KV pool and a
@@ -11187,6 +11187,39 @@ class ServerArgs:
             from sglang.srt.mem_ledger.engine import demand_outside_budget_mib
         except ImportError:
             return None
+        # #596. The phase footprint is keyed by an activation PROFILE, and two
+        # of that profile's fields -- chunked_prefill_size and
+        # cuda_graph_config.decode.max_bs -- are still None this early: the
+        # reserve is decided inside _handle_uneven_tp, which runs BEFORE
+        # _handle_gpu_memory_settings. A profile built from unset fields
+        # digests differently, misses every footprint, and this path then
+        # refuses with "no phase footprint is calibrated" while a calibration
+        # for the very same rig sits in the cache.
+        #
+        # Window 8 is what that costs: the refusal fired on the FIRST call --
+        # the one whose number is installed -- so the boot silently kept the
+        # #590 reserve that had already OOMed in window 7, and a LATER call
+        # (after config resolution) logged the correct full demand to a log
+        # nobody was budgeting from.
+        #
+        # The fix is the one the sibling path already uses: this helper is
+        # idempotent, fills only unset values, and its docstring names this
+        # exact caller class. Resolving the profile HERE is preferred over
+        # moving the reserve decision later, because the shard ratio is
+        # derived FROM these budgets (see derived_reserve_infeasible_note) --
+        # moving the decision after config resolution would invert a
+        # dependency that is load-bearing, to fix a digest.
+        if gpu_mem is not None:
+            self._apply_gpu_mem_capacity_defaults(gpu_mem)
+            # The tier default is not yet the FINAL max_bs: the session
+            # ceiling can still widen it, and that widening lives in
+            # _handle_gpu_memory_settings, i.e. after the reserve is decided.
+            # Without this the profile would be keyed on the tier value while
+            # the boot captures at the widened one -- the same defect this
+            # function fixes, one layer down, on any config that sets
+            # --max-running-requests-ceiling. Idempotent: it returns early
+            # once max_bs already covers the ceiling.
+            self._widen_decode_capture_to_session_ceiling(self.cuda_graph_config.decode)
         try:
             ledgers = self._build_card_ledgers()
         except Exception as e:  # pragma: no cover - NVML/config availability
@@ -11270,7 +11303,7 @@ class ServerArgs:
         # binding card by ~2.2 GiB, which is the window-7 OOM. All or nothing:
         # if the ledger cannot price every term it returns None and refuses,
         # rather than handing back a short number that looks complete.
-        full = self.ledger_full_demand_per_gpu()
+        full = self.ledger_full_demand_per_gpu(gpu_mem)
         if full is not None and all(g in full for g in counts):
             logger.info(
                 "--rank-auto-reserve-mib auto: FULL per-card demand from the "

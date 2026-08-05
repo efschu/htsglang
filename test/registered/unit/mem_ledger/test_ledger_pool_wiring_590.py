@@ -70,7 +70,7 @@ class _Stub:
     def derived_rank_auto_reserve_mib(self, *args, **kwargs):
         return ServerArgs.derived_rank_auto_reserve_mib(self, *args, **kwargs)
 
-    def ledger_full_demand_per_gpu(self):
+    def ledger_full_demand_per_gpu(self, gpu_mem=None):
         """No full-demand model here, on purpose.
 
         #593 put the FULL per-card demand in front of this path, and these
