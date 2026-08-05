@@ -85,6 +85,33 @@ its own anti-fooling rule.
 
 ---
 
+## 1a. Shape table — read from the shipped configs, not assumed
+
+Every geometry used below was read from the checkpoint `config.json` on this
+box. Nothing here is inferred from a model card.
+
+| | Qwen3.5-35B-A3B | Qwen3.5-122B-A10B | DeepSeek-V4-Flash |
+|---|---|---|---|
+| checkpoint | `Qwen3.5-35B-A3B-GPTQ-Int4` | `Qwen3.5-122B-A10B-GPTQ-Int4` | `...-GGUF/UD-IQ3_XXS` |
+| `hidden_size` | 2048 | 3072 | 4096 |
+| `moe_intermediate_size` | 512 | 1024 | 2048 |
+| routed experts | 256 | 256 | 256 (`n_routed_experts`) |
+| `num_experts_per_tok` | 8 | 8 | **6** |
+| shared experts | — | — | 1 |
+| `num_hidden_layers` | 40 | 48 | 43 |
+| `num_nextn_predict_layers` | — | — | **1** (MTP) |
+| one expert, bf16 / int8 | 6.29 / 3.15 MB | 18.87 / 9.44 MB | 50.33 / 25.17 MB |
+
+Expert bytes are computed as `3 x hidden x moe_intermediate x dtype_size`
+(gate, up, down). The 35B geometry is additionally asserted at test time against
+the real checkpoint tensors by `test_shapes_match_the_documented_geometry`, so a
+drift breaks the suite rather than silently invalidating these tables.
+
+Note DSV4F routes **6** experts per token, not 8 — the per-token expert-call
+counts in §3 use the per-model value, not a shared assumption.
+
+---
+
 ## 2. The crossover table (the go/no-go instrument)
 
 `scripts/dev/cpu_expert_lane_microbench.py`. Rotating expert pool >= 400 MB so
@@ -198,8 +225,20 @@ At a 25 ms decode step that is ~135 of 320 expert-calls on the 35B class, i.e.
 same 135 experts would move 849 MB/token, which at the x4 rank's 6.45 GB/s is
 132 ms — five times the whole step. That gap is the feature.
 
+DeepSeek-V4-Flash is the harder case and must be stated separately rather than
+folded in: 43 layers x top_k **6** = **258 expert-calls per token**, against a
+measured 1115 calls/s. All-CPU would be 231 ms/token, i.e. ~4.3 tok/s. At a
+25 ms step the lane absorbs ~28 of 258 calls, **~11 %** — a much thinner slice
+than the 35B class's 42 %, because its experts are 8x larger while host DRAM
+bandwidth is unchanged.
+
+That is the honest shape of the feature: **the per-expert win is largest on
+DSV4F (~10x) while the coverage fraction is smallest there.** The two pull in
+opposite directions, and only a Slice-2 end-to-end measurement resolves which
+dominates. Per-expert speedup alone must not be quoted as the feature's value.
+
 This is a *ceiling*, not a projection: it assumes perfect overlap and ignores
-the transport round trips priced in §6. Slice 2 must measure the realised
+the transport round trips priced in §4.3. Slice 2 must measure the realised
 fraction against it, not restate it.
 
 ---
