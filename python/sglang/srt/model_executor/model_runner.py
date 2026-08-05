@@ -1019,9 +1019,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # post; no-ops unless SGLANG_VRAM_FLIGHT_DIR is set.
         from sglang.srt.mem_ledger import flight_recorder
 
-        flight_recorder.mark("pre_weight_load", rank=self.tp_rank)
+        flight_recorder.mark(
+            "pre_weight_load",
+            rank=self.tp_rank,
+            extra={"draft_worker": bool(self.is_draft_worker)},
+        )
         self.load_model()
-        flight_recorder.mark("weights_loaded", rank=self.tp_rank)
+        flight_recorder.mark(
+            "weights_loaded",
+            rank=self.tp_rank,
+            extra={"draft_worker": bool(self.is_draft_worker)},
+        )
         self._attach_layer_fingerprint()
         self._prepare_moe_topk()
 
@@ -1208,7 +1216,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         from sglang.srt.mem_ledger import flight_recorder
 
-        flight_recorder.mark("kv_pool_sized", rank=self.tp_rank)
+        flight_recorder.mark(
+            "kv_pool_sized",
+            rank=self.tp_rank,
+            extra={"draft_worker": bool(self.is_draft_worker)},
+        )
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
@@ -1409,7 +1421,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # note_capture_begin returns early unless its OWN env var is armed, so
         # a mark placed inside it would be silently conditional on an
         # unrelated instrument.
-        flight_recorder.mark("capture_begin", rank=self.tp_rank)
+        flight_recorder.mark(
+            "capture_begin",
+            rank=self.tp_rank,
+            extra={"draft_worker": bool(self.is_draft_worker)},
+        )
 
         self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
 
