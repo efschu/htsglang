@@ -58,7 +58,7 @@ string, a metric, or an HTTP response field — recorded in the cell's
 These are not opinions from the catalog; each was read out of the source in
 this worktree.
 
-- **S1 — kvso and HiCache are mutually exclusive.** `server_args.py:6679`
+- **S1 — kvso and HiCache are mutually exclusive.** `server_args.py:6773`
   (`if self.enable_hierarchical_cache or self.enable_unified_memory: raise`).
   The production serving recipe runs `--enable-hierarchical-cache
   --hicache-storage-backend file`, so **kvso cannot run on the production
@@ -66,12 +66,12 @@ this worktree.
   hicache flags removed. Composability is task **#547** per
   `docs/rig-runbook.md:877` (the briefing called this #550 — the in-tree name
   is #547).
-- **S2 — kvso x speculation is opt-in, not refused.** `server_args.py:6620-6652`
+- **S2 — kvso x speculation is opt-in, not refused.** `server_args.py:6698-6744`
   raises unless `KVSO_ALLOW_SPEC=1`. The refusal text itself states the
   mechanism is built and names the one unobserved round (a spill landing in
   the same round as a drafter-in-tick step). `KVSO_RESUME=1` is a SECOND,
   independent gate for resume-under-spec
-  (`managers/kv_session_offload.py:503-509`).
+  (`managers/kv_session_offload.py:504-530`).
 - **S3 — the #330 VRAM dial cannot run on the production recipe either.**
   `managers/vram_dial.py:1040-1086` refuses when `hicache_storage_backend` is
   set, and separately when `enable_kv_session_offload` is set. So #330 is
@@ -120,7 +120,7 @@ this worktree.
   (`regime_runtime.py:559`) — it must not be used as an actuation signal. The
   `--regime-trace` JSONL `"actuated"` field is the only trustworthy one.
 - **S9 — #297 and #330 need DIFFERENT amounts of hicache removed.** #330's
-  refusal reads `hicache_storage_backend` (`vram_dial.py:1051-1052`), so
+  refusal reads `hicache_storage_backend` (`vram_dial.py:1051`), so
   dropping only `--hicache-storage-backend file` suffices. #297's Stage-A
   guard reads `enable_hierarchical_cache` itself
   (`managers/kv_reshard.py:652-653`), so the whole flag must go. The guards are
@@ -146,7 +146,7 @@ this worktree.
   `smoke.sh` step 6, which pushes every recipe through the real validator:
   pointing `--model-path` at a GGUF checkpoint is NOT enough, because the gate
   reads `server_args.load_format` before auto-resolution
-  (`server_args.py:13519-13523`). `--load-format gguf` is mandatory. This cost
+  (`server_args.py:13651-13655`). `--load-format gguf` is mandatory. This cost
   zero GPU time to find, which is the entire argument for that smoke step.
 - **S13 — the spill-tick decomposition instrument does not exist.** A
   collective/launch/transfer split of the host-decode tick was requested as a
@@ -223,7 +223,7 @@ env: `SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_MAMBA_SSM_DTYPE=bf
 | H12 | Adaptive/self-calibrating tick cadence | `kv-session-offload: SELF-CALIBRATING spill-tick cadence armed` (`:2464`) | NOT-EXAMINED |
 | H13 | Fast-lane interaction with eviction (fast_lane is term 2 of the victim key) | a fast-lane request is NOT chosen while a non-fast-lane candidate exists | NOT-EXAMINED |
 | H14 | Prefill-spill / born-spilled (`--kv-session-offload-prefill`) | `kv-session-offload prefill-spill (born-spilled) ENABLED` (`:2201`) | NOT-EXAMINED |
-| H15 | kvso x HiCache | — | REFUSED-BY-DESIGN(`server_args.py:6679`) — composability is #547. Measured, not built. |
+| H15 | kvso x HiCache | — | REFUSED-BY-DESIGN(`server_args.py:6773`) — composability is #547. Measured, not built. |
 | H16 | kvso x #330 VRAM dial | — | REFUSED-BY-DESIGN(`managers/vram_dial.py:1052`) |
 | H17 | kvso x weightless-KV fastlane | — | REFUSED-BY-DESIGN(`server_args.py:6673`) |
 | H18 | kvso x PD disagg / dp>1 / pp>1 / page_size>1 / non-flashinfer | — | REFUSED-BY-DESIGN(`server_args.py:6596-6641`) |
@@ -247,7 +247,7 @@ entirely for #297 (S9). kvso is absent because the dial refuses it (S3).
 | L7 | #297 reshard is lossless (determinism probe across the flip) | identical greedy output either side of the reshard | NOT-EXAMINED |
 | L8 | #363 observe mode emits a per-round verdict | `--regime-trace` JSONL rows; field `actuated` (`regime_runtime.py:409/423`). NOT the log line — S8 | NOT-EXAMINED |
 | L9 | #363 `act` mode actuates a stage flip | — | BLOCKED(S8: `regime_runtime.py:911` passes no `solve_fn`, so the stage table has zero flip targets; `regime_stages.py:350-389`). Code gap, ticket owed. |
-| L10 | LEITER stack x production recipe (hicache present) | — | REFUSED-BY-DESIGN(`vram_dial.py:1051-1052` for #330; `kv_reshard.py:652-653` for #297) |
+| L10 | LEITER stack x production recipe (hicache present) | — | REFUSED-BY-DESIGN(`vram_dial.py:1051` for #330; `kv_reshard.py:652-653` for #297) |
 
 ## COLD — park / hibernate / restore
 

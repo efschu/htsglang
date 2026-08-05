@@ -777,12 +777,12 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   (`http_server.py:1149`). **KV pressure ladder**
   (geometry stages instead of rejects; explicit ladders work; rung-dependency
   refusals exist and fire — for EXPLICIT specs only, `if isinstance(spec,
-  tuple):`, `server_args.py:6955`). `--kv-pressure-ladder auto` resolves to a
+  tuple):`, `server_args.py:7145`). `--kv-pressure-ladder auto` resolves to a
   real table at this tip (`ladder = build_ladder_from_server_args(server_args,
   table_fn=auto_ladder_table_fn(server_args))`,
   `managers/kv_pressure_runtime.py:467`), which closes AUDIT_421 F1; on a
   heterogeneous node it REQUIRES `--rank-gpu-id` (`if len(names) > 1: raise
-  ValueError`, `managers/kv_ladder_auto.py:190`). Boot validation pending — the
+  ValueError`, `managers/kv_ladder_auto.py:192`). Boot validation pending — the
   table is
   computed from the rig profile by the #272 planner, rank-uniformly and
   UUID-keyed, and inventories only rungs whose actuator this configuration
