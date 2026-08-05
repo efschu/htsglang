@@ -69,6 +69,14 @@ def register_cpu_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op)."""
+    if isinstance(est_time, type) or (callable(est_time) and not isinstance(est_time, (int, float, str))):
+        raise TypeError(
+            f"register_cpu_ci was applied as a bare decorator to "
+            f"{est_time.__name__ if hasattr(est_time, '__name__') else est_time!r}; "
+            f"it is call-style and returns None, which would silently replace the "
+            f"decorated object and hide its tests from pytest collection. "
+            f"Use register_cpu_ci(est_time=..., suite=...) as a module-level statement."
+        )
     return None
 
 
@@ -82,6 +90,14 @@ def register_cuda_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op)."""
+    if isinstance(est_time, type) or (callable(est_time) and not isinstance(est_time, (int, float, str))):
+        raise TypeError(
+            f"register_cuda_ci was applied as a bare decorator to "
+            f"{est_time.__name__ if hasattr(est_time, '__name__') else est_time!r}; "
+            f"it is call-style and returns None, which would silently replace the "
+            f"decorated object and hide its tests from pytest collection. "
+            f"Use register_cuda_ci(est_time=..., suite=...) as a module-level statement."
+        )
     return None
 
 
@@ -95,6 +111,14 @@ def register_amd_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
+    if isinstance(est_time, type) or (callable(est_time) and not isinstance(est_time, (int, float, str))):
+        raise TypeError(
+            f"register_amd_ci was applied as a bare decorator to "
+            f"{est_time.__name__ if hasattr(est_time, '__name__') else est_time!r}; "
+            f"it is call-style and returns None, which would silently replace the "
+            f"decorated object and hide its tests from pytest collection. "
+            f"Use register_amd_ci(est_time=..., suite=...) as a module-level statement."
+        )
     return None
 
 
@@ -108,6 +132,14 @@ def register_musa_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
+    if isinstance(est_time, type) or (callable(est_time) and not isinstance(est_time, (int, float, str))):
+        raise TypeError(
+            f"register_musa_ci was applied as a bare decorator to "
+            f"{est_time.__name__ if hasattr(est_time, '__name__') else est_time!r}; "
+            f"it is call-style and returns None, which would silently replace the "
+            f"decorated object and hide its tests from pytest collection. "
+            f"Use register_musa_ci(est_time=..., suite=...) as a module-level statement."
+        )
     return None
 
 
@@ -121,6 +153,14 @@ def register_npu_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
+    if isinstance(est_time, type) or (callable(est_time) and not isinstance(est_time, (int, float, str))):
+        raise TypeError(
+            f"register_npu_ci was applied as a bare decorator to "
+            f"{est_time.__name__ if hasattr(est_time, '__name__') else est_time!r}; "
+            f"it is call-style and returns None, which would silently replace the "
+            f"decorated object and hide its tests from pytest collection. "
+            f"Use register_npu_ci(est_time=..., suite=...) as a module-level statement."
+        )
     return None
 
 
@@ -134,6 +174,14 @@ def register_xpu_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
+    if isinstance(est_time, type) or (callable(est_time) and not isinstance(est_time, (int, float, str))):
+        raise TypeError(
+            f"register_xpu_ci was applied as a bare decorator to "
+            f"{est_time.__name__ if hasattr(est_time, '__name__') else est_time!r}; "
+            f"it is call-style and returns None, which would silently replace the "
+            f"decorated object and hide its tests from pytest collection. "
+            f"Use register_xpu_ci(est_time=..., suite=...) as a module-level statement."
+        )
     return None
 
 
@@ -147,6 +195,14 @@ def register_musa_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
+    if isinstance(est_time, type) or (callable(est_time) and not isinstance(est_time, (int, float, str))):
+        raise TypeError(
+            f"register_musa_ci was applied as a bare decorator to "
+            f"{est_time.__name__ if hasattr(est_time, '__name__') else est_time!r}; "
+            f"it is call-style and returns None, which would silently replace the "
+            f"decorated object and hide its tests from pytest collection. "
+            f"Use register_musa_ci(est_time=..., suite=...) as a module-level statement."
+        )
     return None
 
 
@@ -160,6 +216,14 @@ def register_mlx_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for MLX CI registration (parsed via AST; runtime no-op)."""
+    if isinstance(est_time, type) or (callable(est_time) and not isinstance(est_time, (int, float, str))):
+        raise TypeError(
+            f"register_mlx_ci was applied as a bare decorator to "
+            f"{est_time.__name__ if hasattr(est_time, '__name__') else est_time!r}; "
+            f"it is call-style and returns None, which would silently replace the "
+            f"decorated object and hide its tests from pytest collection. "
+            f"Use register_mlx_ci(est_time=..., suite=...) as a module-level statement."
+        )
     return None
 
 
