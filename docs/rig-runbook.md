@@ -877,6 +877,25 @@ on later. Both are live for non-hybrid models on `HiRadixCache`.
 `--enable-kv-session-offload` and `--weightless-kv-host-spill-tokens` — each
 is its own host tier. Making them composable is task #547.
 
+**Production boot additions to the 4.1 recipe** (`start-serving-30030.sh`,
+outside the repo). The live serving instance carries these flags beyond the
+standard 4.1 + 4.1.3 recipe:
+
+- `--enable-cache-report` — populates `usage.prompt_tokens_details.cached_tokens`
+  in every response. The Anthropic front maps this field to
+  `cache_read_input_tokens` for the client-facing usage block.
+- `--sleep-on-idle` — reduces per-rank scheduler idle CPU from 92-95 % to
+  0-1 % via zmq.Poller event-driven wake. When reshard flips are armed all
+  ranks skip the sleep by design; see the `maybe_sleep_on_idle` comment in
+  `scheduler.py` for the guard logic.
+
+**WARNING (2026-08-05): HiCache storage directory reset.**
+`/spinning/hicache` was freshly reset today after the Grenzen incident
+(11.7 M files flat, `max_size` not enforced). The fix is in progress under
+`fix/hicache-file-bounds-558`. Until that fix is merged, monitor the
+directory size with `du`/`df` on `/spinning` — the `max_size` 100Gi cap in the
+boot config is NOT reliable for bounding growth on the current tree.
+
 ### 4.2 Co-location (several ranks on one physical GPU)
 
 Duplicates in `--rank-gpu-id` (e.g. `0,0,1,2`) require a **runtime NCCL >=
