@@ -3,7 +3,7 @@
 Status: DESIGN, no code. Branch `feat/exact-vram-ledger` (design only; the
 implementation gets its own branch per slice).
 
-This document is written against the mandate plus four addenda. Addenda 3 and 4
+This document is written against the mandate plus five addenda. Addenda 3 and 4
 are recorded as R6, R7 and R9 because each names an ERROR CLASS the design must
 be structurally unable to commit -- not a behaviour it should prefer. That
 distinction drives the falsifiers: several are deliberately PAIRS, because a
@@ -51,7 +51,7 @@ reimplements a carrier instead of driving it has failed the mandate.
 
 ## 2. Requirements
 
-Requirements R1-R9. Each carries a falsifier: a concrete situation that must produce a
+Requirements R1-R10. Each carries a falsifier: a concrete situation that must produce a
 specific observable, and which the current design would fail if the
 requirement were dropped.
 
@@ -334,6 +334,89 @@ produce an OBSERVABLE layout difference -- not merely a planner decision logged.
 The test asserts on the actuated state, because #578 is precisely the case
 where the decision existed and the actuation did not.
 
+### R10 -- (Addendum 5) WEIGHT residency is phase-dependent, to layer-slice granularity
+
+*User requirement, 2026-08-05.* R7 made **evacuation ordering** phase-dependent.
+R10 says the same of **weights themselves**, and at a finer grain than "the
+model": individual layers, and slices of layers.
+
+**The named first-class case: the draft/target ping-pong.** During the DRAFT
+phase the target's layers or layer slices may be spilled -- to ANY tier, for
+ANY reason, including simply that the video and sound pipelines want the VRAM
+and this is the only way everything is held at once. During PREFILL/VERIFY the
+draft is spilled and the target's layers return. The two models take turns
+owning VRAM because they take turns computing.
+
+**(a) Every conceivable combination must be EXPRESSIBLE.** Coverage comes from
+structure, not from enumerated cases (R3 applied to residency). The unit is
+"(layer or slice) x (tier) x (phase)", and the planner must be able to express
+any assignment over that product. A design that enumerates "draft spilled" and
+"target spilled" as two supported modes has already failed: the third thing
+somebody wants is a half-spilled target during a long prefill while the
+diffusion lane holds a card.
+
+**(b) The planner computes automatically WHAT moves WHEN.** This is a
+movement-bound decision on R9's priced flip axis: movement cost against the
+value of the VRAM held. It is never a structural "cannot". If the planner
+declines to spill a target slice, that must be because the arithmetic said so
+and the reason is recoverable under R8.
+
+**(c) It is automatically EXECUTED, and the freed VRAM is automatically
+REFILLED.** Freeing bytes and leaving them idle is a DEFECT, not a neutral
+outcome -- it is the "surplus sits idle" failure #582 removed from the boot
+path, reappearing at runtime. Whatever the solver yields takes the space: KV,
+a tenant, a lane. An empty hole means the refill step did not run.
+
+**Overlap is the reason this is cheap, and it must be PRICED.**
+
+While the draft computes, the target's layers are idle -- so their reload can
+hide behind draft compute, and symmetrically the draft's reload hides behind
+target compute. The movement-cost model must therefore charge the **unhidden
+remainder**, not raw bytes over bandwidth:
+
+    effective_cost = max(0, transfer_time - overlappable_compute_time)
+
+Charging raw transfer time would price every ping-pong as unaffordable and the
+planner would never take a swap that is in fact nearly free. This is the same
+error shape as pricing a restore at capture cost (F9e): a cost model that is
+wrong upward simply never exercises the mechanism, and nothing surfaces it.
+
+**Carriers -- verified, with an honest split.**
+
+*Present in tree:* the #77/#123/#125 weight-streaming machinery is real and
+does H2D fetch of weight rows from a host tier --
+`layers/moe/expert_offload.py`, `expert_heat_migration.py`,
+`fused_moe_triton/layer.py`, `cold_tier_fetch.py` (host DRAM segments,
+identity-keyed by card UUID and PCI BDF, zero-copy peer views, the fetch path
+issuing `copy_` over the rank's own PCIe link), plus
+`model_executor/offload_register.py`, `short_term_offload_register.py`,
+`offload_movement.py`.
+
+*NOT present:* that machinery is **expert-granular**. Generalising it to
+arbitrary layer / layer-slice granularity is the claim, and I did not find
+layer-granular streaming in tree (`offload_movement.py` has no per-layer
+addressing). Slice 5 therefore EXTENDS this carrier rather than merely driving
+it -- the same honest posture as #553. The double-buffered
+prefetch-behind-previous-layer-compute structure is likewise asserted in the
+addendum but not something I located as a general mechanism; treat its
+existence as a slice-5 finding, not a premise.
+
+*Falsifier F10.* A co-tenant demand that fits ONLY via draft-phase target-slice
+spill must be **planned AND executed**, not refused. A planner that declines it
+for lack of expressiveness fails (a); one that plans it and does not execute
+fails (c).
+
+*Falsifier F10b.* The VERIFY phase following such a spill must produce
+**byte-identical** output to a never-spilled reference run. This is the
+full-captured doctrine applied to weights: a residency decision is a placement
+decision, never a numerics decision. Any bit difference means spilling changed
+the computation, which would make the whole mechanism unusable under the
+determinism arm.
+
+*Falsifier F10c.* After a spill frees VRAM, a subsequent ledger read must show
+the freed bytes CLAIMED (KV pool, tenant, or lane). Bytes free and unassigned
+is a defect per (c), and the test asserts on the claim, not on the free.
+
 ### R8 -- Every decision is explainable after the fact
 
 Any configuration the planner chooses must be reconstructible: the candidates
@@ -382,7 +465,8 @@ by "what unblocks the most" and by risk, cheapest proof first.
 | 4 | Phase-dependent heat ranking | R7 | hermetic: F7, F7b |
 | 4b | Per-knob flip pricing; split capture vs restore; fix the WARM rung | R9 (i)-(iv), R5 two-term | hermetic: F9, F9b, F9d, F9e, F5b |
 | 4c | Pre-capture + park the planner stair; host-RAM ledger term | R9 (iii), R1b | hermetic: F9d; GPU: measured restore band |
-| 5 | Actuation; BUILD elastic co-residency (#553) | R6 execution, tenant events | GPU: a live re-cut under load |
+| 4d | Phase-dependent weight residency: express + price (no execution) | R10 (a), (b), overlap pricing | hermetic: F10 planning half |
+| 5 | Actuation; BUILD elastic co-residency (#553); EXTEND weight streaming to layer/slice | R6 execution, tenant events, R10 (c) | GPU: live re-cut under load; F10 execution, F10b byte-identity, F10c refill |
 | 6 | Explainability surface | R8 | hermetic + a live boot |
 
 ### Slice 0 is a hard prerequisite, and it is small
@@ -455,6 +539,20 @@ only one that should ever wait on a GPU window.
   must not assume.
 - **Host-RAM accounting does not exist yet.** R1's extension to host bytes is
   new work, not a carrier to drive. The #582 ledger is VRAM-only today.
+- **Weight streaming is EXPERT-granular, not layer-granular.** R10 needs layer
+  and layer-slice granularity; the #77/#123/#125 machinery streams expert rows
+  (`expert_offload.py`, `cold_tier_fetch.py`, `offload_movement.py`) and
+  `offload_movement.py` carries no per-layer addressing. Slice 5 EXTENDS it.
+  The double-buffered prefetch-behind-previous-layer-compute structure is
+  likewise a premise of the addendum I could not locate as a general mechanism
+  -- slice 5 must confirm or build it, and the overlap pricing in R10 depends
+  on it being real.
+- **The reference boot's measured demand already contradicts one inherited
+  term.** The 2026-08-05 window measured out-of-budget demand of 2434 MiB
+  (3080) and 1305 MiB (5090) against a ledger prediction of >=4664 / >=5016,
+  driven by the stock activation heuristic (3968 MiB). The ledger is
+  conservative, not dangerous, but R2's "exact" is not yet met on that term.
+  Fixing it is a prerequisite for trusting any objective computed from it.
 - **R9's knob inventory is incomplete.** The classification table covers the
   knobs the addendum named. A sweep for every knob that changes a layout, with
   a cost for each, is part of slice 4b -- an unclassified knob is an unpriced
