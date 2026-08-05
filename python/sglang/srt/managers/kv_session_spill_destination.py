@@ -1091,6 +1091,39 @@ def _fail_unpark(mgr, ctl: SpillDestinationController, t: _Transfer, why: str) -
         _release_parked_req(mgr, rec)
 
 
+def parked_session_ended(req) -> bool:
+    """Whether a PARKED session has ended and must be reaped.
+
+    ``req.finished()`` alone is not the signal here. ``Scheduler.abort_request``
+    reaches parked sessions on purpose (``inflight_batches`` extends with
+    ``parked_inflight_entries``) and marks them the same way it marks every
+    other in-flight request -- "abort method 3", ``req.to_finish =
+    FINISH_ABORT()`` -- leaving the promotion to ``finished_reason`` to
+    ``Req.update_finish_state``, which runs only while processing a batch
+    result. A parked session is in no batch and runs no forward (``_commit_park``
+    popped it out of ``mgr.spills`` and its tick is suppressed), so that
+    promotion never happens: keying the reap on ``finished()`` dropped the abort
+    silently and leaked the device head, the req-pool slot, the tree lock and
+    the remote blob, while the client waited forever.
+
+    Pure function of replicated request state (``abort_request`` marks the same
+    rid on every rank in the same iteration), so the reap set is rank-uniform.
+    """
+    return req.finished() or getattr(req, "to_finish", None) is not None
+
+
+def _stream_terminal(mgr, req) -> None:
+    """Emit one terminal output for a request that ends outside any batch.
+
+    Tolerant by design: the CPU unit path drives this module with a stub
+    scheduler that carries no output streamer, and a missing streamer must not
+    turn a memory-release path into a crash."""
+    streamer = getattr(getattr(mgr, "scheduler", None), "output_streamer", None)
+    if streamer is None:
+        return
+    streamer.stream_output([req], getattr(req, "return_logprob", False))
+
+
 def _release_parked_req(mgr, rec: ParkedSession) -> None:
     """Cleanup of a parked session that ends without unparking (abort or
     unrecoverable unpark). Mirrors release_finished_spilled_req minus the
@@ -1099,6 +1132,22 @@ def _release_parked_req(mgr, rec: ParkedSession) -> None:
     req = rec.slot.req
     pool = mgr.req_to_token_pool
     rpi = req.req_pool_idx
+    # Promote a pending abort BEFORE releasing: nothing else will. The normal
+    # promotion site (Req.update_finish_state) only runs on a batch result, and
+    # this session never produces one. Without it every later `finished()`
+    # check -- reap loops, abort re-scans, the tokenizer's terminal handling --
+    # would keep seeing an unfinished request whose memory is already gone.
+    if not req.finished() and getattr(req, "to_finish", None) is not None:
+        req.finished_reason = req.to_finish
+        req.to_finish = None
+        # ...and TELL the client. A device-resident or host-spilled abort gets
+        # its terminal chunk from the one decode forward the request still runs
+        # ("the request will still run one decode forward pass. Then we reuse
+        # all existing code to clean up"). A parked session runs no forward, so
+        # this is the only place that can emit it -- same single-request emit
+        # the scheduler uses for requests that terminate before ever entering a
+        # batch. Without it the abort frees the memory and the caller hangs.
+        _stream_terminal(mgr, req)
     if rpi is None:
         return
     boundary = rec.boundary
@@ -1137,8 +1186,11 @@ def maybe_park_flow(mgr, running_batch, last_batch):
         return running_batch
     now = mgr._iter_ct
 
-    # 1. Reap aborted parked sessions.
-    for rid in [r for r, rec in ctl.parked.items() if rec.slot.req.finished()]:
+    # 1. Reap aborted parked sessions (see parked_session_ended: a parked
+    #    session's abort arrives as `to_finish`, which nothing else promotes).
+    for rid in [
+        r for r, rec in ctl.parked.items() if parked_session_ended(rec.slot.req)
+    ]:
         rec = ctl.parked.pop(rid)
         ctl.counters["parked_aborted"] += 1
         ctl.counters["blobs_orphaned"] += 1

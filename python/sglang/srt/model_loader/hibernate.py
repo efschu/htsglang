@@ -137,7 +137,7 @@ def _model_identity(server_args) -> Dict[str, Any]:
     ``launch_view`` (``overrides.py``) un-applies exactly the sources on the
     IDENTITY-TRANSPARENT registry: writes that RE-DERIVE a field from state
     this fingerprint already pins -- the rank's card (re-checked by NVML UUID
-    at ``:568``, presence-gated at match time in ``_manifest_cards_present``)
+    at ``:642``, presence-gated at match time in ``_manifest_cards_present``)
     and the checkpoint at ``model_path``. A write that genuinely changes what
     is loaded is NOT on that registry and keeps showing through: a runtime
     ``/update_weights`` moving ``model_path`` must still invalidate the

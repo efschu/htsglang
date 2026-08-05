@@ -22,6 +22,7 @@ import torch
 
 import sglang.srt.managers.kv_session_spill_destination as kd
 from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.kv_session_spill_destination import (
     ALL_STORAGE_BACKENDS,
     DestinationTier,
@@ -381,9 +382,15 @@ class _FakeReq:
         self.to_abort = False
         self.to_abort_message = None
         self._finished = False
+        # Mirrors the real Req: `to_finish` is what Scheduler.abort_request
+        # sets ("abort method 3"), `finished_reason` is what the result
+        # processor later promotes it to (Req.update_finish_state).
+        self.to_finish = None
+        self.finished_reason = None
+        self.return_logprob = False
 
     def finished(self):
-        return self._finished
+        return self._finished or self.finished_reason is not None
 
 
 class _FakeSlot:
@@ -437,7 +444,15 @@ def _make_mgr(dest_ctl):
     mgr.req_to_token_pool = _FakeReqToTokenPool()
     mgr.allocator = _FakeAllocator()
     mgr.tree_cache = SimpleNamespace(dec_lock_ref=lambda n: None)
-    mgr.scheduler = SimpleNamespace(running_batch=None, tp_rank=0)
+    streamed = []
+    mgr.scheduler = SimpleNamespace(
+        running_batch=None,
+        tp_rank=0,
+        output_streamer=SimpleNamespace(
+            stream_output=lambda reqs, rl, **kw: streamed.extend(reqs)
+        ),
+    )
+    mgr.streamed = streamed
     mgr._log = lambda *a, **k: None
     return mgr
 
@@ -691,6 +706,58 @@ def test_parked_abort_reaps_and_releases():
     assert mgr.req_to_token_pool.freed_reqs == ["rid-g"]
 
 
+def test_parked_abort_via_to_finish_is_reaped():
+    """ABORT of a PARKED session must reap it -- the real abort signal is
+    ``to_finish``, not ``finished_reason``.
+
+    THE HOLE THIS PINS. ``Scheduler.abort_request`` reaches a parked session
+    (``inflight_batches`` deliberately extends with ``parked_inflight_entries``)
+    and marks it the only way it marks any running request: "abort method 3",
+    ``req.to_finish = FINISH_ABORT()`` (scheduler.py). That flag is promoted to
+    ``finished_reason`` by ``Req.update_finish_state``, which runs ONLY when a
+    batch result is processed. A parked session is in no batch and runs no
+    forward -- ``mgr.spills`` no longer holds it (``_commit_park`` pops it) and
+    its tick is suppressed -- so the promotion NEVER happens and
+    ``req.finished()`` stays False forever.
+
+    The reap loop in ``maybe_park_flow`` selected on ``req.finished()`` alone,
+    so the abort was silently dropped: the ``ParkedSession`` record stayed in
+    ``ctl.parked``, the retained device head, the req-pool slot, the radix tree
+    lock and the remote blob all leaked, and the client waited for a response
+    that no code path would ever send.
+
+    CAN-FAIL PROOF: this test is RED on the pre-fix tree (the session is still
+    in ``ctl.parked`` after pumping and nothing is freed).  The neighbouring
+    ``test_parked_abort_reaps_and_releases`` stays green either way because it
+    sets ``_finished`` directly -- which is exactly the step the real abort
+    path does not perform for a parked session.
+    """
+    tier = _DictTier()
+    ctl = _make_ctl([tier])
+    mgr = _make_mgr(ctl)
+    slot, boundary, _L, _tail = _add_spilled_session(mgr, "rid-i", 1, 0, seq=1)
+    ctl.note_region_shortfall(mgr._iter_ct)
+    assert _pump(mgr, ctl, until=lambda: "rid-i" in ctl.parked)
+
+    # Exactly what Scheduler.abort_request does to an in-flight request.
+    slot.req.to_finish = FINISH_ABORT()
+    assert not slot.req.finished()
+
+    assert _pump(mgr, ctl, until=lambda: "rid-i" not in ctl.parked)
+    assert ctl.counters["parked_aborted"] == 1
+    # Released like any other ended spilled session.
+    assert mgr.req_to_token_pool.freed_reqs == ["rid-i"]
+    assert slot.req.kv_spill_state is None
+    if boundary > 0:
+        assert mgr.allocator.freed, "retained device head was not freed"
+    # The abort is now honest: the flag was promoted, so every later
+    # `finished()` check (reap loops, abort re-scans) agrees.
+    assert slot.req.finished()
+    assert slot.req.to_finish is None
+    # ...and the client is told, since no forward pass will ever stream for it.
+    assert [r.rid for r in mgr.streamed] == ["rid-i"]
+
+
 def test_park_instead_of_demote_seam():
     tier = _DictTier()
     ctl = _make_ctl([tier])
@@ -879,6 +946,7 @@ def _fake_server_args(**over):
         kv_session_offload_wave_back_min_free_tokens=0,
         kv_session_offload_mtp_resident_slices=0,
         kv_session_offload_spec_in_tick=False,
+        kv_session_offload_resume_under_spec=False,
         # #236 budget flags (defaults OFF -> inert; the merged validator
         # reads both the budget and the destination attribute sets)
         kv_session_offload_budget_total_tokens=0,

@@ -705,6 +705,7 @@ def _fake_server_args(**over):
         kv_session_offload_wave_back_min_free_tokens=0,
         kv_session_offload_mtp_resident_slices=0,
         kv_session_offload_spec_in_tick=False,
+        kv_session_offload_resume_under_spec=False,
         kv_session_offload_budget_total_tokens=0,
         kv_session_offload_budget_session_tokens=0,
         kv_session_offload_budget_prefill_tokens=0,

@@ -733,7 +733,7 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   GGUF checkpoints only (`if self.load_format != "gguf": raise`,
   `server_args.py:13204`), pure single-node TP (`hibernate.py:106-123`), and a
   per-rank NVML-UUID recheck on restore (`if live_uuid !=
-  rank_meta["nvml_uuid"]: raise RuntimeError`, `:568`).
+  rank_meta["nvml_uuid"]: raise RuntimeError`, `:642`).
   `--enable-weights-disk-backup` and `--hibernate-dir` require each other in
   both directions (`server_args.py:13191-13199`).
   Plus suspend-to-RAM (memory saver; reaches the legacy hybrid-SWA `SWAKVPool`
@@ -1652,6 +1652,94 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Unreachable-interop family (#547): interop code written FOR a pair the boot
+refuses is not interop, it is a claim. `force_host_write_through` (#242) exists
+so a kv-session-offload budget demotion hands its prefix over losslessly under
+HiCache — the donating insert is exempted from HiCache's hit-count
+write-through heuristic, which would otherwise drop exactly the leaves the
+session just produced while the same finish frees their device slots. It has
+ONE producer (`kv_session_offload._budget_demote`) and its readers are the
+prefix caches, whose host tier only exists when hierarchical caching is
+initialised (`mem_cache/registry.py`) — and `server_args` refuses
+`--enable-kv-session-offload` together with `--enable-hierarchical-cache`. So
+the mechanism cannot fire, while FEATURES_VS_UPSTREAM stated flatly that "the
+hand-over is lossless under HiCache", i.e. described behaviour no boot can
+reach. Two lessons, both cheap to apply: a seam whose producer and consumer
+sit on opposite sides of a mutual exclusion is dead by construction and a grep
+for its writers proves it in seconds; and a feature table sentence in the
+present indicative is a claim that something RUNS, so "written for" and
+"observed" need different words. The refusal itself was the other half of the
+problem — it read "each is its own host tier", a description of the two
+features rather than a reason for the exclusion, leaving a reader unable to
+tell a physical impossibility from an unbuilt piece. Reading the tree settles
+it: the host buffers are two independent `MHATokenToKVPoolHost` objects, the
+key spaces are disjoint (kvso addresses host rows by sentinel slot ids above
+the device allocator's range, HiCache by page indices and hash keys), and
+neither module reads the other's state; what is missing is a JOINT pinned-host-
+RAM budget (each validates its own alone, and over-committing pinned memory
+invokes the OOM killer rather than swapping) and a MEASUREMENT of the
+contention between kvso's in-critical-path spill copies and HiCache's
+backup/prefetch transfers. The refusal now says exactly that, and
+`test/registered/unit/server_args/test_kvso_hicache_exclusion_547.py` pins both
+halves — six of its tests go red against the old one-sentence refusal, and the
+structural half goes red the moment the seam gains a producer or a reader
+outside the layer that makes the reasoning true.
+
+Equivalent-fallback family (#552): a decline is only worth its name when the
+fallback it hands off to does something DIFFERENT. `try_spill` declined
+outright whenever speculative decoding was active and the FCFS/minimal-eviction
+victim was not the back-most request (`spec_decline_non_back_spill`: under
+EAGLE/MTP a request may only leave the batch from the back), and handed the
+pressure to stock `retract_decode`. But stock retraction is back-only under
+spec too -- `_get_decode_retraction_order` returns the indices UNSORTED and the
+loop pops the tail -- so the back-most request was evicted either way. The
+decline changed nothing about WHO paid and everything about WHAT survived:
+spill keeps the session's KV on host and it decodes on through the spill tick,
+retraction throws the work away and the request re-prefills from scratch. So
+speculative decoding silently cost the whole offload feature in exactly the
+case the feature exists for, while every line read as a careful safety
+decision. The shape is reachable rather than theoretical because batch position
+is not arrival order: a retracted request keeps its `kv_arrival_seq` but is
+appended at the BACK on re-admission, so an old session sits behind younger
+ones and FCFS picks a middle index. Fixed by offering the back-most request to
+the spill when it is a legitimate victim by the SAME eligibility rules
+(`spill_victim_candidates`, extracted so ORDER and ELIGIBILITY are asked
+separately and no second copy of the rules can drift), declining only when it
+is protected. The rule: before writing a decline, state what the fallback will
+do -- if it is the same action with a worse outcome, the decline is a bug
+wearing a safety comment. Related: the ordering constraint itself cannot be
+lifted here, so FEATURES_VS_UPSTREAM's victim-order row now names it as a bound
+of speculative decoding instead of promising unconditional FCFS.
+
+Unpromoted-terminal-flag family (#552): a terminal signal that only ONE code
+path promotes is silently lost by every state that does not run that path.
+`Scheduler.abort_request` marks an in-flight request with `req.to_finish =
+FINISH_ABORT()` ("abort method 3") and leaves the promotion to
+`finished_reason` to `Req.update_finish_state`, which runs only while
+processing a batch result -- fine for device-resident and host-spilled
+sessions, both of which still run a forward. A #224 PARKED session runs none:
+`_commit_park` pops it out of `mgr.spills` and its tick is suppressed. The
+reap loop in `kv_session_spill_destination.maybe_park_flow` nevertheless keyed
+on `req.finished()`, so the abort was dropped: the `ParkedSession` record, the
+retained device head, the req-pool slot, the radix tree lock and the remote
+blob all leaked, and the caller waited for a terminal chunk no path would ever
+emit. Note the abort DID reach the session -- `inflight_batches` extends with
+`parked_inflight_entries` on purpose -- which is why this reads as working
+code: the delivery was right and only the acceptance was missing. Fixed with
+`parked_session_ended` (finished OR `to_finish` pending) as the reap
+predicate, promotion of the flag inside `_release_parked_req`, and a
+single-request `stream_output` there, since nothing else can emit for a
+session that never forwards again. The rule: when a flag's promotion lives in
+one path, every state reachable WITHOUT that path needs its own promotion, and
+a reap predicate must test the signal the producer actually writes -- not the
+downstream field some other path derives from it. `test/registered/unit/
+test_kv_spill_destination_unit.py::test_parked_abort_via_to_finish_is_reaped`
+pins it and is can-fail against the pre-fix file; its neighbour
+`test_parked_abort_reaps_and_releases` stayed green throughout because it set
+`finished` directly -- a test that performs the step the real caller omits
+records the omission as expected behaviour (same trap as the incomplete-cache-
+key family above).
+
 Two-stage-error family (#505-B-01, fixed in #514): when ONE `try` spans two
 stages whose failures mean OPPOSITE things about where the bytes are, the
 handler is forced to lie about one of them. `RealMovementBackend.wave_in`
@@ -1802,7 +1890,7 @@ Fix: the identity reads through `launch_view` (`arg_groups/overrides.py`) --
 `resolved_view` plus the un-applied writes of `IDENTITY_TRANSPARENT_SOURCES`.
 A source is identity-TRANSPARENT when it RE-DERIVES a field from state the
 fingerprint already pins (the rank's card, re-checked by NVML UUID at
-`hibernate.py:568` and presence-gated at match time in
+`hibernate.py:642` and presence-gated at match time in
 `_manifest_cards_present`; the checkpoint at `model_path`). A source that
 changes WHAT IS LOADED is deliberately absent and must keep showing through --
 `model_runner.update_weights` is the case #499 argued must never be normalized

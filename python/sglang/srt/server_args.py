@@ -1948,6 +1948,31 @@ class ServerArgs:
             "active --speculative-algorithm; hard error otherwise.",
         ),
     ] = False
+    kv_session_offload_resume_under_spec: A[
+        bool,
+        Arg(
+            help="kv-session-offload (Step 2): let a spilled session under "
+            "speculative decoding WAVE BACK to device and rejoin the LIVE spec "
+            "decode batch, instead of being held on host through completion. "
+            "Default OFF, and that default is a NAMED decision, not an "
+            "oversight: with an active --speculative-algorithm the restore path "
+            "currently keeps a spilled session on host to completion because "
+            "that is the validated, crash-free route (spill -> host decode -> "
+            "finish). The resume path is BUILT -- the draft-KV share spills and "
+            "restores inside the session's residency bundle, the seed is "
+            "republished into the future map, and the host-finish guard lifts "
+            "at both of its sites -- but it has not been observed rejoining a "
+            "live spec batch on hardware, so it stays opt-in until it has. "
+            "Turning it ON also DISABLES the PS2 deep prefill spill "
+            "(--kv-session-offload-prefill): a born-spilled prompt never wrote "
+            "the draft KV that the rejoined session's drafter would attend, so "
+            "the two are mutually exclusive by construction and the boot says "
+            "so. Env twin: SGLANG_KVSO_RESUME=1 (legacy alias KVSO_RESUME=1, "
+            "deprecated); either source turning it on is enough. Requires "
+            "--enable-kv-session-offload and an active --speculative-algorithm; "
+            "hard error otherwise.",
+        ),
+    ] = False
     kv_session_offload_mtp_resident_slices: A[
         int,
         Arg(
@@ -6533,6 +6558,25 @@ class ServerArgs:
                     "--kv-session-offload-park-timeout-iters must be >= 1; "
                     f"got {self.kv_session_offload_park_timeout_iters}."
                 )
+        # #552: the env twin ORs into the flag ONCE, here, BEFORE the
+        # feature-disabled return -- so that everything downstream (this
+        # validation block, the boot log, the effective-args dump the operator
+        # reads back) sees one truth instead of each site re-deriving it from
+        # os.environ, and so arming it without the feature is REJECTED rather
+        # than silently ignored. `resume_under_spec_enabled()` reads the same
+        # OR at runtime for processes that never saw these args.
+        if envs.SGLANG_KVSO_RESUME.get():
+            self.kv_session_offload_resume_under_spec = True
+        if self.kv_session_offload_resume_under_spec and (
+            not self.enable_kv_session_offload
+        ):
+            raise ValueError(
+                "--kv-session-offload-resume-under-spec (or "
+                "SGLANG_KVSO_RESUME=1) is a sub-mode of "
+                "--enable-kv-session-offload: it lifts the host-finish guard "
+                "on a SPILLED session, and with the feature off nothing spills, "
+                "so the flag would silently do nothing."
+            )
         if not self.enable_kv_session_offload:
             return
         if self.kv_session_offload_host_ram_gib < 0:
@@ -6600,6 +6644,37 @@ class ServerArgs:
                 f"(0 disables the cap); got "
                 f"{self.kv_session_offload_mtp_resident_slices}."
             )
+        # The env twin was already OR-ed into the flag above (before the
+        # feature-disabled return), so this block reads the flag only.
+        if self.kv_session_offload_resume_under_spec:
+            # Waving a spilled session back INTO a live spec batch only means
+            # anything when there is a spec batch. Fail fast at arg-parse: the
+            # alternative is a flag that silently does nothing, which is how a
+            # boot arm ends up "testing" a path it never armed.
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--kv-session-offload-resume-under-spec (or "
+                    "SGLANG_KVSO_RESUME=1) requires an active "
+                    "--speculative-algorithm: it lifts the host-finish guard so "
+                    "a spilled session rejoins the LIVE spec decode batch, and "
+                    "with no spec algorithm there is no such batch and no guard "
+                    "to lift. None is configured."
+                )
+            if self.kv_session_offload_prefill:
+                # Not a policy choice -- a placement fact. See
+                # kv_session_offload.prefill_spill_deep_reject_reason: a
+                # born-spilled prompt never wrote the draft KV that the
+                # rejoined session's drafter attends, so PS2 and resume cannot
+                # both be on. Naming it here beats a runtime decline nobody
+                # reads.
+                raise ValueError(
+                    "--kv-session-offload-resume-under-spec cannot be combined "
+                    "with --kv-session-offload-prefill (PS2 deep prefill "
+                    "spill): a session that waves back rejoins the live spec "
+                    "batch and its drafter attends the prompt positions, which "
+                    "a born-spilled prefill never wrote. Drop one of the two "
+                    "(PS1 born-spilled admission is unaffected either way)."
+                )
         if self.kv_session_offload_spec_in_tick:
             # Step 2 Phase 1: running the drafter in the spill tick is only
             # meaningful when the server actually has a speculative algorithm to
@@ -6676,10 +6751,47 @@ class ServerArgs:
                 "identity (static tier map vs per-session sentinels)."
             )
         if self.enable_hierarchical_cache or self.enable_unified_memory:
+            # #547. "Each is its own host tier" is a DESCRIPTION, not a reason,
+            # and it was the whole of the old message -- which left every reader
+            # unable to tell a physical impossibility from an unbuilt piece.
+            # From the code, it is the latter, and the two conflicts are these:
+            #
+            # (1) NOBODY SUMS THE PINNED HOST RAM. kvso validates
+            #     --kv-session-offload-host-ram-gib alone (host_ram_budget_error,
+            #     once, in the launcher, against psutil available minus an OS
+            #     reserve); HiCache sizes its own MHATokenToKVPoolHost from
+            #     hicache_ratio/hicache_size and validates independently. Both
+            #     pools are PINNED, so an over-commit is not a swap, it is the
+            #     OOM killer picking an unrelated process on this swap-less box.
+            #     One joint budget check is the missing piece.
+            # (2) THE TRANSFER CONTENTION IS UNMEASURED. kvso streams a spilled
+            #     tail D2H/H2D on its own copy stream INSIDE the decode loop's
+            #     critical path; HiCache's controller runs backup and prefetch
+            #     on its own threads and streams. Both cross the same link into
+            #     pinned host memory. That is a latency interaction, not a
+            #     correctness one -- but the spill tick's latency budget is the
+            #     feature, so it must be measured before the pair is allowed.
+            #
+            # What is NOT a conflict, and was checked rather than assumed: the
+            # host buffers are two independent MHATokenToKVPoolHost objects with
+            # separate lifecycles; the key spaces are disjoint (kvso addresses
+            # host rows by sentinel slot ids strictly above the device
+            # allocator's range, HiCache by its own page indices and hash keys);
+            # and neither module reads the other's state. The #242 lossless
+            # hand-over is even written FOR this pair (force_host_write_through)
+            # and is unreachable only because of this refusal.
             raise ValueError(
-                "--enable-kv-session-offload is its own host tier; it cannot "
-                "be combined with --enable-hierarchical-cache or "
-                "--enable-unified-memory."
+                "--enable-kv-session-offload cannot yet be combined with "
+                "--enable-hierarchical-cache or --enable-unified-memory "
+                "(task #547). Not a physical impossibility: the two host pools "
+                "are independent objects and their key spaces are disjoint. Two "
+                "things are missing. (1) Nothing sums the PINNED host RAM of "
+                "the two pools -- each validates its own budget alone, and an "
+                "over-commit of pinned memory invokes the OOM killer instead of "
+                "swapping. (2) The contention between kvso's in-critical-path "
+                "spill copies and HiCache's backup/prefetch transfers over the "
+                "same link has never been measured, and the spill tick's "
+                "latency budget is the whole feature."
             )
         if self.enable_hisparse:
             raise ValueError(
