@@ -61,7 +61,7 @@ class TestAbsoluteConversion(unittest.TestCase):
         """`mamba num` is printed on DECODE lines only.
 
         In this reference that is 14 samples, all 16, while the regime's peak
-        (51 slots) occurs on PREFILL lines carrying no `mamba num`. A deriver
+        (51 slots) occurs on PREFILL lines carrying no `mamba num`. A solver
         reading only `mamba num` reports a flat regime and misses the peak by
         more than 3x -- which is exactly how soak arm 1 came out dead flat.
         """
@@ -69,7 +69,7 @@ class TestAbsoluteConversion(unittest.TestCase):
         ref = read_reference(BARLINK_REF)
         self.assertGreater(
             ref.peak_slots, 3 * ref.median_slots // 2,
-            "peak collapsed toward the median: the deriver is probably "
+            "peak collapsed toward the median: the solver is probably "
             "reading decode-only samples",
         )
         self.assertEqual(ref.peak_slots, 51)
@@ -130,7 +130,7 @@ class TestReferenceSelectionGuards(unittest.TestCase):
         """boot6 is the MAMBA crash and saturated its pool.
 
         Targeting it reproduces a saturating regime, which the harness's own
-        gate scores REGIME FAIL. The deriver has to be able to say so, or the
+        gate scores REGIME FAIL. The solver has to be able to say so, or the
         next operator aims at the most recent crash by reflex.
         """
         _skip_unless(MAMBA_REF)
