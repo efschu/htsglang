@@ -2318,7 +2318,19 @@ class MHATokenToKVPool(KVCache):
     def finalize_backing(self, config) -> None:
         """After capture+sizing: back the final span and set serving capacity.
         ``config`` is a MemoryPoolConfig (duck-typed); each pool family reads the
-        fields it needs, so the finalizer stays pool-agnostic."""
+        fields it needs, so the finalizer stays pool-agnostic.
+
+        #592: ``max_total_num_tokens`` IS the physical row count here, and that
+        identity holds only at ``dcp_size == 1``. On the weighted uneven-DCP
+        lane a rank holds ``dcp_compact_pool_rows(C, cp_S, ratio_r)`` rows for
+        a global context of C -- which is why all five pool-CONSTRUCTION sites
+        go through ``ModelRunner._dcp_token_sharded_pool_rows`` and this
+        RESIZE path does not. It does not have to today, because
+        ``post_capture_kv_sizing_planned()`` is False whenever ``dcp_size >
+        1``; that gate is what makes the assumption true rather than merely
+        usually true. Anyone lifting the gate (see the #592 note there) must
+        translate the row count here first.
+        """
         self._finalize_backing_tokens(config.max_total_num_tokens)
 
     def _finalize_backing_tokens(self, final_num_tokens: int) -> None:

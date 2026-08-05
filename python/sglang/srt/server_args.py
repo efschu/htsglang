@@ -11799,6 +11799,55 @@ class ServerArgs:
         return (
             envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
             and self.device == "cuda"
+            # #592: THE DCP GATE IS AN IMPLEMENTATION GAP, NOT A HARD LIMIT,
+            # and it is stated here because the difference decides whether
+            # anyone should ever try to lift it.
+            #
+            # It arrived with the feature itself (upstream 2ad9a243f5, "Size KV
+            # pool after CUDA graph capture (opt-in)") and carried no comment,
+            # i.e. it is feature SCOPE. Nothing about post-capture resizing is
+            # unsafe under DCP per se:
+            #
+            #   * Graph safety comes from ADDRESS STABILITY, not from the pool
+            #     size being frozen. The VMM owner maps and unmaps physical
+            #     pages behind a fixed VA reservation, so "addresses never
+            #     move, so captured CUDA graphs keep replaying"
+            #     (memory_pool.py, runtime_set_backing_tokens) and
+            #     KvVmmBufferOwner.finalize refuses to exceed the reservation
+            #     that a graph baked in (store_bound_rows).
+            #   * The very same post-capture backing mechanism ALREADY runs
+            #     under uneven DCP on the #330 vram-dial lane, whose boot
+            #     capacity plan is computed inside the uneven-DCP branch of
+            #     ModelRunner._apply_token_constraints.
+            #   * The resize does not make a rank-local decision about the
+            #     context: it goes through _config_from_budget ->
+            #     _apply_token_constraints, whose uneven-DCP branch min-reduces
+            #     the per-rank unit over the world group, so C stays
+            #     group-consistent. Only the BUDGET measurement is rank-local,
+            #     which is the intended --rank-gpu-memory-mib semantics.
+            #   * The weighted owner rule does not depend on C at all:
+            #     dcp_weighted_owner_bounds() reads the token VECTOR
+            #     (dcp_size, dcp_rank), and the post-capture pass is
+            #     explicitly hint-only for the vector.
+            #
+            # What is genuinely missing is one translation. On the weighted
+            # lane a rank's PHYSICAL row count is
+            # dcp_compact_pool_rows(C, cp_S, ratio_r), not C -- every one of
+            # the five pool-construction sites goes through
+            # ModelRunner._dcp_token_sharded_pool_rows for exactly that
+            # reason, while the resize path does not: pool.finalize_backing()
+            # hands config.max_total_num_tokens straight to
+            # _finalize_backing_tokens as a row count. That identity holds
+            # only at dcp_size == 1. Lifting the gate without routing the
+            # resize through the same translation would back C rows per rank
+            # instead of the rank's compact rows and set pool.size to a number
+            # the owner rule never addresses.
+            #
+            # So a lift is: translate the rows, then re-check that the three
+            # bullets above still hold on the target config. It is bounded
+            # work, and test_post_capture_dcp_gap_592 pins both the gate and
+            # the missing translation so that whoever attempts it starts from
+            # the evidence rather than from scratch.
             and self.dcp_size == 1
             and not (use_mla() if callable(use_mla) else use_mla)
             and not self.prefill_only_disable_kv_cache
