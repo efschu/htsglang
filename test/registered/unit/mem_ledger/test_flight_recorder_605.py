@@ -38,6 +38,7 @@ from sglang.srt.mem_ledger.flight_recorder import (
     python_stack,
     read_marks,
     resident_attribution,
+    trace_requested_for_rank,
 )
 from sglang.srt.registry.nvml import pin_resolvable_without_cuda
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -428,7 +429,7 @@ class TestServingWiring(unittest.TestCase):
         """Order is the whole property: a trace armed after the first
         allocation attributes none of the boot (#602: 3 of 25142 MiB)."""
         text = self.sources["python/sglang/srt/managers/scheduler.py"]
-        arm = text.index("flight_recorder.arm_process_trace()")
+        arm = text.index("flight_recorder.arm_process_trace(")
         construct = text.index("scheduler = Scheduler(")
         self.assertLess(arm, construct)
 
@@ -439,6 +440,55 @@ class TestServingWiring(unittest.TestCase):
         scheduler = self.sources["python/sglang/srt/managers/scheduler.py"]
         self.assertNotIn("flight_recorder.dump_trace", runner)
         self.assertIn("flight_recorder.dump_trace", scheduler)
+
+
+class TestTraceScope(unittest.TestCase):
+    """Scoping the trace to some ranks is not capping the ring.
+
+    The distinction matters because ``max_entries`` is the knob that produced
+    the #602 wrap, and "the boot used too much host RAM" is the pressure that
+    would send a future reader back to it. A rank scope costs the unscoped
+    ranks their trace entirely -- visibly -- instead of costing every rank its
+    oldest events invisibly.
+    """
+
+    def _env(self, value):
+        import os as _os
+
+        old = _os.environ.get("SGLANG_VRAM_FLIGHT_TRACE")
+        if value is None:
+            _os.environ.pop("SGLANG_VRAM_FLIGHT_TRACE", None)
+        else:
+            _os.environ["SGLANG_VRAM_FLIGHT_TRACE"] = value
+
+        def restore():
+            if old is None:
+                _os.environ.pop("SGLANG_VRAM_FLIGHT_TRACE", None)
+            else:
+                _os.environ["SGLANG_VRAM_FLIGHT_TRACE"] = old
+
+        self.addCleanup(restore)
+
+    def test_unset_arms_nothing(self):
+        self._env(None)
+        self.assertFalse(trace_requested_for_rank(0))
+
+    def test_one_arms_every_rank(self):
+        self._env("1")
+        self.assertTrue(all(trace_requested_for_rank(r) for r in range(4)))
+
+    def test_a_rank_list_arms_only_those_ranks(self):
+        self._env("0,2")
+        self.assertTrue(trace_requested_for_rank(0))
+        self.assertFalse(trace_requested_for_rank(1))
+        self.assertTrue(trace_requested_for_rank(2))
+
+    def test_rank_zero_alone_is_not_read_as_off(self):
+        """``0`` is a rank name here, not a boolean. Reading it as false would
+        silently produce a boot with no trace at all."""
+        self._env("0")
+        self.assertTrue(trace_requested_for_rank(0))
+        self.assertFalse(trace_requested_for_rank(1))
 
 
 def _artifact(name):

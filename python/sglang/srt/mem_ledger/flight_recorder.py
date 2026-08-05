@@ -88,6 +88,7 @@ __all__ = [
     "Coverage",
     "SiteFootprint",
     "arm_process_trace",
+    "trace_requested_for_rank",
     "disarm_process_trace",
     "trace_armed",
     "dump_trace",
@@ -107,6 +108,8 @@ MIB = 1 << 20
 #: process; every scheduler process inherits it. Off by default because the
 #: recording costs host RAM proportional to the number of allocations a boot
 #: makes, and that cost is a measurement's price, not a serving cost.
+#: ``1``/``all`` arms every rank; a comma-separated rank list arms only those,
+#: which is how a first measurement boot keeps its host-RAM cost to one rank.
 TRACE_ENV = "SGLANG_VRAM_FLIGHT_TRACE"
 
 #: Directory for the phase-mark log (source 1) and any snapshot dumps. Absent,
@@ -143,7 +146,26 @@ def trace_armed() -> bool:
     return _trace_armed
 
 
-def arm_process_trace(force: bool = False) -> bool:
+def trace_requested_for_rank(rank: int) -> bool:
+    """Whether :data:`TRACE_ENV` asks for a trace on THIS rank.
+
+    ``1``/``all`` arms every rank; a comma-separated rank list arms only those.
+    A SCOPE, not a cap: whichever ranks are armed record their whole boot with
+    nothing dropped. It exists because the ring is uncapped by design and its
+    host-RAM cost scales with a boot's allocation count on a swapless box, so
+    "measure one rank first" has to be expressible without reaching for
+    ``max_entries`` -- which is the knob that produced the #602 wrap.
+    """
+    raw = (os.environ.get(TRACE_ENV) or "").strip()
+    if not raw:
+        return False
+    if raw.lower() in {"1", "all", "true", "yes"}:
+        return True
+    wanted = {tok.strip() for tok in raw.split(",") if tok.strip()}
+    return str(int(rank)) in wanted
+
+
+def arm_process_trace(rank: int = 0, force: bool = False) -> bool:
     """Start recording allocations, before the process's first CUDA allocation.
 
     ``max_entries`` is deliberately NOT passed. The #602 capture set it to
@@ -158,7 +180,7 @@ def arm_process_trace(force: bool = False) -> bool:
     global _trace_armed
     if _trace_armed:
         return True
-    if not (force or os.environ.get(TRACE_ENV)):
+    if not (force or trace_requested_for_rank(rank)):
         return False
     try:
         import torch

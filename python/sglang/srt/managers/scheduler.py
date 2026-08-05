@@ -6282,7 +6282,7 @@ def run_scheduler_process(
     # initialises CUDA.
     from sglang.srt.mem_ledger import flight_recorder
 
-    flight_recorder.arm_process_trace()
+    flight_recorder.arm_process_trace(rank=tp_rank)
     flight_recorder.mark("process_start", rank=tp_rank)
 
     # Set up tracing
