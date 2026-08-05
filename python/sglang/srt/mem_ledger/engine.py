@@ -565,29 +565,26 @@ def build_card_ledgers(
                 )
             )
         else:
-            capture_tokens = sum(int(inputs.capture_tokens_per_rank[r]) for r in ranks)
-            terms.append(
-                LedgerTerm(
-                    name=TERM_GRAPH_CAPTURE,
-                    mib=capture_tokens * GRAPH_MIB_PER_CAPTURED_TOKEN,
-                    provenance=Provenance.MODELED,
-                    derivation=(
-                        f"{capture_tokens} captured tokens across all graph "
-                        f"families on this card (decode max_bs x the "
-                        f"speculative capture-token multiplier, summed over "
-                        f"{n_co} rank process(es)) x "
-                        f"{GRAPH_MIB_PER_CAPTURED_TOKEN} MiB/token, the stock "
-                        "coefficient. KNOWN LOW by 3.3-3.8x against the "
-                        "2026-08-05 measurement; used only until a phase "
-                        "footprint is calibrated for this profile"
-                    ),
-                    inputs=(
-                        "cuda_graph_config.decode.max_bs",
-                        "speculative_num_draft_tokens",
-                        "speculative_algorithm",
-                        "disable_cuda_graph",
-                    ),
-                )
+            # REFUSAL, not the token estimate. The 2026-08-05 window measured
+            # that estimate 3.3-3.8x LOW (192 MiB booked against 633-730 MiB
+            # actually taken per rank), and an under-charge is the direction
+            # that OOMs a boot rather than merely costing KV. Keeping it as a
+            # fallback would mean the ledger's most dangerous term is also its
+            # least trustworthy one, silently, on any rig that has not been
+            # probed.
+            est = sum(int(inputs.capture_tokens_per_rank[r]) for r in ranks) * (
+                GRAPH_MIB_PER_CAPTURED_TOKEN
+            )
+            unbounded.append(
+                f"{TERM_GRAPH_CAPTURE} on {card.name} (rank(s) "
+                f"{', '.join(str(r) for r in ranks)}): no phase footprint is "
+                "calibrated for this hardware fingerprint and activation "
+                "profile. Run `scripts/vram_ledger/probe_activation.py`, or "
+                "`ingest-boot-log` against a boot log that contains the "
+                "'Capture ... begin' lines. This term does NOT fall back to "
+                f"the captured-tokens x {GRAPH_MIB_PER_CAPTURED_TOKEN} MiB "
+                f"estimate (~{est} MiB here), which that window measured "
+                "3.3-3.8x low -- an under-charge is the direction that OOMs"
             )
 
         # -- adaptive ladder, charged to exactly one GPU ---------------------
