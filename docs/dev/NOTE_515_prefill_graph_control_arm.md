@@ -8,6 +8,18 @@ Artifacts:
 and `.../2026-08-05_prefill_graphs_w2/` (production recipe).
 Harness: `tests/prefill_graphs/`.
 
+**Measurement conditions.** GPU power caps on this rig were recently reduced:
+both RTX 3080s from 320 W to **200 W**, the RTX 5090 from 525 W to **400 W**
+(verified at the hardware — `power.limit` reads 200/400/200 against
+`power.default_limit` 320/575/320). Every number in this note is a same-rig,
+same-cap A/B: both arms of every comparison ran under these caps, so the
+deltas and the eager-vs-eager floors are unaffected. **Comparisons against
+archive numbers taken before the change — the #320 Messbuendel tables in
+particular — are confounded and must not be read as like-for-like.** The
+absolute tok/s in §5 are therefore valid against each other and against
+nothing else. `window3_boot_floor.sh` prints the measured caps in its report
+header for the same reason.
+
 ---
 
 ## 1. The premise was a conflation
@@ -192,10 +204,56 @@ footgun into a safe text-only fast path. It is *not* implemented here: with no
 measurable throughput to win (§5), shipping a guard for a path nobody should
 turn on would be untested code defending an unused door.
 
+## 6a. The barlink hypothesis — the one live reason §5 might not be the end
+
+User directive, 2026-08-05: the claim to prove or refute is that a captured
+prefill only pays **in combination with barlink**. The mechanism is specific
+and falsifiable. §5 measured graphs against NCCL, whose collectives are
+host-driven: the launch train a graph would tighten is not the part that
+costs, so a captured prefill has nothing to recover. Barlink's device-side
+collectives can sit *inside* the captured graph, so the 68-75 % collective
+share of the prefill window (#252) becomes reachable in a way it is not under
+NCCL. If that is right, §5's flat result is a property of the transport, not
+of prefill graphs.
+
+`window3_boot_floor.sh` therefore runs a 2x2 of transport x prefill-backend,
+staged via `STAGE=nccl|barlink|all`:
+
+|  | prefill eager | prefill graphs |
+|---|---|---|
+| **NCCL** | E1, E2 | G |
+| **barlink** | BE1, BE2 | BG |
+
+Each transport carries **its own** eager-vs-eager floor (E1/E2 and BE1/BE2);
+a graph delta in either row counts only against the floor of its own row, and
+the reported swing counts only if it clears both. Points are the long-prompt
+1900 and the bs>1 short-prompt concurrency mix (256 tokens, 4 in flight,
+scored on `aggregate_tok_s` because per-request rates understate a concurrent
+regime).
+
+Two preconditions are **enforced in the script, not assumed**: the barlink
+stage refuses to run unless `b001d102fa` (the #583 tripped-spin-kernel /
+CUDA-context fix) is an ancestor of HEAD, and unless the operator passes
+`BARLINK_VERDICT=confirmed` from barlink-583's live-load repro window. If that
+window finds a second killer, the NCCL stage stands alone and the barlink row
+becomes a follow-up — the report degrades to "hypothesis UNTESTED at this
+point" rather than guessing.
+
+Note the content axis does not get a free pass here either: the barlink row
+has its own content gate, because a transport change is exactly the kind of
+thing that moves reduction order.
+
 ## 7. Recommendation
 
-Do not enable the prefill graph backend on the production recipe. It cannot
-pass a content-identity gate, and it buys nothing measurable in the regime
-production actually runs. The current `disabled` state is right for the wrong
-reason — worth knowing, because the reason is one upstream rule away from
-flipping.
+Do not enable the prefill graph backend on the production recipe **under
+NCCL**. It cannot pass a content-identity gate, and it buys nothing measurable
+in the regime production actually runs. The current `disabled` state is right
+for the wrong reason — worth knowing, because the reason is one upstream rule
+away from flipping.
+
+This recommendation is scoped to the transport it was measured on. §6a is the
+open question that could reopen it, and it is a real one: if the barlink row
+shows a graph delta that clears its own floor, the correct conclusion becomes
+"prefill graphs are a barlink feature", not "prefill graphs are worthless" —
+and the content gate then becomes the thing worth spending effort on rather
+than a reason to stop.

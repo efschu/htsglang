@@ -68,16 +68,19 @@ run_arm() {
   boot "$arm" "$@" || return 1
   "$VENV/bin/python" "$WT/tests/prefill_graphs/content_gate.py" record \
       --port $PORT --out "$OUT/${arm}_gate.json" || return 1
-  if [ "${PERF:-1}" = "1" ]; then
-    for sz in 256 900 1900; do
-      "$VENV/bin/python" "$WT/tests/prefill_graphs/prefill_perf.py" \
-          --port $PORT --tokens $sz --n 12 --seed 4242 \
-          --out "$OUT/${arm}_perf_${sz}.json" || return 1
-    done
+  # SIZES is per-stage: the NCCL stage sweeps the length axis, the barlink
+  # stage only needs the two points the 2x2 is stated over.
+  for sz in ${SIZES:-256 900 1900}; do
+    "$VENV/bin/python" "$WT/tests/prefill_graphs/prefill_perf.py" \
+        --port $PORT --tokens $sz --n 12 --seed 4242 \
+        --out "$OUT/${arm}_perf_${sz}.json" || return 1
+  done
+  if [ "${CONC:-1}" = "1" ]; then
     # Agent-like arrivals: short prompts, 4 in flight, so the scheduler
-    # actually forms bs>1 prefill batches. This is the last regime where a
+    # actually forms bs>1 prefill batches. This is the regime where a
     # captured prefill could plausibly pay -- launch-train bound, not GEMM
-    # bound (the 68-75% collective share of the prefill window, #252).
+    # bound (the 68-75% collective share of the prefill window, #252) -- and
+    # it is the regime the barlink hypothesis is really about.
     "$VENV/bin/python" "$WT/tests/prefill_graphs/prefill_perf.py" \
         --port $PORT --tokens 256 --n 24 --seed 777 --concurrency 4 \
         --out "$OUT/${arm}_perf_256c4.json" || return 1
@@ -85,64 +88,143 @@ run_arm() {
   stop_arm "$arm"
 }
 
-run_arm E1 || { stop_arm E1; exit 1; }
-run_arm E2 || { stop_arm E2; exit 1; }
-run_arm G --cuda-graph-backend-prefill breakable || { stop_arm G; exit 1; }
+STAGE="${STAGE:-nccl}"
 
-# Determinism question: can this recipe ever be byte-strict under graphs, or
-# only distribution-level? --enable-deterministic-inference is NOT in the
-# breakable rule list (server_args.py:8487) -- only tc_piecewise rejects it --
-# so BCG + deterministic is a legal combination. Content gate only, no perf.
-PERF=0 run_arm ED --enable-deterministic-inference || { stop_arm ED; exit 1; }
-PERF=0 run_arm GD --enable-deterministic-inference \
-    --cuda-graph-backend-prefill breakable || { stop_arm GD; exit 1; }
+if [ "$STAGE" = "nccl" ] || [ "$STAGE" = "all" ]; then
+  unset SGLANG_BARLINK
+  run_arm E1 || { stop_arm E1; exit 1; }
+  run_arm E2 || { stop_arm E2; exit 1; }
+  run_arm G --cuda-graph-backend-prefill breakable || { stop_arm G; exit 1; }
+
+  # Determinism question: can this recipe ever be byte-strict under graphs, or
+  # only distribution-level? --enable-deterministic-inference is NOT in the
+  # breakable rule list (server_args.py:8487) -- only tc_piecewise rejects it --
+  # so BCG + deterministic is a legal combination. Content gate only.
+  SIZES="" CONC=0 run_arm ED --enable-deterministic-inference \
+      || { stop_arm ED; exit 1; }
+  SIZES="" CONC=0 run_arm GD --enable-deterministic-inference \
+      --cuda-graph-backend-prefill breakable || { stop_arm GD; exit 1; }
+fi
+
+if [ "$STAGE" = "barlink" ] || [ "$STAGE" = "all" ]; then
+  # PRECONDITION, enforced not assumed: barlink arms only run on a tree that
+  # carries the #583 fix (b001d102fa, tripped spin kernel must not kill the
+  # CUDA context), and only once barlink-583's repro window has confirmed the
+  # fix holds under live load. Operator passes BARLINK_VERDICT=confirmed.
+  if ! git -C "$WT" merge-base --is-ancestor b001d102fa HEAD 2>/dev/null; then
+    echo "REFUSING barlink stage: #583 fix b001d102fa is not in this tree."
+    exit 2
+  fi
+  if [ "${BARLINK_VERDICT:-}" != "confirmed" ]; then
+    echo "REFUSING barlink stage: BARLINK_VERDICT is not 'confirmed'"
+    echo "(barlink-583's repro window must clear the fix under live load first)."
+    exit 2
+  fi
+  export SGLANG_BARLINK=1
+  # Only the two points the 2x2 is stated over: the long-prompt point and the
+  # bs>1 short-prompt concurrency mix.
+  SIZES="1900" run_arm BE1 || { stop_arm BE1; exit 1; }
+  SIZES="1900" run_arm BE2 || { stop_arm BE2; exit 1; }
+  SIZES="1900" run_arm BG --cuda-graph-backend-prefill breakable \
+      || { stop_arm BG; exit 1; }
+  unset SGLANG_BARLINK
+fi
+
+
+# ---------------------------------------------------------------- reporting
+# Every comparison is skipped rather than faked when its arms did not run, so
+# a barlink-less window still produces a valid (smaller) report.
+gate() {  # gate <label> <armA> <armB>
+  [ -f "$OUT/${2}_gate.json" ] && [ -f "$OUT/${3}_gate.json" ] || return 0
+  echo "--- $1"
+  "$VENV/bin/python" "$WT/tests/prefill_graphs/content_gate.py" \
+      compare "$OUT/${2}_gate.json" "$OUT/${3}_gate.json"
+}
 
 echo
-echo "########## BOOT-TO-BOOT CONTENT FLOOR (eager vs eager) ##########"
-echo "If this FAILS, the window-2 graph-vs-eager divergence is boot noise."
-"$VENV/bin/python" "$WT/tests/prefill_graphs/content_gate.py" compare "$OUT/E1_gate.json" "$OUT/E2_gate.json"
-echo
-echo "########## GRAPHS vs EAGER (same gate) ##########"
-"$VENV/bin/python" "$WT/tests/prefill_graphs/content_gate.py" compare "$OUT/E1_gate.json" "$OUT/G_gate.json"
+echo "########## REPORT HEADER: measurement conditions ##########"
+echo "Enforced GPU power caps at report time (measured, not assumed):"
+nvidia-smi --query-gpu=index,name,power.limit,power.default_limit \
+           --format=csv,noheader | sed 's/^/  /'
+cat <<'HDR'
+  Caps were reduced on this rig (3080 320->200 W, 5090 525->400 W).
+  Every arm below is SAME-RIG and shares these caps, so the A/B deltas and the
+  eager-vs-eager floors are unaffected. Any comparison against ARCHIVE numbers
+  taken before the change -- the #320 Messbuendel tables in particular -- is
+  CONFOUNDED by the power change and must not be read as a like-for-like
+  regression or gain.
+HDR
 
 echo
-echo "########## DETERMINISTIC INFERENCE: byte-strict or only distribution? ##########"
-echo "--- eager-det vs graphs-det:"
-"$VENV/bin/python" "$WT/tests/prefill_graphs/content_gate.py" compare "$OUT/ED_gate.json" "$OUT/GD_gate.json"
-echo "--- eager-det vs eager (does determinism change eager's own output?):"
-"$VENV/bin/python" "$WT/tests/prefill_graphs/content_gate.py" compare "$OUT/E1_gate.json" "$OUT/ED_gate.json"
+echo "########## CONTENT FLOORS AND GATES ##########"
+echo "A graphs-vs-eager divergence only counts if the eager-vs-eager floor above"
+echo "it passes. NCCL and barlink each get their own floor."
+gate "NCCL   floor  : eager vs eager (E1/E2)"        E1 E2
+gate "NCCL   gate   : eager vs graphs (E1/G)"        E1 G
+gate "barlink floor : eager vs eager (BE1/BE2)"      BE1 BE2
+gate "barlink gate  : eager vs graphs (BE1/BG)"      BE1 BG
+gate "transport     : NCCL eager vs barlink eager"   E1 BE1
+gate "determinism   : eager-det vs graphs-det"       ED GD
+gate "determinism   : eager vs eager-det"            E1 ED
 
 echo
-echo "########## PREFILL THROUGHPUT, with boot-to-boot noise floor ##########"
+echo "########## THROUGHPUT: 2x2 transport x prefill-backend ##########"
 "$VENV/bin/python" - "$OUT" <<'PY'
-import json, sys, statistics as st
+import json, os, statistics as st, sys
 out = sys.argv[1]
-print(f"{'size':>6} {'eager E1':>10} {'eager E2':>10} {'graphs G':>10} "
-      f"{'noise E1E2':>11} {'G vs E-mean':>12}")
-for sz in ("256", "900", "1900", "256c4"):
-    v = {}
-    for arm in ("E1", "E2", "G"):
-        d = json.load(open(f"{out}/{arm}_perf_{sz}.json"))
-        v[arm] = st.median(d["prefill_tok_s_all"])
-        if d["cached_tokens_total"]:
-            print(f"  !! {arm} size {sz}: cache hits, contaminated")
-    noise = (v["E2"] / v["E1"] - 1) * 100
-    emean = (v["E1"] + v["E2"]) / 2
-    delta = (v["G"] / emean - 1) * 100
-    print(f"{sz:>6} {v['E1']:>10.1f} {v['E2']:>10.1f} {v['G']:>10.1f} "
-          f"{noise:>+10.1f}% {delta:>+11.1f}%")
-print()
-print("A delta smaller in magnitude than the E1/E2 noise column is NOT a result.")
-print()
-print("Concurrent point (256 tok x4 in flight), AGGREGATE throughput --")
-print("per-request rates understate this regime, so read this line instead:")
-agg = {}
-for arm in ("E1", "E2", "G"):
-    d = json.load(open(f"{out}/{arm}_perf_256c4.json"))
-    agg[arm] = d["aggregate_tok_s"]
-    print(f"  {arm:>3}: {d['aggregate_tok_s']:8.1f} tok/s aggregate "
-          f"over {d['wall_seconds']:.1f}s")
-n = (agg["E2"] / agg["E1"] - 1) * 100
-dl = (agg["G"] / ((agg["E1"] + agg["E2"]) / 2) - 1) * 100
-print(f"  eager boot-to-boot noise {n:+.1f}%  |  graphs vs eager {dl:+.1f}%")
+
+
+def med(arm, sz):
+    p = f"{out}/{arm}_perf_{sz}.json"
+    if not os.path.exists(p):
+        return None, None
+    d = json.load(open(p))
+    if d["cached_tokens_total"]:
+        print(f"  !! {arm}/{sz}: cache hits present, number is contaminated")
+    # Under concurrency the per-request rate understates throughput, so the
+    # aggregate is the honest column there.
+    if d.get("concurrency", 1) > 1:
+        return d["aggregate_tok_s"], d["wall_seconds"]
+    return st.median(d["prefill_tok_s_all"]), None
+
+
+def block(label, e1, e2, g, sizes):
+    print(f"\n=== {label} ===")
+    for sz in sizes:
+        a, _ = med(e1, sz)
+        b, _ = med(e2, sz)
+        c, _ = med(g, sz)
+        if a is None or c is None:
+            continue
+        if b is None:
+            print(f"{sz:>6}: eager {a:8.1f}  graphs {c:8.1f}  "
+                  f"delta {(c/a-1)*100:+.1f}%  (NO FLOOR -- second eager boot missing)")
+            continue
+        noise = (b / a - 1) * 100
+        emean = (a + b) / 2
+        delta = (c / emean - 1) * 100
+        verdict = "INSIDE NOISE" if abs(delta) <= abs(noise) else "outside noise"
+        print(f"{sz:>6}: eager {a:8.1f}/{b:8.1f}  graphs {c:8.1f}  "
+              f"floor {noise:+6.1f}%  delta {delta:+6.1f}%  -> {verdict}")
+
+
+block("NCCL", "E1", "E2", "G", ("256", "900", "1900", "256c4"))
+block("barlink", "BE1", "BE2", "BG", ("1900", "256c4"))
+
+# The user's hypothesis, stated as one number per point: does the prefill-graph
+# delta become positive under barlink where it was flat/negative under NCCL?
+print("\n=== HYPOTHESIS: does the graph delta improve under barlink? ===")
+print("(prefill-graph delta under NCCL vs under barlink, same point;")
+print(" each compared against its OWN transport's eager floor)")
+for sz in ("1900", "256c4"):
+    n_e1, _ = med("E1", sz); n_e2, _ = med("E2", sz); n_g, _ = med("G", sz)
+    b_e1, _ = med("BE1", sz); b_e2, _ = med("BE2", sz); b_g, _ = med("BG", sz)
+    if None in (n_e1, n_g, b_e1, b_g):
+        print(f"{sz:>6}: barlink arms absent -- hypothesis UNTESTED at this point")
+        continue
+    nd = (n_g / ((n_e1 + n_e2) / 2 if n_e2 else n_e1) - 1) * 100
+    bd = (b_g / ((b_e1 + b_e2) / 2 if b_e2 else b_e1) - 1) * 100
+    print(f"{sz:>6}: NCCL {nd:+.1f}%   barlink {bd:+.1f}%   swing {bd - nd:+.1f} pp")
+print("\nA swing only supports the hypothesis if it exceeds BOTH transports'")
+print("eager floors; otherwise it is noise wearing a mechanism story.")
 PY
