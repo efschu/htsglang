@@ -50,9 +50,7 @@ def load_script():
 FLOOR_MIB = 16000
 
 
-def write_dump(
-    d, rank, uuid, activation_mib, capture_mib, profile=PROFILE, fp=FP
-):
+def write_dump(d, rank, uuid, activation_mib, capture_mib, profile=PROFILE, fp=FP):
     """``activation_mib`` is the DELTA -- the prefill transient (#589).
 
     The raw peak is written as floor + delta, which is what the counter

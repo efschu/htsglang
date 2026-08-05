@@ -118,6 +118,14 @@ def production_inputs(**overrides):
         mamba_floor_slots=16,
         mamba_floor_derivation="4 running requests x (1 active + 2 ping-pong "
         "+ 1 donation + 1 pinned checkpoint) = 4 x 5 = 20 slots",
+        # #595 (a): NCCL buffers are a first-class term now and UNBOUNDED
+        # until measured, so these fixtures state a value. The figure is this
+        # file's own stand-in, not a measurement -- what it keeps alive is
+        # what these tests were written for (exact fit, overcommit
+        # itemization); the refusal-when-absent behaviour is pinned in
+        # test_coverage_terms_595.py instead.
+        nccl_buffer_mib_per_gpu={0: 128.0, 1: 128.0, 2: 128.0},
+        nccl_signature="tp3.dcp3.pp1",
     )
     base.update(overrides)
     return DemandInputs(**base)
