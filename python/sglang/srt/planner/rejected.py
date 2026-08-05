@@ -796,6 +796,60 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         ),
         unlock="--rank-tp-ratio 5,3,3 --rank-gpu-id <5090>,<3080a>,<3080b>",
     ),
+    RejectedEntry(
+        key="cpu_expert_lane_per_event_dequant",
+        what=(
+            "computing cold MoE experts on the LOCAL CPU with a per-event "
+            "int4 -> fp32 dequant of the expert's weights"
+        ),
+        verdict=(
+            "BLOCKED: the dequant costs 6.177 ms per expert against 0.36 ms "
+            "of headroom (17x), and ~10x the entire H2D fetch it was meant to "
+            "replace -- the lane would be roughly ten times SLOWER than just "
+            "streaming the weights"
+        ),
+        gain=(
+            "activations cross the link, not weights: ~800:1 less traffic "
+            "per expert event in decode, worth ~2.3x on compute"
+        ),
+        cost="6.177 ms/expert of dequant against 0.36 ms of headroom (17x)",
+        why=(
+            "half precision on this CPU is a 400x cliff (~1.0 GFLOP/s bf16 "
+            "and fp16 vs 23-432 fp32), so the lane must compute in fp32; fp32 "
+            "masters need 129 GB against 98 GB with no swap, so they cannot be "
+            "held; which forces the dequant per event, where it costs more "
+            "than the transfer. The three only conflict together."
+        ),
+        level=BLOCKED,
+        evidence=(
+            "docs/dev/ANALYSE_CPU_EXPERT_LANE.md SS2 (CPU GEMM on the real "
+            "expert shapes) and SS6a (dequant on REAL tensors from the "
+            "delivered Qwen3.5-35B-A3B-GPTQ-Int4 shards, layer 23 expert 0, "
+            "all three projections, cold source, 16 threads), measured "
+            "2026-08-05. Hermetic CPU measurements, no card. Robust to kernel "
+            "quality: even a 5x faster dequant leaves it 3.4x over budget"
+        ),
+        tags=("moe-offload", "cpu-lane"),
+        scope="rig",
+        note=(
+            "TWO ROUTES REMAIN, and neither is this one. (a) INTEGER CPU "
+            "KERNELS (llama.cpp-style K-quant GEMM) have no dequant step at "
+            "all; that is the natural route for the DSV4F/K3 vehicle, whose "
+            "transfer wall makes the upside largest, and it stays OPEN -- "
+            "nothing here argues for or against it, it is simply a much "
+            "larger build. (b) a PRE-DEQUANTISED PARTIAL fp32 TIER: an fp32 "
+            "expert is 12.6 MB, so ~40 GB of spare RAM holds ~31 % of the "
+            "model's experts with no dequant in the path. That is a DIFFERENT "
+            "feature (a second host tier plus an admission policy, #407 being "
+            "the right home) and it is gated on a measurement nobody has: how "
+            "skewed cold-expert routing actually is. That measurement is "
+            "task #390 (expert-heat statistics) -- answerable from existing "
+            "instrumentation without a line of CPU-lane code, and it is the "
+            "FIRST question on any revisit, not a CPU-GEMM question at all. "
+            "The rig scope is because both the 98 GB RAM ceiling and the "
+            "half-precision cliff are properties of this box."
+        ),
+    ),
 )
 
 
