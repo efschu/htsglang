@@ -4212,6 +4212,16 @@ class Scheduler(
             num_tokens_next = batch.new_tokens_required_next_decode()
             evict_from_tree_cache(self.tree_cache, num_tokens_next)
             kv_full_retract_flag = self.uniform_min_avail() < num_tokens_next
+        # #583 (desync site 2): hand the SAME reduced value to the batch, so
+        # `retract_decode`'s loop bound and its last-survivor test decide from
+        # it too. #603 made the decision to ENTER retraction rank-uniform;
+        # without this line the ranks still enter together and then pop
+        # DIFFERENT numbers of victims from their local pools -- and a rank
+        # that pops down to empty returns `ret = None`, skips `run_batch`
+        # (the `if batch:` at the top of the event loop) and goes round to
+        # `recv_requests` while the others enter the decode collective. That
+        # is the observed 2026-08-05 21:10 stack pair exactly.
+        batch.uniform_avail_floor = self.uniform_min_avail()
         if kv_full_retract_flag:
             # #287 THROTTLE BEFORE RETRACT. Retraction still runs -- it is the
             # only thing that frees tokens for the step that is about to
