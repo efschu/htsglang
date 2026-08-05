@@ -3315,41 +3315,65 @@ class Scheduler(
         try:
             c = _CENSUS
             c.next_round()
-            # Announced from HERE, not at import: an import-time line proves
-            # only that the module loaded, while this one proves the wired
-            # path is reached on the production flagset. An instrument that
-            # is silent when healthy and silent when unwired cannot be told
-            # apart from a dead one (#380).
-            c.announce_armed_once(self.tp_rank, _CENSUS_INTERVAL, _CENSUS_HEARTBEAT)
+            # `self.ps.tp_rank`, NOT `self.tp_rank`: the Scheduler keeps its
+            # parallel identity on the ParallelState wrapper. The first cut
+            # of this used `self.tp_rank`, which does not exist -- every
+            # tick raised AttributeError, the census counted nothing, and a
+            # desk test that stubbed the attribute never noticed. Pinned by
+            # test_census_attribute_surface_583.py against the REAL class.
+            rank = self.ps.tp_rank
             if c.due(_CENSUS_HEARTBEAT):
-                c.heartbeat(self.tp_rank)
-            if not c.due(_CENSUS_INTERVAL):
-                return
-            grp = getattr(self, "tp_cpu_group", None)
-            if grp is None:
-                return
-            c.compare_across_ranks(
-                grp,
-                torch.distributed.get_world_size(grp),
-                self.tp_rank,
-            )
+                c.heartbeat(rank)
+            if c.due(_CENSUS_INTERVAL):
+                grp = getattr(self, "tp_cpu_group", None)
+                if grp is not None:
+                    c.compare_across_ranks(
+                        grp, torch.distributed.get_world_size(grp), rank
+                    )
+            # Announced only AFTER a tick has completed without raising, so
+            # a broken census can never look armed. The arming line is the
+            # only evidence a reader has that the instrument is live; if it
+            # printed before the work, it would certify the very failure it
+            # exists to expose.
+            c.announce_armed_once(rank, _CENSUS_INTERVAL, _CENSUS_HEARTBEAT)
         except Exception as exc:  # noqa: BLE001 - instrument must not raise
-            logger.warning(
-                "collective census tick skipped (%s: %s)", type(exc).__name__, exc
-            )
+            # ONCE, not per tick: this fired 2661 times in one boot and
+            # still told the reader nothing the first line had not.
+            _CENSUS.warn_skipped_once(exc)
 
     def uniform_min_avail(self) -> int:
         """This iteration's rank-uniform available_size.
 
-        Falls back to the live local value when the reduce has not run yet
-        (construction, tests, single rank) -- the same shape as
-        ``dcp_min_avail``, and for the same reason: a decision must never
-        read a value that silently means something else.
+        Falls back to the live local value ONLY on a single rank, where
+        there is nothing to diverge from. On a group a missing reduce is
+        refused loudly instead -- a decision must never read a value that
+        silently means something else, and "this rank's own pool" is exactly
+        that when the caller asked for the group's.
         """
         v = getattr(self, "_uniform_min_avail", None)
-        if v is None:
-            return int(self.token_to_kv_pool_allocator.available_size())
-        return int(v)
+        if v is not None:
+            return int(v)
+        # #583 follow-up: refuse rather than silently reinstate the defect.
+        #
+        # The old fallback returned this rank's local available_size()
+        # whenever the reduce had not run. On a single rank that is exactly
+        # right. On a GROUP it is the rank-local predicate #603 removed,
+        # restored silently by any path that reaches a decode-mem decision
+        # before `_update_uniform_pool_budget` -- and a getattr default is
+        # precisely the shape that hides such a path (#606): the guard reads
+        # as present in the source while being absent at runtime.
+        if self.ps.tp_size > 1:
+            raise RuntimeError(
+                "uniform_min_avail() was reached before "
+                "_update_uniform_pool_budget() ran on a multi-rank boot. "
+                "Returning this rank's local available_size() here would "
+                "restore the rank-local decode-mem predicate #603 removed "
+                "and split the ranks across branches carrying different "
+                "collectives. The reduce is unconditional and pre-branch in "
+                "get_next_batch_to_run; a caller reaching this line means a "
+                "decode-mem decision escaped that ordering."
+            )
+        return int(self.token_to_kv_pool_allocator.available_size())
 
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]

@@ -24,6 +24,7 @@ through a fake that behaves like ``torch.distributed`` for a MIN all_reduce
 over a fixed set of per-rank values.
 """
 
+import types
 import unittest
 from unittest import mock
 
@@ -48,11 +49,18 @@ class _FakeScheduler:
     the real constructor wants a model, a device and a process group, none of
     which this decision depends on."""
 
-    def __init__(self, avail, world_avails=None):
+    def __init__(self, avail, world_avails=None, tp_size=None):
         self.token_to_kv_pool_allocator = _FakeAllocator(avail)
         self.kv_session_offload = None
         self.tp_cpu_group = object() if world_avails else None
         self._world_avails = world_avails
+        # The real Scheduler carries its parallel identity on `self.ps`
+        # (ParallelState), NOT as `self.tp_size` -- a stub that invents the
+        # flat attribute is what let the census ship dead against
+        # `self.tp_rank`. Model the real shape.
+        self.ps = types.SimpleNamespace(
+            tp_size=tp_size if tp_size is not None else len(world_avails or [1])
+        )
 
     _update_uniform_pool_budget = Scheduler._update_uniform_pool_budget
     uniform_min_avail = Scheduler.uniform_min_avail
@@ -109,9 +117,12 @@ class UniformPoolBudgetTest(unittest.TestCase):
 
         # The pre-fix predicate, spelled out, to show it really does diverge.
         local_answers = [avail < demand for avail in world]
-        self.assertEqual(local_answers, [False, False, True],
-                         msg="the fixture must actually be a divergent case, "
-                             "otherwise the test below proves nothing")
+        self.assertEqual(
+            local_answers,
+            [False, False, True],
+            msg="the fixture must actually be a divergent case, "
+            "otherwise the test below proves nothing",
+        )
 
         uniform_answers = []
         for own in world:
