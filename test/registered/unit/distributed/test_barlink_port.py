@@ -19,6 +19,7 @@ What they lock down:
 
 import ast
 import importlib.util
+import inspect
 import pathlib
 import sys
 import types
@@ -619,13 +620,29 @@ def test_async_allgather_does_not_bypass_barlink():
 
 
 def test_construction_is_flag_gated():
+    """The gate is `should_build_barlink`, and its body is still the flag.
+
+    It used to be inlined here. #598 gave it a name because a SECOND reader
+    needs it: the VRAM ledger has to answer "does this launch build an NCCL
+    communicator at all?" during argument parsing, and a ledger that re-derived
+    `envs.SGLANG_BARLINK.get() and world_size > 1` would keep pricing that term
+    at 0 after this condition changed. So the assertion moves down one level --
+    the gate must BE the shared predicate, and the predicate must still be the
+    flag -- rather than being dropped.
+    """
+    from sglang.srt.distributed.parallel_state import should_build_barlink
+
     src = _PARALLEL_STATE.read_text()
-    assert "if envs.SGLANG_BARLINK.get() and self.world_size > 1:" in src, (
+    assert "if should_build_barlink(self.world_size):" in src, (
         "barlink must only be constructed when the flag is on"
     )
+    assert (
+        "return bool(envs.SGLANG_BARLINK.get()) and world_size > 1"
+        in inspect.getsource(should_build_barlink)
+    ), "should_build_barlink must still be exactly the flag-and-multi-rank gate"
     # The communicator module must not be imported at all when the flag is off.
     assert src.count("from sglang.srt.distributed.device_communicators.barlink import") == 1
-    idx_gate = src.index("if envs.SGLANG_BARLINK.get()")
+    idx_gate = src.index("if should_build_barlink(self.world_size):")
     idx_import = src.index(
         "from sglang.srt.distributed.device_communicators.barlink import"
     )

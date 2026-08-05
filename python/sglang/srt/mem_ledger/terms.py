@@ -145,6 +145,25 @@ class LedgerTerm:
     chunk size, staged execution). #493: padding does not cap a transient, so
     a transient term without a mechanism is not a term -- it is an
     :attr:`CardVramLedger.unbounded` entry and refuses the boot.
+
+    ``not_applicable`` is the THIRD state a quantity can be in, and it is the
+    reason this flag exists rather than a bare 0 MiB row (#598). A term is:
+
+      * a NUMBER, when it was modeled or measured. Zero is one of those
+        numbers: "we looked at this allocation and it came out at 0 MiB".
+      * :attr:`CardVramLedger.unbounded`, when the allocation exists and
+        nobody could bound it. A refusal.
+      * NOT APPLICABLE, when the allocation does not EXIST in this
+        configuration -- a different transport owns the path, the feature is
+        off, the group has one rank.
+
+    Collapsing the third into the first loses the distinction that matters
+    when the configuration changes: a measured zero is invalidated by a new
+    measurement, a NOT_APPLICABLE is invalidated by a config change, and a
+    reader of a 0 row cannot tell which of the two he is looking at unless the
+    row says so. Charging is identical (0 MiB either way) -- the difference is
+    entirely in what the ledger CLAIMS, and this ledger's whole premise is
+    that the claim is checkable.
     """
 
     name: str
@@ -153,6 +172,10 @@ class LedgerTerm:
     derivation: str
     inputs: Tuple[str, ...] = ()
     bounded_by: Optional[str] = None
+    #: True when the quantity does not exist in this configuration. Forces
+    #: ``mib == 0``; see the class docstring for why this is not the same
+    #: statement as a measured zero.
+    not_applicable: bool = False
     #: Fingerprint the calibration was taken under. Set for CALIBRATED terms
     #: only; a mismatch against the live fingerprint invalidates the value.
     fingerprint: Optional[str] = None
@@ -196,16 +219,31 @@ class LedgerTerm:
                 f"DECLARED term {self.name!r} names no tenant; a coresident "
                 "sum must be able to say who asked for the bytes"
             )
+        if self.not_applicable and self.mib:
+            raise LedgerError(
+                f"term {self.name!r} is marked not applicable and still "
+                f"charges {self.mib} MiB. 'This allocation does not exist in "
+                "this configuration' and 'it exists and costs something' are "
+                "not both true"
+            )
 
     @property
-    def row(self) -> str:
+    def mark(self) -> str:
+        """The provenance column, carrying every qualifier a reader needs in
+        order to tell two 0 MiB rows apart."""
         mark = self.provenance.value
+        if self.not_applicable:
+            mark = f"{mark}/n-a"
         if self.fingerprint:
             mark = f"{mark}@{self.fingerprint[:12]}"
         if self.tenant:
             mark = f"{mark}:{self.tenant}"
+        return mark
+
+    @property
+    def row(self) -> str:
         cap = f" [capped by {self.bounded_by}]" if self.bounded_by else ""
-        return f"{self.name}|{self.mib}|{mark}|{self.derivation}{cap}"
+        return f"{self.name}|{self.mib}|{self.mark}|{self.derivation}{cap}"
 
     def to_json(self) -> dict:
         return {
@@ -217,6 +255,7 @@ class LedgerTerm:
             "bounded_by": self.bounded_by,
             "fingerprint": self.fingerprint,
             "tenant": self.tenant,
+            "not_applicable": self.not_applicable,
         }
 
 
@@ -326,11 +365,10 @@ class CardVramLedger:
             (USER_RESERVE_TERM, self.user_reserve_mib, "operator", "external headroom")
         ]
         for t in self.terms:
-            mark = t.provenance.value
-            if t.fingerprint:
-                mark = f"{mark}@{t.fingerprint[:12]}"
-            if t.tenant:
-                mark = f"{mark}:{t.tenant}"
+            # One mark builder, so a qualifier added to the row (e.g. the
+            # #598 not-applicable marker) cannot be visible in one renderer
+            # and invisible in the other.
+            mark = t.mark
             why = t.derivation
             if t.bounded_by:
                 why = f"{why} [capped by {t.bounded_by}]"

@@ -47,7 +47,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.mem_ledger.terms import (
     CardVramLedger,
@@ -55,6 +55,9 @@ from sglang.srt.mem_ledger.terms import (
     LedgerTerm,
     Provenance,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from sglang.srt.mem_ledger.nccl_transport import CommunicatorGroup
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,7 @@ __all__ = [
     "TERM_ATTN_WORKSPACE",
     "BUDGET_FUNDED_TERMS",
     "TERM_NCCL_BUFFERS",
+    "communicator_groups_from_server_args",
     "demand_outside_budget_mib",
 ]
 
@@ -247,6 +251,14 @@ class DemandInputs:
     #: unchanged, which is why it is carried with the number instead of being
     #: keyed on the hardware fingerprint alone.
     nccl_signature: str = ""
+    #: #598. The communicator groups this launch builds, as
+    #: :class:`~sglang.srt.mem_ledger.nccl_transport.CommunicatorGroup`
+    #: descriptions. ``None`` means "not stated" and keeps the pre-#598
+    #: two-state term exactly (priced when measured, UNBOUNDED otherwise), so
+    #: every existing caller is byte-identical. An EMPTY tuple is not the same
+    #: thing: it is the positive statement that this launch builds no
+    #: multi-rank group, and it resolves the term to NOT_APPLICABLE.
+    communicator_groups: Optional[Sequence["CommunicatorGroup"]] = None
 
     def rank_count(self) -> int:
         return len(self.weight_mib_per_rank)
@@ -447,6 +459,15 @@ class DemandInputs:
                 int(attn_scratch) if attn_scratch is not None else None
             ),
             parent_binds_cuda_context=False,
+            # #598. Stating the groups is what lets the NCCL term reach its
+            # third state. It is stated from the SAME ServerArgs the boot uses,
+            # and the verdict then comes from the construction predicates
+            # themselves, so a launch whose TP group barlink owns prices this
+            # term at 0-with-a-reason instead of refusing the whole reserve
+            # over a communicator that is never built.
+            communicator_groups=communicator_groups_from_server_args(
+                server_args, rank_gpu_id
+            ),
         )
 
 
@@ -478,6 +499,66 @@ def _ranks_on(gpu_id: int, rank_gpu_id: Sequence[int]) -> Tuple[int, ...]:
     return tuple(r for r, g in enumerate(rank_gpu_id) if g == gpu_id)
 
 
+def _classify_nccl_groups(inputs: "DemandInputs"):
+    """Per-group transport verdicts, or ``None`` when the launch did not state
+    its communicator groups.
+
+    ``None`` is the pre-#598 world and must stay byte-identical there: a caller
+    that says nothing about transports gets the old two-state term (priced when
+    measured, UNBOUNDED otherwise). Only a caller that DESCRIBES its groups can
+    reach the NOT_APPLICABLE state, because only then is there something to
+    derive it from.
+    """
+    if inputs.communicator_groups is None:
+        return None
+    from sglang.srt.mem_ledger.nccl_transport import classify_communicator_groups
+
+    return classify_communicator_groups(inputs.communicator_groups)
+
+
+def communicator_groups_from_server_args(
+    server_args, rank_gpu_id: Sequence[int]
+) -> Tuple["CommunicatorGroup", ...]:
+    """The multi-rank groups this launch builds, as far as the ledger needs
+    them.
+
+    NOT an exhaustive enumeration of GroupCoordinators (a launch can also build
+    dcp, attn_cp, moe_ep, moe_tp, ... groups), and it does not have to be,
+    because of how the composite resolves:
+
+      * The WORLD group spans every rank and is built unconditionally, so
+        whenever any other group could be multi-rank, the world group is too.
+        With barlink off, the world group alone already yields "an NCCL
+        communicator is built" -> the old UNBOUNDED/priced behaviour, no matter
+        what the unlisted groups do.
+      * With barlink on, ``should_build_barlink`` is true for EVERY group of
+        more than one rank -- the switch is launch-global -- and a single-rank
+        group builds no device communicator. So no unlisted group can build
+        NCCL either.
+
+    A missing group can therefore not turn an NCCL launch into a
+    NOT_APPLICABLE one, which is the only direction that would under-charge the
+    card. The named sub-groups are listed so the ledger row says which ones
+    were considered rather than making the reader trust an invisible set.
+    """
+    from sglang.srt.mem_ledger.nccl_transport import CommunicatorGroup
+
+    tp = int(getattr(server_args, "tp_size", 1) or 1)
+    pp = int(getattr(server_args, "pp_size", 1) or 1)
+    dcp = int(getattr(server_args, "dcp_size", 1) or 1)
+    # Conservative on purpose: whichever count is larger is the one that can
+    # make the world group multi-rank.
+    world = max(len(rank_gpu_id), tp * pp)
+    groups = [
+        CommunicatorGroup(name="world", world_size=world),
+        CommunicatorGroup(name="tp", world_size=tp),
+        CommunicatorGroup(name="pp", world_size=pp),
+    ]
+    if dcp > 1:
+        groups.append(CommunicatorGroup(name="dcp", world_size=dcp))
+    return tuple(groups)
+
+
 def build_card_ledgers(
     inputs: DemandInputs,
     *,
@@ -503,6 +584,12 @@ def build_card_ledgers(
         )
     tenant_terms = tenant_terms or {}
     residual_by_uuid = calibration.by_uuid() if calibration is not None else {}
+    # Once for the launch, not once per card: the communicator set is a
+    # property of the launch, and the per-card part of the NCCL term is only
+    # the co-located rank multiplier.
+    nccl_verdicts = _classify_nccl_groups(inputs)
+    nccl_unresolved = [v for v in nccl_verdicts or () if not v.resolved]
+    nccl_building = [v for v in nccl_verdicts or () if v.builds_nccl]
 
     ledgers: List[CardVramLedger] = []
     for card in cards:
@@ -845,22 +932,94 @@ def build_card_ledgers(
         # signature; if a measurement ever shows drift within a signature the
         # term must become a bound instead.
         #
-        # THIS RIG ALWAYS PAYS IT. Custom all-reduce is disabled for
-        # --rank-gpu-id on heterogeneous cards (different NVML totals) and the
-        # boot falls back to NCCL for TP collectives, as the window-8 log
-        # states. So on exactly the configuration whose reserve keeps coming
-        # up short, these buffers are present and were charged to nothing.
+        # #598: A THIRD STATE, AND THE MIS-INFERENCE THAT MADE IT NECESSARY.
+        #
+        # The paragraph that stood here claimed "THIS RIG ALWAYS PAYS IT",
+        # reasoning from the window-8 boot line "custom all-reduce disabled ->
+        # falling back to NCCL for TP collectives". That line is real and it
+        # is about CUSTOM ALL-REDUCE being disabled; it says nothing about
+        # what happens AFTERWARDS. On this rig barlink then takes ownership of
+        # the TP group, and a group barlink owns never constructs a PyNccl
+        # communicator at all -- GroupCoordinator logs exactly that: "barlink
+        # is active for group 'tp:0': skipping PyNccl communicator
+        # construction". Window 9 confirmed it from the other side:
+        # NCCL_DEBUG=INFO with NCCL_DEBUG_SUBSYS=INIT,ALLOC produced ZERO
+        # allocation lines, because there is nothing to allocate.
+        #
+        # So the evidence chain was wrong for this transport: "custom AR is
+        # off" implies "NCCL would be the fallback", not "NCCL is what runs".
+        # A term that reasons from a log line about a DIFFERENT decision is
+        # exactly the adjacent-evidence failure this ledger keeps meeting; the
+        # fix is to branch on the SAME predicate the construction site
+        # branches on, which is what nccl_transport does (it imports
+        # should_build_barlink / should_build_pynccl rather than restating
+        # them, so the two cannot drift).
+        #
+        # The three states, and why NOT_APPLICABLE may not be folded into a
+        # measured zero, are spelled out in mem_ledger/nccl_transport.py and
+        # on LedgerTerm.not_applicable. In short: this term is UNBOUNDED while
+        # an NCCL communicator is built and unmeasured, PRICED once measured
+        # for a named communicator set, and NOT APPLICABLE when no NCCL
+        # communicator is constructed at all. Only the last one is derivable
+        # from configuration, which is why it is MODELED while the priced case
+        # is CALIBRATED.
         nccl_mib = (inputs.nccl_buffer_mib_per_gpu or {}).get(card.gpu_id)
-        if nccl_mib is None:
+        if nccl_verdicts is not None and nccl_unresolved:
+            # Conservative composite: one group nobody could place is enough
+            # to refuse, and it is NAMED, because "could not tell" must not
+            # read like "there is none".
+            unbounded.append(
+                f"{TERM_NCCL_BUFFERS} on {card.name}: the transport owning "
+                f"{len(nccl_unresolved)} communicator group(s) could not be "
+                "resolved, so whether NCCL buffers are allocated at all is "
+                "unknown -- "
+                + "; ".join(f"{v.name}: {v.reason}" for v in nccl_unresolved)
+            )
+        elif nccl_verdicts is not None and not nccl_building:
+            skipped = ", ".join(f"{v.name} ({v.reason})" for v in nccl_verdicts) or (
+                "this launch builds no multi-rank communicator group"
+            )
+            terms.append(
+                LedgerTerm(
+                    name=TERM_NCCL_BUFFERS,
+                    mib=0,
+                    provenance=Provenance.MODELED,
+                    derivation=(
+                        "NOT APPLICABLE: no group of this launch constructs an "
+                        f"NCCL communicator, so there is nothing to allocate. {skipped}. "
+                        "This is a configuration statement, not a measurement "
+                        "of zero: it is void as soon as the transport changes, "
+                        "and it is derived from the same predicates the "
+                        "construction site branches on "
+                        "(should_build_barlink / should_build_pynccl)"
+                    ),
+                    inputs=("communicator_groups", "SGLANG_BARLINK", "tp_size"),
+                    not_applicable=True,
+                )
+            )
+        elif nccl_mib is None:
+            still_nccl = (
+                " NCCL-owned group(s): "
+                + ", ".join(f"{v.name} ({v.reason})" for v in nccl_building)
+                + "."
+                if nccl_building
+                else ""
+            )
             unbounded.append(
                 f"{TERM_NCCL_BUFFERS} on {card.name}: allocated inside "
                 "libnccl at communicator init and never sized by this "
                 "process, so there is nothing to derive. Measure it once for "
                 "this communicator set (VRAM delta around communicator init, "
                 "or the NCCL_DEBUG=INFO alloc lines) and pass it as "
-                "nccl_buffer_mib_per_gpu with its nccl_signature."
+                "nccl_buffer_mib_per_gpu with its nccl_signature." + still_nccl
             )
         else:
+            priced_for = (
+                "; groups that build NCCL here: "
+                + ", ".join(v.name for v in nccl_building)
+                if nccl_building
+                else ""
+            )
             terms.append(
                 LedgerTerm(
                     name=TERM_NCCL_BUFFERS,
@@ -870,7 +1029,7 @@ def build_card_ledgers(
                         f"measured on {card.name}: {float(nccl_mib):.0f} MiB "
                         f"per rank process x {n_co} on this card, for the "
                         f"communicator set "
-                        f"{inputs.nccl_signature or '<unstated>'}"
+                        f"{inputs.nccl_signature or '<unstated>'}{priced_for}"
                     ),
                     inputs=("nccl_buffer_mib_per_gpu", "nccl_signature"),
                     bounded_by=(
