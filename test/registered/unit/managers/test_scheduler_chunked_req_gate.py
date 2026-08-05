@@ -84,7 +84,17 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
-    s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
+    # A bare MagicMock makes EVERY flag truthy, which arms the phase-boundary
+    # actuators this gate test has nothing to do with (kv-reshard raised on
+    # its own precondition). The flags the prologue reads are pinned off.
+    s.server_args = MagicMock(
+        speculative_skip_dp_mlp_sync=True,
+        kv_reshard_vectors=None,
+        kv_pressure_ladder=None,
+        regime_controller="off",
+        gdn_state_set_ladder=None,
+        enable_vram_dial=False,
+    )
     s.running_batch = MagicMock()
     s.running_batch.is_empty.return_value = True
     s.running_batch.is_prefill_only = False
@@ -102,6 +112,33 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
+    # get_next_batch_to_run's prologue reads these before it reaches the
+    # stash gate under test. A hand-built __new__ stub only carries what the
+    # function needed on the day it was written, so it drifts red as the
+    # function grows -- which is how it stood before #603 (AttributeError on
+    # enable_hierarchical_cache, nothing to do with the gate).
+    s.enable_hierarchical_cache = False
+    s.enable_fpm = False
+    # #603: the rank-uniform pool budget. None offload manager and no TP CPU
+    # group means the helper takes its no-collective path and reads the local
+    # allocator, so the stub only has to answer available_size().
+    s.kv_session_offload = None
+    s.tp_cpu_group = None
+    s.token_to_kv_pool_allocator = MagicMock(available_size=lambda: 1 << 30)
+    # The optional per-iteration runtimes. All of them are "None means the
+    # feature is off, take no collective and change nothing", so None is the
+    # configuration this gate test wants: it isolates the stash gate from
+    # every phase-boundary actuator that shares the prologue.
+    s.kv_reshard_runtime = None
+    s.kv_pressure_runtime = None
+    s.kv_capacity_runtime = None
+    s.regime_observer = None
+    s.regime_stage_table = None
+    s._regime_observer_mode = None
+    s.gdn_slot_executor = None
+    s.waiting_queue = []
+    s.req_to_token_pool = tree_cache.req_to_token_pool
+    s.congruent_prefill_lane = None
     return s
 
 
