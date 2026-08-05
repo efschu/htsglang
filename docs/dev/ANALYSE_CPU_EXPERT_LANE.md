@@ -9,9 +9,10 @@ Scope: the **local** CPU (this rig, 98 GB RAM, no swap). `DESIGN_453` prices the
 REMOTE CPU lane on rig 2; that is a different vehicle with a network in the
 middle and is not re-derived here.
 
-**Verdict up front: PROBE FIRST, and the probe is narrow** — one measured
-number decides it, and §2 already produced enough to say which number. Details
-in §6.
+**Verdict up front: DO NOT BUILD the per-event dequant lane.** The probe §6
+called for has been run (§6a) and it came back 17x over budget. One variant
+survives arithmetically — a pre-dequantised partial fp32 tier, §6b — and it is
+a different feature from the one the order asked about. Details in §6.
 
 ---
 
@@ -240,6 +241,72 @@ from a previous iteration), and report the thread count — §2's numbers are at
 16 threads, and a lane competing with the serving process for cores will not
 get 16. A rate measured on an idle box is an upper bound, and the honest
 comparison is against a box that is also serving.
+
+---
+
+## 6a. The probe was run. Result: 17x over budget
+
+Hermetic, CPU only, no card. REAL tensors from the shipped
+`Qwen3.5-35B-A3B-GPTQ-Int4` checkpoint — layer 23, expert 0, all three
+projections, read from the actual shards (`gate_proj`/`up_proj` qweight
+`(256, 512)` int32, `down_proj` qweight `(64, 2048)`; group_size 128, sym,
+4-bit, `desc_act: false`). Standard GPTQ nibble unpack, zero-point subtract,
+scale, to fp32. Source tensors cloned per iteration so the read is not served
+from a tile left in L3 by the previous pass. 16 threads. Output verified
+finite and correctly shaped `(2048, 512)`.
+
+| term | cost per expert event |
+|---|---|
+| **Int4 -> fp32 dequant (3 projections)** | **6.177 ms** |
+| fp32 GEMM @ 1 token (§2) | 0.268 ms |
+| H2D fetch of the bf16 expert (§2) | ~0.63 ms |
+| headroom the 2.3x buys | 0.36 ms |
+
+**The dequant is 17x the available headroom, and on its own is ~10x the entire
+H2D fetch it was supposed to replace.** Adding it to the CPU lane makes that
+lane roughly 10x SLOWER than simply streaming the weights.
+
+Is this an artefact of a naive implementation? Partly — this is a
+straightforward torch unpack, and a tuned kernel would do better. But the gap
+is 17x: even a 5x faster kernel leaves it 3.4x over budget, and a 17x faster
+kernel would have to reach the headroom exactly. **The conclusion is robust to
+implementation quality**, which is precisely why the probe was worth running
+before any build rather than after.
+
+## 6b. Verdict, sharpened
+
+**DO NOT BUILD the per-event dequant lane.** §1's 800:1 traffic ratio is real
+and §2's decode-regime compute win is real, but §3's RAM wall forces a
+per-event dequant on the local vehicles, and §6a prices that at ten times the
+transfer it replaces. The lane as the order describes it does not exist on this
+rig.
+
+**One variant survives arithmetically and should be named rather than buried:**
+a **pre-dequantised partial fp32 tier**. Dequantise once, hold as many experts
+in fp32 as spare RAM allows, and let the CPU compute only on those. The
+arithmetic: an fp32 expert is 12.6 MB, so ~40 GB of spare host RAM holds ~3175
+of the model's 256 x 40 = 10240 experts, i.e. **~31 %**. For that subset the
+comparison is §2's clean one — 0.268 ms compute against ~0.63 ms fetch, a real
+~2.3x — with no dequant in the path at all.
+
+But note what it has become: **a different feature.** It is no longer "compute
+on the pinned host shard"; it is "maintain a second, fp32, partially-populated
+host tier and route cold experts to whichever tier holds them". That competes
+for RAM with the existing bf16 pinned pool, needs an admission policy for which
+experts earn fp32 residency (the #407 registry is the right home), and only
+pays if expert routing is skewed enough that ~31 % of experts absorb most cold
+accesses — which is a MEASUREMENT nobody has, and the fork's own expert-heat
+machinery (`expert_heat_migration.py`) is where it would come from.
+
+**Recommendation:** stop here. Do not build either variant now. If the topic
+returns, the first question is not about CPU GEMM at all — it is "how skewed is
+cold-expert routing?", answerable from the existing heat instrumentation
+without a single line of CPU lane code. Record §6a's number in the
+Verworfenes-Register so the next revisit starts from it.
+
+The DSV4F/K3 vehicle is untouched by §6a, because its natural route is the
+integer kernel of §3 option 2, which has no dequant step. That remains open and
+is a substantially larger build; nothing here argues for or against it.
 
 ---
 
