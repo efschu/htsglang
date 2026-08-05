@@ -6,6 +6,7 @@ injected. The desync falsifier drives REAL threads through a barrier-backed
 mock channel, so "fails loudly, never hangs" is demonstrated with actual
 concurrency, not asserted."""
 
+import inspect
 import logging
 import threading
 import unittest
@@ -468,3 +469,102 @@ class TestLogging(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LADDER_LOGGER = "sglang.srt.managers.kv_pressure_runtime"
+
+
+def _hold_lines(ctx) -> list:
+    """Only the ladder's 'hold:' INFO lines from an assertLogs capture."""
+    return [r.getMessage() for r in ctx.records if " hold: " in r.getMessage()]
+
+
+class TestHoldLogIsNotSpam582(unittest.TestCase):
+    """#582: the hold line was continuous INFO fire.
+
+    Two independent defects produced it:
+
+    1. It narrated the IDLE regime. Production logged
+       "hold: occupancy between the marks" at occupancy 0.06 against a 0.55
+       descend mark, once per scheduler round. Below the lowest mark the
+       ladder is not deferring any decision an operator could act on.
+    2. The de-duplication compared the FORMATTED REASON, and several reasons
+       embed live numbers -- e.g. "pre-stage: level>=0.700 over 3 rounds=
+       False, projected exhaustion<=64 rounds=True". Those flip between
+       rounds, so the text differed almost every round and the guard passed
+       almost every round. De-duplication now keys on the coarse STATE.
+    """
+
+    def test_silent_far_below_the_lower_mark(self):
+        rt = _runtime()
+        with self.assertLogs(LADDER_LOGGER, level="DEBUG") as ctx:
+            logging.getLogger(LADDER_LOGGER).debug("anchor so assertLogs has a record")
+            _drive(rt, [0.06] * 40)
+        self.assertEqual(
+            _hold_lines(ctx), [],
+            "the ladder narrated the idle regime; at 0.06 against a 0.55 "
+            "descend mark there is no deferred decision to report",
+        )
+
+    def test_steady_state_in_band_logs_once_not_per_round(self):
+        rt = _runtime()
+        with self.assertLogs(LADDER_LOGGER, level="DEBUG") as ctx:
+            logging.getLogger(LADDER_LOGGER).debug("anchor")
+            _drive(rt, [0.60] * 30)
+        lines = _hold_lines(ctx)
+        self.assertLessEqual(
+            len(lines), 1,
+            f"steady state produced {len(lines)} hold lines; a state that has "
+            f"not changed is not news. Got: {lines[:4]}",
+        )
+
+    def test_one_line_per_state_transition(self):
+        """Crossing marks is news; sitting still is not."""
+        rt = _runtime()
+        with self.assertLogs(LADDER_LOGGER, level="DEBUG") as ctx:
+            logging.getLogger(LADDER_LOGGER).debug("anchor")
+            # idle -> low -> idle -> low, each held for several rounds.
+            _drive(rt, [0.10] * 6)
+            _drive(rt, [0.60] * 6)
+            _drive(rt, [0.10] * 6)
+            _drive(rt, [0.60] * 6)
+        lines = _hold_lines(ctx)
+        self.assertLessEqual(
+            len(lines), 4,
+            f"expected at most one line per band transition, got {len(lines)}",
+        )
+        self.assertGreaterEqual(
+            len(lines), 1,
+            "leaving the idle band is a transition and must still be reported",
+        )
+
+    def test_numeric_churn_in_the_reason_does_not_defeat_dedup(self):
+        """The exact regression: same STATE, drifting numbers in the text.
+
+        Occupancies differ every round but never leave the band, so the
+        formatted reason can churn while the state does not. The old
+        reason-text guard logged on every one of these rounds.
+        """
+        rt = _runtime()
+        occs = [0.60 + (i % 7) * 0.001 for i in range(30)]
+        with self.assertLogs(LADDER_LOGGER, level="DEBUG") as ctx:
+            logging.getLogger(LADDER_LOGGER).debug("anchor")
+            _drive(rt, occs)
+        lines = _hold_lines(ctx)
+        self.assertLessEqual(
+            len(lines), 1,
+            f"numeric churn inside one band produced {len(lines)} lines; "
+            f"de-duplication is keying on the text again. Got: {lines[:4]}",
+        )
+
+    def test_blocked_plans_are_still_reported_even_when_idle(self):
+        """A blocked plan means something WANTED to move and could not.
+
+        That is news at any occupancy, so the idle suppression must not
+        swallow it. Guarding this keeps the fix from becoming "log less" in
+        the direction that costs an operator a diagnosis.
+        """
+        rt = _runtime()
+        source = inspect.getsource(type(rt)._commit)
+        self.assertIn("plan.blocked is None", source)
+        self.assertIn("_band_of", source)

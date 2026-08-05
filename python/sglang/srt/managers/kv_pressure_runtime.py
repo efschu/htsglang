@@ -51,7 +51,7 @@ promises relief it cannot deliver.
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from sglang.srt.model_executor.kv_pressure_ladder import (
     HANDOVER_NONE,
@@ -147,6 +147,14 @@ class KvPressureRuntime:
         self._pending: List[OccupancySample] = []
         self._epoch = 0
         self._last_noop_reason: Optional[str] = None
+        #: #582: the coarse STATE the last hold line described. Deduplicating
+        #: on the formatted reason (which is what ``_last_noop_reason`` does)
+        #: cannot work, because several hold reasons embed live numbers -- e.g.
+        #: "pre-stage: level>=0.700 over 3 rounds=False, projected exhaustion
+        #: <=64 rounds=True". Those flip between rounds, so the text differs
+        #: almost every round and the guard passes every round. The observed
+        #: symptom was continuous INFO fire at occupancy 0.06.
+        self._last_hold_key: Optional[tuple] = None
         self.desync_checks = 0
         self.transitions = 0
 
@@ -288,14 +296,86 @@ class KvPressureRuntime:
             )
 
     # -- rule 3 + actuation ---------------------------------------------------
+    def _marks(self) -> Optional[Tuple[float, float, float]]:
+        """The sensor's three marks, low to high, or None if unavailable."""
+        sensor = getattr(self._ladder, "sensor", None)
+        if sensor is None:
+            return None
+        try:
+            return (
+                float(sensor.descend_threshold),
+                float(sensor.pre_stage_threshold),
+                float(sensor.ascend_threshold),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _band_of(self, occupancy: Optional[float]) -> str:
+        """Which side of the marks the level sits on.
+
+        Deliberately COARSE. It is the band, never the number, that decides
+        whether a hold line is news -- a level drifting from 0.061 to 0.062
+        below the lowest mark is the same situation twice.
+        """
+        if occupancy is None:
+            return "unknown"
+        marks = self._marks()
+        if marks is None:
+            return "unknown"
+        descend, pre_stage, ascend = marks
+        if occupancy < descend:
+            return "idle"
+        if occupancy < pre_stage:
+            return "low"
+        if occupancy < ascend:
+            return "mid"
+        return "high"
+
+    def _hold_state_key(self, plan: LadderPlan) -> tuple:
+        """The STATE a hold line describes, not the sentence it prints."""
+        occupancy = (
+            plan.reading.occupancy if plan.reading is not None else None
+        )
+        return (
+            plan.phase,
+            plan.current_rung,
+            plan.target_rung,
+            plan.blocked is not None,
+            self._band_of(occupancy),
+        )
+
     def _commit(self, plan: LadderPlan, running_bs: int, phase: str) -> LadderPlan:
         if plan.blocked is not None or plan.is_noop:
             reason = plan.blocked or plan.reason
-            if reason != self._last_noop_reason:
+            key = self._hold_state_key(plan)
+            occupancy = (
+                plan.reading.occupancy if plan.reading is not None else None
+            )
+            # #582 (1): do not narrate the idle regime at all. Below the
+            # DESCEND mark the ladder is not holding back from anything -- it
+            # is on the base rung with the pool nearly empty, and there is no
+            # decision being deferred that an operator could act on. The
+            # observed spam was exactly this: "hold: occupancy between the
+            # marks" at 0.06 against a 0.55 descend mark, once per scheduler
+            # round, forever.
+            #
+            # A BLOCKED plan is different and still reported: something wanted
+            # to move and could not, which is news at any occupancy.
+            if plan.blocked is None and self._band_of(occupancy) == "idle":
+                # Remember the state anyway, so the first line after LEAVING
+                # idle still prints as the transition it is.
+                self._last_hold_key = key
+                self._last_noop_reason = reason
+                return plan
+            # #582 (2): one line per state TRANSITION. See _last_hold_key for
+            # why the previous reason-text guard could not hold.
+            if key != self._last_hold_key:
                 logger.info("%s hold: %s", LOG_PREFIX, reason)
+                self._last_hold_key = key
                 self._last_noop_reason = reason
             return plan
         self._last_noop_reason = None
+        self._last_hold_key = None
         self._ladder.apply(plan)
         self._epoch += 1
         self.transitions += 1
