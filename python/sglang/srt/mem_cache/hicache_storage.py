@@ -380,6 +380,14 @@ class HiCacheStorage(ABC):
         """
         return None
 
+    def check_disk_space(self, force: bool = False) -> bool:
+        """Periodic capacity watchdog; False means the backend stopped writing.
+
+        Backends that own local storage override this (today: ``file``).
+        Backends without a local capacity of their own are always writable.
+        """
+        return True
+
     def resize(
         self,
         *,
@@ -424,6 +432,30 @@ class MetadataCache:
     def clear(self):
         with self.lock:
             self.cache.clear()
+
+
+# Shard directories the page files spread over: the first two hex characters
+# of the key. Page keys are sha256 hex digests, so the first byte spreads
+# uniformly over 256 subdirectories. Stems that do not start with two lowercase
+# hex characters -- only ever synthetic keys -- share one shard.
+_SHARD_HEX = "0123456789abcdef"
+_SHARD_FALLBACK = "zz"
+
+
+def page_shard(stem: str) -> str:
+    """Shard subdirectory a page file with this key stem belongs in.
+
+    Everything that touches the on-disk store must agree on this rule: the
+    backend, and the offline geometry migration in ``hicache_migrate``. Before
+    sharding, every page landed directly in the storage directory -- the
+    incident of task #558 left 11.7 million entries in one flat directory,
+    which cost ~114 s to scan at startup and turned every existence sweep into
+    a full-directory walk.
+    """
+    prefix = stem[:2]
+    if len(prefix) == 2 and all(c in _SHARD_HEX for c in prefix):
+        return prefix
+    return _SHARD_FALLBACK
 
 
 class HiCacheFile(HiCacheStorage):
@@ -476,6 +508,10 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
             self.kv_config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
+        # Shard directories created so far (see page_shard): keeps the write path
+        # to one makedirs per shard instead of one per page.
+        self._known_shards: set[str] = set()
+
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
@@ -510,6 +546,10 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
+        # Every non-MLA rank writes its own files into this one directory, so
+        # they share the configured byte budget; under MLA / dcp owner mode only
+        # rank 0 writes, so it gets the whole budget.
+        writer_count = 1 if is_mla_model else max(1, tp_size)
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
@@ -519,6 +559,9 @@ class HiCacheFile(HiCacheStorage):
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
+            writer_count=writer_count,
+            path_for_stem=self._existing_path,
+            iter_existing=self._iter_existing_files,
         )
 
     # Longest filename most Linux filesystems accept, in bytes.
@@ -563,22 +606,82 @@ class HiCacheFile(HiCacheStorage):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
 
+    def _sharded_path(self, stem: str) -> str:
+        """Path a NEW file for ``stem`` is written to."""
+        return os.path.join(self.file_path, page_shard(stem), f"{stem}.bin")
+
+    def _flat_path(self, stem: str) -> str:
+        """Pre-sharding path for ``stem`` (read-only compatibility)."""
+        return os.path.join(self.file_path, f"{stem}.bin")
+
+    def _existing_path(self, stem: str) -> str:
+        """Where ``stem`` currently lives: sharded if present, else the legacy
+        flat path if present, else the sharded path it would be written to.
+
+        Read-through migration: a directory written before sharding keeps
+        serving hits and its files stay evictable, while every new write is
+        sharded. Nothing rewrites or moves the old files.
+        """
+        sharded = self._sharded_path(stem)
+        if os.path.exists(sharded):
+            return sharded
+        flat = self._flat_path(stem)
+        if os.path.exists(flat):
+            return flat
+        return sharded
+
+    def _stem_exists(self, stem: str) -> bool:
+        """True when ``stem`` is on disk, sharded or in the legacy flat layout."""
+        return os.path.exists(self._sharded_path(stem)) or os.path.exists(
+            self._flat_path(stem)
+        )
+
+    def _ensure_shard_dir(self, path: str) -> None:
+        """Create the shard directory of ``path`` once per shard."""
+        shard = os.path.dirname(path)
+        if shard in self._known_shards:
+            return
+        os.makedirs(shard, exist_ok=True)
+        self._known_shards.add(shard)
+
+    def _iter_existing_files(self):
+        """(stem, stat) for every ``.bin`` under the storage directory.
+
+        Walks the shard directories and the storage directory itself, so a
+        directory that predates sharding is picked up unchanged.
+        """
+        try:
+            with os.scandir(self.file_path) as it:
+                top = list(it)
+        except FileNotFoundError:
+            return
+        for entry in top:
+            if entry.is_dir():
+                try:
+                    with os.scandir(entry.path) as shard_it:
+                        shard_entries = list(shard_it)
+                except OSError:
+                    continue
+                for sub in shard_entries:
+                    if not sub.name.endswith(".bin"):
+                        continue
+                    try:
+                        yield sub.name[:-4], sub.stat()
+                    except OSError:
+                        continue
+            elif entry.name.endswith(".bin"):
+                try:
+                    yield entry.name[:-4], entry.stat()
+                except OSError:
+                    continue
+
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
     ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
+        return self._existing_path(self._get_component_key(key, component_name))
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
-        try:
-            names = os.listdir(self.file_path)
-        except FileNotFoundError:
-            return
-        for fn in names:
-            if not fn.endswith(".bin"):
-                continue
-            stem = fn[:-4]
+        for stem, _st in self._iter_existing_files():
             # Only files belonging to this rank/model (dcp_owner_mode: rank-shared
             # KV files carry the rank-less kv_config_suffix instead).
             if stem.endswith(self.config_suffix) or (
@@ -593,7 +696,7 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        tensor_path = self._existing_path(suffixed)
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
@@ -645,13 +748,15 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
-            self._evictor.touch(suffixed, tensor_path)
+            self._evictor.touch(suffixed, self._existing_path(suffixed))
             return True
+
+        # New pages are always sharded, whatever the directory looked like before.
+        tensor_path = self._sharded_path(suffixed)
 
         tmp_path = None
         reserved = False
@@ -662,6 +767,7 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
+            self._ensure_shard_dir(tensor_path)
             tmp_path = self._tmp_path_for(tensor_path)
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
@@ -699,8 +805,7 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         if self.metadata_cache is not None and self.metadata_cache.contains(key):
             return True
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        if os.path.exists(tensor_path):
+        if self._stem_exists(key):
             if self.metadata_cache is not None:
                 self.metadata_cache.add(key)
             return True
@@ -717,11 +822,15 @@ class HiCacheFile(HiCacheStorage):
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
         if self.metadata_cache is None:
+            # One stat per candidate. This used to be a single full-directory
+            # scandir, which was cheaper only while the directory was flat and
+            # small; sharding makes the targeted lookups strictly better (the
+            # incident directory held 11.7M entries, so every sweep walked
+            # them all).
             existing_files = set()
-            with os.scandir(self.file_path) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name in target_files:
-                        existing_files.add(entry.name)
+            for filename in target_files:
+                if self._stem_exists(filename[:-4]):
+                    existing_files.add(filename)
             return existing_files
 
         existing_files = set()
@@ -730,8 +839,7 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache.contains(stem):
                 existing_files.add(filename)
             else:
-                path = os.path.join(self.file_path, filename)
-                if os.path.exists(path):
+                if self._stem_exists(stem):
                     self.metadata_cache.add(stem)
                     existing_files.add(filename)
         return existing_files
@@ -863,12 +971,22 @@ class HiCacheFile(HiCacheStorage):
         stats["file_path"] = self.file_path
         return stats
 
+    def check_disk_space(self, force: bool = False) -> bool:
+        """Run the free-space watchdog; False means writes are stopped.
+
+        Called from the storage worker loop so a filesystem that fills up is
+        noticed while the backend is idle, not only when the next page happens
+        to be written.
+        """
+        return self._evictor.check_free_space(force=force)
+
     def clear(self) -> bool:
         try:
-            for filename in os.listdir(self.file_path):
-                file_path = os.path.join(self.file_path, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
+            for dirpath, _dirnames, filenames in os.walk(self.file_path):
+                for filename in filenames:
+                    file_path = os.path.join(dirpath, filename)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
             self._evictor.clear()
             if self.metadata_cache is not None:
                 self.metadata_cache.clear()

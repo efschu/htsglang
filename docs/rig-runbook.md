@@ -851,6 +851,27 @@ Four things to get right, each of which fails quietly rather than loudly:
 - **Size suffixes are decimal unless you write `i`.** `100G` is 93.1 GiB;
   `100Gi` is 100 GiB. The runtime endpoint below takes GiB, so `100Gi` keeps
   boot-time and runtime numbers meaning the same thing.
+- **`max_size` is the budget for the whole directory, split across the ranks
+  that write into it** (task #558). It used to be applied once per rank: the
+  boot above, at TP=3, put ~294 GiB on disk for a configured 100Gi and filled
+  the volume on 2026-08-05. Each rank now gets `max_size / tp_size`; pass
+  `"max_size_scope": "per_rank"` for the old per-rank budget. Under MLA / DCP
+  owner mode only rank 0 writes, so it keeps the whole budget.
+
+What the tier does when the volume fills (same task):
+
+- Pages are accounted at their **allocated** size (`st_blocks`), not their
+  apparent length. The incident's 512-byte `.draft` pages occupied 8704 bytes
+  each, so an apparent-size cap bounded a quantity the disk does not charge.
+- A **free-space watchdog** runs in the storage worker, not just on the write
+  path: every few seconds it re-probes `statvfs`, tries to evict its own pages
+  back above `min_free_space`, and if it cannot, logs one `ERROR` and latches
+  writes off. Backups then return clean cache misses until free space recovers
+  with 5% margin, instead of a per-page warning flood.
+- Page files live in **256 two-hex-prefix shard directories** (`<dir>/ab/<key>…`).
+  Files written by an older build stay in the flat layout, are still read and
+  still evicted; nothing is migrated. The flat layout is what made the incident
+  directory (11.7M files) cost ~114 s to scan at every boot.
 
 **Re-capping a running server** — no restart, no idle requirement:
 

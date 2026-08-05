@@ -34,7 +34,8 @@ from sglang.srt.mem_cache.draft_migrate import (
     draft_shard_sizes,
     resolve_draft_reshard,
 )
-from sglang.srt.mem_cache.hicache_migrate import (
+from sglang.srt.mem_cache.hicache_migrate import (  # noqa: I001
+    store_path,
     execute_plan,
     filter_entries_by_manifest,
     plan_migration,
@@ -188,7 +189,7 @@ class TestForwardSplit(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _, dst, blob, _ = self._forward(tmp, ratios)
             for rank in range(3):
-                path = os.path.join(dst, f"aa11.draft_{_SUFFIX}_{rank}_3.bin")
+                path = store_path(dst, f"aa11.draft_{_SUFFIX}_{rank}_3.bin")
                 with open(path, "rb") as f:
                     got = f.read()
                 self.assertEqual(
@@ -267,7 +268,7 @@ class TestRoundTrip(CustomTestCase):
             )
             execute_plan(rev)
             verify_plan(rev)
-            with open(os.path.join(back, name), "rb") as f:
+            with open(store_path(back, name), "rb") as f:
                 self.assertEqual(f.read(), blob)
 
     def test_round_trip_even(self):
@@ -350,7 +351,7 @@ class TestKeyRewriteReplicated(CustomTestCase):
             verify_plan(plan)  # fan-out allowance: three full copies are legal
             for rank in range(3):
                 with open(
-                    os.path.join(dst, f"cc33.draft_{_SUFFIX}_{rank}_3.bin"), "rb"
+                    store_path(dst, f"cc33.draft_{_SUFFIX}_{rank}_3.bin"), "rb"
                 ) as f:
                     self.assertEqual(f.read(), blob)
 
@@ -372,7 +373,7 @@ class TestKeyRewriteReplicated(CustomTestCase):
                 draft_key_rewrite=True,
             )
             execute_plan(plan)
-            victim = os.path.join(dst, f"cc33.draft_{_SUFFIX}_1_2.bin")
+            victim = store_path(dst, f"cc33.draft_{_SUFFIX}_1_2.bin")
             data = bytearray(blob)
             data[17] ^= 0xFF
             _write(victim, bytes(data))

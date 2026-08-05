@@ -260,14 +260,13 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
 
     @classmethod
     def _count_file_storage_pages(cls):
-        try:
-            return sum(
-                1
-                for filename in os.listdir(cls.hicache_dir)
-                if filename.endswith(".bin")
-            )
-        except FileNotFoundError:
-            return 0
+        # Recursive: page files live in 2-hex shard subdirectories (#558).
+        return sum(
+            1
+            for _dirpath, _dirnames, names in os.walk(cls.hicache_dir)
+            for name in names
+            if name.endswith(".bin")
+        )
 
     @classmethod
     def _wait_for_file_storage_pages(cls, min_pages: int):

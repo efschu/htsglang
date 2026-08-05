@@ -35,6 +35,12 @@ from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_by
 from sglang.test.test_utils import CustomTestCase
 
 
+# One 512-byte allocation unit. The evictor accounts what the filesystem
+# charges (st_blocks, 512-byte units) rather than the apparent payload length,
+# so sizes in these tests are whole units to keep the arithmetic exact.
+_UNIT = 512
+
+
 def _t(n_bytes: int, fill: int = 0) -> torch.Tensor:
     """Build a uint8 CPU tensor of n_bytes filled with `fill`."""
     return torch.full((n_bytes,), fill, dtype=torch.uint8)
@@ -183,27 +189,27 @@ class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
 
 class TestCapBasedEviction(HiCacheFileLRUTestBase):
     def test_basic_lru_evicts_oldest(self):
-        b = self.make_backend(max_size="300", eviction_ratio=1.0)
-        self.assertTrue(b.set("a", _t(100)))
-        self.assertTrue(b.set("b", _t(100)))
-        self.assertTrue(b.set("c", _t(100)))
-        self.assertEqual(b._evictor._total_bytes, 300)
+        b = self.make_backend(max_size=str(3 * _UNIT), eviction_ratio=1.0)
+        self.assertTrue(b.set("a", _t(_UNIT)))
+        self.assertTrue(b.set("b", _t(_UNIT)))
+        self.assertTrue(b.set("c", _t(_UNIT)))
+        self.assertEqual(b._evictor._total_bytes, 3 * _UNIT)
         # Adding "d" forces eviction of "a" (oldest).
-        self.assertTrue(b.set("d", _t(100)))
-        self.assertLessEqual(b._evictor._total_bytes, 300)
+        self.assertTrue(b.set("d", _t(_UNIT)))
+        self.assertLessEqual(b._evictor._total_bytes, 3 * _UNIT)
         self.assertFalse(b.exists("a"))
         for k in ("b", "c", "d"):
             self.assertTrue(b.exists(k), f"{k} should still be present")
 
     def test_get_touches_recency(self):
-        b = self.make_backend(max_size="300", eviction_ratio=1.0)
-        b.set("a", _t(100))
-        b.set("b", _t(100))
-        b.set("c", _t(100))
+        b = self.make_backend(max_size=str(3 * _UNIT), eviction_ratio=1.0)
+        b.set("a", _t(_UNIT))
+        b.set("b", _t(_UNIT))
+        b.set("c", _t(_UNIT))
         # Access "a" -> now "b" is the LRU.
-        b.get("a", target_location=_t(100))
+        b.get("a", target_location=_t(_UNIT))
         # Inserting "d" should evict "b", not "a".
-        b.set("d", _t(100))
+        b.set("d", _t(_UNIT))
         self.assertTrue(b.exists("a"), "a was just-accessed and must survive")
         self.assertFalse(b.exists("b"), "b should be the new LRU and got evicted")
 
@@ -216,28 +222,28 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
 
     def test_eviction_ratio_drops_to_watermark(self):
         # ratio=0.5 -> evict down to ~50% of the cap before adding.
-        b = self.make_backend(max_size="400", eviction_ratio=0.5)
+        b = self.make_backend(max_size=str(4 * _UNIT), eviction_ratio=0.5)
         for k in ("a", "b", "c", "d"):
-            b.set(k, _t(100))
-        self.assertEqual(b._evictor._total_bytes, 400)
-        # target = 0.5*400 - 100 = 100, then +100 -> 200.
-        b.set("e", _t(100))
-        self.assertLessEqual(b._evictor._total_bytes, 200)
+            b.set(k, _t(_UNIT))
+        self.assertEqual(b._evictor._total_bytes, 4 * _UNIT)
+        # target = 0.5*4U - 1U = 1U, then +1U -> 2U.
+        b.set("e", _t(_UNIT))
+        self.assertLessEqual(b._evictor._total_bytes, 2 * _UNIT)
 
     def test_repeated_set_same_key_is_noop(self):
-        b = self.make_backend(max_size="300")
-        self.assertTrue(b.set("a", _t(100)))
-        self.assertEqual(b._evictor._total_bytes, 100)
+        b = self.make_backend(max_size=str(3 * _UNIT))
+        self.assertTrue(b.set("a", _t(_UNIT)))
+        self.assertEqual(b._evictor._total_bytes, _UNIT)
         # Same key, different value -- fast path skips rewrite.
-        self.assertTrue(b.set("a", _t(100)))
-        self.assertEqual(b._evictor._total_bytes, 100)
+        self.assertTrue(b.set("a", _t(_UNIT)))
+        self.assertEqual(b._evictor._total_bytes, _UNIT)
         self.assertEqual(len(b._evictor._lru), 1)
 
     def test_clear_resets_state(self):
-        b = self.make_backend(max_size="300")
-        b.set("a", _t(100))
-        b.set("b", _t(100))
-        self.assertEqual(b._evictor._total_bytes, 200)
+        b = self.make_backend(max_size=str(3 * _UNIT))
+        b.set("a", _t(_UNIT))
+        b.set("b", _t(_UNIT))
+        self.assertEqual(b._evictor._total_bytes, 2 * _UNIT)
         self.assertTrue(b.clear())
         self.assertEqual(b._evictor._total_bytes, 0)
         self.assertEqual(len(b._evictor._lru), 0)
@@ -250,7 +256,7 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
         d = tempfile.mkdtemp(prefix="hicache_seed_", dir=self.tmpdir)
         cfg = _make_config(
             model="seedmodel",
-            extra_config={"max_size": "1000", "min_free_space": "0"},
+            extra_config={"max_size": str(10 * _UNIT), "min_free_space": "0"},
         )
         # Files must end with the expected suffix for the rank/model.
         suffix = f"_seedmodel_0_1"
@@ -258,14 +264,14 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
         old_path = os.path.join(d, f"old{suffix}.bin")
         new_path = os.path.join(d, f"new{suffix}.bin")
         with open(old_path, "wb") as f:
-            f.write(b"x" * 50)
+            f.write(b"x" * _UNIT)
         # Force older mtime on old_path.
         old_t = time.time() - 100
         os.utime(old_path, (old_t, old_t))
         with open(new_path, "wb") as f:
-            f.write(b"y" * 70)
+            f.write(b"y" * 2 * _UNIT)
         b = HiCacheFile(cfg, file_path=d)
-        self.assertEqual(b._evictor._total_bytes, 50 + 70)
+        self.assertEqual(b._evictor._total_bytes, 3 * _UNIT)
         # First key in _lru should be the oldest (front = LRU).
         keys = list(b._evictor._lru.keys())
         self.assertEqual(keys[0], f"old{suffix}")
@@ -333,30 +339,31 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
 class TestTrackOrTouch(HiCacheFileLRUTestBase):
     def test_set_fast_path_adopts_external_file(self):
         # A file written by another rank should be adopted on the next set().
-        b = self.make_backend(max_size="500")
-        # Manually drop a suffixed file with the right name on disk.
+        b = self.make_backend(max_size=str(4 * _UNIT))
+        # Manually drop a suffixed file with the right name on disk, in the
+        # pre-sharding flat layout: it must still be found and adopted.
         suffixed = b._get_suffixed_key("xkey")
         path = os.path.join(b.file_path, f"{suffixed}.bin")
         with open(path, "wb") as f:
-            f.write(b"a" * 80)
+            f.write(b"a" * _UNIT)
         self.assertEqual(b._evictor._total_bytes, 0)
         self.assertNotIn(suffixed, b._evictor._lru)
         # set() should hit the fast path and adopt the file.
-        self.assertTrue(b.set("xkey", _t(80)))
+        self.assertTrue(b.set("xkey", _t(_UNIT)))
         self.assertIn(suffixed, b._evictor._lru)
-        self.assertEqual(b._evictor._total_bytes, 80)
+        self.assertEqual(b._evictor._total_bytes, _UNIT)
 
     def test_get_adopts_external_file(self):
-        b = self.make_backend(max_size="500")
+        b = self.make_backend(max_size=str(4 * _UNIT))
         suffixed = b._get_suffixed_key("ykey")
         path = os.path.join(b.file_path, f"{suffixed}.bin")
         with open(path, "wb") as f:
-            f.write(b"\x00" * 64)
-        # get() should return the data and also adopt the file.
-        out = b.get("ykey", target_location=_t(64))
+            f.write(b"\x00" * _UNIT)
+        # get() should return the data and also adopt the file (flat layout).
+        out = b.get("ykey", target_location=_t(_UNIT))
         self.assertIsNotNone(out)
         self.assertIn(suffixed, b._evictor._lru)
-        self.assertEqual(b._evictor._total_bytes, 64)
+        self.assertEqual(b._evictor._total_bytes, _UNIT)
 
 
 class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
@@ -488,22 +495,22 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
         self.assertTrue(b.metadata_cache.contains(f"k1{suffix}"))
 
     def test_eviction_removes_from_metadata_cache(self):
-        # max_size=200, so setting three 100B tensors will evict the oldest
+        # cap = two pages, so setting a third page evicts the oldest
         b = self.make_backend(
-            max_size="200",
+            max_size=str(2 * _UNIT),
             eviction_ratio=1.0,
             metadata_ttl=-1.0,
             enable_metadata_cache=True,
         )
         suffix = b.config_suffix
 
-        b.set("k1", _t(100))
-        b.set("k2", _t(100))
+        b.set("k1", _t(_UNIT))
+        b.set("k2", _t(_UNIT))
         self.assertTrue(b.metadata_cache.contains(f"k1{suffix}"))
         self.assertTrue(b.metadata_cache.contains(f"k2{suffix}"))
 
         # Forces eviction of k1
-        b.set("k3", _t(100))
+        b.set("k3", _t(_UNIT))
         self.assertFalse(b.metadata_cache.contains(f"k1{suffix}"))
         self.assertTrue(b.metadata_cache.contains(f"k2{suffix}"))
         self.assertTrue(b.metadata_cache.contains(f"k3{suffix}"))

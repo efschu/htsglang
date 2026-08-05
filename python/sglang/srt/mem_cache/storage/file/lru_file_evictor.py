@@ -27,13 +27,20 @@ import argparse
 import logging
 import os
 import threading
+import time
 from collections import OrderedDict
-from typing import Any, Callable, Optional, Set, Tuple
+from typing import Any, Callable, Iterable, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import human_readable_int
 
 logger = logging.getLogger(__name__)
+
+# How often the free-space watchdog may probe statvfs, in seconds.
+_FREE_SPACE_PROBE_INTERVAL_S = 5.0
+# Free space must climb this far above min_free before a latched write stop is
+# released, so the backend cannot oscillate between stopped and writing.
+_FREE_SPACE_RECOVERY_FACTOR = 1.05
 
 
 def _parse_size_to_bytes(value: Any) -> int:
@@ -72,17 +79,41 @@ class LRUFileEvictor:
         is_mla_model: bool,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
+        writer_count: int = 1,
+        path_for_stem: Optional[Callable[[str], str]] = None,
+        iter_existing: Optional[
+            Callable[[], Iterable[Tuple[str, os.stat_result]]]
+        ] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
         self._on_evict = on_evict
+        # Every rank that writes into this directory shares one filesystem, so
+        # by default the configured cap is split between them (see _load_config).
+        self._writer_count = max(1, int(writer_count))
+        # The backend owns the on-disk layout (sharded subdirectories, legacy
+        # flat files); it injects how a key stem maps to a path and how to
+        # enumerate what is already there. The defaults below describe the
+        # PRE-SHARDING flat layout only -- a caller whose store is sharded must
+        # inject BOTH, or the scan will not see its sharded files (they stay
+        # untracked, hence never evictable) and eviction will unlink paths that
+        # do not exist. ``HiCacheFile`` injects both.
+        self._path_for_stem = path_for_stem or (
+            lambda stem: os.path.join(self.file_path, f"{stem}.bin")
+        )
+        self._iter_existing = iter_existing or self._iter_existing_flat
+        # Free-space watchdog state: a latch, so a full disk produces one loud
+        # error and cheap refusals instead of a per-page warning flood.
+        self._write_stopped = False
+        self._last_free_probe = 0.0
+        self._refused_since_stop = 0
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
         self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
 
-        # suffixed_key -> file size in bytes; oldest at front.
+        # suffixed_key -> allocated disk bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
         self._pending_writes: Set[str] = set()
         self._total_bytes: int = 0
@@ -110,9 +141,11 @@ class LRUFileEvictor:
             if self.min_free_bytes > 0:
                 self._enforce_free_space_locked(0)
         logger.info(
-            f"HiCacheFile eviction enabled: cap={self.max_size_bytes} B, "
+            f"HiCacheFile eviction enabled: cap={self.max_size_bytes} B "
+            f"({self.max_size_scope} scope, {self._writer_count} writer ranks), "
             f"watermark={self.eviction_ratio:.2f}, min_free={self.min_free_bytes} B, "
-            f"existing={self._total_bytes} B ({len(self._lru)} entries)"
+            f"existing={self._total_bytes} B ({len(self._lru)} entries, "
+            f"allocated bytes)"
         )
 
     def _load_config(self, extra: dict) -> None:
@@ -127,6 +160,30 @@ class LRUFileEvictor:
         self.min_free_bytes = _parse_size_to_bytes(
             _cfg("min_free_space", envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE)
         )
+
+        # max_size bounds the DIRECTORY, not one rank. Every TP rank builds its
+        # own evictor over the same directory and only ever sees its own
+        # suffixed files, so an undivided cap is spent once per rank: a TP=3 run
+        # configured with 100Gi put ~294 GiB on disk (task #558). Split the cap
+        # between the ranks that write here. "per_rank" restores the old
+        # multiplying behaviour for anyone who wants a budget per rank.
+        scope = extra.get("max_size_scope")
+        scope = "shared" if scope is None else str(scope).strip().lower()
+        if scope not in ("shared", "per_rank"):
+            logger.warning(
+                f"Unknown max_size_scope {scope!r} for HiCacheFile; using 'shared'."
+            )
+            scope = "shared"
+        self.max_size_scope = scope
+        if scope == "shared" and self._writer_count > 1 and self.max_size_bytes > 0:
+            shared_total = self.max_size_bytes
+            self.max_size_bytes //= self._writer_count
+            logger.info(
+                f"HiCacheFile max_size {shared_total} B is shared across "
+                f"{self._writer_count} ranks writing to {self.file_path!r}: "
+                f"{self.max_size_bytes} B for this rank. Pass "
+                f'"max_size_scope": "per_rank" to budget each rank separately.'
+            )
 
         ratio_raw = _cfg(
             "eviction_ratio", envs.SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO
@@ -150,6 +207,32 @@ class LRUFileEvictor:
                 )
                 self.max_size_bytes = safe_max
 
+    @property
+    def write_stopped(self) -> bool:
+        """True when the free-space watchdog has latched writes off."""
+        return self._write_stopped
+
+    @staticmethod
+    def _allocated_size(st: os.stat_result) -> int:
+        """Disk bytes a file occupies: the larger of its blocks and its length.
+
+        The filesystem charges allocated blocks, not apparent length. On the
+        incident filesystem (ZFS) the 512-byte ``.draft`` pages each occupied
+        8704 bytes -- accounting them at apparent size undercounted real usage by
+        17x, and there were 5.8 million of them. ``st_blocks`` is always in
+        512-byte units, whatever the filesystem's own block size is.
+
+        ``st_blocks`` alone is not enough: filesystems with delayed allocation
+        (ZFS again) report a single block for a file that was just written and
+        has not reached a transaction group yet. Never go below the payload
+        length, so a fresh write is charged at least what its data must cost and
+        the next scan of that file corrects it upward.
+        """
+        blocks = getattr(st, "st_blocks", None)
+        if blocks is None:
+            return st.st_size
+        return max(int(blocks) * 512, st.st_size)
+
     def _stats_locked(self) -> dict:
         """``stats()`` for callers already holding ``_lock``."""
         return {
@@ -157,10 +240,13 @@ class LRUFileEvictor:
             "enabled": self._eviction_enabled,
             "is_storage_owner": self._is_storage_owner,
             "max_size_bytes": self.max_size_bytes,
+            "max_size_scope": self.max_size_scope,
+            "writer_count": self._writer_count,
             "min_free_bytes": self.min_free_bytes,
             "eviction_ratio": self.eviction_ratio,
             "used_bytes": self._total_bytes,
             "num_entries": len(self._lru),
+            "write_stopped": self._write_stopped,
         }
 
     def stats(self) -> dict:
@@ -194,7 +280,11 @@ class LRUFileEvictor:
         """
         with self._lock:
             if max_size_bytes is not None:
-                self.max_size_bytes = max(0, int(max_size_bytes))
+                # Same directory-wide semantics as the boot-time cap.
+                new_max = max(0, int(max_size_bytes))
+                if self.max_size_scope == "shared" and self._writer_count > 1:
+                    new_max //= self._writer_count
+                self.max_size_bytes = new_max
             if min_free_bytes is not None:
                 self.min_free_bytes = max(0, int(min_free_bytes))
 
@@ -227,6 +317,13 @@ class LRUFileEvictor:
                 self._evict_locked(0)
             if self.min_free_bytes > 0:
                 self._enforce_free_space_locked(0)
+            else:
+                # No watermark left to breach: drop any latched write stop so
+                # stats() does not keep reporting a stop nothing can clear.
+                self._write_stopped = False
+            # Re-cap changed the watermark, so the watchdog's last verdict is
+            # stale; let the next call probe instead of trusting its interval.
+            self._last_free_probe = 0.0
             freed = before - self._total_bytes
 
             result = self._stats_locked()
@@ -279,6 +376,14 @@ class LRUFileEvictor:
                 f"{self.max_size_bytes} B; not caching {key}"
             )
             return False
+        # Latched by the watchdog: refuse cheaply and silently (it already said
+        # so, once and loudly) rather than warning per page. Advisory only --
+        # the authoritative watermark check is _enforce_free_space_locked below,
+        # under the lock, so a page that races the latch is still refused there.
+        if not self.check_free_space():
+            with self._lock:
+                self._refused_since_stop += 1
+            return False
 
         with self._lock:
             # Cap-based eviction: evict, then bail if still over cap.
@@ -314,11 +419,25 @@ class LRUFileEvictor:
         return True
 
     def commit(self, suffixed_key: str) -> None:
-        """Mark a reserved write as durably on disk (clears its in-flight flag)."""
+        """Mark a reserved write as durably on disk (clears its in-flight flag).
+
+        The reservation was an estimate; the file now exists, so replace it with
+        the allocation the filesystem actually made.
+        """
         if not self._eviction_enabled:
             return
+        actual = None
+        try:
+            actual = self._allocated_size(os.stat(self._path_for_stem(suffixed_key)))
+        except OSError:
+            pass
         with self._lock:
             self._pending_writes.discard(suffixed_key)
+            if actual is not None and suffixed_key in self._lru:
+                reserved = self._lru[suffixed_key]
+                if actual != reserved:
+                    self._lru[suffixed_key] = actual
+                    self._total_bytes += actual - reserved
 
     def abort(self, suffixed_key: str) -> None:
         """Release a reservation whose write failed: drop it and refund the bytes."""
@@ -340,7 +459,7 @@ class LRUFileEvictor:
                 return
         # Untracked file: stat without holding the lock.
         try:
-            size = os.path.getsize(tensor_path)
+            size = self._allocated_size(os.stat(tensor_path))
         except OSError:
             return
         with self._lock:
@@ -363,8 +482,9 @@ class LRUFileEvictor:
             st = os.statvfs(self.file_path)
         except (OSError, AttributeError):
             return None
-        total = st.f_blocks * st.f_frsize
-        free = st.f_bavail * st.f_frsize
+        frsize = st.f_frsize or st.f_bsize or 4096
+        total = st.f_blocks * frsize
+        free = st.f_bavail * frsize
         return total, free
 
     def _enforce_free_space_locked(self, value_bytes: int) -> bool:
@@ -387,26 +507,109 @@ class LRUFileEvictor:
             return True
         return fs[1] - value_bytes >= self.min_free_bytes
 
-    def _scan_existing_files(self) -> None:
-        """Seed LRU index from disk on startup (oldest mtime first)."""
+    def check_free_space(self, force: bool = False) -> bool:
+        """Watchdog: police free space outside the write path. Returns writable.
+
+        ``min_free_space`` used to be consulted only while admitting a write,
+        so a filesystem that filled up (whether from this cache or from anything
+        else sharing it) was never noticed while the backend sat idle, and the
+        eventual notice was one ``warning`` per refused page. This probes
+        ``statvfs`` at most every few seconds, tries to buy the space back by
+        evicting this rank's own pages, and if that fails logs ONE error and
+        latches writes off -- upstream then sees plain cache misses instead of a
+        filling disk. The latch releases once free space recovers with margin.
+
+        The latch is an advisory fast path, not the authority: ``reserve`` still
+        runs ``_enforce_free_space_locked`` under the lock for every admitted
+        page, so a page that races a latch being set is refused there anyway.
+        The lock is dropped across the ``statvfs`` probe so a slow filesystem
+        cannot block writers.
+        """
+        if self.min_free_bytes <= 0 or not self._eviction_enabled:
+            return True
+        with self._lock:
+            now = time.monotonic()
+            if (
+                not force
+                and (now - self._last_free_probe) < _FREE_SPACE_PROBE_INTERVAL_S
+            ):
+                return not self._write_stopped
+            self._last_free_probe = now
+
+        fs = self._fs_stats()
+        if fs is None:
+            # Cannot probe: leave the latch as it is.
+            with self._lock:
+                return not self._write_stopped
+        free = fs[1]
+
+        if free >= self.min_free_bytes:
+            with self._lock:
+                self._release_write_stop_locked(free)
+                # Inside the hysteresis band (above min_free, below the recovery
+                # margin) the latch is still set and writes stay refused.
+                return not self._write_stopped
+
+        # Below the watermark: first try to buy the space back from our own LRU.
+        with self._lock:
+            self._enforce_free_space_locked(0)
+            fs = self._fs_stats()
+            free = fs[1] if fs is not None else free
+            if free >= self.min_free_bytes:
+                self._release_write_stop_locked(free)
+                return True
+            if not self._write_stopped:
+                self._write_stopped = True
+                self._refused_since_stop = 0
+                logger.error(
+                    f"HiCacheFile STOPPING WRITES: the filesystem hosting "
+                    f"{self.file_path!r} has {free} B free, below min_free="
+                    f"{self.min_free_bytes} B, and evicting this rank's "
+                    f"{len(self._lru)} cached pages ({self._total_bytes} B) did "
+                    f"not recover it. New pages will be a cache miss instead of "
+                    f"filling the disk. Free space on that filesystem, or lower "
+                    f"max_size / min_free_space."
+                )
+        return False
+
+    def _release_write_stop_locked(self, free: int) -> None:
+        """Clear a latched write stop once free space recovered with margin."""
+        if not self._write_stopped:
+            return
+        if free < self.min_free_bytes * _FREE_SPACE_RECOVERY_FACTOR:
+            return
+        refused = self._refused_since_stop
+        self._write_stopped = False
+        self._refused_since_stop = 0
+        logger.warning(
+            f"HiCacheFile resuming writes: {free} B free on the filesystem "
+            f"hosting {self.file_path!r} is back above min_free="
+            f"{self.min_free_bytes} B ({refused} pages were missed while stopped)."
+        )
+
+    def _iter_existing_flat(self) -> Iterable[Tuple[str, os.stat_result]]:
+        """(stem, stat) for every ``.bin`` directly in the storage directory."""
         try:
             names = os.listdir(self.file_path)
         except FileNotFoundError:
             return
-        entries = []
         for fn in names:
             if not fn.endswith(".bin"):
                 continue
-            stem = fn[:-4]
+            try:
+                st = os.stat(os.path.join(self.file_path, fn))
+            except OSError:
+                continue
+            yield fn[:-4], st
+
+    def _scan_existing_files(self) -> None:
+        """Seed LRU index from disk on startup (oldest mtime first)."""
+        entries = []
+        for stem, st in self._iter_existing():
             # Only files belonging to this rank/model.
             if not stem.endswith(self.config_suffix):
                 continue
-            fp = os.path.join(self.file_path, fn)
-            try:
-                st = os.stat(fp)
-            except OSError:
-                continue
-            entries.append((st.st_mtime, stem, st.st_size))
+            entries.append((st.st_mtime, stem, self._allocated_size(st)))
         entries.sort(key=lambda e: e[0])  # oldest first
         for _, stem, size in entries:
             self._lru[stem] = size
@@ -432,7 +635,7 @@ class LRUFileEvictor:
             # Keep in-flight reservations; their file isn't committed yet.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
-        tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
+        tensor_path = self._path_for_stem(evict_stem)
         try:
             os.remove(tensor_path)
             freed = evict_size
