@@ -858,6 +858,50 @@ async def validate_json_request(raw_request: Request):
 ##### Native API endpoints #####
 
 
+def _health_fast_path() -> Response:
+    """Fast-path liveness check when generation-based health is disabled.
+
+    Returns 503 if any scheduler or detokenizer subprocess is dead, with a
+    response body naming the dead component.  This closes the gap in #604
+    where the fast path returned 200 unconditionally while scheduler
+    subprocesses could be dead/zombie.
+    """
+    watchdog = getattr(
+        _global_state.tokenizer_manager, "_subprocess_watchdog", None
+    )
+    if watchdog is not None:
+        for proc, name in watchdog.processes_with_names():
+            # is_alive() calls os.waitpid(pid, WNOHANG) internally which
+            # reaps zombies. After the call, proc.exitcode is set if the
+            # process has exited. A long-running scheduler/detokenizer that
+            # is not alive is always a failure, regardless of exit code.
+            if not proc.is_alive():
+                logger.error(
+                    "Health check failed: subprocess %s (pid=%d) is dead "
+                    "with exit code %s",
+                    name,
+                    proc.pid,
+                    proc.exitcode,
+                )
+                return Response(
+                    status_code=503,
+                    content=_make_health_error_json(name, proc.pid, proc.exitcode),
+                    media_type="application/json",
+                )
+    return Response(status_code=200)
+
+
+def _make_health_error_json(name: str, pid: int, exitcode: int | None) -> str:
+    """Build the JSON body for a 503 subprocess-dead health response."""
+    detail = {
+        "error": "subprocess not alive",
+        "component": name,
+        "pid": pid,
+        "exit_code": exitcode,
+    }
+    return json.dumps(detail)
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -879,7 +923,7 @@ async def health_generate(request: Request) -> Response:
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
     ):
-        return Response(status_code=200)
+        return _health_fast_path()
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
