@@ -48,10 +48,27 @@ SIGNALS = {
     # needs SGLANG_KVSO_TICK_TRACE=1 and reports the host tail draining
     # (boundary advancing towards L) once every 16 iterations.
     "H3": [("restoregate", r"kv-session-offload restore-gate: iter=\d+ L=\d+ boundary=\d+")],
-    "H4": [("restore", r"restored to device")],                           # :5276
+    # H4/H7 CORRECTED A SECOND TIME, same failure class as the first round and
+    # worth recording for that reason. "restored to device" is _close_slot's
+    # reason string, and _close_slot logs it through logger.DEBUG. Every boot in
+    # this matrix runs at the default --log-level info, so that cell could not
+    # have been non-zero whether or not a single session restored -- it reported
+    # a working mechanism as unproven, which is exactly what the note above says
+    # these signals exist to prevent. Boot K2 then read its zero as "the
+    # on-device rejoin is not corroborated" (RESULTS_K2_spill.md).
+    # The INFO-level line three statements later in _finalize_restore is the
+    # real observable, and it now carries spec=0/1 so a rejoin into a LIVE spec
+    # batch is ATTRIBUTABLE instead of inferred.
+    # A signal string may never be one that only logger.debug emits; the binding
+    # to the source is pinned by
+    # test/registered/unit/test_kvso_restore_signal_552.py.
+    "H4": [("restore", r"kv-session-offload RESTORE complete: rid=.* rejoining device batch spec=\d")],
     "H5": [("spill", r"kv-session-offload SPILL\(partial\): rid=.*arrival_seq=")],
     "H6": [("draftkv", r"kv-session-offload: draft-KV bundle armed")],     # :2175
-    "H7": [("restore", r"restored to device")],
+    # H7 is the #552 pair: the seed republish AND the rejoin it must be
+    # attributed to. spec=1 is the half K2 could not establish.
+    "H7": [("resumeseed", r"kv-session-offload MTP RESUME seed published: rid=.* L=\d+"),
+           ("restorespec", r"kv-session-offload RESTORE complete: rid=.* rejoining device batch spec=1")],
     "H8": [("specintick", r"kv-session-offload spec-in-tick: reserved \d+ draft-read")],  # :2520
     "H9": [("specspill", r"kv-session-offload spec-in-tick: rid=.* spill batch armed with")],  # :3867
     "H11": [("budget", r"kv-session-offload SPILL BUDGET \(#236\) armed:"),        # :2409

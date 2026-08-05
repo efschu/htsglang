@@ -8,7 +8,7 @@
 # desk instead of costing a boot inside the window.
 set -u
 
-WT=/spinning/wt-spill-matrix
+WT=${WT:-/spinning/wt-spill-matrix}
 VENV=/spinning/htsglang-gpu/.venv
 HERE="$WT/scripts/dev/spill_matrix"
 TMP=$(mktemp -d)
@@ -50,9 +50,22 @@ cat > "$TMP/fake.log" <<'EOF'
 [TP0] kv-session-offload: SELF-CALIBRATING spill-tick cadence armed (floor=8)
 [TP0] kv-session-offload prefill-spill (born-spilled) ENABLED: a prompt
 [TP0] kv-session-offload tick build: rid=abc has no output token yet
-[TP0] closing slot 3: restored to device
+[TP0] kv-session-offload restore-gate: iter=48 L=1143 boundary=900 remaining=243 avail=64 evictable=4096 margin=256 drained=False fits_now=True quiescent=True suppress_tick=False
+[TP0] kv-session-offload MTP RESUME seed published: rid=abc L=1143 (rank 0)
+[TP0] kv-session-offload RESTORE complete: rid=abc L=1143 (rank 0) rejoining device batch spec=1
 EOF
-for cell in H1 H2 H4 H5 H6 H8 H9 H11 H12 H14 H3; do
+# TWO FIXTURE DEFECTS FIXED HERE, same family: this file is the harness's own
+# self-test, and it was out of sync with the signal table it tests.
+#   * the old restore line was "[TP0] closing slot 3: restored to device" -- a
+#     PARAPHRASE. It matched H4's regex, so this smoke was green while the real
+#     boot could not produce the signal at all (_close_slot logs at DEBUG).
+#   * H3 was in the cell loop below but had NO fixture line at all, so this
+#     smoke has been reporting one failure since H3 was corrected after K1.
+# Fixture lines must be copied from the code's actual format string, never
+# paraphrased, or this test greens on a message that does not exist -- and
+# every cell in the loop below needs a line, or it reds on a message nobody
+# wrote.
+for cell in H1 H2 H4 H5 H6 H7 H8 H9 H11 H12 H14 H3; do
     if "$VENV/bin/python" "$HERE/drive.py" signals "$TMP/fake.log" "$cell" 2>&1 | grep -q 'ALL SIGNALS PRESENT'; then
         ok "signals $cell match"
     else

@@ -4403,6 +4403,24 @@ class KVSessionOffloadManager:
 
         # 3. Restore / wave-back each spilled session independently. A
         #    completed restore merges that session back into running_batch.
+        #
+        #    ORDER IS LOAD-BEARING (FIFO restore, module docstring line 1).
+        #    Restores compete for the same freed device space: the first slot
+        #    in this iteration that finds `fits_now` takes it, so iteration
+        #    order IS the queue discipline. `self.spills` is a dict, and the
+        #    only thing making this FIFO is dict insertion order -- oldest
+        #    SPILL first (a session re-spilled after a restore is re-inserted
+        #    at the back, which is the intended demotion). Swapping this
+        #    container for a set, or rebuilding it from an unordered source,
+        #    silently starves the eldest spilled session behind younger ones
+        #    with no error anywhere; under spec that elder is exactly the
+        #    long-context session the feature exists for. Pinned by
+        #    test_kvso_restore_signal_552.py.
+        #
+        #    Rank-uniform: spills are inserted by replicated spill decisions in
+        #    the same iteration on every rank, so every rank walks the same
+        #    order and reaches the same restore verdict -- a rank-split order
+        #    here desynchronises the collective restore into a hang.
         for rpi, slot in list(self.spills.items()):
             if getattr(slot, "park_pending", False):
                 # #224: on its way OUT to a park tier -- restoring it now
@@ -4503,19 +4521,47 @@ class KVSessionOffloadManager:
         return 0
 
     def _maybe_restore_flow(self, slot, running_batch, last_batch):
-        # DEVICE-RESUME UNDER SPEC -- MILESTONE GUARD. A spilled session decodes
-        # PLAIN on host: its EAGLE/MTP draft state (hidden_states / topk /
-        # future_indices) is dropped at spill and never rebuilt while
-        # host-resident. Merging it back into a LIVE spec decode batch therefore
-        # contributes no valid EagleDraftInput, and ScheduleBatch.merge_batch ->
-        # EagleDraftInput.merge_batch asserts on the missing spec_info. Rebuilding
-        # the resumed session's draft state (a one-shot draft-extend from its
-        # committed KV + last token) is the follow-up for true on-device MTP
-        # resume; until then, under an active server spec algorithm we keep the
-        # session on host through completion -- the validated, crash-free
-        # spill + host-decode + finish path. Non-spec sessions restore to device
-        # fully (unchanged / byte-identical). Rank-uniform: the server spec
-        # algorithm is global, so every rank makes the same decision.
+        # DEVICE-RESUME UNDER SPEC -- CAPABILITY GATE (#552).
+        #
+        # THE PROBLEM. A spilled session decodes PLAIN on host: its EAGLE/MTP
+        # draft state (hidden_states / topk / future_indices) is dropped at
+        # spill and never rebuilt while host-resident. Merging it back into a
+        # LIVE spec decode batch therefore contributes no valid
+        # EagleDraftInput, and ScheduleBatch.merge_batch ->
+        # EagleDraftInput.merge_batch asserts on the missing spec_info.
+        #
+        # THE MECHANISM EXISTS. The rebuild this guard once waited for is
+        # BUILT: `_seed_resumed_draft_state` (draft-only backfill, no target
+        # re-forward, GDN-safe) re-primes the draft state from the tick hiddens
+        # and the draft-KV bundle, and `_publish_resume_seed` relays it through
+        # the FutureMap. Do not read this guard as "on-device resume is
+        # unimplemented" -- it is a DEFAULT, not an absence.
+        #
+        # WHY IT IS STILL THE DEFAULT. Not code but an OBSERVATION is missing:
+        # no boot on record shows a spilled session rejoining a LIVE spec
+        # decode batch. Boot K2 published the resume seed on all three ranks
+        # and never took the host-finish route, but its corroborating restore
+        # cell was keyed on a DEBUG-only string and so could not have reported
+        # the rejoin either way (see the attributing signal in
+        # `_finalize_restore`). The flag flips when a boot cites `RESTORE
+        # complete ... spec=1`.
+        #
+        # UNSUPPORTED COMBINATIONS ARE NAMED, NEVER SILENT: arming the flag
+        # without kvso, without a spec algorithm, or together with PS2 deep
+        # prefill-spill is rejected at arg-parse with the reason
+        # (`server_args._handle_kv_session_offload`); PS2's own placement
+        # refusal carries its wording in `prefill_spill_deep_reject_reason`.
+        # Falling through here is the ONE remaining decline, and it is a
+        # default-off policy rather than an unsupported configuration -- so it
+        # keeps the validated, crash-free spill + host-decode + finish path
+        # instead of raising.
+        #
+        # Non-spec sessions restore to device fully (unchanged /
+        # byte-identical). Rank-uniform: the server spec algorithm is global
+        # and `resume_under_spec_enabled()` reads replicated config (env twin
+        # OR server arg), so every rank makes the same decision -- this
+        # predicate is on the collective spill/restore path and a rank-split
+        # verdict here is a hang, not a wrong answer.
         spec_algo = getattr(self.scheduler, "spec_algorithm", None)
         if (
             spec_algo is not None
@@ -5352,7 +5398,8 @@ class KVSessionOffloadManager:
         # is unchanged (byte-identical). Rank-uniform: every DCP rank captured
         # its own replicated tick hidden and runs the identical seed here.
         spec_algo = getattr(self.scheduler, "spec_algorithm", None)
-        if spec_algo is not None and not spec_algo.is_none():
+        rejoined_spec = spec_algo is not None and not spec_algo.is_none()
+        if rejoined_spec:
             # The spill batch was built spec_algorithm=NONE for the plain host
             # tick; flip it back to the server algorithm so the resumed session
             # runs a REAL spec decode (the post-forward `batch.spec_info =
@@ -5392,12 +5439,26 @@ class KVSessionOffloadManager:
                     req.rid, len(req.output_ids), self._budget_now
                 )
         self._close_slot(req.req_pool_idx, "restored to device")
+        # THE ATTRIBUTING RESTORE SIGNAL (#552). This line, not _close_slot's
+        # reason string, is what an operator or a matrix harness may grep to
+        # establish that a spilled session rejoined the device batch:
+        # _close_slot logs at DEBUG, so its "restored to device" reason is
+        # structurally absent from a default --log-level info boot and a cell
+        # keyed on it reads zero whether or not the restore happened (boot K2's
+        # H4/H7 cells did exactly that). It carries `spec=` so the rejoin can be
+        # ATTRIBUTED to a live spec batch rather than merely inferred from the
+        # earlier "MTP RESUME seed published" line -- seed-published proves the
+        # republish, spec=1 here proves the session went on to rejoin.
+        # Rank-uniform: both inputs (`rejoined_spec` from the replicated server
+        # spec algorithm, L from replicated batch metadata) are the same on
+        # every rank; only the level differs (_log: info on rank 0, debug else).
         self._log(
             "kv-session-offload RESTORE complete: rid=%s L=%d (rank %d) "
-            "rejoining device batch",
+            "rejoining device batch spec=%d",
             req.rid,
             L,
             self.dcp_rank,
+            int(rejoined_spec),
         )
         if running_batch.is_empty():
             return batch
