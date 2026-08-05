@@ -27,6 +27,8 @@ host, no card -- the leak is a shell property and is falsifiable as one.
 """
 
 import pathlib
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -407,15 +409,65 @@ class TestPgrepSelfMatchTrap(CustomTestCase):
     def _lauf_real(self, **env):
         return _lauf("altlast", STUB_ALTLAST_REAL="1", **env)
 
-    def test_the_checking_shell_does_not_count_itself(self):
-        """No decoy anywhere: the checking shell's own command line carries
-        the pattern as a string but is not launch_server. PROC must read 0.
+    @staticmethod
+    def _real_launch_servers() -> int:
+        """Independent oracle: real ``launch_server`` processes, counted by
+        reading ``/proc`` directly.
 
-        Without the bracket this test is the falsifier -- it goes red on
-        its own, on a host running nothing at all.
+        Deliberately NOT a second copy of the shell's ``pgrep`` idiom -- a
+        re-implementation would carry the same self-match bug and agree with
+        it, which is the "checks something adjacent to the thing under test"
+        trap. Reading ``/proc`` cannot match a shell command line that merely
+        MENTIONS the pattern, because it inspects each process's own argv.
         """
+        total = 0
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    argv = f.read().split(b"\0")
+            except OSError:
+                continue  # the process exited between listdir and open
+            if any(b"launch_server" in a for a in argv if a):
+                total += 1
+        return total
+
+    def test_the_checking_shell_does_not_count_itself(self):
+        """The subject is the OFF-BY-ONE, not the verdict.
+
+        This used to assert ``FREI`` -- the overall verdict, which also folds
+        in the port and the cards. That made a test of the ``pgrep`` idiom
+        fail whenever anything at all was serving on this host, which is a
+        property of the rig and not of the code under test. It went red for
+        exactly that reason during #603, with production running: the script
+        truthfully reported one launch_server, and the assertion read it as
+        a self-match.
+
+        So the count is compared against an independent oracle instead. With
+        the bracket the two agree; without it the checking shell counts its
+        own command line and the script reads one HIGHER -- which is the
+        original bug, and it is still caught here whether the host is idle or
+        busy.
+        """
+        vorher = self._real_launch_servers()
         fertig, _ = self._lauf_real()
-        self.assertIn("FREI", fertig.stdout, msg=fertig.stdout + fertig.stderr)
+        ausgabe = fertig.stdout + fertig.stderr
+        treffer = re.search(r"launch_server-Prozesse=(\d+)", ausgabe)
+        self.assertIsNotNone(
+            treffer, msg=f"no process count in the output at all: {ausgabe}"
+        )
+        gemeldet = int(treffer.group(1))
+        nachher = self._real_launch_servers()
+        # The oracle is sampled either side so a process starting or stopping
+        # mid-run widens the window instead of flaking the assertion.
+        self.assertIn(
+            gemeldet, {vorher, nachher},
+            msg=(f"script reported {gemeldet} launch_server process(es), "
+                 f"/proc says {vorher}..{nachher}. One MORE than the oracle "
+                 f"is the self-match bug: the checking shell counted its own "
+                 f"command line.\n{ausgabe}"),
+        )
 
     def test_a_real_launch_server_named_process_is_still_counted(self):
         """Positive control: an actual process whose command line carries
