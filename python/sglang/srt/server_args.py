@@ -29,7 +29,17 @@ import socket
 import tempfile
 import uuid
 from functools import cached_property
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
@@ -2303,6 +2313,47 @@ class ServerArgs:
             type_parser=str,
         ),
     ] = "auto"
+    rank_user_reserve_mib: A[
+        Union[int, str],
+        Arg(
+            help="EXTERNAL headroom (MiB) per physical card: memory left free "
+            "for things OUTSIDE this engine (a desktop compositor, an "
+            "nvidia-smi, a short-lived CUDA tool). Default 1024. This flag "
+            "has exactly one meaning and it never funds anything internal -- "
+            "no activation peak, no graph capture, no workspace, no CUDA "
+            "context is charged against it. Those are computed per card by "
+            "the VRAM ledger (--enable-vram-ledger) and printed itemized at "
+            "boot. Either a single value applied to every card, or a "
+            "comma-separated list with one value per rank (aligned with "
+            "--rank-gpu-id); when co-located ranks disagree the largest wins, "
+            "because the headroom belongs to the card and not to a rank. "
+            "Raising this buys free memory on the card and costs exactly that "
+            "many MiB of KV pool -- it cannot fix an internal term that was "
+            "modelled too small, and it never could: a budget line does not "
+            "cap a runtime allocation (#493). Requires --enable-vram-ledger; "
+            "passing it without one is refused rather than silently ignored.",
+            type_parser=str,
+        ),
+    ] = 1024
+    enable_vram_ledger: A[
+        bool,
+        Arg(
+            help="Size every card from the EXACT VRAM ledger instead of from "
+            "the --rank-auto-reserve-mib demand model. Under the ledger a "
+            "card's memory is user_reserve + computed_demand + kv_pool, all "
+            "three exact: the demand is itemized per term (weights, "
+            "activation peak, graph capture, mamba pool, prefill scratch, "
+            "attention workspaces, hardware residual, co-resident tenants), "
+            "every term is either derived from configuration or measured once "
+            "per hardware fingerprint, and the KV pool takes the residual so "
+            "no surplus sits idle. A card that cannot hold user_reserve + "
+            "demand is REFUSED at parse time with the itemization printed, "
+            "instead of booting with a 'short by N MiB' warning. Requires a "
+            "cached hardware calibration: run `python -m "
+            "sglang.srt.mem_ledger.probe` once per rig (card set, driver and "
+            "torch build key the cache).",
+        ),
+    ] = False
     rank_perf_loose_ctx_percent: A[
         float,
         Arg(
@@ -9195,7 +9246,22 @@ class ServerArgs:
 
             counts = Counter(self.rank_gpu_id)
             reserve_was_pinned = str(self.rank_auto_reserve_mib) != "auto"
-            if str(self.rank_auto_reserve_mib) == "auto":
+            if self.vram_ledger_enabled():
+                # THE LEDGER PATH (gated; the legacy branches below are
+                # untouched and unreachable from here).
+                #
+                # The ledger hands back, per card, the memory that is NOT the
+                # KV pool: the operator's external headroom plus the itemized
+                # internal demand. Feeding that into the SAME
+                # "budget = (total - non_kv) // colocated" arithmetic the
+                # reserve path already uses is deliberate -- the ledger changes
+                # where the number comes from, not how a budget is formed, so
+                # everything downstream (shard ratio, co-residence split, the
+                # free-VRAM bound) behaves identically and only the input is
+                # now exact. An overcommitted card raised LedgerOvercommit
+                # inside this call and never reaches here.
+                reserve_per_gpu = self._vram_ledger_non_kv_per_gpu(counts)
+            elif str(self.rank_auto_reserve_mib) == "auto":
                 # #68: derive the reserve from the actual demand (stock
                 # runtime reserve + captured-token graph demand; the
                 # capture term scales with the co-located rank count).
@@ -9548,6 +9614,7 @@ class ServerArgs:
         No-op when none of the flags is used — the default path stays
         unchanged.
         """
+        self._check_vram_ledger_flags()
         # Per-rank MoE resident fraction (#417 follow-up): validated here with
         # the rest of the rank-vector family rather than lazily at model load,
         # so a wrong length is a CLI error and not a worker crash six minutes
@@ -10801,6 +10868,217 @@ class ServerArgs:
                     logger.warning("%s", note)
         except Exception as e:  # pragma: no cover - advisory only
             logger.debug("Could not evaluate the budget against free VRAM: %s", e)
+
+    # -- the semantic split: external headroom vs computed demand -----------
+    #
+    # --rank-auto-reserve-mib carried BOTH meanings. Under 'auto' it derived
+    # the engine's internal demand and installed it as "headroom"; pinned, it
+    # was the operator's number and replaced that demand model wholesale. The
+    # two are not the same quantity and must not share a flag: an operator who
+    # wanted 3800 MiB free for their desktop was, without being told, also
+    # deciding how much memory CUDA-graph capture would get, and the boot's own
+    # demand model then said 4160 and warned -- every boot -- while proceeding
+    # anyway. Ops raised 3800 to 4200 by hand, which is guessing, and the
+    # guess was invisible in the flag that recorded it.
+    #
+    # Split:
+    #   --rank-user-reserve-mib  external headroom ONLY, default 1024
+    #   the VRAM ledger          every internal term, computed and itemized
+    #
+    # The old flag keeps working exactly as it did so that existing recipes
+    # boot unchanged; it is deprecated, and the two modes are mutually
+    # exclusive because they are two different answers to "what are these bytes
+    # for".
+
+    def vram_ledger_enabled(self) -> bool:
+        return bool(getattr(self, "enable_vram_ledger", False))
+
+    def _user_reserve_was_passed(self) -> bool:
+        from sglang.srt.mem_ledger.terms import DEFAULT_USER_RESERVE_MIB
+
+        raw = self.rank_user_reserve_mib
+        return str(raw) != str(DEFAULT_USER_RESERVE_MIB)
+
+    def user_reserve_mib_per_gpu(self, rank_gpu_id: Sequence[int]) -> Dict[int, int]:
+        """``{physical gpu id: external headroom MiB}``.
+
+        A per-rank list collapses to the LARGEST entry per card: the headroom
+        is a property of the card (there is one desktop on it, not one per
+        rank), so two co-located ranks asking for different amounts of free
+        memory are asking for the same free memory twice, and the larger ask is
+        the one that is satisfied by leaving it free.
+        """
+        raw = str(self.rank_user_reserve_mib)
+        try:
+            values = [int(part) for part in raw.split(",")]
+        except ValueError:
+            raise ValueError(
+                "--rank-user-reserve-mib must be an integer or a "
+                f"comma-separated list of integers, got {raw!r}."
+            ) from None
+        if any(v < 0 for v in values):
+            raise ValueError(
+                f"--rank-user-reserve-mib values must be >= 0, got {values}."
+            )
+        if len(values) == 1:
+            values = values * len(rank_gpu_id)
+        if len(values) != len(rank_gpu_id):
+            raise ValueError(
+                f"--rank-user-reserve-mib has {len(values)} entries but "
+                f"{len(rank_gpu_id)} ranks are placed; pass one value or "
+                "exactly one per rank."
+            )
+        out: Dict[int, int] = {}
+        for gpu_id, value in zip(rank_gpu_id, values):
+            out[gpu_id] = max(out.get(gpu_id, 0), value)
+        return out
+
+    def _check_vram_ledger_flags(self) -> None:
+        """Fail fast on the two ways the split can be misread, and deprecate
+        the conflated flag.
+
+        Both checks refuse rather than warn, and for the same reason the ledger
+        refuses rather than warns: a flag that is silently inert, or two flags
+        that silently mean the same bytes, is how a configuration ends up
+        describing a machine it is not running on.
+        """
+        ledger_on = self.vram_ledger_enabled()
+        auto_reserve_pinned = (
+            str(self.rank_auto_reserve_mib) != self.AUTO_RANK_MEMORY_RESERVE_MIB
+        )
+
+        if self._user_reserve_was_passed() and not ledger_on:
+            raise ValueError(
+                "--rank-user-reserve-mib is the VRAM ledger's external-headroom "
+                "flag and does nothing without --enable-vram-ledger. Add "
+                "--enable-vram-ledger, or use --rank-auto-reserve-mib for the "
+                "legacy reserve path. (Refused rather than ignored: a flag "
+                "that silently does nothing is worse than one that is absent.)"
+            )
+
+        if ledger_on and auto_reserve_pinned:
+            raise ValueError(
+                "--rank-auto-reserve-mib and --enable-vram-ledger both decide "
+                "what a card's non-KV memory is, and they mean different "
+                "things by it.\n"
+                f"  --rank-auto-reserve-mib {self.rank_auto_reserve_mib} is ONE "
+                "number covering the operator's external headroom AND the "
+                "engine's internal demand (activations, graph capture, "
+                "workspaces, CUDA context).\n"
+                "  --enable-vram-ledger splits those: "
+                "--rank-user-reserve-mib is external headroom only (default "
+                "1024 MiB), and every internal term is computed and itemized "
+                "per card.\n"
+                "Pass one or the other. To port a pinned recipe, drop "
+                "--rank-auto-reserve-mib and set --rank-user-reserve-mib to the "
+                "headroom you actually want left free; the ledger will print "
+                "what the internal terms cost and refuse if they do not fit, "
+                "instead of warning that they might not."
+            )
+
+        if auto_reserve_pinned and not ledger_on:
+            logger.warning(
+                "--rank-auto-reserve-mib %s is DEPRECATED: it conflates two "
+                "different quantities in one number -- the memory you want "
+                "left free for things outside this engine, and the memory the "
+                "engine itself needs for activations, graph capture, "
+                "workspaces and its CUDA context. That is why this path can "
+                "warn that its own demand model derives more than you pinned "
+                "and then boot anyway. Migrate to --enable-vram-ledger with "
+                "--rank-user-reserve-mib <external headroom, default 1024>: "
+                "the internal terms are then computed and itemized per card, "
+                "and a card that does not fit is refused at parse time with "
+                "the itemization instead of warned about. This boot proceeds "
+                "unchanged.",
+                self.rank_auto_reserve_mib,
+            )
+
+    def _vram_ledger_non_kv_per_gpu(self, counts) -> Dict[int, int]:
+        """``{physical gpu id: MiB that is NOT the rank budget}``, from the
+        exact ledger, after printing it and refusing an overcommitted card.
+
+        WHY THE WEIGHTS ARE NOT A TERM HERE, stated because their absence looks
+        like an omission and is not. This runs while the shard ratio is still
+        being derived, and the ratio is derived FROM the budgets this returns
+        (``derived_reserve_infeasible_note`` documents that loop). A weights
+        term at this point would have to assume the answer to the question the
+        caller is asking. So the residual is labelled what it actually is -- a
+        RANK BUDGET that funds weights and KV pool together -- and the weights
+        are charged against it downstream by the profiling step that already
+        owns them. Everything that is independent of the ratio (activation
+        peak, graph capture, mamba pool, prefill scratch, workspaces, hardware
+        residual, co-resident tenants) IS charged here, exactly, which is the
+        whole difference to the reserve it replaces.
+        """
+        from sglang.srt.mem_ledger.calibration import load_calibration
+        from sglang.srt.mem_ledger.contract import enforce_boot_contract
+        from sglang.srt.mem_ledger.engine import (
+            CardFacts,
+            DemandInputs,
+            build_card_ledgers,
+            demand_outside_budget_mib,
+        )
+
+        rank_gpu_id = list(self.rank_gpu_id)
+        cards_by_ordinal = _resolve_rank_gpu_cards(rank_gpu_id)
+        cards = [
+            CardFacts(
+                gpu_id=ordinal,
+                uuid=card.uuid,
+                name=card.name,
+                total_mib=card.total_mib,
+            )
+            for ordinal, card in sorted(cards_by_ordinal.items())
+        ]
+        gpu_total_mib = {c.gpu_id: c.total_mib for c in cards}
+        user_reserve = self.user_reserve_mib_per_gpu(rank_gpu_id)
+
+        inputs = DemandInputs.from_server_args(
+            self,
+            rank_gpu_id=rank_gpu_id,
+            gpu_total_mib=gpu_total_mib,
+            # Not a placeholder: see the docstring. The residual is labelled
+            # "rank budget", so these bytes are accounted for, not dropped.
+            weight_mib_per_rank=[0] * len(rank_gpu_id),
+        )
+        ledgers = build_card_ledgers(
+            inputs,
+            cards=cards,
+            rank_gpu_id=rank_gpu_id,
+            user_reserve_mib=user_reserve,
+            calibration=load_calibration(),
+        )
+        ledgers = [
+            dataclasses.replace(
+                x,
+                residual_label="weight shards + KV pool (residual)",
+                residual_note=(
+                    "total - user reserve - demand. The weight shards are not "
+                    "a term above because their size depends on the shard "
+                    "ratio, which is derived FROM this number; they and the KV "
+                    "pool share this residual, and the profiling step splits "
+                    "it once the ratio exists. Surplus flows here rather than "
+                    "sitting idle"
+                ),
+            )
+            for x in ledgers
+        ]
+        enforce_boot_contract(ledgers)
+        out: Dict[int, int] = {}
+        for x in ledgers:
+            # BUDGET_FUNDED_TERMS are inside the budget the next line forms, so
+            # charging them here as well would reserve them twice.
+            non_kv = x.user_reserve_mib + demand_outside_budget_mib(x)
+            if (x.total_mib - non_kv) // max(counts[x.gpu_id], 1) <= 0:
+                raise ValueError(
+                    f"{x.card} has no memory left for a rank budget after the "
+                    f"user reserve ({x.user_reserve_mib} MiB) and the computed "
+                    f"demand ({x.demand_mib} MiB). The itemization above says "
+                    "which term to shrink; lowering --rank-user-reserve-mib "
+                    "returns exactly its own MiB and no more."
+                )
+            out[x.gpu_id] = non_kv
+        return out
 
     def reserve_demand_per_gpu(self, gpu_mem, counts) -> Dict[int, int]:
         """``{physical gpu id: derived reserve demand MiB}`` for *counts*
