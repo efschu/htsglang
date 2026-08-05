@@ -1327,8 +1327,22 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
+                    # Capacity watchdog: rate-limited inside the backend, so this
+                    # is cheap per operation. A backend that has stopped writing
+                    # (out of disk) still runs the backup: the individual page
+                    # writes turn into refusals, which the ack path already
+                    # treats as a partial backup, so the caller sees a cache
+                    # miss rather than a stalled queue.
+                    self.storage_backend.check_disk_space()
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
+                # Idle: an idle backend is exactly when a filesystem filling up
+                # from other writers would otherwise go unnoticed.
+                if self.enable_storage and self.storage_backend is not None:
+                    try:
+                        self.storage_backend.check_disk_space()
+                    except Exception as e:  # never kill the worker over a probe
+                        logger.warning(f"HiCache capacity watchdog failed: {e}")
                 continue
