@@ -151,7 +151,14 @@ BOOT=(
   --port "$PORT" --host 127.0.0.1
   --tp-size 3 --dcp-size 3
   --rank-gpu-id "$RANK_GPU_ID"
-  --rank-gpu-memory-mib "$RANK_GPU_MEM"
+  # auto-performance, exactly as production and the crash boot ran it. The
+  # crash log's rank_gpu_memory_mib=[27107,16680,16680] and
+  # rank_tp_ratio=[27107,16680,16680] are the DERIVED values, not flags --
+  # passing them explicitly instead collides with
+  # "--rank-auto-reserve-mib only applies with --rank-tp-ratio auto"
+  # (server_args.py:9656).
+  --rank-tp-ratio auto-performance
+  --rank-perf-tune phase-decode
   --rank-auto-reserve-mib 5500,3800,3800
   --kv-cache-dtype fp8_e4m3
   --context-length 262144
@@ -160,6 +167,20 @@ BOOT=(
   --page-size 1
   --attention-backend flashinfer
   --mamba-backend triton
+  # Production's value. The default (64) is not enough for four concurrent
+  # long-prefix sessions: the run dies in _alloc_ping_pong_buffer
+  # (memory_pool.py:1494, "Not enough space for mamba ping pong idx") long
+  # before any barlink deadline is approached, which masks what this harness
+  # exists to measure. That assert killing the scheduler is a separate defect
+  # -- the merged "Mamba slot starvation must not kill the scheduler" fix does
+  # not cover this allocation site.
+  --max-mamba-cache-size 96
+  # EAGLE, exactly as the crash boot's server_args recorded it
+  # (speculative_algorithm='EAGLE', speculative_draft_model_path=None -- Qwen3.6
+  # carries its own MTP head, so no draft model is needed). NOT "NEXTN": that
+  # alias is resolved by the arg hook only AFTER _handle_dcp_validation has
+  # already called SpeculativeAlgorithm.from_string on the raw string, so under
+  # --dcp-size it raises "Unknown speculative algorithm name: NEXTN".
   --speculative-algorithm EAGLE
   --speculative-num-steps 3
   --speculative-eagle-topk 1
@@ -176,6 +197,11 @@ BOOT=(
 )
 
 export SGLANG_BARLINK=1
+# spec + DCP is only permitted on the uneven-hybrid WEIGHTED path, which is
+# what the crash boot ran (rank_tp_ratio=[27107,16680,16680], non-uniform).
+# Without these two, _handle_dcp_validation refuses the combination outright.
+export SGLANG_UNEVEN_DCP=1
+export SGLANG_UNEVEN_DCP_WEIGHTED=1
 # Do NOT silence the #583 abort check: the whole point of the window is to see
 # the structured DeviceCollectiveAborted instead of a dead context.
 unset SGLANG_BARLINK_BAR1_ABORT_CHECK
@@ -225,8 +251,27 @@ def session(idx: int):
     # A growing conversation: each turn re-sends the whole history, so the
     # cached-token count climbs into the tens of thousands exactly as in the
     # crash log, while each turn still adds a fresh chunk to prefill.
-    history = [{"role": "user", "content": "Explain memory coherence. " * 400}]
+    #
+    # BOUNDED ON PURPOSE (2026-08-05 window). An unbounded version of this
+    # loop drove `mamba usage` to 1.00 and killed both arms on mamba
+    # allocation asserts long before any barlink deadline was approached --
+    # first "Not enough space for mamba ping pong idx", then, with
+    # --max-mamba-cache-size 96, "Not enough space for mamba cache". Neither
+    # is a barlink fault and both masked what this harness measures. The crash
+    # boot ran at mamba usage 0.25-0.28 with 3-4 running requests, so the load
+    # has to stay in THAT regime: distinct long prefixes are what consume
+    # mamba states, so each session recycles its prefix instead of growing one
+    # forever. Watch the "mamba usage" field in the log -- if it climbs past
+    # ~0.5 the arm is measuring the wrong thing.
+    base = f"Session {idx}. Explain memory coherence. " + "Detail. " * 120
+    history = [{"role": "user", "content": base}]
+    turns = 0
     while not stop.is_set() and time.time() < deadline:
+        turns += 1
+        if turns % 6 == 0:
+            # Recycle: drop back to the seed prefix so the number of distinct
+            # cached prefixes (and therefore mamba states) stays bounded.
+            history = [{"role": "user", "content": base}]
         body = json.dumps({
             "model": "Qwen3.6-27B-583",
             "messages": history,
