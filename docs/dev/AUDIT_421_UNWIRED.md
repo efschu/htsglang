@@ -751,3 +751,51 @@ Positive replacements, each with a documented can-fail proof:
 | `test/registered/unit/model_executor/test_offload_register_wiring_421.py` | F2: all three flags observable in the register; planted typos refuse; once-per-process; and an AST pin on the **call site**, so a refactor cannot move the configure step after the first adapter read |
 | `test/registered/unit/layers/test_expert_offload_repack_door_421.py` | F8: eligibility classification, both refusal messages, the escape hatch, and the real entry point refusing before doing any work |
 | `test/registered/unit/distributed/test_barlink_dispatcher_inert_421.py` | F9: the overflow tier is reachable at exactly 1.0 and works with a measured threshold; `transport_hint` is pinned as an absence, and the hook is shown to work once a hint exists |
+
+## B.9 F-S8 — the #363 stage feed: a seam whose docstring claimed its own wiring
+
+Found while auditing spill composability (2026-08-04), same detector class as
+this audit's, and worth recording here because it is the sharpest instance yet
+of the failure mode the audit was built for.
+
+`regime_stages.planner_candidates(server_args, *, solve_fn=None)` is the
+production feed of the #363 stage table. Its docstring stated:
+
+> ``solve_fn`` is the seam. Production binds it to the key solver
+> (``planner.key_solver.solve`` through ``planner.solver_api``) ...
+
+Nothing binds it, under any configuration. The one production caller,
+`regime_runtime.build_regime_stage_table`, invokes it as
+`planner_candidates(server_args)` — the argument omitted — so the
+`solve_fn is None` branch is the only branch production ever takes. The stage
+table therefore permanently holds the booted stage alone, and act mode has
+nothing to select between: not broken, UNFED.
+
+**Why the usual detectors missed it.** The seam has tests, and they pass —
+three of them, all injecting a stub, which is exactly the shape section 1
+warns about ("the tests called the feature directly"). The runtime also
+behaves correctly and says so: the `None` branch emits an honest note ("no
+planner feed bound: the stage table holds the booted stage only"). So the
+absence was reported at runtime while the docstring asserted the opposite, and
+a reader who read either one alone came away with a consistent — and, in the
+docstring's case, wrong — picture.
+
+**It is a wiring gap, not a missing solver.** `key_solver.solve` exists and is
+#348b/#350-aware by construction. But its signature takes `plan_inputs`, a base
+plan, per-rank budgets and `RigRates` — a card probe and a measured rate set —
+and a binding also has to map a `SolverAnswer` back onto a `Stage`. That is a
+boot-time construction job, not a two-line call, which is the most likely
+reason it never happened and the reason it is tracked (#363/S8) rather than
+fixed in passing.
+
+**Disposition.** Docstring corrected to state that the seam is unbound, what
+binding requires, and that the runtime note is the honest report until then.
+`test_regime_act.py::TestPlannerFeed::test_the_seam_is_unbound_in_production`
+is a RATCHET over both the call site and the docstring: it goes red when the
+seam is bound, which forces the wiring and the prose to move together.
+
+**The general lesson, for the next sweep.** A docstring that describes its own
+production wiring is an assertion about a call site somewhere else, and nothing
+checks it. Prefer a test that reads the call site (`inspect.getsource`) over a
+sentence that describes it — and when a seam's default branch exists to report
+an absence, that branch being the only reachable one is the thing to detect.
