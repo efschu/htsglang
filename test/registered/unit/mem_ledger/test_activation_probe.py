@@ -44,15 +44,31 @@ def load_script():
     return m
 
 
-def write_dump(d, rank, uuid, activation_mib, capture_mib, profile=PROFILE, fp=FP):
+#: What a rank has resident before its first prefill: weights, KV pool and the
+#: captured graphs. The peak counter re-bases here rather than at zero, so it
+#: has to appear in the fixture for the dump to have the shape ingest sees.
+FLOOR_MIB = 16000
+
+
+def write_dump(
+    d, rank, uuid, activation_mib, capture_mib, profile=PROFILE, fp=FP
+):
+    """``activation_mib`` is the DELTA -- the prefill transient (#589).
+
+    The raw peak is written as floor + delta, which is what the counter
+    actually reports, so these fixtures cannot drift back into treating an
+    absolute figure as an activation cost.
+    """
     payload = {
         "rank": rank,
         "card_uuid": uuid,
         "hw_fingerprint": fp,
         "profile": profile.canonical(),
-        "activation_peak_bytes": activation_mib << 20,
+        "activation_peak_bytes": (FLOOR_MIB + activation_mib) << 20,
+        "peak_floor_bytes": FLOOR_MIB << 20,
+        "activation_delta_bytes": activation_mib << 20,
         "capture_bytes": capture_mib << 20,
-        "reserved_peak_bytes": (activation_mib + 300) << 20,
+        "reserved_peak_bytes": (FLOOR_MIB + activation_mib + 300) << 20,
         "prefill_tokens": 70018,
     }
     with open(os.path.join(str(d), f"phase_footprint_rank{rank}.json"), "w") as f:
@@ -216,6 +232,7 @@ def _reset_probe_state():
     ap._capture_bytes_total = 0
     ap._activation_peak_bytes = 0
     ap._identity = None
+    ap._peak_floor_bytes = None
 
 
 def _instrument(monkeypatch, peaks):

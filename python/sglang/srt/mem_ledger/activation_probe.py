@@ -53,8 +53,21 @@ def is_armed() -> bool:
 
 
 def reset_peaks(device_index: int = 0) -> None:
-    """Zero the peak counters. Called after the KV pool is sized so the
-    measurement starts from the steady baseline rather than from the load."""
+    """Re-base the peak counters, and record the floor they were re-based to.
+
+    ``torch.cuda.reset_peak_memory_stats`` does not zero the peak: it re-bases
+    it at whatever is allocated *right now*, which after model load and KV
+    sizing is weights + KV pool + captured graphs. The counter read back later
+    is therefore an ABSOLUTE resident figure, not the activation cost. That is
+    what the window-5 dumps recorded -- 26555 / 17306 / 16368 MiB, the whole
+    footprint of each rank rather than its prefill transient (#589).
+
+    So every re-base records its floor here, and the activation number the
+    ledger ingests is peak MINUS that floor. The raw peak is still dumped
+    alongside it, labelled, because it is the figure the operator sees in
+    ``nvidia-smi`` and dropping it would make the two impossible to reconcile.
+    """
+    global _peak_floor_bytes
     if not is_armed():
         return
     try:
@@ -63,6 +76,8 @@ def reset_peaks(device_index: int = 0) -> None:
         torch.cuda.reset_peak_memory_stats(device_index)
     except Exception as e:  # pragma: no cover - torch shape differences
         logger.debug("could not reset peak memory stats: %s", e)
+        return
+    _peak_floor_bytes = int(read_peaks(device_index).get("allocated_bytes", 0))
 
 
 def read_peaks(device_index: int = 0) -> dict:
@@ -92,12 +107,31 @@ def write_footprint_dump(
     reserved_peak_bytes: int = 0,
     prefill_tokens: Optional[int] = None,
     dump_dir: Optional[str] = None,
+    peak_floor_bytes: Optional[int] = None,
 ) -> Optional[str]:
     """Write this rank's dump. One file per rank, so no collective is needed
-    and a rank that dies mid-run simply contributes nothing."""
+    and a rank that dies mid-run simply contributes nothing.
+
+    Three activation numbers are written, not one, because they answer
+    different questions and window 5 proved they get confused otherwise:
+
+    ``activation_peak_bytes``   the raw counter -- ABSOLUTE, weights and KV
+                                included, because the reset re-bases rather
+                                than zeroes (see :func:`reset_peaks`).
+    ``peak_floor_bytes``        what was resident when the bracket opened.
+    ``activation_delta_bytes``  peak minus floor: the prefill transient, and
+                                the only one of the three the ledger reserves
+                                for. ``None`` when no floor was recorded --
+                                an honest absence, never a silent fallback to
+                                the raw peak, which would re-introduce the
+                                exact over-charge this field exists to fix.
+    """
     directory = dump_dir or os.environ.get(DUMP_ENV)
     if not directory:
         return None
+    delta: Optional[int] = None
+    if peak_floor_bytes is not None:
+        delta = max(0, int(activation_peak_bytes) - int(peak_floor_bytes))
     try:
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, f"phase_footprint_rank{rank}.json")
@@ -107,6 +141,10 @@ def write_footprint_dump(
             "hw_fingerprint": hw_fingerprint,
             "profile": profile_canonical,
             "activation_peak_bytes": int(activation_peak_bytes),
+            "peak_floor_bytes": (
+                None if peak_floor_bytes is None else int(peak_floor_bytes)
+            ),
+            "activation_delta_bytes": delta,
             "capture_bytes": int(capture_bytes),
             "reserved_peak_bytes": int(reserved_peak_bytes),
             "prefill_tokens": prefill_tokens,
@@ -143,6 +181,9 @@ _baseline_allocated: Optional[int] = None
 _capture_bytes_total: int = 0
 _activation_peak_bytes: int = 0
 _identity: Optional[dict] = None
+#: What was resident at the last peak re-base; see :func:`reset_peaks`. None
+#: until a bracket is opened, which is why the delta can be honestly absent.
+_peak_floor_bytes: Optional[int] = None
 
 
 def _device_index() -> int:
@@ -190,12 +231,16 @@ def _resolve_identity(model_runner) -> Optional[dict]:
         return _identity or None
     try:
         from sglang.srt.mem_ledger.activation import profile_from_server_args
-        from sglang.srt.mem_ledger.calibration import live_fingerprint
+        from sglang.srt.mem_ledger.calibration import rig_fingerprint
         from sglang.srt.mem_ledger.engine import _model_architectures
         from sglang.srt.registry import nvml as registry_nvml
 
         server_args = model_runner.server_args
-        live = live_fingerprint()
+        # The RIG fingerprint, not this process's. Every rank here is pinned
+        # to one card by CUDA_VISIBLE_DEVICES, and ``live_fingerprint`` would
+        # hash only that card -- three ranks, three different fingerprints,
+        # none of them the rig's, and ingest rightly refuses all three (#589).
+        live = rig_fingerprint()
         profile = profile_from_server_args(
             server_args, _model_architectures(server_args)
         )
@@ -240,4 +285,5 @@ def record_prefill_peak(model_runner, num_tokens: int) -> None:
         capture_bytes=_capture_bytes_total,
         reserved_peak_bytes=int(peaks.get("reserved_peak_bytes", 0)),
         prefill_tokens=int(num_tokens),
+        peak_floor_bytes=_peak_floor_bytes,
     )

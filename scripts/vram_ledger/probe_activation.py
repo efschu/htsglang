@@ -120,12 +120,32 @@ def ingest(dump_dir: str, cache_dir: Optional[str] = None) -> int:
     footprints: Dict[str, PhaseFootprint] = {}
     for d in dumps:
         uuid = str(d["card_uuid"])
-        activation = int(d["activation_peak_bytes"]) // (1 << 20)
+        raw_peak = int(d.get("activation_peak_bytes", 0)) // (1 << 20)
+        floor = d.get("peak_floor_bytes")
+        delta = d.get("activation_delta_bytes")
+        # The delta, never the raw peak. reset_peak_memory_stats RE-BASES the
+        # counter at the current allocation instead of zeroing it, so
+        # activation_peak_bytes still contains weights and the KV pool -- the
+        # window-5 dumps read 26555/17306/16368 MiB, whole-rank footprints
+        # (#589). A dump from before that fix carries no delta and cannot be
+        # repaired here, because the floor it would need was never recorded.
+        if delta is None:
+            print(
+                f"REFUSING: rank {d.get('rank')} on {uuid} carries no "
+                "activation_delta_bytes, so its activation_peak_bytes "
+                f"({raw_peak} MiB) is the ABSOLUTE resident figure -- weights "
+                "and KV pool included -- not the prefill transient. Ingesting "
+                "it would reserve a whole rank's footprint as its activation "
+                "term. Re-measure with a build that records the peak floor "
+                "(#589)."
+            )
+            return 1
+        activation = int(delta) // (1 << 20)
         capture = int(d["capture_bytes"]) // (1 << 20)
         if activation <= 0:
             print(
                 f"REFUSING: rank {d.get('rank')} on {uuid} reports a "
-                f"non-positive activation peak ({activation} MiB). That is a "
+                f"non-positive activation delta ({activation} MiB). That is a "
                 "failed measurement, not a small one -- the prefill hook did "
                 "not run, or ran before the workload."
             )
@@ -136,8 +156,10 @@ def ingest(dump_dir: str, cache_dir: Optional[str] = None) -> int:
             provenance=FootprintProvenance.MEASURED_PEAK,
             source=(
                 f"probe_activation.py: torch.cuda.memory_stats() "
-                f"allocated_bytes.all.peak on rank {d.get('rank')}; reserved "
-                f"peak {int(d.get('reserved_peak_bytes', 0)) // (1 << 20)} MiB "
+                f"allocated_bytes.all.peak MINUS the post-capture floor on "
+                f"rank {d.get('rank')} ({raw_peak} MiB peak - "
+                f"{int(floor or 0) // (1 << 20)} MiB floor); reserved peak "
+                f"{int(d.get('reserved_peak_bytes', 0)) // (1 << 20)} MiB "
                 f"(the allocator slack nvidia-smi would have shown instead); "
                 f"prefill of {d.get('prefill_tokens', '?')} tokens"
             ),

@@ -160,6 +160,17 @@ def list_devices() -> list[DeviceInfo]:
         return devices
 
 
+def driver_version() -> str:
+    """The NVIDIA driver version string, as NVML spells it.
+
+    A fingerprint input rather than a display value: it is hashed alongside
+    the card UUIDs, so it is read from NVML here rather than re-derived by
+    each caller that needs to key a cache on "this rig, this driver".
+    """
+    with nvml_session() as pynvml:
+        return _decode(pynvml.nvmlSystemGetDriverVersion())
+
+
 def device_by_uuid(uuid: str) -> DeviceInfo:
     for device in list_devices():
         if device.uuid == uuid:
@@ -283,9 +294,21 @@ def current_device_uuid() -> str:
     unambiguous and no logical-to-physical mapping table is needed. Both
     forms of the variable are accepted, index and ``GPU-...`` UUID.
 
+    A UUID pin answers itself. An *index* pin does not, and reading it as an
+    NVML index is the #392/#397/#406 device-order defect (#589): the value
+    indexes CUDA's enumeration of the UNMASKED rig -- ``FASTEST_FIRST``
+    unless ``CUDA_DEVICE_ORDER`` says otherwise -- while NVML enumerates in
+    PCI bus order. On the reference rig the 5090 is CUDA 0 and NVML 1, so
+    ``CUDA_VISIBLE_DEVICES=0`` self-reported a 20 GB 3080 and the ledger
+    would have charged the 5090's activation bound against the wrong card.
+
+    The index is therefore never interpreted. What is resolved instead is
+    the card this process can actually see: masking to one device makes
+    in-process CUDA ordinal 0 the pin by definition, and the #331
+    :class:`IdentityMap` bridges that ordinal to NVML over the PCI BDF.
+
     When the variable is unset or names more than one device, the current
-    torch device is bridged to NVML through the PCI bus id rather than
-    through the index.
+    torch device is resolved through the same map.
     """
     tokens = _visible_device_tokens()
     devices = list_devices()
@@ -304,19 +327,60 @@ def current_device_uuid() -> str:
             raise DeviceNotFoundError(
                 f"CUDA_VISIBLE_DEVICES={token!r} is neither an index nor a UUID"
             ) from None
-        # CUDA_VISIBLE_DEVICES indices are NVML/PCI-order indices, unlike the
-        # in-process torch indices they produce.
+        return _pinned_device_uuid(index, devices)
+    return _current_device_uuid_via_torch(devices)
+
+
+def _pinned_device_uuid(index: int, devices: list[DeviceInfo]) -> str:
+    """The single card ``CUDA_VISIBLE_DEVICES=<index>`` leaves visible.
+
+    ``index`` is deliberately not used as a lookup key -- it is carried only
+    so the errors can quote the pin the operator actually wrote. The lookup
+    is ordinal 0, which the mask makes unambiguous.
+
+    No CUDA context is created for this: ``allow_cuda_init`` stays off, so a
+    launcher asking about its own pin before forking does not pay a context
+    on every visible card (the ``rank_cards`` doctrine).
+    """
+    imap = identity_map(devices)
+    card = imap.by_cuda_ordinal(0)
+    if card is not None:
+        return card.uuid
+    # No CUDA side to the map here (torch absent, or no context in this
+    # process). The pin can still be read literally -- but only when the
+    # environment DECLARES the enumeration that makes the literal reading
+    # true: CUDA_DEVICE_ORDER=PCI_BUS_ID makes CUDA order == PCI order ==
+    # NVML order, which is exactly the contract the GGUF launch path relies
+    # on. Without that declaration the index is unknowable and is refused.
+    if os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID":
         for device in devices:
             if device.index == index:
                 return device.uuid
         raise DeviceNotFoundError(
             f"CUDA_VISIBLE_DEVICES={index} is out of range for "
-            f"{len(devices)} NVML device(s)"
+            f"{len(devices)} NVML device(s) under CUDA_DEVICE_ORDER=PCI_BUS_ID"
         )
-    return _current_device_uuid_via_torch(devices)
+    raise DeviceOrderUnresolvedError(
+        f"CUDA_VISIBLE_DEVICES={index} pins one card, but WHICH card cannot "
+        "be determined in this process: the value indexes CUDA's enumeration "
+        "of the unmasked rig, not NVML's PCI order, and the CUDA side of the "
+        "identity map is unavailable here. Reading it as an NVML index is the "
+        "#392 defect and is refused (#589). Resolve it by launching with "
+        "CUDA_DEVICE_ORDER=PCI_BUS_ID, by pinning with the GPU-... UUID "
+        f"instead, or by resolving the ordinal before the mask is applied. "
+        f"Reason: {cuda_bridge_diagnosis()}. Cards present:\n"
+        + (imap.describe() or "  (no NVML devices)")
+    )
 
 
 def _current_device_uuid_via_torch(devices: list[DeviceInfo]) -> str:
+    """Unpinned (or multi-card) process: the card torch calls current.
+
+    Bridged through the #331 identity map over the PCI BDF, never over the
+    index. This used to re-implement the BDF match inline against only the
+    bus byte; the map is the one bridge (#397), and it normalizes the whole
+    domain:bus:device triple rather than comparing one field of it.
+    """
     try:
         import torch  # noqa: PLC0415 - optional, only for the unpinned case
     except ImportError as exc:
@@ -330,21 +394,16 @@ def _current_device_uuid_via_torch(devices: list[DeviceInfo]) -> str:
             "CUDA_VISIBLE_DEVICES does not pin exactly one device and torch "
             "reports no CUDA device."
         )
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    bus = getattr(props, "pci_bus_id", None)
-    if bus is None:
-        raise NvmlUnavailableError(
-            "torch does not expose pci_bus_id on this build, so the CUDA "
-            "device cannot be bridged to NVML by bus id."
+    ordinal = int(torch.cuda.current_device())
+    # current_device() has already created the context, so asking the map to
+    # fill the CUDA side costs nothing further here.
+    card = identity_map(devices, allow_cuda_init=True).by_cuda_ordinal(ordinal)
+    if card is None:
+        raise DeviceNotFoundError(
+            f"the current CUDA device (ordinal {ordinal}) matches no NVML card "
+            f"by PCI bus id. Reason: {cuda_bridge_diagnosis()}"
         )
-    for device in devices:
-        # NVML formats the bus id as "00000000:BB:00.0"; torch reports the bus
-        # number as an int.
-        if int(device.pci_bus_id.split(":")[1], 16) == bus:
-            return device.uuid
-    raise DeviceNotFoundError(
-        f"current CUDA device sits on PCI bus {bus:#x}, which matches no NVML device"
-    )
+    return card.uuid
 
 
 # ===========================================================================

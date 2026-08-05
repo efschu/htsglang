@@ -251,6 +251,46 @@ def live_fingerprint(
     return fp, gpus, driver or ""
 
 
+def rig_fingerprint() -> Optional[Tuple[str, List[dict], str]]:
+    """``live_fingerprint`` for the WHOLE rig, independent of CVD masking.
+
+    :func:`live_fingerprint` describes the cards the *calling process* can
+    see, because its inventory is built from ``torch.cuda``. That is right in
+    the launcher and wrong in a pinned worker: each window-5 rank
+    fingerprinted only its own card (``fad5762191c9`` / ``9ce0ed6a79fc`` /
+    ``b0c936f23170``) and ingest correctly refused all three against the
+    rig's ``a191a0712717`` (#589). A dump has to name the rig it was measured
+    on, not the slice of it one process was pinned to.
+
+    NVML ignores ``CUDA_VISIBLE_DEVICES``, so its device list *is* the rig.
+    The hashing is not duplicated: that inventory is handed to
+    ``live_fingerprint``'s own injection point, so a pinned worker and an
+    unmasked launcher compute the identical fingerprint through the identical
+    code (``calibration_fingerprint`` sorts the UUIDs, so enumeration order
+    cannot change the answer either).
+    """
+    try:
+        from sglang.srt.registry import nvml as registry_nvml
+
+        devices = registry_nvml.list_devices()
+        driver = registry_nvml.driver_version()
+    except Exception as e:
+        logger.debug("VRAM calibration: no NVML rig inventory (%s)", e)
+        return None
+    gpus = [
+        {
+            # No cuda_index: the masked process cannot place the cards it
+            # cannot see, and this field is not a fingerprint input anyway.
+            "cuda_index": None,
+            "uuid": d.uuid,
+            "name": d.name,
+            "total_mib": d.total_mib,
+        }
+        for d in sorted(devices, key=lambda d: d.index)
+    ]
+    return live_fingerprint(inventory=(gpus, driver))
+
+
 def load_calibration(
     *,
     cache_dir: Optional[str] = None,

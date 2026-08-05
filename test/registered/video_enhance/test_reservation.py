@@ -689,17 +689,48 @@ class TestNvmlIdentitySeam(unittest.TestCase):
         with self.assertRaises(nvml.DeviceNotFoundError):
             nvml.resolve_index_by_name_fragment("Radeon")
 
-    def test_current_device_uuid_reads_the_pinning(self):
+    def test_a_uuid_pinning_answers_itself(self):
         from sglang.srt.video_enhance import nvml
 
-        for value, expected in (("1", "GPU-bbbb"), ("GPU-cccc", "GPU-cccc")):
-            with unittest.mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": value}):
-                self.assertEqual(nvml.current_device_uuid(), expected)
+        with unittest.mock.patch.dict(
+            os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-cccc"}
+        ):
+            self.assertEqual(nvml.current_device_uuid(), "GPU-cccc")
+
+    def test_an_index_pinning_is_not_read_as_an_nvml_index(self):
+        """#589. This test used to assert the opposite -- that
+        ``CUDA_VISIBLE_DEVICES=1`` means NVML index 1 -- and that assertion was
+        the defect in test form. The value indexes CUDA's enumeration of the
+        unmasked rig, which this process cannot observe, so with no CUDA
+        bridge the only honest answer is a refusal. See
+        test/registered/registry/test_current_device_uuid_589.py for the
+        falsifier on a rig whose two orders actually diverge.
+        """
+        from sglang.srt.video_enhance import nvml
+
+        with unittest.mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}):
+            os.environ.pop("CUDA_DEVICE_ORDER", None)
+            with self.assertRaises(nvml.DeviceOrderUnresolvedError) as ctx:
+                nvml.current_device_uuid()
+            self.assertIn("PCI_BUS_ID", str(ctx.exception))
+
+    def test_a_declared_pci_bus_order_makes_the_index_readable(self):
+        """The one environment in which the literal reading is true."""
+        from sglang.srt.video_enhance import nvml
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"CUDA_VISIBLE_DEVICES": "1", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"},
+        ):
+            self.assertEqual(nvml.current_device_uuid(), "GPU-bbbb")
 
     def test_out_of_range_pinning_is_named(self):
         from sglang.srt.video_enhance import nvml
 
-        with unittest.mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "9"}):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"CUDA_VISIBLE_DEVICES": "9", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"},
+        ):
             with self.assertRaises(nvml.DeviceNotFoundError):
                 nvml.current_device_uuid()
 
