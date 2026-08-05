@@ -15,7 +15,9 @@ observed (graph replay, unreadable events).
 """
 
 import logging
+import os
 import unittest
+import unittest.mock
 
 import torch
 from types import SimpleNamespace
@@ -41,8 +43,7 @@ try:
     from sglang.test.ci.ci_register import register_cpu_ci
 except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
     pytest.skip(
-        f"#249 default-device collection leak broke the import chain: "
-        f"{_import_err}",
+        f"#249 default-device collection leak broke the import chain: {_import_err}",
         allow_module_level=True,
     )
 
@@ -87,13 +88,30 @@ class FakeEvent:
 
 
 class FakeClock:
-    """Returns a scripted collective total for whatever slot it is handed."""
+    """Returns a scripted collective total for whatever slot it is handed.
+
+    ``values`` entries are either a plain total (seconds, no family
+    decomposition -- what an unlabelled region looks like) or a
+    ``(total_s, {family: FamilyStat})`` tuple.
+    """
 
     def __init__(self, values):
         self.values = list(values)
 
+    def harvest_detail(self, slot):
+        from sglang.srt.utils.collective_clock import HarvestResult
+
+        v = self.values.pop(0)
+        if v is None:
+            return None
+        if isinstance(v, tuple):
+            total_s, families = v
+            return HarvestResult(total_s=total_s, families=families)
+        return HarvestResult(total_s=v, families={})
+
     def harvest(self, slot):
-        return self.values.pop(0)
+        result = self.harvest_detail(slot)
+        return None if result is None else result.total_s
 
 
 class TestForwardModePlainPrefill(unittest.TestCase):
@@ -408,6 +426,250 @@ class TestReporterEmitsAheadOfLoggingGate(unittest.TestCase):
             SchedulerMetricsReporter._maybe_log_idle_metrics(stub)
         self.assertEqual(len(cm.output), 1)
         self.assertIn("#cached-token: 4", cm.output[0])
+
+
+class TestCollectiveFamilies(unittest.TestCase):
+    """#588: the wait number decomposes by collective family.
+
+    One summed ``wait`` cannot arbitrate between "TP all-reduce payload grows
+    with new tokens" and "DCP attention traffic grows with context" -- the two
+    have the same units and different fixes. These pin the decomposition.
+    """
+
+    def setUp(self):
+        # span() asks CUDA whether a graph is capturing. Patch that single
+        # query rather than skipping without a GPU: the family accounting is
+        # pure arithmetic over faked events and deserves to be pinned on a
+        # CPU box, which is where this suite runs.
+        patcher = unittest.mock.patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _clock(self, timestamps, ready=True):
+        clock = CollectiveClock()
+        events = [FakeEvent(ts, ready) for ts in timestamps]
+        clock._acquire = lambda: events.pop(0)
+        return clock
+
+    def test_per_family_totals_counts_and_max(self):
+        # tp.all_reduce: spans of 2 ms and 6 ms. dcp.all_gather: one 3 ms.
+        clock = self._clock([0.0, 2.0, 10.0, 16.0, 20.0, 23.0])
+        clock.arm()
+        with clock.span("tp.all_reduce"):
+            pass
+        with clock.span("tp.all_reduce"):
+            pass
+        with clock.span("dcp.all_gather"):
+            pass
+        result = clock.harvest_detail(clock.disarm())
+        self.assertAlmostEqual(result.total_s, 0.011)
+        self.assertEqual(set(result.families), {"tp.all_reduce", "dcp.all_gather"})
+        tp = result.families["tp.all_reduce"]
+        self.assertAlmostEqual(tp.total_ms, 8.0)
+        self.assertEqual(tp.count, 2)
+        # max is NOT the total: same 8 ms could be one stall or two transfers.
+        self.assertAlmostEqual(tp.max_ms, 6.0)
+        ag = result.families["dcp.all_gather"]
+        self.assertAlmostEqual(ag.total_ms, 3.0)
+        self.assertEqual(ag.count, 1)
+        self.assertAlmostEqual(ag.max_ms, 3.0)
+
+    def test_family_totals_sum_to_the_grand_total(self):
+        clock = self._clock([0.0, 2.0, 10.0, 16.0, 20.0, 23.0])
+        clock.arm()
+        for fam in ("tp.all_reduce", "tp.all_reduce", "dcp.all_gather"):
+            with clock.span(fam):
+                pass
+        result = clock.harvest_detail(clock.disarm())
+        self.assertAlmostEqual(
+            sum(f.total_ms for f in result.families.values()),
+            result.total_s * 1000.0,
+        )
+
+    def test_unlabelled_span_lands_in_other_and_is_still_counted(self):
+        """An unlabelled collective must never be dropped from the total."""
+        clock = self._clock([0.0, 4.0])
+        clock.arm()
+        with clock.span():
+            pass
+        result = clock.harvest_detail(clock.disarm())
+        self.assertAlmostEqual(result.total_s, 0.004)
+        self.assertEqual(list(result.families), ["other"])
+        self.assertAlmostEqual(result.families["other"].total_ms, 4.0)
+
+    def test_label_scope_overrides_the_dispatch_site_default(self):
+        """The caller knows more than the generic dispatch site."""
+        clock = self._clock([0.0, 5.0])
+        clock.arm()
+        with clock.label_scope("cp.lse_ag"):
+            with clock.span("dcp.all_gather"):
+                pass
+        result = clock.harvest_detail(clock.disarm())
+        self.assertEqual(list(result.families), ["cp.lse_ag"])
+
+    def test_label_scope_restores_the_previous_label(self):
+        clock = self._clock([0.0, 1.0, 5.0, 9.0])
+        clock.arm()
+        with clock.label_scope("cp.lse_ag"):
+            with clock.span("dcp.all_gather"):
+                pass
+        # Outside the scope the dispatch-site default applies again.
+        with clock.span("dcp.all_gather"):
+            pass
+        result = clock.harvest_detail(clock.disarm())
+        self.assertEqual(set(result.families), {"cp.lse_ag", "dcp.all_gather"})
+
+    def test_harvest_float_view_matches_detail_total(self):
+        clock = self._clock([0.0, 7.0])
+        clock.arm()
+        with clock.span("tp.all_reduce"):
+            pass
+        self.assertAlmostEqual(clock.harvest(clock.disarm()), 0.007)
+
+    def test_unreadable_slot_yields_no_detail(self):
+        clock = self._clock([0.0, 7.0], ready=False)
+        clock.arm()
+        with clock.span("tp.all_reduce"):
+            pass
+        self.assertIsNone(clock.harvest_detail(clock.disarm()))
+
+
+class TestFamilyLabelDerivation(unittest.TestCase):
+    """The four dispatch sites must carry the family of THEIR group."""
+
+    def test_families_are_derived_from_the_group_name(self):
+        from sglang.srt.distributed.parallel_state import collective_clock_families
+
+        self.assertEqual(
+            collective_clock_families("tp"),
+            ("tp.all_reduce", "tp.all_gather", "tp.all_gatherv", "tp.reduce_scatterv"),
+        )
+        self.assertEqual(collective_clock_families("dcp")[1], "dcp.all_gather")
+
+    def test_each_dispatch_site_passes_its_own_family(self):
+        """Pin the wiring: a site that passes the wrong family would report
+        all_gather traffic as all_reduce, which is worse than no label."""
+
+        src = open(
+            os.path.join(
+                os.path.dirname(
+                    os.path.dirname(
+                        os.path.dirname(
+                            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                        )
+                    )
+                ),
+                "python",
+                "sglang",
+                "srt",
+                "distributed",
+                "parallel_state.py",
+            )
+        ).read()
+        for op in ("all_reduce", "all_gather", "all_gatherv", "reduce_scatterv"):
+            pattern = (
+                r"_COLLECTIVE_CLOCK\.span\(self\._clock_family_%s\):\s*\n\s*"
+                r"return self\.%s\(" % (op, op)
+            )
+            self.assertRegex(
+                src,
+                pattern,
+                f"dispatch site for {op} does not pass its matching family",
+            )
+
+
+class TestWaitByFamilyLogLine(unittest.TestCase):
+    """The log-line extension: armed-only, compact, biggest family first."""
+
+    def _make(self, wait_values):
+        log = RankPrefillLog()
+        timer = FakeTimer(log)
+        log.timer = timer
+        log.clock = FakeClock(wait_values)
+        return log, timer
+
+    def _emit(self, log, timer, records, completions):
+        for new_tokens, cached_tokens, graphed in records:
+            log.record(
+                new_tokens=new_tokens,
+                cached_tokens=cached_tokens,
+                timed=True,
+                graphed=graphed,
+            )
+        timer.completed.extend(completions)
+        with self.assertLogs(LOGGER_NAME, level=logging.INFO) as cm:
+            log.flush()
+        self.assertEqual(len(cm.output), 1)
+        return cm.output[0]
+
+    def test_families_are_appended_after_the_split(self):
+        from sglang.srt.utils.collective_clock import FamilyStat
+
+        log, timer = self._make(
+            [
+                (
+                    0.05,
+                    {
+                        "dcp.all_gather": FamilyStat(10.0, 8, 4.0),
+                        "tp.all_reduce": FamilyStat(40.0, 2, 30.0),
+                    },
+                )
+            ]
+        )
+        line = self._emit(log, timer, [(64, 3, False)], [(0.25, Slot())])
+        self.assertIn("gpu-ms: 250.0 (compute 200.0, wait 50.0)", line)
+        # Biggest contributor first, so the owner of the wait is readable.
+        self.assertIn(
+            "(wait by family: tp.all_reduce 40.0/2x, dcp.all_gather 10.0/8x)", line
+        )
+        self.assertLess(line.index("wait 50.0"), line.index("wait by family"))
+
+    def test_no_families_means_no_extension(self):
+        """Byte-neutral when nothing was labelled: the old line, unchanged."""
+        log, timer = self._make([0.05])
+        line = self._emit(log, timer, [(64, 3, False)], [(0.25, Slot())])
+        self.assertIn("#chunks: 1, gpu-ms: 250.0 (compute 200.0, wait 50.0)", line)
+        self.assertNotIn("wait by family", line)
+
+    def test_unclocked_line_is_byte_identical_to_before(self):
+        """The off path must not gain a character."""
+        log = RankPrefillLog()
+        timer = FakeTimer(log)
+        log.timer = timer
+        log.clock = None
+        line = self._emit(log, timer, [(64, 3, False)], [0.25])
+        self.assertTrue(
+            line.endswith(
+                "Prefill rank batch, #new-token: 64, #cached-token: 3, "
+                "#chunks: 1, gpu-ms: 250.0"
+            ),
+            line,
+        )
+
+    def test_graph_covered_forward_reports_no_families(self):
+        """No split means no decomposition either -- never a fake zero."""
+        from sglang.srt.utils.collective_clock import FamilyStat
+
+        log, timer = self._make([(0.05, {"tp.all_reduce": FamilyStat(40.0, 2, 30.0)})])
+        line = self._emit(log, timer, [(64, 3, True)], [(0.25, Slot())])
+        self.assertNotIn("wait by family", line)
+        self.assertNotIn("compute", line)
+
+    def test_families_merge_across_chunks_folded_into_one_line(self):
+        from sglang.srt.utils.collective_clock import FamilyStat
+
+        log, timer = self._make(
+            [
+                (0.04, {"tp.all_reduce": FamilyStat(40.0, 2, 30.0)}),
+                (0.06, {"tp.all_reduce": FamilyStat(60.0, 3, 35.0)}),
+            ]
+        )
+        line = self._emit(
+            log, timer, [(5, 0, False), (5, 0, False)], [(0.10, Slot()), (0.10, Slot())]
+        )
+        self.assertIn("tp.all_reduce 100.0/5x", line)
 
 
 if __name__ == "__main__":
