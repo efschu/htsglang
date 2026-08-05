@@ -159,15 +159,20 @@ class RankPrefillLog:
 
     def _on_duration(self, t: float, collective_slot=None, **_kwargs) -> None:
         wait_s = None
+        families = None
         if self.clock is not None:
             # Query-only. The slot's events were recorded before the interval
             # end event that just completed, so this normally returns a value;
             # None means "not readable", and the split is dropped rather than
             # guessed.
-            wait_s = self.clock.harvest(collective_slot)
+            result = self.clock.harvest_detail(collective_slot)
+            if result is not None:
+                wait_s = result.total_s
+                families = result.families
             if collective_slot is not None and collective_slot.graph_capture_skipped:
                 wait_s = None
-        self._durations.append((t, wait_s))
+                families = None
+        self._durations.append((t, wait_s, families))
 
     def record(
         self,
@@ -180,7 +185,7 @@ class RankPrefillLog:
             self._pending.append((new_tokens, cached_tokens, graphed))
         else:
             logger.info(
-                "Prefill rank batch, #new-token: %d, #cached-token: %d, " "#chunks: 1",
+                "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
                 new_tokens,
                 cached_tokens,
             )
@@ -197,16 +202,26 @@ class RankPrefillLog:
         gpu_s = 0.0
         wait_s = 0.0
         split_known = True
+        # family -> [total_ms, count]. Merged across the records folded into
+        # this one line, the same way gpu-ms and wait already are.
+        family_acc: dict = {}
         for _ in range(k):
             n, c, graphed = self._pending.popleft()
             new_tokens += n
             cached_tokens += c
-            t, w = self._durations.popleft()
+            t, w, fams = self._durations.popleft()
             gpu_s += t
             if graphed or w is None:
                 split_known = False
             else:
                 wait_s += w
+                for name, stat in (fams or {}).items():
+                    slot_acc = family_acc.get(name)
+                    if slot_acc is None:
+                        family_acc[name] = [stat.total_ms, stat.count]
+                    else:
+                        slot_acc[0] += stat.total_ms
+                        slot_acc[1] += stat.count
         line = (
             "Prefill rank batch, #new-token: %d, #cached-token: %d, "
             "#chunks: %d, gpu-ms: %.1f"
@@ -218,6 +233,21 @@ class RankPrefillLog:
             # granularity can push the difference a hair below zero.
             line += " (compute %.1f, wait %.1f)"
             args += [max(gpu_s - wait_s, 0.0) * 1000.0, wait_s * 1000.0]
+            if family_acc:
+                # One compact extension, biggest contributor first: the
+                # decomposition is only worth a line if the reader can see
+                # at a glance WHICH family owns the wait. Emitted only when
+                # the split is known and something was actually labelled, so
+                # an unarmed or graph-covered forward is byte-identical to
+                # before.
+                parts = ", ".join(
+                    "%s %.1f/%dx" % (name, total_ms, count)
+                    for name, (total_ms, count) in sorted(
+                        family_acc.items(), key=lambda kv: -kv[1][0]
+                    )
+                )
+                line += " (wait by family: %s)"
+                args.append(parts)
         logger.info(line, *args)
         # #363: the same numbers, kept for one structured reader instead of
         # only being formatted into a log line. ``last_split_known`` is False

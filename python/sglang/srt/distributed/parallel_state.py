@@ -91,6 +91,26 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # other collectives is the `armed` attribute read below.
 _COLLECTIVE_CLOCK = collective_clock()
 
+
+def collective_clock_families(group_name: str) -> Tuple[str, str, str, str]:
+    """Per-group collective-clock family names, in dispatch-site order.
+
+    ``(all_reduce, all_gather, all_gatherv, reduce_scatterv)``.
+
+    The GROUP is the axis the wait decomposition needs. "tp.all_reduce" is
+    the per-layer tensor reduction whose payload scales with new tokens;
+    "dcp.all_gather" is context-parallel attention traffic. They have the
+    same units and completely different fixes, which is precisely why one
+    summed ``wait`` number cannot arbitrate between them.
+    """
+    return (
+        f"{group_name}.all_reduce",
+        f"{group_name}.all_gather",
+        f"{group_name}.all_gatherv",
+        f"{group_name}.reduce_scatterv",
+    )
+
+
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
@@ -102,7 +122,9 @@ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 #: ``sys.modules`` rather than imported: a boot without an barlink transport
 #: never loads it, and ``GroupCoordinator.barrier`` must not be the thing
 #: that changes that.
-_BARLINK_LIVENESS_MODULE = "sglang.srt.distributed.device_communicators.barlink_liveness"
+_BARLINK_LIVENESS_MODULE = (
+    "sglang.srt.distributed.device_communicators.barlink_liveness"
+)
 
 #: Mirrors ``barlink_liveness.ENV_ENABLE``. Duplicated because reading the
 #: switch must not require importing the module the switch controls; the
@@ -415,7 +437,9 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     )
 
 
-def should_build_pynccl(use_pynccl: bool, world_size: int, barlink_active: bool) -> bool:
+def should_build_pynccl(
+    use_pynccl: bool, world_size: int, barlink_active: bool
+) -> bool:
     """Whether GroupCoordinator should CONSTRUCT a PyNccl communicator.
 
     Module-level and importable ON PURPOSE: it is the single definition of this
@@ -548,6 +572,16 @@ class GroupCoordinator:
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
+        # Collective-clock families for this group's dispatch sites (#588).
+        # Built ONCE here, so an armed span costs an attribute read and no
+        # string work on the hot path.
+        (
+            self._clock_family_all_reduce,
+            self._clock_family_all_gather,
+            self._clock_family_all_gatherv,
+            self._clock_family_reduce_scatterv,
+        ) = collective_clock_families(group_name)
+
         # Set rank info
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
@@ -614,7 +648,8 @@ class GroupCoordinator:
                     ranks,
                     backend="gloo",
                     timeout=(
-                        subgroup_timeout if subgroup_timeout is not None
+                        subgroup_timeout
+                        if subgroup_timeout is not None
                         else gloo_timeout
                     ),
                 )
@@ -729,7 +764,9 @@ class GroupCoordinator:
                     "ACHIEVED=%s. Every SGLANG_BARLINK* env must be identical "
                     "on all ranks; the host-staged transports (shm/gloo/ucx) "
                     "additionally require --disable-cuda-graph.",
-                    self.unique_name, requested, achieved,
+                    self.unique_name,
+                    requested,
+                    achieved,
                 )
             else:
                 logger.warning(
@@ -737,9 +774,13 @@ class GroupCoordinator:
                     "This group does NOT run over %s. A measurement from "
                     "this run is mixed and must not be reported as a "
                     "%s value.",
-                    self.unique_name, requested, achieved,
-                    state.get("stage", "?"), state.get("reason", "?"),
-                    requested, requested,
+                    self.unique_name,
+                    requested,
+                    achieved,
+                    state.get("stage", "?"),
+                    state.get("reason", "?"),
+                    requested,
+                    requested,
                 )
 
         # When barlink is active the pynccl communicator is NOT CONSTRUCTED --
@@ -1078,7 +1119,7 @@ class GroupCoordinator:
             # re-enter with the clock disarmed: the body runs exactly once,
             # and a collective built out of other collectives is counted once
             # rather than once per level.
-            with _COLLECTIVE_CLOCK.span():
+            with _COLLECTIVE_CLOCK.span(self._clock_family_all_reduce):
                 return self.all_reduce(input_)
 
         # Bypass the function if we are using only 1 GPU.
@@ -1289,9 +1330,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
 
         # barlink handles the dim/movedim bookkeeping itself and must not go
         # through the symmetric-memory allocator below (which is a NCCL/
@@ -1509,7 +1550,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         if _COLLECTIVE_CLOCK.armed:
             # See all_reduce for why this re-enters.
-            with _COLLECTIVE_CLOCK.span():
+            with _COLLECTIVE_CLOCK.span(self._clock_family_reduce_scatterv):
                 return self.reduce_scatterv(input_, output=output, sizes=sizes)
         if self.barlink_comm is not None:
             self._barlink_unsupported("reduce_scatterv")
@@ -1517,9 +1558,9 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for reduce_scatterv"
+            assert pynccl_comm is not None and not pynccl_comm.disabled, (
+                "pynccl is required for reduce_scatterv"
+            )
 
             if sizes is not None:
                 assert len(sizes) == world_size
@@ -1645,7 +1686,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         if _COLLECTIVE_CLOCK.armed:
             # See all_reduce for why this re-enters.
-            with _COLLECTIVE_CLOCK.span():
+            with _COLLECTIVE_CLOCK.span(self._clock_family_all_gather):
                 return self.all_gather(
                     input_, dim=dim, output_tensor_list=output_tensor_list
                 )
@@ -1670,9 +1711,9 @@ class GroupCoordinator:
                 output_tensor_list, input_, group=self.device_group
             )
 
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
 
         # barlink: vendor-neutral path, ahead of every device-specific
         # communicator. The output_tensor_list form above is left on NCCL in
@@ -1740,7 +1781,7 @@ class GroupCoordinator:
         """
         if _COLLECTIVE_CLOCK.armed:
             # See all_reduce for why this re-enters.
-            with _COLLECTIVE_CLOCK.span():
+            with _COLLECTIVE_CLOCK.span(self._clock_family_all_gatherv):
                 return self.all_gatherv(input_, sizes=sizes, output=output)
         if self.barlink_comm is not None:
             self._barlink_unsupported("all_gatherv")
@@ -1748,9 +1789,9 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for all_gatherv"
+            assert pynccl_comm is not None and not pynccl_comm.disabled, (
+                "pynccl is required for all_gatherv"
+            )
 
             def _all_gather_allocate_output(
                 input_: torch.Tensor,
@@ -1814,9 +1855,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -1963,9 +2004,9 @@ class GroupCoordinator:
         """NOTE: `src` is the local rank of the source rank."""
 
         assert src < self.world_size, f"Invalid src rank ({src})"
-        assert (
-            src != self.rank_in_group
-        ), "Invalid source rank. Source rank is the same as the current rank."
+        assert src != self.rank_in_group, (
+            "Invalid source rank. Source rank is the same as the current rank."
+        )
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
@@ -2012,9 +2053,9 @@ class GroupCoordinator:
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
             metadata_list: List[Tuple[Any, Any]] = []
-            assert isinstance(
-                tensor_dict, dict
-            ), f"Expecting a dictionary, got {type(tensor_dict)}"
+            assert isinstance(tensor_dict, dict), (
+                f"Expecting a dictionary, got {type(tensor_dict)}"
+            )
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
@@ -2201,9 +2242,9 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        assert isinstance(
-            tensor_dict, dict
-        ), f"Expecting a dictionary, got {type(tensor_dict)}"
+        assert isinstance(tensor_dict, dict), (
+            f"Expecting a dictionary, got {type(tensor_dict)}"
+        )
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
@@ -2463,25 +2504,25 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
 
 def get_tp_group() -> GroupCoordinator:
     if _ENABLE_PDMUX_P_TP:
-        assert (
-            _PDMUX_PREFILL_TP_GROUP is not None
-        ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        assert _PDMUX_PREFILL_TP_GROUP is not None, (
+            "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        )
         return _PDMUX_PREFILL_TP_GROUP
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
 
 def get_attn_tp_group() -> GroupCoordinator:
-    assert (
-        _ATTN_TP is not None
-    ), "attention tensor model parallel group is not initialized"
+    assert _ATTN_TP is not None, (
+        "attention tensor model parallel group is not initialized"
+    )
     return _ATTN_TP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
-    assert (
-        _ATTN_CP is not None
-    ), "attention context model parallel group is not initialized"
+    assert _ATTN_CP is not None, (
+        "attention context model parallel group is not initialized"
+    )
     return _ATTN_CP
 
 
@@ -2688,7 +2729,7 @@ def init_distributed_environment(
     recovered_rank: bool = False,
 ):
     logger.debug(
-        "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
+        "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
         rank,
         local_rank,
@@ -2759,9 +2800,9 @@ def init_distributed_environment(
             ranks, local_rank, backend, recovered_rank=recovered_rank
         )
     else:
-        assert (
-            _WORLD.world_size == torch.distributed.get_world_size()
-        ), "world group already initialized with a different world size"
+        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+            "world group already initialized with a different world size"
+        )
 
 
 def initialize_model_parallel(
@@ -2880,9 +2921,9 @@ def initialize_model_parallel(
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
-        assert (
-            _PDMUX_PREFILL_TP_GROUP is None
-        ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        assert _PDMUX_PREFILL_TP_GROUP is None, (
+            "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        )
         _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2953,9 +2994,9 @@ def initialize_model_parallel(
     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
 
     global _ATTN_CP
-    assert (
-        _ATTN_CP is None
-    ), "attention context model parallel group is already initialized"
+    assert _ATTN_CP is None, (
+        "attention context model parallel group is already initialized"
+    )
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
     else:
@@ -2987,9 +3028,9 @@ def initialize_model_parallel(
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
     global _ATTN_TP
-    assert (
-        _ATTN_TP is None
-    ), "attention tensor model parallel group is already initialized"
+    assert _ATTN_TP is None, (
+        "attention tensor model parallel group is already initialized"
+    )
     if attn_tp_size == tensor_model_parallel_size:
         _ATTN_TP = _TP
     else:
@@ -3245,9 +3286,9 @@ def ensure_model_parallel_initialized(
     )
     if decode_context_parallel_size > 1:
         dcp_world_size = get_dcp_group().world_size
-        assert (
-            dcp_world_size == decode_context_parallel_size
-        ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
+        assert dcp_world_size == decode_context_parallel_size, (
+            f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
+        )
 
 
 def model_parallel_is_initialized():
@@ -3474,9 +3515,9 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     as the source rank. It tests if processes are attached to the same
     memory system (shared access to shared memory).
     """
-    assert (
-        torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
-    ), "in_the_same_node_as should be tested with a non-NCCL group."
+    assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
+        "in_the_same_node_as should be tested with a non-NCCL group."
+    )
     # local rank inside the group
     rank = torch.distributed.get_rank(group=pg)
     world_size = torch.distributed.get_world_size(group=pg)
