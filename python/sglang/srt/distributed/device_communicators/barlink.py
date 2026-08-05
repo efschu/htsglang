@@ -162,6 +162,30 @@ def state_summary() -> str:
               if all_direct else
               "barlink: NOT all groups are running the requested transport -- "
               "a measurement over this configuration is mixed.")
+    # A group whose window was reduced still ACHIEVES bar1, and every line
+    # above says so truthfully. It says so in exactly the same words as a
+    # group that got the window it asked for, though, and the difference is
+    # the run's round counts. Naming it here keeps "all groups are running
+    # the requested transport" from being read as "and at the requested size".
+    try:
+        from sglang.srt.distributed.device_communicators.barlink_matrix_transport import (  # noqa: E501
+            window_clips,
+        )
+
+        clips = window_clips()
+    except Exception:  # noqa: BLE001 - a report must never take down a boot
+        clips = {}
+    if clips:
+        lines.append(
+            "  BAR1 windows REDUCED below the requested size (the transport "
+            "is unaffected; the payload per round is not):"
+        )
+        for name, c in sorted(clips.items()):
+            lines.append(
+                f"    {name}: {c['granted_bytes'] // 2**20} MiB granted of "
+                f"{c['requested_bytes'] // 2**20} MiB requested "
+                f"({c['source']})"
+            )
     return header + "\n" + "\n".join(lines)
 
 

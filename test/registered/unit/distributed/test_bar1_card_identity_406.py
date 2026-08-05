@@ -272,16 +272,39 @@ class Bar1FreeFollowsTheCardTest(_RigCase):
         self.assertEqual(card.uuid, UUID_5090)
         self.assertEqual(card.nvml_index, 1)
 
-    def test_window_for_is_clipped_to_the_hosting_card(self):
+    def test_window_for_is_sized_against_the_hosting_card(self):
         """End to end: 100 MiB free on the 5090 minus a 32 MiB reserve is a
         68 MiB window. Pre-fix the 3080's 240 MiB free let the full 96 MiB
-        request through -- a window the hosting card cannot hold."""
-        self.assertEqual(
-            transport.window_for("tp", _FakeDevice(0)), CORRECT_WINDOW_MIB * MIB
-        )
-        self.assertNotEqual(
-            transport.window_for("tp", _FakeDevice(0)), WRONG_WINDOW_MIB * MIB
-        )
+        request through -- a window the hosting card cannot hold.
+
+        The SUBJECT here is card identity, not the clip policy: this fixture
+        pins ``SGLANG_BARLINK_BAR1_WINDOW_MIB`` only so the arithmetic is
+        exact. Since #603 an EXPLICIT window that does not fit refuses
+        instead of being served smaller, so the observable is the refusal --
+        and what it has to prove is unchanged: the arithmetic in it belongs
+        to the 5090 that hosts ``cuda:0``, not to the 3080 whose 240 MiB
+        would have let the full request through.
+        """
+        with self.assertRaises(transport.Bar1WindowRefused) as caught:
+            transport.window_for("tp", _FakeDevice(0))
+        message = str(caught.exception)
+        self.assertIn(f"{CORRECT_WINDOW_MIB} MiB", message)
+        self.assertIn(f"free per NVML {BAR1_FREE_MIB[UUID_5090]} MiB", message)
+        # The pre-fix answer, named: the 3080's free space never appears.
+        self.assertNotIn(f"free per NVML {BAR1_FREE_MIB[UUID_3080_A]} MiB",
+                         message)
+
+    def test_default_window_is_clipped_to_the_hosting_card(self):
+        """The same sizing question on the path that still clips: without an
+        explicit request the window is reduced rather than refused, and it is
+        reduced to the HOSTING card's 68 MiB, not the 3080's 208."""
+        env = {k: v for k, v in os.environ.items()
+               if k != "SGLANG_BARLINK_BAR1_WINDOW_MIB"}
+        env["SGLANG_BARLINK_BAR1_RESERVE_MIB"] = str(RESERVE_MIB)
+        with patch.dict(os.environ, env, clear=True):
+            got = transport.window_for("tp", _FakeDevice(0))
+        self.assertEqual(got, CORRECT_WINDOW_MIB * MIB)
+        self.assertNotEqual(got, WRONG_WINDOW_MIB * MIB)
 
 
 class OrdinalRouteTest(_RigCase):
