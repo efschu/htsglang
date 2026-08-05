@@ -27,6 +27,10 @@ from sglang.srt.distributed import (
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.tp_ar_pipeline import (
+    join_deferred,
+    note_reduce_site,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -556,6 +560,11 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        # Task #597: whichever consumer runs first completes a deferred
+        # all-reduce that a producing layer issued on the comm stream. One
+        # getattr when nothing is pending, which is what the default path
+        # pays. Placed at the ENTRY, before any branch reads the values.
+        hidden_states = join_deferred(hidden_states)
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -585,12 +594,18 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+                    # Task #597: the fused kernel reduces INSIDE the
+                    # layernorm, so it is a reducing site like any other.
+                    hidden_states = note_reduce_site(hidden_states)
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
                             hidden_states, residual, use_attn_tp_group=False
                         )
                     )
                 else:
+                    # Task #597 double-reduce guard: a tensor still carrying
+                    # a deferred handle must never reach a reducing site.
+                    hidden_states = note_reduce_site(hidden_states)
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
@@ -724,9 +739,9 @@ class LayerCommunicator:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-        assert (
-            hidden_states.shape[0] % self._context.tp_size == 0
-        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        assert hidden_states.shape[0] % self._context.tp_size == 0, (
+            f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        )
         local_tokens = hidden_states.shape[0] // self._context.tp_size
         output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
         get_tp_group().reduce_scatter_tensor(output, hidden_states)
@@ -746,6 +761,8 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
+        # Task #597: see prepare_attn.
+        hidden_states = join_deferred(hidden_states)
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -760,6 +777,10 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        # Task #597: see prepare_attn. On the fuse_mlp_allreduce seam this
+        # call is skipped entirely and the join lands in the NEXT layer's
+        # prepare_attn -- a strictly larger issue-to-join window.
+        hidden_states = join_deferred(hidden_states)
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -1071,6 +1092,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         (``moe_dense_tp_size > 1``): both hidden states and residual stay in
         ``TP_ATTN_FULL`` across the boundary.
         """
+        hidden_states = note_reduce_site(hidden_states)  # task #597 guard
         hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
@@ -1106,6 +1128,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
                 if context.attn_tp_size > 1:
+                    hidden_states = note_reduce_site(hidden_states)  # task #597
                     hidden_states = attention_tensor_model_parallel_all_reduce(
                         hidden_states
                     )
@@ -1136,6 +1159,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
+                hidden_states = note_reduce_site(hidden_states)  # task #597
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual, use_attn_tp_group=True
                 )
@@ -1146,6 +1170,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     not forward_batch.forward_mode.is_decode_or_idle()
                     and get_server_args().enable_quant_communications
                 )
+                hidden_states = note_reduce_site(hidden_states)  # task #597
                 if quantize_communications:
                     hidden_states = attention_tensor_model_parallel_quant_all_reduce(
                         hidden_states
@@ -1190,6 +1215,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
+        hidden_states = note_reduce_site(hidden_states)  # task #597 guard
         scattered_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
         scattered_states += residual
         residual = tensor_model_parallel_all_reduce(hidden_states)

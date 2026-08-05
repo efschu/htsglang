@@ -28,6 +28,10 @@ from sglang.srt.distributed.utils import (
     tp_partition_size,
     tp_plan_active,
 )
+from sglang.srt.distributed.tp_ar_pipeline import (
+    issue_deferred_all_reduce,
+    tp_ar_deferred_enabled,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
@@ -2041,6 +2045,23 @@ class FusedMoE(torch.nn.Module):
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         final_hidden_states = self.forward_local(hidden_states, topk_output)
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+            # Task #597: this is the all-reduce that dominates a production
+            # prefill (window 8: 932.2 ms over 129 calls of a 96k-token
+            # prefill). Opt-in, it is issued on the comm stream here and
+            # joined by the first consumer in the LayerCommunicator, so the
+            # transfer runs under the rest of the layer instead of blocking
+            # it. The SAME single reduction happens either way -- nothing
+            # downstream reduces this tensor, so nothing downstream has to be
+            # suppressed and a double reduce cannot arise from this change.
+            if (
+                tp_ar_deferred_enabled()
+                and final_hidden_states.dim() == 2
+                and final_hidden_states.shape[0]
+                >= int(envs.SGLANG_TP_AR_PIPELINE_DEFERRED_MIN_TOKENS.get())
+            ):
+                return issue_deferred_all_reduce(
+                    final_hidden_states, tensor_model_parallel_all_reduce
+                )
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
