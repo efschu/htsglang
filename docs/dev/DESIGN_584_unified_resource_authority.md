@@ -489,6 +489,50 @@ ASSERTED AGAINST MEASUREMENT, not against this document: slice 4c owns that
 measurement, and until it lands the band is an expectation carried from the
 restore observation, not an established input.
 
+**(e) The gate is COMPARATIVE, never an absolute latency threshold.**
+*(User refinement, 2026-08-05: "The proof that even a SECONDS window can be
+worth it: when all VRAM and RAM are already occupied, you put it on disk
+instead (or fetch from there) -- still faster than rebuilding and reloading the
+whole model.")*
+
+This corrects a misreading (d) invites. "Milliseconds" is the expected band for
+the VRAM<->RAM tier; it is **not** a ceiling above which a move is refused. The
+rule is:
+
+    move iff effective_cost(move) < cost(best alternative)
+
+and **the alternative set explicitly includes full re-materialization** -- model
+reload, re-capture, re-prefill, i.e. minutes. A planner that rejects a
+seconds-scale move "because seconds is too slow" while the alternative costs
+minutes is wrong by construction, and it is wrong in the direction that looks
+prudent, which is why it needs to be named.
+
+**Per-tier bands, from the #407 registry, not one universal number:**
+
+| Tier | Band | Source |
+|---|---|---|
+| VRAM <-> VRAM / RAM | milliseconds | 40-85 ms restore observation (R9), PCIe arithmetic |
+| RAM <-> disk | seconds | #89 hibernate resume 8-14 s vs ~50 s cold start |
+
+**Graceful degradation, never refusal:** VRAM full -> RAM; RAM also full ->
+disk. As long as a deeper tier fits, the answer is a slower move, never a
+refusal and never a teardown. Each tier carries its OWN measured band; the
+ladder is the #305/#546 idle-park machinery and the #407 tier registry, and the
+evidence line is already in tree -- `registry/rungs.py` prices the COLD rung at
+"#89 resume 8-14 s at uneven TP=3 (DESIGN_201:1635) plus 3-6 s recapture"
+against a boot it calls "effectively a boot".
+
+*Falsifier F11e.* With VRAM **and** RAM saturated by co-tenants, an eviction
+demand must produce a planned AND executed **disk** spill (and a later restore)
+-- not a refusal, and not a rebuild.
+
+*Falsifier F11f (structural, and the more important one).* The solver's
+alternative-cost table must carry a **rebuild/re-materialize column**. Without
+it F11e cannot even be expressed, because there is nothing to compare the
+seconds-scale move against and "seconds" then looks unconditionally bad. That
+column is a REQUIREMENT, not an optimisation, and a design review that finds it
+missing fails the slice regardless of how the comparator behaves.
+
 ### R8 -- Every decision is explainable after the fact
 
 Any configuration the planner chooses must be reconstructible: the candidates

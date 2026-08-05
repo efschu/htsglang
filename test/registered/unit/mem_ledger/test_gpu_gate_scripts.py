@@ -490,6 +490,7 @@ def test_parser_round_trips_the_REAL_ledger_renderer(compare_mod, tmp_path):
             capture_tokens_per_rank=[96],
             mamba_pool_mib_per_rank=[900.0],
             chunked_prefill_size=2048,
+            phase_footprint_fingerprint="abc123def456",
         ),
         cards=[card],
         rank_gpu_id=[1],

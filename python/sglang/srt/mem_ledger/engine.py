@@ -148,10 +148,30 @@ class DemandInputs:
     #: Per-rank resident weight footprint, MiB, index = tp rank. Under uneven
     #: TP the entries differ; under even TP they are equal by construction.
     weight_mib_per_rank: Sequence[int]
-    #: Per-rank runtime activation + metadata peak, MiB.
-    activation_mib_per_rank: Sequence[float]
-    #: Per-rank captured tokens across all graph families.
+    #: Per-rank runtime activation + metadata peak, MiB. An entry of ``None``
+    #: means "this rank's activation peak is not calibrated for the live
+    #: hardware and profile" and becomes an UNBOUNDED item, i.e. a refusal.
+    #: It is emphatically NOT zero and never falls back to the inherited
+    #: 512+tokens*1.5+tp*pp/8*1024 heuristic, which the 2026-08-05 window
+    #: falsified (it books 3968 MiB where the binding card had 1766 MiB free
+    #: and still completed a 70018-token prefill).
+    activation_mib_per_rank: Sequence[Optional[float]]
+    #: Per-rank captured tokens across all graph families. Used only when
+    #: ``capture_mib_per_rank`` is absent -- the tokens x 2 MiB coefficient is
+    #: itself an inherited estimate and the same window measured it 3.3-3.8x
+    #: LOW (192 MiB booked against 633-730 MiB actually taken).
     capture_tokens_per_rank: Sequence[int]
+    #: Per-rank measured graph-capture cost, MiB. Overrides the token estimate
+    #: when present.
+    capture_mib_per_rank: Optional[Sequence[float]] = None
+    #: Per-rank provenance sentence for the activation and capture numbers.
+    phase_footprint_source_per_rank: Sequence[str] = ()
+    #: Hardware fingerprint the phase footprints were taken under. REQUIRED
+    #: whenever an activation value is supplied: a calibrated number without
+    #: the hardware it was measured on cannot be invalidated, and the ledger
+    #: rejects such a term by construction. There is deliberately no "unknown"
+    #: sentinel -- that would be the un-invalidatable literal wearing a label.
+    phase_footprint_fingerprint: str = ""
     #: Per-rank mamba/GDN state pool, MiB. Empty tuple when the checkpoint has
     #: no such layers (which is "does not apply", not "unknown").
     mamba_pool_mib_per_rank: Sequence[float] = ()
@@ -230,6 +250,7 @@ class DemandInputs:
         weight_mib_per_rank: Sequence[int],
         head_share_per_rank: Optional[Sequence[float]] = None,
         mamba_pool_mib_per_rank: Optional[Sequence[float]] = None,
+        card_uuid_by_gpu: Optional[Mapping[int, str]] = None,
     ) -> "DemandInputs":
         """Fill the inputs by calling the REAL ServerArgs derivations.
 
@@ -242,16 +263,50 @@ class DemandInputs:
         n = len(rank_gpu_id)
         shares = list(head_share_per_rank or [1.0 / max(n, 1)] * n)
 
-        activation: List[float] = []
+        activation: List[Optional[float]] = []
         capture: List[int] = []
         gdn: List[float] = []
         indexer: List[float] = []
         gdn_applicable = True
         indexer_applicable = True
+        # Phase footprints (activation peak, graph capture) come from the
+        # calibration store, keyed by hardware fingerprint AND activation
+        # profile. A miss yields None, which the builder turns into a refusal;
+        # the inherited heuristics are never reached from here.
+        from sglang.srt.mem_ledger.activation import (
+            profile_from_server_args,
+            resolve_phase_footprint,
+        )
+        from sglang.srt.mem_ledger.calibration import live_fingerprint
+
+        live = live_fingerprint()
+        hw_fp = live[0] if live else None
+        capture_mib: List[float] = []
+        sources: List[str] = []
+        footprint_profile = None
+
+        footprint_profile = profile_from_server_args(
+            server_args, _model_architectures(server_args)
+        )
+
         for rank, gpu_id in enumerate(rank_gpu_id):
-            gpu_mem = gpu_total_mib.get(gpu_id)
-            activation.append(float(server_args.mamba_pre_capture_reserve_mb(gpu_mem)))
             capture.append(int(server_args.speculative_capture_tokens()))
+            uuid = (card_uuid_by_gpu or {}).get(gpu_id, "")
+            fp = (
+                resolve_phase_footprint(
+                    uuid, hw_fingerprint=hw_fp, profile=footprint_profile
+                )
+                if uuid
+                else None
+            )
+            if fp is None:
+                activation.append(None)
+                capture_mib.append(0.0)
+                sources.append("")
+            else:
+                activation.append(float(fp.activation_mib))
+                capture_mib.append(float(fp.capture_mib))
+                sources.append(f"[{fp.provenance.value}] {fp.source}")
             scratch = server_args.gdn_prefill_scratch_mib(shares[rank])
             if scratch is None:
                 gdn_applicable = False
@@ -333,6 +388,11 @@ class DemandInputs:
             weight_mib_per_rank=list(weight_mib_per_rank),
             activation_mib_per_rank=activation,
             capture_tokens_per_rank=capture,
+            capture_mib_per_rank=(
+                capture_mib if any(x > 0 for x in capture_mib) else None
+            ),
+            phase_footprint_source_per_rank=tuple(sources),
+            phase_footprint_fingerprint=hw_fp or "",
             mamba_pool_mib_per_rank=list(mamba_pool_mib_per_rank or ()),
             gdn_scratch_mib_per_rank=gdn if gdn_applicable else None,
             indexer_scratch_mib_per_rank=indexer if indexer_applicable else None,
@@ -436,56 +496,99 @@ def build_card_ledgers(
             )
         )
 
-        # -- activation, PER RANK (correction 1) -----------------------------
-        activation = sum(float(inputs.activation_mib_per_rank[r]) for r in ranks)
-        terms.append(
-            LedgerTerm(
-                name=TERM_ACTIVATION,
-                mib=int(math.ceil(activation)),
-                provenance=Provenance.MODELED,
-                derivation=(
-                    f"mamba_pre_capture_reserve_mb() x {n_co} rank process(es) "
-                    f"on this card (512 + activation_tokens*1.5 + tp*pp/8*1024, "
-                    f"activation_tokens from chunked_prefill_size="
-                    f"{inputs.chunked_prefill_size}). Charged per RANK, not per "
-                    "card: co-located ranks are separate processes and hold "
-                    "their prefill peaks simultaneously"
-                ),
-                inputs=(
-                    "chunked_prefill_size",
-                    "max_prefill_tokens",
-                    "tp_size",
-                    "pp_size",
-                    "max_running_requests",
-                ),
-                bounded_by="chunked_prefill_size (the prefill is chunked, so "
-                "the peak is a function of the chunk, not of the request)",
+        # -- activation, PER RANK, CALIBRATED (never the falsified heuristic) --
+        missing_activation = [
+            r for r in ranks if inputs.activation_mib_per_rank[r] is None
+        ]
+        if missing_activation:
+            unbounded.append(
+                f"{TERM_ACTIVATION} on {card.name} (rank(s) "
+                f"{', '.join(str(r) for r in missing_activation)}): no phase "
+                "footprint is calibrated for this hardware fingerprint and "
+                "activation profile. Run "
+                "`scripts/vram_ledger/probe_activation.py` once for this "
+                "config. This term does NOT fall back to the inherited "
+                "512+tokens*1.5+tp*pp/8*1024 heuristic: the 2026-08-05 window "
+                "falsified it (3968 MiB booked against 1766 MiB free on the "
+                "card that then completed a 70018-token prefill), and a "
+                "falsified formula that still runs is worse than a refusal "
+                "because it returns a number that looks like an answer"
             )
-        )
+        else:
+            activation = sum(float(inputs.activation_mib_per_rank[r]) for r in ranks)
+            src = ""
+            for r in ranks:
+                if r < len(inputs.phase_footprint_source_per_rank):
+                    src = inputs.phase_footprint_source_per_rank[r]
+                    break
+            terms.append(
+                LedgerTerm(
+                    name=TERM_ACTIVATION,
+                    mib=int(math.ceil(activation)),
+                    provenance=Provenance.CALIBRATED,
+                    derivation=(
+                        f"prefill activation peak, summed over {n_co} rank "
+                        f"process(es) on this card at chunked_prefill_size="
+                        f"{inputs.chunked_prefill_size}. Charged per RANK, not "
+                        "per card: co-located ranks are separate processes and "
+                        f"hold their prefill peaks simultaneously. {src}"
+                    ),
+                    fingerprint=inputs.phase_footprint_fingerprint,
+                    bounded_by="chunked_prefill_size (the prefill is chunked, "
+                    "so the peak is a function of the chunk, not of the "
+                    "request)",
+                )
+            )
 
-        # -- CUDA graph capture ----------------------------------------------
-        capture_tokens = sum(int(inputs.capture_tokens_per_rank[r]) for r in ranks)
-        terms.append(
-            LedgerTerm(
-                name=TERM_GRAPH_CAPTURE,
-                mib=capture_tokens * GRAPH_MIB_PER_CAPTURED_TOKEN,
-                provenance=Provenance.MODELED,
-                derivation=(
-                    f"{capture_tokens} captured tokens across all graph "
-                    f"families on this card (decode max_bs x the speculative "
-                    f"capture-token multiplier, summed over {n_co} rank "
-                    f"process(es), each of which captures its own graphs) x "
-                    f"{GRAPH_MIB_PER_CAPTURED_TOKEN} MiB/token, the stock "
-                    "coefficient from _handle_gpu_memory_settings"
-                ),
-                inputs=(
-                    "cuda_graph_config.decode.max_bs",
-                    "speculative_num_draft_tokens",
-                    "speculative_algorithm",
-                    "disable_cuda_graph",
-                ),
+        # -- CUDA graph capture, measured where available ---------------------
+        if inputs.capture_mib_per_rank is not None:
+            cap_mib = sum(float(inputs.capture_mib_per_rank[r]) for r in ranks)
+            src = ""
+            for r in ranks:
+                if r < len(inputs.phase_footprint_source_per_rank):
+                    src = inputs.phase_footprint_source_per_rank[r]
+                    break
+            terms.append(
+                LedgerTerm(
+                    name=TERM_GRAPH_CAPTURE,
+                    mib=int(math.ceil(cap_mib)),
+                    provenance=Provenance.CALIBRATED,
+                    derivation=(
+                        f"measured graph-capture cost, summed over {n_co} rank "
+                        f"process(es) on this card (each captures its own "
+                        f"graphs). Replaces the captured-tokens x "
+                        f"{GRAPH_MIB_PER_CAPTURED_TOKEN} MiB estimate, which "
+                        "the 2026-08-05 window measured 3.3-3.8x LOW -- an "
+                        f"under-charge, i.e. the dangerous direction. {src}"
+                    ),
+                    fingerprint=inputs.phase_footprint_fingerprint,
+                )
             )
-        )
+        else:
+            capture_tokens = sum(int(inputs.capture_tokens_per_rank[r]) for r in ranks)
+            terms.append(
+                LedgerTerm(
+                    name=TERM_GRAPH_CAPTURE,
+                    mib=capture_tokens * GRAPH_MIB_PER_CAPTURED_TOKEN,
+                    provenance=Provenance.MODELED,
+                    derivation=(
+                        f"{capture_tokens} captured tokens across all graph "
+                        f"families on this card (decode max_bs x the "
+                        f"speculative capture-token multiplier, summed over "
+                        f"{n_co} rank process(es)) x "
+                        f"{GRAPH_MIB_PER_CAPTURED_TOKEN} MiB/token, the stock "
+                        "coefficient. KNOWN LOW by 3.3-3.8x against the "
+                        "2026-08-05 measurement; used only until a phase "
+                        "footprint is calibrated for this profile"
+                    ),
+                    inputs=(
+                        "cuda_graph_config.decode.max_bs",
+                        "speculative_num_draft_tokens",
+                        "speculative_algorithm",
+                        "disable_cuda_graph",
+                    ),
+                )
+            )
 
         # -- adaptive ladder, charged to exactly one GPU ---------------------
         ladder_mib = int(inputs.ladder_mib_per_gpu.get(card.gpu_id, 0))
