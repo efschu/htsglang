@@ -562,10 +562,37 @@ def alloc_req_slots(
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
+        # #583: name the pool that ACTUALLY ran out.
+        #
+        # `available_size()` is the REQUEST-slot count. On a
+        # HybridReqToTokenPool the alloc needs a mamba state (and, with the
+        # extra buffer, a ping-pong slot) as well, and it returns None if
+        # EITHER is unavailable. Reporting only the request-slot count
+        # therefore produced the boot-14 line
+        #   available_size()=4, num_reqs=1
+        # -- a message saying there was room, on a failure to find room. The
+        # mamba pool was 96/96. A fail-loud path that names the wrong
+        # resource costs more time than it saves.
+        detail = f"{req_to_token_pool.available_size()=} (request slots), {num_reqs=}"
+        if isinstance(req_to_token_pool, HybridReqToTokenPool):
+            alloc = req_to_token_pool.mamba_allocator
+            try:
+                detail += (
+                    f", mamba_available={alloc.available_size()}"
+                    f", mamba_schedulable={alloc.schedulable_available_size()}"
+                    f", mamba_total={alloc.size}"
+                )
+            except Exception:  # noqa: BLE001 - diagnostics must not mask the error
+                detail += ", mamba_available=<unavailable>"
+            detail += (
+                ". A hybrid pool needs BOTH a request slot and a mamba state, "
+                "so an exhausted mamba pool fails here even with request slots "
+                "free -- raise --max-mamba-cache-size, or look for mamba slots "
+                "held by unevictable radix checkpoints"
+            )
         raise RuntimeError(
             "alloc_req_slots runs out of memory. "
-            "Please set a smaller number for `--max-running-requests`. "
-            f"{req_to_token_pool.available_size()=}, {num_reqs=}, "
+            "Please set a smaller number for `--max-running-requests`. " + detail
         )
     return req_pool_indices
 
