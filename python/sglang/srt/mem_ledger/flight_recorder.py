@@ -95,6 +95,8 @@ __all__ = [
     "is_recording_phases",
     "mark",
     "read_marks",
+    "list_boots",
+    "boot_id",
     "phase_deltas",
     "python_site",
     "python_stack",
@@ -262,6 +264,35 @@ def is_recording_phases() -> bool:
     return bool(os.environ.get(DIR_ENV))
 
 
+_boot_id: Optional[str] = None
+
+
+def boot_id() -> str:
+    """An id shared by every rank of ONE boot, distinct across boots.
+
+    Derived from the LAUNCHER (this process's parent) rather than from this
+    process: the ranks are its children, so its pid and start time are the one
+    thing they agree on without a collective. A per-process uuid would tag each
+    rank's file with a different id and make cross-rank reading impossible,
+    which is the opposite of what the id is for.
+
+    Falls back to this process's own identity when the parent cannot be read;
+    a per-rank id still separates BOOTS within a rank's file, which is the
+    property :func:`read_marks` depends on.
+    """
+    global _boot_id
+    if _boot_id is not None:
+        return _boot_id
+    try:
+        import psutil
+
+        parent = psutil.Process().parent()
+        _boot_id = f"{parent.pid}-{int(parent.create_time())}"
+    except Exception:  # pragma: no cover - psutil absence / permissions
+        _boot_id = f"self{os.getpid()}-{int(time.time())}"
+    return _boot_id
+
+
 def cuda_initialized() -> bool:
     """True when torch's lazy CUDA init has run in this process.
 
@@ -376,6 +407,10 @@ def mark(
     record: Dict[str, Any] = {
         "phase": str(phase),
         "rank": int(rank),
+        # Identifies the boot this mark belongs to. Without it a file that
+        # accumulates boots cannot be read as one boot, and the delta across
+        # the seam is a number describing nothing.
+        "boot_id": boot_id(),
         "pid": os.getpid(),
         "wall": time.time(),
         "monotonic": time.monotonic(),
@@ -408,8 +443,22 @@ def mark(
     return record
 
 
-def read_marks(directory: str) -> Dict[int, List[dict]]:
-    """``{rank: [mark, ...]}`` in the order they were written."""
+def read_marks(directory: str, *, boot: Optional[str] = None) -> Dict[int, List[dict]]:
+    """``{rank: [mark, ...]}`` for ONE boot, latest by default.
+
+    THE FILE HOLDS MORE THAN ONE BOOT and that is the point of the format: a
+    rank appends, so a crashed boot keeps the boundaries it did reach and the
+    next boot does not erase them. It also means a reader that returns the
+    whole file returns marks from several process lifetimes, and
+    :func:`phase_deltas` over that produces a delta across the seam --
+    ``boot_complete`` of one boot to ``process_start`` of the next -- which is
+    a number describing nothing, printed with the same confidence as a real
+    post. Selecting a boot is therefore not a convenience, it is the thing that
+    keeps the output honest once the recorder is armed on every boot.
+
+    Pass ``boot="all"`` to get every record, for a reader that means to handle
+    the seams itself.
+    """
     out: Dict[int, List[dict]] = {}
     if not os.path.isdir(directory):
         return out
@@ -430,9 +479,41 @@ def read_marks(directory: str) -> Dict[int, List[dict]]:
                     # Keep the boundaries that did land rather than dropping
                     # the rank's whole history over its last byte.
                     logger.warning("flight recorder: dropping a torn line in %s", path)
+        if not records:
+            continue
+        if boot != "all":
+            wanted = boot if boot is not None else records[-1].get("boot_id")
+            selected = [r for r in records if r.get("boot_id") == wanted]
+            # Records written before boot_id existed carry none; keeping them
+            # out of a boot-scoped read is right, but silently returning
+            # nothing would look like "the boot wrote no marks".
+            if not selected and wanted is None:
+                logger.warning(
+                    "flight recorder: %s carries no boot_id; it predates "
+                    "boot-scoped reads and is being returned whole",
+                    path,
+                )
+                selected = records
+            records = selected
         if records:
             out[int(records[0].get("rank", 0))] = records
     return out
+
+
+def list_boots(directory: str) -> List[Tuple[str, float, int]]:
+    """``[(boot_id, first wall clock, mark count), ...]``, oldest first."""
+    seen: Dict[str, List[Any]] = {}
+    for records in read_marks(directory, boot="all").values():
+        for record in records:
+            boot_id = record.get("boot_id")
+            if boot_id is None:
+                continue
+            entry = seen.setdefault(boot_id, [float(record.get("wall", 0.0)), 0])
+            entry[0] = min(entry[0], float(record.get("wall", 0.0)))
+            entry[1] += 1
+    return sorted(
+        ((boot_id, v[0], v[1]) for boot_id, v in seen.items()), key=lambda t: t[1]
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -464,6 +545,20 @@ def phase_deltas(marks: Sequence[Mapping[str, Any]]) -> List[PhaseDelta]:
     """Consecutive differences. Each one is a post, measured."""
     out: List[PhaseDelta] = []
     for a, b in zip(marks, marks[1:]):
+        if a.get("boot_id") != b.get("boot_id"):
+            # The seam between two boots. Skipped rather than reported: the
+            # difference between one boot's last mark and the next boot's
+            # first is not a post, and printing it beside real posts in the
+            # same table is exactly how a reader would come to trust it.
+            logger.warning(
+                "flight recorder: skipping the delta from %s to %s, which "
+                "spans two boots (%s -> %s)",
+                a.get("phase"),
+                b.get("phase"),
+                a.get("boot_id"),
+                b.get("boot_id"),
+            )
+            continue
         out.append(
             PhaseDelta(
                 frm=str(a.get("phase", "?")),

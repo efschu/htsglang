@@ -38,14 +38,30 @@ sys.path.insert(
 from sglang.srt.mem_ledger.flight_recorder import (  # noqa: E402
     MIB,
     churn_attribution,
+    list_boots,
     phase_deltas,
     read_marks,
     resident_attribution,
 )
 
 
+def _boots(args) -> int:
+    import datetime
+
+    boots = list_boots(args.directory)
+    if not boots:
+        print(f"No flight marks under {args.directory}.")
+        return 1
+    print(f"{'boot id':<24} {'first mark':<20} {'marks':>6}")
+    for boot, wall, count in boots:
+        stamp = datetime.datetime.fromtimestamp(wall).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{boot:<24} {stamp:<20} {count:>6}")
+    print(f"\nlatest is {boots[-1][0]}; 'phases' shows it unless --boot says otherwise")
+    return 0
+
+
 def _phases(args) -> int:
-    by_rank = read_marks(args.directory)
+    by_rank = read_marks(args.directory, boot=getattr(args, "boot", None))
     if not by_rank:
         print(f"No flight marks under {args.directory}.")
         print("Boot with SGLANG_VRAM_FLIGHT_DIR=<dir> to produce them.")
@@ -53,7 +69,10 @@ def _phases(args) -> int:
     for rank in sorted(by_rank):
         marks = by_rank[rank]
         first = marks[0]
-        print(f"\n=== rank {rank} (pid {first.get('pid')}) ===")
+        print(
+            f"\n=== rank {rank} (pid {first.get('pid')}, "
+            f"boot {first.get('boot_id')}) ==="
+        )
         card = first.get("card_uuid") or marks[-1].get("card_uuid") or "unresolved"
         print(f"card {card}")
         print(
@@ -120,7 +139,16 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("phases", help="per-phase costs from the mark log")
     p.add_argument("directory")
+    p.add_argument(
+        "--boot",
+        default=None,
+        help="which boot to show (default: the latest; 'all' ignores the seams)",
+    )
     p.set_defaults(func=_phases)
+
+    p = sub.add_parser("boots", help="which boots this directory holds")
+    p.add_argument("directory")
+    p.set_defaults(func=_boots)
 
     p = sub.add_parser("snapshot", help="per-callsite bytes from a trace dump")
     p.add_argument("path")

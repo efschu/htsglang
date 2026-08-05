@@ -36,6 +36,7 @@ from sglang.srt.mem_ledger.flight_recorder import (
     phase_deltas,
     python_site,
     python_stack,
+    list_boots,
     read_marks,
     resident_attribution,
     trace_requested_for_rank,
@@ -489,6 +490,84 @@ class TestTraceScope(unittest.TestCase):
         self._env("0")
         self.assertTrue(trace_requested_for_rank(0))
         self.assertFalse(trace_requested_for_rank(1))
+
+
+class TestBootScoping(unittest.TestCase):
+    """Arming the recorder on EVERY production boot makes one file hold many
+    boots. The reader must then say which boot it is showing.
+
+    Without this, ``phase_deltas`` computes a difference from one boot's last
+    mark to the next boot's first -- a number that describes nothing, printed
+    in the same table and the same units as the real posts. That is the
+    "absences and mixtures must never be silent" rule applied to the seam.
+    """
+
+    def _two_boots(self, directory):
+        import sglang.srt.mem_ledger.flight_recorder as fr
+
+        original = fr._boot_id
+        try:
+            fr._boot_id = "bootA"
+            mark("process_start", rank=0, directory=directory)
+            mark("boot_complete", rank=0, directory=directory)
+            fr._boot_id = "bootB"
+            mark("process_start", rank=0, directory=directory)
+            mark("weights_loaded", rank=0, directory=directory)
+            mark("boot_complete", rank=0, directory=directory)
+        finally:
+            fr._boot_id = original
+
+    def test_the_latest_boot_is_returned_by_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._two_boots(d)
+            marks = read_marks(d)[0]
+            self.assertEqual(len(marks), 3)
+            self.assertTrue(all(m["boot_id"] == "bootB" for m in marks))
+
+    def test_an_older_boot_can_be_named(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._two_boots(d)
+            marks = read_marks(d, boot="bootA")[0]
+            self.assertEqual(
+                [m["phase"] for m in marks], ["process_start", "boot_complete"]
+            )
+
+    def test_boots_are_listed_oldest_first_with_their_sizes(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._two_boots(d)
+            boots = list_boots(d)
+            self.assertEqual([b[0] for b in boots], ["bootA", "bootB"])
+            self.assertEqual([b[2] for b in boots], [2, 3])
+
+    def test_a_delta_is_never_computed_across_the_seam(self):
+        """The failing shape: five marks from two boots read as one sequence
+        would yield four deltas, one of them meaningless."""
+        with tempfile.TemporaryDirectory() as d:
+            self._two_boots(d)
+            everything = read_marks(d, boot="all")[0]
+            self.assertEqual(len(everything), 5)
+            deltas = phase_deltas(everything)
+            self.assertEqual(len(deltas), 3)
+            self.assertNotIn(
+                ("boot_complete", "process_start"),
+                [(x.frm, x.to) for x in deltas],
+            )
+
+    def test_every_rank_of_one_boot_shares_the_id(self):
+        """The id comes from the LAUNCHER, so the ranks agree without a
+        collective. A per-process uuid would make cross-rank reading
+        impossible, which is the opposite of what the id is for."""
+        import sglang.srt.mem_ledger.flight_recorder as fr
+
+        original = fr._boot_id
+        try:
+            fr._boot_id = None
+            first = fr.boot_id()
+            fr._boot_id = None  # simulate a sibling rank process
+            second = fr.boot_id()
+            self.assertEqual(first, second)
+        finally:
+            fr._boot_id = original
 
 
 def _artifact(name):
