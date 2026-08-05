@@ -164,7 +164,10 @@ def build_app(
             rung=rung_of(
                 instance.state,
                 ever_staged=bool(getattr(instance, "ever_staged", True)),
-                reserved_bytes=getattr(instance, "reserved_bytes", 0),
+                # Honest-absence pattern: None means the instance was built
+                # without carve-out data; coerce_bytes in rung_of treats it
+                # the same as 0 but the caller can see the difference.
+                reserved_bytes=getattr(instance, "reserved_bytes", None),
             ),
             pinned=pinned,
             can_fund=bool(getattr(instance, "can_fund", True)),

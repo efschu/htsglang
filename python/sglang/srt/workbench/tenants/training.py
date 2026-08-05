@@ -93,7 +93,19 @@ class TrainingWorkTenant(IdleWorkTenant):
     def estimate(self) -> WorkEstimate:
         """Ordering only: the training gate prices each job for itself."""
         jobs = self.service.jobs.queued()
-        per_card = int(getattr(jobs[0], "reserved_bytes_per_card", 0)) if jobs else 0
+        if jobs:
+            rbp = getattr(jobs[0], "reserved_bytes_per_card", None)
+            if rbp is None:
+                raise RuntimeError(
+                    "training job is missing the contractually required "
+                    "'reserved_bytes_per_card' attribute. The workbench cannot "
+                    "price this job and capacity will be silently under-booked "
+                    "if a fallback is used. Ensure the training job declares "
+                    "this field."
+                )
+            per_card = int(rbp)
+        else:
+            per_card = 0
         return WorkEstimate(
             per_card_bytes=per_card,
             posts={"training_job": per_card} if per_card else {},
