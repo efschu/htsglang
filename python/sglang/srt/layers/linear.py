@@ -25,6 +25,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.tp_ar_pipeline import (
+    pipelined_row_all_reduce,
+    tp_ar_pipeline_enabled,
+)
 from sglang.srt.distributed.utils import (
     attn_kv_replicated,
     attn_q_partition_groups,
@@ -66,6 +70,37 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _tp_ar_pipeline_quant_comms(forward_batch) -> bool:
+    """Mirror of the quantized-communications condition used below.
+
+    Hoisted so the pipeline can decline that path: a quantized all-reduce
+    changes the payload dtype per collective, which the token-slice cost
+    model does not describe.
+    """
+    if forward_batch is None:
+        return False
+    return (
+        not forward_batch.forward_mode.is_decode_or_idle()
+        and get_server_args().enable_quant_communications
+    )
+
+
+def _tp_ar_pipeline_max_reduce(tensor: torch.Tensor) -> torch.Tensor:
+    """Element-wise max of a small scalar vector across the TP group.
+
+    The calibration's only job here is to make every rank agree on the same
+    numbers before they derive a slice count from them; the max also picks
+    the slowest rank per term, which is the rank that paces the group.
+    """
+    torch.distributed.all_reduce(
+        tensor,
+        op=torch.distributed.ReduceOp.MAX,
+        group=get_tp_group().device_group,
+    )
+    return tensor
+
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -2238,6 +2273,38 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        # Task #588: token-slice pipelining of the TP all-reduce. Opt-in; when
+        # SGLANG_TP_AR_PIPELINE is unset this costs one cached bool read and
+        # the path below is byte-for-byte the one that ran before.
+        #
+        # Eligibility is deliberately narrow, and every condition is
+        # group-uniform (module config, env, forward mode, token count) --
+        # the slice count is part of the collective sequence, so a
+        # rank-divergent condition here is a hang, not a slow path. The
+        # symmetric-memory context of the default path below is skipped
+        # because it is required to be DISABLED for the pipeline to engage,
+        # and use_symmetric_memory(disabled=True) is a nullcontext.
+        if (
+            tp_ar_pipeline_enabled()
+            and self.reduce_results
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and not self.use_dp_attention_reduce
+            and not is_allocation_symmetric()
+            and input_parallel.dim() == 2
+            and not should_skip_mlp_all_reduce()
+            and not _tp_ar_pipeline_quant_comms(forward_batch)
+        ):
+            output = pipelined_row_all_reduce(
+                input_parallel,
+                apply_fn=lambda chunk: self.quant_method.apply(self, chunk, bias=bias_),
+                all_reduce_fn=tensor_model_parallel_all_reduce,
+                max_reduce_fn=_tp_ar_pipeline_max_reduce,
+                out_features=self.output_size,
+            )
+            return output, (self.bias if self.skip_bias_add else None)
+
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
