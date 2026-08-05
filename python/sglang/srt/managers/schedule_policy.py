@@ -610,12 +610,44 @@ class PrefillAdder:
         # that mamba-recoverable budget separately or an over-admit hits the
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
+        # Slots one newly admitted request will hold at once (active state +
+        # ping-pong track buffers + donation slot + pinned checkpoint). The
+        # old code charged a flat 1, which is what the FIXME in
+        # `_mamba_gap_budget_for_req` warned about: admission believed a
+        # request cost one slot while it actually holds `floor_per_req`, so
+        # the pool was over-committed and the shortfall surfaced as a bare
+        # assert deep inside `HybridReqToTokenPool.alloc` (#581).
+        self._mamba_slots_per_req = 1
         if self._mamba_slot_cost:
             self.rem_mamba_slots = (
                 self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             )
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
+        elif self.is_hybrid_ssm_cache:
+            # Non-unified hybrid pool (`HybridReqToTokenPool`): there was NO
+            # mamba admission gate here at all -- `rem_mamba_slots` stayed
+            # None, so `PrefillAdder` admitted requests the state pool could
+            # not serve and the over-admission died on an assert instead of
+            # deferring. Gate it on the same budget the unified path uses.
+            from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+            # Gate on the concrete pool type, not on duck-typing: the budget
+            # is only meaningful for a real state pool, and a stubbed cache
+            # (unit tests) must leave the baseline path untouched.
+            pool = getattr(self.tree_cache, "req_to_token_pool", None)
+            if isinstance(pool, HybridReqToTokenPool):
+                from sglang.srt.mem_cache.mamba_pool_floor import (
+                    mamba_slots_per_running_req,
+                )
+
+                self._mamba_slots_per_req = mamba_slots_per_running_req(
+                    get_server_args()
+                )
+                self.rem_mamba_slots = (
+                    pool.mamba_allocator.available_size()
+                    + self.tree_cache.mamba_evictable_size()
+                )
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -751,6 +783,19 @@ class PrefillAdder:
             return self._mamba_slot_cost
         return 0
 
+    def _mamba_slots_for_req(self, req: Req) -> int:
+        """Mamba state slots a request will hold once admitted, or 0 if it
+        already owns its state (chunked continuation / radix CoW resume).
+
+        `_mamba_slots_per_req` is 1 on the unified pool, where the shared-gap
+        reservation carries the rest of the cost, and the full per-request
+        demand floor on the non-unified `HybridReqToTokenPool` -- the case
+        that previously had no admission gate at all (#581).
+        """
+        if self.rem_mamba_slots is None or req.mamba_pool_idx is not None:
+            return 0
+        return self._mamba_slots_per_req
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -880,6 +925,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        mamba_slot_charge: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -896,10 +942,13 @@ class PrefillAdder:
         self.cur_rem_token_offset += (
             extend_input_len + page_overhead + mamba_gap_reserve
         )
-        # The new mamba slot also consumes one mamba-recoverable slot (gated
-        # separately so full_evictable can't cover it — see __init__).
-        if mamba_gap_reserve and self.rem_mamba_slots is not None:
-            self.rem_mamba_slots -= 1
+        # The new mamba state also consumes mamba-recoverable slots (gated
+        # separately so full_evictable can't cover them — see __init__).
+        # `_mamba_slots_per_req` is 1 on the unified path (where the gap
+        # reservation already carries the rest) and the full per-request floor
+        # on the non-unified hybrid pool.
+        if self.rem_mamba_slots is not None and mamba_slot_charge:
+            self.rem_mamba_slots -= mamba_slot_charge
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
@@ -949,6 +998,7 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slot_charge=self._mamba_slots_for_req(req),
         )
 
     def _req_inc_lock_ref(self, req: Req):
@@ -984,6 +1034,7 @@ class PrefillAdder:
             max_new_tokens,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slot_charge=self._mamba_slots_for_req(req),
         )
 
         # Return based on remaining token availability
@@ -1028,6 +1079,7 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            mamba_slot_charge=self._mamba_slots_for_req(req),
         )
 
         # Return if chunked prefill not finished
@@ -1140,6 +1192,7 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                mamba_slot_charge=self._mamba_slots_for_req(req),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -1160,6 +1213,7 @@ class PrefillAdder:
                 0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                mamba_slot_charge=self._mamba_slots_for_req(req),
             )
 
         return self.budget_state()
@@ -1320,6 +1374,7 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_slot_charge=self._mamba_slots_for_req(req),
                 )
             else:
                 # Make sure at least one page is available
@@ -1361,6 +1416,7 @@ class PrefillAdder:
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_slot_charge=self._mamba_slots_for_req(req),
                 )
 
         return self.budget_state()

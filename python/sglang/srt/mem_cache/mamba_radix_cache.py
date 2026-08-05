@@ -437,6 +437,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
+        # #581: let the pool evict cached checkpoints from its own REQUIRED
+        # allocation sites (active state / ping-pong buffers) instead of
+        # asserting when the free list is empty.
+        if hasattr(self.req_to_token_pool, "bind_tree_cache"):
+            self.req_to_token_pool.bind_tree_cache(self)
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         # --mamba-checkpoint-interval: when set, checkpoints live only at

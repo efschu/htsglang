@@ -1647,9 +1647,17 @@ class ModelRunnerKVCacheMixin:
         (max_num_reqs = slots // ratio). Floored at `ratio` so at least one
         request is always admissible -- the scheduler is never starved
         ("state cache too small" / max_num_reqs=0 can't return)."""
+        from sglang.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
+
         target = self._auto_mamba_target_concurrency()
         slots = math.ceil(target * ratio * MAMBA_AUTO_SAFETY_MARGIN)
-        return int(max(slots, ratio))
+        # #581: floor the auto size at the hard per-request demand, so the
+        # derived value can never sit below what the running set structurally
+        # requires. For the extra-buffer + overlap shape the two agree
+        # (ratio == floor_per_req) and the safety margin still applies on top;
+        # the floor binds for shapes where `ratio` understates the demand.
+        floor = mamba_hard_floor(self.server_args, target)
+        return int(max(slots, ratio, floor))
 
     def _mamba_pool_budget_cost_gb(
         self: ModelRunner, size: int, per_req: int, ratio: int, D: int
