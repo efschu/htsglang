@@ -166,6 +166,11 @@ class CollectiveCensus:
         #: actually reached on this flagset. Silence from an instrument that
         #: is silent when healthy is otherwise unfalsifiable (#380).
         self._armed_announced = False
+        #: Skip-warnings are emitted ONCE. A tick that cannot run usually
+        #: cannot run EVERY tick (a wrong attribute, a missing group), so
+        #: per-tick warning produces thousands of identical lines that bury
+        #: the one that mattered -- 2661 of them in a single boot.
+        self._skip_warned = False
 
     # -- hot path -------------------------------------------------------
 
@@ -210,6 +215,20 @@ class CollectiveCensus:
             heartbeat,
             len(self._counts),
             ", ".join(sorted(self._counts)) or "none yet",
+        )
+
+    def warn_skipped_once(self, exc: BaseException) -> None:
+        """Report an unusable tick ONCE, loudly enough to act on."""
+        if self._skip_warned:
+            return
+        self._skip_warned = True
+        logger.error(
+            "collective census is NOT RUNNING: the per-iteration tick raised "
+            "%s: %s. Counting and the cross-rank comparison are both dead for "
+            "this process; the abort-time dump will be empty. This message is "
+            "printed once, not per tick.",
+            type(exc).__name__,
+            exc,
         )
 
     def heartbeat(self, rank: int) -> None:
