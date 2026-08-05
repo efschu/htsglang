@@ -425,6 +425,13 @@ class ModelRunnerOutput:
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
+    #: #605 flight recorder: whether the first-extend mark has been written.
+    #: A CLASS attribute rather than an ``__init__`` assignment plus a
+    #: ``getattr`` default at the read site, so a runner built through a path
+    #: that skips ``initialize()`` still reads False instead of raising -- and
+    #: so the default lives in one place a reader can find.
+    _flight_first_forward_marked = False
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -1008,7 +1015,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         # Load the model
         self.sampler = create_sampler()
+        # #605 phase marks. Each pair of consecutive marks IS one measured
+        # post; no-ops unless SGLANG_VRAM_FLIGHT_DIR is set.
+        from sglang.srt.mem_ledger import flight_recorder
+
+        flight_recorder.mark("pre_weight_load", rank=self.tp_rank)
         self.load_model()
+        flight_recorder.mark("weights_loaded", rank=self.tp_rank)
         self._attach_layer_fingerprint()
         self._prepare_moe_topk()
 
@@ -1192,6 +1205,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.memory_pool_config = memory_pool_config
 
         self.init_memory_pool(self.pre_model_load_memory)
+
+        from sglang.srt.mem_ledger import flight_recorder
+
+        flight_recorder.mark("kv_pool_sized", rank=self.tp_rank)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
@@ -1385,9 +1402,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Phase-footprint probe: baseline here, with the KV pool sized and
         # nothing captured yet. Inert unless SGLANG_PHASE_FOOTPRINT_DUMP is set.
-        from sglang.srt.mem_ledger import activation_probe
+        from sglang.srt.mem_ledger import activation_probe, flight_recorder
 
         activation_probe.note_capture_begin()
+        # Marked separately from the probe above rather than folded into it:
+        # note_capture_begin returns early unless its OWN env var is armed, so
+        # a mark placed inside it would be silently conditional on an
+        # unrelated instrument.
+        flight_recorder.mark("capture_begin", rank=self.tp_rank)
 
         self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
 
@@ -1433,6 +1455,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Called once per runner, so a speculative process folds the target's
         # and the draft's capture cost together.
         activation_probe.note_capture_end()
+        # Tagged with the runner, because a speculative process runs this twice
+        # (target and NEXTN draft) and their capture costs ADD. The snapshot is
+        # NOT dumped here for the same reason: the first runner to finish would
+        # write a picture that is missing the second one's captures. It is
+        # dumped once per process, after every runner is up, in
+        # run_scheduler_process.
+        flight_recorder.mark(
+            "capture_end",
+            rank=self.tp_rank,
+            extra={"draft_worker": bool(self.is_draft_worker)},
+        )
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
@@ -3871,6 +3904,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             activation_probe.record_prefill_peak(
                 self, int(forward_batch.extend_num_tokens or 0)
             )
+            # #605: one mark on the FIRST extend only. The boundary that
+            # matters is "boot finished -> real work has run once"; marking
+            # every prefill would turn a boot record into a serving log and put
+            # an NVML call on the hot path.
+            from sglang.srt.mem_ledger import flight_recorder
+
+            if not self._flight_first_forward_marked:
+                self._flight_first_forward_marked = True
+                flight_recorder.mark(
+                    "first_forward",
+                    rank=self.tp_rank,
+                    extra={"extend_tokens": int(forward_batch.extend_num_tokens or 0)},
+                )
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (

@@ -2605,10 +2605,7 @@ class Scheduler(
         # extended while the destination may still commit. No-op on every
         # default path (runtime is None until the first handover request,
         # and returns immediately while no handover is active).
-        if (
-            self.session_handover_runtime is not None
-            and recv_req.input_ids is not None
-        ):
+        if self.session_handover_runtime is not None and recv_req.input_ids is not None:
             parked_msg = self.session_handover_runtime.parked_conflict(
                 recv_req.input_ids
             )
@@ -5097,14 +5094,10 @@ class Scheduler(
         # scheduler -- an operator can re-cap a busy server. A shrink still runs its
         # unlinks inline here, delaying the next batch by that much.
         max_size_bytes = (
-            None
-            if recv_req.max_size_gb is None
-            else int(recv_req.max_size_gb * _GIB)
+            None if recv_req.max_size_gb is None else int(recv_req.max_size_gb * _GIB)
         )
         min_free_bytes = (
-            None
-            if recv_req.min_free_gb is None
-            else int(recv_req.min_free_gb * _GIB)
+            None if recv_req.min_free_gb is None else int(recv_req.min_free_gb * _GIB)
         )
 
         try:
@@ -6281,6 +6274,17 @@ def run_scheduler_process(
     )
     parent_process = psutil.Process().parent()
 
+    # VRAM flight recorder (#605). Armed here and nowhere later: this is the
+    # last point in a rank's life at which no CUDA allocation has happened yet,
+    # and a recording started after the first one cannot attribute a single
+    # boot-resident post -- the #602 capture proved that with 3 MiB of 25142
+    # MiB. Both calls are no-ops unless their env var is set, and neither
+    # initialises CUDA.
+    from sglang.srt.mem_ledger import flight_recorder
+
+    flight_recorder.arm_process_trace()
+    flight_recorder.mark("process_start", rank=tp_rank)
+
     # Set up tracing
     if server_args.enable_trace:
         process_tracing_init(
@@ -6309,6 +6313,14 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+
+        # #605: every runner in this process is now up, so this is the first
+        # moment a snapshot shows the WHOLE boot -- under speculative decoding
+        # the target and the NEXTN draft each capture graphs, and a snapshot
+        # taken at either runner's capture_end is missing the other's.
+        flight_recorder.mark("boot_complete", rank=tp_rank)
+        flight_recorder.dump_trace("boot_complete", rank=tp_rank)
+        flight_recorder.disarm_process_trace()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

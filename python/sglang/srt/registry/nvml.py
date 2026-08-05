@@ -348,6 +348,27 @@ def _visible_device_tokens() -> list[str] | None:
     return [tok for tok in (t.strip() for t in raw.split(",")) if tok]
 
 
+def pin_resolvable_without_cuda() -> bool:
+    """True when :func:`current_device_uuid` can answer with no CUDA context.
+
+    A caller that must not bind a context asks this first. The two answerable
+    shapes are a single ``GPU-...``/``MIG-...`` pin, which names the card
+    outright, and a single index pin under ``CUDA_DEVICE_ORDER=PCI_BUS_ID``,
+    which is the one declaration that makes CUDA's enumeration equal NVML's.
+    Every other shape needs the CUDA side of the #331 identity map, and
+    building that side initialises CUDA -- see
+    :func:`sglang.srt.mem_ledger.flight_recorder.cuda_initialized` for why an
+    instrument may not pay that price to describe the state before it.
+    """
+    tokens = _visible_device_tokens()
+    if tokens is None or len(tokens) != 1:
+        return False
+    token = tokens[0]
+    if token.startswith("GPU-") or token.startswith("MIG-"):
+        return True
+    return os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID"
+
+
 def current_device_uuid() -> str:
     """NVML UUID of the GPU this process is pinned to.
 
@@ -594,7 +615,9 @@ class IdentityMap:
             raise DeviceNotFoundError(
                 f"card {uuid} is not present on this host; visible now: "
                 + (
-                    ", ".join(f"{c.uuid} ({c.name}, nvml {c.nvml_index})" for c in self.cards)
+                    ", ".join(
+                        f"{c.uuid} ({c.name}, nvml {c.nvml_index})" for c in self.cards
+                    )
                     or "no NVML devices"
                 )
             )
@@ -860,9 +883,7 @@ def cuda_to_nvml_index_map(*, allow_cuda_init: bool = True) -> dict[int, int]:
         )
         return {}
     return {
-        int(c.cuda_ordinal): c.nvml_index
-        for c in imap
-        if c.cuda_ordinal is not None
+        int(c.cuda_ordinal): c.nvml_index for c in imap if c.cuda_ordinal is not None
     }
 
 
