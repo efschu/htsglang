@@ -21,6 +21,42 @@ Qwen3.6-27B-INT8-W8A8, is dense (`num_experts` absent from its config), so
 that path is structurally absent from the production geometry. #452 never
 gated the prefill route.
 
+### 1a. The recorded artifacts settle it — the prefill backend was never on trial
+
+`/spinning/gpu-battery-results/2026-08-03_452_arms/` is the #452 B2 follow-up,
+and its own results file says so outright (`B2_RESULTS.md:90`): the fold of the
+treatment was the **decode** backend (`disabled` -> `full`), while
+
+> `prefill=PhaseConfig(backend='disabled', …)` is **byte-identical in both**
+
+Both #452 arms ran with the prefill graph backend OFF, on
+`Qwen3.6-35B-A3B-AWQ-4bit` (an MoE model), not the dense production
+checkpoint. No #452 arm ever captured a prefill graph.
+
+Worse for the original B2 claim, that window's oracle was invalid.
+`B2_RESULTS.md:254` §9 declares the greedy-text half of B2 **UNANSWERABLE**:
+three identical greedy requests per arm produced **3/3 distinct** hashes in
+*both* arms, so neither arm was internally deterministic. Recomputing from the
+raw files confirms it — and shows how badly:
+
+| comparison | first differing char |
+|---|---|
+| eager_1 vs eager_2 (same boot) | 568 |
+| eager_1 vs eager_3 (same boot) | 582 |
+| graphs_1 vs graphs_2 (same boot) | 478 |
+| eager_1 vs graphs_1 (across arms) | **748** |
+
+The cross-arm divergence is *later* than the within-arm divergence. That run
+could not have demonstrated a graph-vs-eager effect of any size. Its setup —
+one long prompt, 192 new tokens — sat well above the ~109-token GDN prefill
+reproducibility ceiling, which is precisely why §4's harness keeps every probe
+underneath it. §9 prescribed the fix (`--enable-deterministic-inference` plus a
+pinned `random_seed`), and that is what `window3_boot_floor.sh` now runs.
+
+So the "systematic from character 5" headline rests on the earlier
+2026-08-02 window, which carried **no** A-vs-A floor at all — only
+`decode_eager1.json` and `decode_graphs.json`, with no eager repeat.
+
 ## 2. What actually makes production prefill eager
 
 An upstream config-time rule, not ours:
