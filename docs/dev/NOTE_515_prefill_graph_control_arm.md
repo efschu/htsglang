@@ -195,31 +195,74 @@ with arm order**, and G ran last every time:
 | 1900 | 1875 | 1822 (-2.8 %) | 1740 (-7.2 %) |
 | 256c4 | 1860 | 1804 (-3.0 %) | 1740 (-6.5 %) |
 
-That is a thermal-soak signature on 200 W-capped 3080s, perfectly aligned with
-run order, and it is larger than every throughput delta measured. Worse for a
-naive reading: G's *throughput* deficit (-4.0/-2.1/-3.2 %) is consistently
-**smaller** than its *clock* deficit (-6.0/-7.1/-7.2 %), so per-MHz the graph
-arm is not behind at all. The experiment cannot support a directional claim in
-either direction, and the §5 sentence "no measurable gain" now rests on window
-2, not on this one.
+The decay is aligned with run order, and it is larger than every throughput
+delta measured. The experiment cannot support a directional claim in either
+direction, and the §5 sentence "no measurable gain" now rests on window 2, not
+on this one.
+
+**Retracted (2026-08-05).** An earlier revision of this section argued that
+because G's throughput deficit was smaller than its clock deficit, "per-MHz the
+graph arm is not behind at all". That inference is invalid and is withdrawn.
+At a *fixed* power limit -- and the caps were identical across every run -- a
+lower clock usually means HIGHER load, not a disadvantage: a power-limited card
+downclocks precisely when it is doing more work per cycle. Low clock with high
+power draw is a busy card; low clock with low power is an idle one. Clock alone
+therefore proves nothing in either direction, and normalising throughput by
+clock is not a legitimate operation. The withdrawal of the throughput claim
+stands, but for the plain reason that the numbers are confounded -- not because
+of any per-MHz argument.
+
+Standing rule adopted from this (applies to all later windows): score on **ms
+per fixed unit of work**, sample **clock and power together**, read them
+**jointly and only as diagnostic annotation of load character**, and never use
+either as a validity criterion or a normaliser. Validity is carried by the
+interleaved pairing and the A-vs-A floor.
 
 The 256c4 point is separately unusable: its eager floor is +9.1 % (E1 1511.8
 vs E2 1649.6), swamping any effect.
 
-**Fix for the follow-up window:** interleave the arms (E, G, E, G, E, G)
-instead of running them in blocks, so thermal drift is spread across both
-treatments rather than aliased onto one, and report per-arm clock medians
-alongside every number. Block order plus a power-capped card is not a
-recoverable design.
+**Fix for the follow-up window**, built and smoke-tested at desk as
+`tests/prefill_graphs/window4_interleaved.sh` with the ticket in
+`TICKET_prefill_graphs_window4.md`:
+
+* interleave the arms (E, G, E, G, E, G) so slow drift loads on both
+  treatments instead of being aliased onto one -- drift elimination is
+  interleaving's only job here;
+* score **ms per fixed unit of work** (byte-identical prompt set, same count,
+  same order, verified equal across arms), paired G_i against E_i;
+* two workload points only, each sized into the 5-20 s band, because the
+  spread is saturated there and more points only inflate the window;
+* clock and power sampled together, printed as annotation, never a gate.
+
+The 256c4 point's +9.1 % "floor" was also diagnosed and was **my harness's
+fault, not the server's**: E1 and E2 had done byte-identical work (32 draws,
+8523 tokens) and differed only by 0.471 s of drain tail inside a
+tokens-over-wall denominator. Scored on fixed work both give exactly
+1704.6 tok/s -- a 0.0 % floor. The point is kept, with the denominator fixed.
 
 **ED / GD did not run.** Both determinism arms failed to boot: OOM during
 capture, `boot_ED.log` showing `avail mem=0.05 GB` on TP1 followed by
 `multimem all-gather disabled (CUDA driver error: out of memory)`.
-`--enable-deterministic-inference` sets
-`enforce_disable_flashinfer_allreduce_fusion` and evidently shifts the capture
-footprint enough to exceed the `5500,3800,3800` reserve. The determinism
-question in §6a is therefore still open, and needs a larger reserve on the
-3080s rather than a code change.
+The cause is now derived rather than guessed:
+`--enable-deterministic-inference` rewrites the flashinfer workspace from the
+384 MiB default (`environ.py:1270`) to 2048 MiB
+(`flashinfer_backend.py:1007`), a delta of **1664 MiB per rank process**. The
+served arch `Qwen3_5ForConditionalGeneration` is not on the 512 MiB Qwen list
+at `flashinfer_backend.py:987`, so the baseline really is 384 MiB. Since
+`TERM_ATTN_WORKSPACE` is not budget-funded (`engine.py:105`), that demand comes
+out of reserve headroom. The failed boot confirms it: E1 consumed 2.49 -> 1.91
+GB between pool end and capture begin, ED 2.48 -> 0.30 GB, a 1649 MiB extra
+demand against 1664 MiB derived, with identical KV pools.
+
+The follow-up window must therefore boot with
+**`RESERVE="7164,5464,5464"`** (= 5500+1664, 3800+1664, 3800+1664). No code
+change is needed. See `TICKET_prefill_graphs_window4.md` Part B, which also
+records the one thing the VRAM ledger cannot express yet: `engine.py:293` reads
+`SGLANG_FLASHINFER_WORKSPACE_SIZE` at ledger-build time, but the backend
+rewrites that variable afterwards, so `TERM_ATTN_WORKSPACE` does not move when
+`enable_deterministic_inference` moves. The missing piece is a resolver
+replicating the backend's own rule, plus that flag in the term's declared
+inputs.
 
 ## 6. What is still missing
 
