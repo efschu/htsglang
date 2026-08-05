@@ -11581,6 +11581,69 @@ class ServerArgs:
             reserved_mem = max(reserved_mem, 10 * 1024)
         return reserved_mem
 
+    #: Set once the inherited activation heuristic has been used in anger, so
+    #: the warning below fires per process rather than per call site.
+    _activation_heuristic_warned = False
+
+    def activation_reserve_mb(self, gpu_mem, card_uuid: Optional[str] = None) -> float:
+        """Prefill activation reserve (MiB): CALIBRATED where the rig has a
+        measurement, the inherited heuristic otherwise -- loudly.
+
+        #586. ``mamba_pre_capture_reserve_mb`` books
+        ``512 + tokens*1.5 + tp*pp/8*1024`` = 3968 MiB on the reference recipe.
+        The 2026-08-05 window falsified that: the binding card completed a
+        70018-token prefill with 1766 MiB free, so a 3968 MiB peak could not
+        have happened. Every MiB of the difference is KV pool the boot gave
+        away.
+
+        WHY THIS FALLS BACK INSTEAD OF REFUSING, unlike the ledger. These are
+        the legacy KV-sizing sites, on the path every existing recipe boots
+        through. Refusing here would make an unprobed rig unbootable, which is
+        a bigger regression than an over-reserve. So the heuristic stands when
+        nothing is calibrated -- and says so, once per process, because a
+        silent fallback to a number known to be wrong is how 3968 survived this
+        long.
+        """
+        try:
+            from sglang.srt.mem_ledger.activation import (
+                profile_from_server_args,
+                resolve_phase_footprint,
+            )
+            from sglang.srt.mem_ledger.calibration import live_fingerprint
+            from sglang.srt.mem_ledger.engine import _model_architectures
+
+            uuid = card_uuid
+            if not uuid:
+                from sglang.srt.registry import nvml as registry_nvml
+
+                uuid = registry_nvml.current_device_uuid()
+            live = live_fingerprint()
+            footprint = resolve_phase_footprint(
+                uuid,
+                hw_fingerprint=live[0] if live else None,
+                profile=profile_from_server_args(self, _model_architectures(self)),
+            )
+            if footprint is not None:
+                return float(footprint.activation_mib)
+        except Exception as e:  # pragma: no cover - probe/NVML availability
+            logger.debug("activation footprint unavailable (%s)", e)
+
+        heuristic = self.mamba_pre_capture_reserve_mb(gpu_mem)
+        if not ServerArgs._activation_heuristic_warned:
+            ServerArgs._activation_heuristic_warned = True
+            logger.warning(
+                "Using the INHERITED activation heuristic (%.0f MiB per rank): "
+                "no phase footprint is calibrated for this hardware "
+                "fingerprint and activation profile. That formula was "
+                "falsified on 2026-08-05 -- it books more than the card was "
+                "measured to have free while completing a deep prefill, so it "
+                "over-reserves and the KV pool pays for it. Run "
+                "scripts/vram_ledger/probe_activation.py once for this config "
+                "to replace it with a measurement.",
+                heuristic,
+            )
+        return heuristic
+
     def reserve_for_graph_mb(self) -> float:
         decode_cuda_graph_config = self.cuda_graph_config.decode
         prefill_cuda_graph_config = self.cuda_graph_config.prefill

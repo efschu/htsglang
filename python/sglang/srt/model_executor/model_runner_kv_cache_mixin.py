@@ -589,7 +589,7 @@ class ModelRunnerKVCacheMixin:
             )
             if self.mambaish_config is not None and self.post_capture_kv_active:
                 mamba_precapture_gb = (
-                    self.server_args.mamba_pre_capture_reserve_mb(
+                    self.server_args.activation_reserve_mb(
                         get_device_memory_capacity(self.device)
                     )
                     / 1024
@@ -602,7 +602,7 @@ class ModelRunnerKVCacheMixin:
                 # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
                 slack_gb = max(
                     slack_gb,
-                    self.server_args.mamba_pre_capture_reserve_mb(
+                    self.server_args.activation_reserve_mb(
                         get_device_memory_capacity(self.device)
                     )
                     / 1024,
@@ -2085,10 +2085,10 @@ class ModelRunnerKVCacheMixin:
                     else ""
                 )
                 + "). "
-                f"Try: (1) reduce --max-running-requests, "
-                f"(2) increase --mem-fraction-static, "
-                f"(3) reduce --speculative-num-draft-tokens, or "
-                f"(4) use GPUs with more memory."
+                "Try: (1) reduce --max-running-requests, "
+                "(2) increase --mem-fraction-static, "
+                "(3) reduce --speculative-num-draft-tokens, or "
+                "(4) use GPUs with more memory."
             )
 
         # Stage-local bytes: what THIS rank's pools will actually allocate
@@ -2252,7 +2252,7 @@ class ModelRunnerKVCacheMixin:
         if eager_decode_gap or self.mambaish_config is not None:
             headroom_gb = max(
                 headroom_gb,
-                self.server_args.mamba_pre_capture_reserve_mb(
+                self.server_args.activation_reserve_mb(
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,

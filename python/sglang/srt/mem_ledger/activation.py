@@ -388,3 +388,41 @@ def profile_from_server_args(
         ),
         decode_max_bs=decode_max_bs,
     )
+
+
+def measured_capture_mib_per_token(
+    card_uuid: str,
+    *,
+    hw_fingerprint: Optional[str],
+    profile: ActivationProfile,
+    boot_capture_tokens: int,
+    cache_dir: Optional[str] = None,
+) -> Optional[float]:
+    """MiB of graph memory per captured token, MEASURED, or ``None``.
+
+    The inherited coefficient is the literal 2, and the 2026-08-05 window put
+    it 3.3-3.8x low. Rather than replace one literal with another, this derives
+    the coefficient from a measurement the rig actually took:
+
+        coefficient = measured_boot_capture_mib / boot_capture_tokens
+
+    i.e. the magnitude comes from the measurement and the SCALING across rungs
+    stays config-derived (a rung with twice the captured tokens still costs
+    about twice as much). That keeps the part the config knows in the config
+    and the part only hardware knows in the calibration.
+
+    ``None`` when nothing is calibrated for this (card, hardware, profile), and
+    the caller must treat that as "not priced" rather than substituting 2 --
+    which is the whole point.
+    """
+    if boot_capture_tokens <= 0:
+        return None
+    fp = resolve_phase_footprint(
+        card_uuid,
+        hw_fingerprint=hw_fingerprint,
+        profile=profile,
+        cache_dir=cache_dir,
+    )
+    if fp is None or fp.capture_mib <= 0:
+        return None
+    return float(fp.capture_mib) / float(boot_capture_tokens)
