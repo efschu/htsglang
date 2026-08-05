@@ -133,10 +133,10 @@ LOG="$OUTDIR/583_${ARM}_${STAMP}.log"
 # both failed arms on 2026-08-05.
 # ---------------------------------------------------------------------------
 REFERENCE="${REFERENCE:-/spinning/spill-night-20260804/results/CRASH_20260805_boot5_barlink_full.log}"
-DERIVER="$(dirname "$0")/derive_soak_target.py"
-if [[ -f "$REFERENCE" && -f "$DERIVER" ]]; then
-  "$PY" "$DERIVER" "$REFERENCE" | tee -a "$LOG"
-  if DERIVED="$("$PY" "$DERIVER" --shell "$REFERENCE" 2>/dev/null)"; then
+SOLVER="$(dirname "$0")/derive_soak_target.py"
+if [[ -f "$REFERENCE" && -f "$SOLVER" ]]; then
+  "$PY" "$SOLVER" "$REFERENCE" | tee -a "$LOG"
+  if DERIVED="$("$PY" "$SOLVER" --shell "$REFERENCE" 2>/dev/null)"; then
     eval "$(sed 's/^/DERIVED_/' <<<"$DERIVED")"
   fi
 fi
@@ -292,6 +292,11 @@ srvlog = os.environ["SRVLOG"]
 band_lo = float(os.environ["MAMBA_LO"])
 band_hi = float(os.environ["MAMBA_HI"])
 valve_mark = float(os.environ["MAMBA_VALVE"])
+# Reference regime as FRACTIONS of this arm's own denominator, supplied by
+# the auto-solver. Defaults are the boot5 barlink crash (median 16/64=0.25,
+# peak 51/64=0.80). Compared only against this arm's own pool size.
+ref_peak_frac = float(os.environ.get("REF_PEAK_FRAC", "0.80"))
+band_ref_med = float(os.environ.get("REF_MED_FRAC", "0.25"))
 random.seed(583)
 stop = threading.Event()
 errors = []
@@ -441,9 +446,25 @@ if mamba_samples:
     elif med < band_lo:
         print(f"== REGIME WARNING: median {med:.2f} below {band_lo:.2f} -- the "
               f"load is too light to represent the crash. Raise PREFIX_POOL. ==")
+    elif hi < ref_peak_frac * 0.6:
+        # Gate gap found by soak arm 2 (2026-08-05): it matched the reference
+        # MEDIAN exactly (0.25) and was scored REGIME OK, while its peak was
+        # also 0.25 against the reference's 0.80 -- spikiness 1.0x versus the
+        # reference's 3.19x. Matching the median while never reproducing the
+        # EXCURSIONS is half a regime, and the excursion half is the part that
+        # plausibly stresses the transport. Median agreement alone is not
+        # sufficient evidence, so it no longer passes.
+        print(f"== REGIME PARTIAL: median {med:.2f} matches, but peak {hi:.2f} "
+              f"is far below the reference peak {ref_peak_frac:.2f} "
+              f"(spikiness {hi / med if med else 0:.2f}x vs reference "
+              f"{ref_peak_frac / band_ref_med if band_ref_med else 0:.2f}x). "
+              f"The excursion regime was NOT reproduced; a null fault verdict "
+              f"from this arm is weak. Raise PREFIX_POOL -- the auto-solver "
+              f"(derive_soak_target.py) computes it from the reference peak. ==")
     else:
-        print(f"== REGIME OK: median {med:.2f} matches the crash boot's 0.25, "
-              f"peak {hi:.2f} stayed clear of saturation. ==")
+        print(f"== REGIME OK: median {med:.2f} matches the reference, peak "
+              f"{hi:.2f} reproduced its excursions and stayed clear of "
+              f"saturation. ==")
 else:
     print("== REGIME UNKNOWN: no 'mamba usage' lines parsed from the log. ==")
 if running_samples:

@@ -121,5 +121,37 @@ class TestHarnessGrepsOnlyPinnedMarkers(unittest.TestCase):
         )
 
 
+class TestRegimeGateChecksPeakNotOnlyMedian(unittest.TestCase):
+    """Gate gap found by soak arm 2 (2026-08-05).
+
+    That arm matched the reference MEDIAN exactly (0.25) and was scored
+    REGIME OK -- while its peak was also 0.25 against the reference's 0.80,
+    i.e. spikiness 1.00x versus 3.19x. It reproduced half the regime and the
+    gate called it whole, which would have let a null barlink verdict be
+    reported as if the crash conditions had been met.
+    """
+
+    def test_harness_has_a_peak_fidelity_branch(self):
+        harness = (_repo_root() / _HARNESS).read_text()
+        self.assertIn(
+            "REGIME PARTIAL",
+            harness,
+            "the regime gate has no peak-fidelity verdict: an arm that "
+            "matches the median while never reproducing the reference's "
+            "excursions would score REGIME OK",
+        )
+        self.assertIn("ref_peak_frac", harness)
+
+    def test_peak_gate_precedes_the_ok_verdict(self):
+        """Ordering matters: OK must be the last resort, not the first match."""
+        harness = (_repo_root() / _HARNESS).read_text()
+        self.assertLess(
+            harness.index("REGIME PARTIAL"),
+            harness.index("REGIME OK:"),
+            "the OK branch is evaluated before the peak check, so a "
+            "median-only match still passes",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
