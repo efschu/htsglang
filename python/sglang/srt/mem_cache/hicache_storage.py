@@ -648,13 +648,15 @@ class HiCacheFile(HiCacheStorage):
         directory that predates sharding is picked up unchanged.
         """
         try:
-            top = list(os.scandir(self.file_path))
+            with os.scandir(self.file_path) as it:
+                top = list(it)
         except FileNotFoundError:
             return
         for entry in top:
             if entry.is_dir():
                 try:
-                    shard_entries = list(os.scandir(entry.path))
+                    with os.scandir(entry.path) as shard_it:
+                        shard_entries = list(shard_it)
                 except OSError:
                     continue
                 for sub in shard_entries:
