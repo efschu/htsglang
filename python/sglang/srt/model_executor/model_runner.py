@@ -1383,6 +1383,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # The graph plan must be a GROUP decision, not a per-rank one.
         self._harmonize_cuda_graph_plan()
 
+        # Phase-footprint probe: baseline here, with the KV pool sized and
+        # nothing captured yet. Inert unless SGLANG_PHASE_FOOTPRINT_DUMP is set.
+        from sglang.srt.mem_ledger import activation_probe
+
+        activation_probe.note_capture_begin()
+
         self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
 
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
@@ -1421,6 +1427,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             register_forward_hooks(self.model, self.server_args.forward_hooks)
 
         self.prealloc_symmetric_memory_pool()
+
+        # Phase-footprint probe: charge what the captured graphs KEEP, then
+        # re-baseline so the prefill peak is measured from the steady state.
+        # Called once per runner, so a speculative process folds the target's
+        # and the draft's capture cost together.
+        activation_probe.note_capture_end()
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
@@ -3848,6 +3860,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     split_forward_count,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+
+        # Phase-footprint probe: the prefill activation peak. EXTEND only --
+        # decode runs inside captured graphs against a far smaller working set,
+        # so folding it in could only lower the high-water mark the ledger
+        # reserves for. Inert unless SGLANG_PHASE_FOOTPRINT_DUMP is set.
+        if forward_batch.forward_mode.is_extend():
+            from sglang.srt.mem_ledger import activation_probe
+
+            activation_probe.record_prefill_peak(
+                self, int(forward_batch.extend_num_tokens or 0)
+            )
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (

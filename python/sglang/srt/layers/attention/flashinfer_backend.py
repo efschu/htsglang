@@ -922,6 +922,23 @@ class FlashInferAttnBackend(AttentionBackend):
             self.dcp_overlap_reorder_only = _dcp_overlap_mode == "2"
         elif self.uneven_dcp and _dcp_overlap_mode == "3":
             self.dcp_overlap_scatter_late = True
+        # State the resolved mode. An A/B over this variable is otherwise
+        # unfalsifiable: the mode is read once at backend init, and nothing
+        # downstream announces it, so an arm that failed to bind (variable
+        # unexported to the scheduler processes, or set after init) is
+        # indistinguishable from one that bound and did nothing. Logged for
+        # mode 0 too -- the control arm needs the same proof as the treatment.
+        if self.uneven_dcp:
+            logger.info(
+                "DCP collective/compute overlap: mode %s (%s)",
+                _dcp_overlap_mode,
+                {
+                    "0": "sequential baseline, default",
+                    "1": "dual-stream overlap",
+                    "2": "diagnostic: overlap issue order, single stream",
+                    "3": "diagnostic: late scatter-write, single stream",
+                }.get(_dcp_overlap_mode, "unrecognized -- treated as baseline"),
+            )
 
         # Tree/branching speculative decoding (--speculative-eagle-topk > 1)
         # under uneven-DCP. With topk == 1 the draft is a linear CHAIN and the

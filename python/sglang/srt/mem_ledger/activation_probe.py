@@ -40,6 +40,9 @@ __all__ = [
     "reset_peaks",
     "read_peaks",
     "write_footprint_dump",
+    "note_capture_begin",
+    "note_capture_end",
+    "record_prefill_peak",
 ]
 
 DUMP_ENV = "SGLANG_PHASE_FOOTPRINT_DUMP"
@@ -117,3 +120,124 @@ def write_footprint_dump(
     except OSError as e:  # pragma: no cover - filesystem differences
         logger.warning("could not write the phase footprint dump: %s", e)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Serving-path wiring
+# ---------------------------------------------------------------------------
+#
+# The three call sites below are what turn this module from a design into a
+# measurement. Before them the probe had unit tests and no callers, so
+# ``SGLANG_PHASE_FOOTPRINT_DUMP`` armed nothing and ``probe_activation.py
+# ingest`` could only ever report "No rank dumps" -- the ledger stayed on its
+# shipped UPPER_BOUNDs with no way to reach MEASURED_PEAK.
+#
+# State is module-level (process-wide) ON PURPOSE. ``torch.cuda.memory_stats``
+# is per-device and process-wide, and a rank IS a process, so the number the
+# ledger reserves for is the process peak -- not one model runner's. This also
+# makes the speculative case right for free: the target runner and the NEXTN
+# draft runner both capture graphs in the same process, and their capture costs
+# must ADD rather than overwrite.
+
+_baseline_allocated: Optional[int] = None
+_capture_bytes_total: int = 0
+_activation_peak_bytes: int = 0
+_identity: Optional[dict] = None
+
+
+def _device_index() -> int:
+    try:
+        import torch
+
+        return int(torch.cuda.current_device())
+    except Exception:  # pragma: no cover - non-CUDA platforms
+        return 0
+
+
+def note_capture_begin() -> None:
+    """Baseline immediately before graph capture (KV pool already sized)."""
+    global _baseline_allocated
+    if not is_armed():
+        return
+    peaks = read_peaks(_device_index())
+    _baseline_allocated = int(peaks.get("allocated_bytes", 0))
+    reset_peaks(_device_index())
+
+
+def note_capture_end() -> None:
+    """Fold this capture's PERSISTENT cost in, then re-baseline for prefill.
+
+    Capture is charged as the delta in LIVE allocations across the capture,
+    not as the peak: the ledger reserves for the memory the captured graphs go
+    on holding, and a transient spike during capture is already gone by the
+    time the first prefill runs. The peak counters are reset afterwards so the
+    activation measurement starts from the post-capture steady state.
+    """
+    global _capture_bytes_total, _baseline_allocated
+    if not is_armed():
+        return
+    if _baseline_allocated is not None:
+        current = int(read_peaks(_device_index()).get("allocated_bytes", 0))
+        _capture_bytes_total += max(0, current - _baseline_allocated)
+        _baseline_allocated = None
+    reset_peaks(_device_index())
+
+
+def _resolve_identity(model_runner) -> Optional[dict]:
+    """Card UUID, rig fingerprint and activation profile for the dump."""
+    global _identity
+    if _identity is not None:
+        return _identity or None
+    try:
+        from sglang.srt.mem_ledger.activation import profile_from_server_args
+        from sglang.srt.mem_ledger.calibration import live_fingerprint
+        from sglang.srt.mem_ledger.engine import _model_architectures
+        from sglang.srt.registry import nvml as registry_nvml
+
+        server_args = model_runner.server_args
+        live = live_fingerprint()
+        profile = profile_from_server_args(
+            server_args, _model_architectures(server_args)
+        )
+        _identity = {
+            "card_uuid": registry_nvml.current_device_uuid(),
+            "hw_fingerprint": live[0] if live else "",
+            "profile_canonical": profile.canonical(),
+            "rank": int(getattr(model_runner, "tp_rank", 0) or 0),
+        }
+    except Exception as e:  # pragma: no cover - NVML/config availability
+        logger.warning("phase footprint probe cannot identify this rank: %s", e)
+        _identity = {}
+    return _identity or None
+
+
+def record_prefill_peak(model_runner, num_tokens: int) -> None:
+    """After a prefill: keep the running peak and rewrite this rank's dump.
+
+    Rewritten on every new high rather than once at exit, because there is no
+    reliable "last prefill" to hook and a rank that is killed mid-run should
+    still leave its best measurement behind. The deepest prefill the rank is
+    driven through is the one that sets the number, which is why the operator
+    drives a representative deep prefill before ingesting.
+    """
+    global _activation_peak_bytes
+    if not is_armed():
+        return
+    peaks = read_peaks(_device_index())
+    peak = int(peaks.get("allocated_peak_bytes", 0))
+    if peak <= _activation_peak_bytes:
+        return
+    _activation_peak_bytes = peak
+    identity = _resolve_identity(model_runner)
+    if not identity:
+        return
+    write_footprint_dump(
+        rank=identity["rank"],
+        card_uuid=identity["card_uuid"],
+        hw_fingerprint=identity["hw_fingerprint"],
+        profile_canonical=identity["profile_canonical"],
+        activation_peak_bytes=peak,
+        capture_bytes=_capture_bytes_total,
+        reserved_peak_bytes=int(peaks.get("reserved_peak_bytes", 0)),
+        prefill_tokens=int(num_tokens),
+    )

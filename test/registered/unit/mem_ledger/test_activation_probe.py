@@ -197,3 +197,111 @@ def test_script_answers_help_as_a_subprocess():
     )
     assert p.returncode == 0, p.stderr
     assert "usage:" in p.stdout
+
+
+# ---------------------------------------------------------------------------
+# Serving-path wiring: the guard is load-bearing
+# ---------------------------------------------------------------------------
+#
+# The three hooks sit on the serving path (graph capture and every extend
+# forward), so "does nothing when unarmed" is not a nicety -- it is the reason
+# the default boot is unaffected and the reason T2's KV-pool acceptance can be
+# read without asking whether the probe moved it. These two tests are a pair:
+# the first pins the inert path, the second proves the first can fail by
+# arming the same hooks and watching them act.
+
+
+def _reset_probe_state():
+    ap._baseline_allocated = None
+    ap._capture_bytes_total = 0
+    ap._activation_peak_bytes = 0
+    ap._identity = None
+
+
+def _instrument(monkeypatch, peaks):
+    """Count every entry into the torch layer; never touch a real device."""
+    calls = {"read": 0, "reset": 0}
+
+    def fake_read(_device_index=0):
+        calls["read"] += 1
+        return dict(peaks)
+
+    def fake_reset(_device_index=0):
+        calls["reset"] += 1
+
+    monkeypatch.setattr(ap, "read_peaks", fake_read)
+    monkeypatch.setattr(ap, "reset_peaks", fake_reset)
+    monkeypatch.setattr(ap, "_device_index", lambda: 0)
+    return calls
+
+
+def test_unarmed_hooks_touch_nothing(monkeypatch, tmp_path):
+    _reset_probe_state()
+    monkeypatch.delenv(ap.DUMP_ENV, raising=False)
+    calls = _instrument(monkeypatch, {"allocated_bytes": 1 << 30})
+
+    ap.note_capture_begin()
+    ap.note_capture_end()
+    ap.record_prefill_peak(object(), 70018)
+
+    assert calls == {"read": 0, "reset": 0}, (
+        "an unarmed hook entered the torch memory-stats layer; the serving "
+        "path must be untouched when the probe is off"
+    )
+    assert list(tmp_path.iterdir()) == []
+    assert ap._capture_bytes_total == 0
+    assert ap._activation_peak_bytes == 0
+
+
+def test_armed_hooks_record_capture_and_activation_peak(monkeypatch, tmp_path):
+    """The can-fail twin of the inertness test above."""
+    _reset_probe_state()
+    monkeypatch.setenv(ap.DUMP_ENV, str(tmp_path))
+    monkeypatch.setattr(
+        ap,
+        "_resolve_identity",
+        lambda _runner: {
+            "card_uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+            "hw_fingerprint": FP,
+            "profile_canonical": PROFILE.canonical(),
+            "rank": 1,
+        },
+    )
+
+    # Capture: live allocations rise by 640 MiB across the bracket, so that --
+    # not the transient peak -- is what the graphs are charged.
+    peaks = {"allocated_bytes": 1000 << 20}
+    calls = _instrument(monkeypatch, peaks)
+    ap.note_capture_begin()
+    peaks["allocated_bytes"] = 1640 << 20
+    ap.note_capture_end()
+    assert ap._capture_bytes_total == 640 << 20
+
+    # Prefill: the peak counter is what the activation term reads.
+    peaks.update(
+        {"allocated_peak_bytes": 1766 << 20, "reserved_peak_bytes": 2066 << 20}
+    )
+    ap.record_prefill_peak(object(), 70018)
+
+    assert calls["read"] > 0 and calls["reset"] > 0
+    dumps = load_dumps_dir(tmp_path)
+    assert len(dumps) == 1, dumps
+    d = dumps[0]
+    assert d["rank"] == 1
+    assert d["activation_peak_bytes"] == 1766 << 20
+    assert d["capture_bytes"] == 640 << 20
+    assert d["prefill_tokens"] == 70018
+
+    # A shallower prefill must not lower the high-water mark.
+    peaks["allocated_peak_bytes"] = 900 << 20
+    ap.record_prefill_peak(object(), 128)
+    assert load_dumps_dir(tmp_path)[0]["activation_peak_bytes"] == 1766 << 20
+
+
+def load_dumps_dir(d):
+    out = []
+    for name in sorted(os.listdir(str(d))):
+        if name.startswith("phase_footprint_rank") and name.endswith(".json"):
+            with open(os.path.join(str(d), name)) as f:
+                out.append(json.load(f))
+    return out
