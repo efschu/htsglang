@@ -260,6 +260,10 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
             self.name = name
             self.total_mib = total
             self.free_mib = total
+            # #602: the boot path prices the NVML carve-out from this field.
+            # A realistic non-zero value, so the budget this test forms is the
+            # one the boot would form.
+            self.reserved_mib = 425
 
     cards = {
         0: Card(0, "GPU-5090", "RTX 5090", 32768),
@@ -313,13 +317,19 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
         non_kv = args._vram_ledger_non_kv_per_gpu(Counter([0, 1]))
 
     # 1024 user reserve + 1766 activation + 640 capture + 384 flashinfer
-    # workspace + 408 hardware residual = 4222.
+    # workspace + 408 hardware residual + 425 NVML carve-out = 4647.
     #
     # Was 5976 before the phase footprints landed: activation 3968 (the
     # falsified heuristic) and capture 192 (the token estimate the same window
-    # measured 3.3-3.8x low). The net -1754 MiB per card goes back to the KV
-    # pool, and that is the whole point of the term fix.
-    assert non_kv == {0: 4222, 1: 4222}
+    # measured 3.3-3.8x low). The net goes back to the KV pool, and that is
+    # the whole point of the term fix.
+    #
+    # #602 added the last term, +425: the MiB the driver reserves out of the
+    # card's nominal total and never allocates. It is charged ONCE per card,
+    # which is why both cards move by 425 and not by 425 x ranks. Unlike the
+    # corrections above this one makes the budget SMALLER on purpose -- the
+    # KV pool had been sized against memory that does not exist.
+    assert non_kv == {0: 4647, 1: 4647}
     text = caplog.text
     assert "attention workspaces (capped)" in text
     assert "SGLANG_FLASHINFER_WORKSPACE_SIZE" in text
@@ -351,6 +361,7 @@ def test_the_boot_path_refuses_an_overcommitted_card(monkeypatch):
         name = "RTX 3080"
         total_mib = 20480
         free_mib = 20480
+        reserved_mib = 425  # #602: see the sibling stub above
 
     monkeypatch.setattr(sa, "_resolve_rank_gpu_cards", lambda ids: {1: Card()})
     monkeypatch.setattr(

@@ -582,6 +582,12 @@ class _RankGpuCard:
     name: str
     total_mib: int
     free_mib: int
+    #: MiB of ``total_mib`` the driver never allocates. Required, not
+    #: defaulted: the first cut of #602 read this off the card with a
+    #: getattr(..., 0) fallback, the card type did not carry it, and the term
+    #: silently priced at zero in a boot whose log looked correct. A missing
+    #: field must be a TypeError here, not a quiet 0.
+    reserved_mib: int
 
     def describe(self) -> str:
         return (
@@ -653,6 +659,7 @@ def _resolve_rank_gpu_cards(gpu_ids) -> Dict[int, _RankGpuCard]:
             name=card.name,
             total_mib=mem.total_bytes // 2**20,
             free_mib=mem.free_bytes // 2**20,
+            reserved_mib=mem.reserved_mib,
         )
     return cards
 
@@ -11109,7 +11116,10 @@ class ServerArgs:
                 uuid=card.uuid,
                 name=card.name,
                 total_mib=card.total_mib,
-                reserved_mib=getattr(card, "reserved_mib", 0),
+                # Attribute access, NOT getattr with a default: see
+                # _RankGpuCard.reserved_mib for why a quiet 0 here shipped a
+                # half-applied fix once already.
+                reserved_mib=card.reserved_mib,
             )
             for ordinal, card in sorted(cards_by_ordinal.items())
         ]

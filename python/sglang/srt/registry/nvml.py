@@ -240,10 +240,24 @@ class MemoryInfo:
     total_bytes: int
     free_bytes: int
     used_bytes: int
+    #: See :attr:`DeviceInfo.reserved_bytes`. Note that ``used_bytes`` above
+    #: comes from NVML's v1 struct and ALREADY INCLUDES this, while
+    #: ``free_bytes`` excludes it -- so ``total - used - free`` is ~0 here and
+    #: is not a way to recover it.
+    reserved_bytes: int = 0
 
     @property
     def free_mib(self) -> int:
         return self.free_bytes // MIB
+
+    @property
+    def reserved_mib(self) -> int:
+        return self.reserved_bytes // MIB
+
+    @property
+    def allocatable_mib(self) -> int:
+        """See :attr:`DeviceInfo.allocatable_mib`."""
+        return (self.total_bytes - self.reserved_bytes) // MIB
 
 
 def memory_info_for_uuid(uuid: str) -> MemoryInfo:
@@ -261,10 +275,12 @@ def memory_info_for_uuid(uuid: str) -> MemoryInfo:
             if _decode(pynvml.nvmlDeviceGetUUID(handle)) != uuid:
                 continue
             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            _, reserved_bytes = _memory_info(pynvml, handle)
             return MemoryInfo(
                 total_bytes=int(mem.total),
                 free_bytes=int(mem.free),
                 used_bytes=int(mem.used),
+                reserved_bytes=reserved_bytes,
             )
     raise DeviceNotFoundError(f"no NVML device with UUID {uuid!r}")
 

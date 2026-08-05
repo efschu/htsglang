@@ -319,3 +319,60 @@ class TestTheCorridorZeroIsCoupledToTheDemand(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheCarveOutSurvivesTheProductionCardPath(unittest.TestCase):
+    """The gap the first cut of #602 shipped.
+
+    Every test above builds CardFacts by hand with reserved_mib set, so they
+    all passed while the BOOT priced the term at zero: the card object the
+    boot actually resolves (_RankGpuCard, via memory_info_for_uuid) had no
+    such field, and _build_card_ledgers read it with getattr(..., 0). The
+    demand moved by exactly the user reserve and not one MiB more, on a log
+    that otherwise looked correct.
+
+    These pin the CHAIN rather than the endpoint: NVML -> MemoryInfo ->
+    _RankGpuCard -> CardFacts. A hand-built fixture cannot substitute for it.
+    """
+
+    def test_memory_info_carries_reserved_and_allocatable(self):
+        from sglang.srt.registry.nvml import MemoryInfo
+
+        mem = MemoryInfo(
+            total_bytes=RTX_3080_TOTAL_MIB * MIB,
+            free_bytes=1000 * MIB,
+            used_bytes=19000 * MIB,
+            reserved_bytes=RTX_3080_RESERVED_MIB * MIB,
+        )
+        self.assertEqual(mem.reserved_mib, RTX_3080_RESERVED_MIB)
+        self.assertEqual(
+            mem.allocatable_mib, RTX_3080_TOTAL_MIB - RTX_3080_RESERVED_MIB
+        )
+
+    def test_the_rank_card_requires_the_field_instead_of_defaulting(self):
+        """_RankGpuCard must REFUSE to be built without it. If this ever
+        becomes optional again, the carve-out can silently price at 0 in a
+        boot while every hand-built fixture still passes."""
+        from sglang.srt.server_args import _RankGpuCard
+
+        with self.assertRaises(TypeError):
+            _RankGpuCard(
+                cuda_ordinal=0,
+                nvml_index=1,
+                uuid="GPU-x",
+                pci_bus_id="00000000:05:00.0",
+                name="NVIDIA GeForce RTX 3080",
+                total_mib=RTX_3080_TOTAL_MIB,
+                free_mib=1000,
+            )
+
+    def test_card_facts_reads_the_attribute_not_a_getattr_default(self):
+        """Reads the source, because the defect was invisible at runtime: a
+        getattr default turns a missing field into a priced-zero term."""
+        import inspect
+
+        from sglang.srt.server_args import ServerArgs
+
+        src = inspect.getsource(ServerArgs._build_card_ledgers)
+        self.assertIn("reserved_mib=card.reserved_mib", src)
+        self.assertNotIn('getattr(card, "reserved_mib"', src)
