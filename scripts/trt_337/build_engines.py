@@ -304,6 +304,202 @@ def _dyn_shape(net, trt, ref, static_dim: int, dyn_axis: int):
 
 
 # --------------------------------------------------------------------------
+# Fold variants: dequantize the weights at BUILD time
+# --------------------------------------------------------------------------
+
+#: name -> (trt DataType attr, torch dtype name, bytes per weight element)
+FOLD_DTYPES = {
+    "fold_bf16": ("BF16", "bfloat16", 2),
+    "fold_fp16": ("HALF", "float16", 2),
+    "fp32_ref": ("FLOAT", "float32", 4),
+}
+
+
+def _trt_weights_from_torch(trt, t, keep):
+    """A trt.Weights view of a CPU torch tensor, without a copy.
+
+    numpy has no bfloat16, so the (type, ptr, count) overload is used and the
+    tensor is appended to ``keep`` -- TensorRT does not copy, so the buffer must
+    outlive the build call.
+    """
+    import torch
+
+    dt = {
+        torch.bfloat16: trt.DataType.BF16,
+        torch.float16: trt.DataType.HALF,
+        torch.float32: trt.DataType.FLOAT,
+    }[t.dtype]
+    t = t.contiguous()
+    keep.append(t)
+    return trt.Weights(dt, t.data_ptr(), t.numel())
+
+
+def dequantized_weight(weights, torch_dtype: str):
+    """w_q x per-channel scale, materialised once at build time.
+
+    This is the FOLD. The INT8 grid the checkpoint was quantized to is
+    preserved exactly -- every value is still a representable point of that
+    grid -- it is simply stored in a wider container so no runtime dequantize
+    is needed, and no activation quantization is needed either.
+
+    On quality: bf16 carries 8 mantissa bits and fp16 carries 11, against an
+    INT8 weight grid of ~7 bits plus a per-channel exponent. The fold therefore
+    loses nothing on the weight side, and REMOVES the per-token activation
+    quantization error the deployed path pays. It is a quality-neutral
+    candidate in the strict sense: the harness measures both paths against an
+    exact fp32 reference and gates on the fold being at least as accurate as
+    what we deploy, rather than asserting it here.
+    """
+    import torch
+
+    dt = getattr(torch, torch_dtype)
+    w = weights.q.to(torch.float32) * weights.scale.reshape(-1, 1).to(torch.float32)
+    return w.to(dt)
+
+
+def build_fold_network(trt, builder, target, stage_weights, variant: str, keep):
+    """The WHOLE chain as one engine.
+
+    With the weights folded there is no activation quantization anywhere, and
+    that is what removes the constraint that forced the INT8 variant to cut the
+    chain at every quant: TensorRT could not express our per-token dynamic
+    scale, so the INT8 engines are per-stage islands with our kernel between
+    them. Folded, the entire part -- every GEMM, the SiLU-gate multiply, the
+    attention-core bridge -- is a single engine and a single graph node, with
+    nothing of ours running inside it at all.
+
+    That is the interesting arm: it is the largest fusion surface TensorRT can
+    be given on this model, and it is also the arm that pays 2x the weight
+    bytes. Which of those two wins is the crossover this task measures.
+    """
+    trt_attr, torch_dtype, _ = FOLD_DTYPES[variant]
+    dt = getattr(trt.DataType, trt_attr)
+    net = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+    )
+    k0 = target.engine_stages[0].gemm.k
+    cur = net.add_input("x", dt, (-1, k0))
+
+    for st in target.stages:
+        if st.kind == "quant":
+            # Deliberately nothing: the fold has no activation quant at all.
+            continue
+        if st.kind == "bridge":
+            sl = net.add_slice(cur, (0, 0), (0, st.out_width), (1, 1))
+            sl.set_input(2, _dyn_shape(net, trt, cur, st.out_width, 0))
+            sl.name = f"bridge_{st.name}"
+            cur = sl.get_output(0)
+            continue
+
+        spec = st.gemm
+        w = dequantized_weight(stage_weights[st.name], torch_dtype)
+        wc = net.add_constant(
+            (spec.n, spec.k), _trt_weights_from_torch(trt, w, keep)
+        ).get_output(0)
+        mm = net.add_matrix_multiply(
+            cur, trt.MatrixOperation.NONE, wc, trt.MatrixOperation.TRANSPOSE
+        )
+        mm.name = f"gemm_{st.name}"
+        cur = mm.get_output(0)
+
+        if spec.epilogue == "silu_mul":
+            half = spec.n // 2
+            gate = net.add_slice(cur, (0, 0), (0, half), (1, 1))
+            gate.set_input(2, _dyn_shape(net, trt, cur, half, 0))
+            up = net.add_slice(cur, (0, half), (0, half), (1, 1))
+            up.set_input(2, _dyn_shape(net, trt, cur, half, 0))
+            sig = net.add_activation(gate.get_output(0), trt.ActivationType.SIGMOID)
+            silu = net.add_elementwise(
+                gate.get_output(0), sig.get_output(0), trt.ElementWiseOperation.PROD
+            )
+            cur = net.add_elementwise(
+                silu.get_output(0), up.get_output(0), trt.ElementWiseOperation.PROD
+            ).get_output(0)
+
+    if dt != trt.DataType.BF16:
+        # The deployed path emits bf16. The arms are compared on the same output
+        # dtype so the tolerance numbers mean the same thing across variants.
+        c = net.add_cast(cur, trt.DataType.BF16)
+        c.name = "to_bf16"
+        cur = c.get_output(0)
+    cur.name = "out"
+    net.mark_output(cur)
+    return net
+
+
+def build_fold_engine(
+    trt, target, stage_weights, variant, out_path, compute_capabilities,
+    profile_opts, max_bs, verbose,
+):
+    logger = trt.Logger(trt.Logger.VERBOSE if verbose else trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    keep = []  # weight buffers TensorRT does not copy
+    net = build_fold_network(trt, builder, target, stage_weights, variant, keep)
+
+    cfg = builder.create_builder_config()
+    cfg.clear_flag(trt.BuilderFlag.TF32)
+    cfg.set_flag(trt.BuilderFlag.DISABLE_TIMING_CACHE)
+    cfg.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+    portable = hasattr(cfg, "set_compute_capability")
+    if portable:
+        cfg.num_compute_capabilities = len(compute_capabilities)
+        for i, cc in enumerate(compute_capabilities):
+            if not cfg.set_compute_capability(getattr(trt.ComputeCapability, cc), i):
+                raise SystemExit(f"builder rejected compute capability {cc}")
+
+    k0 = target.engine_stages[0].gemm.k
+    for opt in profile_opts:
+        p = builder.create_optimization_profile()
+        p.set_shape("x", (1, k0), (opt, k0), (max_bs, k0))
+        cfg.add_optimization_profile(p)
+
+    t0 = time.time()
+    plan = builder.build_serialized_network(net, cfg)
+    dt = time.time() - t0
+    if plan is None:
+        raise SystemExit(f"fold AOT build failed for {target.name} / {variant}")
+    with open(out_path, "wb") as fh:
+        fh.write(bytes(plan))
+
+    _, torch_dtype, elem_bytes = FOLD_DTYPES[variant]
+    weight_elems = sum(s.gemm.n * s.gemm.k for s in target.engine_stages)
+    return {
+        "engine": os.path.basename(out_path),
+        "variant": variant,
+        "target": target.name,
+        "stages": [s.name for s in target.engine_stages],
+        "single_engine_whole_chain": True,
+        "activation_quant_kernels": 0,
+        "bytes": plan.nbytes,
+        "aot_build_seconds": round(dt, 3),
+        "weight_elements": weight_elems,
+        "weight_bytes_fold": weight_elems * elem_bytes,
+        "weight_bytes_int8": weight_elems + sum(
+            s.gemm.n * 2 for s in target.engine_stages
+        ),
+        "memory_multiplier_vs_int8": round(
+            weight_elems * elem_bytes
+            / max(weight_elems + sum(s.gemm.n * 2 for s in target.engine_stages), 1),
+            3,
+        ),
+        "compute_capabilities": list(compute_capabilities) if portable
+        else ["<current-device>"],
+        "portable_multi_arch": portable,
+        "profile_opts": list(profile_opts),
+        "max_batch": max_bs,
+        "strongly_typed": True,
+        "builder_flags_set": sorted(
+            f for f in dir(trt.BuilderFlag)
+            if f.isupper() and cfg.get_flag(getattr(trt.BuilderFlag, f))
+        ),
+        "built_with_visible_devices": os.environ.get(
+            "CUDA_VISIBLE_DEVICES", "<unset>"
+        ),
+        "tensorrt_rtx_version": trt.__version__,
+    }
+
+
+# --------------------------------------------------------------------------
 # Build
 # --------------------------------------------------------------------------
 
@@ -417,6 +613,35 @@ def mock_engine(spec: tgt.GemmSpec, weights, out_path: str) -> dict:
     }
 
 
+def mock_fold_engine(target, variant, out_path) -> dict:
+    """Stub fold plan, so --mock exercises the fold code paths too."""
+    _, _, elem_bytes = FOLD_DTYPES[variant]
+    elems = sum(s.gemm.n * s.gemm.k for s in target.engine_stages)
+    with open(out_path, "wb") as fh:
+        fh.write(b"MOCK337\x00" + json.dumps(
+            {"target": target.name, "variant": variant,
+             "stages": [s.name for s in target.engine_stages]}
+        ).encode())
+    return {
+        "engine": os.path.basename(out_path),
+        "variant": variant,
+        "target": target.name,
+        "stages": [s.name for s in target.engine_stages],
+        "single_engine_whole_chain": True,
+        "activation_quant_kernels": 0,
+        "bytes": os.path.getsize(out_path),
+        "weight_elements": elems,
+        "weight_bytes_fold": elems * elem_bytes,
+        "weight_bytes_int8": elems + sum(s.gemm.n * 2 for s in target.engine_stages),
+        "memory_multiplier_vs_int8": round(
+            elems * elem_bytes
+            / max(elems + sum(s.gemm.n * 2 for s in target.engine_stages), 1),
+            3,
+        ),
+        "mock": True,
+    }
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -436,6 +661,23 @@ def main(argv=None) -> int:
     ap.add_argument("--profile-opts", default="1,4")
     ap.add_argument("--max-bs", type=int, default=DEFAULT_MAX_BS)
     ap.add_argument("--dq-dtype", choices=("float", "bf16"), default="float")
+    ap.add_argument(
+        "--precision",
+        default="int8",
+        help="comma list of variants to build: int8 (per-stage engines, our "
+             "quant kernel between them), fold_bf16 / fold_fp16 (weights "
+             "dequantized at build time, WHOLE chain in one engine, no "
+             "activation quant anywhere), fp32_ref (diagnostic only -- see "
+             "--fp32-ref-targets).",
+    )
+    ap.add_argument(
+        "--fp32-ref-targets",
+        default="gemm_mlp_gate_up",
+        help="fp32_ref is a diagnostic arm, not a deployment candidate: at 4 "
+             "bytes per weight it does not fit this rig. Built for ONE shape so "
+             "it can isolate TensorRT runtime quality from the quantization "
+             "constraints, and no further.",
+    )
     ap.add_argument(
         "--random-weights",
         action="store_true",
@@ -481,8 +723,12 @@ def main(argv=None) -> int:
     opts = [int(x) for x in a.profile_opts.split(",")]
     optional = [x for x in a.optional.split(",") if x]
 
+    variants = [v.strip() for v in a.precision.split(",") if v.strip()]
+    fp32_targets = {t for t in a.fp32_ref_targets.split(",") if t}
+
     manifest = {
         "task": "337",
+        "variants": variants,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "mock": a.mock,
         "library": a.library,
@@ -517,32 +763,67 @@ def main(argv=None) -> int:
                 "shapes": tgt.shape_table(ts),
             }
         )
-        for t in ts:
-            for st in t.engine_stages:
-                key = (rank, st.gemm.name, st.gemm.n, st.gemm.k, st.gemm.epilogue)
-                if key in seen:
-                    continue  # identical stages are shared across targets
-                suffix = "" if a.library == "rtx" else ".classic"
-                name = f"rank{rank}_{geo.arch}_{st.gemm.name}{suffix}.plan"
+        if "int8" in variants:
+            for t in ts:
+                for st in t.engine_stages:
+                    key = (rank, st.gemm.name, st.gemm.n, st.gemm.k,
+                           st.gemm.epilogue)
+                    if key in seen:
+                        continue  # identical stages are shared across targets
+                    suffix = "" if a.library == "rtx" else ".classic"
+                    name = f"rank{rank}_{geo.arch}_{st.gemm.name}{suffix}.plan"
+                    path = os.path.join(a.out_dir, name)
+                    w = tgt.load_gemm_weights(
+                        st.gemm, geo, a.model_dir, a.random_weights, a.seed
+                    )
+                    if a.mock:
+                        rec = mock_engine(st.gemm, w, path)
+                    else:
+                        rec = build_engine(
+                            trt, st.gemm, w, path, ccs, opts, a.max_bs,
+                            a.dq_dtype, a.verbose,
+                        )
+                    rec["rank"] = rank
+                    rec["arch"] = geo.arch
+                    rec["variant"] = "int8"
+                    manifest["engines"].append(rec)
+                    seen[key] = name
+                    print(
+                        f"  built {name:48s} N={st.gemm.n:6d} K={st.gemm.k:6d} "
+                        f"{rec.get('bytes',0)/1e6:7.2f} MB "
+                        f"{rec.get('aot_build_seconds', 0):6.2f}s"
+                    )
+
+        for variant in variants:
+            if variant == "int8":
+                continue
+            if variant not in FOLD_DTYPES:
+                raise SystemExit(f"unknown precision variant {variant!r}")
+            for t in ts:
+                if variant == "fp32_ref" and t.name not in fp32_targets:
+                    continue
+                name = f"rank{rank}_{geo.arch}_{t.name}.{variant}.plan"
                 path = os.path.join(a.out_dir, name)
-                w = tgt.load_gemm_weights(
-                    st.gemm, geo, a.model_dir, a.random_weights, a.seed
-                )
+                sw = {
+                    st.name: tgt.load_gemm_weights(
+                        st.gemm, geo, a.model_dir, a.random_weights, a.seed
+                    )
+                    for st in t.engine_stages
+                }
                 if a.mock:
-                    rec = mock_engine(st.gemm, w, path)
+                    rec = mock_fold_engine(t, variant, path)
                 else:
-                    rec = build_engine(
-                        trt, st.gemm, w, path, ccs, opts, a.max_bs,
-                        a.dq_dtype, a.verbose,
+                    rec = build_fold_engine(
+                        trt, t, sw, variant, path, ccs, opts, a.max_bs, a.verbose
                     )
                 rec["rank"] = rank
                 rec["arch"] = geo.arch
                 manifest["engines"].append(rec)
-                seen[key] = name
                 print(
-                    f"  built {name:44s} N={st.gemm.n:6d} K={st.gemm.k:6d} "
+                    f"  built {name:48s} chain={len(t.engine_stages)} "
                     f"{rec.get('bytes',0)/1e6:7.2f} MB "
-                    f"{rec.get('aot_build_seconds', 0):6.2f}s"
+                    f"{rec.get('aot_build_seconds', 0):6.2f}s "
+                    f"mem_x{rec.get('memory_multiplier_vs_int8','?')}"
                 )
 
     manifest["total_build_seconds"] = round(time.time() - total_t0, 2)

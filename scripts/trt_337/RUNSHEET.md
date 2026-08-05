@@ -3,7 +3,8 @@
 Desk work is done and the engines already exist. This sheet is everything the
 card operator needs.
 
-**Total card time: about 12 minutes for both arms.** The engines were built on a
+**Total card time: about 16 minutes for both arms** (the fold arms ride in the
+same rotation; 12 min without them). The engines were built on a
 CPU with no GPU visible, so no build step is on the critical path.
 
 ## 0. What is being decided
@@ -23,7 +24,9 @@ the run: the verdict cell is `trt_outer_graph / torch_graph`, and
 repo        /spinning/wt-337-trt              branch feat/trt-microbench-337
 scripts     scripts/trt_337/
 artifacts   /spinning/gpu-battery-results/2026-08-05_trt_microbench_prep/
-  engines/          10 AOT plans, CPU-built, real checkpoint weights
+  engines/          32 AOT plans, CPU-built, real checkpoint weights:
+                    INT8 per-stage + fold_bf16 / fold_fp16 whole-chain + one
+                    fp32_ref diagnostic shape per rank
   pylibs/           tensorrt_rtx 1.6.1.120 + onnx, ISOLATED from every venv
   capability_probe.json
   shape_table.json
@@ -52,9 +55,10 @@ export LD_LIBRARY_PATH="/spinning/htsglang-gpu/.venv/lib/python3.12/site-package
 $REPO/scripts/trt_337/mock_smoke.sh
 ```
 
-Exercises every script end to end on the CPU with stub engines. Green on the
-desk on 2026-08-05: 10 points, 30 arm measurements, tolerance path exercised on
-every point. Re-run after any rebase -- a harness that has never executed is not
+Exercises every script end to end on the CPU with stub engines, INT8 and fold
+variants both. Green on the desk on 2026-08-05: 10 points, 52 arm measurements,
+tolerance and quality paths exercised on every point, with the fp16 chain
+overflow surfaced as a NOTE. Re-run after any rebase -- a harness that has never executed is not
 a harness.
 
 ## 4. Claim the cards
@@ -93,6 +97,54 @@ CUDA_VISIBLE_DEVICES=<3080_idx> $PY $REPO/scripts/trt_337/microbench_trt.py \
   --runtime-cache-dir $ART/rtcache \
   --out $ART/bench.sm86_3080.json
 ```
+
+## 6b. The fold arms -- included in arms A and B by default
+
+Arms A and B above already run them; this section is what they mean and what to
+look at. Three extra arms ride in the same rotation:
+
+| arm | engine | what runs |
+|---|---|---|
+| `trt_fold_bf16_graph` | whole chain, one engine, bf16 weights | no activation quant at all |
+| `trt_fold_fp16_graph` | same, fp16 weights | same |
+| `trt_fp32_ref_graph` | `gemm_mlp_gate_up` only | **diagnostic, not a candidate** |
+
+The fold engines were built at the desk alongside the INT8 ones and are already
+in `engines/` (32 plans total).
+
+**The crossover is the question.** The fold removes every activation-quant
+kernel and pays 2x the weight bytes in a memory-bound GEMV. Read
+`verdict.fold_bf16_over_torch_graph` across M = 1, 2, 4, 8 and find where it
+crosses 1.0. Below the crossover the part is a fold candidate; above it, leave
+it INT8. `verdict.fold_bf16_over_trt_int8` separates "the fold helps" from "the
+engine helps" -- they are different wins and a per-part decision needs both.
+
+**Quality is gated, not assumed.** Every point emits `quality`, with each path's
+max-abs error against an exact fp32 reference built from the dequantized
+checkpoint weights. The gate is
+`quality.arms.*.at_least_as_accurate_as_deployed` -- a fold passes if its error
+is no larger than the deployed INT8 path's. Check it; do not check the fold
+against the deployed *output*, which would measure the deployed path's own
+quantization error.
+
+**Watch fp16 on the chain targets.** The desk mock produced a non-finite fp16
+output on `chain_decode_layer` (4 GEMMs deep): fp16 has 11 mantissa bits but
+only 5 exponent bits, max 65504, while bf16 carries fp32's range. The mock's
+random weights exaggerate intermediate magnitudes, so the real-weight run is the
+one that decides. If `quality.arms.trt_fold_fp16_graph.finite` is false, that
+arm is a **result about fp16 in that chain**, not a broken run -- record it and
+continue; bf16 is unaffected.
+
+**Memory.** `engines/manifest.json` carries `weight_bytes_fold`,
+`weight_bytes_int8` and `memory_multiplier_vs_int8` per engine (measured:
+1.999x). Full-model fold does not fit the 3080s and is not the proposal -- the
+proposal is a per-part stair. Report the winning parts with their MB so the
+planner can price residency.
+
+The fp32 arm is one shape, ~1 min, and exists only to separate TensorRT runtime
+quality from the quantization constraints. At 4 bytes per weight it is
+disqualified as a deployment candidate by memory; label it that way in any
+summary.
 
 ## 7. Arm C -- cross-architecture control, optional (~5 min)
 
@@ -150,15 +202,18 @@ fallback kernel.
 1. `duration_rule_met: true` on every point. Each point runs >= 10 s measured.
 2. `verdict.a2_floor_frac` -- the A-vs-A spread. If
    `verdict.inside_noise_floor` is true, that point decided nothing.
-3. `tolerance.pass` and `tolerance.max_abs_diff`. Byte identity is not expected;
+3. `quality.arms.*.at_least_as_accurate_as_deployed` on every fold arm, and
+   `quality.arms.*.finite`. A fold that is less accurate than the deployed path
+   is not a fold candidate, whatever its speed.
+4. `tolerance.pass` and `tolerance.max_abs_diff`. Byte identity is not expected;
    the bound is 2e-2 relative. **A failure does not stop the run** -- an engine
    that is fast and wrong is a result, and it is recorded as one.
-4. `clocks.before` / `clocks.after` -- SM clock, power, temperature, throttle
+5. `clocks.before` / `clocks.after` -- SM clock, power, temperature, throttle
    reasons. Power targets on this rig are reduced (3080 200 W, 5090 400 W); a
    point that throttled mid-rotation is a point about thermals.
-5. `environment.kernels_missing` empty, `environment.capability` matches the arm
+6. `environment.kernels_missing` empty, `environment.capability` matches the arm
    you think you ran.
-6. **Did an INT8 tactic actually run?** A TensorRT loss caused by a silently
+7. **Did an INT8 tactic actually run?** A TensorRT loss caused by a silently
    chosen fp32 tactic is a different finding than a loss on equal footing. The
    engine inspector output is available via `TrtEngine.layer_information()`; if
    the verdict comes out badly against TensorRT, dump it before concluding
@@ -191,6 +246,9 @@ Stop and report rather than pushing on, if:
   index -> card-name mapping you resolved, and whether arms C and D ran.
 - The verdict sentence should name the cell: "trt_outer_graph / torch_graph =
   X at (target, M) on (arch)", never a ratio against eager.
+- For the fold: report the crossover M per part, with the part's fold MB next to
+  it. "gate_up folds below M=N at +83 MB per layer" is the sentence the planner
+  can act on; "the fold is faster" is not.
 - If TensorRT wins: the next question is integration cost, not more
   microbenchmarks. If it loses: `layer_information()` decides whether it lost on
   equal footing or on a bad tactic, and those lead to different next tasks.
