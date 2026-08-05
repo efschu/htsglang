@@ -733,6 +733,25 @@ class Envs:
     # prepare_attn (rides the fuse_mlp_allreduce seam). Requires the ucx
     # transport; rank-uniform like every other flag in this block.
     SGLANG_BARLINK_UCX_OVERLAP = EnvBool(False)
+    # Token-slice pipelining of the TP all-reduce (task #588). Splits a
+    # row-parallel layer's token axis so slice i's transfer occupies the wire
+    # during slice i+1's GEMM. Eager prefill only; the saving is bounded by
+    # the layer's own GEMM time, never by the transfer term. Off by default:
+    # when unset, RowParallelLinear.forward reads this bool and nothing else
+    # changes. RANK-UNIFORM, like every flag in this block -- the slice count
+    # is part of the collective sequence, so ranks that disagree deadlock.
+    SGLANG_TP_AR_PIPELINE = EnvBool(False)
+    # Upper bound on the slice count. Caps the K*latency term that grows with
+    # K and bounds the extra launch traffic per layer.
+    SGLANG_TP_AR_PIPELINE_MAX_SLICES = EnvInt(8)
+    # Below this token count a forward stays unsliced. Keeps decode (and any
+    # short extend) on the untouched path, where there is no transfer to hide
+    # anything behind.
+    SGLANG_TP_AR_PIPELINE_MIN_TOKENS = EnvInt(256)
+    # Force a fixed slice count instead of deriving it from the measured cost
+    # model. 0 = derive. For A/B arms that need K held constant, not for
+    # production tuning.
+    SGLANG_TP_AR_PIPELINE_SLICES = EnvInt(0)
     # Number of independent UCX contexts/workers per rank for the collective
     # plane (task #266). 2 splits the flat exchange's peers over the two
     # workers by the symmetric (rank + peer) % ways rule, so no rank has all
