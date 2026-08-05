@@ -4558,6 +4558,23 @@ class BarlinkBar1Transport:
             if self._ctl_defer
             else ""
         )
+        # #583: dump THIS rank's collective census before raising. No
+        # collective is taken here on purpose -- by now a peer is very likely
+        # already wedged or dead (in crashes 9/10/11 the third rank aborted
+        # ~30 s after the first two), so any cross-rank exchange would hang
+        # exactly when the evidence is wanted. Each rank logs its own counts;
+        # diffing the three lines afterwards names the family that diverged.
+        # Warn-never-raise: an instrument must not replace the real error.
+        try:
+            from sglang.srt.distributed.collective_census import (
+                census_enabled,
+                format_local_census,
+            )
+
+            if census_enabled():
+                logger.error("%s", format_local_census(self.rank))
+        except Exception:  # noqa: BLE001 - never mask the abort below
+            pass
         raise Bar1CollectiveAborted(
             f"barlink-BAR1 rank {self.rank}/{self.world} group "
             f"{self.group or '<unnamed>'}: a spin kernel took its abort path, "

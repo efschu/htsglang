@@ -65,6 +65,11 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.collective_census import (  # noqa: E402
+    census,
+    census_enabled,
+    census_interval,
+)
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -314,6 +319,12 @@ logger = logging.getLogger(__name__)
 
 # Runtime HiCache resize requests are expressed in GiB.
 _GIB = 1024**3
+
+# #583 collective census: resolved once at import so the per-iteration
+# tick is a bool read, not an environment lookup.
+_CENSUS = census()
+_CENSUS_ON = census_enabled()
+_CENSUS_INTERVAL = census_interval()
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -3284,6 +3295,39 @@ class Scheduler(
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
         self._uniform_min_avail = int(t[0].item())
 
+    def _census_tick(self) -> None:
+        """Advance the census round and, on cadence, diff counts across ranks.
+
+        #583. The collective COUNT is the quantity every desync in this
+        family disagrees about; comparing it is what turns "rank 2 was
+        somewhere else" into "rank 2 skipped its Nth tp.all_reduce". The
+        detector fires while the ranks are still healthy -- typically within
+        one tick, i.e. ~30 s before the spin deadline would abort.
+
+        Instrument discipline: it never raises, and a failure to compare is
+        logged and dropped rather than escalated (see
+        ``CollectiveCensus.compare_across_ranks``).
+        """
+        if not _CENSUS_ON:
+            return
+        try:
+            c = _CENSUS
+            c.next_round()
+            if not c.due(_CENSUS_INTERVAL):
+                return
+            grp = getattr(self, "tp_cpu_group", None)
+            if grp is None:
+                return
+            c.compare_across_ranks(
+                grp,
+                torch.distributed.get_world_size(grp),
+                self.tp_rank,
+            )
+        except Exception as exc:  # noqa: BLE001 - instrument must not raise
+            logger.warning(
+                "collective census tick skipped (%s: %s)", type(exc).__name__, exc
+            )
+
     def uniform_min_avail(self) -> int:
         """This iteration's rank-uniform available_size.
 
@@ -3441,6 +3485,15 @@ class Scheduler(
         # reaches this line exactly once per iteration, so the collective
         # count stays rank-uniform no matter which branch is taken later.
         self._update_uniform_pool_budget()
+
+        # #583 collective census. Same placement argument as the reduce above:
+        # every rank reaches this line exactly once per iteration, so the
+        # round counter it advances is REPLICATED and the cadence gate inside
+        # `due` opens on the same round for all of them. The comparison runs
+        # on tp_cpu_group (gloo), never the device/BAR1 path, so a wedged
+        # device group cannot silence the instrument meant to explain it.
+        # Warn-never-raise lives inside compare_across_ranks.
+        self._census_tick()
 
         # #297 phase-boundary KV resharding: same lazy-build and cadence
         # discipline as the #287 block below. Built FIRST so the pressure
