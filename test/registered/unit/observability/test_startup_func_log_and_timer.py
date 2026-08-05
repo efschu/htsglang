@@ -136,6 +136,41 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
         mock_gauge.labels.assert_not_called()
         self.assertIsNotNone(get_max_duration("add"))
 
+    def test_startup_timer_noop_without_enable(self):
+        """Using startup_timer without calling enable_startup_timer() must
+        remain silent (no gauge access, no exceptions). This is the safety
+        guarantee that allows call sites to use startup_timer unconditionally
+        behind an enable_metrics gate at the caller level."""
+        # Ensure metrics are disabled and gauge is None (fresh state).
+        mod.enable_startup_metrics = False
+        mod.STARTUP_LATENCY_SECONDS = None
+        mod._max_durations.clear()
+
+        # Using the timer without enable should not raise and should not
+        # touch STARTUP_LATENCY_SECONDS (which is None).
+        with startup_timer("noop_test"):
+            pass
+
+        # Duration is tracked in-memory (harmless), but gauge must NOT be hit.
+        self.assertIsNotNone(get_max_duration("noop_test"))
+        # Verify gauge was not accessed (it is None and accessing .labels()
+        # would raise AttributeError).
+        mod.STARTUP_LATENCY_SECONDS = self.orig_gauge  # restore for tearDown
+
+    def test_time_startup_latency_noop_without_enable(self):
+        """The decorator must also be a safe no-op without enable."""
+        mod.enable_startup_metrics = False
+        mod.STARTUP_LATENCY_SECONDS = None
+        mod._max_durations.clear()
+
+        @time_startup_latency(name="noop_decorator_test")
+        def sample_work():
+            return 42
+
+        result = sample_work()
+        self.assertEqual(result, 42)
+        self.assertIsNotNone(get_max_duration("noop_decorator_test"))
+
 
 if __name__ == "__main__":
     unittest.main()

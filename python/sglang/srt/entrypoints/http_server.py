@@ -3290,6 +3290,16 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    # Enable startup latency timer for Prometheus metrics when metrics are enabled.
+    # startup_timer is a safe no-op when this is not called, but calling it here
+    # ensures gauge emission for callers that use launch_server.
+    if server_args.enable_metrics:
+        from sglang.srt.observability.startup_func_log_and_timer import (
+            enable_startup_timer,
+        )
+
+        enable_startup_timer()
+
     # Launch subprocesses
     (
         tokenizer_manager,

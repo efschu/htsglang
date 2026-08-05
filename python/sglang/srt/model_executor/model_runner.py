@@ -2132,88 +2132,92 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
         ):
-            self.loader = get_model_loader(
-                load_config=self.load_config,
-                model_config=self.model_config,
+            from sglang.srt.observability.startup_func_log_and_timer import (
+                startup_timer,
             )
-            # Weightless-KV fast lane (Option-B, B1): build + load the model as
-            # weight-TP=1 (every family full, no sharding, no FFN/residual
-            # all-reduce). The head rank runs this full model TP=1; only the
-            # attention op dispatches across the dcp group (size 3) via the
-            # [H,0,0] weightless path. Linears cache self.tp_size at construction
-            # and RowParallelLinear gates its all-reduce on that cached value
-            # (linear.py:2103), so a construction-time override sticks through
-            # forward. attn_tp_size is already 1 under dcp==tp, so attention proj
-            # is full; the override makes FFN/embed/lm_head/GDN full too. The dcp
-            # group is NOT overridden, so the attention dispatch still spans 3
-            # ranks. No-op on the default path.
-            from sglang.srt.runtime_context import get_parallel
+            with startup_timer("weight_loading"):
+                self.loader = get_model_loader(
+                    load_config=self.load_config,
+                    model_config=self.model_config,
+                )
+                # Weightless-KV fast lane (Option-B, B1): build + load the model as
+                # weight-TP=1 (every family full, no sharding, no FFN/residual
+                # all-reduce). The head rank runs this full model TP=1; only the
+                # attention op dispatches across the dcp group (size 3) via the
+                # [H,0,0] weightless path. Linears cache self.tp_size at construction
+                # and RowParallelLinear gates its all-reduce on that cached value
+                # (linear.py:2103), so a construction-time override sticks through
+                # forward. attn_tp_size is already 1 under dcp==tp, so attention proj
+                # is full; the override makes FFN/embed/lm_head/GDN full too. The dcp
+                # group is NOT overridden, so the attention dispatch still spans 3
+                # ranks. No-op on the default path.
+                from sglang.srt.runtime_context import get_parallel
 
-            # Also pin the per-family RANKS to 0: at tp_size==1 the only shard
-            # is rank 0, but the real tp_rank is still 1/2 on the workers. Any
-            # rank-indexed partition (e.g. the VL vision tower's
-            # tp_partition_size(total, tp_size, rank)[rank]) would IndexError on
-            # the now length-1 partition list without this. The dcp geometry is
-            # set later at attention-backend init (NOT under this override), so
-            # it still uses the real rank for the KV token-shard.
-            # Draft-solo placement reuses the exact same construction-time
-            # override: BOTH the solo host and the shadows build the draft
-            # module graph as weight-TP=1 (full families, no sharding, no
-            # draft-internal all-reduce -- linears cache tp_size at
-            # construction), and rank pinned to 0 so rank-indexed partition
-            # lists stay valid. The host then LOADS the full weights; a
-            # shadow builds on `meta` (no weights) exactly like a weightless
-            # KV worker -- its draft forward is never called.
-            _wl_build_ctx = (
-                get_parallel().override(
-                    tp_size=1,
-                    tp_rank=0,
-                    moe_tp_size=1,
-                    moe_tp_rank=0,
-                    attn_tp_size=1,
-                    attn_tp_rank=0,
-                )
-                if (
-                    self.is_weightless_head
-                    or self.is_weightless_worker
-                    or self.is_draft_solo_host
-                    or self.is_draft_solo_shadow
-                )
-                else contextlib.nullcontext()
-            )
-            with _wl_build_ctx:
-                if self.is_dual_group_lane:
-                    # Multi-group runtime (#274): the lane's model is not
-                    # loaded, it is ASSEMBLED -- complement shards via the
-                    # stock loader under the lane's own scoped geometry, a
-                    # full-width hull, and shells that replace the lane
-                    # group's collectives with local ops. Rank-local.
-                    #
-                    # The NEXTN head takes the SAME treatment: it is one more
-                    # decoder layer in the serving group's geometry, so the
-                    # assembly is the assembly -- only the vocab is special
-                    # (it points at the lane target's shells).
-                    from sglang.srt.model_executor.dual_group_lane import (
-                        build_lane_draft_model,
-                        build_lane_model,
+                # Also pin the per-family RANKS to 0: at tp_size==1 the only shard
+                # is rank 0, but the real tp_rank is still 1/2 on the workers. Any
+                # rank-indexed partition (e.g. the VL vision tower's
+                # tp_partition_size(total, tp_size, rank)[rank]) would IndexError on
+                # the now length-1 partition list without this. The dcp geometry is
+                # set later at attention-backend init (NOT under this override), so
+                # it still uses the real rank for the KV token-shard.
+                # Draft-solo placement reuses the exact same construction-time
+                # override: BOTH the solo host and the shadows build the draft
+                # module graph as weight-TP=1 (full families, no sharding, no
+                # draft-internal all-reduce -- linears cache tp_size at
+                # construction), and rank pinned to 0 so rank-indexed partition
+                # lists stay valid. The host then LOADS the full weights; a
+                # shadow builds on `meta` (no weights) exactly like a weightless
+                # KV worker -- its draft forward is never called.
+                _wl_build_ctx = (
+                    get_parallel().override(
+                        tp_size=1,
+                        tp_rank=0,
+                        moe_tp_size=1,
+                        moe_tp_rank=0,
+                        attn_tp_size=1,
+                        attn_tp_rank=0,
                     )
+                    if (
+                        self.is_weightless_head
+                        or self.is_weightless_worker
+                        or self.is_draft_solo_host
+                        or self.is_draft_solo_shadow
+                    )
+                    else contextlib.nullcontext()
+                )
+                with _wl_build_ctx:
+                    if self.is_dual_group_lane:
+                        # Multi-group runtime (#274): the lane's model is not
+                        # loaded, it is ASSEMBLED -- complement shards via the
+                        # stock loader under the lane's own scoped geometry, a
+                        # full-width hull, and shells that replace the lane
+                        # group's collectives with local ops. Rank-local.
+                        #
+                        # The NEXTN head takes the SAME treatment: it is one more
+                        # decoder layer in the serving group's geometry, so the
+                        # assembly is the assembly -- only the vocab is special
+                        # (it points at the lane target's shells).
+                        from sglang.srt.model_executor.dual_group_lane import (
+                            build_lane_draft_model,
+                            build_lane_model,
+                        )
 
-                    if self.is_dual_group_lane_draft:
-                        self.model = build_lane_draft_model(self)
+                        if self.is_dual_group_lane_draft:
+                            self.model = build_lane_draft_model(self)
+                        else:
+                            self.model = build_lane_model(self)
+                    elif self.is_weightless_worker or self.is_draft_solo_shadow:
+                        # B2a / draft-solo shadow: meta-model, NO weight load.
+                        self.model = self._build_weightless_worker_meta_model()
                     else:
-                        self.model = build_lane_model(self)
-                elif self.is_weightless_worker or self.is_draft_solo_shadow:
-                    # B2a / draft-solo shadow: meta-model, NO weight load.
-                    self.model = self._build_weightless_worker_meta_model()
-                else:
-                    self.model = self.loader.load_model(
-                        model_config=self.model_config,
-                        device_config=DeviceConfig(self.device, self.gpu_id),
+                        self.model = self.loader.load_model(
+                            model_config=self.model_config,
+                            device_config=DeviceConfig(self.device, self.gpu_id),
+                        )
+                if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
+                    self.remote_instance_transfer_engine_weight_info = (
+                        self.loader.remote_instance_transfer_engine_weight_info
                     )
-            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_transfer_engine_weight_info = (
-                    self.loader.remote_instance_transfer_engine_weight_info
-                )
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:

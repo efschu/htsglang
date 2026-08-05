@@ -234,18 +234,23 @@ class Engine(EngineScoreMixin, EngineBase):
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        (
-            tokenizer_manager,
-            template_manager,
-            port_args,
-            scheduler_init_result,
-            subprocess_watchdog,
-        ) = self._launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=self.init_tokenizer_manager_func,
-            run_scheduler_process_func=self.run_scheduler_process_func,
-            run_detokenizer_process_func=self.run_detokenizer_process_func,
+        from sglang.srt.observability.startup_func_log_and_timer import (
+            startup_timer,
         )
+
+        with startup_timer("subprocess_launch"):
+            (
+                tokenizer_manager,
+                template_manager,
+                port_args,
+                scheduler_init_result,
+                subprocess_watchdog,
+            ) = self._launch_subprocesses(
+                server_args=server_args,
+                init_tokenizer_manager_func=self.init_tokenizer_manager_func,
+                run_scheduler_process_func=self.run_scheduler_process_func,
+                run_detokenizer_process_func=self.run_detokenizer_process_func,
+            )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
