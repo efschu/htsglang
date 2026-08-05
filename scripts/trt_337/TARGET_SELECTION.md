@@ -133,6 +133,97 @@ engine could replace **today**, and nothing it could not.
 that may move is a number with a short shelf life. It is one flag away
 (`--optional gdn_conv`) when #325 settles.
 
+## 2b. The fold variants, and the stair
+
+Everything above assumes the deployed INT8 storage. There is a second, more
+interesting option: **fold the dequantize into the weights at build time.**
+Store `w_q * w_scale` as bf16 or fp16 in the engine, and the per-token
+activation quantization has nothing left to do -- so it disappears entirely.
+
+That changes the structure, not just the numbers. The INT8 arms are per-stage
+engine *islands* with our quant kernel between them, because TensorRT cannot
+express a per-token dynamic scale. Folded, the constraint is gone: the whole
+part becomes **one engine, one graph node, with nothing of ours inside it**.
+`chain_decode_layer` folded is a single engine containing four GEMMs, the
+SiLU-gate multiply and the attention-core bridge.
+
+### Quality: measured, not asserted
+
+The fold does not coarsen the weights -- `w_q * w_scale` is the checkpoint's
+weight exactly, just in a wider container, and every value stays a representable
+point of the original INT8 grid. bf16 carries 8 mantissa bits and fp16 carries
+11, against a ~7-bit weight grid plus a per-channel exponent. And the fold
+*removes* the per-token activation quantization error the deployed path pays.
+
+So the harness measures every path against the same exact fp32 reference
+computed from the dequantized weights, and gates a fold on being **at least as
+accurate as what we deploy** -- not on a fixed tolerance. Comparing a fold to
+the deployed *output* would measure the deployed path's own quantization error
+and call it a fold defect.
+
+Desk mock, random weights, `gemm_mlp_gate_up` M=1 (directional only -- CPU
+stubs):
+
+| path | max-abs error vs exact |
+|---|---:|
+| deployed INT8 | 0.0112 |
+| fold bf16 | 0.0031 |
+| fold fp16 | 0.0024 |
+
+### The fp16 caveat the mock found
+
+fp16 has the better mantissa (11 bits vs 8) but a much smaller exponent range --
+5 bits, max representable 65504. bf16 carries fp32's exponent range. In the
+4-GEMM `chain_decode_layer` the intermediate magnitudes compound, and the mock's
+fp16 fold produced a **non-finite output** where bf16 did not.
+
+The mock uses random weights, which make intermediates larger than the
+checkpoint's would be, so this is a flag rather than a verdict -- the card run
+with real weights decides. But it qualifies the "fp16 rounding 2^-11 beats the
+INT8 grid" rationale precisely: fp16 wins on mantissa and loses on range, and
+the deep chains are exactly where range matters. The harness detects non-finite
+output per arm and records it as a result (`quality.arms.*.overflow`) instead of
+letting a NaN pass as a number.
+
+### The stair: fold is per-part, and that is the design
+
+Full-model fold does not fit. Every fold engine is measured at **1.999x** the
+INT8 weight bytes (2 bytes vs 1 byte plus the per-channel scale), and the 3080s
+have 20 GB with a shard of a 27B model already in them. That is not an argument
+against the fold -- it is the reason the fold is a **stair**: fold the hot parts,
+leave the rest INT8, and the untouched parts stay offloadable exactly as they
+are today.
+
+Per-part cost, measured from the built engines (rank 0 = 5090, rank 1 = 3080):
+
+| target | rank 0 fold MB | rank 0 INT8 MB | rank 1 fold MB | rank 1 INT8 MB |
+|---|---:|---:|---:|---:|
+| `gemm_mlp_gate_up` | 167.1 | 83.6 | 94.7 | 47.4 |
+| `gemm_mlp_down` | 83.6 | 41.8 | 47.3 | 23.7 |
+| `gemm_attn_qkv` | 73.4 | 36.7 | 36.7 | 18.4 |
+| `chain_mlp_block` | 250.7 | 125.4 | 142.0 | 71.1 |
+| `chain_decode_layer` | 355.5 | 177.8 | 194.5 | 97.3 |
+| `gemm_mlp_gate_up` fp32_ref | 334.2 | 83.6 | 189.4 | 47.4 |
+
+These are per **one** layer's worth of that part. The MLP parts run in all 64
+layers and the attention parts in 16, so the planner can price residency for any
+subset of the stair from this table plus the layer counts in section 1. Every
+number is in `engines/manifest.json` as `weight_bytes_fold`,
+`weight_bytes_int8` and `memory_multiplier_vs_int8`, per engine, so the pricing
+does not depend on this table staying current.
+
+### The crossover question
+
+The fold trades **zero activation-quant kernels** against **2x the weight bytes
+moved**. At M=1 the GEMM is memory-bound GEMV: bytes dominate and the fold
+should lose on bandwidth while winning on kernel count. As M grows the weight
+bytes amortise across more rows. #368 measured the quant at 78 % of M=1 *eager*
+INT8 linear time -- but graph replay already cuts its share to ~11 %, so under
+graphs the fold is spending 2x bandwidth to win back a much smaller slice than
+the eager number suggests. Which way that lands, and **where it crosses**, is
+what decides which parts get folded. That is why the fold arms are measured
+under graphs against `torch_graph`, at M = 1, 2, 4, 8.
+
 ## 3. Regimes
 
 `M in {1, 2, 4, 8}`. Decode at bs=1 is the operating point that matters most and

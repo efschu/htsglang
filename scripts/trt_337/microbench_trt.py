@@ -125,8 +125,24 @@ ARMS = [
     "trt_enqueue",
     "trt_native_graph",
     "trt_outer_graph",
+    "trt_fold_bf16_graph",
+    "trt_fold_fp16_graph",
+    "trt_fp32_ref_graph",
 ]
-DEFAULT_A2 = "torch_graph,trt_outer_graph"
+#: fold variants: the WHOLE chain is one engine and no activation quant runs at
+#: all, so these arms have no torch-side stage structure to mirror -- they are
+#: one engine call, captured in one graph, compared against torch_graph.
+FOLD_ARMS = {
+    "trt_fold_bf16_graph": "fold_bf16",
+    "trt_fold_fp16_graph": "fold_fp16",
+    "trt_fp32_ref_graph": "fp32_ref",
+}
+DEFAULT_A2 = "torch_graph,trt_outer_graph,trt_fold_bf16_graph"
+FOLD_TORCH_DTYPE = {
+    "fold_bf16": "bfloat16",
+    "fold_fp16": "float16",
+    "fp32_ref": "float32",
+}
 MOCK_MAGIC = b"MOCK337\x00"
 
 
@@ -201,6 +217,37 @@ def load_kernels(mock: bool) -> Kernels:
 # --------------------------------------------------------------------------
 # Engine wrappers -- real and stub, same interface
 # --------------------------------------------------------------------------
+
+
+class StubFoldEngine:
+    """Torch stand-in for a fold engine: the whole chain, dense weights.
+
+    Mirrors build_fold_network op for op so --mock exercises the fold arms.
+    """
+
+    def __init__(self, target, dense_weights, fold_dtype):
+        self.target = target
+        self.w = dense_weights
+        self.fold_dtype = fold_dtype
+        self.stub = True
+        self.jit_seconds = 0.0
+
+    def run_fold(self, x):
+        import torch
+
+        cur = x
+        for st in self.target.stages:
+            if st.kind == "quant":
+                continue
+            if st.kind == "bridge":
+                cur = cur[:, : st.out_width].contiguous()
+                continue
+            cur = cur @ self.w[st.name].t()
+            if st.gemm.epilogue == "silu_mul":
+                half = cur.shape[-1] // 2
+                gate, up = cur[:, :half], cur[:, half:]
+                cur = torch.nn.functional.silu(gate) * up
+        return cur.to(torch.bfloat16)
 
 
 class StubEngine:
@@ -302,6 +349,18 @@ class TrtEngine:
             self._out = torch.empty(shp, dtype=torch.bfloat16, device=self.device)
         self.ctx.set_tensor_address("a_q", a_q.data_ptr())
         self.ctx.set_tensor_address("a_scale", a_scale.data_ptr())
+        self.ctx.set_tensor_address("out", self._out.data_ptr())
+        return self._out
+
+    def bind_fold(self, x, m: int):
+        """One dense input, one output. No scale, no quantized activation."""
+        import torch
+
+        self.ctx.set_input_shape("x", (m, x.shape[1]))
+        shp = tuple(self.ctx.get_tensor_shape("out"))
+        if self._out is None or tuple(self._out.shape) != shp:
+            self._out = torch.empty(shp, dtype=torch.bfloat16, device=self.device)
+        self.ctx.set_tensor_address("x", x.data_ptr())
         self.ctx.set_tensor_address("out", self._out.data_ptr())
         return self._out
 
@@ -499,6 +558,25 @@ class Chain:
             torch.randn(m, k0, generator=g, dtype=torch.float32).to(device).to(dtype)
         )
         self.stream = torch.cuda.current_stream() if device.type == "cuda" else None
+        self.fold_engine = None
+        self.exact_weights = {}
+        self.x_fold = self.x
+
+    def attach_fold(self, engine, fold_dtype):
+        """Bind a fold engine and the input cast its network declares.
+
+        The input is cast, not re-sampled: both arms must see the same numbers,
+        and a fold arm fed different randoms would be measuring the randoms.
+        """
+        import torch
+
+        self.fold_engine = engine
+        self.x_fold = self.x.to(getattr(torch, fold_dtype)).contiguous()
+        return self
+
+    def attach_exact(self, weights):
+        self.exact_weights = weights
+        return self
 
     def _engine_for(self, stage):
         return self.engines[stage.name]
@@ -532,6 +610,46 @@ class Chain:
                 cur = out
         return cur
 
+    def fold_step(self):
+        """The whole part as ONE engine call. No quant kernel runs at all.
+
+        This is what the fold buys structurally, before any timing: the INT8
+        arms are per-stage engine islands with our quant kernel between them,
+        because TensorRT cannot express a per-token dynamic scale. Folded, there
+        is nothing left to express -- one input, one engine, one graph node.
+        """
+        e = self.fold_engine
+        if e.stub:
+            return e.run_fold(self.x_fold)
+        e.bind_fold(self.x_fold, self.m)
+        return e.enqueue(self.stream)
+
+    def exact_reference(self):
+        """fp32 ground truth from the dequantized weights.
+
+        w_q * w_scale is exact -- it IS the checkpoint's weight, just in a wider
+        container. Computing the chain from it in fp32 gives the value both the
+        deployed path and the fold are approximating, so each one's error can be
+        measured against the same target instead of against each other. That is
+        what turns "the fold is quality-neutral" from a claim into a number.
+        """
+        import torch
+
+        cur = self.x.float()
+        for st in self.target.stages:
+            if st.kind == "quant":
+                continue
+            if st.kind == "bridge":
+                cur = cur[:, : st.out_width].contiguous()
+                continue
+            w = self.exact_weights[st.name]
+            cur = cur @ w.t()
+            if st.gemm.epilogue == "silu_mul":
+                half = cur.shape[-1] // 2
+                gate, up = cur[:, :half], cur[:, half:]
+                cur = torch.nn.functional.silu(gate) * up
+        return cur
+
     def trt_step(self):
         """The same part with every GEMM stage served by an engine."""
         cur = self.x
@@ -554,6 +672,29 @@ class Chain:
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+
+
+def _dense_weight(spec, geo, model_dir, random_weights, seed, device, torch_dtype):
+    """w_q x per-channel scale, in the fold's storage dtype.
+
+    Same loader and same slicing as the INT8 arms, so the fold arm and the
+    deployed arm differ in exactly one thing: where the dequantize happens.
+    """
+    import torch
+
+    w = tgt.load_gemm_weights(spec, geo, model_dir, random_weights, seed)
+    dense = w.q.to(torch.float32) * w.scale.reshape(-1, 1).to(torch.float32)
+    return dense.to(getattr(torch, torch_dtype)).to(device)
+
+
+def _exact_weights(target, geo, model_dir, random_weights, seed, device):
+    """fp32 dequantized weights for the exact reference."""
+    return {
+        st.name: _dense_weight(
+            st.gemm, geo, model_dir, random_weights, seed, device, "float32"
+        )
+        for st in target.engine_stages
+    }
 
 
 def build_torch_weights(target, manifest, rank, geo, model_dir, random_weights,
@@ -611,6 +752,11 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="")
     ap.add_argument("--mock", action="store_true")
     ap.add_argument("--no-nvml", action="store_true")
+    ap.add_argument(
+        "--quality-reference",
+        action="store_true",
+        help="compute the exact fp32 reference even when no fold arm runs",
+    )
     a = ap.parse_args(argv)
 
     import torch
@@ -624,7 +770,10 @@ def main(argv=None) -> int:
     arms = [x for x in a.arms.split(",") if x]
     a2_arms = [x for x in a.a2_arms.split(",") if x]
     if a.mock:
-        arms = [x for x in arms if x in ("torch_eager", "trt_enqueue")]
+        # CUDA-graph arms cannot run on a CPU; everything else can, including
+        # the fold arms, which are the point of the mock now that they exist.
+        keep = ("torch_eager", "trt_enqueue", *FOLD_ARMS)
+        arms = [x for x in arms if x in keep]
         a2_arms = [x for x in a2_arms if x in arms] or ["torch_eager"]
 
     geo = tgt.derive_geometry(a.config, a.tp_size, ratio, a.rank)
@@ -738,10 +887,62 @@ def main(argv=None) -> int:
                     }
                 )
 
+        # ---- fold engines: one per variant for the WHOLE target ----
+        fold_engines = {}
+        for arm, variant in FOLD_ARMS.items():
+            if arm not in arms:
+                continue
+            plan = os.path.join(
+                a.engine_dir,
+                f"rank{a.rank}_{geo.arch}_{target.name}.{variant}.plan",
+            )
+            if not os.path.exists(plan):
+                # fp32_ref is built for one shape only, by design.
+                out.setdefault("skipped_fold_arms", []).append(
+                    {"target": target.name, "arm": arm, "reason": "no engine built"}
+                )
+                continue
+            with open(plan, "rb") as fh:
+                head = fh.read(len(MOCK_MAGIC))
+            torch_dtype = FOLD_TORCH_DTYPE[variant]
+            if head == MOCK_MAGIC or a.mock:
+                dense = {
+                    st.name: _dense_weight(
+                        st.gemm, geo, a.model_dir, a.random_weights, a.seed,
+                        device, torch_dtype,
+                    )
+                    for st in target.engine_stages
+                }
+                fold_engines[arm] = (StubFoldEngine(target, dense, torch_dtype),
+                                     torch_dtype)
+            else:
+                cache_path = ""
+                if a.runtime_cache_dir:
+                    cache_path = os.path.join(
+                        a.runtime_cache_dir,
+                        f"{out['environment']['capability']}_"
+                        f"rank{a.rank}_{target.name}.{variant}.cache",
+                    )
+                t0 = time.time()
+                eng = TrtEngine(
+                    trt, logger, plan, "DISABLED", a.kernel_specialization,
+                    cache_path, profile_opts, device, mode="fold",
+                )
+                fold_engines[arm] = (eng, torch_dtype)
+                out["jit_warmup"].append(
+                    {
+                        "target": target.name,
+                        "stage": f"{target.name}.{variant}",
+                        "deserialize_seconds": round(time.time() - t0, 3),
+                        "runtime_cache_preloaded": eng.cache_preloaded,
+                        "runtime_cache_path": cache_path,
+                    }
+                )
+
         for m in ms:
             point = run_point(
                 target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
-                cuda, mon, trt, logger, profile_opts, out,
+                cuda, mon, trt, logger, profile_opts, out, fold_engines, geo,
             )
             point["target"] = target.name
             point["m"] = m
@@ -778,7 +979,8 @@ def _med(point, arm):
 
 
 def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
-              cuda, mon, trt, logger, profile_opts, out) -> dict:
+              cuda, mon, trt, logger, profile_opts, out, fold_engines=None,
+              geo=None) -> dict:
     """One (target, M) operating point: every arm, interleaved, same rotation."""
     import torch
 
@@ -864,6 +1066,22 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
                         # capture DISABLED, and the whole part -- our quant
                         # kernels included -- captured in one outer graph.
                         fn, div = graphed(make_chain(off, True).trt_step)
+                elif name in FOLD_ARMS:
+                    if not cuda and not a.mock:
+                        continue
+                    if not fold_engines or name not in fold_engines:
+                        continue
+                    eng, fold_dtype = fold_engines[name]
+                    ch = make_chain(off, True).attach_fold(eng, fold_dtype)
+                    if not a.mock and not eng.stub:
+                        eng.select_profile(m, torch.cuda.current_stream())
+                        for _ in range(3):
+                            ch.fold_step()
+                        torch.cuda.synchronize()
+                    if cuda:
+                        fn, div = graphed(ch.fold_step)
+                    else:
+                        fn, div = ch.fold_step, 1
                 else:
                     continue
             except Exception as ex:
@@ -924,6 +1142,13 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
         ("torch_eager", "torch_graph", "our_launch_axis"),
         ("trt_enqueue", "trt_native_graph", "trt_launch_axis"),
         ("trt_outer_graph", "torch_eager", "DO_NOT_QUOTE_trt_graph_over_eager"),
+        # The fold crossover. Both sides are graph-captured, so what is left is
+        # exactly the trade the fold makes: one engine and zero activation-quant
+        # kernels, against 2x the weight bytes moved in a memory-bound GEMV.
+        ("trt_fold_bf16_graph", "torch_graph", "fold_bf16_over_torch_graph"),
+        ("trt_fold_fp16_graph", "torch_graph", "fold_fp16_over_torch_graph"),
+        ("trt_fold_bf16_graph", "trt_outer_graph", "fold_bf16_over_trt_int8"),
+        ("trt_fp32_ref_graph", "torch_graph", "DIAGNOSTIC_fp32_ref_over_torch_graph"),
     ):
         if num in rec["arms"] and den in rec["arms"]:
             verdict[key] = (
@@ -934,16 +1159,28 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
     if r is not None and f == f:
         verdict["inside_noise_floor"] = abs(1.0 - r) <= f
     verdict["reading"] = (
-        "trt_over_torch_graph is the verdict: < 1.0 means the engine wins with "
-        "the launch axis removed from BOTH sides. "
-        "DO_NOT_QUOTE_trt_graph_over_eager double counts the CUDA-graph win and "
-        "is recorded only so nobody has to recompute it to see that."
+        "trt_over_torch_graph is the verdict for the same-precision question: "
+        "< 1.0 means the engine wins with the launch axis removed from BOTH "
+        "sides. fold_*_over_torch_graph is the fold crossover: the fold removes "
+        "every activation-quant kernel (78 % of M=1 eager INT8 linear time per "
+        "#368, though graph replay already shrinks that share to ~11 %) and "
+        "pays 2x the weight bytes in a memory-bound GEMV -- so it should win at "
+        "small M and lose as M grows, and WHERE it crosses decides which parts "
+        "get the fold. DO_NOT_QUOTE_trt_graph_over_eager double counts the "
+        "CUDA-graph win. DIAGNOSTIC_fp32_ref_* is not a deployment candidate at "
+        "4 bytes per weight; it isolates TensorRT runtime quality from the "
+        "quantization constraints and nothing else."
     )
     rec["verdict"] = verdict
 
-    # ---- tolerance ----
+    # ---- tolerance, and the quality question the fold arms raise ----
     rec["tolerance"] = compare_outputs(target, engines, tw, kn, m, device, dtype,
                                        a, cuda)
+    if geo is not None and (fold_engines or a.quality_reference):
+        rec["quality"] = compare_quality(
+            target, engines, tw, kn, fold_engines or {}, m, device, dtype, a,
+            geo, cuda,
+        )
     rec["clocks"]["after"] = mon.sample()
     return rec
 
@@ -953,6 +1190,91 @@ def e_plan_path(a, out, st):
         a.engine_dir,
         f"rank{a.rank}_{out['settings']['arch']}_{st.gemm.name}.plan",
     )
+
+
+def compare_quality(target, engines, tw, kn, fold_engines, m, device, dtype, a,
+                    geo, cuda) -> dict:
+    """Every path's error against the SAME exact fp32 reference.
+
+    The fold's quality argument is that it removes error rather than adding it:
+    the weight grid is untouched (w_q * w_scale is exact, just stored wider) and
+    the per-token activation quantization disappears entirely. That is a
+    testable claim, so it is tested rather than asserted.
+
+    The gate is not a fixed tolerance -- it is RELATIVE TO WHAT WE DEPLOY: a fold
+    passes if its error against exact is no larger than the deployed INT8 path's
+    error against exact. Comparing the fold to the deployed OUTPUT instead would
+    measure the deployed path's own quantization error and call it a fold defect.
+    """
+    import torch
+
+    try:
+        exact_w = _exact_weights(
+            target, geo, a.model_dir, a.random_weights, a.seed, device
+        )
+        ref_chain = Chain(target, tw, kn, m, device, dtype, a.seed, False)
+        ref_chain.attach_exact(exact_w)
+        with torch.no_grad():
+            exact = ref_chain.exact_reference()
+            deployed = ref_chain.torch_step().float()
+        if cuda:
+            torch.cuda.synchronize()
+
+        scale = exact.abs().amax().clamp(min=1e-6)
+
+        def err(v):
+            return float((v - exact).abs().amax() / scale)
+
+        out = {
+            "exact_absmax": float(scale),
+            "deployed_int8_err_vs_exact": err(deployed),
+            "note": (
+                "errors are max-abs against an fp32 chain computed from the "
+                "dequantized checkpoint weights. A fold arm is quality-neutral "
+                "if its error is <= the deployed path's."
+            ),
+            "arms": {},
+        }
+        for arm, (eng, fold_dtype) in fold_engines.items():
+            ch = Chain(target, engines, kn, m, device, dtype, a.seed, True)
+            ch.attach_fold(eng, fold_dtype)
+            with torch.no_grad():
+                got = ch.fold_step().float()
+            if cuda:
+                torch.cuda.synchronize()
+            finite = bool(torch.isfinite(got).all())
+            e = err(got) if finite else float("nan")
+            entry = {
+                "err_vs_exact": e,
+                "storage_dtype": fold_dtype,
+                "finite": finite,
+                "at_least_as_accurate_as_deployed": (
+                    finite and e <= out["deployed_int8_err_vs_exact"]
+                ),
+                "err_vs_deployed_output": (
+                    float((got - deployed).abs().amax() / scale)
+                    if finite else float("nan")
+                ),
+            }
+            if not finite:
+                # fp16 keeps 11 mantissa bits but only 5 exponent bits, so its
+                # max representable value is 65504. bf16 has fp32's exponent
+                # range and cannot overflow where fp32 does not. In a chain of
+                # several GEMMs the intermediate magnitudes compound, and that
+                # is where the difference stops being academic. Recorded as a
+                # RESULT about fp16 in this chain, not swallowed.
+                entry["overflow"] = (
+                    "non-finite output: fp16 exponent range exceeded somewhere "
+                    "in the chain. bf16 carries fp32's exponent range and is "
+                    "not exposed to this."
+                )
+                entry["max_abs_finite_intermediate"] = float(
+                    got[torch.isfinite(got)].abs().amax()
+                ) if torch.isfinite(got).any() else float("inf")
+            out["arms"][arm] = entry
+        return out
+    except Exception as ex:
+        return {"error": f"{type(ex).__name__}: {ex}"}
 
 
 def compare_outputs(target, engines, tw, kn, m, device, dtype, a, cuda) -> dict:

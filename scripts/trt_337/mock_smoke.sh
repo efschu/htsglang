@@ -45,11 +45,12 @@ else
   echo "tensorrt_rtx not on PYTHONPATH -- skipping probe (mock path continues)"
 fi
 
-step "3/6 stub engine build"
+step "3/6 stub engine build (INT8 per-stage AND fold whole-chain variants)"
 "$PY" "$HERE/build_engines.py" --mock --random-weights --ranks 0 \
+  --precision int8,fold_bf16,fold_fp16,fp32_ref \
   --out-dir "$WORK/engines"
 
-step "4/6 harness over every target, stub engines, CPU"
+step "4/6 harness over every target and every arm, stub engines, CPU"
 "$PY" "$HERE/microbench_trt.py" --mock --engine-dir "$WORK/engines" \
   --random-weights --rank 0 --m 1,4 \
   --min-point-seconds 0.2 --min-arm-seconds 0.05 --target-ms 2 \
@@ -71,6 +72,7 @@ d = json.load(open(sys.argv[1]))
 assert d["mock"] is True, "mock run must be stamped"
 assert d["results"], "no results emitted"
 bad = []
+fold_seen = set()
 for r in d["results"]:
     if not r.get("arms"):
         bad.append(f"{r['target']} M={r['m']}: no arm ran")
@@ -88,11 +90,41 @@ for r in d["results"]:
     for name, arm in r["arms"].items():
         if not arm.get("stub"):
             bad.append(f"{r['target']} M={r['m']} {name}: mock timing not stamped")
+        if name.startswith("trt_fold") or name.startswith("trt_fp32"):
+            fold_seen.add(name.replace("#A2", ""))
+    # The fold arms carry the quality claim, so the quality instrument has to
+    # have run wherever a fold arm ran -- an unmeasured claim is the thing this
+    # whole harness exists to avoid.
+    q = r.get("quality")
+    if any(n.startswith("trt_fold") for n in r["arms"]):
+        if not q or "error" in q:
+            bad.append(f"{r['target']} M={r['m']}: fold arm ran without a "
+                       f"quality reading ({q})")
+        else:
+            for name, qa in q.get("arms", {}).items():
+                if not qa.get("finite", True):
+                    # A real property of fp16 in a multi-GEMM chain, and the
+                    # mock's random weights make intermediates larger than the
+                    # checkpoint's would be. Reported loudly, not treated as a
+                    # harness failure -- the card run with real weights decides
+                    # whether it bites in practice.
+                    print(f"  NOTE {r['target']} M={r['m']} {name}: "
+                          f"{qa.get('overflow')}")
+                elif not qa.get("at_least_as_accurate_as_deployed"):
+                    bad.append(
+                        f"{r['target']} M={r['m']} {name}: fold is LESS accurate "
+                        f"than the deployed path ({qa.get('err_vs_exact')} vs "
+                        f"{q.get('deployed_int8_err_vs_exact')}) -- the "
+                        f"quality-neutrality premise does not hold here"
+                    )
+if not {"trt_fold_bf16_graph", "trt_fold_fp16_graph"} <= fold_seen:
+    bad.append(f"fold arms never ran; only saw {sorted(fold_seen)}")
 if bad:
     print("FAIL"); [print("  " + b) for b in bad]; sys.exit(1)
 print(f"OK: {len(d['results'])} points, "
       f"{sum(len(r['arms']) for r in d['results'])} arm measurements, "
-      f"tolerance path exercised on every point")
+      f"fold arms {sorted(fold_seen)}, "
+      f"tolerance and quality paths exercised on every point")
 EOF
 
 printf '\nmock smoke GREEN -- artifacts under %s\n' "$WORK"
