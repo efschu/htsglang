@@ -939,8 +939,11 @@ class _RunningFakeSupervisor(_FakeSupervisor):
 
 
 def _reset_landing_state():
-    webui._LANDING_SNAPSHOT_STATE = None
-    webui._LANDING_TARGET_KEY = None
+    # a587cbe2fa (#533) replaced the single _LANDING_SNAPSHOT_STATE slot and
+    # its _LANDING_TARGET_KEY with per-target baselines in
+    # _LANDING_STATE_BY_KEY. Assigning the retired globals here reset nothing
+    # and let one test's baseline leak into the next through the live map.
+    webui._LANDING_STATE_BY_KEY.clear()
     webui._DETECTED_ENDPOINT = None
 
 
@@ -987,7 +990,7 @@ class TestLandingSnapshotRoute(CustomTestCase):
         request keeps going. A slow /metrics scrape (contended for CPU/IO by
         real inference work) can therefore still be in flight when the NEXT
         poll's request starts on a second thread, and without serialization
-        the two requests interleave their read of _LANDING_SNAPSHOT_STATE:
+        the two requests interleave their read of _LANDING_STATE_BY_KEY:
         whichever call WRITES last wins, even if it read an older baseline,
         which regresses the stored state and hands the next poll a t_prev
         that live_metrics._rates() treats as an "out-of-order scrape" --
@@ -1504,17 +1507,23 @@ class TestMonitorTargetResolution(CustomTestCase):
         self.assertIsNone(d["snapshot"])
         self.assertIsNone(d["target"])
 
-    def test_target_switch_resets_delta_state(self):
+    def test_two_targets_never_share_a_delta_baseline(self):
         # Counters from two different servers must never be subtracted: the
-        # second (switched) poll must start with prev_state=None.
+        # second (switched) poll must start with prev_state=None. Since
+        # a587cbe2fa (#533) that holds because each target owns its own
+        # baseline under key (kind, label), NOT because a single shared slot
+        # is wiped on every target change -- so the first target's baseline
+        # must also SURVIVE the second poll.
+        k0 = ("explicit", "http://127.0.0.1:30000")
         with mock.patch(
             "sglang.srt.planner.live_metrics.snapshot",
             return_value=self._snap(),
         ) as m:
             webui.landing_snapshot_payload({"endpoint": "127.0.0.1:30000"})
-            self.assertIsNotNone(webui._LANDING_SNAPSHOT_STATE)
+            self.assertIn(k0, webui._LANDING_STATE_BY_KEY)
             webui.landing_snapshot_payload({"endpoint": "127.0.0.1:30100"})
         self.assertIsNone(m.call_args_list[1].kwargs["prev_state"])
+        self.assertIn(k0, webui._LANDING_STATE_BY_KEY)
 
     def test_detect_endpoint_payload_probes_ports(self):
         with mock.patch.object(

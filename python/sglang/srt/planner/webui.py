@@ -3173,7 +3173,9 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
     monitored and whether it is managed or external; an external target has
     no LaunchSettings, so live_metrics falls back to /get_server_info for the
     start config. The delta ``state`` is kept module-side only (never
-    persisted) and is reset whenever the target changes."""
+    persisted) and is stored PER TARGET KEY (#533), so counters from two
+    targets are never subtracted -- rather than one shared slot being wiped
+    whenever the target changes, which is what it used to do."""
     from sglang.srt.planner import live_metrics
 
     global _LANDING_STATE_BY_KEY
