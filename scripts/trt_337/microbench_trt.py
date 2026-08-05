@@ -219,6 +219,195 @@ def load_kernels(mock: bool) -> Kernels:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# Signature conformance: run the REAL TrtEngine against a fake library
+# --------------------------------------------------------------------------
+
+
+class _FakeTrt:
+    """The slice of the tensorrt_rtx API surface that TrtEngine actually uses.
+
+    Why this exists: the mock previously substituted a StubFoldEngine for the
+    whole TrtEngine class, so the real constructor and the real call sites were
+    never executed on the desk. A ``TrtEngine(..., mode="fold")`` kwarg that did
+    not exist passed every mock run and died on the first card invocation with a
+    TypeError, after a window had already been claimed.
+
+    So the mock now drives the REAL TrtEngine through the REAL call sequence --
+    construct, select_profile, bind, enqueue, save_cache, layer_information --
+    with only the library underneath faked. The numerics still come from the
+    stub engines; this checks the thing the stub cannot check, which is that
+    every signature at every call site is one that exists.
+    """
+
+    class Logger:
+        VERBOSE = 0
+        WARNING = 1
+
+        def __init__(self, level=1):
+            self.level = level
+
+    class DataType:
+        INT8 = "int8"
+        BF16 = "bf16"
+        HALF = "fp16"
+        FLOAT = "fp32"
+
+    class CudaGraphStrategy:
+        DISABLED = "disabled"
+        WHOLE_GRAPH_CAPTURE = "whole"
+
+    class DynamicShapesKernelSpecializationStrategy:
+        EAGER = "eager"
+        LAZY = "lazy"
+        NONE = "none"
+
+    class LayerInformationFormat:
+        JSON = "json"
+
+    class _Cache:
+        def deserialize(self, blob):
+            return True
+
+        def serialize(self):
+            return b"fake-runtime-cache"
+
+    class _RuntimeConfig:
+        def __init__(self):
+            self.cuda_graph_strategy = None
+            self.dynamic_shapes_kernel_specialization_strategy = None
+            self._cache = None
+
+        def create_runtime_cache(self):
+            return _FakeTrt._Cache()
+
+        def set_runtime_cache(self, cache):
+            self._cache = cache
+            return True
+
+        def get_runtime_cache(self):
+            return self._cache
+
+    class _Context:
+        def __init__(self, shapes):
+            self._shapes = shapes
+            self._addr = {}
+            self.profile = None
+
+        def set_optimization_profile_async(self, idx, stream_handle):
+            self.profile = idx
+            return True
+
+        def set_input_shape(self, name, shape):
+            self._shapes[name] = tuple(shape)
+            return True
+
+        def get_tensor_shape(self, name):
+            m = next(iter(self._shapes.values()))[0] if self._shapes else 1
+            return (m, self._shapes.get("__out_width__", (1, 1))[1])
+
+        def set_tensor_address(self, name, ptr):
+            self._addr[name] = ptr
+            return True
+
+        def execute_async_v3(self, stream_handle):
+            # Recorded so a test can assert WHICH stream the call was given --
+            # the defect this whole file now guards against.
+            _FakeTrt.last_stream_handle = stream_handle
+            return True
+
+    class _Engine:
+        def __init__(self, out_width):
+            self._shapes = {"__out_width__": (1, out_width)}
+
+        def create_runtime_config(self):
+            return _FakeTrt._RuntimeConfig()
+
+        def create_execution_context(self, runtime_config=None):
+            return _FakeTrt._Context(self._shapes)
+
+        def create_engine_inspector(self):
+            class _I:
+                execution_context = None
+
+                def get_engine_information(self, fmt):
+                    return json.dumps({"fake": True, "format": str(fmt)})
+
+            return _I()
+
+    class Runtime:
+        def __init__(self, logger):
+            self.logger = logger
+
+        def deserialize_cuda_engine(self, plan):
+            return _FakeTrt._Engine(_FakeTrt.out_width)
+
+    __version__ = "fake-0"
+    out_width = 8
+    last_stream_handle = None
+
+
+def signature_conformance_check(plan_path, out_width, device, profile_opts,
+                                spec_strategy) -> dict:
+    """Drive the real TrtEngine through every real call site, faked underneath.
+
+    Returns a record rather than raising, so the mock smoke can assert on it and
+    print something actionable when a signature drifts.
+    """
+    import torch
+
+    steps = []
+    try:
+        _FakeTrt.out_width = out_width
+        trt = _FakeTrt
+        logger = trt.Logger(trt.Logger.WARNING)
+        eng = TrtEngine(
+            trt, logger, plan_path, "DISABLED", spec_strategy, "",
+            profile_opts, device,
+        )
+        steps.append("construct")
+
+        class _S:
+            cuda_stream = 12345
+
+            def synchronize(self):
+                return None
+
+        eng.select_profile(1, _S())
+        steps.append("select_profile")
+
+        x = torch.zeros(1, 4, dtype=torch.bfloat16, device=device)
+        eng.bind_fold(x, 1)
+        steps.append("bind_fold")
+
+        a_q = torch.zeros(1, 4, dtype=torch.int8, device=device)
+        a_scale = torch.ones(1, 1, dtype=torch.float32, device=device)
+        eng.bind(a_q, a_scale, 1)
+        steps.append("bind")
+
+        eng.enqueue(_S())
+        steps.append("enqueue")
+        if _FakeTrt.last_stream_handle != 12345:
+            raise AssertionError(
+                f"enqueue passed stream handle "
+                f"{_FakeTrt.last_stream_handle!r}, not the one it was given"
+            )
+        steps.append("enqueue_used_given_stream")
+
+        eng.layer_information()
+        steps.append("layer_information")
+        eng.save_cache()
+        steps.append("save_cache")
+        return {"pass": True, "steps": steps}
+    except Exception as ex:
+        return {
+            "pass": False,
+            "steps": steps,
+            "failed_after": steps[-1] if steps else "<nothing>",
+            "error": f"{type(ex).__name__}: {ex}",
+        }
+
+
 class StubFoldEngine:
     """Torch stand-in for a fold engine: the whole chain, dense weights.
 
@@ -458,6 +647,134 @@ def rounds_for_duration(
     return rounds
 
 
+def verify_graph_contains_engines(graph, engines, cuda, sync=None) -> dict:
+    """Prove the captured graph actually executes the engines.
+
+    A CUDA graph that silently lost its engine work replays in tens of
+    nanoseconds and looks like a triumph. The only reliable way to tell a fast
+    graph from an EMPTY one is to ask whether the work's side effect happened:
+    poison every engine output buffer, replay once, and require every buffer to
+    have been overwritten with finite values.
+
+    Cheap, unambiguous, and it fails loudly on exactly the defect that produced
+    window 6's fold numbers.
+    """
+    import torch
+
+    if not cuda or not engines:
+        return {"checked": False, "reason": "no real engine in this arm"}
+    poisoned = []
+    for e in engines:
+        buf = getattr(e, "_out", None)
+        if buf is None:
+            return {"checked": False, "reason": "engine has no bound output yet"}
+        buf.fill_(float("nan"))
+        poisoned.append(buf)
+    graph.replay()
+    (sync or torch.cuda.synchronize)()
+    stale = [
+        i for i, b in enumerate(poisoned) if not bool(torch.isfinite(b).all())
+    ]
+    return {
+        "checked": True,
+        "engines": len(poisoned),
+        "stale_engine_indices": stale,
+        "verified": not stale,
+        "reason": (
+            ""
+            if not stale
+            else (
+                f"{len(stale)} of {len(poisoned)} engine output buffers were "
+                f"still the poison value after replay: the engine work is NOT "
+                f"in the graph. Any timing from this arm measures an empty or "
+                f"partial graph."
+            )
+        ),
+    }
+
+
+def judge_arm(median_ms: float, nbytes: int, floor_ms: float,
+              slack: float) -> dict:
+    """The plausibility decision, with no CUDA in it so it can be tested.
+
+    An arm is INVALID when it claims to have done a GEMM over ``nbytes`` of
+    weights in less time than the same card needs to merely read ``nbytes``.
+    """
+    entry = {
+        "min_weight_bytes": int(nbytes),
+        "median_ms": median_ms,
+        "implied_gbps": (nbytes / (median_ms * 1e-3)) / 1e9 if median_ms > 0
+        else float("inf"),
+    }
+    if floor_ms is None or floor_ms <= 0:
+        entry["valid"] = True
+        entry["reason"] = "no floor measured"
+        return entry
+    entry["floor_ms"] = floor_ms
+    entry["floor_gbps"] = (nbytes / (floor_ms * 1e-3)) / 1e9
+    entry["ratio_to_floor"] = median_ms / floor_ms
+    entry["valid"] = entry["ratio_to_floor"] >= (1.0 - slack)
+    entry["reason"] = (
+        ""
+        if entry["valid"]
+        else (
+            f"{median_ms:.3e} ms is below the measured floor for merely "
+            f"reading this arm's {nbytes/1e6:.1f} MB of weights "
+            f"({floor_ms:.3e} ms, {entry['floor_gbps']:.0f} GB/s). Implied "
+            f"traffic {entry['implied_gbps']:.0f} GB/s. The arm is not "
+            f"executing the work it claims to time."
+        )
+    )
+    return entry
+
+
+def byte_touch_floor(nbytes: int, device, graph_bodies: int, target_ms: float,
+                     max_iters: int, cuda: bool) -> dict:
+    """How long it takes this card to merely READ nbytes, measured, not assumed.
+
+    The plausibility guard needs a ceiling on speed, and a datasheet bandwidth
+    figure is the wrong one: under graph replay the same weights are read 32
+    times back to back and land in L2, so an arm can legitimately exceed HBM
+    bandwidth. A hardcoded constant would then flag honest arms and still have
+    to be maintained per card.
+
+    So the ceiling is measured on the same card, in the same capture mode, over
+    the same number of bytes: a pure reduction over a buffer of exactly that
+    size. No GEMM over W can be faster than reading W. An arm below this floor
+    is not fast, it is not running.
+    """
+    import torch
+
+    if not cuda:
+        return {"measured": False, "reason": "cpu"}
+    try:
+        buf = torch.empty(int(nbytes), dtype=torch.uint8, device=device)
+
+        def probe():
+            return buf.sum(dtype=torch.int64)
+
+        iters, _ = calibrate(probe, target_ms, cuda, max_iters)
+        g = capture_graph(probe, graph_bodies)
+        samples = [time_burst(g.replay, max(1, iters // graph_bodies), cuda)
+                   / graph_bodies for _ in range(5)]
+        ms = statistics.median(samples)
+        result = {
+            "measured": True,
+            "bytes": int(nbytes),
+            "floor_ms": ms,
+            "achieved_gbps": (nbytes / (ms * 1e-3)) / 1e9,
+        }
+        # The probe buffer is as large as the arm's weights; release it before
+        # the next floor is measured, or the two compete for VRAM. Not `del buf`
+        # -- the closure still closes over it, and a deleted free variable is a
+        # latent NameError the linter is right to refuse.
+        g = probe = None
+        torch.cuda.empty_cache()
+        return result
+    except Exception as ex:
+        return {"measured": False, "reason": f"{type(ex).__name__}: {ex}"}
+
+
 def summarize(samples) -> dict:
     s = sorted(samples)
     return {
@@ -576,10 +893,43 @@ class Chain:
         self.x = (
             torch.randn(m, k0, generator=g, dtype=torch.float32).to(device).to(dtype)
         )
-        self.stream = torch.cuda.current_stream() if device.type == "cuda" else None
+        # NO stream is stored here. See _cur_stream(): a stream captured at
+        # construction is the defect that made every graph arm lie.
+        self.is_cuda = device.type == "cuda"
         self.fold_engine = None
         self.exact_weights = {}
         self.x_fold = self.x
+
+    def _cur_stream(self):
+        """The stream that is active RIGHT NOW, resolved per call.
+
+        This is the fix for the defect window 6 measured. The old code stored
+        ``torch.cuda.current_stream()`` on the Chain at construction and passed
+        that to ``execute_async_v3`` forever after. Inside
+        ``with torch.cuda.graph(g):`` torch makes a private capture stream
+        current, so the stored stream is NOT the capturing one -- the engine
+        work was launched on the old stream, escaped the capture, and the graph
+        replayed without it.
+
+        The evidence, from window 6 on the 5090 at M=1:
+
+          trt_fold_*_graph  3.39e-05 ms, IDENTICAL across bf16/fp16/fp32 and
+                            identical across targets of 36 MB, 83 MB and
+                            178 MB -- an empty graph replay, nothing else is
+                            size- and precision-independent.
+          trt_outer_graph   1.345 / 1.409 / 1.344 ms for gate_up / down / qkv,
+                            again size-independent, and 2x that for the 2-quant
+                            chain and 4x for the 4-quant chain. That arm was
+                            timing our quant kernels and NOTHING of the engine
+                            (#368 measured int8_quant under graph replay at
+                            0.0012 ms; this is that number, once per stage).
+
+        So the fold lane was not the only casualty: the INT8 verdict came from
+        the same hole. Both are re-measurements, not corrections to a result.
+        """
+        import torch
+
+        return torch.cuda.current_stream() if self.is_cuda else None
 
     def attach_fold(self, engine, fold_dtype):
         """Bind a fold engine and the input cast its network declares.
@@ -641,7 +991,27 @@ class Chain:
         if e.stub:
             return e.run_fold(self.x_fold)
         e.bind_fold(self.x_fold, self.m)
-        return e.enqueue(self.stream)
+        return e.enqueue(self._cur_stream())
+
+    def live_engines(self):
+        """Every real TensorRT engine this chain will execute, in order.
+
+        Used by the graph-content check to poison and then inspect each
+        engine's output buffer.
+        """
+        out = []
+        if self.fold_engine is not None and not getattr(
+            self.fold_engine, "stub", False
+        ):
+            out.append(self.fold_engine)
+        if self.use_trt:
+            for st in self.target.stages:
+                if st.kind != "engine":
+                    continue
+                e = self._engine_for(st)
+                if not getattr(e, "stub", False):
+                    out.append(e)
+        return out
 
     def exact_reference(self):
         """fp32 ground truth from the dequantized weights.
@@ -684,7 +1054,7 @@ class Chain:
                     cur = e.run(self.q, self.s)
                 else:
                     e.bind(self.q, self.s.float(), self.m)
-                    cur = e.enqueue(self.stream)
+                    cur = e.enqueue(self._cur_stream())
         return cur
 
 
@@ -771,7 +1141,23 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=337)
     ap.add_argument("--out", default="")
     ap.add_argument("--mock", action="store_true")
+    ap.add_argument(
+        "--expect-arch",
+        default="",
+        help="abort unless the visible card reports this SM arch (e.g. sm120). "
+             "The arm label and the card must agree; window 6 ran an arm "
+             "labelled sm120 on a 3080 because nvidia-smi index order is not "
+             "CUDA order. A prose warning does not survive; this does.",
+    )
     ap.add_argument("--no-nvml", action="store_true")
+    ap.add_argument(
+        "--plausibility-slack",
+        type=float,
+        default=0.10,
+        help="how far below the measured byte-touch floor an arm may sit "
+             "before it is ruled INVALID. 0.10 allows a 10 percent measurement "
+             "margin; it does not allow a physically impossible number.",
+    )
     ap.add_argument(
         "--quality-reference",
         action="store_true",
@@ -795,6 +1181,21 @@ def main(argv=None) -> int:
         keep = ("torch_eager", "trt_enqueue", *FOLD_ARMS)
         arms = [x for x in arms if x in keep]
         a2_arms = [x for x in a2_arms if x in arms] or ["torch_eager"]
+
+    if a.expect_arch:
+        got = ("sm%d%d" % torch.cuda.get_device_capability(0)) if cuda else "cpu"
+        if got != a.expect_arch:
+            raise SystemExit(
+                f"ARCH MISMATCH: --expect-arch {a.expect_arch} but the visible "
+                f"card reports {got} "
+                f"({torch.cuda.get_device_name(0) if cuda else 'no cuda'}, "
+                f"CUDA_VISIBLE_DEVICES="
+                f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}). "
+                f"nvidia-smi index order is NVML order and is NOT CUDA order; "
+                f"pin the card by UUID: "
+                f"CUDA_VISIBLE_DEVICES=$(python3 scripts/trt_337/select_card.py "
+                f"--arch {a.expect_arch})"
+            )
 
     geo = tgt.derive_geometry(a.config, a.tp_size, ratio, a.rank)
     all_targets = tgt.build_targets(geo, [x for x in a.optional.split(",") if x])
@@ -859,6 +1260,26 @@ def main(argv=None) -> int:
         "jit_warmup": [],
         "results": [],
     }
+
+    if a.mock:
+        # The one thing a stub engine cannot check: that every real call site's
+        # signature exists. Runs before any measurement so a drift fails fast.
+        any_plan = os.path.join(a.engine_dir, "manifest.json")
+        plan_files = [
+            os.path.join(a.engine_dir, f)
+            for f in sorted(os.listdir(a.engine_dir))
+            if f.endswith(".plan")
+        ]
+        out["signature_conformance"] = signature_conformance_check(
+            plan_files[0] if plan_files else any_plan,
+            out_width=8,
+            device=device,
+            profile_opts=profile_opts,
+            spec_strategy=a.kernel_specialization,
+        )
+        if not out["signature_conformance"]["pass"]:
+            print("SIGNATURE CONFORMANCE FAILED: "
+                  f"{out['signature_conformance']}")
 
     t_all = time.time()
     for target in all_targets:
@@ -1042,9 +1463,11 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
     if "trt_enqueue" in arms:
         builders["trt_enqueue"] = lambda off: make_chain(off, True).trt_step
 
+    graphs = {}
+
     def graphed(fn):
         g = capture_graph(fn, a.graph_bodies)
-        return lambda: g.replay(), a.graph_bodies
+        return lambda: g.replay(), a.graph_bodies, g
 
     lanes = {}
     for name in arms:
@@ -1059,7 +1482,8 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
                 elif name == "torch_graph":
                     if not cuda:
                         continue
-                    fn, div = graphed(make_chain(off, False).torch_step)
+                    fn, div, _g = graphed(make_chain(off, False).torch_step)
+                    graphs[name + suffix] = (_g, [])
                 elif name in ("trt_native_graph", "trt_outer_graph"):
                     if not cuda or a.mock:
                         continue
@@ -1086,7 +1510,9 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
                         # The deployment form: engines with their own graph
                         # capture DISABLED, and the whole part -- our quant
                         # kernels included -- captured in one outer graph.
-                        fn, div = graphed(make_chain(off, True).trt_step)
+                        _ch = make_chain(off, True)
+                        fn, div, _g = graphed(_ch.trt_step)
+                        graphs[name + suffix] = (_g, _ch.live_engines())
                 elif name in FOLD_ARMS:
                     if not cuda and not a.mock:
                         continue
@@ -1100,7 +1526,8 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
                             ch.fold_step()
                         torch.cuda.synchronize()
                     if cuda:
-                        fn, div = graphed(ch.fold_step)
+                        fn, div, _g = graphed(ch.fold_step)
+                        graphs[name + suffix] = (_g, ch.live_engines())
                     else:
                         fn, div = ch.fold_step, 1
                 else:
@@ -1110,6 +1537,15 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
                                     f"{type(ex).__name__}: {ex}")
                 continue
             lanes[name + suffix] = (fn, div)
+
+    # ---- the graph arms must PROVE they contain their engine work ----
+    rec["graph_verification"] = {}
+    for name, (g, engs) in graphs.items():
+        v = verify_graph_contains_engines(g, engs, cuda)
+        rec["graph_verification"][name] = v
+        if v.get("checked") and not v.get("verified"):
+            rec["notes"].append(f"{name}: INVALID -- {v['reason']}")
+            lanes.pop(name, None)
 
     if not lanes:
         rec["notes"].append("no runnable arm at this point")
@@ -1187,11 +1623,27 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
         rec["arms"][name]["iters"] = iters[name]
         rec["arms"][name]["stub"] = bool(a.mock)
 
+    # ---- plausibility: an arm cannot beat the time to read its own weights ----
+    rec["plausibility"] = plausibility_guard(
+        rec, target, a, device, cuda, geo,
+    )
+    invalid = [n for n, v in rec["plausibility"].get("arms", {}).items()
+               if not v.get("valid", True)]
+    for n in invalid:
+        rec["notes"].append(
+            f"{n}: INVALID -- {rec['plausibility']['arms'][n]['reason']}"
+        )
+        rec["arms"][n]["invalid"] = True
+
     # ---- A-vs-A floor and the verdict ----
+    # Invalid arms are excluded from every ratio. Averaging a number that the
+    # card cannot physically have produced is how a broken lane becomes a
+    # published verdict.
+    valid_arms = {k: v for k, v in rec["arms"].items() if not v.get("invalid")}
     verdict = {}
     for name in a2_arms:
-        if name in rec["arms"] and name + "#A2" in rec["arms"]:
-            x, y = rec["arms"][name]["median_ms"], rec["arms"][name + "#A2"]["median_ms"]
+        if name in valid_arms and name + "#A2" in valid_arms:
+            x, y = valid_arms[name]["median_ms"], valid_arms[name + "#A2"]["median_ms"]
             verdict[f"a2_spread_{name}"] = abs(x - y) / max(x, y, 1e-12)
     verdict["a2_floor_frac"] = max(
         [v for k, v in verdict.items() if k.startswith("a2_spread_")] or [float("nan")]
@@ -1209,9 +1661,13 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
         ("trt_fold_bf16_graph", "trt_outer_graph", "fold_bf16_over_trt_int8"),
         ("trt_fp32_ref_graph", "torch_graph", "DIAGNOSTIC_fp32_ref_over_torch_graph"),
     ):
-        if num in rec["arms"] and den in rec["arms"]:
+        if num in valid_arms and den in valid_arms:
             verdict[key] = (
-                rec["arms"][num]["median_ms"] / rec["arms"][den]["median_ms"]
+                valid_arms[num]["median_ms"] / valid_arms[den]["median_ms"]
+            )
+        elif num in rec["arms"] or den in rec["arms"]:
+            verdict[key + "_SUPPRESSED"] = (
+                "an operand arm was ruled invalid; no ratio is reported"
             )
     r = verdict.get("trt_over_torch_graph")
     f = verdict.get("a2_floor_frac")
@@ -1249,6 +1705,59 @@ def e_plan_path(a, out, st):
         a.engine_dir,
         f"rank{a.rank}_{out['settings']['arch']}_{st.gemm.name}.plan",
     )
+
+
+def arm_weight_bytes(target, arm: str) -> int:
+    """Bytes of weight an arm must move at least once per call.
+
+    The INT8 arms carry one byte per weight plus a bf16 per-output-channel
+    scale; the fold arms carry two (or four for the fp32 diagnostic). This is a
+    LOWER bound on traffic -- activations, the output and any spill are extra --
+    which is what makes it safe to use as a floor.
+    """
+    elems = sum(st.gemm.n * st.gemm.k for st in target.engine_stages)
+    chans = sum(st.gemm.n for st in target.engine_stages)
+    if "fold_bf16" in arm or "fold_fp16" in arm:
+        return elems * 2
+    if "fp32_ref" in arm:
+        return elems * 4
+    return elems + chans * 2
+
+
+def plausibility_guard(rec, target, a, device, cuda, geo) -> dict:
+    """Flag any arm that claims to move its weights faster than the card can.
+
+    Window 6 published three fold arms at 3.39e-05 ms -- identical across bf16,
+    fp16 and fp32, and identical across targets from 36 MB to 178 MB. That is
+    ~5000 TB/s of implied traffic on a card whose HBM does ~1.8 TB/s and whose
+    L2 does not approach it either. Nothing in the artifact said so, and the
+    number was averaged and reported like any other.
+
+    The ceiling is measured rather than assumed, because under graph replay the
+    same weights are re-read 32 times and can legitimately sit in L2 -- a
+    datasheet HBM figure would flag honest arms. The floor probe reads exactly
+    the same number of bytes on the same card in the same capture mode, so it
+    carries the same cache behaviour. An arm faster than "just read the bytes"
+    is not fast; it is not running.
+    """
+    out = {"slack": a.plausibility_slack, "arms": {}, "floors": {}}
+    if not cuda:
+        out["note"] = "cpu run: guard not applicable"
+        return out
+    for name, stats in rec["arms"].items():
+        base = name.replace("#A2", "")
+        nbytes = arm_weight_bytes(target, base)
+        if nbytes not in out["floors"]:
+            out["floors"][nbytes] = byte_touch_floor(
+                nbytes, device, a.graph_bodies, a.target_ms, a.max_iters, cuda
+            )
+        floor = out["floors"][nbytes]
+        out["arms"][name] = judge_arm(
+            stats["median_ms"], nbytes,
+            floor.get("floor_ms") if floor.get("measured") else None,
+            a.plausibility_slack,
+        )
+    return out
 
 
 def compare_quality(target, engines, tw, kn, fold_engines, m, device, dtype, a,

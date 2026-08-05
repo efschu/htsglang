@@ -35,29 +35,32 @@ mkdir -p "$WORK"
 
 step() { printf '\n=== %s ===\n' "$1"; }
 
-step "1/6 shape table (rank 0 and rank 1, cross-checked against the serving split)"
+step "0/7 guard tests (stream, empty-graph, plausibility, signatures, card id)"
+"$PY" "$HERE/test_guards.py"
+
+step "1/7 shape table (rank 0 and rank 1, cross-checked against the serving split)"
 "$PY" "$HERE/targets.py" --ranks 0,1
 
-step "2/6 TensorRT capability probe (what the installed library can express)"
+step "2/7 TensorRT capability probe (what the installed library can express)"
 if "$PY" -c "import tensorrt_rtx" 2>/dev/null; then
   "$PY" "$HERE/build_engines.py" --probe | head -40
 else
   echo "tensorrt_rtx not on PYTHONPATH -- skipping probe (mock path continues)"
 fi
 
-step "3/6 stub engine build (INT8 per-stage AND fold whole-chain variants)"
+step "3/7 stub engine build (INT8 per-stage AND fold whole-chain variants)"
 "$PY" "$HERE/build_engines.py" --mock --random-weights --ranks 0 \
   --precision int8,fold_bf16,fold_fp16,fp32_ref \
   --out-dir "$WORK/engines"
 
-step "4/6 harness over every target and every arm, stub engines, CPU"
+step "4/7 harness over every target and every arm, stub engines, CPU"
 "$PY" "$HERE/microbench_trt.py" --mock --engine-dir "$WORK/engines" \
   --random-weights --rank 0 --m 1,4 \
   --min-point-seconds 0.2 --min-arm-seconds 0.05 --target-ms 2 \
   --rounds-floor 3 --graph-bodies 4 \
   --out "$WORK/bench.json"
 
-step "5/6 ONNX export path (tiny shapes)"
+step "5/7 ONNX export path (tiny shapes)"
 if "$PY" -c "import onnx" 2>/dev/null; then
   "$PY" "$HERE/export_onnx.py" --mock --ranks 0 --out-dir "$WORK/onnx" \
     2>&1 | grep -v -i deprecation
@@ -65,11 +68,19 @@ else
   echo "onnx not on PYTHONPATH -- skipping (secondary path, see export_onnx.py)"
 fi
 
-step "6/6 result sanity"
+step "6/7 result sanity"
 "$PY" - "$WORK/bench.json" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["mock"] is True, "mock run must be stamped"
+# The mock must have driven the REAL TrtEngine through the REAL call sites.
+# A stub-only mock is what let TrtEngine(mode="fold") reach a card window.
+sc = d.get("signature_conformance")
+assert sc, "mock run did not perform the signature conformance check"
+assert sc.get("pass"), f"signature conformance FAILED: {sc}"
+for _step in ("construct", "select_profile", "bind_fold", "bind", "enqueue",
+              "enqueue_used_given_stream", "layer_information", "save_cache"):
+    assert _step in sc["steps"], f"conformance skipped {_step}: {sc}"
 assert d["results"], "no results emitted"
 bad = []
 fold_seen = set()
@@ -121,6 +132,11 @@ if not {"trt_fold_bf16_graph", "trt_fold_fp16_graph"} <= fold_seen:
     bad.append(f"fold arms never ran; only saw {sorted(fold_seen)}")
 if bad:
     print("FAIL"); [print("  " + b) for b in bad]; sys.exit(1)
+# No arm may be reported without the plausibility verdict attached.
+for r in d["results"]:
+    p = r.get("plausibility")
+    if p is None:
+        bad.append(f"{r['target']} M={r['m']}: no plausibility record")
 print(f"OK: {len(d['results'])} points, "
       f"{sum(len(r['arms']) for r in d['results'])} arm measurements, "
       f"fold arms {sorted(fold_seen)}, "

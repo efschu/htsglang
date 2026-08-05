@@ -7,6 +7,46 @@ card operator needs.
 same rotation; 12 min without them). The engines were built on a
 CPU with no GPU visible, so no build step is on the critical path.
 
+## 0a. Window 6's numbers are withdrawn -- ALL graph arms, not just the fold
+
+Window 6's fold lane reported 3.39e-05 ms, identical across bf16, fp16 and fp32
+and identical across targets from 36 MB to 178 MB. Nothing that is both
+size-independent and precision-independent is doing arithmetic.
+
+The cause is one line: `Chain` stored `torch.cuda.current_stream()` at
+construction and passed it to `execute_async_v3` forever after. Inside
+`with torch.cuda.graph(g):` torch makes a private capture stream current, so the
+engine work went to the old stream, escaped the capture, and the graph replayed
+without it.
+
+**The same defect invalidates the INT8 verdict.** `trt_outer_graph` reported
+1.345 / 1.409 / 1.344 ms for gate_up / down / qkv -- three targets of 84, 42 and
+37 MB, all the same time -- and 2x that for the two-quant chain, 4x for the
+four-quant chain. That arm was timing our quant kernels once per stage and
+nothing of the engine (#368 measured `int8_quant` under graph replay at
+0.0012 ms; this is that number). The reported 0.087 / 0.055 medians are the
+ratio of a quant kernel to a real GEMM, not a TensorRT result.
+
+So the next window re-measures BOTH lanes. Nothing from window 6's graph arms
+should be carried forward. The eager arms (`torch_eager`, `trt_enqueue`) were
+never graph-captured and are unaffected -- and they are the ones that read
+1.71 and 1.03 TB/s on a card that does ~1.8, which is what a plausible number
+looks like.
+
+Three guards now stand between that defect and a published number:
+
+1. **Stream resolved per call**, never stored (`Chain._cur_stream`).
+2. **Graph-content verification**: every engine output buffer is poisoned, the
+   graph is replayed once, and any buffer still holding the poison means the
+   work is not in the graph. The arm is dropped and marked INVALID.
+3. **Plausibility guard**: each arm is compared against a MEASURED floor for
+   merely reading its own weight bytes on the same card in the same capture
+   mode. Faster than reading the weights is not fast, it is not running.
+   Invalid arms are excluded from every ratio instead of averaged into one.
+
+`scripts/trt_337/test_guards.py` drives all three against window 6's actual
+numbers, each with a can-fail twin.
+
 ## 0. What is being decided
 
 Whether per-part TensorRT engines beat our own kernels at the same precision,
@@ -70,19 +110,37 @@ the same card moves the SM clock and the result is then a number about the
 other job. If the window owner explicitly agrees to share, record their
 agreement in the result JSON's notes and treat every ratio as an upper bound.
 
-Resolve the physical indices at runtime -- NVML order shifts between boots:
+### Pin the card by UUID, never by index
+
+**Window 6 ran the arm labelled `sm120` on a 3080.** The old text here said to
+read the index from `nvidia-smi --query-gpu=index` and put it in
+`CUDA_VISIBLE_DEVICES`. Those are two different orderings: `nvidia-smi` prints
+NVML order, `CUDA_VISIBLE_DEVICES` consumes CUDA order. On this rig NVML index 1
+is the 5090, and `CUDA_VISIBLE_DEVICES=1` opens an sm86 card. The instruction was
+followed exactly and produced the wrong card, and every number from that arm was
+mislabelled.
+
+`CUDA_VISIBLE_DEVICES` also accepts `GPU-<uuid>`, which is unambiguous under both
+orderings and stable across reboots. So:
 
 ```bash
-nvidia-smi --query-gpu=index,name,uuid,memory.total --format=csv,noheader
+$PY $REPO/scripts/trt_337/select_card.py --list     # index, name, arch, UUID
+export SM120_CARD=$($PY $REPO/scripts/trt_337/select_card.py --arch sm120)
+export SM86_CARD=$($PY  $REPO/scripts/trt_337/select_card.py --arch sm86)
 ```
 
-The 5090 is the sm120 arm. Either 3080 is the sm86 arm.
+Every arm below then passes `--expect-arch`, which aborts if the card CUDA
+actually opened is not the one the arm is labelled for. The resolver and the
+assertion catch different mistakes -- a wrong architecture map in the resolver,
+versus a wrong card in CUDA -- so both are armed. **Do not remove
+`--expect-arch` to "save a check".** It is the only part of this section that
+survives someone paraphrasing the prose.
 
 ## 5. Arm A -- sm120, the 5090, rank-0 shapes (~5 min)
 
 ```bash
-CUDA_VISIBLE_DEVICES=<5090_idx> $PY $REPO/scripts/trt_337/microbench_trt.py \
-  --engine-dir $ART/engines --rank 0 \
+CUDA_VISIBLE_DEVICES=$SM120_CARD $PY $REPO/scripts/trt_337/microbench_trt.py \
+  --engine-dir $ART/engines --rank 0 --expect-arch sm120 \
   --m 1,2,4,8 \
   --runtime-cache-dir $ART/rtcache \
   --out $ART/bench.sm120_5090.json
@@ -91,8 +149,8 @@ CUDA_VISIBLE_DEVICES=<5090_idx> $PY $REPO/scripts/trt_337/microbench_trt.py \
 ## 6. Arm B -- sm86, a 3080, rank-1 shapes (~5 min)
 
 ```bash
-CUDA_VISIBLE_DEVICES=<3080_idx> $PY $REPO/scripts/trt_337/microbench_trt.py \
-  --engine-dir $ART/engines --rank 1 \
+CUDA_VISIBLE_DEVICES=$SM86_CARD $PY $REPO/scripts/trt_337/microbench_trt.py \
+  --engine-dir $ART/engines --rank 1 --expect-arch sm86 \
   --m 1,2,4,8 \
   --runtime-cache-dir $ART/rtcache \
   --out $ART/bench.sm86_3080.json
@@ -154,8 +212,8 @@ shape" from "TensorRT is better on this architecture" -- a control that the
 per-arch build model could not have offered at all.
 
 ```bash
-CUDA_VISIBLE_DEVICES=<3080_idx> $PY $REPO/scripts/trt_337/microbench_trt.py \
-  --engine-dir $ART/engines --rank 0 \
+CUDA_VISIBLE_DEVICES=$SM86_CARD $PY $REPO/scripts/trt_337/microbench_trt.py \
+  --engine-dir $ART/engines --rank 0 --expect-arch sm86 \
   --m 1,4 --targets gemm_mlp_gate_up,chain_mlp_block \
   --runtime-cache-dir $ART/rtcache \
   --out $ART/bench.sm86_rank0shapes.json
@@ -169,10 +227,10 @@ venv, so the control costs one build plus one arm. Its builder needs a GPU, so
 unlike everything else here the build is **inside** the window:
 
 ```bash
-CUDA_VISIBLE_DEVICES=<5090_idx> $PY $REPO/scripts/trt_337/build_engines.py \
+CUDA_VISIBLE_DEVICES=$SM120_CARD $PY $REPO/scripts/trt_337/build_engines.py \
   --library classic --ranks 0 --out-dir $ART/engines-classic
-CUDA_VISIBLE_DEVICES=<5090_idx> $PY $REPO/scripts/trt_337/microbench_trt.py \
-  --engine-dir $ART/engines-classic --rank 0 --m 1,4 \
+CUDA_VISIBLE_DEVICES=$SM120_CARD $PY $REPO/scripts/trt_337/microbench_trt.py \
+  --engine-dir $ART/engines-classic --rank 0 --m 1,4 --expect-arch sm120 \
   --targets gemm_mlp_gate_up --out $ART/bench.classic_sm120.json
 ```
 
