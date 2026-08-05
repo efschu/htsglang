@@ -3,7 +3,7 @@
 Status: DESIGN, no code. Branch `feat/exact-vram-ledger` (design only; the
 implementation gets its own branch per slice).
 
-This document is written against the mandate plus five addenda. Addenda 3 and 4
+This document is written against the mandate plus six addenda. Addenda 3 and 4
 are recorded as R6, R7 and R9 because each names an ERROR CLASS the design must
 be structurally unable to commit -- not a behaviour it should prefer. That
 distinction drives the falsifiers: several are deliberately PAIRS, because a
@@ -51,7 +51,7 @@ reimplements a carrier instead of driving it has failed the mandate.
 
 ## 2. Requirements
 
-Requirements R1-R10. Each carries a falsifier: a concrete situation that must produce a
+Requirements R1-R11. Each carries a falsifier: a concrete situation that must produce a
 specific observable, and which the current design would fail if the
 requirement were dropped.
 
@@ -416,6 +416,78 @@ determinism arm.
 *Falsifier F10c.* After a spill frees VRAM, a subsequent ledger read must show
 the freed bytes CLAIMED (KV pool, tenant, or lane). Bytes free and unassigned
 is a defect per (c), and the test asserts on the claim, not on the free.
+
+### R11 -- (Addendum 6) Necessity is COMPUTED per step; the rest moves, coldest first, only when free
+
+*User requirement, 2026-08-05:* "It must effectively be COMPUTED what is
+actually necessary in each step. The rest is moved elsewhere by a
+coldest-to-hottest rule, when necessary, and when it costs no performance
+(redistribution within the vram/ram tier should only take milliseconds)."
+
+This is the rule that ties R6, R7, R9 and R10 together: they say what MAY move
+and what it costs; R11 says what must STAY.
+
+**(a) Necessity calculus per step.** For every step -- phase transitions and
+finer steps within them -- the planner computes that step's actual minimal
+working set. Everything outside it is a movement CANDIDATE. Necessity is
+computed from the step, never inherited from a static class label: "weights are
+necessary" is not a fact, it is a fact about a step, and R10 exists precisely
+because a target layer is unnecessary during a draft step.
+
+*Falsifier F11a.* Two steps whose minimal working sets differ must yield
+different candidate sets. A planner that returns the same candidates for a
+draft step and a verify step is not computing necessity, it is reading a class
+table.
+
+**(b) Eviction order: coldest to hottest.** The movement plan evicts in
+ascending heat, where heat is R7's PHASE-DEPENDENT ordering. R7 says heat is
+not static; R11 says what to do with the ranking once you have it. The two are
+one mechanism: R7 supplies the order, R11 consumes it coldest-first.
+
+*Falsifier F11b.* Given a heat ranking, the emitted eviction sequence must be
+its ascending order. Any inversion -- evicting a hotter item while a colder one
+remains resident -- is a defect, and the test asserts on the sequence, not on
+the final residency set (two different orders can reach the same end state,
+and only one of them is free).
+
+**(c) TWO gates, both required.** A movement happens only if BOTH hold:
+
+| Gate | Meaning | Fails when |
+|---|---|---|
+| **need-driven** | a trigger exists: demand, phase change, tenant arrival | eager reshuffling "to be tidy" |
+| **performance-neutral** | hidden behind compute, or placed in an idle gap | the unhidden remainder is non-zero and nothing forces it |
+
+Performance-neutrality is exactly R10's overlap pricing:
+`effective_cost = max(0, transfer_time - overlappable_compute_time)`. A move
+that cannot be hidden AND is not forced by need **does not happen**.
+
+Note the asymmetry, because it matters: need without hiding is allowed (a
+forced move pays its cost), and hiding without need is not (a free move is
+still churn, and churn has second-order costs -- fragmentation, cache
+disruption -- that the model does not price). So the gates are not symmetric
+and must not be collapsed into a single score.
+
+*Falsifier F11c.* A perfectly hideable movement with NO trigger must not be
+emitted. This is the gate that a naive optimiser fails: it sees a free move
+that marginally improves a metric and takes it, forever.
+
+**(d) Latency expectation: milliseconds, not seconds.** The user expects
+VRAM/RAM-tier redistribution to complete in MILLISECONDS. This is consistent
+with what is already measured: the 40-85 ms graph-restore band (R9) and plain
+PCIe transfer arithmetic.
+
+**Any cost model that prices ordinary VRAM/RAM redistribution in SECONDS is
+wrong until it justifies itself against a measurement.** This is the same
+family as the blanket-recapture mispricing recorded in §5 (`registry/rungs.py`
+charging 3-6 s for a promotion that costs a restore): a model that
+over-prices a mechanism never exercises it, and never exercising it means the
+over-price is never contradicted.
+
+*Falsifier F11d.* A step-scoped movement whose transfer is fully overlappable
+must be priced at ~0 effective cost. And the millisecond band itself must be
+ASSERTED AGAINST MEASUREMENT, not against this document: slice 4c owns that
+measurement, and until it lands the band is an expectation carried from the
+restore observation, not an established input.
 
 ### R8 -- Every decision is explainable after the fact
 
