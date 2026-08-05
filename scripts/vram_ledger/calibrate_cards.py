@@ -150,7 +150,7 @@ def measure_child(uuid: str) -> int:
             )
             return 2
         name = torch.cuda.get_device_name(0)
-        ctx, gran, ws, note = _measure_one_card(0)
+        ctx, gran, ws, note = _measure_one_card(0, uuid)
     except Exception as e:
         print(json.dumps({"uuid": uuid, "error": f"{type(e).__name__}: {e}"}))
         return 3

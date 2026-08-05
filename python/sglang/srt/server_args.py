@@ -11040,6 +11040,10 @@ class ServerArgs:
             # Not a placeholder: see the docstring. The residual is labelled
             # "rank budget", so these bytes are accounted for, not dropped.
             weight_mib_per_rank=[0] * len(rank_gpu_id),
+            # Without this the phase-footprint lookup has no card identity and
+            # every activation term resolves to "uncalibrated", i.e. every boot
+            # refuses. Found by the boot-path smoke, not by review.
+            card_uuid_by_gpu={c.gpu_id: c.uuid for c in cards},
         )
         ledgers = build_card_ledgers(
             inputs,

@@ -339,11 +339,19 @@ class CardVramLedger:
         name_w = max([len(r[0]) for r in rows] + [24])
         mark_w = max([len(r[2]) for r in rows] + [10])
         ranks = ", ".join(str(r) for r in self.ranks) or "none"
-        verdict = (
-            f"FITS, KV pool {self.kv_pool_mib} MiB"
-            if self.fits
-            else f"OVERCOMMITTED by {self.overcommit_mib} MiB"
-        )
+        if self.fits:
+            verdict = f"FITS, KV pool {self.kv_pool_mib} MiB"
+        elif self.unbounded:
+            # Distinguished on purpose: "OVERCOMMITTED by 0 MiB" is what this
+            # said before, and it sent a reader hunting for a size problem when
+            # the actual fault is a term nobody could bound.
+            verdict = f"REFUSED, {len(self.unbounded)} unbounded item(s)" + (
+                f" (and overcommitted by {self.overcommit_mib} MiB)"
+                if self.overcommit_mib
+                else ""
+            )
+        else:
+            verdict = f"OVERCOMMITTED by {self.overcommit_mib} MiB"
         lines = [
             f"VRAM ledger for {self.card} (ranks: {ranks}): "
             f"{self.total_mib} MiB total -- {verdict}",

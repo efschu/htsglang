@@ -199,6 +199,34 @@ def test_a_version_bump_invalidates_rather_than_reinterprets(tmp_path, monkeypat
 # --- the boot path actually runs -------------------------------------------
 
 
+def _install_footprints(monkeypatch, *, activation_mib, capture_mib):
+    """Make the phase-footprint lookup succeed with stated numbers.
+
+    The boot path resolves activation and capture from the calibration store,
+    not from the inherited heuristics, so a hermetic boot test has to supply
+    them. Injecting here rather than monkeypatching the old ServerArgs methods
+    is the point: those methods are no longer on the ledger's path at all.
+    """
+    from sglang.srt.mem_ledger.activation import FootprintProvenance, PhaseFootprint
+
+    def fake(card_uuid, *, hw_fingerprint, profile, cache_dir=None):
+        return PhaseFootprint(
+            activation_mib=activation_mib,
+            capture_mib=capture_mib,
+            provenance=FootprintProvenance.MEASURED_PEAK,
+            source="test-injected footprint",
+            card_uuid=card_uuid,
+        )
+
+    monkeypatch.setattr(
+        "sglang.srt.mem_ledger.activation.resolve_phase_footprint", fake
+    )
+    monkeypatch.setattr(
+        "sglang.srt.mem_ledger.calibration.live_fingerprint",
+        lambda **kw: ("testfp000000", [], "drv"),
+    )
+
+
 def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     """EXECUTION SMOKE for the wiring, not just for the ledger.
 
@@ -260,8 +288,8 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     )
     # The demand derivations that need a checkpoint are the ones a hermetic
     # test cannot supply; stub exactly those and let the rest run for real.
-    monkeypatch.setattr(type(args), "mamba_pre_capture_reserve_mb", lambda s, m: 3968.0)
     monkeypatch.setattr(type(args), "speculative_capture_tokens", lambda s, n=None: 96)
+    _install_footprints(monkeypatch, activation_mib=1766, capture_mib=640)
     monkeypatch.setattr(type(args), "gdn_prefill_scratch_mib", lambda s, share: None)
     monkeypatch.setattr(type(args), "dsv4_indexer_prefill_scratch_mib", lambda s: None)
     monkeypatch.setattr(type(args), "ladder_reserve_gpu_id", lambda s: None)
@@ -271,11 +299,14 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     with caplog.at_level("INFO"):
         non_kv = args._vram_ledger_non_kv_per_gpu(Counter([0, 1]))
 
-    # 1024 user reserve + 3968 activation + 192 capture + 384 flashinfer
-    # workspace (read from SGLANG_FLASHINFER_WORKSPACE_SIZE, not stubbed --
-    # this term is exactly the "allocated lazily after KV sizing" pool the old
-    # reserve text named and no budget charged) + 408 hardware residual.
-    assert non_kv == {0: 5976, 1: 5976}
+    # 1024 user reserve + 1766 activation + 640 capture + 384 flashinfer
+    # workspace + 408 hardware residual = 4222.
+    #
+    # Was 5976 before the phase footprints landed: activation 3968 (the
+    # falsified heuristic) and capture 192 (the token estimate the same window
+    # measured 3.3-3.8x low). The net -1754 MiB per card goes back to the KV
+    # pool, and that is the whole point of the term fix.
+    assert non_kv == {0: 4222, 1: 4222}
     text = caplog.text
     assert "attention workspaces (capped)" in text
     assert "SGLANG_FLASHINFER_WORKSPACE_SIZE" in text
@@ -330,8 +361,8 @@ def test_the_boot_path_refuses_an_overcommitted_card(monkeypatch):
         disaggregation_mode="null",
         speculative_num_draft_tokens=None,
     )
-    monkeypatch.setattr(type(args), "mamba_pre_capture_reserve_mb", lambda s, m: 8000.0)
     monkeypatch.setattr(type(args), "speculative_capture_tokens", lambda s, n=None: 512)
+    _install_footprints(monkeypatch, activation_mib=8000, capture_mib=640)
     monkeypatch.setattr(type(args), "gdn_prefill_scratch_mib", lambda s, share: None)
     monkeypatch.setattr(type(args), "dsv4_indexer_prefill_scratch_mib", lambda s: None)
     monkeypatch.setattr(type(args), "ladder_reserve_gpu_id", lambda s: None)

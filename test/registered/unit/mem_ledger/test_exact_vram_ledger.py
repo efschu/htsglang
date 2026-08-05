@@ -109,6 +109,7 @@ def production_inputs(**overrides):
         capture_tokens_per_rank=[96] * n,
         mamba_pool_mib_per_rank=[900.0] * n,
         chunked_prefill_size=CHUNKED_PREFILL,
+        phase_footprint_fingerprint="deadbeefcafe",
         max_running_requests=4,
         mamba_floor_slots=16,
         mamba_floor_derivation="4 running requests x (1 active + 2 ping-pong "
@@ -640,6 +641,7 @@ def workspace_inputs(n_ranks=1, **overrides):
         capture_tokens_per_rank=[96] * n_ranks,
         mamba_pool_mib_per_rank=[900.0] * n_ranks,
         chunked_prefill_size=CHUNKED_PREFILL,
+        phase_footprint_fingerprint="deadbeefcafe",
         flashinfer_workspace_mib=resolve_flashinfer_workspace_mib(
             enable_deterministic_inference=deterministic,
             architectures=architectures,
