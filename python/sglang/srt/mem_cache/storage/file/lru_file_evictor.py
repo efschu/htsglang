@@ -94,7 +94,11 @@ class LRUFileEvictor:
         self._writer_count = max(1, int(writer_count))
         # The backend owns the on-disk layout (sharded subdirectories, legacy
         # flat files); it injects how a key stem maps to a path and how to
-        # enumerate what is already there.
+        # enumerate what is already there. The defaults below describe the
+        # PRE-SHARDING flat layout only -- a caller whose store is sharded must
+        # inject BOTH, or the scan will not see its sharded files (they stay
+        # untracked, hence never evictable) and eviction will unlink paths that
+        # do not exist. ``HiCacheFile`` injects both.
         self._path_for_stem = path_for_stem or (
             lambda stem: os.path.join(self.file_path, f"{stem}.bin")
         )
