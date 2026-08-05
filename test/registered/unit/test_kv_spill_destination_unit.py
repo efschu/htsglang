@@ -815,7 +815,9 @@ def test_park_unpark_roundtrip_real_file_backend(tmp_path):
     before = _snapshot_region(mgr, 0, rows)
     ctl.note_region_shortfall(mgr._iter_ct)
     assert _pump(mgr, ctl, until=lambda: "rid-file" in ctl.parked)
-    assert len(list(tmp_path.iterdir())) == 1 + 2 * LAYERS  # real files
+    # Recursive: the file backend writes into 2-hex shard subdirectories (#558),
+    # so the pages are one level below tmp_path.
+    assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 1 + 2 * LAYERS
     for fl in range(LAYERS):
         mgr.host_pool.k_data_refs[fl].zero_()
         mgr.host_pool.v_data_refs[fl].zero_()
