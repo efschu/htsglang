@@ -428,15 +428,34 @@ def calibrate(fn, target_ms, cuda, max_iters) -> tuple:
     return max(1, min(max_iters, int(target_ms / probe))), probe
 
 
-def rounds_for_duration(per_arm_ms, n_arms, min_arm_s, min_point_s, floor) -> int:
-    """Round count that satisfies BOTH duration rules.
+def rounds_for_duration(
+    per_round_ms, fastest_arm_ms, min_arm_s, min_point_s, floor, max_point_s=None
+) -> int:
+    """Round count that satisfies the duration rules.
 
-    per_arm_ms is the wall time of one burst of one arm. One round runs every
-    arm once, so a round costs ``per_arm_ms * n_arms``.
+    ``per_round_ms`` is the TRUE cost of one round: the sum over arms of each
+    arm's own burst. Sizing from ``slowest * n_arms`` instead assumes every
+    arm is as slow as the slowest, which over-predicts badly once one arm is
+    an order of magnitude faster than another -- the 2026-08-05 window-6 run
+    predicted 10.20 s per point and measured 6.56 s, so every point of the
+    arm missed the 10 s floor while the harness believed it had met it.
+
+    ``fastest_arm_ms`` drives the per-arm rule: the FASTEST arm is the one at
+    risk of not accumulating ``min_arm_s``, so it is the binding one.
+
+    ``max_point_s`` caps the point. A point longer than the cap is not more
+    truth, it is card time spent on a number that was already resolved, so
+    the cap wins over the floor when the two disagree -- except that the
+    per-arm rule and the floor of rounds still apply, and a violated cap is
+    reported rather than silently truncating an arm below usefulness.
     """
-    need_arm = math.ceil(min_arm_s * 1e3 / max(per_arm_ms, 1e-6))
-    need_point = math.ceil(min_point_s * 1e3 / max(per_arm_ms * n_arms, 1e-6))
-    return int(max(floor, need_arm, need_point))
+    need_arm = math.ceil(min_arm_s * 1e3 / max(fastest_arm_ms, 1e-6))
+    need_point = math.ceil(min_point_s * 1e3 / max(per_round_ms, 1e-6))
+    rounds = int(max(floor, need_arm, need_point))
+    if max_point_s:
+        allowed = int(math.floor(max_point_s * 1e3 / max(per_round_ms, 1e-6)))
+        rounds = min(rounds, max(allowed, int(max(floor, need_arm))))
+    return rounds
 
 
 def summarize(samples) -> dict:
@@ -742,6 +761,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-iters", type=int, default=4000)
     ap.add_argument("--min-arm-seconds", type=float, default=1.0)
     ap.add_argument("--min-point-seconds", type=float, default=10.0)
+    ap.add_argument("--max-point-seconds", type=float, default=30.0)
     ap.add_argument("--graph-bodies", type=int, default=32)
     ap.add_argument("--tolerance", type=float, default=2e-2)
     ap.add_argument("--kernel-specialization", default="EAGER",
@@ -828,6 +848,7 @@ def main(argv=None) -> int:
             "target_ms": a.target_ms,
             "min_arm_seconds": a.min_arm_seconds,
             "min_point_seconds": a.min_point_seconds,
+            "max_point_seconds": a.max_point_seconds,
             "graph_bodies": a.graph_bodies,
             "tolerance": a.tolerance,
             "kernel_specialization": a.kernel_specialization,
@@ -926,7 +947,7 @@ def main(argv=None) -> int:
                 t0 = time.time()
                 eng = TrtEngine(
                     trt, logger, plan, "DISABLED", a.kernel_specialization,
-                    cache_path, profile_opts, device, mode="fold",
+                    cache_path, profile_opts, device,
                 )
                 fold_engines[arm] = (eng, torch_dtype)
                 out["jit_warmup"].append(
@@ -1101,15 +1122,28 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
         it, probe = calibrate(fn, a.target_ms, cuda, a.max_iters)
         iters[name] = it
         probes[name] = probe
-    slowest = max(probes[n] * iters[n] for n in lanes)
+    per_arm_ms = {n: probes[n] * iters[n] for n in lanes}
+    slowest = max(per_arm_ms.values())
+    fastest = min(per_arm_ms.values())
+    per_round_ms = sum(per_arm_ms.values())
     rounds = rounds_for_duration(
-        slowest, len(lanes), a.min_arm_seconds, a.min_point_seconds, a.rounds_floor
+        per_round_ms,
+        fastest,
+        a.min_arm_seconds,
+        a.min_point_seconds,
+        a.rounds_floor,
+        a.max_point_seconds,
     )
     rec["calibration"] = {
         "iters": iters,
         "probe_ms": {k: round(v, 6) for k, v in probes.items()},
         "rounds": rounds,
-        "predicted_point_seconds": round(slowest * len(lanes) * rounds / 1e3, 2),
+        # Predicted from the real per-round cost, so it can be compared with
+        # measured_seconds and a drift between them is a finding, not noise.
+        "per_round_ms": round(per_round_ms, 6),
+        "slowest_arm_ms": round(slowest, 6),
+        "fastest_arm_ms": round(fastest, 6),
+        "predicted_point_seconds": round(per_round_ms * rounds / 1e3, 2),
     }
 
     # ---- interleaved rotation: one burst per arm per round ----
@@ -1120,8 +1154,33 @@ def run_point(target, engines, tw, kn, m, device, dtype, arms, a2_arms, a,
         for name in rotation:
             fn, div = lanes[name]
             samples[name].append(time_burst(fn, iters[name], cuda) / div)
+    # The calibration model PREDICTS the point length; only the clock knows it.
+    # On the 2026-08-05 window-6 5090 arm the model said 12.44 s and the
+    # rotation took 7.23 s (the probe carries per-call overhead the burst
+    # amortises), so a predicted-only sizing silently missed the floor on
+    # every point. Extend by whole rounds until the floor is really met,
+    # never past the cap -- so the rule is enforced by measurement.
+    extra = 0
+    while (time.time() - t_meas0) < a.min_point_seconds:
+        if a.max_point_seconds and (time.time() - t_meas0) >= a.max_point_seconds:
+            break
+        for name in rotation:
+            fn, div = lanes[name]
+            samples[name].append(time_burst(fn, iters[name], cuda) / div)
+        extra += 1
+    rec["calibration"]["extra_rounds_to_meet_floor"] = extra
+    rec["calibration"]["rounds_total"] = rounds + extra
     rec["measured_seconds"] = round(time.time() - t_meas0, 2)
-    rec["duration_rule_met"] = rec["measured_seconds"] >= a.min_point_seconds
+    # Both bounds. A point under the floor has not resolved anything; a point
+    # over the cap spent card time on a number that was already resolved.
+    rec["duration_rule_met"] = (
+        rec["measured_seconds"] >= a.min_point_seconds
+        and (
+            not a.max_point_seconds
+            or rec["measured_seconds"] <= a.max_point_seconds
+        )
+    )
+    rec["duration_window_s"] = [a.min_point_seconds, a.max_point_seconds]
 
     for name, s in samples.items():
         rec["arms"][name] = summarize(s)
