@@ -60,9 +60,19 @@ requirement were dropped.
 Every VRAM decision anywhere resolves through `mem_ledger` terms. No component
 keeps a private constant, a private fraction, or a private reserve.
 
+**This extends to HOST RAM where the stack parks things there.** Parked graph
+stages (R9 iv), parked expert tiers and spilled KV all consume host bytes that
+nothing currently accounts for. A stack that parks eight stages without a term
+for their host footprint is running the same unledgered-demand defect #582
+removed from VRAM, one tier down.
+
 *Falsifier:* grep gate -- a new module-level MiB constant used in memory
 arithmetic outside `mem_ledger` fails CI. (The three constants #582 already
 replaced, 1280/1536/600, are the template for what must not recur.)
+
+*Falsifier R1b.* Parking N pre-captured stages must move a HOST-RAM ledger term
+by N x the per-stage footprint. A ledger that reports the same host total
+before and after parking is not accounting for them.
 
 ### R2 -- Demand is computed, headroom is the user's
 
@@ -122,9 +132,23 @@ Evacuating to RAM, resharding, re-cutting and rebuilding graphs all cost time.
 The planner compares the *discounted* benefit of a new configuration against
 the movement cost of reaching it, over an expected horizon.
 
-*Falsifier:* a 2% throughput gain that costs a 40 s reshard must be REFUSED at
-short horizon and ACCEPTED at long horizon, with the horizon an explicit input,
-not a constant.
+**Graph cost is TWO terms, never one** (see R9's correction). Collapsing them
+is what makes a cheap flip look expensive:
+
+| Term | When paid | Observed | Nature |
+|---|---|---|---|
+| graph **capture** | first entry into a stage, once | 3-6 s | one-time investment, schedulable during low load |
+| graph **restore** | every flip to a parked, already-captured stage | 40-85 ms | per-flip, #464 improvement pending |
+
+A cost model with a single "graph cost" line is wrong in one direction or the
+other by roughly two orders of magnitude.
+
+*Falsifier F5.* A 2% throughput gain that costs a 40 s reshard must be REFUSED
+at short horizon and ACCEPTED at long horizon, with the horizon an explicit
+input, not a constant.
+
+*Falsifier F5b.* The same gain against a 60 ms restore must be ACCEPTED even at
+short horizon. A model that refuses it has priced a restore as a capture.
 
 ### R6 -- (Addendum 3a) A state change re-solves the CUT, not only the pools
 
@@ -210,14 +234,75 @@ the #578 bug (see slice 0) written into the architecture.
 by a blanket rule.** For each control knob the design states its flip cost and
 classifies it:
 
+**CAPTURED GRAPHS ARE SPILLABLE. Recapture is a ONE-TIME cost per layout
+stage, never a per-flip tax.** *(User correction, 2026-08-05 -- pinned here
+because it has been forgotten more than once.)*
+
+The stack can pre-capture N stages and park the inactive stages' graph state
+**full-captured in host RAM**. Nothing has to be rebuilt to flip back to a
+stage that was already captured. The carriers are present in tree, checked:
+
+- `#93` physical aliasing / remap keeps virtual addresses stable across the
+  park (`model_executor/offload_register.py`, `offload_movement.py`,
+  `input_buffers.py`, `runtime_context.py`) -- this is what makes a parked
+  capture still valid on return;
+- `#286` offload register **already lists `graph_rungs` as a parkable item
+  class** (`offload_register.py:17` "cold capture rungs of the K-/algo ladder",
+  and in the class table at `:114`);
+- `#89` hibernate machinery for the host-side staging.
+
+So a flip between PRE-CAPTURED stages costs only the graph-state RESTORE:
+**observed band 40-85 ms**, with `#464` targeting ~3 driver calls per contiguous
+VA region. (`#464` has no marker in `python/sglang/srt/` -- it is a target, not
+a mechanism. The design prices restore at the observed 40-85 ms and treats any
+#464 gain as upside.)
+
+**Revised classification.** "Costs a recapture" disqualifies a knob from fast
+flipping ONLY when the target stage has never been captured:
+
 | Class | Criterion | Flips at | Examples |
 |---|---|---|---|
-| **tick-flippable** | not graph-addressed AND zero data movement | every forward | #439 cold-expert compute assignment (verified VRAM-neutral: `expert_heat_migration.py:31` calls same-size-before-and-after "the #439 sizing latch's invariant", `expert_compute_placement.py:566`); candidate: token vector per prefill batch |
-| **regime-flippable** | graph-addressed OR moves data | regime boundary, with hysteresis | anything requiring CUDA-graph recapture (3-6 s, the general property in `DESIGN_140`); KV resharding (#297); TP re-cut (#261) |
+| **tick-flippable** | not graph-addressed AND zero data movement | every forward | #439 cold-expert compute assignment (verified VRAM-neutral: `expert_heat_migration.py:31` calls same-size-before-and-after "the #439 sizing latch's invariant"); candidate: token vector per prefill batch |
+| **restore-flippable** | graph-addressed, but target stage ALREADY captured and parked | regime boundary, possibly coarse tick | any pre-captured stage of the #363 stair -- priced at restore (40-85 ms), NOT at capture |
+| **capture-bound** | target stage NEVER captured | one-time, scheduled deliberately | first entry into a newly solved stage (3-6 s, `DESIGN_140`) |
+| **movement-bound** | moves data | regime boundary, with hysteresis | KV resharding (#297); TP re-cut (#261) |
 
-The two criteria are the whole classification. A knob is tick-flippable exactly
-when flipping it costs neither a recapture nor a byte moved -- and that is a
-property of the knob that can be checked, not a judgement call.
+A knob is tick-flippable exactly when flipping it costs neither a recapture nor
+a byte moved. The correction is that "graph-addressed" no longer implies
+"expensive" -- it implies "expensive **once**".
+
+**(iii) The planner pre-captures its own stair.** The stages the planner solves
+(#363) are pre-captured at boot or lazily on first entry, then parked. First
+entry is a **priced one-time investment the planner schedules deliberately**
+(e.g. during low load), never a tax paid at the moment a flip is wanted. A
+design that pays capture at flip time has turned a startup cost into a serving
+cost.
+
+**(iv) Holding N stages is nearly VRAM-free while parked** -- physical pages are
+returned via the VMM dial (#330) and only the VA reservation remains. But it is
+NOT free in host RAM, and therefore: **the ledger must carry the parked stages'
+HOST-RAM footprint as a term** (R1 applies to host RAM here, not only VRAM). A
+stack that parks eight stages and never accounts for their host bytes is
+running the same unledgered-demand defect #582 removed from VRAM.
+
+*Falsifier F9d.* A flip to an ALREADY-CAPTURED stage that triggers a recapture
+is a defect, and the test asserts on the absence of recapture, not on elapsed
+time (a fast machine could hide a recapture inside a generous threshold).
+
+*Falsifier F9e.* A cost model that prices a flip to an already-captured stage at
+CAPTURE cost must fail its test. This is the modelling error, distinct from the
+runtime one in F9d, and it is the more dangerous of the two: it never
+misbehaves, it just silently refuses flips that were actually cheap -- so the
+gain is never observed and nothing surfaces the mistake.
+
+**Known instance of exactly this error, in tree today.** `registry/rungs.py:93-95`
+prices the `WARM` rung at "3-6 s" with basis *"graph recapture / weight flip"*,
+i.e. it assumes promotion pays a recapture. Under this correction a WARM rung
+whose stage is captured-and-parked should price at restore (40-85 ms), roughly
+two orders of magnitude cheaper. The ladder is not wrong for a never-captured
+stage; it is wrong as a blanket price. Slice 4b must split that entry the same
+way R5 splits its graph terms, or the planner will inherit the very tax this
+correction removes.
 
 **Within a tick**, where the layout is fixed by definition, the answer is
 overlap and behaviour adaptation rather than layout change: #128/#199 collective
@@ -295,7 +380,8 @@ by "what unblocks the most" and by risk, cheapest proof first.
 | 2 | Candidate enumeration (cuts, no movement) | R3, R6 candidate set | hermetic: F6 candidate-set assertion |
 | 3 | Joint phase-weighted objective + movement cost | R4, R5 | hermetic: F4, F4b, F6, F6b |
 | 4 | Phase-dependent heat ranking | R7 | hermetic: F7, F7b |
-| 4b | Per-knob flip pricing and classification | R9 (i), (ii) | hermetic: F9, F9b |
+| 4b | Per-knob flip pricing; split capture vs restore; fix the WARM rung | R9 (i)-(iv), R5 two-term | hermetic: F9, F9b, F9d, F9e, F5b |
+| 4c | Pre-capture + park the planner stair; host-RAM ledger term | R9 (iii), R1b | hermetic: F9d; GPU: measured restore band |
 | 5 | Actuation; BUILD elastic co-residency (#553) | R6 execution, tenant events | GPU: a live re-cut under load |
 | 6 | Explainability surface | R8 | hermetic + a live boot |
 
@@ -328,6 +414,11 @@ Slice 1 is already most of the way there on this branch: #582 built the ledger
 and the boot wiring behind `--enable-vram-ledger`. Slice 1 completes when
 TICKET_582's GPU gates pass and the flag can default on.
 
+**Slice 4c is the one addition that needs a card**, because the restore band
+(40-85 ms) is a measured quantity and the whole flip economics rest on it. It
+is a cheap measurement, not a full boot matrix: capture two stages, park one,
+flip, time the restore.
+
 **Slices 2-4b are desk-provable in full.** They are search, arithmetic,
 ordering and pricing; none needs a card. This is deliberate -- slice 5 is the
 only one that should ever wait on a GPU window.
@@ -350,8 +441,20 @@ only one that should ever wait on a GPU window.
 - **Re-cut cost is not currently measurable.** R5 needs a movement-cost model,
   and no component times a reshard today. Slice 3 must either measure it or
   declare it a calibrated term in the ledger's sense (measured once per rig,
-  fingerprinted) -- not a literal. The same applies to the recapture cost R9
-  prices knobs by: "3-6 s" is an observed range, and a range is not a model.
+  fingerprinted) -- not a literal. This applies to BOTH graph terms: "3-6 s"
+  capture and "40-85 ms" restore are observed ranges, and a range is not a
+  model. Restore in particular is the per-flip term, so its error enters every
+  flip decision.
+- **`registry/rungs.py` prices the WARM rung at recapture cost.** Named in R9:
+  the LADDER entry at `:93-95` charges "3-6 s / graph recapture" for a
+  promotion that, for a captured-and-parked stage, costs a 40-85 ms restore.
+  Slice 4b must split it. Until then any planner reading that ladder inherits
+  the per-flip tax this correction exists to remove.
+- **`#464` is a target, not a mechanism.** No marker in `python/sglang/srt/`.
+  Restore is priced at the observed 40-85 ms; a #464 gain is upside the design
+  must not assume.
+- **Host-RAM accounting does not exist yet.** R1's extension to host bytes is
+  new work, not a carrier to drive. The #582 ledger is VRAM-only today.
 - **R9's knob inventory is incomplete.** The classification table covers the
   knobs the addendum named. A sweep for every knob that changes a layout, with
   a cost for each, is part of slice 4b -- an unclassified knob is an unpriced
