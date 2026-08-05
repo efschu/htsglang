@@ -1300,6 +1300,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        # Bound by the radix cache at construction (`bind_tree_cache`) so the
+        # allocation sites below can evict cached checkpoints before declaring
+        # the pool exhausted. None until then (and for pool-only unit setups),
+        # in which case the sites degrade without an evict attempt.
+        self.tree_cache = None
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
@@ -1391,6 +1396,29 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
+    def bind_tree_cache(self, tree_cache) -> None:
+        """Give the pool a handle on the radix cache that owns its cached
+        checkpoints, so `alloc` can evict before failing (#581)."""
+        self.tree_cache = tree_cache
+
+    def _alloc_mamba_slots_or_evict(self, n: int) -> Optional[torch.Tensor]:
+        """Allocate `n` mamba slots, evicting cached checkpoints if needed.
+
+        Returns None only when the pool is exhausted AND eviction frees
+        nothing -- i.e. every cached state is locked by a running request.
+        Callers must handle None; these are REQUIRED allocations (the
+        request's own active state / ping-pong buffers), so the correct
+        degradation is to fail the whole `alloc` cleanly and let admission
+        defer the request, never to assert mid-mutation.
+        """
+        slots = self.mamba_allocator.alloc(n)
+        if slots is None and self.tree_cache is not None:
+            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+            self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=n))
+            slots = self.mamba_allocator.alloc(n)
+        return slots
+
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
@@ -1400,16 +1428,31 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
+        # Requests this call gave a fresh mamba state / ping-pong buffer to.
+        # On a mid-loop exhaustion every one of them must be handed back, or a
+        # deferred batch silently leaks the slots it already took (#581).
+        fresh_state_reqs: list[Req] = []
+        fresh_pingpong_reqs: list[Req] = []
         for req in reqs:
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
                 pass
             else:
-                mid = self.mamba_allocator.alloc(1)
-                assert (
-                    mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                mid = self._alloc_mamba_slots_or_evict(1)
+                if mid is None:
+                    # REQUIRED allocation, and eviction could free nothing:
+                    # every cached state is locked by a running request. Roll
+                    # this call back completely and report failure so the
+                    # caller defers the batch -- this used to be a bare assert
+                    # that killed the scheduler AFTER partially mutating the
+                    # pool.
+                    self._rollback_alloc(
+                        reqs, select_index, fresh_state_reqs, fresh_pingpong_reqs
+                    )
+                    self._log_mamba_alloc_failure("mamba state", len(reqs))
+                    return None
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
+                fresh_state_reqs.append(req)
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
                 # ring. write_pos=0 means "ring empty", so the decode kernel
                 # ignores ring contents and reads only the checkpoint state
@@ -1419,7 +1462,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
-                    self._alloc_ping_pong_buffer(req)
+                    if not self._alloc_ping_pong_buffer(req):
+                        # Same REQUIRED-allocation degradation as the active
+                        # state above: this is the exact site that killed
+                        # rank 0 in the #581 boot-6 crash.
+                        self._rollback_alloc(
+                            reqs, select_index, fresh_state_reqs, fresh_pingpong_reqs
+                        )
+                        self._log_mamba_alloc_failure("mamba ping-pong", len(reqs))
+                        return None
+                    fresh_pingpong_reqs.append(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
         assert len(select_index) == len(
             mamba_indices
@@ -1479,22 +1531,84 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return req.mamba_next_track_idx
         return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
 
-    def _alloc_ping_pong_buffer(self, req: Req):
+    def _rollback_alloc(
+        self,
+        reqs: List[Req],
+        select_index: List[int],
+        fresh_state_reqs: List[Req],
+        fresh_pingpong_reqs: List[Req],
+    ) -> None:
+        """Undo a partially completed `alloc` so a deferred batch leaks nothing.
+
+        Frees exactly what THIS call handed out -- fresh mamba states, fresh
+        ping-pong buffers and the request-pool rows it took -- and nothing
+        else. A chunked continuation that arrived already owning its active
+        state slot must keep it; freeing that would hand a live request's
+        state to someone else.
+        """
+        for req in fresh_pingpong_reqs:
+            if req.mamba_ping_pong_track_buffer is not None:
+                buf = req.mamba_ping_pong_track_buffer
+                self.mamba_allocator.free(buf[buf != -1])
+                req.mamba_ping_pong_track_buffer = None
+                req.mamba_next_track_idx = None
+                req.mamba_pingpong_clear_indices = None
+        for req in fresh_state_reqs:
+            if req.mamba_pool_idx is not None:
+                self.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
+                req.mamba_pool_idx = None
+            req.mamba_needs_clear = False
+        # Hand the request-pool rows back (mirrors ReqToTokenPool.free). Only
+        # the rows this call handed out are in `select_index`; requests that
+        # reused an existing row keep it.
+        taken = set(select_index)
+        for req in reqs:
+            if req.req_pool_idx is not None and int(req.req_pool_idx) in taken:
+                req.req_pool_idx = None
+        self.free_slots = list(select_index) + self.free_slots
+
+    def _log_mamba_alloc_failure(self, what: str, num_reqs: int) -> None:
+        """Rate-limited warning for a REQUIRED mamba allocation that could not
+        be served even after eviction."""
+        self._mamba_alloc_failures = getattr(self, "_mamba_alloc_failures", 0) + 1
+        count = self._mamba_alloc_failures
+        if count <= 3 or count % 1000 == 0:
+            evictable = protected = -1
+            if self.tree_cache is not None:
+                evictable = self.tree_cache.mamba_evictable_size()
+                protected = self.tree_cache.mamba_protected_size()
+            logger.warning(
+                "%s slot pool exhausted and nothing evictable (all cached "
+                "states are locked by running requests): deferring this batch "
+                "of %d request(s). occurrence=%d pool=%d available=%d "
+                "mamba_evictable=%d mamba_protected=%d",
+                what,
+                num_reqs,
+                count,
+                self.mamba_pool.size,
+                self.mamba_allocator.available_size(),
+                evictable,
+                protected,
+            )
+
+    def _alloc_ping_pong_buffer(self, req: Req) -> bool:
         """Allocate the ping-pong track buffer for a new request.
 
         Lazy mode allocates 1 slot with the second set to -1 (allocated
         on demand at track boundaries). Normal mode allocates all slots upfront.
+
+        Returns False when the pool is exhausted and eviction frees nothing;
+        the caller then rolls the whole `alloc` back and defers the batch. It
+        used to assert here, which killed the scheduler process (#581).
         """
         n = (
             1
             if self.enable_mamba_extra_buffer_lazy
             else self.mamba_ping_pong_track_buffer_size
         )
-        slots = self.mamba_allocator.alloc(n)
-        assert slots is not None, (
-            "Not enough space for mamba ping pong idx, "
-            "try to increase --mamba-full-memory-ratio."
-        )
+        slots = self._alloc_mamba_slots_or_evict(n)
+        if slots is None:
+            return False
         buf = torch.full(
             (self.mamba_ping_pong_track_buffer_size,),
             -1,
@@ -1509,6 +1623,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # recycled slots otherwise expose the previous occupant's state to
         # any premature or partial read.
         req.mamba_pingpong_clear_indices = slots.clone()
+        return True
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.

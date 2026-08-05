@@ -12053,11 +12053,51 @@ class ServerArgs:
             return
 
         self._handle_mamba_checkpoint_interval(view)
+        self._validate_max_mamba_cache_size(view)
 
         if mamba_extra_buffer_of(view):
             self._validate_mamba_extra_buffer(view, model_arch)
         else:
             self._validate_mamba_no_buffer(view, model_arch)
+
+    def _validate_max_mamba_cache_size(self, view) -> None:
+        """Refuse a `--max-mamba-cache-size` below the hard demand floor.
+
+        The floor is what the RUNNING set structurally requires -- active
+        state, ping-pong track buffers, the donation slot and the pinned
+        resume checkpoint, per concurrent request. A pool below it cannot run
+        the configured concurrency to completion regardless of traffic: the
+        shortfall used to surface at runtime as a bare assert inside
+        `HybridReqToTokenPool.alloc` after minutes of serving (#581), which is
+        exactly the late failure the validate-early rule exists to prevent.
+        Values at or above the floor are left untouched -- everything above it
+        is cache, and sizing that is the operator's call.
+        """
+        if self.max_mamba_cache_size is None:
+            return
+        if self.max_running_requests is None:
+            # Concurrency not pinned yet; the auto path floors itself.
+            return
+
+        from sglang.srt.mem_cache.mamba_pool_floor import (
+            describe_mamba_floor,
+            mamba_hard_floor,
+        )
+
+        floor = mamba_hard_floor(self, self.max_running_requests)
+        if self.max_mamba_cache_size >= floor:
+            return
+        raise ValueError(
+            f"--max-mamba-cache-size {self.max_mamba_cache_size} is below the "
+            f"hard demand floor of {floor} slots for this configuration.\n"
+            f"  {describe_mamba_floor(self, self.max_running_requests)}\n"
+            "Every term is a slot a single running request holds at the same "
+            "time, so a smaller pool cannot serve "
+            f"--max-running-requests {self.max_running_requests} and will "
+            "starve at runtime instead of failing here. Either raise "
+            f"--max-mamba-cache-size to at least {floor}, or lower "
+            "--max-running-requests."
+        )
 
     def _handle_mamba_checkpoint_interval(self, view) -> None:
         """Validate --mamba-checkpoint-interval and unify the tracking grid.

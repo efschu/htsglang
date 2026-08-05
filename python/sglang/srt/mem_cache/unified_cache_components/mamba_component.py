@@ -322,9 +322,11 @@ class MambaComponent(TreeComponent):
             logger.warning(
                 "%s slot pool exhausted and nothing evictable (all cached states "
                 "are locked by running requests): skipping this cache insert. "
-                "occurrence=%d",
+                "occurrence=%d mamba_evictable=%d mamba_protected=%d",
                 pool_name,
                 count,
+                self.cache.mamba_evictable_size(),
+                self.cache.mamba_protected_size(),
             )
 
     @property
@@ -564,8 +566,19 @@ class MambaComponent(TreeComponent):
                     if dst is None:
                         self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-                        assert dst is not None, "Cannot alloc mamba for load_back"
-                    req.mamba_pool_idx = dst[0]
+                    if dst is not None:
+                        req.mamba_pool_idx = dst[0]
+                    else:
+                        # #581 sibling site: exhausted with nothing evictable.
+                        # Skip the host->device restore instead of asserting;
+                        # the request re-prefills the segment, which is a
+                        # slowdown, not a dead scheduler.
+                        self._log_mamba_slot_starvation("mamba (host load-back)")
+            if (
+                req is not None
+                and cd.host_value is not None
+                and req.mamba_pool_idx is not None
+            ):
                 transfers.append(
                     PoolTransfer(
                         name=PoolName.MAMBA,
