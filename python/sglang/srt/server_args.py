@@ -6593,18 +6593,38 @@ class ServerArgs:
             # a rank-divergent boot decision, i.e. an NCCL hang rather than an
             # error. Every per-rank sizing decision downstream is pure
             # arithmetic over replicated arguments.
-            import psutil
-
             from sglang.srt.managers.kv_session_offload import (
                 host_ram_budget_error,
             )
+            from sglang.srt.memtier.profile import host_memory_bytes_for_pinning
 
-            _vm = psutil.virtual_memory()
-            _err = host_ram_budget_error(
-                self.kv_session_offload_host_ram_gib, _vm.total, _vm.available
-            )
-            if _err is not None:
-                raise ValueError(_err)
+            # NOT psutil.virtual_memory(): inside a container /proc/meminfo is
+            # synthesised by lxcfs and does not describe what this process may
+            # have -- MemAvailable can exceed MemTotal (observed on this rig),
+            # and with memory.max unlimited it reports the HOST's figures on a
+            # box other containers are also spending. The #407 memtier profile
+            # is the declared owner of that number and consults
+            # /sys/fs/cgroup; this guard reads it there so the pinned-RAM
+            # question has ONE answer. A pool whose over-commit is the OOM
+            # killer rather than a swap cannot be validated against a figure
+            # that does not denote anything.
+            _total, _available = host_memory_bytes_for_pinning()
+            if _total is None or _available is None:
+                # No honest number -> no guard. Refusing to guess beats
+                # refusing a boot (or admitting one) on a fabricated figure.
+                logger.warning(
+                    "kv-session-offload: host RAM could not be established "
+                    "honestly (neither /sys/fs/cgroup nor /proc/meminfo gave a "
+                    "usable pair); skipping the --kv-session-offload-host-ram-"
+                    "gib plausibility check. The pool is pinned, so size it "
+                    "against the machine yourself."
+                )
+            else:
+                _err = host_ram_budget_error(
+                    self.kv_session_offload_host_ram_gib, _total, _available
+                )
+                if _err is not None:
+                    raise ValueError(_err)
         if self.kv_session_offload_block_size <= 0:
             raise ValueError(
                 "--kv-session-offload-block-size must be > 0; got "

@@ -354,11 +354,26 @@ def planner_candidates(
 ) -> Tuple[List[Stage], List[str]]:
     """The production feed: ask the planner for one stage per regime.
 
-    ``solve_fn`` is the seam. Production binds it to the key solver
-    (``planner.key_solver.solve`` through ``planner.solver_api``), which is
-    #348b/#350-aware by construction -- it already ranks on the shared cost
-    library and honours ``--objective``. Tests inject a stub, so nothing here
-    needs a card probe.
+    ``solve_fn`` is the seam, and it is UNBOUND. This docstring used to say
+    "production binds it to the key solver (``planner.key_solver.solve``
+    through ``planner.solver_api``)" -- nothing does, under any configuration.
+    The one production caller, ``regime_runtime.build_regime_stage_table``,
+    invokes this function with the argument omitted, so the ``solve_fn is
+    None`` branch below is the ONLY branch production takes and the stage
+    table permanently holds the booted stage alone. Act mode consequently has
+    nothing to select between; it is not broken, it is unfed.
+
+    That is a WIRING gap, not a missing solver. ``key_solver.solve`` exists and
+    is #348b/#350-aware by construction (it ranks on the shared cost library
+    and honours ``--objective``), but its signature needs ``plan_inputs``, a
+    base plan, per-rank budgets and ``RigRates`` -- i.e. a card probe and a
+    measured rate set. Binding the seam means constructing those at boot and
+    mapping a ``SolverAnswer`` back onto a ``Stage``; it is not a two-line
+    call, which is presumably why it never happened. Tracked as #363/S8.
+
+    Until then the note below is the honest report and must stay reachable:
+    an operator reading it learns both that the feed is absent and what would
+    supply it. Tests inject a stub, so nothing here needs a card probe.
 
     A goal the planner cannot answer yields NO stage and a note. That is the
     honest outcome on a rig with no probe, and it is why the observer's

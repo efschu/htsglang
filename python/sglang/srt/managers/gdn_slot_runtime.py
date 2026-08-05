@@ -249,11 +249,22 @@ def build_gdn_slot_executor(scheduler) -> Optional[GdnSlotRuntime]:
         # on the host while their mamba slot stayed resident. Read fresh every
         # round -- the manager is built late in the scheduler's __init__ and
         # sessions enter and leave it constantly.
+        #
+        # `live_offload_reqs()` and NOT `manager.spills`: a #224-PARKED session
+        # is popped out of `spills` at park commit while staying alive and
+        # keeping its state slot. Reading `spills` made such a session invisible
+        # here, and `on_round` treats an id it cannot find in the inventory as a
+        # DEAD session and calls `forget(sid)` on it -- discarding the exported
+        # GDN state blob of a session that is coming back. The session then
+        # unparks, resumes, and continues with recurrent state that no longer
+        # exists: wrong output, no crash, nothing logged.
         manager = getattr(scheduler, "kv_session_offload", None)
-        spills = getattr(manager, "spills", None) if manager is not None else None
-        if not spills:
+        if manager is None:
             return []
-        return [slot.req for slot in spills.values() if getattr(slot, "req", None)]
+        getter = getattr(manager, "live_offload_reqs", None)
+        if getter is None:
+            return []
+        return [req for req in getter() if req is not None]
 
     return GdnSlotRuntime(
         mamba_pool=mamba_pool,

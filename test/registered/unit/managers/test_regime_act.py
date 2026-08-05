@@ -248,6 +248,41 @@ class TestPlannerFeed(CustomTestCase):
         self.assertEqual(stages, [])
         self.assertIn("no card probe", " ".join(notes))
 
+    def test_the_seam_is_unbound_in_production(self):
+        """#363/S8 RATCHET: the only production caller omits ``solve_fn``.
+
+        ``regime_stages.planner_candidates``'s docstring used to claim
+        "production binds it to the key solver". Nothing does, under any
+        configuration: ``regime_runtime.build_regime_stage_table`` calls it
+        with the argument omitted, so the ``solve_fn is None`` branch is the
+        only branch production takes and the stage table permanently holds the
+        booted stage alone. Act mode is therefore not broken but UNFED, and a
+        docstring asserting the opposite is how that stays invisible.
+
+        This is a wiring gap, not a missing solver: ``key_solver.solve``
+        exists but needs plan inputs, a base plan, per-rank budgets and
+        ``RigRates`` -- a card probe and a measured rate set -- plus a mapping
+        from ``SolverAnswer`` back onto a ``Stage``.
+
+        The test is a RATCHET: when the seam is bound it goes red, which is
+        the point. Update it together with the wiring, and delete the
+        "unbound" wording from the docstring in the same commit.
+
+        CAN-FAIL: pass any ``solve_fn`` at the production call site and this
+        goes red immediately.
+        """
+        import inspect
+
+        from sglang.srt.managers import regime_runtime
+
+        src = inspect.getsource(regime_runtime.build_regime_stage_table)
+        self.assertIn("planner_candidates(server_args)", src)
+        self.assertNotIn("solve_fn", src)
+
+        doc = planner_candidates.__doc__ or ""
+        self.assertIn("UNBOUND", doc)
+        self.assertNotIn("Production binds it", doc)
+
     def test_the_feed_asks_one_goal_per_regime(self):
         asked = []
 

@@ -1652,6 +1652,60 @@ not prose -- `test/registered/unit/test_kvso_reclaim_decline_501.py` pins the
 ordering structurally so a decline added later cannot move in front of it
 (4 tests, all four executed can-fail against the pre-fix file).
 
+Round-trip-asymmetry family (#568): a save/restore pair built from two APIs
+whose coverage differs, so the gap between them is filled with garbage instead
+of an error. The #286 ledger parked a module by capturing `state_dict()` and
+restored it with `to_empty(device=...)` followed by `load_state_dict(...,
+strict=True)`. `state_dict()` omits NON-PERSISTENT buffers by definition;
+`to_empty()` re-materialises them anyway, with whatever was in that memory; and
+the strict load fills only the keys the state dict has. Every non-persistent
+buffer therefore came back as uninitialised memory while park and restore both
+reported success and the measured restore latency looked healthy. `strict=True`
+does not catch it — the missing keys are missing from BOTH sides, which is
+exactly why the asymmetry is invisible at the seam. For the translator that
+buffer is the rotary `inv_freq`, so the symptom is NaN cos/sin -> NaN attention
+-> NaN logits -> "probability tensor contains inf, nan or element < 0" from
+`torch.multinomial`, one park and thirty layers from the cause. Reachable by
+DEFAULT: `IdleParkConfig.enabled` is True and the #546 idle park drives exactly
+this pair (`ledger.park_all()` on the way down, `ensure_resident()` on the way
+back). Note the same failure already had a repair on the LOAD path
+(`qwen3_tts_compat.refresh_rotary_buffers`, whose docstring describes this NaN
+chain in full) — the restore path simply never got an equivalent, so the fork
+had diagnosed the failure once and remained exposed to it through a second
+door. Fixed generically in the ledger: park also captures the non-persistent
+buffers (`named_buffers()` minus the state-dict keys) and restore writes them
+back through `register_buffer(persistent=False)`, carrying the bytes verbatim
+rather than recomputing them — recomputation is a per-module repair someone has
+to remember to write for each new buffer, copying is correct for every module
+the ledger will ever be handed. The rule: whenever save and restore use
+different APIs, enumerate what each one covers and assert the difference is
+empty; and a repair written for one entry path is a standing question about
+every other entry path to the same state.
+
+Absent-means-dead family (#551): an inventory built from one container, and a
+consumer that reads "not in the inventory" as "gone". The #364 GDN slot ladder
+enumerated live offload sessions through `kv_session_offload.spills`, and
+`GdnSlotRuntime.on_round` drops the exported state blob of any parked id it
+cannot find ("a parked session that died while parked leaves a blob nobody will
+ever ask for"). But `_commit_park` POPS a #224-parked session out of `spills`
+while the session stays alive and keeps its req-pool slot, its radix lock and
+its Mamba/GDN state slot. So a session whose GDN state had been exported, and
+which then parked its KV to the next tier, had that blob discarded; it later
+unparks, restores its KV, resumes, and continues with recurrent state that no
+longer exists -- no crash, no log, wrong tokens. The comment was not wrong, its
+PREMISE was: absence meant "dead" only while every live session was in
+`spills`. Fixed with `KVSessionOffloadManager.live_offload_reqs()` (spilled AND
+parked) as the single enumeration, mirroring what `inflight_batches` already
+had to do for abort scanning -- a second consumer making the same mistake is
+the signal that the container, not the consumer, was the wrong abstraction. The
+rule: when a lifecycle can move an object between containers, "enumerate the
+live set" must be a method on the owner, never a field read at the call site;
+and any code that deletes on absence has to name which container's absence it
+means. Note the neighbouring `inflight_batches` had ALREADY been taught about
+parked sessions for abort scanning -- so the knowledge existed in the module
+and the second consumer simply never received it, which is what a missing
+accessor costs.
+
 Unreachable-interop family (#547): interop code written FOR a pair the boot
 refuses is not interop, it is a claim. `force_host_write_through` (#242) exists
 so a kv-session-offload budget demotion hands its prefix over losslessly under

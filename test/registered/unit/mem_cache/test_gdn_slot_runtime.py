@@ -207,5 +207,97 @@ class TestBuilder(CustomTestCase):
         self.assertIsNone(build_gdn_slot_executor(scheduler))
 
 
+class TestParkedSessionsAreVisibleToTheLadder(CustomTestCase):
+    """#551: a #224-PARKED session still holds its GDN state slot.
+
+    THE CORRECTNESS GAP. ``build_gdn_slot_executor``'s ``idle_holders`` closure
+    enumerated live offload sessions through ``kv_session_offload.spills``. But
+    ``_commit_park`` POPS a session out of ``spills`` when it parks to a deeper
+    tier, while the session stays alive and keeps its req-pool slot, its radix
+    tree lock and -- the part that matters here -- its Mamba/GDN state slot.
+
+    A parked session was therefore invisible to the ladder's inventory, and
+    ``on_round`` treats an id it cannot find as DEAD::
+
+        # A parked session that died while parked leaves a blob nobody will
+        # ever ask for; drop it here rather than grow the store forever.
+        for sid in parked_ids:
+            if sid not in self._by_id:
+                self._executor.forget(sid)
+
+    So a session whose GDN state had been exported to a blob, and which then
+    parked its KV to the next tier, had that blob DISCARDED. It later unparks,
+    restores its KV, resumes -- and continues with recurrent state that no
+    longer exists. No crash, no log, wrong tokens. The comment was not wrong,
+    its premise was: absence from the inventory meant "dead" only as long as
+    every live session was in ``spills``.
+
+    CAN-FAIL: point ``idle_holders`` back at ``manager.spills`` and
+    ``test_the_builder_sees_a_parked_session`` goes red -- the parked request
+    is missing from the inventory, which is exactly the state that makes the
+    ladder throw its blob away.
+    """
+
+    def _manager(self, spilled, parked):
+        from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+
+        mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
+        mgr.spills = {
+            r.req_pool_idx: SimpleNamespace(req=r) for r in spilled
+        }
+        mgr._dest = SimpleNamespace(
+            parked={r.rid: SimpleNamespace(slot=SimpleNamespace(req=r)) for r in parked}
+        )
+        return mgr
+
+    def test_live_offload_reqs_covers_spilled_and_parked(self):
+        spilled = _req("s", arrival=1, req_pool_idx=0)
+        parked = _req("p", arrival=2, req_pool_idx=1)
+        mgr = self._manager([spilled], [parked])
+        rids = sorted(r.rid for r in mgr.live_offload_reqs())
+        self.assertEqual(rids, ["p", "s"])
+        # ...and `spills` alone is exactly the set that misses the parked one.
+        self.assertEqual([s.req.rid for s in mgr.spills.values()], ["s"])
+
+    def test_live_offload_reqs_without_a_destination_chain(self):
+        """Unarmed chain: byte-identical to the old spills-only enumeration."""
+        spilled = _req("s", arrival=1, req_pool_idx=0)
+        mgr = self._manager([spilled], [])
+        mgr._dest = None
+        self.assertEqual([r.rid for r in mgr.live_offload_reqs()], ["s"])
+
+    def test_the_builder_sees_a_parked_session(self):
+        from sglang.srt.managers.gdn_slot_runtime import build_gdn_slot_executor
+
+        h = Harness(slots=2)
+        spilled = _req("s", arrival=1, req_pool_idx=0)
+        parked = _req("p", arrival=2, req_pool_idx=1)
+        h.give_slot(spilled)
+        h.give_slot(parked)
+        scheduler = SimpleNamespace(
+            req_to_token_pool=h.req_to_token_pool,
+            kv_session_offload=self._manager([spilled], [parked]),
+        )
+        rt = build_gdn_slot_executor(scheduler)
+        self.assertIsNotNone(rt)
+        rids = sorted(r.rid for r in rt._idle_holders())
+        self.assertEqual(
+            rids,
+            ["p", "s"],
+            "a parked session is missing from the ladder inventory; on_round "
+            "would forget its exported GDN state blob while it is still alive",
+        )
+
+    def test_no_offload_manager_is_still_an_empty_inventory(self):
+        from sglang.srt.managers.gdn_slot_runtime import build_gdn_slot_executor
+
+        h = Harness(slots=2)
+        scheduler = SimpleNamespace(
+            req_to_token_pool=h.req_to_token_pool, kv_session_offload=None
+        )
+        rt = build_gdn_slot_executor(scheduler)
+        self.assertEqual(rt._idle_holders(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
