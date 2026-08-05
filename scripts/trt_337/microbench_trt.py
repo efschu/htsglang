@@ -748,10 +748,20 @@ def byte_touch_floor(nbytes: int, device, graph_bodies: int, target_ms: float,
     if not cuda:
         return {"measured": False, "reason": "cpu"}
     try:
-        buf = torch.empty(int(nbytes), dtype=torch.uint8, device=device)
+        # float32, NOT uint8->int64. The window-7 run measured this floor at
+        # 90 GB/s on a 5090 whose HBM does ~1.8 TB/s, and the guard then ruled
+        # every arm invalid -- including torch's own reference GEMM, which is
+        # the tell that the ceiling and not the arm was wrong. The cause was
+        # the probe itself: summing uint8 into int64 is a width-converting
+        # reduction whose cost is per ELEMENT, so it measures conversion
+        # throughput, not bandwidth. A floor must be the cheapest possible way
+        # to touch the bytes, or it is not a floor. Same byte count, same
+        # capture mode, one element per 4 bytes and no dtype promotion.
+        n = max(1, int(nbytes) // 4)
+        buf = torch.ones(n, dtype=torch.float32, device=device)
 
         def probe():
-            return buf.sum(dtype=torch.int64)
+            return buf.sum()
 
         iters, _ = calibrate(probe, target_ms, cuda, max_iters)
         g = capture_graph(probe, graph_bodies)
