@@ -354,26 +354,27 @@ def planner_candidates(
 ) -> Tuple[List[Stage], List[str]]:
     """The production feed: ask the planner for one stage per regime.
 
-    ``solve_fn`` is the seam, and it is UNBOUND. This docstring used to say
-    "production binds it to the key solver (``planner.key_solver.solve``
-    through ``planner.solver_api``)" -- nothing does, under any configuration.
-    The one production caller, ``regime_runtime.build_regime_stage_table``,
-    invokes this function with the argument omitted, so the ``solve_fn is
-    None`` branch below is the ONLY branch production takes and the stage
-    table permanently holds the booted stage alone. Act mode consequently has
-    nothing to select between; it is not broken, it is unfed.
+    ``solve_fn`` is the seam. #578 BOUND it: the one production caller,
+    ``regime_runtime.build_regime_stage_table``, now passes
+    ``regime_runtime._planner_solve_fn(scheduler)``, which drives
+    ``planner.solver_api.key_solver_payload`` and maps the winning candidate
+    onto a ``Stage``. Before that it was called with the argument omitted, so
+    the ``solve_fn is None`` branch was the only branch production took, the
+    stage table permanently held the booted stage alone, and act mode had
+    nothing to select between -- it was not broken, it was unfed.
 
-    That is a WIRING gap, not a missing solver. ``key_solver.solve`` exists and
-    is #348b/#350-aware by construction (it ranks on the shared cost library
-    and honours ``--objective``), but its signature needs ``plan_inputs``, a
-    base plan, per-rank budgets and ``RigRates`` -- i.e. a card probe and a
-    measured rate set. Binding the seam means constructing those at boot and
-    mapping a ``SolverAnswer`` back onto a ``Stage``; it is not a two-line
-    call, which is presumably why it never happened. Tracked as #363/S8.
+    THE FEED BEING BOUND IS NOT THE SAME AS THE TABLE BEING USABLE. Stages
+    produced by the planner arrive marked ``Stage.unmeasured``: a solver
+    predicts a layout, but ``measured_gain_pct``, ``measured_band_pct`` and
+    ``flip_cost_s`` are MEASUREMENTS -- an A-vs-A run on the stage's own phase
+    plus an instrumented flip -- and ``SolverAnswer`` carries no counterpart to
+    any of the three. ``StageTable`` refuses unmeasured stages by name. That
+    refusal is the intended end state of this slice: an operator now reads
+    "the feed works, these stages lack measurement" instead of seeing an empty
+    table and no explanation. Taking the measurements is #584's slice.
 
-    Until then the note below is the honest report and must stay reachable:
-    an operator reading it learns both that the feed is absent and what would
-    supply it. Tests inject a stub, so nothing here needs a card probe.
+    The ``solve_fn is None`` branch is kept for tests and for callers that
+    deliberately want no feed.
 
     A goal the planner cannot answer yields NO stage and a note. That is the
     honest outcome on a rig with no probe, and it is why the observer's

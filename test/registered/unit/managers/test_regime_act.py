@@ -65,6 +65,15 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 _FLOOR = 4.2
 _BOOT_VRAM = (29607, 17780, 17780)
 
+#: #578: a minimal server_args for the feed tests. planner_candidates only
+#: forwards it to solve_fn, so the stubs never read it.
+_SERVER_ARGS_578 = types.SimpleNamespace(
+    model_path="/nonexistent/model",
+    tp_size=3,
+    rank_gpu_id=[0, 1, 2],
+    rank_gpu_memory_mib=list(_BOOT_VRAM),
+)
+
 
 def _stage(
     name,
@@ -248,40 +257,41 @@ class TestPlannerFeed(CustomTestCase):
         self.assertEqual(stages, [])
         self.assertIn("no card probe", " ".join(notes))
 
-    def test_the_seam_is_unbound_in_production(self):
-        """#363/S8 RATCHET: the only production caller omits ``solve_fn``.
+    def test_the_seam_is_bound_and_refuses_without_measurement(self):
+        """#578: the successor to the #363/S8 "unbound" ratchet.
 
-        ``regime_stages.planner_candidates``'s docstring used to claim
-        "production binds it to the key solver". Nothing does, under any
-        configuration: ``regime_runtime.build_regime_stage_table`` calls it
-        with the argument omitted, so the ``solve_fn is None`` branch is the
-        only branch production takes and the stage table permanently holds the
-        booted stage alone. Act mode is therefore not broken but UNFED, and a
-        docstring asserting the opposite is how that stays invisible.
+        The old ratchet asserted that ``regime_runtime.build_regime_stage_table``
+        called ``planner_candidates(server_args)`` with ``solve_fn`` OMITTED,
+        which was true and was the whole bug: the ``solve_fn is None`` branch
+        was the only branch production took, so the stage table permanently
+        held the booted stage alone and act mode had nothing to select
+        between. It was not broken, it was unfed. That ratchet was designed to
+        go red when the seam was bound, and #578 bound it.
 
-        This is a wiring gap, not a missing solver: ``key_solver.solve``
-        exists but needs plan inputs, a base plan, per-rank budgets and
-        ``RigRates`` -- a card probe and a measured rate set -- plus a mapping
-        from ``SolverAnswer`` back onto a ``Stage``.
+        The pin therefore INVERTS rather than disappearing. What must stay
+        true now is:
 
-        The test is a RATCHET: when the seam is bound it goes red, which is
-        the point. Update it together with the wiring, and delete the
-        "unbound" wording from the docstring in the same commit.
+        1. the seam is BOUND at the production call site, and
+        2. stages the planner produces are marked ``unmeasured`` and are
+           REFUSED BY NAME, because a solver cannot predict an A-vs-A gain,
+           the band it was taken against, or an instrumented flip cost.
 
-        CAN-FAIL: pass any ``solve_fn`` at the production call site and this
-        goes red immediately.
+        Deleting the pin instead of inverting it would let the feed regress to
+        silence, or -- worse -- let unmeasured stages become selectable, which
+        is exactly the "flipping on noise with a number written next to it"
+        that #360 exists to prevent.
         """
         import inspect
 
         from sglang.srt.managers import regime_runtime
 
         src = inspect.getsource(regime_runtime.build_regime_stage_table)
-        self.assertIn("planner_candidates(server_args)", src)
-        self.assertNotIn("solve_fn", src)
+        self.assertIn("solve_fn", src)
+        self.assertNotIn("planner_candidates(server_args)\n", src)
 
         doc = planner_candidates.__doc__ or ""
-        self.assertIn("UNBOUND", doc)
-        self.assertNotIn("Production binds it", doc)
+        self.assertNotIn("it is UNBOUND", doc)
+        self.assertIn("unmeasured", doc)
 
     def test_the_feed_asks_one_goal_per_regime(self):
         asked = []
@@ -873,5 +883,132 @@ class TestObserveStillCannotAct(CustomTestCase):
             self.assertNotIn(forbidden, called)
 
 
+class TestPlannerFeedAcceptance578(CustomTestCase):
+    """#578 acceptance, both branches, hermetic.
+
+    The bug was that ``planner_candidates`` was called without ``solve_fn``,
+    so it returned ``[]`` and the enforcer actuated never. Binding the seam is
+    only half the fix: what the planner produces is a PREDICTION, and the
+    #360 gate refuses stages whose gain does not clear their own A-vs-A band.
+    A solver cannot supply a gain, a band, or an instrumented flip cost, so
+    planner stages arrive marked ``unmeasured`` and are refused BY NAME.
+
+    Both halves are pinned here:
+      * MEASURED stub stages -> a non-empty table with a real flip target,
+        which proves the feed and the selection plumbing work end to end;
+      * UNMEASURED stages -> the named #578 refusal, which is what production
+        legitimately gets until #584 takes the measurements.
+    """
+
+    def test_measured_stub_stages_produce_a_non_empty_selection(self):
+        solved = {
+            REGIME_PREFILL_HEAVY: _stage(
+                "planner:enc",
+                REGIME_PREFILL_HEAVY,
+                kv=(2, 11, 10),
+                pool=380_000,
+                gain=9.0,
+                band=1.0,
+            )
+        }
+        candidates, notes = planner_candidates(
+            _SERVER_ARGS_578,
+            solve_fn=lambda goal: solved.get(REGIME_PREFILL_HEAVY)
+            if goal == "enc"
+            else None,
+        )
+        self.assertTrue(candidates, f"the feed produced no stage; notes={notes}")
+        plan = build_stage_table(
+            booted=BOOTED,
+            candidates=candidates,
+            declared_vectors=((2, 11, 10),),
+        )
+        self.assertGreaterEqual(
+            len(plan.flip_targets), 1,
+            "a measured stage in a declared vector must be a flip target; "
+            "without one, act mode still has nowhere to go",
+        )
+
+    def test_unmeasured_stages_are_refused_by_name(self):
+        unmeasured = Stage(
+            name="planner:enc",
+            regime=REGIME_PREFILL_HEAVY,
+            weight_vector=None,
+            kv_token_vector=(2, 11, 10),
+            vram_budget_mib=BOOTED.vram_budget_mib,
+            max_total_num_tokens=380_000,
+            measured_gain_pct=0.0,
+            measured_band_pct=0.0,
+            flip_cost_s=0.0,
+            unmeasured=True,
+        )
+        self.assertFalse(unmeasured.clears_its_band)
+        with self.assertRaises(RegimeError) as caught:
+            build_stage_table(
+                booted=BOOTED,
+                candidates=[unmeasured],
+                declared_vectors=((2, 11, 10),),
+            )
+        msg = str(caught.exception)
+        # The refusal must name the MEASUREMENT gap, not look like the
+        # inside-the-band case: the two have completely different remedies.
+        self.assertIn("#578", msg)
+        self.assertIn("measured_gain_pct", msg)
+        self.assertIn("measured_band_pct", msg)
+        self.assertIn("flip_cost_s", msg)
+        self.assertIn("planner:enc", msg)
+
+    def test_unmeasured_may_not_carry_a_measurement_claim(self):
+        """A non-zero number beside unmeasured=True is a claim, and is refused.
+
+        Without this, "unmeasured" degrades into a label anyone can attach to
+        fabricated numbers, which is the failure mode #360 already names.
+        """
+        with self.assertRaises(RegimeError):
+            Stage(
+                name="planner:bogus",
+                regime=REGIME_PREFILL_HEAVY,
+                weight_vector=None,
+                kv_token_vector=(2, 11, 10),
+                vram_budget_mib=BOOTED.vram_budget_mib,
+                max_total_num_tokens=380_000,
+                measured_gain_pct=9.0,
+                measured_band_pct=1.0,
+                flip_cost_s=0.3,
+                unmeasured=True,
+            )
+
+    def test_production_call_site_passes_a_real_solve_fn(self):
+        import inspect
+
+        from sglang.srt.managers import regime_runtime
+
+        src = inspect.getsource(regime_runtime.build_regime_stage_table)
+        self.assertIn("_planner_solve_fn", src)
+
+    def test_solve_fn_names_why_it_cannot_answer(self):
+        """A feed that cannot answer must say so, never return a silent None.
+
+        Silence is what #578 was. The closure raises PlannerFeedUnavailable
+        with a reason, and planner_candidates turns it into a note.
+        """
+        from sglang.srt.managers.regime_runtime import _planner_solve_fn
+
+        scheduler = types.SimpleNamespace(
+            server_args=types.SimpleNamespace(rank_gpu_memory_mib=None)
+        )
+        candidates, notes = planner_candidates(
+            _SERVER_ARGS_578, solve_fn=_planner_solve_fn(scheduler)
+        )
+        self.assertEqual(candidates, [])
+        self.assertTrue(notes, "a feed that answered nothing must leave a note")
+        self.assertTrue(
+            any("rank_gpu_memory_mib" in n for n in notes),
+            f"the note must name the missing input; got {notes}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

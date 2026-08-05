@@ -908,7 +908,9 @@ def build_regime_stage_table(scheduler):
         if booted is None:
             return None
         declared = _declared_vectors(scheduler)
-        candidates, notes = planner_candidates(server_args)
+        candidates, notes = planner_candidates(
+            server_args, solve_fn=_planner_solve_fn(scheduler)
+        )
         plan = build_stage_table(
             booted=booted, candidates=candidates, declared_vectors=declared
         )
@@ -924,6 +926,129 @@ def build_regime_stage_table(scheduler):
             exc,
         )
         return None
+
+
+class PlannerFeedUnavailable(Exception):
+    """The planner feed cannot answer, with a reason worth printing.
+
+    Raised by the solve closure rather than returned as ``None`` so that
+    ``planner_candidates`` records WHY a goal produced no stage. A silent
+    ``None`` is what #578 was: a feed that looks bound and says nothing.
+    """
+
+
+def _planner_solve_fn(scheduler):
+    """Bind the planner feed (#578). Returns ``goal -> Optional[Stage]``.
+
+    This is the seam ``regime_stages.planner_candidates`` documents and that
+    nothing bound until now, which is why the stage table permanently held the
+    booted stage alone and act mode had nothing to select between.
+
+    WHAT THIS DOES NOT DO. The stages it returns are marked ``unmeasured``.
+    The planner predicts a layout; it cannot predict the A-vs-A gain, the band
+    that gain was taken against, or an instrumented flip cost, and
+    ``SolverAnswer`` carries no counterpart to any of the three. ``StageTable``
+    refuses such stages by name -- see its #578 branch. That refusal is the
+    intended end state of this slice: it replaces a silent empty table with a
+    diagnosable "the feed works, the measurement is missing", and taking the
+    measurements is #584's slice.
+    """
+    from sglang.srt.managers.regime_classifier import Stage
+
+    server_args = scheduler.server_args
+
+    def solve(goal: str):
+        from sglang.srt.planner.solver_api import key_solver_payload
+
+        budgets = [
+            int(x) for x in (getattr(server_args, "rank_gpu_memory_mib", None) or ())
+        ]
+        if not budgets:
+            raise PlannerFeedUnavailable(
+                "no per-rank VRAM budget on server_args "
+                "(rank_gpu_memory_mib); the solver needs one per rank"
+            )
+        answer = key_solver_payload(
+            {
+                "model_path": getattr(server_args, "model_path", "") or "",
+                "tp_size": int(getattr(server_args, "tp_size", 0) or len(budgets)),
+                "rank_gpu_id": list(
+                    getattr(server_args, "rank_gpu_id", None) or range(len(budgets))
+                ),
+                "rank_gpu_memory_mib": budgets,
+                "goal": goal,
+                "kv_cache_dtype": getattr(server_args, "kv_cache_dtype", None),
+                "speculative_algorithm": getattr(
+                    server_args, "speculative_algorithm", None
+                ),
+                "speculative_num_draft_tokens": getattr(
+                    server_args, "speculative_num_draft_tokens", None
+                ),
+                "max_running_requests": getattr(
+                    server_args, "max_running_requests", None
+                ),
+            }
+        )
+        if not answer.get("ok"):
+            raise PlannerFeedUnavailable(
+                "; ".join(answer.get("reasons") or ["the solver declined"])
+            )
+        cands = answer.get("candidates") or []
+        if not cands:
+            raise PlannerFeedUnavailable("the solver returned no candidate")
+        best = cands[0]
+        pool = ((best.get("predictions") or {}).get("maxkv") or {}).get("value")
+        if not pool:
+            raise PlannerFeedUnavailable(
+                "the winning candidate has no maxkv prediction, so the stage "
+                "would fund no pool"
+            )
+        kv_vector = best.get("kv_token_vector") or best.get("per_rank_tokens")
+        if not kv_vector:
+            # NOT invented. Stage.kv_token_vector is the #297 reshard target
+            # and must be the solver's own per-rank split; the solver computes
+            # it (key_solver.capacity() -> cap["p"]) but does not return it
+            # through this API. Splitting the total here -- evenly, or by
+            # budget share -- would be a fabricated reshard target that looks
+            # authoritative. Surfacing cap["p"] through key_solver_payload is
+            # the next concrete step and belongs to #584's slice with the
+            # measurement pass.
+            raise PlannerFeedUnavailable(
+                "the solver API returns no per-rank KV vector "
+                "(Stage.kv_token_vector). key_solver.capacity() computes it "
+                "as cap['p'] but key_solver_payload does not surface it; "
+                "exposing it is the remaining wiring step. A split derived "
+                "here would be a fabricated reshard target"
+            )
+        weights = ((best.get("key") or {}).get("rank_mlp_ratio")) or None
+        return Stage(
+            name=f"planner:{goal}",
+            regime=_regime_for_goal(goal),
+            weight_vector=tuple(int(x) for x in weights) if weights else None,
+            kv_token_vector=tuple(int(x) for x in kv_vector),
+            vram_budget_mib=tuple(budgets),
+            max_total_num_tokens=int(pool),
+            # Placeholders, and marked as such. See Stage.unmeasured: a
+            # non-zero value alongside unmeasured=True is refused outright,
+            # precisely so nothing can claim a measurement it did not take.
+            measured_gain_pct=0.0,
+            measured_band_pct=0.0,
+            flip_cost_s=0.0,
+            unmeasured=True,
+        )
+
+    return solve
+
+
+def _regime_for_goal(goal: str) -> str:
+    """Invert REGIME_GOALS. The feed solves per regime, so the answer knows
+    which regime it was solved for."""
+    from sglang.srt.managers.regime_stages import REGIME_GOALS
+
+    for regime, regime_goal in REGIME_GOALS.items():
+        if regime_goal == goal:
+            return regime
+    raise PlannerFeedUnavailable(f"no regime maps to planner goal {goal!r}")
 
 
 def _booted_stage(scheduler):
