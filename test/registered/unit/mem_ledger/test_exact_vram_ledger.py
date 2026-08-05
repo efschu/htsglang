@@ -610,3 +610,144 @@ def test_budget_funded_terms_are_not_charged_twice():
     # pool the budget funds, is exactly the ledger's own residual.
     budget = ledger.total_mib - (ledger.user_reserve_mib + outside)
     assert budget - ledger.term(TERM_MAMBA_POOL).mib == ledger.kv_pool_mib
+
+
+# --- the flashinfer workspace responds to the config that actually sets it ---
+#
+# The gap: the term read SGLANG_FLASHINFER_WORKSPACE_SIZE at ledger-build time,
+# but FlashInferAttnBackend.__init__ REWRITES that variable afterwards -- 512
+# MiB for listed architectures, then 2048 MiB under deterministic inference,
+# which overrides the first. So the term charged the 384 MiB default for a
+# deterministic boot that allocates 2048, and did not move when
+# enable_deterministic_inference moved. That is exactly the property
+# test_each_term_moves_when_its_declared_driver_moves asserts of MODELED terms,
+# unasserted for this one because the driver was not among its inputs.
+
+
+def workspace_inputs(n_ranks=1, **overrides):
+    from sglang.srt.layers.attention.flashinfer_workspace import (
+        describe_flashinfer_workspace,
+        resolve_flashinfer_workspace_mib,
+    )
+
+    deterministic = overrides.pop("deterministic", False)
+    architectures = overrides.pop("architectures", ("Qwen3_5ForConditionalGeneration",))
+    default_bytes = overrides.pop("default_bytes", 384 * 1024 * 1024)
+    base = dict(
+        weight_mib_per_rank=[0] * n_ranks,
+        activation_mib_per_rank=[stock_activation_mib(CHUNKED_PREFILL, TP_SIZE)]
+        * n_ranks,
+        capture_tokens_per_rank=[96] * n_ranks,
+        mamba_pool_mib_per_rank=[900.0] * n_ranks,
+        chunked_prefill_size=CHUNKED_PREFILL,
+        flashinfer_workspace_mib=resolve_flashinfer_workspace_mib(
+            enable_deterministic_inference=deterministic,
+            architectures=architectures,
+            default_bytes=default_bytes,
+        ),
+        flashinfer_workspace_note=describe_flashinfer_workspace(
+            enable_deterministic_inference=deterministic,
+            architectures=architectures,
+            default_bytes=default_bytes,
+        ),
+        enable_deterministic_inference=deterministic,
+        model_architectures=architectures,
+    )
+    base.update(overrides)
+    return DemandInputs(**base)
+
+
+def workspace_ledger(**overrides):
+    cards = [CARD_3080_A]
+    return build_card_ledgers(
+        workspace_inputs(**overrides),
+        cards=cards,
+        rank_gpu_id=[1],
+        user_reserve_mib={1: DEFAULT_USER_RESERVE_MIB},
+        calibration=calibration_for(*cards),
+    )[0]
+
+
+def test_workspace_term_moves_with_deterministic_inference():
+    """CAN-FAIL ANCHOR. Empirically the failed deterministic boot consumed an
+    extra 1649 MiB between pool end and capture begin against a derived delta
+    of 1664 MiB (2048 - 384); before this fix the ledger's delta was 0."""
+    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+
+    off = workspace_ledger(deterministic=False).term(TERM_ATTN_WORKSPACE).mib
+    on = workspace_ledger(deterministic=True).term(TERM_ATTN_WORKSPACE).mib
+    assert off == 384, off
+    assert on == 2048, on
+    assert on - off == 1664
+
+
+def test_the_served_architecture_is_not_on_the_high_workspace_list():
+    """Qwen3_5ForConditionalGeneration is NOT one of the listed architectures,
+    so its non-deterministic workspace is the 384 MiB env default and not 512.
+    This is what makes the empirical delta 1664 rather than 1536; a substring
+    match against 'Qwen3ForCausalLM' would get this wrong."""
+    from sglang.srt.layers.attention.flashinfer_workspace import (
+        HIGH_WORKSPACE_ARCHITECTURES,
+        resolve_flashinfer_workspace_mib,
+    )
+
+    assert "Qwen3_5ForConditionalGeneration" not in HIGH_WORKSPACE_ARCHITECTURES
+    assert (
+        resolve_flashinfer_workspace_mib(
+            architectures=("Qwen3_5ForConditionalGeneration",),
+            default_bytes=384 * 1024 * 1024,
+        )
+        == 384
+    )
+
+
+def test_a_listed_architecture_raises_the_workspace_to_512():
+    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+
+    listed = workspace_ledger(architectures=("Qwen3ForCausalLM",))
+    assert listed.term(TERM_ATTN_WORKSPACE).mib == 512
+
+
+def test_deterministic_overrides_the_architecture_bump_not_the_reverse():
+    """The backend assigns the architecture bump FIRST and the deterministic
+    bump SECOND, so deterministic wins. Getting this backwards would charge 512
+    for a boot that allocates 2048."""
+    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+
+    both = workspace_ledger(deterministic=True, architectures=("Qwen3ForCausalLM",))
+    assert both.term(TERM_ATTN_WORKSPACE).mib == 2048
+
+
+def test_workspace_term_declares_the_inputs_that_actually_drive_it():
+    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+
+    term = workspace_ledger(deterministic=True).term(TERM_ATTN_WORKSPACE)
+    assert "enable_deterministic_inference" in term.inputs
+    assert "hf_config.architectures" in term.inputs
+    # ...and the row says WHICH rule applied, so 2048-deterministic is
+    # distinguishable from 2048-anything-else at a glance.
+    assert "deterministic" in term.derivation
+
+
+def test_workspace_scales_with_colocated_ranks():
+    from sglang.srt.mem_ledger.engine import TERM_ATTN_WORKSPACE
+
+    ledger = build_card_ledgers(
+        workspace_inputs(n_ranks=3, deterministic=True),
+        cards=[CARD_5090],
+        rank_gpu_id=[0, 0, 0],
+        user_reserve_mib={0: DEFAULT_USER_RESERVE_MIB},
+        calibration=calibration_for(CARD_5090),
+    )[0]
+    assert ledger.term(TERM_ATTN_WORKSPACE).mib == 2048 * 3
+
+
+def test_the_resolver_is_the_one_the_backend_uses():
+    """Not a second implementation: the backend imports these very names, so a
+    change to the rule cannot move one side without the other."""
+    import sglang.srt.layers.attention.flashinfer_backend as fb
+    from sglang.srt.layers.attention import flashinfer_workspace as fw
+
+    assert fb.HIGH_WORKSPACE_ARCHITECTURES is fw.HIGH_WORKSPACE_ARCHITECTURES
+    assert fb.WORKSPACE_ARCH_MIB == fw.WORKSPACE_ARCH_MIB == 512
+    assert fb.WORKSPACE_DETERMINISTIC_MIB == fw.WORKSPACE_DETERMINISTIC_MIB == 2048

@@ -23,6 +23,11 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_workspace import (
+    HIGH_WORKSPACE_ARCHITECTURES,
+    WORKSPACE_ARCH_MIB,
+    WORKSPACE_DETERMINISTIC_MIB,
+)
 from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
@@ -974,17 +979,18 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
-        # Qwen2/Qwen3 models require higher flashinfer workspace size
+        # Qwen2/Qwen3 models require higher flashinfer workspace size.
+        # The rule lives in flashinfer_workspace so that things which must know
+        # the size BEFORE this backend exists (the VRAM ledger sizing a card,
+        # the planner predicting capacity) apply the same one instead of
+        # reading the raw env var and getting the pre-rewrite value.
         if (
-            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
-            or "Qwen3VLForConditionalGeneration"
-            in model_runner.model_config.hf_config.architectures
-            or "Qwen3VLMoeForConditionalGeneration"
-            in model_runner.model_config.hf_config.architectures
+            set(model_runner.model_config.hf_config.architectures)
+            & HIGH_WORKSPACE_ARCHITECTURES
         ):
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(
+                WORKSPACE_ARCH_MIB * 1024 * 1024
+            )
 
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
@@ -1004,7 +1010,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
             self.disable_cuda_graph_kv_split = True
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
+            # Overrides the architecture bump above; see flashinfer_workspace,
+            # which encodes that precedence once for every reader.
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(
+                WORKSPACE_DETERMINISTIC_MIB * 1024 * 1024
+            )
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 

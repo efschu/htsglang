@@ -179,6 +179,15 @@ class DemandInputs:
     #: case the configuration permits.
     flashinfer_workspace_mib: Optional[int] = None
     attn_scratch_budget_mib: Optional[int] = None
+    #: Why the flashinfer workspace is the size it is (which of the three rules
+    #: applied). Carried into the ledger row so a reader can tell a 2048 MiB
+    #: deterministic workspace from a 2048 MiB anything-else at a glance.
+    flashinfer_workspace_note: str = ""
+    #: Config inputs the workspace size actually depends on. Declared on the
+    #: term so the "a MODELED term moves when its driver moves" test can reach
+    #: them; this term charged a constant 384 MiB before they were wired in.
+    enable_deterministic_inference: bool = False
+    model_architectures: Tuple[str, ...] = ()
     #: True when a parent/tokenizer process binds a CUDA context on the cards
     #: (#237/#403). The SIZE of that context is a hardware residual.
     parent_binds_cuda_context: bool = False
@@ -286,15 +295,38 @@ class DemandInputs:
             except Exception:  # pragma: no cover - env shape differences
                 indexer_cap = None
 
+        # The flashinfer workspace is NOT simply the env var: the backend
+        # rewrites it during __init__ (512 MiB for listed architectures, then
+        # 2048 MiB under deterministic inference, which overrides the first).
+        # Reading the raw variable here charged 384 MiB for a deterministic
+        # boot that allocates 2048 -- 1664 MiB the ledger never charged, and a
+        # MODELED term that does not move with a config input it depends on.
+        # resolve_flashinfer_workspace_mib is the SAME function the backend
+        # uses, so the two cannot drift.
         flashinfer_mib = None
+        deterministic = bool(
+            getattr(server_args, "enable_deterministic_inference", False)
+        )
+        architectures: Tuple[str, ...] = ()
         try:
-            from sglang.srt.environ import envs
-
-            flashinfer_mib = int(envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()) // (
-                1 << 20
+            from sglang.srt.layers.attention.flashinfer_workspace import (
+                describe_flashinfer_workspace,
+                resolve_flashinfer_workspace_mib,
             )
-        except Exception:  # pragma: no cover - env shape differences
+
+            architectures = tuple(_model_architectures(server_args))
+            flashinfer_mib = resolve_flashinfer_workspace_mib(
+                enable_deterministic_inference=deterministic,
+                architectures=architectures,
+            )
+            flashinfer_note = describe_flashinfer_workspace(
+                enable_deterministic_inference=deterministic,
+                architectures=architectures,
+            )
+        except Exception as e:  # pragma: no cover - env/config shape differences
+            logger.debug("flashinfer workspace size unavailable: %s", e)
             flashinfer_mib = None
+            flashinfer_note = ""
         attn_scratch = getattr(server_args, "attn_scratch_budget_mib", None)
 
         return cls(
@@ -312,11 +344,38 @@ class DemandInputs:
             mamba_floor_derivation=floor_note,
             indexer_chunk_cap_mib=indexer_cap,
             flashinfer_workspace_mib=flashinfer_mib,
+            flashinfer_workspace_note=flashinfer_note,
+            enable_deterministic_inference=deterministic,
+            model_architectures=architectures,
             attn_scratch_budget_mib=(
                 int(attn_scratch) if attn_scratch is not None else None
             ),
             parent_binds_cuda_context=False,
         )
+
+
+def _model_architectures(server_args) -> Tuple[str, ...]:
+    """The checkpoint's ``architectures`` list, or ``()`` when unreadable.
+
+    Read straight from the HF config rather than through ``get_model_config()``:
+    that one memoizes a full ModelConfig on the ServerArgs, and this runs during
+    argument resolution, so caching one here would change what every later
+    reader sees. Same stance (and the same reason) as
+    ``_gdn_linear_attention_dims``.
+    """
+    try:
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        cfg = get_config(
+            server_args.model_path,
+            trust_remote_code=getattr(server_args, "trust_remote_code", False),
+            revision=getattr(server_args, "revision", None),
+            model_config_parser=getattr(server_args, "model_config_parser", None),
+        )
+        return tuple(str(a) for a in (getattr(cfg, "architectures", None) or ()))
+    except Exception as e:  # pragma: no cover - config-source differences
+        logger.debug("could not read the checkpoint architectures: %s", e)
+        return ()
 
 
 def _ranks_on(gpu_id: int, rank_gpu_id: Sequence[int]) -> Tuple[int, ...]:
@@ -552,11 +611,12 @@ def build_card_ledgers(
         ws_mib = 0
         if inputs.flashinfer_workspace_mib:
             ws_mib += inputs.flashinfer_workspace_mib * n_co
-            ws_parts.append(
-                f"flashinfer float workspace "
-                f"{inputs.flashinfer_workspace_mib} MiB/rank "
-                f"(SGLANG_FLASHINFER_WORKSPACE_SIZE)"
+            detail = (
+                inputs.flashinfer_workspace_note
+                or f"{inputs.flashinfer_workspace_mib} MiB/rank "
+                "(SGLANG_FLASHINFER_WORKSPACE_SIZE)"
             )
+            ws_parts.append(f"flashinfer float workspace {detail}")
         if inputs.attn_scratch_budget_mib:
             ws_mib += inputs.attn_scratch_budget_mib * n_co
             ws_parts.append(
@@ -578,6 +638,11 @@ def build_card_ledgers(
                     ),
                     inputs=(
                         "SGLANG_FLASHINFER_WORKSPACE_SIZE",
+                        # The backend rewrites the env var from these two
+                        # during __init__, so they -- not the raw variable --
+                        # are what the size actually depends on.
+                        "enable_deterministic_inference",
+                        "hf_config.architectures",
                         "attn_scratch_budget_mib",
                         "attention_backend",
                     ),
