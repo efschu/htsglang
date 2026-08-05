@@ -551,8 +551,30 @@ class Stage:
     measured_band_pct: float
     #: Instrumented cost of flipping INTO this stage, seconds.
     flip_cost_s: float
+    #: #578: this stage was SOLVED, not MEASURED. The planner predicts a
+    #: layout; it cannot predict an A-vs-A gain, the band that gain was taken
+    #: against, or an instrumented flip cost -- those are measurements, and
+    #: `SolverAnswer` carries no counterpart to any of the three.
+    #:
+    #: The flag exists so that "no measurement" is a STATE the table can name,
+    #: rather than three zeros that read like a measured result of zero. A
+    #: stage marked this way is refused by the #360 gate with its own reason;
+    #: see `StageTable.__init__`. Supplying the measurements is #584's job.
+    unmeasured: bool = False
 
     def __post_init__(self) -> None:
+        if self.unmeasured and (
+            self.measured_gain_pct or self.measured_band_pct or self.flip_cost_s
+        ):
+            raise RegimeError(
+                f"stage {self.name!r} is marked unmeasured but carries "
+                f"gain={self.measured_gain_pct}, "
+                f"band={self.measured_band_pct}, "
+                f"flip_cost={self.flip_cost_s}. An unmeasured stage must "
+                f"carry placeholder zeros; a non-zero value here is a "
+                f"measurement claim, and the whole point of the flag is that "
+                f"nothing may claim one without having taken it."
+            )
         if self.regime not in REGIMES:
             raise RegimeError(
                 f"stage {self.name!r} names regime {self.regime!r}; known: "
@@ -572,7 +594,16 @@ class Stage:
 
     @property
     def clears_its_band(self) -> bool:
-        """#360: a gain inside its own A-vs-A band is not a measurement."""
+        """#360: a gain inside its own A-vs-A band is not a measurement.
+
+        An UNMEASURED stage never clears: there is no gain to compare and no
+        band to compare it against. Returning False here rather than letting
+        `abs(0.0) > 0.0` decide it is deliberate -- the two are the same
+        boolean today, but they mean different things, and only one of them
+        survives someone later giving a stage a real band of 0.0.
+        """
+        if self.unmeasured:
+            return False
         return abs(self.measured_gain_pct) > self.measured_band_pct
 
     def admits(
@@ -625,15 +656,36 @@ class StageTable:
                 f"other stage's gain was measured against."
             )
         rejected: List[str] = []
+        unmeasured: List[str] = []
         for stage in stages:
             if stage.name == reference:
                 continue
-            if not stage.clears_its_band:
+            if stage.unmeasured:
+                unmeasured.append(stage.name)
+            elif not stage.clears_its_band:
                 rejected.append(
                     f"{stage.name!r}: gain {stage.measured_gain_pct:+.1f}% does "
                     f"not clear its own A-vs-A band of "
                     f"{stage.measured_band_pct:.1f}%"
                 )
+        if unmeasured:
+            # #578: the planner feed is BOUND and produced these stages; what
+            # they lack is measurement, not a solver. Naming that distinctly
+            # from the inside-the-band case is the whole point -- the two look
+            # identical from `clears_its_band` and have completely different
+            # remedies ("measure these" vs "re-measure or drop these").
+            raise RegimeError(
+                "stage table refused (#578): the planner solved "
+                f"{len(unmeasured)} stage(s) -- {', '.join(sorted(unmeasured))}"
+                " -- but they carry no measurement. Each needs "
+                "measured_gain_pct, measured_band_pct and flip_cost_s, taken "
+                "once at stage creation (an A-vs-A run on the stage's own "
+                "phase plus an instrumented flip), before #360 will let a "
+                "controller select it. The solver cannot predict any of the "
+                "three. This is NOT the old 'unfed' state: the feed is bound "
+                "and working; what is missing is the measurement pass, which "
+                "is #584's slice."
+            )
         if rejected:
             raise RegimeError(
                 "stage table refused (#360): a gain inside its own measured "
