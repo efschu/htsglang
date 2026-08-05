@@ -3,15 +3,21 @@
 Status: DESIGN, no code. Branch `feat/exact-vram-ledger` (design only; the
 implementation gets its own branch per slice).
 
-This document is written against the mandate plus three addenda. Addendum 3 is
-recorded verbatim in intent as R6 and R7 below, because both name an error
-class the design must be structurally unable to commit -- not a behaviour it
-should prefer.
+This document is written against the mandate plus four addenda. Addenda 3 and 4
+are recorded as R6, R7 and R9 because each names an ERROR CLASS the design must
+be structurally unable to commit -- not a behaviour it should prefer. That
+distinction drives the falsifiers: several are deliberately PAIRS, because a
+single case is passed by exactly the static implementation being excluded.
+
+Requirements are numbered in the order they were established, not in reading
+order (R9 arrived with addendum 4 and sits before R8 below). References
+elsewhere use the numbers, so they are not renumbered.
 
 **Provenance note.** The mandate and addenda 1-2 are summarised here from the
-coordinator's messages, not quoted. Where a requirement below depends on
-precise wording (the objective function in R4 especially), it is marked
-`[CONFIRM]` and must be checked against the original before that slice starts.
+coordinator's messages, not quoted. Addenda 3 and 4 are recorded close to their
+wording. Every mechanism this document builds on was checked in the tree before
+being relied on; where a check contradicted the brief, the finding is in §5 and
+the design follows the tree.
 
 ---
 
@@ -45,7 +51,7 @@ reimplements a carrier instead of driving it has failed the mandate.
 
 ## 2. Requirements
 
-Each requirement carries a falsifier: a concrete situation that must produce a
+Requirements R1-R9. Each carries a falsifier: a concrete situation that must produce a
 specific observable, and which the current design would fail if the
 requirement were dropped.
 
@@ -77,15 +83,38 @@ declaration (`declare_tenant_terms`, loud on omission) is the pattern.
 must require zero edits to planner logic -- only a declaration. A design review
 that cannot demonstrate this on paper fails the slice.
 
-### R4 -- The objective is throughput/latency, not fit `[CONFIRM]`
+### R4 -- The objective is JOINT and phase-weighted
+
+*Answered by the user, 2026-08-05; no longer `[CONFIRM]`.*
 
 The planner does not seek *a* configuration that fits; it seeks the one that
-maximises the stated objective subject to fitting. Fitting is a constraint, the
+maximises the objective subject to fitting. Fitting is a constraint, the
 objective is the goal.
 
-*Falsifier:* a configuration that fits comfortably but is throughput-inferior
+The objective is **joint**: maximum compute AND maximum VRAM
+throughput/latency, at all times. These are two axes, not one scalar, and the
+design must not collapse them into a single number chosen on the user's behalf.
+
+When the two disagree, **the running task's phase decides dominance**:
+
+| Phase | Bound by | Dominant axis |
+|---|---|---|
+| decode | memory bandwidth | VRAM throughput -- bandwidth *is* throughput here |
+| prefill | compute | compute |
+
+So the scoring function is a phase-weighted combination whose weights come from
+the same regime signal R7 uses, not a constant. A rig serving a decode-heavy
+mix and one serving a prefill-heavy mix are answering different questions, and
+a single fixed weighting would be wrong on at least one of them.
+
+*Falsifier F4.* Two candidates, A compute-superior and B bandwidth-superior.
+Under `REGIME_DECODE_HEAVY` the planner must choose B; under
+`REGIME_PREFILL_HEAVY`, A. A planner with a fixed scalar objective passes
+exactly one of these, which is why the falsifier is again the pair.
+
+*Falsifier F4b.* A configuration that fits comfortably but is objective-inferior
 to a tighter one must lose. If the planner ever prefers slack for its own sake,
-this requirement is not implemented.
+the constraint has been confused with the goal.
 
 ### R5 -- Movement has a cost and the cost is in the objective
 
@@ -164,6 +193,62 @@ single case.
 plan must NOT evacuate decode graphs. This separates "phase-dependent" from
 "reacts to the instantaneous phase", which is a different and worse thing.
 
+### R9 -- (Addendum 4) Flip granularity is a PRICED AXIS, and an enforcer exists
+
+*User requirement, 2026-08-05.*
+
+**The requirement has two halves and both are load-bearing.**
+
+**(i) Every prefill / draft / decode(verify) cut is itself a load change.** The
+best layout for a prefill tick is not the best layout for a verify tick. The
+planner must be able to use a different layout per load, and an ENFORCER must
+actually cause that different layout to happen. A design where the planner
+*could* choose differently but nothing actuates is not this requirement; it is
+the #578 bug (see slice 0) written into the architecture.
+
+**(ii) Tick-level versus regime-level flipping is PRICED PER KNOB, not decided
+by a blanket rule.** For each control knob the design states its flip cost and
+classifies it:
+
+| Class | Criterion | Flips at | Examples |
+|---|---|---|---|
+| **tick-flippable** | not graph-addressed AND zero data movement | every forward | #439 cold-expert compute assignment (verified VRAM-neutral: `expert_heat_migration.py:31` calls same-size-before-and-after "the #439 sizing latch's invariant", `expert_compute_placement.py:566`); candidate: token vector per prefill batch |
+| **regime-flippable** | graph-addressed OR moves data | regime boundary, with hysteresis | anything requiring CUDA-graph recapture (3-6 s, the general property in `DESIGN_140`); KV resharding (#297); TP re-cut (#261) |
+
+The two criteria are the whole classification. A knob is tick-flippable exactly
+when flipping it costs neither a recapture nor a byte moved -- and that is a
+property of the knob that can be checked, not a judgement call.
+
+**Within a tick**, where the layout is fixed by definition, the answer is
+overlap and behaviour adaptation rather than layout change: #128/#199 collective
+overlap, #125 prefetch, #274 phase pairing, #156 adaptive draft. These are not
+lesser substitutes for flipping; they are the correct tool at that timescale,
+because at tick granularity the flip cost of anything structural exceeds a
+tick.
+
+**Every knob must carry its classification and its justification by cost.** A
+knob placed on the regime side without a stated cost is an unpriced assumption,
+which is the same defect class as an unledgered VRAM term (R1).
+
+*Falsifier F9.* A knob that is not graph-addressed and needs zero data movement
+must be flipped PER TICK by the planner. Concretely: give the planner a
+workload whose optimal #439 cold-expert assignment differs between consecutive
+prefill and verify ticks; it must emit a different assignment on each. A
+planner that holds it until a regime boundary has mis-classified a zero-cost
+knob as expensive -- and that failure is silent and permanent, because a
+wrongly-regime-classified knob simply never demonstrates the gain it could have
+made.
+
+*Falsifier F9b.* The mirror, guarding against the opposite error: a
+graph-addressed knob must NOT flip per tick. A planner that flips a knob
+costing a 3-6 s recapture at tick granularity would spend the entire tick
+budget on recapture and serve nothing.
+
+*Falsifier F9c (enforcement, not intent).* After slice 0, a regime change must
+produce an OBSERVABLE layout difference -- not merely a planner decision logged.
+The test asserts on the actuated state, because #578 is precisely the case
+where the decision existed and the actuation did not.
+
 ### R8 -- Every decision is explainable after the fact
 
 Any configuration the planner chooses must be reconstructible: the candidates
@@ -205,35 +290,71 @@ by "what unblocks the most" and by risk, cheapest proof first.
 
 | # | Slice | Proves | Gate |
 |---|---|---|---|
+| **0** | **#578: bind the planner feed (`solve_fn`)** | **the authority has a runtime arm at all** | **hermetic: a non-empty stage table; F9c** |
 | 1 | Boot path: ledger replaces the `RESERVE` vector | R1, R2 end to end on the production recipe | TICKET_582 gates (a)+(b) |
 | 2 | Candidate enumeration (cuts, no movement) | R3, R6 candidate set | hermetic: F6 candidate-set assertion |
-| 3 | Objective + movement cost model | R4, R5 | hermetic: F6, F6b |
+| 3 | Joint phase-weighted objective + movement cost | R4, R5 | hermetic: F4, F4b, F6, F6b |
 | 4 | Phase-dependent heat ranking | R7 | hermetic: F7, F7b |
-| 5 | Actuation through existing carriers | R6 execution | GPU: a live re-cut under load |
+| 4b | Per-knob flip pricing and classification | R9 (i), (ii) | hermetic: F9, F9b |
+| 5 | Actuation; BUILD elastic co-residency (#553) | R6 execution, tenant events | GPU: a live re-cut under load |
 | 6 | Explainability surface | R8 | hermetic + a live boot |
+
+### Slice 0 is a hard prerequisite, and it is small
+
+**Verified in code, not taken on report.** `regime_runtime.py:911` calls
+`planner_candidates(server_args)` with `solve_fn` omitted, so
+`regime_stages.py:383` takes the `solve_fn is None` branch, returns `[]`, and
+the stage table permanently holds the booted stage alone. The docstring at
+`regime_stages.py:357` states this outright: *"it is not broken, it is
+unfed."*
+
+Consequence for #584: the enforcer required by R9(i) **exists as code and
+actuates never**. Every requirement in this document that ends in an actuated
+layout change is unreachable until this seam is bound, so no later slice can be
+honestly demonstrated first.
+
+The work is named by that same docstring (tracked as #363/S8): `key_solver.solve`
+already exists and is objective-aware, but its signature needs `plan_inputs`, a
+base plan, per-rank budgets and `RigRates` -- i.e. a card probe and a measured
+rate set -- and a `SolverAnswer` must be mapped back onto a `Stage`. It is
+wiring plus a mapping, not a new solver, which is why it is slice 0 rather than
+a project of its own.
+
+Note the dependency this creates: binding the seam needs a card probe, which is
+TICKET_582 gate (a). Slice 0 and slice 1 therefore share a GPU prerequisite and
+should be scheduled into the same window.
 
 Slice 1 is already most of the way there on this branch: #582 built the ledger
 and the boot wiring behind `--enable-vram-ledger`. Slice 1 completes when
 TICKET_582's GPU gates pass and the flag can default on.
 
-**Slices 2-4 are desk-provable in full.** They are search, arithmetic and
-ordering; none needs a card. This is deliberate -- the expensive slice (5) is
-the only one that should ever wait on a GPU window.
+**Slices 2-4b are desk-provable in full.** They are search, arithmetic,
+ordering and pricing; none needs a card. This is deliberate -- slice 5 is the
+only one that should ever wait on a GPU window.
 
 ---
 
 ## 5. Known gaps and risks
 
-- **`#551` elastic co-residency has no marker in `python/sglang/srt/`.** The
-  analysis exists (`docs/dev/ANALYSE_553_elastic_coresidence.md`) but the
-  mandate named #551 as a carrier and I did not find one in code. Either the
-  number is 553, or the carrier is a design and not yet a mechanism. MUST be
-  resolved before slice 5 plans to drive it.
-- **R4's objective is `[CONFIRM]`.** Throughput and latency are not the same
-  objective and can disagree. The design cannot pick for the user.
+- **Elastic co-residency is a DESIGN, not a mechanism.** *Resolved:* task-list
+  ID #551 is in-tree ID #553, and `docs/dev/ANALYSE_553_elastic_coresidence.md`
+  is all that exists -- there is no code. Slice 5 therefore **BUILDS** it, as
+  the planner's tenant-event actuator. It is not a carrier to be driven, and
+  the slice plan must not be read as if it were: this is new construction, with
+  the schedule that implies.
+- **~~R4's objective is `[CONFIRM]`~~** -- *answered.* Joint compute + VRAM
+  throughput, phase-weighted for dominance. See R4.
+- **~~The enforcer~~** -- *promoted from unknown risk to slice 0 (#578).* This
+  was the largest hidden hole in the first draft: every actuated requirement
+  here depended on a seam that production never binds.
 - **Re-cut cost is not currently measurable.** R5 needs a movement-cost model,
   and no component times a reshard today. Slice 3 must either measure it or
   declare it a calibrated term in the ledger's sense (measured once per rig,
-  fingerprinted) -- not a literal.
+  fingerprinted) -- not a literal. The same applies to the recapture cost R9
+  prices knobs by: "3-6 s" is an observed range, and a range is not a model.
+- **R9's knob inventory is incomplete.** The classification table covers the
+  knobs the addendum named. A sweep for every knob that changes a layout, with
+  a cost for each, is part of slice 4b -- an unclassified knob is an unpriced
+  assumption, and R9 forbids those.
 - **The pressure ladder's autonomy overlaps the planner's authority.** Slice 5
   must resolve this or the two will fight over the same pool under load.
