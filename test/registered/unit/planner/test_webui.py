@@ -5384,11 +5384,18 @@ class TestSpillTierPanel(CustomTestCase):
 class TestRateMedianBadges(CustomTestCase):
     """#522 posten 2: "0 (median 43.2)" on the rate tiles."""
 
-    def test_every_rate_tile_carries_a_badge(self):
+    def test_every_rate_tile_renders_its_median(self):
+        # Every rate tile must show the median of its #522 window. Since
+        # 047e9fa968 (#533, user decision) that happens in two shapes: the
+        # four tok/s tiles HEADLINE the median through rateTokPerS and carry
+        # the instantaneous rate as a labelled secondary line, while the two
+        # percent tiles keep the medBadge suffix. The pin follows the tile,
+        # not one of the two renderers.
         html = webui.INDEX_HTML
-        for key in ("decode_tok_s", "prefill_tok_s", "spec_accept_rate",
-                    "cache_hit_overall", "decode_tok_s_per_request",
-                    "prefill_tok_s_per_request"):
+        for key in ("decode_tok_s", "prefill_tok_s",
+                    "decode_tok_s_per_request", "prefill_tok_s_per_request"):
+            self.assertIn("rateTokPerS(s,'" + key + "'", html)
+        for key in ("spec_accept_rate", "cache_hit_overall"):
             self.assertIn("medBadge(s,'" + key + "'", html)
 
     def test_an_empty_window_renders_no_badge_at_all(self):
