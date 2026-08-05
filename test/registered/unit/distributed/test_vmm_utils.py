@@ -110,6 +110,18 @@ def _assert_region(va: int, expected: int, peer: int, chunk: int) -> None:
 @pytest.mark.parametrize("n_chunks", [1, 3])
 @pytest.mark.parametrize("transport", ["posix", "fabric"])
 def test_handle_roundtrip(transport: str, n_chunks: int) -> None:
+    # This file is a MULTI-PROCESS test: `_gloo_group` pins the device from
+    # LOCAL_RANK, which a launcher (torchrun) sets. Collected by a plain
+    # pytest run all the same, where it used to die with a bare
+    # KeyError: 'LOCAL_RANK' -- a missing launcher reported as a failure,
+    # which is not the same thing as this code being broken.
+    if "LOCAL_RANK" not in os.environ:
+        pytest.skip(
+            "needs a distributed launcher (torchrun sets LOCAL_RANK); run "
+            "this file under one, not as a plain unit test"
+        )
+    if not torch.cuda.is_available():
+        pytest.skip("VMM handles need a CUDA device")
     group = _gloo_group()
     if transport == "fabric" and not _fabric_available():
         pytest.skip("FABRIC handles require an NVLink fabric (GB200/GB300)")

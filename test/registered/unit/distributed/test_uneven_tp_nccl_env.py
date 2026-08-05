@@ -134,11 +134,37 @@ class ColocationNCCLEnvTest(CustomTestCase):
             _configure_nccl_env_for_colocation(make_args([0, 0]))
         self.assertTrue(any("MPS" in m for m in logs.output))
 
-    def test_no_mps_warning_when_pipe_dir_exists(self):
+    def test_no_mps_warning_when_the_daemon_answers(self):
+        """Renamed, because the contract changed under the old name.
+
+        This asserted "pipe directory exists -> no warning", which was the
+        condition when it was written. The check has since been hardened to
+        PROBE the control daemon (``_mps_control_daemon_responsive``), on the
+        stated grounds that a directory left behind by a dead daemon proves
+        nothing. The old test therefore demanded silence in exactly the case
+        the code now (correctly) warns about, and went red on every host
+        without a live daemon -- which is every CI host.
+
+        A unit test cannot run an MPS daemon, so the probe is stubbed. That
+        is the honest seam here: the probe's own behaviour is not the subject,
+        the reaction to its answer is.
+        """
         os.environ.pop("NCCL_NVLS_ENABLE", None)
-        with self.assertLogs(ENGINE_LOGGER, level=logging.WARNING) as logs:
-            _configure_nccl_env_for_colocation(make_args([0, 0]))
+        with patch(
+            "sglang.srt.entrypoints.engine._mps_control_daemon_responsive",
+            return_value=True,
+        ):
+            with self.assertLogs(ENGINE_LOGGER, level=logging.WARNING) as logs:
+                _configure_nccl_env_for_colocation(make_args([0, 0]))
         self.assertFalse(any("MPS" in m for m in logs.output))
+        # The gate must be able to fire, or the assertion above is vacuous.
+        with patch(
+            "sglang.srt.entrypoints.engine._mps_control_daemon_responsive",
+            return_value=False,
+        ):
+            with self.assertLogs(ENGINE_LOGGER, level=logging.WARNING) as logs:
+                _configure_nccl_env_for_colocation(make_args([0, 0]))
+        self.assertTrue(any("MPS" in m for m in logs.output))
 
 
 if __name__ == "__main__":

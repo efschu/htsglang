@@ -71,6 +71,13 @@ class TestPrefillAdder(CustomTestCase):
         server_args.schedule_low_priority_values_first = (
             schedule_low_priority_values_first
         )
+        # A bare MagicMock answers every flag truthily, so the fast lane --
+        # added after these tests were written -- armed itself here and then
+        # compared its (also mocked) reserved-slot count against an int. These
+        # cases are about PRIORITY preemption ordering, which is the behaviour
+        # with the fast lane off; the heavy-slot cap has its own tests.
+        server_args.enable_fast_lane = False
+        server_args.fast_lane_reserved_heavy_slots = 0
         return server_args
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):

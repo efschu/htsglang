@@ -83,6 +83,47 @@ RESERVE_MIB_DEFAULT = 32
 _LEDGER: dict[int, list[tuple[str, int]]] = {}
 
 
+class Bar1WindowRefused(RuntimeError):
+    """An explicitly requested BAR1 window does not fit into the aperture.
+
+    Deliberately fatal. The alternative -- serving a smaller window than the
+    operator asked for -- is the failure this class exists to remove: it
+    silently rewrites the input to every downstream size decision.
+    """
+
+
+#: Windows that came out SMALLER than requested, per group. Only the default
+#: request can land here; an explicit one raises instead (``window_for``).
+#:
+#: This exists because the clip is otherwise invisible in the place people
+#: actually look. ``report_state``/``state_summary`` report which TRANSPORT a
+#: group achieved, and a clipped group still achieves bar1 -- truthfully, but
+#: on a smaller window than the configuration asked for. Without this table
+#: the two cases print identically, and the run's round counts have no
+#: recorded cause.
+_CLIPS: dict[str, dict] = {}
+
+
+def record_clip(group: str, requested: int, granted: int, source: str,
+                arithmetic: str) -> None:
+    _CLIPS[group or "<unnamed>"] = {
+        "group": group or "<unnamed>",
+        "requested_bytes": int(requested),
+        "granted_bytes": int(granted),
+        "source": source,
+        "arithmetic": arithmetic,
+    }
+
+
+def window_clips() -> dict[str, dict]:
+    """Groups whose BAR1 window was reduced below the requested size."""
+    return dict(_CLIPS)
+
+
+def reset_clips_for_test() -> None:
+    _CLIPS.clear()
+
+
 def _ordinal(device) -> int:
     idx = getattr(device, "index", None)
     if idx is not None:
@@ -313,19 +354,61 @@ def window_for(group: str, device) -> int:
     if cap >= requested:
         return requested
 
+    granted = max(cap, 0)
+
+    # THE INVARIANT: a number the operator wrote down is never silently
+    # lowered. `_requested` falls back to a default when neither env var is
+    # set, and shrinking THAT is an adaptation. Shrinking a value somebody
+    # typed is overriding an instruction, and on an explicitly requested
+    # direct path that is the C1 shape -- a warning on a promise path. So an
+    # explicit request that does not fit refuses here, at group build, where
+    # the arithmetic is still on hand, instead of degrading later where only
+    # the symptom shows.
+    if source in os.environ:
+        raise Bar1WindowRefused(
+            f"barlink-BAR1: group {group or '<unnamed>'!r} was explicitly "
+            f"given {requested // 2**20} MiB via {source}, but only "
+            f"{granted // 2**20} MiB of BAR1 is available on this card. "
+            f"{arithmetic} This is NOT clipped to fit: an explicit window is "
+            f"an instruction, and silently serving a smaller one would make "
+            f"every later size decision of this group rest on a number "
+            f"nobody chose. Either lower {source}, give the other groups "
+            f"less (their windows are listed in the arithmetic above), or "
+            f"raise SGLANG_BARLINK_BAR1_RESERVE_MIB's counterpart by freeing "
+            f"BAR1 elsewhere."
+        )
+
+    # The default was not met. This is recorded rather than merely logged:
+    # the group still comes up, and its "ACHIEVED=bar1" line would otherwise
+    # read exactly like a group whose window was granted in full.
+    #
+    # What the clip actually costs, stated precisely -- the previous wording
+    # here claimed messages "fall back to the gloo layer without further
+    # notice", and that has been wrong since the round decompositions landed:
+    # all_reduce (`_handles_all_reduce`) and all_to_all (`_handles_a2a`) both
+    # split an oversized payload into rounds instead of declining it. A
+    # smaller window therefore costs ROUNDS first; the direct path is only
+    # declined once the round caps (SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS /
+    # _A2A_MAX_ROUNDS, 16 each) are exceeded. And when that does happen, it is
+    # not silent either: outside a capture the dispatcher warns once per
+    # operation and size class, and inside a CUDA-graph capture it raises
+    # (barlink.py, the graph gate) rather than staging over the host.
+    record_clip(group, requested, granted, source, arithmetic)
     logger.warning(
-        "barlink-BAR1: group %r requests %d MiB (%s), but only %d MiB is "
-        "usable. %s The request is being clipped to %d MiB, which LOWERS "
-        "the largest payload this group can carry -- messages about it "
-        "fall back to the gloo layer without further notice. Anyone who "
-        "doesn't want that should set SGLANG_BARLINK_BAR1_WINDOW_MIB_%s "
-        "explicitly, give the other group less, or deliberately let this "
-        "group run over NCCL.",
+        "barlink-BAR1: group %r requests %d MiB (%s, the default), but only "
+        "%d MiB is usable. %s The window is reduced to %d MiB. This lowers "
+        "the payload this group carries per ROUND: all_reduce and all_to_all "
+        "decompose oversized payloads into rounds, so the direct path is kept "
+        "and pays in launches, not in coverage -- until a payload needs more "
+        "than the round cap allows, at which point the dispatcher warns "
+        "(outside a capture) or raises (inside one). It never degrades "
+        "unreported. Set SGLANG_BARLINK_BAR1_WINDOW_MIB_%s explicitly to get "
+        "a refusal instead of this reduction, or give the other groups less.",
         group or "<unnamed>", requested // 2**20, source,
-        max(cap, 0) // 2**20, arithmetic, max(cap, 0) // 2**20,
+        granted // 2**20, arithmetic, granted // 2**20,
         _group_key(group),
     )
-    return max(cap, 0)
+    return granted
 
 
 def _window_bytes() -> int:
