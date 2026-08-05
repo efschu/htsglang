@@ -312,7 +312,23 @@ def save_calibration(
     return path
 
 
-def _measure_one_card(device_index: int) -> Tuple[int, int, int, str]:
+def _nvml_free_bytes(uuid: str) -> Optional[int]:
+    """Free bytes on *uuid* read through NVML, which does NOT create a CUDA
+    context. Returns None when NVML cannot answer."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByUUID(uuid.encode())
+        return int(pynvml.nvmlDeviceGetMemoryInfo(handle).free)
+    except Exception as e:  # pragma: no cover - NVML shape differences
+        logger.debug("NVML free read failed for %s: %s", uuid, e)
+        return None
+
+
+def _measure_one_card(
+    device_index: int, uuid: Optional[str] = None
+) -> Tuple[int, int, int, str]:
     """``(context_bytes, granularity_bytes, workspace_bytes, note)`` on one card.
 
     Deliberately three small measurements rather than one big one: the terms
@@ -320,10 +336,28 @@ def _measure_one_card(device_index: int) -> Tuple[int, int, int, str]:
     workspace until the backend is torn down, granularity is per allocation),
     and a single number would not tell a later reader which of them moved when
     the total moves.
+
+    THE BASELINE MUST COME FROM NVML, NOT FROM TORCH. ``torch.cuda.mem_get_info``
+    initialises CUDA in order to answer, so using it for the "before" reading
+    measures the context AFTER the context already exists -- and reports the
+    context as a couple of MiB instead of a few hundred. The reference window of
+    2026-08-05 measured 2 MiB that way against a true 505 MiB on the 5090, an
+    undercount of 503 MiB PER RANK PROCESS that would have been charged to
+    nobody. Importing torch is fine (it allocates nothing); the first CUDA
+    *call* is the line that must not be crossed before the baseline is taken.
     """
     import torch
 
-    free_before, _total = torch.cuda.mem_get_info(device_index)
+    free_before = _nvml_free_bytes(uuid) if uuid else None
+    if free_before is None:
+        # No NVML: refuse rather than fall back to the torch reading, which is
+        # the defect above wearing a plausible number.
+        raise RuntimeError(
+            "cannot read a pre-context NVML baseline for this card; refusing "
+            "to measure the CUDA context with torch.cuda.mem_get_info, which "
+            "creates the context it is supposed to measure and yields a "
+            "few MiB instead of a few hundred"
+        )
     # Creating the primary context: the first real allocation forces it.
     torch.cuda.set_device(device_index)
     anchor = torch.empty(1, dtype=torch.uint8, device=f"cuda:{device_index}")
@@ -392,7 +426,7 @@ def measure_calibration(
     residuals: List[CardResidual] = []
     for gpu in gpus:
         index = int(gpu["cuda_index"])
-        ctx, gran, ws, note = _measure_one_card(index)
+        ctx, gran, ws, note = _measure_one_card(index, str(gpu["uuid"]))
         residuals.append(
             CardResidual(
                 uuid=str(gpu["uuid"]),
