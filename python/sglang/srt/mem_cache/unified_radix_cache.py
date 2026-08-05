@@ -82,6 +82,18 @@ class HiCacheCollectiveError(RuntimeError):
     """A HiCache control collective cannot be issued rank-uniformly."""
 
 
+class HiCacheCollectiveDesyncError(HiCacheCollectiveError):
+    """A HiCache control collective reduced a payload it did not post.
+
+    Raised when a self-identifying control vector comes back carrying a
+    foreign tag, i.e. the ranks were not all inside the same collective.
+    gloo only aborts the process when the mismatched buffers differ in size
+    (``op.preamble.length <= op.nbytes``); equal-sized traffic from another
+    site is accepted silently and would corrupt the reduced values instead.
+    This turns that second case into a named error on every rank.
+    """
+
+
 class HiCacheCollectiveTimeoutError(HiCacheCollectiveError):
     """A HiCache control collective did not complete within its bound.
 
@@ -107,6 +119,11 @@ _POOL_SLOT_COUNT: int = len(_POOL_SLOT_ORDER)
 # Poll schedule for _wait_bounded. The spin window covers the latency of a
 # healthy CPU collective between local ranks, so the sleep path is only ever
 # reached once something is actually wrong.
+#: Self-identifying head of the prefetch participation vote (#580). Any value
+#: works as long as it is the same on every rank and not a plausible payload
+#: value; it is reduced as a (tag, -tag) pair so one MIN yields min and max.
+_PREFETCH_VOTE_TAG = 580
+
 _COLLECTIVE_POLL_SPINS = 512
 _COLLECTIVE_POLL_MIN_S = 0.0005
 _COLLECTIVE_POLL_MAX_S = 0.05
@@ -510,6 +527,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             and self.tp_world_size > 1
             and uneven_dcp_active()
         )
+
+    def prefetch_participation_is_collective(self) -> bool:
+        """True when whether to prefetch is decided by the GROUP, not per rank.
+
+        The scheduler asks before applying its own local prefetch gate: in this
+        mode every rank must call ``prefetch_from_storage`` so that every rank
+        enters the participation vote, and a rank whose local gate says no
+        passes ``locally_eligible=False`` instead of skipping the call (#580).
+        Absent on the other tree-cache classes, which stay on the local gate.
+        """
+        return self._hicache_prefetch_symmetric()
 
     def _symmetrize_prefetch_capacity(self) -> None:
         """Mechanism (2): derive the speculative-prefetch capacity limit from the
@@ -2106,9 +2134,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        locally_eligible: bool = True,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
+
+        # #580: decide the MODE before any rank-local predicate runs. Under
+        # `symmetric` the participation vote below is the group's decision
+        # point, so nothing between here and it may `return` -- see the
+        # eligibility comment further down.
+        symmetric = self._hicache_prefetch_symmetric()
 
         extra_key = last_host_node.key.extra_key if last_host_node.key else None
         prefetch_key = RadixKey(
@@ -2117,67 +2152,88 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        # RANK-LOCAL predicates, every one of them. `locally_eligible` carries
+        # the caller's own local gate (Scheduler._prefetch_kvcache tests
+        # `last_host_node.backuped`, i.e. "full KV in THIS rank's host pool");
+        # `prefetch_rate_limited()` reads the per-rank prefetch_tokens_occupied
+        # counter. Under uneven DCP the host pools -- and therefore both -- drift
+        # apart across ranks.
+        #
+        # #580: these MUST NOT gate entry into the collective. They did until
+        # 2026-08-05, on the (false) assumption recorded here that the gate was
+        # rank-symmetric because _symmetrize_prefetch_capacity symmetrizes the
+        # capacity LIMIT. It symmetrizes the limit, never the occupancy counter
+        # and never `backuped`. A rank that tripped one of them returned before
+        # the vote, so its peers stood in a collective it never entered: TP0
+        # posted the 4-byte vote while TP1/TP2 had moved on to the 64-byte
+        # kv-pressure consensus on the same gloo group, and gloo aborted TP0
+        # with "op.preamble.length <= op.nbytes. 16 vs 4".
+        #
+        # So under `symmetric` local ineligibility only LOWERS THIS RANK'S VOTE;
+        # participation itself is unconditional and the payload shape is fixed.
+        eligible = (
+            locally_eligible
+            and prefetch_length >= self.prefetch_threshold
+            and not self.cache_controller.prefetch_rate_limited()
+        )
+        if not eligible and not symmetric:
             return
 
-        # Uneven-DCP: the enable_storage / threshold / rate-limit gate above is
-        # rank-symmetric (rate-limit symmetrized in _symmetrize_prefetch_capacity),
-        # so every rank that continues reaches the participation consensus below.
-        symmetric = self._hicache_prefetch_symmetric()
-
-        anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
-        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            self.evict_host(prefetch_length)
+        anchor_lock_params = None
+        host_indices = None
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        sidecar_xfers: list[PoolTransfer] = []
+        alloc_failed = True
+        if eligible:
+            anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None and not symmetric:
-            available_size = self.cache_controller.mem_pool_host.available_size()
-            prefetch_length = available_size - (available_size % self.page_size)
-            if prefetch_length >= self.prefetch_threshold:
-                prefetch_key = prefetch_key[:prefetch_length]
+            if host_indices is None:
+                self.evict_host(prefetch_length)
                 host_indices = self.cache_controller.mem_pool_host.alloc(
                     prefetch_length
                 )
-            else:
+            if host_indices is None and not symmetric:
+                available_size = self.cache_controller.mem_pool_host.available_size()
+                prefetch_length = available_size - (available_size % self.page_size)
+                if prefetch_length >= self.prefetch_threshold:
+                    prefetch_key = prefetch_key[:prefetch_length]
+                    host_indices = self.cache_controller.mem_pool_host.alloc(
+                        prefetch_length
+                    )
+                else:
+                    self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+                    return
+            if host_indices is None and not symmetric:
                 self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
-        if host_indices is None and not symmetric:
-            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-            return
-        # NOTE: under `symmetric` we deliberately SKIP the truncation-retry so
-        # prefetch_key length (hence prefetch_tokens_occupied and the
-        # min_completed_tokens reduce) stays identical across ranks; a failed
-        # full alloc leaves host_indices None and becomes a negative consensus
-        # vote below rather than a per-rank early-return.
+            # NOTE: under `symmetric` we deliberately SKIP the truncation-retry so
+            # prefetch_key length (hence prefetch_tokens_occupied and the
+            # min_completed_tokens reduce) stays identical across ranks; a failed
+            # full alloc leaves host_indices None and becomes a negative consensus
+            # vote below rather than a per-rank early-return.
 
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        alloc_failed = host_indices is None
-        if host_indices is not None:
-            for comp in self._components_tuple:
-                if comp.component_type == BASE_COMPONENT_TYPE:
-                    continue
-                transfers = comp.build_hicache_transfers(
-                    last_host_node,
-                    CacheTransferPhase.PREFETCH,
-                    token_ids=prefetch_key.token_ids,
-                    prefetch_tokens=len(prefetch_key),
-                    last_hash=last_hash,
+            alloc_failed = host_indices is None
+            if host_indices is not None:
+                for comp in self._components_tuple:
+                    if comp.component_type == BASE_COMPONENT_TYPE:
+                        continue
+                    transfers = comp.build_hicache_transfers(
+                        last_host_node,
+                        CacheTransferPhase.PREFETCH,
+                        token_ids=prefetch_key.token_ids,
+                        prefetch_tokens=len(prefetch_key),
+                        last_hash=last_hash,
+                    )
+                    if transfers == []:
+                        alloc_failed = True
+                        break
+                    if transfers:
+                        comp_xfers[comp.component_type] = transfers
+            if host_indices is not None:
+                kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+                sidecar_xfers = self._build_sidecar_transfers(
+                    CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
                 )
-                if transfers == []:
-                    alloc_failed = True
-                    break
-                if transfers:
-                    comp_xfers[comp.component_type] = transfers
-        if host_indices is not None:
-            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
-            sidecar_xfers = self._build_sidecar_transfers(
-                CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
-            )
-        else:
-            sidecar_xfers = []
 
         if symmetric:
             # Mechanism (1) -- participation symmetry. Per-rank host pools are
@@ -2186,25 +2242,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # SUBSET makes check_prefetch_progress enter its _all_reduce_attn_groups
             # collectives (can_terminate_prefetch's MAX reduce and the
             # min_completed_tokens MIN reduce) on a mismatched set of ranks ->
-            # NCCL deadlock. All-reduce a single "did I fully allocate" bit with
-            # MIN (logical AND): every rank registers the prefetch iff ALL ranks
-            # could; otherwise none do, keeping the downstream collectives matched.
-            # No async prefetch op exists yet, so a negative vote is a clean local
-            # release with nothing to tear down.
-            local_ok = 1 if (host_indices is not None and not alloc_failed) else 0
-            vote = torch.tensor([local_ok], dtype=torch.int)
+            # NCCL deadlock. All-reduce "am I eligible AND did I fully allocate"
+            # with MIN (logical AND): every rank registers the prefetch iff ALL
+            # ranks could; otherwise none do, keeping the downstream collectives
+            # matched. No async prefetch op exists yet, so a negative vote is a
+            # clean local release with nothing to tear down.
+            #
+            # The (tag, -tag) head makes the payload SELF-IDENTIFYING: after a
+            # MIN reduce, slot 0 is min(tag) and slot 1 is -max(tag), so
+            # slot0 != -slot1 proves the ranks were not all in this collective.
+            # Same-width traffic from another site is then a named error on
+            # every rank instead of a short read some ranks silently accept.
+            local_ok = 1 if (eligible and not alloc_failed) else 0
+            vote = torch.tensor(
+                [_PREFETCH_VOTE_TAG, -_PREFETCH_VOTE_TAG, local_ok], dtype=torch.int
+            )
             self._all_reduce_attn_groups(
                 vote,
                 torch.distributed.ReduceOp.MIN,
                 label="prefetch_participation_vote",
             )
-            if vote[0].item() == 0:
+            tag_lo, tag_hi = int(vote[0].item()), -int(vote[1].item())
+            if tag_lo != tag_hi or tag_lo != _PREFETCH_VOTE_TAG:
+                raise HiCacheCollectiveDesyncError(
+                    "prefetch_participation_vote returned a foreign payload "
+                    f"(tag min={tag_lo} max={tag_hi}, expected "
+                    f"{_PREFETCH_VOTE_TAG} on every rank): the TP ranks were "
+                    "not all inside this collective. Some rank issued a "
+                    "different collective on the same group -- the #580 "
+                    "failure -- and continuing would corrupt the vote."
+                )
+            if int(vote[2].item()) == 0:
                 if host_indices is not None:
                     self.cache_controller.append_host_mem_release(
                         host_indices=host_indices,
                         extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
                     )
-                self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+                if anchor_lock_params is not None:
+                    self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
             # Positive consensus: every rank allocated -> all fall through to register.
         elif alloc_failed:
