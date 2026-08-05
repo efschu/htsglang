@@ -1868,6 +1868,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else:
                     logger.warning(msg)
 
+        # #583: agree the all-reduce FUSION ARCH term across the TP group,
+        # once, here -- every rank reaches this line exactly once, the TP
+        # group exists, and no CUDA graph is capturing. Deciding it per rank
+        # would let a mixed group fuse on some ranks only, which removes a
+        # collective from those ranks' layers and desyncs the group (silently
+        # first, see decide_ar_fusion_arch).
+        from sglang.srt.layers.communicator import decide_ar_fusion_arch
+
+        decide_ar_fusion_arch(self.tp_group)
+
         logger.info(
             f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
