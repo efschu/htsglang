@@ -3245,6 +3245,19 @@ class Scheduler(
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
 
+        # #581: release lock_ref on completed write-through nodes ONCE PER
+        # SCHEDULER ITERATION, before any batch is built. This used to sit in
+        # `update_running_batch`, i.e. only on iterations that had a running
+        # decode batch; a prefill-dominated window therefore took hicache
+        # write-through pins (one per inserted checkpoint) with no release
+        # path running, and the mamba state pool ratcheted to full with
+        # `evict_mamba` finding nothing evictable. Here it is unconditional
+        # and rank-symmetric -- every rank reaches this line exactly once per
+        # iteration, which is required because `writing_check` min-reduces the
+        # ack count across the TP group.
+        if self.enable_hierarchical_cache:
+            self.tree_cache.flush_write_through_acks()
+
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -4026,10 +4039,11 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
-        # Eagerly release lock_ref on completed write-through nodes so they
-        # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
-            self.tree_cache.flush_write_through_acks()
+        # NOTE(#581): the write-through ack drain moved to the top of
+        # `get_next_batch_to_run`, so it runs on every scheduler iteration
+        # rather than only on iterations with a running decode batch. Calling
+        # it again here would issue a second TP collective per iteration for
+        # no additional headroom.
 
         # #287: one pressure sample per decode round. This is the EARLY half
         # of the throttle -- lowering here, at the water mark, is what keeps

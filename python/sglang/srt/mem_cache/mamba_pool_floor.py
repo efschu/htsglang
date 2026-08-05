@@ -1,0 +1,115 @@
+"""Hard floor for the mamba/GDN state pool (`--max-mamba-cache-size`).
+
+Single source of truth for "how many mamba slots does a running request hold
+at once". Both the boot-time validation (`--max-mamba-cache-size` refusal /
+auto floor) and the hierarchical cache's write-through pin budget derive from
+the numbers computed here, so the two can never drift apart.
+
+The floor is a DEMAND model, not a heuristic: every term below is one concrete
+allocation site that a single running request can hold simultaneously.
+
+    per running request
+      1   active state slot          memory_pool.py HybridReqToTokenPool.alloc
+      P   ping-pong track buffer     memory_pool.py _alloc_ping_pong_buffer,
+                                     P = mamba_ping_pong_track_buffer_size
+                                       = 2 with overlap schedule, else 1;
+                                     lazy mode holds 1 and takes the second
+                                     transiently at a track boundary
+      1   donation slot              mamba_radix_cache.py cache_unfinished_req
+                                     allocates the replacement slot BEFORE
+                                     donating the tracked one
+      1   pinned radix checkpoint    mamba_radix_cache.py cache_unfinished_req
+                                     inc_lock_ref(new_last_node): the node the
+                                     request resumes from is not evictable
+                                     while the request runs
+
+    floor_per_req = 1 + P + 1 + 1
+    hard_floor    = max_running_requests * floor_per_req
+
+Anything above `hard_floor` is cache: evictable prefix checkpoints. Anything
+below it is a configuration that cannot run to completion at the configured
+concurrency, because the last request's own required slots do not exist.
+
+Cross-check against the two constant families that already encode parts of
+this model:
+
+* `common.MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3` (active + 2 ping-pong) is the
+  ADMISSION charge -- it deliberately omits the donation slot and the pinned
+  checkpoint because `alloc_req_slots` evicts to make room for them.
+* `model_runner_kv_cache_mixin._calculate_mamba_ratio()` = 3 + 2 = 5 with the
+  extra-buffer strategy and overlap is the SIZING ratio, and equals
+  `floor_per_req` for that configuration by construction.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
+#: Active state slot every running request owns (`req.mamba_pool_idx`).
+MAMBA_FLOOR_ACTIVE_SLOTS = 1
+
+#: Replacement slot allocated before a checkpoint donation, plus the radix
+#: checkpoint the request is pinned to (`inc_lock_ref(req.last_node)`). Both
+#: exist only when the radix cache is on.
+MAMBA_FLOOR_DONATION_SLOTS = 1
+MAMBA_FLOOR_PINNED_CHECKPOINT_SLOTS = 1
+
+
+def mamba_ping_pong_slots(server_args: "ServerArgs") -> int:
+    """Ping-pong track-buffer slots a running request holds.
+
+    Mirrors `HybridReqToTokenPool.mamba_ping_pong_track_buffer_size`
+    (`2 if enable_overlap_schedule else 1`) and the lazy strategy, which
+    allocates only the first slot up front and takes the second transiently
+    at a track boundary -- transient, but concurrent with everything else the
+    request holds, so it counts toward the floor.
+    """
+    if not server_args.enable_mamba_extra_buffer():
+        return 0
+    return 1 if server_args.disable_overlap_schedule else 2
+
+
+def mamba_slots_per_running_req(server_args: "ServerArgs") -> int:
+    """Mamba slots one running request can hold simultaneously."""
+    slots = MAMBA_FLOOR_ACTIVE_SLOTS
+    if server_args.disable_radix_cache:
+        # No radix cache: no donation and no pinned checkpoint, the request
+        # only ever owns its active state slot.
+        return slots
+    slots += mamba_ping_pong_slots(server_args)
+    slots += MAMBA_FLOOR_DONATION_SLOTS
+    slots += MAMBA_FLOOR_PINNED_CHECKPOINT_SLOTS
+    return slots
+
+
+def mamba_hard_floor(server_args: "ServerArgs", max_running_requests: int) -> int:
+    """Smallest `--max-mamba-cache-size` that can serve `max_running_requests`.
+
+    A pool below this cannot run the configured concurrency to completion: the
+    required (non-evictable) allocations of the running set alone exceed it.
+    """
+    per_req = mamba_slots_per_running_req(server_args)
+    return max(1, int(max_running_requests)) * per_req
+
+
+def describe_mamba_floor(server_args: "ServerArgs", max_running_requests: int) -> str:
+    """Human-readable derivation, for error messages and boot logs."""
+    per_req = mamba_slots_per_running_req(server_args)
+    pp = mamba_ping_pong_slots(server_args)
+    if server_args.disable_radix_cache:
+        terms = f"{MAMBA_FLOOR_ACTIVE_SLOTS} active (radix cache disabled)"
+    else:
+        terms = (
+            f"{MAMBA_FLOOR_ACTIVE_SLOTS} active"
+            f" + {pp} ping-pong"
+            f" + {MAMBA_FLOOR_DONATION_SLOTS} donation"
+            f" + {MAMBA_FLOOR_PINNED_CHECKPOINT_SLOTS} pinned checkpoint"
+        )
+    return (
+        f"{max_running_requests} running requests x ({terms}) "
+        f"= {max_running_requests} x {per_req} = "
+        f"{mamba_hard_floor(server_args, max_running_requests)} slots"
+    )
