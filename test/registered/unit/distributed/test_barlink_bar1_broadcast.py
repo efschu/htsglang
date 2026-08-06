@@ -94,12 +94,16 @@ def _drive(t, tensor, src):
     calls = []
 
     def _a2a(_self, comm, output, inp, s_len, e_len, s_off, e_off,
-             kernel_bytes=None):
+             kernel_bytes=None, rounds=None, op_label="all_to_all"):
         calls.append(
             {
                 "s_len": list(s_len), "e_len": list(e_len),
                 "s_off": list(s_off), "e_off": list(e_off),
                 "kernel_bytes": kernel_bytes, "out": output, "in": inp,
+                # #583: the caller's own collective name, so a tripped kernel
+                # is reported as the broadcast it served and not as the a2a
+                # kernel that served it.
+                "op_label": op_label,
             }
         )
         n = int(s_len[t.rank])
