@@ -78,6 +78,7 @@ def parse_file(path: str) -> List[Dict]:
 # Diff logic
 # ---------------------------------------------------------------------------
 
+
 def diff_ranks(records_by_rank: Dict[int, List[Dict]]) -> str:
     """Compare (last_op, last_nbytes) multisets across all ranks per timestamp.
 
@@ -138,6 +139,7 @@ def diff_ranks(records_by_rank: Dict[int, List[Dict]]) -> str:
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+
 
 def main(argv: Optional[List[str]] = None) -> None:
     if argv is None:

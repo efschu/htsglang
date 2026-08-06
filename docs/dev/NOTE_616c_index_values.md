@@ -605,3 +605,74 @@ Trap worth recording, hit twice: `pkill -f <pattern>` and any
 `/proc/PID/cmdline` scan match the AGENT'S OWN wrapper shell, because the
 pattern appears in the command being run. Both times it killed the calling
 shell mid-command. Kill by pgid taken from a listed pid instead.
+
+## 17. The wedge names itself: a ONE-GENERATION skew (measured)
+
+The abort-time flag snapshot added in this window fired on its first real
+wedge (19:06:38, agent-only load) and produced the number nothing else could
+read:
+
+| rank | max generation across its flag lines | non-zero lines |
+|---|---|---|
+| 0 | **1190714** | 11 |
+| 1 | **1190715** | 11 |
+| 2 | no snapshot (died before emitting) | -- |
+
+Distinct generation values present: `1188313, 1190712, 1190714, 1190715`.
+
+**Rank 1 is exactly ONE generation ahead of rank 0.** That is a
+sequence/generation mismatch, which section 15 listed as one of the two
+remaining candidates and could not test. It is now measured rather than
+inferred: rank 1 has published generation 1190715 and is waiting for peers
+that are still at 1190714.
+
+### Why every earlier instrument missed it
+
+The #583 census counts collectives at the Python `GroupCoordinator` layer and
+reported no divergence; the barlink launch sampler compares the last op NAME
+and size, which are identical on both sides of a one-generation skew. The
+skew lives in the BAR1 generation counter, which is incremented per barlink
+op in DEVICE memory. So "the census is silent" -- the inconvenient fact
+recorded in section 8 -- is explained: it was never counting the thing that
+diverged. That closes the loop on the objection that mechanism M1 owed an
+explanation for the census silence.
+
+### This unifies the two families
+
+The index-assert crash (sections 6-8) was a pairing shift of exactly ONE
+collective: `accept_index` received `predict`'s payload because the two are
+the same wire size. The wedge is a skew of exactly ONE generation. Same
+distance, two symptoms, and which one you get depends only on whether the
+mismatched pair happens to be the same size:
+
+* same size -> silent substitution -> wrong indices -> device-side assert;
+* different size -> nobody pairs -> spin to the cycle cap -> Bar1CollectiveAborted.
+
+The accept-broadcast fusion removed the *consequence* for one specific pair.
+It did not remove the skew itself, which is why the wedge survives the fix --
+exactly as observed (soaks 2, 3 and 4 wedged with zero index asserts).
+
+### What is still NOT known
+
+Which collective creates the skew, and why. The generation counter is
+per-group and device-side; the snapshot shows the STATE at abort, not the
+op that caused the divergence. The next step is the ring buffer of recent
+(family, nbytes) per rank -- started in this window, not finished -- so the
+abort log carries the recent SEQUENCE per rank and the first differing entry
+names the culprit.
+
+### Limitation of the instrument, recorded honestly
+
+Rank 2 emitted no snapshot: it was still spinning when the other two aborted
+and its process went down before reaching the abort path. So the instrument
+gives 2 of 3 ranks in this incident. Making the third rank's state available
+(for instance by having the first aborting rank read the PEER windows, which
+are host-mapped and therefore readable without a device sync) is a concrete
+improvement and is not done here.
+
+### Load note that corrects section 16
+
+This wedge occurred under AGENT-ONLY load (`#running-req: 1, #queue-req: 0`),
+not under the saturated reproducer. Section 16 stated that both families were
+only ever observed under saturation; that is now false for the wedge. The
+index assert's 192 s envelope remains a saturated-load measurement.

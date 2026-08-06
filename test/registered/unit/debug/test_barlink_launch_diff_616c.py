@@ -1,7 +1,5 @@
 """Hermetic unit tests for barlink_launch_diff (issue #616c)."""
 
-import pytest
-
 from sglang.srt.debug_utils.barlink_launch_diff import (
     diff_ranks,
     main,
@@ -73,6 +71,7 @@ class TestParseLine:
 # parse_file
 # ---------------------------------------------------------------------------
 
+
 class TestParseFile:
     def test_parses_all_valid_lines(self, tmp_path):
         """parse_file returns records for every valid line, skips bad ones."""
@@ -95,6 +94,7 @@ class TestParseFile:
 # ---------------------------------------------------------------------------
 # diff_ranks
 # ---------------------------------------------------------------------------
+
 
 def _make_record(ts: str, rank: int, last_op: str, last_nbytes: int) -> dict:
     return {
@@ -189,6 +189,7 @@ class TestDiffRanks:
 # ---------------------------------------------------------------------------
 # main (CLI)
 # ---------------------------------------------------------------------------
+
 
 class TestMain:
     def test_main_writes_report(self, tmp_path, capsys):
