@@ -225,6 +225,43 @@ class Bar1KernelAborted(PeerLivenessError):
     """
 
 
+class Bar1CollectiveStalled(Bar1KernelAborted):
+    """The compute stream stopped retiring work, and no kernel tripped (#616f).
+
+    A DIFFERENT fact from ``Bar1CollectiveAborted``, which reports a kernel
+    that took its abort path and left a partial buffer behind. Here nothing
+    tripped: the status word stayed clean and the watchdog's private-stream
+    poll kept saying so, while the compute stream simply stopped making
+    progress -- the shape of the #616 wedge, where three ranks spun at 100 %
+    SM with a clean abort word for over ten minutes.
+
+    It derives from ``Bar1KernelAborted`` so that a caller which already
+    treats "this group is finished" uniformly keeps working, and carries the
+    same structured attribution, because the question is still WHICH
+    collective stopped.
+    """
+
+    def __init__(self, group, rank, op: str, nbytes: int, waited_s: float,
+                 expiries: int):
+        self.group = group
+        self.rank = rank
+        self.op = op
+        self.nbytes = int(nbytes)
+        self.waited_s = float(waited_s)
+        self.expiries = int(expiries)
+        super().__init__(
+            f"barlink-BAR1 group {group} rank {rank}: collective stalled. "
+            f"The staged status read failed to resolve {expiries} consecutive "
+            f"times over ~{waited_s:.1f} s, so the compute stream has not "
+            f"retired a four-byte copy in that window. Last launch: "
+            f"op={op} nbytes={nbytes}. The abort word is CLEAN -- no kernel "
+            f"took its abort path -- so this is a stall, not a trip: the "
+            f"collective is waiting on a peer contribution that is not "
+            f"arriving. Compare last_op/nbytes across ranks; they must match "
+            f"pairwise for a collective to complete."
+        )
+
+
 class Bar1CollectiveAborted(Bar1KernelAborted):
     """The same fact, raised from a PRODUCTION path with its context (#431).
 
@@ -1560,6 +1597,26 @@ class BarlinkBar1Transport:
         self._ctl_event = None        # completion of the staged copy
         self._ctl_inflight = False
         self._ctl_lag = 0
+        #: The watchdog-owned read of the same word, on a PRIVATE stream
+        #: (#616f). The staged read above is ordered behind the compute
+        #: stream by construction; when that stream is the thing that hung,
+        #: the read hangs with it and the guard becomes part of the fault.
+        #: This pair is ordered against nothing the model is doing, so it
+        #: still observes the word while the compute stream is wedged. The
+        #: device transport has carried this shape since #517 phase 2; the
+        #: BAR1 transport did not, which is why a BAR1 wedge reported
+        #: nothing at all.
+        self._abort_poll_stream = None  # private stream for the watchdog read
+        self._abort_poll_dst = None     # pinned host destination of that read
+        self._abort_poll_active = False
+        self._abort_code_seen = 0
+        #: How often the staged read hit its deadline with the copy still in
+        #: flight. Non-zero means the compute stream is not retiring work.
+        self._ctl_sync_timeouts = 0
+        #: The CONSECUTIVE run of those, reset by any resolved read. This is
+        #: what escalates: one expiry is a slow step, an unbroken run is a
+        #: stream that has stopped.
+        self._ctl_stall_run = 0
         #: Collectives (host-path and captured) that have run since the last
         #: RESOLVED read of the status word. With a blocking read this always
         #: equals the current window; with a staged read it accumulates over
@@ -2236,6 +2293,8 @@ class BarlinkBar1Transport:
         self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
         # #517: arm the deferred status read now that the word exists.
         self._arm_status_stage()
+        # #616f: and the watchdog's private-stream read of the same word.
+        self._arm_abort_poll()
         # Absolute chunk counter of the sliding window. Separate from the
         # round counter, because it grows by K per call and is only
         # advanced by mesh_pipe -- it is the reference against which the
@@ -4488,6 +4547,143 @@ class BarlinkBar1Transport:
         self._ctl_lag = 0
         self._ctl_defer = True
 
+    def _arm_abort_poll(self) -> None:
+        """Build the watchdog's private-stream read of the status word.
+
+        Why this exists (#616f). ``barlink_abort_gate.poll_status_words``
+        walks every registered transport and calls ``poll_status_word`` on
+        each -- but it looks the method up with ``getattr(..., None)`` and
+        skips the transport when it is absent. Only the DEVICE transport ever
+        defined it. The BAR1 transport therefore had no watchdog read at all:
+        the walk reached it, found nothing, and moved on, silently. Every
+        abort report on the BAR1 path consequently depended on the in-line
+        staged read, which is ordered behind the compute stream -- so a
+        wedged compute stream produced no report from either side.
+
+        Failure to build the pair degrades to exactly the previous
+        behaviour (no watchdog read), never to a raise: a guard that can
+        break bring-up is worse than the gap it closes.
+        """
+        ctl = self._ctl_dev
+        if ctl is None:
+            return
+        if not bool(getattr(ctl, "is_cuda", False)):
+            # A host word needs no private stream; the direct read is already
+            # unordered with respect to the compute stream.
+            return
+        if not barlink_abort_gate.abort_check_enabled():
+            return
+        import torch
+
+        try:
+            self._abort_poll_stream = torch.cuda.Stream(device=self.device)
+            self._abort_poll_dst = torch.zeros(1, dtype=ctl.dtype, pin_memory=True)
+        except Exception as e:  # noqa: BLE001 - degrade to the in-line read
+            logger.warning(
+                "barlink-BAR1 group %s: no watchdog abort poll (%s); keeping "
+                "the in-line read.",
+                self.group,
+                e,
+            )
+            self._abort_poll_stream = None
+            self._abort_poll_dst = None
+            return
+        self._abort_poll_active = True
+
+    def poll_status_word(self) -> bool:
+        """One watchdog read of the abort word. Returns True once tripped.
+
+        Runs on the WATCHDOG thread, never on the serving path. The copy is
+        issued on a private stream and only that stream is synchronized, so
+        the read waits for its own four bytes and for nothing the model is
+        doing. That is the entire point: it is the one read that still
+        resolves while the compute stream is wedged.
+
+        Sticky in both directions of the word's life: the device word only
+        ever goes 0 -> non-zero, and this mirror only ever follows it once,
+        so a poll after a trip is a no-op and the hot path's view can never
+        go backwards.
+        """
+        if not self._abort_poll_active or self._ctl_dev is None:
+            return bool(self._abort_code_seen)
+        if self._abort_code_seen:
+            return True
+        import torch
+
+        with torch.cuda.stream(self._abort_poll_stream):
+            self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
+        # Waits for THIS copy on THIS stream only -- not for the model.
+        self._abort_poll_stream.synchronize()
+        code = int(self._abort_poll_dst[0])
+        if code:
+            self._abort_code_seen = code
+            return True
+        return False
+
+    def _wait_ctl_event(self) -> bool:
+        """Wait for the staged copy, but never past the deadline.
+
+        Returns True when the event resolved (the staged word is readable),
+        False when the deadline expired with the copy still in flight.
+
+        A deadline of 0 restores the pre-#616f blocking wait verbatim, for
+        bisecting against this change.
+
+        The expiry is LOGGED, once per transport per ramp of ten, because it
+        is the first host-visible symptom of a wedged compute stream that
+        this path can emit at all. Before #616f the same condition produced
+        no line anywhere: the thread was inside ``event.synchronize()`` and
+        stayed there.
+        """
+        deadline_s = barlink_abort_gate.sync_deadline_s()
+        if deadline_s <= 0.0:
+            self._ctl_event.synchronize()
+            return True
+        end = time.monotonic() + deadline_s
+        while True:
+            if self._ctl_event.query():
+                self._ctl_stall_run = 0
+                return True
+            if time.monotonic() >= end:
+                break
+            time.sleep(0.0005)
+        self._ctl_sync_timeouts += 1
+        self._ctl_stall_run += 1
+        n = self._ctl_sync_timeouts
+        if n == 1 or n % 10 == 0:
+            logger.warning(
+                "barlink-BAR1 group %s rank %s: staged status read did not "
+                "resolve within %.1f ms (%d time(s)); the compute stream has "
+                "not retired the copy. last_op=%s last_nbytes=%d "
+                "unchecked_window=%d. The watchdog's private-stream poll is "
+                "now the only reader that can still see a trip.",
+                self.group,
+                self.rank,
+                deadline_s * 1000.0,
+                n,
+                self._last_op or "unknown",
+                int(self._last_nbytes),
+                int(self._deferred_launches),
+            )
+        limit = barlink_abort_gate.stall_raise_after()
+        if limit and self._ctl_stall_run >= limit:
+            # The escalation. Logging alone left #616 a black hole: the host
+            # thread stayed in the guard and the only actor that ever ended
+            # the wedge was an external supervisor, minutes later, with no
+            # attribution. A raise reaches the serving path with the op and
+            # the byte count in hand.
+            run = self._ctl_stall_run
+            self._ctl_stall_run = 0
+            raise Bar1CollectiveStalled(
+                self.group,
+                self.rank,
+                self._last_op or "unknown",
+                int(self._last_nbytes),
+                run * deadline_s,
+                run,
+            )
+        return False
+
     def _read_status_for_check(self):
         """The status value for one check, or ``None`` if it is not in yet.
 
@@ -4512,10 +4708,16 @@ class BarlinkBar1Transport:
         """
         if not self._ctl_defer:
             return self.status()
+        # #616f: the watchdog's private-stream mirror outranks the staged
+        # word. It is sticky and it resolves while the compute stream is
+        # wedged, which is precisely the case the staged read cannot serve.
+        if self._abort_code_seen:
+            return int(self._abort_code_seen)
         value = None
         if self._ctl_inflight:
             if self._ctl_event.query():
                 self._ctl_inflight = False
+                self._ctl_stall_run = 0
                 value = int(self._ctl_stage[0])
             else:
                 self._ctl_lag += 1
@@ -4524,9 +4726,23 @@ class BarlinkBar1Transport:
                     # indefinitely; without this the staged word could stay
                     # in flight for as long as it keeps queueing, and a
                     # check that never resolves is not a check.
-                    self._ctl_event.synchronize()
-                    self._ctl_inflight = False
-                    value = int(self._ctl_stage[0])
+                    #
+                    # #616f: but the wait itself must be bounded too. This
+                    # event is ordered behind the collective that just ran,
+                    # so waiting on it without a deadline makes the guard
+                    # hang on the very fault it reports. A deadline turns
+                    # "never returns" into "unresolved this time"; the
+                    # window is preserved (``_deferred_launches`` is only
+                    # cleared by a RESOLVED clean read), so nothing is lost
+                    # but the latency.
+                    if self._wait_ctl_event():
+                        self._ctl_inflight = False
+                        value = int(self._ctl_stage[0])
+                    else:
+                        # Still in flight. Leave it in flight -- re-recording
+                        # the event would queue a SECOND copy behind the same
+                        # stuck kernel and lose the one already staged.
+                        return None
         if not self._ctl_inflight:
             self._ctl_stage.copy_(self._ctl_src, non_blocking=True)
             self._ctl_event.record()
@@ -5024,6 +5240,11 @@ class BarlinkBar1Transport:
         self._ctl_stage = None
         self._ctl_event = None
         self._ctl_inflight = False
+        # #616f: the watchdog poll holds a pinned page and a stream, and it
+        # reads `_ctl_dev` directly -- it has to stand down with the word.
+        self._abort_poll_active = False
+        self._abort_poll_stream = None
+        self._abort_poll_dst = None
         self._step_dev = None
         self._result_gen_dev = None
 

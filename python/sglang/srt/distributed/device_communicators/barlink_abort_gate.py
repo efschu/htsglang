@@ -138,6 +138,22 @@ ENV_MAX_LAG = "SGLANG_BARLINK_BAR1_ABORT_MAX_LAG"
 #: the poll itself (one 4-byte D2H on a private stream).
 ENV_POLL_MS = "SGLANG_BARLINK_BAR1_ABORT_POLL_MS"
 
+#: Milliseconds the hot-path staged read may block on its OWN event before it
+#: gives up for this check (#616f). The legacy deferred read issues its D2H on
+#: the compute stream, so the event is ordered behind the collective that just
+#: ran; ``event.synchronize()`` on it is bounded by that collective, and when
+#: the collective is the fault it is not bounded at all. Three ranks were
+#: captured inside that exact call for over ten minutes, emitting nothing.
+#: Default 2000 ms -- far above any healthy step (~46 ms) and far below the
+#: supervisor's patience. ``0`` restores the pre-#616f unbounded wait.
+ENV_SYNC_DEADLINE_MS = "SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS"
+
+#: Consecutive ``ENV_SYNC_DEADLINE_MS`` expiries before the rank raises a
+#: stall (#616f). ``0`` never raises and keeps the condition a log line.
+#: Default 30, i.e. a minute of a compute stream that will not retire four
+#: bytes, which no healthy step produces.
+ENV_STALL_RAISE_AFTER = "SGLANG_BARLINK_BAR1_STALL_RAISE_AFTER"
+
 #: Whether the CUDA-graph replay boundary checks. Separate from ENV_ENABLE
 #: because it is the one check that can cost a synchronization the host would
 #: not otherwise have paid (an overlap-scheduled decode runs ahead of the
@@ -194,6 +210,59 @@ def max_lag() -> int:
     except ValueError:
         logger.warning("%s=%r is not an integer; using 4.", ENV_MAX_LAG, raw)
         return 4
+
+
+def sync_deadline_s() -> float:
+    """Seconds the staged read may block on its own event before giving up.
+
+    The staged D2H is issued on the COMPUTE stream, so the event that signals
+    it is ordered behind whatever collective just ran. ``event.synchronize()``
+    on that event is therefore bounded by the collective -- and when the
+    collective is the fault, it is not bounded at all. #616f measured three
+    ranks sitting in exactly that call for over ten minutes with no report.
+
+    So the wait gets a wall-clock deadline. Exceeding it is not itself an
+    error: the read simply stays unresolved for this check, the accumulated
+    window is preserved, and the watchdog's private-stream poll -- which does
+    not queue behind the model -- remains the path that can still see a trip.
+    0 disables the bound and restores the pre-#616f blocking wait.
+    """
+    raw = os.environ.get(ENV_SYNC_DEADLINE_MS)
+    if raw is None:
+        return 2.0
+    try:
+        return max(float(raw), 0.0) / 1000.0
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number; using 2000.", ENV_SYNC_DEADLINE_MS, raw
+        )
+        return 2.0
+
+
+def stall_raise_after() -> int:
+    """Consecutive deadline expiries before the stall is raised, 0 to never.
+
+    A single expiry is a slow step; an unbroken run of them is a compute
+    stream that is not retiring a four-byte copy, which no healthy step
+    produces -- a decode round on this rig is ~46 ms. The default of 30 at
+    the default 2 s deadline means a minute of that before the rank gives up.
+
+    Raising matters because the alternative is what #616f observed: the host
+    thread sat in the guard, the supervisor's health probe saw nothing it
+    could attribute, and the wedge stayed a black hole for ten minutes. A
+    raise reaches the serving path, names the op and the byte count, and lets
+    the supervisor restart a rank that is definitively not coming back.
+    """
+    raw = os.environ.get(ENV_STALL_RAISE_AFTER)
+    if raw is None:
+        return 30
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using 30.", ENV_STALL_RAISE_AFTER, raw
+        )
+        return 30
 
 
 def poll_interval_s() -> float:
@@ -395,6 +464,8 @@ __all__ = [
     "check_every",
     "defer_enabled",
     "max_lag",
+    "sync_deadline_s",
+    "stall_raise_after",
     "pause_polling",
     "poll_interval_s",
     "poll_status_words",
