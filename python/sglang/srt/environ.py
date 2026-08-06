@@ -540,6 +540,10 @@ class Envs:
     SGLANG_INDEX_RACE_GUARD_CLAMP = EnvBool(False)
     # Poll the guard counters every N scheduler iterations.
     SGLANG_INDEX_RACE_GUARD_POLL = EnvInt(1)
+    # Directory for the guard's durable per-rank counter dump. A rank that HANGS
+    # never reaches an exception handler and never logs again, so a log line is
+    # not a record for that failure mode -- a file is.
+    SGLANG_INDEX_RACE_GUARD_DIR = EnvStr("")
     # Force the overlap scheduler's WAR barrier onto its CONSERVATIVE form
     # (full wait_stream on the forward stream) instead of the fast-path
     # read-done event. #616 bisection arm: if the crash disappears with this

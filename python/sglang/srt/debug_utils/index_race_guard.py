@@ -315,8 +315,57 @@ def poll(iteration: Optional[int] = None) -> None:
         st.staged_iteration = st.iteration
 
 
+def _dump_to_disk(st: _GuardState, changed: bool) -> None:
+    """Persist the staged counters so a rank that HANGS still leaves evidence.
+
+    A wedged rank never reaches an exception handler and never prints another
+    log line -- that is exactly how the #616 window's first arm lost its data
+    (rank 2 went silent and the other two ranks only aborted 176 s later on the
+    collective deadline). A log line is not a durable record for that failure
+    mode; a file is.
+    """
+    d = envs.SGLANG_INDEX_RACE_GUARD_DIR.get()
+    if not d:
+        return
+    # Rewrite on every change, and periodically regardless so the file also
+    # proves the guard was still alive at time T.
+    if not changed and st.iteration % 200:
+        return
+    try:
+        import json
+        import os
+
+        os.makedirs(d, exist_ok=True)
+        rank = os.environ.get("SGLANG_RANK") or os.environ.get("RANK") or "x"
+        payload = {
+            "iteration": st.iteration,
+            "staged_at_iteration": st.staged_iteration,
+            "pid": os.getpid(),
+            "sites": {
+                name: {
+                    "bad": int(st.mirror[slot][_F_BAD]),
+                    "mutated": int(st.mirror[slot][_F_MUT]),
+                    "min": int(st.mirror[slot][_F_MIN]),
+                    "max": int(st.mirror[slot][_F_MAX]),
+                    "bounds": list(st.bounds.get(name, (0, 0))),
+                    "stream": hex(st.streams.get(name, 0)),
+                }
+                for slot, name in enumerate(st.slot_names)
+            },
+        }
+        tmp = os.path.join(d, f"index_race_rank{rank}_{os.getpid()}.json.tmp")
+        final = os.path.join(d, f"index_race_rank{rank}_{os.getpid()}.json")
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=1)
+        os.replace(tmp, final)
+    except Exception:
+        # A diagnostic must never be the reason a run dies.
+        pass
+
+
 def _report(st: _GuardState) -> None:
     mirror = st.mirror
+    changed_any = False
     for slot, name in enumerate(st.slot_names):
         bad = int(mirror[slot][_F_BAD])
         mut = int(mirror[slot][_F_MUT])
@@ -343,6 +392,8 @@ def _report(st: _GuardState) -> None:
             hex(st.streams.get(name, 0)),
             st.staged_iteration,
         )
+        changed_any = True
+    _dump_to_disk(st, changed_any)
 
 
 def _reset_for_test(enabled: bool = True, clamp: bool = False) -> None:
