@@ -113,6 +113,15 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_w = H * K
 
     index = tl.load(initial_state_indices + i_n).to(tl.int32)
+    # Padded rows carry the PAD_SLOT_ID (-1) sentinel: a batch padded up to a
+    # captured/synced shape stamps it over the tail of `cache_indices`
+    # (`hybrid_linear_attn_backend.py:96-99`), and `gdn_triton.py:183` hands
+    # that same tensor to this kernel as `initial_state_indices`. The decode
+    # kernel already guards on it (`fused_recurrent.py:908`/`:997`); the
+    # chunked extend path did not, so a padded lane both read and wrote one
+    # slot-pitch BELOW the pool base. Skip the state I/O for those lanes --
+    # the recurrence itself may still run, only its state anchor is invalid.
+    valid_state = index >= 0
     h0 = initial_state + index * stride_h
     ht = initial_state + index * stride_h
     if USE_INITIAL_STATE:
@@ -121,7 +130,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         ht = ht + i_h * V * K
 
     # load initial state
-    if USE_INITIAL_STATE:
+    if USE_INITIAL_STATE and valid_state:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -272,7 +281,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
-    if INPLACE_UPDATE:
+    if INPLACE_UPDATE and valid_state:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         if K > 64:
