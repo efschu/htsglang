@@ -248,6 +248,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
 
+    # #616g: this iteration's rank-uniform availability floor (group MIN of
+    # `available_size()`), published by the scheduler once per iteration when
+    # the ranks' pools are uneven. Cache-MUTATION triggers -- eviction and
+    # hicache load-back -- decide from it instead of from this rank's own
+    # pool, which is what keeps the radix replicas identical and therefore
+    # keeps `match_prefix` (and the extend token count it feeds) rank-uniform.
+    # None means "pools agree, or a single rank": read the live local value,
+    # exactly as before the fix. DECLARED HERE, not left to getattr on the
+    # instance, so the attribute is visible in the type rather than only in
+    # the path that happens to set it (#606).
+    uniform_avail_floor: Optional[int] = None
+
     def init_metrics_collector(self):
         from sglang.srt.runtime_context import get_server_args
 

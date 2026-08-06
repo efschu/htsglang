@@ -424,6 +424,21 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+def uniform_avail_for_evict(tree_cache, allocator) -> int:
+    """The availability a cache-mutation trigger must decide from (#616g).
+
+    The scheduler publishes ``uniform_avail_floor`` once per iteration when the
+    ranks' pools are uneven; it is the group MIN of ``available_size()``, so
+    every rank evicts on the same predicate and the radix replicas stay
+    identical. When it is None -- single rank, or pools that agree -- this is
+    the live local value and the caller behaves exactly as it did before.
+    """
+    floor = getattr(tree_cache, "uniform_avail_floor", None)
+    if floor is None:
+        return int(allocator.available_size())
+    return int(floor)
+
+
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
@@ -446,7 +461,20 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             )
     else:
         # Standard allocator
-        if allocator.available_size() < num_tokens:
+        #
+        # #616g: RANK-UNIFORM trigger. `num_tokens` is replicated (it comes
+        # from the batch, e.g. `batch.extend_num_tokens`); `available_size()`
+        # is this rank's own pool shard and differs across ranks under uneven
+        # TP/DCP. Deciding from the local side makes the roomy rank skip an
+        # eviction the tight ranks take, the radix trees stop being replicas,
+        # and the next `match_prefix` hands back a rank-dependent prefix ->
+        # rank-dependent `extend_num_tokens` -> TP collectives entered with
+        # mismatched shapes (the #616 BAR1 stall). The floor is the group MIN
+        # of exactly this quantity, published once per iteration by the
+        # scheduler from a reduce that already ran. None => pools agree (or
+        # single rank) => the live local value, unchanged.
+        avail = uniform_avail_for_evict(tree_cache, allocator)
+        if avail < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 

@@ -1922,17 +1922,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
-        if self.supports_swa():
-            avail = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = self.token_to_kv_pool_allocator.available_size()
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
+        # #616g: RANK-UNIFORM load-back admission. This is the same defect as
+        # the eviction trigger in `evict_from_tree_cache`, in the class this
+        # rig actually runs (UnifiedRadixCache, not HiRadixCache): load-back
+        # EXTENDS this rank's device prefix, and whether it happens is decided
+        # from this rank's own free space. Under uneven pools the roomy rank
+        # loads the prefix back while the tight rank gives up, the device trees
+        # stop being replicas, and `match_prefix` -> `extend_num_tokens` turns
+        # that into TP collectives entered with rank-dependent token counts --
+        # the 21:52:25 wedge (rank 0, the largest pool, reducing 1690 tokens
+        # against its peers' 1818).
+        #
+        # Decide from the group floor: if the BINDING rank cannot hold the
+        # load-back, no rank attempts it. Note the floor makes the local
+        # eviction retry unreachable rather than merely unlikely -- the floor
+        # is a MIN, so `floor >= kv_tokens` implies this rank's own
+        # availability is >= kv_tokens too. None (single rank, or pools that
+        # agree) keeps the live local path exactly as it was.
+        floor = getattr(self, "uniform_avail_floor", None)
+        if floor is not None:
+            if floor < kv_tokens:
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
+        else:
+            if self.supports_swa():
+                avail = self.token_to_kv_pool_allocator.full_available_size()
+            else:
+                avail = self.token_to_kv_pool_allocator.available_size()
+            if avail < kv_tokens:
+                needed = kv_tokens - avail
+                result = self.evict(EvictParams(num_tokens=needed))
+                if result.num_tokens_evicted < needed:
+                    self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                    self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                    return False
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
