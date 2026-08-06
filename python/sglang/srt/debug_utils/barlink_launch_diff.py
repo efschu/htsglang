@@ -1,74 +1,66 @@
-"""Automated comparison of BAR1-collective launch logs across ranks.
-
-When multiple GPU ranks hang, each rank writes a ~1 Hz record of its last
-BAR1 collective to its own log file.  This module parses those logs and
-compares them rank-by-rank per shared timestamp, reporting the first
-timestamp where the ranks disagree.
+"""Compare BAR1 collective-launch log files across ranks.
 
 Usage:
     python -m sglang.srt.debug_utils.barlink_launch_diff rank0.log rank1.log rank2.log
+
+Each log file contains one 1-Hz sampler record per line, e.g.:
+    17:47:59 group=? rank=0/? last_op=all_gather last_nbytes=192512 ...
 """
 
 from __future__ import annotations
 
 import re
 import sys
-from collections import Counter
-from typing import Dict, List, Optional
+from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers
+# Parsing
 # ---------------------------------------------------------------------------
 
-_FIELD_RE = re.compile(r"(\w+)=([\S\(]+(?:\)[\S]*)?)")
-_TS_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\s")
-_RANK_RE = re.compile(r"rank=(\d+)/")
+_LINE_RE = re.compile(
+    r"^(\d{2}:\d{2}:\d{2})\s+"
+    r"group=\S+\s+"
+    r"rank=(\d+)/\S+\s+"
+    r"last_op=(\S+)\s+"
+    r"last_nbytes=(\d+)\s+"
+    r".*?"
+    r"captured_launches=(\S+)\s+"
+    r"last_op_captured=(\S+)"
+)
 
 
-def _parse_bool(value: str) -> bool:
-    return value == "True"
+def _parse_bool(val: str) -> bool:
+    return val.lower() in ("true", "yes", "1")
 
 
-def parse_line(line: str) -> Optional[Dict]:
-    """Parse a single log line into a dict, or return *None* on bad input."""
+def parse_line(line: str) -> Optional[dict]:
+    """Parse a single log line into a dict, or return None on failure.
+
+    Never raises.
+    """
     line = line.strip()
     if not line:
         return None
-
-    ts_match = _TS_RE.match(line)
-    if ts_match is None:
+    m = _LINE_RE.search(line)
+    if m is None:
         return None
-
-    rank_match = _RANK_RE.search(line)
-    if rank_match is None:
-        return None
-
-    fields = _FIELD_RE.findall(line)
-    field_map: Dict[str, str] = {k: v for k, v in fields}
-
-    try:
-        captured_launches_str = field_map.get("captured_launches", "False")
-        last_op_captured_str = field_map.get("last_op_captured", "False")
-
-        return {
-            "ts": ts_match.group(1),
-            "rank": int(rank_match.group(1)),
-            "last_op": field_map.get("last_op", ""),
-            "last_nbytes": int(field_map.get("last_nbytes", "0")),
-            "captured_launches": _parse_bool(captured_launches_str),
-            "last_op_captured": _parse_bool(last_op_captured_str),
-        }
-    except (ValueError, TypeError):
-        return None
+    return {
+        "ts": m.group(1),
+        "rank": int(m.group(2)),
+        "last_op": m.group(3),
+        "last_nbytes": int(m.group(4)),
+        "captured_launches": _parse_bool(m.group(5)),
+        "last_op_captured": _parse_bool(m.group(6)),
+    }
 
 
-def parse_file(path: str) -> List[Dict]:
-    """Parse every line in *path*, returning only successfully parsed records."""
-    records: List[Dict] = []
-    with open(path, "r") as fh:
-        for line in fh:
-            rec = parse_line(line)
+def parse_file(path: str) -> list[dict]:
+    """Parse an entire log file into a list of record dicts."""
+    records: list[dict] = []
+    with open(path, "r") as f:
+        for raw in f:
+            rec = parse_line(raw)
             if rec is not None:
                 records.append(rec)
     return records
@@ -79,80 +71,73 @@ def parse_file(path: str) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 
-def diff_ranks(records_by_rank: Dict[int, List[Dict]]) -> str:
-    """Compare (last_op, last_nbytes) multisets across all ranks per timestamp.
+def diff_ranks(records_by_rank: dict[int, list[dict]]) -> str:
+    """Compare the multiset of (last_op, last_nbytes) across ranks per timestamp.
 
-    Only timestamps present in **every** rank are compared.  On disagreement
-    the report names the **first** offending timestamp and shows what each
-    rank had.  On agreement it states how many timestamps were compared.
+    Only timestamps present in **all** ranks are compared.
+    Returns the first disagreement (or a "no disagreement" message).
     """
     if not records_by_rank:
-        return "No ranks provided."
+        return "No records provided."
 
-    # Build per-rank per-timestamp multisets of (last_op, last_nbytes).
-    # Value:  {rank: {ts: Counter[(last_op, last_nbytes)]}}
-    rank_ts_counters: Dict[int, Dict[str, Counter]] = {}
-    for rank, records in records_by_rank.items():
-        counters: Dict[str, Counter] = {}
-        for rec in records:
-            ts = rec["ts"]
-            counters.setdefault(ts, Counter())
-            counters[ts][(rec["last_op"], rec["last_nbytes"])] += 1
-        rank_ts_counters[rank] = counters
+    all_ranks = sorted(records_by_rank.keys())
 
-    # Find timestamps common to all ranks.
-    ranks = list(records_by_rank.keys())
-    if len(ranks) < 2:
-        return "Need at least 2 ranks to compare."
+    # Build per-rank timestamp -> list of (last_op, last_nbytes)
+    ts_by_rank: dict[int, dict[str, list[tuple[str, int]]]] = {}
+    for rank, recs in records_by_rank.items():
+        ts_map: dict[str, list[tuple[str, int]]] = {}
+        for r in recs:
+            ts_map.setdefault(r["ts"], []).append((r["last_op"], r["last_nbytes"]))
+        ts_by_rank[rank] = ts_map
 
-    ts_sets = [set(rank_ts_counters[r]) for r in ranks]
-    common_ts = sorted(set.intersection(*ts_sets))
+    # Intersection of timestamps across all ranks (preserving file order of
+    # the first rank)
+    first_rank = all_ranks[0]
+    seen: set[str] = set()
+    ordered_ts: list[str] = []
+    for ts in ts_by_rank[first_rank]:
+        if ts not in seen:
+            seen.add(ts)
+            ordered_ts.append(ts)
 
-    if not common_ts:
-        return "No common timestamps found across all ranks."
+    common_ts = [ts for ts in ordered_ts if all(ts in ts_by_rank[r] for r in all_ranks)]
 
-    # Compare each common timestamp in chronological order.
+    # Compare each common timestamp
     for ts in common_ts:
-        multisets = [(r, rank_ts_counters[r][ts]) for r in sorted(ranks)]
-        # Check equality of all multisets.
-        first_counter = multisets[0][1]
-        if any(c != first_counter for _, c in multisets[1:]):
-            # Disagreement -- build report.
-            lines = [
-                f"DISAGREEMENT at timestamp {ts}",
-                "",
-            ]
-            for r, cnt in multisets:
-                parts = ", ".join(
-                    f"({op!r}, {nbytes}) x{count}"
-                    for (op, nbytes), count in sorted(cnt.items())
-                )
-                lines.append(f"  rank {r}: {parts}")
+        rank_tuples = {r: tuple(sorted(ts_by_rank[r][ts])) for r in all_ranks}
+        values = list(rank_tuples.values())
+        if not all(v == values[0] for v in values):
+            lines = [f"Disagreement at timestamp {ts}:"]
+            for r in all_ranks:
+                lines.append(f"  rank {r}: {ts_by_rank[r][ts]}")
             return "\n".join(lines)
 
     return (
-        f"No disagreement found across all ranks. "
-        f"Compared {len(common_ts)} common timestamps."
+        f"No disagreements found. Compared {len(common_ts)} common timestamps "
+        f"across ranks {all_ranks}."
     )
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 
-def main(argv: Optional[List[str]] = None) -> None:
-    if argv is None:
-        argv = sys.argv[1:]
-
-    if len(argv) < 2:
-        print("Usage: barlink_launch_diff rank0.log rank1.log [rank2.log ...]")
+def main(argv: Optional[list[str]] = None) -> None:
+    args = argv if argv is not None else sys.argv[1:]
+    if len(args) < 2:
+        print(
+            "Usage: barlink_launch_diff <log0> <log1> [log2 ...]",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    records_by_rank: Dict[int, List[Dict]] = {}
-    for path in argv:
-        for rec in parse_file(path):
-            records_by_rank.setdefault(rec["rank"], []).append(rec)
+    # Parse each file and group by rank (inferred from content, not filename)
+    records_by_rank: dict[int, list[dict]] = {}
+    for path in args:
+        recs = parse_file(path)
+        for r in recs:
+            records_by_rank.setdefault(r["rank"], []).append(r)
 
     print(diff_ranks(records_by_rank))
 

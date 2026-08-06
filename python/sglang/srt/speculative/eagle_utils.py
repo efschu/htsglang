@@ -1023,10 +1023,21 @@ def eagle_sample(
             else get_tp_group()
         )
         if tp_group.world_size > 1:
+            # #616c: this RECEIVE path must issue byte-for-byte the same
+            # collective as the send path further down, or the ranks disagree
+            # on how many collectives a round contains and the group desyncs.
+            # It was three separate broadcasts while the sender was fused to
+            # one -- latent because the weightless-KV fast lane is off in the
+            # default configuration, and fatal the moment it is on. Same
+            # fusion, same order, one collective.
+            _packed = pack_accept_payload(predict, accept_index, num_correct_drafts)
             capture_safe_tp_broadcast(
                 tp_group,
-                (predict, accept_index, num_correct_drafts),
+                (_packed,),
                 src=spec_accept_broadcast_src(),
+            )
+            unpack_accept_payload(
+                _packed, predict, accept_index, num_correct_drafts
             )
         return predict, num_correct_drafts + 1, accept_index
 
