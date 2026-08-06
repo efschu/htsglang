@@ -162,5 +162,78 @@ class TestPriorityLabelEmission(unittest.TestCase):
                 self.assertEqual(p, "UNKNOWN")
 
 
+class TestPriorityLabelCardinalityBound(unittest.TestCase):
+    """Overflow the cap and assert the LABEL SET stays bounded.
+
+    The per-value tests above prove individual values are transformed. The
+    property that actually protects Prometheus is different and stronger: no
+    matter how many distinct priorities clients send, the number of distinct
+    `priority` label values emitted is bounded by a small constant. A metric
+    store dies from the size of the label set, not from any one bad label.
+    """
+
+    # LOW + HIGH + UNKNOWN, plus the pass-through band "0".."30".
+    MAX_DISTINCT_LABELS = 3 + 31
+
+    def _emitted_labels(self, priorities):
+        from sglang.srt.observability.metrics_collector import (
+            SchedulerMetricsCollector,
+        )
+
+        qc = QueueCount.from_reqs(
+            [FakeReq(p) for p in priorities], enable_priority_scheduling=True
+        )
+
+        mock_collector = MagicMock()
+        mock_collector.labels = {"model_name": "test", "priority": ""}
+        mock_collector._known_priorities = set()
+
+        gauge_mock = MagicMock()
+        SchedulerMetricsCollector._log_gauge_queue_count(
+            mock_collector, gauge_mock, qc
+        )
+
+        return {
+            call.kwargs["priority"]
+            for call in gauge_mock.labels.call_args_list
+            if call.kwargs.get("priority", "")
+        }
+
+    def test_ten_thousand_distinct_priorities_stay_bounded(self):
+        """10k distinct client priorities must not mint 10k Prometheus series."""
+        priorities = list(range(-5000, 5000))
+        self.assertEqual(len(set(priorities)), 10000)
+
+        emitted = self._emitted_labels(priorities)
+
+        self.assertLessEqual(
+            len(emitted),
+            self.MAX_DISTINCT_LABELS,
+            f"priority label cardinality escaped the cap: {len(emitted)} distinct "
+            f"labels from {len(priorities)} distinct priorities",
+        )
+        # And the cap is doing the collapsing at both ends, not silently dropping.
+        self.assertIn("LOW", emitted)
+        self.assertIn("HIGH", emitted)
+        # No raw out-of-band value survived.
+        for label in emitted:
+            if label not in ("LOW", "HIGH", "UNKNOWN"):
+                self.assertTrue(label.isdigit(), f"non-numeric label leaked: {label}")
+                self.assertLess(int(label), 31)
+
+    def test_cardinality_saturates_rather_than_grows(self):
+        """Widening the input range past the band does not widen the output."""
+        # Both ranges must cover the whole 0..30 pass-through band contiguously,
+        # otherwise the sets differ for a reason that has nothing to do with the
+        # cap (a stepped range simply skips band members).
+        narrow = self._emitted_labels(list(range(-50, 50)))
+        wide = self._emitted_labels(list(range(-50000, 50000)))
+        self.assertEqual(narrow, wide)
+
+    def test_unhashable_flood_of_none_is_single_label(self):
+        emitted = self._emitted_labels([None] * 1000)
+        self.assertEqual(emitted, {"UNKNOWN"})
+
+
 if __name__ == "__main__":
     unittest.main()

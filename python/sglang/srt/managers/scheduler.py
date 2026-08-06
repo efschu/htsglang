@@ -6756,6 +6756,25 @@ def run_scheduler_process(
     flight_recorder.arm_process_trace(rank=tp_rank)
     flight_recorder.mark("process_start", rank=tp_rank)
 
+    # Startup phase timers (#560). The boot phases that dominate time to first
+    # token -- weight loading, KV pool sizing, attention backend init, cuda
+    # graph capture -- all run in THIS process, not in the parent that calls
+    # launch_server. Without this call the phase timers here would log but
+    # never reach the gauge, which is the half-wired state #560 inherited.
+    #
+    # Gauge on rank 0 only. STARTUP_LATENCY_SECONDS carries a single "context"
+    # label and no rank label, and its multiprocess_mode is "mostrecent", so
+    # arming every rank would make the exported value the last rank to finish
+    # a phase rather than any well-defined rank. The per-rank breakdown is not
+    # lost: startup_timer logs its INFO line on every rank regardless of this
+    # gate, which is the form #539 boot attribution actually reads.
+    if server_args.enable_metrics and tp_rank == 0:
+        from sglang.srt.observability.startup_func_log_and_timer import (
+            enable_startup_timer,
+        )
+
+        enable_startup_timer()
+
     # Set up tracing
     if server_args.enable_trace:
         process_tracing_init(

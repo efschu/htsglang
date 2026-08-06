@@ -2945,7 +2945,14 @@ def _wait_and_warmup(
 
     # Send a warmup request
     if not server_args.skip_server_warmup:
-        if not execute_warmup_func(server_args):
+        from sglang.srt.observability.startup_func_log_and_timer import startup_timer
+
+        # Runs in the parent process, where launch_server has already called
+        # enable_startup_timer(). The context manager still times and logs the
+        # phase when warmup fails and this function returns early.
+        with startup_timer("server_warmup"):
+            warmup_ok = execute_warmup_func(server_args)
+        if not warmup_ok:
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
