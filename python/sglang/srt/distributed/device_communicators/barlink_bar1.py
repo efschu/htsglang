@@ -4583,6 +4583,62 @@ class BarlinkBar1Transport:
             "all-equal values mean the flags agree and the wait is elsewhere."
         )
 
+    def _abort_peer_flag_snapshot(self, max_lines: int = 64) -> Optional[str]:
+        """Every PEER's flag region, read from THIS process at abort time.
+
+        Closes the gap that made the first three wedges only partly readable
+        (#616c). The abort path dumps the flag words of whichever rank reaches
+        it, and the last rank to abort tends to die before it gets there -- so
+        every incident so far yielded at most 2 of 3 ranks, and any
+        (block, sender) cell involving the missing rank could not be compared.
+        One incident even showed a sender-2 disagreement that the next could
+        neither confirm nor refute, precisely because rank 2 was the one that
+        never emitted.
+
+        This needs no device sync and no cooperation from the peer: setup
+        already mapped each peer's flag region into THIS process's address
+        space (``PeerTarget.flag.host_address``), so the read is an ordinary
+        host load from a mapped BAR window. That is what makes it safe on the
+        abort path, where a device read would queue behind the wedged spin.
+
+        Reading a write-combined BAR mapping from the host is slow per access;
+        it is bounded here to ``max_lines`` lines of 256 bytes per peer, which
+        is a few kB total and only ever runs once, after the collective has
+        already failed.
+        """
+        peers = getattr(self, "_peers", None)
+        if not peers:
+            return None
+        parts = []
+        for peer_rank in sorted(peers):
+            mapping = getattr(peers[peer_rank], "flag", None)
+            host_addr = getattr(mapping, "host_address", 0) if mapping else 0
+            length = int(getattr(mapping, "length", 0) or 0) if mapping else 0
+            if not host_addr or length <= 0:
+                continue
+            line = 256
+            n_lines = min(length // line, int(max_lines))
+            if n_lines <= 0:
+                continue
+            raw = bytes(
+                (ctypes.c_ubyte * (n_lines * line)).from_address(int(host_addr))
+            )
+            words = " ".join(
+                f"{i}:{int.from_bytes(raw[i * line : i * line + 4], 'little')}"
+                for i in range(n_lines)
+            )
+            parts.append(f"peer {peer_rank} [{n_lines} lines]: {words}")
+        if not parts:
+            return None
+        return (
+            f"barlink-BAR1 abort PEER flag snapshot, observed by rank "
+            f"{self.rank}/{self.world} group {self.group or '<unnamed>'} -- "
+            + " || ".join(parts)
+            + ". These are the peers' OWN flag regions read from this process, "
+            "so one surviving rank publishes every rank's view; compare cells "
+            "by (block, sender), never by per-rank maximum."
+        )
+
     def check_aborted(self, where: str) -> None:
         """The production check: raise if a kernel took its abort path.
 
@@ -4772,6 +4828,16 @@ class BarlinkBar1Transport:
             snapshot = self._abort_flag_snapshot()
             if snapshot:
                 logger.error("%s", snapshot)
+        except Exception:  # noqa: BLE001 - an instrument must not mask the abort
+            pass
+        # #616c: and every PEER's region, read from here. The rank that dies
+        # first never reaches its own dump, so without this an incident yields
+        # at most 2 of 3 views -- which is exactly why the sender-2 reading of
+        # wedge 2 could not be confirmed or refuted by wedge 3.
+        try:
+            peer_snapshot = self._abort_peer_flag_snapshot()
+            if peer_snapshot:
+                logger.error("%s", peer_snapshot)
         except Exception:  # noqa: BLE001 - an instrument must not mask the abort
             pass
         raise Bar1CollectiveAborted(
