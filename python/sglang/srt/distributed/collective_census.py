@@ -108,7 +108,16 @@ DEFAULT_HEARTBEAT = 10000
 #: Default ring-buffer capacity for per-collective history. Stores the most
 #: recent N (family, nbytes) pairs so the abort-time dump can show the
 #: sequence of collectives, not just the cumulative counts.
-DEFAULT_HISTORY_LEN = 64
+#:
+#: Sized from a measurement, not a guess (#616c). At 64 the first real wedge
+#: produced two ranks whose histories were byte-identical -- useless for
+#: locating a divergence, because 64 entries covered ~1 % of the run (the
+#: census counted 5701 tp.broadcast alone by then) and 50 of those 64 were a
+#: single uninterrupted run of broadcasts. A divergence that happened earlier
+#: is simply outside the window. 4096 entries is still only a few hundred kB
+#: of tuples per rank and costs one deque append per collective, which is the
+#: same hot-path cost as before.
+DEFAULT_HISTORY_LEN = 4096
 
 
 def census_enabled() -> bool:

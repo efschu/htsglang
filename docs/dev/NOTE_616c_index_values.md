@@ -676,3 +676,59 @@ This wedge occurred under AGENT-ONLY load (`#running-req: 1, #queue-req: 0`),
 not under the saturated reproducer. Section 16 stated that both families were
 only ever observed under saturation; that is now false for the wedge. The
 index assert's 192 s envelope remains a saturated-load measurement.
+
+## 18. RETRACTION of section 17's "exactly one generation", and what replaces it
+
+Section 17 claimed the ranks sit **exactly one** generation apart, from
+rank 0's maximum flag value being 1190714 and rank 1's 1190715. **That claim
+is withdrawn.** It compared per-rank MAXIMA over line indices that are not
+aligned across ranks, and it did not check the spread WITHIN a rank.
+
+The second wedge, with both ranks captured, shows why that was unsound:
+rank 0's own snapshot carries 285932, 285934 AND 285935 on different lines.
+Values one apart occur inside a single rank, so a cross-rank difference of one
+is inside the normal spread and proves nothing.
+
+The layout is one 256-byte line per (topology, step, sender), 7 blocks x 3
+ranks = 21 lines, and each rank's region holds the flags its PEERS wrote into
+it -- which is why rank 0 has zeros exactly at the sender-0 slots and rank 1 at
+the sender-1 slots. Line *i* on rank 0 is therefore a different logical slot
+from line *i* on rank 1, and the two must be compared block-by-block, by
+sender, not by maximum.
+
+### What the second wedge actually measured
+
+| block | rank 0 (peer flags it holds) | rank 1 (peer flags it holds) |
+|---|---|---|
+| 0 (mesh) | 285932, 285932 | 285938, 285937 |
+| 1 (mesh) | 285932, 285932 | 285937, 285937 |
+| 2-5 (ring) | 283536 | 283536 |
+| 6 (a2a) | 285934, 285935 | 285935, 285935 |
+
+In the MESH blocks rank 0's received flags stand at 285932 while rank 1's
+stand at 285937/285938 -- a gap of five to six generations, not one. The ring
+blocks agree exactly (283536 on both) and the a2a block nearly agrees. So the
+divergence is real, it is confined to the mesh topology, and its size is ~5-6.
+
+Stated carefully: these are the values each rank HOLDS, written by its peers.
+Turning that into "rank X is ahead/behind" requires the kernel's publish/wait
+semantics, which is not read off here. What is solid: the mesh flag lines
+disagree across ranks by ~5-6 generations while the ring lines agree exactly.
+
+### The Python-level sequences were IDENTICAL
+
+Both ranks' collective histories at abort were byte-identical: 64 entries
+each, same order, `cmp` reports no difference. Composition: 50 tp.broadcast,
+8 tp.all_reduce, 3 dcp.all_gather, 2 tp.all_gather, 1 dcp.all_reduce.
+
+So the divergence is NOT visible in the sequence of Python-level collectives,
+consistent with sections 13 and 17: it lives below that layer.
+
+### Instrument limitation found by using it
+
+64 entries covered about 1 % of the run -- the census had counted 5701
+tp.broadcast by then -- and 50 of the 64 were one uninterrupted run of
+broadcasts. A divergence occurring earlier is outside the window entirely, so
+"the histories are identical" is weak evidence at this size. DEFAULT_HISTORY_LEN
+is therefore raised from 64 to 4096, which is a few hundred kB per rank and the
+same one-append hot-path cost. The next wedge gets a window worth diffing.
