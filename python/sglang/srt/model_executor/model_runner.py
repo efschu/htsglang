@@ -184,6 +184,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.observability.startup_func_log_and_timer import time_startup_latency
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -1207,6 +1208,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         return rows
 
+    @time_startup_latency(name="memory_pool_init")
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
@@ -1282,6 +1284,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # of the None an MTP forward dereferences. False everywhere else.
         self.dual_group_lane_draft_capture: bool = False
 
+    @time_startup_latency(name="attention_backend_init")
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
         # TODO: Refactor device-specific init branches into platform interface (separate PR).
@@ -1402,6 +1405,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             getattr(cfg, phase).backend = Backend.DISABLED
 
+    @time_startup_latency(name="cuda_graph_capture")
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
 
@@ -2135,6 +2139,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.observability.startup_func_log_and_timer import (
                 startup_timer,
             )
+
             with startup_timer("weight_loading"):
                 self.loader = get_model_loader(
                     load_config=self.load_config,

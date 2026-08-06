@@ -17,11 +17,24 @@ _max_durations: Dict[str, float] = {}
 
 
 def enable_startup_timer():
-    """Initialize startup latency metrics when metrics are enabled"""
+    """Initialize startup latency metrics when metrics are enabled.
+
+    Idempotent: there is one call per process that emits startup phases --
+    the parent process (launch_server) and every scheduler subprocess
+    (run_scheduler_process) -- but a process can reach both paths when an
+    Engine is constructed in-process. Re-registering the same Gauge name in
+    one CollectorRegistry raises "Duplicated timeseries", so a second call
+    only re-arms the flag and keeps the existing gauge.
+    """
+    global enable_startup_metrics, STARTUP_LATENCY_SECONDS
+
+    if STARTUP_LATENCY_SECONDS is not None:
+        enable_startup_metrics = True
+        return
+
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import Gauge
 
-    global enable_startup_metrics, STARTUP_LATENCY_SECONDS
     enable_startup_metrics = True
 
     STARTUP_LATENCY_SECONDS = Gauge(
