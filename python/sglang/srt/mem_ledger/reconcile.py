@@ -161,6 +161,10 @@ class CardReconciliation:
     residuum_mib: int
     residuum_note: str = ""
     missing_phases: Tuple[str, ...] = ()
+    #: Terms computed with a global delta because marks lacked draft_worker tags.
+    #: Empty when all marks carry runner tags; non-empty signals that the
+    #: measurement is still valid but runner attribution is unavailable.
+    ambiguous_runner_terms: Tuple[str, ...] = ()
 
     @property
     def overprediction_mib(self) -> int:
@@ -194,25 +198,116 @@ class CardReconciliation:
                 "  UNMEASURED terms are not evidence the term is wrong OR "
                 "right: " + ", ".join(unmeasured)
             )
+        if self.ambiguous_runner_terms:
+            lines.append(
+                "  AMBIGUOUS RUNNER: the mark log lacks draft_worker tags on "
+                "per-runner phases; these terms were computed with a global "
+                "delta (first -> last) rather than per-runner sum -- the "
+                "measurement is still valid but runner attribution is "
+                "unavailable: "
+                + ", ".join(self.ambiguous_runner_terms)
+            )
         return "\n".join(lines)
 
 
 def _delta_bytes(
     marks: Sequence[Mapping[str, Any]], frm: str, to: str, field: str
-) -> Optional[int]:
-    """Growth of *field* between two named phases, summing repeats of *to*.
+) -> Tuple[Optional[int], bool]:
+    """Growth of *field* between two named phases, per-runner then summed.
 
-    ``capture_end`` occurs once per runner in a speculative process, and their
-    costs ADD; taking the last one would silently drop the draft runner's
-    graphs.
+    Under speculative decoding a rank runs TWO model runners (target + NEXTN
+    draft), so ``initialize()`` runs twice and there are 14 marks per rank,
+    not 8. The target runner loads its weights, then the draft runner loads
+    its. A global ``first(frm) -> last(to)`` span would cross the draft's
+    weight load and charge draft weights to ``TERM_MAMBA_POOL``.
+
+    FIX: partition marks by ``extra.draft_worker``, compute a delta per runner,
+    sum across runners. ``capture_end`` already added correctly by accident
+    (taking the last one includes both); weights and the state pool do not.
+
+    When ``extra.draft_worker`` is MISSING on the marks (old boots predating
+    the tag), a single global delta is computed and the caller is informed via
+    the returned boolean so the result is not silently mis-attributed.
+
+    Returns ``(delta_bytes, had_ambiguous_runner)`` where the boolean is True
+    when the marks lacked runner tags and a global delta was used.
     """
-    start = next((m for m in marks if m.get("phase") == frm), None)
-    if start is None:
-        return None
-    ends = [m for m in marks if m.get("phase") == to]
-    if not ends:
-        return None
-    return int(ends[-1].get(field, 0)) - int(start.get(field, 0))
+    # Only partition marks that carry the requested phases. Process-level
+    # phases (boot_complete, first_forward) have no runner tag and would
+    # pollute the "other" bucket if we partitioned every mark.
+    relevant_phases = {frm, to}
+    relevant_marks = [m for m in marks if m.get("phase") in relevant_phases]
+
+    tagged_false: List[Mapping[str, Any]] = []
+    tagged_true: List[Mapping[str, Any]] = []
+    other: List[Mapping[str, Any]] = []
+    for m in relevant_marks:
+        extra = m.get("extra") or {}
+        tag = extra.get("draft_worker")
+        if tag is True:
+            tagged_true.append(m)
+        elif tag is False:
+            tagged_false.append(m)
+        else:
+            other.append(m)
+
+    # If no marks carry a runner tag, use the global delta.
+    if not tagged_false and not tagged_true:
+        # Deduplicate: within the untagged set, keep the first occurrence of
+        # each phase so process-level phases that fire once per runner do not
+        # double-count their delta.
+        deduped = _dedup_first(other, [frm, to])
+        start = next((m for m in deduped if m.get("phase") == frm), None)
+        if start is None:
+            return None, True
+        ends = [m for m in deduped if m.get("phase") == to]
+        if not ends:
+            return None, True
+        return int(ends[-1].get(field, 0)) - int(start.get(field, 0)), True
+
+    # Mixed tags: cannot compute per-runner because the untagged marks would
+    # be silently attributed. Return None and report the ambiguity.
+    if other:
+        return None, True
+
+    # Pure per-runner: compute delta within each tagged partition, sum.
+    total: int = 0
+    for partition in (tagged_false, tagged_true):
+        if not partition:
+            continue
+        # Deduplicate within the partition so process-level phases that fire
+        # once per runner with identical values do not double-count.
+        deduped = _dedup_first(partition, [frm, to])
+        start = next((m for m in deduped if m.get("phase") == frm), None)
+        if start is None:
+            continue
+        ends = [m for m in deduped if m.get("phase") == to]
+        if not ends:
+            continue
+        total += int(ends[-1].get(field, 0)) - int(start.get(field, 0))
+
+    return total if total else None, False
+
+
+def _dedup_first(
+    marks: Sequence[Mapping[str, Any]], phases: Sequence[str]
+) -> List[Mapping[str, Any]]:
+    """Keep only the FIRST occurrence of each named phase.
+
+    Process-level phases like ``first_forward`` fire once per runner with
+    identical values. Taking both would double-count the activation delta.
+    The spec says to dedupe by taking the first, never sum.
+    """
+    seen: Dict[str, bool] = {}
+    result: List[Mapping[str, Any]] = []
+    for m in marks:
+        phase = m.get("phase")
+        if phase in phases and seen.get(phase):
+            continue
+        if phase in phases:
+            seen[phase] = True
+        result.append(m)
+    return result
 
 
 def _field_bytes(
@@ -269,6 +364,8 @@ def reconcile_card(
     kv_pool_bytes = int(ledger.get("kv_pool_mib", 0)) * MIB
     comparisons: List[TermComparison] = []
     claimed_bytes = 0
+    #: Terms computed with a global delta because marks lacked runner tags.
+    ambiguous_runner_terms: List[str] = []
     for term in ledger.get("terms", []):
         name = str(term.get("name", ""))
         modeled_mib = int(term.get("mib", 0))
@@ -288,7 +385,11 @@ def reconcile_card(
         (kind, *args), basis = mapping
         measured: Optional[int]
         if kind == "delta":
-            measured = _delta_bytes(marks, args[0], args[1], "reserved_bytes")
+            measured, ambiguous = _delta_bytes(
+                marks, args[0], args[1], "reserved_bytes"
+            )
+            if ambiguous and measured is not None:
+                ambiguous_runner_terms.append(name)
             if measured is not None and name == TERM_MAMBA_POOL:
                 # The KV pool is allocated in the same gap and is the ledger's
                 # residual, not a term. Subtract it so what remains is the
@@ -357,6 +458,7 @@ def reconcile_card(
             else "every measured MiB is claimed by a term above"
         ),
         missing_phases=missing,
+        ambiguous_runner_terms=tuple(ambiguous_runner_terms),
     )
 
 
