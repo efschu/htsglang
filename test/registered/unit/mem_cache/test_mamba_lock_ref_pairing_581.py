@@ -39,6 +39,14 @@ does not strand the ref. `_split_node` leaves `mamba_value` AND
 `mamba_lock_ref` on the deeper child -- the same object the acquirer holds --
 and gives the new upper half `mamba_value=None, mamba_lock_ref=0`.
 
+`TestAdmissionLockPrecondition` pins the emergent invariant that keeps the
+SIBLING site safe: `PrefillAdder._req_inc_lock_ref` (schedule_policy.py) drops
+the acquire's `skip_lock_node_ids`, and the paired release
+(`cache_finished_req` / `cache_unfinished_req` -> `dec_lock_ref(req.last_node)`)
+passes no params, so that lock would steal a ref by the same mechanism as (1)
+IF `req.last_node` could be a mamba tombstone there. It cannot -- but only
+because three separate facts line up, so they are asserted mechanically.
+
 Every pool here is built on `torch.device("cpu")`; the hierarchical cache runs
 against a fake cache controller, so no GPU and no host pool assembly.
 """
@@ -516,6 +524,95 @@ class TestLockRefPairing(unittest.TestCase):
         self.assertEqual(tree.mamba_protected_size(), 0)
         self.assertEqual(tree.ongoing_load_back, {})
         self.assertEqual(tree.ongoing_write_through, {})
+
+
+class TestAdmissionLockPrecondition(unittest.TestCase):
+    """The REQUEST lock (`_req_inc_lock_ref` -> `dec_lock_ref(req.last_node)`)
+    carries no skip set in either direction, so it is only safe while
+    `req.last_node` cannot be a mamba tombstone when it is taken.
+
+    `match_prefix` DOES hand out mamba tombstones as `last_device_node`
+    (`_match_prefix_helper` selects on `mamba_value is not None OR
+    mamba_backuped`), and `init_next_round_input` assigns that node straight to
+    `req.last_node`. What saves the request lock is that admission reaches
+    `_req_inc_lock_ref` only after `init_load_back` has run, and a tombstone
+    always forces `init_load_back` to run:
+
+      mamba_backuped => backuped        a mamba host copy is only ever written
+                                        where the KV host copy is written too
+                                        (`mamba_backup_commit`,
+                                        `_insert_helper_host`)
+      => `last_host_node` stops AT the tombstone rather than walking past it
+      => `mamba_host_hit_length == 1`
+      => `Req.needs_host_load_back()` is True
+      => `init_load_back` runs and resolves the tombstone.
+
+    Each link is asserted below. If a future path ever creates a mamba host
+    copy without a KV host copy, the second link breaks, `mamba_host_hit_length`
+    goes to 0, the tombstone reaches `_req_inc_lock_ref`, and the request lock
+    starts stealing refs -- so this test failing means the skip set has to be
+    threaded through `Req` (like `swa_uuid_for_lock`) to the release sites.
+    """
+
+    def _staged_internal_tombstone(self):
+        """A tombstone that KEEPS its device KV -- the shape where the KV side
+        gives no load-back signal at all, so `mamba_host_hit_length` is the
+        only thing that forces `init_load_back`."""
+        tree, allocator, pool = _build_hi(mamba_size=8)
+        prefix = list(range(2000, 2032))
+        deeper = prefix + list(range(3000, 3032))
+        internal = _insert(tree, allocator, pool, prefix)
+        leaf = _insert(tree, allocator, pool, deeper)
+        tree.cache_controller.complete()
+        tree.writing_check()
+
+        # Lock the leaf so the internal node is the mamba eviction victim; an
+        # internal node is tombstoned in place and keeps its device KV.
+        tree.inc_lock_ref(leaf)
+        tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        tree.dec_lock_ref(leaf)
+        self.assertTrue(internal.mamba_evicted, "test setup: not a tombstone")
+        self.assertFalse(internal.evicted, "test setup: KV left the device")
+        return tree, prefix, internal
+
+    def test_mamba_host_copy_implies_kv_host_copy(self):
+        """Link 2: the reason `last_host_node` cannot walk past a tombstone."""
+        tree, _, internal = self._staged_internal_tombstone()
+        self.assertTrue(internal.mamba_backuped)
+        self.assertTrue(
+            internal.backuped,
+            "a mamba host copy without a KV host copy breaks the admission "
+            "precondition -- see this class's docstring",
+        )
+
+    def test_tombstone_last_device_node_forces_a_load_back(self):
+        """Links 1+3: the node admission would lock IS the tombstone, and the
+        match still reports a host hit, so `init_load_back` cannot be skipped."""
+        tree, prefix, internal = self._staged_internal_tombstone()
+
+        match = tree.match_prefix(MatchPrefixParams(key=_key(prefix)))
+        self.assertIs(match.last_device_node, internal)
+        self.assertIsNone(match.last_device_node.mamba_value)
+        # The KV side is silent here: only the mamba term forces the load back.
+        self.assertEqual(match.host_hit_length, 0)
+        self.assertEqual(match.mamba_host_hit_length, 1)
+
+    def test_load_back_resolves_the_tombstone_before_the_request_lock(self):
+        """Link 4: what `_req_inc_lock_ref` finally locks always has a value."""
+        tree, prefix, internal = self._staged_internal_tombstone()
+        match = tree.match_prefix(MatchPrefixParams(key=_key(prefix)))
+
+        _, last_node = tree.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+            )
+        )
+        self.assertIsNotNone(
+            last_node.mamba_value,
+            "the request lock would be taken on a tombstone and its paramless "
+            "release would steal a ref",
+        )
 
 
 if __name__ == "__main__":
