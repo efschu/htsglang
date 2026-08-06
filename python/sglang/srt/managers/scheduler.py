@@ -1866,6 +1866,50 @@ class Scheduler(
             ]
         )
 
+    def _uniform_timeout_ballot(self, local_verdicts: List[bool]) -> List[bool]:
+        """MAX-reduce a positional wall-clock timeout verdict over the TP group.
+
+        #610, the rank-local-test-before-a-group-collective family. A timeout
+        verdict is built from TWO rank-local quantities: the entry timestamp
+        (``req_time_stats.set_wait_queue_entry_time`` / ``set_forward_entry_time``
+        stamp ``time.perf_counter()`` on the rank that processes the request)
+        and ``time.perf_counter()`` read at THIS rank's own point in its own
+        scheduler iteration. Two ranks straddling the deadline therefore
+        disagree, and both callers act on that disagreement in ways that split
+        the group -- see their own comments.
+
+        The fix is the established family pattern (#580/#607-E): the rank-local
+        verdict does not decide, it only casts a ballot, and participation in
+        the ballot is unconditional. MAX (logical OR), not MIN: the timeout is a
+        LIVENESS promise to the client, so the first rank to observe the
+        deadline decides for the group. MAX is also monotone -- once a request
+        is voted out it cannot be voted back in by a slower rank on a later
+        iteration, which a MIN ballot would allow and which would make the
+        abort flap.
+
+        COST: one MAX ``all_reduce`` of a ``len(local_verdicts)``-element int64
+        CPU tensor on ``tp_cpu_group`` (gloo), i.e. NOT the device group and not
+        BAR1. Both callers are gated on ``SGLANG_REQ_*_TIMEOUT > 0``, which
+        defaults to -1, so the default path takes NO collective at all and is
+        byte-identical.
+
+        PAYLOAD LENGTH is rank-uniform by construction: both callers index a
+        collection that is already replicated across the group (the waiting
+        queue is fed by the rank-0 broadcast in ``_broadcast_reqs_across_ranks``
+        and drained by decisions that are themselves rank-uniform; the running
+        batch is built from a rank-uniform plan). A length that nonetheless
+        diverged would be a pre-existing composition split, and gloo reports it
+        as the named ``op.preamble.length`` mismatch rather than hanging.
+        """
+        if not local_verdicts:
+            return local_verdicts
+        grp = getattr(self, "tp_cpu_group", None)
+        if grp is None or torch.distributed.get_world_size(grp) <= 1:
+            return local_verdicts
+        t = torch.tensor([int(v) for v in local_verdicts], dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=grp)
+        return [bool(v) for v in t.tolist()]
+
     def _abort_on_running_timeout(self, running_batch: ScheduleBatch):
         # NOTE: this should be called before a batch is launched.
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
@@ -1874,9 +1918,23 @@ class Scheduler(
         if running_batch.is_empty():
             return
 
+        # #610: the wall-clock verdict below is RANK-LOCAL (see
+        # `_uniform_timeout_ballot`). Acting on it directly sets `to_finish` on
+        # a rank-dependent subset of the running batch; `check_finished`
+        # promotes that to `finished_reason` (schedule_batch.py:1516) and the
+        # request leaves the batch on some ranks only. The next iteration then
+        # builds decode batches of DIFFERENT composition per rank, and the
+        # per-layer TP collectives inside the forward are entered with
+        # mismatched shapes. Vote first, act on the group's verdict.
         deadline = time.perf_counter() - timeout_s
-        for req in running_batch.reqs:
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+        timed_out = self._uniform_timeout_ballot(
+            [
+                0 < req.time_stats.forward_entry_time < deadline
+                for req in running_batch.reqs
+            ]
+        )
+        for req, expired in zip(running_batch.reqs, timed_out):
+            if expired and not req.finished():
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
@@ -2405,12 +2463,20 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
         )
 
     def init_output_streamer(self) -> None:
@@ -3054,11 +3120,33 @@ class Scheduler(
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
 
+        # #610: the wall-clock verdict below is RANK-LOCAL (see
+        # `_uniform_timeout_ballot`) and it FENCES A GROUP COLLECTIVE. The abort
+        # body calls `tree_cache.release_aborted_request`, which enters a TP
+        # barrier on every hierarchical cache class -- `_barrier_attn_groups` at
+        # unified_radix_cache.py:2480 and hiradix_cache.py:1921,
+        # `torch.distributed.barrier` at hi_mamba_radix_cache.py:2296. A rank
+        # whose clock has crossed the deadline enters that barrier while its
+        # peers, still a scheduler-loop jitter short of it, never call the
+        # function at all: the aborting rank blocks against a partner that is
+        # not coming. With hicache storage off the same divergence is still a
+        # defect, one step milder -- the request leaves `waiting_queue` on a
+        # subset of ranks and the next prefill batch is composed differently
+        # per rank.
+        #
+        # This function is reached from `get_next_batch_to_run` (:3398), which
+        # every rank runs once per iteration, so voting here keeps the
+        # collective count rank-uniform.
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
-        for req in self.waiting_queue:
-            entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
+        timed_out = self._uniform_timeout_ballot(
+            [
+                0 < req.time_stats.wait_queue_entry_time < deadline
+                for req in self.waiting_queue
+            ]
+        )
+        for req, expired in zip(self.waiting_queue, timed_out):
+            if expired:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -3285,6 +3373,10 @@ class Scheduler(
         kvso = self.kv_session_offload
         if kvso is not None:
             self._uniform_min_avail = int(kvso.dcp_min_avail())
+            # The offload manager reduced the admission quantity itself in
+            # `update_dcp_admission_state`; `get_new_batch_prefill` reads it
+            # from there, so nothing is stored here.
+            self._uniform_budget_deficit = 0
             return
 
         alloc = self.token_to_kv_pool_allocator
@@ -3292,10 +3384,68 @@ class Scheduler(
         grp = getattr(self, "tp_cpu_group", None)
         if grp is None or torch.distributed.get_world_size(grp) <= 1:
             self._uniform_min_avail = local_avail
+            self._uniform_budget_deficit = 0
             return
-        t = torch.tensor([local_avail], dtype=torch.int64)
+        # #610: PREFILL ADMISSION rides on this same reduce. `PrefillAdder`'s
+        # `rem_total_tokens` / `cur_rem_tokens` (schedule_policy.py:681/719) read
+        # `available_size() + evictable_size()` -- rank-LOCAL under uneven DCP,
+        # where the ranks own weighted shares of the token axis. `budget_state`
+        # (:808) turns that straight into NO_TOKEN, so the binding rank stops
+        # admitting while the slack ranks continue: `can_run_list` differs, the
+        # prefill batch is composed differently per rank, and the per-layer TP
+        # collectives in the forward are entered with mismatched shapes. The
+        # kv-session-offload path has been pinned against exactly this since
+        # `update_dcp_admission_state` (kv_session_offload.py:2741), but that
+        # pin only exists when the offload manager is constructed -- with
+        # `--enable-kv-session-offload` off, which is the default, prefill
+        # admission was still deciding rank-locally. Same defect, same fix, one
+        # branch further out.
+        #
+        # MIN-ballot, not gate removal: the budget every rank admits against is
+        # the BINDING rank's, so no rank is asked to hold a request it cannot.
+        # The per-rank surplus is exported as a non-negative deficit the adder
+        # subtracts, which is the representation the offload variant already
+        # uses and the adder already consumes (`dcp_avail_deficit`).
+        #
+        # PACK SIZE is decided by `uneven_dcp_active(dcp_size)`, a replicated
+        # config-derived predicate (the token-ratio vector is installed
+        # identically on every rank), so the payload width is rank-uniform. Even
+        # TP keeps the one-element payload and a structurally zero deficit --
+        # byte-identical, no behaviour change on the default path.
+        from sglang.srt.distributed.utils import uneven_dcp_active
+
+        pin_admission = uneven_dcp_active(self.server_args.dcp_size)
+        local_admission = 0
+        if pin_admission:
+            tree = self.tree_cache
+            fe = getattr(tree, "full_evictable_size", None)
+            # Mirrors `update_dcp_admission_state`'s quantity exactly, including
+            # its known simplification: the all-SWA adder reads
+            # `swa_evictable_size` instead. SWA models route to
+            # UnifiedRadixCache and are out of this path's reach.
+            local_evict = int(fe() if fe is not None else tree.evictable_size())
+            local_admission = local_avail + local_evict
+        vals = [local_avail, local_admission] if pin_admission else [local_avail]
+        t = torch.tensor(vals, dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
         self._uniform_min_avail = int(t[0].item())
+        # >= 0: the local budget can only exceed the group minimum.
+        self._uniform_budget_deficit = (
+            local_admission - int(t[1].item()) if pin_admission else 0
+        )
+
+    def uniform_budget_deficit(self) -> int:
+        """This iteration's non-negative prefill-admission surplus over the
+        group minimum, for `PrefillAdder` to subtract (#610).
+
+        0 when the pin is not active (even TP, world size 1) and 0 when the
+        per-iteration value was never computed -- the same fallback shape
+        `KVSessionOffload.dcp_budget_deficit` documents, so an entry point that
+        reaches prefill without passing `_update_uniform_pool_budget` (the PP
+        mixin's own loop) keeps today's behaviour rather than reading a stale
+        reduce from a differently-shaped path.
+        """
+        return int(getattr(self, "_uniform_budget_deficit", 0))
 
     def _census_tick(self) -> None:
         """Advance the census round and, on cadence, diff counts across ranks.
@@ -4007,6 +4157,11 @@ class Scheduler(
         prefill_spill_regions = 0
         prefill_spill_region_tokens = 0
         prefill_spill_deep = False
+        # #610: off the offload path the same pin now comes from
+        # `_update_uniform_pool_budget`, which ran unconditionally and
+        # pre-branch at the top of this iteration. 0 unless uneven DCP is
+        # active, so the default path is unchanged.
+        dcp_avail_deficit = self.uniform_budget_deficit()
         if self.kv_session_offload is not None:
             dcp_avail_deficit = self.kv_session_offload.dcp_budget_deficit()
             # PS2 (deep prefill-spill): replicated region capacity + master
@@ -4128,9 +4283,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -5517,8 +5671,7 @@ class Scheduler(
                         lane.tick()
                     except Exception:
                         logger.exception(
-                            "dual-group lane %d tick failed; dropping the "
-                            "active job.",
+                            "dual-group lane %d tick failed; dropping the active job.",
                             lane.lane_id,
                         )
                         # Releases the pool slots too: with one request slot
@@ -5790,7 +5943,7 @@ class Scheduler(
                         flipped += 1
                 if flipped:
                     logger.info(
-                        "dual-group lane pairing policy set to %s on %d " "lane(s).",
+                        "dual-group lane pairing policy set to %s on %d lane(s).",
                         pairing_on,
                         flipped,
                     )

@@ -77,21 +77,50 @@ class DecodeHiCachePreallocMixin:
         last_host_node = None
         if self.scheduler.enable_decode_hicache:
             last_host_node = result.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+            # RANK-LOCAL verdict, the same `backuped` ("full KV in THIS rank's
+            # host pool") that #607-E dealt with one function further on.
+            locally_eligible = (
+                last_host_node.backuped or last_host_node is self.tree_cache.root_node
+            )
+            # #610: `query_storage_hit_length` runs a MIN all_reduce
+            # (hiradix_cache.py:1452). Returning early on the rank-local verdict
+            # leaves the peers alone in it -- the #580 failure, on the one
+            # prefetch collective #607-E did not reach. When the tree cache
+            # decides participation by group vote, call unconditionally and let
+            # the reduce decide; the local verdict rides along as
+            # `locally_eligible`. Tree caches without the predicate keep the
+            # plain local gate and the byte-identical call below.
+            group_decides = getattr(
+                self.tree_cache, "prefetch_participation_is_collective", None
+            )
+            group_decides = bool(group_decides is not None and group_decides())
+            if locally_eligible or group_decides:
                 matched_len = l1_prefix_len + l2_host_hit_length
                 suffix_tokens = req.origin_input_ids[matched_len:]
-                last_hash = last_host_node.get_last_hash_value()
+                last_hash = (
+                    last_host_node.get_last_hash_value() if locally_eligible else None
+                )
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    if locally_eligible
+                    and self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    last_host_node,
-                    suffix_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
+                if group_decides:
+                    l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
+                        last_host_node,
+                        suffix_tokens,
+                        last_hash,
+                        prefix_keys,
+                        locally_eligible=locally_eligible,
+                    )
+                else:
+                    l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
+                        last_host_node,
+                        suffix_tokens,
+                        last_hash,
+                        prefix_keys,
+                    )
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
