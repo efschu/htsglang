@@ -464,3 +464,48 @@ guaranteed on every model/path, so it would have been a model-dependent fix in
 what is a model-independent communication and sharding layer -- and a wrong
 total silently mis-sizes an attention index buffer. Not a trade worth making
 for a sync that is not the root.
+
+## 14. The blocking-D2H theory of the wedge is unsound for THIS transport
+
+The brief for this window (inherited from `NOTE_616b` section 4) reasoned:
+all three ranks host-block in a blocking D2H, therefore none can enqueue the
+work that would release the peers' BAR1 spin, therefore deadlock. That
+reasoning silently assumes the CPU is in the delivery path. Under the BAR1
+transport it is not.
+
+From `distributed/device_communicators/barlink_bar1.py`:
+
+> The source card writes via DMA directly into the destination card's BAR1
+> aperture. No host memory, no NIC, no NCCL.
+
+and the whole setup (VMM allocation, dma-buf fd passed by `SCM_RIGHTS`,
+`dma_buf_attach`, mapping `resource1_wc` + `cudaHostRegister`) runs **once at
+startup** -- "nothing is mapped and nothing is registered on the hot path".
+The spin side is device-driven too (`barlink_device.py`): "a kernel spin-waits
+on the peers' flags with volatile loads -- no CPU involvement, no stream
+synchronization."
+
+**Consequence.** A flag is written by an already-enqueued device kernel,
+straight into the peer's BAR1 over PCIe. A host thread parked in `.item()` or
+`.cpu()` cannot delay that write. So a blocking D2H, on its own, CANNOT
+produce this deadlock, and removing the D2H at `flashinfer_backend.py:7429` or
+`dcp/owner.py:529` was never going to cure the wedge. That is an independent
+confirmation of the decision in section 13 to drop the plumbing.
+
+What a `Bar1CollectiveAborted` therefore means here is narrower and more
+useful: the peer's flag did not arrive within the ~3e11-cycle cap, and since
+delivery needs no CPU, the peer's flag-writing kernel did not RUN. Only two
+things do that:
+
+* the peer's GPU was busy ahead of it (a long-running kernel), or
+* the peer had not ENQUEUED it yet, because its host was still upstream of
+  the launch.
+
+Both remain open, and the two wedges observed this window look like different
+members of that pair: wedge 1 had the ranks at DIFFERENT stages (rank 0 inside
+the forward, ranks 1 and 2 still in `prepare_for_extend`), which is the
+not-yet-enqueued case; wedge 2 had all three at the same line with identical
+barlink records, which is the busy-GPU case. Distinguishing them per-incident
+is the next concrete step, and the launch sampler already records enough to do
+it if its output is diffed per rank at the moment of abort rather than
+afterwards.
