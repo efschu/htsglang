@@ -509,3 +509,67 @@ barlink records, which is the busy-GPU case. Distinguishing them per-incident
 is the next concrete step, and the launch sampler already records enough to do
 it if its output is diffed per rank at the moment of abort rather than
 afterwards.
+
+## 15. Wedge 3: the GPUs are SPINNING, not busy — my own hypothesis falsified
+
+Soak 2 (post-fix build) ran 18:02:43 -> 18:17:46 = ~15 min, 277 completions,
+ZERO index asserts, then wedged. Third wedge of the window, and the first one
+measured on the GPUs themselves while it was happening.
+
+`nvidia-smi` DURING the wedge (18:18:52, ~66 s after the last completion):
+
+| GPU | util.gpu | util.memory | power | rated |
+|---|---|---|---|---|
+| 0 (5090) | 100 % | **0 %** | 176 W | 400 W |
+| 1 (3080) | 100 % | **0 %** | 130 W | 200 W |
+| 2 (3080) | 100 % | **0 %** | 162 W | 200 W |
+
+100 % SM occupancy with **0 % memory utilisation and power far below limit** is
+a spin-wait kernel burning SMs and moving no data. A long-running compute or
+index kernel would show the opposite (high memory utilisation, power at cap).
+
+**That falsifies section 13's hypothesis** that the queue is busy with
+pathologically long device work. It is not busy; it is waiting. After the
+~3e11-cycle cap expired the cards fell to 0 % / ~20 W and
+`Bar1CollectiveAborted` fired.
+
+State at the wedge, all three ranks identical:
+
+* Python stack: `build_dcp_weighted_kv_indices` (`dcp/owner.py:548`, which is
+  the same `total = int(full_indptr[bs].item())` as before -- the line number
+  moved only because a comment was added above it) <- `call_begin_forward`
+  (`flashinfer_backend.py:6926`) <- `update_single_wrapper` <-
+  `init_forward_metadata` <- `_execute_extend`.
+* barlink last ops, per rank: `broadcast:32`, `broadcast:24`,
+  `all_gather:192512` -- byte-identical across ranks.
+
+So all three ranks are host-blocked at the same sync, all three GPUs are
+spinning, and all three report the same last collective. Every "the ranks
+disagree" explanation is now falsified from three directions (census counts,
+barlink last-ops, and this).
+
+### Where that leaves it
+
+The remaining explanations are ones this window has NOT been able to
+distinguish, and they are all below the Python level:
+
+* the spinning collective and the peers' completed one carry different
+  SEQUENCE numbers (a flag is set for a generation the waiter has passed or
+  not yet reached), or
+* a BAR1 flag write is not visible to the waiting peer (write-combining /
+  ordering across the PCIe aperture), rather than never issued.
+
+Distinguishing these needs the DEVICE flag words, which the launch dump
+deliberately does not read (reading them would sync behind the wedged spin).
+The honest instrument is a post-mortem one: a GPU coredump captured at abort
+time would carry the flag region, exactly as it carried the index values in
+section 6.
+
+### Scope, stated plainly
+
+This wedge is PRE-EXISTING and not introduced by this branch: hunter-4 saw the
+same family, and wedge 1 of this window occurred on the un-fixed build. It is
+also a DIFFERENT failure from the #616 index assert this window was sent to
+fix. The accept-broadcast fix is validated against its own family (15 min and
+277 completions with zero index asserts, against a pre-fix envelope of 192 s);
+the wedge is what now truncates every soak, and it is unfixed.
