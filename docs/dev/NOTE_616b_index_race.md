@@ -51,6 +51,28 @@ not corruption of the index tensor's bytes.
 The earlier reproductions are consistent: 12 lanes at bs=3 (all 12 trapped),
 16 lanes at bs=4 with 8 trapped. Width always `bs x (spec_steps+1)`.
 
+**An unresolved tension in this reading, stated rather than glossed.** If the
+trapped lanes really are `accept_index` gathering from `predict`, then row 0's
+accepted entries should hold the SMALL values 0,1,2 (for a topk=1 chain,
+`accept_index[i,j] = i*draft_token_num + j`), and those are in range for any
+non-empty `predict` — yet they trapped. So at least one of the following must
+also be true, and the values in the dump would say which:
+
+1. the gathered tensor is not `predict` but a much smaller int32 tensor (the
+   verify path has several int32 gathers of this shape — the mamba commit
+   indexes `accept_index` too, and two of the three observed surfaces were in
+   mamba/req-pool code), or
+2. the index tensor is not `accept_index` but another tensor that happens to
+   carry `-1` in exactly the padding positions, or
+3. `accept_index`'s accepted entries do not carry the chain-offset values this
+   reasoning assumes.
+
+What the lane pattern establishes independently of which of those holds is the
+strong part: the trapped set is *structured*, aligned to a
+`bs x (spec_steps+1)` grid and to per-row accept lengths, so whatever tensor
+this is, it was written by something that knew the batch's real accept
+structure. That is not the signature of a freed-and-reused allocation.
+
 ## 2. The surface site is aftermath — now confirmed three times over
 
 A device-side assert destroys the CUDA context, so the exception surfaces at
