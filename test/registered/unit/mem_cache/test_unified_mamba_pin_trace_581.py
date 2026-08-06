@@ -22,6 +22,7 @@ MAMBA is correctly NOT counted as holding a mamba pin).
 # package __init__, so load it by path rather than by relative import.
 import importlib.util
 import os
+import threading
 import unittest
 from array import array
 from collections import Counter
@@ -210,3 +211,187 @@ class _FakeEntry:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeEvent:
+    def __init__(self, ready: bool = True):
+        self.ready = ready
+
+    def query(self) -> bool:
+        return self.ready
+
+    def synchronize(self) -> None:
+        pass
+
+
+class _FakeController:
+    """Only the two ack queues writing_check / loading_check poll."""
+
+    def __init__(self):
+        self.ack_write_queue = []
+        self.ack_load_queue = []
+
+    def queue_write(self, node_id: int, ready: bool = True) -> None:
+        self.ack_write_queue.append((None, _FakeEvent(ready), [node_id]))
+
+    def queue_load(self, node_id: int, ready: bool = True) -> None:
+        self.ack_load_queue.append((None, _FakeEvent(ready), [node_id]))
+
+
+class _MinAllReduce:
+    """MIN all_reduce over N threads, one per simulated TP rank."""
+
+    def __init__(self, n: int):
+        self.barrier = threading.Barrier(n, timeout=30)
+        self.values = [None] * n
+        self.local = threading.local()
+
+    def __call__(self, tensor, op=None, label=None):
+        self.values[self.local.rank] = int(tensor.item())
+        self.barrier.wait()
+        reduced = min(v for v in self.values if v is not None)
+        self.barrier.wait()
+        tensor.fill_(reduced)
+
+
+class TestAckDrainAcrossRanks(unittest.TestCase):
+    """FALSIFIERS for the #581 write-through drain freeze in the LIVE class.
+
+    Measured on the instrumented boot: `ack_write == wt_mamba_pins ==
+    ongoing_wt == protected` climbed together on TP0 (10 -> 71) and TP1
+    (-> 31, then plateau) while TP2 stayed at 0 and never took a
+    write-backup pin. When the load stopped the queues did NOT drain -- TP0
+    frozen at 71 across thousands of idle ticks. A MIN over rank-local ready
+    counts pinned at 0 by the idle rank produces exactly that.
+    """
+
+    RANKS = 3
+    QUEUED = 4
+
+    def _run(self, queued_per_rank, drain_rounds=1, load_queue=False):
+        allreduce = _MinAllReduce(self.RANKS)
+        caches, drained, errors = [], {}, {}
+        for rank in range(self.RANKS):
+            cache, _, _ = build_fixture(_mamba_cfg())
+            cache.cache_controller = _FakeController()
+            cache.tp_world_size = self.RANKS
+            cache.pp_rank = 0
+            cache._all_reduce = allreduce
+            for i in range(queued_per_rank[rank]):
+                if load_queue:
+                    cache.cache_controller.queue_load(i)
+                else:
+                    cache.cache_controller.queue_write(i)
+            # The scheduling of the drain is under test, not the per-ack
+            # bookkeeping: record instead of replaying real registry entries.
+            seen = []
+            if load_queue:
+                cache.ongoing_load_back = _RecordingPop(seen)
+                cache.dec_lock_ref = lambda *a, **k: None
+                cache.dec_host_lock_ref = lambda *a, **k: None
+            else:
+                cache._finish_write_through_ack = seen.append
+            drained[rank] = seen
+            caches.append(cache)
+
+        def run(rank):
+            allreduce.local.rank = rank
+            try:
+                for _ in range(drain_rounds):
+                    if load_queue:
+                        caches[rank].loading_check()
+                    else:
+                        caches[rank].writing_check()
+            except BaseException as exc:
+                errors[rank] = exc
+                raise
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(self.RANKS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertEqual(errors, {}, f"rank thread raised: {errors}")
+        self.assertFalse(any(t.is_alive() for t in threads), "rank thread hung")
+        return caches, drained
+
+    def test_an_idle_rank_does_not_freeze_the_write_drain(self):
+        """FALSIFIER: TP2 has nothing queued; TP0/TP1 must still drain.
+
+        Before the fix every rank drained 0 and the queues stayed full --
+        the live 71/31/0 freeze.
+        """
+        caches, drained = self._run([self.QUEUED, self.QUEUED, 0])
+
+        self.assertEqual(len(drained[0]), self.QUEUED, "backing-up rank never drained")
+        self.assertEqual(len(drained[1]), self.QUEUED)
+        self.assertEqual(len(drained[2]), 0)
+        for rank in range(self.RANKS):
+            self.assertEqual(caches[rank].cache_controller.ack_write_queue, [])
+
+    def test_an_idle_rank_does_not_freeze_the_load_drain(self):
+        """The loading_check sibling has the identical shape."""
+        caches, drained = self._run([self.QUEUED, self.QUEUED, 0], load_queue=True)
+        self.assertEqual(len(drained[0]), self.QUEUED)
+        self.assertEqual(len(drained[2]), 0)
+        for rank in range(self.RANKS):
+            self.assertEqual(caches[rank].cache_controller.ack_load_queue, [])
+
+    def test_queues_empty_when_no_new_backups_arrive(self):
+        """Idle-drain regression: the live falsifier is that the frozen
+        queues must return to ~0 once the load stops."""
+        caches, _ = self._run([self.QUEUED, 2, 0], drain_rounds=4)
+        for rank in range(self.RANKS):
+            self.assertEqual(
+                caches[rank].cache_controller.ack_write_queue,
+                [],
+                f"rank{rank} still holds acks after idle rounds",
+            )
+
+    def test_ranks_with_queues_stay_throttled_to_the_slowest(self):
+        """The fix must not turn the drain into a free-for-all: a rank whose
+        head event is NOT ready still throttles the others."""
+        allreduce = _MinAllReduce(self.RANKS)
+        caches, drained, errors = [], {}, {}
+        for rank in range(self.RANKS):
+            cache, _, _ = build_fixture(_mamba_cfg())
+            cache.cache_controller = _FakeController()
+            cache.tp_world_size = self.RANKS
+            cache.pp_rank = 0
+            cache._all_reduce = allreduce
+            # rank 2 has a queue whose head is still in flight -> 0 ready.
+            for i in range(3):
+                cache.cache_controller.queue_write(i, ready=(rank != 2))
+            seen = []
+            cache._finish_write_through_ack = seen.append
+            drained[rank] = seen
+            caches.append(cache)
+
+        def run(rank):
+            allreduce.local.rank = rank
+            try:
+                caches[rank].writing_check()
+            except BaseException as exc:
+                errors[rank] = exc
+                raise
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(self.RANKS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertEqual(errors, {}, f"rank thread raised: {errors}")
+        for rank in range(self.RANKS):
+            self.assertEqual(len(drained[rank]), 0, f"rank{rank} ran ahead")
+
+
+class _RecordingPop(dict):
+    """ongoing_load_back stand-in: records the ack ids the drain pops."""
+
+    def __init__(self, sink):
+        super().__init__()
+        self._sink = sink
+
+    def pop(self, ack_id, *args):
+        self._sink.append(ack_id)
+        return (None, None, None)
