@@ -73,7 +73,6 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
-
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
 
@@ -187,6 +186,10 @@ class HiRadixCache(RadixCache):
             extra_metric_labels=self.extra_metric_labels,
         )
 
+        # #610: must run after the controller exists and before any request is
+        # served, so every rank enters the capacity reduce from the same point.
+        self._symmetrize_prefetch_capacity()
+
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
@@ -219,6 +222,75 @@ class HiRadixCache(RadixCache):
                 reduced = True
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _hicache_prefetch_symmetric(self) -> bool:
+        """True when the per-rank host pools are asymmetric and the prefetch
+        control path must therefore be decided by the GROUP rather than per rank.
+
+        #610. HiRadixCache never received the #580 symmetrization that
+        UnifiedRadixCache carries (`unified_radix_cache.py:531`), yet its
+        prefetch control path runs the same collectives: the storage-hit MIN
+        reduce in `query_storage_hit_length`, and `check_prefetch_progress`'s
+        can_terminate MAX reduce plus min_completed_tokens MIN reduce. Under
+        weighted DCP the host pool is sized from the per-rank DEVICE pool
+        (`memory_pool_host.py:126`, `size = int(device_pool.size * ratio)`), so
+        allocation success and `prefetch_rate_limited()` answer differently per
+        rank and those collectives were entered by a SUBSET of the group.
+
+        Same predicate as the unified cache: storage on, real controller,
+        multi-rank, non-uniform token vector. Stock even-TP HiCache -- uniform
+        host pools, identical alloc/free histories -- never trips it, so that
+        path stays byte-identical.
+        """
+        from sglang.srt.distributed.utils import uneven_dcp_active
+
+        return (
+            self.enable_storage
+            and getattr(self, "cache_controller", None) is not None
+            and self.tp_world_size > 1
+            and uneven_dcp_active()
+        )
+
+    def prefetch_participation_is_collective(self) -> bool:
+        """True when whether to prefetch is decided by the GROUP, not per rank.
+
+        `Scheduler._prefetch_kvcache` (scheduler.py:2907) and
+        `DecodeHiCachePreallocMixin._start_hicache_prefetch`
+        (decode_hicache_mixin.py:134) both probe for this method before applying
+        their own rank-local gate: when it answers True they call
+        `prefetch_from_storage` unconditionally and pass their local verdict as
+        `locally_eligible` instead of returning early. Those call sites were
+        already written for #580/#607-E; defining the predicate here is what
+        connects HiRadixCache to them.
+        """
+        return self._hicache_prefetch_symmetric()
+
+    def _symmetrize_prefetch_capacity(self) -> None:
+        """Derive the speculative-prefetch capacity limit from the MIN host-pool
+        size across the group (#610, mirroring unified_radix_cache.py:543).
+
+        Under weighted DCP the host pools differ per rank, so the stock per-rank
+        `int(0.5 * mem_pool_host.size)` limit (cache_controller.py:477) makes
+        `prefetch_rate_limited()` trip on different iterations on different
+        ranks -- a divergence UPSTREAM of the participation vote, which would
+        desync the vote itself. The shared MIN makes the rate-limit gate trip in
+        lockstep. Gated so the even-TP path keeps its per-rank limit unchanged.
+        """
+        if not self._hicache_prefetch_symmetric():
+            return
+        cc = self.cache_controller
+        if getattr(cc, "mem_pool_host", None) is None:
+            # The gate above is rank-uniform (config + uneven_dcp_active), so a
+            # rank-local early return HERE would leave the peers alone in the
+            # all_reduce below. Name it instead of hanging.
+            raise RuntimeError(
+                "cache controller has no mem_pool_host while prefetch "
+                "symmetrization is active; the peer ranks are entering the "
+                "capacity all_reduce and this rank cannot."
+            )
+        size_tensor = torch.tensor([int(cc.mem_pool_host.size)], dtype=torch.long)
+        self._all_reduce_attn_groups(size_tensor, torch.distributed.ReduceOp.MIN)
+        cc.prefetch_capacity_limit = int(0.5 * int(size_tensor[0].item()))
 
     def _barrier_attn_groups(self):
         waited = False
@@ -1109,9 +1181,9 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             if node.parent is None:
-                assert (
-                    node is self.root_node
-                ), f"This request holds the node from another tree"
+                assert node is self.root_node, (
+                    f"This request holds the node from another tree"
+                )
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1317,9 +1389,9 @@ class HiRadixCache(RadixCache):
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
-            assert (
-                node.backuped
-            ), "No backup available on evicted nodes, should not happen"
+            assert node.backuped, (
+                "No backup available on evicted nodes, should not happen"
+            )
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
@@ -1417,37 +1489,67 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        locally_eligible: bool = True,
     ) -> int:
-        if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
+        # #610: decide the MODE before any rank-local predicate runs. Under
+        # `symmetric` the MIN reduce below is the group's decision point and
+        # nothing between here and it may `return`.
+        symmetric = self._hicache_prefetch_symmetric()
+
+        # RANK-LOCAL, all of them. `locally_eligible` carries the caller's own
+        # gate (`_build_decode_prefix_match` tests `last_host_node.backuped`,
+        # i.e. "full KV in THIS rank's host pool"); `prefetch_rate_limited()`
+        # reads the per-rank prefetch_tokens_occupied counter against a limit
+        # derived from the per-rank host pool. Under weighted DCP both drift
+        # apart across ranks, and returning on either one left the peers alone
+        # in the reduce -- the #580 shape, still live here after f081654e8d
+        # fixed Scheduler._prefetch_kvcache and af5e0c947e the decode side.
+        eligible = (
+            locally_eligible
+            and self.enable_storage
+            and not self.cache_controller.prefetch_rate_limited()
+        )
+        prefetch_key = None
+        if eligible:
+            prefetch_key = RadixKey(
+                new_input_tokens,
+                extra_key=last_host_node.key.extra_key,
+                is_bigram=self.is_eagle,
+            ).page_aligned(self.page_size)
+            if len(prefetch_key) < self.prefetch_threshold:
+                eligible = False
+        if not eligible and not symmetric:
             return 0
 
-        prefetch_key = RadixKey(
-            new_input_tokens,
-            extra_key=last_host_node.key.extra_key,
-            is_bigram=self.is_eagle,
-        ).page_aligned(self.page_size)
-        if len(prefetch_key) < self.prefetch_threshold:
-            return 0
+        if eligible:
+            prefetch_op_cls = (
+                HybridPrefetchOperation
+                if isinstance(self.cache_controller, HybridCacheController)
+                else PrefetchOperation
+            )
+            extra_kwargs = {}
+            if prefetch_op_cls is HybridPrefetchOperation:
+                extra_kwargs["pool_transfers"] = self._get_extra_pools().get(
+                    "extra_pools"
+                )
+            operation = prefetch_op_cls(
+                "__storage_hit_query__",
+                self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                **extra_kwargs,
+            )
+            hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
+                operation
+            )
+        else:
+            # Ineligible under `symmetric`: enter the reduce carrying 0. The op
+            # is a MIN, so a single ineligible rank pulls the group answer to 0
+            # and NO rank sees an L3 hit -- the local verdict only LOWERS the
+            # ballot, it never decides participation.
+            storage_hit_count = 0
 
-        prefetch_op_cls = (
-            HybridPrefetchOperation
-            if isinstance(self.cache_controller, HybridCacheController)
-            else PrefetchOperation
-        )
-        extra_kwargs = {}
-        if prefetch_op_cls is HybridPrefetchOperation:
-            extra_kwargs["pool_transfers"] = self._get_extra_pools().get("extra_pools")
-        operation = prefetch_op_cls(
-            "__storage_hit_query__",
-            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
-            prefetch_key,
-            last_hash,
-            prefix_keys,
-            **extra_kwargs,
-        )
-        hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
-            operation
-        )
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce_attn_groups(
             storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
@@ -1664,7 +1766,12 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        locally_eligible: bool = True,
     ):
+        # #610: MODE first, before any rank-local predicate. See
+        # `_hicache_prefetch_symmetric`.
+        symmetric = self._hicache_prefetch_symmetric()
+
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
@@ -1673,33 +1780,78 @@ class HiRadixCache(RadixCache):
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        # RANK-LOCAL predicates. `locally_eligible` is the caller's own gate
+        # (`last_host_node.backuped`); `prefetch_rate_limited()` reads the
+        # per-rank occupancy counter. Under `symmetric` they may not gate entry
+        # into the vote below -- they only lower this rank's ballot.
+        eligible = (
+            locally_eligible
+            and self.enable_storage
+            and prefetch_length >= self.prefetch_threshold
+            and not self.cache_controller.prefetch_rate_limited()
+        )
+        if not eligible and not symmetric:
             return
 
-        last_host_node.protect_host()
-        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            self.evict_host(prefetch_length)
+        host_indices = None
+        protected = False
+        if eligible:
+            last_host_node.protect_host()
+            protected = True
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            available_size = self.cache_controller.mem_pool_host.available_size()
-            prefetch_length = available_size - (available_size % self.page_size)
-            if prefetch_length >= self.prefetch_threshold:
-                prefetch_key = prefetch_key[:prefetch_length]
+            if host_indices is None:
+                self.evict_host(prefetch_length)
                 host_indices = self.cache_controller.mem_pool_host.alloc(
                     prefetch_length
                 )
-                if host_indices is None:
+            if host_indices is None and not symmetric:
+                available_size = self.cache_controller.mem_pool_host.available_size()
+                prefetch_length = available_size - (available_size % self.page_size)
+                if prefetch_length >= self.prefetch_threshold:
+                    prefetch_key = prefetch_key[:prefetch_length]
+                    host_indices = self.cache_controller.mem_pool_host.alloc(
+                        prefetch_length
+                    )
+                    if host_indices is None:
+                        last_host_node.release_host()
+                        return
+                else:
                     last_host_node.release_host()
+                    # no sufficient host memory for prefetch
                     return
-            else:
-                last_host_node.release_host()
-                # no sufficient host memory for prefetch
+            # NOTE: under `symmetric` the truncation-retry above is deliberately
+            # SKIPPED so `len(prefetch_key)` -- hence prefetch_tokens_occupied
+            # and the min_completed_tokens reduce in check_prefetch_progress --
+            # stays identical across ranks. A failed full alloc becomes a
+            # negative vote below instead of a per-rank early return.
+
+        if symmetric:
+            # Participation symmetry, the #580 mechanism ported from
+            # UnifiedRadixCache (:2243). Registering `ongoing_prefetch` on only
+            # a SUBSET of ranks makes `check_prefetch_progress` enter its
+            # can_terminate MAX reduce (:1546) and min_completed_tokens MIN
+            # reduce (:1580) on a mismatched set of ranks, because its
+            # `req_id not in self.ongoing_prefetch` early return (:1555) is
+            # rank-local exactly when registration is. MIN over "am I eligible
+            # AND did I fully allocate" is a logical AND: every rank registers
+            # iff ALL could, otherwise none do, and that early return becomes
+            # rank-SYMMETRIC. No async op exists yet, so a negative vote is a
+            # clean local release with nothing to tear down.
+            vote = torch.tensor(
+                [1 if (eligible and host_indices is not None) else 0], dtype=torch.int
+            )
+            self._all_reduce_attn_groups(vote, torch.distributed.ReduceOp.MIN)
+            if int(vote[0].item()) == 0:
+                if host_indices is not None:
+                    self.cache_controller.append_host_mem_release(host_indices)
+                if protected:
+                    last_host_node.release_host()
                 return
+            # Positive consensus: every rank allocated -> all fall through.
+        elif host_indices is None:
+            last_host_node.release_host()
+            return
+
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
