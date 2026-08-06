@@ -167,6 +167,24 @@ PP_STAGE_NO_MAMBA_STATE_SLOTS = 1 << 30
 logger = logging.getLogger(__name__)
 
 
+def corridor_mode_active(server_args) -> bool:
+    """--rank-kv-ratio corridor (#602), asked tolerantly.
+
+    A module-level function rather than a mixin method because the token-vector
+    path is exercised with stub runners that bind only the methods under test;
+    a predicate reached through ``self`` would make every such caller carry
+    scaffolding for a mode it does not use.
+
+    A server_args view that predates the mode simply is not in it, which is the
+    DEFAULT path and byte-identical -- so an absent predicate answers False
+    rather than raising. Everything DOWNSTREAM of a True answer refuses loudly
+    instead: once the mode is on, a missing corridor input is an error, never a
+    quiet fallback to "no floor".
+    """
+    predicate = getattr(server_args, "uneven_kv_corridor_mode", None)
+    return bool(predicate()) if callable(predicate) else False
+
+
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -542,6 +560,16 @@ class ModelRunnerKVCacheMixin:
         # has to reason about the bytes the card actually has left, not about
         # this rank's accounting view of them.
         device_free_gb = available_gpu_memory
+        # #602 corridor: the free-VRAM reading the floor is evaluated against
+        # has to be taken exactly HERE -- after the barrier above (so every
+        # co-located rank has finished loading its weights and the card's
+        # occupancy is deterministic) and before any pool is allocated. It is
+        # read from NVML's free column rather than derived from this rank's
+        # accounting view or from total-minus-used: NVML holds a per-card
+        # driver carve-out back from BOTH total and used, so total-minus-used
+        # over-states free by exactly that amount, and the corridor law is
+        # written on the free column.
+        self._corridor_card_free_bytes = self._read_corridor_card_free_bytes()
         # Co-located ranks: mem_get_info() above charged this rank for its
         # sibling(s)' weights too. Add their own footprint back so only
         # this rank's weights are charged against its budget (no-op on the
@@ -4807,6 +4835,107 @@ class ModelRunnerKVCacheMixin:
             return None
         return max(int(p_h), 1)
 
+    def _corridor_card_key(self: ModelRunner):
+        """This rank's entry in --rank-gpu-id, i.e. the key every parse-time
+        per-card number (#602 post-sizing demand, user reserve) is filed
+        under. None when there is no explicit placement."""
+        ids = getattr(self.server_args, "rank_gpu_id", None)
+        if not ids:
+            return None
+        idx = self._rank_vector_index()
+        if not 0 <= idx < len(ids):
+            return None
+        return ids[idx]
+
+    def _read_corridor_card_free_bytes(self: ModelRunner):
+        """NVML free bytes of the PHYSICAL card this rank runs on, or None.
+
+        Only read in --rank-kv-ratio corridor: outside it nothing consumes
+        the number, and an NVML round-trip on every boot is not free. The card
+        is resolved through the registry's identity map (nvml.current_device_
+        uuid), never by assuming the CUDA ordinal equals the NVML index --
+        they differ on this rig.
+        """
+        if not corridor_mode_active(self.server_args):
+            return None
+        from sglang.srt.registry import nvml
+
+        uuid = nvml.current_device_uuid()
+        return int(nvml.memory_info_for_uuid(uuid).free_bytes)
+
+    def _corridor_local_capacity(self: ModelRunner, configurator) -> int:
+        """Q_r: the KV tokens this rank may hold and still leave its card at
+        or above the operator's free-VRAM floor (#602).
+
+        Deliberately expressed in the CONFIGURATOR's own currency rather than
+        by dividing bytes by a cell size guessed here: the same function that
+        turns a budget into a token count for P_r turns the corridor budget
+        into Q_r, so the two are directly comparable and no second, drifting
+        copy of the cell arithmetic exists.
+        """
+        from sglang.srt.distributed.corridor_vector import corridor_pool_bytes
+
+        card = self._corridor_card_key()
+        free_bytes = getattr(self, "_corridor_card_free_bytes", None)
+        if card is None or free_bytes is None:
+            raise ValueError(
+                "--rank-kv-ratio corridor could not resolve this rank's "
+                f"physical card (rank_gpu_id entry {card!r}, free reading "
+                f"{free_bytes!r}). The floor is per card, so there is nothing "
+                "to enforce it against; this refuses rather than sizing the "
+                "pool as if no floor existed."
+            )
+        post_sizing = (self.server_args.corridor_post_sizing_mib or {}).get(card)
+        if post_sizing is None:
+            raise ValueError(
+                f"--rank-kv-ratio corridor has no post-sizing demand for GPU "
+                f"{card}. It is priced once at parse time "
+                "(_handle_corridor_kv_ratio); its absence here means the "
+                "worker is running a server_args this mode never validated."
+            )
+        ids = list(self.server_args.rank_gpu_id)
+        colocated = ids.count(card)
+        reserve_mib = self.server_args.user_reserve_mib_per_gpu(ids)[card]
+        allow_bytes = corridor_pool_bytes(
+            free_bytes,
+            reserve_mib=reserve_mib,
+            post_sizing_mib=post_sizing,
+            colocated_ranks=colocated,
+        )
+        if allow_bytes <= 0:
+            raise ValueError(
+                f"--rank-kv-ratio corridor: GPU {card} cannot fund its "
+                f"free-VRAM floor. NVML free at the post-weight-load "
+                f"measuring point is {free_bytes >> 20} MiB; the operator "
+                f"reserve is {reserve_mib} MiB and the demand that still has "
+                f"to materialize on this card (graph capture, activation "
+                f"peak, attention workspaces) is {post_sizing} MiB, across "
+                f"{colocated} co-located rank(s). That leaves nothing for a "
+                "KV pool. Lower --rank-user-reserve-mib, move a rank off "
+                "this card, or shrink a demand term -- this refuses rather "
+                "than allocating into the reserve."
+            )
+        tokens = int(
+            configurator.calculate_pool_sizes(
+                allow_bytes, self.page_size
+            ).max_total_num_tokens
+        )
+        logger.info(
+            "#602 corridor capacity (rank %d, GPU %d): NVML free %d MiB - "
+            "reserve %d MiB - post-sizing demand %d MiB = %d MiB over %d "
+            "co-located rank(s) -> %d MiB -> %d KV tokens for this rank.",
+            self.tp_rank,
+            card,
+            free_bytes >> 20,
+            reserve_mib,
+            post_sizing,
+            (free_bytes >> 20) - reserve_mib - post_sizing,
+            colocated,
+            allow_bytes >> 20,
+            tokens,
+        )
+        return max(tokens, 0)
+
     def _maybe_suggest_dcp_token_vector(
         self: ModelRunner, budget_bytes: int, allow_install: bool = False
     ) -> None:
@@ -4890,8 +5019,21 @@ class ModelRunnerKVCacheMixin:
         # corrected value (rank-uniform decision). None on every non-solo path.
         curve = self._solo_host_capacity_curve(budget_bytes, active)
 
+        # #602: Q_r rides the SAME collective as P_r. It is rank-local (this
+        # rank's card, its free memory) and the vector must stay a pure
+        # function of all-gathered values, so it cannot be recomputed
+        # per-rank after the gather. The mode predicate is rank-uniform, so
+        # either every rank contributes a Q or none does.
+        corridor_mode = corridor_mode_active(self.server_args)
+        local_q = self._corridor_local_capacity(configurator) if corridor_mode else None
+
         world = get_world_group().world_size
-        payload = (int(get_parallel().attn_dcp_rank), int(local_p), curve)
+        payload = (
+            int(get_parallel().attn_dcp_rank),
+            int(local_p),
+            curve,
+            local_q,
+        )
         gathered: list = [None] * world
         torch.distributed.all_gather_object(
             gathered, payload, group=get_world_group().cpu_group
@@ -4899,10 +5041,17 @@ class ModelRunnerKVCacheMixin:
         # Order the capacities by DCP rank (the token vector is indexed by
         # attn_dcp_rank, which need not equal the global rank).
         p_by_rank = [0] * self.dcp_size
+        q_by_rank: list = [None] * self.dcp_size
         solo_host_rank, solo_curve = None, None
-        for dcp_rank, p_val, rank_curve in gathered:
+        for entry in gathered:
+            # Positional, tolerant unpack: the Q slot was appended to a
+            # 3-tuple payload, and a gather that predates it is still a valid
+            # no-corridor payload.
+            dcp_rank, p_val, rank_curve = entry[0], entry[1], entry[2]
+            q_val = entry[3] if len(entry) > 3 else None
             if 0 <= dcp_rank < self.dcp_size:
                 p_by_rank[dcp_rank] = p_val
+                q_by_rank[dcp_rank] = q_val
                 if rank_curve is not None:
                     solo_host_rank, solo_curve = dcp_rank, rank_curve
         if any(p <= 0 for p in p_by_rank):
@@ -4932,7 +5081,111 @@ class ModelRunnerKVCacheMixin:
 
         c_active = _context_budget(active, p_measured)
 
-        if solo_curve is not None:
+        if corridor_mode:
+            # #602. Two changes against 'capacity', and only two:
+            #
+            #   1. The capacity a rank is solved against is min(P_r, Q_r) --
+            #      the budget model AND the measured floor, whichever binds.
+            #      Because C(v) = min_r(cap_r // v_r) * sum(v) means rank r
+            #      holds exactly unit * v_r <= cap_r tokens, clamping the
+            #      capacity IS enforcing the floor. It stays a hard
+            #      constraint and never becomes a term the token objective
+            #      can trade away.
+            #   2. The vector is solved exactly instead of by proportional
+            #      rounding at a fixed grain (see solve_token_vector).
+            #
+            # c_active is re-scored against the same clamped capacities:
+            # comparing a corridor-respecting candidate to an active vector
+            # scored on the unclamped P_r would compare two different
+            # feasible sets and could report a "regression" for the act of
+            # coming back above the floor.
+            from sglang.srt.distributed.corridor_vector import (
+                CorridorInfeasible,
+                RankCapacity,
+                solve_corridor_vector,
+            )
+
+            if solo_curve is not None:
+                raise ValueError(
+                    "--rank-kv-ratio corridor does not cover draft-solo KV "
+                    "placement: the solo host's token capacity is a FUNCTION "
+                    "of the vector being solved for, so a fixed per-rank "
+                    "capacity clamp is not the right constraint for it. Use "
+                    "--rank-kv-ratio capacity for that topology."
+                )
+            if any(q is None for q in q_by_rank):
+                raise ValueError(
+                    "--rank-kv-ratio corridor: rank(s) "
+                    f"{[r for r, q in enumerate(q_by_rank) if q is None]} "
+                    "contributed no corridor capacity to the collective. The "
+                    "mode predicate is rank-uniform, so this means the ranks "
+                    "disagree about server_args -- refusing rather than "
+                    "solving on a partial floor."
+                )
+            try:
+                solution = solve_corridor_vector(
+                    [
+                        RankCapacity(r, p_by_rank[r], q_by_rank[r])
+                        for r in range(self.dcp_size)
+                    ]
+                )
+            except CorridorInfeasible as exc:
+                raise ValueError(
+                    f"--rank-kv-ratio corridor cannot satisfy the free-VRAM "
+                    f"floor: {exc}. Profiled capacities {p_by_rank}, corridor "
+                    f"capacities {q_by_rank} tokens per rank."
+                ) from exc
+            optimal = solution.vector
+            c_optimal = solution.context_tokens
+            if len(set(optimal)) == 1 and len(set(active)) != 1:
+                # An all-equal vector is the EVEN-MODULO owner rule, not a
+                # weighted one (uneven_dcp_active is False for it). Switching
+                # owner rules is a different change from re-weighting one, and
+                # nothing here has validated the even path's geometry for this
+                # boot -- so the corridor keeps the weighted vector and says
+                # the capacities have equalized.
+                if self.tp_rank == 0:
+                    logger.info(
+                        "#602 corridor: the solved vector %s is uniform, "
+                        "which would switch the owner rule from weighted to "
+                        "even modulo. Keeping the active weighted vector %s "
+                        "(capacities %s have equalized; pass an explicit "
+                        "--rank-kv-ratio to change the owner rule).",
+                        optimal,
+                        active,
+                        solution.capacities,
+                    )
+                return
+            capped = [
+                r for r in range(self.dcp_size) if q_by_rank[r] < p_by_rank[r]
+            ]
+            c_active = _context_budget(active, solution.capacities)
+            active_unit = min(
+                solution.capacities[r] // active[r] for r in range(self.dcp_size)
+            )
+            waste_before = sum(
+                solution.capacities[r] - active_unit * active[r]
+                for r in range(self.dcp_size)
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "#602 corridor solve: profiled capacity %s, corridor "
+                    "capacity %s -> effective %s tokens per rank (floor binds "
+                    "on rank(s) %s). Vector %s -> %s, max_total_num_tokens "
+                    "%d -> %d, per-rank tokens %s, unallocated %s (was %s).",
+                    p_by_rank,
+                    q_by_rank,
+                    solution.capacities,
+                    capped or "none",
+                    active,
+                    optimal,
+                    c_active,
+                    c_optimal,
+                    solution.per_rank_tokens,
+                    solution.total_waste_tokens,
+                    waste_before,
+                )
+        elif solo_curve is not None:
             alpha, beta = solo_curve
             grain = 64
             other_ranks = [r for r in range(self.dcp_size) if r != solo_host_rank]
@@ -5059,11 +5312,18 @@ class ModelRunnerKVCacheMixin:
             # must not be gated on c_optimal > c_active the way 'capacity' is.
             # The budget floor was already enforced inside
             # cp_token_speed_vector.
-            improves = (
-                c_optimal >= 0
-                if self.server_args.uneven_kv_speed_mode()
-                else c_optimal > c_active
-            )
+            #
+            # 'corridor' is likewise not gated on an improvement, for the
+            # opposite reason: when the floor binds, the whole point of the
+            # install is to hold a SMALLER pool than the active vector would
+            # take. Gating on c_optimal > c_active would refuse exactly the
+            # case the mode exists for and leave the card below its reserve.
+            # c_optimal and c_active are both scored on the clamped
+            # capacities above, so the logged pair stays comparable.
+            if self.server_args.uneven_kv_speed_mode() or corridor_mode:
+                improves = c_optimal >= 0
+            else:
+                improves = c_optimal > c_active
             if optimal != active and improves:
                 mode = self.server_args.rank_kv_ratio
                 set_cp_token_ratios(optimal)
