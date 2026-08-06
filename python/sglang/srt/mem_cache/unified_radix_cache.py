@@ -2771,6 +2771,61 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
+    #: Contribution of a rank with an EMPTY transfer queue to the cross-rank
+    #: MIN: "I impose no constraint", not "drain nothing".
+    _NO_ACK_CONSTRAINT = 1 << 30
+
+    def _count_ready_acks(self, ack_queue, label: str) -> int:
+        """How many leading entries of `ack_queue` this rank may drain now.
+
+        The transfer queues are RANK-LOCAL and differ in LENGTH, not just in
+        completion timing: `write_backup` gives up on a purely rank-local
+        condition -- the host pool cannot free room for this node
+        (:1786-1793), or the recursive "parent must be backed up first"
+        invariant already failed on this rank (:1765-1769) -- and under uneven
+        TP the ranks' host pools differ by construction. A rank that backs
+        nothing up therefore keeps an EMPTY ack queue forever.
+
+        Every rank must still enter the all_reduce, or the NCCL op sequence
+        desyncs and TP > 1 deadlocks. But a rank with an empty queue must not
+        drag the reduction to zero: a MIN over "how many of MY acks are ready"
+        conflates "nothing to drain" with "not finished yet", so one idle rank
+        froze the write-through drain on ALL ranks. Every pin then lives
+        forever, and since a write-through pin also makes a mamba checkpoint
+        unevictable, `protected` ratchets one per cached checkpoint until the
+        state pool is gone -- the #581 exhaustion, observed live as
+        `ack_write == wt_mamba_pins == ongoing_wt == protected` climbing
+        together on the backing-up ranks while the idle rank sat at 0.
+
+        A rank that HAS a queue still throttles the others to its own
+        progress, so the ranks never run further apart than the slowest live
+        transfer.
+        """
+        ready = 0
+        if self.pp_rank == 0:
+            for _, finish_event, _ack_list in ack_queue:
+                if not finish_event.query():
+                    break
+                ready += 1
+            contribution = ready if ack_queue else self._NO_ACK_CONSTRAINT
+        else:
+            # Overwritten by the PP broadcast inside `_all_reduce`.
+            contribution = 0
+
+        finish_count_tensor = torch.tensor(contribution, dtype=torch.int, device="cpu")
+        self._all_reduce(
+            finish_count_tensor,
+            torch.distributed.ReduceOp.MIN,
+            label=label,
+        )
+        finish_count = int(finish_count_tensor.item())
+
+        # Never pop more than this rank actually has: the reduction comes back
+        # as the sentinel when no rank holds a queue.
+        if self.pp_rank == 0:
+            return min(finish_count, ready)
+        return min(finish_count, len(ack_queue))
+
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
         cc = self.cache_controller
@@ -2789,22 +2844,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # Every rank must enter the all_reduce below; ongoing_write_through can
-        # diverge across ranks (e.g. write_backup returning 0 on a subset).
-        finish_count = 0
-        if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_write_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
-
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(
-            finish_count_tensor,
-            torch.distributed.ReduceOp.MIN,
-            label="writing_check",
-        )
-        finish_count = finish_count_tensor.item()
+        finish_count = self._count_ready_acks(cc.ack_write_queue, "writing_check")
 
         # Process completed acks
         while finish_count > 0:
@@ -2819,21 +2859,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
-        # Every rank must enter the all_reduce below; ongoing_load_back can
-        # diverge across ranks.
-        finish_count = 0
-        if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_load_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(
-            finish_count_tensor,
-            torch.distributed.ReduceOp.MIN,
-            label="loading_check",
-        )
-        finish_count = finish_count_tensor.item()
+        # Same rank-local-queue rule as the write side: a rank with nothing
+        # loading must not hold the others' load-back pins (which also make
+        # mamba checkpoints unevictable).
+        finish_count = self._count_ready_acks(cc.ack_load_queue, "loading_check")
 
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
