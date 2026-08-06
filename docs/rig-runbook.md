@@ -366,6 +366,52 @@ recipe in section 4 already exports it, and a boot that skips it fails in
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 ```
 
+## 2.2 Sampling-backend JIT is built at boot, not on the first request (#603b)
+
+**Boot behaviour change.** `Scheduler.init_model_worker` now calls
+`warm_sampling_backend()` immediately after CUDA-graph capture. With
+`--sampling-backend flashinfer` (the default) it runs one tiny throwaway
+`top_k_top_p_sampling_from_probs` / `min_p_sampling_from_probs` on every rank
+inside the JIT cold-build window, then barriers on the CPU group. Any other
+sampling backend takes no build and no collective, byte-identical to before.
+
+**Why.** `flashinfer.sampling` resolves its CUDA module lazily, on first call,
+via `get_sampling_module` → ninja → nvcc. On a cold cache that is a 60-90 s
+compile, and the first call used to land inside `Sampler.forward` — i.e. inside
+a serving forward, on a rank its peers are waiting for. On 2026-08-06 that
+produced `Bar1CollectiveAborted ... a peer did not arrive`: py-spy caught two
+ranks in `run_ninja` and the third blocked on the build's `FileLock`, with the
+`.o`/`.so` mtimes in both arch caches inside the same window.
+
+**Why it bites this rig specifically.** flashinfer keys its JIT cache by ARCH
+(`~/.cache/flashinfer/<ver>/<arch>/cached_ops`) and each rank sees only its own
+GPU, so the 5090 rank resolves to `120f` while BOTH 3080 ranks resolve to the
+same `86` directory — same dir, same `FileLock`. Those two therefore serialise
+against each other while the odd rank builds alone, so the three ranks leave the
+stall at materially different times. Whichever leaves first walks into the next
+forward's first collective and waits on a peer still in nvcc.
+
+**Do not "fix" a recurrence by wrapping the lazy build in a cold-build window.**
+That window is process-local, and the rank that aborts is the one NOT building —
+its multiplier is closed. Raising `SGLANG_BARLINK_BAR1_CAP_CYCLES` only pads the
+race. The barrier after the build is the load-bearing half.
+
+**Operational note.** A truncated build is self-perpetuating: a watchdog SIGKILL
+landing mid-nvcc leaves the cache cold, so the next boot rebuilds and can wedge
+again. To warm both arch caches by hand after such a kill:
+
+```bash
+ls -la /root/.cache/flashinfer/0.6.14/{86,120f}/cached_ops/sampling/sampling.so
+```
+
+Both files must exist and be newer than the last toolchain or flashinfer change.
+
+**This closes only the sampling-JIT half of the 2026-08-06 crash family.** A
+second wedge shape — all three ranks blocked in `check_after_graph_replay` →
+`_read_status_for_check` → stream `synchronize()` inside the EAGLE draft-extend
+graph replay, with NO compiler running and warm caches — was still observed
+afterwards (crashes #8/#9) and is not explained by this change.
+
 ## 3. Mandatory boot flags
 
 **The usability trias is a STANDARD boot setting, not a tuning knob** (user
