@@ -2612,6 +2612,12 @@ class ModelRunnerKVCacheMixin:
                 page_size=self.page_size,
                 layout="layer_first",
                 pin_memory=True,
+                # Name this pool's post in the joint pinned-host-RAM guard
+                # (#550). Without it the spill pool would be booked under the
+                # HiCache class name and a refusal would point the operator at
+                # the wrong flag.
+                budget_label="kv-session-offload spill pool",
+                budget_flag="--kv-session-offload-host-ram-gib",
             )
             eff_max_spills = host_pool_effective_max_spills(
                 host_pool.size, region_tokens, max_spills
@@ -2668,6 +2674,8 @@ class ModelRunnerKVCacheMixin:
             page_size=self.page_size,
             layout="layer_first",
             pin_memory=True,
+            budget_label="kv-session-offload spill pool",
+            budget_flag="--kv-session-offload-host-ram-gib",
         )
         if host_pool.size < need_tokens:
             raise ValueError(

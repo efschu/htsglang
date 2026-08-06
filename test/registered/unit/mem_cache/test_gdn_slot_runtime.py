@@ -299,5 +299,100 @@ class TestParkedSessionsAreVisibleToTheLadder(CustomTestCase):
         self.assertEqual(rt._idle_holders(), [])
 
 
+class TestUnparkedStraightIntoRunning(CustomTestCase):
+    """#549: the door back in that is not the waiting queue.
+
+    kv-session-offload's restore loop runs in ``pre_schedule`` and merges an
+    unparked session into ``running_batch`` BEFORE ``on_round`` plans. By the
+    time the ladder looks, that session is RUNNING, has no mamba slot, and is
+    still in ``parked_ids`` -- kvso's unpark commit pops its own record and
+    never tells the GDN executor. Against the three original branches
+    (resident / resumed-from-waiting / newcomer) it matched NONE, so it was
+    absent from ``residents``, absent from ``resumed_ids``, and therefore
+    absent from ``vacate_plan``'s restore list. It then decoded with all-None
+    mamba state -- silently wrong output, no error raised anywhere.
+
+    CAN-FAIL: drop the in-transit branch in ``GdnSlotRuntime.on_round`` and
+    ``test_it_is_restored_before_it_decodes`` goes red with the session still
+    parked and slotless -- exactly the state that produces the wrong answer.
+    """
+
+    def _park_b(self, h, a, b):
+        """Drive a real round that parks ``b``, so the state under test is
+        produced by the machinery rather than hand-set."""
+        queued = _req("c", arrival=3, req_pool_idx=2)
+        h.idle_holders = [b]
+        h.rt.on_round(_batch([a]), [queued])
+        assert b.mamba_pool_idx is None
+        assert h.rt._executor.parked_ids == ["b"]
+        h.idle_holders = []
+
+    def test_it_is_restored_before_it_decodes(self):
+        h = Harness(slots=2)
+        a = _req("a", arrival=1, req_pool_idx=0)
+        b = _req("b", arrival=2, req_pool_idx=1)
+        h.give_slot(a)
+        h.give_slot(b)
+        self._park_b(h, a, b)
+
+        # kvso unparks b straight into the running batch: no slot, not in the
+        # waiting queue, blob still in the store.
+        h.rt.on_round(_batch([a, b]), [])
+
+        self.assertIsNotNone(
+            b.mamba_pool_idx,
+            "a session unparked into the running batch decoded without its "
+            "GDN state restored (#549): all-None mamba state is silently "
+            "wrong output, not a crash",
+        )
+        self.assertNotIn("b", h.rt._executor.parked_ids)
+
+    def test_the_restore_rebinds_the_req_index_mapping(self):
+        """Same trap as the #364 rebind test: the batch builder reads
+        ``req_index_to_mamba_index_mapping``, not ``req.mamba_pool_idx``."""
+        h = Harness(slots=2)
+        a = _req("a", arrival=1, req_pool_idx=0)
+        b = _req("b", arrival=2, req_pool_idx=1)
+        h.give_slot(a)
+        h.give_slot(b)
+        self._park_b(h, a, b)
+
+        h.rt.on_round(_batch([a, b]), [])
+
+        self.assertEqual(int(h.mapping[b.req_pool_idx]), int(b.mamba_pool_idx))
+
+    def test_a_running_parked_session_that_already_has_a_slot_is_untouched(self):
+        """The branch must key on MISSING state, not on being parked. A
+        session holding a slot is already resident and must not be re-restored
+        (that would be a second alloc for the same session)."""
+        h = Harness(slots=2)
+        a = _req("a", arrival=1, req_pool_idx=0)
+        b = _req("b", arrival=2, req_pool_idx=1)
+        h.give_slot(a)
+        h.give_slot(b)
+        self._park_b(h, a, b)
+        # Hand b a slot back without clearing the parked record.
+        h.give_slot(b)
+        slot_before = b.mamba_pool_idx
+
+        h.rt.on_round(_batch([a, b]), [])
+
+        self.assertEqual(b.mamba_pool_idx, slot_before)
+
+    def test_the_waiting_queue_door_still_works(self):
+        """The original branch B must not have been displaced by the new one."""
+        h = Harness(slots=2)
+        a = _req("a", arrival=1, req_pool_idx=0)
+        b = _req("b", arrival=2, req_pool_idx=1)
+        h.give_slot(a)
+        h.give_slot(b)
+        self._park_b(h, a, b)
+
+        h.rt.on_round(_batch([a]), [b])
+
+        self.assertIsNotNone(b.mamba_pool_idx)
+        self.assertNotIn("b", h.rt._executor.parked_ids)
+
+
 if __name__ == "__main__":
     unittest.main()

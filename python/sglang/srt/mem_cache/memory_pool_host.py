@@ -10,7 +10,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
 import numpy as np
-import psutil
 import torch
 
 from sglang.jit_kernel.hicache import (
@@ -20,6 +19,7 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
+from sglang.srt.mem_cache.pinned_host_budget import check_and_register_pinned_post
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MambaPool,
@@ -137,16 +137,13 @@ class MambaPoolHost(HostKVCache):
                 device_pool.size,
             )
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
+        check_and_register_pinned_post(
+            name="HiCache Mamba host pool",
+            flag="--hicache-size / --hicache-ratio",
+            requested_bytes=requested_bytes,
+            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        )
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
             requested_bytes / 1e9,
@@ -770,14 +767,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 paged pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
+        check_and_register_pinned_post(
+            name=f"V4 paged host pool {pool_name}",
+            flag="--hicache-size / --hicache-ratio",
+            requested_bytes=requested_bytes,
+            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
@@ -1149,14 +1144,12 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.size_per_token = self.state_page_bytes
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 state pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
+        check_and_register_pinned_post(
+            name=f"V4 state host pool {pool_name}",
+            flag="--hicache-size / --hicache-ratio",
+            requested_bytes=requested_bytes,
+            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
@@ -1684,14 +1677,12 @@ class DSAIndexerPoolHost(HostKVCache):
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for DSA indexer hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
+        check_and_register_pinned_post(
+            name="DSA indexer host pool",
+            flag="--hicache-size / --hicache-ratio",
+            requested_bytes=requested_bytes,
+            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        )
         logger.info(
             "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
             requested_bytes / 1e9,

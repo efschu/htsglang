@@ -1739,6 +1739,80 @@ halves — six of its tests go red against the old one-sentence refusal, and the
 structural half goes red the moment the seam gains a producer or a reader
 outside the layer that makes the reasoning true.
 
+RESOLVED IN #550, and the split between the two halves is the lesson. Gap (1)
+was a MECHANISM and could be built at the desk: `mem_cache/pinned_host_budget`
+is now the single owner of "may this pinned host buffer be allocated", every
+pinned host pool routes its check through it, and `_handle_kv_session_offload`
+sums both posts once in the launcher. Gap (2) was a MEASUREMENT, and writing a
+guard does not produce a number — so the pair became an opt-in
+(`KVSO_ALLOW_HICACHE=1`) rather than a default, and the remaining refusal names
+the measurement and no longer claims the RAM gap is open. Two things fell out
+of building it that the #547 reading had not reached. First, the shared choke
+point: kvso allocates its spill pool through the SAME `MHATokenToKVPoolHost`
+class HiCache uses, so `pool_host/base.py` was already the one place both posts
+pass through — the joint check needed no new plumbing, only a `budget_label`
+so a refusal can name which flag to lower. Second, the honest figure: all six
+per-pool checks read `psutil.virtual_memory()`, which under lxcfs is
+synthesised (`MemAvailable` can exceed `MemTotal` on this rig), so the pools
+were being validated against a number that does not denote anything — the
+lxcfs half of #549/#551, closed in the same cut by routing every site through
+`memtier.profile.host_memory_bytes_for_pinning`. The rule worth keeping: when a
+refusal names N missing pieces, check which of them are mechanisms and which
+are measurements before promising to lift it — only the first kind can be
+closed by writing code, and shipping as though the second kind were closed too
+is exactly what the refusal existed to prevent.
+
+MEASURED in the #550 GPU window, and gap (2) is still OPEN. The pair booted
+together for the first time (3x 1.00 GB kvso spill pools alongside an 8.00 GB
+HiCache tier, one joint budget, byte-coherent). ms/round, median streaming
+inter-token interval, 16 streams x ~20k prompt tokens: WITHOUT HiCache
+**115.11 ms/round** with an A-vs-A floor of **0.48 ms (0.4 %)**; WITH HiCache
+**151.39 ms/round** mean but an A-vs-A floor of **75.97 ms (50.2 %)**. That
+second floor is the whole result: one of the two WITH runs spilled and the
+other did not, so the arm measured two different regimes and called the
+difference noise. Comparing like with like, the no-spill runs are 113.40 (with)
+vs 115.11 (without) — no measurable HiCache penalty in steady state — while the
+one spilling run cost 189.38. The control never spilled, so SPILL COST and
+HICACHE CONTENTION are confounded and neither is isolated. The pair therefore
+stays opt-in: the honest reading is "boots, and costs nothing when nothing
+spills", which is not the claim the refusal asked for.
+
+The window also produced a sharper lesson than the numbers. EVERY passing
+spill arm in the boot matrix (`B_offload`, `G_all_axes`, `J_waveback_ps2`,
+`N_resume_under_spec`) spilled ZERO times: their probes are a few dozen tokens
+against a ~120k-token device pool, so the logs contain only arming lines
+(`wave-back THRESHOLD armed`, `spec-in-spill-tick: flag=True ready=True`) and
+not one `SPILL(`. Those PASSes prove the configurations boot and stay
+byte-coherent; they do NOT exercise the spill path, and reading them as
+evidence for it is the same "a test that performs the step the real caller
+omits" trap recorded above. Consequence: the B1 spec gate was NOT flipped —
+its stated reason is one unobserved round (a spill landing in the same round as
+a drafter-in-tick step) and nothing here observed it. A spill arm needs a LOAD
+PRECONDITION (assert `SPILL(` appears, or fail the arm) before any of them can
+count as evidence about spilling.
+
+Wrong-door family (#549): a state machine that classifies by ENUMERATING the
+doors it knows will silently drop anything that arrives through a new one.
+`GdnSlotRuntime.on_round` sorted every session into three branches — resident
+(`mamba_pool_idx` is not None), resuming (parked AND in the waiting queue), or
+newcomer (not parked) — which is exhaustive only if the waiting queue is the
+sole way back from parked. It is not: kv-session-offload's restore loop runs in
+`pre_schedule` and merges an unparked session into `running_batch` BEFORE
+`on_round` plans, and `_commit_unpark` pops kvso's own record without telling
+the GDN executor. Such a session is running, has no slot, and is still in
+`parked_set` — so it matched NO branch, never entered `residents`, never
+entered `resumed_ids`, and `vacate_plan`'s restore list (built from
+`resumed_ids`) never restored it. It then decoded with all-None mamba state:
+silently wrong output, no error, no log. Fixed with a fourth classification
+derived STRUCTURALLY — running, parked, and slotless — rather than signalled
+from the unpark commit, because what makes the session dangerous is "about to
+decode with its state still a blob" and any future path producing that state is
+equally dangerous; keying on one producer would leave the next one broken the
+same way. Note the neighbouring `forget` loop had already been taught that a
+parked session can be in `_by_id`, so the module half-knew. Pinned by
+`test_gdn_slot_runtime.TestUnparkedStraightIntoRunning`, whose two core tests go
+red against the pre-fix classification.
+
 Equivalent-fallback family (#552): a decline is only worth its name when the
 fallback it hands off to does something DIFFERENT. `try_spill` declined
 outright whenever speculative decoding was active and the FCFS/minimal-eviction
