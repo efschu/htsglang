@@ -266,6 +266,8 @@ class MambaComponent(TreeComponent):
                 self.cache.component_evictable_size_[ct] -= vlen
                 self.cache.component_protected_size_[ct] += vlen
             cd.lock_ref += 1
+        if self.cache._pin_trace_every:
+            self.cache.record_pin_trace_mamba("inc", host=lock_host)
         return result
 
     def release_component_lock(
@@ -289,6 +291,8 @@ class MambaComponent(TreeComponent):
                 host_lru = self.cache.host_lru_lists[ct]
                 if not host_lru.in_list(node):
                     host_lru.insert_mru(node)
+            if self.cache._pin_trace_every:
+                self.cache.record_pin_trace_mamba("dec", host=True)
             return
 
         if cd.lock_ref > 0:
@@ -297,6 +301,8 @@ class MambaComponent(TreeComponent):
                 self.cache.component_evictable_size_[ct] += vlen
                 self.cache.component_protected_size_[ct] -= vlen
             cd.lock_ref -= 1
+            if self.cache._pin_trace_every:
+                self.cache.record_pin_trace_mamba("dec", host=False)
 
     def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
         """Allocate one mamba pool slot, evicting if necessary.
