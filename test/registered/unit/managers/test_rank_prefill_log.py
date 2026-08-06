@@ -542,11 +542,22 @@ class TestFamilyLabelDerivation(unittest.TestCase):
     def test_families_are_derived_from_the_group_name(self):
         from sglang.srt.distributed.parallel_state import collective_clock_families
 
+        # #583 appended two CENSUS-ONLY families (no clock span at their
+        # dispatch sites): the 2026-08-06 desync hid in exactly the families
+        # nobody counted.
         self.assertEqual(
             collective_clock_families("tp"),
-            ("tp.all_reduce", "tp.all_gather", "tp.all_gatherv", "tp.reduce_scatterv"),
+            (
+                "tp.all_reduce",
+                "tp.all_gather",
+                "tp.all_gatherv",
+                "tp.reduce_scatterv",
+                "tp.broadcast",
+                "tp.all_to_all",
+            ),
         )
         self.assertEqual(collective_clock_families("dcp")[1], "dcp.all_gather")
+        self.assertEqual(collective_clock_families("dcp")[4], "dcp.broadcast")
 
     def test_each_dispatch_site_passes_its_own_family(self):
         """Pin the wiring: a site that passes the wrong family would report
