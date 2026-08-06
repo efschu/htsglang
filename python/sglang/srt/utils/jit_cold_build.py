@@ -379,6 +379,27 @@ def run_capture_warmups(
                 out = forward_fn()
                 if post_warmup_hook is not None:
                     post_warmup_hook()
+            # Trailing join: the loop's synchronize/barrier lead each forward,
+            # so without this the LAST warmup's async work is still in flight
+            # when the caller constructs torch.cuda.CUDAGraph() and enters
+            # stream capture. JIT compilation triggered by that forward
+            # (DeepGEMM/TVM, and in the DSpark compact ragged-verify arm every
+            # new non-uniform verify_lens shape) then issues driver calls --
+            # cuModuleLoadData and friends -- from inside the capture region,
+            # which surfaces as CUDA_ERROR_ILLEGAL_ADDRESS or
+            # cudaErrorStreamCaptureUnsupported at capture time.
+            #
+            # It stays INSIDE the cold-build window on purpose: this barrier is
+            # the join that ENDS the cold-build phase, so a peer rank still
+            # sitting in nvcc during its own warmups must be waited out under
+            # the relaxed deadline. Closing the window first would give this
+            # collective the steady-state deadline and turn a slow peer's cold
+            # build into a false wedge -- the exact failure the window exists
+            # to prevent. The recorded pass still runs outside the window.
+            if device_module is not None:
+                device_module.synchronize()
+            if tp_group is not None and not skip_barrier:
+                tp_group.barrier()
             return out
         except BaseException as exc:
             if not isinstance(exc, Exception):

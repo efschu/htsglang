@@ -142,7 +142,12 @@ class TestWarmupLoopCarriesTheWindow(CustomTestCase):
 
         run_capture_warmups(forward_fn, device_module=dev, tp_group=group)
 
-        self.assertEqual(calls, ["sync", "barrier", "forward"] * 2)
+        # The trailing sync+barrier is the post-warmup join (#611 / upstream
+        # #33795): it must land after the LAST forward, before the caller
+        # builds the CUDAGraph.
+        self.assertEqual(
+            calls, ["sync", "barrier", "forward"] * 2 + ["sync", "barrier"]
+        )
         self.assertTrue(
             seen and all(v > _BASE for v in seen),
             f"warmup forwards saw deadlines {seen}, expected the relaxed one",
@@ -168,9 +173,7 @@ class TestWarmupLoopCarriesTheWindow(CustomTestCase):
         """The breakable backend sizes its shared output buffer from it."""
         _, dev, group = self._fakes()
         seq = iter(["first", "last"])
-        out = run_capture_warmups(
-            lambda: next(seq), device_module=dev, tp_group=group
-        )
+        out = run_capture_warmups(lambda: next(seq), device_module=dev, tp_group=group)
         self.assertEqual(out, "last")
 
     def test_skip_barrier_and_hook_are_honoured(self):
@@ -182,7 +185,73 @@ class TestWarmupLoopCarriesTheWindow(CustomTestCase):
             skip_barrier=True,
             post_warmup_hook=lambda: calls.append("hook"),
         )
-        self.assertEqual(calls, ["sync", "forward", "hook"] * 2)
+        # skip_barrier suppresses the trailing barrier too, not just the
+        # per-iteration ones -- the trailing sync still runs.
+        self.assertEqual(calls, ["sync", "forward", "hook"] * 2 + ["sync"])
+
+    def test_no_forward_is_left_in_flight_when_the_warmups_return(self):
+        """#611 / upstream #33795: the post-warmup join must be the LAST thing.
+
+        The caller's very next statement is ``torch.cuda.CUDAGraph()`` plus
+        stream capture. If the last warmup forward's async work -- notably JIT
+        compilation it triggered -- is still in flight, those driver calls land
+        inside the capture region and abort it (CUDA_ERROR_ILLEGAL_ADDRESS /
+        cudaErrorStreamCaptureUnsupported).
+
+        Falsifier: with the trailing synchronize()/barrier() removed, the call
+        log ends in "forward" and both assertions below go red.
+        """
+        calls, dev, group = self._fakes()
+        run_capture_warmups(
+            lambda: calls.append("forward"),
+            device_module=dev,
+            tp_group=group,
+            post_warmup_hook=lambda: calls.append("hook"),
+        )
+
+        last_forward = max(i for i, c in enumerate(calls) if c == "forward")
+        self.assertIn(
+            "sync",
+            calls[last_forward:],
+            f"no device synchronize after the last warmup forward: {calls}",
+        )
+        self.assertIn(
+            "barrier",
+            calls[last_forward:],
+            f"no TP barrier after the last warmup forward: {calls}",
+        )
+
+    def test_the_post_warmup_join_stays_inside_the_cold_build_window(self):
+        """The join waits out a peer that is still in nvcc.
+
+        A rank reaching the trailing barrier has finished its own builds, but a
+        peer may still be compiling inside ITS warmup loop. Under the
+        steady-state deadline that wait is a false wedge, so the join has to be
+        covered by the relaxed window -- while the recorded pass afterwards
+        must not be (pinned by
+        ``test_the_recorded_pass_is_outside_the_window``).
+        """
+        _, dev, group = self._fakes()
+        log = []
+        group.barrier = lambda: log.append(("barrier", resolve_timeout_cycles(_BASE)))
+
+        run_capture_warmups(
+            lambda: log.append(("forward", None)), device_module=dev, tp_group=group
+        )
+
+        kinds = [k for k, _ in log]
+        last_forward = max(i for i, k in enumerate(kinds) if k == "forward")
+        trailing = [d for k, d in log[last_forward:] if k == "barrier"]
+        self.assertTrue(
+            trailing,
+            f"no barrier after the last warmup forward -- the join is missing: {kinds}",
+        )
+        self.assertGreater(
+            trailing[-1],
+            _BASE,
+            "the post-warmup join ran with the unrelaxed deadline; a peer "
+            "still cold-building would be misread as a wedge",
+        )
 
     def test_failure_inside_the_window_names_the_cold_build(self):
         """MULTI-rank: the peer hypothesis is the useful reading."""
