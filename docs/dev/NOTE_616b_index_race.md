@@ -150,6 +150,53 @@ this window's instrumentation. It is a distinct live failure sharing the same
 load, and it is why "the reproducer hits in 3.5-4 min" is only true about half
 the time — the two families compete for which kills the run first.
 
+## 4b. The LXC hypothesis: FALSIFIED for the wedge family
+
+The user's hypothesis was that the crashes began when htsglang moved from the
+Proxmox host into the LXC container (CT999), i.e. that containerisation is the
+axis. Tested directly, in three environments running the SAME worktree:
+
+| environment | wedge reproduced? | where |
+|---|---|---|
+| CT999 (LXC) | yes, arms A/B/D | `flashinfer_backend.py:7429`, all 3 ranks |
+| Docker on the host | yes, ~72 s of load | same line, all 3 ranks |
+| **Bare metal on the host** | **yes, ~86 s of load** | same line, all 3 ranks |
+
+The bare-metal arm used the Proxmox host's own kernel and init with **no
+container at all** — the only isolation was a private MOUNT namespace, used
+solely so the hardcoded `/spinning/...` paths resolve (no pid/net/user
+namespace, no cgroup limits, no seccomp/apparmor). It ran CT999's OWN venv
+(same torch 2.11.0+cu130, same sgl_kernel 0.4.4, same flashinfer) and this
+worktree, so code and wheels were identical to the LXC arms.
+
+**Verdict: the wedge is NOT caused by the LXC container.** It reproduces
+outside it, in the same time envelope, with an identical three-rank stack.
+Evidence: `/spinning/616b-hunter4/bmrun/baremetal_wedge_dumps.txt` (bare
+metal), `hostrun/dockerhost_wedge_dumps.txt` (docker), `armB/`, `armD/` (LXC).
+
+Scope this honestly: what is falsified is the LXC axis for the WEDGE family.
+The INDEX-ASSERT family was not observed on bare metal within this window, so
+for that family the LXC axis is untested rather than excluded — though the two
+families share one load and one code path, and nothing about the assert's
+mechanism (§1) is container-related.
+
+Confounds recorded for the bare-metal arm:
+- The Proxmox host (Debian 13) has no python3.12; the venv's base interpreter
+  is `/bin/python3.12`. CT999's python3.12 binary, stdlib and headers were
+  staged under `/spinning` and symlinked into the host's `/usr`. Nothing was
+  built and no new venv was created; the binary needs no libpython and only
+  libm/libz/libexpat/libc, all present on the host. Remove
+  `/usr/bin/python3.12`, `/usr/lib/python3.12`,
+  `/usr/include/python3.12` and `/usr/include/x86_64-linux-gnu/python3.12`
+  to restore the host.
+- Neither the host system CUDA (12.2) nor CT999's (12.9) can target the 5090's
+  `compute_120`; both reject it. CT999 in fact builds with the CUDA 13 nvcc
+  BUNDLED IN THE VENV (`nvidia/cu13/bin/nvcc`), and the bare-metal arm was
+  pointed at that same toolchain, so the barlink extension is the same build.
+- `ulimit -n` differs: host default 1024 vs CT999 524288. The bare-metal arm
+  was launched with `ulimit -n 524288` to match.
+- `/dev/shm` is 63G in both.
+
 ## 5. What is NOT the cause (falsified here or earlier)
 
 - Not the two req-pool double-frees (#616 hunter-3): their fail-loud guards
