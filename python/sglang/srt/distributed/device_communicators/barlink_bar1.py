@@ -4753,6 +4753,16 @@ class BarlinkBar1Transport:
 
             if census_enabled():
                 logger.error("%s", format_local_census(self.rank))
+                # #616c: the COUNTS say which family diverged, but not where.
+                # The flag snapshot below proved the ranks sit one generation
+                # apart; this recent-sequence dump is what turns that into a
+                # named culprit -- diff the three ranks' history lines and the
+                # first differing entry is the collective that caused the skew.
+                from sglang.srt.distributed.collective_census import (
+                    format_local_history,
+                )
+
+                logger.error("%s", format_local_history(self.rank))
         except Exception:  # noqa: BLE001 - never mask the abort below
             pass
         # #616c: and the device flag words this rank's spin was waiting on.
