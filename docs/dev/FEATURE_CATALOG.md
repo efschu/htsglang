@@ -22,6 +22,11 @@ DRIVEN against the real `ServerArgs` validation by
 `test/registered/unit/planner/test_flag_registry_contract_500.py`, so a
 registry that forbids more than the server does fails a test instead of
 silently greying a field. Add an edge there when you add one to `flags.py`.
+(5) **§18 is the reusable-INFRASTRUCTURE index, and it has a merge
+obligation:** consult §18 before building new infrastructure, and a PR that
+adds a reusable module adds its §18 entry in the SAME PR. §1-§17 answer "does
+this fork do X"; §18 answers "is there already a module I should be calling".
+Fourteen incidents came from rebuilding what §18 lists.
 Last full refresh: 2026-08-02 (tip 33148dbe0f); reach-audited 2026-08-03 (#500,
 tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
 
@@ -3041,3 +3046,357 @@ consumer SHOULD call it instead of restating it, but none does yet; and anything
 whether a path is worth its cost is an instance of `DESIGN_363_regime_controller.md`
 §20.1's worth-it autocheck rather than a new flag. Read those three before
 adding a cell, and register the answer back into them in the same merge.
+
+## 18. Reusable building blocks (infrastructure, not features)
+
+§1-§17 answer "does this fork DO X". This section answers the other question,
+the one that has cost us fourteen recorded incidents: **"is there already a
+module I should be calling instead of writing one?"** Everything below is
+infrastructure — generic machinery with more than one plausible consumer —
+not a user-facing capability. Paths are relative to `python/sglang/srt/`
+unless they start with `tests/`, `test/`, `docs/` or `scripts/`.
+
+Each entry is **name — capability / ENTRY / GATE / CONSUMERS**. The GATE line
+is the same pointer-to-a-predicate contract as the rest of this file (header
+rule 3): read the predicate before you act on it. "GATE: none" means the
+module is importable and callable with no flag — a plain library.
+
+**MERGE OBLIGATION (rule 5, enforced by review, not by a hook).**
+A PR that adds a reusable module adds its §18 entry in the SAME PR; a PR that
+builds new infrastructure states that §18 was consulted first. Two lines in
+the PR body, not a form. The mechanical half is pinned by
+`test/registered/unit/docs/test_building_blocks_catalog_538.py`, which fails
+when a §18 `file:line` no longer resolves — so a deleted or moved module
+breaks a test instead of rotting quietly here.
+
+### 18.1 Device and process identity
+
+- **IdentityMap** — the live UUID <-> NVML index <-> CUDA ordinal <-> PCI BDF
+  resolver; the single source of truth for card identity, and the reason
+  torch's enumeration order is never trusted (#331).
+  ENTRY `registry/nvml.py:867` (`identity_map()`), class at `:611`,
+  `require()` at `:648` raises rather than returning a nearest match.
+  GATE: NVML present (`registry/nvml.py:131`). `allow_cuda_init=True` is
+  needed for the CUDA-ordinal side and **creates a CUDA context worth a few
+  hundred MiB** — `registry/rank_cards.py:43` documents why that is a
+  deliberate cost and not a default.
+  CONSUMERS `server_args.py:545`, `:632`; `registry/rank_cards.py:200`,
+  `:312`; `layers/moe/expert_offload.py:943`;
+  `distributed/device_communicators/barlink_matrix_transport.py:190`;
+  `planner/flags.py:3143`; `uneven_perf.py:571`.
+- **cuda_init_tracer** — answers "why does this process own a CUDA context at
+  all" by hooking torch.cuda init and dumping the stack of the first toucher
+  (#237, which found a 634 MiB context on a GPU-passive parent).
+  ENTRY `utils/cuda_init_tracer.py:68` (`install()`).
+  GATE: explicit `install()` call; `emulate=True` for a torch-free desk run.
+  CONSUMERS: diagnostic, invoked from its own `main()` at `:125`.
+- **card_probe** — self-calibrating per-card capability profile (FP8 support,
+  measured GEMM TFLOPs, pairwise link) with a UUID+driver-keyed cache, so a
+  hardware-dependent term is measured once instead of hardcoded per rig.
+  ENTRY `rigmon/card_probe.py:495` (`load_card_probe()`), write side
+  `:483`, cache key `:370`, staleness match `:394`.
+  GATE: cache path resolution `:382` — a miss means a probe run, not a
+  fabricated number.
+  CONSUMERS `planner/` cost model and hardware tiers (18 import sites).
+
+### 18.2 Process-static runtime state
+
+- **runtime_context** — one structured accessor for process-static state:
+  parallel topology (read-through to `distributed.parallel_state`, never a
+  cache), the process-wide `ServerArgs`, the runtime-flag tiers, and a
+  **lane-keyed** stream and buffer pool. This is the module with the widest
+  fan-in in the fork (~400 import sites) and the one most often rebuilt
+  locally as "a module-level global".
+  ENTRY `runtime_context.py:914` (`get_parallel`), `:918`
+  (`get_server_args`), `:935` (`get_flags`), `:947`/`:951` (stream
+  get/set), `:955` (`get_buffer(name, factory)`), `:930` (`lane_scope`).
+  GATE: none for reads. The buffer pool is keyed by LANE since #274
+  (`LaneScope` at `:141`); `SGLANG_LANE_SHARED_ATTN_WORKSPACE=1`
+  (`:59`) restores the pre-#274 process-wide key and exists as the
+  falsifier for that fix, **not** as an operating mode.
+  CONSUMERS: everywhere. If you are about to write a module-level
+  singleton for per-process runtime state, use this instead.
+- **arg_groups/overrides** — declarative model-override registry: a model
+  architecture (or a predicate over architecture names) registers the
+  `ServerArgs` fields it wants defaulted, instead of another `if
+  "Qwen3" in arch` branch inside `__post_init__`.
+  ENTRY `arg_groups/overrides.py:82` (`register_model_override`), predicate
+  form `:99`, post-process pass `:155` / `:175`, resolution view `:122`.
+  GATE: none — registration is import-time; overrides fill only unset
+  values (`_apply_fields`, `:207`).
+  CONSUMERS: 66 import sites across model bring-ups.
+- **planner/rejected.py** — the machine-readable half of the rejected
+  register: combinations tried on this project and settled, as data, so the
+  wizard and the flag surface cannot propose something already refuted.
+  ENTRY `planner/rejected.py:869` (`check_combination(tags)`), `:864`
+  (`blocked_keys`), `:859` (`by_key`), `:884` (`register_json`),
+  row type `:60`.
+  GATE: none. Register the refusal HERE when you settle one — the prose
+  register in the operator notes is the other half, not a substitute.
+
+### 18.3 Memory: registers, ledgers, dials
+
+The #286 "offload register" is **two modules**, and conflating them is a
+recurring error: `offload_register.py` is the mechanism (items, policies,
+movement, admission), `short_term_offload_register.py` is the asset-class
+taxonomy and the global importance ladder.
+
+- **OffloadRegister (#286 mechanism)** — bookkeeping and movement for
+  parkable items: asset class per item, per-class policy, park-target
+  preference order, capture refusal.
+  ENTRY `model_executor/offload_register.py:525` (class), classes tuple
+  `:113`, thin booking helpers `:1316` (`maybe_register_item`) and `:1350`
+  (`maybe_touch_item`), policy parse `:294` / `:335`.
+  GATE `offload_register_enabled()` `:1213` — `SGLANG_OFFLOAD_REGISTER`,
+  **default off, immediate no-op, default path byte-unchanged**
+  (`environ.py:1139`). CLI surface `server_args.py:4864`, `:4886`, `:4907`.
+  CONSUMERS `layers/moe/breakable_offload.py:194`, `:213`, `:262`;
+  `runtime_context.py:70` (lane workspaces, CPU-phase adapter).
+- **short_term_offload_register (#286 taxonomy + ladder)** — the executable
+  form of DESIGN_407 §8's ONE global importance ladder, plus a per-class
+  descriptor. A class added without a ladder rank **fails at import**.
+  ENTRY `model_executor/short_term_offload_register.py:503`
+  (`describe_class`), ladder `:160` (`LadderRank`), `:994` (`plan_spill`),
+  completeness guard `:493`.
+  GATE: none (import-time). `describe_class` has a production consumer
+  (`layers/moe/breakable_offload.py:216`); `plan_spill` still has none
+  outside the module's own `rung1_evict` — a new victim policy SHOULD call
+  it rather than restate it.
+- **mem_ledger engine (#593/#596)** — per-card VRAM ledgers: card facts,
+  demand terms, communicator-group classification, itemized refusal.
+  ENTRY `mem_ledger/engine.py:808` (`build_card_ledgers`), `:189`
+  (`CardFacts`), `:213` (`DemandInputs`), `:692`
+  (`communicator_groups_from_server_args`).
+  GATE: construct through the ONE call site `server_args.py:11182`
+  (`_build_card_ledgers`) — #593's whole point is that the gated ledger path
+  and the full-demand reserve read the same ledger, because two
+  constructions are two answers. #596 is the same defect fixed on one caller
+  only (`server_args.py:11201`); do not reintroduce a second construction.
+- **mem_ledger flight recorder (#605)** — allocation flight recorder: an
+  UNCAPPED ring (deliberately — #602 proved a capped ring turns "no event
+  here" into an untrue statement), phase marks, per-site resident and churn
+  attribution, and `allocator_transient_bytes` per mark.
+  ENTRY `mem_ledger/flight_recorder.py:177` (`arm_process_trace`, must run
+  before the process's first CUDA allocation), `:471` (`mark`), `:539`
+  (`read_marks`), `:637` (`phase_deltas`), `:780` (`resident_attribution`),
+  `:854` (`churn_attribution`); the transient term at `:523`.
+  GATE `trace_requested_for_rank()` `:158` — the trace env accepts
+  `1`/`all` or a comma-separated rank list. It is a SCOPE, not a cap:
+  armed ranks record the whole boot with nothing dropped.
+- **vram_dial (#330)** — runtime per-card VRAM budget dial with KV capacity
+  re-raise over the VMM-backed pool. Reusable as a *participant registry*:
+  anything holding VMM-backed capacity can join the dial.
+  ENTRY `managers/vram_dial.py:134` (`register_dial_participant`), `:1090`
+  (`build_kv_capacity_runtime`), `:1041` (`validate_vram_dial_compat`),
+  `:993` (`verify_pool_reached_capacity`), boot plan `:115`/`:130`.
+  GATE `--enable-vram-dial` (`server_args.py:5229`, `:7133`); chunk size
+  `environ.py:371`. Control surface `managers/io_struct.py:1474`,
+  `managers/tokenizer_control_mixin.py:316`.
+- **memtier registry (#407)** — the tier registry: what storage tiers exist,
+  what each costs, and what each REFUSES, with named-post reservations
+  against a tier ledger. The generic answer to "where can this asset live".
+  ENTRY `memtier/registry.py:213` (`TierRegistry`), query `:182`, refusal
+  `:96` / rules `:81`; reservations `memtier/reservations.py:154`
+  (`TierLedger` protocol), `:107` (`ledger_post_name` — an unnamed post is
+  a `ValueError` at `:82`), `:184` (in-memory ledger); tier identity
+  `memtier/tiers.py:165`, `:172`, `:179`, `:186`.
+  GATE: none — data and protocol. A reservation without a name is refused.
+- **KV resharding mover (#297)** — moves KV pool contents across a changed
+  rank/shard geometry, with staged guards and a cutover callback.
+  ENTRY `managers/kv_reshard.py:697` (`build_kv_reshard_runtime`), runtime
+  `:176`, pool view `:84`, stage-A guards `:644`, cutover `:675`,
+  checksum `:170`.
+  GATE: stage-A guards at `:644` return the refusal list; the #330 dial
+  lane's VMM interaction is documented at `:731`.
+- **ConsumedPageDropper (PAGEOUT-first page dropping)** — releases the page
+  cache behind a streaming GGUF read, with a bookkeeping contract that
+  cannot lose correctness: a region is advised only once EVERY tensor owning
+  a byte in it is consumed, cut at the page boundary below the first
+  unconsumed tensor; out-of-order consumption stalls the watermark, which
+  loses cache release, never bytes.
+  ENTRY `model_loader/gguf_shards.py:676` (class), `:748` (`for_readers`),
+  `:953` (`make_stream_page_dropper`), `:773` (`register`).
+  GATE `SGLANG_GGUF_STREAM_DROP_CACHE`, `environ.py:1882`, **default True**;
+  set False to restore pre-#391 accumulation.
+  CONSUMERS `model_loader/weight_utils.py:1466` (constructed), `:1471`,
+  `:1525`, `:1527`.
+- **ProgressCoupledTrim** — ties cgroup reclaim RATE to consumer PROGRESS
+  instead of a wall clock, because an external sampler on an interval gets
+  outrun (88 -> 102 GiB inside one 15 s window, #391).
+  ENTRY `model_loader/gguf_shards.py:462`.
+  GATE `SGLANG_GGUF_STREAM_TRIM_SOFT_GIB`, `environ.py:1891`, **default 0.0
+  = off**. Its budget model was wrong until #537 — see §16 for the pinned
+  cgroup-accounting correction before reusing the arithmetic.
+- **hibernate (#89)** — park model weights to disk and restore them, manifest
+  -gated on model identity and on the cards being the same ones.
+  ENTRY `model_loader/hibernate.py:474` (`park_weights_to_disk`), `:619`
+  (`restore_model_from_disk`), `:218` (`hibernate_manifest_matches`),
+  `:204` (`load_manifest`), `:325`/`:366` (GGUF attr snapshot/restore),
+  `:463` (`_byte_hash` — the park/restore identity check).
+  GATE `_assert_v1_scope` `:176` (scope refusal) and `_manifest_cards_present`
+  `:246`; card identity resolves via `:54` (`current_gpu_nvml_uuid`), i.e.
+  through NVML, never an index.
+
+### 18.4 Sessions, tenants, liveness
+
+- **session_handover (#261)** — export/import a session's KV state across
+  processes as a manifest + verified roundtrip, with a conflict rule on
+  overlapping prefixes.
+  ENTRY `managers/session_handover.py:309` (`SessionHandoverRuntime`),
+  `:176` (`build_manifest`), `:209` (`validate_manifest_completeness`),
+  `:253` (`verify_import`), `:101` (`HandoverLedger`), `:87`
+  (`handover_id_for`), `:77` (`prefixes_conflict`).
+  GATE: completeness validation at `:209` and `verify_import` at `:253` —
+  an unverified import is not a supported path.
+- **IdleWorkTenant / WorkSegment (#347 W2)** — the interface every piece of
+  idle work is wrapped behind: a VRAM lease, preemption by
+  checkpoint-and-release, a work estimate, a feasibility answer and an
+  outcome. The generalization of #341's training-only machinery.
+  ENTRY `workbench/tenant.py:245` (`IdleWorkTenant`), `:224`
+  (`WorkSegment`), `:164` (`WorkGrant`), `:139` (`Feasibility`), `:97`
+  (`WorkEstimate`), `:205` (`SegmentOutcome`).
+  GATE: none — abstract base classes. New idle work implements these
+  instead of growing a second scheduler.
+- **AttachmentRegistry / ConsumerWatchdog** — resource claims held on behalf
+  of an attached consumer, with an attachment phase model and a grace
+  policy, plus the watchdog that decides a consumer is gone.
+  ENTRY `liveness/grace.py:309` (`global_attachment_registry`), registry
+  `:147`, claim `:79`, attachment `:97`, phases `:51`, claim kinds `:57`;
+  watchdog `liveness/watchdog.py:173`, policy `:97`, state `:144`, config
+  `:378` with `:449`/`:462` accessors, `ConsumerGone` `:82`.
+  GATE: `LivenessConfig` (`:378`) — a null global config means the
+  watchdog is inert; set it through `:449`.
+
+### 18.5 Collectives and transport
+
+- **CollectiveClock** — per-rank compute vs wait split from paired CUDA
+  events, with caller-supplied labels that beat the dispatch site's derived
+  ones, and an honest `graph_capture_skipped` flag making a slot's total a
+  lower bound when a capture swallowed a collective.
+  ENTRY `utils/collective_clock.py:102`, `arm` `:114`, `disarm` `:117`,
+  `label_scope` `:124`.
+  GATE: reported for **plain-prefill forwards on the target runner only**,
+  cuda, `pp_size == 1`
+  (`managers/scheduler_components/metrics_reporter.py:341`). There is no
+  decode/verify-round equivalent (#505-D14) — do not read one into it.
+- **CollectiveCensus** — per-rank collective ring history plus divergence
+  detection; the instrument that turns "rank 2 is stuck" into "rank 2 is
+  three collectives behind and here they are".
+  ENTRY `distributed/collective_census.py:384` (`census()`), class `:168`,
+  `format_local_census` `:388`, `format_local_history` `:401`,
+  `Divergence` `:146`, ring capacity `:108`.
+  GATE `census_enabled()` `:123`; heartbeat/interval `:127`/`:136`.
+  CONSUMERS `debug_utils/wedge_triage.py:29` greps its exact output line —
+  changing the format breaks triage.
+- **barlink peer-flag table** — the per-rank device-pointer table (payload
+  base + flag base per peer) that every barlink kernel launch is
+  parameterized by; the own-rank slot is patched in from local state, not
+  read back over the bus.
+  ENTRY `distributed/device_communicators/barlink_bar1.py:3088` (build),
+  `:3413`, `:4145` (the other two launch shapes); the C++ side's contract
+  and its `world`-sized assertions
+  `distributed/device_communicators/barlink_bar1_ext.py:1188`, `:1216`.
+  GATE: sizes are asserted against `world` at `distributed/device_communicators/barlink_bar1_ext.py:1216` —
+  a short table is a hard failure, not a silent partial ring.
+- **Staged non-blocking status read (#517)** — the pattern for reading a
+  device-side status word without paying the blocking read on every
+  iteration: arm once, defer, check every N. The pre-#517 blocking read cost
+  6.64 us per call in the #476 window.
+  ENTRY `distributed/device_communicators/barlink_bar1.py:4504` (the
+  deferred read), arming `:2294`, deferred state `:1589`, check-every knob
+  `:1627`, cost note `:4887`.
+  GATE `_ctl_defer` — false restores the pre-#517 blocking read verbatim
+  (`:4690`), which is the falsifier for the optimization.
+  Reuse the PATTERN, not the module, for any other device status word.
+
+### 18.6 Observability and triage
+
+- **startup timers** — phase timing for boot, with a max-duration accessor
+  and an idempotent enable so a second call cannot double-count.
+  ENTRY `observability/startup_func_log_and_timer.py:73` (`startup_timer`
+  context manager), `:19` (`enable_startup_timer`, idempotent), `:48`
+  (`set_startup_metric`), `:67` (`get_max_duration`), `:61` (reset).
+  GATE: `enable_startup_timer()`; the scheduler-subprocess gauge is enabled
+  on `tp_rank 0` only (#560).
+- **label_transform** — the single choke point that collapses an unbounded
+  label value into a bounded metric label, so a high-cardinality field
+  cannot blow up the metrics registry (#560 pinned it with a real
+  cardinality bound: 10k priorities collapse to <= 34 labels).
+  ENTRY `observability/label_transform.py:11` (`transform_priority`).
+  GATE: none — but it is a CHOKE POINT. A second transform site is the bug;
+  route new unbounded label values through here.
+- **wedge timeline / wedge triage** — the wedge-catcher pair: freeze-point
+  detection and a windowed timeline from a log, plus a live collector that
+  discovers the stuck PIDs and gathers their state.
+  ENTRY `debug_utils/wedge_timeline.py:54` (`find_freeze_point`), `:76`
+  (`timeline`), `:111` (`summarize`); `debug_utils/wedge_triage.py:74`
+  (`collect`), pid discovery `:55`.
+  GATE: none. Triage matches the collective-census output line
+  (`debug_utils/wedge_triage.py:29`) — see §18.5.
+- **DeviceTimer / SplitDeviceTimer / GapTimer** — CUDA-event timers for a
+  region, a split region, and the GAP between regions (the last is what
+  turns "the kernel is fast" into "the kernel is fast and we wait 8 ms
+  before it").
+  ENTRY `utils/device_timer.py:9`, `:38`, `:66`.
+  GATE: none.
+- **BreakCostClock** — per-round, per-phase cost accounting with explicit
+  phase-crossing bounds; the instrument behind the breakable-route and
+  phase-optimal work.
+  ENTRY `utils/break_cost_clock.py:201`, round `:168`, crossing bounds
+  `:392`.
+  GATE: none.
+- **boot_matrix (#349)** — the standing cross-feature bug net: arms,
+  effective-config extraction from a real boot log, coherence grading of
+  probe outputs. Cross-feature breaks are invisible to git and to
+  single-feature tests, which is the entire reason it exists.
+  ENTRY `boot_matrix/effective.py:33` (`EffectiveConfig` — what the boot
+  ACTUALLY resolved, parsed from the log rather than assumed),
+  `boot_matrix/coherence.py:139` (`grade_probes`), result types `:51`,
+  `:66`.
+  GATE: none. Read `EffectiveConfig` before trusting an arm's declared
+  configuration — #340 published a wrong verdict from a harness environment
+  that silently carried `SGLANG_UNEVEN_DCP=1`.
+- **kv_canary** — installable KV-correctness canary: patches the model
+  forward, holds expected inputs and a token oracle, and reports
+  perturbation-driven divergence.
+  ENTRY `kv_canary/api.py:30` (`install_canary`), forward patch `:103`.
+  GATE: `install_canary()` is explicit and patches a live runner — it is a
+  debug instrument, not a serving path.
+- **byte-identity / determinism harness (#124)** — trajectory capture and
+  verdict combination for byte-identity gates, including the speculative
+  trajectory variant, plus a standalone diff.
+  ENTRY `tests/determinism/determinism_harness/trajectory.py:111`
+  (`Trajectory`), verdict `:43`, combination `:81`, flip kinds `:24`;
+  spec variant `tests/determinism/determinism_harness/spec_trajectory.py`;
+  diff `tests/determinism/determinism_diff.py`.
+  GATE: none (test-side). Note the standing limits before designing a gate
+  around it: GDN prefill is non-reproducible above ~109 tokens (upstream),
+  and GPTQ/AWQ-marlin offload is intrinsically ~1e-2 — see §10.
+
+### 18.7 Small primitives that keep getting rewritten
+
+- **confine_to_root** — confines a caller-supplied filesystem path to a
+  configured root. Deliberately dependency-free (no torch, no fastapi) so
+  the HTTP handler that answers 400 and the scheduler-side sink that raises
+  can both import it.
+  ENTRY `utils/path_confinement.py:26`, error `:22`. GATE: none.
+- **tensor_bridge** — MLX <-> PyTorch tensor conversion, zero-copy where
+  Apple Silicon unified memory allows.
+  ENTRY `utils/tensor_bridge.py:38` (`use_mlx`), `:32` (`is_mlx_available`),
+  `:75` (`get_torch_device`). GATE: `use_mlx()` — availability is a
+  runtime question, not an import-time one.
+
+### 18.8 Known gaps in this section
+
+Honest absences, so nobody reads silence as coverage:
+
+- `plan_spill` (§18.3) has **no production consumer** outside its own
+  module. It is reusable by design and unused in practice; the first real
+  victim-policy consumer should call it rather than restate the ladder.
+- `memtier`'s `TierLedger` (§18.3) ships with an in-memory implementation
+  only. A durable ledger is a protocol implementation away, not a redesign.
+- The #517 staged status read (§18.5) is a PATTERN embodied in one module,
+  not a generic helper. Reusing it elsewhere means writing the arm/defer/
+  check-every trio again against your own status word.
+- `label_transform` (§18.6) currently transforms exactly one field
+  (priority). Its value is the choke-point property, not its coverage.
