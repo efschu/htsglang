@@ -88,8 +88,12 @@ class TestGridDefaultFollowsTheRelease(CustomTestCase):
     to ``1blk``. That is exactly what happened, and it cost 16.1%.
     """
 
-    def test_without_the_release_the_reservation_stands(self):
-        self.assertFalse(graph_grid_default({}))
+    def test_unset_release_follows_the_canonical_default(self):
+        # Since the #369 release (8d9a9ec314) graph_enable_set() defaults ON
+        # when the env var is unset; graph_grid_default() must mirror that
+        # default instead of silently keeping the pre-release reservation.
+        # The explicit off-ramp still stands.
+        self.assertTrue(graph_grid_default({}))
         self.assertFalse(
             graph_grid_default({"SGLANG_BARLINK_GRAPH_ENABLE": "0"})
         )

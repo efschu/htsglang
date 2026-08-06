@@ -288,6 +288,15 @@ def _is_on(value: Optional[str]) -> bool:
     return value is not None and value not in _OFF
 
 
+def _is_on_with_default(value: Optional[str], default: bool = True) -> bool:
+    """Whether an environment variable counts as on, with a configurable
+    default when unset. Used to mirror graph_enable_set() which defaults
+    to True (release ON by default since #369)."""
+    if value is None:
+        return default
+    return value not in _OFF
+
+
 def graph_grid_default(env=None) -> bool:
     """May the cooperative launch fire WHILE a graph is being captured?
 
@@ -323,7 +332,10 @@ def graph_grid_default(env=None) -> bool:
     explicit = env.get("SGLANG_BARLINK_BAR1_GRAPH_GRID")
     if explicit is not None:
         return explicit not in _OFF
-    return _is_on(env.get("SGLANG_BARLINK_GRAPH_ENABLE"))
+    # Mirror graph_enable_set(): default to True when unset (release ON
+    # since #369). Using _is_on_with_default instead of _is_on so the
+    # unset case returns True, not False.
+    return _is_on_with_default(env.get("SGLANG_BARLINK_GRAPH_ENABLE"), default=True)
 
 
 # ===========================================================================
