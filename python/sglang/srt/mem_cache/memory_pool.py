@@ -396,9 +396,45 @@ class ReqToTokenPool:
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
+    def free_slot(self, idx: int, *, owner: str = "request", prepend: bool = False):
+        """Return one row to the free list, refusing a corrupt return loudly.
+
+        Every row handed out is named in exactly two places -- the request that
+        holds it and, for a streaming session, the ``SessionSlot`` that parked
+        it between turns. If both return the same row the free list carries it
+        twice and the pool hands one row to two concurrent requests: the two
+        then share a ``req_to_token`` row and a mamba mapping entry, and
+        ``available_size()`` reports more rows than the pool owns, so admission
+        over-fills against buffers sized by ``max_num_reqs`` (#616).
+
+        A double return is a bookkeeping defect, never something to absorb: it
+        is refused by name here rather than silently corrupting the pool for a
+        later device-side assert to surface somewhere unrelated. The membership
+        scan is O(free list), which is bounded by the pool size and runs once
+        per finished request.
+        """
+        if idx is None:
+            raise ValueError(f"{owner} returned a null req_pool_idx to the pool")
+        if not 0 <= idx < self._alloc_size:
+            raise ValueError(
+                f"{owner} returned req_pool_idx={idx} to a pool holding rows "
+                f"0..{self._alloc_size - 1}"
+            )
+        if idx in self.free_slots:
+            raise ValueError(
+                f"{owner} returned req_pool_idx={idx} which is already free -- "
+                "the row was returned twice, so it was still owned by someone "
+                "when one of the two returns happened"
+            )
+        if prepend:
+            # Rollback puts rows back at the head so the retry reuses them.
+            self.free_slots.insert(0, idx)
+        else:
+            self.free_slots.append(idx)
+
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        self.free_slot(req.req_pool_idx, owner="request")
         req.req_pool_idx = None
 
     def clear(self):
@@ -504,9 +540,9 @@ class MambaPool:
                 # mamba layers/slots share one contiguous byte buffer; conv and
                 # temporal are strided views into it (see mem_cache/layout/
                 # page_major.py). Only the standard CUDA Triton path is supported.
-                assert not _is_npu and not (
-                    _is_cpu and _cpu_has_amx_support
-                ), "envelope_layout mamba is only supported on the CUDA path"
+                assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
+                    "envelope_layout mamba is only supported on the CUDA path"
+                )
                 max_slots = size + 1
                 entry_bytes = mamba_entry_bytes(
                     layer_num=num_mamba_layers,
@@ -849,8 +885,10 @@ class MambaPool:
             # physical buffers; zero the physical storage where it exists
             # (UnifiedMambaPool holds only the dense logical tensors).
             phys = getattr(self, "_intermediate_conv_window_phys", None)
-            for t in phys if phys is not None else (
-                self.mamba_cache.intermediate_conv_window
+            for t in (
+                phys
+                if phys is not None
+                else (self.mamba_cache.intermediate_conv_window)
             ):
                 t.zero_()
         if self.replayssm_write_pos is not None:
@@ -981,8 +1019,7 @@ class MambaPool:
         idx = int(slot)
         if idx < 1 or idx > self.size:
             raise ValueError(
-                f"state slot {idx} out of range; slots 1..{self.size} are "
-                "session slots"
+                f"state slot {idx} out of range; slots 1..{self.size} are session slots"
             )
         expected = set(self.state_blob_fields())
         got = set(blob.keys())
@@ -1148,9 +1185,7 @@ class MambaPool:
         rank = parallel.attn_tp_rank
 
         def _offset(total: int) -> int:
-            return sum(
-                tp_partition_size(total, tp_size, r, units) for r in range(rank)
-            )
+            return sum(tp_partition_size(total, tp_size, r, units) for r in range(rank))
 
         conv_offset = _offset(conv_dim_total)
         temporal_offset = _offset(num_heads_total)
@@ -1422,9 +1457,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
+        # Requests that arrive without a row are the ones this call allocates
+        # for. `super().alloc` returns a row for EVERY request in the batch
+        # (chunked continuations included), so it cannot be used to decide what
+        # a rollback may hand back -- see `_rollback_alloc` (#616).
+        needs_row = [r for r in reqs if r.req_pool_idx is None]
         select_index = super().alloc(reqs)
         if select_index is None:
             return None
+        fresh_rows = [r.req_pool_idx for r in needs_row]
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
@@ -1446,7 +1487,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     # that killed the scheduler AFTER partially mutating the
                     # pool.
                     self._rollback_alloc(
-                        reqs, select_index, fresh_state_reqs, fresh_pingpong_reqs
+                        reqs, fresh_rows, fresh_state_reqs, fresh_pingpong_reqs
                     )
                     self._log_mamba_alloc_failure("mamba state", len(reqs))
                     return None
@@ -1467,19 +1508,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         # state above: this is the exact site that killed
                         # rank 0 in the #581 boot-6 crash.
                         self._rollback_alloc(
-                            reqs, select_index, fresh_state_reqs, fresh_pingpong_reqs
+                            reqs, fresh_rows, fresh_state_reqs, fresh_pingpong_reqs
                         )
                         self._log_mamba_alloc_failure("mamba ping-pong", len(reqs))
                         return None
                     fresh_pingpong_reqs.append(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert len(select_index) == len(
-            mamba_indices
-        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        assert len(select_index) == len(mamba_indices), (
+            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
+                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -1534,7 +1575,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def _rollback_alloc(
         self,
         reqs: List[Req],
-        select_index: List[int],
+        fresh_rows: List[int],
         fresh_state_reqs: List[Req],
         fresh_pingpong_reqs: List[Req],
     ) -> None:
@@ -1558,14 +1599,21 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 self.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
                 req.mamba_pool_idx = None
             req.mamba_needs_clear = False
-        # Hand the request-pool rows back (mirrors ReqToTokenPool.free). Only
-        # the rows this call handed out are in `select_index`; requests that
-        # reused an existing row keep it.
-        taken = set(select_index)
+        # Hand the request-pool rows back (mirrors ReqToTokenPool.free).
+        #
+        # ONLY the rows this call took. `super().alloc` returns a row for every
+        # request in the batch, including chunked continuations that arrived
+        # already owning one, so rolling back that list returned live rows to
+        # the free list and cleared their owners' `req_pool_idx` -- the pool
+        # then handed one row to two requests (#616). `fresh_rows` is built
+        # from the requests that arrived without a row, which is exactly the
+        # set this call allocated.
+        taken = set(fresh_rows)
         for req in reqs:
             if req.req_pool_idx is not None and int(req.req_pool_idx) in taken:
                 req.req_pool_idx = None
-        self.free_slots = list(select_index) + self.free_slots
+        for idx in fresh_rows:
+            self.free_slot(idx, owner="alloc rollback", prepend=True)
 
     def _log_mamba_alloc_failure(self, what: str, num_reqs: int) -> None:
         """Rate-limited warning for a REQUIRED mamba allocation that could not
@@ -1685,7 +1733,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
                     1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                ], (
+                    f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                )
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -2044,7 +2094,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -2745,9 +2797,9 @@ class MHATokenToKVPool(KVCache):
         if N == 0:
             return
 
-        assert (
-            self._kv_copy_config is not None
-        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        assert self._kv_copy_config is not None, (
+            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        )
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
@@ -3982,13 +4034,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert (
-                    self.page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert self.page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                )
             else:
-                assert (
-                    self.page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                assert self.page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                )
         else:
             assert self.page_size == 64
         self._create_index_buffers()
