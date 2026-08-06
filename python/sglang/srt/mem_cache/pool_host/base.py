@@ -6,10 +6,13 @@ import threading
 from functools import wraps
 from typing import Optional
 
-import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pinned_host_budget import (
+    check_and_register_pinned_post,
+    unregister_pinned_post,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
@@ -111,7 +114,17 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        budget_label: Optional[str] = None,
+        budget_flag: str = "--hicache-size / --hicache-ratio",
     ):
+        # ``budget_label``/``budget_flag`` name this pool's post in the joint
+        # pinned-host-RAM guard (#550). They are parameters rather than class
+        # properties because the SAME MHATokenToKVPoolHost class backs both
+        # claimants: HiCache's L2 tier and kv-session-offload's spill pool, and
+        # a refusal has to tell the operator WHICH flag to lower. The defaults
+        # are HiCache's, so every pre-existing caller is unchanged.
+        self.budget_label = budget_label or type(self).__name__
+        self.budget_flag = budget_flag
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
@@ -143,21 +156,20 @@ class HostKVCache(abc.ABC):
                 device_pool.size,
             )
 
-        # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
+        # Verify there is enough available host memory -- for THIS pool plus
+        # every pinned pool already allocated in this process (#550). The
+        # figure comes from the #407 memtier profile, not psutil: under lxcfs
+        # /proc/meminfo does not describe what this container may have.
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+        check_and_register_pinned_post(
+            name=self.budget_label,
+            flag=self.budget_flag,
+            requested_bytes=requested_bytes,
+            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        )
+        logger.info(
+            f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+        )
 
         self.kv_buffer = self.init_kv_buffer()
 
@@ -176,6 +188,10 @@ class HostKVCache(abc.ABC):
         if getattr(self, "_destroyed", False):
             return
         self._destroyed = True
+        # The joint budget must stop charging for a buffer that is gone (#550),
+        # or a re-init inside one process would be refused for RAM nothing is
+        # holding any more.
+        unregister_pinned_post(getattr(self, "budget_label", type(self).__name__))
         buffers = getattr(self, "kv_buffer", None)
         if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
             if not isinstance(buffers, (list, tuple)):

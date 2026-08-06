@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import Optional
 
-import psutil
 import torch
 
 from sglang.jit_kernel.hicache import (
@@ -26,6 +26,7 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
+from sglang.srt.mem_cache.pinned_host_budget import check_and_register_pinned_post
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
@@ -97,6 +98,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        budget_label: Optional[str] = None,
+        budget_flag: str = "--hicache-size / --hicache-ratio",
     ):
         super().__init__(
             device_pool,
@@ -107,6 +110,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            budget_label=budget_label,
+            budget_flag=budget_flag,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
@@ -675,15 +680,13 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for MiniMax index-K hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
+        check_and_register_pinned_post(
+            name="MiniMax index-K host pool",
+            flag="--hicache-size / --hicache-ratio",
+            requested_bytes=requested_bytes,
+            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        )
         logger.info(
             "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",
             requested_bytes / 1e9,

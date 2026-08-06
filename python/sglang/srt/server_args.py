@@ -6827,48 +6827,89 @@ class ServerArgs:
                 "identity (static tier map vs per-session sentinels)."
             )
         if self.enable_hierarchical_cache or self.enable_unified_memory:
-            # #547. "Each is its own host tier" is a DESCRIPTION, not a reason,
-            # and it was the whole of the old message -- which left every reader
-            # unable to tell a physical impossibility from an unbuilt piece.
-            # From the code, it is the latter, and the two conflicts are these:
+            # #550, replacing the #547 blanket refusal. That refusal named two
+            # missing pieces rather than a physical conflict -- the host buffers
+            # are independent MHATokenToKVPoolHost objects, the key spaces are
+            # disjoint (kvso addresses host rows by sentinel slot ids strictly
+            # above the device allocator's range, HiCache by its own page
+            # indices and hash keys), and neither module reads the other's
+            # state. Both pieces are now supplied:
             #
-            # (1) NOBODY SUMS THE PINNED HOST RAM. kvso validates
-            #     --kv-session-offload-host-ram-gib alone (host_ram_budget_error,
-            #     once, in the launcher, against psutil available minus an OS
-            #     reserve); HiCache sizes its own MHATokenToKVPoolHost from
-            #     hicache_ratio/hicache_size and validates independently. Both
-            #     pools are PINNED, so an over-commit is not a swap, it is the
-            #     OOM killer picking an unrelated process on this swap-less box.
-            #     One joint budget check is the missing piece.
-            # (2) THE TRANSFER CONTENTION IS UNMEASURED. kvso streams a spilled
-            #     tail D2H/H2D on its own copy stream INSIDE the decode loop's
-            #     critical path; HiCache's controller runs backup and prefetch
-            #     on its own threads and streams. Both cross the same link into
-            #     pinned host memory. That is a latency interaction, not a
-            #     correctness one -- but the spill tick's latency budget is the
-            #     feature, so it must be measured before the pair is allowed.
+            # (1) THE PINNED HOST RAM IS SUMMED. Below, over configured numbers
+            #     only, in the single launcher process. The runtime backstop is
+            #     mem_cache.pinned_host_budget's registry, which makes the
+            #     second pinned allocation in a worker see the first.
+            # (2) THE TRANSFER CONTENTION IS STILL A MEASUREMENT, so the pair
+            #     is an OPT-IN rather than a default. kvso streams a spilled
+            #     tail D2H/H2D on its own copy stream inside the decode loop's
+            #     critical path while HiCache's controller runs backup and
+            #     prefetch on its own threads and streams; both cross the same
+            #     link into pinned host memory. It is a latency interaction,
+            #     never a correctness one -- but the spill tick's latency
+            #     budget IS the feature, so a number has to exist before this
+            #     becomes default-on. Writing the guard does not produce that
+            #     number, which is why lifting gap (1) does not lift gap (2).
             #
-            # What is NOT a conflict, and was checked rather than assumed: the
-            # host buffers are two independent MHATokenToKVPoolHost objects with
-            # separate lifecycles; the key spaces are disjoint (kvso addresses
-            # host rows by sentinel slot ids strictly above the device
-            # allocator's range, HiCache by its own page indices and hash keys);
-            # and neither module reads the other's state. The #242 lossless
-            # hand-over is even written FOR this pair (force_host_write_through)
-            # and is unreachable only because of this refusal.
-            raise ValueError(
-                "--enable-kv-session-offload cannot yet be combined with "
-                "--enable-hierarchical-cache or --enable-unified-memory "
-                "(task #547). Not a physical impossibility: the two host pools "
-                "are independent objects and their key spaces are disjoint. Two "
-                "things are missing. (1) Nothing sums the PINNED host RAM of "
-                "the two pools -- each validates its own budget alone, and an "
-                "over-commit of pinned memory invokes the OOM killer instead of "
-                "swapping. (2) The contention between kvso's in-critical-path "
-                "spill copies and HiCache's backup/prefetch transfers over the "
-                "same link has never been measured, and the spill tick's "
-                "latency budget is the whole feature."
+            # The sum is checked HERE and not per rank for the reason spelled
+            # out at kv_session_offload.host_ram_budget_error: `available`
+            # shrinks as each rank pins its share, so a per-rank check against
+            # live availability can pass on rank 0 and raise on rank 2 -- a
+            # rank-divergent boot decision, which is an NCCL hang rather than
+            # an error.
+            #
+            # --hicache-ratio is a multiple of the DEVICE KV pool, whose size
+            # is not known until the model is loaded and the memory profile has
+            # run. There is no honest parse-time number for it, so that case is
+            # left to the runtime registry instead of being priced with a
+            # guess; --hicache-size is absolute and is summed exactly.
+            from sglang.srt.mem_cache.pinned_host_budget import (
+                PinnedHostPost,
+                hicache_configured_host_bytes,
+                joint_pinned_host_error,
+                pinned_host_memory_bytes,
             )
+
+            _hicache_bytes = hicache_configured_host_bytes(
+                getattr(self, "hicache_size", 0) or 0,
+                getattr(self, "hicache_ratio", 0) or 0,
+            )
+            _kvso_bytes = int(
+                (self.kv_session_offload_host_ram_gib or 0) * (1024**3)
+            )
+            if _hicache_bytes is not None and _kvso_bytes > 0:
+                _total, _available = pinned_host_memory_bytes()
+                _err = joint_pinned_host_error(
+                    [
+                        PinnedHostPost(
+                            name="HiCache host tier",
+                            flag="--hicache-size",
+                            nbytes=_hicache_bytes,
+                        ),
+                        PinnedHostPost(
+                            name="kv-session-offload spill pool",
+                            flag="--kv-session-offload-host-ram-gib",
+                            nbytes=_kvso_bytes,
+                        ),
+                    ],
+                    _total,
+                    _available,
+                )
+                if _err is not None:
+                    raise ValueError(_err)
+            if os.environ.get("KVSO_ALLOW_HICACHE", "0") != "1":
+                raise ValueError(
+                    "--enable-kv-session-offload x --enable-hierarchical-cache"
+                    "/--enable-unified-memory is an OPT-IN combination (task "
+                    "#550): set KVSO_ALLOW_HICACHE=1. It is no longer refused "
+                    "as unbuildable -- the two host pools are independent "
+                    "objects with disjoint key spaces, and their PINNED host "
+                    "RAM is now summed by one joint budget guard instead of "
+                    "each validating alone. What remains is a measurement, not "
+                    "a mechanism: the contention between kvso's "
+                    "in-critical-path spill copies and HiCache's "
+                    "backup/prefetch transfers over the same link, which "
+                    "decides the spill tick's latency budget."
+                )
         if self.enable_hisparse:
             raise ValueError(
                 "--enable-kv-session-offload cannot be combined with "
