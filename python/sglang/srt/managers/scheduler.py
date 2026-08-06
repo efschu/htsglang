@@ -1163,6 +1163,33 @@ class Scheduler(
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
+        self.warm_sampling_backend()
+
+    def warm_sampling_backend(self):
+        """#603b: make the sampling JIT kernels resident BEFORE serving starts.
+
+        The flashinfer sampling module is built lazily on its first call, which
+        lands inside ``Sampler.forward`` -- i.e. inside a serving forward, on a
+        rank its peers are waiting for. On a cold cache that is a 60-90 s nvcc
+        compile, and it produced seven ``Bar1CollectiveAborted`` crashes on
+        2026-08-06 (py-spy caught two ranks in ``run_ninja`` and one on the
+        build's ``FileLock``). See ``layers/sampler_warmup.py`` for the full
+        mechanism, including why the heterogeneous arch-keyed cache makes the
+        two same-arch ranks serialise against each other.
+
+        Placed here rather than inside the Sampler because this point is
+        rank-uniform and unconditional: every rank reaches ``init_model_worker``
+        exactly once, after capture and before the event loop, so the barrier
+        inside the warmup pairs up by construction.
+        """
+        from sglang.srt.layers.sampler_warmup import warm_sampling_backend_kernels
+
+        status = warm_sampling_backend_kernels(
+            self.server_args.sampling_backend,
+            self.tp_worker.device,
+            tp_group=self.tp_group,
+        )
+        logger.info("sampling-backend JIT warmup: %s", status)
 
         model_runner = self.tp_worker.model_runner
         # post_capture_kv_active gate: the #330 vram-dial lane also sets the
