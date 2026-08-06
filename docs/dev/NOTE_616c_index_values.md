@@ -405,3 +405,62 @@ the same path, reached when `uneven_dcp_weighted` is off.
 distinct wedge sites say the host pins wherever it next touches a stalled
 queue, so even a wired 529 fix is expected to relocate the wedge rather than
 cure it, until the reason a device queue stops draining is itself understood.
+
+## 13. The wedge is NOT a collective desync — falsified two independent ways
+
+Two instruments, both already armed during the wedged soak, agree that the
+ranks were in step:
+
+1. **#583 collective census.** No cross-rank divergence was ever reported, and
+   the local dumps at abort time are byte-identical between the ranks that
+   emitted them (`dcp.all_gather 4480x`, `dcp.all_reduce 320x`,
+   `tp.all_gather 504x`, `tp.all_reduce 31809x`, `tp.broadcast 42231x`).
+2. **barlink per-rank launch sampler** (`/spinning/wedge-catch-603b/launch_rank*.log`,
+   1 Hz, host-side only by design so it cannot sync behind a wedged spin).
+   At 17:47:59 all three ranks carry the SAME last-op records, per group:
+   `all_gather 192512`, `broadcast 32`, `broadcast 24`, `all_gather 192512`.
+
+So the ranks issued the same collectives, of the same sizes, in the same
+order. **The wedge is not a pairing shift and not a count divergence.** Any
+future work should stop looking for one; that hypothesis is spent.
+
+### The hypothesis this leaves
+
+If every rank has enqueued the same collective and all three are nonetheless
+blocked in the next host sync, the queue is not waiting on a missing peer — it
+is busy. `Bar1CollectiveAborted` is then a CONSEQUENCE: a peer's spin kernel
+hits its 300e9-cycle deadline because the GPU it waits on is still executing,
+not because the matching launch never came.
+
+That points at the device work immediately preceding the sync in
+`build_dcp_weighted_kv_indices`: `create_flashinfer_kv_indices_triton`, whose
+per-request loop is `cdiv(seq_len, 128)` iterations, and the
+`torch.empty(max(total, 1))` sitting right before it. A pathological
+`paged_kernel_lens` / `total` would make either of them enormous, and would do
+so on ALL ranks at once because the value comes from replicated scheduler
+state. That matches the observed "all three ranks on the same line".
+
+This is a hypothesis, not a finding. The measurement that would settle it is
+the VALUE of `total` and `max(paged_kernel_lens)` at wedge time. Note that
+reading them costs a sync, so the honest instrument is the same one that
+worked for the index assert: let the run fault/abort and recover the values
+post-mortem, rather than adding a hot-path probe that perturbs the window
+(NOTE_616b section 3).
+
+### Why the per-site D2H removal was dropped
+
+`owner.py` contains a SECOND, unavoidable host sync a few lines below 529:
+`kv_indices = compact[owned].contiguous()` (line 566) is boolean-mask
+indexing, which calls `nonzero()` and must sync to learn the output size.
+Removing only the `.item()` at 529 therefore cannot make the function
+sync-free, and on the above hypothesis the sync is not the cause anyway --
+it is merely where the wait becomes visible.
+
+A `total_tokens` channel is kept on `build_dcp_weighted_kv_indices` (inert by
+default, no call site passes it) because it is harmless and documents the
+option. The plumbing that would have fed it was written and then **dropped on
+purpose**: it derived the total from `extend_prefix_lens_cpu`, which is not
+guaranteed on every model/path, so it would have been a model-dependent fix in
+what is a model-independent communication and sharding layer -- and a wrong
+total silently mis-sizes an attention index buffer. Not a trade worth making
+for a sync that is not the root.
