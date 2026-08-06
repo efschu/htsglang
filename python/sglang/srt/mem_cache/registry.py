@@ -103,6 +103,8 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
         return _create_unified_radix_cache(ctx, server_args, params)
 
+    # Hybrid SSM/SWA under hierarchical cache ALWAYS takes UnifiedRadixCache.
+    # HiMambaRadixCache has no construction site anywhere (see its module docstring).
     if ctx.enable_hierarchical_cache:
         if ctx.is_hybrid_ssm or ctx.is_hybrid_swa:
             # HybridModel launches HiCache via UnifiedRadixCache by default.

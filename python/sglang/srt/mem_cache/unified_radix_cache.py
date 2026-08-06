@@ -953,7 +953,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if is_insert:
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
-                priority=getattr(req, "priority", 0) or 0,
+                priority=req.priority or 0,
                 force_host_write_through=requests_forced_host_write_through(req),
             )
 
@@ -993,7 +993,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
@@ -1024,7 +1024,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1083,7 +1083,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
         )
         lock_result = self.inc_lock_ref(new_last_node)
 
