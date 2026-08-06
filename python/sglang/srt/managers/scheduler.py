@@ -1163,33 +1163,6 @@ class Scheduler(
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
-        self.warm_sampling_backend()
-
-    def warm_sampling_backend(self):
-        """#603b: make the sampling JIT kernels resident BEFORE serving starts.
-
-        The flashinfer sampling module is built lazily on its first call, which
-        lands inside ``Sampler.forward`` -- i.e. inside a serving forward, on a
-        rank its peers are waiting for. On a cold cache that is a 60-90 s nvcc
-        compile, and it produced seven ``Bar1CollectiveAborted`` crashes on
-        2026-08-06 (py-spy caught two ranks in ``run_ninja`` and one on the
-        build's ``FileLock``). See ``layers/sampler_warmup.py`` for the full
-        mechanism, including why the heterogeneous arch-keyed cache makes the
-        two same-arch ranks serialise against each other.
-
-        Placed here rather than inside the Sampler because this point is
-        rank-uniform and unconditional: every rank reaches ``init_model_worker``
-        exactly once, after capture and before the event loop, so the barrier
-        inside the warmup pairs up by construction.
-        """
-        from sglang.srt.layers.sampler_warmup import warm_sampling_backend_kernels
-
-        status = warm_sampling_backend_kernels(
-            self.server_args.sampling_backend,
-            self.tp_worker.device,
-            tp_group=self.tp_group,
-        )
-        logger.info("sampling-backend JIT warmup: %s", status)
 
         model_runner = self.tp_worker.model_runner
         # post_capture_kv_active gate: the #330 vram-dial lane also sets the
@@ -1310,6 +1283,55 @@ class Scheduler(
                 context_len=self.model_config.context_len,
                 startup_available_gpu_memory_gb=avail_mem,
             )
+
+        # #603b: LAST in this method, after every worker, pool, backend and
+        # graph exists. The warmup ends in a group barrier, so it must sit at a
+        # point every rank reaches exactly once with the model fully built.
+        self.warm_sampling_backend()
+
+    def warm_sampling_backend(self):
+        """#603b: make the sampling JIT kernels resident BEFORE serving starts.
+
+        The flashinfer sampling module is built lazily on its first call, which
+        lands inside ``Sampler.forward`` -- i.e. inside a serving forward, on a
+        rank its peers are waiting for. On a cold cache that is a 60-90 s nvcc
+        compile, and it produced seven ``Bar1CollectiveAborted`` crashes on
+        2026-08-06 (py-spy caught two ranks in ``run_ninja`` and one on the
+        build's ``FileLock``). See ``layers/sampler_warmup.py`` for the full
+        mechanism, including why the heterogeneous arch-keyed cache makes the
+        two same-arch ranks serialise against each other.
+
+        Placed here rather than inside the Sampler because this point is
+        rank-uniform and unconditional: every rank reaches ``init_model_worker``
+        exactly once, after capture and before the event loop, so the barrier
+        inside the warmup pairs up by construction.
+        """
+        from sglang.srt.layers.sampler_warmup import warm_sampling_backend_kernels
+
+        # NOT `self.tp_group`: that attribute is assigned later in __init__ than
+        # `init_model_worker()` runs, so reading it here raised
+        # `AttributeError: 'Scheduler' object has no attribute 'tp_group'` and
+        # killed the boot (observed on-card, window boot 438456). The group
+        # itself exists by now -- the model worker is built and its collectives
+        # have run -- so resolve it from the registry the same way __init__
+        # later does, instead of depending on attribute-assignment order.
+        try:
+            group = get_tp_group()
+        except Exception as exc:  # noqa: BLE001 - warmup must not kill a boot
+            logger.warning(
+                "sampling-backend JIT warmup: no TP group available (%s: %s); "
+                "warming without the rendezvous barrier.",
+                type(exc).__name__,
+                exc,
+            )
+            group = None
+
+        status = warm_sampling_backend_kernels(
+            self.server_args.sampling_backend,
+            self.tp_worker.device,
+            tp_group=group,
+        )
+        logger.info("sampling-backend JIT warmup: %s", status)
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
