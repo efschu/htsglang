@@ -174,11 +174,23 @@ outside it, in the same time envelope, with an identical three-rank stack.
 Evidence: `/spinning/616b-hunter4/bmrun/baremetal_wedge_dumps.txt` (bare
 metal), `hostrun/dockerhost_wedge_dumps.txt` (docker), `armB/`, `armD/` (LXC).
 
-Scope this honestly: what is falsified is the LXC axis for the WEDGE family.
-The INDEX-ASSERT family was not observed on bare metal within this window, so
-for that family the LXC axis is untested rather than excluded — though the two
-families share one load and one code path, and nothing about the assert's
-mechanism (§1) is container-related.
+A SECOND bare-metal run (same host, same everything, caches warm) was then made
+specifically to look for the index assert: it stayed **healthy for 7.4 min /
+159 completions with ZERO index asserts and zero BAR1 aborts**, and was stopped
+deliberately. That is past both LXC index-assert times (233 s and 311 s).
+
+Scope this honestly, because n is small and the two families compete:
+- The WEDGE family: falsified as LXC-specific. Reproduced bare metal, docker,
+  and LXC, same line, same envelope.
+- The INDEX-ASSERT family: **NOT excluded and NOT confirmed** for the LXC axis.
+  One clean 7.4-min bare-metal run is not evidence of absence — LXC arm D also
+  ran 420 s under the same load without asserting, so a single clean run is
+  well inside the observed variance of the LXC side itself. Deciding this axis
+  needs several bare-metal runs that each reach the assert or clearly outlast
+  the envelope; that is named work, not a conclusion.
+
+Nothing about the assert's mechanism (§1 — a size disagreement between an index
+tensor and the tensor it gathers from) is container-related on its face.
 
 Confounds recorded for the bare-metal arm:
 - The Proxmox host (Debian 13) has no python3.12; the venv's base interpreter
