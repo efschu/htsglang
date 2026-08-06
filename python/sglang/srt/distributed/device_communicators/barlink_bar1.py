@@ -3032,7 +3032,7 @@ class BarlinkBar1Transport:
             peer_flag[r] = z.flag.dev_ptr
         peer_payload[self.rank] = self._own[0]
         peer_flag[self.rank] = self._own_flag[0]
-        self._note_launch("all_reduce", nbytes)
+        self._note_launch("all_reduce", nbytes, kernel_variant)
         self._ext.bar1_all_reduce(
             inp, out, int(self.rank), int(self.world),
             0 if algo == "mesh" else 1,
@@ -3372,7 +3372,7 @@ class BarlinkBar1Transport:
             pipe_fbase,
         )
 
-        self._note_launch("all_reduce/mesh_pipe", nbytes)
+        self._note_launch("all_reduce/mesh_pipe", nbytes, kernel_variant)
         self._pipe_ext.bar1_mesh_pipe(
             inp, out, int(self.rank), int(self.world),
             peer_payload, peer_flag, peer_result,
@@ -4096,7 +4096,7 @@ class BarlinkBar1Transport:
         # "all_to_all" made an 8-byte broadcast be reported as an 8-byte
         # all_to_all -- a collective no seam in the decode loop issues, which
         # is why the 2026-08-06 crash triage went looking for one.
-        self._note_launch(op_label, int(moved))
+        self._note_launch(op_label, int(moved), kernel_variant)
         self._ext.bar1_all_to_all(
             inp, output, int(self.rank), int(R),
             [int(x) for x in send_off], [int(x) for x in send_bytes],
@@ -4384,7 +4384,9 @@ class BarlinkBar1Transport:
 
     # -- The loud abort (#431 fix 2) -----------------------------------------
 
-    def _note_launch(self, op: str, nbytes: int) -> None:
+    def _note_launch(
+        self, op: str, nbytes: int, variant: Optional[int] = None
+    ) -> None:
         """Record what is about to be launched. Three stores, no allocation.
 
         Under stream capture the kernel is RECORDED, not executed, so there
@@ -4394,6 +4396,14 @@ class BarlinkBar1Transport:
         is that this transport's kernels are now inside a graph and will run
         on every replay with no host code between them; that is what
         ``_captured_launches`` arms.
+
+        ``variant`` is the kernel choice from ``_kernel`` (1 = cooperative
+        grid, 0 = 1blk). It is passed only so the capture census can record
+        it: the choice is derived from ``moved`` bytes, and where ``moved`` is
+        not rank-uniform the ranks bake DIFFERENT kernels into the same
+        collective -- a divergence no other instrument in this tree can see
+        (#603b). Not stored on the hot-path attributes; the census call below
+        is already gated on capture, so a serving replay pays nothing.
         """
         self._last_op = op
         self._last_nbytes = int(nbytes)
@@ -4404,6 +4414,14 @@ class BarlinkBar1Transport:
         if graph_capture_running():
             self._captured_launches = True
             self._last_op_captured = True
+            # #603b: this launch is being BAKED INTO A GRAPH. Everything the
+            # replay will do is decided here, and nothing observes it later --
+            # so it is recorded here or not at all.
+            from sglang.srt.distributed.device_communicators import (
+                barlink_capture_census,
+            )
+
+            barlink_capture_census.note(op, int(nbytes), variant)
         else:
             self._unchecked_launches += 1
             self._last_op_captured = False

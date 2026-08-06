@@ -1114,6 +1114,23 @@ Off by default (`SGLANG_BARLINK_RECORD_DECISIONS=1`, read ONCE at import —
 on a wedged run but does nothing on its own, because recorders are only built
 from `record_decision`, which returns early when recording is off, `:250`
 — #500-B20).
+**Capture census** (`barlink_capture_census.py`, #603b): the same
+rank-uniformity question as the #431 recorder above, asked one level deeper —
+inside a captured CUDA graph. Records every barlink BAR1 collective baked into
+each graph (`op`, `nbytes`, kernel variant, callsite), keyed by ShapeKey, and
+diffs the per-rank sequences over the gloo group ONCE per boot at the first
+`_census_tick`. Fills a structural blind spot shared by both existing
+instruments: the #583 census counts host-side calls and a replay makes none,
+and `barlink_launch_dump`'s `_unchecked_launches` deliberately does not advance
+under capture. ARMED BY DEFAULT (`SGLANG_BARLINK_CAPTURE_CENSUS=0` disables;
+`..._DIR` moves the per-rank dump), zero replay cost because nothing runs
+outside a capture. The #431 `CollectiveDecision` recorder was deliberately NOT
+reused: it has no field for the kernel variant and no notion of which graph a
+decision belongs to, and it is an unbounded host-path recorder that is off by
+default. FIRST ON-CARD RESULT (2026-08-06, TP=3 uneven DCP + NEXTN + bar1 on
+world/tp/dcp): sequences AGREE on all three ranks, 4 segments, 840 collectives
+— so the "ranks baked different graphs" hypothesis for the #603b shape-B wedge
+is falsified, and the recorded-graph axis is closed.
 **#279 path dispatcher**: flag-gated (`SGLANG_BARLINK_PATH_DISPATCHER=1`, read at
 call time, `barlink_path_dispatcher.py:428`) and inert — a fresh dispatcher has
 an EMPTY registry, so every decision is the status-quo #240 choice (`:431-443`).

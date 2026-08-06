@@ -412,6 +412,40 @@ second wedge shape — all three ranks blocked in `check_after_graph_replay` →
 graph replay, with NO compiler running and warm caches — was still observed
 afterwards (crashes #8/#9) and is not explained by this change.
 
+## 2.3 What each rank baked into its CUDA graphs (#603b capture census)
+
+**Armed by default.** During CUDA-graph capture, every barlink BAR1 collective
+is recorded per graph — `op | nbytes | kernel variant | callsite`, in order —
+and the per-rank sequences are compared across ranks ONCE, on the gloo CPU
+group, at the first `_census_tick` after boot. One line per rank says either
+that the sequences agree or which graph, which position and which field
+diverged. A per-rank dump is written to
+`$SGLANG_BARLINK_CAPTURE_CENSUS_DIR/capture_census_rank<N>.txt`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SGLANG_BARLINK_CAPTURE_CENSUS` | `1` (on) | `0` disables recording and the comparison |
+| `SGLANG_BARLINK_CAPTURE_CENSUS_DIR` | `/spinning/wedge-catch-603b` | where the per-rank dump is written |
+
+**Why it exists.** The #583 collective census counts HOST-side calls, and a
+captured collective is a host call exactly once per boot — at capture. Every
+replay afterwards makes no host call at all, so the count census is
+structurally blind to what a replayed graph does, which is where the shape-B
+wedge sits. The launch record (`barlink_launch_dump`) is blind in the same
+place: `_unchecked_launches` deliberately does not advance under capture, so at
+wedge time its fields describe the last host-path collective. This is the only
+instrument in the tree that can see inside a captured graph.
+
+**Cost.** Zero on replay — nothing here runs outside a capture. At capture it
+is one tuple append plus a short frame walk per collective (840 collectives on
+the TP=3 INT8 NEXTN boot), and one small `all_gather_object` once per boot.
+
+**Result of the first on-card run** (2026-08-06 12:33:39, TP=3 uneven DCP,
+NEXTN, bar1 on all three groups): the sequences **AGREE** on all three ranks —
+4 graph segments, 840 collectives, identical op/size/variant/callsite lists.
+So "the ranks captured different graphs" is FALSIFIED as the shape-B root; the
+divergence, wherever it is, is not in what was baked into the graphs.
+
 ## 3. Mandatory boot flags
 
 **The usability trias is a STANDARD boot setting, not a tuning knob** (user
