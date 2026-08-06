@@ -410,6 +410,12 @@ class Envs:
     # nondeterministic resume (or a checkpoint at a wrong position) can be
     # attributed from server logs.
     SGLANG_MAMBA_CKPT_DEBUG = EnvBool(False)
+    # #581 mamba pin trace: emit one line per rank every N scheduler ticks
+    # with the transfer-queue depths, the outstanding write-through and
+    # load-back pin counts, the protected/evictable sizes, and the
+    # inc/dec_lock_ref traffic per call site since the previous line. 0 = off
+    # (default; the traced path is not entered at all).
+    SGLANG_MAMBA_PIN_TRACE = EnvInt(0)
     # Zero the attention KV data buffers on /flush_cache (default ON, set 0
     # to opt out): a flushed server must match a fresh boot bit-for-bit even
     # if some kernel folds residual bytes beyond the valid region into its

@@ -5,14 +5,17 @@ import heapq
 import json
 import logging
 import os
+import sys
 import threading
 import time
+from collections import Counter
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -222,6 +225,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self._write_through_inflight: dict[int, int] = {}
         self._mamba_pin_budget_cached: Optional[int] = None
         self._mamba_pin_skipped = 0
+        self._init_pin_trace()
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -254,6 +258,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self._write_through_pinned = {}
         self._write_through_inflight = {}
         self._mamba_pin_skipped = 0
+        self._init_pin_trace()
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_full_device_leaves.clear()
         self.evictable_full_host_leaves.clear()
@@ -578,6 +583,62 @@ class HiMambaRadixCache(MambaRadixCache):
             # write to host if the node is not backuped
             self.write_backup(node)
 
+    # ---- #581 pin trace (SGLANG_MAMBA_PIN_TRACE, default off) --------------
+
+    def _init_pin_trace(self) -> None:
+        """Arm the per-tick pin trace from the environment.
+
+        `SGLANG_MAMBA_PIN_TRACE=N` emits one line every N scheduler ticks; 0
+        (default) leaves every traced path unentered, so the default behaviour
+        is unchanged apart from one attribute test per lock operation.
+        """
+        self._pin_trace_every = int(envs.SGLANG_MAMBA_PIN_TRACE.get())
+        self._pin_trace_ticks = 0
+        self._pin_trace_ops: Counter = Counter()
+
+    def _record_pin_trace_op(self, op: str, mamba_moved: bool) -> None:
+        """Attribute one lock operation to its immediate caller.
+
+        `op` is "inc"/"dec"; `mamba_moved` says whether a MAMBA ref actually
+        changed hands (the full-lock walk happens on every call and is not
+        what exhausts the state pool).
+        """
+        site = sys._getframe(2).f_code.co_name
+        self._pin_trace_ops[(op, site)] += 1
+        if mamba_moved:
+            self._pin_trace_ops[(op + "_mamba", site)] += 1
+
+    def _emit_pin_trace(self) -> None:
+        """One line per rank per N ticks. Counters are since the previous line."""
+        self._pin_trace_ticks += 1
+        if self._pin_trace_ticks % self._pin_trace_every:
+            return
+
+        ops = " ".join(
+            f"{op}@{site}={count}"
+            for (op, site), count in sorted(self._pin_trace_ops.items())
+        )
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        logger.info(
+            "MAMBA-PIN-TRACE tick=%d ack_write=%d ack_load=%d "
+            "wt_pins=%d wt_inflight=%d lb_pins=%d "
+            "ongoing_wt=%d ongoing_lb=%d "
+            "protected=%d evictable=%d mamba_avail=%s ops[%s]",
+            self._pin_trace_ticks,
+            len(self.cache_controller.ack_write_queue),
+            len(self.cache_controller.ack_load_queue),
+            sum(self._write_through_pinned.values()),
+            sum(self._write_through_inflight.values()),
+            sum(self._load_back_pins.values()),
+            len(self.ongoing_write_through),
+            len(self.ongoing_load_back),
+            self.mamba_protected_size(),
+            self.mamba_evictable_size(),
+            "?" if mamba_allocator is None else mamba_allocator.available_size(),
+            ops,
+        )
+        self._pin_trace_ops.clear()
+
     #: Contribution of a rank with an EMPTY transfer queue to the cross-rank
     #: MIN below: "I impose no constraint", not "drain nothing".
     _NO_ACK_CONSTRAINT = 1 << 30
@@ -696,6 +757,9 @@ class HiMambaRadixCache(MambaRadixCache):
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
+
+        if self._pin_trace_every:
+            self._emit_pin_trace()
 
         if self.enable_storage:
             self.drain_storage_control_queues()
@@ -1442,10 +1506,14 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.mamba_evictable_size_ -= len(node.mamba_value)
                 self.mamba_protected_size_ += len(node.mamba_value)
             node.mamba_lock_ref += 1
+            if self._pin_trace_every:
+                self._record_pin_trace_op("inc", True)
         else:
             result.skip_lock_node_ids.setdefault(ComponentType.MAMBA, set()).add(
                 node.id
             )
+            if self._pin_trace_every:
+                self._record_pin_trace_op("inc", False)
 
         while node != self.root_node:
             if node.evicted:
@@ -1482,15 +1550,18 @@ class HiMambaRadixCache(MambaRadixCache):
         skipped_mamba = node.id in _skipped_ids(params, ComponentType.MAMBA)
         skipped_full = _skipped_ids(params, ComponentType.FULL)
 
-        if (
+        released_mamba = (
             not skipped_mamba
             and node.mamba_value is not None
             and node.mamba_lock_ref > 0
-        ):
+        )
+        if released_mamba:
             if node.mamba_lock_ref == 1:
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 self.mamba_protected_size_ -= len(node.mamba_value)
             node.mamba_lock_ref -= 1
+        if self._pin_trace_every:
+            self._record_pin_trace_op("dec", released_mamba)
 
         while node != self.root_node:
             if node.evicted or node.id in skipped_full:

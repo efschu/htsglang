@@ -54,6 +54,7 @@ against a fake cache controller, so no GPU and no host pool assembly.
 import threading
 import unittest
 from array import array
+from collections import Counter
 from typing import List, Optional
 
 import torch
@@ -890,6 +891,85 @@ class TestMultiTurnRetireReturnsEveryCheckpoint(unittest.TestCase):
         )
         self.assertEqual(_locked_nodes(tree), [])
         self.assertGreater(tree.mamba_evictable_size(), 0)
+
+
+class TestPinTrace(unittest.TestCase):
+    """SGLANG_MAMBA_PIN_TRACE: the field diagnostic for #581.
+
+    Production gives `mamba_protected` only in the dying breath. This emits
+    the pin ledger every N scheduler ticks so a ramp can be attributed to a
+    queue depth and a call site while it is still climbing.
+    """
+
+    def test_trace_line_renders_with_the_pin_ledger(self):
+        with envs.SGLANG_MAMBA_PIN_TRACE.override(1):
+            tree, allocator, pool = _build_hi(mamba_size=16)
+            self.assertEqual(tree._pin_trace_every, 1)
+            node = _insert(tree, allocator, pool, list(range(2000, 2032)))
+            tree.inc_lock_ref(node)
+            with self.assertLogs(
+                "sglang.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
+            ) as captured:
+                tree.check_hicache_events()
+
+        line = next(m for m in captured.output if "MAMBA-PIN-TRACE" in m)
+        for field in (
+            "tick=",
+            "ack_write=",
+            "ack_load=",
+            "wt_pins=",
+            "wt_inflight=",
+            "lb_pins=",
+            "ongoing_wt=",
+            "ongoing_lb=",
+            "protected=",
+            "evictable=",
+            "mamba_avail=",
+            "ops[",
+        ):
+            self.assertIn(field, line)
+        # `protected` counts SLOTS, not refs: this node carries two refs (the
+        # insert's write-through pin and the explicit lock) but one slot.
+        self.assertIn("protected=1", line)
+        self.assertIn("wt_pins=1", line)
+        self.assertEqual(node.mamba_lock_ref, 2)
+        # inc/dec traffic is attributed to the calling function.
+        self.assertIn("inc_mamba@write_backup=1", line)
+        self.assertIn("inc_mamba@test_trace_line_renders_with_the_pin_ledger=1", line)
+
+    def test_counters_reset_between_lines(self):
+        with envs.SGLANG_MAMBA_PIN_TRACE.override(1):
+            tree, allocator, pool = _build_hi(mamba_size=16)
+            _insert(tree, allocator, pool, list(range(2000, 2032)))
+            with self.assertLogs(
+                "sglang.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
+            ) as first:
+                tree.check_hicache_events()
+            with self.assertLogs(
+                "sglang.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
+            ) as second:
+                tree.check_hicache_events()
+
+        self.assertIn("inc_mamba@write_backup=1", first.output[0])
+        line = next(m for m in second.output if "MAMBA-PIN-TRACE" in m)
+        self.assertIn("ops[]", line)
+
+    def test_interval_throttles_the_line(self):
+        with envs.SGLANG_MAMBA_PIN_TRACE.override(3):
+            tree, allocator, pool = _build_hi(mamba_size=16)
+            with self.assertLogs(
+                "sglang.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
+            ) as captured:
+                for _ in range(6):
+                    tree.check_hicache_events()
+        self.assertEqual(sum(1 for m in captured.output if "MAMBA-PIN-TRACE" in m), 2)
+
+    def test_default_is_off(self):
+        """Unset env: the traced path is never entered."""
+        tree, _, _ = _build_hi(mamba_size=16)
+        self.assertEqual(tree._pin_trace_every, 0)
+        tree.check_hicache_events()
+        self.assertEqual(tree._pin_trace_ops, Counter())
 
 
 if __name__ == "__main__":
