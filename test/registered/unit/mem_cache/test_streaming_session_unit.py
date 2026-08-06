@@ -44,6 +44,25 @@ class _FakeInnerCache:
         return None
 
 
+class _FakeReqToTokenPool(SimpleNamespace):
+    """Stub pool mirroring the slice of ReqToTokenPool the session touches.
+
+    ``free_slot`` refuses a row that is already free, exactly as the real pool
+    does (#616), so a double return shows up here as a loud failure rather than
+    a silently duplicated free list.
+    """
+
+    def free_slot(self, idx, *, owner="request", prepend=False):
+        if idx is None:
+            raise ValueError(f"{owner} returned a null req_pool_idx")
+        if idx in self.free_slots:
+            raise ValueError(f"{owner} returned req_pool_idx={idx} twice")
+        if prepend:
+            self.free_slots.insert(0, idx)
+        else:
+            self.free_slots.append(idx)
+
+
 class _FakeReq:
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
@@ -93,7 +112,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
     the session: session=None, abort_req() called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(
         req_to_token_pool,
@@ -141,7 +160,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     slot is created from req state and nuked via release_session."""
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
@@ -170,7 +189,7 @@ def test_nth_mid_abort_nukes_session_slot():
     in req_nodes for next turn's re-prefill."""
     page_size = 1
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
@@ -218,7 +237,7 @@ def test_trim_overshoot_postcondition():
     """
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
     tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)

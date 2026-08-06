@@ -218,10 +218,43 @@ class StreamingSession(BasePrefixCache):
         if slot is None or slot.req_pool_idx is None:
             return None
         if req.to_finish is not None:
+            if req.req_pool_idx == slot.req_pool_idx:
+                # An earlier scheduling cycle already lent this row to the req
+                # (chunked prefill / a retry after the scheduler declined the
+                # batch), so the row and the mamba state are named twice: by
+                # the slot and by the req.
+                #
+                # Detaching hands the req to the normal abort path, which frees
+                # everything it holds. `abort_req` also clears the session's
+                # in-flight flag, which is the only thing making
+                # SessionController._close DEFER the release -- so the slot
+                # would then return the very same row and mamba state a second
+                # time (#616). Ownership rests with the req from here; the slot
+                # relinquishes its claim and the session's next turn
+                # re-prefills.
+                self._relinquish_lent_resources(slot)
             req.session.abort_req()
             req.session = None
             return None
         return slot
+
+    @staticmethod
+    def _relinquish_lent_resources(slot: SessionSlot) -> None:
+        """Drop a slot's claim on resources now owned by a live request.
+
+        Only the claim is dropped -- nothing is freed here, because the request
+        that holds them frees them on its own path. `last_node` /
+        `cache_protected_len` / `swa_uuid_for_lock` are deliberately kept: the
+        tree lock is the slot's own and `release_session` must still drop it.
+        """
+        slot.req_pool_idx = None
+        slot.kv_committed_len = 0
+        slot.kv_allocated_len = 0
+        slot.mamba_pool_idx = None
+        slot.mamba_ping_pong_track_buffer = None
+        slot.mamba_next_track_idx = None
+        slot.mamba_last_track_seqlen = None
+        slot.mamba_branching_seqlen = None
 
     # -- BasePrefixCache abstract methods --
 
@@ -434,7 +467,13 @@ class StreamingSession(BasePrefixCache):
                     slot.req_pool_idx, start:end
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+            self.req_to_token_pool.free_slot(
+                slot.req_pool_idx, owner=f"session {session_id}"
+            )
+            # The slot no longer names the row. Without this a second release
+            # of the same slot object (the mid-abort path builds an ephemeral
+            # slot and releases it) would return the row a second time.
+            slot.req_pool_idx = None
 
         self._free_slot_mamba(slot)
 
