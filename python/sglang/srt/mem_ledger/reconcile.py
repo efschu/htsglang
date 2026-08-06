@@ -44,6 +44,7 @@ from sglang.srt.mem_ledger.engine import (
     TERM_ATTN_WORKSPACE,
     TERM_GRAPH_CAPTURE,
     TERM_HARDWARE_RESIDUAL,
+    TERM_LOAD_TRANSIENT,
     TERM_MAMBA_POOL,
     TERM_NVML_CARVE_OUT,
     TERM_PARENT_CONTEXT,
@@ -91,6 +92,13 @@ TERM_TO_POST: Dict[str, Tuple[Tuple, str]] = {
         ("field", "non_torch_bytes", "weights_loaded"),
         "CUDA context + allocator granularity + lazy workspaces are exactly "
         "the bytes NVML charges this pid that torch does not account for",
+    ),
+    TERM_LOAD_TRANSIENT: (
+        ("field", "allocator_transient_bytes", "weights_loaded"),
+        "the allocator's reserved PEAK minus what is still reserved once the "
+        "weights are in, i.e. the transient the load phase raised and gave "
+        "back. A LOWER BOUND on the term: the serving phase can raise a "
+        "larger one, and the ledger charges the term for the whole boot",
     ),
     TERM_ACTIVATION: (
         ("delta", "boot_complete", "first_forward"),

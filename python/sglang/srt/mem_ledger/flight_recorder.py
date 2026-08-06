@@ -511,6 +511,18 @@ def mark(
         record["non_torch_bytes"] = max(
             0, int(record["nvml_self_bytes"]) - int(record["reserved_bytes"])
         )
+    if "reserved_peak_bytes" in record and "reserved_bytes" in record:
+        # #612. The allocator peak ABOVE what is still resident at this mark:
+        # the transient the ledger's TERM_LOAD_TRANSIENT stands for. Computed
+        # here, at write time, for the same reason non_torch_bytes is -- the
+        # subtraction is the measurement, and a reader of one line should not
+        # have to know which two counters to subtract. RESERVED and not
+        # ALLOCATED on purpose: NVML sees the allocator's reservation, so the
+        # reserved pair is the one that moves the free-memory floor the
+        # corridor is measured against.
+        record["allocator_transient_bytes"] = max(
+            0, int(record["reserved_peak_bytes"]) - int(record["reserved_bytes"])
+        )
     if extra:
         record["extra"] = dict(extra)
     try:

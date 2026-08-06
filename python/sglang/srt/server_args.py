@@ -11441,6 +11441,15 @@ class ServerArgs:
     #                                 (handle_max_mamba_cache), so it is
     #                                 already priced on this path.
     #
+    # CHARGED here since #612, and worth naming because its phase is not
+    # obvious: the load transient. The free reading this solve anchors on is
+    # taken between weight load and pool sizing, at a moment when the allocator
+    # has already given the load peak back -- so the anchor does NOT contain it,
+    # while the serving phase the corridor floor is measured under does raise a
+    # peak of that family again. Leaving it out is exactly the documented gap
+    # where the corridor solve landed up to ~70 MiB below its own target under
+    # load (runbook 16.6/16.7).
+    #
     # Note this is a DIFFERENT partition from demand_outside_budget_mib, which
     # splits on "inside vs outside the rank budget" rather than on residency.
     # The two agree on nothing that matters here; do not substitute one.
@@ -11458,6 +11467,7 @@ class ServerArgs:
             TERM_GRAPH_CAPTURE,
             TERM_INDEXER_SCRATCH,
             TERM_LADDER,
+            TERM_LOAD_TRANSIENT,
         )
 
         return (
@@ -11467,6 +11477,7 @@ class ServerArgs:
             TERM_GDN_SCRATCH,
             TERM_INDEXER_SCRATCH,
             TERM_LADDER,
+            TERM_LOAD_TRANSIENT,
         )
 
     def corridor_post_sizing_mib_per_gpu(self) -> Dict[int, int]:

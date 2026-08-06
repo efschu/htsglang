@@ -47,6 +47,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import os
 from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.mem_ledger.terms import (
@@ -77,6 +78,10 @@ __all__ = [
     "TERM_ATTN_WORKSPACE",
     "BUDGET_FUNDED_TERMS",
     "TERM_NCCL_BUFFERS",
+    "TERM_LOAD_TRANSIENT",
+    "LOAD_TRANSIENT_REFERENCE_MIB",
+    "LOAD_TRANSIENT_REFERENCE_TAG",
+    "RUNTIME_COMMUNICATOR_GROUPS",
     "communicator_groups_from_server_args",
     "demand_outside_budget_mib",
 ]
@@ -93,6 +98,47 @@ TERM_PARENT_CONTEXT = "parent/tokenizer CUDA context"
 TERM_NCCL_BUFFERS = "NCCL communicator buffers"
 TERM_ATTN_WORKSPACE = "attention workspaces (capped)"
 TERM_NVML_CARVE_OUT = "NVML driver carve-out (not allocatable)"
+TERM_LOAD_TRANSIENT = "load transient (allocator peak over resident)"
+
+#: The load transient, MiB per rank process, as the 2026-08-06 corridor window
+#: recorded it.
+#:
+#: PROVENANCE, STATED IN FULL BECAUSE THIS NUMBER IS INHERITED AND NOT MEASURED
+#: BY ANYTHING IN THIS TREE. It comes from the #602 corridor acceptance runs
+#: (docs/rig-runbook.md section 16.6, scripts/dev/602_corridor/README.md), which
+#: sampled per-card NVML free at 10 Hz first at idle and then under serving
+#: load, and found the load MINIMUM sitting up to ~70 MiB below the idle
+#: reading on every card. That dip is an allocator peak above the resident set
+#: that no ledger term charged: every other term is either resident (weights,
+#: pools, workspaces) or already priced as its own transient (activation,
+#: prefill scratch), and the corridor floor was still undershot by this much.
+#:
+#: WHAT IT IS NOT. It is not an attribution to one allocation site. The same
+#: allocator family produces a peak during WEIGHT LOAD as well -- per-tensor
+#: host-to-device staging plus the quantization repack in
+#: ``model_loader/loader.py:867-899`` (``load_weights_and_postprocess``), where
+#: each ``process_weights_after_loading`` holds a repacked copy beside the
+#: original -- and that peak has never been measured separately on this rig.
+#: The number below is therefore charged as ONE per-rank allocator transient
+#: covering the phase where the peak is largest, not as a sum of sites.
+#:
+#: HOW IT STOPS BEING INHERITED. ``flight_recorder.mark`` now computes
+#: ``allocator_transient_bytes`` (reserved peak minus reserved current) on every
+#: mark, and ``reconcile`` compares this term against that field at the
+#: ``weights_loaded`` mark. A boot with ``SGLANG_VRAM_FLIGHT_DIR`` set therefore
+#: measures the quantity this constant stands in for; feeding the measurement
+#: back through ``DemandInputs.load_transient_mib_per_rank`` replaces the
+#: constant with a CALIBRATED per-rank number carrying the rig fingerprint.
+LOAD_TRANSIENT_REFERENCE_MIB = 70
+
+#: The fingerprint the inherited number above carries. Deliberately a WINDOW
+#: tag and not a rig fingerprint: it can never equal ``live_fingerprint()``, so
+#: the ledger row renders as ``calibrated@window-2026-`` and a reader can see at
+#: a glance that this line was not measured on the card in front of him. The
+#: alternative -- borrowing the live fingerprint for a number the live rig never
+#: produced -- would be an un-invalidatable literal wearing a measurement's
+#: label, which is the exact defect this module exists to remove.
+LOAD_TRANSIENT_REFERENCE_TAG = "window-2026-08-06"
 
 #: Terms the RANK BUDGET already funds, i.e. terms that live INSIDE
 #: ``--rank-gpu-memory-mib`` rather than outside it.
@@ -208,6 +254,13 @@ class DemandInputs:
     #: Per-rank mamba/GDN state pool, MiB. Empty tuple when the checkpoint has
     #: no such layers (which is "does not apply", not "unknown").
     mamba_pool_mib_per_rank: Sequence[float] = ()
+    #: Per-rank allocator transient above the resident set, MiB. ``None`` means
+    #: "no boot of this rig has measured it", and it does NOT mean zero: the
+    #: term then charges :data:`LOAD_TRANSIENT_REFERENCE_MIB` per rank and says
+    #: in its derivation that the number is inherited. A silent zero here is
+    #: precisely the shape of the gap this term closes -- the #602 corridor
+    #: floor was undershot by a transient that no row mentioned.
+    load_transient_mib_per_rank: Optional[Sequence[float]] = None
     #: Per-rank GDN prefill scratch peak, MiB, or None when not applicable.
     gdn_scratch_mib_per_rank: Optional[Sequence[float]] = None
     #: Per-rank DSV4 C4-indexer prefill scratch peak, MiB, or None when the
@@ -286,6 +339,7 @@ class DemandInputs:
             "mamba_pool_mib_per_rank",
             "gdn_scratch_mib_per_rank",
             "indexer_scratch_mib_per_rank",
+            "load_transient_mib_per_rank",
         ):
             value = getattr(self, field_name)
             if value is not None and len(value) not in (0, n):
@@ -562,47 +616,193 @@ def _classify_nccl_groups(inputs: "DemandInputs"):
     return classify_communicator_groups(inputs.communicator_groups)
 
 
+#: Every group name ``sglang.srt.distributed.parallel_state`` constructs a
+#: GroupCoordinator for, mapped to the rule this module declares it by.
+#:
+#: ONE SOURCE OF TRUTH (#504-a pattern). A contract test AST-scans
+#: ``parallel_state`` for its ``group_name=`` literals and refuses while that
+#: set and these keys differ IN EITHER DIRECTION. Both directions are real
+#: defects and they fail differently:
+#:
+#:   * a group built at runtime and missing here is an UNDER-declaration. Its
+#:     communicator allocates buffers that no ledger row mentions, and it does
+#:     not move ``nccl_signature``, so a measurement taken without it is reused
+#:     for a launch that has it. That is the OOM direction.
+#:   * a group declared here and never built is an OVER-declaration. It cannot
+#:     under-charge, but it poisons ``nccl_signature`` with a phantom member,
+#:     which invalidates measurements that are still exactly correct and can
+#:     push an otherwise NOT_APPLICABLE launch to UNBOUNDED, i.e. a refusal
+#:     nobody can satisfy by measuring.
+#:
+#: The value is the declaration rule, so a reader can check a row against the
+#: construction site without reading this function.
+RUNTIME_COMMUNICATOR_GROUPS: Mapping[str, str] = {
+    "world": (
+        "always built (init_world_group, parallel_state.py:2511-2525) and "
+        "always with use_pynccl=False -- the world coordinator never "
+        "constructs a PyNccl communicator. Declared with that flag, not with "
+        "the default True"
+    ),
+    "tp": (
+        "always built (parallel_state.py:3018) with the default transport; "
+        "spans tp_size ranks"
+    ),
+    "pdmux_prefill_tp": (
+        "built when duplicate_tp_group is passed, which model_runner takes "
+        "from --enable-pdmux (parallel_state.py:3032, model_runner.py:1823). "
+        "A SECOND communicator over the same tp ranks, so it allocates a "
+        "second set of buffers"
+    ),
+    "dcp": "built when dcp_size > 1 (parallel_state.py:3054); spans dcp_size ranks",
+    "dcp_spill": (
+        "built when dcp_size > 1 AND SGLANG_KVSO_DECOUPLE=1 "
+        "(parallel_state.py:3079): the kv-session-offload comm B, a second "
+        "communicator over the same dcp ranks"
+    ),
+    "attn_cp": (
+        "built only when attn_cp_size != tp_size (parallel_state.py:3113-3129); "
+        "equal sizes ALIAS _TP and construct nothing"
+    ),
+    "attention_tp": (
+        "built only when attn_tp_size != tp_size, where attn_tp_size = "
+        "tp_size // attn_cp_size // attn_dp_size (parallel_state.py:3145-3163); "
+        "constructed with use_pynccl=(SYNC_TOKEN_IDS_ACROSS_TP or "
+        "--enable-symm-mem)"
+    ),
+    "moe_dp": (
+        "built only when moe_dp_size != tp_size AND attn_cp_size <= moe_dp_size "
+        "(parallel_state.py:3168-3195); otherwise it aliases _ATTN_CP or _TP"
+    ),
+    "moe_ep": (
+        "built only when ep_size != tp_size (parallel_state.py:3197-3223), and "
+        "then with use_pynccl=False"
+    ),
+    "moe_tp": (
+        "built only when moe_tp_size != tp_size, where moe_tp_size = tp_size // "
+        "ep_size // moe_dp_size (parallel_state.py:3225-3251), and then with "
+        "use_pynccl=False"
+    ),
+    "pp": (
+        "always built (parallel_state.py:3267) with the default transport; "
+        "spans pp_size ranks"
+    ),
+}
+
+
 def communicator_groups_from_server_args(
     server_args, rank_gpu_id: Sequence[int]
 ) -> Tuple["CommunicatorGroup", ...]:
-    """The multi-rank groups this launch builds, as far as the ledger needs
-    them.
+    """The communicator groups this launch builds, one entry per group that
+    ``initialize_model_parallel`` actually CONSTRUCTS.
 
-    NOT an exhaustive enumeration of GroupCoordinators (a launch can also build
-    dcp, attn_cp, moe_ep, moe_tp, ... groups), and it does not have to be,
-    because of how the composite resolves:
+    #612 rewrote this. The first cut declared ``world``/``tp``/``pp`` (+``dcp``)
+    and argued from a composite that the rest could not matter. Both halves of
+    that were wrong against the construction sites:
 
-      * The WORLD group spans every rank and is built unconditionally, so
-        whenever any other group could be multi-rank, the world group is too.
-        With barlink off, the world group alone already yields "an NCCL
-        communicator is built" -> the old UNBOUNDED/priced behaviour, no matter
-        what the unlisted groups do.
-      * With barlink on, ``should_build_barlink`` is true for EVERY group of
-        more than one rank -- the switch is launch-global -- and a single-rank
-        group builds no device communicator. So no unlisted group can build
-        NCCL either.
+      * ``world`` was declared with the default ``use_pynccl=True`` while
+        ``init_world_group`` passes ``use_pynccl=False`` unconditionally
+        (parallel_state.py:2518). The world coordinator never builds a PyNccl
+        communicator, so it was a phantom member of every ``nccl_signature``
+        this function produced.
+      * ``pdmux_prefill_tp``, ``dcp_spill``, ``attn_cp``, ``attention_tp``,
+        ``moe_dp``, ``moe_ep`` and ``moe_tp`` were not declared at all. Two of
+        them are DUPLICATE communicators over ranks another group already
+        covers (the PDMUX prefill TP group and the kv-session-offload spill
+        group), i.e. a second buffer set on the same ranks -- the direction
+        that under-charges a card.
 
-    A missing group can therefore not turn an NCCL launch into a
-    NOT_APPLICABLE one, which is the only direction that would under-charge the
-    card. The named sub-groups are listed so the ledger row says which ones
-    were considered rather than making the reader trust an invisible set.
+    The old argument ("the world group is multi-rank whenever anything else is,
+    so the composite verdict cannot be wrong") survives its own premise being
+    fixed, and that is why this rewrite does not change any verdict on a real
+    launch: whenever ``world`` spans more than one rank so does ``tp`` or
+    ``pp``, and both are declared with the default transport. What the rewrite
+    changes is the SIGNATURE and the named group list -- i.e. what a
+    measurement is filed as valid for.
+
+    :data:`RUNTIME_COMMUNICATOR_GROUPS` is the checked inventory of names; this
+    function is the per-launch instance of it.
     """
     from sglang.srt.mem_ledger.nccl_transport import CommunicatorGroup
 
-    tp = int(getattr(server_args, "tp_size", 1) or 1)
-    pp = int(getattr(server_args, "pp_size", 1) or 1)
-    dcp = int(getattr(server_args, "dcp_size", 1) or 1)
+    def _size(name: str, default: int = 1) -> int:
+        return int(getattr(server_args, name, default) or default)
+
+    tp = _size("tp_size")
+    pp = _size("pp_size")
+    dcp = _size("dcp_size")
+    ep = _size("ep_size")
+    moe_dp = _size("moe_dp_size")
+    attn_cp = _size("attn_cp_size")
+    # model_runner.py:561 -- attention DP collapses to 1 unless dp attention is
+    # on, and the group geometry follows that value, not the raw --dp-size.
+    attn_dp = (
+        _size("dp_size") if getattr(server_args, "enable_dp_attention", False) else 1
+    )
+
     # Conservative on purpose: whichever count is larger is the one that can
     # make the world group multi-rank.
     world = max(len(rank_gpu_id), tp * pp)
     groups = [
-        CommunicatorGroup(name="world", world_size=world),
+        # use_pynccl=False is not a policy choice here, it is a QUOTE of
+        # init_world_group (parallel_state.py:2518). The world coordinator
+        # exists on every launch and builds a torch process group, but never a
+        # PyNccl communicator, so it allocates none of the buffers this term
+        # prices.
+        CommunicatorGroup(name="world", world_size=world, use_pynccl=False),
         CommunicatorGroup(name="tp", world_size=tp),
         CommunicatorGroup(name="pp", world_size=pp),
     ]
+    if getattr(server_args, "enable_pdmux", False):
+        groups.append(CommunicatorGroup(name="pdmux_prefill_tp", world_size=tp))
     if dcp > 1:
         groups.append(CommunicatorGroup(name="dcp", world_size=dcp))
+        if os.environ.get("SGLANG_KVSO_DECOUPLE", "0") == "1":
+            groups.append(CommunicatorGroup(name="dcp_spill", world_size=dcp))
+    if attn_cp != tp:
+        groups.append(CommunicatorGroup(name="attn_cp", world_size=attn_cp))
+    # Clamped at 1: an invalid size combination (ep * moe_dp > tp, say)
+    # floor-divides to 0, and a 0-rank group is not a thing the runtime
+    # builds -- such a launch fails its own asserts long before this.
+    attn_tp = max(1, tp // max(attn_cp, 1) // max(attn_dp, 1))
+    if attn_tp != tp:
+        groups.append(
+            CommunicatorGroup(
+                name="attention_tp",
+                world_size=attn_tp,
+                use_pynccl=_attention_tp_uses_pynccl(server_args),
+            )
+        )
+    if attn_cp <= moe_dp and moe_dp != tp:
+        groups.append(CommunicatorGroup(name="moe_dp", world_size=moe_dp))
+    if ep != tp:
+        groups.append(CommunicatorGroup(name="moe_ep", world_size=ep, use_pynccl=False))
+    moe_tp = max(1, tp // max(ep, 1) // max(moe_dp, 1))
+    if moe_tp != tp:
+        groups.append(
+            CommunicatorGroup(name="moe_tp", world_size=moe_tp, use_pynccl=False)
+        )
     return tuple(groups)
+
+
+def _attention_tp_uses_pynccl(server_args) -> bool:
+    """The flag ``attention_tp`` is constructed with
+    (parallel_state.py:3159-3161).
+
+    Read from the same module the construction site reads it from rather than
+    restated. When that import is unavailable the answer is True, which
+    OVER-declares: an over-declared PyNccl group can only push the term toward
+    UNBOUNDED or priced, never toward NOT_APPLICABLE, and under-charging is the
+    direction that OOMs a card.
+    """
+    if bool(getattr(server_args, "enable_symm_mem", False)):
+        return True
+    try:
+        from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
+
+        return bool(SYNC_TOKEN_IDS_ACROSS_TP)
+    except Exception as e:  # pragma: no cover - import-environment differences
+        logger.debug("could not read SYNC_TOKEN_IDS_ACROSS_TP (%s)", e)
+        return True
 
 
 def build_card_ledgers(
@@ -664,6 +864,60 @@ def build_card_ledgers(
                 inputs=("rank_tp_ratio", "model_path", "quantization", "dtype"),
             )
         )
+
+        # -- load transient, PER RANK ----------------------------------------
+        # #612. An allocator peak above the resident set that no other term
+        # covers. Charged per RANK for the same reason the activation term is
+        # (correction 1 in the module docstring): co-located ranks are separate
+        # processes, they load and serve concurrently, and each holds its own
+        # peak. The 2026-08-06 window that produced the inherited number ran one
+        # rank per card, so it cannot distinguish per-card from per-rank; per
+        # rank is the reading that cannot under-charge a co-located card.
+        measured_transient = inputs.load_transient_mib_per_rank
+        if measured_transient and len(measured_transient) > max(ranks):
+            transient = sum(float(measured_transient[r]) for r in ranks)
+            terms.append(
+                LedgerTerm(
+                    name=TERM_LOAD_TRANSIENT,
+                    mib=int(math.ceil(transient)),
+                    provenance=Provenance.CALIBRATED,
+                    derivation=(
+                        "measured allocator peak above the resident set "
+                        f"(reserved peak - reserved current), summed over "
+                        f"{n_co} rank process(es) on this card"
+                    ),
+                    fingerprint=inputs.phase_footprint_fingerprint
+                    or LOAD_TRANSIENT_REFERENCE_TAG,
+                    bounded_by=(
+                        "the caching allocator: the peak is reservation above "
+                        "the resident set within one phase, not a growing pool"
+                    ),
+                )
+            )
+        else:
+            terms.append(
+                LedgerTerm(
+                    name=TERM_LOAD_TRANSIENT,
+                    mib=LOAD_TRANSIENT_REFERENCE_MIB * n_co,
+                    provenance=Provenance.CALIBRATED,
+                    derivation=(
+                        f"INHERITED, not measured on this rig: "
+                        f"{LOAD_TRANSIENT_REFERENCE_MIB} MiB per rank x {n_co} "
+                        "rank process(es) on this card, from the 2026-08-06 "
+                        "#602 corridor window, where the per-card NVML free "
+                        "minimum under load sat up to that far below the idle "
+                        "reading with every other term priced. Boot with "
+                        "SGLANG_VRAM_FLIGHT_DIR set and reconcile this term "
+                        "against the measured allocator_transient_bytes to "
+                        "replace the inherited figure"
+                    ),
+                    fingerprint=LOAD_TRANSIENT_REFERENCE_TAG,
+                    bounded_by=(
+                        "the caching allocator: the peak is reservation above "
+                        "the resident set within one phase, not a growing pool"
+                    ),
+                )
+            )
 
         # -- activation, PER RANK, CALIBRATED (never the falsified heuristic) --
         missing_activation = [
