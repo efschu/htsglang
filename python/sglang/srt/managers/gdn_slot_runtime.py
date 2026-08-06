@@ -181,7 +181,32 @@ class GdnSlotRuntime:
             for sid in (_rid(r) for r in waiting)
             if sid is not None and sid in parked_set
         ]
+
+        # ...and so is a parked session that kv-session-offload has already
+        # unparked STRAIGHT INTO THE RUNNING BATCH (#549). The waiting queue is
+        # not the only door back in: the kvso restore loop runs in
+        # `pre_schedule` and merges the session into `running_batch` BEFORE
+        # `on_round` gets to plan, so by the time we look, the session is
+        # running, has no slot yet, and is still in `parked_set` because the
+        # unpark commit pops kvso's own record without telling the GDN
+        # executor. That state matched none of the three branches below --
+        # not resident (no slot), not resumed (not in `waiting`), not a
+        # newcomer (still parked) -- so the session vanished from the plan
+        # entirely and `vacate_plan` never restored it. It then decoded with
+        # all-None mamba state: silently wrong output, no error anywhere.
+        #
+        # The condition is derived STRUCTURALLY rather than signalled from the
+        # unpark commit on purpose. What makes a session dangerous here is
+        # "about to decode this tick with its state still a blob", and any
+        # path that produces that state is equally dangerous; keying on one
+        # producer would leave the next one silently broken in the same way.
         resumed_set = set(resumed_ids)
+        for sid in active_ids:
+            if sid in parked_set and sid not in resumed_set:
+                req = self._by_id.get(sid)
+                if req is not None and getattr(req, "mamba_pool_idx", None) is None:
+                    resumed_ids.append(sid)
+                    resumed_set.add(sid)
 
         residents, newcomers = [], 0
         for sid, req in self._by_id.items():
