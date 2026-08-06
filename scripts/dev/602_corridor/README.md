@@ -77,11 +77,23 @@ grep -E "max_total_num_tokens|#602 corridor|Uneven DCP" /tmp/602_<arm>.log | tai
   post-sizing demand for that card is under-priced, and the term to look at is
   named in the ledger itemisation the boot prints.
 
-## Restore, unconditionally
+## Restore, unconditionally, to the TENANT layout
+
+Restore is **not** the solo/default serving layout. The cards carry a
+user-facing translator stack, and it has to come back as it was: the tenant
+reserve layout `RESERVE=13000,4200,4200` (runbook tenant layout), which leaves
+the headroom the translator tenants boot into. Restoring the default layout
+gives the KV pool that headroom and the translator has nowhere to land.
+
+Note the known gap: the watchdog's auto-restart falls back to `RESERVE=auto`,
+so a restore that only starts the watchdog does NOT reproduce the tenant
+layout. Boot the tenant recipe explicitly, then arm the watchdog.
 
 ```bash
-systemctl start serving-30030-watchdog.service
+# tenant layout first, explicitly -- not via the watchdog's auto-restart
+setsid <tenant boot command with --rank-auto-reserve-mib 13000,4200,4200> &
 until curl -s -o /dev/null -m 5 http://127.0.0.1:30030/health; do sleep 5; done
+systemctl start serving-30030-watchdog.service
 curl -s -o /dev/null -w '%{http_code}\n' -m 5 http://127.0.0.1:30030/health
 ```
 
