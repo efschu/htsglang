@@ -24,7 +24,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
-from sglang.srt.distributed.device_communicators import barlink_abort_gate
+from sglang.srt.distributed.device_communicators import (
+    barlink_abort_gate,
+    barlink_capture_census,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -140,13 +143,22 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # Stage-2 adaptive offload routes the capture through the build tag's
         # torch_memory_saver region (pauseable capture pool); a no-op
         # passthrough to graph_ctx otherwise.
-        with adaptive_graph_memory.capture_graph_ctx(
-            graph_ctx,
-            cuda_graph=graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-        ):
-            out = forward_fn()
+        # #603b: everything a replay of THIS graph will do is decided in the
+        # recorded pass below, and no instrument observes a replay -- the
+        # collective census counts host calls (a replay makes none) and the
+        # launch record's unchecked counter deliberately does not advance
+        # under capture. So the collectives are recorded here, keyed by the
+        # shape, and diffed across ranks once at the first scheduler census
+        # tick. The key is the ShapeKey, which carries no rank-local
+        # component, so the segments line up across ranks by construction.
+        with barlink_capture_census.segment(f"full/{shape_key}"):
+            with adaptive_graph_memory.capture_graph_ctx(
+                graph_ctx,
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+            ):
+                out = forward_fn()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out

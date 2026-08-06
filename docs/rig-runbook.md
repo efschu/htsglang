@@ -412,6 +412,70 @@ second wedge shape — all three ranks blocked in `check_after_graph_replay` →
 graph replay, with NO compiler running and warm caches — was still observed
 afterwards (crashes #8/#9) and is not explained by this change.
 
+## 2.3 What each rank baked into its CUDA graphs (#603b capture census)
+
+**Armed by default.** During CUDA-graph capture, every barlink BAR1 collective
+is recorded per graph — `op | nbytes | kernel variant | callsite`, in order —
+and the per-rank sequences are compared across ranks ONCE, on the gloo CPU
+group, at the first `_census_tick` after boot. One line per rank says either
+that the sequences agree or which graph, which position and which field
+diverged. A per-rank dump is written to
+`$SGLANG_BARLINK_CAPTURE_CENSUS_DIR/capture_census_rank<N>.txt`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SGLANG_BARLINK_CAPTURE_CENSUS` | `1` (on) | `0` disables recording and the comparison |
+| `SGLANG_BARLINK_CAPTURE_CENSUS_DIR` | `/spinning/wedge-catch-603b` | where the per-rank dump is written |
+
+**Why it exists.** The #583 collective census counts HOST-side calls, and a
+captured collective is a host call exactly once per boot — at capture. Every
+replay afterwards makes no host call at all, so the count census is
+structurally blind to what a replayed graph does, which is where the shape-B
+wedge sits. The launch record (`barlink_launch_dump`) is blind in the same
+place: `_unchecked_launches` deliberately does not advance under capture, so at
+wedge time its fields describe the last host-path collective. This is the only
+instrument in the tree that can see inside a captured graph.
+
+**Cost.** Zero on replay — nothing here runs outside a capture. At capture it
+is one tuple append plus a short frame walk per collective (840 collectives on
+the TP=3 INT8 NEXTN boot), and one small `all_gather_object` once per boot.
+
+**Result of the first on-card run** (2026-08-06 12:33:39, TP=3 uneven DCP,
+NEXTN, bar1 on all three groups): the sequences **AGREE** on all three ranks —
+4 graph segments, 840 collectives, identical op/size/variant/callsite lists.
+So "the ranks captured different graphs" is FALSIFIED as the shape-B root; the
+divergence, wherever it is, is not in what was baked into the graphs.
+
+**What the same boot then did, 4 minutes into an 8-way soak** (12:39:28, all
+evidence in `/spinning/603b-hunter2/wedge1/`): it wedged — and the wedge was
+NOT a barlink desync.
+
+* `Bar1CollectiveAborted`: **zero**, over six minutes, against
+  `SGLANG_BARLINK_BAR1_CAP_CYCLES=300e9` (~176 s at 1.7 GHz). A spin kernel
+  sitting on its deadline would have trapped inside that window.
+* The barlink peer watchdog polls the sticky abort words every tick and never
+  tripped; it was idle in its timer at every py-spy sample.
+* All three ranks were stopped at the same host line, `memory_pool.py:1484`,
+  identical across two py-spy rounds. That line is
+  `self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor`
+  — a CUDA index_put, i.e. the next CUDA-touching host op, which is the
+  aftermath signature, not the origin.
+* It ended in a CUDA **device-side assert**, `IndexKernel.cu:111
+  "index out of bounds"`, surfacing at that same line. The mapping is
+  allocated with `req_pool_size` rows (`memory_pool.py:1384`), so a
+  `select_index` at or above `req_pool_size` came out of the req-pool
+  allocator on the prefill path
+  (`alloc_req_slots` -> `alloc_for_extend` -> `prepare_for_extend`).
+
+CAVEAT, do not skip it: CUDA errors are reported asynchronously, so the
+assert is not *proven* to come from the index_put on line 1484 — an earlier
+queued index kernel could be the real source. `CUDA_LAUNCH_BLOCKING=1` on the
+next reproduction is what settles that.
+
+The consequence for triage: a wedge in this family that shows **no**
+`Bar1CollectiveAborted` is not a barlink collective desync and should not be
+investigated as one. Check for a device-side assert first.
+
 ## 3. Mandatory boot flags
 
 **The usability trias is a STANDARD boot setting, not a tuning knob** (user

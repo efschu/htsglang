@@ -71,6 +71,10 @@ from sglang.srt.distributed.collective_census import (  # noqa: E402
     census_heartbeat,
     census_interval,
 )
+from sglang.srt.distributed.device_communicators.barlink_capture_census import (  # noqa: E402
+    capture_census,
+    capture_census_enabled,
+)
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -3529,6 +3533,15 @@ class Scheduler(
                     c.compare_across_ranks(
                         grp, torch.distributed.get_world_size(grp), rank
                     )
+                    # #603b: the CAPTURE census, once. Graph capture is over
+                    # by the time the scheduler loop runs, so the recorded
+                    # sequences are final and one comparison settles them for
+                    # the whole boot -- a per-tick repeat would re-ship the
+                    # same answer forever. It rides this point rather than the
+                    # end of capture because this is a proven rank-uniform
+                    # cadence on the gloo group: every rank reaches it in the
+                    # same round or none do.
+                    self._capture_census_once(grp, rank)
             # Announced only AFTER a tick has completed without raising, so
             # a broken census can never look armed. The arming line is the
             # only evidence a reader has that the instrument is live; if it
@@ -3539,6 +3552,47 @@ class Scheduler(
             # ONCE, not per tick: this fired 2661 times in one boot and
             # still told the reader nothing the first line had not.
             _CENSUS.warn_skipped_once(exc)
+
+    def _capture_census_once(self, group, rank: int) -> None:
+        """Diff the CAPTURED collective sequences across ranks. Exactly once.
+
+        #603b. The #583 census above compares host-side collective COUNTS,
+        and a captured collective is a host-side call exactly once in a boot
+        -- at capture. Everything after that is replay, which makes no host
+        call at all, so the count census is structurally blind to what a
+        replayed graph does. That is where this crash family lives: the ranks
+        are wedged inside a replayed decode graph, waiting on peer flags.
+
+        A graph's behaviour is fixed when it is recorded. So if the ranks
+        recorded different sequences, the mismatch is already present and
+        readable at boot, minutes before the first wedge -- no reproduction
+        needed. This asks that question once and logs the answer either way.
+
+        Instrument discipline, as everywhere in this family: warn-never-raise.
+        """
+        if not capture_census_enabled():
+            return
+        cc = capture_census()
+        if cc.compared:
+            return
+        try:
+            path = cc.dump_to_file(rank)
+            cc.compare_across_ranks(
+                group, torch.distributed.get_world_size(group), rank
+            )
+            if path:
+                logger.info("barlink capture census: per-rank record at %s", path)
+        except Exception as exc:  # noqa: BLE001 - instrument must not raise
+            # Mark it done regardless: a comparison that cannot run will not
+            # start working on the next tick, and retrying it every interval
+            # would turn one warning into a per-tick stream.
+            cc.compared = True
+            logger.warning(
+                "barlink capture census: one-shot comparison unavailable "
+                "(%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
 
     def uniform_min_avail(self) -> int:
         """This iteration's rank-uniform available_size.
