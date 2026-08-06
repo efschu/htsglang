@@ -741,8 +741,8 @@ class Holder:
         valid = min(nents, max_entries)
         raw = bytes(buffer.raw[: 16 * valid])
         for i in range(valid):
-            a, l = struct.unpack_from("=QQ", raw, 16 * i)
-            entries.append(SgEntry(a, l))
+            addr, length = struct.unpack_from("=QQ", raw, 16 * i)
+            entries.append(SgEntry(addr, length))
         return handle_, entries, int(total_len), int(nents)
 
     def release(self, handle_: int) -> None:
@@ -4164,7 +4164,7 @@ class BarlinkBar1Transport:
         if not self._up or self._ext is None:
             return False
 
-        R, r = self.world, self.rank
+        R = self.world
         slot = int(self._geo.get("a2a_slot", 0))
         # The largest block of the skewed pass is 3*block+6.
         block = min(8192, (slot - 6) // 3)
