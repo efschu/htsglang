@@ -378,3 +378,30 @@ is `Health check failed ... detokenizer` in the log and a health endpoint that
 stops answering, with the BAR1 abort arriving only after the ~300e9-cycle
 deadline. Any future soak monitor for this bug must watch health/liveness, not
 just the two crash strings, or a wedge reads as a clean soak.
+
+## 12. State of the owner.py:529 fix — channel added, NOT yet wired
+
+`build_dcp_weighted_kv_indices` now accepts `total_tokens: Optional[int]`. When
+supplied, the blocking `full_indptr[bs].item()` is skipped entirely; when None
+the old read is kept, so this commit changes NO behaviour anywhere yet. It is a
+channel, not a fix.
+
+**The remaining step, stated precisely so it is not mistaken for done:** the
+call site that actually wedged
+(`flashinfer_backend.py:6926`, the `uneven_dcp_weighted` branch) passes
+`prefix_lens` as `paged_kernel_lens`, and `call_begin_forward` currently
+receives `seq_lens_cpu` but NOT a `prefix_lens` host mirror. Wiring therefore
+needs `sum(forward_batch.extend_prefix_lens_cpu)` threaded down through
+`init_forward_metadata` -> `update_single_wrapper` -> `call_begin_forward`.
+`extend_prefix_lens_cpu` exists (`forward_batch_info.py:473`) and is already
+passed into this backend elsewhere (`flashinfer_backend.py:1720`, `5732`), so
+the material is there; the threading is what is missing.
+
+Also found while reading, same hazard, NOT addressed: the sibling `else` branch
+a few lines below does `int(dcp_lens.sum().item())` — another blocking D2H on
+the same path, reached when `uneven_dcp_weighted` is off.
+
+**Do not read this window as having fixed the wedge.** Section 11's three
+distinct wedge sites say the host pins wherever it next touches a stalled
+queue, so even a wired 529 fix is expected to relocate the wedge rather than
+cure it, until the reason a device queue stops draining is itself understood.
