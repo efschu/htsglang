@@ -4534,6 +4534,55 @@ class BarlinkBar1Transport:
             self._ctl_lag = 0
         return value
 
+    def _abort_flag_snapshot(self, max_lines: int = 64) -> Optional[str]:
+        """This rank's flag words, read AFTER a spin kernel took its abort path.
+
+        Why this is the one instrument the wedge still lacks (#616c). Every
+        HOST-visible signal says the ranks agree: the #583 census counts match,
+        the launch sampler shows identical last ops and identical
+        captured/eager flags, and the host kernel logs zero Xid / AER / IOMMU
+        faults over 23 h. Yet all three GPUs sit at 100 % SM occupancy with
+        0 % memory utilisation -- spinning, not computing. What nothing reads
+        is the DEVICE flag state the spin actually waits on, which is where the
+        remaining explanations live (a sequence/generation mismatch, or a flag
+        written but never observed).
+
+        Why reading it HERE is safe, when the 1 Hz launch sampler deliberately
+        refuses to: the sampler runs while a collective may still be in flight,
+        so a device read would queue behind the wedged spin and hang exactly
+        when the evidence is wanted. By the time this runs the kernel has
+        ALREADY taken its abort path, so there is nothing left to queue behind.
+
+        One 256-byte line per (topology, step, sender); the flag/generation
+        word is the first dword of each line, so only that is reported.
+        Diffing the three ranks' snapshots is what names a generation mismatch
+        -- a value one rank still waits for that its peers have already passed.
+        """
+        fptr, _handle, fsize = self._own_flag
+        if not fptr or not fsize or self._cuda is None:
+            return None
+        line = 256
+        n_lines = min(int(fsize) // line, int(max_lines))
+        if n_lines <= 0:
+            return None
+        nbytes = n_lines * line
+        buf = (ctypes.c_ubyte * nbytes)()
+        self._cuda.memcpy(ctypes.addressof(buf), int(fptr), nbytes)
+        raw = bytes(buf)
+        words = [
+            int.from_bytes(raw[i * line : i * line + 4], "little")
+            for i in range(n_lines)
+        ]
+        shown = " ".join(f"{i}:{w}" for i, w in enumerate(words))
+        return (
+            f"barlink-BAR1 abort flag snapshot rank {self.rank}/{self.world} "
+            f"group {self.group or '<unnamed>'}: {n_lines} lines of "
+            f"{int(fsize)} bytes, first dword per line -- {shown}. "
+            "Compare against the peers': a rank waiting on a generation its "
+            "peers have already passed is a sequence mismatch, whereas "
+            "all-equal values mean the flags agree and the wait is elsewhere."
+        )
+
     def check_aborted(self, where: str) -> None:
         """The production check: raise if a kernel took its abort path.
 
@@ -4705,6 +4754,15 @@ class BarlinkBar1Transport:
             if census_enabled():
                 logger.error("%s", format_local_census(self.rank))
         except Exception:  # noqa: BLE001 - never mask the abort below
+            pass
+        # #616c: and the device flag words this rank's spin was waiting on.
+        # Same warn-never-raise discipline as the census above, and safe only
+        # because the kernel has already aborted -- see _abort_flag_snapshot.
+        try:
+            snapshot = self._abort_flag_snapshot()
+            if snapshot:
+                logger.error("%s", snapshot)
+        except Exception:  # noqa: BLE001 - an instrument must not mask the abort
             pass
         raise Bar1CollectiveAborted(
             f"barlink-BAR1 rank {self.rank}/{self.world} group "
