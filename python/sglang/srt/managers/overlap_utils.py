@@ -7,6 +7,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
+from sglang.srt.debug_utils import index_race_guard
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -293,6 +294,9 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
+        # Row width of req_to_token: the bound every relayed seq_len must
+        # respect, since seq_lens address that row. Kept for the #616 guard.
+        self.max_context_len = req_to_token_pool.req_to_token.shape[1]
 
         if _DEBUG_ASSERT:
             # Poisoned init: every row must be written before its first gather.
@@ -514,6 +518,16 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        # #616 instrument: the relay is the prime suspect for a cross-stream
+        # read -- new_seq_lens_buf is written by the forward stream and gathered
+        # here on the schedule stream. A hit means the gather observed a row
+        # mid-update despite the publish_ready fence.
+        if index_race_guard.is_enabled():
+            index_race_guard.guard("future_indices", fi, 0, self.req_pool_size)
+            index_race_guard.guard(
+                "relayed_seq_lens", batch.seq_lens, 0, self.max_context_len
+            )
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);

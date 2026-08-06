@@ -42,6 +42,7 @@ from torch.distributed import barrier
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.debug_utils import index_race_guard
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -2041,8 +2042,16 @@ class Scheduler(
         # wait_stream.
         if not self._war_barrier_enabled:
             return
+        # #616 bisection arm: SGLANG_WAR_BARRIER_FASTPATH=0 forces the
+        # CONSERVATIVE barrier (wait on the whole forward stream) instead of the
+        # read-done event. If the crash survives the fast path but disappears
+        # here, the event is published before the forward's last read of the
+        # shared pool and the scheduler's next write races that read.
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
+        if ev is not None and not envs.SGLANG_WAR_BARRIER_FASTPATH.get():
+            runner.war_fastpath_read_done_event = None
+            ev = None
         if ev is not None:
             self.schedule_stream.wait_event(ev)
             runner.war_fastpath_read_done_event = None
@@ -2124,6 +2133,10 @@ class Scheduler(
             # (see event_loop_normal). Runs on the default stream before the
             # overlap machinery touches forward_stream this iteration.
             self._dual_group_lane_tick()
+
+            # #616 instrument: consume/stage the index-race counters. Sync-free
+            # (staged D2H + event query), no-op unless the guard is armed.
+            index_race_guard.poll()
 
             self._apply_war_barrier()
 

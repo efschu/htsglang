@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.srt.debug_utils import index_race_guard
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -2684,6 +2685,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             vocab_mask,
             weightless_recv=_wl_worker,
         )
+        # #616 instrument: first consumption point after eagle_sample. Guarding
+        # HERE rather than only at the `predict[accept_index]` gather covers
+        # every downstream consumer (the mamba commit indexes accept_index too),
+        # and under CLAMP it is the single place that keeps the whole round
+        # alive instead of letting the first consumer abort the context.
+        if index_race_guard.is_enabled():
+            index_race_guard.check_stable("accept_index", accept_index)
+            accept_index = index_race_guard.guard(
+                "accept_index@post_sample", accept_index, -1, predict.numel()
+            )
         new_seq_lens = batch.seq_lens + accept_lens
         # Round 7b posten 0: the serving group's PER-POSITION acceptance, so it
         # can be put next to the lane's. Off unless the probe env is set, and
@@ -2722,6 +2733,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         if not batch.forward_mode.is_idle():
+            # #616 instrument: CONSUMPTION point of accept_index. This gather is
+            # the ATen advanced-index kernel whose device-side assert
+            # (IndexKernel.cu:111) is the crash, and its output width is exactly
+            # bs * accept_index.shape[1] -- the 12 / 16 lanes seen in both
+            # reproductions. check_stable compares against the copy taken at the
+            # production site: both run on this stream, so a non-zero mutation
+            # count is proof that another stream wrote accept_index in between.
+            if index_race_guard.is_enabled():
+                index_race_guard.check_stable("accept_index", accept_index)
+                accept_index = index_race_guard.guard(
+                    "accept_index@consume", accept_index, -1, predict.numel()
+                )
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]

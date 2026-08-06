@@ -529,6 +529,23 @@ class Envs:
     # even when is_cuda() is False (e.g. AMD/ROCm). On CUDA the barrier is
     # already enabled regardless of this flag (see start_event_loop).
     SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
+    # #616 index-race guard (srt/debug_utils/index_race_guard.py). Sync-free,
+    # non-fatal bounds + stability instrumentation for the index tensors of the
+    # overlap / speculative-decode path. Default off; when off the guard costs a
+    # single module-level bool test per call site.
+    SGLANG_INDEX_RACE_GUARD = EnvBool(False)
+    # Clamp offending values back into range instead of letting the kernel
+    # assert, so a run SURVIVES the first bad batch and keeps reporting.
+    # Diagnostic only -- output is not trustworthy on a round that reports a hit.
+    SGLANG_INDEX_RACE_GUARD_CLAMP = EnvBool(False)
+    # Poll the guard counters every N scheduler iterations.
+    SGLANG_INDEX_RACE_GUARD_POLL = EnvInt(1)
+    # Force the overlap scheduler's WAR barrier onto its CONSERVATIVE form
+    # (full wait_stream on the forward stream) instead of the fast-path
+    # read-done event. #616 bisection arm: if the crash disappears with this
+    # set, the fast-path event is published before the forward's last read of
+    # the shared pool.
+    SGLANG_WAR_BARRIER_FASTPATH = EnvBool(True)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
