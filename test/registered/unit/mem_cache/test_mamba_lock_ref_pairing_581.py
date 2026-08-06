@@ -51,6 +51,7 @@ Every pool here is built on `torch.device("cpu")`; the hierarchical cache runs
 against a fake cache controller, so no GPU and no host pool assembly.
 """
 
+import threading
 import unittest
 from array import array
 from typing import List, Optional
@@ -613,6 +614,282 @@ class TestAdmissionLockPrecondition(unittest.TestCase):
             "the request lock would be taken on a tombstone and its paramless "
             "release would steal a ref",
         )
+
+
+class _MinAllReduce:
+    """MIN all_reduce over N threads, one per simulated TP rank."""
+
+    def __init__(self, n: int):
+        self.n = n
+        self.barrier = threading.Barrier(n, timeout=30)
+        self.values = [None] * n
+        self.local = threading.local()
+
+    def __call__(self, tensor, op=None, group=None):
+        self.values[self.local.rank] = int(tensor.item())
+        self.barrier.wait()
+        reduced = min(v for v in self.values if v is not None)
+        self.barrier.wait()
+        tensor.fill_(reduced)
+
+
+class TestAckDrainAcrossRanks(unittest.TestCase):
+    """FALSIFIERS for the production-surviving half of #581.
+
+    The transfer queues are RANK-LOCAL. `write_backup` backs a node up on one
+    rank and skips it on another -- host pool full, pin budget reached, parent
+    not backed up yet -- and under uneven TP/DCP the ranks' host pools differ
+    by construction (`scheduler.py`: "RANK-LOCAL: `backuped` means full KV
+    present in THIS rank's host pool ... it can be true here and false on a
+    peer for the same node"). So the queues differ in LENGTH.
+
+    `writing_check` min-reduced each rank's "how many of MY acks are ready"
+    across the group. A rank with an EMPTY queue contributed 0, so no rank
+    drained anything, so every write-through pin -- each of which makes a
+    mamba checkpoint unevictable -- was held forever. One cached checkpoint
+    per finished request, `mamba_evictable` at 0, and only the backing-up rank
+    hitting the wall: the signature that survived the first fix.
+    """
+
+    RANKS = 2
+    TURNS = 12
+
+    def _run_ranks(self, rank0_backs_up=True, rank1_backs_up=False, prime=None):
+        allreduce = _MinAllReduce(self.RANKS)
+        trees = []
+        for rank in range(self.RANKS):
+            tree, allocator, pool = _build_hi(mamba_size=32)
+            tree.tp_world_size = self.RANKS
+            tree.tp_group = None
+            backs_up = rank0_backs_up if rank == 0 else rank1_backs_up
+            if not backs_up:
+                # Rank-local host pressure: write_backup returns 0 here, so
+                # this rank's registry and ack queue both stay empty.
+                tree.cache_controller.write = lambda *a, **k: None
+            trees.append((tree, allocator, pool))
+
+        results, errors = {}, {}
+
+        def run(rank):
+            allreduce.local.rank = rank
+            tree, allocator, pool = trees[rank]
+            try:
+                if prime is not None:
+                    prime(rank, tree, allocator, pool)
+                for turn in range(self.TURNS):
+                    _insert(
+                        tree,
+                        allocator,
+                        pool,
+                        list(range(1000, 1032))
+                        + list(range(2000 + 100 * turn, 2032 + 100 * turn)),
+                    )
+                    tree.cache_controller.complete()
+                    tree.writing_check()
+                results[rank] = tree
+            except BaseException as exc:  # surface, never hang the barrier
+                errors[rank] = exc
+                self.addCleanup(lambda: None)
+                raise
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(self.RANKS)]
+        original = torch.distributed.all_reduce
+        torch.distributed.all_reduce = allreduce
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=60)
+        finally:
+            torch.distributed.all_reduce = original
+        self.assertEqual(errors, {}, f"rank thread raised: {errors}")
+        self.assertFalse(any(t.is_alive() for t in threads), "rank thread hung")
+        return results
+
+    def test_a_rank_with_no_backups_does_not_stall_the_drain(self):
+        """FALSIFIER: rank 1 writes nothing; rank 0 must still drain its acks.
+
+        Before the fix rank 0 ended with protected == TURNS and evictable == 0
+        -- the production ramp, one pinned checkpoint per finished request.
+        """
+        results = self._run_ranks()
+        backing_up = results[0]
+
+        self.assertEqual(
+            backing_up.mamba_protected_size(),
+            0,
+            "write-through pins were never released",
+        )
+        self.assertEqual(backing_up.mamba_evictable_size(), self.TURNS)
+        self.assertEqual(backing_up.ongoing_write_through, {})
+        self.assertEqual(backing_up._write_through_pinned, {})
+        self.assertEqual(backing_up.cache_controller.ack_write_queue, [])
+
+    def test_pins_are_bounded_by_in_flight_copies_not_by_request_count(self):
+        """The invariant the ramp violated: what is pinned at any moment is
+        what is still being copied, never a function of how many requests have
+        been served."""
+        results = self._run_ranks()
+        tree = results[0]
+        self.assertEqual(len(tree._write_through_pinned), 0)
+        self.assertLessEqual(
+            tree.mamba_protected_size(), len(tree.ongoing_write_through)
+        )
+
+    def test_a_rank_with_no_loads_does_not_stall_the_load_back_drain(self):
+        """FALSIFIER, and the mechanism the production log points at.
+
+        `loading_check` min-reduces the same way, and load-back pins are
+        subject to NO budget (unlike write-through pins, which `write_backup`
+        caps at pool - hard_floor). In the boot that survived the first fix the
+        pin-budget warning never fired even though protected reached 93 of 96,
+        i.e. the write-through pins stayed under their cap of 76 -- so the ramp
+        was carried by the unbudgeted load-back pins, one per turn, each
+        holding a mamba checkpoint unevictable forever.
+        """
+        allreduce = _MinAllReduce(self.RANKS)
+        trees, results, errors = [], {}, {}
+        for _ in range(self.RANKS):
+            trees.append(_build_hi(mamba_size=16))
+
+        def run(rank):
+            allreduce.local.rank = rank
+            tree, allocator, pool = trees[rank]
+            try:
+                if rank == 0:
+                    # Only this rank holds a host copy to load back -- exactly
+                    # the RANK-LOCAL `backuped` divergence uneven TP produces.
+                    # Staged while still single-rank: its internal drain must
+                    # not inject a collective the other rank never enters.
+                    node = _stage_mamba_tombstone(
+                        tree, allocator, pool, list(range(2000, 2032))
+                    )
+                tree.tp_world_size = self.RANKS
+                for _ in range(self.TURNS):
+                    if rank == 0 and node.mamba_evicted:
+                        tree.load_back(node)
+                    tree.cache_controller.complete()
+                    tree.loading_check()  # collective: every rank enters
+                results[rank] = tree
+            except BaseException as exc:
+                errors[rank] = exc
+                raise
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(self.RANKS)]
+        original = torch.distributed.all_reduce
+        torch.distributed.all_reduce = allreduce
+        for tree, _, _ in trees:
+            tree.tp_group = None
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=60)
+        finally:
+            torch.distributed.all_reduce = original
+        self.assertEqual(errors, {}, f"rank thread raised: {errors}")
+
+        loading = results[0]
+        self.assertEqual(loading.ongoing_load_back, {}, "load-back pins never drained")
+        self.assertEqual(loading._load_back_pins, {})
+        self.assertEqual(loading.mamba_protected_size(), 0)
+
+    def test_ranks_that_both_back_up_stay_in_lockstep(self):
+        """The fix must not turn the drain into a free-for-all: when every rank
+        HAS a queue, the reduction still throttles all of them to the slowest
+        live transfer."""
+        results = self._run_ranks(rank0_backs_up=True, rank1_backs_up=True)
+        for rank, tree in results.items():
+            self.assertEqual(tree.mamba_protected_size(), 0, f"rank{rank}")
+            self.assertEqual(tree.mamba_evictable_size(), self.TURNS, f"rank{rank}")
+
+    def test_stale_ack_without_registry_entry_does_not_stall_the_drain(self):
+        """FALSIFIER: the removed `len(ongoing_write_through) > 0` gate.
+
+        A node that leaves the tree mid-copy is popped from the registry by
+        `_forget_write_through`, leaving an ack queued with no registry entry.
+        The gate then reported "0 ready" forever and froze the drain on EVERY
+        rank through the MIN.
+        """
+
+        def prime(rank, tree, allocator, pool):
+            if rank != 0:
+                return
+            node = _insert(tree, allocator, pool, list(range(5000, 5032)))
+            tree.cache_controller.complete()
+            # The copy is queued and acked, but the node left the tree first.
+            tree._forget_write_through(node)
+            self.assertEqual(tree.ongoing_write_through, {})
+            self.assertNotEqual(tree.cache_controller.ack_write_queue, [])
+
+        results = self._run_ranks(prime=prime)
+        tree = results[0]
+        self.assertEqual(tree.cache_controller.ack_write_queue, [])
+        self.assertEqual(tree.mamba_protected_size(), 0)
+
+    def test_single_rank_drain_needs_no_collective(self):
+        """tp_world_size == 1 keeps the default path: drain what is ready, no
+        all_reduce at all."""
+        tree, allocator, pool = _build_hi(mamba_size=32)
+        self.assertEqual(tree.tp_world_size, 1)
+
+        def explode(*a, **k):
+            raise AssertionError("single-rank drain must not collective-reduce")
+
+        original = torch.distributed.all_reduce
+        torch.distributed.all_reduce = explode
+        try:
+            for turn in range(6):
+                _insert(
+                    tree,
+                    allocator,
+                    pool,
+                    list(range(3000 + 100 * turn, 3032 + 100 * turn)),
+                )
+                tree.cache_controller.complete()
+                tree.writing_check()
+        finally:
+            torch.distributed.all_reduce = original
+
+        self.assertEqual(tree.mamba_protected_size(), 0)
+        self.assertEqual(tree.mamba_evictable_size(), 6)
+
+
+class TestMultiTurnRetireReturnsEveryCheckpoint(unittest.TestCase):
+    """The production shape -- one conversation, many short prefills over a
+    growing cached prefix -- on a SINGLE rank.
+
+    This is a NEGATIVE result, not a falsifier: it passes with and without the
+    drain fix, which is the point. The ramp needs TP > 1 to reproduce, because
+    a single rank never min-reduces its ack count against anyone. Anybody
+    trying to reproduce #581 on one rank will see nothing; see
+    `TestAckDrainAcrossRanks` for the shape that fails.
+    """
+
+    def test_protected_does_not_ratchet_with_turn_count(self):
+        tree, allocator, pool = _build_hi(mamba_size=64)
+        prefix = list(range(1000, 1064))
+        protected_seen = []
+
+        for turn in range(40):
+            # Each turn caches one more checkpoint on the shared prefix.
+            _insert(
+                tree,
+                allocator,
+                pool,
+                prefix + list(range(4000 + 50 * turn, 4032 + 50 * turn)),
+            )
+            tree.cache_controller.complete()
+            tree.check_hicache_events()
+            protected_seen.append(tree.mamba_protected_size())
+
+        self.assertEqual(
+            max(protected_seen),
+            0,
+            f"protected ratcheted across turns: {protected_seen}",
+        )
+        self.assertEqual(_locked_nodes(tree), [])
+        self.assertGreater(tree.mamba_evictable_size(), 0)
 
 
 if __name__ == "__main__":
