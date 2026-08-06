@@ -438,6 +438,40 @@ class DemandInputs:
             flashinfer_note = ""
         attn_scratch = getattr(server_args, "attn_scratch_budget_mib", None)
 
+        # ------------------------------------------------------------------
+        # #594. NCCL communicator buffers: state the communicator set, publish
+        # its signature so the RANKS stamp their measurements with the same
+        # key the LAUNCHER will look them up by (the #605 boot-id lesson), and
+        # price the term from the cache when a measurement for exactly this
+        # (rig, communicator set) exists.
+        # ------------------------------------------------------------------
+        _groups = communicator_groups_from_server_args(server_args, rank_gpu_id)
+        _nccl_mib_per_gpu = None
+        _nccl_sig = ""
+        try:
+            from sglang.srt.mem_ledger.nccl_probe import (
+                load_nccl_buffers,
+                publish_signature,
+            )
+            from sglang.srt.mem_ledger.nccl_transport import nccl_signature
+
+            _nccl_sig = nccl_signature(_groups)
+            publish_signature(_nccl_sig)
+            if hw_fp:
+                measured = load_nccl_buffers(hw_fp, _nccl_sig)
+                if measured:
+                    # Cache is keyed by card UUID; the ledger charges per
+                    # gpu_id. Map through the identity map's uuid table rather
+                    # than positionally -- a CUDA ordinal is not an NVML index
+                    # on this rig and never was.
+                    by_gpu = {}
+                    for gpu_id, uuid in (card_uuid_by_gpu or {}).items():
+                        if uuid in measured:
+                            by_gpu[int(gpu_id)] = float(measured[uuid])
+                    _nccl_mib_per_gpu = by_gpu or None
+        except Exception as e:  # pragma: no cover - cache/env differences
+            logger.debug("NCCL buffer measurement unavailable: %s", e)
+
         return cls(
             weight_mib_per_rank=list(weight_mib_per_rank),
             activation_mib_per_rank=activation,
@@ -471,9 +505,15 @@ class DemandInputs:
             # themselves, so a launch whose TP group barlink owns prices this
             # term at 0-with-a-reason instead of refusing the whole reserve
             # over a communicator that is never built.
-            communicator_groups=communicator_groups_from_server_args(
-                server_args, rank_gpu_id
-            ),
+            communicator_groups=_groups,
+            # #594. The two fields that let TERM_NCCL_BUFFERS reach "priced".
+            # They shipped declared and unassigned: #598 wired the groups so
+            # the term could reach NOT_APPLICABLE, but nothing ever supplied a
+            # measurement, so every TP>1 boot refused at parse time. The
+            # measurement comes from mem_ledger/nccl_probe.py, keyed on the
+            # rig fingerprint AND the communicator set it was taken under.
+            nccl_buffer_mib_per_gpu=_nccl_mib_per_gpu,
+            nccl_signature=_nccl_sig,
         )
 
 

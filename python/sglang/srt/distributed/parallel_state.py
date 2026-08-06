@@ -882,10 +882,18 @@ class GroupCoordinator:
         _barlink_active = self.barlink_comm is not None
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if should_build_pynccl(use_pynccl, self.world_size, _barlink_active):
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group,
-                device=self.device,
-            )
+            # The ledger's NCCL term cannot be derived -- libnccl sizes these
+            # buffers itself, outside the torch allocator -- so the only way it
+            # ever reaches "priced" is a measurement taken right here, around
+            # the one constructor that allocates them. Unarmed, the bracket is
+            # two no-op calls. See mem_ledger/nccl_probe.py.
+            from sglang.srt.mem_ledger.nccl_probe import measure_communicator_init
+
+            with measure_communicator_init(self.unique_name, self.device.index):
+                self.pynccl_comm = PyNcclCommunicator(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
         elif use_pynccl and self.world_size > 1:
             logger.info(
                 "barlink is active for group '%s': skipping PyNccl "

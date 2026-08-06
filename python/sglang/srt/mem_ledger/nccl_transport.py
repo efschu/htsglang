@@ -56,12 +56,15 @@ call-through testable.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from typing import Iterable, Optional, Sequence, Tuple
 
 __all__ = [
     "CommunicatorGroup",
     "GroupVerdict",
     "classify_communicator_groups",
+    "nccl_signature",
 ]
 
 
@@ -163,3 +166,41 @@ def classify_communicator_groups(
             )
         out.append(GroupVerdict(name=g.name, builds_nccl=bool(builds), reason=reason))
     return tuple(out)
+
+
+def nccl_signature(groups: Iterable[CommunicatorGroup]) -> str:
+    """What a measured NCCL figure is valid FOR: this launch's communicator set.
+
+    Keyed on the groups that actually BUILD a communicator, plus each one's
+    rank count -- the two things libnccl sizes its buffers from. A group that
+    barlink owns, or that spans one rank, or that was constructed with
+    ``use_pynccl=False``, allocates nothing and therefore may not move the
+    signature: if it did, switching barlink on for an unrelated group would
+    invalidate a measurement that is still exactly correct.
+
+    The inverse matters more and is the reason this is a digest of the verdicts
+    rather than of the ServerArgs: adding a TP rank, or turning barlink off for
+    the TP group, DOES change what libnccl allocates, and both change the
+    verdict set, so both invalidate the measurement automatically. A stale
+    figure cannot survive a change to the thing it measured.
+
+    An UNRESOLVED group (the predicates could not be imported) poisons the
+    signature deliberately -- ``unresolved`` sorts into the digest and no
+    measurement taken under a resolvable tree will match it, so the term stays
+    UNBOUNDED instead of being priced from a launch we could not classify.
+    """
+    # Materialise once: ``groups`` is an Iterable, and classifying it would
+    # otherwise exhaust a generator before the zip could read it again.
+    described: Sequence[CommunicatorGroup] = tuple(groups)
+    parts = []
+    for verdict, group in zip(classify_communicator_groups(described), described):
+        if verdict.builds_nccl is None:
+            parts.append(f"{group.name}:unresolved")
+        elif verdict.builds_nccl:
+            parts.append(f"{group.name}:nccl:{group.world_size}")
+    if not parts:
+        # No group builds a communicator. NOT_APPLICABLE is decided by the
+        # term, not here; this is just the stable name of that empty set.
+        return "no-nccl"
+    blob = json.dumps(sorted(parts), sort_keys=True)
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
