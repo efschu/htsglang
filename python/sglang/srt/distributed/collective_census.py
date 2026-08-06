@@ -155,6 +155,9 @@ class CollectiveCensus:
     def __init__(self) -> None:
         self._counts: Dict[str, int] = {}
         self._round: int = 0
+        #: Families DECLARED from replicated config, as opposed to families
+        #: that happen to have fired. See :meth:`declare_families`.
+        self._declared: set = set()
         #: Number of comparisons that actually ran, so a test (or a boot log)
         #: can prove the instrument is live rather than dormant.
         self.comparisons = 0
@@ -171,6 +174,33 @@ class CollectiveCensus:
         #: per-tick warning produces thousands of identical lines that bury
         #: the one that mattered -- 2661 of them in a single boot.
         self._skip_warned = False
+
+    # -- declaration ----------------------------------------------------
+
+    def declare_families(self, families: Sequence[str]) -> None:
+        """Seed families to zero from REPLICATED config, before any fire.
+
+        WHY THIS EXISTS (#610 lesson: pack size is decided by replicated
+        config, never by rank-local state). ``snapshot`` is what
+        ``all_gather_object`` packs, so the KEY SET is the payload width. Left
+        to grow on first use, that key set is a function of what a rank has
+        happened to execute -- which is precisely the rank-local state this
+        instrument exists to catch diverging. A rank that has not yet issued
+        its first ``tp.broadcast`` would pack a narrower dict than its peers,
+        and the widths would differ for the same reason the counts do.
+
+        Group construction is replicated -- every rank builds the same groups
+        under the same names -- so declaring each group's families at
+        construction makes the key set identical on every rank from the first
+        comparison onward, independent of execution.
+
+        A second effect worth having: a declared family that never fires is
+        now VISIBLE as ``0x`` rather than absent, so "this family was never
+        counted" and "this family is not instrumented" stop looking alike.
+        """
+        for family in families:
+            self._declared.add(family)
+            self._counts.setdefault(family, 0)
 
     # -- hot path -------------------------------------------------------
 

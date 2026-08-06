@@ -98,22 +98,43 @@ _CENSUS = census()
 _CENSUS_ON = census_enabled()
 
 
-def collective_clock_families(group_name: str) -> Tuple[str, str, str, str]:
+def collective_clock_families(
+    group_name: str,
+) -> Tuple[str, str, str, str, str, str]:
     """Per-group collective-clock family names, in dispatch-site order.
 
-    ``(all_reduce, all_gather, all_gatherv, reduce_scatterv)``.
+    ``(all_reduce, all_gather, all_gatherv, reduce_scatterv, broadcast,
+    all_to_all)``.
 
     The GROUP is the axis the wait decomposition needs. "tp.all_reduce" is
     the per-layer tensor reduction whose payload scales with new tokens;
     "dcp.all_gather" is context-parallel attention traffic. They have the
     same units and completely different fixes, which is precisely why one
     summed ``wait`` number cannot arbitrate between them.
+
+    CENSUS-ONLY TAIL. The first four names have a ``_COLLECTIVE_CLOCK.span``
+    at their dispatch site and are therefore also wait-decomposed in the
+    per-rank prefill line. ``broadcast`` and ``all_to_all`` are counted by the
+    census but carry NO clock span: this function is the one place that names
+    a group's families, and both instruments read it, but arming a span is a
+    separate decision with its own cost and its own log-line surface. Naming
+    a family here is not a claim that it is timed.
+
+    ``broadcast`` and ``all_to_all`` were added by #583. The 2026-08-06
+    05:53:59 crash was a rank-arrival desync in which all FOUR censused
+    families agreed exactly across ranks (10176/2864/580/36824 on ranks 0 and
+    1), so the family that diverged was necessarily one nobody counted --
+    and the abort named an 8-byte collective served by the a2a kernel. A
+    census that cannot see the two families the failure hid in reports
+    agreement and calls it health.
     """
     return (
         f"{group_name}.all_reduce",
         f"{group_name}.all_gather",
         f"{group_name}.all_gatherv",
         f"{group_name}.reduce_scatterv",
+        f"{group_name}.broadcast",
+        f"{group_name}.all_to_all",
     )
 
 
@@ -606,12 +627,23 @@ class GroupCoordinator:
         # Collective-clock families for this group's dispatch sites (#588).
         # Built ONCE here, so an armed span costs an attribute read and no
         # string work on the hot path.
+        _clock_families = collective_clock_families(group_name)
         (
             self._clock_family_all_reduce,
             self._clock_family_all_gather,
             self._clock_family_all_gatherv,
             self._clock_family_reduce_scatterv,
-        ) = collective_clock_families(group_name)
+            self._clock_family_broadcast,
+            self._clock_family_all_to_all,
+        ) = _clock_families
+
+        # #583: declare this group's families to the census from REPLICATED
+        # config, at construction, before any of them can fire. Every rank
+        # builds the same groups under the same names, so the census payload
+        # width is fixed by configuration rather than by which collectives a
+        # rank has happened to reach (#610).
+        if _CENSUS_ON:
+            _CENSUS.declare_families(_clock_families)
 
         # Set rank info
         self.rank = torch.distributed.get_rank()
@@ -1519,6 +1551,8 @@ class GroupCoordinator:
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
+        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+            _CENSUS.bump(self._clock_family_all_to_all)
         if self.world_size == 1:
             output.copy_(input)
             return
@@ -1552,6 +1586,11 @@ class GroupCoordinator:
         Dynamo; whoever needs it under torch.compile has to graph-break
         around it.
         """
+        # Same family as the even form: what the census compares is how many
+        # times each rank entered this wire family, and a rank that skips an
+        # uneven a2a has skipped an a2a.
+        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+            _CENSUS.bump(self._clock_family_all_to_all)
         if self.world_size == 1:
             output.copy_(input)
             return output
@@ -1926,6 +1965,9 @@ class GroupCoordinator:
         NOTE: `src` is the local rank of the source rank.
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
+
+        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+            _CENSUS.bump(self._clock_family_broadcast)
 
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
