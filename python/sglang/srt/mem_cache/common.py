@@ -78,7 +78,7 @@ def free_swa_out_of_window_slots(
     assert (
         req.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
-    evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
+    evict_floor = max(req.cache_protected_len, req.swa_evict_floor)
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
@@ -130,7 +130,7 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return
 
-    if getattr(req, "kv_spill_state", None) == "host":
+    if req.kv_spill_state == "host":
         # kv-session-offload: this request's rows past `kv_spill_boundary` are
         # HOST SENTINELS, not device KV. Inserting them into the device radix
         # tree donates indices that address no device row: the tree's
@@ -816,7 +816,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # subsequent reset_for_retract (retract caller) is safe: it resets logical
     # state and does not touch req_pool_idx. Device (non-spilled) reqs have
     # kv_spill_state None -> stock path unchanged, byte-identical.
-    if getattr(req, "kv_spill_state", None) == "host":
+    if req.kv_spill_state == "host":
         from sglang.srt.managers.kv_session_offload import (
             get_kv_session_offload_manager,
         )

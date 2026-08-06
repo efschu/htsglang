@@ -1,3 +1,13 @@
+"""Hierarchical Mamba Radix Cache -- extends MambaRadixCache with HiCache storage pooling.
+
+UNREACHABLE IN THE DEFAULT FACTORY: no code path constructs this class --
+registry.py routes hierarchical + hybrid-SSM configs to UnifiedRadixCache.
+Fixes for production behavior belong in unified_radix_cache.py. This class is
+retained as tested latent code for a potential future construction site; three
+hardening commits (2915f6de4f, 1d379c56ee, 8bca9d3db1) landed here before the
+reachability gap was discovered (#581).
+"""
+
 from __future__ import annotations
 
 import atexit
