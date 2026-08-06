@@ -550,6 +550,72 @@ ARMS: Tuple[Arm, ...] = (
         reject_markers=("--draft-kv-layout dcp", "--enable-kv-session-offload"),
         expected_seconds=60.0,
     ),
+    # --- #550/#552: the two arms that turn open questions into numbers ----
+    Arm(
+        name="N_resume_under_spec",
+        axis="spilled session waving back INTO a live spec batch (#552 R1-R4)",
+        catches=(
+            "the one path --kv-session-offload-resume-under-spec exists for "
+            "and has never been observed on hardware: a spilled session "
+            "rejoining the LIVE spec decode batch instead of being held on "
+            "host to completion. The flag's own help text names that gap as "
+            "the reason it defaults OFF, so an arm is the only thing that can "
+            "close it -- the draft-KV share must restore inside the session's "
+            "residency bundle and the republished seed must still verify, "
+            "which is a CORRECTNESS claim and therefore byte-gated"
+        ),
+        env={"KVSO_ALLOW_SPEC": "1"},
+        flags=(
+            "--enable-kv-session-offload",
+            "--kv-session-offload-resume-under-spec",
+            "--kv-session-offload-host-ram-gib", "8",
+            # Force real spill pressure: without a wave-back trigger the
+            # session never leaves host and the arm would pass by never
+            # exercising its own subject.
+            "--kv-session-offload-wave-back-min-free-tokens", "2048",
+        ),
+        # PS2 is mutually exclusive with resume by construction (a born-
+        # spilled prompt never wrote the draft KV the rejoined drafter
+        # attends); server_args refuses the pair by name, so this arm must
+        # not carry --kv-session-offload-prefill.
+        expect=_expect(offload=True),
+        coherence="byte+graded",
+        expected_seconds=300.0,
+    ),
+    Arm(
+        name="O_hicache_contention",
+        axis="kvso spill copies x HiCache backup/prefetch on one link (#550)",
+        catches=(
+            "the measurement #547 refused the pair for. Both features stream "
+            "into PINNED host memory over the same link -- kvso from inside "
+            "the decode loop's critical path, HiCache from its own controller "
+            "threads -- and the spill tick's latency budget IS the feature. "
+            "This arm exists to produce ms/round WITH and WITHOUT a live "
+            "HiCache host tier, not to prove the pair boots"
+        ),
+        # Both gates: the spec bring-up gate and the #550 pair opt-in.
+        env={"KVSO_ALLOW_SPEC": "1", "KVSO_ALLOW_HICACHE": "1"},
+        flags=(
+            "--enable-kv-session-offload",
+            "--kv-session-offload-host-ram-gib", "8",
+            "--enable-hierarchical-cache",
+            # Absolute, so the joint budget guard can price BOTH posts at
+            # parse time; --hicache-ratio has no honest parse-time number.
+            # 8 GiB kvso + 8 GB HiCache sits far under this box's host RAM,
+            # so the arm measures contention rather than tripping the guard.
+            "--hicache-size", "8",
+        ),
+        expect=_expect(offload=True),
+        coherence="byte+graded",
+        expected_seconds=360.0,
+        capture_note=(
+            "PAIRED arm: run B_offload as the without-HiCache control in the "
+            "same boot session and report ms/round for both. An A-vs-A noise "
+            "floor must be established BEFORE the A-vs-B claim, and runs must "
+            "be >= 10 s -- a contention number below the noise floor is not a "
+            "number."
+        ),
+    ),
 )
 
 

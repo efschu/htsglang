@@ -111,23 +111,51 @@ class TestSweep1ArmRepairs(CustomTestCase):
     def test_offload_arms_opt_into_the_spec_bring_up_gate(self):
         """--enable-kv-session-offload x spec is gated on KVSO_ALLOW_SPEC=1.
 
-        Five arms cross exactly that and none of them set it, so all five died
-        on the gate. The gate is correct; the arms have to opt in the way an
-        operator would.
+        Five arms crossed exactly that and none of them set it, so all five
+        died on the gate. The gate is correct; the arms have to opt in the way
+        an operator would.
+
+        DERIVED, not enumerated. The first version of this test listed the five
+        arms by name, which meant a NEW offload arm could be added and die on
+        the same gate with the suite green -- the enumerate-the-known-cases
+        shape that #549 cost an afternoon. The condition is now read off each
+        arm: enables offload, does not drop the base spec flags, therefore
+        needs the gate.
         """
-        for name in (
-            "B_offload",
-            "D_offload_x_crossalgo",
-            "G_all_axes",
-            "I_dflash_shards",
-            "J_waveback_ps2",
-        ):
-            arm = arm_by_name(name)
+        checked = []
+        for arm in ARMS:
+            if arm.kind != "boot":
+                continue
+            if "--enable-kv-session-offload" not in arm.flags:
+                continue
+            if "--speculative-algorithm" in arm.drop_flags:
+                continue  # a deliberate no-spec control (see H)
+            checked.append(arm.name)
             self.assertEqual(
                 arm.env.get("KVSO_ALLOW_SPEC"),
                 "1",
-                f"{name} crosses offload with spec and must opt into the gate",
+                f"{arm.name} crosses offload with spec and must opt into the "
+                "gate, or it dies on the gate and reports whatever the gate "
+                "said instead of testing its own axis",
             )
+        # The derivation must actually select arms; a filter that matches
+        # nothing would make this test vacuously green forever.
+        self.assertGreaterEqual(len(checked), 5, checked)
+
+    def test_the_hicache_pair_arm_opts_into_both_gates(self):
+        """#550: kvso x HiCache is opt-in behind KVSO_ALLOW_HICACHE on top of
+        the spec gate. An arm carrying only one of the two dies on the other
+        and reports that refusal as its result."""
+        for arm in ARMS:
+            if "--enable-hierarchical-cache" not in arm.flags:
+                continue
+            if "--enable-kv-session-offload" not in arm.flags:
+                continue
+            self.assertEqual(arm.env.get("KVSO_ALLOW_HICACHE"), "1", arm.name)
+            # The joint budget guard can only price HiCache at parse time from
+            # an ABSOLUTE --hicache-size; --hicache-ratio has no honest
+            # parse-time number, so a contention arm must pin the absolute one.
+            self.assertIn("--hicache-size", arm.flags, arm.name)
 
     def test_h_is_the_no_spec_control_and_needs_no_gate(self):
         """If H ever needs KVSO_ALLOW_SPEC, the gate stopped meaning what it says."""

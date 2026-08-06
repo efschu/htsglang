@@ -1739,6 +1739,51 @@ halves — six of its tests go red against the old one-sentence refusal, and the
 structural half goes red the moment the seam gains a producer or a reader
 outside the layer that makes the reasoning true.
 
+RESOLVED IN #550, and the split between the two halves is the lesson. Gap (1)
+was a MECHANISM and could be built at the desk: `mem_cache/pinned_host_budget`
+is now the single owner of "may this pinned host buffer be allocated", every
+pinned host pool routes its check through it, and `_handle_kv_session_offload`
+sums both posts once in the launcher. Gap (2) was a MEASUREMENT, and writing a
+guard does not produce a number — so the pair became an opt-in
+(`KVSO_ALLOW_HICACHE=1`) rather than a default, and the remaining refusal names
+the measurement and no longer claims the RAM gap is open. Two things fell out
+of building it that the #547 reading had not reached. First, the shared choke
+point: kvso allocates its spill pool through the SAME `MHATokenToKVPoolHost`
+class HiCache uses, so `pool_host/base.py` was already the one place both posts
+pass through — the joint check needed no new plumbing, only a `budget_label`
+so a refusal can name which flag to lower. Second, the honest figure: all six
+per-pool checks read `psutil.virtual_memory()`, which under lxcfs is
+synthesised (`MemAvailable` can exceed `MemTotal` on this rig), so the pools
+were being validated against a number that does not denote anything — the
+lxcfs half of #549/#551, closed in the same cut by routing every site through
+`memtier.profile.host_memory_bytes_for_pinning`. The rule worth keeping: when a
+refusal names N missing pieces, check which of them are mechanisms and which
+are measurements before promising to lift it — only the first kind can be
+closed by writing code, and shipping as though the second kind were closed too
+is exactly what the refusal existed to prevent.
+
+Wrong-door family (#549): a state machine that classifies by ENUMERATING the
+doors it knows will silently drop anything that arrives through a new one.
+`GdnSlotRuntime.on_round` sorted every session into three branches — resident
+(`mamba_pool_idx` is not None), resuming (parked AND in the waiting queue), or
+newcomer (not parked) — which is exhaustive only if the waiting queue is the
+sole way back from parked. It is not: kv-session-offload's restore loop runs in
+`pre_schedule` and merges an unparked session into `running_batch` BEFORE
+`on_round` plans, and `_commit_unpark` pops kvso's own record without telling
+the GDN executor. Such a session is running, has no slot, and is still in
+`parked_set` — so it matched NO branch, never entered `residents`, never
+entered `resumed_ids`, and `vacate_plan`'s restore list (built from
+`resumed_ids`) never restored it. It then decoded with all-None mamba state:
+silently wrong output, no error, no log. Fixed with a fourth classification
+derived STRUCTURALLY — running, parked, and slotless — rather than signalled
+from the unpark commit, because what makes the session dangerous is "about to
+decode with its state still a blob" and any future path producing that state is
+equally dangerous; keying on one producer would leave the next one broken the
+same way. Note the neighbouring `forget` loop had already been taught that a
+parked session can be in `_by_id`, so the module half-knew. Pinned by
+`test_gdn_slot_runtime.TestUnparkedStraightIntoRunning`, whose two core tests go
+red against the pre-fix classification.
+
 Equivalent-fallback family (#552): a decline is only worth its name when the
 fallback it hands off to does something DIFFERENT. `try_spill` declined
 outright whenever speculative decoding was active and the FCFS/minimal-eviction
