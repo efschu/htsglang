@@ -54,13 +54,12 @@ def _is_trouble(line: str) -> bool:
 def find_freeze_point(lines: List[str]) -> Optional[str]:
     """Return the timestamp of the last normal progress line before the
     first trouble line, or None if no trouble is found."""
-    first_trouble_idx: Optional[int] = None
     last_progress_ts: Optional[str] = None
+    trouble_found = False
 
     for line in lines:
-        if _is_trouble(line) and first_trouble_idx is None:
-            first_trouble_idx = len(lines)  # sentinel to stop scanning
-        if first_trouble_idx is not None:
+        if _is_trouble(line) and not trouble_found:
+            trouble_found = True
             break
 
         if _is_progress(line):
@@ -68,7 +67,7 @@ def find_freeze_point(lines: List[str]) -> Optional[str]:
             if ts is not None:
                 last_progress_ts = ts.strftime("%Y-%m-%d %H:%M:%S")
 
-    if first_trouble_idx is None:
+    if not trouble_found:
         return None
 
     return last_progress_ts
@@ -133,14 +132,25 @@ def summarize(lines: List[str]) -> str:
     freeze_dt = datetime.strptime(freeze_point, "%Y-%m-%d %H:%M:%S")
 
     # --- Gap to first trouble ---
-    first_trouble_ts: Optional[str] = None
     first_trouble_idx: Optional[int] = None
+    first_trouble_ts: Optional[str] = None
+
     for i, line in enumerate(lines):
         if _is_trouble(line):
-            first_trouble_ts_raw = _parse_ts(line)
-            if first_trouble_ts_raw is not None:
-                first_trouble_ts = first_trouble_ts_raw.strftime("%Y-%m-%d %H:%M:%S")
             first_trouble_idx = i
+            # The trouble line itself may be a traceback (no timestamp).
+            # Try its own timestamp first, then fall back to the last
+            # timestamped line preceding it.
+            ts = _parse_ts(line)
+            if ts is not None:
+                first_trouble_ts = ts.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                # Scan backwards from the trouble line for a timestamp.
+                for j in range(i - 1, -1, -1):
+                    ts_prev = _parse_ts(lines[j])
+                    if ts_prev is not None:
+                        first_trouble_ts = ts_prev.strftime("%Y-%m-%d %H:%M:%S")
+                        break
             break
 
     if first_trouble_ts is not None and first_trouble_idx is not None:
