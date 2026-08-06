@@ -573,3 +573,35 @@ also a DIFFERENT failure from the #616 index assert this window was sent to
 fix. The accept-broadcast fix is validated against its own family (15 min and
 277 completions with zero index asserts, against a pre-fix envelope of 192 s);
 the wedge is what now truncates every soak, and it is unfixed.
+
+## 16. Load policy, and what it costs the evidence
+
+From this point the rig's test load comes ONLY from real local-model
+sub-subagents doing meaningful work (max 2 concurrent), not from synthetic
+curl loops. Rationale: a soak that burns the GPU on throwaway prompts produces
+no artefact, and the same hours can produce committed code.
+
+**The cost, stated so nobody mistakes a quiet run for a validated fix.** The
+`trigger_8way.sh` reproducer drives 8 concurrent long-output completions and
+saturates the server (`#running-req: 4`, `#queue-req: 5-6`). Two local-model
+workers drive `#running-req: 1, #queue-req: 0`. Both crash families in this
+window were only ever observed under SATURATION, and the pre-fix envelope
+(192 s to the index assert) was measured there. So:
+
+* the accept-broadcast fix's evidence -- 15 min / 277 completions and
+  23.5 min / 273 completions with zero index asserts -- comes from the
+  saturated reproducer, and stands;
+* any FUTURE clean period under agent-only load is NOT comparable evidence
+  and must not be quoted as a soak result.
+
+If a regression soak is needed later, the synthetic load may be used again,
+but only: freshly launched, its pgid recorded at launch, killed by that pgid,
+and its absence proven (`#running-req` back to the agent-only baseline) before
+any soak result is reported. The teardown of soak 4 is the worked example --
+before: `#running-req: 3, #queue-req: 5`; after: `#running-req: 1,
+#queue-req: 0`, server untouched at 9 processes and health 200.
+
+Trap worth recording, hit twice: `pkill -f <pattern>` and any
+`/proc/PID/cmdline` scan match the AGENT'S OWN wrapper shell, because the
+pattern appears in the command being run. Both times it killed the calling
+shell mid-command. Kill by pgid taken from a listed pid instead.
