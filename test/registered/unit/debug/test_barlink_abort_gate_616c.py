@@ -8,7 +8,6 @@ decision helpers.  Nothing here touches a GPU or imports torch.
 
 from __future__ import annotations
 
-import threading
 
 import pytest
 
@@ -19,8 +18,6 @@ from sglang.srt.distributed.device_communicators.barlink_abort_gate import (
     ENV_MAX_LAG,
     ENV_POLL_MS,
     ENV_REPLAY,
-    _FALSE,
-    _PausePolling,
     abort_check_enabled,
     check_aborts,
     check_after_graph_replay,
@@ -30,7 +27,6 @@ from sglang.srt.distributed.device_communicators.barlink_abort_gate import (
     pause_polling,
     poll_interval_s,
     poll_status_words,
-    polling_paused,
     register,
     registered,
     replay_check_enabled,
@@ -44,6 +40,7 @@ from sglang.srt.distributed.device_communicators.barlink_abort_gate import (
 # ---------------------------------------------------------------------------
 # _env_flag (indirect via abort_check_enabled, defer_enabled, etc.)
 # ---------------------------------------------------------------------------
+
 
 class TestEnvFlagDefaults:
     """_env_flag returns default when the variable is unset (line 156-158)."""
@@ -72,15 +69,29 @@ class TestEnvFlagTruthyFalsy:
     """
 
     # Values in _FALSE that must yield False.
-    @pytest.mark.parametrize("val", ["0", "false", "False", "FALSE", "no", "No",
-                                    "off", "Off", "OFF", ""])
+    @pytest.mark.parametrize(
+        "val", ["0", "false", "False", "FALSE", "no", "No", "off", "Off", "OFF", ""]
+    )
     def test_falsy_values(self, val, monkeypatch):
         monkeypatch.setenv(ENV_ENABLE, val)
         assert abort_check_enabled() is False
 
     # Values NOT in _FALSE that must yield True.
-    @pytest.mark.parametrize("val", ["1", "true", "True", "TRUE", "yes", "on",
-                                    "anything", "garbage", "2", "random"])
+    @pytest.mark.parametrize(
+        "val",
+        [
+            "1",
+            "true",
+            "True",
+            "TRUE",
+            "yes",
+            "on",
+            "anything",
+            "garbage",
+            "2",
+            "random",
+        ],
+    )
     def test_truthy_values(self, val, monkeypatch):
         monkeypatch.setenv(ENV_ENABLE, val)
         assert abort_check_enabled() is True
@@ -114,6 +125,7 @@ class TestEnvFlagUnrecognisedValue:
 # check_every -- integer clamping (lines 171-179)
 # ---------------------------------------------------------------------------
 
+
 class TestCheckEvery:
     def test_default_is_one(self, monkeypatch):
         monkeypatch.delenv(ENV_EVERY, raising=False)
@@ -143,6 +155,7 @@ class TestCheckEvery:
 # max_lag -- integer clamping (lines 187-196)
 # ---------------------------------------------------------------------------
 
+
 class TestMaxLag:
     def test_default_is_four(self, monkeypatch):
         monkeypatch.delenv(ENV_MAX_LAG, raising=False)
@@ -171,6 +184,7 @@ class TestMaxLag:
 # poll_interval_s -- float parsing (lines 199-208)
 # ---------------------------------------------------------------------------
 
+
 class TestPollIntervalS:
     def test_default_10ms(self, monkeypatch):
         monkeypatch.delenv(ENV_POLL_MS, raising=False)
@@ -198,6 +212,7 @@ class TestPollIntervalS:
 # ---------------------------------------------------------------------------
 # should_poll_status and should_defer_status -- pure predicates
 # ---------------------------------------------------------------------------
+
 
 class TestShouldPollStatus:
     """Lines 287-300: returns bool(status_is_cuda) and bool(watchdog_running)."""
@@ -235,6 +250,7 @@ class TestShouldDeferStatus:
 # pause_polling context manager -- capture depth (lines 222-253)
 # ---------------------------------------------------------------------------
 
+
 class TestPausePolling:
     """Test the _PausePolling reentrant context manager without a GPU."""
 
@@ -242,7 +258,8 @@ class TestPausePolling:
         """polling_paused flips True during __enter__ and back to False."""
         # We need to reset any pre-existing depth; _PausePolling uses a global.
         monkeypatch.setattr(
-            "sglang.srt.distributed.device_communicators.barlink_abort_gate._capture_depth", 0
+            "sglang.srt.distributed.device_communicators.barlink_abort_gate._capture_depth",
+            0,
         )
         from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
 
@@ -255,6 +272,7 @@ class TestPausePolling:
     def test_reentrant_nested(self, monkeypatch):
         """Two pause_polling() contexts nested -> depth 2, unpauses fully only after both exit."""
         from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
+
         monkeypatch.setattr(m, "_capture_depth", 0)
 
         with pause_polling():
@@ -269,6 +287,7 @@ class TestPausePolling:
     def test_pause_polling_does_not_swallow_exceptions(self, monkeypatch):
         """__exit__ returns None, so exceptions propagate (line 235)."""
         from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
+
         monkeypatch.setattr(m, "_capture_depth", 0)
 
         with pytest.raises(ValueError):
@@ -282,8 +301,8 @@ class TestPausePolling:
 # Registry CRUD -- register, unregister, registered, reset_for_test
 # ---------------------------------------------------------------------------
 
-class TestRegistry:
 
+class TestRegistry:
     @pytest.fixture(autouse=True)
     def _clean_registry(self):
         reset_for_test()
@@ -339,8 +358,8 @@ class TestRegistry:
 # poll_status_words -- returns 0 when registry is empty
 # ---------------------------------------------------------------------------
 
-class TestPollStatusWords:
 
+class TestPollStatusWords:
     @pytest.fixture(autouse=True)
     def _clean(self, monkeypatch):
         reset_for_test()
@@ -357,6 +376,7 @@ class TestPollStatusWords:
 
     def test_paused_does_not_poll(self, monkeypatch):
         from sglang.srt.distributed.device_communicators import barlink_abort_gate as m
+
         m._capture_depth = 1
         monkeypatch.setenv(ENV_ENABLE, "1")
         try:
@@ -394,8 +414,8 @@ class TestPollStatusWords:
 # check_aborts and check_after_graph_replay -- empty path
 # ---------------------------------------------------------------------------
 
-class TestCheckAborts:
 
+class TestCheckAborts:
     @pytest.fixture(autouse=True)
     def _clean(self, monkeypatch):
         reset_for_test()
@@ -427,7 +447,6 @@ class TestCheckAborts:
 
 
 class TestCheckAfterGraphReplay:
-
     @pytest.fixture(autouse=True)
     def _clean(self, monkeypatch):
         reset_for_test()
@@ -453,6 +472,7 @@ class TestCheckAfterGraphReplay:
 # ---------------------------------------------------------------------------
 # replay_check_enabled -- AND logic
 # ---------------------------------------------------------------------------
+
 
 class TestReplayCheckEnabled:
     """replay_check_enabled = abort_check_enabled() AND _env_flag(ENV_REPLAY, True)"""

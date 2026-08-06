@@ -13,14 +13,11 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 # Timestamp pattern: [YYYY-MM-DD HH:MM:SS ...]
-_TS_RE = re.compile(
-    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s.*?\]"
-)
+_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s.*?\]")
 
 PROGRESS_MARKERS = [
     "POST /v1/chat/completions",
@@ -60,9 +57,9 @@ def find_freeze_point(lines: List[str]) -> Optional[str]:
     first_trouble_idx: Optional[int] = None
     last_progress_ts: Optional[str] = None
 
-    for i, line in enumerate(lines):
+    for line in lines:
         if _is_trouble(line) and first_trouble_idx is None:
-            first_trouble_idx = i
+            first_trouble_idx = len(lines)  # sentinel to stop scanning
         if first_trouble_idx is not None:
             break
 
@@ -85,10 +82,10 @@ def timeline(lines: List[str], window_s: int = 60) -> List[str]:
         return []
 
     freeze_dt = datetime.strptime(freeze_point, "%Y-%m-%d %H:%M:%S")
-    cutoff_dt = freeze_dt - __import__("datetime").timedelta(seconds=window_s)
+    cutoff_dt = freeze_dt - timedelta(seconds=window_s)
 
     # Locate the first trouble line index to separate pre / post sections.
-    first_trouble_idx = None
+    first_trouble_idx: Optional[int] = None
     for i, line in enumerate(lines):
         if _is_trouble(line):
             first_trouble_idx = i
@@ -128,7 +125,7 @@ def summarize(lines: List[str]) -> str:
     parts.append("=" * 60)
 
     if freeze_point is None:
-        parts.append("No trouble lines found — no freeze detected.")
+        parts.append("No trouble lines found - no freeze detected.")
         parts.append("")
         return "\n".join(parts)
 
@@ -149,7 +146,9 @@ def summarize(lines: List[str]) -> str:
     if first_trouble_ts is not None and first_trouble_idx is not None:
         trouble_dt = datetime.strptime(first_trouble_ts, "%Y-%m-%d %H:%M:%S")
         gap = (trouble_dt - freeze_dt).total_seconds()
-        parts.append(f"  First trouble : {first_trouble_ts}  (line {first_trouble_idx + 1})")
+        parts.append(
+            f"  First trouble : {first_trouble_ts}  (line {first_trouble_idx + 1})"
+        )
         parts.append(f"  Gap           : {gap:.1f} s after freeze point")
 
     parts.append("")
@@ -169,12 +168,12 @@ def summarize(lines: List[str]) -> str:
 
     # --- Last 20 progress lines before freeze ---
     progress_lines: list[str] = []
-    in_trouble = False
+    in_trouble_section = False
     for line in lines:
-        if in_trouble:
+        if in_trouble_section:
             break
         if _is_trouble(line):
-            in_trouble = True
+            in_trouble_section = True
             break
         if _is_progress(line):
             progress_lines.append(line)
