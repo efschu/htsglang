@@ -27,6 +27,11 @@ class DecodePrefixMatch:
     l3_storage_hit_length: int
     last_device_node: Any
     last_host_node: Any = None
+    # The matched host node, kept regardless of whether this rank found an L3
+    # hit. `last_host_node` above is cleared when the RANK-LOCAL l3 hit length
+    # is 0, but a rank that is locally ineligible must still be able to enter
+    # the prefetch participation vote carrying a node (#580/#607).
+    matched_host_node: Any = None
     prefetch_registered: bool = False
 
     @property
@@ -94,6 +99,7 @@ class DecodeHiCachePreallocMixin:
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
             last_host_node=last_host_node if l3_storage_hit_length > 0 else None,
+            matched_host_node=last_host_node,
         )
 
     def _start_hicache_prefetch(
@@ -103,27 +109,68 @@ class DecodeHiCachePreallocMixin:
 
         On failure, degrades to L2-only restore by clearing l3 fields.
         """
-        if (
-            prefix_match is None
-            or prefix_match.l3_storage_hit_length <= 0
-            or prefix_match.last_host_node is None
-        ):
+        if prefix_match is None or prefix_match.matched_host_node is None:
+            # Rank-uniform: `prefix_match` is None only when the decode radix
+            # cache is off or this is a rebootstrap, and `matched_host_node` is
+            # always populated when decode HiCache is on. Skipping here is
+            # therefore symmetric across ranks.
             return
+
+        # RANK-LOCAL verdict. `l3_storage_hit_length` is derived in
+        # `_build_decode_prefix_match` from `last_host_node.backuped`, i.e.
+        # "full KV in THIS rank's host pool", which diverges across ranks under
+        # uneven DCP (see unified_radix_cache.py:2160-2175).
+        locally_eligible = (
+            prefix_match.l3_storage_hit_length > 0
+            and prefix_match.last_host_node is not None
+        )
+        # #580/#607: when the tree cache decides prefetch participation by group
+        # vote, `prefetch_from_storage` runs an all_reduce. Returning early on
+        # the rank-local verdict above would leave the peers standing alone in
+        # that collective -- the #580 failure, reproduced on the decode side.
+        # Call unconditionally and let the vote decide; the local verdict rides
+        # along as `locally_eligible`. Tree caches without the predicate keep
+        # the plain local gate and the byte-identical call below.
+        group_decides = getattr(
+            self.tree_cache, "prefetch_participation_is_collective", None
+        )
+        group_decides = bool(group_decides is not None and group_decides())
+        if not locally_eligible and not group_decides:
+            return
+
         try:
-            node = prefix_match.last_host_node
-            matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = req.origin_input_ids[
-                matched_len : matched_len + prefix_match.l3_storage_hit_length
-            ]
-            last_hash = node.get_last_hash_value()
-            prefix_keys = (
-                node.get_prefix_hash_values(node.parent)
-                if self.tree_cache.hicache_storage_pass_prefix_keys
-                else None
-            )
-            self.tree_cache.prefetch_from_storage(
-                req.rid, node, suffix, last_hash, prefix_keys
-            )
+            node = prefix_match.matched_host_node
+            if locally_eligible:
+                matched_len = (
+                    prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
+                )
+                suffix = req.origin_input_ids[
+                    matched_len : matched_len + prefix_match.l3_storage_hit_length
+                ]
+                last_hash = node.get_last_hash_value()
+                prefix_keys = (
+                    node.get_prefix_hash_values(node.parent)
+                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    else None
+                )
+            else:
+                # Ineligible here: enter the vote carrying nothing. The empty
+                # token list keeps every derived length at 0 on this rank and
+                # the vote comes out negative, so no rank registers a prefetch.
+                suffix, last_hash, prefix_keys = [], None, None
+            if group_decides:
+                self.tree_cache.prefetch_from_storage(
+                    req.rid,
+                    node,
+                    suffix,
+                    last_hash,
+                    prefix_keys,
+                    locally_eligible=locally_eligible,
+                )
+            else:
+                self.tree_cache.prefetch_from_storage(
+                    req.rid, node, suffix, last_hash, prefix_keys
+                )
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch
             )
@@ -188,11 +235,25 @@ class DecodeHiCacheTransferMixin:
         """
         pm = dr.prefix_match
 
-        # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
-        if pm.l3_storage_hit_length > 0:
-            if not self.tree_cache.check_prefetch_progress(dr.req.rid):
-                return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+        # Wait for L3 -> L2 prefetch to drain.
+        #
+        # #607: this call is UNCONDITIONAL by design. `check_prefetch_progress`
+        # runs `_all_reduce_attn_groups` collectives (the can_terminate_prefetch
+        # MAX reduce at unified_radix_cache.py:2356 and the min_completed_tokens
+        # MIN reduce at :2400). The `pm.l3_storage_hit_length > 0` gate that used
+        # to stand here is RANK-LOCAL -- it derives from `last_host_node.backuped`
+        # -- so it fenced a subset of ranks out of those collectives while their
+        # peers entered: a hang, not a wrong answer.
+        #
+        # Calling it on every rank is safe and cheap: its own
+        # `req_id not in self.ongoing_prefetch` early-return (:2366) is
+        # rank-SYMMETRIC, because prefetch registration is all-or-none under the
+        # participation vote in `prefetch_from_storage`. A rank with no prefetch
+        # registered returns True immediately without touching a collective, and
+        # `pop_prefetch_loaded_tokens` is a plain dict pop defaulting to 0.
+        if not self.tree_cache.check_prefetch_progress(dr.req.rid):
+            return False
+        self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(
@@ -202,6 +263,20 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
         )
+        # #607: `match_prefix_for_req` re-points `dr.req.last_node` at the node it
+        # just matched (schedule_policy.py:123), but the admission lock taken in
+        # `DecodePreallocQueue._match_prefix_and_lock` (decode.py:545) still sits
+        # on `pm.last_device_node`. Every teardown path releases `req.last_node`
+        # (release_kv_cache -> cache_finished_req), so leaving the pointer and the
+        # lock split leaks the locked node and under-decrements the newly matched
+        # one -- and under mamba a leaked lock also holds that node's checkpoint
+        # unevictable. Move the lock along with the pointer, inc'ing the new node
+        # BEFORE dec'ing the old so a shared ancestor cannot be evicted in the gap
+        # (init_load_back below can evict).
+        if dr.req.last_node is not pm.last_device_node:
+            self.tree_cache.inc_lock_ref(dr.req.last_node)
+            self.tree_cache.dec_lock_ref(pm.last_device_node)
+            pm.last_device_node = dr.req.last_node
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
@@ -307,3 +382,10 @@ class DecodeHiCacheTransferMixin:
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )
         decode_req.req.last_node = decode_req.hicache_restored_node
+        # #607: ownership of the restore lock moves to `req.last_node` here, so
+        # the request teardown (release_kv_cache -> cache_finished_req) becomes
+        # its sole releaser. Drop our handle: `_clean_hicache_prefetch_resources`
+        # releases `hicache_restored_node` when it is still set, and after this
+        # assignment that would be a SECOND release of the very node teardown is
+        # about to release.
+        decode_req.hicache_restored_node = None
