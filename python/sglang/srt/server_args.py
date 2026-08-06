@@ -11108,6 +11108,35 @@ class ServerArgs:
             build_card_ledgers,
         )
 
+        # #594. Resolve the activation profile's inputs HERE, in the single
+        # function that constructs a ledger, and not at a caller.
+        #
+        # #596 diagnosed this exact defect and fixed it on ONE caller
+        # (ledger_full_demand_per_gpu). The gated path calls this constructor
+        # directly, so it kept asking the footprint cache a malformed
+        # question: chunked_prefill_size and cuda_graph_config.decode.max_bs
+        # are both still unset while _handle_uneven_tp runs, the profile then
+        # digests to a key nothing is cached under, and the activation and
+        # capture terms were UNBOUNDED on every gated boot no matter how often
+        # probe_activation had been run. Measured on the 2026-08-06 window:
+        # the ledger looked up a77d53df9f2e (chunk 0, decode_max_bs 0) while
+        # the ranks wrote their footprints under ff1fa555fe7a (2048, 24).
+        #
+        # Placing it at a caller is what let the defect survive its own fix,
+        # which is the #605 lesson restated: a step every path needs belongs
+        # in the function every path goes through. Both helpers are idempotent
+        # and fill only unset values, so the path #596 already fixed is
+        # byte-identical.
+        # Both helpers read cuda_graph_config.decode, so both need it built.
+        # Callers that reach the ledger without one exist (the reserve-split
+        # path constructs its inputs directly), and for them there is no
+        # capture set to resolve or widen: a real shape difference, not a
+        # guard against a state that cannot occur.
+        gpu_mem = get_device_memory_capacity(self.device)
+        if gpu_mem is not None and self.cuda_graph_config is not None:
+            self._apply_gpu_mem_capacity_defaults(gpu_mem)
+            self._widen_decode_capture_to_session_ceiling(self.cuda_graph_config.decode)
+
         rank_gpu_id = list(self.rank_gpu_id)
         cards_by_ordinal = _resolve_rank_gpu_cards(rank_gpu_id)
         cards = [
