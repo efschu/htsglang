@@ -501,6 +501,7 @@ def build_dcp_weighted_kv_indices(
     cp_ratio: int,
     pad: int = 0,
     req_to_token_stride: Optional[int] = None,
+    total_tokens: Optional[int] = None,
 ):
     """Weighted-DCP paged kv_indices: this rank's OWNED cache slots, compacted.
 
@@ -526,7 +527,25 @@ def build_dcp_weighted_kv_indices(
     lens64 = paged_kernel_lens.to(torch.int64)
     full_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
     full_indptr[1:] = torch.cumsum(lens64, dim=0).to(torch.int32)
-    total = int(full_indptr[bs].item())
+    # #616c: `total` is the ONLY host sync in this function, and reading it off
+    # the device (`full_indptr[bs].item()`) is a BLOCKING D2H sitting inside
+    # the collective window. A wedge was caught with all three ranks stopped on
+    # exactly this line while their device queues held a BAR1 spin kernel
+    # waiting on a peer -- each rank blocked draining its own queue, so none
+    # could enqueue the work that would release the others
+    # (docs/dev/NOTE_616c_index_values.md section 11).
+    #
+    # `total` is just sum(paged_kernel_lens), so a caller that already holds
+    # those lengths on the host can supply it and skip the sync entirely.
+    # `total_tokens` is that channel; when it is None the old read is kept, so
+    # callers that have no CPU mirror are unaffected.
+    if total_tokens is not None:
+        total = int(total_tokens)
+    elif not paged_kernel_lens.is_cuda:
+        # Already host-side: summing here is free and still avoids a sync.
+        total = int(lens64.sum())
+    else:
+        total = int(full_indptr[bs].item())
     full_kv = torch.empty(max(total, 1), dtype=torch.int32, device=device)
     if total > 0:
         create_flashinfer_kv_indices_triton[(bs,)](

@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import deque
 from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ __all__ = [
     "census_heartbeat",
     "census_interval",
     "format_local_census",
+    "format_local_history",
 ]
 
 #: Kill switch. Default ON -- see the module docstring.
@@ -102,6 +104,20 @@ DEFAULT_INTERVAL = 50
 #: comparison would not already have escalated. One modulo on a counter that
 #: is incremented anyway, so the hot path is untouched.
 DEFAULT_HEARTBEAT = 10000
+
+#: Default ring-buffer capacity for per-collective history. Stores the most
+#: recent N (family, nbytes) pairs so the abort-time dump can show the
+#: sequence of collectives, not just the cumulative counts.
+#:
+#: Sized from a measurement, not a guess (#616c). At 64 the first real wedge
+#: produced two ranks whose histories were byte-identical -- useless for
+#: locating a divergence, because 64 entries covered ~1 % of the run (the
+#: census counted 5701 tp.broadcast alone by then) and 50 of those 64 were a
+#: single uninterrupted run of broadcasts. A divergence that happened earlier
+#: is simply outside the window. 4096 entries is still only a few hundred kB
+#: of tuples per rank and costs one deque append per collective, which is the
+#: same hot-path cost as before.
+DEFAULT_HISTORY_LEN = 4096
 
 
 def census_enabled() -> bool:
@@ -174,6 +190,9 @@ class CollectiveCensus:
         #: per-tick warning produces thousands of identical lines that bury
         #: the one that mattered -- 2661 of them in a single boot.
         self._skip_warned = False
+        #: Ring buffer of the most recent (family, nbytes) entries, bounded
+        #: at DEFAULT_HISTORY_LEN. Per-instance, not global shared state.
+        self._history: deque = deque(maxlen=DEFAULT_HISTORY_LEN)
 
     # -- declaration ----------------------------------------------------
 
@@ -204,12 +223,35 @@ class CollectiveCensus:
 
     # -- hot path -------------------------------------------------------
 
-    def bump(self, family: str) -> None:
-        """Count one collective. One dict increment; no allocation."""
+    def bump(self, family: str, nbytes: int = 0) -> None:
+        """Count one collective. One dict increment; no allocation.
+
+        ``nbytes`` is an optional byte-count for the history ring buffer;
+        defaults to 0 for backward compatibility.
+        """
         self._counts[family] = self._counts.get(family, 0) + 1
+        self._history.append((family, nbytes))
 
     def snapshot(self) -> Dict[str, int]:
         return dict(self._counts)
+
+    def format_local_history(self, rank: int) -> str:
+        """This rank's recent collective sequence, oldest-first.
+
+        Intended for the abort path: each rank dumps its own history into
+        the log; the three lines are diffed after the fact to find where
+        the sequences diverged.
+        """
+        entries = list(self._history)
+        count = len(entries)
+        if not entries:
+            return f"collective history (rank {rank}, {count} entries): no entries recorded"
+        body = " ".join(f"{f}:{n}" for f, n in entries)
+        return (
+            f"collective history (rank {rank}, {count} entries): {body}. "
+            f"Diff this line against the peers' to find where the sequences "
+            f"diverged."
+        )
 
     # -- reporting ------------------------------------------------------
 
@@ -354,3 +396,13 @@ def format_local_census(rank: int) -> str:
         f"Compare this line against the peers' -- the family whose count "
         f"differs is the one that diverged."
     )
+
+
+def format_local_history(rank: int) -> str:
+    """This rank's recent collective sequence, for the abort path.
+
+    Mirrors the shape of ``format_local_census`` but shows the ring-buffer
+    history instead of the cumulative counts, so the reader can diff the
+    per-rank sequences to find where they diverged.
+    """
+    return _CENSUS.format_local_history(rank)
