@@ -446,6 +446,36 @@ NEXTN, bar1 on all three groups): the sequences **AGREE** on all three ranks —
 So "the ranks captured different graphs" is FALSIFIED as the shape-B root; the
 divergence, wherever it is, is not in what was baked into the graphs.
 
+**What the same boot then did, 4 minutes into an 8-way soak** (12:39:28, all
+evidence in `/spinning/603b-hunter2/wedge1/`): it wedged — and the wedge was
+NOT a barlink desync.
+
+* `Bar1CollectiveAborted`: **zero**, over six minutes, against
+  `SGLANG_BARLINK_BAR1_CAP_CYCLES=300e9` (~176 s at 1.7 GHz). A spin kernel
+  sitting on its deadline would have trapped inside that window.
+* The barlink peer watchdog polls the sticky abort words every tick and never
+  tripped; it was idle in its timer at every py-spy sample.
+* All three ranks were stopped at the same host line, `memory_pool.py:1484`,
+  identical across two py-spy rounds. That line is
+  `self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor`
+  — a CUDA index_put, i.e. the next CUDA-touching host op, which is the
+  aftermath signature, not the origin.
+* It ended in a CUDA **device-side assert**, `IndexKernel.cu:111
+  "index out of bounds"`, surfacing at that same line. The mapping is
+  allocated with `req_pool_size` rows (`memory_pool.py:1384`), so a
+  `select_index` at or above `req_pool_size` came out of the req-pool
+  allocator on the prefill path
+  (`alloc_req_slots` -> `alloc_for_extend` -> `prepare_for_extend`).
+
+CAVEAT, do not skip it: CUDA errors are reported asynchronously, so the
+assert is not *proven* to come from the index_put on line 1484 — an earlier
+queued index kernel could be the real source. `CUDA_LAUNCH_BLOCKING=1` on the
+next reproduction is what settles that.
+
+The consequence for triage: a wedge in this family that shows **no**
+`Bar1CollectiveAborted` is not a barlink collective desync and should not be
+investigated as one. Check for a device-side assert first.
+
 ## 3. Mandatory boot flags
 
 **The usability trias is a STANDARD boot setting, not a tuning knob** (user
