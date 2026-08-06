@@ -18,15 +18,52 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import shutil
 import subprocess
+import sys
 import time
 from errno import ENXIO
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import psutil
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_pyspy_binary() -> Optional[str]:
+    """Absolute path to the py-spy executable, or None if it cannot be found.
+
+    py-spy is a console script installed into the SAME bin directory as the
+    interpreter running us. It is NOT necessarily on PATH: a server launched as
+    ``/path/to/venv/bin/python -m sglang.launch_server`` never activates the
+    venv, so a bare ``py-spy`` resolved through ``/bin/sh`` misses it and every
+    automatic wedge dump silently produces nothing (observed 2026-08-06: the
+    only dump of a live wedge failed with "/bin/sh: 1: py-spy: not found" while
+    py-spy sat in the venv bin dir the whole time).
+
+    Search sys.executable's directory WITHOUT resolving symlinks first. A venv's
+    ``bin/python`` is normally a symlink to the base interpreter, so resolving it
+    lands in ``/usr/bin`` -- where the venv's console scripts are not, which
+    reproduces the very bug this function exists to prevent. The resolved
+    directory is still tried afterwards, for the layouts where it is the right
+    answer, and PATH last.
+    """
+    override = os.environ.get("SGLANG_PYSPY_BIN")
+    if override:
+        return override
+
+    executable = Path(sys.executable)
+    seen = set()
+    for bindir in (executable.parent, executable.resolve().parent):
+        if bindir in seen:
+            continue
+        seen.add(bindir)
+        candidate = bindir / "py-spy"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    return shutil.which("py-spy")
 
 
 def _resolve_cuda_coredump_pipe_path(proc: psutil.Process) -> Path:
@@ -77,17 +114,31 @@ def pyspy_dump_schedulers(scheduler_only=False):
         pids = [proc.pid for proc in procs]
     else:
         pids = [psutil.Process().pid]
+
+    pyspy = resolve_pyspy_binary()
+    if pyspy is None:
+        logger.error(
+            "py-spy executable not found next to %s nor on PATH; skipping the "
+            "dump. Install it into this interpreter's environment, or point "
+            "SGLANG_PYSPY_BIN at it.",
+            sys.executable,
+        )
+        return
+
     for pid in pids:
-        for attempt, native_flag in enumerate(["--native", ""]):
+        for attempt, native_flag in enumerate([["--native"], []]):
+            argv = [pyspy, "dump", *native_flag, "--pid", str(pid)]
             try:
-                cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
                 result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, check=True
+                    argv, capture_output=True, text=True, check=True
                 )
-                logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
+                logger.error(
+                    f"Pyspy dump for PID {pid} ({' '.join(argv)}):\n{result.stdout}"
+                )
                 break
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
+            except (subprocess.CalledProcessError, OSError) as e:
+                stderr = getattr(e, "stderr", None) or str(e)
+                logger.error(f"Pyspy failed ({' '.join(argv)}). Error: {stderr}")
                 if attempt == 1:
                     logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
