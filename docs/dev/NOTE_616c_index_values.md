@@ -788,3 +788,19 @@ the abort could read its peers' flag regions directly, without a device sync,
 and publish all three views from one process. Until that exists, every
 incident gives at most 2 of 3 ranks and cells involving the missing rank
 cannot be compared.
+
+## 20. The freeze-to-abort gap equals the cycle cap
+
+`wedge_timeline` on `boot_wedge3_nodisagree.log`:
+
+* last progress line: `2026-08-06 19:35:04` -- a **Prefill batch**, 143 new tokens
+* first trouble line: `2026-08-06 19:37:40`
+* gap: **156.0 s**, then 4 `Bar1CollectiveAborted` (ranks 0 and 1, twice each)
+
+156 s is the 3e11-cycle cap at ~1.9 GHz (~158 s). So nothing "happens" between
+freeze and abort: the spin simply runs to its deadline. That rules out a slow
+recovery, a retry, or a second event in between -- the wedge is instantaneous
+and the 2.5 minutes are pure deadline.
+
+The last progress being a PREFILL is consistent with every py-spy stack in
+this window landing in `_execute_extend`, never in a pure decode round.
