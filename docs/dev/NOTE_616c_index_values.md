@@ -732,3 +732,59 @@ broadcasts. A divergence occurring earlier is outside the window entirely, so
 "the histories are identical" is weak evidence at this size. DEFAULT_HISTORY_LEN
 is therefore raised from 64 to 4096, which is a few hundred kB per rank and the
 same one-append hot-path cost. The next wedge gets a window worth diffing.
+
+## 19. Third wedge: the sender-2 flag disagreement did NOT replicate
+
+Instrumented run with DEFAULT_HISTORY_LEN raised to 4096. The wedge fired,
+aborted, and both instruments produced output.
+
+**Collective histories: byte-identical over 4096 entries.** Rank 0 and rank 1
+each dumped 4096 (family, nbytes) entries and `cmp` reports no difference.
+Section 18 flagged the 64-entry window as too small to trust; at 64x the size
+the answer is unchanged. The ranks issue the same collective sequence. That
+result is now solid and should be treated as settled: **the divergence is not
+at the Python collective layer.**
+
+**Flag cells: no disagreement at all this time.** The `bar1_flag_align` tool
+reports every shared (block, sender) cell in agreement. That is the OPPOSITE
+of the second wedge, where two cells (block 0 and block 1, both sender 2)
+disagreed with spread 5.
+
+So across two observed wedges the flag-cell evidence is:
+
+| wedge | disagreeing cells | note |
+|---|---|---|
+| 2 (section 18) | 2 cells, sender 2, spread 5 | ranks 0 and 1 captured |
+| 3 (this one) | none | rank 2 emitted no snapshot |
+
+**The sender-2 reading is therefore NOT replicated, and I am not building on
+it.** The obvious confound is stated rather than hidden: rank 2 failed to emit
+its snapshot in this incident, so cells describing what rank 2 observed are
+unobserved, not proven equal. Two incidents, one instrument each, is not a
+basis for a mechanism -- this note has already had to retract one conclusion
+(section 18) drawn from a single incident, and repeating that pattern would be
+worse than admitting the gap.
+
+### What survives all three wedges
+
+1. All three ranks host-blocked at the same line, in `_execute_extend`.
+2. GPUs at ~100 % SM occupancy, ~0 % memory utilisation, power far below cap
+   -- spinning, not computing.
+3. Zero Xid, zero PCIe AER, zero IOMMU faults, zero GPU resets on the host
+   across 23 h.
+4. Identical collective sequences (now over a 4096-entry window).
+5. `Bar1CollectiveAborted` after the cycle cap, then the cards fall idle.
+
+That combination still has no mechanism attached. The honest statement is that
+the wedge remains UNEXPLAINED, with a large set of eliminated candidates and
+two instruments that now capture the relevant state when they fire.
+
+### Concrete gap to close next
+
+Rank 2 emitted no snapshot in this incident and none in the first. The abort
+path only dumps the rank that reaches it, and the last rank to abort often
+dies first. The peer BAR1 windows are host-mapped, so a rank that DOES reach
+the abort could read its peers' flag regions directly, without a device sync,
+and publish all three views from one process. Until that exists, every
+incident gives at most 2 of 3 ranks and cells involving the missing rank
+cannot be compared.
