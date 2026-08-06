@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
+from sglang.srt.debug_utils import index_race_guard
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     alloc_paged_token_slots_extend_npu,
 )
@@ -969,7 +970,9 @@ def eagle_sample(
         accept_index = torch.full(ai_shape, -1, dtype=torch.int32, device=device)
         num_correct_drafts = torch.zeros(nd_shape, dtype=torch.int32, device=device)
         tp_group = (
-            get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
         )
         if tp_group.world_size > 1:
             capture_safe_tp_broadcast(
@@ -1163,11 +1166,45 @@ def eagle_sample(
         # the draft-pick sync in eagle_worker_v2._broadcast_draft_picks.
         from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
+        # #616 instrument: this broadcast REWRITES accept_index / predict in
+        # place on every non-root rank, so it is the one place where a
+        # rank-locally valid index tensor can be replaced by something else.
+        # Guarding both sides of it separates "the verify kernel produced a bad
+        # index" from "the transport delivered a bad index".
+        if index_race_guard.is_enabled():
+            _n_predict = predict.numel()
+            index_race_guard.guard(
+                "accept_index@pre_broadcast", accept_index, -1, _n_predict
+            )
+            index_race_guard.guard(
+                "predict@pre_broadcast", predict, 0, next_token_logits.shape[-1]
+            )
+            index_race_guard.guard(
+                "num_correct_drafts@pre_broadcast",
+                num_correct_drafts,
+                0,
+                verify_input.draft_token_num,
+            )
+
         capture_safe_tp_broadcast(
             tp_group,
             (predict, accept_index, num_correct_drafts),
             src=spec_accept_broadcast_src(),
         )
+
+        if index_race_guard.is_enabled():
+            accept_index = index_race_guard.guard(
+                "accept_index@post_broadcast", accept_index, -1, predict.numel()
+            )
+            index_race_guard.guard(
+                "predict@post_broadcast", predict, 0, next_token_logits.shape[-1]
+            )
+            index_race_guard.guard(
+                "num_correct_drafts@post_broadcast",
+                num_correct_drafts,
+                0,
+                verify_input.draft_token_num,
+            )
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
@@ -1230,6 +1267,17 @@ def eagle_sample(
             accept_lens=accept_lens,
             draft_token_num=verify_input.draft_token_num,
         )
+
+    # #616 instrument: PRODUCTION point of the index tensor that feeds
+    # `predict[accept_index]` in eagle_worker_v2. A hit here means the value was
+    # already wrong when eagle_sample returned; a clean hit here paired with a
+    # dirty consumption site means it was corrupted afterwards, by a write this
+    # stream never issued.
+    if index_race_guard.is_enabled():
+        index_race_guard.guard(
+            "accept_index@produced", accept_index, -1, predict.numel()
+        )
+        index_race_guard.snapshot("accept_index", accept_index)
 
     return predict, accept_lens, accept_index
 
