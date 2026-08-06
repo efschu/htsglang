@@ -877,6 +877,54 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def accept_payload_lengths(predict, accept_index, num_correct_drafts):
+    """Element counts of the three accept-broadcast tensors, in wire order."""
+    return predict.numel(), accept_index.numel(), num_correct_drafts.numel()
+
+
+def pack_accept_payload(predict, accept_index, num_correct_drafts):
+    """Fuse the three accept-result tensors into ONE int32 wire buffer.
+
+    Why fuse (#616c): predict and accept_index are both int32 and both carry
+    ``bs * draft_token_num`` elements, so as separate collectives their
+    payloads are indistinguishable by size. A pairing shift of exactly one
+    then delivers predict's payload into accept_index's buffer with nothing
+    for NCCL to reject, and the following ``predict[accept_index]`` gathers
+    with token IDs as indices. One fused buffer has no intra-tuple pairing to
+    shift, and its length matches none of the three individually, so a
+    residual desync surfaces as a size mismatch instead of silent corruption.
+
+    Device-side and shape-static: capture-safe, no host sync.
+    """
+    n_p, n_a, n_c = accept_payload_lengths(predict, accept_index, num_correct_drafts)
+    packed = torch.empty(n_p + n_a + n_c, dtype=torch.int32, device=predict.device)
+    packed[:n_p] = predict.reshape(-1)
+    packed[n_p : n_p + n_a] = accept_index.reshape(-1)
+    packed[n_p + n_a :] = num_correct_drafts.reshape(-1)
+    return packed
+
+
+def unpack_accept_payload(packed, predict, accept_index, num_correct_drafts):
+    """Inverse of :func:`pack_accept_payload`, written back IN PLACE.
+
+    In place because callers hold other references to these three tensors
+    (guard snapshots, the mamba commit, the logprob path); rebinding would
+    leave those aliases pointing at pre-broadcast values.
+    """
+    n_p, n_a, n_c = accept_payload_lengths(predict, accept_index, num_correct_drafts)
+    if packed.numel() != n_p + n_a + n_c:
+        raise ValueError(
+            "accept-broadcast payload length mismatch: got "
+            f"{packed.numel()}, expected {n_p + n_a + n_c} "
+            f"(predict {n_p} + accept_index {n_a} + num_correct_drafts {n_c}). "
+            "A fused payload of the wrong length means the ranks disagree on "
+            "the accept-broadcast shape."
+        )
+    predict.reshape(-1).copy_(packed[:n_p])
+    accept_index.reshape(-1).copy_(packed[n_p : n_p + n_a])
+    num_correct_drafts.reshape(-1).copy_(packed[n_p + n_a :])
+
+
 def spec_accept_broadcast_src() -> int:
     """Group rank that owns the authoritative accept decision.
 
@@ -1186,11 +1234,40 @@ def eagle_sample(
                 verify_input.draft_token_num,
             )
 
+        # #616c: ONE fused broadcast, not three separate ones.
+        #
+        # predict and accept_index are both int32 and both carry
+        # bs * draft_token_num elements, so their payloads are byte-identical
+        # in SIZE. Sent as three back-to-back collectives, a pairing shift of
+        # exactly one delivers predict's payload into accept_index's buffer
+        # and NCCL has nothing to reject -- it is silent, and the next
+        # `predict[accept_index]` gathers with token IDs as indices.
+        #
+        # That is not hypothetical: docs/dev/NOTE_616c_index_values.md records
+        # a coredump in which the index tensor and the gathered tensor hold
+        # element-wise identical values, and the non-accepted slots hold 0 --
+        # predict's zero-init, not accept_index's -1 fill. All three observed
+        # faults landed on RECEIVING ranks; rank 0 is the source and only ever
+        # reads its own buffers.
+        #
+        # Packing removes the intra-tuple pairing entirely (there is nothing
+        # left to shift against), and gives the fused payload a size that
+        # matches none of the individual tensors, so a residual desync becomes
+        # a loud NCCL size mismatch instead of a silent wrong-answer payload.
+        # Everything here is device-side and shape-static, so it stays
+        # capture-safe and adds no D2H.
+        _packed = pack_accept_payload(predict, accept_index, num_correct_drafts)
+
         capture_safe_tp_broadcast(
             tp_group,
-            (predict, accept_index, num_correct_drafts),
+            (_packed,),
             src=spec_accept_broadcast_src(),
         )
+
+        # Unpack in place, so every downstream alias of these three tensors
+        # (the guard snapshots, the mamba commit, the logprob path) keeps
+        # seeing the same objects it would have seen before.
+        unpack_accept_payload(_packed, predict, accept_index, num_correct_drafts)
 
         if index_race_guard.is_enabled():
             accept_index = index_race_guard.guard(
