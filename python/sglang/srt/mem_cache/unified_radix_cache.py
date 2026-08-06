@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 from array import array
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import partial
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
@@ -685,6 +685,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self._init_pin_trace()
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -850,6 +851,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return result
         if self.disable:
             return IncLockRefResult()
+        if self._pin_trace_every:
+            self._pin_trace_begin("inc")
         result = IncLockRefResult()
         for component in self._components_tuple:
             result = component.acquire_component_lock(node=node, result=result)
@@ -868,6 +871,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return result
         if self.disable:
             return DecLockRefResult()
+        if self._pin_trace_every:
+            self._pin_trace_begin("dec")
         for component in self._components_tuple:
             if skip_swa and component.component_type == ComponentType.SWA:
                 continue
@@ -2894,12 +2899,89 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_best_match_device_node,
         )
 
+    # ---- #581 mamba pin trace (SGLANG_MAMBA_PIN_TRACE, default off) -------
+
+    def _init_pin_trace(self) -> None:
+        """Arm the per-tick mamba pin trace from the environment.
+
+        `SGLANG_MAMBA_PIN_TRACE=N` emits one line per rank every N scheduler
+        ticks; 0 (default) leaves every traced path unentered.
+        """
+        self._pin_trace_every = int(envs.SGLANG_MAMBA_PIN_TRACE.get())
+        self._pin_trace_ticks = 0
+        self._pin_trace_site = "?"
+        self._pin_trace_ops: Counter = Counter()
+
+    def _pin_trace_begin(self, op: str) -> None:
+        """Attribute the lock call about to run to its immediate caller.
+
+        Resolved ONCE per inc/dec_lock_ref rather than once per component, so
+        the components can tag their own mamba accounting with the same site.
+        """
+        self._pin_trace_site = sys._getframe(2).f_code.co_name
+        self._pin_trace_ops[(op, self._pin_trace_site)] += 1
+
+    def record_pin_trace_mamba(self, op: str, host: bool = False) -> None:
+        """Called by the MAMBA component when a mamba ref actually moves."""
+        tag = f"{op}_mamba_host" if host else f"{op}_mamba"
+        self._pin_trace_ops[(tag, self._pin_trace_site)] += 1
+
+    def _mamba_pins_in(self, registry) -> int:
+        """Registry entries whose stored lock actually took a MAMBA ref.
+
+        An entry's `lock_params` carries the skip set from the paired acquire,
+        so an entry that skipped MAMBA (tombstone at acquire time) holds no
+        mamba pin and must not be counted as one.
+        """
+        count = 0
+        for entry in registry.values():
+            params = entry.lock_params
+            if params is None:
+                continue
+            if entry.node.id in params.skip_lock_node_ids.get(ComponentType.MAMBA, ()):
+                continue
+            count += 1
+        return count
+
+    def _emit_pin_trace(self) -> None:
+        """One line per rank per N ticks; counters are since the previous line."""
+        self._pin_trace_ticks += 1
+        if self._pin_trace_ticks % self._pin_trace_every:
+            return
+
+        ops = " ".join(
+            f"{op}@{site}={count}"
+            for (op, site), count in sorted(self._pin_trace_ops.items())
+        )
+        controller = self.cache_controller
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        logger.info(
+            "MAMBA-PIN-TRACE impl=unified tick=%d ack_write=%s ack_load=%s "
+            "wt_mamba_pins=%d lb_mamba_pins=%d ongoing_wt=%d ongoing_lb=%d "
+            "ongoing_backup=%d protected=%d evictable=%d mamba_avail=%s ops[%s]",
+            self._pin_trace_ticks,
+            "?" if controller is None else len(controller.ack_write_queue),
+            "?" if controller is None else len(controller.ack_load_queue),
+            self._mamba_pins_in(self.ongoing_write_through),
+            self._mamba_pins_in(self.ongoing_load_back),
+            len(self.ongoing_write_through),
+            len(self.ongoing_load_back),
+            len(self.ongoing_backup),
+            self.component_protected_size_.get(ComponentType.MAMBA, 0),
+            self.component_evictable_size_.get(ComponentType.MAMBA, 0),
+            "?" if mamba_allocator is None else mamba_allocator.available_size(),
+            ops,
+        )
+        self._pin_trace_ops.clear()
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         self.writing_check()
         self.loading_check()
+        if self._pin_trace_every:
+            self._emit_pin_trace()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
