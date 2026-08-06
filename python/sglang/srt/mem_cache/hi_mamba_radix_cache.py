@@ -578,6 +578,49 @@ class HiMambaRadixCache(MambaRadixCache):
             # write to host if the node is not backuped
             self.write_backup(node)
 
+    #: Contribution of a rank with an EMPTY transfer queue to the cross-rank
+    #: MIN below: "I impose no constraint", not "drain nothing".
+    _NO_ACK_CONSTRAINT = 1 << 30
+
+    def _count_ready_acks(self, ack_queue) -> int:
+        """How many leading entries of `ack_queue` this rank may drain now.
+
+        The transfer queues are RANK-LOCAL: `write_backup` backs a node up on
+        one rank and skips it on another (host pool full, pin budget reached,
+        parent not backed up yet -- and under uneven TP/DCP the ranks' host
+        pools differ by construction), so the queues differ in LENGTH, not just
+        in completion timing.
+
+        Every rank must still enter the all_reduce, or the NCCL op sequence
+        desyncs and TP > 1 deadlocks. But a rank with an EMPTY queue must not
+        drag the reduction to zero: that let one rank with nothing to write
+        hold every other rank's acks -- and with them the write-through pins
+        that make mamba checkpoints unevictable -- forever, which is the #581
+        pool exhaustion (protected ratchets by one per cached checkpoint,
+        evictable falls to zero, and only the backing-up rank hits the wall).
+        A rank with a queue still throttles the others to its own progress, so
+        ranks never run further apart than the slowest live transfer.
+        """
+        ready = 0
+        for _, finish_event, _ack_list in ack_queue:
+            if not finish_event.query():
+                break
+            ready += 1
+
+        if self.tp_world_size <= 1:
+            return ready
+
+        contribution = ready if ack_queue else self._NO_ACK_CONSTRAINT
+        reduced = torch.tensor(contribution, dtype=torch.int, device="cpu")
+        torch.distributed.all_reduce(
+            reduced,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_group,
+        )
+        # Never pop more than this rank actually has ready (the reduction can
+        # come back as the sentinel when no rank has a queue).
+        return min(ready, int(reduced.item()))
+
     def writing_check(self, write_back=False):
         if write_back:
             # blocking till all write back complete
@@ -597,21 +640,15 @@ class HiMambaRadixCache(MambaRadixCache):
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks because loading_check processes DMA completions
         # independently (no cross-rank sync).
-        finish_count = 0
-        if len(self.ongoing_write_through) > 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
-
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-        finish_count = int(queue_size.item())
+        #
+        # The scan is UNCONDITIONAL (upstream HiRadixCache / UnifiedRadixCache
+        # gate only on the constant `pp_rank`). Gating it on
+        # `len(self.ongoing_write_through) > 0` made a rank that had entries in
+        # its ack queue but none in its registry -- `_forget_write_through`
+        # pops the registry entry of a node that leaves the tree mid-copy --
+        # report "0 ready" forever, and the MIN below then froze the drain on
+        # EVERY rank.
+        finish_count = self._count_ready_acks(self.cache_controller.ack_write_queue)
 
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
@@ -637,21 +674,10 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def loading_check(self):
         # Every rank must enter the all_reduce below; ongoing_load_back can
-        # diverge across ranks.
-        finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
-
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-        finish_count = int(queue_size.item())
+        # diverge across ranks. Same rank-local-queue rule as the write side:
+        # a rank with nothing loading must not hold the others' load-back pins
+        # (which also make mamba checkpoints unevictable).
+        finish_count = self._count_ready_acks(self.cache_controller.ack_load_queue)
 
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
