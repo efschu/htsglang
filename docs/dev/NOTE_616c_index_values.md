@@ -323,3 +323,58 @@ indices, so the next step is a default-off runtime cross-check that computes
 the host candidate and diffs it against the device `kv_indptr` — cheap, and it
 either validates the formula or falsifies it in one run. That work is NOT done
 here.
+
+## 11. The wedge's actual blocking site, caught with all three ranks on it
+
+Second wedge this window, ~10.5 min into the post-fix soak (last completion
+17:46:26). All THREE ranks were stopped at the same line
+(`/spinning/616c-hunter5/wedge2_dump_*.txt`):
+
+```
+build_dcp_weighted_kv_indices (layers/dcp/owner.py:529)
+call_begin_forward            (flashinfer_backend.py:6926)
+update_single_wrapper         (flashinfer_backend.py:6695)
+init_forward_metadata         (hybrid_linear_attn_backend.py:933)
+_execute_extend               (runner/eager_runner.py:294)
+```
+
+`owner.py:529` is:
+
+```python
+total = int(full_indptr[bs].item())
+```
+
+a **blocking device-to-host `.item()`**, and this is the all-three-ranks-on-one-
+line signature Hunter-4 described — but at a site nobody had named. Three
+distinct wedge sites are now on record across the two windows:
+
+| window | site | kind |
+|---|---|---|
+| hunter-4 | `flashinfer_backend.py:7429` `.cpu()` | blocking D2H |
+| hunter-5 wedge 1 | `memory_pool.py:1525` scatter | kernel ENQUEUE (queue backpressure) |
+| hunter-5 wedge 2 | `dcp/owner.py:529` `.item()` | blocking D2H |
+
+That spread is itself the finding: the host gets pinned wherever it next
+touches a device queue that is not draining. Fixing any ONE of these sites
+moves the wedge to the next one; it does not cure it. The 7429 fix named in
+the brief is therefore necessary-at-best, not sufficient, and this window
+should not be read as having fixed the wedge family.
+
+`owner.py:529` is nevertheless the best of the three to remove, because
+`total` is pure host-derivable arithmetic -- it is just the sum of
+`paged_kernel_lens`, which the caller usually already has on CPU. A safe
+change is an optional `total_tokens: int` parameter that callers supply from a
+CPU mirror, falling back to the existing `.item()` when they have none. Note
+the caller at 6926 passes `prefix_lens` as `paged_kernel_lens`, and whether a
+`prefix_lens` CPU mirror exists at that point is NOT established -- that is
+the one thing to check before writing the change. Not implemented here.
+
+### Instrument lesson, recorded because it bit this window
+
+The soak probe grepped only for `index out of bounds` and
+`Bar1CollectiveAborted`, and so reported "faults=0" while the server had
+already been wedged for a minute. The wedge's FIRST observable is neither: it
+is `Health check failed ... detokenizer` in the log and a health endpoint that
+stops answering, with the BAR1 abort arriving only after the ~300e9-cycle
+deadline. Any future soak monitor for this bug must watch health/liveness, not
+just the two crash strings, or a wedge reads as a clean soak.
