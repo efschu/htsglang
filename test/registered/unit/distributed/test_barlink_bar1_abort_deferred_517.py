@@ -237,7 +237,15 @@ class TestTheDeferredGuardStillSeesTheCrash(CustomTestCase):
         self.assertIn("a spin kernel took its abort path", text)
         self.assertIn("observed at cuda-graph replay", text)
         self.assertIn("all_to_all (8 bytes", text)
-        self.assertIn("0 collective(s) ran since the previous check", text)
+        # #583 reworded this. The old text was "0 collective(s) ran since the
+        # previous check, so the abort is in that window and the named one is
+        # its most recent member" -- which is false exactly here: nothing ran
+        # on the host path, so the named collective is a graph-capture
+        # artefact and not a member of anything. The empty window must now
+        # say so, and must not claim membership.
+        self.assertIn("No collective ran on the host path", text)
+        self.assertIn("GRAPH-REPLAY window", text)
+        self.assertNotIn("its most recent member", text)
         # The staged read announces itself, so a post-mortem does not read
         # the boundary it names as the boundary it happened on.
         self.assertIn("STAGED", text)

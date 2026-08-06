@@ -1497,6 +1497,15 @@ class BarlinkBar1Transport:
         # the run is already broken and cost no longer matters.
         self._last_op = ""
         self._last_nbytes = 0
+        #: Whether ``_last_op`` was recorded under stream capture (#583). It
+        #: decides whether the raise may present the named collective as a
+        #: member of the abort window at all: a captured launch is RECORDED,
+        #: not executed, so it does not belong to any host-path window and
+        #: can predate the abort by the whole run. Crash 2026-08-06 05:53:59
+        #: named an 8-byte collective from capture as "its most recent
+        #: member" and sent the investigation after a collective that never
+        #: ran in that window.
+        self._last_op_captured = False
         #: Collectives launched on the HOST path since the last device read of
         #: the status word. Zero means there is nothing new to look at, which
         #: is what makes a check at a boundary free when no traffic happened.
@@ -3525,6 +3534,7 @@ class BarlinkBar1Transport:
             e_len = [x[1] for x in round]
             self.barlink_all_to_all_single(
                 comm, flat, inp, s_len, e_len, s_off, e_off,
+                op_label="all_gather",
             )
         out = out.movedim(0, dim)
         return out.reshape(shape[:dim] + (self.world * shape[dim],) + shape[dim + 1:])
@@ -3678,6 +3688,7 @@ class BarlinkBar1Transport:
             self.barlink_all_to_all_single(
                 comm, dst, source, s_len, e_len, s_off, e_off,
                 kernel_bytes=length * (R - 1),
+                op_label="broadcast",
             )
         tensor.copy_(dst.view(tensor.shape))
         return tensor
@@ -3887,7 +3898,8 @@ class BarlinkBar1Transport:
     def barlink_all_to_all_single(self, comm, output, inp,
                                 send_bytes, recv_bytes,
                                 send_offsets=None, recv_offsets=None,
-                                kernel_bytes=None, rounds=None):
+                                kernel_bytes=None, rounds=None,
+                                op_label="all_to_all"):
         """Wrapper with a round loop. One step or several, depending on the block.
 
         ``rounds`` comes from the caller and is GROUP-WIDE identical -- the
@@ -3909,6 +3921,7 @@ class BarlinkBar1Transport:
             return self._a2a_one_round(
                 comm, output, inp, send_bytes, recv_bytes,
                 send_offsets, recv_offsets, kernel_bytes,
+                op_label=op_label,
             )
         slot = int(self._geo["a2a_slot"])
         s_base = list(send_offsets) if send_offsets is not None else None
@@ -3937,13 +3950,14 @@ class BarlinkBar1Transport:
                 [b + k * slot for b in s_base],
                 [b + k * slot for b in e_base],
                 kernel_bytes,
+                op_label=op_label,
             )
         return output
 
     def _a2a_one_round(self, comm, output, inp,
                         send_bytes, recv_bytes,
                         send_offsets=None, recv_offsets=None,
-                        kernel_bytes=None):
+                        kernel_bytes=None, op_label="all_to_all"):
         """``all_to_all_single`` over the direct path. One step, one barrier.
 
         ``send_bytes[j]`` is the block going to rank ``j``,
@@ -4043,7 +4057,13 @@ class BarlinkBar1Transport:
         peer_payload[self.rank] = self._own[0]
         peer_flag[self.rank] = self._own_flag[0]
 
-        self._note_launch("all_to_all", int(moved))
+        # #583: the label names the collective the CALLER asked for, not the
+        # kernel that serves it. ``barlink_broadcast`` and
+        # ``barlink_all_gather`` both run this a2a kernel, so recording a bare
+        # "all_to_all" made an 8-byte broadcast be reported as an 8-byte
+        # all_to_all -- a collective no seam in the decode loop issues, which
+        # is why the 2026-08-06 crash triage went looking for one.
+        self._note_launch(op_label, int(moved))
         self._ext.bar1_all_to_all(
             inp, output, int(self.rank), int(R),
             [int(x) for x in send_off], [int(x) for x in send_bytes],
@@ -4350,8 +4370,10 @@ class BarlinkBar1Transport:
 
         if graph_capture_running():
             self._captured_launches = True
+            self._last_op_captured = True
         else:
             self._unchecked_launches += 1
+            self._last_op_captured = False
 
     def _rounds_for(self, op: str, nbytes: int) -> int:
         """Round count of the named collective, computed at RAISE time only.
@@ -4558,6 +4580,64 @@ class BarlinkBar1Transport:
             if self._ctl_defer
             else ""
         )
+        # #583: ATTRIBUTION. ``_last_op`` is stored by ``_note_launch`` on
+        # every launch INCLUDING captured ones, while ``_unchecked_launches``
+        # is deliberately not advanced under capture. So when the window is
+        # empty the named collective is not in it -- it is simply the last
+        # launch this transport ever saw, which at a replay boundary in the
+        # steady state is whatever was recorded at graph-capture time. The
+        # 2026-08-06 05:53:59 crash presented exactly that as "its most
+        # recent member" and cost a triage cycle chasing a collective that
+        # had not run for the whole serving run.
+        named = f"{op} ({nbytes} bytes, {rounds} rounds)"
+        if pending > 0:
+            attribution = (
+                f"Last collective launched: {named}; {pending} collective(s) "
+                f"ran on the host path since the previous check, so the abort "
+                f"is in that window and the named one is its most recent "
+                f"member."
+            )
+        else:
+            # getattr, not attribute access: this runs on an already-broken
+            # run, and a diagnostic must never be the thing that raises. Some
+            # bring-up and test paths build the transport without __init__.
+            origin = (
+                "recorded under CUDA-graph capture"
+                if getattr(self, "_last_op_captured", False)
+                else "from an earlier, already-closed window"
+            )
+            attribution = (
+                "No collective ran on the host path since the previous check, "
+                "so this is a GRAPH-REPLAY window: the kernel that aborted is "
+                "inside the replayed graph and is NOT named here. The last "
+                f"launch this transport recorded is {named}, {origin}; it can "
+                "predate this abort by the whole run and must not be read as "
+                "the culprit."
+            )
+        # #583: CAUSE. The two causes the message used to offer as a
+        # disjunction are not equally unknowable -- the host abort word's
+        # state is local and exact. Reporting "either A or B" when B is
+        # decidable here forced the reader to reconstruct it from the absence
+        # of an unrelated log line. Decide it.
+        deadline = (
+            f"the kernel exceeded its cycle deadline "
+            f"(SGLANG_BARLINK_BAR1_CAP_CYCLES={self.cap_cycles}, effective "
+            f"this launch {self._deadline_cycles()}) waiting for a peer's flag"
+        )
+        if reason is not None:
+            cause = f"Cause: the host abort word was set on this rank -- {reason}."
+        elif window is None:
+            cause = (
+                f"Cause: {deadline}. This rank has no device-mapped host abort "
+                f"word, so the cycle deadline is the only path a kernel has "
+                f"into its abort branch."
+            )
+        else:
+            cause = (
+                f"Cause: {deadline}. The host abort word exists on this rank "
+                f"and was NOT set, which excludes it: no peer was declared "
+                f"dead and no host wait gave up. A peer did not arrive."
+            )
         # #583: dump THIS rank's collective census before raising. No
         # collective is taken here on purpose -- by now a peer is very likely
         # already wedged or dead (in crashes 9/10/11 the third rank aborted
@@ -4578,16 +4658,8 @@ class BarlinkBar1Transport:
         raise Bar1CollectiveAborted(
             f"barlink-BAR1 rank {self.rank}/{self.world} group "
             f"{self.group or '<unnamed>'}: a spin kernel took its abort path, "
-            f"observed at {where}. Last collective launched: {op} "
-            f"({nbytes} bytes, {rounds} rounds); {pending} collective(s) ran "
-            f"since the previous check, so the abort is in that window and "
-            f"the named one is its most recent member.{staged} Cause: either the "
-            f"kernel exceeded its cycle deadline "
-            f"(SGLANG_BARLINK_BAR1_CAP_CYCLES={self.cap_cycles}, effective "
-            f"this launch {self._deadline_cycles()}) waiting for a peer's "
-            f"flag, or the host abort word was set"
-            + (f" -- {reason}" if reason else "")
-            + ". The output buffer of that collective is partially written; "
+            f"observed at {where}. {attribution}{staged} {cause}"
+            " The output buffer of that collective is partially written; "
             "every result computed from it is garbage, which is why this "
             "raises instead of logging. Set "
             f"{barlink_abort_gate.ENV_ENABLE}=0 to restore the previous, "
