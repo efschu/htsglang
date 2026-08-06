@@ -5299,3 +5299,299 @@ forever, so the symptom is a turn failing with a `WakeTimeout` in the
 translator log, not a silent stall. The state is left `parked`, and the next
 request retries the wake from scratch — a failed park or wake never leaves the
 tenant in a half-moved state a turn could run against.
+
+## 16. VRAM ledger: exact per-card demand model (`--enable-vram-ledger`)
+
+> First booted on this rig on 2026-08-06 (branch `fix/ledger-fill-594`,
+> merged `f9c87be403`). This section replaces the legacy
+> `--rank-auto-reserve-mib` demand model, which conflates operator headroom
+> and internal engine demand in one number. Under the ledger the three
+> components are separate and itemized.
+
+**Mutual exclusion with `--enable-vram-dial`.** The flags
+`--enable-vram-dial` and `--enable-vram-ledger` are completely unrelated
+code paths. `--enable-vram-dial` is the runtime budget dial feature (#330):
+it requires `--vram-budget-mib` for initial per-rank budgets and uses
+`--vram-dial-consensus-interval` for the commit cadence. Do NOT conflate the
+two modes. `--enable-vram-ledger` is a boot-time sizing mode. The ledger
+check at `server_args.py:11058` explicitly refuses when both are present.
+
+### 16.1 What the ledger is
+
+The ledger builds a `CardVramLedger` per physical GPU. Each ledger is a list
+of `LedgerTerm` entries, every one with a name, a MiB charge, a provenance
+(`MODELED`, `CALIBRATED`, or `REPORTED`), and a derivation string. The
+equation per card is:
+
+```
+card.total_mib = user_reserve + demand_mib + kv_pool
+```
+
+The demand side is the sum of the terms below. The KV pool takes whatever
+remains. If `user_reserve + demand_mib > total_mib`, the boot is **refused**
+at parse time with the full itemization printed. No warning, no fallback,
+no boot with a "short by N MiB" message.
+
+#### Ledger terms
+
+Each term is defined in `python/sglang/srt/mem_ledger/engine.py`. The name
+constants and their provenance are:
+
+| Term constant | Ledger line name | Provenance | Source |
+|---|---|---|---|
+| `TERM_WEIGHTS` | `model weights (shards)` | MODELED | Sum of per-rank resident shard footprint from the uneven-TP partition. Source: `engine.py:84` |
+| `TERM_ACTIVATION` | `runtime activation + metadata` | CALIBRATED | Prefill activation peak, **per rank** (co-located ranks do not share this term). Resolved from the activation footprint cache keyed on hardware fingerprint AND activation profile. Source: `engine.py:85`, resolution at `engine.py:668-710` |
+| `TERM_GRAPH_CAPTURE` | `CUDA graph capture` | CALIBRATED | Measured graph-capture cost, per rank. Replaces the inherited `captured_tokens * 2 MiB` estimate, which was measured 3.3-3.8x low. Source: `engine.py:86`, resolution at `engine.py:712-757` |
+| `TERM_LADDER` | `adaptive draft ladder` | MODELED | Rungs the adaptive controller builds beyond the boot rung, charged to the GPU that hosts the solo draft rank. Source: `engine.py:87`, resolution at `engine.py:759-779` |
+| `TERM_GDN_SCRATCH` | `GDN prefill scratch` | MODELED | Intermediate buffers of one chunked GDN layer alive simultaneously, summed over co-located ranks. Capped by `chunked_prefill_size`. Source: `engine.py:88`, resolution at `engine.py:813-831` |
+| `TERM_INDEXER_SCRATCH` | `DSV4 indexer prefill scratch` | MODELED | Paged-MQA logits transient of one C4-indexer call. Capped by `SGLANG_DSV4_INDEXER_QUERY_CHUNK_MIB`. Source: `engine.py:89`, resolution at `engine.py:834-871` |
+| `TERM_MAMBA_POOL` | `mamba/GDN state pool` | MODELED | Per-rank SSM state + conv buffers, sized by GDN-unit share. Subject to `mamba_hard_floor` minimum. Source: `engine.py:90`, resolution at `engine.py:782-809` |
+| `TERM_HARDWARE_RESIDUAL` | `hardware residual (per process)` | CALIBRATED | CUDA primary context + allocator granularity + lazy kernel workspaces, measured once per rig fingerprint, multiplied by number of processes on the card. Source: `engine.py:91`, resolution at `engine.py:1089-1116` |
+| `TERM_PARENT_CONTEXT` | `parent/tokenizer CUDA context` | CALIBRATED | Extra CUDA context when the parent/tokenizer process binds CUDA on this card. Source: `engine.py:92`, resolution at `engine.py:1118-1132` |
+| `TERM_NCCL_BUFFERS` | `NCCL communicator buffers` | CALIBRATED (or MODELED as NOT_APPLICABLE) | Measured VRAM delta around `ncclCommInitRank`. Keyed on (rig fingerprint, communicator signature). Three states: priced when measured, NOT_APPLICABLE when no NCCL communicator is built (e.g., barlink owns all groups), UNBOUNDED otherwise. Source: `engine.py:93`, resolution at `engine.py:954-1087` |
+| `TERM_ATTN_WORKSPACE` | `attention workspaces (capped)` | MODELED | Sum of flashinfer float workspace (or TRTLLM backend workspace) and chunked-prefix attention scratch, charged at the configured cap. Source: `engine.py:94`, resolution at `engine.py:873-951` |
+| `TERM_NVML_CARVE_OUT` | `NVML driver carve-out (not allocatable)` | REPORTED | Memory the driver holds back out of `total_mib`, read from NVML v2 memory struct. Charged once per card. Source: `engine.py:95`, resolution at `engine.py:1140-1157` |
+
+Two of these terms (weights and mamba pool) are funded **inside** the rank
+budget (`BUDGET_FUNDED_TERMS`, `engine.py:112`). All others live outside it.
+This distinction prevents a double-charge: the profiling step already
+subtracts weights and SSM pool from the budget before sizing the KV pool.
+
+Any term whose required measurement is absent becomes **UNBOUNDED** and the
+boot is refused. This is a deliberate design choice — an unmeasured term is
+not defaulted to zero (zero is indistinguishable from "does not apply") and
+not defaulted to a heuristic (the inherited `512 + tokens * 1.5 + ...` was
+falsified, booking 3968 MiB where the binding card had 1766 MiB free).
+
+### 16.2 Pre-boot probe: resolving demand without a server
+
+The ledger can be probed before any boot to determine which terms are priced
+and which are UNBOUNDED for a given configuration.
+
+```bash
+python -m sglang.srt.mem_ledger.probe --show
+```
+
+<!-- probe.py:35-96 -->
+
+This prints the cached hardware calibration (CUDA context, allocator
+granularity, lazy workspace per card) and exits without measuring. Output
+format:
+
+```
+VRAM calibration <fingerprint> (driver <ver>, build <ver>)
+  <card name>       <context>  <granularity>  <workspace>   <total>
+```
+
+If no calibration matches the current rig fingerprint (card set, driver
+version, torch build), the probe returns 1 and prints "No VRAM calibration
+matches this rig." A fresh calibration is required before the ledger can boot.
+
+**Verdict states.** Every term resolves to one of three states:
+
+- **PRICED**: a concrete MiB value, from configuration (MODELED) or measurement (CALIBRATED/REPORTED).
+- **UNBOUNDED**: the required input is absent. The boot is refused, and the error message names the term and the remediation (which probe to run).
+- **NOT_APPLICABLE**: the feature the term covers is not present in this launch. Charged at 0 MiB with a provenance string explaining why. Only available when the launch explicitly describes its communicator groups (`engine.py:548-562`).
+
+Any single UNBOUNDED term refuses the entire boot. There is no "one term
+missing, try anyway" path.
+
+### 16.3 Calibration prerequisites
+
+The ledger has two calibration caches: the hardware residual (per rig) and the
+activation footprint (per rig AND per activation profile). Both must be
+populated before the ledger boots.
+
+#### Hardware residual probe (one-time per rig)
+
+Run once after any card, driver, or torch build change:
+
+```bash
+python -m sglang.srt.mem_ledger.probe
+```
+
+<!-- probe.py:35-72 -->
+
+With `--force`, re-measures even when a cached calibration exists. The result
+is cached under a fingerprint derived from card set, driver version, and
+torch build. The cache path is printed on success.
+
+#### Activation footprint cache (per recipe)
+
+The activation and graph-capture terms are keyed on the activation profile,
+which is a digest of the configuration. On this system the profile digest
+includes `chunked_prefill_size` and `cuda_graph.decode.max_bs`. A new recipe
+requires its own measurement.
+
+**Step 1 — boot with instrumentation:**
+
+```bash
+SGLANG_PHASE_FOOTPRINT_DUMP=/spinning/footprints <usual launch command>
+```
+
+<!-- probe_activation.py:17-18 -->
+
+The in-process hook
+(`sglang.srt.mem_ledger.activation_probe.record_phase_footprint`) records
+baseline after KV pool sizing, resets peak counters, then reads them after
+graph capture and after a prefill. Each rank writes one JSON file.
+
+**Step 2 — drive a representative deep prefill** on the running server.
+
+**Step 3 — ingest the dumps:**
+
+```bash
+python scripts/vram_ledger/probe_activation.py ingest --dump-dir /spinning/footprints
+```
+
+<!-- probe_activation.py:84-184 -->
+
+The ingest validates that all dumps carry the same hardware fingerprint and
+activation profile, then folds them into the fingerprinted store. It reads
+`activation_delta_bytes` (never `activation_peak_bytes`, which includes
+weights and KV pool) and `capture_bytes`. A dump from a build that does not
+record `activation_delta_bytes` is refused (#589).
+
+To view the shipped reference-window upper bounds:
+
+```bash
+python scripts/vram_ledger/probe_activation.py show
+```
+
+#### NCCL buffer measurement (per communicator set)
+
+NCCL buffers are allocated inside `libnccl` via raw `cudaMalloc`, invisible
+to PyTorch's caching allocator. The only measurement instrument is
+`torch.cuda.mem_get_info` (driver-level free memory). The delta is netted:
+
+```
+nccl_mib = (free_before - free_after) - (reserved_after - reserved_before)
+```
+
+**Step 1 — boot with the measurement armed:**
+
+```bash
+SGLANG_NCCL_BUFFER_DUMP=/spinning/nccl_dumps <usual launch command>
+```
+
+<!-- nccl_probe.py:84 -->
+
+The launcher publishes the communicator-set signature via the
+`SGLANG_NCCL_SIGNATURE` environment variable (`nccl_probe.py:91`). Each rank
+brackets its communicator construction with the
+`measure_communicator_init` context manager (`nccl_probe.py:113-165`).
+
+**Step 2 — once the ranks are up, ingest:**
+
+```bash
+python scripts/vram_ledger/probe_nccl.py ingest --dump-dir /spinning/nccl_dumps
+```
+
+<!-- probe_nccl.py:52-66, nccl_probe.py:322-396 -->
+
+The measurement is valid for exactly one `(rig fingerprint, communicator
+signature)` pair. Change the TP width or hand the TP group to barlink and
+the signature moves. Ingest refuses dumps from non-exclusive cards (co-located
+ranks on one physical GPU) because the driver delta captures both ranks'
+allocations.
+
+The first boot with a new communicator geometry measures and caches it
+automatically: the boot itself writes the dumps if the env var is set, then
+ingest folds them. Without a cached measurement, the term is UNBOUNDED and
+the ledger refuses.
+
+### 16.4 Boot flags
+
+The ledger is enabled with one flag and has one companion for operator headroom:
+
+| Flag | Type | Default | What it gates | Source |
+|---|---|---|---|---|
+| `--enable-vram-ledger` | bool | `False` | Switches card sizing from the legacy `--rank-auto-reserve-mib` demand model to the itemized ledger. Cards that cannot fund all terms are refused. | `server_args.py:2345-2363` |
+| `--rank-user-reserve-mib` | int or comma-separated list | `1024` | External headroom per physical card for processes outside this engine (desktop compositor, monitoring, etc.). Single value for all cards, or one per rank aligned with `--rank-gpu-id`. Co-located ranks take the maximum per card. **Requires `--enable-vram-ledger`** — passed without it is refused. | `server_args.py:2325-2344` |
+
+**Important: the legacy split.** `--rank-auto-reserve-mib` and
+`--enable-vram-ledger` are mutually exclusive (`server_args.py:11058-11076`).
+The former is deprecated: it merges operator headroom and internal demand in
+one number. The latter splits them: `--rank-user-reserve-mib` is headroom
+only, and every internal term is computed per card. A boot that passes both
+is refused with a migration hint.
+
+`--enable-vram-dial`, `--vram-budget-mib`, and
+`--vram-dial-consensus-interval` are **not** ledger flags. They belong to the
+runtime budget dial feature (#330) and are unrelated to ledger sizing. The
+ledger path and the dial path are separate gateways in the codebase. See
+section 4.1.2 for the dial feature.
+
+### 16.5 Verification
+
+The ledger produces two artefacts per boot, both written to the directory
+specified by `SGLANG_VRAM_FLIGHT_DIR` (`flight_recorder.py:126`):
+
+1. **Flight marks** (`ledger_*` phase marks): one per rank at each boot
+   boundary (`process_start`, `pre_weight_load`, `weights_loaded`,
+   `kv_pool_sized`, `capture_begin`, `capture_end`, `boot_complete`,
+   `first_forward`). These are written by the flight recorder unconditionally
+   when `SGLANG_VRAM_FLIGHT_DIR` is set.
+
+2. **Modeled ledger** (`ledger_<boot_id>.json`): the itemized ledger
+   constructed during argument resolution. Written by
+   `_dump_modeled_ledger` (`engine.py:1185-1197`) at the end of
+   `build_card_ledgers`, which is called by both the ledger path and the
+   full-demand reserve path (`server_args.py:11285` comment). Named with the
+   boot id, so the file appears beside the mark files even if the boot
+   refused.
+
+To read the artefacts:
+
+```bash
+# List boots and their mark counts:
+python scripts/vram_ledger/attribute_flight.py boots <SGLANG_VRAM_FLIGHT_DIR>
+
+# Show per-phase costs from the marks:
+python scripts/vram_ledger/attribute_flight.py phases <SGLANG_VRAM_FLIGHT_DIR>
+
+# Reconcile modeled ledger terms against measured boot posts:
+python scripts/vram_ledger/attribute_flight.py reconcile <SGLANG_VRAM_FLIGHT_DIR>
+```
+
+<!-- attribute_flight.py:49-211 -->
+
+The `reconcile` subcommand reads `ledger_<boot_id>.json` and the mark files,
+then prints per-card overprediction (`modeled - measured`). A positive value
+means the ledger reserved more than the boot actually took (idle safety
+margin). A negative value means the ledger under-charged — the dangerous
+direction that leads to OOM. The `snapshot` subcommand reads process-start
+allocation recordings (`SGLANG_VRAM_FLIGHT_TRACE`-armed) for per-callsite
+attribution, but that is a separate, optional measurement arm.
+
+### 16.6 Known limits
+
+- **Production recipe still uses the legacy path.** The current production
+  boot on this rig (`--rank-auto-reserve-mib`) runs the legacy demand model.
+  The ledger is not active there; it is a separate sizing mode gated by
+  `--enable-vram-ledger`. Migrating the production recipe is a deliberate
+  step that requires the calibration probes to be run for that recipe first.
+
+- **Per-card load transient (~70 MiB) is not yet priced.** Measured in the
+  2026-08-06 window: a ~70 MiB per-card spike under load that becomes
+  NVML-visible only at tight fill (allocator slack masks it otherwise). No
+  ledger term covers it today (#612). Until it is priced, corridor
+  acceptance runs must expect the time-series minimum to dip by up to this
+  amount below the idle reading.
+
+- **Uneven-DCP token-vector quantisation gap (~2.7 GB) is NOT a ledger
+  term.** Under uneven DCP the pool is sized as
+  `min_over_ranks(P_r // ratio_r) * sum(ratios)`
+  (`model_runner_kv_cache_mixin.py:4304-4373`): every non-binding rank
+  wastes `P_r - unit * ratio_r` tokens, measured at ~2.7 GB across the
+  three cards on the 2026-08-06 window. The ledger prices demand correctly;
+  the waste is in the vector choice. The fix is a corridor-constrained
+  vector solver on the existing in-process install path (#602), not a new
+  ledger term.
+
+- **Co-located ranks and NCCL measurement.** The NCCL buffer probe refuses
+  dumps from non-exclusive cards (`CUDA_VISIBLE_DEVICES` with more than one
+  GPU, or two ranks pinned to the same GPU). On a rig that does co-location,
+  the NCCL term for the co-located card must be measured under single-rank
+  isolation or derived from a known configuration. First boot with co-location
+  on an unmeasured rig will leave this term UNBOUNDED.
