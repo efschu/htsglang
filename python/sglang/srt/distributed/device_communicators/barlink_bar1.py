@@ -1528,6 +1528,27 @@ class BarlinkBar1Transport:
         #: the per-collective counter cannot see a replay at all.
         self._captured_launches = False
         self._registered_in_gate = False
+        # #603b: make this transport's launch record readable from OUTSIDE, on
+        # every rank at once. `_note_launch` already records the position, but
+        # only the rank that RAISES ever prints it -- and exactly one rank
+        # raises per crash, so the cross-rank comparison that would name a
+        # POSITION offset (as opposed to the COUNT divergence the census
+        # covers) has never been available. Registration is a weakref append;
+        # the handler is host-side only and takes no device read.
+        from sglang.srt.distributed.device_communicators import (
+            barlink_launch_dump as _launch_dump,
+        )
+
+        _launch_dump.register(self)
+        _launch_dump.install_sigusr1_handler()
+        # The sampler, not the signal, is what actually observes a wedge: a
+        # Python signal handler cannot run while the main thread sits in a
+        # C-level CUDA sync, which is precisely the wedge state (verified
+        # on-card: SIGUSR1 delivered to all three ranks, nothing logged).
+        try:
+            _launch_dump.start_sampler(int(getattr(self, "rank", -1)))
+        except Exception:  # noqa: BLE001 - diagnostic must not break a boot
+            pass
         # #517: the deferred status read. All of it stays None/0 until
         # bring-up decides (via `barlink_abort_gate.should_defer_status`)
         # that this transport's status word is a DEVICE word and therefore

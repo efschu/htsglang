@@ -178,3 +178,39 @@ def test_scheduler_boot_actually_calls_the_warmup():
     # stretch, and warming before it would put the barrier in the wrong place.
     assert src.index("init_all_cuda_graphs()") < src.index("warm_sampling_backend()")
     assert hasattr(Scheduler, "warm_sampling_backend")
+
+
+def test_warmup_does_not_read_attributes_init_has_not_set_yet(stub_flashinfer):
+    """REGRESSION, and it cost a boot.
+
+    The first cut read ``self.tp_group`` for the barrier. That attribute is
+    assigned LATER in ``Scheduler.__init__`` than ``init_model_worker()`` runs,
+    so every boot died with
+    ``AttributeError: 'Scheduler' object has no attribute 'tp_group'``.
+
+    The wiring test above did not catch it because it only greps the SOURCE --
+    it proves the call exists, not that the call WORKS. This one executes the
+    real method against an object carrying only what exists at that point in
+    __init__, which is exactly the condition the boot hit. Desk-checked code
+    that is never executed is unvalidated; this is the execution.
+    """
+    import types
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    log = []
+    stub_flashinfer(log)
+
+    class _Args:
+        sampling_backend = "flashinfer"
+
+    class _Worker:
+        device = "cpu"
+
+    # Deliberately NO `tp_group`: that is the state at init_model_worker time.
+    stub = types.SimpleNamespace(server_args=_Args(), tp_worker=_Worker())
+    assert not hasattr(stub, "tp_group")
+
+    # Must not raise, and must still have done the build.
+    Scheduler.warm_sampling_backend(stub)
+    assert any(name == "top_k_top_p" for name, *_ in log if isinstance(name, str))
