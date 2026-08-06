@@ -274,3 +274,52 @@ broadcast once, unpack. This:
 It is a design, not a result. It has not been written, tested, or soaked, and
 it should not be treated as a fix until a can-fail falsifier and a soak past
 the 3.5-7 min crash envelope exist.
+
+## 10. The wedge family (task B): the briefed target is not what wedged here
+
+Hunter-4 recorded the wedge as all three ranks blocking in
+`flashinfer_backend.py:7429` (`self.kv_indptr[:, : bs + 1].cpu()`), a blocking
+D2H in the draft path, and the brief for this window was to root-fix that.
+
+This window reproduced a wedge under the same load, and it has a DIFFERENT
+shape (`/spinning/616c-hunter5/wedge1_dump_*.txt`):
+
+| rank | frame |
+|---|---|
+| 0 | `call_begin_forward` (`flashinfer_backend.py:6926`), inside the forward |
+| 1 | `alloc` (`memory_pool.py:1525`) via `alloc_req_slots` / `prepare_for_extend` |
+| 2 | same as rank 1 |
+
+`memory_pool.py:1525` is `self.req_index_to_mamba_index_mapping[select_index] =
+mamba_index_tensor` — a device scatter ENQUEUE, not a D2H. Rank 0 is ahead
+inside the forward while ranks 1 and 2 are still preparing the next batch.
+
+So in this instance the host was pinned by **CUDA launch-queue backpressure**
+(the device queue not draining), not by a blocking device-to-host copy. That
+matters for the fix: replacing the `.cpu()` at 7429 with a staged
+non-blocking read would not have cleared this wedge, because no rank was in
+that call. A non-blocking copy plus an event wait is also not a deadlock cure
+in general — the host still cannot proceed until the queue drains; it only
+avoids pulling in more streams than necessary.
+
+The honest position: 7429 is a real blocking D2H on the draft path and is
+worth removing on its own merits, but it is **one of several places the host
+can get pinned by a stalled queue, not established as the wedge's root**. The
+root question is why a device queue stops draining, which points back at the
+same collective-pairing question as section 8 rather than at any single
+`.cpu()`.
+
+A removal of the 7429 D2H is derivable — the decode path already builds this
+indptr host-side from `seq_lens_cpu` (`flashinfer_backend.py:6546-6550`), and
+the draft kernel's rule is
+`kv_indptr[i][z] = sum(positions[:z]) + z*(i+1)`
+(`kernels/ops/speculative/cache_locs.py:189-197`). `ForwardBatch.seq_lens_cpu`
+exists, so the host has the raw material. What is NOT established is the exact
+relation between the draft `positions` buffer and `seq_lens` (off-by-one, and
+the topk>1 / page_size>1 branches). That buffer is device-only under graph
+capture, so the relation cannot be confirmed by reading alone. Writing the
+host-side formula without confirming it would silently corrupt attention
+indices, so the next step is a default-off runtime cross-check that computes
+the host candidate and diffs it against the device `kv_indptr` — cheap, and it
+either validates the formula or falsifies it in one run. That work is NOT done
+here.
