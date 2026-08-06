@@ -5587,7 +5587,7 @@ attribution, but that is a separate, optional measurement arm.
   three cards on the 2026-08-06 window. The ledger prices demand correctly;
   the waste is in the vector choice. The fix is a corridor-constrained
   vector solver on the existing in-process install path (#602), not a new
-  ledger term.
+  ledger term. **Implemented as `--rank-kv-ratio corridor`** — see 16.7.
 
 - **Co-located ranks and NCCL measurement.** The NCCL buffer probe refuses
   dumps from non-exclusive cards (`CUDA_VISIBLE_DEVICES` with more than one
@@ -5595,3 +5595,86 @@ attribution, but that is a separate, optional measurement arm.
   the NCCL term for the co-located card must be measured under single-rank
   isolation or derived from a known configuration. First boot with co-location
   on an unmeasured rig will leave this term UNBOUNDED.
+
+### 16.7 Corridor-constrained KV token vector (`--rank-kv-ratio corridor`)
+
+Implemented 2026-08-06 on branch `feat/corridor-vector-602`. This is the fix
+named in 16.6 for the quantisation gap, and it is a mode of the existing
+`--rank-kv-ratio` axis, not a new flag.
+
+#### What it changes
+
+Under uneven DCP the reported context budget is
+
+```
+C(v) = min_over_ranks(cap_r // v_r) * sum(v)
+```
+
+and rank `r` physically holds `unit * v_r` tokens with
+`unit = min_over_ranks(cap_r // v_r)`. Two things were wrong before:
+
+1. **The vector was not solved, it was rounded.** `capacity` mode took
+   `partition_units(64, P)` — proportional rounding at a fixed grain.
+2. **There was no floor.** `cap_r` was the budget model's profiled capacity
+   `P_r`. Where the model over-states a card, driving every rank tight
+   against `P_r` drives that card below the operator's free-VRAM reserve.
+   Measured: the recommended vector on the ledger boot landed at min-free
+   964 / 834 MiB on two of three cards, against a 1024 MiB floor.
+
+`corridor` fixes both:
+
+- **Exact solve.** For a fixed `unit = u` the best vector is `v_r = E_r // u`,
+  giving `C(u) = u * sum(E_r // u)`. `C` is increasing inside each divisor
+  block, so enumerating block ends finds the argmax in `O(n * sqrt(max E))`.
+  Verified against a brute-force oracle over all compositions.
+- **The floor as a capacity.** Each rank contributes `Q_r`, the tokens that
+  still leave its card at or above its reserve, and the solve runs on
+  `E_r = min(P_r, Q_r)`. Because `unit <= E_r // v_r` by construction,
+  `unit * v_r <= E_r` holds for every rank and every solution — the floor
+  cannot be violated by any vector the solver can return, so it never has to
+  appear as a penalty term competing with the token objective.
+
+#### Where the numbers come from
+
+| Input | Source | Why there |
+|---|---|---|
+| `P_r` | the existing profiled capacity | unchanged from `capacity` mode |
+| free VRAM | NVML `free` column, read at the post-weight-load barrier in `_profile_available_bytes` | after the barrier every co-located rank has loaded, so the card's occupancy is deterministic; before any pool exists. NVML `free`, never `total - used` — the driver carve-out is invisible in both |
+| reserve | `--rank-user-reserve-mib` (default 1024) | the operator's floor, per card |
+| post-sizing demand | the ledger's `activation`, `graph capture`, `attention workspaces`, `GDN scratch`, `indexer scratch`, `adaptive ladder` terms | the only terms whose bytes are still in the future at the measuring point |
+
+The residency partition is **not** `demand_outside_budget_mib`. That splits
+on inside/outside the rank budget; this splits on resident/not-yet-resident.
+They disagree on five terms. In particular the NVML driver carve-out is
+charged at **zero** here: NVML already subtracts it from the `free` column,
+so charging it against a free anchor would subtract it twice.
+
+`Q_r` rides the same `all_gather` as `P_r`, so the install decision stays a
+pure function of gathered values and every rank derives the identical vector.
+
+#### Refusals
+
+No silent fallbacks. The mode aborts, naming the numbers, when:
+
+- a card cannot fund its reserve plus its post-sizing demand (names the GPU,
+  the free reading, the reserve, the demand, the co-located rank count);
+- any ledger term is UNBOUNDED (an unpriced term is not worth 0 MiB, and the
+  floor is only as honest as the demand model behind it);
+- `--rank-gpu-id` or the per-rank budgets are missing;
+- draft-solo KV placement is active — the solo host's capacity is a *function*
+  of the vector being solved for, so a fixed per-rank clamp is the wrong
+  constraint. Use `--rank-kv-ratio capacity` for that topology.
+
+#### Interaction with the improvement gate
+
+`capacity` installs only when `C` strictly improves. `corridor` does not, and
+must not: when the floor binds, the whole point of the install is to hold a
+**smaller** pool than the active vector would take. Both `C` values are scored
+against the clamped capacities so the logged pair stays comparable.
+
+#### Known limit
+
+The ~70 MiB per-card load transient (#612) is still unpriced, so the corridor
+solve can land up to that much below its own target under load. That is a
+demand-model gap, not a solver gap: `--rank-user-reserve-mib` is the operator's
+knob for it, and no hidden safety margin is added on top of the value passed.

@@ -47,6 +47,12 @@ lower bound for the features, not a projection of them. Stated once, not repeate
   sizes within one tensor-parallel group.
 - **Asymmetric / uneven DCP** (`--rank-kv-ratio`): capacity-weighted per-rank KV ownership during
   decode.
+- **Corridor-constrained KV token vector** (`--rank-kv-ratio corridor`, #602): the same ownership
+  vector solved exactly, under a hard per-card free-VRAM floor. `capacity` maximizes tokens against
+  the budget model's per-rank capacity; `corridor` additionally measures what each physical card can
+  actually give at the post-weight-load barrier, subtracts the operator reserve and the demand that
+  has not materialized yet, and solves under the smaller of the two. The floor enters as a capacity,
+  not as a term in the objective, so it can never be traded for tokens.
 
 ## Overview matrix
 
