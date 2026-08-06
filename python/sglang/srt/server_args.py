@@ -489,9 +489,10 @@ def _parse_rank_moe_ratio(value: str) -> Union[str, List[int]]:
 
 def _parse_rank_kv_ratio(value: str) -> Union[str, List[int]]:
     """Parse --rank-kv-ratio: 'coupled', 'capacity', 'auto' (alias of
-    'capacity'), 'speed', or a comma-separated positive integer list."""
+    'capacity'), 'speed', 'corridor', or a comma-separated positive integer
+    list."""
     mode = value.strip()
-    if mode in ("coupled", "capacity", "speed"):
+    if mode in ("coupled", "capacity", "speed", "corridor"):
         return mode
     if mode == "auto":
         return "capacity"
@@ -499,8 +500,8 @@ def _parse_rank_kv_ratio(value: str) -> Union[str, List[int]]:
         return [int(part.strip()) for part in value.split(",")]
     except ValueError as e:
         raise ValueError(
-            "--rank-kv-ratio must be 'coupled', 'capacity', 'auto', 'speed' "
-            f"or a comma-separated integer list, got {value!r}."
+            "--rank-kv-ratio must be 'coupled', 'capacity', 'auto', 'speed', "
+            f"'corridor' or a comma-separated integer list, got {value!r}."
         ) from e
 
 
@@ -2592,7 +2593,21 @@ class ServerArgs:
             "linearly with resident context. 'speed' needs the per-rank "
             "bandwidth scores, so it requires --rank-tp-ratio "
             "auto-performance; without them it degrades to 'capacity' and "
-            "says so. A comma-separated "
+            "says so. 'corridor' (#602): 'capacity' plus a HARD per-card "
+            "free-VRAM floor. 'capacity' maximizes tokens against the "
+            "profiled capacity P_r, which is a budget-MODEL number; where "
+            "that model over-states a card, driving every rank tight against "
+            "P_r pushes the card below the operator's reserve. 'corridor' "
+            "measures the live NVML free VRAM at the same barriered "
+            "post-weight-load point, subtracts --rank-user-reserve-mib and "
+            "the modeled demand that has not materialized yet (graph "
+            "capture, activation peak, attention workspaces), and solves the "
+            "same token objective under min(P_r, that). The floor is a hard "
+            "constraint, never traded against tokens: the solved vector "
+            "always satisfies unit * v_r <= capacity_r on every rank. A card "
+            "that cannot fund its reserve plus its demand aborts the boot "
+            "with the per-card numbers instead of silently over-filling. "
+            "A comma-separated "
             "positive integer list (one entry per rank) pins the ownership "
             "vector explicitly — the capacity-vs-depth-speed slider. "
             "Non-'coupled' values imply the weighted-DCP path (no "
@@ -2625,6 +2640,13 @@ class ServerArgs:
     # post-weight-load profiling. None => no profile => 'speed' degrades to
     # 'capacity'.
     rank_kv_speed_weights: Optional[List[int]] = None
+    # Internal (no CLI flag): {physical gpu id: MiB of modeled demand that has
+    # NOT materialized yet at the post-weight-load, pre-pool profiling point}.
+    # Resolved once at parse time by _handle_corridor_kv_ratio (the ledger
+    # lives here, not in the worker) and consumed by the #602 corridor solver
+    # in _maybe_suggest_dcp_token_vector. None outside --rank-kv-ratio
+    # corridor, so no other path can read a number this one did not price.
+    corridor_post_sizing_mib: Optional[Dict[int, int]] = None
     # -------------------------------------------------------------------------
     # Per-message-class link selection (task #240)
     # -------------------------------------------------------------------------
@@ -5902,6 +5924,11 @@ class ServerArgs:
         # --mem-fraction-static is still distinguishable (None = unset).
         self._handle_uneven_tp()
 
+        # #602 corridor token vector. After _handle_uneven_tp because it needs
+        # the resolved per-rank budgets and placement, and because the ledger
+        # it prices its demand from is built against them.
+        self._handle_corridor_kv_ratio()
+
         # Weightless-KV fast lane (Variant C Stage 1): validate scope and
         # hard-reject the out-of-scope modes (spec, chunked prefill) up front,
         # so an unsupported config fails fast at arg-parse rather than
@@ -8765,10 +8792,29 @@ class ServerArgs:
         machinery (and its rank-uniformity invariant) exactly."""
         return getattr(self, "rank_kv_ratio", "coupled") == "speed"
 
+    def uneven_kv_corridor_mode(self) -> bool:
+        """True for --rank-kv-ratio corridor (#602): the capacity objective
+        under a HARD free-VRAM floor per physical card.
+
+        'capacity' derives the vector from the profiled token capacity P_r
+        alone, which is a budget-MODEL number. Where that model over-states
+        what a card can give, driving every rank tight against P_r drives the
+        card below the operator's free-VRAM reserve. 'corridor' additionally
+        measures, at the same barriered post-weight-load point, how many
+        tokens still leave the card at or above its reserve once the modeled
+        post-sizing demand has materialized, and solves under
+        min(P_r, that). Same install point, same rank-uniformity invariant."""
+        return getattr(self, "rank_kv_ratio", "coupled") == "corridor"
+
     def uneven_kv_derived_mode(self) -> bool:
-        """True for either derived mode ('capacity' or 'speed'), i.e. the
-        vector is computed after profiling rather than pinned by the user."""
-        return self.uneven_kv_capacity_mode() or self.uneven_kv_speed_mode()
+        """True for any derived mode ('capacity', 'speed' or 'corridor'),
+        i.e. the vector is computed after profiling rather than pinned by the
+        user."""
+        return (
+            self.uneven_kv_capacity_mode()
+            or self.uneven_kv_speed_mode()
+            or self.uneven_kv_corridor_mode()
+        )
 
     def uneven_weighted_dcp_enabled(self) -> bool:
         """True when the weighted-DCP token vector should be installed:
@@ -11368,6 +11414,138 @@ class ServerArgs:
                 )
             out[x.gpu_id] = non_kv
         return out
+
+    # ------------------------------------------------------------------
+    # #602 corridor token vector: the demand that has NOT materialized yet
+    # at the post-weight-load, pre-pool profiling point.
+    # ------------------------------------------------------------------
+    #
+    # The corridor solver anchors on a LIVE free-VRAM reading taken at that
+    # point, so it must charge exactly the terms whose bytes are still in the
+    # future there -- no more, no less. Getting the partition wrong in either
+    # direction is silent: charging a resident term twice shrinks the pool for
+    # no reason, and omitting a future term hands those bytes to the KV pool
+    # and breaks the floor at capture time instead of at boot time.
+    #
+    # NOT charged here, and why:
+    #   * model weights            -- resident before the barrier that the
+    #                                 reading is taken after.
+    #   * hardware residual,       -- CUDA primary context, allocator residue,
+    #     parent context,             communicator buffers: all allocated
+    #     NCCL buffers                during startup, i.e. already reflected.
+    #   * NVML driver carve-out    -- NVML subtracts it from the `free` column
+    #                                 already; charging it against a free
+    #                                 anchor would subtract it twice.
+    #   * mamba/GDN state pool     -- the profiling step deducts it from the
+    #                                 same budget separately
+    #                                 (handle_max_mamba_cache), so it is
+    #                                 already priced on this path.
+    #
+    # Note this is a DIFFERENT partition from demand_outside_budget_mib, which
+    # splits on "inside vs outside the rank budget" rather than on residency.
+    # The two agree on nothing that matters here; do not substitute one.
+    @staticmethod
+    def corridor_late_term_names() -> Tuple[str, ...]:
+        """The ledger terms charged by :meth:`corridor_post_sizing_mib_per_gpu`.
+
+        Taken from the term constants rather than spelled out, so renaming a
+        ledger line cannot silently drop it out of the corridor's demand.
+        """
+        from sglang.srt.mem_ledger.engine import (
+            TERM_ACTIVATION,
+            TERM_ATTN_WORKSPACE,
+            TERM_GDN_SCRATCH,
+            TERM_GRAPH_CAPTURE,
+            TERM_INDEXER_SCRATCH,
+            TERM_LADDER,
+        )
+
+        return (
+            TERM_ACTIVATION,
+            TERM_GRAPH_CAPTURE,
+            TERM_ATTN_WORKSPACE,
+            TERM_GDN_SCRATCH,
+            TERM_INDEXER_SCRATCH,
+            TERM_LADDER,
+        )
+
+    def corridor_post_sizing_mib_per_gpu(self) -> Dict[int, int]:
+        """``{physical gpu id: MiB that materializes after the KV pool is
+        sized}``, for the #602 corridor solver.
+
+        Raises rather than returning a partial sum. An unpriced term here
+        would be indistinguishable from a zero-cost one, and the pool would
+        be sized as if the missing bytes were free -- exactly the failure the
+        ledger's all-or-nothing refusal exists to prevent.
+        """
+        late_names = self.corridor_late_term_names()
+        ledgers = self._build_card_ledgers()
+        if not ledgers:
+            raise ValueError(
+                "--rank-kv-ratio corridor needs a per-card VRAM ledger to "
+                "price the demand that appears after the KV pool is sized "
+                "(graph capture, activation peak, attention workspaces), and "
+                "no ledger could be built for this configuration. Either "
+                "price it (scripts/vram_ledger/probe_activation.py for this "
+                "recipe) or use --rank-kv-ratio capacity, which does not "
+                "enforce a free-VRAM floor."
+            )
+        out: Dict[int, int] = {}
+        for card in ledgers:
+            if card.unbounded:
+                raise ValueError(
+                    f"--rank-kv-ratio corridor cannot price {card.card}: "
+                    f"{len(card.unbounded)} ledger term(s) are neither "
+                    f"measured nor bounded -- {'; '.join(sorted(card.unbounded))}. "
+                    "The corridor floor is only as honest as the demand model "
+                    "behind it, so this refuses instead of treating an "
+                    "unmeasured term as 0 MiB. Run the probe named above for "
+                    "this recipe, or use --rank-kv-ratio capacity."
+                )
+            late = 0
+            for name in late_names:
+                term = card.term(name)
+                if term is not None:
+                    late += int(term.mib)
+            out[card.gpu_id] = late
+        return out
+
+    def _handle_corridor_kv_ratio(self):
+        """Resolve and validate --rank-kv-ratio corridor (#602).
+
+        Everything the corridor needs that is NOT rank-local is resolved here,
+        in the single parse-time process that already owns NVML and the
+        ledger. The worker then only reads its own card's free memory and the
+        number this parked for it, which keeps the install decision a pure
+        function of all-gathered values (the rank-uniformity invariant).
+        """
+        if not self.uneven_kv_corridor_mode():
+            return
+        if not self.rank_gpu_id:
+            raise ValueError(
+                "--rank-kv-ratio corridor requires --rank-gpu-id: the floor "
+                "is per PHYSICAL card, so the solver has to know which card "
+                "each rank sits on and how many ranks share it. Without the "
+                "placement there is no card to hold a reserve against."
+            )
+        if self.rank_gpu_memory_mib is None:
+            raise ValueError(
+                "--rank-kv-ratio corridor requires per-rank memory budgets "
+                "(--rank-gpu-memory-mib, or --rank-tp-ratio auto which "
+                "derives them). The corridor clamps the profiled capacity; "
+                "without a budget there is no profiled capacity to clamp."
+            )
+        self.corridor_post_sizing_mib = self.corridor_post_sizing_mib_per_gpu()
+        logger.info(
+            "--rank-kv-ratio corridor (#602): per-card demand that appears "
+            "AFTER the KV pool is sized = %s MiB (activation + graph capture "
+            "+ attention workspaces + GDN/indexer scratch + adaptive ladder). "
+            "The solver subtracts this and --rank-user-reserve-mib %s from "
+            "each card's live free VRAM to get the token count that still "
+            "keeps the card above its floor.",
+            {g: m for g, m in sorted(self.corridor_post_sizing_mib.items())},
+            self.rank_user_reserve_mib,
+        )
 
     def reserve_demand_per_gpu(self, gpu_mem, counts) -> Dict[int, int]:
         """``{physical gpu id: derived reserve demand MiB}`` for *counts*
