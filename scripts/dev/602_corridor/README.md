@@ -69,10 +69,13 @@ grep -E "max_total_num_tokens|#602 corridor|Uneven DCP" /tmp/602_<arm>.log | tai
 
 - Acceptance band for the per-card minimum under load: **[1024, ~1600] MiB**.
 - Expect the load minimum to sit up to **~70 MiB** below the idle reading:
-  that is the per-card load transient (#612), which no ledger term prices yet.
-  It is a demand-model gap, not a solver gap — the solver spends exactly the
-  budget it is given. If the floor has to hold against it today, raise
-  `--rank-user-reserve-mib`; no hidden margin is added on top of that value.
+  that is the per-card load transient. Since #612 the ledger PRICES it
+  (`TERM_LOAD_TRANSIENT`, charged per rank and included in the corridor's
+  post-sizing demand), but on the INHERITED 70 MiB from this very window — no
+  measurement on the rig has replaced it yet. So the dip should now be inside
+  the budget rather than under it; if it is not, that is the constant being
+  wrong, not the solver. `--rank-user-reserve-mib` remains the operator's knob
+  and no hidden margin is added on top of that value.
 - A card below 1024 in the corridor arm but above it in the baseline means the
   post-sizing demand for that card is under-priced, and the term to look at is
   named in the ledger itemisation the boot prints.

@@ -317,7 +317,8 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
         non_kv = args._vram_ledger_non_kv_per_gpu(Counter([0, 1]))
 
     # 1024 user reserve + 1766 activation + 640 capture + 384 flashinfer
-    # workspace + 408 hardware residual + 425 NVML carve-out = 4647.
+    # workspace + 408 hardware residual + 425 NVML carve-out + 70 load
+    # transient = 4717.
     #
     # Was 5976 before the phase footprints landed: activation 3968 (the
     # falsified heuristic) and capture 192 (the token estimate the same window
@@ -329,7 +330,13 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     # which is why both cards move by 425 and not by 425 x ranks. Unlike the
     # corrections above this one makes the budget SMALLER on purpose -- the
     # KV pool had been sized against memory that does not exist.
-    assert non_kv == {0: 4647, 1: 4647}
+    #
+    # #612 added the load transient, +70 per RANK (one rank per card here, so
+    # +70 per card): the allocator peak above the resident set that the
+    # 2026-08-06 corridor window saw the free-memory floor dip into and that no
+    # term charged. Same direction as the carve-out and for the same reason --
+    # the budget was being formed against memory the boot does not keep.
+    assert non_kv == {0: 4717, 1: 4717}
     text = caplog.text
     assert "attention workspaces (capped)" in text
     assert "SGLANG_FLASHINFER_WORKSPACE_SIZE" in text
