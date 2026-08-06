@@ -167,8 +167,15 @@ class HostKVCache(abc.ABC):
             requested_bytes=requested_bytes,
             reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
         )
+        # Name the POST, not the class of feature. This line used to say
+        # "hierarchical KV cache" unconditionally, so a kv-session-offload
+        # spill pool announced itself as HiCache -- with both features live
+        # (#550) that reading is simply wrong, and the allocation log is the
+        # first place an operator looks when the joint budget refuses.
         logger.info(
-            f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+            "Allocating %.2f GB pinned host memory for %s.",
+            requested_bytes / 1e9,
+            self.budget_label,
         )
 
         self.kv_buffer = self.init_kv_buffer()

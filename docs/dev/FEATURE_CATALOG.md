@@ -1762,6 +1762,35 @@ are measurements before promising to lift it — only the first kind can be
 closed by writing code, and shipping as though the second kind were closed too
 is exactly what the refusal existed to prevent.
 
+MEASURED in the #550 GPU window, and gap (2) is still OPEN. The pair booted
+together for the first time (3x 1.00 GB kvso spill pools alongside an 8.00 GB
+HiCache tier, one joint budget, byte-coherent). ms/round, median streaming
+inter-token interval, 16 streams x ~20k prompt tokens: WITHOUT HiCache
+**115.11 ms/round** with an A-vs-A floor of **0.48 ms (0.4 %)**; WITH HiCache
+**151.39 ms/round** mean but an A-vs-A floor of **75.97 ms (50.2 %)**. That
+second floor is the whole result: one of the two WITH runs spilled and the
+other did not, so the arm measured two different regimes and called the
+difference noise. Comparing like with like, the no-spill runs are 113.40 (with)
+vs 115.11 (without) — no measurable HiCache penalty in steady state — while the
+one spilling run cost 189.38. The control never spilled, so SPILL COST and
+HICACHE CONTENTION are confounded and neither is isolated. The pair therefore
+stays opt-in: the honest reading is "boots, and costs nothing when nothing
+spills", which is not the claim the refusal asked for.
+
+The window also produced a sharper lesson than the numbers. EVERY passing
+spill arm in the boot matrix (`B_offload`, `G_all_axes`, `J_waveback_ps2`,
+`N_resume_under_spec`) spilled ZERO times: their probes are a few dozen tokens
+against a ~120k-token device pool, so the logs contain only arming lines
+(`wave-back THRESHOLD armed`, `spec-in-spill-tick: flag=True ready=True`) and
+not one `SPILL(`. Those PASSes prove the configurations boot and stay
+byte-coherent; they do NOT exercise the spill path, and reading them as
+evidence for it is the same "a test that performs the step the real caller
+omits" trap recorded above. Consequence: the B1 spec gate was NOT flipped —
+its stated reason is one unobserved round (a spill landing in the same round as
+a drafter-in-tick step) and nothing here observed it. A spill arm needs a LOAD
+PRECONDITION (assert `SPILL(` appears, or fail the arm) before any of them can
+count as evidence about spilling.
+
 Wrong-door family (#549): a state machine that classifies by ENUMERATING the
 doors it knows will silently drop anything that arrives through a new one.
 `GdnSlotRuntime.on_round` sorted every session into three branches — resident

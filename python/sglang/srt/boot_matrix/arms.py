@@ -604,6 +604,18 @@ ARMS: Tuple[Arm, ...] = (
             # 8 GiB kvso + 8 GB HiCache sits far under this box's host RAM,
             # so the arm measures contention rather than tripping the guard.
             "--hicache-size", "8",
+            # MANDATORY on this model, and the reason is worth stating: the
+            # serving model is a hybrid GDN/mamba checkpoint, and HiCache's
+            # MambaPoolHost accepts ONLY page_first_direct ("incompatible with
+            # write-back staging kernel"). The layout normalizer in server_args
+            # resolves layout-vs-io-backend pairs but has no hybrid-model case,
+            # so the default layout reaches pool construction and dies there
+            # with a scheduler traceback instead of a named argument error.
+            # Measured in the #550 window: without this flag the arm boots to
+            # "MambaPoolHost only supports layout='page_first_direct', got
+            # 'page_first'". (--hicache-io-backend then auto-resolves to
+            # direct, which is why it is not passed separately.)
+            "--hicache-mem-layout", "page_first_direct",
         ),
         expect=_expect(offload=True),
         coherence="byte+graded",
