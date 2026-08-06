@@ -3832,6 +3832,102 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _drain_prefetch_progress(self) -> Dict[str, bool]:
+        """Advance EVERY queued request's HiCache storage prefetch, and return
+        the per-request verdict the admission loop then reads.
+
+        #580, the rank-local-condition-before-a-group-collective family
+        (#94/#194/#312/#431). ``UnifiedRadixCache.check_prefetch_progress``
+        carries two collectives on the attn/TP groups -- the MAX reduce inside
+        ``can_terminate_prefetch`` and the ``check_prefetch_progress``
+        MIN reduce over completed tokens + sidecar hit pages. It used to be
+        called from INSIDE the waiting-queue admission loop, i.e. only for the
+        prefix of the queue that the loop reached before one of its exits:
+
+          * ``running_batch.batch_is_full`` -- a PERSISTENT flag carried on
+            running_batch, set from ``get_num_allocatable_reqs`` and from the
+            adder's NO_TOKEN verdict, which reads
+            ``token_to_kv_pool_allocator.available_size()``;
+          * the ``AddReqResult != CONTINUE`` break, same source;
+          * and, before the loop is even entered, the early returns on
+            ``batch_is_full``, on ``min_free_slots_delayer.should_delay`` and
+            on ``get_num_allocatable_reqs(...) <= 0``.
+
+        Every one of those reads THIS rank's pool. Under uneven TP/DCP the
+        pools differ by construction, so near a pool boundary one rank stops
+        at request N while a peer walks on to N+1 and enters the collectives
+        alone. The peer then meets the stopping rank's next collective instead
+        of its own -- two different ops of two different widths on one gloo
+        group, which is the observed ``op.preamble.length <= op.nbytes. 16 vs
+        4`` abort. The existing #580 vote
+        (``prefetch_from_storage``/``prefetch_participation_vote``) makes
+        REGISTRATION rank-uniform; it says nothing about who later walks into
+        the progress check, which is this defect.
+
+        The fix is structural, not a mask: the entry decision is moved off the
+        rank-local admission state entirely. The drain runs over
+        ``self.waiting_queue``, which is replicated across the TP ranks (same
+        request stream, same admission order -- see ``_add_request_to_queue``),
+        under the rank-uniform ``enable_hicache_storage`` config flag, and it
+        visits ALL of the queue, so the number and order of collectives no
+        longer depend on any per-rank pool value. All ranks enter for a given
+        request, or none do.
+
+        Placement: called from ``_get_new_batch_prefill_raw`` AFTER the
+        grammar queue has drained into the waiting queue (those requests
+        register prefetches in ``_add_request_to_queue``, so an earlier call
+        would miss them) and BEFORE the first rank-local admission predicate.
+        That is the same point ``check_hicache_events`` already occupies, so
+        no new assumption about which ranks reach this line is introduced.
+
+        Cost: unchanged in the common case. A request with no registered
+        prefetch returns at the ``req_id not in self.ongoing_prefetch`` guard
+        without any collective, and ``ongoing_prefetch`` is exactly the set
+        the participation vote already keeps rank-uniform. Off HiCache storage
+        this returns an empty map and touches nothing -- byte-identical.
+
+        Behavioural note, deliberately named: under
+        ``--hicache-storage-prefetch-policy best_effort`` (NOT the default,
+        which is ``timeout``) ``can_terminate_prefetch`` returns True
+        immediately, so a queued request's prefetch is now cut on the first
+        iteration after registration rather than whenever admission happened
+        to look at it. "Whenever admission looked at it" is precisely the
+        rank-local quantity this removes; under a group the only rank-uniform
+        answer available without adding a collective is "every iteration".
+        """
+        if not self.enable_hicache_storage:
+            return {}
+        return {
+            req.rid: self.tree_cache.check_prefetch_progress(req.rid)
+            for req in self.waiting_queue
+        }
+
+    def _prefetch_done_for(self, req: Req, drained: Dict[str, bool]) -> bool:
+        """Read the drained verdict for ``req``; refuse to answer locally.
+
+        A miss means the waiting queue changed between the drain and the
+        admission loop, i.e. the set of requests is no longer the replicated
+        one the drain was computed over. Falling back to a live
+        ``check_prefetch_progress`` call here would re-open #580 exactly:
+        this rank would enter a collective its peers are not in. On a group
+        that is named and refused; on a single rank there is nothing to
+        diverge from, so the live call is correct and kept.
+        """
+        verdict = drained.get(req.rid)
+        if verdict is not None:
+            return verdict
+        if self.ps.tp_size > 1:
+            raise RuntimeError(
+                f"request {req.rid} reached the prefill admission loop without "
+                "a drained HiCache prefetch verdict on a multi-rank boot. The "
+                "drain runs over the replicated waiting queue before any "
+                "rank-local admission predicate; a miss means the queue was "
+                "mutated in between, so calling check_prefetch_progress() here "
+                "would enter a collective the peer ranks are not in -- the "
+                "#580 failure."
+            )
+        return self.tree_cache.check_prefetch_progress(req.rid)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3845,6 +3941,11 @@ class Scheduler(
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
+
+        # #580: rank-uniform entry into the prefetch-progress collectives.
+        # MUST stay above every early return and every loop exit below -- all
+        # of them read this rank's own pool. See _drain_prefetch_progress.
+        prefetch_verdicts = self._drain_prefetch_progress()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -4034,7 +4135,11 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                # #580: READ the verdict drained before the rank-local
+                # predicates above; do NOT call into the tree cache here. The
+                # call carries collectives and this point is only reachable on
+                # the ranks whose own pool let them get this far.
+                prefetch_done = self._prefetch_done_for(req, prefetch_verdicts)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
