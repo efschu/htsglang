@@ -304,6 +304,93 @@ script is mandatory), and
 `--disaggregation-decode-enable-radix-cache` is a hard ValueError for
 Mamba/SSM models, which Qwen3.6-27B is.
 
+## 7a. Route A guards (#631a/#631b), and the slice-2 variant choice
+
+### Guard 1 — model identity at the PD handshake
+
+`try_ensure_parallel_info` (`disaggregation/common/conn.py:411-454`, sole call
+site `decode.py:788`) compares exactly two fields: `page_size` and
+`kv_cache_dtype`. Nothing else. Two arms holding DIFFERENT WEIGHTS pair
+happily and produce fluent nonsense (#212), which is the worst failure mode
+available to us because the output looks like output.
+
+**The guard is half-built already, and that decides the design.** The fork's
+own NCCL transport carries `TransportIdentity.model_identity_hash`
+(`disaggregation/nccl/contract.py:146`), a sha256 over model path, revision,
+dtype, quantization and kv_cache_dtype, and it explicitly REUSES
+`compute_model_identity_hash` from `mem_cache.hicache_storage` rather than
+inventing a hash. So the correct slice is not "add a checksum" but "lift the
+existing identity into the transport-independent handshake": add the hash to
+`PrefillServerInfo` (`common/conn.py:67-90`, which today carries only topology
+fields) and compare it in `try_ensure_parallel_info` beside the two existing
+checks, with the same refusal shape. One hash function, three transports, one
+place to compare.
+
+Refusal must name both hashes and the likely cause (different checkpoints, or
+the same checkpoint at different revisions/quantizations), because the operator
+symptom — plausible but wrong text — gives no hint on its own.
+
+### Guard 2 — decode-arm radix cache on a hybrid model
+
+`--disaggregation-decode-enable-radix-cache` raises for SSM models at
+`mem_cache/kv_cache_builder.py:195-199` (`is_hybrid_ssm`). Qwen3.6-27B is a
+hybrid GDN model, so this is live for us. The existing PD hook
+(`pd_disaggregation_hook.py:80-96`) already refuses this flag against
+`--enable-hisparse`, the `fake` backend and speculation — but NOT against
+hybrid SSM, so that one fires late, at cache-build time, rather than at parse.
+
+The guard is to move it earlier, next to its three siblings, so the decode
+arm's recipe cannot carry the flag past argument parsing. The model-type read
+needed for it is not new: the #481 sibling-config canon
+(`declared_config_path`) already resolves a checkpoint's declared config at
+parse time for `--pp-stage-ratio`, and must be reused rather than
+re-implemented — a second config reader is how the GGUF `.gguf`-file trap got
+in last time.
+
+### Slice 2 (#631b): I am NOT taking variant (i), and here is the number
+
+The steer's default was (i) recompute the draft layer's prompt KV locally on
+the decode arm. The concrete reason it loses, on this model's real geometry
+(`hidden_size` 5120, `num_key_value_heads` 4, `head_dim` 256, KV fp8):
+
+| what crosses the boundary | bytes per token | at 32 768 tokens |
+|---|---|---|
+| (i) last-layer hidden states, bf16 | 5120 x 2 = 10 240 B | **335 MB** |
+| (ii)/(iii) one draft layer's K+V, fp8 | 2 x 4 x 256 = 2 048 B | **67 MB** |
+
+Variant (i) is **5x more traffic**, and worse, it is a NEW payload: the PD
+handover moves KV, and hidden states for every prompt position are not
+something it carries today. The premise that (i) is "more local" does not
+survive contact with the requirement — the decode arm cannot reconstruct the
+draft layer's input from what it receives. It gets the main model's K and V,
+and K/V are projections; they do not invert back into hidden states. So "one
+layer of recompute" silently implies "ship 335 MB of activations first".
+
+**What I propose instead — variant (iii), a canonical-layout draft KV.** The
+PREFILL arm computes the draft layer's KV during its own prefill, where the
+hidden states already exist in flight and the marginal cost is one layer on
+top of 64. It ships that KV in a canonical FULL-HEAD layout, and the decode
+arm slices out the heads its own sharding owns. This gets (ii)'s 67 MB without
+building (ii)'s general uneven head reslicing: with 4 KV heads over 3 decode
+ranks nothing divides evenly, which is exactly the generality the code comment
+balks at — and a canonical intermediate layout removes the need for it, since
+neither side ever has to understand the other's sharding.
+
+Cost of (iii): the prefill arm must hold the draft layer's weights (one layer),
+and one canonical layout has to be specified and versioned. That is a smaller
+and more local change than either (i)'s new activation payload or (ii)'s
+general resharder.
+
+I am flagging this as a DEVIATION from the steer and will not build it until
+it is confirmed, since the steer named (i) explicitly.
+
+### Hard precondition, not mine to fix
+
+#630 (PP x disk-HiCache warm-up wedge, §4a) blocks SHIPPING a PP prefill
+group at all: disk HiCache is mandatory in every serving boot, and the two
+together wedge silently. Slices 1 and 2 are both reachable without touching
+it, but a PP prefill group cannot go into production until #630 closes.
+
 ## 8. Open risks
 
 - R1: pipeline may not fill for a single request (§2) — kills the feature.

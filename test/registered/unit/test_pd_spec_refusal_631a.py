@@ -12,11 +12,14 @@ So the default is now a refusal that names the arm and the reason, and the
 old behaviour is reachable only by asking for it explicitly through
 ``SGLANG_PD_AUTO_DISABLE_SPEC=1``.
 
-The tests drive ``handle_pd_disaggregation`` with a stub rather than a real
-``ServerArgs``: constructing ``ServerArgs`` requires an accelerator (it raises
-"No accelerator ... is available" under ``CUDA_VISIBLE_DEVICES=99``), and a
-hermetic desk test must not need a GPU to check an argument-validation rule.
-The stub carries exactly the attributes the hook touches.
+The tests drive ``handle_pd_disaggregation`` with a stub carrying exactly the
+attributes the hook touches. The alternative house pattern,
+``ServerArgs(model_path="dummy")``, also works hermetically -- the dummy path
+short-circuits ``__post_init__`` -- and is used where a test needs the real
+resolution order. Here it would only add coupling: this rule is a pure
+function of four fields, and a stub that names them documents the rule's
+actual surface. (A real model path is what does NOT work at a desk: it
+resolves and dies on "No accelerator ... is available".)
 """
 
 import unittest
@@ -25,6 +28,10 @@ from typing import Optional
 from unittest import mock
 
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 @dataclass
@@ -45,7 +52,7 @@ class _StubArgs:
     dp_size: int = 1
 
 
-class PdSpecRefusalTest(unittest.TestCase):
+class PdSpecRefusalTest(CustomTestCase):
     def test_decode_arm_with_spec_is_refused(self):
         args = _StubArgs(disaggregation_mode="decode", speculative_algorithm="NEXTN")
         with self.assertRaises(ValueError) as ctx:
