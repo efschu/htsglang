@@ -93,6 +93,13 @@ def _stub(event: _Event) -> types.SimpleNamespace:
         _last_op="all_reduce",
         _last_nbytes=12584960,
         _deferred_launches=3,
+        # #615: the stub mirrors the real transport's fields so the
+        # build-window deferral path is actually EXERCISED here rather than
+        # short-circuited by an AttributeError. With no peer table there is no
+        # peer that could be building, so every assertion below keeps its
+        # pre-#615 meaning: these tests pin the escalation, not the extension.
+        _ctl_build_deferred_s=0.0,
+        _peer_table=None,
     )
 
 

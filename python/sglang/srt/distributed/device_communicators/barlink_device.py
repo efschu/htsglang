@@ -844,17 +844,37 @@ def _ext_cache_guarded(name: str):
         build_dir = None
         marker = None
 
-    if marker is None:
-        # No marker and no build_directory override: byte-identical to the
-        # pre-#181 call, which is the right thing to degrade to.
-        yield None
-        return
-    # The marker is what lets the NEXT process tell "a co-located rank is
-    # compiling this right now" from "somebody was killed compiling this",
-    # without a lock and without deleting live work. An orderly failure inside
-    # the block clears it, so the entry is immediately recognisable as poison.
-    with marker(build_dir):
-        yield build_dir
+    # #615: tell the PEERS, not just the next process to want this entry.
+    # ``cache_health.building_marker`` below is keyed by cache ENTRY and read
+    # by whoever wants to build the same thing; this one is keyed by RANK and
+    # read by whoever is waiting in a collective for that rank. Different
+    # question, different reader -- a peer stuck in an all-reduce never looks
+    # at the cache directory of an extension it is not building.
+    # Best-effort like every other step in this function: cache hygiene, and
+    # now build visibility, must never be the reason a server fails to start.
+    try:
+        from sglang.srt.distributed.device_communicators.barlink_build_window import (
+            barlink_build_window,
+        )
+    except Exception:  # noqa: BLE001 - degrade to the pre-#615 invisible build
+        from contextlib import nullcontext
+
+        def barlink_build_window(reason):  # type: ignore[misc]
+            return nullcontext()
+
+    with barlink_build_window(f"barlink extension JIT build of {name!r}"):
+        if marker is None:
+            # No marker and no build_directory override: byte-identical to the
+            # pre-#181 call, which is the right thing to degrade to.
+            yield None
+            return
+        # The marker is what lets the NEXT process tell "a co-located rank is
+        # compiling this right now" from "somebody was killed compiling this",
+        # without a lock and without deleting live work. An orderly failure
+        # inside the block clears it, so the entry is immediately recognisable
+        # as poison.
+        with marker(build_dir):
+            yield build_dir
 
 
 def _load_ext(cpu_group):

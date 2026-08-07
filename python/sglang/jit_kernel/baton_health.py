@@ -494,6 +494,37 @@ def torch_build_directory(name: str) -> Path:
     return Path(_get_build_directory(name, False))
 
 
+def _publish_build_window(reason: str) -> None:
+    """Tell the peers this process is about to block in a build (#615).
+
+    Imported lazily and swallowed on failure: this module is reached from
+    processes with no barlink transport and no peers at all (the render
+    kernels, a bare ``load()`` in a tool), and a notice must never be the
+    reason a build fails. Failure degrades to the pre-#615 behaviour, where
+    the build was invisible to everyone but the builder.
+    """
+    try:
+        from sglang.srt.distributed.device_communicators.barlink_build_window import (
+            publish_building,
+        )
+
+        publish_building(reason)
+    except Exception:  # noqa: BLE001 - see the docstring
+        pass
+
+
+def _withdraw_build_window() -> None:
+    """Symmetric partner of ``_publish_build_window``. Never raises."""
+    try:
+        from sglang.srt.distributed.device_communicators.barlink_build_window import (
+            clear_building,
+        )
+
+        clear_building()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @contextmanager
 def jit_build_guard(
     name: str,
@@ -504,6 +535,16 @@ def jit_build_guard(
 
     Yields the build directory, or None when arming failed -- in which case the
     call behaves exactly as it did before this module existed.
+
+    GROUP VISIBILITY (#615). This is the one wrapper every baton-guarded build
+    in the tree already goes through -- ``hicache_hash_cpp``, the arena stub,
+    ``radix_tree_cpp``, ``hf3fs_utils``, the NCCL allocator, the render
+    kernels -- so publishing the build window HERE makes all of them visible
+    to the peers at once, without a hook at any individual call site. These
+    are precisely the uncoordinated builds the #615 gap is about: one rank
+    compiles for minutes (18 of them, at the ``hicache_hash_cpp`` site, in the
+    incident this module was written for) while its peers sit in a collective
+    with a steady-state deadline and no way to tell a compiler from a wedge.
     """
     build_dir: Optional[Path] = None
     try:
@@ -517,4 +558,12 @@ def jit_build_guard(
     except Exception as exc:
         logger.warning("JIT build-lock self-heal not armed for %s: %r", name, exc)
         build_dir = None
-    yield build_dir
+    _publish_build_window(f"JIT build of {name!r}")
+    try:
+        yield build_dir
+    finally:
+        # The withdrawal has to be in a ``finally``: a build that raises must
+        # not leave a marker behind that extends its peers' deadlines for the
+        # rest of the run. A build whose PROCESS dies does leave one, which is
+        # why every reader checks the pid.
+        _withdraw_build_window()

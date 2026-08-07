@@ -262,6 +262,55 @@ class Bar1CollectiveStalled(Bar1KernelAborted):
         )
 
 
+def defer_stall_for_building_peer(transport, run: int, deadline_s: float) -> bool:
+    """Forgive one stall run because a PEER published a build window (#615).
+
+    Returns True when the escalation is deferred -- the caller then leaves the
+    read in flight and returns False, exactly as it does for any unresolved
+    read -- and False when it must raise.
+
+    MODULE-LEVEL, not a method, and that is load-bearing. The guard's methods
+    are invoked UNBOUND against stubs by their tests
+    (``test_barlink_bar1_abort_poll_616f.py``, "constructing a real transport
+    needs BAR1, peers and a device"), so a method call from inside
+    ``_wait_ctl_event`` would resolve against the stub and raise
+    ``AttributeError`` on the very path the stub exists to exercise. A plain
+    function takes the transport as an argument and works for both.
+
+    THE BOUND. ``_ctl_build_deferred_s`` accumulates every forgiven run and is
+    checked against ``build_cap_s()`` BEFORE the next one is granted, so the
+    total a building peer can buy from this guard is the cap -- not the cap
+    per extension. It is cleared only by a RESOLVED read (the stream actually
+    retiring the copy), never by a forgiven run: otherwise a peer that
+    republishes its marker between two runs would reset its own ceiling and
+    the bound would not exist.
+
+    WHAT THIS DOES NOT DO. No device read, no event wait, no ``.item()``. The
+    whole decision is one directory ``stat`` per same-host peer plus float
+    arithmetic, on a path that has already stalled for a minute. The wedge
+    census that motivated the asymmetry found 195 of 239 events parked in this
+    very bounded poll and recovering, while the only fatal-capable events were
+    the unbounded host syncs -- so the guard's extension must not become one.
+    """
+    try:
+        from sglang.srt.distributed.device_communicators import barlink_build_window
+
+        builds = barlink_build_window.extension_for(
+            transport._ctl_build_deferred_s,
+            run * deadline_s,
+            f"barlink-BAR1 group {transport.group} rank {transport.rank} "
+            f"status read",
+            table=transport._peer_table,
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic must not hold a wedge open
+        return False
+    if builds is None:
+        return False
+    transport._ctl_build_deferred_s += run * deadline_s
+    transport._ctl_stall_run = 0
+    return True
+
+
 class Bar1CollectiveAborted(Bar1KernelAborted):
     """The same fact, raised from a PRODUCTION path with its context (#431).
 
@@ -1617,6 +1666,13 @@ class BarlinkBar1Transport:
         #: what escalates: one expiry is a slow step, an unbroken run is a
         #: stream that has stopped.
         self._ctl_stall_run = 0
+        #: Seconds of stall this transport has already FORGIVEN because a peer
+        #: published a build window (#615). Accumulated across extensions and
+        #: never reset by a forgiven run, because it is what the absolute cap
+        #: is applied to: a peer that keeps republishing a marker must not be
+        #: able to buy unbounded time. Reset only by a RESOLVED read, i.e. by
+        #: the stream actually retiring the copy.
+        self._ctl_build_deferred_s = 0.0
         #: Collectives (host-path and captured) that have run since the last
         #: RESOLVED read of the status word. With a blocking read this always
         #: equals the current window; with a staged read it accumulates over
@@ -4643,6 +4699,10 @@ class BarlinkBar1Transport:
         while True:
             if self._ctl_event.query():
                 self._ctl_stall_run = 0
+                # #615: the stream retired the copy, so whatever a build
+                # window forgave is spent history and the next stall starts
+                # from a full cap. This is the ONLY thing that clears it.
+                self._ctl_build_deferred_s = 0.0
                 return True
             if time.monotonic() >= end:
                 break
@@ -4667,6 +4727,23 @@ class BarlinkBar1Transport:
             )
         limit = barlink_abort_gate.stall_raise_after()
         if limit and self._ctl_stall_run >= limit:
+            # #615: ...unless a PEER is legitimately inside a lazy JIT build
+            # and has published it. The escalation below is ~60 s of stall by
+            # default (30 expiries x 2 s), and an nvcc build of gptq_marlin or
+            # a flashinfer JIT runs for minutes -- so without this check the
+            # guard aborts the group for a healthy cold boot. The extension is
+            # bounded by ``SGLANG_BARLINK_BUILD_WINDOW_CAP_S`` measured over
+            # the whole stall, so a rank that publishes a build and then
+            # actually wedges is still caught, just later and by name.
+            #
+            # This costs the waiter one ``stat`` per same-host peer, on a path
+            # that has already stalled for a minute. It adds no sync, no
+            # ``.item()`` and no device read -- deliberately: the wedge census
+            # (239 events) found that every bounded poll recovered and only
+            # the unbounded host syncs were fatal-capable, so the guard's
+            # extension must not be the thing that introduces one.
+            if defer_stall_for_building_peer(self, self._ctl_stall_run, deadline_s):
+                return False
             # The escalation. Logging alone left #616 a black hole: the host
             # thread stayed in the guard and the only actor that ever ended
             # the wedge was an external supervisor, minutes later, with no
@@ -4679,7 +4756,14 @@ class BarlinkBar1Transport:
                 self.rank,
                 self._last_op or "unknown",
                 int(self._last_nbytes),
-                run * deadline_s,
+                # #615: the time a published build already bought is part of
+                # how long this stall has run. Zero unless an extension
+                # happened, so the pre-#615 arithmetic is unchanged on every
+                # path that never saw a building peer. ``getattr`` because
+                # this suite's documented pattern is to invoke these methods
+                # unbound against stubs, and a diagnostic must not be what
+                # turns a stall report into an AttributeError.
+                run * deadline_s + getattr(self, "_ctl_build_deferred_s", 0.0),
                 run,
             )
         return False
@@ -4718,6 +4802,7 @@ class BarlinkBar1Transport:
             if self._ctl_event.query():
                 self._ctl_inflight = False
                 self._ctl_stall_run = 0
+                self._ctl_build_deferred_s = 0.0  # #615: see _wait_ctl_event
                 value = int(self._ctl_stage[0])
             else:
                 self._ctl_lag += 1

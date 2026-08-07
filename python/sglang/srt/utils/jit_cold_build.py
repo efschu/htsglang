@@ -153,6 +153,39 @@ def resolve_timeout_cycles(base_cycles: int) -> int:
     return min(base_cycles * mult, _U64_MAX)
 
 
+def _publish_build_window(reason: str) -> None:
+    """Make this window visible to the peers (#615). Never raises.
+
+    Imported lazily and swallowed on failure for the same reason every other
+    reference to the distributed package from ``utils`` is: this module is
+    imported by processes that have no barlink transport, no peers and in
+    some cases no torch.distributed, and a diagnostic must never be the thing
+    that breaks them. Publication failing degrades to exactly the pre-#615
+    behaviour -- a rank-local window -- which is why nothing here reports an
+    error the caller could act on.
+    """
+    try:
+        from sglang.srt.distributed.device_communicators.barlink_build_window import (
+            publish_building,
+        )
+
+        publish_building(reason)
+    except Exception:  # noqa: BLE001 - see the docstring
+        pass
+
+
+def _withdraw_build_window() -> None:
+    """Symmetric partner of ``_publish_build_window``. Never raises."""
+    try:
+        from sglang.srt.distributed.device_communicators.barlink_build_window import (
+            clear_building,
+        )
+
+        clear_building()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @contextmanager
 def cold_build_window(reason: str) -> Iterator[None]:
     """Open the window for the enclosed block. Re-entrant, exception-safe.
@@ -167,6 +200,16 @@ def cold_build_window(reason: str) -> Iterator[None]:
     accounting instrument that can only count one direction reports a leak
     whether or not one exists; the close line is what makes the open count
     falsifiable.
+
+    GROUP VISIBILITY (#615). The depth counter above is RANK-LOCAL, so every
+    deadline it relaxes is one evaluated in the builder's own process -- and
+    the rank stuck in nvcc is never the rank whose deadline matters. The
+    peers are, and they are not in a window. So opening this window also
+    PUBLISHES the fact, via ``barlink_build_window``: one marker file the
+    peers can read without any cooperation from a process that is about to
+    disappear into a compiler. Every existing call site therefore becomes
+    group-visible without moving, which is the point of hooking it here
+    rather than at each build.
     """
     global _depth, _reason
     opened_at = time.monotonic()
@@ -175,6 +218,7 @@ def cold_build_window(reason: str) -> Iterator[None]:
         outermost = _depth == 1
         if outermost:
             _reason = reason
+    _publish_build_window(reason)
     if outermost:
         logger.info(
             "JIT cold-build window open (%s): deadline-bearing device "
@@ -191,6 +235,7 @@ def cold_build_window(reason: str) -> Iterator[None]:
             closed = _depth == 0
             if closed:
                 _reason = None
+        _withdraw_build_window()
         if closed:
             logger.info(
                 "JIT cold-build window close (%s) after %.1fs: "
