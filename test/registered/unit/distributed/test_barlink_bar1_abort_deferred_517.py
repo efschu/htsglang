@@ -44,7 +44,6 @@ from unittest import mock
 
 import torch
 
-os.environ.setdefault("SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS", "0")
 
 from sglang.srt.distributed.device_communicators import barlink_abort_gate
 from sglang.srt.distributed.device_communicators.barlink import BarlinkCommunicator
@@ -280,6 +279,13 @@ class TestTheDeferredGuardStillSeesTheCrash(CustomTestCase):
         self.assertGreater(cm.exception.launches, 1)
 
 
+# The lag-bound tests drive _wait_ctl_event against an event that never
+# completes; deadline 0 makes each bounded wait expire immediately instead
+# of eating the 2000 ms default per wait. Scoped to this class so the
+# process-wide default stays untouched for every other test in the run.
+@mock.patch.dict(
+    os.environ, {"SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "0"}
+)
 class TestTheLagBoundIsLoadBearing(CustomTestCase):
     """The naive cheapening, and why the shipped default is not it.
 
