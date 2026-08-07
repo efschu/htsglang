@@ -2564,6 +2564,38 @@ class ServerArgs:
             type_parser=_parse_rank_moe_ratio,
         ),
     ] = None
+    expert_placement_override: A[
+        Optional[List[str]],
+        Arg(
+            help="#396: declarative tensor-name placement rule, "
+            "'<python-regex>=<target>', repeatable. Target is 'cpu' (host "
+            "cold tier), 'gpu:<cuda-index>' or 'gpu:GPU-<uuid>' (a card, "
+            "resolved through the NVML identity map -- never torch's "
+            "enumeration order, which diverges from NVML's on mixed rigs), "
+            "or 'disk:<tier-id>' (a #407 fs:/blob: tier). The spec splits on "
+            "the LAST '=', so a regex may contain one; the FIRST rule whose "
+            "regex matches a tensor name wins, so write specific rules before "
+            "general ones. Rules are matched against each expert's names: the "
+            "real HF/safetensors keys "
+            "('model.layers.<L>.mlp.experts.<E>.w1.weight'), plus a synthetic "
+            "per-expert form over GGUF's expert-major tensors "
+            "('blk.<L>.ffn_gate_exps.<E>.weight') -- GGUF stores all experts "
+            "in one tensor and so has no per-expert key of its own, and the "
+            "placement unit here is the individual expert. "
+            "This is the llama.cpp '-ot' surface, with one "
+            "deliberate difference: the rules are CONSTRAINTS handed to the "
+            "residency solve, not a bypass around it. The planner still "
+            "solves and still checks, and a rule it cannot satisfy -- more "
+            "experts pinned resident than the resident fraction leaves slots "
+            "for, one expert matched to two different targets, an expert "
+            "pinned to a card its owning rank does not run on -- is refused "
+            "by name at parse time instead of being quietly relaxed. Requires "
+            "--rank-moe-resident-fraction < 1: with every expert resident "
+            "there is no residency split to constrain, and that too is "
+            "refused rather than accepted as a no-op.",
+            action="append",
+        ),
+    ] = None
     rank_kv_ratio: A[
         Union[str, List[int]],
         Arg(
