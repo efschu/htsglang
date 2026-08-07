@@ -118,6 +118,81 @@ unproven expectation is how the fallback disappears exactly when it is needed.
    REPLICATED degrades above `tp > kv`. Here `kv=4 > tp=3`, so that note does
    not bite, but the acceptance-rate check (L6) still has to run.
 
+## 0b. Owed item (2) SETTLED at the desk: the combination is UNCONSIDERED
+
+**Composition verdict: neither accepted nor refused — unconsidered.** Every
+parse-time interaction, exhaustively:
+
+- `draft_kv_layout` appears in `server_args.py` exactly twice: the argument
+  definition (`:1517`) and the #108 gate (`:7799`). The #108 gate contains no
+  reference to disaggregation, prefill or decode.
+- `pd_disaggregation_hook.py` contains no reference to `draft_kv_layout`.
+- Only two files in `srt/` mention both concepts at all, and in both the
+  mention is incidental (`server_args.py`, `model_runner.py`, the latter only
+  for `reject_multi_layer_draft_kv_dcp`).
+
+Nothing refuses the combination and nothing supports it. That is the dangerous
+answer, so here is what breaks first, established from code rather than
+predicted.
+
+### The assumption that breaks first: a shared index space that is not shared
+
+Three facts, each read directly:
+
+1. **The transport is draft-blind.** `mooncake/conn.py` contains ZERO
+   occurrences of "draft". The draft pool's buffers are appended to
+   `kv_data_ptrs` / `kv_item_lens` as ordinary extra layers
+   (`prefill.py:186-195`, `decode.py:439-448`) under the comment "The indices
+   are always shared with a target model."
+2. **The decode arm translates indices once, for everything.**
+   `decode.py:1119-1125` rewrites `kv_indices` into compact owner-rule rows
+   `(L // S) * (hi - lo) + (L % S - lo)` when `uneven_dcp_owner_bounds()` is
+   set. That single translated array addresses every registered buffer,
+   target layers and draft layers alike.
+3. **The draft pool's row space depends on `--draft-kv-layout`**, and the
+   default is NOT compact. `model_runner_kv_cache_mixin.py:2821-2823`:
+   `if draft_pool_is_replicated(...) or not uneven_dcp_active(...): return
+   int(global_rows)`, commented "Default 'replicated' keeps the early return,
+   i.e. the full global context per rank, byte-identical." Under
+   `--draft-kv-layout dcp` the same function falls through to
+   `dcp_compact_pool_rows(...)` — the target pool's own row count.
+
+Put together: **on a DCP decode arm with the DEFAULT draft layout, compact row
+indices are applied to a pool sized to the full global context.** The two are
+different coordinate systems, so every draft row lands at the wrong address,
+with an offset that grows with the slot id — #345's right-token/wrong-slot
+drift exactly, which is silent rather than a crash. It is latent today only
+because #631a nulls `speculative_algorithm` on a PD arm, so no draft worker
+exists and the extra-layers registration never runs.
+
+Under `--draft-kv-layout dcp` the draft pool takes `dcp_compact_pool_rows`,
+i.e. the same coordinate system as the target, so the shared indices are
+correct BY CONSTRUCTION and no new translation code is needed. That is the
+strongest argument for path B yet, and it is not an efficiency argument: path
+B is the only one of the two layouts on which the existing shared-index
+transfer is correct at all.
+
+**This settles owed item (1).** The per-rank item-length question resolves the
+same way: under `dcp` the draft pool carries `get_total_num_kv_heads()`
+(`:2788-2791`), matching the target's treatment under
+`uneven_dcp_kv_replicated`, so per-rank item lengths agree by the same
+construction. The window can therefore CONFIRM rather than investigate.
+
+### New refusal this uncovered: the arms must agree on `draft_kv_layout`
+
+If the two arms run different `--draft-kv-layout` values, the draft pool's row
+count AND its per-row byte length both differ between them, while the
+transport indexes both with one shared array. Nothing checks this today, and
+**guard 1 will not catch it**: `draft_kv_layout` is not part of
+`compute_model_identity_hash`, correctly, since it is a parallelism decision
+rather than a weights one.
+
+So the wiring slice owes one more refusal: the arms must agree on
+`draft_kv_layout`, refused at the handshake by name. Natural home is beside
+the layout version in `DraftKvCanonicalLayout` — which is a second reason not
+to retire that contract, since its version-negotiation channel is exactly
+where this belongs.
+
 ## 1. The #631a refusal-lift criterion
 
 The checkable list. The refusal comes off when **every** item is satisfied,
@@ -133,6 +208,8 @@ each by the named instrument. "Looks fine on a boot" satisfies nothing here.
 | L6 | Acceptance rate on the PD pair is within the same-boot noise floor of the monolithic arm. | ms/round canon, A-vs-A floor first, warm-up draw discarded. A draft whose KV is subtly wrong still decodes correctly — it just accepts less — so L5 alone cannot catch it. |
 | L7 | Any of L1-L4 unsatisfiable at runtime causes a REFUSAL, never a fallback to no-spec. | Can-fail per refusal path. |
 | L8 | The #636 contract still holds unchanged (page_size 1, dcp == tp, mooncake, hisparse off). | Existing gate; no new exemption. |
+| L10 | Both arms run the SAME `--draft-kv-layout`, refused by name at the handshake if not. Guard 1 cannot cover it: `draft_kv_layout` is deliberately not part of `compute_model_identity_hash`. | Hermetic test + can-fail by skewing the layout on one arm. |
+| L11 | On a DCP decode arm, `--draft-kv-layout` is `dcp`. Under `replicated` the shared transfer indices address a full-context pool with compact rows (§0b) — silent wrong-slot writes. | Boot refusal; can-fail with `replicated` + `dcp_size > 1` + `disaggregation_mode decode`. |
 | L9 | Monolithic servers are byte-identical. The standing production boot is a monolithic NEXTN server. | Base-vs-branch by name, not by count. |
 
 L6 is the one most likely to be skipped and the one that matters most: a draft
