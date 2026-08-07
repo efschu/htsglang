@@ -61,6 +61,10 @@ class _FakeScheduler:
         self.ps = types.SimpleNamespace(
             tp_size=tp_size if tp_size is not None else len(world_avails or [1])
         )
+        # _update_uniform_pool_budget now reads self.server_args.dcp_size
+        # (scheduler.py:3503) to decide whether the uneven DCP lane is active.
+        # dcp_size=1 means even TP (no uneven DCP), the default path.
+        self.server_args = types.SimpleNamespace(dcp_size=1)
 
     _update_uniform_pool_budget = Scheduler._update_uniform_pool_budget
     uniform_min_avail = Scheduler.uniform_min_avail

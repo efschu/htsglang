@@ -85,6 +85,11 @@ class _PoolRowStub(ModelRunnerKVCacheMixin):
     def __init__(self, *, dcp_size, is_draft_worker=False):
         self.dcp_size = dcp_size
         self.is_draft_worker = is_draft_worker
+        # _dcp_token_sharded_pool_rows calls draft_pool_is_replicated(
+        #   self.is_draft_worker, self.server_args) which reads
+        # getattr(server_args, "draft_kv_layout", "replicated").
+        # An empty stand-in is sufficient: the default is "replicated".
+        self.server_args = SimpleNamespace()
 
 
 class _LaneFixture(CustomTestCase):

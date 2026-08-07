@@ -340,6 +340,9 @@ def _stub(table=None, event=None) -> types.SimpleNamespace:
         _last_op="all_reduce",
         _last_nbytes=12584960,
         _deferred_launches=3,
+        # #619: expiry-path capture-census latch; default False so the dump
+        # fires at most once per process (barlink_bar1.py:1690).
+        _expiry_census_fired=False,
     )
 
 
