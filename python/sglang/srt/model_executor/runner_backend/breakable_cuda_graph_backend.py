@@ -456,6 +456,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        # #622: same reason as in FullCudaGraphBackend.replay -- name the
+        # window before the launch. The per-SEGMENT ordinal is refined inside
+        # BreakableCUDAGraph.replay, which knows which segment it is on.
+        barlink_abort_gate.note_replay("breakable", shape_key)
         self._graphs[shape_key].replay()
         # #431: same reason as in FullCudaGraphBackend.replay -- a replayed
         # graph runs the barlink BAR1 spin kernels with no host code between

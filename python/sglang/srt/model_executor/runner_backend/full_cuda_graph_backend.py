@@ -176,6 +176,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        # #622: name the window BEFORE the launch. If the kernels in this
+        # graph abort, the check three lines below is the host point that
+        # reports it, and without this it can only say "some replayed graph".
+        # Host-side, outside any capture, five stores, no allocation.
+        barlink_abort_gate.note_replay("full", shape_key)
         self._graphs[shape_key].replay()
         # #431: a captured graph contains the barlink BAR1 spin kernels but no
         # host code between them, so the per-collective abort check cannot

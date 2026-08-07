@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.distributed.device_communicators import barlink_abort_gate
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -712,6 +713,10 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         batch size."""
         runner = self.runners[step]
         runner.raw_bs = self.raw_bs
+        # #622: the draft chain replays one graph per rung against a shared
+        # buffer set, so a bare "draft graph" attribution would not say WHICH
+        # rung. The rung is the ordinal; the backend refines the key below.
+        barlink_abort_gate.note_replay("draft/rung", None, step)
         out = runner.replay(self.bs, self.seq_lens_sum, self._replay_spec_info)
         raw_bs = self.raw_bs
         raw_num_tokens = self.raw_num_tokens

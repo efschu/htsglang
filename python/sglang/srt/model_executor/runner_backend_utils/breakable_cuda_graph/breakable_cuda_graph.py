@@ -37,6 +37,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
+from sglang.srt.distributed.device_communicators import barlink_abort_gate
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.break_cost_clock import break_cost_clock
 
@@ -298,8 +299,16 @@ class BreakableCUDAGraph:
             # the unmeasured one, statement for statement. Nothing is recorded,
             # nothing is allocated. Armed, the measured loop is used instead.
             clock = break_cost_clock()
+            # #622: a breakable graph replays as N segments with eager break
+            # functions between them, so "which graph" is not precise enough
+            # -- the aborting spin kernel is in ONE of those segments. The
+            # segment ordinal is recorded per segment for the same reason the
+            # #494 clock below brackets each one: this loop already tolerates
+            # per-segment host work, and the ordinal is what turns a graph
+            # name into a place to read. Five stores, no device access.
             if clock is None:
                 for i, seg in enumerate(self._segments):
+                    barlink_abort_gate.note_replay("breakable/seg", None, i)
                     seg.replay()
                     if i < len(self._break_fns):
                         self._break_fns[i]()
@@ -317,6 +326,7 @@ class BreakableCUDAGraph:
         try:
             for i, seg in enumerate(self._segments):
                 clock.segment_begin(rnd)
+                barlink_abort_gate.note_replay("breakable/seg", None, i)
                 seg.replay()
                 clock.segment_end(rnd)
                 if i < len(self._break_fns):
