@@ -153,7 +153,120 @@ established. A pin was drafted and dropped: the defect class is suggestive,
 the mechanism is not demonstrated, and pinning it would trade real cache
 capacity for a hypothesis.
 
-## 5. Falsifier
+## 5. On-card validation
+
+### 5.0 The first A/B proved nothing, and measuring it is what showed that
+
+Two 45-minute arms under the four-way `verify-stress.sh` harness -- fixed
+(A2) and unfixed (B) -- both came back completely clean: 0 Stalled, 0
+Aborted, no restarts, ~1400 prefill batches each. Read naively, arm A2 "met
+the acceptance bar". It did not, and arm B is the proof: an unfixed tree that
+survives the same window says the window does not test the defect.
+
+The reason is measurable in the logs of both arms:
+
+    full token usage   A2: n=1564 median 0.20 peak 0.66
+                        B: n=1559 median 0.21 peak 0.58
+
+This defect lives at the pool boundary. `evict_from_tree_cache` only fires
+when availability drops under the demand, and load-back only fails when the
+device has no room. At a median occupancy of 0.20 neither trigger runs at
+all, so neither arm exercised the mechanism under test. `verify-stress.sh`
+reuses its prompts, so most of its traffic is served from the prefix cache
+and never fills the pool -- exactly the wrong workload for this defect.
+
+### 5.1 A reproducer that actually engages the mechanism
+
+`/spinning/616f-harness/616g/pressure.py`: six workers, UNIQUE 20-45K-token
+contexts (nothing hits the prefix cache, so every request must allocate),
+prefill-dominated. It drives the pool to the eviction boundary in about three
+minutes and holds it there.
+
+Against the UNFIXED tree (3752da399d), that turned a ~17-minute-mean random
+wedge into an 80-second deterministic one, with the specimen's signature:
+
+    00:17:14  rank 1 last_op=all_reduce last_nbytes=20971520  (2048 tokens)
+              rank 0 last_op=all_reduce last_nbytes=10485760  (1024 tokens)
+    00:18:36  Bar1CollectiveStalled, rank 0, abort word CLEAN
+
+Rank 0 -- the largest pool -- again carries the SMALLER count, which is the
+direction the root cause predicts and the third independent specimen to show
+it. The `dcp:0` all_gather diverged in the same window (rank 0 4194304 against
+peers' 4046848), so the divergence is not specific to one collective family.
+Archived: `/spinning/616f-harness/616g/UNFIXED_pressure_wedge.log`.
+
+### 5.1b The reproducer needed REUSE as well as pressure
+
+The pure-pressure recipe was not repeatable: a second run on the unfixed tree
+went 8 minutes to peak 0.76 with nothing at all. The reason is in the recipe
+itself -- UNIQUE contexts fill the pool but never populate the host tier, so
+`load_back` is never even attempted, and load-back is the trigger the A-to-A2
+step implicated as dominant. Pressure alone therefore exercises only half the
+defect.
+
+The recipe that fires reliably is BOTH at once: four `verify-stress.sh` loops
+(prompt REUSE -> populated radix + host tiers -> load-back actually runs)
+plus the pressure generator at concurrency 3 (unique 15-35K contexts -> pool
+driven to the eviction boundary). That is also, in hindsight, exactly the
+state the production server was in during all of the evening's wedges.
+
+### 5.2 The matched-condition comparison
+
+Same box, same hour, same four stress loops
+(`verify-stress.sh`, `URL=http://127.0.0.1:30030 MODEL=Qwen3.6-27B`), same
+flagset. The only variable is the tree.
+
+Every run of the evening, in order, with the load that was actually applied:
+
+| # | tree | load | duration | peak usage | divergence |
+|---|------|------|----------|-----------|------------|
+| 1 | unfixed (production) | agent traffic + 4x stress | evening | (warm, saturated) | 3 wedges, incl. the 21:52:25 specimen |
+| 2 | partial fix (load-back pin in the unused class) | 4x stress | 6m15s | - | 1 Aborted |
+| 3 | **complete fix** | 4x stress | 46m39s | 0.66 | none |
+| 4 | unfixed | 4x stress | 45m | 0.58 | none |
+| 5 | unfixed | pressure only | ~1m | 0.63 | **Stalled**, rank 0 1024 vs peers 2048 |
+| 6 | unfixed | pressure only, cold boot | 8m | 0.76 | none |
+| 7 | **complete fix** | pressure only | 25m | **0.91** | none |
+| 8 | unfixed | **reuse + pressure** | **91s** | 0.76 | **Stalled**, rank 0 265 vs peers 2048 |
+| 9 | **complete fix** | **reuse + pressure** | **25m** | 0.55 | **none** |
+
+Runs 3 and 4 are the pair that must not be read as a result: both clean, but
+both at a median occupancy of 0.20, so neither engaged the defect (5.0).
+Runs 8 and 9 are the comparison that counts -- the same load, with a
+demonstrated positive control that fails in 91 seconds, survived for 25
+minutes (16x) by the fixed tree, with 459940 cached tokens and 1079 prefill
+batches proving the reuse and load-back paths were live throughout.
+
+One asymmetry in run 9 is worth naming rather than hiding: peak occupancy was
+0.55 against the unfixed tree's 0.76, so the fixed tree did not reach quite
+the same fill level. That is a PREDICTED consequence of the fix, not a gap in
+the test. `full token usage` is logged by rank 0, the LARGEST pool, and the
+floor makes rank 0 evict at the BINDING rank's threshold instead of its own --
+so the roomiest rank is expected to sit lower once the pin is in. The same
+mechanism that removes the divergence necessarily lowers that number.
+
+The A-to-A2 step (rows 2 and 3) is worth recording on its own: arm A carried
+the eviction pin and still died in six minutes, because its load-back pin had
+been written into the class this deployment does not use. Adding the pin to
+the class it actually runs is what turned six minutes into a clean 45 -- the
+cleanest available evidence that load-back, not eviction alone, is the
+dominant divergence source on this rig.
+
+Raw evidence: `UNFIXED_combo_wedge.log`, `FIXED_combo_clean.log`,
+`UNFIXED_pressure_wedge.log`, `FIXED_pressure_clean.log`,
+`A2_FULL_WINDOW.log`, `events_A*.log`, `events_B.log`, all under
+`/spinning/616f-harness/616g/`. Reproducer: `pressure.py` in the same
+directory, run alongside four `verify-stress.sh` loops.
+
+The A-to-A2 step is worth recording on its own: arm A carried the eviction
+pin and still died in six minutes, because its load-back pin had been written
+into the class this deployment does not use. Adding the pin to the class it
+actually runs is what turned six minutes into a clean 45. That is also the
+cleanest available evidence that load-back -- not eviction alone -- is the
+dominant divergence source on this rig.
+
+
+## 6. Falsifier
 
 `test/registered/unit/distributed/test_uniform_evict_floor_616g.py`, hermetic
 (no CUDA, no process group). The load-bearing case builds the three real pool
