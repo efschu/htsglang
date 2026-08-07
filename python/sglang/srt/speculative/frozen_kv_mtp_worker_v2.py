@@ -710,7 +710,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         # refuses at argument resolution, before any weights load. This call
         # is the backstop for directly constructed workers; first statement
         # of __init__ on purpose.
-        reject_frozen_kv_mtp_verify_under_dcp(getattr(server_args, "dcp_size", 1))
+        reject_frozen_kv_mtp_verify_under_dcp(server_args.dcp_size)
         # NOTE: intentionally does NOT call EAGLEWorkerV2.__init__ -- that builds
         # an EagleDraftWorker (with its own draft KV pool). The frozen draft owns
         # no KV, so we mirror the relevant setup and build a FrozenKVMTPDraftWorker.

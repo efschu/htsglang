@@ -65,7 +65,7 @@ class NGRAMWorker(BaseSpecWorker):
         # is the backstop for directly constructed workers; first statement
         # of __init__ on purpose, so the refusal cannot land behind the
         # corpus (capacity-sized) allocation.
-        reject_ngram_verify_under_dcp(getattr(server_args, "dcp_size", 1))
+        reject_ngram_verify_under_dcp(server_args.dcp_size)
         self.server_args = server_args
         self.enable_overlap = not server_args.disable_overlap_schedule
         self._target_worker = target_worker
