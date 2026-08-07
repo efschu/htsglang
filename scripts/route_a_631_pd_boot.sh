@@ -13,13 +13,22 @@
 # "GPU-<uuid>" in CUDA_VISIBLE_DEVICES, which is ordering-independent, so that
 # is what is used.
 #
-# ENV: SGLANG_BARLINK=0 and the weighted-DCP pair are NOT decoration. They are
-# what the production stack on this rig runs with. With barlink left enabled a
-# first boot wedged both decode ranks at 100% CPU / 0% GPU inside
-# dcp_even_write_mask (owner.py:392) during decode graph capture. The weighted
-# owner rule takes a different write path entirely ("The WEIGHTED rule needs
-# none of this", owner.py) and is additionally required by --draft-kv-layout
-# dcp, which the nextn rung needs.
+# ENV. SGLANG_BARLINK=0 is kept only to match production and explains
+# NOTHING: environ.py:688 declares SGLANG_BARLINK = EnvBool(False), so it is
+# already the default, and on this rig barlink was additionally forced off
+# rig-wide by /spinning/COUNTERTEST_NCCL. An earlier version of this header
+# credited it with clearing a decode wedge. That was wrong.
+#
+# The wedge was rank-divergent CUDA-graph capture shapes: capture_bs is clamped
+# by the RANK-LOCAL req_to_token_pool.size, capture replays a collective per
+# shape, and two ranks with different lists run different collective counts
+# (TP0 [..,16,19] vs TP1 [..,16,24] -> hang; identical lists -> served). Fixed
+# in base_cuda_graph_runner.py by min-reducing that bound across the TP group.
+#
+# SGLANG_UNEVEN_DCP_WEIGHTED=1 does have a mechanism -- the WEIGHTED owner rule
+# never reaches dcp_even_write_mask -- and is required by --draft-kv-layout dcp.
+# SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0 is required because a decode TP
+# group spanning a 5090 and a 3080 is deliberately unbalanced.
 set -euo pipefail
 
 RUNG="${1:-pair}"
