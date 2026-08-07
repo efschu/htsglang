@@ -5063,13 +5063,27 @@ class BarlinkBar1Transport:
                 if getattr(self, "_last_op_captured", False)
                 else "from an earlier, already-closed window"
             )
+            # #622: the sentence above is true and was, until now, the end
+            # of the trail -- both the 2026-08-05 21:10 and 2026-08-07 03:25
+            # specimens stop exactly here. The kernel still cannot be named
+            # (no host code runs per collective inside a replay), but the
+            # GRAPH it is in can be: the host chose that graph one frame above
+            # the launch, and barlink_abort_gate records it there. Diff this
+            # line across the ranks -- ranks in different windows is host-path
+            # divergence, ranks in the SAME window sends you to that graph's
+            # capture census.
+            replay_tag = "<unavailable>"
+            try:
+                replay_tag = barlink_abort_gate.format_current_replay()
+            except Exception:  # noqa: BLE001 - a diagnostic must not mask this
+                pass
             attribution = (
                 "No collective ran on the host path since the previous check, "
                 "so this is a GRAPH-REPLAY window: the kernel that aborted is "
                 "inside the replayed graph and is NOT named here. The last "
                 f"launch this transport recorded is {named}, {origin}; it can "
                 "predate this abort by the whole run and must not be read as "
-                "the culprit."
+                f"the culprit. REPLAY WINDOW (#622): {replay_tag}."
             )
         # #583: CAUSE. The two causes the message used to offer as a
         # disjunction are not equally unknowable -- the host abort word's
@@ -5121,6 +5135,31 @@ class BarlinkBar1Transport:
 
                 logger.error("%s", format_local_history(self.rank))
         except Exception:  # noqa: BLE001 - never mask the abort below
+            pass
+        # #622 (composes with #619): the collective census above counts HOST
+        # calls, and a replay makes none -- so on a GRAPH-REPLAY abort it is
+        # silent by construction, which is precisely the window the replay tag
+        # just named. The CAPTURE census is the instrument that can speak
+        # about that window: it recorded, at capture time, the ordered kernel
+        # list baked into each graph. It was previously dumped only from the
+        # scheduler's periodic tick (scheduler.py _capture_census_once), which
+        # a rank that dies first never reaches -- the 2026-08-05 specimen has
+        # rank 0 raising 10 s before the others for exactly that reason.
+        # Dumping it here pairs "which graph was replaying" with "what is in
+        # that graph", per rank, on the one rank that is certain to get here.
+        # Scope note: this ADDS a dump site for the abort path only. #619
+        # owns the expiry-path dump; nothing about that path is changed here.
+        # Warn-never-raise, same discipline as the census above.
+        try:
+            from sglang.srt.distributed.device_communicators import (
+                barlink_capture_census,
+            )
+
+            if barlink_capture_census.capture_census_enabled():
+                logger.error(
+                    "%s", barlink_capture_census.format_local_capture_census(self.rank)
+                )
+        except Exception:  # noqa: BLE001 - an instrument must not mask the abort
             pass
         # #616c: and the device flag words this rank's spin was waiting on.
         # Same warn-never-raise discipline as the census above, and safe only

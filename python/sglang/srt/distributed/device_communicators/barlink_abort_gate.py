@@ -412,6 +412,114 @@ def reset_for_test() -> None:
         _transports.clear()
 
 
+# ---------------------------------------------------------------------------
+# #622: REPLAY-WINDOW ATTRIBUTION
+# ---------------------------------------------------------------------------
+# The gap. ``Bar1CollectiveAborted`` raised at a replay boundary says, in its
+# own words, that "the kernel that aborted is inside the replayed graph and is
+# NOT named here". That is honest and it is also the end of the trail: the
+# 2026-08-05 21:10 and 2026-08-07 03:25 specimens both stop exactly there,
+# with the only named collective being an 8-byte control-plane launch from a
+# window that had already closed.
+#
+# Nothing in the process knew which graph was on the stream, because nobody
+# recorded it. A replay makes no host calls, so the collective census (#583)
+# and the launch record both stay silent through it -- but the HOST still
+# knows which graph it just asked for, one frame up, at the replay call site.
+# This is that fact, kept where the abort handler can read it.
+#
+# WHAT IT IS. Four module globals, rank-local, written at every replay launch
+# and read only on the already-broken abort path.
+#
+# ``kind``   which replay site: "full", "breakable", "breakable/seg",
+#           "draft/rung". Distinguishes the decode graph from a draft rung
+#           without either site having to know about the other.
+# ``key``    the runner's own key object, stored BY REFERENCE and never
+#           formatted here -- formatting on the hot path would allocate a
+#           string per decode step for a value almost never read. It is
+#           ``repr``'d once, defensively, at abort time.
+# ``index``  the segment / rung ordinal within that graph, or -1.
+# ``seq``    a monotonic replay counter. Its only job is to let the reader
+#           distinguish "this tag describes the replay we just aborted in"
+#           from a stale tag left by a process that stopped replaying.
+#
+# GRAPH SAFETY. Every write happens on the HOST, at replay LAUNCH time, i.e.
+# outside any capture and outside the graph itself. No device read, no
+# synchronization, no collective, no ``.item()``. A captured graph cannot
+# contain any of this because none of it is a CUDA op.
+#
+# COST. One function call and five stores per replay. No allocation: the key
+# is an existing reference, the ordinals are small ints, the kind strings are
+# module constants. Deliberately NOT gated on a live transport -- the gate
+# test would cost about what the stores cost, and an instrument that is only
+# armed in the configuration you already suspect explains nothing about the
+# one you do not.
+#
+# NOT A LOCK. Concurrent writers would interleave, and that is accepted: the
+# value is a rank-local hint on a path that is already failing, and a lock on
+# the decode replay path would be a real cost paid every step to protect a
+# read that happens once per crash.
+_REPLAY_UNSET = "<no replay recorded>"
+
+_replay_kind: str = ""
+_replay_key: Any = None
+_replay_index: int = -1
+_replay_seq: int = 0
+
+
+def note_replay(kind: str, key: Any = None, index: int = -1) -> None:
+    """Record which captured segment this rank is replaying RIGHT NOW.
+
+    Called from the replay call sites immediately BEFORE the launch, so that
+    if the graph's kernels abort, the next host point -- the abort check at
+    the very same boundary -- can name the graph they were in.
+    """
+    global _replay_kind, _replay_key, _replay_index, _replay_seq
+    _replay_kind = kind
+    _replay_key = key
+    _replay_index = index
+    _replay_seq += 1
+
+
+def current_replay():
+    """``(kind, key, index, seq)`` as last recorded. Diagnostics only."""
+    return (_replay_kind, _replay_key, _replay_index, _replay_seq)
+
+
+def format_current_replay() -> str:
+    """One line naming the replay window, for the abort message.
+
+    Never raises. This runs on an already-broken run and inside an exception
+    path; a diagnostic that throws would replace the real error with its own,
+    which is the failure mode #583's attribution note was written about. The
+    key is arbitrary caller data, so even its ``repr`` is guarded.
+    """
+    try:
+        if not _replay_kind:
+            return _REPLAY_UNSET
+        try:
+            key = repr(_replay_key)
+        except Exception:  # noqa: BLE001 - a repr must not break triage
+            key = "<unrepresentable key>"
+        if len(key) > 200:
+            key = key[:200] + "..."
+        part = f"{_replay_kind} key={key}"
+        if _replay_index >= 0:
+            part += f" index={_replay_index}"
+        return f"{part} (replay #{_replay_seq} on this rank)"
+    except Exception:  # noqa: BLE001 - never mask the abort
+        return "<replay tag unreadable>"
+
+
+def reset_replay_tag_for_test() -> None:
+    """Clear the tag. Tests only."""
+    global _replay_kind, _replay_key, _replay_index, _replay_seq
+    _replay_kind = ""
+    _replay_key = None
+    _replay_index = -1
+    _replay_seq = 0
+
+
 def check_aborts(where: str) -> None:
     """Raise if any live BAR1 transport's kernels took their abort path.
 
@@ -462,6 +570,10 @@ __all__ = [
     "check_aborts",
     "check_after_graph_replay",
     "check_every",
+    "current_replay",
+    "format_current_replay",
+    "note_replay",
+    "reset_replay_tag_for_test",
     "defer_enabled",
     "max_lag",
     "sync_deadline_s",
