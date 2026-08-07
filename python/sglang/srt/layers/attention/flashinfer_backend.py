@@ -6225,6 +6225,32 @@ def _build_dcp_ragged_tree_mask(
 _build_dcp_weighted_kv_indices = build_dcp_weighted_kv_indices
 
 
+def _dcp_host_total_tokens(
+    extend_prefix_lens_cpu: Optional[List[int]],
+) -> Optional[int]:
+    """Host-side ``sum(prefix_lens)`` for the weighted-DCP index build, or None.
+
+    #616c: ``build_dcp_weighted_kv_indices`` otherwise derives that sum with
+    ``int(full_indptr[bs].item())`` -- an UNBOUNDED blocking device-to-host read
+    sitting inside the collective window. That is the site the 2026-08-07 02:00
+    wedge died on, with all three ranks stopped on exactly that line while their
+    device queues each held a BAR1 spin kernel; a host parked in a CUDA sync can
+    neither poll nor time out nor enqueue, so no rank could release the others
+    and the peers' spin kernels ran out their 300e9-cycle deadline. barlink's own
+    staged-status wait (``barlink_bar1._wait_ctl_event``) is a BOUNDED poll that
+    returns and lets the host keep running, which is why wedges that park there
+    recover and this one did not.
+
+    ``prefix_lens`` is ``forward_batch.extend_prefix_lens`` (flashinfer_backend
+    line ~1681) and ``extend_prefix_lens_cpu`` is its host mirror, so this sum is
+    the same number the device read would have produced -- not an estimate. When
+    no mirror is supplied the caller passes None and the old read is kept.
+    """
+    if extend_prefix_lens_cpu is None:
+        return None
+    return int(sum(extend_prefix_lens_cpu))
+
+
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
@@ -6710,6 +6736,13 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
+            # #616c: forwarded so the weighted-DCP branch of call_begin_forward
+            # can derive sum(prefix_lens) on the host. The branch above only
+            # consumes this mirror when use_ragged is True, and a multimodal
+            # model forces use_ragged=False (line ~1684) while STILL taking the
+            # DCP split -- which is exactly how this rig reached the blocking
+            # read. Forwarding it makes the mirror available on both paths.
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
         )
 
     def update_sliding_window(
@@ -6900,6 +6933,10 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        # #616c: host mirror of prefix_lens. Optional and defaulted, so the
+        # other callers of this method (sliding-window, cross-attention) keep
+        # their current behaviour and simply fall back to the device read.
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
     ):
         bs = len(seq_lens)
         # Draft->draft tree mask for the uneven-DCP ragged verify wrapper
@@ -6934,6 +6971,10 @@ class FlashInferIndicesUpdaterPrefill:
                     self.attn_backend.cp_hi,
                     self.attn_backend.cp_ratio,
                     pad=256,
+                    # #616c: kills the blocking D2H inside the collective
+                    # window. prefix_lens IS forward_batch.extend_prefix_lens,
+                    # so this host mirror is the same sum, not an estimate.
+                    total_tokens=_dcp_host_total_tokens(extend_prefix_lens_cpu),
                 )
             else:
                 dcp_lens = get_dcp_lens(prefix_lens, dcp_size, dcp_rank, None)
