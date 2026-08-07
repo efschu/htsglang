@@ -45,7 +45,17 @@ BOOTSTRAP_PORT=8998
 export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
-export SGLANG_BARLINK=0
+# barlink is deliberately NOT pinned here. An earlier version of this script
+# exported SGLANG_BARLINK=0, which was wrong twice over: it is a no-op
+# (environ.py:688 declares SGLANG_BARLINK = EnvBool(False)), and hardcoding it
+# contradicts the standing order recorded in docs/rig-runbook.md sec 4 --
+# barlink is the collective transport for recipes on this rig, and pinning a
+# recipe to NCCL is exactly the "NCCL-Ausweich" that order forbids.
+#
+# HONEST SCOPE OF WHAT WAS MEASURED: the Route A pair that served was measured
+# with barlink OFF, because the rig-wide counter-test flag /spinning/COUNTERTEST_NCCL
+# was forcing the NCCL transport at the time. Route A x barlink is therefore
+# UNVALIDATED, not "known good" -- run it once the counter-test is lifted.
 export SGLANG_UNEVEN_DCP=1
 export SGLANG_UNEVEN_DCP_WEIGHTED=1
 # The decode arm's TP group deliberately spans a 5090 and a 3080. sglang's

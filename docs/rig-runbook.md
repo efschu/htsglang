@@ -2464,6 +2464,19 @@ already off by default and setting it to 0 is a no-op (on this rig it was
 additionally forced off rig-wide by `/spinning/COUNTERTEST_NCCL`). Production
 sets it belt-and-braces; copying that line explains nothing.
 
+**Consequently, Route A x barlink is UNVALIDATED — not "known good".** Every
+number and every green run in this section was taken with barlink OFF, because
+the counter-test flag was forcing the NCCL transport for the whole rig at the
+time. That matters because section 4's standing order makes barlink the
+transport for recipes here, so the served pair above was measured on the path
+this rig does NOT normally run. `scripts/route_a_631_pd_boot.sh` therefore does
+NOT pin `SGLANG_BARLINK` at all: an earlier version exported 0, which would
+have quietly frozen every future Route A boot onto NCCL — the "NCCL-Ausweich"
+the standing order exists to prevent. Re-run the pair with barlink once
+`/spinning/COUNTERTEST_NCCL` is lifted, and treat the collective-heavy DCP
+paths (`cp_lse_ag_out_ar_mha_uneven`, the per-shape capture collectives) as the
+places most likely to behave differently.
+
 `SGLANG_UNEVEN_DCP_WEIGHTED=1` does have a mechanism -- it installs the
 WEIGHTED owner rule, which does not reach `dcp_even_write_mask` at all ("The
 WEIGHTED rule needs none of this", `owner.py`) and is required by
