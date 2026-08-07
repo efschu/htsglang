@@ -521,6 +521,56 @@ resharder is NOT expressible across the boundary and must not be counted on
 for Route A. The PD handover in (a) is the mechanism; #297 is not a fallback
 for it.
 
+### Slice 2 (#631b): variant (iii) chosen, and where the slice line falls
+
+Approved after pricing. The prefill arm computes the NEXTN draft layer's KV
+during its own prefill, where the hidden states already exist in flight, and
+ships it in a canonical FULL-HEAD layout; the decode arm slices the heads its
+own sharding owns.
+
+The decisive argument is NOT the byte count, it is non-invertibility. Local
+recompute on the decode arm is impossible: that arm receives the main model's
+K and V, and K/V are projections that do not invert back into hidden states.
+So variant (i) is not "one layer of recompute", it is "ship 335 MB of
+activations and THEN recompute one layer". Variant (ii) fails on arithmetic
+rather than effort — the existing pairwise helper
+`staging_buffer.compute_head_slice_params` computes
+`total_kv_heads // attn_tp_size`, which for 4 KV heads over 3 decode ranks is
+1 and silently drops a head. A canonical intermediate needs no pairwise
+mapping, so neither wall is hit.
+
+Byte comparison on the reference checkpoint, for the record: 2048 B/token
+canonical (4 heads x 256 head_dim x 2 for K+V x 1 B fp8 x 1 draft layer),
+67 MB at 32k, against 10240 B/token of bf16 hidden states = 335 MB.
+
+**Built so far** (`disaggregation/draft_kv_canonical.py`): the versioned
+layout contract and the geometry gate — the two invariants the review made
+conditions of the approval.
+
+- `CANONICAL_LAYOUT_VERSION` + `DraftKvCanonicalLayout.assert_compatible`:
+  a version mismatch is a NAMED refusal, never a reinterpretation. A layout
+  either side could guess at would rebuild the silent-wrongness problem
+  variant (iii) was chosen to avoid, inside variant (iii).
+- `check_full_head_shipment_is_justified`: re-derives the shipment's
+  justification from the geometry actually loaded, every time, instead of
+  letting this checkpoint's numbers stand as an assumption. The bound is the
+  ALTERNATIVE'S OWN COST rather than a constant in MB — a megabyte threshold
+  would be arbitrary and would rot, while "cheaper than the option we rejected
+  it for" stays meaningful on any checkpoint and explains itself. A wide-KV
+  (MHA) checkpoint inverts the comparison and is refused.
+- `local_head_window`: largest-remainder dealing, so 4 heads over 3 ranks is
+  (2,1,1) and every head has exactly one owner. Each side calls it for ITSELF
+  against the canonical total, which is what keeps the arms decoupled.
+
+**NOT built, and deliberately outside this slice**: the prefill-side draft
+layer forward that produces the KV, the transport wiring that moves it, and
+lifting the #631a spec refusal for the decode arm once both exist. Those need
+the draft model plumbing and a GPU window; the contract above is what they
+must agree on, and it is provable at a desk, so it lands first and separately.
+The #631a refusal therefore STAYS in force until that wiring exists — a
+half-wired draft path that boots is exactly the failure this task has been
+removing everywhere else.
+
 ### Hard precondition, not mine to fix
 
 #630 (PP x disk-HiCache warm-up wedge, §4a) blocks SHIPPING a PP prefill
