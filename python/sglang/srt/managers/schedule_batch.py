@@ -2237,6 +2237,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens = [r.extend_range.end for r in reqs]
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
+        # #639: this vector is the single rank-local input that decides both
+        # the SHAPE of every per-layer TP collective in the forward (via
+        # `extend_num_tokens` two lines up) and WHICH DCP collectives run at
+        # all (via `weightless_has_prefix` -> `_forward_extend_dcp`'s
+        # `if not has_prefix: ... return`). Check it here, once, where it is
+        # first materialised -- not per layer, and not after the forward has
+        # already entered a collective it cannot leave. Detector only: no
+        # collective and no behaviour change without DCP over >1 rank.
+        # Imported here rather than at module scope: this file's import block
+        # is already an E402 region, and a local import keeps the new
+        # dependency out of it without adding a finding.
+        from sglang.srt.layers.dcp.prefix_lens_check import (
+            assert_prefix_lens_rank_uniform,
+        )
+
+        assert_prefix_lens_rank_uniform(prefix_lens)
         extend_lens = [r.extend_range.length for r in reqs]
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
