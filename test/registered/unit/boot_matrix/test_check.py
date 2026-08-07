@@ -40,6 +40,15 @@ _ENGAGED = (
     "[2026-08-01 00:00:01 TP0] Uneven-DCP token sizing: rank 0 (vector [30, 17, 17])."
 )
 _GRAPHS = "[2026-08-01 00:00:05 TP0] Capture draft decode CUDA graph begin."
+#: #614: an offload arm now also has a LOAD precondition -- it must show that a
+#: spill actually fired, or the run is VOID rather than PASS. These fixtures
+#: exercise the DECLARED-vs-RESOLVED half of the check, so their synthetic logs
+#: carry the trigger; without it the arm would be voided before the assertion
+#: under test is reached. Literal from kv_session_offload.py:4189.
+_PS2_SPILL = (
+    "[2026-08-01 00:01:00 TP0] kv-session-offload PREFILL-SPILL (PS2, "
+    "born-spilled deep): rid=bf447dd1 L=9000 boundary=0 host_tail=9000"
+)
 
 
 def _boot_log(**over):
@@ -350,7 +359,7 @@ class TestAbsenceIsAnAssertion(CustomTestCase):
             enable_kv_session_offload="True",
             speculative_algorithm="None",
             speculative_eagle_topk="None",
-        )
+        ) + "\n" + _PS2_SPILL
 
     def _log_with_spec(self):
         return _boot_log(enable_kv_session_offload="True")
@@ -370,7 +379,7 @@ class TestAbsenceIsAnAssertion(CustomTestCase):
             "[2026-08-01 00:00:00] server_args=ServerArgs(tp_size=3, dcp_size=3, "
             "enable_kv_session_offload=True, draft_kv_layout='replicated')"
         )
-        log = "\n".join([body, _ENGAGED, _GRAPHS, f"[..] {READY_MARKER}"])
+        log = "\n".join([body, _ENGAGED, _GRAPHS, _PS2_SPILL, f"[..] {READY_MARKER}"])
         with tempfile.TemporaryDirectory() as d:
             _write(d, arm=arm, boot_status="ready", log_text=log,
                    probes=GRADED_PROBES)

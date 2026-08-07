@@ -67,6 +67,16 @@ COHERENCE_TIERS = ("byte+graded", "graded_only", "none")
 #: the timeout kill, and a clean reject also exits non-zero).
 BOOT_STATUSES = ("ready", "timeout", "crashed", "refused")
 
+#: The literal the decode-path spill emits (``kv_session_offload.py:3865``).
+#: Kept here rather than inlined per arm so a renamed message is one edit and
+#: not a silently always-absent marker in eight places.
+SPILL_MARKER_DECODE = "kv-session-offload SPILL(partial): rid="
+#: The literal the PS2 born-spilled prefill path emits
+#: (``kv_session_offload.py:4189``). A different mechanism, so a different
+#: marker: an arm that can only decode-spill must not be allowed to satisfy
+#: its precondition with a prefill-spill line, and vice versa.
+SPILL_MARKER_PREFILL = "kv-session-offload PREFILL-SPILL (PS2, born-spilled deep): rid="
+
 
 @dataclass(frozen=True)
 class Arm:
@@ -99,6 +109,39 @@ class Arm:
     #: REJECT arms: every substring here must appear in the refusal message,
     #: and the boot must not have reached the ready marker.
     reject_markers: Tuple[str, ...] = ()
+    #: BOOT arms: the LOAD PRECONDITION. At least ONE of these literals must
+    #: appear in the arm's log, or the arm never exercised its own subject and
+    #: the run is VOID -- not PASS.
+    #:
+    #: WHY THIS IS NOT OPTIONAL RIGOUR. An offload arm declares kvso flags and
+    #: the check confirms they RESOLVED; nothing confirmed that a spill ever
+    #: FIRED. A load that does not press the KV pool spills zero times, and
+    #: such a run is byte-coherent and resolves exactly as declared -- so it
+    #: reports PASS while proving nothing about the spill path. The #550 window
+    #: hit precisely this from the other side (FEATURE_CATALOG.md:1793-1799):
+    #: "one of the two WITH runs spilled and the other did not, so the arm
+    #: measured two different regimes and called the difference noise". A green
+    #: null soak is worse than a red arm, because it retires the question.
+    #:
+    #: ANY, not ALL: the two spill mechanisms (decode-path and PS2 born-spilled
+    #: prefill) are alternative ways for the same subject to be exercised, and
+    #: an arm that can reach either must not be VOIDed for reaching only one.
+    require_any_markers: Tuple[str, ...] = ()
+    #: BOOT arms: literals that must NOT appear. A hit is a FAIL -- the arm
+    #: declared a property the log disproves, the same class as a resolved
+    #: config that disagrees with ``expect``.
+    #:
+    #: This is the CONTROL side of ``require_any_markers``. A contention arm's
+    #: control leg is only a control if its own confounder is pinned off AND
+    #: the pin is checked; the #550 window's control "never spilled" by luck of
+    #: the load, not by construction, which is why the catalog records SPILL
+    #: COST and HICACHE CONTENTION as confounded and neither isolated.
+    forbid_markers: Tuple[str, ...] = ()
+    #: BOOT arms: the name of the arm that is this arm's CONTROL leg, when the
+    #: arm's result is a DELTA rather than a boot property. Machine-readable on
+    #: purpose: arm O carried its pairing in ``capture_note`` prose, so nothing
+    #: could check that the control was run, let alone that it was clean.
+    control_arm: Optional[str] = None
     #: The tenant/sweep time estimate. Reported, never enforced.
     expected_seconds: float = 240.0
     #: A caveat folded into the estimate (e.g. cold graph-cache capture).
@@ -121,6 +164,20 @@ class Arm:
             raise ValueError(
                 f"arm {self.name}: a reject arm never boots, so it has no "
                 "effective config to expect"
+            )
+        if self.kind == "reject" and (
+            self.require_any_markers or self.forbid_markers or self.control_arm
+        ):
+            raise ValueError(
+                f"arm {self.name}: a reject arm never runs a load, so it has "
+                "no load precondition, no forbidden runtime marker and no "
+                "control leg"
+            )
+        overlap = set(self.require_any_markers) & set(self.forbid_markers)
+        if overlap:
+            raise ValueError(
+                f"arm {self.name}: marker(s) {sorted(overlap)} are both "
+                "required and forbidden, so the arm can never be decided"
             )
 
 
@@ -263,6 +320,7 @@ ARMS: Tuple[Arm, ...] = (
         flags=("--enable-kv-session-offload", "--kv-session-offload-host-ram-gib", "8"),
         expect=_expect(offload=True),
         coherence="byte+graded",
+        require_any_markers=(SPILL_MARKER_DECODE,),
     ),
     Arm(
         name="C_crossalgo",
@@ -302,6 +360,7 @@ ARMS: Tuple[Arm, ...] = (
         ),
         expect=_expect(offload=True, cross_algorithm=True),
         coherence="byte+graded",
+        require_any_markers=(SPILL_MARKER_DECODE,),
     ),
     Arm(
         name="E_barlink",
@@ -335,6 +394,7 @@ ARMS: Tuple[Arm, ...] = (
         expect=_expect(offload=True, cross_algorithm=True, barlink="device"),
         coherence="byte+graded",
         expected_seconds=360.0,
+        require_any_markers=(SPILL_MARKER_DECODE,),
     ),
     Arm(
         name="H_ps2_prefill_spill",
@@ -360,6 +420,8 @@ ARMS: Tuple[Arm, ...] = (
         # spec off: this arm deliberately overrides the base spec flags.
         expect=_expect(offload=True, spec_algorithm=None, eagle_topk=None),
         coherence="graded_only",  # no-spec long output; graded, not byte
+        # PS2 is on, so either mechanism exercises the subject.
+        require_any_markers=(SPILL_MARKER_PREFILL, SPILL_MARKER_DECODE),
     ),
     Arm(
         name="I_dflash_shards",
@@ -379,6 +441,7 @@ ARMS: Tuple[Arm, ...] = (
         ),
         expect=_expect(spec_algorithm="DFLASH", offload=True),
         coherence="byte+graded",
+        require_any_markers=(SPILL_MARKER_DECODE,),
     ),
     Arm(
         name="J_waveback_ps2",
@@ -396,6 +459,7 @@ ARMS: Tuple[Arm, ...] = (
         ),
         expect=_expect(offload=True),
         coherence="byte+graded",
+        require_any_markers=(SPILL_MARKER_PREFILL, SPILL_MARKER_DECODE),
     ),
     # --- boot arms: axes the r3 seed set did not cover --------------------
     Arm(
@@ -581,6 +645,10 @@ ARMS: Tuple[Arm, ...] = (
         expect=_expect(offload=True),
         coherence="byte+graded",
         expected_seconds=300.0,
+        # The arm's own comment already says a session that never leaves
+        # device would "pass by never exercising its own subject". That was a
+        # flag and a hope; this is the assertion.
+        require_any_markers=(SPILL_MARKER_DECODE,),
     ),
     Arm(
         name="O_hicache_contention",
@@ -620,13 +688,68 @@ ARMS: Tuple[Arm, ...] = (
         expect=_expect(offload=True),
         coherence="byte+graded",
         expected_seconds=360.0,
+        # The measurement is only a measurement if the spill actually fired in
+        # THIS run -- see require_any_markers.
+        require_any_markers=(SPILL_MARKER_DECODE,),
+        control_arm="P_hicache_nospill_control",
         capture_note=(
-            "PAIRED arm: run B_offload as the without-HiCache control in the "
-            "same boot session and report ms/round for both. An A-vs-A noise "
-            "floor must be established BEFORE the A-vs-B claim, and runs must "
-            "be >= 10 s -- a contention number below the noise floor is not a "
-            "number."
+            "PAIRED arm: B_offload is the without-HiCache leg and "
+            "P_hicache_nospill_control is the without-SPILL leg; report "
+            "ms/round for all three. An A-vs-A noise floor must be "
+            "established BEFORE any A-vs-B claim, and runs must be >= 10 s -- "
+            "a contention number below the noise floor is not a number. The "
+            "#550 window ran only the first pairing and its control happened "
+            "not to spill, which is why SPILL COST and HICACHE CONTENTION "
+            "came out confounded (FEATURE_CATALOG.md:1799-1800); the third "
+            "leg is what separates them."
         ),
+    ),
+    Arm(
+        name="P_hicache_nospill_control",
+        axis="kvso x HiCache with spilling PINNED OFF (#550 control leg)",
+        catches=(
+            "the confound the #550 window shipped with: with kvso armed, "
+            "whether a run spills is decided by the load, not by the "
+            "configuration, so the 'control' of a contention arm can spill "
+            "and its no-spill property is luck rather than construction. This "
+            "arm is O_hicache_contention with the SAME HiCache tier and the "
+            "SAME pinned kvso host pool, and the only difference is that no "
+            "spill may be admitted -- so O minus P is spill cost under "
+            "HiCache, and B_offload vs O is HiCache contention under spill"
+        ),
+        env={"KVSO_ALLOW_SPEC": "1", "KVSO_ALLOW_HICACHE": "1"},
+        flags=(
+            "--enable-kv-session-offload",
+            "--kv-session-offload-host-ram-gib", "8",
+            "--enable-hierarchical-cache",
+            "--hicache-size", "8",
+            "--hicache-mem-layout", "page_first_direct",
+            # THE PIN. #236's total-volume regler declines a spill AT
+            # ADMISSION when the projected host-resident volume exceeds it
+            # (budget_admission_violation, kv_session_offload.py:1588-1589) and
+            # the decline falls back to stock retraction -- today's behaviour
+            # when no host region is free. At 1 token every real session's
+            # tail overshoots, so no spill is ever admitted, while kvso stays
+            # armed and its pinned host pool is still allocated: the control
+            # keeps the memory posture of the treatment and loses only the
+            # event under study.
+            #
+            # WHY NOT max-spills 0: --kv-session-offload-max-spills is
+            # validated >= 1 (server_args.py:6762) and clamped to >= 1 again
+            # in the manager (kv_session_offload.py:2395), so there is no
+            # "armed but zero regions" setting to pin with. WHY NOT dropping
+            # --enable-kv-session-offload: that removes the pinned host pool
+            # too, so the control would no longer share the treatment's host
+            # RAM posture -- which is the very thing HiCache contends with.
+            "--kv-session-offload-budget-total-tokens", "1",
+        ),
+        expect=_expect(offload=True),
+        coherence="byte+graded",
+        expected_seconds=360.0,
+        # The pin is only a pin if it is checked. Both mechanisms are
+        # forbidden, not just the decode one: a control that born-spilled
+        # would be just as contaminated.
+        forbid_markers=(SPILL_MARKER_DECODE, SPILL_MARKER_PREFILL),
     ),
 )
 

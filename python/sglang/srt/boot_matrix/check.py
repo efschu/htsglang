@@ -22,6 +22,26 @@ same reason (``scripts/gpu_battery/checks/check_common.py``):
 * STOP -- a precondition is wrong and nothing was learned: an artifact is
           missing, the grader is absent, a declared fact is not in the log, a
           byte probe was mis-designed past the reproducibility window.
+* VOID -- the arm RAN correctly and proved nothing, because its own subject
+          never occurred. STOP is about the harness (an artifact is missing);
+          VOID is about the LOAD (the artifacts are complete, the boot resolved
+          as declared, the output is coherent -- and the mechanism under test
+          never fired). The two must not be merged: STOP says "run it again the
+          same way", VOID says "the load did not press hard enough, change the
+          load". VOID can only ever replace a PASS, never a FAIL: a red arm
+          stays red whether or not its trigger fired.
+
+WHY VOID EXISTS. Every offload arm here declares kvso flags, and the check
+confirmed they RESOLVED. Nothing confirmed a spill ever FIRED. A load that does
+not press the KV pool spills zero times and is byte-coherent and resolves
+exactly as declared -- so it reported PASS while proving nothing about the
+spill path, which is a null soak dressed as a green light. The #550 window met
+the same shape from the other side (``docs/dev/FEATURE_CATALOG.md:1793-1800``):
+"one of the two WITH runs spilled and the other did not, so the arm measured
+two different regimes and called the difference noise", and "The control never
+spilled, so SPILL COST and HICACHE CONTENTION are confounded and neither is
+isolated". ``Arm.require_any_markers`` is the treatment-side assertion,
+``Arm.forbid_markers`` the control-side one.
 
 THE ARTIFACT CONTRACT. One directory per arm run:
     arm.json     {"name","kind","boot_status", ...} -- boot_status is one of
@@ -53,6 +73,7 @@ from sglang.srt.boot_matrix.effective import (
 PASS = 0
 FAIL = 1
 STOP = 2
+VOID = 3
 
 # Mirrors scripts/gpu_battery/checks/check_common.FATAL_LOG_MARKERS. This is
 # generic boot-liveness plumbing, not the grader, so it is kept local to make
@@ -121,7 +142,7 @@ def _first_error_line(log_text: str) -> Optional[str]:
 
 @dataclass(frozen=True)
 class Verdict:
-    status: int  # PASS | FAIL | STOP
+    status: int  # PASS | FAIL | STOP | VOID
     arm: str
     reason: str
     effective: Optional[EffectiveConfig] = None
@@ -131,7 +152,7 @@ class Verdict:
 
     @property
     def label(self) -> str:
-        return {PASS: "PASS", FAIL: "FAIL", STOP: "STOP"}[self.status]
+        return {PASS: "PASS", FAIL: "FAIL", STOP: "STOP", VOID: "VOID"}[self.status]
 
     def render(self) -> str:
         head = f"BOOTMATRIX-{self.label} {self.arm}: {self.reason}"
@@ -202,6 +223,83 @@ def _unconfirmed_fields(arm: Arm, eff: EffectiveConfig) -> List[str]:
         for key, want in arm.expect.items()
         if want is not None and getattr(eff, key, None) is None
     ]
+
+
+def _load_precondition_held(arm: Arm, log_text: str) -> bool:
+    """Did the arm's own subject occur at all?
+
+    ANY of ``require_any_markers`` is enough -- they are alternative
+    mechanisms for the same subject (decode-path spill vs PS2 born-spilled
+    prefill), not a conjunction of requirements. An arm that declares none has
+    no load precondition and is trivially satisfied: most arms prove a boot
+    property, and demanding a runtime marker from them would invent a gate.
+    """
+    if not arm.require_any_markers:
+        return True
+    return any(marker in log_text for marker in arm.require_any_markers)
+
+
+def _forbidden_hits(arm: Arm, log_text: str) -> List[str]:
+    """Markers the arm declared absent that the log nevertheless contains.
+
+    A control arm pinned spill-off is only a control if the pin is checked.
+    Reported as a FAIL rather than a VOID on purpose: the arm declared a
+    property of its own configuration and the log disproves it, which is the
+    same class as a resolved config disagreeing with ``expect``.
+    """
+    return [marker for marker in arm.forbid_markers if marker in log_text]
+
+
+def _void_reason(arm: Arm) -> str:
+    return (
+        "booted and resolved as declared, but the load precondition never "
+        "held: none of "
+        + ", ".join(repr(m) for m in arm.require_any_markers)
+        + " appears in the log, so the mechanism this arm exists to test never "
+        "fired. Nothing was proven -- press the KV pool harder (smaller "
+        "--max-total-tokens, longer or more concurrent prompts) and re-run"
+    )
+
+
+def check_pairing(verdict: Verdict, control: Optional[Verdict]) -> Verdict:
+    """Fold a declared control leg's verdict into a treatment arm's verdict.
+
+    An arm whose result is a DELTA (``Arm.control_arm`` is set) has no result
+    at all without its baseline, so a PASS whose control did not itself PASS is
+    downgraded to VOID: the number exists, the comparison does not. Anything
+    that is not a PASS is returned untouched -- a control cannot turn a red arm
+    green, and a missing control cannot make a FAIL disappear.
+
+    Pure and separate from :func:`check_arm` because the two legs are two runs
+    with two artifact directories, and the pairing is a statement about the
+    pair rather than about either run.
+    """
+    if verdict.status != PASS:
+        return verdict
+    if control is None:
+        return Verdict(
+            VOID,
+            verdict.arm,
+            (
+                "declared a control leg but none was supplied, so its delta "
+                "has no baseline -- the arm ran, the comparison did not"
+            ),
+            effective=verdict.effective,
+            coherence=verdict.coherence,
+        )
+    if control.status != PASS:
+        return Verdict(
+            VOID,
+            verdict.arm,
+            (
+                f"control leg {control.arm} is {control.label} "
+                f"({control.reason}); the treatment ran but its delta has no "
+                "usable baseline"
+            ),
+            effective=verdict.effective,
+            coherence=verdict.coherence,
+        )
+    return verdict
 
 
 def check_arm(arm: Arm, artifact_dir: str) -> Verdict:
@@ -341,7 +439,31 @@ def _check_boot(
             effective=eff,
         )
 
+    # The control-side assertion. Placed with the #340 config checks because it
+    # is one: an arm that declares "no spill may be admitted here" and then
+    # logs a spill resolved to something it did not declare.
+    forbidden = _forbidden_hits(arm, log_text)
+    if forbidden:
+        return Verdict(
+            FAIL,
+            arm.name,
+            (
+                "logged marker(s) the arm declared absent: "
+                + ", ".join(repr(m) for m in forbidden)
+                + " -- the pin did not hold, so this leg is contaminated and "
+                "cannot serve as a control"
+            ),
+            effective=eff,
+        )
+
     if arm.coherence == "none":
+        if not _load_precondition_held(arm, log_text):
+            return Verdict(
+                VOID,
+                arm.name,
+                _void_reason(arm),
+                effective=eff,
+            )
         return Verdict(
             PASS, arm.name, "booted and resolved as declared", effective=eff
         )
@@ -382,6 +504,17 @@ def _check_boot(
             FAIL,
             arm.name,
             "coherence gate red: " + coh.render(),
+            effective=eff,
+            coherence=coh,
+        )
+    # LAST, so VOID can only ever replace a PASS. A coherence failure is a real
+    # defect whether or not the arm's trigger fired, and must not be masked by
+    # "the load was too light".
+    if not _load_precondition_held(arm, log_text):
+        return Verdict(
+            VOID,
+            arm.name,
+            _void_reason(arm),
             effective=eff,
             coherence=coh,
         )

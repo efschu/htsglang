@@ -538,6 +538,45 @@ def draft_kv_verify_enabled() -> bool:
     return os.environ.get("KVSO_S1_VERIFY", "0") == "1"
 
 
+#: Graph-coverage states the spill-tick trace can report. The three are NOT
+#: two-plus-noise: "unattributed" is the honest answer whenever no collective
+#: slot reached the reporter, and collapsing it into "eager" is exactly the
+#: wrong-zero the CollectiveClock's own docstring refuses to emit
+#: (utils/collective_clock.py:41-44).
+TICK_GRAPH_UNATTRIBUTED = "unattributed"  # no collective slot reached us
+TICK_GRAPH_COVERED = "covered"  # a collective ran under graph capture
+TICK_GRAPH_EAGER = "eager"  # slot present, nothing skipped for capture
+
+
+def tick_graph_state_from_slot(slot: Optional[object]) -> str:
+    """Classify one spill-tick forward's collective slot for the trace.
+
+    WHY THIS READS ONE BOOLEAN AND NOTHING ELSE. The slot arrives as
+    ``collective_slot`` metadata from :class:`SplitDeviceTimer`, and the same
+    slot object is handed to EVERY reporter registered on that timer. Harvesting
+    it is destructive -- ``CollectiveClock.harvest_detail`` returns the events
+    to the pool and clears ``slot.pairs`` -- so whoever harvests first empties
+    it for everyone after. kvso installs its reporter with ``add_reporter``
+    (:meth:`_install_regulator_device_timer`), i.e. LAST, so any ms read here
+    would be an order-dependent zero. ``graph_capture_skipped`` is the one
+    field harvesting does not touch, so it is order-independent and safe; the
+    ms axis stays with the existing ``tick_cost`` and with whoever owns the
+    harvest.
+
+    Arms H and I of the #550 window ran under full CUDA graphs
+    (``boot_matrix/arms.py`` BASE_EXPECT ``graphs=True``) with no way to say
+    which part of a tick was graph-covered and which was eager. This is that
+    axis, at the one place a spill tick is already measured.
+    """
+    if slot is None:
+        return TICK_GRAPH_UNATTRIBUTED
+    return (
+        TICK_GRAPH_COVERED
+        if getattr(slot, "graph_capture_skipped", False)
+        else TICK_GRAPH_EAGER
+    )
+
+
 def tick_trace_enabled() -> bool:
     """Diagnostic-only time-series trace of the self-cal spill-tick regulator:
     when SGLANG_KVSO_TICK_TRACE=1, emit one throttled log line per spilled
@@ -2435,6 +2474,11 @@ class KVSessionOffloadManager:
         # identical); cached once so the per-iteration path stays branch-cheap.
         self._tick_trace = tick_trace_enabled()
         self._tick_trace_iter = 0
+        # Graph-coverage attribution for the spill tick (see
+        # _device_timer_report). One of TICK_GRAPH_* below; starts
+        # "unattributed" and only ever moves when a tick forward is actually
+        # reported, so an absent value never reads as "eager".
+        self._tick_graph_state = TICK_GRAPH_UNATTRIBUTED
         if bool(getattr(sa, "kv_session_offload_tick_adaptive", False)):
             self.tick_controller = SpillTickController(
                 floor_interval=int(sa.kv_session_offload_tick_floor),
@@ -2697,6 +2741,15 @@ class KVSessionOffloadManager:
         ms = t * 1000.0
         self._busy_ms_accum += ms
         if self._regulator_spec_server and category == "decode":
+            # Graph-coverage attribution, diagnostic only: latch what this tick
+            # forward was, so the tick trace can say whether the number next to
+            # it came from a graph-covered or an eager segment. Reads one
+            # boolean off the slot and never harvests it -- see
+            # tick_graph_state_from_slot for why that distinction is load-
+            # bearing rather than fastidious.
+            self._tick_graph_state = tick_graph_state_from_slot(
+                kw.get("collective_slot")
+            )
             self._tick_cost_ms = (
                 ms
                 if self._tick_cost_ms is None
@@ -4331,7 +4384,7 @@ class KVSessionOffloadManager:
                     self._log(
                         "kv-session-offload: tick-trace t=%.3f interval=%d "
                         "tick_cost=%.3fms headroom=%.4f host_tail=%d "
-                        "host_tail_sum=%d spilled=%d",
+                        "host_tail_sum=%d spilled=%d tick_graph=%s",
                         time.time(),
                         tc._effective,
                         self._tick_cost_ms
@@ -4341,6 +4394,11 @@ class KVSessionOffloadManager:
                         max_tail,
                         tot_tail,
                         len(self.spills),
+                        # Which segment class the tick_cost next to it came
+                        # from. "unattributed" means no collective slot reached
+                        # the reporter (no SplitDeviceTimer installed on this
+                        # runner) -- it is not a synonym for "eager".
+                        self._tick_graph_state,
                     )
 
         # #236: refresh the rank-uniform budget clock + rate bucket BEFORE any

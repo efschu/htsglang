@@ -139,11 +139,20 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         )
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
+        # #614: the refusal class changed from AssertionError to ValueError and
+        # the wording from two Python identifiers to a named refusal. Both are
+        # deliberate -- this is a refusal of a user CONFIGURATION, not a
+        # violated internal invariant, and the old text named neither the flag
+        # responsible nor the way out. The composition set that has no builder
+        # at all is unchanged; only what the gate SAYS about it changed.
         for cls in (SWAKVPool, DeepSeekV4TokenToKVPool):
             kvcache = _mock_kvcache(cls)
-            with self.assertRaises(AssertionError) as cm:
+            with self.assertRaises(ValueError) as cm:
                 _select_strategy(kvcache, {FULL})
-            self.assertIn("No matching HiCache strategy", str(cm.exception))
+            msg = str(cm.exception)
+            self.assertIn("no HiCache host-pool builder covers", msg)
+            self.assertIn("--enable-hierarchical-cache", msg)
+            self.assertNotIsInstance(cm.exception, AssertionError)
 
     def test_register_custom_strategy_takes_precedence(self):
         class _CustomStrategy(StackStrategy):
