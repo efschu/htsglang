@@ -90,6 +90,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
     get_alloc_reserve_per_decode,
+    peer_needs_mamba_evict,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -3081,6 +3082,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if new_slot is None:
                     self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                     new_slot = pool.mamba_allocator.alloc(1)
+                elif peer_needs_mamba_evict(self.tree_cache):
+                    # #639b: this rank got its boundary slot straight from the
+                    # pool while a peer had to tombstone a cached mamba
+                    # checkpoint for its own. The tombstone is visible to
+                    # `match_prefix`, so not matching it here diverges the
+                    # radix replicas and, one step later, the extend prefix
+                    # vector. Only reachable when the scheduler published a
+                    # floor, i.e. when the ranks' occupancy actually differs.
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.mamba_next_track_idx = other_idx

@@ -1201,18 +1201,54 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         `None`; for cache-insert paths the correct degradation is to skip
         caching this state (a later cache miss), never to crash.
 
-        Rank-uniform without a collective: `max_mamba_cache_size` is min-reduced
-        across ranks at startup (see `_sync_uneven_mamba_cache_size`), the
-        schedulers are replicated and see the identical request stream, so the
-        pool reaches exhaustion on every rank in the same step and all ranks
-        take the same degrade branch.
+        NOT rank-uniform on its own (#639b). This docstring used to claim it
+        was -- "rank-uniform without a collective: `max_mamba_cache_size` is
+        min-reduced across ranks at startup (see `_sync_uneven_mamba_cache_size`),
+        the schedulers are replicated and see the identical request stream, so
+        the pool reaches exhaustion on every rank in the same step" -- and that
+        reasoning is wrong. It was part of the 2026-08-07 07:45 / 10:04
+        `PrefixLensRankDivergence` crashes (rank 0 sum=19711, rank 1 sum=16957).
+
+        A uniform pool SIZE is not a uniform eviction OUTCOME. The startup
+        min-reduce equalises how many slots each rank HAS; it says nothing
+        about which slots are FREE. Occupancy is what this branch tests, and
+        it diverges from two rank-local sources that the size reduce cannot
+        touch:
+
+        * WHICH node gets tombstoned is chosen by a rank-local LRU walk
+          (`evict_mamba` / `MambaComponent.drive_eviction` use
+          `get_lru_no_lock`, which skips nodes with `mamba_lock_ref > 0`), so
+          equal-sized pools at different occupancy tombstone different nodes.
+        * the degrade branch itself is rank-local: returning `None` makes the
+          caller SKIP a cache insert on that rank only, so the trees stop being
+          replicas and the divergence sustains itself.
+
+        And the tombstone is visible to the matcher -- it clears the mamba
+        state while leaving the node's KV in place, so the node still exists
+        on both ranks but only one of them will match through it.
+
+        The eviction trigger is therefore pinned to the group MIN of the mamba
+        pool's availability, published once per iteration by the scheduler from
+        the reduce it already runs (`_publish_uniform_mamba_floor`). No new
+        collective, and no floor at all on a single rank or on ranks whose
+        occupancy agrees.
         """
+        # Imported here rather than at module scope: this file's import block
+        # is already an E402 region, and a local import keeps the new
+        # dependency out of it without adding a finding.
+        from sglang.srt.mem_cache.common import peer_needs_mamba_evict
+
         slot = self.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.req_to_token_pool.mamba_allocator.alloc(1)
             if slot is None:
                 self._log_mamba_slot_starvation("mamba")
+        elif peer_needs_mamba_evict(self):
+            # #639b: this rank had a slot, a peer did not; match its tombstone.
+            # Unreachable unless a floor was published, so a single-rank or
+            # even-occupancy boot takes exactly the pre-#639b path.
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
         return slot
 
     def _log_mamba_slot_starvation(self, pool_name: str) -> None:
@@ -1409,6 +1445,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.evict(EvictParams(num_tokens=0, mamba_num=1))
                     dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                     self.dec_lock_ref(last_node)
+                else:
+                    # #639b: sibling of `_alloc_mamba_slot`'s pin. This rank's
+                    # COW slot came out of the pool while a peer had to
+                    # tombstone a node for its own; match that tombstone, or
+                    # the replicas disagree about which nodes carry mamba
+                    # state. Locked as above so eviction cannot reclaim the
+                    # node this request resumes from.
+                    from sglang.srt.mem_cache.common import peer_needs_mamba_evict
+
+                    if peer_needs_mamba_evict(self):
+                        self.inc_lock_ref(last_node)
+                        self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                        self.dec_lock_ref(last_node)
                 if dst_index is None:
                     # REQUIRED-allocation path: this slot would hold the
                     # request's OWN resumed state, so "skip caching" is not an

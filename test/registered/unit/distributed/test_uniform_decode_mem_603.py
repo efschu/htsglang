@@ -80,6 +80,12 @@ class _FakeScheduler:
     _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
     _local_host_avail = Scheduler._local_host_avail
     _publish_uniform_host_floor = Scheduler._publish_uniform_host_floor
+    # #639b: and the MAMBA pair, same reason one release later again. No
+    # `req_to_token_pool` here, so `_local_mamba_avail` is the ABSENT
+    # sentinel and the #603 quantities stay untouched.
+    _MAMBA_AVAIL_ABSENT = Scheduler._MAMBA_AVAIL_ABSENT
+    _local_mamba_avail = Scheduler._local_mamba_avail
+    _publish_uniform_mamba_floor = Scheduler._publish_uniform_mamba_floor
 
 
 class _FakeDist:

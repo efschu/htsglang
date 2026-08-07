@@ -142,6 +142,7 @@ class _FakeTreeCache:
 
     uniform_avail_floor = None
     uniform_host_avail_floor = None
+    uniform_mamba_avail_floor = None
 
     def __init__(self, device_avail, host_avail):
         self.token_to_kv_pool_allocator = _FakeAllocator(device_avail)
@@ -167,6 +168,12 @@ class _FakeScheduler:
         self.ps = types.SimpleNamespace(tp_size=len(world or [1]))
 
     _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
+    # #639b: the mamba pair rides the same reduce. This fixture has no
+    # `req_to_token_pool`, so it contributes the ABSENT sentinel and no mamba
+    # floor is published -- the #639 host quantities stay untouched.
+    _MAMBA_AVAIL_ABSENT = Scheduler._MAMBA_AVAIL_ABSENT
+    _local_mamba_avail = Scheduler._local_mamba_avail
+    _publish_uniform_mamba_floor = Scheduler._publish_uniform_mamba_floor
     _update_uniform_pool_budget = Scheduler._update_uniform_pool_budget
     _publish_uniform_evict_floor = Scheduler._publish_uniform_evict_floor
     _publish_uniform_host_floor = Scheduler._publish_uniform_host_floor
@@ -192,9 +199,19 @@ class _FakeDist:
         return len(self.world_device)
 
     def _payload(self, device_avail, host_avail):
-        # Mirrors the production packing for pin_admission=False:
-        #   [local_avail, -local_avail, local_host_avail, -local_host_avail]
-        return [device_avail, -device_avail, host_avail, -host_avail]
+        # Mirrors the production packing for pin_admission=False. #639b
+        # appended the mamba pair AFTER the host pair, which is why the
+        # publisher stopped reading the host term off `t[-2]`/`t[-1]`:
+        #   [avail, -avail, host, -host, mamba, -mamba]
+        m_absent = Scheduler._MAMBA_AVAIL_ABSENT
+        return [
+            device_avail,
+            -device_avail,
+            host_avail,
+            -host_avail,
+            m_absent,
+            -m_absent,
+        ]
 
     def all_reduce(self, t, op=None, group=None):
         self.calls += 1
