@@ -4902,13 +4902,57 @@ class BarlinkBar1Transport:
             for i in range(n_lines)
         ]
         shown = " ".join(f"{i}:{w}" for i, w in enumerate(words))
+        # #622/#649: the round counter, WITHOUT which this whole dump cannot be
+        # interpreted.
+        #
+        # Every reading of these snapshots so far has had to assume which round
+        # the spin was waiting for, because roundDev is never printed anywhere
+        # in this file. That assumption is load-bearing: the claim "the
+        # aborting spin's exit condition was already satisfied in its own flag
+        # region" (ANALYSE_622_replay_abort.md:151-160) is derived from it, and
+        # it has never been measured. It is the same class of error as the
+        # retracted per-rank-maximum reading (41d76e7513), which this very
+        # function's closing sentence still warns against.
+        #
+        # With the counter printed, "was the exit condition satisfied?" stops
+        # being an inference and becomes a subtraction: compare round against
+        # the per-topology watermarks above. A spin waiting on R with peers
+        # published at R is satisfied; waiting on R with peers at R-1 is a
+        # genuine missing flag.
+        #
+        # Read through the SAME ctypes memcpy path as the flag region above,
+        # deliberately NOT via .item(): a tensor read would enqueue on the
+        # compute stream and, on the very wedge this runs inside, would queue
+        # behind the stuck kernel and hang exactly when the evidence is wanted.
+        # Eight bytes from a local VRAM word the peers never touch.
+        #
+        # This belongs HERE and not in the host-only sibling dump: the sibling
+        # path deliberately takes no device access at all, and the existing
+        # device copy already cost 55 s in the 06:12 specimen
+        # (barlink_abort_gate.py:544-548). Adding device reads per sibling
+        # transport would multiply that.
+        round_txt = "unavailable"
+        try:
+            rd = getattr(self, "_round_dev", None)
+            if rd is not None and self._cuda is not None:
+                rbuf = (ctypes.c_ubyte * 8)()
+                self._cuda.memcpy(ctypes.addressof(rbuf), int(rd.data_ptr()), 8)
+                round_txt = str(int.from_bytes(bytes(rbuf), "little"))
+        except Exception as exc:  # noqa: BLE001 - never lose the flag dump
+            # The flag words above are the primary evidence; failing to read an
+            # 8-byte counter must never suppress them.
+            round_txt = f"unreadable ({type(exc).__name__})"
         return (
             f"barlink-BAR1 abort flag snapshot rank {self.rank}/{self.world} "
             f"group {self.group or '<unnamed>'}: {n_lines} lines of "
-            f"{int(fsize)} bytes, first dword per line -- {shown}. "
+            f"{int(fsize)} bytes, roundDev={round_txt}, first dword per line "
+            f"-- {shown}. "
             "Compare against the peers': a rank waiting on a generation its "
             "peers have already passed is a sequence mismatch, whereas "
-            "all-equal values mean the flags agree and the wait is elsewhere."
+            "all-equal values mean the flags agree and the wait is elsewhere. "
+            "roundDev is this rank's own counter at dump time; compare it "
+            "against the per-topology watermarks rather than assuming which "
+            "round the spin awaited."
         )
 
     def _abort_peer_flag_snapshot(self, max_lines: int = 64) -> Optional[str]:
