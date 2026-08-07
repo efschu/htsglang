@@ -195,6 +195,15 @@ class _FakeScheduler:
         self.disaggregation_mode = scheduler_mod.DisaggregationMode.NULL
         self.truncation_align_size = None
         self._adder_verdicts = adder_verdicts or []
+        # Stubbed after _update_uniform_pool_budget now reads
+        # self.server_args.dcp_size (scheduler.py:3503) and calls
+        # uniform_budget_deficit() (scheduler.py:4366).
+        self.server_args = types.SimpleNamespace(dcp_size=1, prefill_max_requests=None)
+        self._uniform_budget_deficit = 0
+
+    def uniform_budget_deficit(self):
+        """Mirror the real Scheduler method; always 0 in the stub."""
+        return 0
 
     def get_num_allocatable_reqs(self, running_bs):
         return 1024
