@@ -909,7 +909,11 @@ class Scheduler(
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
-            and self.server_args.sleep_on_idle
+            and (
+                self.server_args.sleep_on_idle
+                # #547: same mechanism, reachable without the server arg.
+                or envs.SGLANG_IDLE_BLOCKING_POLL.get()
+            )
         ):
             self.idle_sleeper = IdleSleeper(
                 sockets=[
@@ -2088,6 +2092,11 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                # #547: a batch ran this iteration -> the idle poll ladder goes
+                # back to its zero-poll rung, so the first iterations after a
+                # loaded phase never block. One None-test per forward.
+                if self.idle_sleeper is not None:
+                    self.idle_sleeper.reset()
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -2166,6 +2175,10 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                # #547: see event_loop_normal -- a loaded iteration resets the
+                # idle poll ladder to its zero-poll rung.
+                if self.idle_sleeper is not None:
+                    self.idle_sleeper.reset()
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -5321,6 +5334,11 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
+            # #547: no batch to run, but work is queued somewhere (waiting
+            # queue, grammar, disagg, hicache drain). That is the loaded path
+            # as far as the idle poll is concerned -- back to the zero-poll rung.
+            if self.idle_sleeper is not None:
+                self.idle_sleeper.reset()
             return
 
         if self.enable_unified_memory:
@@ -6444,6 +6462,14 @@ class Scheduler(
             self.kv_capacity_runtime is not None
             and self.kv_capacity_runtime.pending_work()
         ):
+            return
+        # #274/#547: the multi-group lane runtime is driven from this loop --
+        # a SERIAL lane's forward runs inside _dual_group_lane_tick, and a
+        # CONCURRENT lane's admission/lending decision is taken there too. The
+        # serving group being idle says nothing about the lane, so parking the
+        # loop would starve the protected class. Scope the idle poll to the
+        # classic single-group path and leave the lane runtime alone.
+        if self.dual_group_lanes:
             return
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()

@@ -522,6 +522,13 @@ class Envs:
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
 
     # Scheduler: others:
+    # #547 idle blocking poll. Turns the scheduler's (and the DP controller's)
+    # true-idle busy spin into a blocking zmq poll with a stepped-up timeout,
+    # without requiring the `--sleep-on-idle` server arg. Off by default: the
+    # CPU win is proven hermetically, but the loaded-path A/B and the idle
+    # wattage still need a card window (see IdleSleeper for the ladder and the
+    # exact "loaded => unchanged" condition).
+    SGLANG_IDLE_BLOCKING_POLL = EnvBool(False)
     # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
