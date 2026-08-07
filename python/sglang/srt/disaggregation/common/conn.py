@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
@@ -74,6 +75,18 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+
+    # #631a guard 1. Identity of the WEIGHTS, from
+    # mem_cache.hicache_storage.compute_model_identity_hash with
+    # include_parallel_vectors=False -- the same recipe the NCCL transport
+    # and the HiCache keys use, not a second hash to keep in step. Without
+    # it the handshake compared page_size and kv_cache_dtype and nothing
+    # else, so two arms holding DIFFERENT CHECKPOINTS paired happily and
+    # produced fluent nonsense (#212): plausible text, no error, nothing to
+    # notice. Optional and default None so a mixed-version pair (one arm
+    # predating this field) keeps working instead of refusing on absence --
+    # the check below only fires when BOTH sides supply a hash.
+    model_identity_hash: Optional[str] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -448,6 +461,45 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        # #631a guard 1: the arms must be serving the SAME WEIGHTS.
+        #
+        # The two checks above compare the KV byte format. Nothing compared
+        # the model, so a decode arm pointed at a prefill arm holding a
+        # different checkpoint paired cleanly and answered with fluent
+        # nonsense -- the #212 trap, and the worst shape available to us
+        # because the output looks like output.
+        #
+        # Deliberately NOT compared here: tp/pp/dcp geometry. A PD pair is
+        # EXPECTED to differ in parallelism (TransportIdentity.COMPARED omits
+        # tp_size and pp_size for that reason, and a token-axis difference is
+        # handled by owned_ordinals), so a geometry check would refuse pairs
+        # the engine transfers correctly -- notably Route A's PP prefill into
+        # a DCP decode. Hence the hash is taken WITHOUT the parallel vectors.
+        #
+        # Both-sides-present gate: an arm from before this field sends no
+        # hash, and refusing on absence would break a mixed-version rollout
+        # for a check that cannot be performed anyway.
+        local_identity_hash = compute_model_identity_hash(
+            self.server_args, include_parallel_vectors=False
+        )
+        if (
+            info.model_identity_hash is not None
+            and info.model_identity_hash != local_identity_hash
+        ):
+            raise RuntimeError(
+                f"Model identity mismatch: prefill server has "
+                f"model_identity_hash={info.model_identity_hash}, but decode "
+                f"server has {local_identity_hash}. The two arms are not "
+                "serving the same weights, so a transfer between them would "
+                "produce fluent but wrong output rather than an error. The "
+                "hash covers model path, revision, dtype, quantization and "
+                "kv-cache dtype, so the usual causes are two different "
+                "checkpoints, or the same checkpoint at a different "
+                "--revision or --quantization. Parallelism is NOT part of "
+                "it: differing TP/PP/DCP between the arms is supported and "
+                "is not what this refusal is about."
+            )
+
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
@@ -598,6 +650,12 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
+            # #631a guard 1. Parallel vectors excluded on purpose: see
+            # compute_model_identity_hash. This must answer "same weights?",
+            # and the two PD arms are expected to differ in parallelism.
+            "model_identity_hash": compute_model_identity_hash(
+                self.server_args, include_parallel_vectors=False
+            ),
             "load_balance_method": self.server_args.load_balance_method,
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
@@ -1448,6 +1506,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        # #631a guard 1: first registrant's weights identity, served back to
+        # the decode side in the /route response.
+        self.model_identity_hash: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -1517,6 +1578,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        model_identity_hash = data.get("model_identity_hash")
         prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
@@ -1536,6 +1598,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.model_identity_hash is None and model_identity_hash is not None:
+            self.model_identity_hash = model_identity_hash
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -1609,6 +1674,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                model_identity_hash=self.model_identity_hash,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
