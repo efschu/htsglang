@@ -64,6 +64,12 @@ class _FakeScheduler:
 
     _update_uniform_pool_budget = Scheduler._update_uniform_pool_budget
     uniform_min_avail = Scheduler.uniform_min_avail
+    # #616g: the reduce now also publishes the rank-uniform eviction floor, so
+    # the stub must carry that method too. A stub that models less surface than
+    # the real class is exactly what this file's own `self.tp_rank` story warns
+    # about; it has no `tree_cache`, so the publisher is a no-op here and the
+    # #603 quantities under test are untouched.
+    _publish_uniform_evict_floor = Scheduler._publish_uniform_evict_floor
 
 
 class _FakeDist:

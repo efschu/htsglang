@@ -3452,6 +3452,9 @@ class Scheduler(
         kvso = self.kv_session_offload
         if kvso is not None:
             self._uniform_min_avail = int(kvso.dcp_min_avail())
+            # The offload manager only exists under uneven DCP, so the pools
+            # ARE uneven here; publish unconditionally (no max to compare).
+            self._publish_uniform_evict_floor(self._uniform_min_avail)
             # The offload manager reduced the admission quantity itself in
             # `update_dcp_admission_state`; `get_new_batch_prefill` reads it
             # from there, so nothing is stored here.
@@ -3464,6 +3467,10 @@ class Scheduler(
         if grp is None or torch.distributed.get_world_size(grp) <= 1:
             self._uniform_min_avail = local_avail
             self._uniform_budget_deficit = 0
+            # One rank: nothing to diverge from, so the floor stays OFF and
+            # every cache-mutation trigger keeps reading its live local value
+            # -- byte-identical to the pre-#616g path.
+            self._publish_uniform_evict_floor(None)
             return
         # #610: PREFILL ADMISSION rides on this same reduce. `PrefillAdder`'s
         # `rem_total_tokens` / `cur_rem_tokens` (schedule_policy.py:681/719) read
@@ -3504,7 +3511,19 @@ class Scheduler(
             # UnifiedRadixCache and are out of this path's reach.
             local_evict = int(fe() if fe is not None else tree.evictable_size())
             local_admission = local_avail + local_evict
-        vals = [local_avail, local_admission] if pin_admission else [local_avail]
+        # #616g: `-local_avail` rides the SAME reduce so one MIN yields both
+        # the group minimum and (negated) the group MAXIMUM. The pair is what
+        # decides whether the pools are uneven AT ALL this iteration, which is
+        # the activation predicate for the eviction floor below -- derived from
+        # a collective, so it is rank-uniform by construction and needs no
+        # server-arg coupling. Width stays rank-uniform: the element is added
+        # unconditionally, and `pin_admission` (the only other width term) is a
+        # replicated config predicate.
+        vals = (
+            [local_avail, local_admission, -local_avail]
+            if pin_admission
+            else [local_avail, -local_avail]
+        )
         t = torch.tensor(vals, dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
         self._uniform_min_avail = int(t[0].item())
@@ -3512,6 +3531,60 @@ class Scheduler(
         self._uniform_budget_deficit = (
             local_admission - int(t[1].item()) if pin_admission else 0
         )
+        self._publish_uniform_evict_floor(
+            int(t[0].item()), max_avail=-int(t[-1].item())
+        )
+
+    def _publish_uniform_evict_floor(
+        self, min_avail: Optional[int], max_avail: Optional[int] = None
+    ) -> None:
+        """Publish this iteration's rank-uniform availability floor on the tree
+        cache, for the CACHE-MUTATION triggers to decide from (#616g).
+
+        WHY, measured: #603 and #610 made the decode-mem and prefill-admission
+        DECISIONS rank-uniform, but both left eviction as an explicitly local
+        side effect ("Still evict locally for the space"). Under uneven pools
+        that side effect is itself a divergence source, one level below the
+        decisions:
+
+          `evict_from_tree_cache` fires on `available_size() < num_tokens`,
+          where the DEMAND is replicated (`batch.extend_num_tokens`) but the
+          AVAILABILITY is this rank's own shard -- 179825 / 143860 / 136667
+          tokens on the 2026-08-06 boot. The rank with the roomiest pool
+          declines to evict while the tight ranks evict, so the radix trees
+          stop being replicas. `match_prefix` then returns a rank-dependent
+          prefix, `prepare_for_extend` computes
+          `extend_num_tokens = sum(seq_len - len(prefix_indices))` from it,
+          and every per-layer TP all_reduce of that forward is entered with a
+          rank-dependent token count. That is the 21:52:25 wedge exactly:
+          all three ranks parked in the SAME collective at the SAME layer_idx
+          with rank 0 reducing 1690 tokens against 1818 on its peers.
+
+        The floor is the MIN over ranks of the same quantity, taken from the
+        reduce that already runs once per iteration, pre-branch -- NO new
+        collective and no new synchronisation point.
+
+        DIRECTION IS SAFE BY CONSTRUCTION: min <= local, so
+        `floor < num_tokens` is true whenever the local test was, and
+        sometimes when it was not. Every rank therefore evicts at least as
+        often as before the fix; under-eviction (which would turn into an
+        allocator OOM) is arithmetically impossible. The price is that slack
+        ranks drop cache they did not personally need, which is what keeping
+        the replicas identical costs.
+
+        ACTIVATION is itself collective-derived: the floor is published only
+        when the group's min and max availability DIFFER, i.e. when the pools
+        are actually uneven this iteration. On even TP the two are equal, the
+        floor stays None, and every trigger reads its live local value exactly
+        as before -- byte-identical, no behaviour change on the default path.
+        """
+        tree = getattr(self, "tree_cache", None)
+        if tree is None:
+            return
+        if min_avail is None or (max_avail is not None and min_avail >= max_avail):
+            tree.uniform_avail_floor = None
+            return
+        tree.uniform_avail_floor = int(min_avail)
 
     def uniform_budget_deficit(self) -> int:
         """This iteration's non-negative prefill-admission surplus over the

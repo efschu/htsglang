@@ -1414,6 +1414,25 @@ class HiRadixCache(RadixCache):
         for n in nodes_to_load:
             n.protect_host()
 
+        # #616g: the SECOND rank-local source of radix divergence, and the one
+        # that needs no eviction at all to fire. Load-back EXTENDS this rank's
+        # device prefix; whether it succeeds depends on this rank's own free
+        # device space. Under uneven pools the roomy rank loads a prefix back
+        # while the tight ranks fail and skip it, so the device trees diverge
+        # directly -- and the roomy rank then matches MORE and computes FEWER
+        # extend tokens, which is the observed direction of the 21:52:25
+        # specimen (rank 0, the largest pool at 179825 tokens, reducing 1690
+        # against its peers' 1818).
+        #
+        # Decide from the group floor instead: if the BINDING rank cannot hold
+        # the load-back, no rank attempts it. Uniform in both outcomes, and the
+        # floor being a MIN means a rank that clears it has the room.
+        floor = getattr(self, "uniform_avail_floor", None)
+        if floor is not None and floor < len(host_indices):
+            self.dec_lock_ref(ancester_node)
+            for n in nodes_to_load:
+                n.release_host()
+            return None
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
             node_id=last_hit_node.id,
