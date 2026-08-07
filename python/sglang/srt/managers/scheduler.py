@@ -3737,8 +3737,27 @@ class Scheduler(
             or (max_host_avail is not None and min_host_avail >= max_host_avail)
         ):
             tree.uniform_host_avail_floor = None
+            tree.uniform_host_admitted_since_floor = 0
+            tree.uniform_host_refusals_since_floor = 0
             return
         tree.uniform_host_avail_floor = int(min_host_avail)
+        # #645: the floor above is a snapshot taken at the TOP of the
+        # iteration, but the backups that read it run at the END of it
+        # (`process_batch_result_prefill` -> `cache_unfinished_req` ->
+        # `insert` -> `write_backup`). Without a ledger it keeps counting as
+        # free every slot this iteration's own backups have already taken, so
+        # the rank whose pool IS the floor runs out for real while its peers,
+        # reading the same optimistic number, sail on -- and the tight rank
+        # then takes a rank-LOCAL host-eviction branch its peers do not.
+        # Reset here, in the same call that publishes the number it corrects,
+        # so the ledger can never outlive its floor. Every path through
+        # `_update_uniform_pool_budget` reaches this publisher exactly once
+        # per iteration, so the reset inherits that cadence for free.
+        tree.uniform_host_admitted_since_floor = 0
+        # Same cadence for the refusal counter, which only exists to keep the
+        # #645 warning to one line per published floor instead of one per
+        # insert.
+        tree.uniform_host_refusals_since_floor = 0
 
     #: What a rank with no mamba pool contributes to the mamba pair, so the
     #: reduce payload width never depends on a per-rank capability. Same role
