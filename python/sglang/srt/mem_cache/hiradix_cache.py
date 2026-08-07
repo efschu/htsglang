@@ -928,6 +928,30 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
+        # #639: RANK-UNIFORM host admission, the same pin the sibling class
+        # carries. This class asks the question by attempting the write and
+        # reading a None back rather than by testing `available_size()`
+        # first, but the quantity that decides the answer is the same
+        # rank-sized host pool, and the consequence is the same: under
+        # `write_through` a node that fails to back up is DELETED from the
+        # tree at its next device eviction while a backed-up one is demoted
+        # and stays matchable, so a rank-local verdict makes the radix
+        # replicas diverge and the extend token count with them.
+        #
+        # Refuse up front when the group floor cannot hold the node, so every
+        # rank reaches the same verdict before any rank allocates. None (host
+        # pools agree, single rank, no host tier) leaves the path exactly as
+        # it was -- this class is not the one the wedging rig instantiates,
+        # and it is pinned here because #616g's load-back fix spent a boot
+        # sitting in the class that deployment never built.
+        from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
+
+        mem_pool_host = getattr(self.cache_controller, "mem_pool_host", None)
+        if self.uniform_host_avail_floor is not None and mem_pool_host is not None:
+            host_avail = uniform_host_avail_for_backup(self, mem_pool_host)
+            if host_avail < len(node.value):
+                return 0
+
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,

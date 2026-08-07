@@ -74,6 +74,12 @@ class _FakeScheduler:
     # about; it has no `tree_cache`, so the publisher is a no-op here and the
     # #603 quantities under test are untouched.
     _publish_uniform_evict_floor = Scheduler._publish_uniform_evict_floor
+    # #639: same reason, one release later -- the reduce also carries the
+    # HOST-tier pair now. No `tree_cache` here either, so both publishers are
+    # no-ops and the #603 quantities are untouched.
+    _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
+    _local_host_avail = Scheduler._local_host_avail
+    _publish_uniform_host_floor = Scheduler._publish_uniform_host_floor
 
 
 class _FakeDist:

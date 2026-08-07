@@ -462,6 +462,17 @@ class HiRadixPrefetchParticipationTest(unittest.TestCase):
 
 class BudgetHarness:
     _update_uniform_pool_budget = Scheduler._update_uniform_pool_budget
+    # #639: the reduce grew a HOST-tier pair. Bound here so this harness keeps
+    # modelling the real class; its tree cache has no `cache_controller`, so
+    # the sentinel rides and no host floor is published.
+    # Pre-existing red at e9d67ae2bd: #616g added this publisher to the
+    # reduce and never bound it here, so both admission tests failed with
+    # AttributeError before this change. Bound now, for the same reason the
+    # #639 members below are.
+    _publish_uniform_evict_floor = Scheduler._publish_uniform_evict_floor
+    _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
+    _local_host_avail = Scheduler._local_host_avail
+    _publish_uniform_host_floor = Scheduler._publish_uniform_host_floor
     # Absent before the fix; the caller then reads a 0 deficit, which is
     # exactly the pre-fix admission behaviour.
     if hasattr(Scheduler, "uniform_budget_deficit"):

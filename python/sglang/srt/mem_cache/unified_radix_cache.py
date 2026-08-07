@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     requests_forced_host_write_through,
 )
+from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
@@ -1783,9 +1784,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-        # Pre-evict host if insufficient
+        # Pre-evict host if insufficient.
+        #
+        # #639: RANK-UNIFORM host admission. `kv_tokens` is replicated (it is
+        # this node's own length); the host pool is this rank's own shard --
+        # 359652 / 287722 / 273336 slots on the crashing boot. Decided
+        # locally, the roomy rank backs the node up and the tight ranks return
+        # 0, and under `write_through` that verdict is a TREE EDIT rather than
+        # bookkeeping: `_evict_device_leaf` DEMOTES a backed-up node (it stays
+        # in the tree, matchable, and `load_back` can restore it) and DELETES
+        # one without a backup. The radix replicas then diverge, `match_prefix`
+        # returns a rank-dependent prefix, and `prepare_for_extend` turns it
+        # into a rank-dependent `extend_num_tokens` -- the BAR1 stall with the
+        # CLEAN abort word, four specimens, roomiest rank always LOW.
+        #
+        # This is one tier BELOW the #616g device-side floors and upstream of
+        # them, which is why those are deployed and did not bind: `load_back`'s
+        # floor decides whether host content is loaded back, not whether it
+        # was ever written. None (host pools agree, single rank, no host tier)
+        # keeps the live local value exactly as before.
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
+        host_avail = uniform_host_avail_for_backup(
+            self, self.cache_controller.mem_pool_host
+        )
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)

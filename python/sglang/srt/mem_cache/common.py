@@ -439,6 +439,36 @@ def uniform_avail_for_evict(tree_cache, allocator) -> int:
     return int(floor)
 
 
+def uniform_host_avail_for_backup(tree_cache, mem_pool_host) -> int:
+    """The HOST availability a write-through backup must decide from (#639).
+
+    The device-side sibling one function up pins the two triggers that mutate
+    the DEVICE tree. This pins the one that mutates whether a node has a HOST
+    copy at all -- which under ``write_through`` decides whether the node
+    SURVIVES its device eviction:
+    ``UnifiedRadixCache._evict_device_leaf`` demotes a backed-up node (it
+    stays in the tree, matchable and loadable back) and DELETES one without a
+    backup. So a rank-local backup verdict is a rank-local tree edit, one tier
+    below the #616g pins and upstream of them.
+
+    Deciding it from this rank's own host pool is what produced the four
+    2026-08-06/07 wedges: the host pools are 359652 / 287722 / 273336 slots,
+    the node length is replicated, so the roomy rank backed up a node its
+    peers refused, kept a prefix they deleted, matched longer, and entered
+    every per-layer TP all_reduce of the next extend with a smaller token
+    axis (rank 0 at 912/914/828/1690 tokens against peers' 2048/2048/1818).
+
+    The scheduler publishes ``uniform_host_avail_floor`` once per iteration,
+    from the reduce it already performs, when the ranks' HOST pools are
+    uneven. None -- single rank, pools that agree, or no host tier at all --
+    is the live local value and the caller behaves exactly as before.
+    """
+    floor = getattr(tree_cache, "uniform_host_avail_floor", None)
+    if floor is None:
+        return int(mem_pool_host.available_size())
+    return int(floor)
+
+
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return

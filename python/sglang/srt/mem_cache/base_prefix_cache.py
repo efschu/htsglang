@@ -260,6 +260,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     # the path that happens to set it (#606).
     uniform_avail_floor: Optional[int] = None
 
+    # #639: the same pin one tier down, for the HOST pool. The host KV pools
+    # are rank-sized too (359652 / 287722 / 273336 slots on the crashing
+    # boot), and `write_backup`'s admission is decided against them from a
+    # replicated node length. Under `write_through` that verdict is a TREE
+    # edit, not bookkeeping: `_evict_device_leaf` demotes a backed-up node
+    # (stays in the tree) and DELETES one without a backup, so a rank-local
+    # backup verdict makes the radix replicas diverge one tier BELOW the
+    # #616g pins -- which is why those did not bind on it. Group MIN of the
+    # host `available_size()`, published by the scheduler once per iteration
+    # when the host pools are uneven. None means "pools agree, single rank,
+    # or no host tier": read the live local value, exactly as before.
+    uniform_host_avail_floor: Optional[int] = None
+
     def init_metrics_collector(self):
         from sglang.srt.runtime_context import get_server_args
 
