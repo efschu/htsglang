@@ -118,6 +118,80 @@ boundary KV move inherits every one of those exclusions.
 min-reduced across the world group, so the tightest stage sets capacity for
 all (runbook §4.7/§4.9, open #201 slice-3 item).
 
+## 4a. MEASURED, 2026-08-07 — the gate is passed, and it moves the design
+
+Window artifacts: `/spinning/gpu-battery-results/2026-08-07_625/`. Both arms
+Qwen3.6-27B-INT8-W8A8, ctx 65536, KV fp8_e4m3, `chunked_prefill_size` 2048,
+both no-spec, both `--disable-overlap-schedule`, both without hierarchical
+cache (see the defect below). Uncached random `input_ids`, `max_new_tokens=1`,
+warm-up draw discarded, 3 kept draws. A-vs-A same-boot floor at 8192 tok:
+**0.10 % on both arms**.
+
+| uncached tokens | TP=3 median | TP tok/s | PP=3 median | PP tok/s | PP speedup |
+|---|---|---|---|---|---|
+| 2 048 | 1080.1 ms | 1896.1 | 453.3 ms | 4518.1 | **2.38x** |
+| 8 192 | 5475.5 ms | 1496.1 | 1094.8 ms | 7482.9 | **5.00x** |
+| 32 768 | 24088.9 ms | 1360.3 | 4611.0 ms | 7106.4 | **5.22x** |
+
+Per-length spreads <= 0.97 %. The differences are 200-500 %, three orders of
+magnitude above the floor, so nothing here is close to the noise.
+
+**R1 is resolved positively: the pipeline DOES fill.** PP throughput RISES
+from 4518 tok/s at one chunk to 7483 tok/s at four — that rise is only
+possible if successive chunks of the same request occupy different microbatch
+slots. The §2 falsification arm did not trigger.
+
+**Correctness, not just speed.** The PP arm answers 14*3=42 and Jupiter
+identically to the TP arm, and retrieves a needle planted mid-prompt across a
+6862-token (3.4-chunk) pipelined prefill. Multi-chunk PP prefill is correct.
+
+**Decode confirms the phase split.** PP decode bs=1 measured ~31 tok/s against
+the documented TP+NEXTN 112 tok/s (runbook §4.1.0, INT8 decode arm) — PP is
+~3.6x WORSE at decode. Prefill and decode really do want opposite topologies,
+which is the premise of #625 and is now measured on both sides.
+
+### What the numbers change about the design
+
+**There is no threshold.** PP wins at every length measured, including 2048
+tokens — one chunk, where PP has maximum bubble and literally zero pipelining
+(stage 0's 32 layers, then stage 1's 16, then stage 2's 16, strictly serial).
+It still wins 2.38x there, because on this rig the per-layer collectives cost
+more than the entire serialisation penalty. That is ANALYSE_299's 68-75 %
+figure showing up from the other side.
+
+So the §1 target picture's central mechanism — a prompt-length threshold that
+flips TP->PP and back — **is the wrong shape for this rig**. A per-request
+flip would also have to pay a weight-topology switch (B2) that no actuator
+performs. The measurement instead points at Route A (§7) in its strongest
+form: **two persistent groups, no per-request switch at all.** A PP prefill
+group and a TP+NEXTN decode group both stay resident; the router sends prefill
+to the PP group always (not above a threshold), and the only per-request cost
+is the KV handover, which #212 measured at 1.8 % of TTFT. The "threshold"
+degenerates into "is the handover cheaper than 2.38x of prefill", which at
+2048 tokens it already is.
+
+The honest caveat: the TP arm ran the plain VRAM-auto split. Every
+concentrated phase-prefill candidate was refused UNBOOTABLE at reserve
+4500,2700,2700 (rank 1 residual below the derived 4016 MiB demand), so the
+planner CHOSE "keep plain VRAM-auto split". That is the production-RESIDENT
+decode layout, which is the right baseline for the target picture; per runbook
+§4.1.0 the ideal INT8 prefill vector would have added only ~6.1 %, which does
+not touch a 2.38-5.22x gap.
+
+### Defect found: PP + disk HiCache wedges at warm-up
+
+`--enable-hierarchical-cache` with the file backend under `--pp-size 3` never
+becomes ready. Health stays 503 indefinitely; the launcher sits in
+`_wait_and_warmup`. Two identical py-spy samples, i.e. wedged and not merely
+slow: **PP2 blocked in `isend`** (`send_tensor_dict` ->
+`_pp_send_output_to_next_stage`) while **PP0 spins in `_drain_async_work` ->
+`check_hicache_events`** inside `_get_new_batch_prefill_raw`, so PP0 never
+posts the matching recv. The same topology without hicache boots in ~2 min.
+It fails SILENTLY (no refusal, no error line), which is the AUDIT_505 shape.
+Evidence: `pp3_hicache_wedge_pyspy.txt`, `pp3_hicache_wedge.boot.log`.
+Not fixed here; it needs its own task, and until then PP boots must refuse
+hierarchical cache loudly at parse time rather than hang.
+
 ## 5. Measurement plan (the implementation gate)
 
 Two boots, both no-spec — per the register, a PP number must never be placed
