@@ -260,6 +260,43 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     # the path that happens to set it (#606).
     uniform_avail_floor: Optional[int] = None
 
+    # #639: the same pin one tier down, for the HOST pool. The host KV pools
+    # are rank-sized too (359652 / 287722 / 273336 slots on the crashing
+    # boot), and `write_backup`'s admission is decided against them from a
+    # replicated node length. Under `write_through` that verdict is a TREE
+    # edit, not bookkeeping: `_evict_device_leaf` demotes a backed-up node
+    # (stays in the tree) and DELETES one without a backup, so a rank-local
+    # backup verdict makes the radix replicas diverge one tier BELOW the
+    # #616g pins -- which is why those did not bind on it. Group MIN of the
+    # host `available_size()`, published by the scheduler once per iteration
+    # when the host pools are uneven. None means "pools agree, single rank,
+    # or no host tier": read the live local value, exactly as before.
+    uniform_host_avail_floor: Optional[int] = None
+
+    # #639b: the same pin for the MAMBA/SSM state pool. The two floors above
+    # cover the KV token axis (device and host); neither reaches the mamba
+    # slot pool, whose eviction is still decided rank-locally by
+    # `alloc(1) is None`. That verdict is a TREE EDIT of exactly the kind the
+    # other two close: `MambaComponent.evict_component` tombstones the mamba
+    # component of a node (`cd.value = None`) and leaves its KV in place, so
+    # the node survives on both ranks but stops satisfying
+    # `create_match_validator` on the rank that evicted. `_all_valid` in
+    # `UnifiedRadixCache._match_prefix_helper` advances the match only while
+    # ALL components are resident, so that rank's match stops short and the
+    # extend token axis diverges with it.
+    #
+    # A uniform POOL SIZE is not a uniform eviction OUTCOME. The mamba pool
+    # IS min-reduced at startup, but occupancy is not: which node is
+    # tombstoned depends on rank-local LRU order and lock_ref history, and
+    # `_alloc_mamba_slot` returning None makes the caller SKIP a cache insert
+    # rank-locally, so the divergence is self-sustaining once seeded.
+    #
+    # Group MIN of the mamba allocator's `available_size()`, published by the
+    # scheduler once per iteration when the ranks' mamba occupancy is uneven.
+    # None means "occupancy agrees, single rank, or no mamba pool": read the
+    # live local value, exactly as before.
+    uniform_mamba_avail_floor: Optional[int] = None
+
     def init_metrics_collector(self):
         from sglang.srt.runtime_context import get_server_args
 

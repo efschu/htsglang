@@ -32,8 +32,12 @@ from typing import Optional, Sequence, Tuple
 __all__ = [
     "AG_HEADS_TAG_PREFIX",
     "LSE_MERGE_TAG",
+    "PrefixLensRankDivergence",
     "dcp_forces_prefix",
     "draft_extend_prefix_lens",
+    "format_prefix_lens_divergence",
+    "prefix_lens_ballot",
+    "prefix_lens_ballot_agrees",
     "weightless_has_prefix",
     "weightless_layer_op_tags",
     "weightless_step_op_tags",
@@ -141,6 +145,116 @@ def weightless_has_prefix(
     if extend_prefix_lens_cpu is None:
         return False
     return any(extend_prefix_lens_cpu)
+
+
+# ---------------------------------------------------------------------------
+# #639: the DETECTOR for the premise the docstring above ASSERTS.
+#
+# `weightless_has_prefix` requires its inputs to be replicated and says so:
+# "The answer decides whether the Q all-gather and the LSE merge are issued at
+# all, so it must be identical on the head rank and on every weightless
+# worker. Both inputs are replicated." The REQUIREMENT is stated; the PREMISE
+# was never checked. `extend_prefix_lens_cpu` traces to
+# `schedule_batch.py:2239` -- `prefix_lens = [len(r.prefix_indices) for r in
+# reqs]` -- i.e. to the content of this rank's radix cache, which is the
+# quantity #616B had to install a group-MIN floor to keep uniform. The same
+# line at :2235 builds `extend_num_tokens`, so one vector decides both the
+# SHAPE of every per-layer collective and WHICH collectives run at all.
+#
+# Caught live 2026-08-07 08:26 with all three ranks alive: TP0 past attention
+# in `prepare_mlp`'s all_reduce, TP1 and TP2 inside `_ag_lse`'s all_gather,
+# seven lines apart in one layer body. TP0 had taken `_forward_extend_dcp`'s
+# `if not has_prefix: ... return` and left an LSE all-gather its peers were
+# still waiting in.
+#
+# THIS IS A DETECTOR, NOT A CORRECTION, and that distinction must survive in
+# the code. Once the prefix vector diverges the attention result is already
+# wrong; making the branch uniform only makes the failure uniform and loud. It
+# is deliberately NOT an OR-ballot: OR-ing the derived boolean would quietly
+# adopt the position that a divergent prefix vector is legitimate and should
+# be absorbed, which is the OPPOSITE of the position #616B took when it made
+# that vector uniform on the paths it reached. Refusing on disagreement is
+# neutral between "extend #616B's floor to this path" and "divergence is
+# legal here", and it forecloses neither -- while turning a 60-second silent
+# stall plus stack archaeology into one line naming the rank and its vector.
+# ---------------------------------------------------------------------------
+
+
+class PrefixLensRankDivergence(RuntimeError):
+    """The extend prefix-length vector is not the same on every rank (#639)."""
+
+
+def _prefix_lens_digest(prefix_lens: Sequence[int]) -> int:
+    """A deterministic 62-bit digest of the vector.
+
+    NOT :func:`hash`: that is salted for ``str``/``bytes`` and is a per-process
+    value in exactly the situation this must compare ACROSS processes. A plain
+    integer polynomial is deterministic everywhere, needs no import, and stays
+    inside int64 after the negation the MIN-pair trick performs.
+    """
+    h = 1469598103934665603
+    for n in prefix_lens:
+        h = (h * 1099511628211 + (int(n) + 1)) & ((1 << 62) - 1)
+    return h
+
+
+def prefix_lens_ballot(prefix_lens: Sequence[int]) -> Tuple[int, int, int, int]:
+    """This rank's packed ballot: ``(n, -n, digest, -digest)``.
+
+    Packed as (x, -x) pairs so ONE MIN all_reduce yields both the group min and
+    the group max of each field, which is what makes disagreement detectable
+    without a second collective. The LENGTH rides alongside the digest because
+    the batch size can diverge too -- a rank that admitted a different number
+    of requests is the same defect one step earlier, and a digest alone would
+    report it as an opaque mismatch instead of naming the count.
+    """
+    n = len(prefix_lens)
+    d = _prefix_lens_digest(prefix_lens)
+    return (n, -n, d, -d)
+
+
+def prefix_lens_ballot_agrees(reduced: Sequence[int]) -> bool:
+    """True when the MIN-reduced ballot shows every rank sent the same vector.
+
+    ``reduced`` is the elementwise MIN of every rank's :func:`prefix_lens_ballot`
+    output, so ``reduced[0] == -reduced[1]`` says the group agreed on the
+    length and ``reduced[2] == -reduced[3]`` that it agreed on the contents.
+    """
+    return reduced[0] == -reduced[1] and reduced[2] == -reduced[3]
+
+
+def format_prefix_lens_divergence(per_rank: Sequence[Sequence[int]]) -> str:
+    """The message the detector raises with, given every rank's vector.
+
+    Prints the vectors rather than a digest: the whole point of paying for the
+    check is that the next occurrence self-diagnoses instead of costing a live
+    py-spy capture of three processes inside a 60-second stall.
+    """
+    lines = [
+        "DCP extend prefix-length vector is NOT rank-uniform (#639). "
+        "`prefix_lens = [len(r.prefix_indices) for r in reqs]` "
+        "(schedule_batch.py) feeds BOTH `extend_num_tokens` and "
+        "`weightless_has_prefix`, so a divergent vector makes the ranks enter "
+        "the per-layer TP collectives with different shapes AND makes some "
+        "ranks skip `_forward_extend_dcp`'s LSE all-gather entirely "
+        "(`if not has_prefix: return`). Refusing here instead of stalling.",
+        "Per-rank vectors:",
+    ]
+    for rank, lens in enumerate(per_rank):
+        vec = list(lens) if lens is not None else None
+        has_prefix = bool(vec) and any(vec)
+        lines.append(
+            f"  rank {rank}: n={0 if vec is None else len(vec)} "
+            f"sum={0 if not vec else sum(vec)} has_prefix={has_prefix} {vec}"
+        )
+    lines.append(
+        "This is a DETECTOR, not a correction: once the vector diverges the "
+        "attention result is already wrong. The open question it exists to "
+        "answer is whether a divergent vector is legitimate under DCP token "
+        "ownership or a gap in #616B's uniformity floor -- the vectors above "
+        "are the evidence for that call."
+    )
+    return "\n".join(lines)
 
 
 def weightless_layer_op_tags(

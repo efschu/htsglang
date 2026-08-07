@@ -1452,6 +1452,21 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
             self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=n))
             slots = self.mamba_allocator.alloc(n)
+        elif slots is not None and self.tree_cache is not None:
+            # #639b: this rank's alloc succeeded, a peer's did not. The peer is
+            # tombstoning `n` mamba checkpoints right now, and a tombstone is a
+            # tree edit the matcher reads (`create_match_validator` refuses a
+            # node whose mamba value is None, and `_match_prefix_helper` stops
+            # the match there). Not matching it here is what makes the two
+            # radix replicas disagree about the prefix -- the 2026-08-07
+            # `PrefixLensRankDivergence` crashes. Gated on a floor the
+            # scheduler only publishes when the ranks' occupancy actually
+            # differs, so a single-rank or even boot takes the pre-#639b path.
+            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+            from sglang.srt.mem_cache.common import peer_needs_mamba_evict
+
+            if peer_needs_mamba_evict(self.tree_cache, n):
+                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=n))
         return slots
 
     # For chunk prefill req, we do not need to allocate mamba cache,

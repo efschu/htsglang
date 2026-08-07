@@ -439,6 +439,147 @@ def uniform_avail_for_evict(tree_cache, allocator) -> int:
     return int(floor)
 
 
+def uniform_host_avail_for_backup(tree_cache, mem_pool_host) -> int:
+    """The HOST availability a write-through backup must decide from (#639).
+
+    The device-side sibling one function up pins the two triggers that mutate
+    the DEVICE tree. This pins the one that mutates whether a node has a HOST
+    copy at all -- which under ``write_through`` decides whether the node
+    SURVIVES its device eviction:
+    ``UnifiedRadixCache._evict_device_leaf`` demotes a backed-up node (it
+    stays in the tree, matchable and loadable back) and DELETES one without a
+    backup. So a rank-local backup verdict is a rank-local tree edit, one tier
+    below the #616g pins and upstream of them.
+
+    Deciding it from this rank's own host pool is what produced the four
+    2026-08-06/07 wedges: the host pools are 359652 / 287722 / 273336 slots,
+    the node length is replicated, so the roomy rank backed up a node its
+    peers refused, kept a prefix they deleted, matched longer, and entered
+    every per-layer TP all_reduce of the next extend with a smaller token
+    axis (rank 0 at 912/914/828/1690 tokens against peers' 2048/2048/1818).
+
+    The scheduler publishes ``uniform_host_avail_floor`` once per iteration,
+    from the reduce it already performs, when the ranks' HOST pools are
+    uneven. None -- single rank, pools that agree, or no host tier at all --
+    is the live local value and the caller behaves exactly as before.
+    """
+    floor = getattr(tree_cache, "uniform_host_avail_floor", None)
+    if floor is None:
+        return int(mem_pool_host.available_size())
+    return int(floor)
+
+
+def uniform_mamba_avail_for_evict(tree_cache, local_avail: int) -> int:
+    """The MAMBA-slot availability an eviction trigger must decide from (#639b).
+
+    The two siblings above pin the KV token axis, device and host. This pins
+    the third pool, and it is the one still open: the mamba slot pool is
+    evicted by ``self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))``
+    fired from ``alloc(1) is None`` -- a rank-LOCAL test with no floor at all.
+
+    Why a uniform pool SIZE does not make it uniform. ``max_mamba_cache_size``
+    is min-reduced across ranks at startup, and a comment in
+    ``MambaRadixCache._alloc_mamba_slot`` concluded from that the path is
+    "rank-uniform without a collective". Size is not occupancy. WHICH node
+    gets tombstoned is chosen by ``MambaComponent.drive_eviction`` from a
+    rank-local LRU (``lru.get_lru_no_lock()``, which skips locked nodes), so
+    two ranks with identically sized pools at different occupancy tombstone
+    different nodes -- or one tombstones and the other does not.
+
+    And the tombstone is a tree edit that the matcher reads.
+    ``MambaComponent.evict_component`` sets ``cd.value = None`` for the mamba
+    component only; the node keeps its KV and stays in the tree, but
+    ``create_match_validator`` now refuses it. ``_match_prefix_helper``'s
+    ``_all_valid`` advances the match only while EVERY component is resident,
+    so the evicting rank's match stops at that node while its peer walks past
+    -- which is the 2026-08-07 07:45 and 10:04 signature exactly
+    (rank 0 sum=19711, rank 1 sum=16957, one request each).
+
+    It compounds: a shorter match extends more tokens, which takes more
+    slots, which forces more eviction, which shortens the next match. That is
+    how the gap reached 2754 tokens.
+
+    The floor is the group MIN of the mamba allocator's ``available_size()``,
+    taken from the reduce the scheduler already runs once per iteration --
+    NO new collective. None -- single rank, occupancy that agrees, or no
+    mamba pool -- is the live local value and the caller behaves exactly as
+    before.
+
+    WHY ``min`` AND NOT A BARE SWAP, unlike the two siblings. They each govern
+    exactly one call site reading exactly one quantity, so returning the floor
+    outright is already <= the local value. This one governs sites reading TWO
+    different quantities: ``alloc_req_slots`` compares
+    ``schedulable_available_size()`` while the ``alloc(1) is None`` sites
+    compare ``available_size()``, and on the shared
+    ``UnifiedMambaSlotAllocator`` the schedulable view is the LARGER of the
+    two (it credits the peer's drainable holes). Handing a schedulable-quantity
+    caller a bare ``available_size``-derived floor would be direction-safe, but
+    handing an ``available_size`` caller a schedulable-derived one would not.
+    ``min`` is safe for either reading and needs no per-call-site coupling to
+    the allocator class.
+
+    UNIFORMITY IS EXACT, not approximate: the floor is the group MIN of
+    ``available_size()``, and every caller's local quantity is >= its own
+    ``available_size()`` >= that MIN, so when the floor is published
+    ``min(local, floor) == floor`` on EVERY rank. When it is not published the
+    ranks' values already agree. Either way every rank decides from the same
+    number.
+
+    DIRECTION IS SAFE BY CONSTRUCTION: ``min(local, floor) <= local``, so a
+    rank evicts at least as often, and at least as much, as it did before the
+    fix. Under-eviction -- the only way this pin could itself become a fault
+    -- is arithmetically impossible. The price is that the rank with the
+    roomiest mamba pool drops checkpoints it did not personally need, which is
+    what keeping the replicas identical costs.
+    """
+    floor = getattr(tree_cache, "uniform_mamba_avail_floor", None)
+    if floor is None:
+        return int(local_avail)
+    return min(int(local_avail), int(floor))
+
+
+def peer_needs_mamba_evict(tree_cache, need: int = 1) -> bool:
+    """Whether a PEER is out of mamba slots though this rank is not (#639b).
+
+    The companion to the floor above, for the "allocate, and evict only if
+    that failed" sites (``_alloc_mamba_slot`` and the two COW paths). Those
+    cannot simply read the floor before allocating: ``MambaSlotAllocator.alloc``
+    serves ``alloc(1)`` from the ``alloc_group_begin`` pre-allocation
+    (``_alloc_iter``) when one is open, and those slots are already OUT of
+    ``free_slots``. A pre-check on ``available_size()`` would therefore evict
+    on a boot where the old code allocated straight from the iterator without
+    evicting -- a behaviour change on the DEFAULT path, which is exactly what
+    these pins are not allowed to cost.
+
+    So the local fast path is left exactly as it was, and this answers the
+    only question it cannot: "my alloc succeeded, must I evict anyway because
+    a peer's did not?" Returns False whenever the floor is unpublished --
+    single rank, or occupancy that agrees -- so a boot that cannot diverge
+    takes literally the pre-#639b path.
+
+    The evict that follows a True keeps the tombstone COUNT equal across the
+    group: the dry rank evicts because its own alloc failed, this rank evicts
+    because the group's minimum says the dry rank did. Same count, same
+    replicated LRU, same tombstone set.
+
+    ONE NAMED GAP, deliberately not closed here. ``_alloc_int8_ckpt_slot``
+    (both cache classes) also fires a ``mamba_num=1`` eviction, but it decides
+    it from the int8 CHECKPOINT pool -- a different pool with a different size,
+    which this floor does not describe. Pinning it needs its own ``(x, -x)``
+    pair in the scheduler's reduce, keyed on
+    ``req_to_token_pool.mamba_ckpt_pool``. It is left open because that pool
+    only exists under ``--enable-int8-mamba-checkpoint``, which is opt-in and
+    off on the crashing deployment, so closing it here would add an unpinnable
+    reduce term to every boot to cover a path none of them take. Named rather
+    than silent, on the same principle as the kv-session-offload host-floor gap
+    in ``Scheduler._update_uniform_pool_budget``.
+    """
+    floor = getattr(tree_cache, "uniform_mamba_avail_floor", None)
+    if floor is None:
+        return False
+    return int(floor) < int(need)
+
+
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
@@ -584,6 +725,26 @@ def alloc_req_slots(
         else:
             factor = MAMBA_STATE_PER_REQ_NO_CACHE
         mamba_state_needed = num_reqs * factor
+        # #639b: RANK-UNIFORM trigger AND magnitude. `mamba_state_needed` is
+        # replicated (`num_reqs` comes from the batch and `factor` from
+        # replicated server args); `mamba_available_size` is this rank's own
+        # occupancy. Deciding from the local side diverges the mamba tombstone
+        # set TWICE over: the roomy rank skips an eviction the tight rank
+        # takes, and when both do evict they evict DIFFERENT AMOUNTS, because
+        # `mamba_num` is itself computed from the local availability. Either
+        # way `MambaComponent.evict_component` tombstones a different set of
+        # nodes per rank (`cd.value = None`, KV left in place), the mamba
+        # validator then refuses different nodes, `_match_prefix_helper`'s
+        # `_all_valid` stops the match at different depths, and
+        # `prepare_for_extend` enters the extend collectives with a
+        # rank-dependent token axis -- the 2026-08-07 07:45/10:04 crashes.
+        # The floor is the group MIN of the mamba slot pool's availability,
+        # published once per iteration by the scheduler from a reduce that
+        # already ran. None => occupancy agrees (or single rank) => the live
+        # local value, unchanged.
+        mamba_available_size = uniform_mamba_avail_for_evict(
+            tree_cache, mamba_available_size
+        )
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)

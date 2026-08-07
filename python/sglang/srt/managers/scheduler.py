@@ -3455,6 +3455,31 @@ class Scheduler(
             # The offload manager only exists under uneven DCP, so the pools
             # ARE uneven here; publish unconditionally (no max to compare).
             self._publish_uniform_evict_floor(self._uniform_min_avail)
+            # #639, A NAMED GAP rather than a silent one. The host floor does
+            # NOT ride the offload manager's reduce, and this branch's whole
+            # contract is that it takes NO reduce of its own -- "a second
+            # reduce here would be a second chance for the collective counts
+            # to diverge", pinned by
+            # test_uniform_decode_mem_603.test_the_offload_manager_is_not_reduced_twice.
+            # Adding one to carry the host term would trade a divergence this
+            # branch has closed for one it has not, on a path that cannot be
+            # exercised without --enable-kv-session-offload.
+            #
+            # So under kv-session-offload the host floor stays OFF and
+            # `write_backup` keeps its pre-#639 rank-local gate. The right
+            # close is to widen `update_dcp_admission_state`'s existing packed
+            # reduce by one pair, in kv_session_offload.py, where the reduce
+            # already lives -- not here.
+            self._publish_uniform_host_floor(None)
+            # #639b: the mamba floor is off here for the same reason and with
+            # the same named gap -- this branch's contract is that it takes NO
+            # reduce of its own, and the offload manager's existing reduce
+            # does not carry a mamba term. Under --enable-kv-session-offload
+            # the mamba eviction keeps its pre-#639b rank-local gate. The right
+            # close is to widen `update_dcp_admission_state`'s packed reduce in
+            # kv_session_offload.py, where the reduce already lives, not to add
+            # a second one here.
+            self._publish_uniform_mamba_floor(None)
             # The offload manager reduced the admission quantity itself in
             # `update_dcp_admission_state`; `get_new_batch_prefill` reads it
             # from there, so nothing is stored here.
@@ -3471,6 +3496,8 @@ class Scheduler(
             # every cache-mutation trigger keeps reading its live local value
             # -- byte-identical to the pre-#616g path.
             self._publish_uniform_evict_floor(None)
+            self._publish_uniform_host_floor(None)
+            self._publish_uniform_mamba_floor(None)
             return
         # #610: PREFILL ADMISSION rides on this same reduce. `PrefillAdder`'s
         # `rem_total_tokens` / `cur_rem_tokens` (schedule_policy.py:681/719) read
@@ -3524,6 +3551,31 @@ class Scheduler(
             if pin_admission
             else [local_avail, -local_avail]
         )
+        # #639: the HOST tier's availability rides the SAME reduce, as a
+        # (x, -x) pair so one MIN yields its group min and max -- the same
+        # trick and the same activation predicate the device floor above
+        # uses. Appended UNCONDITIONALLY: a boot with no host tier still
+        # contributes the pair, carrying `_HOST_AVAIL_ABSENT`, so the payload
+        # width never depends on a per-rank capability. (Whether a host tier
+        # exists is `--enable-hierarchical-cache`, a replicated server arg, so
+        # the sentinel is all-or-nothing in practice; contributing it
+        # unconditionally is what makes that a property of the code rather
+        # than of the flagset.)
+        local_host_avail = self._local_host_avail()
+        vals = vals + [local_host_avail, -local_host_avail]
+        # #639b: the MAMBA slot pool's availability rides the SAME reduce, as
+        # a third (x, -x) pair, on the identical argument the host pair above
+        # documents -- one MIN yields its group min and max, and the
+        # min-vs-max comparison is the activation predicate. Appended
+        # UNCONDITIONALLY, carrying `_MAMBA_AVAIL_ABSENT` on a boot with no
+        # mamba pool, so the payload width never depends on a per-rank
+        # capability. Whether a mamba pool exists is a property of the model
+        # (hybrid SSM or not), replicated across ranks, so the sentinel is
+        # all-or-nothing in practice; contributing it unconditionally is what
+        # makes the uniform width a property of the code rather than of the
+        # checkpoint.
+        local_mamba_avail = self._local_mamba_avail()
+        vals = vals + [local_mamba_avail, -local_mamba_avail]
         t = torch.tensor(vals, dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
         self._uniform_min_avail = int(t[0].item())
@@ -3531,8 +3583,23 @@ class Scheduler(
         self._uniform_budget_deficit = (
             local_admission - int(t[1].item()) if pin_admission else 0
         )
+        # Indices are explicit rather than negative, and now ALL of them are.
+        # #639b appended the mamba pair after the host pair, so the `t[-2]` /
+        # `t[-1]` the host floor used to read would have silently started
+        # reading MAMBA availability -- the exact hazard the previous revision
+        # of this comment named. Layout, in payload order:
+        #   [avail, (admission,) -avail, host, -host, mamba, -mamba]
+        max_avail_at = 2 if pin_admission else 1
+        host_at = 3 if pin_admission else 2
+        mamba_at = 5 if pin_admission else 4
         self._publish_uniform_evict_floor(
-            int(t[0].item()), max_avail=-int(t[-1].item())
+            int(t[0].item()), max_avail=-int(t[max_avail_at].item())
+        )
+        self._publish_uniform_host_floor(
+            int(t[host_at].item()), max_host_avail=-int(t[host_at + 1].item())
+        )
+        self._publish_uniform_mamba_floor(
+            int(t[mamba_at].item()), max_mamba_avail=-int(t[mamba_at + 1].item())
         )
 
     def _publish_uniform_evict_floor(
@@ -3585,6 +3652,189 @@ class Scheduler(
             tree.uniform_avail_floor = None
             return
         tree.uniform_avail_floor = int(min_avail)
+
+    #: What a rank with no host tier contributes to the host pair, so the
+    #: reduce payload width never depends on a per-rank capability. Large
+    #: enough that a MIN against any real availability always loses; small
+    #: enough to stay well inside int64 after negation.
+    _HOST_AVAIL_ABSENT = 1 << 62
+
+    def _local_host_avail(self) -> int:
+        """This rank's free HOST-tier slots, or ``_HOST_AVAIL_ABSENT`` (#639).
+
+        Read through the tree cache's controller because that is the object
+        ``write_backup`` reads it from -- the pin and the gate must sample the
+        same pool or the floor would describe a different tier than the one it
+        governs.
+        """
+        tree = getattr(self, "tree_cache", None)
+        controller = getattr(tree, "cache_controller", None) if tree else None
+        pool = getattr(controller, "mem_pool_host", None) if controller else None
+        if pool is None:
+            return self._HOST_AVAIL_ABSENT
+        try:
+            return int(pool.available_size())
+        except Exception:  # noqa: BLE001
+            # A diagnostic must never be what turns a scheduler iteration into
+            # a crash; an unreadable pool means "no floor", i.e. the pre-#639
+            # local behaviour.
+            return self._HOST_AVAIL_ABSENT
+
+    def _publish_uniform_host_floor(
+        self,
+        min_host_avail: Optional[int],
+        max_host_avail: Optional[int] = None,
+    ) -> None:
+        """Publish this iteration's rank-uniform HOST availability floor on
+        the tree cache, for ``write_backup`` to decide from (#639).
+
+        WHY, measured. #616g pinned the DEVICE-side mutation triggers and
+        explicitly left the host tier alone, on the reading that under
+        ``write_through`` "the eviction path gates on write_policy ==
+        'write_back', not on backup state, so the chain to the device tree is
+        NOT established". ``UnifiedRadixCache._evict_device_leaf`` gates on
+        ``node.backuped`` FIRST and consults ``write_policy`` only inside that
+        branch -- and its write_through arm is the one that removes the node
+        from the tree entirely. So the chain IS established, and it exists
+        only on the policy this deployment runs:
+
+          ``write_backup`` refuses when this rank's own host pool cannot hold
+          the node (359652 / 287722 / 273336 slots on the crashing boot,
+          against a REPLICATED node length). The roomy rank backs the node up
+          and demotes it on eviction -- it stays in the tree, matchable, and
+          ``load_back`` can restore it. The tight ranks refuse and DELETE it.
+          ``match_prefix`` then returns a rank-dependent ``prefix_indices``,
+          ``prepare_for_extend`` turns that into a rank-dependent
+          ``extend_num_tokens``, and every per-layer TP all_reduce of that
+          forward is entered with a shape that cannot pair. Four specimens,
+          all with the roomiest rank LOW: 1690 vs 1818, 828 vs 2048, 912 vs
+          2048, 914 vs 2048.
+
+        The floor is the group MIN of the host ``available_size()``, taken
+        from the reduce that already runs once per iteration, pre-branch --
+        NO new collective on the default path.
+
+        DIRECTION IS SAFE BY CONSTRUCTION: min <= local, so the pinned gate
+        refuses whenever the local gate refused and sometimes when it did not.
+        Over-admission into the host pool -- the only way this pin could
+        itself become a fault -- is arithmetically impossible. The price is
+        that the rank with the roomiest host tier caches less than it could,
+        which is what keeping the replicas identical costs.
+
+        ACTIVATION is collective-derived, exactly as the device floor's is:
+        published only when the group's min and max host availability differ.
+        When they agree, the local test compares the same left side against a
+        replicated right side on every rank and is already uniform, so there
+        is nothing to fix and the path stays byte-identical.
+        """
+        tree = getattr(self, "tree_cache", None)
+        if tree is None:
+            return
+        absent = self._HOST_AVAIL_ABSENT
+        if (
+            min_host_avail is None
+            or min_host_avail >= absent
+            or (max_host_avail is not None and min_host_avail >= max_host_avail)
+        ):
+            tree.uniform_host_avail_floor = None
+            return
+        tree.uniform_host_avail_floor = int(min_host_avail)
+
+    #: What a rank with no mamba pool contributes to the mamba pair, so the
+    #: reduce payload width never depends on a per-rank capability. Same role
+    #: and same magnitude argument as ``_HOST_AVAIL_ABSENT``.
+    _MAMBA_AVAIL_ABSENT = 1 << 62
+
+    def _local_mamba_avail(self) -> int:
+        """This rank's free MAMBA slots, or ``_MAMBA_AVAIL_ABSENT`` (#639b).
+
+        Read off ``req_to_token_pool.mamba_allocator`` because that is the
+        allocator every gated call site allocates from -- the pin and the
+        gates must sample the same pool or the floor would describe a
+        different pool than the one it governs.
+
+        ``available_size()`` and not ``schedulable_available_size()``: the
+        raw free-slot count is defined identically on both allocator classes,
+        while the schedulable view is the LARGER of the two on the shared
+        ``UnifiedMambaSlotAllocator``. Reducing the smaller, universally
+        defined quantity is what lets ``uniform_mamba_avail_for_evict`` stay
+        direction-safe for callers reading either one.
+        """
+        pool = getattr(self, "req_to_token_pool", None)
+        alloc = getattr(pool, "mamba_allocator", None) if pool else None
+        if alloc is None:
+            return self._MAMBA_AVAIL_ABSENT
+        try:
+            return int(alloc.available_size())
+        except Exception:  # noqa: BLE001
+            # A diagnostic must never be what turns a scheduler iteration into
+            # a crash; an unreadable pool means "no floor", i.e. the pre-#639b
+            # local behaviour.
+            return self._MAMBA_AVAIL_ABSENT
+
+    def _publish_uniform_mamba_floor(
+        self,
+        min_mamba_avail: Optional[int],
+        max_mamba_avail: Optional[int] = None,
+    ) -> None:
+        """Publish this iteration's rank-uniform MAMBA availability floor on
+        the tree cache, for the mamba eviction triggers to decide from (#639b).
+
+        WHY, measured. The two floors above pin the KV token axis on the
+        device and on the host. Neither reaches the mamba slot pool, and the
+        2026-08-07 07:45 and 10:04 crashes are that gap:
+
+            rank 0: n=1 sum=19711 has_prefix=True [19711]
+            rank 1: n=1 sum=16957 has_prefix=True [16957]
+
+        ``alloc_req_slots`` evicts on
+        ``mamba_available_size < num_reqs * factor`` -- a REPLICATED demand
+        against this rank's OWN occupancy -- and then evicts
+        ``mamba_state_needed - mamba_available_size`` slots, a magnitude that
+        is itself rank-local. ``MambaComponent.evict_component`` tombstones
+        the mamba component of a node and LEAVES ITS KV, so the node stays in
+        the tree on both ranks but stops satisfying the mamba validator on
+        the rank that evicted. ``_match_prefix_helper`` advances only while
+        every component is resident, so that rank's match stops short, its
+        extend covers more tokens, it takes more slots, and it evicts more
+        next round -- which is how the two ranks got 2754 tokens apart.
+
+        A pre-existing comment in ``MambaRadixCache._alloc_mamba_slot``
+        concluded this path was "rank-uniform without a collective" because
+        ``max_mamba_cache_size`` is min-reduced at startup. That reasoning
+        does not hold and is corrected in this change: a uniform pool SIZE is
+        not a uniform eviction OUTCOME. Which node is tombstoned comes from
+        ``drive_eviction``'s rank-local LRU walk, and occupancy diverges from
+        lock_ref history and from the rank-local "skip this cache insert"
+        degradation that an exhausted pool triggers.
+
+        The floor is the group MIN of the mamba allocator's
+        ``available_size()``, taken from the reduce that already runs once per
+        iteration, pre-branch -- NO new collective.
+
+        DIRECTION IS SAFE BY CONSTRUCTION: min <= local, so every rank evicts
+        at least as often, and at least as much, as before. Under-eviction --
+        which would turn into mamba slot starvation -- is arithmetically
+        impossible. The price is that the rank with the roomiest mamba pool
+        drops checkpoints it did not personally need.
+
+        ACTIVATION is collective-derived, exactly as both siblings are:
+        published only when the group's min and max mamba availability
+        DIFFER. When they agree, every rank's local test already compares the
+        same two numbers and the path stays byte-identical.
+        """
+        tree = getattr(self, "tree_cache", None)
+        if tree is None:
+            return
+        absent = self._MAMBA_AVAIL_ABSENT
+        if (
+            min_mamba_avail is None
+            or min_mamba_avail >= absent
+            or (max_mamba_avail is not None and min_mamba_avail >= max_mamba_avail)
+        ):
+            tree.uniform_mamba_avail_floor = None
+            return
+        tree.uniform_mamba_avail_floor = int(min_mamba_avail)
 
     def uniform_budget_deficit(self) -> int:
         """This iteration's non-negative prefill-admission surplus over the

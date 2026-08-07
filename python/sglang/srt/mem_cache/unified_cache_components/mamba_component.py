@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import peer_needs_mamba_evict
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -110,6 +111,16 @@ class MambaComponent(TreeComponent):
                     lock_result = self.cache.inc_lock_ref(last_node)
                     self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                     dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+                    self.cache.dec_lock_ref(last_node, lock_result.to_dec_params())
+                elif peer_needs_mamba_evict(self.cache):
+                    # #639b: see `_alloc_mamba_slot`. This rank's COW slot came
+                    # straight out of the pool while a peer had to tombstone a
+                    # node for its own; match that tombstone or the two radix
+                    # replicas stop agreeing on which nodes carry mamba state.
+                    # Locked exactly as the sibling branch above, so eviction
+                    # cannot reclaim the node this request is resuming from.
+                    lock_result = self.cache.inc_lock_ref(last_node)
+                    self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                     self.cache.dec_lock_ref(last_node, lock_result.to_dec_params())
                 if dst_index is None:
                     # REQUIRED-allocation path: this slot would hold the
@@ -318,6 +329,15 @@ class MambaComponent(TreeComponent):
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             if slot is None:
                 self._log_mamba_slot_starvation("mamba")
+        elif peer_needs_mamba_evict(self.cache):
+            # #639b: this rank had a slot, a peer did not. The peer is
+            # tombstoning a mamba node right now; skipping the eviction here
+            # would leave that node resident on this rank only, and
+            # `_match_prefix_helper` would then walk past it here and stop at
+            # it there. Evict to keep the tombstone sets equal. Unreachable
+            # unless the scheduler published a floor, i.e. never on a single
+            # rank or on ranks whose occupancy agrees.
+            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
         return slot
 
     def _log_mamba_slot_starvation(self, pool_name: str) -> None:
@@ -572,6 +592,9 @@ class MambaComponent(TreeComponent):
                     if dst is None:
                         self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+                    elif peer_needs_mamba_evict(self.cache):
+                        # #639b: see `_alloc_mamba_slot`. Host load-back sibling.
+                        self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                     if dst is not None:
                         req.mamba_pool_idx = dst[0]
                     else:
