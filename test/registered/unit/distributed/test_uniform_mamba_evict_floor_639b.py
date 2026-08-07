@@ -779,5 +779,69 @@ class AllOrNothingSpecimen1049Test(CustomTestCase):
         self.assertIsNotNone(tree.nodes[0].component_data[ComponentType.FULL].value)
 
 
+class TheDetectorStaysADetectorTest(CustomTestCase):
+    """#639b decision (a): the source is fixed, the detector still REFUSES.
+
+    The alternative considered was to additionally MIN-reduce the prefix
+    vector in ``prepare_for_extend`` so a surviving divergence no longer kills
+    the server. It is rejected, and not only on the "a second silent floor
+    would mask the next source" argument -- there is a mechanical reason it
+    would be WRONG here specifically.
+
+    Clamping the length vector does not clamp the state that was chosen with
+    it. ``MambaComponent.finalize_match_result`` sets
+    ``req.mamba_cow_src_index`` from ``last_node.component_data[MAMBA].value``
+    -- the SSM checkpoint at the depth the match actually reached. Truncating
+    ``prefix_indices`` to the group minimum afterwards would leave the request
+    resuming an SSM state that has already consumed N tokens while its KV
+    prefix and token stream describe M < N. That is not a shorter-but-correct
+    forward, it is a silently wrong one: the two ranks would then AGREE on a
+    vector and disagree on the hidden state behind it, which is strictly worse
+    than the crash because nothing downstream can detect it.
+
+    A correction that is actually safe would have to re-run ``match_prefix``
+    against the clamped depth so the mamba checkpoint, the lock refs and
+    ``last_node`` are chosen together. That is a different change from a MIN
+    on a length vector, and it is not what this crash needs now that the
+    divergence SOURCE is pinned.
+    """
+
+    def test_the_check_refuses_rather_than_clamping(self):
+        import inspect
+
+        from sglang.srt.layers.dcp import prefix_lens_check
+
+        src = inspect.getsource(prefix_lens_check.assert_prefix_lens_rank_uniform)
+        self.assertIn("raise PrefixLensRankDivergence", src)
+        # No write-back of a reduced vector: the ballot is read, never applied.
+        self.assertNotIn("prefix_lens[:]", src)
+        self.assertNotIn("prefix_lens =", src)
+
+    def test_prepare_for_extend_does_not_min_reduce_the_vector(self):
+        import inspect
+
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        src = inspect.getsource(ScheduleBatch.prepare_for_extend)
+        head = src[: src.index("assert_prefix_lens_rank_uniform(prefix_lens)")]
+        tail = src[src.index("assert_prefix_lens_rank_uniform(prefix_lens)") :]
+        # The vector handed to the detector is the one built from the radix
+        # match, and it is not rewritten after the detector returns.
+        self.assertIn("prefix_lens = [len(r.prefix_indices) for r in reqs]", head)
+        self.assertNotIn("prefix_lens = [min(", tail)
+        self.assertNotIn("ReduceOp.MIN", tail)
+
+    def test_the_mamba_checkpoint_is_chosen_with_the_matched_depth(self):
+        """The fact that makes a bare length clamp unsafe: the SSM checkpoint
+        is bound to the node the match reached, not to a length."""
+        import inspect
+
+        from sglang.srt.mem_cache.unified_cache_components import mamba_component
+
+        src = inspect.getsource(mamba_component.MambaComponent.finalize_match_result)
+        self.assertIn("mamba_value = last_node.component_data", src)
+        self.assertIn("req.mamba_cow_src_index = mamba_value", src)
+
+
 if __name__ == "__main__":
     unittest.main()
