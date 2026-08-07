@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.boot_matrix.arms import ARMS, BASE_ENV, BASE_FLAGS, Arm, arm_by_name
-from sglang.srt.boot_matrix.check import Verdict, check_arm
+from sglang.srt.boot_matrix.check import Verdict, check_arm, check_pairing
 from sglang.srt.boot_matrix.effective import READY_MARKER
 
 logger = logging.getLogger(__name__)
@@ -498,6 +498,34 @@ def wait_for_vram_release(
 # ---------------------------------------------------------------------------
 # card-less surfaces
 # ---------------------------------------------------------------------------
+def _apply_pairings(verdicts: List[Verdict]) -> List[Verdict]:
+    """Fold every declared control leg into its treatment arm's verdict.
+
+    Pure over the verdict list, so it is unit-testable without a sweep. An arm
+    that declares no ``control_arm`` is returned untouched, and a control leg
+    that was not run in this sweep resolves to ``None`` -- which
+    :func:`check_pairing` treats as "no baseline", i.e. VOID, not PASS. That
+    asymmetry is the point: a sweep run with ``--only O_hicache_contention``
+    must not be able to report a contention number.
+    """
+    by_name = {v.arm: v for v in verdicts}
+    out: List[Verdict] = []
+    for v in verdicts:
+        try:
+            arm = arm_by_name(v.arm)
+        except KeyError:  # the A-vs-A band baseline is not a matrix arm
+            out.append(v)
+            continue
+        if arm.control_arm is None:
+            out.append(v)
+            continue
+        folded = check_pairing(v, by_name.get(arm.control_arm))
+        if folded is not v:
+            print(folded.render())
+        out.append(folded)
+    return out
+
+
 def render_plan() -> str:
     """The whole matrix as a table, plus the card-time estimate. Pure."""
     lines = ["boot-matrix arms (#349):", ""]
@@ -592,6 +620,16 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         )
         print(v.render())
         verdicts.append(v)
+
+    # PAIRING, AFTER every leg has run. An arm whose result is a DELTA has no
+    # result without its baseline, so a treatment that passed while its
+    # declared control did not -- or was not selected into this sweep at all --
+    # is folded down to VOID here rather than printed as a green number. Done
+    # in a second pass because the control may run AFTER the treatment in arm
+    # order, and a first-pass fold would then read a verdict that does not
+    # exist yet.
+    verdicts = _apply_pairings(verdicts)
+
     with open(os.path.join(args.out, "summary.json"), "w") as f:
         json.dump([v.to_json() for v in verdicts], f, indent=2)
     return 0 if all(v.status == 0 for v in verdicts) else 1

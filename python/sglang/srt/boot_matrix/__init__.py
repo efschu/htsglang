@@ -43,10 +43,13 @@ Verdict vocabulary is the GPU-battery one, for the same reason:
           A REJECT arm that refused cleanly at boot is a PASS.
 * FAIL -- the arm ran and the artifact shows a real cross-feature defect.
 * STOP -- a precondition or the environment is wrong; nothing was learned.
+* VOID -- the arm ran, resolved as declared and stayed coherent, but the
+          mechanism it exists to test never fired (a null soak). VOID replaces
+          a PASS only; a red arm stays red.
 """
 
 from sglang.srt.boot_matrix.arms import ARMS, Arm, arm_by_name
-from sglang.srt.boot_matrix.check import Verdict, check_arm
+from sglang.srt.boot_matrix.check import Verdict, check_arm, check_pairing
 from sglang.srt.boot_matrix.coherence import CoherenceResult, grade_probes
 from sglang.srt.boot_matrix.effective import EffectiveConfig, report_effective
 
@@ -56,6 +59,7 @@ __all__ = [
     "arm_by_name",
     "Verdict",
     "check_arm",
+    "check_pairing",
     "CoherenceResult",
     "grade_probes",
     "EffectiveConfig",

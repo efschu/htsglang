@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -1160,13 +1160,63 @@ def register_stack_strategy(strategy: StackStrategy) -> None:
     _STRATEGIES.insert(0, strategy)
 
 
+def unsupported_composition_message(
+    kvcache_name: str, component_names: Sequence[str]
+) -> str:
+    """The refusal text for a (pool class, component set) HiCache cannot build.
+
+    Pure and string-only so the wording is testable without a pool, a card or a
+    model. Split out from :func:`_select_strategy` for exactly that reason: the
+    thing worth pinning is what the message NAMES, and a test that has to build
+    a KV pool to read a sentence will not be written.
+    """
+    names = ", ".join(component_names)
+    head = (
+        f"--enable-hierarchical-cache is not supported for this model: no "
+        f"HiCache host-pool builder covers the composition "
+        f"kvcache={kvcache_name}, components=[{names}]."
+    )
+    # The GDN/mamba + SWA case is called out by name because it is the one a
+    # model can walk into without asking for anything exotic: `is_hybrid_ssm`
+    # and `is_hybrid_swa` are derived independently (mem_cache/
+    # kv_cache_builder.py:154-163) and a checkpoint that is BOTH -- linear
+    # attention plus sliding-window full-attention layers -- yields the
+    # component set {FULL, SWA, MAMBA}. Every built-in strategy matches on set
+    # EQUALITY (_MambaStrategy needs exactly {FULL, MAMBA}, _SwaStrategy
+    # exactly {FULL, SWA}) and _PlainKvStrategy explicitly declines both pool
+    # classes, so the three-component set has no builder at all.
+    if "MAMBA" in component_names and "SWA" in component_names:
+        head += (
+            " This checkpoint is hybrid on BOTH axes (linear/GDN state AND "
+            "sliding-window attention); the hierarchical cache has a host pool "
+            "for the KV+MAMBA pair and one for the KV+SWA pair, but none that "
+            "backs all three at once, so part of the cache would silently "
+            "never be backed."
+        )
+    return head + (
+        " Drop --enable-hierarchical-cache, or register a stack strategy for "
+        "this composition via "
+        "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+        "register_stack_strategy."
+    )
+
+
 def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrategy:
     for strategy in _STRATEGIES:
         if strategy.matches(kvcache, components):
             return strategy
-    raise AssertionError(
-        f"No matching HiCache strategy for kvcache={type(kvcache).__name__}, "
-        f"components={sorted(c.name for c in components)}"
+    # A ValueError, not an AssertionError. This is a refusal of a user
+    # CONFIGURATION, not a violated internal invariant, and the difference is
+    # not cosmetic: an AssertionError reads as "this build is broken" to every
+    # reader and every handler, and its old text named only two Python
+    # identifiers -- neither the flag responsible nor the way out. The fork's
+    # own rule for this class is that a guard refuses by NAME
+    # (boot_matrix/arms.py:24-27), and a refusal that does not say which flag
+    # to remove sends the reader into the pool assembler to find out.
+    raise ValueError(
+        unsupported_composition_message(
+            type(kvcache).__name__, sorted(c.name for c in components)
+        )
     )
 
 
