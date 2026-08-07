@@ -1152,6 +1152,31 @@ class Scheduler(
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
+        # #631: the last moment before a backend caches attn_dcp_size /
+        # attn_dcp_rank. If the DCP process group is not built yet the
+        # backend caches dcp_size=1 without failing, which silently
+        # disables the owner rule for the whole run. No-op whenever the
+        # group matches the boot recipe -- see dcp_group_guard.
+        from sglang.srt.distributed.dcp_group_guard import (
+            _worker_page_size,
+            assert_dcp_group_formed,
+            assert_pd_decode_dcp_supported,
+        )
+
+        assert_dcp_group_formed(
+            self.server_args, where="Scheduler.init_all_attention_backends"
+        )
+        assert_pd_decode_dcp_supported(
+            self.server_args,
+            # Resolved, not the CLI value: --page-size defaults to None and
+            # is filled in per backend. Read from the WORKER's allocator,
+            # which is the object disaggregation/decode.py later reads.
+            # self.token_to_kv_pool_allocator is deliberately NOT used: it
+            # is assigned after init_model_worker() returns, so at this
+            # point in the boot it does not exist yet and reading it would
+            # make this check silently unreachable.
+            page_size=_worker_page_size(self.tp_worker),
+        )
         self.tp_worker.init_attention_backends()
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()

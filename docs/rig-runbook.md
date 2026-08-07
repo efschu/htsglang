@@ -2384,6 +2384,90 @@ the same load), ~53 ms is the 98 MiB transfer, and ~136 ms is handshake and
 scheduling. On a satellite whose prefill rate is close to the main card's,
 this trade turns positive; the transport is not what stands in the way.
 
+### 4.8.1 Route A (#631): a PP prefill group into a token-sharded decode group
+
+Status: **not yet booted.** The guard and the boot script below are executed
+and tested; no rung of the ladder has run on a GPU. Everything in this
+section that is a measurement is marked as absent, not estimated.
+
+Boot script: `scripts/route_a_631_boot.sh {probe|L1|L2|L3}`. Start with
+`probe` -- it prints the NVML card map, runs the co-location prerequisite
+probe, and prints free VRAM, all without touching a GPU.
+
+**The handover needs no resharding step.** A prefill arm at `dcp_size=1`
+pairing with a decode arm at `dcp_size=3` is a supported pairing, not a
+mismatch. The decode side computes the owner rule itself
+(`disaggregation/decode.py:1108-1130`: `L % S in [lo, hi)`, compact row
+`(L // S) * (hi - lo) + (L % S - lo)`) and ships the result as
+`owned_ordinals` on `send_metadata` (`:1229`,
+documented at `disaggregation/base/conn.py:186-204`); the sender filters
+each chunk's source rows by it (`disaggregation/mooncake/conn.py:1502-1558`).
+The filter IS the reshard. The handshake deliberately does not compare
+tp/pp/dcp geometry (`disaggregation/common/conn.py:472-478`), and PP
+asymmetry is explicit: a decode arm at `pp_size=1` against a prefill arm at
+`pp_size=N` pulls from all N stages and multiplies its expected response
+count by N (`common/conn.py:574-581`).
+
+**Two flags are load-bearing rather than cosmetic.**
+
+- `--disaggregation-transfer-backend mooncake` on both arms. Only the
+  mooncake sender implements the `owned_ordinals` filter; nixl
+  (`nixl/conn.py:2514-2518`) and mori (`mori/conn.py:1702-1706`) refuse it
+  by name. It is also the default, so the risk is an inherited override,
+  not a missing flag.
+- `--rank-tp-ratio` plus `SGLANG_UNEVEN_DCP=1` on the **decode arm only**.
+  Without the uneven-TP replicated-KV layout, a DCP decode arm refuses
+  stock head-sharded receive at `decode.py:1131-1137`.
+
+Both refusals used to arrive on the first transferred request, i.e. after
+the server had reported healthy. They are now hoisted to boot by
+`distributed/dcp_group_guard.py::assert_pd_decode_dcp_supported`, called
+from `Scheduler.init_all_attention_backends`.
+
+**The precondition that costs days if it is missed.** `attn_dcp_size` and
+`attn_dcp_rank` are read ONCE in the attention-backend constructor
+(`layers/attention/triton_backend.py:680-681`) and cached. If the DCP
+process group does not exist at that moment, `runtime_context.py`'s
+`dcp_enabled` getter returns False and `attn_dcp_size` reports **1**
+instead of raising. `uneven_dcp_owner_bounds()` then returns `None` on
+every rank, the owner rule is bypassed, every rank writes every token to
+the same row and reads the whole sequence as local. No hang, no error,
+wrong output. `assert_dcp_group_formed` compares the resolved
+`server_args.dcp_size` against the value a backend built right now would
+cache, and refuses before any backend is constructed. It is a no-op
+whenever the two agree, which includes every default boot and both PP
+prefill arms.
+
+**#630 conflicts with the standing HiCache rule, and #630 wins here.**
+Section 3 requires disk HiCache in every serving boot. Do not apply that to
+a PP prefill arm: PP>1 x Disk-HiCache wedges silently at warmup and health
+stays 503 forever. If a PP prefill arm never comes up, check this before
+debugging anything else.
+
+**Full Route A (PP=3 prefill + TP=3/DCP=3 decode) does not fit this rig's
+venv.** Six ranks on three cards means two processes per card, which is
+`--disaggregation-topology colocated-process`, and that is refused here for
+two independent reasons (probe output, run 2026-08-07): runtime NCCL is
+**2.28.9**, below the required 2.30; and there is no MPS daemon
+(`/tmp/nvidia-mps` absent). The Docker image pins NCCL 2.30.7, so L3 needs
+that image plus `nvidia-cuda-mps-control -d` started before the ranks.
+Until then the two mechanisms are covered separately and cheaply:
+
+| Rung | Prefill | Decode | Covers | Runs today |
+|---|---|---|---|---|
+| L1 | PP=1, one 3080 | TP=2 / DCP=2, 5090 + other 3080 | owner rule + `owned_ordinals` handover | yes |
+| L2 | PP=2, both 3080s | TP=1, 5090 | PP stage fan-in, `pp_size` 2 -> 1 | yes |
+| L3 | PP=3 | TP=3 / DCP=3 | full Route A | Docker + MPS only |
+
+L1 is the one to run first: it exercises the mechanism the whole ticket is
+about. Use a small model (`Qwen3.5-4B`) -- the handover does not care about
+model size, and a 27B checkpoint does not fit a single 3080 prefill arm.
+
+**Reading the result.** A token-sharded handover that dropped or misfiled
+rows produces fluent, grammatical, wrong text -- not an error and not a
+crash. Judge the rung by the content of a deterministic long-form
+completion, never by the status code.
+
 ### 4.9 Pipeline parallelism CROSS-RIG, stage 1 on rig 2 (#201 slice 2)
 
 The stage boundary of section 4.7, moved onto the 40G line: stage 0 on a rig-1
