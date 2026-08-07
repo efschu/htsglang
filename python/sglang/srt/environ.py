@@ -1236,6 +1236,19 @@ class Envs:
     # peak), so a boot's external RAM monitor can be cross-checked against what
     # the code thinks it is holding. Off by default; pure logging.
     SGLANG_MOE_STAGING_TRACE = EnvBool(False)
+    # #396(a): materialize COLD experts on FIRST TOUCH instead of reading every
+    # one of them into the pinned host tier at load time. The tier is still
+    # allocated at load (so every byte figure and capacity check is unchanged);
+    # only the reads move to the first router hit for that expert, behind the
+    # same ``pool[row]`` accessor the #125 prefetch and the #394 cold shard
+    # already use -- neither consumer gains a branch. Requires a door that can
+    # hand ``stage_experts_into_tiers`` a per-expert ``ExpertFileRef``; a door
+    # that cannot stages eagerly regardless of this flag, so turning it on can
+    # never make a boot read LESS than it can prove it is able to re-read.
+    # Off by default: a lazy tier trades a shorter boot for a first-token stall
+    # per cold expert and for a hard dependency on the checkpoint staying in
+    # place, and neither is a default anybody should get without asking.
+    SGLANG_EXPERT_LAZY_STAGING = EnvBool(False)
     # Dump prefix; each rank writes "<prefix>.<rank_tag>.json". Default /tmp.
     SGLANG_EXPERT_STATS_PATH = EnvStr("")
     # Additionally dump every N seconds (0 = only on exit / SIGUSR2).

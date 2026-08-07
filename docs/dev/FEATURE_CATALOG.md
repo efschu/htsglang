@@ -3227,6 +3227,52 @@ taxonomy and the global importance ladder.
   GATE `SGLANG_GGUF_STREAM_TRIM_SOFT_GIB`, `environ.py:1891`, **default 0.0
   = off**. Its budget model was wrong until #537 — see §16 for the pinned
   cgroup-accounting correction before reusing the arithmetic.
+- **LazySpillPool / ExpertFileRef (#396a)** — a cold-expert host tier whose
+  ROWS materialize on first touch. The pool is allocated at load (so every
+  byte figure, ledger entry and capacity check is unchanged); only the reads
+  move to the first router hit. Substitutable for the plain pinned tensor:
+  `pool[row]`, `numel`, `element_size`, `shape`, `dtype`, `is_pinned` all
+  answer, so the #125 prefetch and the #394 cold shard consume it with no
+  branch. Per-row once-latch (concurrent first touches read exactly once and
+  every waiter observes the finished row); a vanished or truncated file raises
+  `LazyExpertUnavailable` rather than yielding zeros, and a failed row is
+  reported NOT materialized.
+  ENTRY `layers/moe/lazy_expert_staging.py:239` (class), accessor `:318`,
+  latch `:358`, ref `:89`, expert-major ref derivation `:176`, gate helper
+  `:72`.
+  REFUSES the capturable spill pool (`SGLANG_MOE_OFFLOAD_CUDA_GRAPH`) by name
+  at `layers/moe/expert_offload.py:2440` (`device_view_of_pinned`): a captured
+  graph reads the pool by ADDRESS and would bypass the accessor, so the pool
+  deliberately exposes no `data_ptr` / `is_contiguous` either.
+  GATE `SGLANG_EXPERT_LAZY_STAGING`, `environ.py:1251`, **default off**. The
+  staging door additionally requires a caller-supplied ref provider
+  (`layers/moe/expert_offload.py:1553`), so a door that cannot describe its
+  bytes on disk stages eagerly no matter what the flag says.
+  CONSUMERS `layers/moe/expert_offload.py:1469` (`_stage_spill_lazily`). NOTE
+  the standing scope limit before wiring a new door: both production doors
+  today run AFTER the loader has already read the experts (§3), so they have
+  nothing left to defer — see the #396 scope verdict there.
+- **placement_overrides (#396b)** — the declarative `regex=target` surface over
+  the residency solve (llama.cpp `-ot` in shape, constraints-into-the-solve in
+  behaviour). Parse + card resolution through the #397 IdentityMap + tier-id
+  validation + conflict refusal + the feasibility arithmetic that turns a rule
+  into a resident/host id split.
+  ENTRY `planner/placement_overrides.py:230` (`parse_placement_overrides`),
+  `:342` (`resolve_expert_constraints`), `:423` (`apply_expert_constraints`),
+  `:279` (`first_match` — FIRST match wins, the operator's order is the
+  precedence), `:312` (`expert_tensor_names`), refusal `:63`.
+  GATE: none at module level. The CLI surface is
+  `server_args.py:2567` (`--expert-placement-override`, repeatable, default
+  None); the solve reads it at `planner/placement.py:1665` and refuses when no
+  resident fraction is pinned, because there is then no residency split for a
+  constraint to act on.
+  CONSUMERS `planner/placement.py:1665`. Reuse this rather than adding a
+  second name-matching surface: the conflict rules (one expert, one tier; an
+  expert cannot leave its rank's card) live here once. NOTE a `disk:` target
+  parses and validates but the solve REFUSES it (`:442`): the residency solve
+  has two classes, GPU-resident and host cold tier, and folding a disk target
+  into the host set would report host RAM for mass asked to sit on NVMe. That
+  refusal is the hook a future disk rung replaces.
 - **hibernate (#89)** — park model weights to disk and restore them, manifest
   -gated on model identity and on the cards being the same ones.
   ENTRY `model_loader/hibernate.py:474` (`park_weights_to_disk`), `:619`

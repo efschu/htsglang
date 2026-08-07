@@ -57,7 +57,15 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from sglang.srt.planner.placement_overrides import (
+    PlacementOverrideConflict,
+    apply_expert_constraints,
+    describe_overrides,
+    parse_placement_overrides,
+    resolve_expert_constraints,
+)
 
 __all__ = [
     "compute_placement",
@@ -136,6 +144,12 @@ class PlacementFlags:
     #: report the full routed pool as the offloadable class without pinning
     #: specific indices.
     moe_resident_expert_fraction: Optional[float] = None
+    #: #396(b): declarative ``regex=target`` placement rules, in command-line
+    #: order (first match wins). Fed to the solve as CONSTRAINTS -- the plan is
+    #: still computed and still checked, and an unmeetable rule is refused by
+    #: name rather than relaxed. ``None`` (the default, and what every caller
+    #: passes today) leaves the offload rule field-for-field what it was.
+    expert_placement_override: Optional[List[str]] = None
     #: Optional physical-card inventory {gpu_index: total_mib} (or name) so the
     #: per-card breakdown can show the card name + a physical-fit check. Purely
     #: informational; never required.
@@ -237,6 +251,15 @@ class PlacementFlags:
                 float(d["moe_resident_expert_fraction"])
                 if d.get("moe_resident_expert_fraction") is not None
                 else None
+            ),
+            expert_placement_override=(
+                [str(x) for x in d["expert_placement_override"]]
+                if isinstance(d.get("expert_placement_override"), (list, tuple))
+                else (
+                    [str(d["expert_placement_override"])]
+                    if d.get("expert_placement_override")
+                    else None
+                )
             ),
             card_total_mib=ctm,
             card_name=(
@@ -366,6 +389,12 @@ class OffloadRankRule:
     host_mib: float
     resident_expert_count: int
     resident_mib: float
+    #: #396(b): the EXPLICIT id lists, populated only when placement overrides
+    #: are in force. Without overrides the host set is the numbered tail and
+    #: ``host_expert_start..host_expert_end`` says everything there is to say,
+    #: so these stay ``None`` and the rule serializes exactly as it did.
+    resident_ids: Optional[Tuple[int, ...]] = None
+    host_ids: Optional[Tuple[int, ...]] = None
 
 
 @dataclasses.dataclass
@@ -1560,6 +1589,24 @@ def _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions):
     return [x for x in out if x["mib"] > 0.005 or x["id"] in ("kv", "ovh")]
 
 
+def _identity_map_or_none():
+    """The live #397 IdentityMap, or ``None`` on a host with no NVML.
+
+    A planner run is frequently a DESK run -- the wizard sizing a rig that is
+    not this box -- so the absence of NVML must not make a plan unanswerable.
+    What it costs is the card-exists check on ``gpu:`` targets; the grammar,
+    the conflict rules and the feasibility arithmetic are all unaffected.
+    ``allow_cuda_init`` stays False: a planner must not create a CUDA context
+    (registry/rank_cards.py:43 on why that is a few hundred MiB).
+    """
+    try:
+        from sglang.srt.registry.nvml import identity_map
+
+        return identity_map()
+    except Exception:  # noqa: BLE001 - no NVML is a legal desk state
+        return None
+
+
 def _compute_offload(
     model, flags, ffn_vector, rank_gpu, experts, mtp, num_experts, notes
 ):
@@ -1603,6 +1650,38 @@ def _compute_offload(
     bpp = model.families["mlp"].bytes_per_param
     per_expert_bytes = 3 * H * moe_i * bpp * model.n_layers
 
+    # #396(b): operator constraints enter HERE -- inside the solve, after the
+    # resident fraction has decided how many slots exist, and before any rule
+    # is published. They can move WHICH experts fill those slots; they cannot
+    # create slots, which is why apply_expert_constraints refuses rather than
+    # widening the fraction behind the operator's back.
+    #
+    # The identity map is resolved ONLY when there is something to resolve.
+    # Building it queries NVML, and a planner solve is run in tight loops by
+    # the wizard and the explorer; paying an NVML sweep per solve on the
+    # default path -- where no override exists to check a card name against --
+    # would be a cost this feature has no right to impose on plans that do not
+    # use it.
+    override_specs = getattr(flags, "expert_placement_override", None)
+    overrides = (
+        parse_placement_overrides(override_specs, identity=_identity_map_or_none())
+        if override_specs
+        else ()
+    )
+    if overrides and fracs is None:
+        raise PlacementOverrideConflict(
+            "placement overrides were given but no resident expert fraction "
+            "is pinned, so this plan has no residency split for them to "
+            "constrain: every expert is GPU-resident and the overrides would "
+            "silently do nothing. Supply moe_resident_expert_fraction (or "
+            "SGLANG_MOE_RESIDENT_EXPERT_FRACTION) alongside them."
+        )
+    if overrides:
+        notes.append(
+            "placement overrides (#396) in force as CONSTRAINTS on the expert "
+            "residency solve: " + describe_overrides(overrides)
+        )
+
     per_rank = []
     total_host = 0.0
     for r in range(tp):
@@ -1610,11 +1689,36 @@ def _compute_offload(
         e = experts[r] if experts else None
         count = e.num_experts if e else 0
         rank_frac = fracs[r] if fracs else None
+        resident_ids = host_ids = None
         if rank_frac is not None and e is not None:
             resident = math.ceil(rank_frac * count)
             host_count = count - resident
             host_start = e.expert_start + resident
             host_end = e.expert_end
+            if overrides:
+                constraints = resolve_expert_constraints(
+                    overrides,
+                    rank=r,
+                    gpu_index=rank_gpu[r],
+                    expert_start=e.expert_start,
+                    expert_end=e.expert_end,
+                    num_layers=model.n_layers,
+                )
+                if not constraints.is_empty:
+                    resident_ids, host_ids = apply_expert_constraints(
+                        constraints, e.expert_start, e.expert_end, resident
+                    )
+                    resident = len(resident_ids)
+                    host_count = len(host_ids)
+                    # The tail range is only meaningful while the host set IS
+                    # a tail. Under overrides it is an explicit id list, and
+                    # reporting a range that no longer describes it would be
+                    # worse than reporting none.
+                    contiguous = list(host_ids) == list(
+                        range(e.expert_end - host_count, e.expert_end)
+                    )
+                    host_start = e.expert_end - host_count if contiguous else None
+                    host_end = e.expert_end if contiguous else None
             host_mib = host_count * per_expert_bytes / _MIB
             resident_mib = resident * per_expert_bytes / _MIB
         else:
@@ -1635,6 +1739,8 @@ def _compute_offload(
                 host_mib=host_mib,
                 resident_expert_count=resident,
                 resident_mib=resident_mib,
+                resident_ids=resident_ids,
+                host_ids=host_ids,
             )
         )
 

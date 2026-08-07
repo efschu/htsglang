@@ -1432,8 +1432,82 @@ def allocate_spill_pool(spill_ids, row_shape, dtype, cold_tier=None, param_attr=
     return pool
 
 
+# ===========================================================================
+# #396(a): ON-DEMAND cold staging -- and the honest limit of its reach today.
+#
+# The mechanism below defers the cold tier's READS to first touch. What it
+# cannot do is make a door defer a read the LOADER has already performed, and
+# every production door into this offload runs after exactly that:
+#
+#   * GGUF materialization door -- ``fused_moe_triton/layer.py:2774`` calls
+#     ``stage_experts_into_tiers(plan, get, ...)`` where ``get`` closes over
+#     ``param.expert_data_map`` (read at ``:2712``, built by
+#     ``_gguf_expert_source`` at ``:2599``). Filling that map IS the load pass:
+#     by the time the plan exists, every expert is already in host RAM. This
+#     is the #123 GGUFUninitializedParameter wall -- experts materialize only
+#     in postprocess -- and deferring here would save no read at all.
+#   * GGUF streaming door (#391c) -- ``StreamingExpertStager.submit``
+#     (``:1869``) is handed a tensor that has already left the weight stream.
+#     The read happened upstream of the call.
+#   * fp8 / GPTQ / AWQ repack door -- ``presplit_expert_offload_after_repack``
+#     from ``layers/quantization/fp8.py:2317``,
+#     ``gptq/schemes/gptq_moe.py:156`` / ``:454``,
+#     ``awq/schemes/awq_moe.py:186``, all inside
+#     ``process_weights_after_loading``: a real ``[E, ...]`` stack exists and
+#     is merely split, so again there is nothing left to defer.
+#
+# End-to-end load-time saving therefore needs the LOADER to stop reading cold
+# experts, not this function to stop copying them -- a genuinely invasive
+# loader change, deliberately not attempted here. What IS delivered is the
+# mechanism plus the one door parameter (``lazy_refs``) it plugs into, so that
+# change becomes "derive refs and pass them" rather than a redesign, and
+# ``expert_refs_from_expert_major_tensor`` already does the derivation for the
+# expert-major layout every one of those doors uses.
+# ===========================================================================
+
+
+def _stage_spill_lazily(plan, lazy_refs, release, cold_tier, param_attr):
+    """#396(a): allocate the cold tier and leave its rows to first touch.
+
+    Same allocation, same row order, same ``spill_ids[j] -> row j`` mapping as
+    the eager loop below -- so ``register_load_time_presplit``'s byte tally,
+    the #394 shard's row layout and the fetch path's ``pool[row]`` are all
+    unchanged. What is skipped is the ``source(expert_id)`` call per cold
+    expert, i.e. exactly the read this feature exists to defer.
+
+    ``release`` still runs for every cold expert. A door that is holding the
+    loader's copy must let go of it here whether or not the bytes were read;
+    trading the load-time read for a retained host copy would be a strictly
+    worse boot.
+    """
+    from sglang.srt.layers.moe.lazy_expert_staging import LazySpillPool
+
+    if not plan.spill_ids:
+        return None
+    refs = {int(e): lazy_refs(int(e)) for e in plan.spill_ids}
+    first = refs[int(plan.spill_ids[0])]
+    storage = allocate_spill_pool(
+        plan.spill_ids,
+        first.shape,
+        first.dtype,
+        cold_tier=cold_tier,
+        param_attr=param_attr,
+    )
+    pool = LazySpillPool(storage, plan.spill_ids, refs)
+    if release is not None:
+        for expert_id in plan.spill_ids:
+            release(expert_id)
+    return pool
+
+
 def stage_experts_into_tiers(
-    plan: ExpertStagingPlan, source, out, release=None, cold_tier=None, param_attr=""
+    plan: ExpertStagingPlan,
+    source,
+    out,
+    release=None,
+    cold_tier=None,
+    param_attr="",
+    lazy_refs=None,
 ):
     """Fill the two tiers from a per-expert ``source(expert_id) -> Tensor``.
 
@@ -1455,6 +1529,16 @@ def stage_experts_into_tiers(
     quantization blocks (Q4_K 144 B / 256 values, Q6_K 210 B / 256 values), so
     ANY split other than "whole experts on the expert axis" would cut a block
     in half. The expert axis is the one axis with no block structure on it.
+
+    ``lazy_refs`` (#396a) is the OPT-IN door to on-demand cold staging: a
+    ``lazy_refs(expert_id) -> ExpertFileRef`` telling the cold tier where that
+    expert's bytes live, so the rows can be read on first touch instead of
+    here. It is consulted only when ``SGLANG_EXPERT_LAZY_STAGING`` is on AND a
+    caller passed one -- both conditions, because a door that cannot describe
+    its bytes on disk must keep staging eagerly no matter what the flag says.
+    The RESIDENT half is never lazy: those experts are read on the first
+    forward regardless, so deferring them would buy nothing and would put a
+    disk read inside the device buffer's fill.
     """
     import torch
 
@@ -1465,6 +1549,18 @@ def stage_experts_into_tiers(
             release(expert_id)
     if R != len(plan.resident_ids):  # defensive: plan invariant
         raise RuntimeError("staging plan resident_ids length != resident_count")
+
+    if lazy_refs is not None:
+        from sglang.srt.layers.moe.lazy_expert_staging import (
+            lazy_expert_staging_enabled,
+        )
+
+        if lazy_expert_staging_enabled():
+            spill = _stage_spill_lazily(plan, lazy_refs, release, cold_tier, param_attr)
+            for expert_id in plan.delegated_ids:
+                if release is not None:
+                    release(expert_id)
+            return spill
 
     spill = None
     for row, expert_id in enumerate(plan.spill_ids):
@@ -2350,6 +2446,26 @@ def device_view_of_pinned(pinned):  # pragma: no cover - requires CUDA
     """
     import torch
 
+    # #396(a): a lazy cold tier CANNOT be handed out as a raw device view. The
+    # whole point of this function is to bake the pool's ADDRESS into a CUDA
+    # graph, and a captured graph then reads that memory directly -- it never
+    # goes through ``LazySpillPool.__getitem__``, so a row nobody happened to
+    # touch first would be read as allocation garbage, at full speed, with no
+    # error anywhere. That is precisely the silent-wrong-expert outcome the
+    # lazy tier's loud-failure rule exists to prevent, so the combination is
+    # refused here rather than left to produce plausible output.
+    from sglang.srt.layers.moe.lazy_expert_staging import LazySpillPool
+
+    if isinstance(pinned, LazySpillPool):
+        raise RuntimeError(
+            "device_view_of_pinned: the cold expert tier is lazily staged "
+            "(SGLANG_EXPERT_LAZY_STAGING), which cannot be combined with the "
+            "capturable spill pool (SGLANG_MOE_OFFLOAD_CUDA_GRAPH): a captured "
+            "graph reads the pool's memory by address and would bypass the "
+            "materialize-on-first-touch accessor entirely, returning "
+            "uninitialized rows for every expert not touched before capture. "
+            "Turn one of the two off."
+        )
     if not pinned.is_pinned():
         raise RuntimeError("device_view_of_pinned: tensor is not page-locked")
     if not pinned.is_contiguous():
