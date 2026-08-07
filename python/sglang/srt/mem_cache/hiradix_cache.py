@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -26,6 +27,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+)
+from sglang.srt.mem_cache.hicache_collective import (
+    HiCacheCollectiveError,
+    bounded_recv,
+    bounded_wait,
+    collective_rank_desc,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -113,6 +120,13 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+        # Deadline for every cross-rank control collective issued from this
+        # cache (#630). Set before the first collective below
+        # (_symmetrize_prefetch_capacity) can run. Without it a dead TP peer or
+        # a PP rank that never posts the matching receive parks this rank until
+        # the gloo group's two-hour default timeout expires -- the PP + disk
+        # HiCache warmup wedge, where health stays 503 with nothing logged.
+        self.collective_timeout_s = envs.SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S.get()
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
@@ -214,14 +228,41 @@ class HiRadixCache(RadixCache):
 
         super().__init__(params=params)
 
-    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+    def _wait_bounded(self, work, label: str) -> None:
+        """Wait for ``work`` with a deadline, or raise a named error.
+
+        Same mechanism and rationale as ``UnifiedRadixCache._wait_bounded``;
+        both delegate to ``hicache_collective.bounded_wait`` so there is one
+        implementation rather than two that drift (#630 was that drift: this
+        class kept raw blocking calls after #259 bounded the unified one).
+
+        The healthy case costs nothing measurable: a CPU collective between
+        local ranks completes inside the initial spin window, so no sleep is
+        ever reached.
+        """
+        bounded_wait(work, label, self.collective_timeout_s, collective_rank_desc(self))
+
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op, label: str = "hicache"):
         reduced = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
+        for name, group in (
+            ("attn_cp", self.attn_cp_group),
+            ("attn_tp", self.attn_tp_group),
+        ):
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.all_reduce(tensor, op=op, group=group)
+                self._wait_bounded(
+                    torch.distributed.all_reduce(
+                        tensor, op=op, group=group, async_op=True
+                    ),
+                    f"{label}/all_reduce/{name}",
+                )
                 reduced = True
         if not reduced and self.tp_world_size > 1:
-            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+            self._wait_bounded(
+                torch.distributed.all_reduce(
+                    tensor, op=op, group=self.tp_group, async_op=True
+                ),
+                f"{label}/all_reduce/tp",
+            )
 
     def _hicache_prefetch_symmetric(self) -> bool:
         """True when the per-rank host pools are asymmetric and the prefetch
@@ -283,23 +324,36 @@ class HiRadixCache(RadixCache):
             # The gate above is rank-uniform (config + uneven_dcp_active), so a
             # rank-local early return HERE would leave the peers alone in the
             # all_reduce below. Name it instead of hanging.
-            raise RuntimeError(
+            raise HiCacheCollectiveError(
                 "cache controller has no mem_pool_host while prefetch "
                 "symmetrization is active; the peer ranks are entering the "
                 "capacity all_reduce and this rank cannot."
             )
         size_tensor = torch.tensor([int(cc.mem_pool_host.size)], dtype=torch.long)
-        self._all_reduce_attn_groups(size_tensor, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(
+            size_tensor,
+            torch.distributed.ReduceOp.MIN,
+            label="symmetrize_prefetch_capacity",
+        )
         cc.prefetch_capacity_limit = int(0.5 * int(size_tensor[0].item()))
 
-    def _barrier_attn_groups(self):
+    def _barrier_attn_groups(self, label: str = "hicache"):
         waited = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
+        for name, group in (
+            ("attn_cp", self.attn_cp_group),
+            ("attn_tp", self.attn_tp_group),
+        ):
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.barrier(group=group)
+                self._wait_bounded(
+                    torch.distributed.barrier(group=group, async_op=True),
+                    f"{label}/barrier/{name}",
+                )
                 waited = True
         if not waited and self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+            self._wait_bounded(
+                torch.distributed.barrier(group=self.tp_group, async_op=True),
+                f"{label}/barrier/tp",
+            )
 
     def _drain_async_work(self):
         """
@@ -308,12 +362,22 @@ class HiRadixCache(RadixCache):
         Called at the start of each event round, so work_list holds the sends
         accumulated since the last round. This bounds it and applies
         backpressure when a downstream PP rank lags. Scheduler thread only.
+
+        Bounded for the same reason as every other collective here (#630):
+        these are isends on the PP gloo ``cpu_group``, and a downstream PP rank
+        that never posts the matching receive parks this rank until the group's
+        two-hour timeout expires.
         """
-        for work in self.work_list:
-            work.wait()
+        for i, work in enumerate(self.work_list):
+            self._wait_bounded(work, f"pp_sync/isend[{i}]->pp{self.pp_rank + 1}")
         self.work_list.clear()
 
-    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
+    def _all_reduce(
+        self,
+        data: torch.Tensor,
+        tp_reduce_op: torch.distributed.ReduceOp,
+        label: str = "hicache",
+    ):
         """
         Synchronize data across all TP and PP ranks.
 
@@ -323,7 +387,7 @@ class HiRadixCache(RadixCache):
         Must be called in the scheduler thread.
         """
         if self.pp_rank == 0:
-            self._all_reduce_attn_groups(data, tp_reduce_op)
+            self._all_reduce_attn_groups(data, tp_reduce_op, label=label)
         self._pp_sync(data)
 
     def _pp_sync(self, data: torch.Tensor) -> None:
@@ -353,11 +417,17 @@ class HiRadixCache(RadixCache):
         if self.pp_size <= 1 or self.pp_group is None:
             return
         if self.pp_rank > 0:
-            torch.distributed.recv(
+            # Bounded via irecv rather than recv: recv has no async form and no
+            # timeout, so every PP rank above the first would otherwise block
+            # here without a deadline. See hicache_collective.bounded_recv.
+            bounded_recv(
                 data,
-                group_src=self.pp_rank - 1,
                 group=self.pp_group,
+                group_src=self.pp_rank - 1,
                 tag=P2PTag.HIRADIX_PP_SYNC,
+                label=f"pp_sync/recv<-pp{self.pp_rank - 1}",
+                timeout_s=self.collective_timeout_s,
+                rank_desc=collective_rank_desc(self),
             )
         if self.pp_rank + 1 < self.pp_size:
             # Make a copy of data, so that the caller is safe to modify `data` after this call.
@@ -1123,7 +1193,9 @@ class HiRadixCache(RadixCache):
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(
+            finish_count_tensor, torch.distributed.ReduceOp.MIN, label="writing_check"
+        )
         finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
@@ -1143,7 +1215,9 @@ class HiRadixCache(RadixCache):
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(
+            finish_count_tensor, torch.distributed.ReduceOp.MIN, label="loading_check"
+        )
         finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
@@ -1595,7 +1669,9 @@ class HiRadixCache(RadixCache):
 
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce_attn_groups(
-            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+            storage_hit_count_tensor,
+            torch.distributed.ReduceOp.MIN,
+            label="query_storage_hit_length",
         )
         storage_hit_count = storage_hit_count_tensor.item()
         storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
@@ -1638,7 +1714,11 @@ class HiRadixCache(RadixCache):
             ],
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(
+            qsizes,
+            torch.distributed.ReduceOp.MIN,
+            label="drain_storage_control_queues",
+        )
 
         n_revoke, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
@@ -1688,7 +1768,9 @@ class HiRadixCache(RadixCache):
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        self._all_reduce_attn_groups(
+            states, torch.distributed.ReduceOp.MAX, label="can_terminate_prefetch"
+        )
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
         # the operation should be terminated if it is already terminated on any TP worker
@@ -1723,7 +1805,9 @@ class HiRadixCache(RadixCache):
         # Synchronize workers before mutating host cache tree state.
         completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
         self._all_reduce_attn_groups(
-            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+            completed_tokens_tensor,
+            torch.distributed.ReduceOp.MIN,
+            label="check_prefetch_progress",
         )
         min_completed_tokens = completed_tokens_tensor.item()
         fetched_key = prefetch_key[:min_completed_tokens]
@@ -1883,7 +1967,11 @@ class HiRadixCache(RadixCache):
             vote = torch.tensor(
                 [1 if (eligible and host_indices is not None) else 0], dtype=torch.int
             )
-            self._all_reduce_attn_groups(vote, torch.distributed.ReduceOp.MIN)
+            self._all_reduce_attn_groups(
+                vote,
+                torch.distributed.ReduceOp.MIN,
+                label="prefetch_participation_vote",
+            )
             if int(vote[0].item()) == 0:
                 if host_indices is not None:
                     self.cache_controller.append_host_mem_release(host_indices)
@@ -2113,7 +2201,7 @@ class HiRadixCache(RadixCache):
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        self._barrier_attn_groups()
+        self._barrier_attn_groups(label="release_aborted_request")
         last_host_node.release_host()
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
