@@ -29,21 +29,52 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     # Single-node hetero PD v1 (#99): speculative decoding is not supported in
     # disaggregation mode on this fork -- the MTP/EAGLE draft KV pool is
     # uneven-head-sharded (not DCP token-sharded), so its transfer would need
-    # general uneven head reslicing. Auto-disable with a warning rather than
-    # hard-erroring so shared launch configs keep working (design ruling).
+    # general uneven head reslicing.
+    #
+    # #631a turned this from an auto-disable into a REFUSAL. The auto-disable
+    # was silent in the only way that matters: a decode arm launched with
+    # --speculative-algorithm NEXTN came up WITHOUT it, produced correct
+    # output, and was merely slower. Nothing downstream can tell that apart
+    # from a slow rig, so the loss of the decode optimum survives every smoke
+    # test. A configuration that cannot be honoured is refused by name
+    # instead. SGLANG_PD_AUTO_DISABLE_SPEC=1 restores the old behaviour for
+    # shared launch configs that feed one flagset to both a PD and a non-PD
+    # server, which was the original ruling's reason.
     if (
         server_args.disaggregation_mode in ("prefill", "decode")
         and server_args.speculative_algorithm is not None
     ):
-        logger.warning(
-            "PD disaggregation: speculative decoding (--speculative-algorithm "
-            "%s) is not supported in disaggregation mode on this fork and has "
-            "been DISABLED for this server. Run without --disaggregation-mode "
-            "to use speculative decoding.",
-            server_args.speculative_algorithm,
-        )
-        server_args.speculative_algorithm = None
-        server_args.speculative_draft_model_path = None
+        if envs.SGLANG_PD_AUTO_DISABLE_SPEC.get():
+            logger.warning(
+                "PD disaggregation (%s arm): speculative decoding "
+                "(--speculative-algorithm %s) is not supported in "
+                "disaggregation mode on this fork and has been DISABLED for "
+                "this server, because SGLANG_PD_AUTO_DISABLE_SPEC=1. This "
+                "server will decode WITHOUT speculation.",
+                server_args.disaggregation_mode,
+                server_args.speculative_algorithm,
+            )
+            server_args.speculative_algorithm = None
+            server_args.speculative_draft_model_path = None
+        else:
+            raise ValueError(
+                f"--speculative-algorithm "
+                f"{server_args.speculative_algorithm} cannot be honoured on "
+                f"the '{server_args.disaggregation_mode}' arm of a PD pair: "
+                "speculative decoding is not supported in disaggregation "
+                "mode on this fork, because the MTP/EAGLE draft KV pool is "
+                "uneven-head-sharded (not DCP token-sharded) and "
+                "transferring it across the PD boundary would need general "
+                "uneven head reslicing. This is refused rather than "
+                "auto-disabled: a server that quietly drops speculation "
+                "still answers correctly and only runs slower, so the loss "
+                "would not surface in any smoke test. Either launch this arm "
+                "WITHOUT --speculative-algorithm (and accept no speculation "
+                "on it), or run a monolithic server without "
+                "--disaggregation-mode to keep speculation. To restore the "
+                "old auto-disable for a shared launch config, set "
+                "SGLANG_PD_AUTO_DISABLE_SPEC=1."
+            )
 
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:

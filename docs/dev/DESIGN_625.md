@@ -304,6 +304,144 @@ script is mandatory), and
 `--disaggregation-decode-enable-radix-cache` is a hard ValueError for
 Mamba/SSM models, which Qwen3.6-27B is.
 
+## 7a. Route A guards (#631a/#631b), and the slice-2 variant choice
+
+### Guard 1 — model identity at the PD handshake
+
+`try_ensure_parallel_info` (`disaggregation/common/conn.py:411-454`, sole call
+site `decode.py:788`) compares exactly two fields: `page_size` and
+`kv_cache_dtype`. Nothing else. Two arms holding DIFFERENT WEIGHTS pair
+happily and produce fluent nonsense (#212), which is the worst failure mode
+available to us because the output looks like output.
+
+**The guard is half-built already, and that decides the design.** The fork's
+own NCCL transport carries `TransportIdentity.model_identity_hash`
+(`disaggregation/nccl/contract.py:146`), a sha256 over model path, revision,
+dtype, quantization and kv_cache_dtype, and it explicitly REUSES
+`compute_model_identity_hash` from `mem_cache.hicache_storage` rather than
+inventing a hash. So the correct slice is not "add a checksum" but "lift the
+existing identity into the transport-independent handshake": add the hash to
+`PrefillServerInfo` (`common/conn.py:67-90`, which today carries only topology
+fields) and compare it in `try_ensure_parallel_info` beside the two existing
+checks, with the same refusal shape. One hash function, three transports, one
+place to compare.
+
+Refusal must name both hashes and the likely cause (different checkpoints, or
+the same checkpoint at different revisions/quantizations), because the operator
+symptom — plausible but wrong text — gives no hint on its own.
+
+#### Guard 1, decided: lift ONE field, and say plainly what stays unwired
+
+`TransportIdentity` is a built-but-unwired class (#421): outside
+`nccl/contract.py` the only references are re-exports in
+`nccl/__init__.py`. Nothing calls `identity_from_args` or
+`assert_compatible`. The temptation is to wire the whole thing into
+`try_ensure_parallel_info` and close the #212 trap in one move. **That would
+be wrong, and the reason is a constraint on Route A that we had not seen.**
+
+`COMPARED` deliberately omits `tp_size` and `pp_size` — PD is expected to pair
+arms of differing TP, because `KVArgs.state_dim_per_tensor` /
+`state_dim_offsets` let the sender re-slice the STATE/HEAD axis. But
+`COMPARED` **does** include `dcp_size` and `row_ownership`, and its own
+docstring explains why that exclusion does not extend to them: DCP shards the
+TOKEN axis, slot L lives on rank `L % S` at row `L // S`, and no offset table
+re-derives row ownership. "A `dcp_size=1` prefill and a `dcp_size=3` decode
+have entirely different row->token mappings, so a transfer between them moves
+bytes to rows that mean something else."
+
+**That is exactly the pair Route A proposes.** Our production decode group
+auto-sets `dcp_size=3` (`= tp_size`, token-axis KV sharding, confirmed in the
+live serving boot log), and a PP prefill group at `tp_size=1` has
+`dcp_size=1`. So wiring `assert_compatible` wholesale would refuse the Route A
+pair — and by the contract's own reasoning that refusal would be CORRECT, not
+a false positive. The KV handover from a non-DCP prefill group into a
+DCP-sharded decode group is not a plain transfer; it needs a token-axis
+remap that the common PD path does not perform today.
+
+Decision, therefore:
+
+- **Lift only `model_identity_hash`** into the common handshake: add it to
+  `PrefillServerInfo` (`common/conn.py:67-90`), populate it at registration
+  next to `page_size` / `kv_cache_dtype` (`:1518-1519`), and compare it in
+  `try_ensure_parallel_info` immediately after the existing two checks
+  (`:449`) and before `_resolve_rank_mapping` (`:451`). This closes the #212
+  trap — two arms with different weights stop pairing — and changes refusal
+  behaviour for existing PD users only in the case where they were already
+  broken.
+- **The rest of `TransportIdentity` stays UNWIRED**, and this document says so
+  rather than letting it look adopted: `kv_dtype` and `page_size` are already
+  covered by the two existing checks, and `total_kv_head_num`, `head_dim`,
+  `state_types`, `dcp_size` and `row_ownership` remain compared nowhere on the
+  common path.
+- **New Route A blocker, filed as an open risk (R6):** the token-axis remap
+  above. Wiring `dcp_size`/`row_ownership` into the common path is the RIGHT
+  end state, but it must land together with either a remap in the handover or
+  a decision to run the decode group without DCP — otherwise it converts a
+  silent wrong-bytes bug into a refusal that blocks the feature. Sequencing
+  that is a decision for the coordinator, not something to slip into a guard
+  commit.
+
+### Guard 2 — decode-arm radix cache on a hybrid model
+
+`--disaggregation-decode-enable-radix-cache` raises for SSM models at
+`mem_cache/kv_cache_builder.py:195-199` (`is_hybrid_ssm`). Qwen3.6-27B is a
+hybrid GDN model, so this is live for us. The existing PD hook
+(`pd_disaggregation_hook.py:80-96`) already refuses this flag against
+`--enable-hisparse`, the `fake` backend and speculation — but NOT against
+hybrid SSM, so that one fires late, at cache-build time, rather than at parse.
+
+The guard is to move it earlier, next to its three siblings, so the decode
+arm's recipe cannot carry the flag past argument parsing. The model-type read
+needed for it is not new: the #481 sibling-config canon
+(`declared_config_path`) already resolves a checkpoint's declared config at
+parse time for `--pp-stage-ratio`, and must be reused rather than
+re-implemented — a second config reader is how the GGUF `.gguf`-file trap got
+in last time.
+
+### Slice 2 (#631b): I am NOT taking variant (i), and here is the number
+
+The steer's default was (i) recompute the draft layer's prompt KV locally on
+the decode arm. The concrete reason it loses, on this model's real geometry
+(`hidden_size` 5120, `num_key_value_heads` 4, `head_dim` 256, KV fp8):
+
+| what crosses the boundary | bytes per token | at 32 768 tokens |
+|---|---|---|
+| (i) last-layer hidden states, bf16 | 5120 x 2 = 10 240 B | **335 MB** |
+| (ii)/(iii) one draft layer's K+V, fp8 | 2 x 4 x 256 = 2 048 B | **67 MB** |
+
+Variant (i) is **5x more traffic**, and worse, it is a NEW payload: the PD
+handover moves KV, and hidden states for every prompt position are not
+something it carries today. The premise that (i) is "more local" does not
+survive contact with the requirement — the decode arm cannot reconstruct the
+draft layer's input from what it receives. It gets the main model's K and V,
+and K/V are projections; they do not invert back into hidden states. So "one
+layer of recompute" silently implies "ship 335 MB of activations first".
+
+**What I propose instead — variant (iii), a canonical-layout draft KV.** The
+PREFILL arm computes the draft layer's KV during its own prefill, where the
+hidden states already exist in flight and the marginal cost is one layer on
+top of 64. It ships that KV in a canonical FULL-HEAD layout, and the decode
+arm slices out the heads its own sharding owns. This gets (ii)'s 67 MB without
+building (ii)'s general uneven head reslicing: with 4 KV heads over 3 decode
+ranks nothing divides evenly, which is exactly the generality the code comment
+balks at — and a canonical intermediate layout removes the need for it, since
+neither side ever has to understand the other's sharding.
+
+Cost of (iii): the prefill arm must hold the draft layer's weights (one layer),
+and one canonical layout has to be specified and versioned. That is a smaller
+and more local change than either (i)'s new activation payload or (ii)'s
+general resharder.
+
+I am flagging this as a DEVIATION from the steer and will not build it until
+it is confirmed, since the steer named (i) explicitly.
+
+### Hard precondition, not mine to fix
+
+#630 (PP x disk-HiCache warm-up wedge, §4a) blocks SHIPPING a PP prefill
+group at all: disk HiCache is mandatory in every serving boot, and the two
+together wedge silently. Slices 1 and 2 are both reachable without touching
+it, but a PP prefill group cannot go into production until #630 closes.
+
 ## 8. Open risks
 
 - R1: pipeline may not fill for a single request (§2) — kills the feature.
@@ -315,6 +453,14 @@ Mamba/SSM models, which Qwen3.6-27B is.
 - R4: `planner/rejected.py:342` `pp_with_spec` evidence line had drifted from
   the code (cited `:11214`, real site `:16240-16245`); corrected in this
   branch under the register's own re-check rule.
+- R6 (Route A, NEW and structural): the production decode group is DCP-sharded
+  on the TOKEN axis (`dcp_size=3`), a PP prefill group is not (`dcp_size=1`),
+  and per `TransportIdentity`'s own reasoning no offset table re-derives row
+  ownership across that difference. The KV handover Route A depends on is
+  therefore not a plain transfer between these two groups. Either the handover
+  gains a token-axis remap, or the decode group gives up DCP, or Route A pairs
+  only same-DCP groups. Unresolved; it gates slice 2 more tightly than the
+  draft-KV question does.
 - R5 (Route A): the PD spec auto-disable is SILENT. Any #625 work on Route A
   must convert it into a loud refusal for the decode arm before it can be
   trusted, or a boot that looks correct will have lost NEXTN without saying
