@@ -40,6 +40,9 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
     dcp_even_write_mask,
+    dcp_host_even_total,
+    dcp_host_lens,
+    dcp_host_total_tokens,
     get_dcp_lens,
 )
 from sglang.srt.layers.dcp.lockstep import (
@@ -6226,7 +6229,8 @@ _build_dcp_weighted_kv_indices = build_dcp_weighted_kv_indices
 
 
 def _dcp_host_total_tokens(
-    extend_prefix_lens_cpu: Optional[List[int]],
+    extend_prefix_lens_cpu: Optional[Union[List[int], torch.Tensor]],
+    expected_sum: Optional[int] = None,
 ) -> Optional[int]:
     """Host-side ``sum(prefix_lens)`` for the weighted-DCP index build, or None.
 
@@ -6245,10 +6249,16 @@ def _dcp_host_total_tokens(
     line ~1681) and ``extend_prefix_lens_cpu`` is its host mirror, so this sum is
     the same number the device read would have produced -- not an estimate. When
     no mirror is supplied the caller passes None and the old read is kept.
+
+    #623: the other four builder call sites in this file take their mirror from
+    a different vector (``seq_lens_cpu``, or the draft-extend subtraction of
+    it), so the shared host math lives in ``layers/dcp/layout.py`` and this
+    stays the named entry point for the extend site. ``expected_sum`` is the
+    optional host-side staleness check documented there -- a mirror that does
+    not sum to the caller's independently known total is refused, and the
+    caller keeps its device read.
     """
-    if extend_prefix_lens_cpu is None:
-        return None
-    return int(sum(extend_prefix_lens_cpu))
+    return dcp_host_total_tokens(extend_prefix_lens_cpu, expected_sum)
 
 
 class FlashInferIndicesUpdaterDecode:
@@ -6449,6 +6459,14 @@ class FlashInferIndicesUpdaterDecode:
             bs = len(req_pool_indices)
             dcp_size = self.attn_backend.dcp_size
             dcp_rank = self.attn_backend.dcp_rank
+            # #623: host mirror of the length vector this branch indexes over.
+            # Every caller of this method sets seq_lens_cpu to the mirror of the
+            # paged_kernel_lens it passes (update_single_wrapper: seq_lens /
+            # seq_lens_cpu; update_sliding_window: both clamped by the same
+            # window; update_cross_attention: seq_lens or encoder_lens with the
+            # matching .cpu()), and paged_kernel_lens_sum is that vector's sum
+            # in all three -- so it doubles as the staleness check.
+            host_lens = dcp_host_lens(seq_lens_cpu, expected_sum=paged_kernel_lens_sum)
             if self.attn_backend.uneven_dcp_weighted:
                 # WEIGHTED owner rule: owned slots + compact indices from the
                 # out_cache_loc (loc % cp_S in [cp_lo, cp_hi)); see
@@ -6463,6 +6481,9 @@ class FlashInferIndicesUpdaterDecode:
                     self.attn_backend.cp_lo,
                     self.attn_backend.cp_hi,
                     self.attn_backend.cp_ratio,
+                    # #623: same unbounded-D2H removal as the extend site.
+                    # None when no usable mirror -> the old device read.
+                    total_tokens=dcp_host_total_tokens(host_lens),
                 )
             else:
                 dcp_lens = get_dcp_lens(
@@ -6470,8 +6491,17 @@ class FlashInferIndicesUpdaterDecode:
                 )
                 kv_indptr[1 : bs + 1] = torch.cumsum(dcp_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
+                # #618: the even branch's own unbounded sync. kv_start_idx is
+                # part of the length formula and is device-only here, so this
+                # falls back whenever it is set (cross-attention, sliding
+                # window) and only skips the read on the plain decode path.
+                n_dcp = dcp_host_even_total(
+                    host_lens, dcp_size, dcp_rank, start=kv_start_idx
+                )
                 kv_indices = torch.empty(
-                    int(dcp_lens.sum().item()), dtype=torch.int32, device="cuda"
+                    (n_dcp if n_dcp is not None else int(dcp_lens.sum().item())),
+                    dtype=torch.int32,
+                    device="cuda",
                 )
                 create_triton_kv_indices_for_dcp_triton[(bs,)](
                     self.req_to_token,
@@ -6714,9 +6744,17 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
             else:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+            # #623: the host mirror OF paged_kernel_lens, whichever vector that
+            # turned out to be. Named for the tensor it mirrors rather than for
+            # its source, because the two DCP spec branches downstream index
+            # over paged_kernel_lens and must not be handed the extend mirror by
+            # accident -- that confusion is exactly what made paged_kernel_lens_sum
+            # (sum of seq_lens) the wrong number at the extend site (NOTE_616h).
+            paged_kernel_lens_cpu = extend_prefix_lens_cpu
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
+            paged_kernel_lens_cpu = seq_lens_cpu
 
         self.call_begin_forward(
             # active_ragged_wrapper: per-bucket graph-mode wrapper under a
@@ -6743,6 +6781,10 @@ class FlashInferIndicesUpdaterPrefill:
             # DCP split -- which is exactly how this rig reached the blocking
             # read. Forwarding it makes the mirror available on both paths.
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            # #623: the mirror of paged_kernel_lens for the two DCP SPEC
+            # branches (target-verify, draft-extend), which index over that
+            # vector and not over prefix_lens.
+            paged_kernel_lens_cpu=paged_kernel_lens_cpu,
         )
 
     def update_sliding_window(
@@ -6937,8 +6979,25 @@ class FlashInferIndicesUpdaterPrefill:
         # other callers of this method (sliding-window, cross-attention) keep
         # their current behaviour and simply fall back to the device read.
         extend_prefix_lens_cpu: Optional[List[int]] = None,
+        # #623: host mirror of paged_kernel_lens -- a DIFFERENT vector from the
+        # one above whenever use_ragged is False, which is precisely the case
+        # the DCP spec branches run in. Same opt-in contract: only
+        # update_single_wrapper supplies it, everyone else keeps the old read.
+        paged_kernel_lens_cpu: Optional[Union[List[int], torch.Tensor]] = None,
     ):
         bs = len(seq_lens)
+        # #623: host mirror of paged_kernel_lens, validated against the sum the
+        # caller already computed for the same vector. None (-> keep the device
+        # read) when no mirror was supplied or when the two disagree, which is
+        # how a stale gpu_only seq_lens_cpu is refused instead of mis-sizing an
+        # index buffer.
+        # Gated on uneven_dcp so a non-DCP prefill does not even sum the mirror:
+        # the default path keeps doing exactly what it did.
+        host_paged_lens = (
+            dcp_host_lens(paged_kernel_lens_cpu, expected_sum=paged_kernel_lens_sum)
+            if self.attn_backend.uneven_dcp
+            else None
+        )
         # Draft->draft tree mask for the uneven-DCP ragged verify wrapper
         # (--speculative-eagle-topk > 1); stays None on every other path so the
         # ragged plan keeps its default (causal chain / non-causal extend).
@@ -6980,8 +7039,12 @@ class FlashInferIndicesUpdaterPrefill:
                 dcp_lens = get_dcp_lens(prefix_lens, dcp_size, dcp_rank, None)
                 kv_indptr[1 : bs + 1] = torch.cumsum(dcp_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
+                # #618: the even sibling of the weighted read above carries the
+                # same unbounded D2H. The mirror is the extend one here, because
+                # this branch indexes over prefix_lens.
+                n_dcp = dcp_host_even_total(extend_prefix_lens_cpu, dcp_size, dcp_rank)
                 kv_indices = torch.empty(
-                    int(dcp_lens.sum().item()) + 256,
+                    (n_dcp if n_dcp is not None else int(dcp_lens.sum().item())) + 256,
                     dtype=torch.int32,
                     device=req_pool_indices.device,
                 )
@@ -7059,6 +7122,16 @@ class FlashInferIndicesUpdaterPrefill:
             dcp_prefix_lens = draft_extend_prefix_lens(
                 paged_kernel_lens, num_tokens_per_req
             )
+            # #623: the same subtraction on the host mirror. Running the SAME
+            # function rather than re-deriving `- k` here is the point: the
+            # clamp at zero is part of the length definition, and a host sum
+            # that skipped it would over-size the index buffer on a request
+            # whose whole sequence is this step's tokens.
+            host_dcp_prefix_lens = (
+                None
+                if host_paged_lens is None
+                else draft_extend_prefix_lens(host_paged_lens, num_tokens_per_req)
+            )
             if self.attn_backend.uneven_dcp_weighted:
                 kv_indptr, kv_indices = _build_dcp_weighted_kv_indices(
                     self.req_to_token,
@@ -7071,6 +7144,8 @@ class FlashInferIndicesUpdaterPrefill:
                     self.attn_backend.cp_hi,
                     self.attn_backend.cp_ratio,
                     pad=256,
+                    # #623: kills the unbounded D2H on the draft-extend path.
+                    total_tokens=dcp_host_total_tokens(host_dcp_prefix_lens),
                 )
             else:
                 dcp_size = self.attn_backend.dcp_size
@@ -7078,8 +7153,10 @@ class FlashInferIndicesUpdaterPrefill:
                 dcp_lens = get_dcp_lens(dcp_prefix_lens, dcp_size, dcp_rank, None)
                 kv_indptr[1 : bs + 1] = torch.cumsum(dcp_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
+                # #618: even sibling, same host vector.
+                n_dcp = dcp_host_even_total(host_dcp_prefix_lens, dcp_size, dcp_rank)
                 kv_indices = torch.empty(
-                    int(dcp_lens.sum().item()) + 256,
+                    (n_dcp if n_dcp is not None else int(dcp_lens.sum().item())) + 256,
                     dtype=torch.int32,
                     device=req_pool_indices.device,
                 )
@@ -7168,6 +7245,14 @@ class FlashInferIndicesUpdaterPrefill:
                     self.attn_backend.cp_hi,
                     self.attn_backend.cp_ratio,
                     pad=256,
+                    # #623: THE production wedge stack. The 02:02 crash and the
+                    # 03:23 wedge dump both pinned owner.py's
+                    # full_indptr[bs].item() reached from this file; the extend
+                    # site was wired in #616h, this is the verify twin. The
+                    # committed prefix IS paged_kernel_lens, so its host mirror
+                    # is the exact same sum -- and NOT paged_kernel_lens_sum's
+                    # cousin at the extend site, which sums seq_lens.
+                    total_tokens=dcp_host_total_tokens(host_paged_lens),
                 )
             else:
                 dcp_size = self.attn_backend.dcp_size
@@ -7175,8 +7260,10 @@ class FlashInferIndicesUpdaterPrefill:
                 dcp_lens = get_dcp_lens(paged_kernel_lens, dcp_size, dcp_rank, None)
                 kv_indptr[1 : bs + 1] = torch.cumsum(dcp_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
+                # #618: even sibling of the verify read.
+                n_dcp = dcp_host_even_total(host_paged_lens, dcp_size, dcp_rank)
                 kv_indices = torch.empty(
-                    int(dcp_lens.sum().item()) + 256,
+                    (n_dcp if n_dcp is not None else int(dcp_lens.sum().item())) + 256,
                     dtype=torch.int32,
                     device=req_pool_indices.device,
                 )

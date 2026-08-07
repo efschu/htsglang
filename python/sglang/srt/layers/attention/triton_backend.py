@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence, Union
 
 import torch
 import triton
@@ -22,6 +22,8 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
     dcp_even_write_mask,
+    dcp_host_even_total,
+    dcp_host_total_tokens,
     dcp_token_sharded_layer,
     dcp_verify_mask_mode,
     dcp_verify_paged_lens,
@@ -997,19 +999,42 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr: torch.Tensor,
         kv_indices: Optional[torch.Tensor] = None,
         kv_start_idx: Optional[torch.Tensor] = None,
+        lens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
+        lens_sum: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Build per-DCP-rank sharded KV indptr/indices. eager passes kv_indices=None
         # (fresh tensor); cuda-graph passes an address-stable buffer to fill in place.
+        #
+        # #618/#623: lens_cpu is the host mirror of `lens` and lens_sum its
+        # independently known host sum (the staleness check). Both default to
+        # None, which keeps the blocking device read -- the cuda-graph callers
+        # have no mirror in scope and are unchanged.
         if self.uneven_dcp_weighted:
             return self._dcp_weighted_kv_indices(
-                req_pool_indices, lens, kv_indptr, kv_indices, kv_start_idx
+                req_pool_indices,
+                lens,
+                kv_indptr,
+                kv_indices,
+                kv_start_idx,
+                lens_cpu=lens_cpu,
+                lens_sum=lens_sum,
             )
         dcp_lens = self._dcp_lens(lens, kv_start_idx)
         kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
         kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
         if kv_indices is None:
+            # #618: unbounded D2H unless the host mirror covers it.
+            n_dcp = dcp_host_even_total(
+                lens_cpu,
+                self.dcp_size,
+                self.dcp_rank,
+                start=kv_start_idx,
+                expected_sum=lens_sum,
+            )
             kv_indices = torch.empty(
-                int(dcp_lens.sum().item()), dtype=torch.int64, device=self.device
+                (n_dcp if n_dcp is not None else int(dcp_lens.sum().item())),
+                dtype=torch.int64,
+                device=self.device,
             )
         create_triton_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
             self.req_to_token,
@@ -1031,6 +1056,8 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr: torch.Tensor,
         kv_indices: Optional[torch.Tensor],
         kv_start_idx: Optional[torch.Tensor],
+        lens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
+        lens_sum: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """WEIGHTED owner rule read side (#173), same contract as the even one.
 
@@ -1062,6 +1089,10 @@ class TritonAttnBackend(AttentionBackend):
             self.cp_hi,
             self.cp_ratio,
             req_to_token_stride=self.req_to_token.stride(0),
+            # #623: the Triton twin of the flashinfer wiring. Without this the
+            # builder falls back to int(full_indptr[bs].item()), the unbounded
+            # blocking D2H inside the collective window. None -> old read.
+            total_tokens=dcp_host_total_tokens(lens_cpu, lens_sum),
         )
         # Same dtype as the even branch's get_dcp_lens result, because both feed
         # the same get_num_kv_splits kernel and a Triton pointer's element type
@@ -1460,6 +1491,13 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
                         self.kv_indptr,
+                        # #618/#623: host mirror + its independently known sum.
+                        # seq_lens_sum is the "mirror is fresh" signal (it is
+                        # None-preserving for gpu_only batches while
+                        # seq_lens_cpu is a stale slice), and it doubles as the
+                        # equality check, so a stale vector is refused.
+                        lens_cpu=forward_batch.seq_lens_cpu,
+                        lens_sum=forward_batch.seq_lens_sum,
                     )
                 else:
                     # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
@@ -1581,6 +1619,18 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.seq_lens, self.num_draft_tokens
                     ),
                     self.kv_indptr,
+                    # #618/#623: the verify paged length IS seq_lens (see
+                    # dcp_verify_paged_lens for why it is emphatically not
+                    # seq_lens + num_draft_tokens), so the mirror goes through
+                    # the SAME function rather than assuming the identity here.
+                    lens_cpu=(
+                        None
+                        if forward_batch.seq_lens_cpu is None
+                        else dcp_verify_paged_lens(
+                            forward_batch.seq_lens_cpu, self.num_draft_tokens
+                        )
+                    ),
+                    lens_sum=forward_batch.seq_lens_sum,
                 )
             else:
                 # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
@@ -1648,6 +1698,11 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices,
                     forward_batch.extend_prefix_lens,
                     self.kv_indptr,
+                    # #618/#623: extend_prefix_lens_cpu is the exact host mirror
+                    # of extend_prefix_lens -- the non-DCP branch right below
+                    # already sizes its kv_indices from sum() of it. No second
+                    # host sum exists to check it against, so none is claimed.
+                    lens_cpu=forward_batch.extend_prefix_lens_cpu,
                 )
             else:
                 # gpu_only leaves _cpu unset; over-allocate is safe (ragged write).

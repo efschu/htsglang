@@ -47,6 +47,9 @@ from sglang.srt.layers.dcp.comm import (
 )
 from sglang.srt.layers.dcp.kernels import create_triton_kv_indices_for_dcp_triton
 from sglang.srt.layers.dcp.layout import (
+    dcp_host_even_total,
+    dcp_host_lens,
+    dcp_host_total_tokens,
     filter_dcp_local_kv_indices,
     get_dcp_lens,
     update_local_kv_lens_for_dcp,
@@ -111,6 +114,9 @@ __all__ = [
     "dcp_weighted_write_slots",
     "create_triton_kv_indices_for_dcp_triton",
     "dcp_enabled",
+    "dcp_host_even_total",
+    "dcp_host_lens",
+    "dcp_host_total_tokens",
     "filter_dcp_local_kv_indices",
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
