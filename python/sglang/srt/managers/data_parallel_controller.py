@@ -44,6 +44,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler_components.idle_sleeper import idle_poll_timeout_ms
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
@@ -660,14 +661,41 @@ class DataParallelController:
         sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
+        # #547: this loop has no work of its own -- the outer `while True` only
+        # re-enters the drain. With a NOBLOCK recv that makes it a permanent
+        # 100% CPU spin, not merely an idle one. When the idle poll is enabled
+        # we park on the socket instead, with the same step-up ladder the
+        # scheduler uses (zero-poll rung first, so a burst of requests drains at
+        # exactly the current rate). Parking is unconditionally safe here
+        # because the loop body does nothing else.
+        idle_poll = (
+            envs.SGLANG_IDLE_BLOCKING_POLL.get() or self.server_args.sleep_on_idle
+        )
+        poller = None
+        if idle_poll:
+            poller = zmq.Poller()
+            poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+        idle_ticks = 0
+
         while True:
+            received_any = False
             while True:
                 self.soft_watchdog.feed()
                 try:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                received_any = True
                 self._request_dispatcher(recv_req)
+
+            if poller is None:
+                continue
+            idle_ticks = 0 if received_any else idle_ticks + 1
+            timeout_ms = idle_poll_timeout_ms(idle_ticks) if idle_ticks else 0
+            if timeout_ms > 0:
+                # The watchdog is counter-fed; a parked poll must not look stuck.
+                with self.soft_watchdog.disable():
+                    poller.poll(timeout_ms)
 
 
 def run_data_parallel_controller_process(
