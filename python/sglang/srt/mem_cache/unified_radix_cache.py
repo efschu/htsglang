@@ -30,7 +30,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     requests_forced_host_write_through,
 )
-from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
+from sglang.srt.mem_cache.common import (
+    note_uniform_host_admitted,
+    uniform_host_avail_for_backup,
+    uniform_host_floor_active,
+)
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_collective import (
     COLLECTIVE_POLL_MAX_S,
@@ -1799,11 +1803,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # floor decides whether host content is loaded back, not whether it
         # was ever written. None (host pools agree, single rank, no host tier)
         # keeps the live local value exactly as before.
+        #
+        # #645: and the eviction BELOW the compare is where that floor was
+        # still not enough. Making `host_avail` replicated made the `if` a
+        # rank-uniform branch -- every rank now enters the eviction together,
+        # with the same `needed` -- but `evict_host` selects its victims from
+        # `evictable_host_leaves`, and `_is_host_leaf` gates candidacy on
+        # `node.evicted`, i.e. on a rank-sized DEVICE pool. So the ranks
+        # delete different nodes (`_evict_host_leaf` ->
+        # `_remove_leaf_from_parent`, a tree edit) and some raise `needed`
+        # while others do not (`evicted < needed` -> no backup, and under
+        # write_through that node is deleted at its next device eviction).
+        # Two production specimens on 2026-08-07, one per direction: 13:26
+        # rank 0 [22014] vs peers [19967] (kept a chunk node its peers
+        # deleted, difference exactly one 2047-token chunk) and 12:15 rank 0
+        # [2047] vs peers [10238] (lost the new node its peers backed up).
+        #
+        # A floor repairs an ADMISSION, not a SELECTION: no arithmetic on a
+        # published scalar makes two ranks pick the same nodes out of two
+        # different candidate sets. So under an active floor this path does
+        # not evict at all and refuses uniformly instead -- a refusal every
+        # rank reaches on the same replicated compare, leaving every tree
+        # untouched.
+        #
+        # THE COST, stated plainly: this is the only host-eviction trigger the
+        # base component has when `enable_storage` is False (the prefetch
+        # trigger returns early without a storage backend). So on an UNEVEN
+        # rig -- the only case where a floor is published at all -- a
+        # saturated host tier now stops accepting new backups instead of
+        # recycling itself, and the host-tier hit rate decays to whatever was
+        # cached before saturation. That is a throughput regression traded
+        # for a correctness one, deliberately: the alternative is the wedge
+        # above. Recovering the recycling needs a group-agreed victim list,
+        # which is a scheduler-side design, not a fix to this line.
+        #
+        # With no floor (pools agree, single rank, no host tier) the eviction
+        # retry runs exactly as before.
         kv_tokens = len(device_value)
         host_avail = uniform_host_avail_for_backup(
             self, self.cache_controller.mem_pool_host
         )
         if host_avail < kv_tokens:
+            if uniform_host_floor_active(self):
+                return 0
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)
             if evicted < needed:
@@ -1816,6 +1858,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if host_indices is None:
             return 0
+
+        # #645: charge the admission against the published floor, so the next
+        # backup in THIS iteration decides against what is left rather than
+        # against the iteration-start snapshot. No-op when no floor is active.
+        note_uniform_host_admitted(self, kv_tokens)
 
         # Commit
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)

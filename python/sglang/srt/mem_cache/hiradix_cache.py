@@ -1014,10 +1014,16 @@ class HiRadixCache(RadixCache):
         # it was -- this class is not the one the wedging rig instantiates,
         # and it is pinned here because #616g's load-back fix spent a boot
         # sitting in the class that deployment never built.
-        from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
+        from sglang.srt.mem_cache.common import (
+            note_uniform_host_admitted,
+            note_uniform_host_refusal,
+            uniform_host_avail_for_backup,
+            uniform_host_floor_active,
+        )
 
         mem_pool_host = getattr(self.cache_controller, "mem_pool_host", None)
-        if self.uniform_host_avail_floor is not None and mem_pool_host is not None:
+        floor_active = uniform_host_floor_active(self) and mem_pool_host is not None
+        if floor_active:
             host_avail = uniform_host_avail_for_backup(self, mem_pool_host)
             if host_avail < len(node.value):
                 return 0
@@ -1028,6 +1034,39 @@ class HiRadixCache(RadixCache):
             **self._get_extra_pools(),
         )
         if host_indices is None:
+            # #645: the retry's `evict_host` is a RANK-LOCAL tree edit, and
+            # it is reached on a RANK-LOCAL condition -- this rank's write
+            # failed. Its victims are host leaves chosen by this rank's own
+            # `eviction_strategy` out of this rank's own
+            # `evictable_host_leaves`, and it deletes them from the tree
+            # (`x.parent.children.pop(key)` below), so a rank that takes this
+            # branch while its peers do not ends up with a shorter
+            # `match_prefix` than they have. That is the divergence the
+            # detector reports.
+            #
+            # Under an active floor the gate above already refused every node
+            # the group budget cannot hold, so a failure here means this
+            # rank's live pool fell below the group's own agreed budget --
+            # something the ledger makes arithmetically impossible for the
+            # backups this gate admitted, and which otherwise signals an
+            # allocation from OUTSIDE this gate (prefetch). Refusing is the
+            # only answer available without a collective: it costs one
+            # un-backed-up node, while evicting costs a divergent tree. The
+            # sibling class carries the same guard for the same reason; see
+            # `uniform_host_floor_active`.
+            #
+            # No floor (pools agree, single rank, no host tier) keeps the
+            # eviction retry exactly as it was.
+            if floor_active:
+                if note_uniform_host_refusal(self) == 1:
+                    logger.warning(
+                        "#645: host backup refused after a write failure under "
+                        "an active rank-uniform floor (%d tokens). Skipping "
+                        "the rank-local host eviction, which would diverge the "
+                        "radix replicas. Logged once per published floor.",
+                        len(node.value),
+                    )
+                return 0
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
@@ -1035,6 +1074,11 @@ class HiRadixCache(RadixCache):
                 **self._get_extra_pools(),
             )
         if host_indices is not None:
+            # #645: charge the admission against the published floor, so the
+            # next backup in THIS iteration decides against what is left
+            # rather than against the iteration-start snapshot. No-op when no
+            # floor is active.
+            note_uniform_host_admitted(self, len(node.value))
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self._track_write_through_node(node, len(node.key))

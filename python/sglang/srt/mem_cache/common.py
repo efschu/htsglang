@@ -463,10 +463,95 @@ def uniform_host_avail_for_backup(tree_cache, mem_pool_host) -> int:
     uneven. None -- single rank, pools that agree, or no host tier at all --
     is the live local value and the caller behaves exactly as before.
     """
+    #: #645: the floor is published ONCE per iteration, at the top of
+    #: ``_update_uniform_pool_budget``, but the backup that reads it runs at
+    #: the END of the iteration (``process_batch_result_prefill`` ->
+    #: ``cache_unfinished_req`` -> ``insert`` -> ``write_backup``). Every
+    #: backup admitted in between has already spent host slots that the
+    #: published number still counts as free, so a stale floor over-admits:
+    #: the rank whose pool IS the floor runs out for real while its peers,
+    #: reading the same optimistic number, do not.
+    #:
+    #: Charging admissions against the floor removes the staleness without a
+    #: second collective. The ledger is rank-uniform BY CONSTRUCTION: it is
+    #: incremented only on this gate's own admissions, the gate compares two
+    #: replicated numbers, and the node length is replicated -- so every rank
+    #: charges the same amount at the same insert. And it is SUFFICIENT: this
+    #: rank's live availability is at least ``avail_at_publish - admitted``,
+    #: and ``avail_at_publish >= floor``, so a node that clears
+    #: ``floor - admitted`` fits in the real pool too.
     floor = getattr(tree_cache, "uniform_host_avail_floor", None)
     if floor is None:
         return int(mem_pool_host.available_size())
-    return int(floor)
+    admitted = getattr(tree_cache, "uniform_host_admitted_since_floor", 0)
+    return max(0, int(floor) - int(admitted))
+
+
+def uniform_host_floor_active(tree_cache) -> bool:
+    """Whether a rank-uniform HOST floor is in force on this rank (#645).
+
+    The backup path may only take its rank-LOCAL host-eviction branch when
+    this is False. Under an active floor that branch is the wedge: #639 made
+    the trigger ``host_avail < kv_tokens`` replicated, so every rank enters
+    the eviction together, but what happens inside stays rank-local in two
+    ways that both edit the tree.
+
+    WHICH nodes are deleted. ``evict_host``'s victims are H-leaves, and
+    ``_is_host_leaf`` requires ``node.evicted`` -- device-evicted. The device
+    pools are rank-sized (190400 / 143840 / 143906), so each rank offers a
+    different candidate set and ``_evict_host_leaf`` removes different nodes
+    from different trees (``_remove_leaf_from_parent``). The rank that keeps
+    a chunk node its peers deleted matches one chunk further: the 13:26
+    specimen, rank 0 [22014] against peers [19967], difference 2047.
+
+    WHETHER the eviction covered ``needed``. A rank with few H-leaves cannot
+    raise the tokens and returns 0, so its node gets no backup -- and under
+    ``write_through`` an un-backed-up node is DELETED at its next device
+    eviction while a backed-up one is demoted and stays matchable. That rank
+    loses the NEW node instead: the 12:15 specimen, rank 0 [2047] against
+    peers [10238]. Both specimens, opposite directions, one branch.
+
+    A floor cannot repair a SELECTION the way it repairs an admission: both
+    sides of an admission compare can be made replicated, but no arithmetic
+    on a published scalar makes two ranks pick the same nodes out of two
+    different candidate sets. Doing that needs a group-agreed victim list,
+    i.e. a new collective on the hot path. So the backup path refuses
+    uniformly instead, at the price of a saturated host tier that no longer
+    recycles itself on an uneven rig -- a throughput regression traded
+    knowingly for a correctness one. Both directions are reproduced against
+    the real ``write_backup`` in
+    ``test/registered/unit/distributed/test_uniform_host_evict_floor_645.py``.
+    """
+    return getattr(tree_cache, "uniform_host_avail_floor", None) is not None
+
+
+def note_uniform_host_admitted(tree_cache, tokens: int) -> None:
+    """Charge an admitted host backup against the published floor (#645).
+
+    Called only on the success path of ``write_backup``, and only meaningful
+    while a floor is active -- with no floor the attribute is never read.
+    Reset once per iteration by the scheduler when it publishes the next
+    floor, so the ledger never outlives the number it corrects.
+    """
+    if getattr(tree_cache, "uniform_host_avail_floor", None) is None:
+        return
+    current = getattr(tree_cache, "uniform_host_admitted_since_floor", 0)
+    tree_cache.uniform_host_admitted_since_floor = current + int(tokens)
+
+
+def note_uniform_host_refusal(tree_cache) -> int:
+    """Count a refusal that skipped a rank-local host eviction (#645).
+
+    Returns this floor generation's refusal count, so the caller can log the
+    FIRST one and stay quiet for the rest. The condition should be rare --
+    the ledger makes it arithmetically impossible for the backups this gate
+    itself admitted -- but "should be rare" is not a reason to put an
+    unthrottled warning on a path that runs at every insert, least of all
+    one that fires hardest exactly when a rig is already in trouble.
+    """
+    count = getattr(tree_cache, "uniform_host_refusals_since_floor", 0) + 1
+    tree_cache.uniform_host_refusals_since_floor = count
+    return count
 
 
 def uniform_mamba_avail_for_evict(tree_cache, local_avail: int) -> int:

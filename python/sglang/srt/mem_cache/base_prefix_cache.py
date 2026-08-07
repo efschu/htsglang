@@ -273,6 +273,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     # or no host tier": read the live local value, exactly as before.
     uniform_host_avail_floor: Optional[int] = None
 
+    # #645: host tokens this rank has admitted to the host tier SINCE the
+    # floor above was published. The floor is computed once per iteration but
+    # read at the end of it, so it counts as free every slot the iteration's
+    # own backups have already taken; charging admissions against it makes
+    # the gate current without a second collective. Rank-uniform by
+    # construction -- only this gate's admissions are charged, and the gate
+    # compares replicated numbers against a replicated node length. Reset by
+    # the scheduler in the same call that publishes the next floor, so it
+    # never outlives the number it corrects. DECLARED HERE for the same
+    # reason as the floor itself (#606).
+    uniform_host_admitted_since_floor: int = 0
+
+    # #645: how many backups this rank has refused since that floor was
+    # published rather than fall back to a rank-local host eviction. Exists
+    # only to keep the warning to one line per floor instead of one per
+    # insert; reset on the same cadence as the ledger above.
+    uniform_host_refusals_since_floor: int = 0
+
     # #639b: the same pin for the MAMBA/SSM state pool. The two floors above
     # cover the KV token axis (device and host); neither reaches the mamba
     # slot pool, whose eviction is still decided rank-locally by
