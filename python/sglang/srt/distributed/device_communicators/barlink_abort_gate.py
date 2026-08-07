@@ -48,7 +48,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Any, List
+from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -520,6 +520,83 @@ def reset_replay_tag_for_test() -> None:
     _replay_seq = 0
 
 
+def format_sibling_transports(raising: Any) -> Optional[str]:
+    """The OTHER live transports' flag state, read host-only, at abort time.
+
+    #622b, and the gap is not hypothetical. A serving process on this fork
+    brings up THREE independent BAR1 transports -- ``world:0``, ``tp:0`` and
+    ``dcp:0`` (2026-08-07 06:12 boot log lines 162-164, 213-215, 270-273) --
+    and each owns a SEPARATE flag region and a SEPARATE round counter
+    (``round_dev`` is a per-transport tensor: ``barlink_bar1_ext.cpp``
+    launchers at 1249 and 1461 both take the caller's). ``check_aborts``
+    raises at the FIRST transport that reports, and every instrument on the
+    abort path -- capture census, own-flag snapshot, peer-flag snapshot -- is
+    emitted by ``self``, i.e. by that one transport only.
+
+    So the 2026-08-07 06:12 specimen dumped ``tp:0`` and nothing else, and the
+    dump it produced is internally contradictory: every kernel writes its flag
+    BEFORE entering its deadline-bearing spin, yet ``tp:0``'s snapshot shows
+    every cell already at the round its spin was waiting for. A transport
+    whose flags are satisfied cannot be the one that ran out its deadline on
+    them. ``dcp:0`` -- 40544 all-gathers and 12768 all-reduces on that run, all
+    inside the same replayed decode graph -- was never read.
+
+    HOST-ONLY, DELIBERATELY. This runs on the abort path of an already-broken
+    run, where a device read can queue behind a spin that is still going (in
+    the 06:12 specimen ``_abort_flag_snapshot``'s ``cuMemcpy`` took 55 s to
+    return). So this touches no device: ``_abort_peer_flag_snapshot`` is an
+    ordinary host load from an already-mapped BAR window, and the status word
+    is taken from the pinned STAGED copy rather than re-read. The staged value
+    can therefore be one check old -- it is labelled as such rather than
+    refreshed, because refreshing it is the thing that can hang.
+
+    COVERAGE. The peer snapshot omits the reporting rank's OWN region, by
+    construction. It does not need it: across the ranks of a group, every
+    rank's own region appears in both peers' dumps, so the three lines
+    together still cover every (block, sender) cell.
+
+    Returns None when there is nothing to say -- one transport in the process,
+    or no sibling that can be read.
+    """
+    parts = []
+    for transport in registered():
+        if transport is raising:
+            continue
+        group = str(getattr(transport, "group", "") or "<unnamed>")
+        # Pinned host memory, not a device read. May be one staged copy old;
+        # `None` means this transport never staged one.
+        staged = "<never staged>"
+        try:
+            stage = getattr(transport, "_ctl_stage", None)
+            if stage is not None:
+                staged = str(int(stage[0]))
+        except Exception:  # noqa: BLE001 - a diagnostic must not raise
+            staged = "<unreadable>"
+        snapshot = None
+        try:
+            fn = getattr(transport, "_abort_peer_flag_snapshot", None)
+            if fn is not None:
+                snapshot = fn()
+        except Exception:  # noqa: BLE001 - a diagnostic must not raise
+            snapshot = None
+        parts.append(
+            f"group {group}: staged status word {staged} "
+            f"(possibly one check old, NOT re-read); "
+            f"{snapshot if snapshot else 'no peer flag mapping to read'}"
+        )
+    if not parts:
+        return None
+    return (
+        "barlink-BAR1 SIBLING TRANSPORT state at abort (#622b), read host-only "
+        "from the rank that is about to raise. The raising transport's own "
+        "dump above covers only ITS flag region and round counter; these are "
+        "the other live transports in this process, whose regions and counters "
+        "are independent. A sibling whose staged status word is 1, or whose "
+        "flag cells disagree across (block, sender), is where the replay "
+        "actually stalled -- " + " || ".join(parts)
+    )
+
+
 def check_aborts(where: str) -> None:
     """Raise if any live BAR1 transport's kernels took their abort path.
 
@@ -532,6 +609,11 @@ def check_aborts(where: str) -> None:
     wrapped or aggregated: the first transport to report is the one whose
     buffers are corrupt, and a group-level summary would cost the reader the
     rank/op/rounds context that is the entire point.
+
+    #622b: what IS aggregated, just before that raise leaves this function, is
+    the host-readable flag state of the transports the raise skips. See
+    ``format_sibling_transports`` for why the raising transport's own dump is
+    not sufficient evidence, and why this cannot be a device read.
     """
     if not _transports:
         return
@@ -539,8 +621,23 @@ def check_aborts(where: str) -> None:
         return
     for transport in registered():
         check = getattr(transport, "check_aborted", None)
-        if check is not None:
+        if check is None:
+            continue
+        try:
             check(where)
+        except Exception:
+            # ``Exception``, not ``BaseException``: a KeyboardInterrupt or an
+            # interpreter shutdown is not a collective fault and must not pay
+            # for a flag dump. Warn-never-raise below, same discipline as every
+            # other instrument on this path -- the sibling dump must not
+            # replace the real error.
+            try:
+                line = format_sibling_transports(transport)
+                if line:
+                    logger.error("%s", line)
+            except Exception:  # noqa: BLE001 - an instrument must not mask the abort
+                pass
+            raise
 
 
 def check_after_graph_replay(where: str = "cuda-graph replay") -> None:
