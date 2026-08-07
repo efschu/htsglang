@@ -84,6 +84,14 @@ class _FakeScheduler:
     _publish_uniform_evict_floor = Scheduler._publish_uniform_evict_floor
     uniform_min_avail = Scheduler.uniform_min_avail
     uniform_budget_deficit = Scheduler.uniform_budget_deficit
+    # #639: the same reduce now also carries the HOST-tier pair, so the stub
+    # has to model that surface too. This fixture's tree cache has no
+    # `cache_controller`, so `_local_host_avail` returns the ABSENT sentinel
+    # on every rank, no host floor is published, and the #616g quantities
+    # under test are untouched -- which is the point of pinning it here.
+    _HOST_AVAIL_ABSENT = Scheduler._HOST_AVAIL_ABSENT
+    _local_host_avail = Scheduler._local_host_avail
+    _publish_uniform_host_floor = Scheduler._publish_uniform_host_floor
 
 
 class _FakeDist:
@@ -103,9 +111,11 @@ class _FakeDist:
         return len(self.world_avails)
 
     def _payload(self, avail):
+        # #639 appends the host pair; ABSENT on every rank in this fixture.
+        absent = Scheduler._HOST_AVAIL_ABSENT
         if self.pin_admission:
-            return [avail, avail, -avail]
-        return [avail, -avail]
+            return [avail, avail, -avail, absent, -absent]
+        return [avail, -avail, absent, -absent]
 
     def all_reduce(self, t, op=None, group=None):
         self.calls += 1

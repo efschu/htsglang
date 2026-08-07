@@ -520,6 +520,14 @@ class Envs:
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    # #631a. Restores the pre-#631a behaviour: PD arms launched with a
+    # speculative algorithm auto-DISABLE it and warn, instead of refusing.
+    # The default is now the refusal, because the auto-disable is silent in
+    # the only way that matters -- a decode arm asked for NEXTN comes up
+    # without it and merely serves slower, which no smoke test catches. This
+    # escape hatch exists for shared launch configs that pass one flagset to
+    # both a PD and a non-PD server (the original design ruling's reason).
+    SGLANG_PD_AUTO_DISABLE_SPEC = EnvBool(False)
 
     # Scheduler: others:
     # #547 idle blocking poll. Turns the scheduler's (and the DP controller's)
