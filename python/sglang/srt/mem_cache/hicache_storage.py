@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 
 
-def compute_model_identity_hash(server_args: Any) -> str:
+def compute_model_identity_hash(
+    server_args: Any, *, include_parallel_vectors: bool = True
+) -> str:
     """Compute a short hash that uniquely identifies the model and KV layout.
 
     Storage page hashes cover token ids only, and the storage key suffix covers
@@ -41,11 +43,19 @@ def compute_model_identity_hash(server_args: Any) -> str:
     enter the string only when they are set, so an even-TP key is
     byte-identical to the upstream recipe.
     """
+    # Every part is str()-coerced. ``dtype`` and ``kv_cache_dtype`` always
+    # were; ``revision`` and ``quantization`` were not, which left the
+    # function able to raise TypeError in "|".join for any server_args whose
+    # fields are not already strings. That was latent while the only callers
+    # ran late with a fully-resolved ServerArgs; #631a added a call on the PD
+    # REGISTRATION path, where it became reachable. Coercion is byte-identical
+    # for real inputs -- str() of a str is itself, and None still becomes ""
+    # through the `or` -- so no persisted HiCache key moves.
     identity_parts = [
-        os.path.normpath(server_args.model_path) if server_args.model_path else "",
-        server_args.revision or "",
+        os.path.normpath(str(server_args.model_path)) if server_args.model_path else "",
+        str(server_args.revision or ""),
         str(server_args.dtype or "auto").lower(),
-        server_args.quantization or "",
+        str(server_args.quantization or ""),
         str(server_args.kv_cache_dtype or "auto").lower(),
     ]
     # #513 (audit #506, finding A3-2): under this fork's uneven TP,
@@ -60,10 +70,24 @@ def compute_model_identity_hash(server_args: Any) -> str:
     # already persisted: re-keying every rig to fix a case that cannot occur
     # there would be a cost with no benefit. Same convention
     # uneven_perf.measured_kv_budget_fingerprint_fields uses for pp_size.
-    for name in ("rank_tp_ratio", "rank_kv_ratio"):
-        value = getattr(server_args, name, None)
-        if value:
-            identity_parts.append(f"{name}={value}")
+    #
+    # ``include_parallel_vectors=False`` drops this tail, and the distinction
+    # is the whole reason the flag exists (#631a guard 1). These vectors
+    # belong in a STORAGE KEY, where a page's bytes depend on the writing
+    # rank's kv-head count, so two differently-split servers must not read
+    # each other's pages. They do NOT belong in a PD HANDSHAKE, which asks a
+    # different question -- "are these two servers serving the same model?" --
+    # and where differing parallelism between the arms is EXPECTED and
+    # supported: TransportIdentity.COMPARED deliberately omits tp_size and
+    # pp_size, and the token-axis difference is handled by ``owned_ordinals``
+    # (disaggregation/base/conn.py). Comparing the vectors there would refuse
+    # a Route A pair (PP prefill + TP decode) that the engine transfers
+    # correctly. Same recipe, one function, two honest questions.
+    if include_parallel_vectors:
+        for name in ("rank_tp_ratio", "rank_kv_ratio"):
+            value = getattr(server_args, name, None)
+            if value:
+                identity_parts.append(f"{name}={value}")
     identity_str = "|".join(identity_parts)
     return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
 
