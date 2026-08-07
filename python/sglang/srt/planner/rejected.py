@@ -358,7 +358,7 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "one."
         ),
         level=BLOCKED,
-        evidence="server_args.py:11214",
+        evidence="server_args.py:16240-16245 (assert), re-verified #625",
         tags=("pipeline-parallel", "speculation"),
         scope="general",
     ),

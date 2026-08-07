@@ -2187,6 +2187,50 @@ Non-obvious points, each load-bearing:
   everyone; here that stage binds anyway, but on a split where the short stage
   could afford far more tokens this throws that capacity away (open item for
   #201 slice 3).
+#### 4.7.1 PP=3 intra-rig on safetensors, and what it is worth (#625)
+
+The 4.7 recipe at `--pp-size 3`, one card per stage, on
+`Qwen3.6-27B-INT8-W8A8`. Measured 2026-08-07; artifacts in
+`/spinning/gpu-battery-results/2026-08-07_625/`.
+
+```bash
+  --tp-size 1 --pp-size 3 \
+  --pp-stage-ratio 2,1,1 \
+  --rank-gpu-id 0,1,2 \
+  --rank-gpu-memory-mib 28500,17500,17500 \
+  --disable-overlap-schedule \
+  --kv-cache-dtype fp8_e4m3 --context-length 65536 \
+```
+
+`--pp-stage-ratio 2,1,1` derives `32,16,16` over the 64 layers and
+`8,4,4` of the 16 full-attention layers. `max_total_num_tokens` 453782.
+
+- **`--rank-auto-reserve-mib` is refused here**: it "only applies with
+  `--rank-tp-ratio auto`", and a `tp_size=1` pipeline has no TP vector to
+  solve. Give per-stage budgets with `--rank-gpu-memory-mib` instead, as 4.7
+  does. (`--rank-tp-ratio auto` is the other route: on tp=1 pipelines it
+  derives the budget list from NVML, §4.9.1.)
+- **What PP buys, measured against TP=3 on the same model, both no-spec**,
+  uncached prefill, A-vs-A floor 0.10 % on both arms: 2048 tok **2.38x**
+  (1080 -> 453 ms), 8192 tok **5.00x** (5476 -> 1095 ms), 32768 tok **5.22x**
+  (24089 -> 4611 ms). PP wins at EVERY length, including one-chunk prompts
+  where it has no pipelining at all — on this rig the per-layer collectives
+  cost more than the stage serialisation does. This is ANALYSE_299's 68-75 %
+  collective share seen from the other side.
+- **What PP costs**: decode bs=1 measured ~31 tok/s against the TP+NEXTN
+  112 tok/s of §4.1.0. PP is ~3.6x worse at decode, and cannot run spec at
+  all. Prefill and decode want opposite topologies; do not run a PP server
+  as a general-purpose one.
+- **DO NOT combine PP with hierarchical cache — it wedges, silently.**
+  `--enable-hierarchical-cache` with the file backend under `--pp-size 3`
+  never reaches ready: health stays 503 and the launcher sits in
+  `_wait_and_warmup`. Two identical py-spy samples show the last stage blocked
+  in `isend` (`_pp_send_output_to_next_stage`) while stage 0 spins in
+  `_drain_async_work` -> `check_hicache_events` inside
+  `_get_new_batch_prefill_raw` and never posts the matching recv. There is no
+  refusal and no error line. Drop the hicache flags and the same topology
+  boots in ~2 min.
+
 ### 4.8 Prefill satellite: rig 2 prefills, rig 1 decodes (#212)
 
 The satellite is the second box taking a request's prefill so the main rig
