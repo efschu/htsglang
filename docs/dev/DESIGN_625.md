@@ -330,6 +330,57 @@ Refusal must name both hashes and the likely cause (different checkpoints, or
 the same checkpoint at different revisions/quantizations), because the operator
 symptom — plausible but wrong text — gives no hint on its own.
 
+#### Guard 1, decided: lift ONE field, and say plainly what stays unwired
+
+`TransportIdentity` is a built-but-unwired class (#421): outside
+`nccl/contract.py` the only references are re-exports in
+`nccl/__init__.py`. Nothing calls `identity_from_args` or
+`assert_compatible`. The temptation is to wire the whole thing into
+`try_ensure_parallel_info` and close the #212 trap in one move. **That would
+be wrong, and the reason is a constraint on Route A that we had not seen.**
+
+`COMPARED` deliberately omits `tp_size` and `pp_size` — PD is expected to pair
+arms of differing TP, because `KVArgs.state_dim_per_tensor` /
+`state_dim_offsets` let the sender re-slice the STATE/HEAD axis. But
+`COMPARED` **does** include `dcp_size` and `row_ownership`, and its own
+docstring explains why that exclusion does not extend to them: DCP shards the
+TOKEN axis, slot L lives on rank `L % S` at row `L // S`, and no offset table
+re-derives row ownership. "A `dcp_size=1` prefill and a `dcp_size=3` decode
+have entirely different row->token mappings, so a transfer between them moves
+bytes to rows that mean something else."
+
+**That is exactly the pair Route A proposes.** Our production decode group
+auto-sets `dcp_size=3` (`= tp_size`, token-axis KV sharding, confirmed in the
+live serving boot log), and a PP prefill group at `tp_size=1` has
+`dcp_size=1`. So wiring `assert_compatible` wholesale would refuse the Route A
+pair — and by the contract's own reasoning that refusal would be CORRECT, not
+a false positive. The KV handover from a non-DCP prefill group into a
+DCP-sharded decode group is not a plain transfer; it needs a token-axis
+remap that the common PD path does not perform today.
+
+Decision, therefore:
+
+- **Lift only `model_identity_hash`** into the common handshake: add it to
+  `PrefillServerInfo` (`common/conn.py:67-90`), populate it at registration
+  next to `page_size` / `kv_cache_dtype` (`:1518-1519`), and compare it in
+  `try_ensure_parallel_info` immediately after the existing two checks
+  (`:449`) and before `_resolve_rank_mapping` (`:451`). This closes the #212
+  trap — two arms with different weights stop pairing — and changes refusal
+  behaviour for existing PD users only in the case where they were already
+  broken.
+- **The rest of `TransportIdentity` stays UNWIRED**, and this document says so
+  rather than letting it look adopted: `kv_dtype` and `page_size` are already
+  covered by the two existing checks, and `total_kv_head_num`, `head_dim`,
+  `state_types`, `dcp_size` and `row_ownership` remain compared nowhere on the
+  common path.
+- **New Route A blocker, filed as an open risk (R6):** the token-axis remap
+  above. Wiring `dcp_size`/`row_ownership` into the common path is the RIGHT
+  end state, but it must land together with either a remap in the handover or
+  a decision to run the decode group without DCP — otherwise it converts a
+  silent wrong-bytes bug into a refusal that blocks the feature. Sequencing
+  that is a decision for the coordinator, not something to slip into a guard
+  commit.
+
 ### Guard 2 — decode-arm radix cache on a hybrid model
 
 `--disaggregation-decode-enable-radix-cache` raises for SSM models at
@@ -402,6 +453,14 @@ it, but a PP prefill group cannot go into production until #630 closes.
 - R4: `planner/rejected.py:342` `pp_with_spec` evidence line had drifted from
   the code (cited `:11214`, real site `:16240-16245`); corrected in this
   branch under the register's own re-check rule.
+- R6 (Route A, NEW and structural): the production decode group is DCP-sharded
+  on the TOKEN axis (`dcp_size=3`), a PP prefill group is not (`dcp_size=1`),
+  and per `TransportIdentity`'s own reasoning no offset table re-derives row
+  ownership across that difference. The KV handover Route A depends on is
+  therefore not a plain transfer between these two groups. Either the handover
+  gains a token-axis remap, or the decode group gives up DCP, or Route A pairs
+  only same-DCP groups. Unresolved; it gates slice 2 more tightly than the
+  draft-KV question does.
 - R5 (Route A): the PD spec auto-disable is SILENT. Any #625 work on Route A
   must convert it into a loud refusal for the decode arm before it can be
   trusted, or a boot that looks correct will have lost NEXTN without saying
