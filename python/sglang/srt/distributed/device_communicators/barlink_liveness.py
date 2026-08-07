@@ -725,6 +725,30 @@ def _dead_for(table: Optional[PeerTable]) -> List[PeerIdentity]:
     return any_dead_peers()
 
 
+def _extend_for_building_peers(
+    label: str,
+    waited_s: float,
+    increment_s: float,
+    table: Optional[PeerTable],
+) -> bool:
+    """Whether this wait may run one more budget because a peer is building.
+
+    The decision itself lives in ``barlink_build_window.extension_for`` -- one
+    definition, shared with the BAR1 abort guard, so a revert of the mechanism
+    flips both callers rather than leaving one silently on a private copy.
+    Import is lazy and failure is False: a wait must raise on its own terms if
+    the visibility mechanism is absent.
+    """
+    try:
+        from sglang.srt.distributed.device_communicators.barlink_build_window import (
+            extension_for,
+        )
+
+        return extension_for(waited_s, increment_s, label, table=table) is not None
+    except Exception:  # noqa: BLE001 - never let a diagnostic hold a wait open
+        return False
+
+
 def bounded_poll(
     ready: Callable[[], bool],
     label: str,
@@ -772,6 +796,7 @@ def bounded_poll(
     probe_every = probe_interval_s()
     next_probe = start + probe_every
     nap = _SLEEP_MIN_S
+    extended = False  # #615: whether a peer's build window moved the deadline
 
     while not ready():
         now = time.monotonic()
@@ -787,7 +812,23 @@ def bounded_poll(
         if now >= deadline:
             if ready():
                 return
-            message = _timeout_error(label, budget, table)
+            # #615: a peer that is legitimately inside a lazy JIT build has
+            # published that fact, and a deadline that fires on it turns a
+            # slow compiler into a wedge report. Extend by one further
+            # budget, loudly, until the absolute cap -- past which this
+            # raises anyway, so a rank that published a build and then wedged
+            # is still caught. The extension is consulted HERE and nowhere
+            # else: a collective that completes never reaches this branch.
+            if _extend_for_building_peers(label, now - start, budget, table):
+                deadline = now + budget
+                extended = True
+                continue
+            # Report the TOTAL wait once a build extended it. Reporting the
+            # configured budget after twelve minutes of forgiven build time
+            # would send the reader to raise a knob that was never the bound.
+            message = _timeout_error(
+                label, (now - start) if extended else budget, table
+            )
             if on_abort is not None:
                 on_abort()
             raise CollectiveTimeoutError(message)
