@@ -157,6 +157,17 @@ _GEMMA_NORM_NAMES = (
     "mtp.pre_fc_norm_hidden.weight",
 )
 
+# MoE router gates, spelled as the GGUF iterator renames them for any non-F32
+# tensor. Both are built with quant_config=None (Qwen2MoeSparseMoeBlock), so
+# they own a dense `.weight` and never a `.qweight`; see transform_stream.
+# Listed explicitly rather than matched on a shared "gate" substring: the
+# quantized MLP projection `mlp.gate_proj` must NOT be caught by this.
+_GATE_QWEIGHT_SUFFIXES = (
+    ".mlp.gate.qweight",
+    ".shared_expert_gate.qweight",
+)
+_GATE_QWEIGHT_TYPE_SUFFIXES = tuple(s + "_type" for s in _GATE_QWEIGHT_SUFFIXES)
+
 
 class Qwen35GGUFAdapter(GGUFAdapterBase):
     """Builds the GGUF<->HF name map and applies llama.cpp inverse transforms
@@ -498,6 +509,34 @@ class Qwen35GGUFAdapter(GGUFAdapterBase):
         block_size, _ = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(qtype)]
         return self.head_v_dim % block_size != 0
 
+    def _dense_gate_tensor(self, weight: torch.Tensor, qtype: int) -> torch.Tensor:
+        """Materialize a MoE router-gate payload as a dense tensor.
+
+        The gate reaches this point under its renamed ``.qweight`` name (see
+        ``transform_stream``), so the payload is whatever the GGUF iterator
+        handed over for *qtype*:
+
+        * **BF16** -- gguf-py returns raw little-endian uint8 with the last
+          dimension doubled, so a re-view is enough and no conversion happens.
+          This is the case that actually bites: a uint8 payload also fails
+          ``Tensor.is_floating_point()``, so the dense-shard rescue in
+          ``gguf.py:_cast_dense_qweight`` skips it too.
+        * **F16/F32** -- already a real float matrix; only the dtype cast runs.
+        * **anything block-packed** -- defensive. llama.cpp does not quantize
+          router gates (they are tiny and route every token), but a re-export
+          that did would otherwise reach the dense module as packed bytes.
+        """
+        import gguf
+        from gguf.quants import dequantize
+
+        ggml_type = gguf.GGMLQuantizationType(qtype)
+        if ggml_type == gguf.GGMLQuantizationType.BF16:
+            if weight.dtype == torch.uint8:
+                weight = weight.contiguous().view(torch.bfloat16)
+        elif not self._is_dense_gguf_type(qtype):
+            weight = torch.from_numpy(dequantize(weight.numpy(), ggml_type).copy())
+        return weight.to(self.config.torch_dtype)
+
     @staticmethod
     def _is_dense_gguf_type(qtype: int) -> bool:
         """True for GGUF "unquantized" tensor types (F16/BF16/F32), whose data
@@ -657,6 +696,11 @@ class Qwen35GGUFAdapter(GGUFAdapterBase):
             if name.endswith(".qweight_type"):
                 qtype = int(weight.item())
                 qweight_types[name.removesuffix("_type")] = qtype
+                if name.endswith(_GATE_QWEIGHT_TYPE_SUFFIXES):
+                    # MoE router gate (#647): built unquantized, so the module
+                    # has no `.qweight_type` param to receive this. The type is
+                    # recorded above; the payload branch below consumes it.
+                    continue
                 if name.endswith("linear_attn.out_proj.qweight_type") and (
                     self._out_proj_dequant_needed(qtype)
                     or self._is_dense_gguf_type(qtype)
@@ -701,6 +745,35 @@ class Qwen35GGUFAdapter(GGUFAdapterBase):
                 # `.qweight` columns are raw bytes; un-tile at byte granularity.
                 yield name, self._undo_gdn_reorder(name, weight, qweight_types)
                 continue
+
+            # --- MoE router gates: restore the dense name (#647) ---------
+            # The generic iterator renames EVERY non-F32 tensor's `.weight`
+            # leaf to `.qweight` (weight_utils.gguf_quant_weights_iterator),
+            # equating "not F32" with "the destination module is quantized".
+            # For router gates that is false by construction:
+            # Qwen2MoeSparseMoeBlock builds both `mlp.gate` and
+            # `mlp.shared_expert_gate` with quant_config=None, so each owns a
+            # dense `.weight` and no `.qweight` at all -- the renamed tensor
+            # lands on a parameter that does not exist and is dropped with a
+            # single `logger.warning`, leaving the gate at its uninitialized
+            # values. A router gate full of garbage still routes every token to
+            # SOME expert, so the model stays fluent and is quietly wrong.
+            #
+            # Published GGUFs almost always store the gates F32, which are
+            # never renamed -- that is the only reason this stayed invisible.
+            # Qwen3.6-35B-A3B-UD-Q4_K_XL stores the MTP block's two gates as
+            # BF16 (the only non-F32 dense tensors in the whole 753-tensor
+            # file), so on that checkpoint the NEXTN draft's router never
+            # loads. Mirrors the same fix in gguf_deepseek4.transform_stream.
+            #
+            # Reassign instead of yielding, so the dense tensor still passes
+            # through the value transforms below -- `shared_expert_gate` is
+            # stored 1-D and needs the unsqueeze branch a few lines down.
+            if name.endswith(_GATE_QWEIGHT_SUFFIXES):
+                qtype = qweight_types.get(name)
+                assert qtype is not None, f"{name}: qweight_type not seen yet"
+                weight = self._dense_gate_tensor(weight, qtype)
+                name = name.removesuffix(".qweight") + ".weight"
 
             # --- value transforms on plain (unquantized) tensors ---
             if name.endswith("conv1d.weight") and weight.dim() == 2:
