@@ -32,6 +32,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import uniform_host_avail_for_backup
 from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.hicache_collective import (
+    COLLECTIVE_POLL_MAX_S,
+    COLLECTIVE_POLL_MIN_S,
+    COLLECTIVE_POLL_SPINS,
+    HiCacheCollectiveDesyncError,
+    HiCacheCollectiveError,
+    HiCacheCollectiveTimeoutError,
+    bounded_recv,
+    bounded_wait,
+    collective_rank_desc,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -79,31 +90,17 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
-class HiCacheCollectiveError(RuntimeError):
-    """A HiCache control collective cannot be issued rank-uniformly."""
-
-
-class HiCacheCollectiveDesyncError(HiCacheCollectiveError):
-    """A HiCache control collective reduced a payload it did not post.
-
-    Raised when a self-identifying control vector comes back carrying a
-    foreign tag, i.e. the ranks were not all inside the same collective.
-    gloo only aborts the process when the mismatched buffers differ in size
-    (``op.preamble.length <= op.nbytes``); equal-sized traffic from another
-    site is accepted silently and would corrupt the reduced values instead.
-    This turns that second case into a named error on every rank.
-    """
-
-
-class HiCacheCollectiveTimeoutError(HiCacheCollectiveError):
-    """A HiCache control collective did not complete within its bound.
-
-    Raised on the surviving rank when a peer is dead or wedged. The alternative
-    is the failure this exists to prevent: the gloo ``cpu_group`` these control
-    collectives run on carries a two-hour default timeout, so without a bound
-    the survivor parks in ``all_reduce`` for hours after its peer dies of OOM,
-    with nothing in the log naming the reason.
-    """
+# The HiCacheCollective* error types and the bounded-wait mechanism used to be
+# defined here. They moved to hicache_collective so that HiRadixCache shares ONE
+# implementation with this class instead of a second, drifting copy (#630 was
+# exactly that drift). They stay importable from this module because that is
+# their established import surface -- this tuple is what keeps that re-export
+# explicit rather than an import that looks unused and invites deletion.
+_COLLECTIVE_REEXPORTS = (
+    HiCacheCollectiveError,
+    HiCacheCollectiveDesyncError,
+    HiCacheCollectiveTimeoutError,
+)
 
 
 # Rank-invariant slot layout for the sidecar-pool entries of a control
@@ -125,9 +122,9 @@ _POOL_SLOT_COUNT: int = len(_POOL_SLOT_ORDER)
 #: value; it is reduced as a (tag, -tag) pair so one MIN yields min and max.
 _PREFETCH_VOTE_TAG = 580
 
-_COLLECTIVE_POLL_SPINS = 512
-_COLLECTIVE_POLL_MIN_S = 0.0005
-_COLLECTIVE_POLL_MAX_S = 0.05
+_COLLECTIVE_POLL_SPINS = COLLECTIVE_POLL_SPINS
+_COLLECTIVE_POLL_MIN_S = COLLECTIVE_POLL_MIN_S
+_COLLECTIVE_POLL_MAX_S = COLLECTIVE_POLL_MAX_S
 
 
 def _pool_slot(pool_name, offset: int) -> int:
@@ -461,30 +458,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         The healthy case costs nothing measurable: a CPU all_reduce of a few
         ints between local ranks completes inside the initial spin window, so
         no sleep is ever reached.
-        """
-        timeout_s = self.collective_timeout_s
-        if not timeout_s or timeout_s <= 0:
-            work.wait()
-            return
 
-        deadline = time.monotonic() + timeout_s
-        spins = 0
-        sleep_s = _COLLECTIVE_POLL_MIN_S
-        while not work.is_completed():
-            spins += 1
-            if spins <= _COLLECTIVE_POLL_SPINS:
-                continue
-            if time.monotonic() >= deadline:
-                raise HiCacheCollectiveTimeoutError(
-                    f"HiCache control collective '{label}' did not complete "
-                    f"within {timeout_s:g}s. A peer rank is dead or wedged; "
-                    "this rank aborts instead of blocking in the collective "
-                    "until the process-group timeout (2h) expires. Adjust the "
-                    "bound with SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S."
-                )
-            time.sleep(sleep_s)
-            sleep_s = min(sleep_s * 2, _COLLECTIVE_POLL_MAX_S)
-        work.wait()
+        Thin wrapper over the shared mechanism in ``hicache_collective`` -- see
+        that module for the poll schedule and the rationale.
+        """
+        bounded_wait(
+            work,
+            label,
+            self.collective_timeout_s,
+            collective_rank_desc(self),
+        )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op, label: str = "hicache"):
         reduced = False
@@ -608,9 +591,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         Called at the start of each event round, so work_list holds the sends
         accumulated since the last round. This bounds it and applies
         backpressure when a downstream PP rank lags. Scheduler thread only.
+
+        The wait is bounded for the same reason every other collective on this
+        path is (#630): these are isends on the PP gloo ``cpu_group``, and a
+        downstream PP rank that never posts the matching receive parks this
+        rank here until the group's two-hour timeout expires. Under PP + disk
+        HiCache that shows up as a warmup that never finishes and a health
+        endpoint stuck at 503 with nothing in the log.
         """
-        for work in self.work_list:
-            work.wait()
+        for i, work in enumerate(self.work_list):
+            self._wait_bounded(work, f"pp_sync/isend[{i}]->pp{self.pp_rank + 1}")
         self.work_list.clear()
 
     def _all_reduce(
@@ -638,11 +628,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.pp_size <= 1 or self.pp_group is None:
             return
         if self.pp_rank > 0:
-            torch.distributed.recv(
+            # Bounded via irecv rather than recv: recv has no async form and no
+            # timeout, so every PP rank above the first would otherwise block
+            # here without a deadline. See hicache_collective.bounded_recv.
+            bounded_recv(
                 data,
-                group_src=self.pp_rank - 1,
                 group=self.pp_group,
+                group_src=self.pp_rank - 1,
                 tag=P2PTag.HIRADIX_PP_SYNC,
+                label=f"pp_sync/recv<-pp{self.pp_rank - 1}",
+                timeout_s=self.collective_timeout_s,
+                rank_desc=collective_rank_desc(self),
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
