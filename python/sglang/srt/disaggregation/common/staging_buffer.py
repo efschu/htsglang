@@ -758,11 +758,16 @@ def resolve_total_kv_heads(
     total = getattr(kv_args, "total_kv_head_num", 0)
     if total > 0:
         return total
-    per_rank = getattr(kv_args, "kv_head_num", 0)
-    if per_rank > 0:
-        return per_rank * attn_tp_size
+    # total_kv_head_num is always set by both prefill.py:201-202 and
+    # decode.py (via model_config.get_total_num_kv_heads()).  Reaching this
+    # point means an upstream caller failed to populate it -- the previous
+    # behaviour of falling back to ``kv_head_num * attn_tp_size`` was
+    # incorrect under uneven TP and produced silently corrupt attention.
     raise ValueError(
-        "Cannot resolve total_kv_heads: kv_args has neither total_kv_head_num "
-        "nor kv_head_num. "
-        "Ensure DecodePreallocQueue._init_kv_manager sets kv_args.kv_head_num."
+        "Cannot resolve total_kv_heads: kv_args.total_kv_head_num is missing "
+        f"(attn_tp_size={attn_tp_size}).  "
+        "This should never happen after #641 because both the prefill and "
+        "decode paths now set it from model_config.get_total_num_kv_heads(). "
+        "If you see this error, an upstream code path is not setting "
+        "total_kv_head_num."
     )

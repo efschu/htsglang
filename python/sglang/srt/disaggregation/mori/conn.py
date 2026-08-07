@@ -767,7 +767,12 @@ class MoriKVManager(CommonKVManager):
 
         total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
-            total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
+            raise ValueError(
+                "total_kv_head_num is missing from kv_args. "
+                "Prefill should set it from model_config.get_total_num_kv_heads() "
+                "(prefill.py:201-202).  The previous fallback of kv_head_num * "
+                "attn_tp_size was incorrect under uneven TP (#641)."
+            )
 
         src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
