@@ -366,3 +366,89 @@ of which is sufficient:
 L6 in particular wants a same-boot A-vs-A floor plus a monolithic comparison
 arm, which is most of a window by itself. Planning L1-L9 as a tail on window 1
 would produce exactly the skipped-L6 outcome DESIGN_631b warns about.
+
+## 6. Resolution of sections 2 and 3 (#646)
+
+Sections 3a and 3b are fixed and section 2's gate is redesigned. Everything
+below was executed on the cardless box (`CUDA_VISIBLE_DEVICES=99`); reason 3
+of section 5 (the topology does not boot on this rig) is untouched and still
+stands.
+
+### 6.1 The pointer partition
+
+`common/conn.py get_mha_kv_ptrs_with_pp` no longer halves the flat list. It
+splits on the section boundary the registration site declares:
+`prefill.py` and `decode.py` now record `kv_args.num_target_kv_buffers` BEFORE
+appending the draft pool, and the split falls back to the declared PP layer
+range and then to the whole list, never to `len // 2`-as-K/V. The draft pool
+comes back as its own section (`MhaPpKvPtrs.draft_pairs`), each entry carrying
+the source index into `kv_item_lens`, because draft entries sit past the K/V
+halves and cannot be addressed by the `item_lens[i]` / `item_lens[stage + i]`
+formula the callers use.
+
+Two derived decisions:
+
+- **The last PP stage owns the draft section.** The predicate is
+  `start_layer + stage_layers == peer_target_layers`, so no new plumbing. On
+  `pp=1` the only stage IS the last stage, which is why the monolithic path is
+  unchanged.
+- **The head-slicing paths refuse a draft pool** (`mooncake/conn.py`
+  `send_kvcache_slice`, `nixl/conn.py`). They re-slice every buffer along the
+  target pool's head geometry using a single item length from target layer 0;
+  a draft pool does not follow that geometry, so there is no correct way to
+  carry it there.
+
+Measured with `scratch_631/probe_step4_mispair_count.py`, 48 layers over three
+PP stages, draft pool on both arms:
+
+| tree | draft arm | control arm (no draft) |
+|------|-----------|------------------------|
+| base `f936d24db1` | 54 mispaired (18 of 34 per stage) | 0 of 32 per stage |
+| after the fix | 0 | 0 |
+
+The control arm is unchanged in both directions, which is what keeps the
+number evidence rather than an oracle artefact.
+
+### 6.2 The stride channel
+
+The decode arm announces its full `kv_item_lens` plus its draft section size
+(wire frames 16/17 of the mooncake registration, appended so peers that stop
+at frame 15 are unaffected). `KVArgsRegisterInfo` gained `dst_kv_item_lens`
+and `dst_num_draft_buffers`; the scalar `dst_kv_item_len` is unchanged and
+still carries target layer 0 for old peers.
+
+### 6.3 The redesigned gate
+
+`CommonKVManager.describe_kv_geometry_mismatch` is the L10 replacement. It
+compares GEOMETRY, not the `--draft-kv-layout` name, which is what section 2
+concluded a correct gate must do: on this topology the two arms are forced
+onto different layout names, so a name comparison refuses a pair that can
+transfer correctly, while a geometry comparison refuses exactly the pairs that
+cannot.
+
+- The DRAFT section is compared unconditionally, because nothing in the
+  transfer path re-slices it.
+- The TARGET section is compared only where the transfer path requires
+  equality (the fork-DCP token-sharded arm), and then per PP-stage layer
+  rather than at index 0, so a PP pair with legitimately different list
+  lengths is not refused.
+- Both-sides-present rule, as guard 1 established it: a peer that announces
+  nothing is not refused over a check that cannot be performed.
+
+It runs at two points: once at the registration handshake, where the verdict
+is recorded on the peer's `KVArgsRegisterInfo`, and again per transfer, where
+a recorded verdict is raised (the bootstrap thread cannot fail a transfer).
+
+### 6.4 What is NOT fixed
+
+- **The legacy `elif` branch is wrong for uneven PP without a draft pool.**
+  `v_ptr_offset = num_kv_layers * (dst_total // num_kv_layers)` only equals
+  the true V offset when the division is exact. A 48-layer model over stages
+  of 10/10/10/9/9 reaches it and mis-slices. It is left byte for byte as it
+  was, because behaviour neutrality on the no-draft path is the pin this work
+  was required to hold, and that path is today's production path. Its own
+  ticket.
+- **`mori/conn.py _get_mha_mem_desc_slices`** is a separate implementation of
+  the same half-split and was not audited.
+- **No GPU window has been taken**, so none of this has moved a byte over a
+  real fabric.

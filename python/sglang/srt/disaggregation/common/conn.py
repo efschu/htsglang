@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -126,6 +126,33 @@ class PrefillRankInfo:
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+
+
+class MhaPpKvPtrs(NamedTuple):
+    """Pairing of one prefill PP stage's MHA registration with the decode's.
+
+    The first five fields are the historical positional contract and cover the
+    TARGET pool only. Keeping them target-only is deliberate: it preserves the
+    flat item-length indexing every caller relies on -- ``item_lens[i]`` for
+    the i-th K pointer and ``item_lens[layers_current_pp_stage + i]`` for the
+    i-th V pointer -- which is only valid while the source list really is
+    ``[K(L), V(L)]``.
+
+    ``draft_pairs`` carries the draft pool as its OWN section, because it is
+    not part of the K/V halves. Each entry is
+    ``(src_ptr, dst_ptr, src_item_len_index)``; the index is into the source
+    arm's flat ``kv_item_lens``, since the draft entries sit past the target
+    section and therefore cannot be addressed by the K/V formula above.
+    """
+
+    src_k_ptrs: List[int]
+    src_v_ptrs: List[int]
+    dst_k_ptrs: List[int]
+    dst_v_ptrs: List[int]
+    layers_current_pp_stage: int
+    # No default: a mutable default on a NamedTuple is shared state, and every
+    # construction site knows its draft section anyway.
+    draft_pairs: List[Tuple[int, int, int]]
 
 
 class CommonKVManager(BaseKVManager):
@@ -733,9 +760,183 @@ class CommonKVManager(BaseKVManager):
             )
             return sock
 
+    def _local_kv_sections(self) -> Tuple[List[int], List[int]]:
+        """This arm's ``kv_item_lens`` split into (target section, draft section)."""
+        local_lens = list(getattr(self.kv_args, "kv_item_lens", None) or [])
+        num_target = getattr(self.kv_args, "num_target_kv_buffers", None)
+        if not isinstance(num_target, int) or not 0 < num_target <= len(local_lens):
+            num_target = len(local_lens)
+        return local_lens[:num_target], local_lens[num_target:]
+
+    def describe_kv_geometry_mismatch(
+        self,
+        peer_item_lens: Optional[List[int]],
+        peer_num_draft_buffers: Optional[int],
+        peer_row_bytes: Optional[int] = None,
+        compare_target_rows: bool = False,
+    ) -> Optional[str]:
+        """Compare this arm's per-row KV geometry with the peer's, section by section.
+
+        Returns a reason string, or ``None`` when the two agree or when the
+        peer announced too little to compare (the both-sides-present rule that
+        guard 1 established, so a mixed-version pair does not refuse on a
+        check it cannot perform).
+
+        This is the shape of gate that DESIGN_631c section 2 argued for. The
+        L10 requirement as originally written -- "both arms run the SAME
+        --draft-kv-layout" -- is unsatisfiable on the #631 topology, because a
+        pp>1/tp=1 prefill group cannot take ``dcp`` (the #108 gate wants
+        ``dcp_size == tp_size > 1``) while a token-sharded decode group cannot
+        take ``replicated`` (#642). It also cannot live at parse time, because
+        parse time does not see the peer. What actually has to agree is the
+        GEOMETRY the layout produces -- per-row byte length and section size --
+        and that is comparable exactly here, at the handshake, where both
+        arms' registrations are in hand.
+
+        The DRAFT section is compared unconditionally: nothing in the transfer
+        path re-slices it, so its rows are copied one for one. The TARGET
+        section is compared only when the caller asks, because a PD pair is
+        expected to differ there (head slicing across unequal attention TP is
+        supported and handled elsewhere).
+        """
+        local_target_lens, local_draft_lens = self._local_kv_sections()
+        if not local_target_lens:
+            return None
+
+        peer_target_lens: Optional[List[int]] = None
+        peer_draft_lens: Optional[List[int]] = None
+        if peer_item_lens:
+            peer_lens = list(peer_item_lens)
+            peer_draft = peer_num_draft_buffers
+            if peer_draft is None:
+                # Peer announced its lengths but not its section boundary.
+                # Symmetry with this arm is the only available reading.
+                peer_draft = len(local_draft_lens)
+            if not 0 <= peer_draft < len(peer_lens):
+                return (
+                    f"peer announced {len(peer_lens)} KV buffers of which "
+                    f"{peer_draft} are draft-pool entries, which does not "
+                    "decompose into a target section plus a draft section."
+                )
+            peer_target_lens = peer_lens[: len(peer_lens) - peer_draft]
+            peer_draft_lens = peer_lens[len(peer_lens) - peer_draft :]
+
+        if peer_draft_lens is not None and local_draft_lens != peer_draft_lens:
+            return (
+                "draft KV pool row geometry differs between the two PD arms: "
+                f"prefill draft item lengths {local_draft_lens}, decode draft "
+                f"item lengths {peer_draft_lens}. The draft section is copied "
+                "row for row with no re-slicing, so the two arms must produce "
+                "the same per-row byte layout. This compares the GEOMETRY, "
+                "not the --draft-kv-layout name: the arms are allowed to name "
+                "different layouts as long as the rows they produce match."
+            )
+
+        if not compare_target_rows:
+            return None
+
+        if peer_target_lens is None:
+            # Legacy peer: only the target layer-0 scalar crossed the wire.
+            if peer_row_bytes is not None and local_target_lens[0] != peer_row_bytes:
+                return (
+                    f"Got prefill item_len={local_target_lens[0]}, decode "
+                    f"item_len={peer_row_bytes}."
+                )
+            return None
+
+        # This arm may hold only one PP stage of the target pool, so compare
+        # the layers it actually covers against the peer's corresponding ones
+        # rather than the lists as wholes.
+        num_local_layers = len(local_target_lens) // 2
+        num_peer_layers = len(peer_target_lens) // 2
+        start = getattr(self.kv_args, "prefill_start_layer", 0) or 0
+        if num_local_layers == num_peer_layers:
+            start = 0
+        if start + num_local_layers > num_peer_layers:
+            return (
+                f"this arm covers target layers [{start}, "
+                f"{start + num_local_layers}) but the peer registered only "
+                f"{num_peer_layers} target layers."
+            )
+        for j in range(num_local_layers):
+            for local_idx, peer_idx in (
+                (j, start + j),
+                (num_local_layers + j, num_peer_layers + start + j),
+            ):
+                if local_target_lens[local_idx] != peer_target_lens[peer_idx]:
+                    return (
+                        f"target KV row geometry differs at layer {start + j} "
+                        f"({'K' if local_idx < num_local_layers else 'V'}): "
+                        f"prefill item_len={local_target_lens[local_idx]}, "
+                        f"decode item_len={peer_target_lens[peer_idx]}."
+                    )
+        return None
+
+    def _num_target_kv_buffers(self, src_kv_ptrs: List[int]) -> int:
+        """How many entries of ``src_kv_ptrs`` belong to the TARGET pool.
+
+        #646: the flat registration is ``[K(L), V(L)]`` for the target pool and
+        then, when the arm also holds a draft model, ``[draft_K(D),
+        draft_V(D)]`` appended behind it (``prefill.py`` / ``decode.py``). The
+        K/V boundary is therefore NOT ``len(src_kv_ptrs) // 2``.
+
+        Sources, most authoritative first:
+
+        1. ``kv_args.num_target_kv_buffers`` -- recorded by the registration
+           site itself, before the draft pool is appended. Exact.
+        2. The declared PP layer range ``prefill_end_layer -
+           prefill_start_layer``, doubled for the K and V halves. Used only
+           when it fits inside the list, which also rejects the layer-shard
+           path where ``prefill_end_layer`` is set to a BUFFER count rather
+           than a layer count (``prefill.py``).
+        3. The whole list -- i.e. no draft section. This is the legacy reading
+           and keeps a caller that supplies neither of the above on exactly
+           the behaviour it had.
+        """
+        declared = getattr(self.kv_args, "num_target_kv_buffers", None)
+        if (
+            isinstance(declared, int)
+            and 0 < declared <= len(src_kv_ptrs)
+            and declared % 2 == 0
+        ):
+            return declared
+        start = getattr(self.kv_args, "prefill_start_layer", None)
+        end = getattr(self.kv_args, "prefill_end_layer", None)
+        if isinstance(start, int) and isinstance(end, int) and end > start:
+            from_range = 2 * (end - start)
+            if 0 < from_range <= len(src_kv_ptrs):
+                return from_range
+        return len(src_kv_ptrs)
+
     def get_mha_kv_ptrs_with_pp(
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        dst_num_draft_buffers: Optional[int] = None,
+    ) -> MhaPpKvPtrs:
+        """Pair this prefill PP stage's MHA buffers with the decode's.
+
+        ``dst_num_draft_buffers`` is the number of trailing entries of
+        ``dst_kv_ptrs`` that belong to the peer's DRAFT pool, as announced by
+        the peer at registration. ``None`` means the peer did not announce it
+        (older peer, or a backend that does not carry the field).
+        """
+        num_src_target = self._num_target_kv_buffers(src_kv_ptrs)
+        num_src_draft = len(src_kv_ptrs) - num_src_target
+
+        if num_src_draft == 0 and not dst_num_draft_buffers:
+            # BEHAVIOUR PIN. No draft pool on either arm is the production
+            # path today, and it is the case the half-split gets right. Left
+            # byte for byte as it was so the fix below cannot perturb it.
+            return self._legacy_mha_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
+
+        return self._sectioned_mha_kv_ptrs_with_pp(
+            src_kv_ptrs, dst_kv_ptrs, num_src_target, dst_num_draft_buffers
+        )
+
+    def _legacy_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
-    ) -> Tuple[List[int], List[int], List[int], List[int], int]:
+    ) -> MhaPpKvPtrs:
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
         end_layer = start_layer + num_kv_layers
@@ -764,7 +965,109 @@ class CommonKVManager(BaseKVManager):
                 dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
             ]
         layers_current_pp_stage = len(src_k_ptrs)
-        return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
+        return MhaPpKvPtrs(
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage, []
+        )
+
+    def _sectioned_mha_kv_ptrs_with_pp(
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        num_src_target: int,
+        dst_num_draft_buffers: Optional[int],
+    ) -> MhaPpKvPtrs:
+        """#646: split on the DECLARED section boundary, not on list length.
+
+        A registration is ``[K_t(L), V_t(L), K_d(D), V_d(D)]``. Halving the
+        whole list puts ``V_t`` pointers in the K half; on a non-PP pair both
+        arms are mislabelled identically so the pairing survives by accident,
+        but under PP the two lists have different lengths, the mislabel is
+        asymmetric, and source V buffers get written into destination K
+        buffers with no error raised.
+        """
+        start_layer = self.kv_args.prefill_start_layer
+        num_src_draft = len(src_kv_ptrs) - num_src_target
+        if num_src_target % 2 or num_src_draft % 2 or num_src_draft < 0:
+            raise RuntimeError(
+                "PD MHA registration is not a whole number of K/V pairs: "
+                f"{len(src_kv_ptrs)} pointers with a {num_src_target}-entry "
+                f"target section, leaving {num_src_draft} for the draft "
+                "section. Expected [K(L), V(L), draft_K(D), draft_V(D)]."
+            )
+        src_layers = num_src_target // 2
+        src_draft_layers = num_src_draft // 2
+
+        if dst_num_draft_buffers is None:
+            # The peer did not announce its sections. Symmetry with this arm
+            # is the only defensible inference: both arms load the same draft
+            # model or neither does. It is checked below, not assumed.
+            dst_num_draft_buffers = num_src_draft
+        num_dst_target = len(dst_kv_ptrs) - dst_num_draft_buffers
+        if num_dst_target <= 0 or num_dst_target % 2 or dst_num_draft_buffers % 2:
+            raise RuntimeError(
+                "PD MHA peer registration does not decompose: "
+                f"{len(dst_kv_ptrs)} pointers with {dst_num_draft_buffers} "
+                "announced as draft-pool entries."
+            )
+        dst_layers = num_dst_target // 2
+        dst_draft_layers = dst_num_draft_buffers // 2
+
+        if src_draft_layers and src_draft_layers != dst_draft_layers:
+            raise RuntimeError(
+                "PD draft KV pool geometry mismatch: the prefill arm "
+                f"registered {src_draft_layers} draft layer(s) and the decode "
+                f"arm {dst_draft_layers}. The draft section is transferred "
+                "one-to-one, so the two arms must hold the same draft model."
+            )
+
+        if src_layers == dst_layers:
+            # Both arms cover the same layer range (pp=1, or equal PP sizes).
+            dst_k_ptrs = dst_kv_ptrs[:dst_layers]
+            dst_v_ptrs = dst_kv_ptrs[dst_layers:num_dst_target]
+            is_last_pp_stage = True
+        else:
+            end_layer = start_layer + src_layers
+            if start_layer < 0 or end_layer > dst_layers:
+                raise RuntimeError(
+                    f"PD PP stage [{start_layer}, {end_layer}) does not fit "
+                    f"inside the decode arm's {dst_layers} target layers."
+                )
+            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            dst_v_ptrs = dst_kv_ptrs[dst_layers + start_layer : dst_layers + end_layer]
+            is_last_pp_stage = end_layer == dst_layers
+
+        draft_pairs: List[Tuple[int, int, int]] = []
+        if src_draft_layers and is_last_pp_stage:
+            # Only the LAST PP stage ships the draft section. The draft model
+            # sits behind the final target layer, so the last stage is its
+            # owner; letting every stage ship it would write the same rows
+            # once per stage. On pp=1 the only stage IS the last stage, so the
+            # monolithic path keeps shipping it exactly as before.
+            for d in range(src_draft_layers):
+                draft_pairs.append(
+                    (
+                        src_kv_ptrs[num_src_target + d],
+                        dst_kv_ptrs[num_dst_target + d],
+                        num_src_target + d,
+                    )
+                )
+            for d in range(src_draft_layers):
+                draft_pairs.append(
+                    (
+                        src_kv_ptrs[num_src_target + src_draft_layers + d],
+                        dst_kv_ptrs[num_dst_target + dst_draft_layers + d],
+                        num_src_target + src_draft_layers + d,
+                    )
+                )
+
+        return MhaPpKvPtrs(
+            src_kv_ptrs[:src_layers],
+            src_kv_ptrs[src_layers:num_src_target],
+            dst_k_ptrs,
+            dst_v_ptrs,
+            src_layers,
+            draft_pairs,
+        )
 
     def get_mla_kv_ptrs_with_pp(
         self,

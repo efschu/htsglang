@@ -146,6 +146,21 @@ class KVArgsRegisterInfo:
     dst_state_conv_segments: List[List[int]] = dataclasses.field(
         default_factory=list
     )
+    # #646: the FULL per-buffer item-length list, not just index 0.
+    # ``dst_kv_item_len`` above is a single scalar taken from target layer 0,
+    # so any stride divergence confined to another layer -- in particular to
+    # the appended draft section, whose geometry follows --draft-kv-layout and
+    # can legitimately differ between the two arms -- was structurally
+    # invisible to the only guard there was. Empty -> peer predates the field.
+    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    # #646: how many trailing entries of dst_kv_ptrs belong to the DRAFT pool.
+    # None -> peer predates the field, and the prefill arm falls back to
+    # assuming its own draft geometry (checked, not assumed).
+    dst_num_draft_buffers: Optional[int] = None
+    # #646: filled in locally (never from the wire) when this arm's KV row
+    # geometry disagrees with the peer's. Non-None means every transfer to
+    # this session must refuse.
+    geometry_error: Optional[str] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -174,6 +189,18 @@ class KVArgsRegisterInfo:
             # Appended after the staging fields (13,14); older peers omit it.
             dst_state_conv_segments=(
                 unpack_int_lists(msg[15], "I") if len(msg) > 15 else []
+            ),
+            # #646, frames 16/17. Appended last so older peers -- which stop
+            # before these frames -- are unaffected.
+            dst_kv_item_lens=(
+                list(struct.unpack(f"{len(msg[16])//8}Q", msg[16]))
+                if len(msg) > 16 and msg[16] != b""
+                else []
+            ),
+            dst_num_draft_buffers=(
+                int(msg[17].decode("ascii"))
+                if len(msg) > 17 and msg[17] != b""
+                else None
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
@@ -685,6 +712,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         state_type: Optional[StateType] = None,
         force_flat: bool = False,
+        dst_num_draft_buffers: Optional[int] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -715,9 +743,14 @@ class MooncakeKVManager(CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         else:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            pairing = self.get_mha_kv_ptrs_with_pp(
+                src_data_ptrs, dst_data_ptrs, dst_num_draft_buffers
             )
+            src_k_ptrs = pairing.src_k_ptrs
+            src_v_ptrs = pairing.src_v_ptrs
+            dst_k_ptrs = pairing.dst_k_ptrs
+            dst_v_ptrs = pairing.dst_v_ptrs
+            layers_current_pp_stage = pairing.layers_current_pp_stage
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
             # Use correct item lengths for K and V separately
             if layers_current_pp_stage > len(dst_k_ptrs):
@@ -740,6 +773,13 @@ class MooncakeKVManager(CommonKVManager):
                     item_lens[layers_current_pp_stage + layer_id],  # V item length
                 )
                 for layer_id in range(layers_current_pp_stage)
+            ]
+            # #646: the draft pool is its own section past the K/V halves, so
+            # its item lengths cannot be reached by the K/V formula above --
+            # the pairing hands back the source index for each entry.
+            layers_params += [
+                (src_ptr, dst_ptr, item_lens[src_item_idx])
+                for src_ptr, dst_ptr, src_item_idx in pairing.draft_pairs
             ]
         assert layers_params is not None
 
@@ -795,6 +835,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_num_draft_buffers: Optional[int] = None,
     ):
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
@@ -804,6 +845,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            dst_num_draft_buffers=dst_num_draft_buffers,
         )
 
     def send_kvcache_slice(
@@ -868,9 +910,26 @@ class MooncakeKVManager(CommonKVManager):
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-        )
+        pairing = self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+        src_k_ptrs = pairing.src_k_ptrs
+        src_v_ptrs = pairing.src_v_ptrs
+        dst_k_ptrs = pairing.dst_k_ptrs
+        dst_v_ptrs = pairing.dst_v_ptrs
+        layers_current_pp_stage = pairing.layers_current_pp_stage
+        if pairing.draft_pairs:
+            # #646: this path re-slices every buffer along the TARGET pool's
+            # head geometry, using a single item length taken from target
+            # layer 0. A draft pool does not follow that geometry, so there is
+            # no correct way to carry it here. Refuse loudly rather than copy
+            # draft rows through target-shaped offsets.
+            logger.error(
+                "[%s] heterogeneous-TP KV slice transfer cannot carry a draft "
+                "KV pool (%d draft buffer pair(s) registered). Run the two PD "
+                "arms at equal attention TP size when speculation is enabled.",
+                mooncake_session_id,
+                len(pairing.draft_pairs) // 2,
+            )
+            return -1
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -1503,6 +1562,15 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        # #646: refuse a pair whose DRAFT section geometry
+                        # disagrees, on every send path. Decided once at
+                        # registration; re-raised here because the bootstrap
+                        # thread cannot fail a transfer.
+                        if target_rank_registration_info.geometry_error:
+                            raise RuntimeError(
+                                "PD KV geometry mismatch: "
+                                f"{target_rank_registration_info.geometry_error}"
+                            )
                         chunk_prefill_kv_indices = kv_chunk.prefill_kv_indices
                         if req.dst_owned_ordinals is not None:
                             # Fork DCP (replicated kv-heads, token-sharded
@@ -1513,18 +1581,22 @@ class MooncakeKVManager(CommonKVManager):
                             # rows to the owned ordinals. Rows are
                             # byte-identical on both sides (heads replicated),
                             # so the equal-layout generic copy applies.
-                            if (
-                                self.kv_args.kv_item_lens
-                                and target_rank_registration_info.dst_kv_item_len
-                                != self.kv_args.kv_item_lens[0]
-                            ):
+                            # #646: this used to compare kv_item_lens[0]
+                            # against a single announced scalar, so it could
+                            # only ever see target layer 0. It now compares
+                            # every layer this stage covers, and the draft
+                            # section separately.
+                            geometry_error = self.describe_kv_geometry_mismatch(
+                                target_rank_registration_info.dst_kv_item_lens,
+                                target_rank_registration_info.dst_num_draft_buffers,
+                                peer_row_bytes=target_rank_registration_info.dst_kv_item_len,
+                                compare_target_rows=True,
+                            )
+                            if geometry_error:
                                 raise RuntimeError(
                                     "PD DCP token-sharded transfer requires "
                                     "identical per-row KV layout on prefill and "
-                                    "decode (replicated kv-heads). Got prefill "
-                                    f"item_len={self.kv_args.kv_item_lens[0]}, "
-                                    f"decode item_len="
-                                    f"{target_rank_registration_info.dst_kv_item_len}."
+                                    f"decode (replicated kv-heads). {geometry_error}"
                                 )
                             s = kv_chunk.index_slice.start or 0
                             e = kv_chunk.index_slice.stop
@@ -1572,6 +1644,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
+                                target_rank_registration_info.dst_num_draft_buffers,
                             )
                         elif (
                             self.enable_staging
@@ -1759,9 +1832,22 @@ class MooncakeKVManager(CommonKVManager):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    reg_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    # #646: the handshake is the first and only point where
+                    # both arms' KV registrations are in hand, so it is where
+                    # a geometry disagreement has to be caught. Compares row
+                    # bytes, not --draft-kv-layout names.
+                    reg_info.geometry_error = self.describe_kv_geometry_mismatch(
+                        reg_info.dst_kv_item_lens,
+                        reg_info.dst_num_draft_buffers,
                     )
+                    if reg_info.geometry_error:
+                        logger.error(
+                            "Refusing KV transfers to decode session %s: %s",
+                            mooncake_session_id,
+                            reg_info.geometry_error,
+                        )
+                    self.decode_kv_args_table[mooncake_session_id] = reg_info
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
@@ -2115,6 +2201,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
+            # #646: the scalar above describes target layer 0 only. Announce
+            # the whole list plus the draft section size so the prefill arm
+            # can compare per-section geometry instead of one index, and can
+            # split our flat pointer list on its real section boundary.
+            packed_kv_item_lens = struct.pack(
+                f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
+                *self.kv_mgr.kv_args.kv_item_lens,
+            )
+            dst_num_draft_buffers = str(
+                getattr(self.kv_mgr.kv_args, "num_draft_kv_buffers", 0) or 0
+            ).encode("ascii")
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -2146,6 +2243,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_staging_base_ptr,
                         staging_total_size_str,
                         packed_state_conv_segments,
+                        packed_kv_item_lens,
+                        dst_num_draft_buffers,
                     ]
                 )
 

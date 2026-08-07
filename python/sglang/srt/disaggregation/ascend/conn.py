@@ -113,13 +113,14 @@ class AscendKVManager(MooncakeKVManager):
                     for layer_id in range(layers_current_pp_stage)
                 ]
             else:
-                (
-                    src_k_ptrs,
-                    src_v_ptrs,
-                    dst_k_ptrs,
-                    dst_v_ptrs,
-                    layers_current_pp_stage,
-                ) = self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                pairing = self.get_mha_kv_ptrs_with_pp(
+                    self.kv_args.kv_data_ptrs, dst_kv_ptrs
+                )
+                src_k_ptrs = pairing.src_k_ptrs
+                src_v_ptrs = pairing.src_v_ptrs
+                dst_k_ptrs = pairing.dst_k_ptrs
+                dst_v_ptrs = pairing.dst_v_ptrs
+                layers_current_pp_stage = pairing.layers_current_pp_stage
 
                 layers_params = [
                     (
@@ -135,6 +136,12 @@ class AscendKVManager(MooncakeKVManager):
                         self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
+                ]
+                # #646: draft-pool entries sit past the K/V halves and carry
+                # their own source item-length index.
+                layers_params += [
+                    (src_ptr, dst_ptr, self.kv_args.kv_item_lens[src_item_idx])
+                    for src_ptr, dst_ptr, src_item_idx in pairing.draft_pairs
                 ]
         else:
             num_layers = len(self.kv_args.kv_data_ptrs)

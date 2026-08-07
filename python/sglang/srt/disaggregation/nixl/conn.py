@@ -778,11 +778,24 @@ class NixlKVManager(CommonKVManager):
         bytes_per_token_src = src_kv_item_len // page_size
         bytes_per_token_dst = dst_kv_item_len // page_size
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_pp = (
-            self.get_mha_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
-            )
+        pairing = self.get_mha_kv_ptrs_with_pp(
+            self.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
         )
+        src_k_ptrs = pairing.src_k_ptrs
+        src_v_ptrs = pairing.src_v_ptrs
+        dst_k_ptrs = pairing.dst_k_ptrs
+        dst_v_ptrs = pairing.dst_v_ptrs
+        layers_pp = pairing.layers_current_pp_stage
+        if pairing.draft_pairs:
+            # #646: same reason as the mooncake head-slice path -- this
+            # descriptor list re-slices along the target pool's head geometry,
+            # which the draft pool does not share.
+            raise RuntimeError(
+                "NIXL heterogeneous-TP KV slice transfer cannot carry a draft "
+                f"KV pool ({len(pairing.draft_pairs) // 2} draft buffer "
+                "pair(s) registered). Run the two PD arms at equal attention "
+                "TP size when speculation is enabled."
+            )
         src_ptrs = list(src_k_ptrs[:layers_pp]) + list(src_v_ptrs[:layers_pp])
         dst_ptrs = list(dst_k_ptrs[:layers_pp]) + list(dst_v_ptrs[:layers_pp])
         num_ptr_pairs = len(src_ptrs)
@@ -1384,9 +1397,12 @@ class NixlKVManager(CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         else:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-            )
+            pairing = self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            src_k_ptrs = pairing.src_k_ptrs
+            src_v_ptrs = pairing.src_v_ptrs
+            dst_k_ptrs = pairing.dst_k_ptrs
+            dst_v_ptrs = pairing.dst_v_ptrs
+            layers_current_pp_stage = pairing.layers_current_pp_stage
 
             layers_params = [
                 (
@@ -1402,6 +1418,12 @@ class NixlKVManager(CommonKVManager):
                     item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
+            ]
+            # #646: draft-pool entries sit past the K/V halves and carry their
+            # own source item-length index.
+            layers_params += [
+                (src_ptr, dst_ptr, item_lens[src_item_idx])
+                for src_ptr, dst_ptr, src_item_idx in pairing.draft_pairs
             ]
 
         src_addrs = []

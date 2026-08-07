@@ -76,6 +76,15 @@ class KVArgs:
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
+    # #646: section boundary of the flat kv_data_ptrs / kv_item_lens lists.
+    # The registration is [target K(L), target V(L)] followed, when this arm
+    # holds a draft model, by [draft K(D), draft V(D)]. The transfer layer
+    # must not infer the K/V boundary from the list length, because the draft
+    # entries move it. Both are set by prefill.py / decode.py at registration;
+    # code that reads them uses getattr with a default so a backend that never
+    # sets them keeps its previous behaviour.
+    num_target_kv_buffers: int
+    num_draft_kv_buffers: int
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
