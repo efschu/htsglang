@@ -44,6 +44,7 @@ from unittest import mock
 
 import torch
 
+
 from sglang.srt.distributed.device_communicators import barlink_abort_gate
 from sglang.srt.distributed.device_communicators.barlink import BarlinkCommunicator
 from sglang.srt.distributed.device_communicators.barlink_bar1 import (
@@ -77,6 +78,8 @@ class _ScriptedEvent:
         self.records += 1
 
     def query(self) -> bool:
+        if self.syncs > 0:
+            return True
         self.queries += 1
         if self.never:
             return False
@@ -128,6 +131,15 @@ def _transport(*, aborted=0, world=3, rank=0, group="tp:0", defer=True, event=No
     t._ctl_lag = 0
     t._deferred_launches = 0
     t._boundary_checks = 0
+    # --- missing from original builder, defaults from real __init__ ---
+    t._last_op_captured = False         # barlink_bar1.py:1606, default False
+    t._abort_poll_stream = None         # barlink_bar1.py:1658, default None
+    t._abort_poll_dst = None            # barlink_bar1.py:1659, default None
+    t._abort_poll_active = False        # barlink_bar1.py:1660, default False
+    t._ctl_sync_timeouts = 0           # barlink_bar1.py:1664, default 0
+    t._abort_code_seen = 0             # barlink_bar1.py:1661, default 0
+    t._ctl_stall_run = 0               # barlink_bar1.py:1668, default 0
+    t._ctl_build_deferred_s = 0.0      # barlink_bar1.py:1675, default 0.0
     t._up = True
     return t
 
@@ -267,6 +279,13 @@ class TestTheDeferredGuardStillSeesTheCrash(CustomTestCase):
         self.assertGreater(cm.exception.launches, 1)
 
 
+# The lag-bound tests drive _wait_ctl_event against an event that never
+# completes; deadline 0 makes each bounded wait expire immediately instead
+# of eating the 2000 ms default per wait. Scoped to this class so the
+# process-wide default stays untouched for every other test in the run.
+@mock.patch.dict(
+    os.environ, {"SGLANG_BARLINK_BAR1_ABORT_SYNC_DEADLINE_MS": "0"}
+)
 class TestTheLagBoundIsLoadBearing(CustomTestCase):
     """The naive cheapening, and why the shipped default is not it.
 
