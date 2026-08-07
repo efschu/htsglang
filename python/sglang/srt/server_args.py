@@ -6112,6 +6112,12 @@ class ServerArgs:
         # "rank_tp_ratio=auto-performance, dcp_size=1".
         self._reject_unsupported_draft_kv_dcp()
 
+        # BOOT GATE (#636). Must run HERE, after _handle_uneven_tp has
+        # resolved dcp_size: read in _handle_pd_disaggregation it would see
+        # the unresolved value and pass silently. Same trap as the #108 gate
+        # directly above.
+        self._validate_pd_dcp_token_shard_contract()
+
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
 
@@ -7658,6 +7664,13 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _validate_pd_dcp_token_shard_contract(self):
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            validate_pd_dcp_token_shard_contract,
+        )
+
+        validate_pd_dcp_token_shard_contract(self)
 
     def tree_verify_activation_reason(self) -> Optional[str]:
         """Which flag would activate a TREE-MASKED verify, or None.
