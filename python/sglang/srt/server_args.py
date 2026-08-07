@@ -6118,6 +6118,10 @@ class ServerArgs:
         # directly above.
         self._validate_pd_dcp_token_shard_contract()
 
+        # BOOT GATE (#642). Same placement reason as the gate above: reads
+        # dcp_size, so it must run after _handle_uneven_tp resolves it.
+        self._validate_pd_draft_kv_layout()
+
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
 
@@ -7664,6 +7668,13 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _validate_pd_draft_kv_layout(self):
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            validate_pd_draft_kv_layout,
+        )
+
+        validate_pd_draft_kv_layout(self)
 
     def _validate_pd_dcp_token_shard_contract(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (

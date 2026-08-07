@@ -93,6 +93,77 @@ def validate_pd_dcp_token_shard_contract(server_args: ServerArgs) -> None:
     )
 
 
+def validate_pd_draft_kv_layout(server_args: ServerArgs) -> None:
+    """BOOT GATE (#642): a token-sharded PD arm needs ``--draft-kv-layout dcp``.
+
+    The draft KV pool rides the main transfer as extra layers, addressed by the
+    SAME index array as the target pool -- ``prefill.py:186-195`` /
+    ``decode.py:439-448``, "The indices are always shared with a target
+    model", and ``mooncake/conn.py`` contains no occurrence of "draft" at all,
+    so the transport cannot treat them differently even in principle.
+
+    On a DCP decode arm those indices have been rewritten into COMPACT
+    owner-rule rows, ``(L // S) * (hi - lo) + (L % S - lo)``
+    (``decode.py:1119-1125``). Whether that is the right address for the draft
+    pool depends entirely on ``--draft-kv-layout``:
+
+    ``dcp``
+        the draft pool takes ``dcp_compact_pool_rows`` -- the target's own
+        coordinate system -- and the shared indices are correct BY
+        CONSTRUCTION.
+    ``replicated`` (the default)
+        the draft pool keeps "the full global context per rank"
+        (``model_runner_kv_cache_mixin.py:2819-2823``). Compact rows are then
+        addresses in a DIFFERENT coordinate system: token L's draft KV is
+        written at row ``compact(L)``, which in a full-context pool is where
+        a different token lives. The error grows with the slot id and there is
+        no crash -- #345's right-token/wrong-slot class.
+
+    WHY THIS IS NOT REACHABLE TODAY, stated precisely because a latent guard
+    that quietly becomes dead code is its own defect. #631a refuses a PD arm
+    that asks for speculation (default) and its ``SGLANG_PD_AUTO_DISABLE_SPEC``
+    escape hatch disables speculation instead; NEITHER branch lets a draft
+    worker exist, so the registration above never runs. It is "no branch
+    permits it" rather than "the refusal nulls it" -- the two could diverge,
+    and someone hardening only the escape hatch would not realise they were
+    also holding a corruption path shut. This gate is what makes lifting #631a
+    safe, and it is deliberately in the tree BEFORE that lift rather than
+    bundled into it.
+
+    Kept separate from :func:`validate_pd_dcp_token_shard_contract` although
+    both run at the same point: that one is about whether the MAIN handover
+    can run at all, this one about the DRAFT pool's addressing. One refusal
+    text per hazard reads better than a combined one at the moment an operator
+    hits it.
+    """
+    if server_args.disaggregation_mode not in ("prefill", "decode"):
+        return
+    if server_args.speculative_algorithm is None:
+        # No draft worker, no draft pool, no registration, no hazard.
+        return
+    if not (server_args.dcp_size > 1 and server_args.dcp_size == server_args.tp_size):
+        return
+    if server_args.draft_kv_layout == "dcp":
+        return
+
+    raise ValueError(
+        f"--draft-kv-layout '{server_args.draft_kv_layout}' cannot be used on "
+        f"the '{server_args.disaggregation_mode}' arm of a PD pair whose KV "
+        f"pool is token-sharded (dcp_size={server_args.dcp_size} == "
+        f"tp_size={server_args.tp_size}).\n\n"
+        "The draft KV pool is transferred as extra layers addressed by the "
+        "SAME index array as the target pool, and on this arm those indices "
+        "are compact owner-rule rows. Only --draft-kv-layout dcp gives the "
+        "draft pool the matching compact row space; 'replicated' keeps the "
+        "full global context per rank, so every draft row would be written "
+        "at the address of a different token -- silently, with the error "
+        "growing as slot ids grow.\n\n"
+        "Use --draft-kv-layout dcp (its own gate additionally requires a "
+        "linear MTP/NEXTN draft with topk == 1 and one draft KV layer), or "
+        "run this arm without speculation."
+    )
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP

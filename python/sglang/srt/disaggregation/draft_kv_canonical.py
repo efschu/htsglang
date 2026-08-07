@@ -90,6 +90,20 @@ class DraftKvCanonicalLayout:
     #: Draft layers carried. NEXTN/MTP is 1; kept explicit so a multi-layer
     #: draft cannot be mistaken for a single-layer one by size alone.
     num_draft_layers: int
+    #: The arm's ``--draft-kv-layout`` (#642). Compared because it decides the
+    #: draft pool's ROW SPACE, and the transfer addresses both arms' pools
+    #: with one shared index array: 'dcp' gives compact owner-rule rows,
+    #: 'replicated' the full global context. Two arms disagreeing here differ
+    #: in both row count and per-row byte length while sharing indices.
+    #:
+    #: It lives HERE rather than in ``compute_model_identity_hash`` on
+    #: purpose. That hash answers "same weights?", and it is taken with
+    #: ``include_parallel_vectors=False`` precisely so a PP prefill and a
+    #: TP+DCP decode on identical weights still pair (#631a guard 1).
+    #: ``draft_kv_layout`` is a parallelism decision, so putting it in the
+    #: hash would reintroduce exactly the false refusal that flag exists to
+    #: prevent. Same question, different axis, different home.
+    draft_kv_layout: str = "replicated"
 
     def bytes_per_token(self) -> int:
         """K and V, every head, all draft layers, for one token."""
@@ -115,7 +129,13 @@ class DraftKvCanonicalLayout:
             )
         problems = [
             f"{name}: local {getattr(self, name)} != peer {getattr(other, name)}"
-            for name in ("num_kv_heads", "head_dim", "element_size", "num_draft_layers")
+            for name in (
+                "num_kv_heads",
+                "head_dim",
+                "element_size",
+                "num_draft_layers",
+                "draft_kv_layout",
+            )
             if getattr(self, name) != getattr(other, name)
         ]
         if problems:
