@@ -854,7 +854,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             if len(layers) == 0:
                 fused_disable_reason = "no layers found"
-            elif not getattr(self.draft_model, "supports_fused_context_kv", True):
+            elif not getattr(self.draft_model, "supports_fused_context_kv", False):
                 fused_disable_reason = "draft model does not support fused context KV"
 
             if fused_disable_reason is not None:
