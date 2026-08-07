@@ -2427,21 +2427,47 @@ visible at a desk.**
   which schedules through `get_next_disagg_decode_batch_to_run` instead. Two
   scheduling entry points, one of which had been taught the ordering.
 
-**Environment, with one correction worth keeping because it is the kind of
-mistake that turns into folklore.** The first boot wedged BOTH decode ranks at
-100% SM / 0% memory-controller utilisation inside `dcp_even_write_mask`
-(`layers/dcp/owner.py:392`) during decode graph capture, with no timeout and
-no error. `SGLANG_BARLINK=0` was added along with other changes and the wedge
-went away, which made it tempting to credit barlink. It is NOT the cause:
-`environ.py:688` declares `SGLANG_BARLINK = EnvBool(False)`, so barlink is
-already off by default and setting it to 0 is a no-op. Production sets it
-belt-and-braces; copying that line explains nothing.
+**THE WEDGE: rank-divergent CUDA-graph capture shapes.** Two decode boots hung
+at 100% SM / 0% memory-controller utilisation with no timeout and no error.
+The cause is not the transport and not the owner rule -- it is
+`get_batch_sizes_to_capture`
+(`model_executor/runner/base_cuda_graph_runner.py`), which both extends and
+clamps `capture_bs` by `model_runner.req_to_token_pool.size`. That value is
+RANK-LOCAL: it follows each rank's own memory sizing, which under uneven TP
+differs by construction. Capture replays a collective per shape, so different
+lists mean different collective counts -- the shorter rank leaves the loop, its
+peer blocks forever in the next all-reduce. Same rig, same code, same
+afternoon:
 
-What actually applies: `SGLANG_UNEVEN_DCP_WEIGHTED=1` installs the WEIGHTED
-owner rule, which takes a different write path entirely ("The WEIGHTED rule
-needs none of this", `owner.py`) and so does not reach
-`dcp_even_write_mask` at all -- and it is additionally required by
-`--draft-kv-layout dcp`. That is the setting with a mechanism behind it.
+    TP0 bs=[..,16,19]   TP1 bs=[..,16,24]     -> WEDGED 20 min
+    TP0 bs=[1..8,10]    TP1 bs=[1..8,10,12]   -> WEDGED
+    TP0 bs=[..,16,24]   TP1 bs=[..,16,24]     -> captured in 50 s, SERVED
+
+The boot that worked was not configured differently. Both its ranks happened to
+hold pools >= the largest configured bs, so neither clamped and the lists
+coincided BY LUCK. `num_max_requests` is now min-reduced across the TP group,
+so every rank captures the same shapes by construction; the divergence is
+pinned by `test/registered/unit/distributed/
+test_capture_bs_rank_uniform_631.py`, whose key assertion fails if the reduce
+is removed.
+
+The matching py-spy signature, worth recognising on sight: one rank in
+`_dcp_extend_final_merge`, the other inside `cp_lse_ag_out_ar_mha_uneven`,
+identical across samples, utime advancing. Two ranks in DIFFERENT collectives
+is a shape/branch divergence, never a slow kernel.
+
+**One correction, kept because it is the kind of mistake that becomes
+folklore.** `SGLANG_BARLINK=0` was added alongside other changes when a wedge
+cleared, which made it tempting to credit barlink. It is NOT the cause:
+`environ.py:688` declares `SGLANG_BARLINK = EnvBool(False)`, so barlink is
+already off by default and setting it to 0 is a no-op (on this rig it was
+additionally forced off rig-wide by `/spinning/COUNTERTEST_NCCL`). Production
+sets it belt-and-braces; copying that line explains nothing.
+
+`SGLANG_UNEVEN_DCP_WEIGHTED=1` does have a mechanism -- it installs the
+WEIGHTED owner rule, which does not reach `dcp_even_write_mask` at all ("The
+WEIGHTED rule needs none of this", `owner.py`) and is required by
+`--draft-kv-layout dcp` -- but it was not what cleared the wedge either.
 
 **Worker processes do NOT inherit your exported environment.** sglang
 rebuilds a curated env for the scheduler workers -- checked on a running

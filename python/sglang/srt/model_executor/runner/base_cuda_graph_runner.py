@@ -68,6 +68,52 @@ def get_batch_sizes_to_capture(
     capture_bs = list(server_args.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
+    # RANK-UNIFORMITY (#631). `req_to_token_pool.size` is RANK-LOCAL: it follows
+    # this rank's own memory sizing, which under uneven TP / a heterogeneous
+    # group differs BY CONSTRUCTION. It is used below both to extend and to
+    # clamp `capture_bs`, so a rank-local value yields a rank-local SHAPE LIST
+    # -- and graph capture replays a collective per shape. Ranks that disagree
+    # on the list therefore run different numbers of collectives: the rank with
+    # the shorter list leaves the capture loop while its peer blocks forever in
+    # the next all-reduce, with no timeout and no error.
+    #
+    # Measured on this rig, decode arm over a 5090 + a 3080 (all three from the
+    # same afternoon, same code):
+    #   TP0 bs=[..,16,19]        TP1 bs=[..,16,24]         -> WEDGED
+    #   TP0 bs=[1..8,10]         TP1 bs=[1..8,10,12]       -> WEDGED
+    #   TP0 bs=[..,16,24]        TP1 bs=[..,16,24]         -> captured, served
+    # The surviving boot was not configured differently; both ranks simply
+    # happened to hold pools >= the largest configured bs, so neither clamped.
+    # That is the whole difference between a serving decode arm and a silent
+    # 20-minute hang, which is why this is min-reduced rather than documented.
+    #
+    # MIN, not max: the smallest pool is the only bound every rank can honour.
+    # On gloo/CPU because this is a boot-time agreement, not a hot path, and the
+    # device group may not be usable for a plain integer reduce here. Every rank
+    # reaches this line exactly once during runner init, so the reduce itself is
+    # rank-uniform -- the property the rest of this comment is about.
+    if get_parallel().tp_size > 1:
+        import torch
+        import torch.distributed as dist
+
+        from sglang.srt.distributed import get_tp_group
+
+        cpu_group = getattr(get_tp_group(), "cpu_group", None)
+        if cpu_group is not None:
+            t = torch.tensor([int(num_max_requests)], dtype=torch.int64)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN, group=cpu_group)
+            reduced = int(t.item())
+            if reduced != num_max_requests:
+                logger.info(
+                    "cuda-graph capture shapes: req_to_token_pool.size is "
+                    "rank-local (%d here); min-reduced to %d across the TP "
+                    "group so every rank captures the SAME shapes (#631). "
+                    "Diverging shape lists deadlock capture.",
+                    num_max_requests,
+                    reduced,
+                )
+            num_max_requests = reduced
+
     mul_base = 1
     if server_args.enable_two_batch_overlap:
         mul_base *= 2
