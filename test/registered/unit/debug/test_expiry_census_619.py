@@ -98,6 +98,15 @@ def mock_census(monkeypatch):
     monkeypatch.setitem(sys.modules,
                         "sglang.srt.distributed.device_communicators.barlink_capture_census",
                         mp)
+    # `from package import module` resolves through the parent package's
+    # attribute once the real module has been imported anywhere in the
+    # process (e.g. by an earlier test file in the same run), bypassing the
+    # sys.modules entry above. Patch the attribute as well so the fixture
+    # is order-independent.
+    from sglang.srt.distributed import device_communicators as _dc_pkg
+
+    if hasattr(_dc_pkg, "barlink_capture_census"):
+        monkeypatch.setattr(_dc_pkg, "barlink_capture_census", mp)
     return mock, mp
 
 
