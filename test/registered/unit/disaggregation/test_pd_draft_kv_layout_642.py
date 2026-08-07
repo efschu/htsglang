@@ -197,14 +197,62 @@ class LayoutAgreementTest(CustomTestCase):
             )
         self.assertIn("draft_kv_layout", str(ctx.exception))
 
-    def test_guard_one_deliberately_cannot_cover_this(self):
-        """Pin WHY this lives here and not in the identity hash.
+    def test_identity_hash_ignores_draft_kv_layout(self):
+        """THE pin: two arms differing ONLY in draft_kv_layout hash the same.
 
-        compute_model_identity_hash is taken with
-        include_parallel_vectors=False so a PP prefill and a TP+DCP decode on
-        identical weights still pair (#631a guard 1). draft_kv_layout is a
-        parallelism decision, so adding it there would reintroduce exactly the
-        false refusal that flag prevents.
+        This is the property that actually matters -- a PP prefill and a
+        TP+DCP decode on identical weights must pair regardless of draft
+        layout. compute_model_identity_hash is taken with
+        include_parallel_vectors=False for exactly that reason (#631a guard
+        1), and draft_kv_layout is a parallelism decision, so admitting it to
+        the weights identity would reintroduce the false refusal that flag
+        prevents.
+
+        Pinned as BEHAVIOUR rather than as text. The source assertion below
+        catches someone adding the field to that function, but not the likelier
+        refactor: if the hash is later assembled from a tuple, constant or
+        dataclass defined elsewhere, draft_kv_layout could enter the identity
+        without ever appearing in the function's own text -- and a text-only
+        pin would stay green while the invariant was gone. That is the "reads
+        as coverage" failure this whole task has been removing, so it must not
+        be the only thing standing here.
+        """
+        from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
+
+        def _sa(layout):
+            return SimpleNamespace(
+                model_path="/models/qwen3.6-27b",
+                revision=None,
+                dtype="auto",
+                quantization=None,
+                kv_cache_dtype="fp8_e4m3",
+                rank_tp_ratio="10,1,1",
+                rank_kv_ratio="7,3,3",
+                draft_kv_layout=layout,
+            )
+
+        self.assertEqual(
+            compute_model_identity_hash(_sa("replicated")),
+            compute_model_identity_hash(_sa("dcp")),
+            "draft_kv_layout changed the weights-identity hash, so two arms "
+            "on the SAME weights would refuse to pair over a parallelism "
+            "decision",
+        )
+        # Also under the PD handshake's own call form, which is the one that
+        # decides whether a pair is admitted.
+        self.assertEqual(
+            compute_model_identity_hash(
+                _sa("replicated"), include_parallel_vectors=False
+            ),
+            compute_model_identity_hash(_sa("dcp"), include_parallel_vectors=False),
+        )
+
+    def test_identity_hash_source_tripwire(self):
+        """Fast tripwire for the obvious regression. NOT the real pin.
+
+        Kept because it names the field and fails fast and legibly when
+        someone edits that function directly. The behaviour test above is what
+        survives a refactor; see its docstring.
         """
         import inspect
 
