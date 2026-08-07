@@ -435,6 +435,92 @@ general resharder.
 I am flagging this as a DEVIATION from the steer and will not build it until
 it is confirmed, since the steer named (i) explicitly.
 
+### R6 VERDICT (#635): door (a) is not a proposal, it is already shipped
+
+The steer's hypothesis — "ask who writes; the receiving group scatters by
+owner rule into its own pool, so the remap is a receive-side change, not a
+wire format" — is correct, and the fork already implements exactly that. R6
+as I filed it was WRONG in its conclusion, and the error was mine: I reasoned
+from `TransportIdentity.COMPARED` to "the handover is not a plain transfer"
+without reading the handover's own API first.
+
+**Evidence, in the order it settles the question.**
+
+1. `BaseKVSender.send_metadata` already takes `owned_ordinals`
+   (`disaggregation/base/conn.py:186-204`), documented verbatim for this
+   case: "when the decode side token-shards its KV pool (fork DCP with
+   replicated kv-heads), the ordinals ... that THIS rank owns, parallel to
+   `kv_indices` (which are then this rank's compact pool rows). The prefill
+   sender uses them to filter each chunk's source rows."
+
+2. It is WIRED, not the #421 built-but-unwired shape I was on guard for. The
+   decode side computes it at `disaggregation/decode.py:1103-1125` and passes
+   it at `:1229`. The computation IS the weighted owner rule, the same
+   expression as `dcp_weighted_write_slots`:
+   `mask = (L % S) in [lo, hi)`, `compact = (L // S) * (hi - lo) + (L % S - lo)`.
+
+3. The sender implements the filtering: `mooncake/conn.py:1502-1558` filters
+   each chunk's source rows by `dst_owned_ordinals`, and `:2193` puts them on
+   the wire.
+
+4. Unsupported transports REFUSE rather than corrupt: `nixl/conn.py:2511` and
+   `mori/conn.py:1699` both raise "DCP token-sharded PD transfer
+   (owned_ordinals) is only ...". So the capability is mooncake-only and says
+   so out loud.
+
+**Preconditions, all satisfied by our production decode group** (read from the
+live boot log, not assumed):
+
+| precondition | code site | production |
+|---|---|---|
+| `page_size == 1` | `decode.py:1114` | `page_size=1` |
+| uneven-TP replicated-KV, `dcp == tp` | `decode.py:1127` | `dcp_size=3 = tp_size` |
+| mooncake transport | `nixl`/`mori` refuse | `disaggregation_transfer_backend='mooncake'` |
+| not hisparse | `decode.py:1109` | not enabled |
+
+Note `decode.py:1127` refuses the OTHER DCP flavour by name — "Stock
+head-sharded DCP receive is not supported" — so the supported path is exactly
+the one we run.
+
+**Direction matters and favours us.** The hard side is the RECEIVER, which
+must scatter into a token-sharded pool; that is the side already built. Our
+prefill group is the SENDER and is not DCP (`dcp_size=1`), so it simply holds
+every row and filters — the easy direction.
+
+**Consequence for guard 1.** `dcp_size` and `row_ownership` must NOT be lifted
+into the common handshake comparison. A `dcp_size=1` prefill paired with a
+`dcp_size=3` decode is a SUPPORTED configuration, so comparing those fields
+would refuse a pair the engine handles correctly. `TransportIdentity`'s
+`COMPARED` is right for the NCCL transport it was written for, where both ends
+address the same row layout; it is not a statement about the mooncake PD path.
+Guard 1 therefore stays exactly as scoped: lift `model_identity_hash` only.
+
+**Ranking the three doors.**
+
+- **(a) receive-side owner-rule scatter — TAKEN, cost zero.** Already
+  implemented, wired, and guarded on the transports that lack it. Nothing to
+  build; the work is to pin that Route A stays inside its four preconditions.
+- **(b) decode gives up DCP — rejected, and not on taste.** It is the only
+  door that costs measurable KV capacity (production runs
+  `max_total_num_tokens=460288` on the DCP layout) and it would also leave the
+  supported receive path, since `decode.py:1127` refuses stock head-sharded
+  DCP receive. I have NOT priced the capacity loss in a controlled boot A/B,
+  and I am not going to: door (a) makes the question moot, and an unmeasured
+  number should not be quoted as if it were measured.
+- **(c) same-DCP pairing — unnecessary.** It would force DCP onto the PP
+  prefill group for no gain, since the mismatch it avoids is already handled.
+
+**#297 is in-process only — it does not transfer.** Asked and answered
+plainly: `managers/kv_reshard.py` moves bytes with `dist.batch_isend_irecv`
+over a `device_group`, addressing peers via
+`dist.get_global_rank(device_group, peer)` (`:614-632`). That is one
+torch.distributed world. It further requires a replicated round counter, one
+scheduler round, and the whole server idle. A PD pair is two independent
+worlds with two schedulers and no shared group or round counter, so #297's
+resharder is NOT expressible across the boundary and must not be counted on
+for Route A. The PD handover in (a) is the mechanism; #297 is not a fallback
+for it.
+
 ### Hard precondition, not mine to fix
 
 #630 (PP x disk-HiCache warm-up wedge, §4a) blocks SHIPPING a PP prefill
@@ -453,14 +539,21 @@ it, but a PP prefill group cannot go into production until #630 closes.
 - R4: `planner/rejected.py:342` `pp_with_spec` evidence line had drifted from
   the code (cited `:11214`, real site `:16240-16245`); corrected in this
   branch under the register's own re-check rule.
-- R6 (Route A, NEW and structural): the production decode group is DCP-sharded
-  on the TOKEN axis (`dcp_size=3`), a PP prefill group is not (`dcp_size=1`),
-  and per `TransportIdentity`'s own reasoning no offset table re-derives row
-  ownership across that difference. The KV handover Route A depends on is
-  therefore not a plain transfer between these two groups. Either the handover
-  gains a token-axis remap, or the decode group gives up DCP, or Route A pairs
-  only same-DCP groups. Unresolved; it gates slice 2 more tightly than the
-  draft-KV question does.
+- ~~R6 (Route A, structural): DCP mismatch between a `dcp_size=1` PP prefill
+  group and the `dcp_size=3` decode group makes the handover "not a plain
+  transfer".~~ **CLOSED, see §7a.** The conclusion was wrong: the receive-side
+  owner-rule scatter it called for is already implemented and wired
+  (`decode.py:1103-1125`, `mooncake/conn.py:1502-1558`), and every
+  precondition holds in production. The lasting lesson is the reasoning error
+  — I inferred a limitation from `TransportIdentity.COMPARED`, a constant
+  belonging to a DIFFERENT transport, instead of reading the handover's own
+  API. A constant is evidence about the code that reads it, and nothing else.
+- R7 (Route A, live): the supported handover path is narrow and silent about
+  it in only one direction. It needs `page_size == 1`, the uneven-TP
+  replicated-KV layout with `dcp == tp`, and the mooncake transport; the other
+  transports and the stock head-sharded DCP layout refuse by name. Any Route A
+  boot recipe must pin these four, because three of them are things an
+  operator could change for unrelated reasons.
 - R5 (Route A): the PD spec auto-disable is SILENT. Any #625 work on Route A
   must convert it into a loud refusal for the decode arm before it can be
   trusted, or a boot that looks correct will have lost NEXTN without saying
