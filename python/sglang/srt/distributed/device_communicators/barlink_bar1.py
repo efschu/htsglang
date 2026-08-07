@@ -1684,6 +1684,10 @@ class BarlinkBar1Transport:
         #: counter cannot serve here: at a boundary it is zero by
         #: construction, which is exactly why the knob used to miss.
         self._boundary_checks = 0
+        #: Latch for the expiry-path capture-census dump (#619). Once this
+        #: fires the dump runs at most ONCE per process; re-entering the
+        #: expiry path after the dump must not repeat it.
+        self._expiry_census_fired = False
 
         if enabled is None:
             enabled = os.environ.get("SGLANG_BARLINK_MATRIX_DIRECT", "1") not in (
@@ -4725,6 +4729,29 @@ class BarlinkBar1Transport:
                 int(self._last_nbytes),
                 int(self._deferred_launches),
             )
+        # #619: expiry-path capture-census dump. The warning above fires on
+        # the rank whose compute stream is stuck, and that rank never reaches
+        # the abort handler -- so it dumps no census there. Dump the SAME
+        # capture census the abort path uses, after N expiries. Collective-free,
+        # device-sync-free, no new allocation (one bool read for the latch).
+        threshold = int(os.environ.get(
+            'SGLANG_BARLINK_EXPIRY_CENSUS_AFTER', '3'))
+        if (threshold > 0 and n >= threshold
+                and not self._expiry_census_fired):
+            self._expiry_census_fired = True
+            try:
+                from sglang.srt.distributed.device_communicators import (
+                    barlink_capture_census,
+                )
+
+                if barlink_capture_census.capture_census_enabled():
+                    logger.error(
+                        '%s',
+                        barlink_capture_census.format_local_capture_census(
+                            self.rank),
+                    )
+            except Exception:  # noqa: BLE001 - never mask the path below
+                pass
         limit = barlink_abort_gate.stall_raise_after()
         if limit and self._ctl_stall_run >= limit:
             # #615: ...unless a PEER is legitimately inside a lazy JIT build

@@ -100,6 +100,8 @@ def _stub(event: _Event) -> types.SimpleNamespace:
         # pre-#615 meaning: these tests pin the escalation, not the extension.
         _ctl_build_deferred_s=0.0,
         _peer_table=None,
+        # #619: expiry-path census latch
+        _expiry_census_fired=False,
     )
 
 
