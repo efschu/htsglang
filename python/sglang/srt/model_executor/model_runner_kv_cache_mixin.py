@@ -3113,6 +3113,7 @@ class ModelRunnerKVCacheMixin:
                         speculative_num_draft_tokens=max_spec_draft_tokens,
                         speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                        enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,

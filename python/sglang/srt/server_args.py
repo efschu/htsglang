@@ -6118,6 +6118,13 @@ class ServerArgs:
         # directly above.
         self._validate_pd_dcp_token_shard_contract()
 
+        # BOOT GATE (#631b). Whether a PD arm may speculate at all. Must run
+        # BEFORE the #642 gate below (that one assumes a draft worker is
+        # permitted and asks only how its pool is addressed) and after
+        # _handle_uneven_tp, for the same reason as its two neighbours: it
+        # reads dcp_size and the resolved speculative defaults.
+        self._validate_pd_speculation()
+
         # BOOT GATE (#642). Same placement reason as the gate above: reads
         # dcp_size, so it must run after _handle_uneven_tp resolves it.
         self._validate_pd_draft_kv_layout()
@@ -7668,6 +7675,13 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def _validate_pd_speculation(self):
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            validate_pd_speculation,
+        )
+
+        validate_pd_speculation(self)
 
     def _validate_pd_draft_kv_layout(self):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (

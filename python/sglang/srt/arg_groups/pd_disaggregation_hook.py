@@ -164,6 +164,131 @@ def validate_pd_draft_kv_layout(server_args: ServerArgs) -> None:
     )
 
 
+def validate_pd_speculation(server_args: ServerArgs) -> None:
+    """BOOT GATE (#631b): speculation on a PD arm, admitted where the draft
+    pool's ROW SPACE is congruent across the PD boundary.
+
+    #631a refused ``--speculative-algorithm`` on either arm unconditionally.
+    Its reason was specific, not general: "the MTP/EAGLE draft KV pool is
+    uneven-head-sharded (not DCP token-sharded), so its transfer would need
+    general uneven head reslicing". That is a statement about ONE layout. The
+    refusal was written as a statement about all of them, and the blanket is
+    what this gate replaces.
+
+    The draft pool is not transferred on its own. It rides the main transfer as
+    extra layers addressed by the SAME index array as the target pool
+    (``prefill.py:186-195`` / ``decode.py:439-448``, "The indices are always
+    shared with a target model"; ``mooncake/conn.py`` contains no occurrence of
+    "draft" at all, so the transport cannot address it separately even in
+    principle). So the whole question is a single one: do the draft rows and
+    the target rows live in the SAME coordinate system on both arms? Where they
+    do, the shared index array is already correct and there is nothing to
+    reslice. Where they do not, rows land at other tokens' addresses.
+
+    Two shapes answer yes, and they are the two admitted here:
+
+    ``tp_size == 1``
+        Nothing is sharded on this arm. Draft rows and target rows are both
+        global token ids. This is the trivially congruent case and it was
+        swept up by the blanket purely because the blanket did not look.
+
+    ``dcp_size == tp_size > 1`` with ``--draft-kv-layout dcp``
+        The token-sharded path. The draft pool takes ``dcp_compact_pool_rows``
+        -- the target's OWN coordinate system -- so the shared indices are
+        correct by construction. This is not an inference: it is what
+        ``--draft-kv-layout``'s own help text calls the "foundation for
+        speculation in PD-disaggregation", and what
+        :func:`validate_pd_draft_kv_layout` (#642) was pre-positioned to make
+        safe, in the tree BEFORE this lift and deliberately not bundled into
+        it.
+
+    Everything else still refuses, and now refuses for the reason #631a
+    actually had: a head-sharded draft pool on a multi-rank arm, whose rows
+    would need general uneven head reslicing to cross the boundary.
+
+    ORDERING: this reads ``dcp_size``, ``draft_kv_layout`` and the resolved
+    ``speculative_algorithm``, so it MUST run after ``_handle_uneven_tp``, next
+    to the #636 and #642 gates -- not in ``handle_pd_disaggregation``, which
+    runs before ``dcp_size`` is auto-set to ``tp_size`` and would therefore
+    read 1 for exactly the token-sharded configuration this gate admits. That
+    trap has a measured precedent in this file's sibling gates; the refusal
+    lived on the early side, which is why it could only ever be a blanket.
+    """
+    if server_args.disaggregation_mode not in ("prefill", "decode"):
+        return
+    if server_args.speculative_algorithm is None:
+        return
+
+    # The pre-#631a behaviour, kept for shared launch configs that feed one
+    # flagset to both a PD and a non-PD server. Unchanged in meaning; it just
+    # moved here with the rest of the decision so there is exactly one place
+    # that decides whether a PD arm speculates.
+    if envs.SGLANG_PD_AUTO_DISABLE_SPEC.get():
+        logger.warning(
+            "PD disaggregation (%s arm): speculative decoding "
+            "(--speculative-algorithm %s) has been DISABLED for this server "
+            "because SGLANG_PD_AUTO_DISABLE_SPEC=1. This server will decode "
+            "WITHOUT speculation.",
+            server_args.disaggregation_mode,
+            server_args.speculative_algorithm,
+        )
+        server_args.speculative_algorithm = None
+        server_args.speculative_draft_model_path = None
+        return
+
+    # Congruent shape 1: nothing is sharded on this arm.
+    if server_args.tp_size == 1:
+        logger.info(
+            "PD disaggregation (%s arm): speculation admitted -- tp_size=1, "
+            "so the draft and target pools are both addressed by global token "
+            "ids and the shared index array needs no reslicing (#631b).",
+            server_args.disaggregation_mode,
+        )
+        return
+
+    # Congruent shape 2: the token-sharded path, draft in the target's own
+    # compact owner-rule row space. draft_kv_layout != 'dcp' on such an arm is
+    # NOT accepted silently here -- validate_pd_draft_kv_layout (#642) refuses
+    # it by name, with the addressing argument spelled out. Keeping that
+    # refusal there rather than duplicating it keeps one hazard to one text.
+    if server_args.dcp_size > 1 and server_args.dcp_size == server_args.tp_size:
+        logger.info(
+            "PD disaggregation (%s arm): speculation admitted on the token-"
+            "sharded pool (dcp_size=%d == tp_size=%d, --draft-kv-layout "
+            "'%s'); with layout 'dcp' the draft pool uses the target's "
+            "compact owner-rule rows and the shared index array is correct by "
+            "construction (#631b).",
+            server_args.disaggregation_mode,
+            server_args.dcp_size,
+            server_args.tp_size,
+            server_args.draft_kv_layout,
+        )
+        return
+
+    raise ValueError(
+        f"--speculative-algorithm {server_args.speculative_algorithm} cannot "
+        f"be honoured on the '{server_args.disaggregation_mode}' arm of a PD "
+        f"pair with tp_size={server_args.tp_size}, "
+        f"dcp_size={server_args.dcp_size}, "
+        f"--draft-kv-layout '{server_args.draft_kv_layout}'.\n\n"
+        "The draft KV pool rides the main transfer as extra layers addressed "
+        "by the SAME index array as the target pool. On this arm the draft "
+        "pool is head-sharded across ranks while the indices being shared are "
+        "the target's, so crossing the PD boundary would need general uneven "
+        "head reslicing, which is not implemented.\n\n"
+        "Two shapes ARE supported on a PD arm:\n"
+        "  - tp_size == 1: nothing is sharded, rows are global token ids.\n"
+        "  - dcp_size == tp_size > 1 with --draft-kv-layout dcp: the draft "
+        "pool takes the target's compact owner-rule rows (this additionally "
+        "requires a linear MTP/NEXTN draft with --speculative-eagle-topk 1, "
+        "a non-uniform --rank-tp-ratio and the weighted owner rule).\n\n"
+        "Otherwise launch this arm without --speculative-algorithm, or run a "
+        "monolithic server without --disaggregation-mode. To disable "
+        "speculation automatically instead of refusing, set "
+        "SGLANG_PD_AUTO_DISABLE_SPEC=1."
+    )
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
@@ -178,55 +303,17 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
-    # Single-node hetero PD v1 (#99): speculative decoding is not supported in
-    # disaggregation mode on this fork -- the MTP/EAGLE draft KV pool is
-    # uneven-head-sharded (not DCP token-sharded), so its transfer would need
-    # general uneven head reslicing.
-    #
-    # #631a turned this from an auto-disable into a REFUSAL. The auto-disable
-    # was silent in the only way that matters: a decode arm launched with
-    # --speculative-algorithm NEXTN came up WITHOUT it, produced correct
-    # output, and was merely slower. Nothing downstream can tell that apart
-    # from a slow rig, so the loss of the decode optimum survives every smoke
-    # test. A configuration that cannot be honoured is refused by name
-    # instead. SGLANG_PD_AUTO_DISABLE_SPEC=1 restores the old behaviour for
-    # shared launch configs that feed one flagset to both a PD and a non-PD
-    # server, which was the original ruling's reason.
-    if (
-        server_args.disaggregation_mode in ("prefill", "decode")
-        and server_args.speculative_algorithm is not None
-    ):
-        if envs.SGLANG_PD_AUTO_DISABLE_SPEC.get():
-            logger.warning(
-                "PD disaggregation (%s arm): speculative decoding "
-                "(--speculative-algorithm %s) is not supported in "
-                "disaggregation mode on this fork and has been DISABLED for "
-                "this server, because SGLANG_PD_AUTO_DISABLE_SPEC=1. This "
-                "server will decode WITHOUT speculation.",
-                server_args.disaggregation_mode,
-                server_args.speculative_algorithm,
-            )
-            server_args.speculative_algorithm = None
-            server_args.speculative_draft_model_path = None
-        else:
-            raise ValueError(
-                f"--speculative-algorithm "
-                f"{server_args.speculative_algorithm} cannot be honoured on "
-                f"the '{server_args.disaggregation_mode}' arm of a PD pair: "
-                "speculative decoding is not supported in disaggregation "
-                "mode on this fork, because the MTP/EAGLE draft KV pool is "
-                "uneven-head-sharded (not DCP token-sharded) and "
-                "transferring it across the PD boundary would need general "
-                "uneven head reslicing. This is refused rather than "
-                "auto-disabled: a server that quietly drops speculation "
-                "still answers correctly and only runs slower, so the loss "
-                "would not surface in any smoke test. Either launch this arm "
-                "WITHOUT --speculative-algorithm (and accept no speculation "
-                "on it), or run a monolithic server without "
-                "--disaggregation-mode to keep speculation. To restore the "
-                "old auto-disable for a shared launch config, set "
-                "SGLANG_PD_AUTO_DISABLE_SPEC=1."
-            )
+    # Speculation on a PD arm is NOT decided here. It used to be (#99's
+    # auto-disable, then #631a's blanket refusal), and that placement is
+    # precisely why it could only ever be a blanket: this hook runs BEFORE
+    # _handle_uneven_tp resolves dcp_size and the speculative defaults, so the
+    # one distinction that matters -- is the draft pool's row space congruent
+    # with the target's across the boundary? -- is not yet answerable here.
+    # The decision moved WHOLE (refusal, admission and the
+    # SGLANG_PD_AUTO_DISABLE_SPEC escape hatch) to validate_pd_speculation
+    # (#631b), which runs after resolution alongside the #636 and #642 gates.
+    # Deliberately not split across the two points: two places that can each
+    # turn speculation off is how the escape hatch and the refusal drift apart.
 
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:

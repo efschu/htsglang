@@ -2386,13 +2386,81 @@ this trade turns positive; the transport is not what stands in the way.
 
 ### 4.8.1 Route A (#631): a PP prefill group into a token-sharded decode group
 
-Status: **not yet booted.** The guard and the boot script below are executed
-and tested; no rung of the ladder has run on a GPU. Everything in this
-section that is a measurement is marked as absent, not estimated.
+Status: **booted and serving** (2026-08-07). A PD pair ran on this rig with a
+prefill arm on one 3080 handing over to a **TP=2 / DCP=2** decode arm across
+the 5090 + the other 3080, `Qwen3.5-4B`, mooncake, `page_size=1`. Judged by
+content, not status code:
 
-Boot script: `scripts/route_a_631_boot.sh {probe|L1|L2|L3}`. Start with
-`probe` -- it prints the NVML card map, runs the co-location prerequisite
-probe, and prints free VRAM, all without touching a GPU.
+    counting : one, two, three, ... , nineteen, twenty      (complete, ordered)
+    needle   : 61                                           (elderberry=61, correct)
+
+Boot script: **`scripts/route_a_631_pd_boot.sh {pair|nextn}`** -- the one that
+actually booted the pair above, including the UUID card selection and the
+environment settings below. `scripts/route_a_631_boot.sh probe` remains useful
+for its NVML card map and free-VRAM dump without touching a GPU; its L1/L2/L3
+rungs predate the run and are superseded by the table further down.
+
+**Three things had to be fixed before any of that ran, and none of them was
+visible at a desk.**
+
+- **Device order: NVML != CUDA on this host.** `CUDA_VISIBLE_DEVICES` indices
+  are in CUDA's enumeration order, not NVML's. Measured here: NVML 0/1/2 =
+  3080/5090/3080, CUDA 0/1/2 = 5090/3080/3080. Passing NVML indices put the
+  "3080 prefill arm" on the 5090 -- visible only as `avail mem=30.66 GB` on a
+  20 GB card. Select cards by **UUID** (`CUDA_VISIBLE_DEVICES=GPU-<uuid>`),
+  which is immune to both orderings.
+- **`HybridMambaDecodeReqToTokenPool` did not establish `tree_cache`**
+  (`disaggregation/decode.py`). The class skips `HybridReqToTokenPool.
+  __init__` on purpose and re-establishes its attributes by hand; the
+  hand-written list had drifted from the base it copied. The reader is the
+  base's own inherited `_alloc_mamba_slots_or_evict`, so both arms booted
+  healthy and died on the FIRST handover. The same audit found a second
+  omission, `enable_mamba_extra_buffer_lazy`. Pinned by an attribute-CONTRACT
+  test (`test/registered/unit/disaggregation/
+  test_hybrid_decode_pool_attrs_631.py`) that compares the two `__init__`
+  bodies, so the next omission fails in CI rather than on a handover.
+- **The #603 rank-uniform reduce never ran on a PD decode arm.**
+  `_update_uniform_pool_budget` is placed "unconditional and pre-branch" in
+  `get_next_batch_to_run`, and `uniform_min_avail` refuses on a multi-rank
+  boot when it has not run. A PD decode server never enters that function --
+  `dispatch_event_loop` routes it to `event_loop_overlap_disagg_decode`,
+  which schedules through `get_next_disagg_decode_batch_to_run` instead. Two
+  scheduling entry points, one of which had been taught the ordering.
+
+**Environment, with one correction worth keeping because it is the kind of
+mistake that turns into folklore.** The first boot wedged BOTH decode ranks at
+100% SM / 0% memory-controller utilisation inside `dcp_even_write_mask`
+(`layers/dcp/owner.py:392`) during decode graph capture, with no timeout and
+no error. `SGLANG_BARLINK=0` was added along with other changes and the wedge
+went away, which made it tempting to credit barlink. It is NOT the cause:
+`environ.py:688` declares `SGLANG_BARLINK = EnvBool(False)`, so barlink is
+already off by default and setting it to 0 is a no-op. Production sets it
+belt-and-braces; copying that line explains nothing.
+
+What actually applies: `SGLANG_UNEVEN_DCP_WEIGHTED=1` installs the WEIGHTED
+owner rule, which takes a different write path entirely ("The WEIGHTED rule
+needs none of this", `owner.py`) and so does not reach
+`dcp_even_write_mask` at all -- and it is additionally required by
+`--draft-kv-layout dcp`. That is the setting with a mechanism behind it.
+
+**Worker processes do NOT inherit your exported environment.** sglang
+rebuilds a curated env for the scheduler workers -- checked on a running
+production boot, whose workers carry `SGLANG_RANK_CARD_UUIDS` and
+`SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=True` that sglang injected, and carry
+NONE of `SGLANG_BARLINK` / `SGLANG_UNEVEN_DCP*` / `SGLANG_MAMBA_SSM_DTYPE`
+that the launch script exported. This does not break the DCP vars, because
+`SGLANG_UNEVEN_DCP` is read by `server_args.__post_init__` in the PARENT
+(`server_args.py:8030`, `:10353`) at argument-resolution time. It does mean
+that reading a worker's `/proc/<pid>/environ` and concluding "that setting is
+not in force" is unsound -- check WHERE the variable is read first.
+(Corollary: sglang resolves cards by UUID itself and hands each worker a
+single visible device, which is the same conclusion the device-order trap
+above forces on any launcher.)
+
+A decode TP group spanning a 5090 and a 3080 also trips sglang's TP
+memory-balance check (`model_runner.py:1880-1890`), which assumes a
+homogeneous group -- the imbalance IS the configuration here, so downgrade it
+with `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0`.
 
 **The handover needs no resharding step.** A prefill arm at `dcp_size=1`
 pairing with a decode arm at `dcp_size=3` is a supported pairing, not a
@@ -2444,24 +2512,63 @@ a PP prefill arm: PP>1 x Disk-HiCache wedges silently at warmup and health
 stays 503 forever. If a PP prefill arm never comes up, check this before
 debugging anything else.
 
-**Full Route A (PP=3 prefill + TP=3/DCP=3 decode) does not fit this rig's
-venv.** Six ranks on three cards means two processes per card, which is
-`--disaggregation-topology colocated-process`, and that is refused here for
-two independent reasons (probe output, run 2026-08-07): runtime NCCL is
-**2.28.9**, below the required 2.30; and there is no MPS daemon
-(`/tmp/nvidia-mps` absent). The Docker image pins NCCL 2.30.7, so L3 needs
-that image plus `nvidia-cuda-mps-control -d` started before the ranks.
-Until then the two mechanisms are covered separately and cheaply:
+**A PP>=2 prefill group AND a TP>=2 decode group cannot both exist on three
+cards.** Two persistent groups need two servers, and two servers on three
+cards without co-location is three ranks TOTAL. So the split is 2+1 or 1+2 --
+a real PP prefill group or a real TP decode group, not both. This is a
+hardware ceiling, not a configuration choice, and it is worth stating plainly
+because the two obvious ways around it are both closed:
 
-| Rung | Prefill | Decode | Covers | Runs today |
+- `--disaggregation-topology colocated-process` would allow more ranks per
+  card but needs NCCL >= 2.30 (runtime here is 2.28.9) and an MPS daemon.
+- `colocated-congruent` needs NEITHER of those -- but it cannot express Route
+  A. It refuses `--disaggregation-mode` outright ("there are no two servers",
+  `disaggregation/topology.py:247-253`), refuses a layer split because "the
+  lane computes with the decode sharding" (`:255-262`), and its lane tick runs
+  INSTEAD of a decode iteration, with concurrent dispatch "deliberately NOT
+  done here" (`congruent_lane.py`). One group, the decode geometry, serial.
+- In-process multi-group (`DualGroupLane`, #121/#274) is also not a route: it
+  refuses `pp_size > 1` (`model_executor/dual_group_lane.py:5472-5476`), its
+  FAST group is only a contiguous TP sub-partition of the BIG group
+  (`distributed/dual_group.py:82-94`), and its scoped args explicitly set
+  `disaggregation_topology = None` (`dual_group_lane.py:1647`), so a lane can
+  never be one leg of a PD handover.
+
+| Rung | Prefill | Decode | Covers | Status |
 |---|---|---|---|---|
-| L1 | PP=1, one 3080 | TP=2 / DCP=2, 5090 + other 3080 | owner rule + `owned_ordinals` handover | yes |
-| L2 | PP=2, both 3080s | TP=1, 5090 | PP stage fan-in, `pp_size` 2 -> 1 | yes |
-| L3 | PP=3 | TP=3 / DCP=3 | full Route A | Docker + MPS only |
+| pair | TP=1, one 3080 | TP=2 / DCP=2, 5090 + other 3080 | owner rule + `owned_ordinals` handover | **serving, content-verified** |
+| nextn | TP=1, 5090 | TP=2 / DCP=2 + speculation, both 3080s | the #631b lift: a speculating PD decode arm | **admitted + verify graph captured** |
+| PP prefill | PP=2, both 3080s | TP=1, 5090 | PP stage fan-in, `pp_size` 2 -> 1 | runs today, not yet booted |
 
-L1 is the one to run first: it exercises the mechanism the whole ticket is
-about. Use a small model (`Qwen3.5-4B`) -- the handover does not care about
-model size, and a 27B checkpoint does not fit a single 3080 prefill arm.
+Run `pair` first: it exercises the mechanism the whole ticket is about, and a
+small model (`Qwen3.5-4B`) is the right vehicle because the handover does not
+care about model size.
+
+**Speculation on a PD arm is no longer refused outright (#631b).** #631a
+refused it on both arms for a reason that was specific rather than general --
+"the MTP/EAGLE draft KV pool is uneven-head-sharded". The draft pool rides the
+main transfer as extra layers addressed by the SAME index array as the target
+pool, so the only question is whether draft rows and target rows share a
+coordinate system. Two shapes say yes and are now admitted by
+`validate_pd_speculation`: `tp_size == 1` (nothing is sharded), and
+`dcp_size == tp_size > 1` with `--draft-kv-layout dcp` (the draft pool takes
+the target's compact owner-rule rows). Everything else still refuses, now
+naming the actual reason. The gate runs AFTER `_handle_uneven_tp`, next to the
+#636 and #642 gates -- read in `handle_pd_disaggregation` it would see
+`dcp_size` unresolved and could only ever answer with a blanket.
+
+**Pass `--speculative-algorithm EAGLE`, not `NEXTN`, when you also pass
+`--dcp-size` explicitly.** NEXTN is an alias resolved to EAGLE at
+`server_args.py:6067`, but `_handle_dcp_validation` parses the algorithm at
+`:5922` -- before that -- so the raw string reaches
+`SpeculativeAlgorithm.from_string`, which has no NEXTN member, and the boot
+dies with "Unknown speculative algorithm name: NEXTN". The same gate also
+reads `dcp_size` before `_handle_uneven_tp` sets it at `:5957`, which is why
+no existing boot hits this AND why the #229 refusal that gate implements is
+currently dead on the env-driven DCP path. The fix is an ORDERING change and
+is deliberately NOT an alias in `from_string`: the hook maps NEXTN -> EAGLE
+except for a gemma4 draft, where it becomes FROZEN_KV_MTP -- exactly the case
+that gate refuses under `dcp_size > 1`.
 
 **Reading the result.** A token-sharded handover that dropped or misfiled
 rows produces fluent, grammatical, wrong text -- not an error and not a

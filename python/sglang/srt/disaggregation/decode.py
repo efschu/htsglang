@@ -205,6 +205,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_size: int = None,
         start_layer: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        enable_mamba_extra_buffer_lazy: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -216,7 +217,27 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        # HybridReqToTokenPool.__init__ is deliberately NOT called (the pool
+        # takes DecodeReqToTokenPool's sizing instead), so every attribute that
+        # base establishes has to be re-established here. This one was missing,
+        # and it is the base's OWN inherited allocator that reads it:
+        # _alloc_mamba_slots_or_evict (memory_pool.py:1450-1469) branches on
+        # `self.tree_cache is not None` on every mamba slot allocation. On a PD
+        # decode arm carrying a hybrid GDN model the first preallocated request
+        # therefore died with AttributeError -- after both arms had booted
+        # healthy, i.e. at the first real handover rather than at boot.
+        # None is the correct initial value, not a placeholder: the radix cache
+        # binds itself later via bind_tree_cache (memory_pool.py:1434), and a
+        # PD decode arm without --disaggregation-decode-enable-radix-cache
+        # never binds one at all, which the allocator's None branch handles.
+        self.tree_cache = None
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
+        # Same omission, same family, found by the attribute-contract test
+        # rather than by a second crash: read by the inherited pool methods at
+        # memory_pool.py:1586/1669/1776 and by mem_cache/common.py:807. The
+        # non-PD path threads it from server_args (kv_cache_builder.py:229);
+        # this one now does too instead of defaulting silently.
+        self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
         # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
         # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
@@ -2063,6 +2084,28 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        # #603/#631: the rank-uniform pool-headroom reduce, on the PD decode
+        # arm's OWN scheduling entry point.
+        #
+        # `_update_uniform_pool_budget` is placed "unconditional and
+        # pre-branch" in `get_next_batch_to_run`, and `uniform_min_avail`
+        # refuses on a multi-rank boot when it has not run. A PD decode server
+        # never enters `get_next_batch_to_run` -- `dispatch_event_loop` sends
+        # it to `event_loop_overlap_disagg_decode`, which schedules through
+        # THIS function instead -- so on a TP>1 decode arm the reduce never
+        # ran and the first batch to reach `update_running_batch` raised. Two
+        # scheduling entry points, one of which was taught the ordering.
+        #
+        # The placement argument is the one that call site states, and it is
+        # why this line sits at the very top rather than next to its reader:
+        # every rank reaches it exactly once per iteration BEFORE any branch,
+        # so the collective count stays rank-uniform regardless of which
+        # branch each rank takes afterwards. Putting it inside the
+        # `running_batch.is_empty()` else-arm would reintroduce precisely the
+        # rank-split it exists to prevent, because a rank whose batch is empty
+        # would skip a collective its peers perform.
+        self._update_uniform_pool_budget()
+
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
