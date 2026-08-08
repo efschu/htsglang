@@ -1233,9 +1233,20 @@ class PhaseFlipRuntime:
                 )
             incoming_data[peer] = data
 
-        # WRITE (no-return region): local first, then incoming. Source and
-        # destination are different pools; targets are disjoint (injective
-        # row map), so order is free -- kept deterministic anyway.
+        # WRITE (no-return region): local first, then incoming. Targets are
+        # disjoint (injective row map), so the write order is free -- kept
+        # deterministic anyway.
+        #
+        # INVARIANT, load-bearing: every SOURCE READ completes before the
+        # first DESTINATION WRITE. The local leg used to read and write per
+        # layer in one loop, which is safe only while the two pools are
+        # disjoint allocations. That is the #297 reads-before-writes hazard,
+        # and it becomes reachable the moment the phases share backing
+        # (one arena / mutually exclusive VMM backing sized max(PP, TP)
+        # instead of their sum) -- then a destination write can land on a
+        # source row that has not been read yet. Hoisting the reads costs
+        # one list of already-materialised payloads, which the peer legs
+        # above hold anyway.
         t_write0 = self._clock()
         local_src = (
             tr.local_pp_rows if direction == PP_TO_TP else tr.local_tp_rows
@@ -1243,8 +1254,11 @@ class PhaseFlipRuntime:
         local_dst = (
             tr.local_tp_rows if direction == PP_TO_TP else tr.local_pp_rows
         )
-        for f in tr.local_layers:
-            data = src.read_rows(self._src_layer_idx(direction, f), local_src)
+        local_data = [
+            src.read_rows(self._src_layer_idx(direction, f), local_src)
+            for f in tr.local_layers
+        ]
+        for f, data in zip(tr.local_layers, local_data):
             dst.write_rows(self._dst_layer_idx(direction, f), local_dst, data)
         for peer, rows in tr.recv_rows.items():
             n = int(rows.numel())

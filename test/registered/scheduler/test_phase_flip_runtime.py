@@ -1162,3 +1162,136 @@ class TestEmptyLiveSetFlip(CustomTestCase):
             self.assertEqual(rt.completed, 1, f"rank {r} did not complete")
             self.assertEqual(rt.phase, PHASE_TP, f"rank {r} did not change phase")
             self.assertEqual(rt.fit_aborts, 0)
+
+
+def _make_aliased_layout_pools(layer_map, vec, num_slots, seed=7):
+    """Same scenario as :func:`_make_layout_pools`, but each rank's PP and
+    TP buffers are VIEWS INTO ONE per-rank arena -- the shape the shared
+    cross-phase arena has, where the two layouts' bytes overlap because
+    only one of them is physically backed at a time.
+
+    The overlap is deliberate and adversarial: PP layer i and TP layer j
+    are carved from the same flat storage at different strides, so any
+    destination write that happens before a source read is READ has a real
+    chance of clobbering a row still owed to the transition. With disjoint
+    pools that ordering is unobservable, which is exactly why the hazard
+    survived until sharing was attempted.
+    """
+    torch.manual_seed(seed)
+    n_ranks = len(vec)
+    ref_k = [
+        torch.randn(num_slots, HEADS, DIM, dtype=torch.bfloat16)
+        for _ in range(N_LAYERS)
+    ]
+    ref_v = [
+        torch.randn(num_slots, HEADS, DIM, dtype=torch.bfloat16)
+        for _ in range(N_LAYERS)
+    ]
+    live = (
+        torch.arange(num_slots, dtype=torch.int64)[
+            torch.randperm(num_slots)[: int(num_slots * 0.8)]
+        ]
+        .sort()
+        .values
+    )
+    owner = owner_of(live, vec)
+    tp_rows_needed = 1
+    for r in range(n_ranks):
+        rr = rows_of(live[owner == r], vec, r)
+        if rr.numel():
+            tp_rows_needed = max(tp_rows_needed, int(rr.max().item()) + 1)
+
+    arenas, pp_pools, pp_views, tp_pools, tp_views = [], [], [], [], []
+    for r in range(n_ranks):
+        # One arena per rank, big enough for whichever layout is larger --
+        # max(PP, TP), never their sum. That IS the change under test.
+        pp_rows_total = num_slots * len(layer_map[r])
+        tp_rows_total = tp_rows_needed * N_LAYERS
+        arena_rows = max(pp_rows_total, tp_rows_total)
+        arena_k = torch.zeros(arena_rows, HEADS, DIM, dtype=torch.bfloat16)
+        arena_v = torch.zeros(arena_rows, HEADS, DIM, dtype=torch.bfloat16)
+        arenas.append((arena_k, arena_v))
+
+        k_bufs = [
+            arena_k[i * num_slots : (i + 1) * num_slots]
+            for i in range(len(layer_map[r]))
+        ]
+        v_bufs = [
+            arena_v[i * num_slots : (i + 1) * num_slots]
+            for i in range(len(layer_map[r]))
+        ]
+        for i, f in enumerate(layer_map[r]):
+            k_bufs[i][live] = ref_k[f][live]
+            v_bufs[i][live] = ref_v[f][live]
+        pp_pools.append((k_bufs, v_bufs))
+        pp_views.append(KvPoolView(k_bufs, v_bufs))
+
+        tk = [
+            arena_k[i * tp_rows_needed : (i + 1) * tp_rows_needed]
+            for i in range(N_LAYERS)
+        ]
+        tv = [
+            arena_v[i * tp_rows_needed : (i + 1) * tp_rows_needed]
+            for i in range(N_LAYERS)
+        ]
+        tp_pools.append((tk, tv))
+        tp_views.append(KvPoolView(tk, tv))
+    return (ref_k, ref_v), live, pp_pools, pp_views, tp_pools, tp_views
+
+
+class TestSharedArenaReadsPrecedeWrites(CustomTestCase):
+    """Falsifier for the cross-phase shared arena (#631 capacity follow-up).
+
+    Both phases' KV pools are resident today, so the pool is roughly half
+    what one layout could have. The fix is one arena per rank sized
+    max(PP, TP) with mutually exclusive backing -- and it is only correct
+    if the flip reads every source row before writing any destination row.
+
+    This pins that ordering by making the two layouts alias. It fails on
+    the pre-fix local leg, which read and wrote per layer in one loop.
+    """
+
+    def test_pp_to_tp_is_byte_exact_with_aliased_pools(self):
+        ref, live, _pp_pools, pp_views, tp_pools, tp_views = (
+            _make_aliased_layout_pools(MAP_625, VEC, 300)
+        )
+        runtimes, _cutovers = _build_runtimes(pp_views, tp_views, live)
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
+        self.assertTrue(ok, f"aliased-arena flip corrupted rows: {msg}")
+
+    def test_aliased_result_matches_the_disjoint_reference(self):
+        """Byte-identity against the same flip run with disjoint pools --
+        sharing must change memory economics, never a single output byte."""
+        ref_a, live_a, _, pp_a, tp_pools_a, tp_a = _make_aliased_layout_pools(
+            MAP_625, VEC, 300, seed=11
+        )
+        rt_a, _ = _build_runtimes(pp_a, tp_a, live_a)
+        self.assertEqual(
+            [e for e in _run_ranks(3, runtimes=rt_a, directions=[PP_TO_TP] * 3) if e],
+            [],
+        )
+
+        ref_b, live_b, _, pp_b, tp_pools_b, tp_b = _make_layout_pools(
+            MAP_625, VEC, 300, seed=11
+        )
+        rt_b, _ = _build_runtimes(pp_b, tp_b, live_b)
+        self.assertEqual(
+            [e for e in _run_ranks(3, runtimes=rt_b, directions=[PP_TO_TP] * 3) if e],
+            [],
+        )
+
+        self.assertTrue(torch.equal(live_a, live_b))
+        owner = owner_of(live_a, VEC)
+        for r in range(3):
+            rows = rows_of(live_a[owner == r], VEC, r)
+            for f in range(N_LAYERS):
+                self.assertTrue(
+                    torch.equal(tp_pools_a[r][0][f][rows], tp_pools_b[r][0][f][rows]),
+                    f"rank {r} ordinal {f} K differs between aliased and disjoint",
+                )
+                self.assertTrue(
+                    torch.equal(tp_pools_a[r][1][f][rows], tp_pools_b[r][1][f][rows]),
+                    f"rank {r} ordinal {f} V differs between aliased and disjoint",
+                )
