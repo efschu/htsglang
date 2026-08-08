@@ -2587,6 +2587,15 @@ _DCP_SPILL_ACTIVE: bool = False
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
+# #631 Route A phase flip: the SECONDARY (flip-target) group set, built
+# eagerly at init over the same world (the dcp_spill/pdmux duplicate-group
+# precedent -- a group CREATE is itself a collective, never lazy). All None
+# until initialize_phase_flip_secondary_groups runs; the default path never
+# builds them, keeping today's behavior byte-identical.
+_FLIP_TP: Optional[GroupCoordinator] = None
+_FLIP_DCP: Optional[GroupCoordinator] = None
+_FLIP_PP: Optional[GroupCoordinator] = None
+
 _ENABLE_PDMUX_P_TP: bool = False
 
 
@@ -3274,6 +3283,121 @@ def initialize_model_parallel(
     )
 
 
+def phase_flip_groups_initialized() -> bool:
+    return _FLIP_TP is not None
+
+
+def get_phase_flip_group(name: str) -> GroupCoordinator:
+    """Secondary-set accessor for #631 Route A: ``tp``, ``dcp`` or ``pp``."""
+    group = {"tp": _FLIP_TP, "dcp": _FLIP_DCP, "pp": _FLIP_PP}.get(name)
+    if name not in ("tp", "dcp", "pp"):
+        raise ValueError(f"unknown phase-flip group {name!r}")
+    assert group is not None, (
+        f"phase-flip secondary group {name!r} is not initialized "
+        f"(initialize_phase_flip_secondary_groups was not called, or dcp "
+        f"was not requested)"
+    )
+    return group
+
+
+def initialize_phase_flip_secondary_groups(
+    *,
+    tp_size: int,
+    pp_size: int,
+    dcp_size: int = 1,
+    backend: Optional[str] = None,
+    _manifest_salt: int = 0,
+) -> None:
+    """Build the #631 SECONDARY (flip-target) group set over the same world.
+
+    The primary topology (from ``initialize_model_parallel``) serves one
+    phase; this set serves the other (Route A: primary tp=1/pp=3 for the
+    PP prefill phase, secondary tp=N/dcp=N/pp=1 for the TP decode phase).
+    Runtime code routes between the sets via ``get_parallel().override``
+    scopes -- no global here is mutated at flip time.
+
+    DISCIPLINE (operator pin 1, the #431/#616B/#645 rank-divergent
+    collective family): group creation is itself a collective, so the
+    INTENDED creation manifest -- group names, rank lists, in the one
+    fixed creation order tp -> dcp -> pp -- is exchanged and
+    equality-checked across the WORLD **before** the first create. Ranks
+    that disagree die loudly here, never inside a half-built communicator.
+    ``_manifest_salt`` exists solely so the pin test can prove the check
+    can fail; production callers never pass it.
+    """
+    assert torch.distributed.is_initialized()
+    world_size: int = torch.distributed.get_world_size()
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    if tp_size * pp_size != world_size:
+        raise RuntimeError(
+            f"phase-flip secondary set: tp_size ({tp_size}) x pp_size "
+            f"({pp_size}) != world_size ({world_size})"
+        )
+    if dcp_size > 1 and tp_size % dcp_size != 0:
+        raise RuntimeError(
+            f"phase-flip secondary set: tp_size ({tp_size}) not divisible "
+            f"by dcp_size ({dcp_size})"
+        )
+    global _FLIP_TP, _FLIP_DCP, _FLIP_PP
+    assert _FLIP_TP is None and _FLIP_DCP is None and _FLIP_PP is None, (
+        "phase-flip secondary groups are already initialized"
+    )
+
+    # Plan first (pure), in THE fixed creation order.
+    tp_ranks = [
+        list(range(i * tp_size, (i + 1) * tp_size))
+        for i in range(world_size // tp_size)
+    ]
+    planned = [("flip_tp", tp_ranks)]
+    dcp_ranks = None
+    if dcp_size > 1:
+        dcp_ranks = []
+        for group in tp_ranks:
+            for start in range(0, len(group), dcp_size):
+                dcp_ranks.append(group[start : start + dcp_size])
+        planned.append(("flip_dcp", dcp_ranks))
+    num_pp_groups = world_size // pp_size
+    pp_ranks = [
+        list(range(idx, world_size, num_pp_groups)) for idx in range(num_pp_groups)
+    ]
+    planned.append(("flip_pp", pp_ranks))
+
+    # Verify the manifest group-wide BEFORE creating anything.
+    manifest = repr((planned, int(_manifest_salt)))
+    gathered: List[Optional[str]] = [None] * world_size
+    torch.distributed.all_gather_object(
+        gathered, manifest, group=get_world_group().cpu_group
+    )
+    if any(m != manifest for m in gathered):
+        raise RuntimeError(
+            f"{'PHASE-FLIP'} group-creation manifest DIVERGES across ranks "
+            f"-- refusing to create any group (a divergent create order is "
+            f"the #431/#616B/#645 rank-divergent-collective family; dying "
+            f"here is the cheap failure). Per-rank manifests: "
+            f"{dict(enumerate(gathered))}"
+        )
+
+    # Create, in exactly the planned order.
+    local_rank = get_world_group().local_rank
+    _FLIP_TP = init_model_parallel_group(
+        tp_ranks, local_rank, backend, group_name="flip_tp"
+    )
+    if dcp_ranks is not None:
+        _FLIP_DCP = init_model_parallel_group(
+            dcp_ranks, local_rank, backend, group_name="flip_dcp"
+        )
+    _FLIP_PP = init_model_parallel_group(
+        pp_ranks, local_rank, backend, use_custom_allreduce=False,
+        group_name="flip_pp",
+    )
+    logger.info(
+        "phase-flip secondary groups built: tp %s, dcp %s, pp %s",
+        tp_ranks,
+        dcp_ranks,
+        pp_ranks,
+    )
+
+
 def _object_exchange_group() -> Optional[torch.distributed.ProcessGroup]:
     """The CPU process group the rank-config exchange must run on.
 
@@ -3544,6 +3668,17 @@ def destroy_model_parallel():
         _DCP_SPILL.destroy()
     _DCP_SPILL = None
     _DCP_SPILL_ACTIVE = False
+
+    global _FLIP_TP, _FLIP_DCP, _FLIP_PP
+    if _FLIP_TP:
+        _FLIP_TP.destroy()
+    _FLIP_TP = None
+    if _FLIP_DCP:
+        _FLIP_DCP.destroy()
+    _FLIP_DCP = None
+    if _FLIP_PP:
+        _FLIP_PP.destroy()
+    _FLIP_PP = None
 
     global _MOE_EP
     if _MOE_EP:
