@@ -87,6 +87,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shutil
 import sys
 import threading
 from contextlib import contextmanager
@@ -348,7 +349,39 @@ class CaptureCensus:
         try:
             directory = directory or os.environ.get(ENV_DIR, DEFAULT_DIR)
             os.makedirs(directory, exist_ok=True)
+            # #622/#649: scope the record by boot, because the un-scoped name
+            # silently destroyed the evidence it exists to preserve.
+            #
+            # On 2026-08-07 the ordered per-segment collective list was the one
+            # datum that would have separated "the replay stopped at a segment
+            # boundary" from "a transport was frozen behind another" for the
+            # 16:08 wedge. By the time it was read, three later boots had each
+            # rewritten capture_census_rank*.txt at this fixed path -- and the
+            # last of them ran with barlink disabled, so every file said "0
+            # collectives". The forensic question was unanswerable not because
+            # the instrument failed but because it overwrote itself.
+            #
+            # The VRAM flight recorder already solved exactly this by scoping
+            # its marks to a boot id (SGLANG_VRAM_FLIGHT_BOOT_ID, "so the
+            # appended file stays honest across boots"). Same fix here: prefer
+            # the boot commit the launcher publishes, fall back to the pid,
+            # which is still unique per boot.
+            #
+            # The stable un-suffixed name is ALSO written, as a copy, so
+            # existing tooling and the log line that points at it keep working
+            # and always show the current boot.
+            boot_id = (
+                os.environ.get("SGLANG_VRAM_FLIGHT_BOOT_ID")
+                or os.environ.get("SGLANG_BOOT_COMMIT")
+                or str(os.getpid())
+            )
+            # Defend the path component: a boot id is used unvalidated here and
+            # comes from the environment.
+            boot_id = "".join(c for c in boot_id if c.isalnum() or c in "-_")[:40]
             path = os.path.join(directory, f"capture_census_rank{rank}.txt")
+            boot_path = os.path.join(
+                directory, f"capture_census_rank{rank}.{boot_id}.txt"
+            )
             segs = self.segments()
             with open(path, "w") as fh:
                 fh.write(
@@ -362,6 +395,13 @@ class CaptureCensus:
                     fh.write(f"\n[{key}] {len(segs[key])} collectives\n")
                     for i, record in enumerate(segs[key]):
                         fh.write(f"{i:5d} {self.render(record)}\n")
+            # The boot-scoped copy is what survives the next boot. Written
+            # after the primary file and guarded separately: if this fails,
+            # the caller still gets the stable path rather than nothing.
+            try:
+                shutil.copyfile(path, boot_path)
+            except OSError:
+                pass
             return path
         except Exception:  # noqa: BLE001
             return None

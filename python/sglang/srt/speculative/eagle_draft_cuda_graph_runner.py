@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.debug_utils import index_race_guard
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -289,6 +290,47 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------
+    def _war_falsifier_buffers(self):
+        """Buffers written by out-of-graph prep AND read by the captured graph.
+
+        These are the write-after-read pairs whose ordering is currently
+        guaranteed only by prep and replay sharing one FIFO stream. Anything
+        added here must satisfy both halves of that description -- listing a
+        tensor that the graph does not actually read would produce a
+        reassuring zero that means nothing.
+
+        Resolved defensively rather than assumed: the attribute set differs
+        between the single-backend and multi-backend draft configurations, and
+        a missing attribute here must degrade to "guard fewer tensors", never
+        to an exception on the serving path. A falsifier that can take down
+        production is worse than no falsifier.
+        """
+        out = []
+        backend = getattr(self, "draft_attn_backend", None)
+        if backend is None:
+            return out
+
+        # Written by generate_draft_decode_kv_indices before every replay,
+        # read by the captured draft graph (flashinfer_backend.py:7594-7613).
+        buf = getattr(backend, "cuda_graph_kv_indices", None)
+        if isinstance(buf, torch.Tensor) and buf.numel() > 0:
+            out.append(("war/cuda_graph_kv_indices", buf))
+
+        # The indptr the prep path rewrites; this is the tensor whose .cpu()
+        # readback is one of the two observed wedge sites, so it is also the
+        # one most likely to move to an isolated stream.
+        buf = getattr(backend, "kv_indptr", None)
+        if isinstance(buf, torch.Tensor) and buf.numel() > 0:
+            out.append(("war/kv_indptr", buf))
+
+        # Multi-backend draft: each per-step backend owns its own slice.
+        for i, sub in enumerate(getattr(backend, "attn_backends", []) or []):
+            sub_buf = getattr(sub, "kv_indptr", None)
+            if isinstance(sub_buf, torch.Tensor) and sub_buf.numel() > 0:
+                out.append((f"war/kv_indptr[{i}]", sub_buf))
+
+        return out
+
     def _cache_loc_dtype(self):
         return torch.int64
 
@@ -655,8 +697,47 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if self.model_runner.device_timer
             else contextlib.nullcontext()
         )
+        # #622/#649 WAR FALSIFIER. This brackets the replay, and it exists to
+        # answer one question before ISOLATED_PREP is allowed to ship.
+        #
+        # The prep call above (init_forward_metadata_out_graph) WRITES the very
+        # buffers this captured graph READS: cuda_graph_kv_indices and
+        # kv_indptr. Today that write-after-read ordering is safe for free,
+        # because prep and replay share one FIFO compute stream -- prep for
+        # step N physically cannot begin before the replay for step N-1 has
+        # retired. Moving prep onto an isolated stream is exactly what destroys
+        # that guarantee. Prep-N could then overwrite the indices while
+        # replay-(N-1) is still reading them, which does NOT crash and does NOT
+        # hang: it produces wrong attention indices and therefore silently
+        # wrong output. A stability test would score that build as a total
+        # success, because the wedge it was built to remove would indeed be
+        # gone. That is the failure mode this bracket is here to catch.
+        #
+        # Both calls are enqueued on the CURRENT stream, so they are ordered
+        # around the graph launch by construction; per index_race_guard's own
+        # contract a same-stream comparison "must report zero", and any
+        # non-zero count is positive proof that some OTHER stream wrote the
+        # tensor in between. Counting is device-side, so this adds no host
+        # sync and cannot itself perturb the ordering under test.
+        #
+        # Expected readings, and note that the middle arm is the one that makes
+        # this instrument trustworthy rather than merely reassuring:
+        #   baseline, no isolated prep            -> 0   (no false positives)
+        #   isolated prep, WAR event OMITTED      -> >0  (proves it CAN fail)
+        #   isolated prep, WAR event in place     -> 0   (the fix is ordered)
+        # An instrument that has never been shown to fire is not evidence.
+        _war_guarded = index_race_guard.is_enabled()
+        if _war_guarded:
+            _war_bufs = self._war_falsifier_buffers()
+            for _name, _buf in _war_bufs:
+                index_race_guard.snapshot(_name, _buf)
+
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+
+        if _war_guarded:
+            for _name, _buf in _war_bufs:
+                index_race_guard.check_stable(_name, _buf)
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

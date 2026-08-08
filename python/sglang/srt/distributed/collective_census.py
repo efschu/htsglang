@@ -71,6 +71,8 @@ import os
 from collections import deque
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.distributed.device_communicators import lockstep_sentinel
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -231,6 +233,13 @@ class CollectiveCensus:
         """
         self._counts[family] = self._counts.get(family, 0) + 1
         self._history.append((family, nbytes))
+        # #622: the lockstep sentinel records the same event POSITIONALLY.
+        # Placed here, not at the dispatch sites, so its coverage is
+        # count-identical to this census by construction and transport-
+        # agnostic (barlink and NCCL arms record the same stream). nbytes is
+        # deliberately not forwarded: under uneven TP per-rank payload sizes
+        # differ legitimately and must not enter the position hash.
+        lockstep_sentinel.note_host(family)
 
     def snapshot(self) -> Dict[str, int]:
         return dict(self._counts)

@@ -86,6 +86,20 @@ def _describe(t: Any) -> str:
         f"result_i={getattr(t, '_result_i', None)}",
         f"result_counter={getattr(t, '_result_counter', None)}",
     ]
+    # #622: (round, mesh watermark, a2a watermark), from the PINNED mirror the
+    # watchdog poll refreshes on its private stream — CPU-resident by
+    # construction, so printing it here keeps the no-device-sync constraint.
+    # Two spaced SIGUSR1 probes under replay load showing strict growth of all
+    # three words are the ack barrier's live capture-safety proof.
+    _rm = getattr(t, "_round_mirror", None)
+    if _rm is not None:
+        try:
+            parts.append(
+                f"round_mirror=[round={int(_rm[0])}, mesh_consumed={int(_rm[1])}, "
+                f"a2a_consumed={int(_rm[2])}]"
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic must not break the dump
+            parts.append("round_mirror=<unreadable>")
     # CPU-resident mirrors only. See the module docstring: a device read here
     # would queue behind the wedged spin kernel and hang the handler.
     for name in ("_status_stage_host", "_status_host", "_step_host"):

@@ -966,7 +966,11 @@ class TestFlagCoexistence(CustomTestCase):
         to notice that, otherwise it only restates the formula.
         """
         for world in (2, 3, 4, 8):
-            old = flags_requirement(world, True, True) - world * 256
+            # The budget as it would be with only four pipe families. #622
+            # appended two acknowledgment banks BEHIND the pipe rows, so they
+            # come off here as well -- they are not part of the four-family
+            # region this falsifier is about.
+            old = flags_requirement(world, True, True) - world * 256 - 2 * world * 256
             last_row = (pipe_fbase(world, True)
                       + (RESULT_READY_FAMILY * world + world - 1) * 256)
             self.assertGreater(last_row + 256, old)

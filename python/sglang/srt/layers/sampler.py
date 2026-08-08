@@ -76,6 +76,46 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+# #622 (fork): sampled-token sync is ON by default for tp > 1 — see
+# maybe_sync_sampled_tokens. Opt-out, not opt-in: on this fork the upstream
+# determinism assumption is broken by design (mixed archs, uneven-TP shard
+# geometry, per-rank sampling RNG).
+SGLANG_SYNC_SAMPLED_TOKENS = get_bool_env_var("SGLANG_SYNC_SAMPLED_TOKENS", "true")
+
+
+def maybe_sync_sampled_tokens(tokens: torch.Tensor, group=None, src: int = 0) -> None:
+    """Make sampled token ids rank-uniform: broadcast rank ``src``'s tokens.
+
+    #622 ROOT. Upstream skips this by default, resting on "the last
+    all-reduce, the last lm_head matmul, and all sampling kernels" being
+    cross-rank deterministic. On this fork that is violated three ways at
+    once: mixed GPU architectures (near-tie argmax flips), uneven-TP shard
+    geometry (per-rank reduction order — the farm's odd rank was NOT
+    arch-predicted, so this term alone suffices), and per-rank sampling RNG
+    at temperature > 0. The verify accepts (#50) and draft picks (#185)
+    already broadcast; this covers the remaining unsynced sample — the FIRST
+    token of every request — whose divergence flips batch membership when an
+    EOS lands on one side (farm proof: six sentinel specimens, all at
+    output length 1, all matched=248046, under barlink AND NCCL, at
+    temperature 0.7 AND 0.0).
+
+    ``group`` is a GroupCoordinator in production (capture-safe broadcast:
+    pynccl when available, coordinator dispatch — barlink included — when
+    not) or a raw ProcessGroup in tests.
+    """
+    if group is None:
+        return
+    if hasattr(group, "device_group"):  # GroupCoordinator (production)
+        from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+
+        if tokens.is_contiguous():
+            capture_safe_tp_broadcast(group, (tokens,), src=src)
+        else:
+            tmp = tokens.contiguous()
+            capture_safe_tp_broadcast(group, (tmp,), src=src)
+            tokens.copy_(tmp)
+    else:  # raw ProcessGroup (tests)
+        torch.distributed.broadcast(tokens, src=src, group=group)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
@@ -85,8 +125,10 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.tp_sync_group = get_tp_group().device_group
+        self._tp_sync_coordinator = get_tp_group()
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
+            self._tp_sync_coordinator = get_parallel().attn_tp_group
 
         self.rl_on_policy_target = get_server_args().rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -412,6 +454,21 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
+        # #622 (fork default): rank-0 broadcast, authoritative sample, ON for
+        # every tp>1 group — not only mixed-arch ones, because uneven-TP
+        # reduction order breaks the determinism assumption even between
+        # same-arch ranks (the farm's odd rank was not arch-predicted).
+        # Opt-out: SGLANG_SYNC_SAMPLED_TOKENS=0 restores the upstream
+        # opt-in/grammar-only MIN-allreduce below.
+        if (
+            SGLANG_SYNC_SAMPLED_TOKENS
+            and self._tp_sync_coordinator is not None
+            and self._tp_sync_coordinator.world_size > 1
+        ):
+            maybe_sync_sampled_tokens(
+                batch_next_token_ids, group=self._tp_sync_coordinator, src=0
+            )
+            return
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:

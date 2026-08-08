@@ -39,6 +39,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import os
 import re
 import sys
 from array import array
@@ -63,6 +64,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.distributed.device_communicators import lockstep_sentinel
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
@@ -133,6 +135,9 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+# #622: per-finish trace for cross-rank finish-divergence attribution.
+_FINISH_TRACE = os.environ.get("SGLANG_FINISH_TRACE", "0") not in ("0", "", "false")
 
 
 @lru_cache(maxsize=1)
@@ -1511,6 +1516,27 @@ class Req(ReqDllmMixin):
         return False
 
     def update_finish_state(self, new_accepted_len: int = 1):
+        # #622: env-gated finish trace. On a divergent finish (one rank drops
+        # a request its peers keep — proven family injury), the three ranks'
+        # FINISH-TRACE lines for the same rid diff to show WHICH input
+        # diverged: the token tail, or the accept window length.
+        if not _FINISH_TRACE:
+            return self._update_finish_state_impl(new_accepted_len)
+        was_finished = self.finished()
+        self._update_finish_state_impl(new_accepted_len)
+        if not was_finished and self.finished():
+            _fr = self.finished_reason
+            logger.info(
+                "FINISH-TRACE rid=%s reason=%s matched=%r acc_len=%d out_len=%d tail=%s",
+                self.rid[:16] if isinstance(self.rid, str) else self.rid,
+                type(_fr).__name__ if _fr is not None else None,
+                getattr(_fr, "matched", None),
+                new_accepted_len,
+                len(self.output_ids) if self.output_ids else 0,
+                self.output_ids[-6:] if self.output_ids else [],
+            )
+
+    def _update_finish_state_impl(self, new_accepted_len: int = 1):
         if self.finished():
             return
 
@@ -3224,6 +3250,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 
+        # #622: batch-membership drops are rank-uniformity-critical — feed
+        # them to the lockstep sentinel WITH their reason before the list is
+        # rebuilt. No-op unless the sentinel is armed.
+        if lockstep_sentinel.armed() and len(keep_indices) != len(self.reqs):
+            _kept = set(keep_indices)
+            for _i, _req in enumerate(self.reqs):
+                if _i not in _kept:
+                    _fr = _req.finished_reason
+                    # matched carries WHICH token/str ended the request — on a
+                    # divergent drop this is the diverging value itself
+                    # (discriminates sampling divergence from a torn D2H copy).
+                    _matched = getattr(_fr, "matched", None)
+                    lockstep_sentinel.note_decision(
+                        "drop",
+                        _req.rid[:16] if isinstance(_req.rid, str) else str(_req.rid),
+                        type(_fr).__name__ if _fr is not None else "unfinished",
+                        str(_matched) if _matched is not None else "",
+                        len(_req.output_ids) if _req.output_ids else 0,
+                    )
+
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
@@ -3285,6 +3331,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        # #622: admissions are the other half of batch membership (see the
+        # drop notes in filter_batch); a rank admitting a request its peers
+        # did not diverges just as hard as one dropping early.
+        if lockstep_sentinel.armed():
+            for _req in other.reqs:
+                lockstep_sentinel.note_decision(
+                    "admit",
+                    _req.rid[:16] if isinstance(_req.rid, str) else str(_req.rid),
+                )
+
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
