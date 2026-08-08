@@ -250,6 +250,22 @@ def _split_tensor_dict(
     return metadata_list, tensor_list
 
 
+def _move_received_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Land a received p2p tensor on the receiving group's own device.
+
+    The wire buffer is allocated on the SENDER's device type so the
+    cpu-vs-device comm-group routing stays symmetric with the send side; this
+    is the single point where a cross-device-type payload (CPU prefill stage
+    -> GPU stage, #651 W2) is moved onto the receiver's device. Same device
+    type: identity, no copy, byte-identical to the pre-#651 behavior.
+    """
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    if tensor.device.type == device.type:
+        return tensor
+    return tensor.to(device)
+
+
 _group_name_counter: Dict[str, int] = {}
 
 
@@ -2419,7 +2435,15 @@ class GroupCoordinator:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
                     tensor = tensor.reshape(orig_shape)
 
-                tensor_dict[key] = tensor
+                # #651 W2 (mixed-device PP): the recv buffer is allocated on
+                # the SENDER's device type (TensorMetadata carries it, and the
+                # comm-group choice above must keep matching the sender's
+                # cpu-vs-device routing). In a mixed-device world -- a CPU
+                # prefill stage feeding a GPU stage -- the payload would
+                # otherwise stay a CPU tensor on the GPU rank and nothing
+                # downstream inserts the move. Same-device worlds take the
+                # is-a-no-op branch and are byte-identical to before.
+                tensor_dict[key] = _move_received_tensor(tensor, self.device)
             else:
                 tensor_dict[key] = value
         return tensor_dict
