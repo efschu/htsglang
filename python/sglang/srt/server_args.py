@@ -16380,10 +16380,25 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            # #631 Route A: a phase-flip instance is ONE instance that runs
+            # PP for prefill and flips to TP for decode on the same ranks.
+            # Speculation is armed for the TP DECODE phase only: the draft
+            # worker is built on the flip's TP stack and swapped in at
+            # cutover, while the PP phase runs with spec_algorithm NONE and
+            # no draft worker at all.
+            #
+            # So the incompatibility this assert states is NOT waived -- no
+            # draft worker exists in a PP phase, the constructors take no
+            # pp_rank, and none is built. It is enforced by construction
+            # instead of by refusing the flag combination.
+            assert self.speculative_algorithm is None or self.enable_phase_flip, (
+                "Pipeline parallelism is not compatible with speculative "
+                "decoding. With --enable-phase-flip, speculation runs in the "
+                "TP decode phase instead: the draft worker is built on the "
+                "flip's TP stack and armed at cutover."
             )
 
         assert not (

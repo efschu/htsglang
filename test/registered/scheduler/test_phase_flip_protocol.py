@@ -143,7 +143,16 @@ class _StubScheduler:
             tp_worker=SimpleNamespace(name=f"tp_worker[{rank}]"),
             vector=VEC,
             refill=lambda direction: self.log.append(("refill", direction)),
+            # #631 speculation slice: None unless a test arms it.
+            draft_worker=None,
         )
+        # Speculation is a TP-decode-phase capability; the boot (PP) state
+        # is the same one an instance without speculation has.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(None)
+        self.flip_spec_algorithm = SpeculativeAlgorithm.from_string(None)
+        self.draft_worker = None
         from sglang.srt.managers.phase_flip_runtime import AbortDeferralWindow
 
         self.phase_flip_abort_window = AbortDeferralWindow()
@@ -342,6 +351,125 @@ class TestProductionCutover(CustomTestCase):
             parallel_state._PHASE_FLIP_TP_ACTIVE = False  # sabotage routing
             with self.assertRaisesRegex(KvReshardError, "CUTOVER INCOMPLETE"):
                 verify_flip_cutover(sched, tp_phase=True)
+
+
+class TestSpeculationIsTpDecodePhaseOnly(CustomTestCase):
+    """#631 speculation slice: NEXTN runs in the TP DECODE phase.
+
+    The user requirement is speculation in TP decode; the structural
+    constraint is that no draft worker has a PP form. Both are satisfied
+    by the same rule -- the draft worker is built on the flip's TP stack
+    and is armed ONLY while that stack is active. These tests pin the
+    cutover swap in both directions, and that a half-armed cutover is
+    refused rather than run."""
+
+    def tearDown(self):
+        set_cp_token_ratios(None)
+
+    def _armed_stub(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        sched = _StubScheduler(0)
+        # "NEXTN" is a CLI alias the arg hook resolves before the enum
+        # sees it; FROZEN_KV_MTP is what server_args actually carries.
+        sched.flip_spec_algorithm = SpeculativeAlgorithm.from_string(
+            "FROZEN_KV_MTP"
+        )
+        sched.phase_flip_stacks.draft_worker = SimpleNamespace(name="draft[0]")
+        return sched
+
+    def test_pp_phase_carries_no_speculation_at_all(self):
+        sched = self._armed_stub()
+        self.assertTrue(
+            sched.spec_algorithm.is_none(),
+            "the PP prefill phase must run with no speculation",
+        )
+        self.assertIsNone(sched.draft_worker)
+
+    def test_cutover_arms_speculation_with_the_tp_stack(self):
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = self._armed_stub()
+            cutover = build_production_flip_cutover(sched)
+            cutover(PP_TO_TP)
+
+            self.assertFalse(
+                sched.spec_algorithm.is_none(),
+                "the TP decode phase must carry the configured algorithm",
+            )
+            self.assertIs(
+                sched.draft_worker, sched.phase_flip_stacks.draft_worker
+            )
+            self.assertIs(
+                sched.model_worker,
+                sched.phase_flip_stacks.draft_worker,
+                "with speculation the model worker IS the draft worker, as "
+                "at boot",
+            )
+            verify_flip_cutover(sched, tp_phase=True)
+
+    def test_return_trip_disarms_speculation(self):
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = self._armed_stub()
+            cutover = build_production_flip_cutover(sched)
+            cutover(PP_TO_TP)
+            cutover(TP_TO_PP)
+
+            self.assertTrue(
+                sched.spec_algorithm.is_none(),
+                "a draft worker must never survive into the PP phase",
+            )
+            self.assertIsNone(sched.draft_worker)
+            self.assertIs(sched.model_worker, sched.tp_worker)
+            verify_flip_cutover(sched, tp_phase=False)
+
+    def test_unspeculated_flip_is_bit_for_bit_the_old_behaviour(self):
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = _StubScheduler(0)  # no flip_spec_algorithm armed
+            cutover = build_production_flip_cutover(sched)
+            cutover(PP_TO_TP)
+            self.assertIs(
+                sched.model_worker,
+                sched.phase_flip_stacks.tp_worker,
+                "without speculation the TP stack's own worker stays the "
+                "model worker",
+            )
+            self.assertTrue(sched.spec_algorithm.is_none())
+            self.assertIsNone(sched.draft_worker)
+            verify_flip_cutover(sched, tp_phase=True)
+
+    def test_can_fail_half_armed_cutover_is_refused(self):
+        """Algorithm without its draft worker, or a draft worker left
+        armed against the PP stack -- both must fail red at the pin."""
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = self._armed_stub()
+            cutover = build_production_flip_cutover(sched)
+            cutover(PP_TO_TP)
+            verify_flip_cutover(sched, tp_phase=True)  # green baseline
+
+            kept = sched.draft_worker
+            sched.draft_worker = None
+            with self.assertRaisesRegex(KvReshardError, "draft_worker"):
+                verify_flip_cutover(sched, tp_phase=True)
+            sched.draft_worker = kept
+            verify_flip_cutover(sched, tp_phase=True)  # green again
+
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            sched.spec_algorithm = SpeculativeAlgorithm.from_string(None)
+            with self.assertRaisesRegex(KvReshardError, "spec_algorithm"):
+                verify_flip_cutover(sched, tp_phase=True)
+
+    def test_can_fail_draft_worker_surviving_into_pp_is_refused(self):
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = self._armed_stub()
+            cutover = build_production_flip_cutover(sched)
+            cutover(PP_TO_TP)
+            cutover(TP_TO_PP)
+            verify_flip_cutover(sched, tp_phase=False)  # green baseline
+
+            sched.draft_worker = sched.phase_flip_stacks.draft_worker
+            with self.assertRaisesRegex(KvReshardError, "draft_worker"):
+                verify_flip_cutover(sched, tp_phase=False)
 
 
 class TestPin4SchedulerLevelReplay(CustomTestCase):

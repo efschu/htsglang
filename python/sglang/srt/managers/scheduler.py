@@ -484,6 +484,25 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # #631 Route A: speculation is a property of the TP DECODE phase.
+        # A phase-flip instance boots in the PP prefill phase, where no
+        # draft worker exists -- the draft workers take no pp_rank and
+        # there is no PP-shaped draft stack -- so the boot-phase algorithm
+        # is NONE and every spec-keyed branch in this class takes exactly
+        # the path it takes on an instance without speculation. The
+        # configured algorithm is kept aside here and swapped in at the
+        # cutover, together with the draft worker that phase_flip_boot
+        # builds on the flip's TP stack.
+        self.flip_spec_algorithm = SpeculativeAlgorithm.from_string(None)
+        if server_args.enable_phase_flip and not self.spec_algorithm.is_none():
+            self.flip_spec_algorithm = self.spec_algorithm
+            self.spec_algorithm = SpeculativeAlgorithm.from_string(None)
+            logger.info(
+                "#631 phase flip: speculation (%s) is armed for the TP "
+                "decode phase; the PP prefill phase runs without a draft "
+                "worker",
+                server_args.speculative_algorithm,
+            )
         # T156 stage 3/4: per-batch cross-algorithm switching (schedule and
         # auto/bandit modes). True => decode batches consult the meta-worker's
         # switch hook before prepare_for_decode, and DFLASH request validation

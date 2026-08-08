@@ -252,6 +252,11 @@ class PhaseFlipStacks:
     image_pp: torch.Tensor
     image_tp: torch.Tensor
     vector: Tuple[int, ...]
+    #: The speculative draft worker for the TP DECODE phase, or None when
+    #: the instance runs without speculation. Built on the TP stack and
+    #: swapped into the scheduler at cutover (#631); it never participates
+    #: in the PP phase.
+    draft_worker: object = None
 
     def refill(self, direction: str) -> None:
         """The weights leg of a flip: one contiguous H2D refill of the
@@ -281,6 +286,58 @@ class PhaseFlipStacks:
             )
         else:
             raise PhaseFlipBootError(f"unknown flip direction {direction!r}")
+
+
+def build_flip_draft_worker(scheduler, tp_worker, tp_args, world_rank):
+    """Construct the TP-decode-phase speculative draft worker, or None.
+
+    Mirrors ``Scheduler.maybe_init_draft_worker`` with two deliberate
+    substitutions, and no others: the target is the flip's TP-shaped
+    worker rather than the boot worker, and the identity arguments are the
+    TP-phase ones (``tp_rank`` = world rank, no pp_rank -- the draft
+    workers have no PP form, which is exactly why speculation is confined
+    to this phase).
+
+    MUST be called inside ``phase_flip_tp_scope`` with ``tp_args``
+    published on the context, like everything else on this stack: the
+    draft runner reads its geometry from the published server args (#470),
+    and a draft built against the target's PP geometry would shard its
+    heads for the wrong topology.
+    """
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo: SpeculativeAlgorithm = scheduler.flip_spec_algorithm
+    if algo.is_none():
+        return None
+    if algo.is_ngram():
+        # NGRAM keeps an external corpus manager wired to the tokenizer
+        # channel, which the cutover does not rebuild. Refuse rather than
+        # half-arm it.
+        raise PhaseFlipBootError(
+            "speculative algorithm 'ngram' is not supported in the phase "
+            "flip's TP decode phase (its external corpus manager is not "
+            "part of the cutover rebuild list)"
+        )
+
+    DraftWorkerClass = algo.create_worker(tp_args)
+    draft = DraftWorkerClass(
+        server_args=tp_args,
+        gpu_id=scheduler.ps.gpu_id,
+        tp_rank=world_rank,
+        moe_ep_rank=0,
+        nccl_port=scheduler.tp_worker.nccl_port,
+        target_worker=tp_worker,
+        dp_rank=scheduler.tp_worker.dp_rank,
+        attn_cp_rank=scheduler.tp_worker.attn_cp_rank,
+        moe_dp_rank=scheduler.tp_worker.moe_dp_rank,
+    )
+    logger.info(
+        "%s TP-phase draft worker built: %s, tp_rank %d",
+        LOG_PREFIX,
+        type(draft).__name__,
+        world_rank,
+    )
+    return draft
 
 
 def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
@@ -385,6 +442,18 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
 
             image_tp = arena_image(arena, layout_tp, pin=True)
 
+            # 4b. The TP-phase draft worker (#631 speculation slice).
+            # Constructed AFTER the arena is packed, mirroring the boot
+            # order (maybe_init_draft_worker precedes the target's
+            # alloc_memory_pool) and keeping the arena's one big
+            # contiguous allocation away from the draft's. The draft's
+            # weights are its OWN model and stay resident across both
+            # phases -- they are not arena-backed, because there is no
+            # second layout for them to flip between.
+            draft_worker = build_flip_draft_worker(
+                scheduler, tp_worker, tp_args, world_rank
+            )
+
             # 5. TP pools + backends + decode graphs, with the TP arena
             # bytes live (graphs bake the fixed arena addresses; pin 2:
             # ONLY this stack captures decode graphs).
@@ -424,8 +493,27 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                         f"on slot-id identity across layouts"
                     )
 
+            # 5b. Draft pools/backends/graphs, in the boot's order and
+            # from the boot's source of truth: the draft shares the TARGET
+            # stack's request pool and KV allocator (Scheduler
+            # .init_memory_pools does exactly this), so the draft KV is
+            # sized rank-locally inside the TP stack's already-profiled
+            # budget rather than profiling a second time against free
+            # memory that the two resident pools have already claimed.
+            if draft_worker is not None:
+                pool, allocator = tp_worker.get_memory_pool()
+                draft_worker.alloc_memory_pool(
+                    memory_pool_config=tp_worker.model_runner.memory_pool_config,
+                    req_to_token_pool=pool,
+                    token_to_kv_pool_allocator=allocator,
+                )
+
             tp_worker.init_attention_backends()
+            if draft_worker is not None:
+                draft_worker.init_attention_backends()
             tp_worker.init_cuda_graphs()
+            if draft_worker is not None:
+                draft_worker.init_cuda_graphs()
     finally:
         ctx.set_server_args(saved_args)
 
@@ -458,4 +546,5 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         image_pp=image_pp,
         image_tp=image_tp,
         vector=tuple(vec),
+        draft_worker=draft_worker,
     )

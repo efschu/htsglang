@@ -454,9 +454,29 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
         scheduler.init_pp_loop_state()
 
         # 7. Active stack swap: the forward path follows model_worker.
-        scheduler.model_worker = (
-            stacks.tp_worker if tp_phase else boot_model_worker
-        )
+        #
+        # Speculation belongs to the TP DECODE phase (#631). The draft
+        # worker was built on the flip's TP stack at boot and is armed
+        # HERE, with the stack it targets; the PP phase runs with
+        # spec_algorithm NONE and draft_worker None, which is bit-for-bit
+        # the state an instance without speculation has. Mirrors the boot
+        # dispatch in Scheduler.init_model_worker: with speculation the
+        # model worker IS the draft worker, which drives the target
+        # through it.
+        if tp_phase:
+            scheduler.spec_algorithm = scheduler.flip_spec_algorithm
+            scheduler.draft_worker = stacks.draft_worker
+            scheduler.model_worker = (
+                stacks.draft_worker
+                if stacks.draft_worker is not None
+                else stacks.tp_worker
+            )
+        else:
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            scheduler.spec_algorithm = SpeculativeAlgorithm.from_string(None)
+            scheduler.draft_worker = None
+            scheduler.model_worker = boot_model_worker
         scheduler.phase_flip_active_stack = PHASE_TP if tp_phase else PHASE_PP
 
         # 8. Deferred aborts drain in the first post-flip round.
@@ -528,7 +548,29 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
         )
     if scheduler.ps.attn_tp_size != want_tp_size:
         stale.append(f"ps.attn_tp_size ({scheduler.ps.attn_tp_size})")
-    want_worker = stacks.tp_worker if tp_phase else scheduler.tp_worker
+    # Speculation state, pinned per phase (#631). The TP phase must carry
+    # the configured algorithm AND the draft worker built on the TP stack;
+    # the PP phase must carry neither. A half-armed cutover -- the
+    # algorithm swapped in without its draft worker, or a draft worker
+    # left armed against the PP stack it was never built for -- is the
+    # silent-corruption shape this check exists to refuse.
+    want_draft = stacks.draft_worker if tp_phase else None
+    if getattr(scheduler, "draft_worker", None) is not want_draft:
+        stale.append("draft_worker (wrong phase)")
+    want_algo_none = not tp_phase or stacks.draft_worker is None
+    if scheduler.spec_algorithm.is_none() != want_algo_none:
+        stale.append(
+            f"spec_algorithm ({scheduler.spec_algorithm}; want "
+            f"{'none' if want_algo_none else 'the configured algorithm'})"
+        )
+    if tp_phase:
+        want_worker = (
+            stacks.draft_worker
+            if stacks.draft_worker is not None
+            else stacks.tp_worker
+        )
+    else:
+        want_worker = scheduler.tp_worker
     if scheduler.model_worker is not want_worker:
         stale.append("model_worker (wrong stack)")
     # Component ps/group snapshots (step 4b): each holder rebuilt at
