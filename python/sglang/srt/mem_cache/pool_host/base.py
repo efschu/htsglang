@@ -11,6 +11,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pinned_host_budget import (
     check_and_register_pinned_post,
+    pinned_host_reserve_bytes,
     unregister_pinned_post,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -25,6 +26,13 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
+#
+# This is the DEFAULT only. The live figure comes from
+# ``pinned_host_reserve_bytes()``, so that the pinned-RAM question keeps the
+# single answer pinned_host_budget's docstring promises: a second constant
+# here would silently outrank the operator's setting, which is exactly what
+# it did until #651 (a laptop lowering the reserve still got refused by this
+# copy of the number).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
@@ -165,7 +173,7 @@ class HostKVCache(abc.ABC):
             name=self.budget_label,
             flag=self.budget_flag,
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=pinned_host_reserve_bytes(),
         )
         # Name the POST, not the class of feature. This line used to say
         # "hierarchical KV cache" unconditionally, so a kv-session-offload

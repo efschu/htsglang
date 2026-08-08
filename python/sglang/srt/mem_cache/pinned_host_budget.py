@@ -53,9 +53,58 @@ from typing import Dict, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 # Host RAM left free for the OS and every non-pool consumer. Pinned memory is
-# non-swappable and this box has no swap at all, so the reserve is the only
-# thing standing between a tight configuration and the OOM killer.
+# non-swappable and the rig this default was written for has no swap at all,
+# so the reserve is the only thing standing between a tight configuration and
+# the OOM killer.
 PINNED_HOST_RESERVE_BYTES: int = 10 * (1024**3)
+
+#: Override for the reserve above, in MiB.
+#:
+#: The default is an absolute figure sized for the rig: a 10 GiB floor is a
+#: small slice of that machine and buys real protection because pinned pages
+#: there can never be swapped. It does not transfer to every host. On the
+#: gfx1103 laptop (#651) total RAM is 29.5 GiB, the GGUF weights hold ~22.7 GiB
+#: of it through GTT, and 8 GiB of swap exists for everything that is NOT
+#: pinned -- so a fixed 10 GiB reserve refuses a 0.15 GB staging pool that the
+#: machine can trivially afford. The reserve stays a deliberate operator
+#: decision rather than becoming a fraction of RAM: a percentage would silently
+#: shrink exactly on the small machines where the OOM killer hurts most.
+PINNED_HOST_RESERVE_ENV: str = "SGLANG_PINNED_HOST_RESERVE_MIB"
+
+
+def pinned_host_reserve_bytes() -> int:
+    """The reserve in force for this process.
+
+    Resolved per call rather than at import so a test (or a launcher that sets
+    the variable after importing this module) sees its own value. An
+    unparsable or negative setting is ignored with a warning instead of
+    raising: a malformed reserve must not be able to turn a guard OFF, and
+    falling back to the conservative default is the safe direction.
+    """
+    import os
+
+    raw = os.environ.get(PINNED_HOST_RESERVE_ENV)
+    if raw is None or not raw.strip():
+        return PINNED_HOST_RESERVE_BYTES
+    try:
+        mib = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using the default %.1f GiB reserve.",
+            PINNED_HOST_RESERVE_ENV,
+            raw,
+            PINNED_HOST_RESERVE_BYTES / (1024**3),
+        )
+        return PINNED_HOST_RESERVE_BYTES
+    if mib < 0:
+        logger.warning(
+            "%s=%d is negative; using the default %.1f GiB reserve.",
+            PINNED_HOST_RESERVE_ENV,
+            mib,
+            PINNED_HOST_RESERVE_BYTES / (1024**3),
+        )
+        return PINNED_HOST_RESERVE_BYTES
+    return mib * (1024**2)
 
 
 @dataclass(frozen=True)
@@ -95,7 +144,7 @@ def joint_pinned_host_error(
     posts: Sequence[PinnedHostPost],
     total_bytes: Optional[int],
     available_bytes: Optional[int],
-    reserve_bytes: int = PINNED_HOST_RESERVE_BYTES,
+    reserve_bytes: Optional[int] = None,
 ) -> Optional[str]:
     """``None`` when every post fits together, else a complete message.
 
@@ -109,6 +158,8 @@ def joint_pinned_host_error(
         return None
     if total_bytes is None or available_bytes is None:
         return None
+    if reserve_bytes is None:
+        reserve_bytes = pinned_host_reserve_bytes()
     demand = sum(p.nbytes for p in live)
     breakdown = _format_posts(live)
     if demand > int(total_bytes):
@@ -176,7 +227,7 @@ def check_and_register_pinned_post(
     name: str,
     flag: str,
     requested_bytes: int,
-    reserve_bytes: int = PINNED_HOST_RESERVE_BYTES,
+    reserve_bytes: Optional[int] = None,
 ) -> None:
     """Admit ``requested_bytes`` for ``name``, or raise naming every post.
 

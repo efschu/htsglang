@@ -1,0 +1,46 @@
+# #651: oh-my-pi (omp) pointed at the laptop's own on-demand htsglang server.
+#
+# Installed for user efeu at ~/.omp/agent/models.yml.
+#
+# baseUrl DOES include /v1. omp appends the bare route ("/chat/completions"),
+# not the versioned one, so a host-only baseUrl asks sglang for
+# /chat/completions and gets 404 {"detail":"Not Found"}. Vendor guides that
+# say "do not append /v1" are describing providers who also serve the
+# unversioned route; sglang does not.
+#
+# THE FIRST REQUEST IS SLOW ON PURPOSE. This endpoint is the on-demand front
+# door (htsglang-ondemand.service): if the model is parked, the front door
+# loads it and HOLDS the request until it can answer, which takes about two
+# and a half minutes. It is not a hang, and retrying only starts the clock
+# over. Subsequent requests answer immediately until the machine has been idle
+# for HTSGLANG_IDLE_PARK_SECONDS, after which the next one pays the load again.
+#
+# apiKey is a placeholder: the server is bound to 127.0.0.1 and runs no
+# authentication, but omp expects the field to exist.
+providers:
+  local:
+    baseUrl: http://127.0.0.1:31651/v1
+    api: openai-completions
+    apiKey: "local-no-auth"
+    authHeader: true
+    models:
+      - id: qwen36-35b-a3b
+        name: Qwen3.6-35B-A3B Q4_K_M (local iGPU)
+        input: [text]
+        # Matches --context-length in boot_ondemand.sh. Raising it here without
+        # raising it there makes the server truncate silently.
+        contextWindow: 8192
+        maxTokens: 2048
+        compat:
+          # The block replaces the built-in one wholesale rather than merging,
+          # so every field this server needs has to be named here.
+          supportsDeveloperRole: false
+          supportsReasoningEffort: false
+          maxTokensField: max_tokens
+          supportsToolChoice: true
+          # Thinking off by default for this checkpoint: it otherwise spends
+          # the reply budget on a reasoning preamble before answering, which
+          # for a coding assistant is latency without benefit.
+          extraBody:
+            chat_template_kwargs:
+              enable_thinking: false

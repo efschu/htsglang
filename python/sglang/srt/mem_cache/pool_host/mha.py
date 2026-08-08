@@ -26,10 +26,12 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
-from sglang.srt.mem_cache.pinned_host_budget import check_and_register_pinned_post
+from sglang.srt.mem_cache.pinned_host_budget import (
+    check_and_register_pinned_post,
+    pinned_host_reserve_bytes,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -685,7 +687,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             name="MiniMax index-K host pool",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=pinned_host_reserve_bytes(),
         )
         logger.info(
             "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",

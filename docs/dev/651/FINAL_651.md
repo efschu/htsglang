@@ -1060,3 +1060,383 @@ throughput, because no PP=2 forward has completed.
    Prefill graphs remain disabled by the config resolver and are untested. The
    eager labelling elsewhere in this report applies to the PP/dense sections
    and to prefill, not to the section 6a decode numbers.
+
+## 9. The laptop service bundle (#655)
+
+Turning the measured operating point into something the laptop's user can
+actually use: a model that loads when asked, gets out of the way when it is
+not, and a coding agent pointed at it.
+
+### 9.1 Memory budget — the GTT lever is refuted, and the fraction is the real knob
+
+The bundle asked for host RAM to be freed by LOWERING `ttm.pages_limit`
+(the GTT ceiling) toward 26-27 GiB. Measurement says that lever does not exist
+here, and points at a different one.
+
+What the machine actually reports, all at one instant
+(`docs/dev/651/service/mem_probe.py`):
+
+| quantity | value |
+|---|---|
+| `MemTotal` | 29.50 GiB |
+| GTT ceiling (`amdgpu.gttsize` / `ttm.pages_limit`) | 29.00 GiB |
+| `torch.cuda.mem_get_info` total | 29.00 GiB |
+| free right after HIP init | 27.54 GiB |
+| GGUF weights, resident | 22.34 - 23.03 GiB (varies run to run) |
+| GGUF dequant scratch, reserved from the KV budget | 0.95 GiB |
+
+Two facts fall out.
+
+**The GTT ceiling is already 98% of physical RAM.** There is no headroom to
+give back by lowering it, because it is a CEILING, not a reservation: it does
+not hold RAM, it only bounds what the GPU may take. Lowering it to 27 GiB
+would not free 2 GiB for the desktop — the model would still want ~26.6 GiB —
+it would simply stop the model loading. And because KV on this hybrid is tiny
+(see below), every GiB shaved off the ceiling buys the host almost nothing
+while costing ~52k tokens of context.
+
+**`--mem-fraction-static` is what converts free GTT into context**, because
+the KV budget is `mem_fraction_static x total` MINUS what the weights already
+hold. That makes the fraction the opposite of a safety margin here:
+
+| budget point | max_total_num_tokens | free after pool |
+|---|---|---|
+| GTT 29 GiB, memfrac 0.97, ctx 32768 | 7254 | 1.51 GB |
+| GTT 29 GiB, memfrac 0.99, ctx 8192 | 15070 | 1.21 GB |
+| GTT 29 GiB, memfrac 0.99, ctx 8192, HiCache pools built | 9138 | 1.10 GB |
+
+**What binds is NOT the hybrid sizing coupling.** That was the standing
+hypothesis, and it is wrong. The mamba/full-attention ceiling computed 32772
+and never bound; the mamba pool charged 0.12 GiB. The pool is
+`available_bytes // cell_size` with `cell_size` 20480 B/token over 10 real
+attention layers, and the terms that ate the budget are the mem-fraction slack
+plus the **0.95 GiB GGUF dequant scratch**. The ~1.5 GB that appears "free
+after pool" is precisely those two reservations: memory subtracted from the
+budget but never allocated at pool time.
+
+Raising `SGLANG_GGUF_DEQUANT_WS_CAP_MIB` to absorb the scratch was considered
+and rejected: the residual is `peak - held`, so making the workspace hold it
+converts a 0.95 GiB reservation into a ~1 GiB allocation. It is a wash, not a
+win. The memory is genuinely needed.
+
+**The margin is thin enough to be non-deterministic.** The same configuration
+at memfrac 0.99 produced a 15070-token pool on one boot and was refused
+outright on the next, purely on how much host RAM happened to be free when the
+weights landed. This is why `boot_ondemand.sh` drops the page cache before
+every load (a 21.6 GiB checkpoint read fills it every time) and why the
+supervisor retries a failed load exactly once.
+
+That retry is not theoretical: it was observed firing in service, unprompted —
+
+    ValueError: Loaded weights leave no GPU memory for the KV cache under
+    --mem-fraction-static=0.99
+    WARNING ondemand: load attempt 1 failed (boot script exit -9); retrying once
+    INFO ondemand: loading model (attempt 2, ...)
+
+and the second attempt served the request. The cost when it fires is a doubled
+wake (~5 minutes rather than ~2.5). Note also that the refusal message names a
+floor (0.962) BELOW the setting that was refused (0.99), because the floor it
+prints does not account for the dequant-scratch and mamba posts subtracted
+after it — the message is misleading, and following its advice would not help.
+
+One thing the loader already does that makes the explicit `drop_caches`
+partly redundant: it releases checkpoint page cache as it streams
+("GGUF stream: released 8.08 GiB of checkpoint page cache so far in 45 advice
+call(s)"). The drop is kept because it also clears cache the loader did not
+put there, but it is not the only mechanism at work.
+
+**A load does not merely succeed or fail -- it succeeds with a POOL SIZE, and
+the range makes "succeeded" meaningless on its own.** Observed across boots of
+one unchanged configuration:
+
+| boot | max_total_num_tokens | usable? |
+|---|---|---|
+| best | 15070 | yes |
+| typical | 8288 - 9138 | yes |
+| worst | **1081** | no |
+
+The 1081-token boot returned `/health` 200, reported itself ready, and could
+not serve a single real request against an 8192-token context. Nothing it
+emits distinguishes it from a good boot. This is the most operationally
+dangerous state found in this bundle, because every signal says healthy.
+
+The service therefore gates readiness on the POOL, not on health: after
+`/health` comes up it reads `max_total_num_tokens` from `/get_server_info` and
+rejects the load below `HTSGLANG_MIN_KV_TOKENS` (default 4096), stops the
+process, and reloads. Because the pool is a lottery rather than a
+deterministic function of the configuration, the attempt budget is 3, not 1 --
+a single retry is not enough when the failure mode is a draw rather than a
+fault. `kv_tokens` is reported on `/ondemand/status` so the size a running
+server actually got is never a mystery.
+
+The gate was then observed firing in service, on an ordinary request, without
+being provoked:
+
+    WARNING ondemand: load attempt 1 failed (model loaded with only 2924 KV
+    tokens (minimum 4096); the load lost the memory lottery and cannot serve);
+    retrying
+    INFO ondemand: loading model (attempt 2, ...)
+
+Pool sizes seen across consecutive loads of the identical configuration:
+17849, 13782, 2924, 1081. Without the gate, two of those four would have been
+handed to a user as a working server.
+
+### 9.2 Cold load vs #89 hibernate
+
+Cold boot to serving, measured through the service: **149.3 s**.
+
+The cheaper path does not apply to this checkpoint. #89 parks the FINAL
+post-transform tensors, and its snapshot step refuses a GGUF MoE outright:
+`hibernate.py:332-338` (`snapshot_gguf_attrs` -> `materialize_gguf_weights`)
+raises `NotImplementedError` on any GGUF-MoE layer. Qwen3.6-35B-A3B is a GGUF
+MoE, so there is nothing to park. Restore is also boot-time only —
+`/resume_memory_occupation` has no hibernate branch at all
+(`weight_updater.py:235-273`), so a "park" that keeps the process alive would
+free nothing without `--enable-memory-saver`.
+
+Consequently the #499 restore-identity fix could not be exercised on this
+checkpoint: the park refuses before a manifest is ever written. This is a
+scope statement about GGUF MoE, not a defect in #499.
+
+SCOPE OF THAT CLAIM, stated plainly: the GGUF-MoE refusal is read from the
+code path, NOT executed against this checkpoint. A `POST /hibernate` was not
+run here, so what is proven is that the park cannot succeed as written, not
+that it was observed failing. The cold-load figure (149.3 s) and everything in
+9.3 ARE measured. Executing the park to convert this from a code reading into
+an observation costs one boot and is the cheapest open item in this section.
+
+**Park mechanism chosen: plain stop and cold reload.** It is the only one
+available, and at 149.3 s it is affordable for an assistant used in bursts.
+
+### 9.3 The on-demand service
+
+`htsglang-ondemand.service` (unit installed at
+`/etc/systemd/system/htsglang-ondemand.service`, enabled, survives reboot).
+The unit is up from boot; the MODEL is not. A front door on the public port
+31651 proxies to the real server on 31661, loads it on the first real request,
+HOLDS that request until it can be answered, and parks the model once the
+machine goes quiet.
+
+The idle window is `HTSGLANG_IDLE_PARK_SECONDS`, default 60, set as an
+`Environment=` line in the unit.
+
+Three defects were found and fixed while bringing it up, each of which
+presented as something else:
+
+* `CUDA_VISIBLE_DEVICES=""` — set on the unit so the supervisor can never
+  create a HIP context — was inherited by the boot script, whose GPU guard
+  then died with "No HIP GPUs are available" four seconds in. It reads exactly
+  like a model that will not load. The child's environment is now built
+  explicitly.
+* The idle watcher would park a model the instant it finished loading: a load
+  outlasts the idle window, so the watcher saw an alive process, no in-flight
+  requests, and an expired clock, then blocked on the loader's lock. `park()`
+  now re-reads its conditions on the far side of the lock.
+* Health checks must not wake the model. `/health` and `/ondemand/status` are
+  answered by the front door itself and do not count as activity, or any
+  monitoring poll would pin 22.7 GiB forever — the exact failure the service
+  exists to prevent.
+
+Guard v2 and the wedge policy run inside `boot_ondemand.sh`, so they run on
+EVERY load rather than once at first boot, which is the point of routing the
+service through a script instead of a saved command line.
+
+**Acceptance, two full cycles** (`accept_ondemand.sh`, results at
+`/root/651-p2/results/accept_ondemand_214508.txt`):
+
+| step | cycle 1 | cycle 2 |
+|---|---|---|
+| host free, parked | 29093 MiB | 29212 MiB |
+| wake request (held through the load) | 150 s, answer `42` | 150 s, answer `42` |
+| host free, model resident | 1327 MiB | 985 MiB |
+| second request while hot | 2 s, answer `Paris` | 1 s, answer `Paris` |
+| state after 60 s idle | parked | parked |
+| host free, parked again | 29212 MiB | 29202 MiB |
+
+`ACCEPTANCE: PASS (2 cycles)`. Both probes are questions with exactly one
+right answer, at temperature 0 — a model that loads and then emits noise is a
+worse outcome than one that fails to load, because nothing alerts on it.
+
+The probes send `enable_thinking: false`. Without it this checkpoint opens
+with a reasoning preamble, the reply budget runs out before the answer, and
+the probe scores a perfectly healthy model as WRONG. That is exactly what the
+first acceptance run did.
+
+### 9.4 HiCache — the model check passes; the machine is the wall
+
+The predicted blocker did not occur. The GDN hybrid **passes** HiRadixCache's
+model check: it builds `MHATokenToKVPoolHost` plus a mamba host pool through
+`build_hybrid_mamba_stack`. The feared non-MHA `ValueError` never fired.
+
+Three real blockers appeared instead. Two are fixed in this branch:
+
+1. **A 10 GiB pinned-host reserve, hard-coded.** `PINNED_HOST_RESERVE_BYTES`
+   was justified in-comment by "this box has no swap at all" — true of the
+   rig, false of this laptop (29.5 GiB RAM, 8 GiB swap). It refused a 0.15 GB
+   staging tier. It is now overridable via `SGLANG_PINNED_HOST_RESERVE_MIB`,
+   default unchanged. A malformed or negative value falls back to the
+   conservative default: a typo must never be able to switch a guard off.
+   A second copy of the same constant, `HICACHE_HOST_MEMORY_RESERVE_BYTES`,
+   silently outranked the override at all six pool call sites; those now go
+   through the single resolver, which is what the module's own docstring
+   promises.
+2. **A layout collision on ROCm.** `MambaPoolHost` accepts ONLY
+   `page_first_direct`, while on ROCm the default `page_first`+`kernel` pair is
+   auto-downgraded to `layer_first` because the page-first write-back needs a
+   CUDA-only JIT kernel. Left to defaults the two rules collide and the boot
+   dies. `boot_ondemand.sh` pins `page_first_direct`.
+
+The third is physical and is not fixed: the host tier needs pinned RAM this
+machine does not have while the weights are resident. On a GDN hybrid the tier
+has two posts and the mamba one is chunky — a single mamba slot is ~64 MB, so
+the default ratio asked 0.58 GB of mamba pool alone against ~1.08 GB of free
+host RAM. Even trimmed to ratio 0.1 it competes with a load margin already
+thin enough to be non-deterministic.
+
+**Verdict: HiCache is OFF by default on this machine** (`HICACHE=1` re-arms it
+on a host with RAM to spare). No hit-rate evidence is claimed, because the
+feature was never armed in a serving run — reporting a hit rate here would be
+reporting a number that does not exist.
+
+### 9.5 Panel blanking
+
+Not a driver fault and not the GPU. The machine sits at the GDM greeter, and
+the GREETER blanks the panel on its own idle timer; the panel then reads as
+dead (`/sys/class/drm/card1-eDP-1` -> `dpms=Off, enabled=disabled`) to anyone
+who did not know it was merely asleep. `dmesg` shows no eDP link-training
+failure at any point.
+
+The user account `efeu` already had `idle-delay=0` and
+`sleep-inactive-ac-type='nothing'`, so its own session never blanked — only
+the greeter did, which is why the symptom looked like hardware.
+
+Fix: a greeter dconf override (`/etc/dconf/db/gdm.d/10-no-idle-blank`) that
+disables the idle blank, the screensaver, and idle dim for the greeter only.
+The lid switch and explicit suspend are untouched — this disables the idle
+BLANK, not power management.
+
+Honest limit: whether the panel wakes on a keypress cannot be verified from a
+remote session, because it needs a physical keypress. The durable choice made
+here is therefore to stop the idle blank from happening rather than to claim a
+wake path was repaired.
+
+### 9.6 oh-my-pi for efeu
+
+`omp` v17.2.11 (github.com/can1357/oh-my-pi), installed as efeu to
+`/home/efeu/.local/bin/omp`, configured at `/home/efeu/.omp/agent/models.yml`
+against the local front door as provider `local`, model `qwen36-35b-a3b`.
+
+`enable_thinking: false` is set in the model's `extraBody`. This is not
+cosmetic: the checkpoint otherwise spends the reply budget on a reasoning
+preamble before answering, which for a coding assistant is latency without
+benefit — and it is what made the first acceptance probe score a working model
+as wrong.
+
+A short README for efeu (`README-efeu.md`) explains the first-request wake
+latency, since a two-and-a-half-minute first answer looks like a hang to
+anyone who has not been told otherwise.
+
+**A real coding round trip does NOT complete on this hardware, and the reason
+is the wedge.** This is the honest result; the plumbing is fine and the
+hardware is not.
+
+Getting there found and fixed two configuration faults first:
+
+* `baseUrl` must include `/v1`. omp appends the bare route
+  (`/chat/completions`), so a host-only base asks sglang for an unversioned
+  path and gets `404 {"detail":"Not Found"}`. Vendor guides saying "do not
+  append /v1" describe providers that also serve the unversioned route.
+* omp's full tool surface does not fit. With all 32 tools its system prompt
+  alone measures **17029 tokens** against an 8192 context:
+  `400 The input (17029 tokens) is longer than the model's context length`.
+
+With those fixed and the tools trimmed to `read,write`, the request reaches
+the model and kills it:
+
+    RuntimeError: Triton Error [HIP]: Code: 719, unspecified launch failure
+    torch.AcceleratorError: HIP error: unspecified launch failure
+
+and `dmesg` names what userspace cannot:
+
+    [22:07:05] amdgpu: MES failed to respond to msg=REMOVE_QUEUE
+    [22:07:07] GPU reset(4) succeeded!
+    [22:07:07] [drm] device wedged, but recovered through reset
+
+That is the section-3 MES wedge, hit at `--chunked-prefill-size 256` — the cap
+that is a MITIGATION and not a fix, exactly as `wedge_policy.py` says of
+itself. An agent prompt is thousands of tokens of SUSTAINED PREFILL, which is
+the one regime this GPU cannot survive; the acceptance probes pass because a
+one-sentence question is a trivial prefill. Two of the three GPU resets logged
+on this machine today correlate with an omp request.
+
+So the bundle's own conclusion holds and now has a user-facing consequence:
+**decode works on this iGPU, sustained prefill does not**, and a coding agent
+is a prefill-shaped workload. omp is installed, owned by efeu, correctly
+pointed at the endpoint, and will work the moment the prefill path does. It is
+not usable for real work before then.
+
+Encouraging note for whoever picks this up: the service SURVIVED the wedge.
+The backend died, the front door saw an unhealthy backend, stopped it and
+reloaded, and the unit stayed active throughout. The GPU reset recovered.
+Nothing needed a human.
+
+### 9.7 Reaching a ~150k KV cache (user proposal: MoE disk spill)
+
+The proposal is to free memory by spilling MoE experts, so the KV pool can
+reach ~150k tokens. The arithmetic supports it, and is cheaper than it looks.
+
+**The target is small.** The measured cell size is 20480 B/token, because this
+GDN hybrid has only ~10 real attention layers:
+
+    150,000 tokens x 20480 B = 2.86 GiB of KV
+
+So the requirement is not "free the 18 GiB of experts" but "free about 3 GiB".
+Against today's KV budget of 1.2-1.5 GiB, the shortfall is roughly
+**1.5-2.5 GiB** -- a cold slice, not the expert tensor as a whole. That matters
+for the I/O price: the ~162 ms/token figure was measured for naive FULL
+offload, and a spill an order of magnitude smaller does not pay that.
+
+**The target tier is DISK.** Host RAM is not an option on this machine and is
+only mentioned here to close it off: on an APU the host pool and the GPU pool
+are the same DRAM, so an expert moved "to host RAM" has not left the memory we
+are trying to free. The requirement is expert bytes resident on NVMe and
+fetched on demand.
+
+`observability/spill_tiers.py` names the tiers, and the gap is exactly there:
+
+    TIER_EXPERT_HOST  = "expert_host_ram"     # experts -> HOST RAM
+    TIER_HICACHE_FILE = "hicache_file_disk"   # only HiCache has a disk tier
+
+Experts can spill to host RAM today. There is no expert-to-DISK tier.
+
+**Consequence, and it differs per machine:**
+
+* On the RIG a host-RAM spill would already free real VRAM, because there the
+  two pools are physically distinct. That is a side note, not the goal.
+* On this LAPTOP only a DISK tier frees anything: 29.5 GiB total with
+  ~1.0-1.3 GiB free while the model is resident, and the host pool IS the GPU
+  pool. This tier does not exist and is the work to be done.
+
+**Design constraint that decides viability.** A3B activates ~3B params per
+token; in Q4 the expert share is roughly 1.25 GB of weight reads per token if
+every active expert were cold. At NVMe speeds that is ~1 token/s -- so a full
+expert-on-disk design is not viable and never was. What IS viable follows from
+the sizing above: only ~1.5-2.5 GiB of ~18 GiB needs to leave, i.e. the
+coldest ~10-14%. The question that decides the whole feature is therefore
+whether expert access has a genuine COLD TAIL (a stable minority of experts
+that are rarely routed to) rather than a flat distribution. If flat, the miss
+rate makes it unusable at any spill size; if long-tailed, the spill set can be
+chosen by measured access frequency and the per-token miss cost stays small.
+That measurement is the first thing to do, before any code.
+
+**An asset already in the tree:** the GGUF loader streams from disk and
+releases page cache behind itself ("GGUF stream: released 8.08 GiB of
+checkpoint page cache so far in 45 advice call(s)"). Read-then-release is
+exactly the discipline a disk-resident expert needs on a machine where page
+cache competes with the model for the same RAM.
+
+**The blocker that outranks memory on this laptop.** Even with 150k tokens of
+KV, filling that context is sustained prefill, and sustained prefill wedges
+this GPU in firmware (section 3, and reproduced again in 9.6 by an agent-sized
+prompt). A large context is only worth building toward here once the MES fault
+is addressed; on the rig the constraint does not apply.

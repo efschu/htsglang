@@ -19,7 +19,10 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
-from sglang.srt.mem_cache.pinned_host_budget import check_and_register_pinned_post
+from sglang.srt.mem_cache.pinned_host_budget import (
+    check_and_register_pinned_post,
+    pinned_host_reserve_bytes,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MambaPool,
@@ -64,7 +67,6 @@ logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -142,7 +144,7 @@ class MambaPoolHost(HostKVCache):
             name="HiCache Mamba host pool",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=pinned_host_reserve_bytes(),
         )
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
@@ -771,7 +773,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             name=f"V4 paged host pool {pool_name}",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=pinned_host_reserve_bytes(),
         )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
@@ -1148,7 +1150,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             name=f"V4 state host pool {pool_name}",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=pinned_host_reserve_bytes(),
         )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
@@ -1681,7 +1683,7 @@ class DSAIndexerPoolHost(HostKVCache):
             name="DSA indexer host pool",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=pinned_host_reserve_bytes(),
         )
         logger.info(
             "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
