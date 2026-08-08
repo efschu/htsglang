@@ -100,10 +100,20 @@ class RegimeActuator:
         ] = None,
         vram_apply: Optional[Callable[[Tuple[int, ...]], Tuple[bool, str]]] = None,
         selectable_fn: Optional[Callable[[str], Tuple[bool, str]]] = None,
+        phase_flip_arm: Optional[Callable[[str, str], Tuple[bool, str]]] = None,
+        current_phase_fn: Optional[Callable[[], str]] = None,
     ):
         self._reshard_arm = reshard_arm
         self._vram_apply = vram_apply
         self._selectable_fn = selectable_fn
+        # #631: the PP-prefill <-> TP-decode phase flip as a THIRD axis of
+        # the SAME controller (the design's "the regime classifier carries
+        # the flip as a second action -- do not build a new gate"). The
+        # axis participates ONLY when a flip boot wired both callables:
+        # on every other boot the phase mapping below is never consulted
+        # and #363 behavior is byte-identical.
+        self._phase_flip_arm = phase_flip_arm
+        self._current_phase_fn = current_phase_fn
         self.arms = 0
         self.refusals = 0
         self.last: Optional[ActionResult] = None
@@ -115,7 +125,29 @@ class RegimeActuator:
             axes.append("kv")
         if self._vram_apply is not None:
             axes.append("vram")
+        if self._phase_flip_arm is not None and self._current_phase_fn is not None:
+            axes.append("phase")
         return axes
+
+    def _stage_wants_phase(self, stage) -> Optional[str]:
+        """The serving phase a stage's REGIME implies, or None.
+
+        prefill-heavy stages were solved for the PP-prefill layout,
+        decode-heavy stages for the TP-decode layout (DESIGN_631 section
+        0: PP prefill 2.4-5.2x, TP decode 3.6x -- the whole point of the
+        flip). Threshold and sustain hysteresis live in the CLASSIFIER
+        (RegimeSensor/DwellGate) exactly as for every other axis; this is
+        only the regime -> phase mapping."""
+        from sglang.srt.managers.phase_flip_runtime import PHASE_PP, PHASE_TP
+        from sglang.srt.managers.regime_classifier import (
+            REGIME_DECODE_HEAVY,
+            REGIME_PREFILL_HEAVY,
+        )
+
+        return {
+            REGIME_PREFILL_HEAVY: PHASE_PP,
+            REGIME_DECODE_HEAVY: PHASE_TP,
+        }.get(stage.regime)
 
     def apply(self, stage, current) -> ActionResult:
         """Move what can be moved from ``current`` to ``stage``.
@@ -137,7 +169,15 @@ class RegimeActuator:
 
         needs_kv = want_kv != have_kv
         needs_vram = want_vram != have_vram
-        if not needs_kv and not needs_vram:
+        # #631 phase axis: only a wired flip boot ever computes this.
+        needs_flip = False
+        want_phase = None
+        if self._phase_flip_arm is not None and self._current_phase_fn is not None:
+            want_phase = self._stage_wants_phase(stage)
+            needs_flip = (
+                want_phase is not None and self._current_phase_fn() != want_phase
+            )
+        if not needs_kv and not needs_vram and not needs_flip:
             return self._refuse(
                 stage,
                 detail,
@@ -186,6 +226,20 @@ class RegimeActuator:
         if needs_kv:
             ok, msg = self._reshard_arm(want_kv, ARM_SOURCE)
             detail["kv"] = f"{'armed' if ok else 'REFUSED'}: {msg}"
+            armed = armed or ok
+        if needs_flip:
+            # Arming is not flipping: the flip commits at a group-wide
+            # quiescent consensus boundary (PhaseFlipRuntime), exactly
+            # like the #297 arm above; a refusal (guards, wrong direction
+            # for the current phase) is passed through verbatim.
+            from sglang.srt.managers.phase_flip_runtime import _DIR_OF_PHASE
+
+            direction = _DIR_OF_PHASE[self._current_phase_fn()]
+            ok, msg = self._phase_flip_arm(direction, ARM_SOURCE)
+            detail["phase"] = (
+                f"{'armed' if ok else 'REFUSED'} {direction} "
+                f"(-> {want_phase}): {msg}"
+            )
             armed = armed or ok
 
         result = ActionResult(
@@ -243,6 +297,20 @@ def build_regime_actuator(scheduler, table_plan=None) -> RegimeActuator:
         def vram_apply(budgets, _rt=vram_rt):
             return _rt.apply_budget_request(budget_mib=list(budgets))
 
+    # #631: the phase-flip axis, wired only on a flip boot (runtime built
+    # lazily on the first round -- like the #297 axis, a controller built
+    # before then simply has the axis unwired and the next build sees it).
+    phase_flip_arm = None
+    current_phase_fn = None
+    flip_rt = getattr(scheduler, "phase_flip_runtime", None)
+    if flip_rt is not None:
+
+        def phase_flip_arm(direction, source, _s=scheduler):
+            return _s.arm_phase_flip(direction, source)
+
+        def current_phase_fn(_rt=flip_rt):
+            return _rt.phase
+
     selectable_fn = None
     if table_plan is not None:
         selectable_fn = table_plan.is_selectable
@@ -251,6 +319,8 @@ def build_regime_actuator(scheduler, table_plan=None) -> RegimeActuator:
         reshard_arm=reshard_arm,
         vram_apply=vram_apply,
         selectable_fn=selectable_fn,
+        phase_flip_arm=phase_flip_arm,
+        current_phase_fn=current_phase_fn,
     )
     logger.info(
         "%s armed: wired axes %s",

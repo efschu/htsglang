@@ -525,6 +525,20 @@ the TP stack its OWN HybridReqToTokenPool (TP-shaped mamba) while
 sharing the request-mapping TENSORS by rebind (req_to_token,
 req_index_to_mamba_index_mapping; slot spaces asserted equal). 135 green.
 
+5.4 DONE (session 2): the flip is the #363 actuator's THIRD axis
+(regime_act.py: phase_flip_arm + current_phase_fn injectables, regime ->
+phase mapping prefill_heavy->pp / decode_heavy->tp, direction =
+_DIR_OF_PHASE[current]). NO new gate: thresholds, sustain and dwell
+hysteresis are the classifier's existing machinery (RegimeSensor /
+DwellGate / act interlocks / evidence-gated act mode -- all untouched).
+Unwired axis = byte-identical #363 (pinned). The section-1 break-even
+number (~8k pending prefill tokens for enter-PP) is a classifier
+threshold TUNING item for step 6, not new machinery. STEP 5 IS COMPLETE:
+206 green tests via scripts/run_631_flip_family.sh (now incl.
+test_regime_act.py). NEXT: step 6 GPU validation per 5.5 and the
+measurement doctrine of section 4, after the crashfix defect-1 merge and
+a card window (operator sequences both).
+
 Step-6 watch items added in session 2: (a) the uneven plan + cp token
 vector are process-globals installed AFTER the primary PP build --
 PP-phase code paths must never consult them with a non-rank-local size;

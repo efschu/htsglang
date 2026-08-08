@@ -1008,6 +1008,107 @@ class TestPlannerFeedAcceptance578(CustomTestCase):
         )
 
 
+class TestPhaseFlipAxis(CustomTestCase):
+    """#631 slice 5.4: the phase flip as the actuator's THIRD axis.
+
+    The controller carries the flip beside the #297/#330 axes -- no new
+    gate: regime classification, thresholds and dwell hysteresis are the
+    classifier's existing machinery. Pinned here: (a) an UNWIRED axis is
+    byte-identical #363 behavior (the regime->phase mapping is never
+    consulted); (b) a wired axis arms the only legal direction for the
+    current phase with the controller's ARM_SOURCE; (c) same-phase and
+    unmapped regimes arm nothing; (d) an actuator refusal passes through
+    verbatim, armed=False."""
+
+    def _actuator(self, current_phase, arm_log=None, refuse=False, **kw):
+        arm_log = arm_log if arm_log is not None else []
+
+        def _arm(direction, source):
+            arm_log.append((direction, source))
+            if refuse:
+                return False, "guards: PD disaggregation"
+            return True, f"armed {direction}"
+
+        return (
+            RegimeActuator(
+                phase_flip_arm=_arm,
+                current_phase_fn=lambda: current_phase,
+                **kw,
+            ),
+            arm_log,
+        )
+
+    def test_unwired_axis_is_byte_identical_363(self):
+        """Same kv/vram, different regime: without the flip axis this is
+        'no reachable axis' -- exactly as before #631."""
+        actuator = RegimeActuator()
+        result = actuator.apply(
+            _stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED
+        )
+        self.assertFalse(result.armed)
+        self.assertIn("no reachable axis", result.reason)
+        self.assertNotIn("phase", actuator.wired_axes)
+
+    def test_wired_axis_arms_the_legal_direction(self):
+        actuator, log = self._actuator("pp")
+        result = actuator.apply(
+            _stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED
+        )
+        self.assertTrue(result.armed)
+        self.assertEqual(log, [("pp_to_tp", ARM_SOURCE)])
+        self.assertIn("phase", result.detail)
+        self.assertIn("pp_to_tp", result.detail["phase"])
+        self.assertIn("phase", actuator.wired_axes)
+
+    def test_return_direction_from_tp(self):
+        actuator, log = self._actuator("tp")
+        result = actuator.apply(
+            _stage("pp-prefill", REGIME_PREFILL_HEAVY), BOOTED
+        )
+        self.assertTrue(result.armed)
+        self.assertEqual(log, [("tp_to_pp", ARM_SOURCE)])
+
+    def test_same_phase_and_unmapped_regime_arm_nothing(self):
+        actuator, log = self._actuator("tp")
+        result = actuator.apply(
+            _stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED
+        )
+        self.assertFalse(result.armed)
+        self.assertEqual(log, [])
+        actuator2, log2 = self._actuator("pp")
+        result2 = actuator2.apply(
+            _stage("kvp", REGIME_KV_PRESSURE), BOOTED
+        )
+        self.assertFalse(result2.armed)
+        self.assertEqual(log2, [])
+
+    def test_flip_refusal_passes_through_verbatim(self):
+        actuator, log = self._actuator("pp", refuse=True)
+        result = actuator.apply(
+            _stage("tp-decode", REGIME_DECODE_HEAVY), BOOTED
+        )
+        self.assertFalse(result.armed)
+        self.assertIn("REFUSED", result.detail["phase"])
+        self.assertIn("PD disaggregation", result.detail["phase"])
+        self.assertEqual(actuator.refusals, 1)
+
+    def test_mixed_move_arms_kv_and_phase(self):
+        kv_log = []
+
+        def _kv_arm(vector, source):
+            kv_log.append((tuple(vector), source))
+            return True, "armed"
+
+        actuator, log = self._actuator("pp", reshard_arm=_kv_arm)
+        result = actuator.apply(
+            _stage("tp-decode", REGIME_DECODE_HEAVY, kv=(2, 11, 10)), BOOTED
+        )
+        self.assertTrue(result.armed)
+        self.assertEqual(kv_log, [((2, 11, 10), ARM_SOURCE)])
+        self.assertEqual(log, [("pp_to_tp", ARM_SOURCE)])
+        self.assertEqual(set(result.detail), {"kv", "phase"})
+
+
 if __name__ == "__main__":
     unittest.main()
 
