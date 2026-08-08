@@ -225,7 +225,22 @@ def _set_kv_buffer_impl(
     same_kv_dim: bool = True,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
-    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
+    # #651 W1: route on the CACHE'S device, not on the `_is_cuda`/`_is_hip`
+    # BUILD globals. The CPU stage of a mixed-device pipeline runs inside a
+    # ROCm build, so `_is_hip` is True there and a CPU rank entered the CUDA
+    # custom-op branch, failing with "Could not run 'sglang::store_cache' with
+    # arguments from the 'CPU' backend". The naive torch fallback at the bottom
+    # of this function already does the right thing for a CPU cache; it was
+    # simply unreachable. Same-device deployments are unaffected: with the
+    # cache on the accelerator `cache_on_cpu` is False and the branch order is
+    # exactly as before.
+    cache_on_cpu = k_cache.device.type == "cpu"
+    if (
+        (_is_cuda or _is_hip)
+        and not cache_on_cpu
+        and same_kv_dim
+        and can_use_store_cache(row_bytes)
+    ):
         k_cache_rows = k_cache.view(-1, row_dim)
         return store_cache(
             k.view(-1, row_dim),
@@ -237,7 +252,7 @@ def _set_kv_buffer_impl(
             size_limit=kv_store_bound(size_limit, k_cache, row_dim),
         )
 
-    if _is_cpu and _cpu_has_amx_support:
+    if cache_on_cpu and _cpu_has_amx_support:
         return torch.ops.sgl_kernel.store_cache_cpu(
             k,
             v,

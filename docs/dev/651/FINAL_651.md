@@ -425,6 +425,68 @@ completed.** What is claimed: the mixed-device pipeline initializes, forms its
 world, and launches batches on this hardware, and six device-routing defects
 that blocked it are fixed.
 
+### PP=2 END-TO-END: IT RUNS (dense vehicle)
+
+The machinery question was settled by removing the GDN kernels from it. On a
+**dense-attention** checkpoint (Qwen2.5-1.5B-Instruct, `Qwen2ForCausalLM`, 28
+layers, bf16, 2.9 GB, downloaded to the laptop) the mixed-device pipeline runs
+end to end:
+
+```
+--pp-size 2 --pp-device-map cpu,cuda   (CPU = stage 0, iGPU = stage 1)
+probe.py, temperature 0, two rounds:
+  round1 6/6 content-correct, round2 6/6, round1 == round2
+  VERDICT: COHERENT      server healthy afterwards
+```
+
+One further blocker had to be fixed to get there, and it is the **seventh** of
+the same class: `mem_cache/memory_pool.py` selected the CUDA custom op
+`sglang::store_cache` via the `_is_cuda`/`_is_hip` BUILD globals, so the CPU
+rank tried to run it on CPU tensors (`Could not run 'sglang::store_cache' with
+arguments from the 'CPU' backend`). The naive torch fallback
+(`k_cache[indices] = k`) already sat at the bottom of the same function and was
+unreachable. It now routes on `k_cache.device.type`.
+
+**The split is real, not nominal:**
+
+* `sglang::scheduler_PP0` runs with `CUDA_VISIBLE_DEVICES=` **empty** — no
+  accelerator — while `PP1` has it unset and holds the card;
+* the two stages loaded disjoint halves: PP0 2.41 GB and has no
+  `model.norm.weight`; PP1 3.76 GB and has no `model.embed_tokens.weight`.
+
+### Measurement, and what it says
+
+Both configurations measured on the same boot-pair, warmup discarded, unique
+prompts, A-vs-A noise floor first, under the armed wedge policy
+(`--chunked-prefill-size 256`), eager (no graphs).
+
+| configuration | prefill @789 tok | A-vs-A | decode | A-vs-A | TTFT median |
+|---|---|---|---|---|---|
+| PP=2, CPU + iGPU | **671.3 / 669.2 tok/s** | 0.32% | **11.63 / 11.61 tok/s** | 0.21% | 0.129 s |
+| single stage, iGPU only | **968.3 / 962.6 tok/s** | 0.59% | 16.75 / 15.80 tok/s | 5.70% | 0.093 s |
+
+**Adding the CPU as a pipeline stage makes this slower, not faster:** 0.69x on
+prefill and ~0.71x on decode. That is a reportable verdict, not a failure — the
+design plan says so in advance ("Negligible-or-negative CPU contribution after
+throttling = reportable verdict, not failure") — and the reason is structural:
+these runs have `--max-running-requests 1`, and **pipeline parallelism pipelines
+MICROBATCHES**. With one request in flight the stages run strictly in sequence,
+so a PP split can only add the slower stage's time; it cannot overlap anything.
+`bench_prefill.py` carries that warning in its own docstring.
+
+**Per-stage wall split** (derived, with its assumption stated): for the same
+789-token prompt, PP=2 takes 1175 ms and the iGPU alone takes 820 ms for *all*
+28 layers. Assuming the default even 14/14 layer split and strictly sequential
+stages, the iGPU half is ~410 ms, so the CPU half is ~1175 − 410 ≈ **765 ms** —
+roughly **1.9x slower than the iGPU for the same layer share**. This is an
+inference from two wall measurements, not per-stage instrumentation; a direct
+per-stage timer is the honest way to confirm it and was not built here.
+
+The practical consequence for the strand's target: a CPU+iGPU prefill split
+only pays off with several chunks or concurrent requests in flight, and at a
+layer ratio weighted by that ~1.9x — not the even split used here.
+`layer_split.py --split-from` can now be fed real numbers for a dense model.
+
 ### What full CPU-stage coverage still needs
 
 For a Qwen3.5-family (GDN hybrid) checkpoint, in dependency order:
@@ -437,11 +499,17 @@ For a Qwen3.5-family (GDN hybrid) checkpoint, in dependency order:
    one — or a `fused_recurrent` torch equivalent for the prefill path;
 4. a `--linear-attn-backend torch_native` option to select them per rank.
 
-A dense-attention checkpoint (standard attention + MLP, no GDN, no mamba)
-would need **none** of this and would close the end-to-end PP=2 probe
-immediately, since those layers already have torch paths. No such checkpoint is
-on the laptop; fetching one is the cheapest route to the "it runs" bar and is
-named as follow-up rather than started here.
+A dense-attention checkpoint needs **none** of this — which is exactly what the
+section above demonstrates. The list stands as the requirement for running the
+**target** model's family (Qwen3.5/3.6 GDN hybrids) on a CPU stage.
+
+**So the strand's target needs two things this report does not deliver, both
+named follow-ups and neither started:**
+
+1. **the GDN-CPU kernel family** above, for a 35B-A3B GDN-MoE CPU stage;
+2. **GGUF x PP version-skew resolution** — the laptop tree's ROCm-GGUF
+   enablement and this branch's PP slice have to live in one tree before PP=2
+   can use the GGUF checkpoint at all.
 
 ---
 
@@ -547,6 +615,19 @@ Verified on the machine: a boot with `CHUNKED_PREFILL=1024` is refused after
 the sanity guard and before the model loads; the default 256 boots and serves
 a COHERENT probe with no new GPU reset.
 
+**Later observation that narrows the trigger.** A single-stage boot of the 2.9
+GB dense model wedged the GPU at 18:09:47 (`GPU reset(2)`) with `--mem-fraction
+-static 0.60` — i.e. with GB of headroom, not at 3% free — during **startup**,
+moments after the previous server had been killed. So memory pressure is
+sufficient to reproduce the wedge but is **not necessary**, and the earlier
+framing ("only under memory pressure") is too narrow. The `MES ... REMOVE_QUEUE`
+message is a queue-TEARDOWN message, and both this event and the reproducer
+involve queues being destroyed while work is outstanding. That makes "the wedge
+follows queue teardown" the strongest remaining hypothesis, and it is cheap to
+test: kill and restart a server repeatedly with no inference at all and watch
+`dmesg`. Not done here. The retry after the reset booted and measured cleanly,
+which is why the comparator numbers above exist.
+
 ## 7. Canon corrections this session contributes
 
 1. **"GPU poisoning" is not a state.** Delete the reboot ritual. The observable
@@ -598,11 +679,20 @@ iGPU-only decode. Where it actually stands:
   fruitless trigger hunt.
 * **Prefill was measured once** — 148.2 tok/s peak, tight A-vs-A floors — but
   the measurement is not reliably repeatable, because the GPU wedges.
-* **PP=2 was driven live for the first time.** Six device-routing blockers
-  found and fixed; both stages init, the world forms, the pipeline event loop
-  launches batches. It stops where a CPU rank meets a Triton kernel that has no
-  torch equivalent anywhere in the tree.
-* **The wedge regime is now refused at boot** rather than hit at runtime.
+* **PP=2 CPU+iGPU RUNS END TO END** on a dense-attention vehicle: COHERENT,
+  greedy-deterministic, 6/6 both rounds, with the CPU stage provably holding no
+  accelerator and half the weights. Seven device-routing blockers found and
+  fixed to get there. This is the strand's "it runs" bar for the mixed-device
+  machinery, and it is met.
+* **Measured, and it is slower**: 0.69x prefill, ~0.71x decode versus the iGPU
+  alone, because at one request in flight a pipeline cannot overlap anything.
+  Reportable verdict, not failure.
+* **The target model is NOT covered by this**: a 35B-A3B GDN-MoE CPU stage
+  additionally needs the GDN-CPU kernel family, and GGUF x PP needs the
+  version skew resolved. Both named, neither started.
+* **The wedge regime is now refused at boot** rather than hit at runtime —
+  though a later reset with ample free memory shows the trigger is broader than
+  memory pressure alone.
 * **Sustained prefill serving is still not possible**: the iGPU wedges in
   firmware (`MES failed to respond` → `GPU reset`) under prefill load. Decode
   never wedges. This is a hardware/driver limit on gfx1103, not a bug in this
@@ -614,22 +704,20 @@ throughput, because no PP=2 forward has completed.
 
 ### What the next session should do first
 
-1. **Close the PP=2 end-to-end probe with a dense-attention checkpoint.** This
-   is by far the cheapest remaining step: a standard attention+MLP model needs
-   none of the missing GDN kernels, so the mixed CPU+iGPU pipeline — already
-   proven to init, form its world and launch batches — should complete a
-   determined-answer probe as soon as it is pointed at one. That closes the
-   strand's "it runs" bar. Nothing on the laptop qualifies today.
-2. **Then the GDN CPU kernel family**, in the dependency order listed in
-   section 5, if a GDN checkpoint on a CPU stage is actually wanted. This is
-   the multi-day item, and it is what the Qwen3.6 target needs.
-3. **Attack the wedge as a driver problem, not a kernel one.** Candidates in
-   cost order: newer amdgpu/MES firmware; capping GTT so hipBLAS is never
-   squeezed; `HSA_ENABLE_SDMA=0`; and testing whether the wedge follows queue
-   teardown (`REMOVE_QUEUE`) rather than the GEMM itself. The standalone
-   reproducer makes each a 2-minute test with no model load.
-4. **Unify the two trees.** The laptop's ROCm-GGUF enablement and this branch's
-   PP slice must live together before PP=2 can use the GGUF checkpoint at all
-   — GGUF x PP is explicitly follow-up, not part of this leg.
-5. **Graphs.** Every floor here is eager. Nothing is known about this path
+1. **Test the queue-teardown hypothesis for the wedge.** Cheapest and highest
+   value: restart a server repeatedly with no inference and watch `dmesg` for
+   `MES ... REMOVE_QUEUE` / `GPU reset`. If it reproduces without compute, the
+   wedge is a teardown bug and the prefill-chunk cap is treating a symptom.
+   Then: newer amdgpu/MES firmware, `HSA_ENABLE_SDMA=0`.
+2. **A per-stage timer.** The 1.9x CPU-vs-iGPU split in section 5 is derived
+   from two wall measurements; instrument the stages directly before weighting
+   `--pp-layer-ratio` on it.
+3. **PP=2 under concurrency.** Every number here is at one request in flight,
+   where a pipeline cannot help by construction. The interesting measurement is
+   several concurrent requests / chunks, which is the regime a CPU+iGPU split
+   is actually for.
+4. **The GDN CPU kernel family**, in the dependency order in section 5, if the
+   GDN target is to run a CPU stage. Multi-day.
+5. **Unify the two trees** for GGUF x PP.
+6. **Graphs.** Every floor here is eager; nothing is known about this path
    under graph capture.
