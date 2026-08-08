@@ -291,6 +291,39 @@ map. Mamba: export/import per-slot blobs (`MambaPool.export_state_blob`
 (`memory_pool.py:1213+`) -- the q|k|v sub-blocks shard independently,
 never as a flat slice.
 
+### 3.4a KV pool residency: TWO RESIDENT POOLS (option priced 2026-08-08)
+
+Operator challenge resolved with arithmetic. Per-rank KV cost at 2
+KiB/token/full-attn-layer (fp8, measured): PP pool 16/8/8 KiB/token
+(8/4/4 layers), TP pool 15/8.5/8.5 KiB/token (16 layers x [30,17,17]/64)
+-- near-equal per rank by construction (stage ratio ~ vector ~ VRAM), so
+both-resident ~ 2x: 31/16.5/16.5 KiB/token.
+
+Ledger per rank (MiB): arena 15063/8786/9236; GDN slots both layouts
+(16 each) ~1146/690/690; activation+runtime+graphs 4016 (derived demand,
+known-conservative -- the falsified-high heuristic); NCCL for TWO group
+sets ~500 (UNMEASURED, must be measured at first dual-group-set boot);
+CUDA context 900; user reserve 1024. Fixed totals 22649/15916/16366
+against 32607/20480/20480. KV budgets 9958/4564/4114 -> global token
+ceilings ~329k/283k/255k. BINDING: 3080 rank 2 at ~255k global tokens =
+~3.9 concurrent 65536-ctx requests, ~22% below the single-layout
+production cap (327700, itself the mamba cap of 4 x 65536 + headroom).
+Not halved -- the #625 arms sized pools into luxury free VRAM.
+
+DECISION: two resident pools (option a). The ~22% ceiling price is the
+KV analog of the arena's +2.34 GB and is recoverable: the 4016 activation
+term is known-conservative and the 500 NCCL term is a guess -- both are
+measure-then-reclaim items at first boot. The aliasing-falsifier
+exemption in phase_flip_runtime.py is TRUE under this architecture
+(source and destination pools are disjoint buffers). Option (b) -- one
+shared byte region viewed as either layout, in-place exchange -- would
+recover most of the 2x KV factor but re-imports the #297
+reads-before-writes hazard across DIFFERENT per-layer structures; it is
+the named capacity follow-up behind the same KvPoolView interface, and
+the #297 aliasing falsifier TRANSFERS to it if it is ever built. Option
+(c) (rebuild a pool at flip) violates no-growth/no-address-change and
+the decode graphs' baked addresses; rejected outright.
+
 ### 3.5 The flip quiescence predicate is NOT #297 fully-idle
 
 `is_fully_idle` requires an empty waiting queue -- it can never fire
