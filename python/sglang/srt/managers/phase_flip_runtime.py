@@ -1,0 +1,503 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Phase-flip KV mover for #631 Route A (PP=3 prefill <-> TP=3 decode).
+
+Moves the full-attention paged KV between the PP layout (stage owns whole
+layers, pool row = global slot id) and the TP layout (rank owns tokens
+under the weighted DCP vector, pool row = compact row), on the #297
+envelope, carried over LITERALLY from ``managers/kv_reshard.py``:
+
+* CONSENSUS FIRST, BYTES SECOND: every ``consensus_interval``-th round --
+  gated by the replicated round counter, never local state -- every rank
+  enters ONE bounded MIN-reduction with
+  ``(armed, ready, epoch, direction, config_fp, vector...)``. ``armed``
+  and ``ready`` are MIN-semantics (skew is legal and uniformly resolves
+  to "wait"); ``epoch``, ``direction`` (once armed), the layer-map/vector
+  fingerprint (ALWAYS -- it is boot config, divergence is fatal armed or
+  not) and the vector are equality-checked with the same loud
+  :class:`KvReshardError` on every rank.
+* PACK -> EXCHANGE -> CHECKSUM -> WRITE with the pool untouched through
+  pack, exchange and checksum verification; only the write phase is the
+  no-return region. Source and destination are DIFFERENT pools here (the
+  PP pool and the TP pool coexist), so the #297 aliasing hazard cannot
+  arise inside one buffer -- the write order (local first, then incoming,
+  disjoint injective targets) is kept anyway.
+* Pools are pre-sized at boot for BOTH layouts: no growth, no address
+  change, no CUDA-graph recapture. Bounds are checked loudly before any
+  byte moves.
+
+Payload layout per (stage s, dcp rank r) pair, identical on both ends by
+convention (a checksum trailer keeps it falsifiable at runtime): layer
+ordinals ascending, slots ascending within a layer, K bytes then V; one
+row list per pair, reused for every layer (token ownership is
+layer-independent). The receiver derives the expected byte count from ITS
+OWN pool's per-layer row width -- a sender whose row format diverges is a
+loud size/checksum error, which is the runtime pin of the "PP and TP rows
+are byte-compatible" claim.
+
+Weights-arena refill and GDN state movement are separate steps of the
+flip protocol (DESIGN_631 section 3.6); ``pre_cutover_fns`` is their
+injection seam so the scheduler wiring can order them inside the same
+no-return region.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import torch
+
+from sglang.srt.layers.dcp.phase_flip_plan import (
+    PP_TO_TP,
+    TP_TO_PP,
+    PhaseFlipTransition,
+    build_phase_flip_transition,
+    validate_layer_map,
+)
+from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+from sglang.srt.managers.kv_reshard import (
+    _CHECKSUM_BYTES,
+    KvPoolView,
+    _checksum,
+    _encode,
+)
+
+logger = logging.getLogger(__name__)
+
+LOG_PREFIX = "PHASE-FLIP"
+
+PHASE_PP = "pp"
+PHASE_TP = "tp"
+
+_DIR_ID = {PP_TO_TP: 1, TP_TO_PP: 2}
+_DIR_OF_PHASE = {PHASE_PP: PP_TO_TP, PHASE_TP: TP_TO_PP}
+_PHASE_AFTER = {PP_TO_TP: PHASE_TP, TP_TO_PP: PHASE_PP}
+
+
+def _config_fingerprint(
+    layer_map: Tuple[Tuple[int, ...], ...], vector: Tuple[int, ...]
+) -> int:
+    """31-bit stable fingerprint of the replicated flip configuration.
+
+    Folded into every consensus payload and equality-checked ALWAYS: a
+    rank booted with a different layer map or vector must die loudly at
+    the first consensus round, not at the first wrong byte."""
+    acc = 0
+    for s, layers in enumerate(layer_map):
+        for f in layers:
+            acc = (acc * 1_000_003 + (s + 1) * 8191 + f * 131) % (2**31 - 1)
+    for v in vector:
+        acc = (acc * 1_000_003 + v * 65_537) % (2**31 - 1)
+    return acc
+
+
+class PhaseFlipRuntime:
+    """Drives one group's PP<->TP KV layout flip at a quiescent boundary.
+
+    Injectables mirror ``KvReshardRuntime`` so the hermetic tests drive
+    REAL threads through mock channels: ``collective_min`` is the
+    consensus channel, ``exchange`` the pairwise byte channel,
+    ``pp_pool_view``/``tp_pool_view`` the two resident pools (PP view
+    layers = this stage's ordinals ascending; TP view layers = ALL
+    ordinals ascending), ``live_slots_fn`` the replicated live slot
+    enumeration (tree values UNION parked requests' rows -- DESIGN_631
+    section 3.5), ``ready_fn`` the flip quiescence predicate,
+    ``cutover_fn(direction)`` the snapshot-cache installer,
+    ``pre_cutover_fns`` the ordered extra movers (weights arena, GDN
+    state) executed inside the no-return region before cutover.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_ranks: int,
+        rank: int,
+        layer_map: Sequence[Sequence[int]],
+        n_layers: int,
+        tp_vector: Sequence[int],
+        boot_phase: str = PHASE_PP,
+        consensus_interval: int = 8,
+        collective_min: Optional[Callable[[List[int]], List[int]]] = None,
+        exchange: Optional[
+            Callable[[Dict[int, torch.Tensor], Dict[int, int]], Dict[int, torch.Tensor]]
+        ] = None,
+        pp_pool_view: Optional[KvPoolView] = None,
+        tp_pool_view: Optional[KvPoolView] = None,
+        live_slots_fn: Optional[Callable[[], torch.Tensor]] = None,
+        ready_fn: Optional[Callable[[], bool]] = None,
+        cutover_fn: Optional[Callable[[str], None]] = None,
+        pre_cutover_fns: Sequence[Callable[[str], None]] = (),
+        guards: Sequence[str] = (),
+        clock: Callable[[], float] = time.perf_counter,
+    ):
+        if n_ranks < 2:
+            raise KvReshardError(
+                f"a phase flip needs a multi-rank group, got n_ranks={n_ranks}"
+            )
+        if not (0 <= int(rank) < n_ranks):
+            raise KvReshardError(f"rank {rank} out of range for {n_ranks} ranks")
+        if consensus_interval < 1:
+            raise ValueError(
+                f"consensus_interval must be >= 1, got {consensus_interval}"
+            )
+        if collective_min is None or exchange is None:
+            raise KvReshardError(
+                "a phase flip needs both a consensus channel (collective_min) "
+                "and a pairwise byte channel (exchange); running without them "
+                "would turn the first honest divergence into a hang instead "
+                "of a loud error."
+            )
+        missing = [
+            name
+            for fn, name in (
+                (pp_pool_view, "pp_pool_view"),
+                (tp_pool_view, "tp_pool_view"),
+                (live_slots_fn, "live_slots_fn"),
+                (ready_fn, "ready_fn"),
+                (cutover_fn, "cutover_fn"),
+            )
+            if fn is None
+        ]
+        if missing:
+            raise KvReshardError(f"PhaseFlipRuntime needs {', '.join(missing)}")
+        if boot_phase not in (PHASE_PP, PHASE_TP):
+            raise KvReshardError(f"unknown boot phase {boot_phase!r}")
+
+        self._n = int(n_ranks)
+        self._rank = int(rank)
+        self._map = validate_layer_map(layer_map, n_layers)
+        self._n_layers = int(n_layers)
+        self._vec = tuple(int(x) for x in tp_vector)
+        if len(self._map) != self._n or len(self._vec) != self._n:
+            raise KvReshardError(
+                f"layer map has {len(self._map)} stages and the vector "
+                f"{self._vec} has {len(self._vec)} entries, but the group "
+                f"has {self._n} ranks -- the flip reuses the SAME ranks"
+            )
+        my_layers = self._map[self._rank]
+        if pp_pool_view.num_layers != len(my_layers):
+            raise KvReshardError(
+                f"PP pool view has {pp_pool_view.num_layers} layers but "
+                f"stage {self._rank} owns {len(my_layers)} "
+                f"({my_layers}); the view must cover exactly this stage's "
+                f"ordinals, ascending"
+            )
+        if tp_pool_view.num_layers != self._n_layers:
+            raise KvReshardError(
+                f"TP pool view has {tp_pool_view.num_layers} layers but the "
+                f"model has {self._n_layers} full-attention layers; the TP "
+                f"layout holds every ordinal on every rank"
+            )
+        self._fp = _config_fingerprint(self._map, self._vec)
+        self._phase = boot_phase
+        self._interval = int(consensus_interval)
+        self._collective_min = collective_min
+        self._exchange = exchange
+        self._pp = pp_pool_view
+        self._tp = tp_pool_view
+        self._live_slots_fn = live_slots_fn
+        self._ready_fn = ready_fn
+        self._cutover_fn = cutover_fn
+        self._pre_cutover_fns = tuple(pre_cutover_fns)
+        self.blocking_guards = tuple(guards)
+        self._clock = clock
+
+        self._round = 0
+        self._epoch = 0
+        self._pending: Optional[str] = None
+        self._last_hold_reason: Optional[str] = None
+        self.desync_checks = 0
+        self.completed = 0
+        self.last_stats: Optional[dict] = None
+
+        logger.info(
+            "%s armed at boot: rank %d/%d, phase %s, layer map %s, vector "
+            "%s, consensus every %d rounds%s",
+            LOG_PREFIX,
+            self._rank,
+            self._n,
+            self._phase,
+            self._map,
+            self._vec,
+            self._interval,
+            (
+                "; guards BLOCKING arming: " + ", ".join(self.blocking_guards)
+                if self.blocking_guards
+                else ""
+            ),
+        )
+
+    # -- state ---------------------------------------------------------------
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
+    @property
+    def pending(self) -> Optional[str]:
+        return self._pending
+
+    # -- arming (replicated callers) -----------------------------------------
+    def arm(self, direction: str, source: str) -> Tuple[bool, str]:
+        """Arm a flip. Replicated call; the consensus round commits it once
+        every rank is armed AND ready. Returns (ok, msg)."""
+        if self.blocking_guards:
+            msg = (
+                f"phase flip refused (guards): "
+                f"{', '.join(self.blocking_guards)}"
+            )
+            logger.warning("%s %s", LOG_PREFIX, msg)
+            return False, msg
+        if direction not in _DIR_ID:
+            return False, f"unknown flip direction {direction!r}"
+        want = _DIR_OF_PHASE[self._phase]
+        if direction != want:
+            return False, (
+                f"flip {direction} refused: current phase is {self._phase}, "
+                f"the only legal transition is {want}"
+            )
+        if self._pending is not None and self._pending != direction:
+            logger.warning(
+                "%s re-arming %s -> %s (source %s)",
+                LOG_PREFIX,
+                self._pending,
+                direction,
+                source,
+            )
+        self._pending = direction
+        msg = (
+            f"phase flip armed: {direction} (source {source}); commits at "
+            f"the next consensus boundary where every rank is quiescent"
+        )
+        logger.warning("%s %s", LOG_PREFIX, msg)
+        return True, msg
+
+    # -- the per-round hook ---------------------------------------------------
+    def on_round(self) -> Optional[dict]:
+        """One scheduler round; see KvReshardRuntime.on_round. Returns move
+        stats when a flip executed this round, else ``None``."""
+        self._round += 1
+        if self._round % self._interval != 0:
+            return None
+        armed = 1 if self._pending is not None else 0
+        ready = 1 if (armed and self._ready_fn()) else 0
+        dir_id = _DIR_ID[self._pending] if self._pending is not None else 0
+        payload = _encode(
+            [armed, ready, self._epoch, dir_id, self._fp, *self._vec]
+        )
+        self.desync_checks += 1
+        reduced = self._collective_min(payload)
+        if len(reduced) != len(payload):
+            raise KvReshardError(
+                f"consensus channel returned {len(reduced)} values for a "
+                f"{len(payload)}-value payload; the channel contract is "
+                f"element-wise MIN of the packed proposal."
+            )
+        fields = ["armed", "ready", "epoch", "direction", "config_fp"] + [
+            f"vector[{i}]" for i in range(self._n)
+        ]
+        lo = {f: reduced[2 * i] for i, f in enumerate(fields)}
+        hi = {f: -reduced[2 * i + 1] for i, f in enumerate(fields)}
+
+        # Equality family: epoch + config fingerprint + vector ALWAYS
+        # (boot config); direction once every rank is armed.
+        eq_checked = ["epoch", "config_fp"] + [
+            f"vector[{i}]" for i in range(self._n)
+        ]
+        if lo["armed"] == 1:
+            eq_checked.append("direction")
+        mismatches = [
+            f"{f}: min={lo[f]} max={hi[f]}" for f in eq_checked if lo[f] != hi[f]
+        ]
+        if mismatches:
+            raise KvReshardError(
+                f"{LOG_PREFIX} DESYNC at round {self._round}: the ranks "
+                f"disagree on the flip state ({'; '.join(mismatches)}; this "
+                f"rank: armed={armed} pending={self._pending} "
+                f"epoch={self._epoch} phase={self._phase}). A flip that "
+                f"disagrees across ranks must fail loudly HERE, before any "
+                f"rank moves a byte under the wrong layout."
+            )
+        if lo["armed"] == 0:
+            if hi["armed"] == 1:
+                self._hold("waiting for every rank to arm (delivery skew)")
+            return None
+        if lo["ready"] == 0:
+            self._hold(
+                f"armed ({self._pending}), waiting for a group-wide "
+                f"quiescent boundary (this rank ready={ready})"
+            )
+            return None
+        self._last_hold_reason = None
+        return self._execute()
+
+    def _hold(self, reason: str) -> None:
+        if reason != self._last_hold_reason:
+            logger.info("%s hold: %s", LOG_PREFIX, reason)
+            self._last_hold_reason = reason
+
+    # -- pool/layer adapters --------------------------------------------------
+    def _src_dst(self, direction: str) -> Tuple[KvPoolView, KvPoolView]:
+        return (self._pp, self._tp) if direction == PP_TO_TP else (self._tp, self._pp)
+
+    def _src_layer_idx(self, direction: str, ordinal: int) -> int:
+        """Pool-local layer index of a global ordinal in MY sending pool."""
+        if direction == PP_TO_TP:
+            return self._map[self._rank].index(ordinal)
+        return ordinal
+
+    def _dst_layer_idx(self, direction: str, ordinal: int) -> int:
+        if direction == PP_TO_TP:
+            return ordinal
+        return self._map[self._rank].index(ordinal)
+
+    # -- the move -------------------------------------------------------------
+    def _execute(self) -> dict:
+        direction = self._pending
+        assert direction is not None
+        t0 = self._clock()
+        slots = self._live_slots_fn()
+        slots = torch.unique(slots.detach().to("cpu", torch.int64))
+        tr: PhaseFlipTransition = build_phase_flip_transition(
+            slots, self._map, self._n_layers, self._vec, self._rank, direction
+        )
+
+        src, dst = self._src_dst(direction)
+        # Bounds BEFORE any byte moves: both layouts' pools are pre-sized
+        # at boot; an overflow here is a sizing bug, not a runtime state.
+        if tr.max_pp_row() >= self._pp.num_rows:
+            raise KvReshardError(
+                f"{LOG_PREFIX} flip needs PP row {tr.max_pp_row()} but the "
+                f"PP pool holds {self._pp.num_rows} rows (sizing bug: the "
+                f"PP pool must cover every live global slot id)"
+            )
+        if tr.max_tp_row() >= self._tp.num_rows:
+            raise KvReshardError(
+                f"{LOG_PREFIX} flip needs TP row {tr.max_tp_row()} but the "
+                f"TP pool holds {self._tp.num_rows} rows (sizing bug: the "
+                f"TP pool must cover the compact rows of vector {self._vec})"
+            )
+
+        # PACK (reads only): per peer, layers ascending, one row list.
+        t_read0 = self._clock()
+        outgoing_payloads: Dict[int, torch.Tensor] = {}
+        for peer in tr.send_layers:
+            # read_rows returns [n, row_nbytes] uint8, K bytes then V.
+            parts = [
+                src.read_rows(
+                    self._src_layer_idx(direction, f), tr.send_rows[peer]
+                ).reshape(-1)
+                for f in tr.send_layers[peer]
+            ]
+            flat = torch.cat(parts)
+            outgoing_payloads[peer] = torch.cat([flat, _checksum(flat)])
+        read_ms = (self._clock() - t_read0) * 1000.0
+
+        # Expected incoming sizes from MY OWN pool's row widths -- the
+        # runtime pin of row byte-compatibility across layouts.
+        incoming_nbytes: Dict[int, int] = {}
+        for peer in tr.recv_layers:
+            n = int(tr.recv_rows[peer].numel())
+            nbytes = sum(
+                dst.row_nbytes(self._dst_layer_idx(direction, f)) * n
+                for f in tr.recv_layers[peer]
+            )
+            incoming_nbytes[peer] = nbytes + _CHECKSUM_BYTES
+
+        # EXCHANGE (pools still untouched): failure up to and including
+        # checksum verification aborts with both pools byte-identical.
+        t_xfer0 = self._clock()
+        received = self._exchange(outgoing_payloads, incoming_nbytes)
+        xfer_ms = (self._clock() - t_xfer0) * 1000.0
+        incoming_data: Dict[int, torch.Tensor] = {}
+        for peer, rows in tr.recv_rows.items():
+            payload = received.get(peer)
+            if payload is None or payload.numel() != incoming_nbytes[peer]:
+                got = 0 if payload is None else payload.numel()
+                raise KvReshardError(
+                    f"{LOG_PREFIX} exchange returned {got} bytes from peer "
+                    f"{peer}, expected {incoming_nbytes[peer]} -- size "
+                    f"mismatch means the layouts' row formats or the "
+                    f"payload convention diverged"
+                )
+            data = payload[:-_CHECKSUM_BYTES]
+            want = int(payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item())
+            have = int(data.to(torch.int64).sum().item()) if data.numel() else 0
+            if want != have:
+                raise KvReshardError(
+                    f"{LOG_PREFIX} payload checksum mismatch from peer "
+                    f"{peer}: sender {want}, receiver {have} -- refusing to "
+                    f"scatter."
+                )
+            incoming_data[peer] = data
+
+        # WRITE (no-return region): local first, then incoming. Source and
+        # destination are different pools; targets are disjoint (injective
+        # row map), so order is free -- kept deterministic anyway.
+        t_write0 = self._clock()
+        local_src = (
+            tr.local_pp_rows if direction == PP_TO_TP else tr.local_tp_rows
+        )
+        local_dst = (
+            tr.local_tp_rows if direction == PP_TO_TP else tr.local_pp_rows
+        )
+        for f in tr.local_layers:
+            data = src.read_rows(self._src_layer_idx(direction, f), local_src)
+            dst.write_rows(self._dst_layer_idx(direction, f), local_dst, data)
+        for peer, rows in tr.recv_rows.items():
+            n = int(rows.numel())
+            offset = 0
+            for f in tr.recv_layers[peer]:
+                li = self._dst_layer_idx(direction, f)
+                width = dst.row_nbytes(li)
+                chunk = incoming_data[peer][offset : offset + n * width]
+                dst.write_rows(li, rows, chunk.view(n, width))
+                offset += n * width
+        write_ms = (self._clock() - t_write0) * 1000.0
+
+        # EXTRA MOVERS (weights arena, GDN state) then CUTOVER.
+        for fn in self._pre_cutover_fns:
+            fn(direction)
+        self._cutover_fn(direction)
+        self._phase = _PHASE_AFTER[direction]
+        self._pending = None
+        self._epoch += 1
+        self.completed += 1
+        total_ms = (self._clock() - t0) * 1000.0
+        stats = {
+            "direction": direction,
+            "phase": self._phase,
+            "epoch": self._epoch,
+            "live_slots": tr.total_slots,
+            "outgoing_cells": tr.outgoing_cells,
+            "incoming_cells": tr.incoming_cells,
+            "sent_bytes": sum(int(t.numel()) for t in outgoing_payloads.values()),
+            "received_bytes": sum(incoming_nbytes.values()),
+            "read_ms": read_ms,
+            "exchange_ms": xfer_ms,
+            "write_ms": write_ms,
+            "total_ms": total_ms,
+        }
+        self.last_stats = stats
+        logger.warning(
+            "%s DONE %s (epoch %d) in %.1f ms: %d live slots, sent %d "
+            "cells / %.2f MiB, received %d cells / %.2f MiB (read %.1f ms, "
+            "exchange %.1f ms, write %.1f ms)",
+            LOG_PREFIX,
+            direction,
+            self._epoch,
+            total_ms,
+            tr.total_slots,
+            tr.outgoing_cells,
+            stats["sent_bytes"] / 1048576.0,
+            tr.incoming_cells,
+            stats["received_bytes"] / 1048576.0,
+            read_ms,
+            xfer_ms,
+            write_ms,
+        )
+        return stats

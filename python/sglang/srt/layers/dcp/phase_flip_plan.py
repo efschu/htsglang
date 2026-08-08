@@ -53,7 +53,9 @@ def validate_layer_map(
     stage MAY be empty -- a degenerate split is legal, a hole or a
     duplicate is not). Returns the normalized tuple form.
     """
-    norm = tuple(tuple(int(x) for x in stage) for stage in layer_map)
+    # Ascending order per stage is part of the payload-layout convention
+    # (module docstring); normalize here so callers cannot diverge on it.
+    norm = tuple(tuple(sorted(int(x) for x in stage)) for stage in layer_map)
     seen: Dict[int, int] = {}
     for s, layers in enumerate(norm):
         for f in layers:

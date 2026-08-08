@@ -1,0 +1,487 @@
+# SPDX-License-Identifier: Apache-2.0
+"""#631 PhaseFlipRuntime: hermetic contract tests on the #297 envelope.
+
+CPU-only, no torch.distributed, no GPU: consensus and byte channels are
+injected; the multi-rank tests drive REAL threads through barrier-backed
+mocks, so "fails loudly, never hangs" is demonstrated with actual
+concurrency. The load-bearing gates:
+
+* byte identity -- after a threaded PP->TP flip the TP pools equal the
+  global reference under the token-owner rule, and the reverse flip
+  round-trips the PP pools byte-identically;
+* config-fingerprint desync falsifier -- ONE rank booted with a shifted
+  (still valid) layer map raises the same loud KvReshardError on every
+  rank at the FIRST consensus round, and no pool byte moves;
+* checksum / size falsifiers -- a corrupted or truncated payload is a
+  loud error on the receiving rank with its pools untouched;
+* readiness skew -- legal divergence holds uniformly, then commits;
+* pre-sized-pool bounds -- an undersized TP pool is a loud sizing-bug
+  error before any byte moves.
+
+The real-config row-schema equality test (operator pin 3: PP and TP rows
+byte-compatible from the model config, red if the weighted-DCP head
+replication rule changes) needs the pool constructors and lands with the
+integration step; the runtime already pins the property at run time via
+receiver-derived payload sizes + checksums.
+"""
+
+import threading
+import unittest
+
+import torch
+
+from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from sglang.srt.layers.dcp.reshard_plan import KvReshardError, owner_of, rows_of
+from sglang.srt.managers.kv_reshard import KvPoolView
+from sglang.srt.managers.phase_flip_runtime import (
+    PHASE_PP,
+    PhaseFlipRuntime,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+MAP_625 = ((0, 1, 2, 3, 4, 5, 6, 7), (8, 9, 10, 11), (12, 13, 14, 15))
+N_LAYERS = 16
+VEC = (3, 2, 2)
+HEADS, DIM = 2, 4
+
+
+class _BarrierMinChannel:
+    """Element-wise MIN across N rank threads (the #287 mock, restated).
+    A rank that never arrives breaks the barrier and raises in every
+    waiting thread -- a hang cannot masquerade as a pass."""
+
+    def __init__(self, n, timeout=15.0):
+        self.n = n
+        self._barrier = threading.Barrier(n, timeout=timeout)
+        self._slots = [None] * n
+        self._result = None
+
+    def channel_for(self, rank):
+        def _reduce(vals):
+            self._slots[rank] = list(vals)
+            index = self._barrier.wait()
+            if index == 0:
+                self._result = [min(col) for col in zip(*self._slots)]
+            self._barrier.wait()
+            return list(self._result)
+
+        return _reduce
+
+
+class _MailboxExchange:
+    """Pairwise byte channel across N rank threads (barrier-backed)."""
+
+    def __init__(self, n, timeout=15.0):
+        self.n = n
+        self._barrier = threading.Barrier(n, timeout=timeout)
+        self._mail = {}
+
+    def exchange_for(self, rank):
+        def _exchange(outgoing, incoming_nbytes):
+            for peer, payload in outgoing.items():
+                self._mail[(rank, peer)] = payload.clone()
+            self._barrier.wait()
+            received = {}
+            for peer, nbytes in incoming_nbytes.items():
+                payload = self._mail.get((peer, rank))
+                received[peer] = (
+                    payload
+                    if payload is not None
+                    else torch.empty(0, dtype=torch.uint8)
+                )
+            self._barrier.wait()
+            return received
+
+        return _exchange
+
+
+def _make_layout_pools(layer_map, vec, num_slots, seed=7):
+    """Global reference KV per ordinal + per-rank PP and TP pools.
+
+    PP pool of rank r: K/V buffers for r's ordinals, row = slot id,
+    pre-filled with the reference rows of the live set. TP pool of rank
+    r: K/V buffers for ALL ordinals, compact rows, zeroed."""
+    torch.manual_seed(seed)
+    n_ranks = len(vec)
+    ref_k = [
+        torch.randn(num_slots, HEADS, DIM, dtype=torch.bfloat16)
+        for _ in range(N_LAYERS)
+    ]
+    ref_v = [
+        torch.randn(num_slots, HEADS, DIM, dtype=torch.bfloat16)
+        for _ in range(N_LAYERS)
+    ]
+    live = (
+        torch.arange(num_slots, dtype=torch.int64)[
+            torch.randperm(num_slots)[: int(num_slots * 0.8)]
+        ]
+        .sort()
+        .values
+    )
+    owner = owner_of(live, vec)
+    pp_pools, pp_views, tp_pools, tp_views = [], [], [], []
+    tp_rows_needed = 1
+    for r in range(n_ranks):
+        rr = rows_of(live[owner == r], vec, r)
+        if rr.numel():
+            tp_rows_needed = max(tp_rows_needed, int(rr.max().item()) + 1)
+    for r in range(n_ranks):
+        k_bufs = [
+            torch.zeros(num_slots, HEADS, DIM, dtype=torch.bfloat16)
+            for _ in layer_map[r]
+        ]
+        v_bufs = [
+            torch.zeros(num_slots, HEADS, DIM, dtype=torch.bfloat16)
+            for _ in layer_map[r]
+        ]
+        for i, f in enumerate(layer_map[r]):
+            k_bufs[i][live] = ref_k[f][live]
+            v_bufs[i][live] = ref_v[f][live]
+        pp_pools.append((k_bufs, v_bufs))
+        pp_views.append(KvPoolView(k_bufs, v_bufs))
+        tk = [
+            torch.zeros(tp_rows_needed, HEADS, DIM, dtype=torch.bfloat16)
+            for _ in range(N_LAYERS)
+        ]
+        tv = [
+            torch.zeros(tp_rows_needed, HEADS, DIM, dtype=torch.bfloat16)
+            for _ in range(N_LAYERS)
+        ]
+        tp_pools.append((tk, tv))
+        tp_views.append(KvPoolView(tk, tv))
+    return (ref_k, ref_v), live, pp_pools, pp_views, tp_pools, tp_views
+
+
+def _check_tp_layout(tp_pools, ref, live, vec):
+    ref_k, ref_v = ref
+    owner = owner_of(live, vec)
+    for r, (tk, tv) in enumerate(tp_pools):
+        mine = live[owner == r]
+        rows = rows_of(mine, vec, r)
+        for f in range(N_LAYERS):
+            if not torch.equal(tk[f][rows], ref_k[f][mine]):
+                return False, f"rank {r} ordinal {f} K mismatch"
+            if not torch.equal(tv[f][rows], ref_v[f][mine]):
+                return False, f"rank {r} ordinal {f} V mismatch"
+    return True, ""
+
+
+def _run_ranks(
+    n_ranks,
+    *,
+    runtimes,
+    directions,
+    rounds=8,
+):
+    """Drive one runtime per rank on a real thread; arm ``directions[r]``
+    (None = not armed) before the loop. Returns exceptions per rank."""
+    exceptions = [None] * n_ranks
+
+    def _worker(r):
+        try:
+            if directions[r] is not None:
+                runtimes[r].arm(directions[r], source=f"test-rank{r}")
+            for _ in range(rounds):
+                runtimes[r].on_round()
+        except BaseException as e:  # noqa: BLE001 -- the assertion target
+            exceptions[r] = e
+
+    threads = [threading.Thread(target=_worker, args=(r,)) for r in range(n_ranks)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30.0)
+    alive = [t for t in threads if t.is_alive()]
+    if alive:
+        raise AssertionError(
+            f"{len(alive)} rank threads still alive after 30s -- a flip "
+            f"hang, the exact failure mode this suite exists to catch"
+        )
+    return exceptions
+
+
+def _build_runtimes(
+    pp_views,
+    tp_views,
+    live,
+    *,
+    layer_maps=None,
+    ready_fns=None,
+    exchange_factory=None,
+    cutover_log=None,
+):
+    n = len(VEC)
+    channel = _BarrierMinChannel(n)
+    mailbox = _MailboxExchange(n)
+    if exchange_factory is None:
+        exchange_factory = mailbox.exchange_for
+    if cutover_log is None:
+        cutover_log = [[] for _ in range(n)]
+    runtimes = []
+    for r in range(n):
+        runtimes.append(
+            PhaseFlipRuntime(
+                n_ranks=n,
+                rank=r,
+                layer_map=(layer_maps[r] if layer_maps else MAP_625),
+                n_layers=N_LAYERS,
+                tp_vector=VEC,
+                boot_phase=PHASE_PP,
+                consensus_interval=2,
+                collective_min=channel.channel_for(r),
+                exchange=exchange_factory(r),
+                pp_pool_view=pp_views[r],
+                tp_pool_view=tp_views[r],
+                live_slots_fn=lambda: live,
+                ready_fn=(
+                    ready_fns[r] if ready_fns else (lambda: True)
+                ),
+                cutover_fn=lambda d, r=r: cutover_log[r].append(d),
+            )
+        )
+    return runtimes, cutover_log
+
+
+def _clone_pools(pools):
+    return [
+        ([k.clone() for k in ks], [v.clone() for v in vs]) for ks, vs in pools
+    ]
+
+
+def _pools_equal(a, b):
+    for (ak, av), (bk, bv) in zip(a, b):
+        for x, y in zip(ak + av, bk + bv):
+            if not torch.equal(x, y):
+                return False
+    return True
+
+
+class TestByteIdentity(CustomTestCase):
+    def test_pp_to_tp_flip_byte_identity(self):
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 300
+        )
+        runtimes, cutovers = _build_runtimes(pp_views, tp_views, live)
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
+        self.assertTrue(ok, msg)
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.completed, 1)
+            self.assertEqual(rt.phase, "tp")
+            self.assertEqual(cutovers[r], [PP_TO_TP])
+
+    def test_roundtrip_restores_pp_pools(self):
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 260, seed=9
+        )
+        orig = _clone_pools(pp_pools)
+        runtimes, _ = _build_runtimes(pp_views, tp_views, live)
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        # wipe the PP pools, then flip back on the SAME runtimes
+        for ks, vs in pp_pools:
+            for t in ks + vs:
+                t.zero_()
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[TP_TO_PP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        # live rows must round-trip byte-identically
+        for r in range(3):
+            (ks, vs), (oks, ovs) = pp_pools[r], orig[r]
+            for t, o in zip(ks + vs, oks + ovs):
+                self.assertTrue(torch.equal(t[live], o[live]))
+        for rt in runtimes:
+            self.assertEqual(rt.completed, 2)
+            self.assertEqual(rt.phase, "pp")
+
+
+class TestConsensusDiscipline(CustomTestCase):
+    def test_config_fingerprint_desync_all_loud_none_hang(self):
+        # Rank 1 boots with a shifted (still valid) layer map: its PP pool
+        # has 5 layers to match, so construction succeeds -- the divergence
+        # must die at the FIRST consensus round, loudly, on EVERY rank,
+        # with no pool byte moved. Can-fail proof of the fingerprint gate.
+        shifted = ((0, 1, 2, 3, 4, 5, 6), (7, 8, 9, 10, 11), (12, 13, 14, 15))
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 200, seed=13
+        )
+        # rank 1's PP view must cover 5 layers under the shifted map
+        k5 = [torch.zeros(200, HEADS, DIM, dtype=torch.bfloat16) for _ in range(5)]
+        v5 = [torch.zeros(200, HEADS, DIM, dtype=torch.bfloat16) for _ in range(5)]
+        pp_views = list(pp_views)
+        pp_views[1] = KvPoolView(k5, v5)
+        pp_before = _clone_pools(pp_pools)
+        tp_before = _clone_pools(tp_pools)
+        maps = [MAP_625, shifted, MAP_625]
+        runtimes, _ = _build_runtimes(
+            pp_views, tp_views, live, layer_maps=maps
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[None] * 3)
+        for r, e in enumerate(exceptions):
+            self.assertIsInstance(e, KvReshardError, f"rank {r}: {e}")
+            self.assertIn("config_fp", str(e))
+        self.assertTrue(_pools_equal(pp_pools, pp_before))
+        self.assertTrue(_pools_equal(tp_pools, tp_before))
+
+    def test_readiness_skew_holds_uniformly_then_commits(self):
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 180, seed=15
+        )
+        gate = {"count": 0}
+        lock = threading.Lock()
+
+        def _rank1_ready():
+            with lock:
+                gate["count"] += 1
+                return gate["count"] > 2  # not ready the first two probes
+
+        ready_fns = [lambda: True, _rank1_ready, lambda: True]
+        runtimes, _ = _build_runtimes(
+            pp_views, tp_views, live, ready_fns=ready_fns
+        )
+        exceptions = _run_ranks(
+            3, runtimes=runtimes, directions=[PP_TO_TP] * 3, rounds=10
+        )
+        self.assertEqual([e for e in exceptions if e], [])
+        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
+        self.assertTrue(ok, msg)
+        for rt in runtimes:
+            self.assertEqual(rt.completed, 1)
+
+    def test_checksum_falsifier_corrupted_payload_pool_untouched(self):
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 160, seed=17
+        )
+        tp_before = _clone_pools(tp_pools)
+        mailbox = _MailboxExchange(3)
+
+        def _factory(rank):
+            inner = mailbox.exchange_for(rank)
+
+            def _exchange(outgoing, incoming_nbytes):
+                received = inner(outgoing, incoming_nbytes)
+                if rank == 1:
+                    for peer, payload in received.items():
+                        if payload.numel():
+                            payload[0] ^= 0xFF  # corrupt one byte
+                            break
+                return received
+
+            return _exchange
+
+        runtimes, _ = _build_runtimes(
+            pp_views, tp_views, live, exchange_factory=_factory
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertIsInstance(exceptions[1], KvReshardError)
+        self.assertIn("checksum", str(exceptions[1]))
+        # rank 1 aborted BEFORE its write phase: its TP pool is untouched.
+        self.assertTrue(
+            _pools_equal([tp_pools[1]], [tp_before[1]]),
+            "rank 1 scattered bytes after a checksum failure",
+        )
+
+    def test_truncated_payload_is_loud_size_error(self):
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 150, seed=19
+        )
+        mailbox = _MailboxExchange(3)
+
+        def _factory(rank):
+            inner = mailbox.exchange_for(rank)
+
+            def _exchange(outgoing, incoming_nbytes):
+                received = inner(outgoing, incoming_nbytes)
+                if rank == 2:
+                    for peer, payload in received.items():
+                        received[peer] = payload[:-16]
+                        break
+                return received
+
+            return _exchange
+
+        runtimes, _ = _build_runtimes(
+            pp_views, tp_views, live, exchange_factory=_factory
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertIsInstance(exceptions[2], KvReshardError)
+        self.assertIn("size mismatch", str(exceptions[2]))
+
+
+class TestValidationAndBounds(CustomTestCase):
+    def _single_rank_runtime(self, **overrides):
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 100, seed=23
+        )
+        kwargs = dict(
+            n_ranks=3,
+            rank=0,
+            layer_map=MAP_625,
+            n_layers=N_LAYERS,
+            tp_vector=VEC,
+            boot_phase=PHASE_PP,
+            collective_min=lambda vals: list(vals),
+            exchange=lambda o, i: {},
+            pp_pool_view=pp_views[0],
+            tp_pool_view=tp_views[0],
+            live_slots_fn=lambda: live,
+            ready_fn=lambda: True,
+            cutover_fn=lambda d: None,
+        )
+        kwargs.update(overrides)
+        return PhaseFlipRuntime(**kwargs)
+
+    def test_arm_refuses_wrong_direction_for_phase(self):
+        rt = self._single_rank_runtime()
+        ok, msg = rt.arm(TP_TO_PP, source="test")
+        self.assertFalse(ok)
+        self.assertIn("current phase is pp", msg)
+        ok, _ = rt.arm(PP_TO_TP, source="test")
+        self.assertTrue(ok)
+
+    def test_arm_refuses_unknown_direction_and_guards(self):
+        rt = self._single_rank_runtime()
+        ok, _ = rt.arm("sideways", source="test")
+        self.assertFalse(ok)
+        guarded = self._single_rank_runtime(guards=("disk hicache (#630)",))
+        ok, msg = guarded.arm(PP_TO_TP, source="test")
+        self.assertFalse(ok)
+        self.assertIn("disk hicache", msg)
+
+    def test_wrong_pp_view_layer_count_refused(self):
+        with self.assertRaisesRegex(KvReshardError, "PP pool view"):
+            self._single_rank_runtime(
+                pp_pool_view=KvPoolView(
+                    [torch.zeros(10, HEADS, DIM, dtype=torch.bfloat16)],
+                    [torch.zeros(10, HEADS, DIM, dtype=torch.bfloat16)],
+                )
+            )
+
+    def test_undersized_tp_pool_is_loud_sizing_error(self):
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 120, seed=29
+        )
+        # shrink every rank's TP pool below the needed compact rows
+        small_tp_views = []
+        for r in range(3):
+            tk = [
+                torch.zeros(2, HEADS, DIM, dtype=torch.bfloat16)
+                for _ in range(N_LAYERS)
+            ]
+            tv = [
+                torch.zeros(2, HEADS, DIM, dtype=torch.bfloat16)
+                for _ in range(N_LAYERS)
+            ]
+            small_tp_views.append(KvPoolView(tk, tv))
+        runtimes, _ = _build_runtimes(pp_views, small_tp_views, live)
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        for r, e in enumerate(exceptions):
+            self.assertIsInstance(e, KvReshardError, f"rank {r}: {e}")
+            self.assertIn("sizing bug", str(e))
+
+
+if __name__ == "__main__":
+    unittest.main()
