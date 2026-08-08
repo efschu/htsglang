@@ -324,6 +324,21 @@ the #297 aliasing falsifier TRANSFERS to it if it is ever built. Option
 (c) (rebuild a pool at flip) violates no-growth/no-address-change and
 the decode graphs' baked addresses; rejected outright.
 
+### 3.4b Step-6 blocking obligations (operator, 2026-08-08)
+
+1. The two UNMEASURED ledger terms -- NCCL-two-group-sets (~500 MiB
+   guess) and activation/runtime (4016 MiB, known-falsified-high) -- are
+   MEASURED on the first dual-group-set boot and the 3.4a ledger updated.
+   A first boot that does not produce these two numbers is incomplete.
+2. The 1024 MiB/card user reserve is the hard corridor rule: at first
+   boot, NVML-free >= 1024 MiB is verified CONTINUOUSLY under load
+   (100-ms sampling, time-series minimum), never as a boot snapshot.
+3. The GDN-both-layouts ledger term (~1146/690/690 MiB) is pinned by a
+   real-config arithmetic test (Qwen3.6-27B constants: conv_dim 10240 x
+   3 cols, temporal 48 heads x 128 x 128, bf16, 48 linear layers split
+   24/12/12), not left derived (the M2 laptop lesson: mamba sizing
+   killed a spec arm silently).
+
 ### 3.5 The flip quiescence predicate is NOT #297 fully-idle
 
 `is_fully_idle` requires an empty waiting queue -- it can never fire
