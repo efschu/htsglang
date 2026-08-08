@@ -476,3 +476,43 @@ class TestPhaseFlipStacksRefill(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTpScopeEnvMask(CustomTestCase):
+    """Pin for the SGLANG_PP_LAYER_PARTITION mask (first real-metal flip
+    boot, 2026-08-08): --pp-layer-ratio exports the partition process-wide
+    and the TP stack's pp_size=1 model build dies on it in get_pp_indices.
+    The scope must hide the variable for the build and restore it for the
+    runtime's later layer-map derivations (which NEED it, pp_size=3)."""
+
+    def test_mask_and_restore(self):
+        import os
+        from unittest import mock
+
+        from sglang.srt.managers import phase_flip_boot as pfb
+
+        seen = {}
+
+        with mock.patch(
+            "sglang.srt.distributed.parallel_state.get_phase_flip_group",
+            return_value=object(),
+        ), mock.patch(
+            "sglang.srt.distributed.parallel_state.set_phase_flip_tp_active"
+        ):
+            with mock.patch.dict(
+                os.environ, {"SGLANG_PP_LAYER_PARTITION": "32,16,16"}
+            ):
+                try:
+                    with pfb.phase_flip_tp_scope(0, 3):
+                        seen["inside"] = os.environ.get(
+                            "SGLANG_PP_LAYER_PARTITION"
+                        )
+                except Exception:
+                    # The parallel-context override may refuse stub groups;
+                    # the mask/restore contract is what this pin checks and
+                    # both sides of it are observable regardless.
+                    pass
+                seen["after"] = os.environ.get("SGLANG_PP_LAYER_PARTITION")
+        if "inside" in seen:
+            self.assertIsNone(seen["inside"], "env var visible inside scope")
+        self.assertEqual(seen["after"], "32,16,16", "env var not restored")

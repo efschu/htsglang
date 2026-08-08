@@ -690,7 +690,16 @@ class FlashInferAttnBackend(AttentionBackend):
         # silent right-token/wrong-slot corruption, not a crash).
         from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
 
-        _is_draft = bool(getattr(model_runner, "is_draft_worker", False))
+        # The phase-flip TP stack (#631) rides is_draft_worker for the
+        # secondary-runner gates but is a TARGET-shaped model on the DCP
+        # machinery: forcing its uneven_dcp off via the draft-replicated
+        # exemption routed local-head KV writes into the full-width
+        # token-sharded pool (store_cache row mismatch, first real-metal
+        # flip boot 2026-08-08). Same is_draft_worker-ride family as the
+        # attention-registry MTP shortcut.
+        _is_draft = bool(
+            getattr(model_runner, "is_draft_worker", False)
+        ) and not bool(getattr(model_runner, "is_phase_flip_tp_stack", False))
         _draft_replicated = draft_pool_is_replicated(
             _is_draft, getattr(model_runner, "server_args", None)
         )

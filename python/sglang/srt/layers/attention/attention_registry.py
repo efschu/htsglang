@@ -401,8 +401,17 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         # in the GDN backend and died on `assert isinstance(mixed_qkv,
         # torch.Tensor)` -- same shape as contract 1, the head inheriting the
         # target's geometry.
-        if runner.is_draft_worker and not getattr(
-            runner, "is_dual_group_lane_target", False
+        # The phase-flip TP stack (#631) rides is_draft_worker for the
+        # secondary-runner gates but is a full TARGET-shaped model: routing
+        # it by the MTP [0] shortcut classifies GDN layer 0 as full
+        # attention and sends RadixLinearAttention into flashinfer
+        # (AttributeError on is_cross_attention -- first real-metal flip
+        # boot, 2026-08-08). Same trap and same shape as the dual-group
+        # lane target exemption right above.
+        if (
+            runner.is_draft_worker
+            and not getattr(runner, "is_dual_group_lane_target", False)
+            and not getattr(runner, "is_phase_flip_tp_stack", False)
         ):
             # FIXME: we assume that MTP/NEXTN always use full-attention.
             full_attn_layers = [0]

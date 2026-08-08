@@ -227,15 +227,28 @@ def _set_kv_buffer_impl(
     row_bytes = row_dim * store_dtype.itemsize
     if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
         k_cache_rows = k_cache.view(-1, row_dim)
-        return store_cache(
-            k.view(-1, row_dim),
-            v.view(-1, row_dim),
-            k_cache_rows,
-            v_cache.view(-1, row_dim),
-            indices,
-            row_bytes=row_bytes,
-            size_limit=kv_store_bound(size_limit, k_cache, row_dim),
-        )
+        try:
+            return store_cache(
+                k.view(-1, row_dim),
+                v.view(-1, row_dim),
+                k_cache_rows,
+                v_cache.view(-1, row_dim),
+                indices,
+                row_bytes=row_bytes,
+                size_limit=kv_store_bound(size_limit, k_cache, row_dim),
+            )
+        except RuntimeError as e:
+            # The jit kernel's TensorMatcher error names only the offending
+            # tensor; re-raise with the full call geometry so a row/index
+            # count divergence (e.g. a mis-shaped pool under a derived
+            # geometry) is diagnosable from the log alone.
+            raise RuntimeError(
+                f"store_cache rejected: k{tuple(k.shape)} v{tuple(v.shape)} "
+                f"row_dim={row_dim} -> k_rows={k.numel() // row_dim}, "
+                f"k_cache{tuple(k_cache.shape)}, indices"
+                f"{tuple(indices.shape)}:{indices.dtype}, "
+                f"size_limit={size_limit}: {e}"
+            ) from e
 
     if _is_cpu and _cpu_has_amx_support:
         return torch.ops.sgl_kernel.store_cache_cpu(

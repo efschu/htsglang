@@ -514,8 +514,12 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
 
     # Global full-attention geometry from the TP stack's config (pp=1 ->
     # unmutated; the PP stack's was rewritten to its stage-local slice).
+    # full_attention_layer_ids is a property of the HYBRID HF text config
+    # (Qwen3NextConfig etc.), not of sglang's ModelConfig wrapper -- the
+    # attention registry reads it via runner.mambaish_config, mirror that
+    # (first real-metal flip boot, 2026-08-08).
     tp_model_config = stacks.tp_worker.model_config
-    full_ids = list(tp_model_config.full_attention_layer_ids)
+    full_ids = list(tp_model_config.hf_text_config.full_attention_layer_ids)
     layer_map = derive_pp_full_attn_layer_map(
         full_ids,
         int(tp_model_config.num_hidden_layers),

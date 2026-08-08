@@ -39,6 +39,7 @@ Everything here runs rank-uniformly at boot, gated on
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -137,6 +138,12 @@ def phase_flip_tp_scope(world_rank: int, n: int):
     flip_dcp = get_phase_flip_group("dcp")
     flip_pp = get_phase_flip_group("pp")
     set_phase_flip_tp_active(True)
+    # --pp-layer-ratio exports SGLANG_PP_LAYER_PARTITION process-wide; the
+    # TP stack builds with pp_size=1 and get_pp_indices would refuse a
+    # 3-way partition (found on the first real-metal flip boot,
+    # 2026-08-08). Mask it for the build only; the PP stack read it at
+    # primary init and never re-reads it at forward time.
+    pp_partition_env = os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
     try:
         with get_parallel().override(
             tp_size=n,
@@ -162,6 +169,8 @@ def phase_flip_tp_scope(world_rank: int, n: int):
             yield
     finally:
         set_phase_flip_tp_active(False)
+        if pp_partition_env is not None:
+            os.environ["SGLANG_PP_LAYER_PARTITION"] = pp_partition_env
 
 
 def checkpoint_param_dict(model) -> Dict[str, torch.nn.Parameter]:
@@ -333,7 +342,7 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             # tensor rebind instead.
             tp_worker = TpModelWorker(
                 server_args=tp_args,
-                gpu_id=scheduler.gpu_id,
+                gpu_id=scheduler.ps.gpu_id,
                 tp_rank=world_rank,
                 moe_ep_rank=0,
                 pp_rank=0,
