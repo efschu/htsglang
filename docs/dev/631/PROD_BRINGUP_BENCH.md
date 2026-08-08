@@ -519,6 +519,83 @@ NOT yet wired, and each is a real step:
 Expected on completion: the 496671-token measurement above, inside the
 corridor instead of OOMing it.
 
+## 6e. Correction: which pool is the serving capacity (commit c8be5d4d50)
+
+**The TP pool is not the serving capacity, and an earlier claim in this
+file that raising it from 318176 to 340474 was a "+7.0 %" gain is
+WRONG.** The correction matters more than the number.
+
+`Scheduler.build_kv_cache` builds ONE allocator, from the PP stack,
+before the TP stack exists -- and the cutover never swaps it (it swaps
+ps, groups, the batch-result processor and the model worker;
+`scheduler.tp_worker` stays the PP stack). That is required, not an
+oversight: the flip identifies a KV row by its GLOBAL slot id across both
+layouts, so a single id space is what makes the transition expressible at
+all.
+
+So the id space -- and therefore the tokens a request can actually
+occupy -- is the **PP stack's** capacity. On the shipped configuration
+that is **278104**, unchanged by the TP-side work. The TP stack's 340474
+is headroom above the id space, not usable capacity.
+
+### The invariant nobody was checking
+
+Every id the allocator can issue must be addressable in BOTH layouts, so:
+
+    TP stack capacity  >=  PP stack capacity (the id space)
+
+The TP stack derives its capacity independently, from its own budget and
+token vector, so it can come out smaller. Then the first decode touching
+a high id writes past the end of the TP KV pool -- and lands in
+store_kvcache's own guard,
+`SGL_DEVICE_ASSERT(index >= 0 && index < size_limit)`
+(`jit_kernel/csrc/elementwise/kvcache.cuh:112`), a device-side assert
+that kills all three ranks with an async CUDA error whose traceback
+points at whatever host call synchronised next.
+
+**That is the crash this rig hit mid-benchmark** at PP/allocator C =
+46422 against TP C = 27200 (section 5, defect 6). It was recorded there
+as "KV slot OOB under pool exhaustion"; the pool was not exhausted, the
+TP pool was simply smaller than the id space. `c8be5d4d50` refuses that
+shape at boot, naming both capacities and the knob that raises the TP
+side.
+
+### What this means for the capacity work
+
+Raising the TP pool alone buys nothing. The lever is the **PP** pool,
+and it is held down by the same double-residency: the PP pool is sized
+first, against the full budget, but the budget must then still fit the TP
+stack afterwards -- which is why 29000 MiB/rank produced a PP pool of
+802904 and then OOMed building the TP stack.
+
+Boot-time exclusive backing is therefore the piece that pays:
+
+1. PP pool constructed and backed.
+2. Release PP backing before the TP stack allocates its pools and
+   captures its decode graphs.
+3. Release TP backing, restore PP backing (the boot phase is PP).
+
+Peak becomes max(PP, TP) instead of PP + TP at boot as well as at
+runtime, and the per-rank budget can then rise into the ~500k-800k class
+the 496671 measurement showed is reachable. The flip-seam swap
+(fa6ceab7b3) is the runtime half of the same mechanism; the boot half is
+what unlocks the sizing.
+
+### Shipped state (commit c8be5d4d50, re-verified)
+
+| quantity | value |
+|---|---|
+| serving capacity (allocator id space = PP pool) | **278104** |
+| TP stack capacity (must be >= id space) | 340474 |
+| corridor min, 100 ms, prefill rung + flip + decode | **1352 / 1599 / 1040** (floor 1024, HELD) |
+| prefill 2048 / 8192 / 32768 | 4236.2 / 7175.7 / 6718.6 tok/s |
+| decode narrative / code | 77.50 / 103.38 tok/s |
+| flip pp_to_tp per rank | 950 / 1196 / 1674 ms |
+
+A-vs-A against the previous shipped numbers: prefill within noise
+(4227.8 / 7183.8 / 6712.8), decode narrative -1.9 % at CV 2.8 % and code
++0.2 % at CV 1.1 %, flip timings unchanged. No regression from the guard.
+
 ## 7. Reproduce
 
 ```
