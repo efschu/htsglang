@@ -407,6 +407,15 @@ dual-group lane, spec active in PP phase. #633's PP weight-update-group
 deadlock fix is an ancestry fact of this branch -- assert its presence
 in the boot check rather than assuming.
 
+### Test inventory (one glob does NOT cover the family)
+
+- test/registered/scheduler/: test_phase_flip_plan.py,
+  test_phase_flip_runtime.py, test_weights_arena.py,
+  test_gdn_flip_plan.py (+ the #297 test_kv_reshard.py regression).
+- test/registered/unit/distributed/: test_phase_flip_groups.py (real
+  3-process gloo world -- lives with the other multi-process
+  distributed tests on purpose; note the split when running the family).
+
 ## 4. Implementation order (each step lands with its falsifiers first)
 
 1. `flip_plan.py`: pure PP<->TP transition arithmetic (layer map x token
@@ -435,7 +444,13 @@ in the boot check rather than assuming.
      the runtime stats, arena refill, GDN move, cutover), reported per
      rank so the binding rank is identified, not averaged away;
    - the two unmeasured ledger terms (NCCL two-group-sets, activation)
-     measured on the same boots;
+     measured on the same boots. The NCCL term has an EXISTING
+     instrument: mem_ledger/nccl_probe.py's measure_communicator_init
+     already brackets every GroupCoordinator pynccl constructor,
+     including the secondary flip set's -- arm it on the first
+     dual-group-set boot and read both sets' real buffer cost from it
+     (the secondary set's communicators live for the whole boot, through
+     both phases);
    - every run >= 10 s, and an A-vs-A same-boot noise floor is
      established BEFORE any delta is read (the 0.10% #625 floor is the
      reference shape);

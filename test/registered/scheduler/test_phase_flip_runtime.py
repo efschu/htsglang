@@ -483,5 +483,193 @@ class TestValidationAndBounds(CustomTestCase):
             self.assertIn("sizing bug", str(e))
 
 
+class TestSchedulerSideHelpers(CustomTestCase):
+    """Quiescence predicate, live-slot union, guards (DESIGN_631 3.5/3.7)."""
+
+    def _fake_scheduler(self, **over):
+        from types import SimpleNamespace
+
+        tree = SimpleNamespace(
+            all_values_flatten=lambda: torch.tensor([2, 5, 7], dtype=torch.int64)
+        )
+        req_to_token = torch.arange(40, dtype=torch.int64).reshape(4, 10)
+        sched = SimpleNamespace(
+            chunked_req=None,
+            last_batch=None,
+            result_queue=[],
+            tree_cache=tree,
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            running_batch=SimpleNamespace(reqs=[]),
+            waiting_queue=[SimpleNamespace()],  # parked work is LEGAL
+            server_args=SimpleNamespace(
+                enable_hierarchical_cache=False, dual_group_lane=False
+            ),
+            kv_session_offload=None,
+            is_dual_group_lane=False,
+        )
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        sched.disaggregation_mode = DisaggregationMode.NULL
+        for k, v in over.items():
+            setattr(sched, k, v)
+        return sched
+
+    def test_quiescence_true_with_parked_requests(self):
+        from types import SimpleNamespace
+
+        sched = self._fake_scheduler(
+            running_batch=SimpleNamespace(
+                reqs=[SimpleNamespace(seqlen=3, req_pool_idx=0)]
+            )
+        )
+        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+
+        self.assertTrue(build_flip_quiescence_fn(sched)())
+
+    def test_quiescence_false_on_inflight_state(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+
+        for over in (
+            {"chunked_req": object()},
+            {"result_queue": [object()]},
+            {"last_batch": SimpleNamespace(is_empty=lambda: False)},
+            {"_pp_microbatches_drained": lambda: False},
+        ):
+            sched = self._fake_scheduler(**over)
+            self.assertFalse(build_flip_quiescence_fn(sched)(), over)
+
+    def test_live_slots_union_tree_and_parked_rows(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.phase_flip_runtime import build_flip_live_slots_fn
+
+        # req 0 parked with 3 tokens at rows 7, 8, 9 (row 7 also in tree).
+        req_to_token = torch.zeros(4, 10, dtype=torch.int64)
+        req_to_token[0, :3] = torch.tensor([7, 8, 9])
+        sched = self._fake_scheduler(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            running_batch=SimpleNamespace(
+                reqs=[SimpleNamespace(seqlen=3, req_pool_idx=0)]
+            ),
+        )
+        live = build_flip_live_slots_fn(sched)()
+        self.assertEqual(live.tolist(), [2, 5, 7, 8, 9])
+
+    def test_guards(self):
+        from sglang.srt.managers.phase_flip_runtime import flip_blocking_guards
+
+        self.assertEqual(flip_blocking_guards(self._fake_scheduler()), [])
+        sched = self._fake_scheduler()
+        sched.server_args.enable_hierarchical_cache = True
+        guards = flip_blocking_guards(sched)
+        self.assertTrue(any("#630" in g for g in guards), guards)
+        sched = self._fake_scheduler(is_dual_group_lane=True)
+        self.assertTrue(
+            any("dual-group" in g for g in flip_blocking_guards(sched))
+        )
+
+
+class TestAbortDeferral(CustomTestCase):
+    """Pin 4 (DESIGN_631 3.6a): parked-request disconnect during a flip."""
+
+    def test_window_defers_then_drains_in_order(self):
+        from sglang.srt.managers.phase_flip_runtime import AbortDeferralWindow
+
+        window = AbortDeferralWindow()
+        ran = []
+        self.assertFalse(window.submit(lambda: ran.append("now")))
+        self.assertEqual(ran, ["now"])
+        window.activate()
+        self.assertTrue(window.submit(lambda: ran.append("a")))
+        self.assertTrue(window.submit(lambda: ran.append("b")))
+        self.assertEqual(ran, ["now"])
+        self.assertEqual(window.deferred_count, 2)
+        self.assertEqual(window.deactivate_and_drain(), 2)
+        self.assertEqual(ran, ["now", "a", "b"])
+
+    def _runtimes_with_per_rank_live(self, live_per_rank, pp_views, tp_views):
+        channel = _BarrierMinChannel(3)
+        mailbox = _MailboxExchange(3)
+        runtimes = []
+        for r in range(3):
+            runtimes.append(
+                PhaseFlipRuntime(
+                    n_ranks=3,
+                    rank=r,
+                    layer_map=MAP_625,
+                    n_layers=N_LAYERS,
+                    tp_vector=VEC,
+                    boot_phase=PHASE_PP,
+                    consensus_interval=2,
+                    collective_min=channel.channel_for(r),
+                    exchange=mailbox.exchange_for(r),
+                    pp_pool_view=pp_views[r],
+                    tp_pool_view=tp_views[r],
+                    live_slots_fn=lambda r=r: live_per_rank[r],
+                    ready_fn=lambda: True,
+                    cutover_fn=lambda d: None,
+                )
+            )
+        return runtimes
+
+    def test_can_fail_abort_applied_on_one_rank_mid_flip_is_loud(self):
+        # WITHOUT deferral: rank 0 has already applied a disconnect (its
+        # live set lost a slot owned by rank 1) while the peers still see
+        # the old set. The flip must die LOUDLY (size mismatch on the
+        # shrunken pair payload), never scatter silently -- proves the
+        # hazard deferral exists for is real, and that the runtime's
+        # failure mode for it is the loud one.
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 140, seed=31
+        )
+        owner = owner_of(live, VEC)
+        rank1_slots = live[owner == 1]
+        self.assertGreater(int(rank1_slots.numel()), 0)
+        dropped = int(rank1_slots[0].item())
+        live_rank0 = live[live != dropped]
+        live_per_rank = [live_rank0, live, live]
+        runtimes = self._runtimes_with_per_rank_live(
+            live_per_rank, pp_views, tp_views
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        louds = [e for e in exceptions if isinstance(e, KvReshardError)]
+        self.assertTrue(louds, f"divergent live set went undetected: {exceptions}")
+        self.assertTrue(
+            any(
+                "size mismatch" in str(e) or "checksum" in str(e)
+                for e in louds
+            ),
+            louds,
+        )
+
+    def test_deferral_keeps_flip_clean_then_applies_abort(self):
+        # WITH deferral: the disconnect arrives mid-flip on rank 0, is
+        # QUEUED, the flip commits byte-identically on every rank, and
+        # the abort work runs afterwards.
+        from sglang.srt.managers.phase_flip_runtime import AbortDeferralWindow
+
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 140, seed=33
+        )
+        window = AbortDeferralWindow()
+        window.activate()
+        applied = []
+        # The disconnect lands while the window is active (armed flip).
+        self.assertTrue(window.submit(lambda: applied.append("abort req X")))
+        live_per_rank = [live, live, live]  # deferral kept the set uniform
+        runtimes = self._runtimes_with_per_rank_live(
+            live_per_rank, pp_views, tp_views
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
+        self.assertTrue(ok, msg)
+        self.assertEqual(applied, [])
+        self.assertEqual(window.deactivate_and_drain(), 1)
+        self.assertEqual(applied, ["abort req X"])
+
+
 if __name__ == "__main__":
     unittest.main()

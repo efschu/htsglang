@@ -92,6 +92,141 @@ def _config_fingerprint(
     return acc
 
 
+class AbortDeferralWindow:
+    """Pin 4 (DESIGN_631 3.6a): client disconnects during a flip.
+
+    A parked request whose client vanishes mid-flip must not mutate the
+    live slot set between the plan derivation and the write phase -- an
+    abort applied on one rank before its peers diverges the replicated
+    live set, which the runtime can only answer with a LOUD size/desync
+    error (clean abort of the attempt, but a lost flip). Deferral makes
+    the window airtight instead: while a flip is pending or executing,
+    abort work is QUEUED; it drains in the first round after cutover (or
+    after disarm). The queue preserves order. Slots are never leaked --
+    the deferred abort frees them under the NEW layout, which is
+    equivalent by the global-slot-id property (metadata never rewrites).
+    """
+
+    def __init__(self):
+        self._deferred: List[Callable[[], None]] = []
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def deferred_count(self) -> int:
+        return len(self._deferred)
+
+    def activate(self) -> None:
+        self._active = True
+
+    def submit(self, work: Callable[[], None]) -> bool:
+        """Run ``work`` now (returns False) or defer it (returns True)."""
+        if self._active:
+            self._deferred.append(work)
+            return True
+        work()
+        return False
+
+    def deactivate_and_drain(self) -> int:
+        """Close the window and run everything deferred, in order."""
+        self._active = False
+        drained = 0
+        while self._deferred:
+            work = self._deferred.pop(0)
+            work()
+            drained += 1
+        return drained
+
+
+def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
+    """The flip ready predicate (DESIGN_631 3.5) -- NOT #297 fully-idle.
+
+    True when no forward is in flight and no chunk is half-written, with
+    requests PARKED: no partial chunk, previous batch drained, overlap
+    result queue empty, PP micro-batches drained. Deliberately does NOT
+    require an empty waiting queue or an empty running batch -- the flip
+    exists to run between a request's prefill and its decode."""
+
+    def _ready() -> bool:
+        if getattr(scheduler, "chunked_req", None) is not None:
+            return False
+        last_batch = getattr(scheduler, "last_batch", None)
+        if last_batch is not None and not last_batch.is_empty():
+            return False
+        result_queue = getattr(scheduler, "result_queue", None)
+        if result_queue is not None and len(result_queue) > 0:
+            return False
+        drained = getattr(scheduler, "_pp_microbatches_drained", None)
+        if drained is not None and not drained():
+            return False
+        return True
+
+    return _ready
+
+
+def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
+    """Live slots = radix tree values UNION parked requests' rows.
+
+    #297 Stage A enumerates the tree only, correct at fully-idle. The
+    flip runs with requests parked, whose KV rows live in req_to_token
+    and are NOT all in the tree yet -- omitting them would silently drop
+    the freshest prefix KV at the flip (DESIGN_631 3.5). Replicated: the
+    tree and the batch state are rank-replicated between rounds."""
+
+    def _live() -> torch.Tensor:
+        parts: List[torch.Tensor] = []
+        values = scheduler.tree_cache.all_values_flatten()
+        if values is not None and values.numel():
+            parts.append(values.detach().to("cpu", torch.int64))
+        running = getattr(scheduler, "running_batch", None)
+        reqs = list(getattr(running, "reqs", []) or []) if running else []
+        req_to_token = scheduler.req_to_token_pool.req_to_token
+        for req in reqs:
+            n = int(req.seqlen)
+            if n <= 0:
+                continue
+            rows = req_to_token[req.req_pool_idx, :n]
+            parts.append(rows.detach().to("cpu", torch.int64))
+        if not parts:
+            return torch.empty(0, dtype=torch.int64)
+        return torch.unique(torch.cat(parts))
+
+    return _live
+
+
+def flip_blocking_guards(scheduler) -> List[str]:
+    """Features that refuse flip arming (DESIGN_631 3.7). Mirrors the
+    #297 Stage-A guard shape, plus the #630 PP x disk-HiCache wedge."""
+    guards: List[str] = []
+    server_args = scheduler.server_args
+    try:
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        if scheduler.disaggregation_mode != DisaggregationMode.NULL:
+            guards.append("PD disaggregation")
+    except ImportError:
+        pass
+    if getattr(server_args, "enable_hierarchical_cache", False):
+        guards.append(
+            "hierarchical cache (#630: PP x disk HiCache wedges at warmup)"
+        )
+    if getattr(scheduler, "kv_session_offload", None) is not None:
+        guards.append("kv-session-offload")
+    if getattr(scheduler, "is_dual_group_lane", False) or getattr(
+        server_args, "dual_group_lane", None
+    ):
+        guards.append("dual-group lane")
+    if not hasattr(scheduler.tree_cache, "all_values_flatten"):
+        guards.append(
+            f"tree cache {type(scheduler.tree_cache).__name__} (no "
+            f"all_values_flatten enumeration)"
+        )
+    return guards
+
+
 class PhaseFlipRuntime:
     """Drives one group's PP<->TP KV layout flip at a quiescent boundary.
 
