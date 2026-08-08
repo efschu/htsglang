@@ -741,14 +741,28 @@ class SchedulerPPMixin:
         self.process_input_requests(recv_reqs)
 
     def pp_pump_send_req_work(self: Scheduler) -> None:
-        """#631: progress the outstanding request-chain send WITHOUT
-        blocking on it. Called from the armed poll loop.
+        """#631: MEASURED DEAD. Reaps nothing on this build, ever.
 
-        Polls the work handle and only reaps it once it reports complete,
-        so this never waits on a peer. A blocking commit here is corpse
-        B'; an unpumped async send is corpse A (it is progressed by the
-        commit at the top of the NEXT pass, which never arrives once this
-        rank is armed and polling).
+        The intent was to progress the outstanding request-chain send
+        without blocking, by polling the handle and reaping it once it
+        reported complete. Measured 2026-08-08: ``is_completed()`` NEVER
+        fires for an isend here -- not even after the peer has fully
+        consumed the message -- so this never clears ``send_req_work``.
+        The only thing that has ever reaped a chain send is the BLOCKING
+        ``_pp_commit_comm_work``. Pinned by
+        test_measured_the_send_side_pump_can_never_reap.
+
+        Consequence worth stating plainly, because several design notes
+        assumed otherwise: arms reach downstream stages via those stages'
+        own blocking chain recv -- the recv side's wait() is what
+        progresses the transfer -- never because an armed rank pumped the
+        arm forward while it waited.
+
+        Kept rather than deleted: it is harmless (it cannot mutate state),
+        it is where a working predicate would go if the transport ever
+        gains one, and deleting it would silently erase the record of what
+        was tried. It is NOT a mechanism anything may rely on. A blocking
+        commit here would be corpse B'; an unpumped async send is corpse A.
         """
         works = getattr(self, "send_req_work", None)
         if not works:

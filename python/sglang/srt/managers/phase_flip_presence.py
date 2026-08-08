@@ -43,9 +43,52 @@ measured corpses, 2026-08-08:
                                          the gloo pairs and aborted every rank
   E   presence announced while still
       owing a chain send             the gate ASSEMBLED and still wedged
-                                         (boot 18). Fixed by clauses (i)+(ii)
-                                         in
-                                         PhaseFlipRuntime._await_group_presence.
+                                         (boot 18). The decided fix rests on a
+                                         false premise -- see corpse F -- and
+                                         ships OFF behind
+                                         SGLANG_PP_CHAIN_RECEIVER.
+  F   the NON-BLOCKING PUMP          MEASURED DEAD, and it was dead all along.
+                                         pp_pump_send_req_work reaps a chain
+                                         send on work.is_completed(), and on
+                                         this build that predicate NEVER fires
+                                         for an isend -- not even after the peer
+                                         has fully consumed the message. The
+                                         pump has therefore never cleared
+                                         send_req_work; the only thing that has
+                                         ever reaped a chain send is the
+                                         BLOCKING _pp_commit_comm_work.
+                                         Arms reached downstream stages via
+                                         those stages' OWN blocking recv all
+                                         along -- the recv side's wait() is what
+                                         progresses the transfer -- never
+                                         because an armed rank "pumped the arm
+                                         forward while it waited". Every design
+                                         note that credited the pump was
+                                         reasoning about a no-op. No one-line
+                                         repair exists: only wait() progresses a
+                                         send here, and blocking is precisely
+                                         what the armed path may not do.
+                                         Pinned:
+                                         test_measured_the_send_side_pump_can_never_reap.
+
+THE TRANSPORT PREMISE, falsified from three directions
+------------------------------------------------------
+This module already rejected a posted-and-polled ``all_reduce`` because
+its progress-without-explicit-wait premise was unverified. That premise is
+now MEASURED FALSE for point-to-point too, in both directions: a posted
+``irecv`` never completes by polling (so a non-blocking drain absorbs
+nothing), and an ``isend`` never completes by polling either (corpse F).
+On this build, ONLY ``wait()`` progresses a transfer. Any future design
+that needs an armed rank to make progress on a channel without blocking
+must supply its own progress engine -- a thread, or a different transport
+-- and may not assume the handle advances on its own.
+
+A SECOND MEASUREMENT bears on boot 18's diagnosis and is not yet
+explained: an upstream's commit of an UNCONSUMED forward returns in
+0.00 s (8 B and 512 KiB). So "the downstream stopped consuming" does not
+by itself block an upstream here, and what rank 1 was actually waiting on
+at :705 -> :1109 is an OPEN QUESTION. Do not build on the boot-18 story
+until a reproduction with all three stacks on disk says what it is.
 
 WHAT BOOT 18 ACTUALLY SHOWED, and what it did not
 -------------------------------------------------

@@ -422,3 +422,98 @@ def _run_poll_vs_commit(payload_bytes, poll_s, timeout=60.0):
             p.terminate()
             p.join(timeout=5.0)
     return out
+
+
+def _send_poll_side(port, nbytes, q):
+    try:
+        import torch.distributed as dist
+
+        _init(0, port)
+        buf = torch.ones(nbytes, dtype=torch.uint8)
+        work = dist.isend(buf, 1)
+        deadline = time.perf_counter() + 5.0
+        completed = False
+        while time.perf_counter() < deadline:
+            if work.is_completed():
+                completed = True
+                break
+            time.sleep(0.01)
+        q.put(("send_poll_completed", completed))
+        work.wait()
+        time.sleep(0.5)
+    except Exception as exc:  # noqa: BLE001
+        q.put(("error", repr(exc)))
+
+
+def _consume_side(port, nbytes, q):
+    try:
+        import torch.distributed as dist
+
+        _init(1, port)
+        # Consume EARLY and completely, so the send is genuinely finished
+        # long before the sender stops polling.
+        time.sleep(1.0)
+        buf = torch.zeros(nbytes, dtype=torch.uint8)
+        dist.irecv(buf, src=0).wait()
+        q.put(("consumed", True))
+        time.sleep(2.0)
+    except Exception as exc:  # noqa: BLE001
+        q.put(("error", repr(exc)))
+
+
+def test_measured_the_send_side_pump_can_never_reap():
+    """PRE-EXISTING NO-OP, measured 2026-08-08. Standalone finding.
+
+    ``Scheduler.pp_pump_send_req_work`` reaps a chain send only when
+    ``is_completed()`` reports it done. On this build that predicate never
+    fires for an isend -- NOT EVEN AFTER THE PEER HAS FULLY CONSUMED THE
+    MESSAGE, which this test is the control for. So the pump never clears
+    ``send_req_work``, in any circumstance: it is dead code, and the only
+    thing that has ever reaped a chain send here is the BLOCKING
+    ``_pp_commit_comm_work`` (work.wait(), which clears the list).
+
+    This retro-explains behaviour attributed to the pump. Arms have been
+    reaching downstream stages via those stages' own blocking chain recv
+    all along -- the recv side's wait() is what progresses the transfer --
+    never because an armed rank "pumped the arm forward while it waited".
+    Any reasoning that assumed the pump delivered anything was reasoning
+    about a no-op.
+
+    There is no non-blocking predicate that DOES progress a send here, so
+    there is no one-line repair: only wait() progresses it, and blocking is
+    exactly what the armed path may not do.
+    """
+    result = _run_send_poll(payload_bytes=256 * 1024)
+    assert "error" not in result, result
+    assert result.get("consumed") is True, f"peer never consumed: {result}"
+    assert result["send_poll_completed"] is False, (
+        "an isend's is_completed() fired by polling. If this goes red the "
+        "pump is no longer dead -- re-read every design note that assumed "
+        "it delivered the arm, and re-price the non-blocking drain"
+    )
+
+
+def _run_send_poll(payload_bytes, timeout=60.0):
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    port = _free_port()
+    up = ctx.Process(target=_send_poll_side, args=(port, payload_bytes, q))
+    down = ctx.Process(target=_consume_side, args=(port, payload_bytes, q))
+    up.start()
+    down.start()
+    out = {}
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline and len(out) < 2:
+        try:
+            key, value = q.get(timeout=1.0)
+        except Exception:  # noqa: BLE001
+            if not up.is_alive() and not down.is_alive():
+                break
+            continue
+        out[key] = value
+    for p in (up, down):
+        p.join(timeout=5.0)
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=5.0)
+    return out
