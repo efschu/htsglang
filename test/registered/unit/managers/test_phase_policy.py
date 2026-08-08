@@ -517,28 +517,29 @@ def test_arm_is_armed_in_the_same_pass_it_arrives():
     assert "ordinary" in processed[0]
 
 
-def test_arm_carrying_send_is_committed_before_the_join():
-    """(ii) TARGETED COMMIT. Specimen: variant A, 2026-08-08.
+def test_no_blocking_commit_anywhere_in_the_armed_path():
+    """BOOT-13 SPECIMEN. The design law, pinned at the source.
 
-    An async forward is progressed by _pp_commit_comm_work at the TOP of
-    the NEXT pass -- which never comes if this rank arms and blocks in
-    the reduction first. py-spy: rank 0 in bounded_collective, ranks 1-2
-    in _pull_raw_reqs, 0 % GPU. So the arm-carrying handle must be
-    committed in THIS pass, before the flip hook can join.
+    Committing the arm-carrying send in-pass is corpse B': rank 0 blocked
+    in _pp_commit_comm_work while ranks 1-2 sat in the HIDDEN-STATES
+    exchange. "The peer is waiting for the arm" is false -- it may be in
+    another channel entirely, so ANY blocking wait on the chain send can
+    pair with a peer parked elsewhere.
+
+    The arm forward is pumped non-blockingly by the armed poll loop
+    instead. This test fails if a blocking commit is reintroduced for
+    arm-carrying batches.
     """
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
     arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
     s, fwd, sends, processed, commits = _fwd_harness(track_commits=True)
     fwd([arm])
-    assert sends[0][0] is True, (
-        "the forward must stay ASYNC -- a blanket synchronous send is "
-        "variant B and deadlocks against the hidden-states exchange"
-    )
-    assert commits, "the arm-carrying send was never committed"
-    assert commits[-1] == "post-send", (
-        "the arm-carrying handle was not committed in this pass; the peer "
-        "cannot have the arm before this rank joins"
+    assert sends[0][0] is True, "the forward must stay async"
+    assert "post-send" not in commits, (
+        "an arm-carrying send was committed in-pass; that is corpse B' -- "
+        "this rank blocks on the chain send while a peer may be in the "
+        "hidden-states channel"
     )
 
 
@@ -553,12 +554,13 @@ def test_ordinary_traffic_keeps_the_uncommitted_async_forward():
     )
 
 
-def test_manual_flip_takes_the_same_committed_path():
-    """(d) The manual RPC gets the invariant too.
+def test_manual_flip_takes_the_same_non_blocking_path():
+    """(d) The manual RPC goes through the same epoch machinery.
 
     Strictly safer, and it removes manual's latent at-idle deadlock:
-    manual has only ever run UNDER TRAFFIC, where the loop keeps cycling
-    and the commit happens by accident rather than by construction.
+    manual has only ever been exercised UNDER TRAFFIC, where the loop
+    keeps cycling and delivery happens by accident rather than by
+    construction.
     """
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
@@ -566,8 +568,8 @@ def test_manual_flip_takes_the_same_committed_path():
     s, fwd, sends, processed, commits = _fwd_harness(track_commits=True)
     fwd([rpc])
     assert rpc in processed[0], "the manual arm must also be same-pass"
-    assert commits[-1] == "post-send", (
-        "the manual flip skipped the targeted commit"
+    assert "post-send" not in commits, (
+        "the manual flip blocks on its chain send -- corpse B'"
     )
 
 
@@ -686,3 +688,146 @@ def test_the_flip_join_is_not_bounded_and_that_is_deliberate():
         "the flip join was bounded again; abandoning an entered gloo "
         "all_reduce aborts every rank in the group"
     )
+
+
+# -- option 2(b): the pollable presence gate ----------------------------------
+#
+# THE DESIGN LAW: no rank may block on any channel while a peer may be in a
+# different blocking channel. The gate is what makes entering the blocking
+# reduction safe BY CONSTRUCTION -- every participant is provably at the
+# entry, so none is anywhere else.
+
+
+def _presence(tmpdir, n_ranks=3, rank=0):
+    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
+
+    return PhaseFlipPresence(
+        n_ranks=n_ranks, rank=rank, directory=str(tmpdir), instance="test"
+    )
+
+
+def test_presence_is_pollable_and_never_blocks(tmp_path):
+    p0 = _presence(tmp_path, rank=0)
+    assert p0.all_present(epoch=1) is False
+    assert p0.missing(epoch=1) == [0, 1, 2]
+    p0.announce(1)
+    assert p0.observe(1) == {0}
+    assert p0.all_present(1) is False
+
+
+def test_gate_opens_only_when_every_rank_is_present(tmp_path):
+    """ALL-READY GATE. Entering with a peer missing is the deadlock."""
+    ranks = [_presence(tmp_path, rank=r) for r in range(3)]
+    ranks[0].announce(1)
+    ranks[1].announce(1)
+    assert ranks[0].all_present(1) is False, (
+        "the gate opened with rank 2 missing; that rank is elsewhere and "
+        "the reduction would block on it"
+    )
+    ranks[2].announce(1)
+    assert ranks[0].all_present(1) is True
+
+
+def test_announce_is_idempotent(tmp_path):
+    """The armed poll loop announces every iteration rather than tracking
+    whether it already did."""
+    p0 = _presence(tmp_path, rank=0)
+    for _ in range(5):
+        p0.announce(1)
+    assert p0.observe(1) == {0}
+
+
+def test_epochs_are_monotone_and_a_retraction_mints_a_new_one(tmp_path):
+    """Flags are NEVER cleared. A flag observed for epoch E is a fact
+    about E for ever, so a poll cannot be fooled by a racing writer and a
+    writer never has to coordinate a clear."""
+    ranks = [_presence(tmp_path, rank=r) for r in range(3)]
+    for r in ranks:
+        r.announce(1)
+    assert ranks[0].all_present(1) is True
+    # A retraction moves to epoch 2; epoch 1's flags must not count.
+    assert ranks[0].all_present(2) is False
+    assert ranks[0].missing(2) == [0, 1, 2]
+
+
+def test_sweep_never_drops_the_epoch_in_flight(tmp_path):
+    ranks = [_presence(tmp_path, rank=r) for r in range(3)]
+    for r in ranks:
+        r.announce(1)
+        r.announce(2)
+    ranks[0].sweep(keep_epoch=2)
+    assert ranks[0].all_present(2) is True
+    assert ranks[0].all_present(1) is False
+
+
+def _runtime_stub(presence, deadline=60.0, pending="pp_to_tp", clock=None):
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    class R:
+        pass
+
+    r = R()
+    r._presence = presence
+    r._pump_fn = None
+    r._presence_deadline_s = deadline
+    r._presence_wait_started = None
+    r._epoch = 1
+    r._pending = pending
+    r._armed_at = 0.0
+    r._last_hold_reason = None
+    r._phase = PHASE_PP
+    r.presence_timeouts = 0
+    r._clock = clock or (lambda: 0.0)
+    r._await_group_presence = PhaseFlipRuntime._await_group_presence.__get__(r, R)
+    r._abandon_no_quorum = PhaseFlipRuntime._abandon_no_quorum.__get__(r, R)
+    return r
+
+
+def test_gate_holds_the_caller_until_the_group_arrives(tmp_path):
+    r = _runtime_stub(_presence(tmp_path, rank=0))
+    assert r._await_group_presence() is None, "the gate opened too early"
+    # Peers arrive.
+    _presence(tmp_path, rank=1).announce(1)
+    _presence(tmp_path, rank=2).announce(1)
+    assert r._await_group_presence() is True
+
+
+def test_pre_entry_timeout_disarms_loudly_and_keeps_serving(tmp_path):
+    """PRE-ENTRY BOUND, legal precisely because nothing was entered.
+
+    Contrast the withdrawn (c): abandoning an ENTERED all_reduce closed
+    the gloo pairs and aborted every rank. Abandoning a POLL costs
+    nothing -- no peer is owed a collective.
+    """
+    now = {"t": 0.0}
+    r = _runtime_stub(
+        _presence(tmp_path, rank=0), deadline=10.0, clock=lambda: now["t"]
+    )
+    assert r._await_group_presence() is None
+    now["t"] = 11.0
+    out = r._await_group_presence()
+    assert out is None, "abandonment must not raise into the event loop"
+    assert r._pending is None, "the flip must be disarmed so it can be retried"
+    assert r.presence_timeouts == 1
+
+
+def test_gate_pumps_the_arm_forward_while_it_waits(tmp_path):
+    """The pump is what delivers the arm without blocking -- the fix for
+    corpse A (an async send is otherwise progressed only by the commit at
+    the top of the NEXT pass, which never comes once this rank is armed
+    and polling)."""
+    pumped = []
+    r = _runtime_stub(_presence(tmp_path, rank=0))
+    r._pump_fn = lambda: pumped.append(1)
+    r._await_group_presence()
+    assert pumped, "the armed poll loop did not pump its arm forward"
+
+
+def test_a_failing_pump_never_breaks_the_gate(tmp_path):
+    r = _runtime_stub(_presence(tmp_path, rank=0))
+
+    def boom():
+        raise RuntimeError("transport hiccup")
+
+    r._pump_fn = boom
+    assert r._await_group_presence() is None  # no raise
