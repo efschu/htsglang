@@ -1422,3 +1422,30 @@ branches on `ggml_moe_get_block_size(type) > 0` (falls back to the slow
 dequant MoE path, IQ dequant is clean) and re-boot Q2 — expect no crash.
 Q3-as-laptop-fallback then costs slow-path MoE for IQ experts; whether that
 is usable is a measurement, not an assumption.
+
+### 12.16 The poisoning trigger is GPU RUNTIME PM, not system suspend [MEASURED]
+
+Timeline that isolates it: guard PASS at 09:15 on boot 07:55 (GPU
+continuously busy through the morning's tests) -> ~4 h GPU IDLE (no system
+suspend in the journal, sleep targets already masked at check time) -> guard
+FAIL 13:2x (Q5_K dequant non-deterministic) on the SAME boot. amdgpu runtime
+PM (`power/control=auto`) suspends the idle iGPU and the defect family
+follows the GPU's runtime-RESUME. This explains every state flip seen so
+far, including the "overnight suspend" attribution in §12.3 (a system
+suspend forces a GPU suspend — special case, same mechanism).
+
+Countermeasures now standing on the laptop: `power/control=on` for all drm
+devices via oneshot unit `amdgpu-no-runtime-pm.service` (enabled) + sleep
+targets masked + logind lid/idle ignore + the boot guard refusing to serve.
+FALSIFIER still owed: after reboot with runtime PM forbidden, idle >=30 min,
+guard must PASS — that closes the attribution; until then runtime-PM is the
+prime, not the proven, trigger. (#652-adjacent finding: any ROCm consumer on
+this APU class needs the same guard.)
+
+OPERATIONAL: the laptop's DHCP IP moved 192.168.0.116 -> 192.168.0.164
+(same host key). The "suspended and unwakeable" episode of 09:4x-13:2x was a
+WRONG DIAGNOSIS — the machine was up on the new IP the whole time; the
+return-watch pinged a dead address. Rule: reach the laptop by both IPs (or
+fix its lease) before declaring it down. Q3_K_XL WAS once downloaded on the
+laptop (dl_q3.log: 17,227,569,440 B, rc=0 into /root/lh/models/) and was
+deleted later; current laptop inventory: Q4_K_M, Q2_K_XL, the derived noQ6K.
