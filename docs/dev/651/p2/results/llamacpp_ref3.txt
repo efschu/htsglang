@@ -1,0 +1,56 @@
+
+
+Loading model... |-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/ 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b1-69bf643
+model      : /root/lh/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> What is the capital of France? Answer with one word.
+
+[Start thinking]
+
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - Question: "What is the capital of France?"
+   - Constraint: "Answer with one word."
+
+2.  **Identify Key Information:**
+   - Country: France
+   - Capital: Paris
+
+3.  **Check Constraint:**
+   - The answer must be exactly one word.
+   - "Paris" is one word.
+
+4.  **Formulate Output:**
+   - Paris
+
+5.  **Final Verification:**
+   - Does it answer the question? Yes.
+   - Is it
+
+[ Prompt: 12,6 t/s | Generation: 8,3 t/s ]
+
+
+Exiting...
+DONE-EXIT-0

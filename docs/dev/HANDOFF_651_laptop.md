@@ -1205,3 +1205,38 @@ table down; flip budget = park-write ms + reload ms. Reuse the #286 offload
 register classes, #89 hibernate VRAM-to-disk with #456 sparse-write, #407
 registry doctrine — no new spill path. Explicit named park files, never the
 8 GB swap. Flips are regime-wide and rare, so write volume is negligible.
+
+### 12.7 The residual incoherence is OURS: llama.cpp is coherent on the same file
+
+Chain of exoneration (all [MEASURED], evidence in docs/dev/651/p2/results/):
+the checkpoint file is bit-perfect (SHA-256 == upstream HF LFS oid
+`0b21525e...`); llama.cpp b1-69bf643 CPU-only on the SAME file answers the
+probe question with a clean thinking process and "Paris" (8.3 tok/s gen);
+our derived no-Q6K serving is greedy-deterministic but degenerate (repetition
+loops, broken arithmetic). Also exonerated by direct test: every GGUF quant
+kernel this file dispatches (Q4_K/Q5_K/Q8_0 x dequant/MMVQ/MMQ/moe_a8/
+moe_a8_vec), rocBLAS fp16 GEMM at serving shapes, the JIT moe_align kernel
+(invariant-checked at T=1..1024), the attention backend (torch_native swap:
+byte-identical degeneracy). Conclusion: a weight-transform/assignment defect
+in the fork's 35B (qwen35moe) GGUF path. The 27B (qwen35) adapter needed six
+coherence-critical inverse-transforms (memory: htsglang-gguf); the 35B path
+goes through a different map (gguf_deepseek4.py machinery) and was never
+content-verified on ANY platform. Transform audit in flight.
+
+Operational note: llama-cli's modern TUI prints a block-glyph banner and an
+interactive "> " prompt loop on EOF stdin — use `-st -p "..."` for
+non-interactive runs, and never `head`-truncate into a pipe (SIGPIPE kills
+the run mid-load). Five llama-cli orphans from truncated runs had to be
+killed; `pkill -f llama-cli` from an ssh whose command line contains the
+pattern self-kills the session (bracket-trick: `pkill -f "[l]lama-cli"`).
+
+### 12.8 Load-dependence of the kernel defect family [MEASURED]
+
+pins_gfx1103.py (the new red/green pin harness) caught Q5_K dequantize going
+non-deterministic WHILE llama.cpp saturated the CPU/DDR5 — on a fresh boot,
+no suspend involved. So the family is (at least) load-AND-resume-state
+dependent. Consequences: (a) pins baselines and the boot guard must run on a
+quiet machine; (b) the future CPU+iGPU PP co-run must re-validate kernel
+correctness UNDER CONTENTION before any co-run measurement counts; (c) the
+Q5_K tensors (38 in the Q4_K_M file) are a latent hazard under co-run load —
+candidate for the same Q8_0 requant treatment if co-run validation shows it.
