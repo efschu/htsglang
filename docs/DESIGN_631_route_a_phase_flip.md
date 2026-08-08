@@ -460,14 +460,41 @@ in the boot check rather than assuming.
 ## 5. Integration wiring plan (remaining step-5 slices, file:line from
 ## the 2026-08-08 survey; each slice lands with tests before the next)
 
-STATE 2026-08-08 (session 1 of the restaffed strand): steps 1-4 DONE and
-committed with 79 green tests + falsifiers across two dirs; 5.1 DONE
-(args surface, 8 tests); 5.2 STARTED -- the secondary-group boot wiring
-in model_runner.init_torch_distributed is committed (desk-written,
-first-boot-validated in step 6); NEXT SLICE: the TP-shaped runner stack
-built under geometry override (5.2 remainder), then 5.3. Pin status:
-1 discharged (manifest), 3 pending (lands with 5.2 pools), 4 discharged
-at unit level (scheduler-level replay in 5.3).
+STATE 2026-08-08 (session 2): 5.2 DONE -- TP-stack boot builder landed
+(managers/phase_flip_boot.py: server-args derivation, flip geometry
+scope, snapshot/free/pack/image weights choreography, TP pools + decode
+graphs under the scope, PP rebind + refill; scheduler hook at the end of
+init_model_worker, before the post-capture resize). 108 green tests
+(88 prior + 20 new in test_phase_flip_boot.py). Desk-written GPU
+integration validated at step 6. NEXT: 5.3 scheduler flip protocol.
+Pin status: 1 discharged (manifest), 2 discharged STRUCTURALLY
+(is_phase_flip_pp_stack carve before the harmonization collective +
+poison gates on both capture entry points, hermetically pinned red and
+green), 3 DISCHARGED (boot assert assert_row_schema_compatible on the
+real pools + hermetic real-config test with the head-sharded red arm),
+4 discharged at unit level (scheduler-level replay in 5.3).
+
+SURVEY CORRECTION to 3.1 (load-bearing, found in session 2): forward-time
+collectives reach groups through the parallel_state MODULE GETTERS
+(tensor_model_parallel_all_reduce -> get_tp_group()), NOT the
+runtime_context contextvar; the lane precedent never exposed this because
+tp_size=1 short-circuits the collective (linear.py:2338). The contextvar
+override alone would therefore shard weights correctly and then
+all-reduce over the primary tp=1 group -- a silent no-op. Resolution:
+_PHASE_FLIP_TP_ACTIVE module routing in get_tp_group /
+get_attn_tp_group / get_dcp_group / get_pp_group (the
+_ENABLE_PDMUX_P_TP/_DCP_SPILL_ACTIVE precedent), toggled rank-uniformly
+at the boot build scope and at cutover; activation without built flip
+groups REFUSES loudly. Both mechanisms together are the geometry scope
+(phase_flip_boot.phase_flip_tp_scope).
+
+Step-6 watch items added in session 2: (a) the uneven plan + cp token
+vector are process-globals installed AFTER the primary PP build --
+PP-phase code paths must never consult them with a non-rank-local size;
+(b) get_server_args() readers at forward time see the PRIMARY args in
+both phases (the TP stack's copy is published only during its build);
+(c) TP-stack pool sizing uses the copied mem_fraction_static -- the
+3.4a ledger is enforced by measurement at first boot, not yet by code.
 
 ### 5.1 Server args surface
 - New flags: --phase-flip (off default; gates EVERYTHING below),

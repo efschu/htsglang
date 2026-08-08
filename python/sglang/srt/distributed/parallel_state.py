@@ -2596,6 +2596,16 @@ _FLIP_TP: Optional[GroupCoordinator] = None
 _FLIP_DCP: Optional[GroupCoordinator] = None
 _FLIP_PP: Optional[GroupCoordinator] = None
 
+# #631: when True, the module-level group getters below route to the flip
+# set (_FLIP_*). This is the _DCP_SPILL_ACTIVE/_ENABLE_PDMUX_P_TP routing
+# precedent, needed because forward-time collectives reach groups through
+# these getters (tensor_model_parallel_all_reduce -> get_tp_group()), NOT
+# through the runtime_context contextvar -- an override alone would shard
+# weights correctly and then all-reduce on the WRONG (primary tp=1) group,
+# which is a silent no-op, i.e. silent corruption. Toggled rank-uniformly:
+# at boot around the TP-stack build, and at cutover by the flip protocol.
+_PHASE_FLIP_TP_ACTIVE: bool = False
+
 _ENABLE_PDMUX_P_TP: bool = False
 
 
@@ -2605,6 +2615,12 @@ def set_pdmux_status(enable_prefill_multiplexing: bool):
 
 
 def get_tp_group() -> GroupCoordinator:
+    if _PHASE_FLIP_TP_ACTIVE:
+        assert _FLIP_TP is not None, (
+            "phase-flip TP routing is active but the flip group set is not "
+            "initialized"
+        )
+        return _FLIP_TP
     if _ENABLE_PDMUX_P_TP:
         assert _PDMUX_PREFILL_TP_GROUP is not None, (
             "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
@@ -2614,7 +2630,39 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
+def set_phase_flip_tp_active(active: bool) -> None:
+    """#631: route the module-level group getters to the flip set.
+
+    Unlike set_dcp_spill_active this REFUSES (instead of silently no-oping)
+    when the flip groups were never built: activating the route without them
+    would leave every later collective on the primary (tp=1) groups -- a
+    silent no-op all-reduce, the exact corruption class this routing exists
+    to prevent. Rank-uniform by contract: callers are the boot-time TP-stack
+    build scope and the flip cutover, both of which run on every rank in the
+    same round."""
+    global _PHASE_FLIP_TP_ACTIVE
+    if active and _FLIP_TP is None:
+        raise RuntimeError(
+            "set_phase_flip_tp_active(True) without initialized phase-flip "
+            "secondary groups (initialize_phase_flip_secondary_groups was "
+            "never called)"
+        )
+    _PHASE_FLIP_TP_ACTIVE = bool(active)
+
+
+def phase_flip_tp_routing_active() -> bool:
+    return _PHASE_FLIP_TP_ACTIVE
+
+
 def get_attn_tp_group() -> GroupCoordinator:
+    if _PHASE_FLIP_TP_ACTIVE:
+        # The flip TP phase is pure TP (no dp-attention, guarded in
+        # server_args): attn_tp == tp, served by the same flip group.
+        assert _FLIP_TP is not None, (
+            "phase-flip TP routing is active but the flip group set is not "
+            "initialized"
+        )
+        return _FLIP_TP
     assert _ATTN_TP is not None, (
         "attention tensor model parallel group is not initialized"
     )
@@ -2633,6 +2681,15 @@ def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
 
 
 def get_dcp_group() -> GroupCoordinator:
+    # #631: the flip TP phase owns tokens under the flip DCP group. Checked
+    # before the spill route -- kv-session-offload is a flip arming guard,
+    # so the two can never be legitimately active together.
+    if _PHASE_FLIP_TP_ACTIVE:
+        assert _FLIP_DCP is not None, (
+            "phase-flip TP routing is active but the flip dcp group is not "
+            "initialized"
+        )
+        return _FLIP_DCP
     # kv-session-offload decoupling: route the (serial, per-forward) spill
     # forward to its own communicator. Falls back to _DCP when decoupling is
     # off (_DCP_SPILL is None) or outside a spill forward -> byte-identical.
@@ -2684,6 +2741,16 @@ _PP: Optional[GroupCoordinator] = None
 
 
 def get_pp_group() -> GroupCoordinator:
+    # #631: under flip TP routing the pp axis is trivial (pp_size=1); the
+    # flip pp group keeps is_first_rank/is_last_rank and any send/recv
+    # bookkeeping consistent with that geometry instead of the primary
+    # 3-stage pipeline's.
+    if _PHASE_FLIP_TP_ACTIVE:
+        assert _FLIP_PP is not None, (
+            "phase-flip TP routing is active but the flip pp group is not "
+            "initialized"
+        )
+        return _FLIP_PP
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
@@ -3669,7 +3736,8 @@ def destroy_model_parallel():
     _DCP_SPILL = None
     _DCP_SPILL_ACTIVE = False
 
-    global _FLIP_TP, _FLIP_DCP, _FLIP_PP
+    global _FLIP_TP, _FLIP_DCP, _FLIP_PP, _PHASE_FLIP_TP_ACTIVE
+    _PHASE_FLIP_TP_ACTIVE = False
     if _FLIP_TP:
         _FLIP_TP.destroy()
     _FLIP_TP = None

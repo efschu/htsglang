@@ -460,6 +460,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         dual_group_plan: Optional[Any] = None,
         dual_group_lane_id: int = 0,
         dual_group_lane_target_model: Optional[Any] = None,
+        is_phase_flip_tp_stack: bool = False,
     ):
         # Multi-group runtime (#274): this runner is an in-process LANE over
         # the host runner's weight bytes (dual_group_lane.py). Rank-local by
@@ -482,6 +483,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if is_dual_group_lane and not is_draft_worker:
             raise ValueError(
                 "A dual-group lane runner must be constructed with "
+                "is_draft_worker=True (the existing secondary-runner gates)."
+            )
+        # #631 Route A: this runner is the SECONDARY (TP decode) stack of the
+        # phase flip -- the full target model rebuilt under the flip group
+        # set's geometry, beside the primary PP stack. Like the lane, it
+        # rides the is_draft_worker secondary-runner gates (no distributed
+        # re-init, no process-global installs); flip-specific deviations are
+        # gated on is_phase_flip_tp_stack.
+        self.is_phase_flip_tp_stack = is_phase_flip_tp_stack
+        if is_phase_flip_tp_stack and not is_draft_worker:
+            raise ValueError(
+                "A phase-flip TP-stack runner must be constructed with "
                 "is_draft_worker=True (the existing secondary-runner gates)."
             )
 
@@ -815,8 +828,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # unguarded global of this family, DESIGN_121 §1.4): a lane runner
         # constructing after the serving rank would silently replace the
         # resident offloader mid-flight. The lane computes with the resident
-        # weights and needs no offloader of its own.
-        if not self.is_dual_group_lane:
+        # weights and needs no offloader of its own. Same guard for the #631
+        # phase-flip TP stack: it builds AFTER the primary PP stack in the
+        # same process and must not replace the primary's offloader.
+        if not self.is_dual_group_lane and not self.is_phase_flip_tp_stack:
             set_offloader(
                 create_offloader_from_server_args(server_args, dp_rank=dp_rank)
             )
@@ -1405,6 +1420,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             getattr(cfg, phase).backend = Backend.DISABLED
 
+    @property
+    def is_phase_flip_pp_stack(self) -> bool:
+        """#631: True for the PRIMARY (PP prefill) stack of a phase-flip
+        boot. False on every non-flip boot (default path untouched), on the
+        flip's own TP stack, and on any draft/lane secondary runner."""
+        return (
+            getattr(self.server_args, "enable_phase_flip", False)
+            and not self.is_draft_worker
+            and not self.is_phase_flip_tp_stack
+        )
+
     @time_startup_latency(name="cuda_graph_capture")
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
@@ -1412,6 +1438,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Spec draft runners pass capture_decode_cuda_graph=False
         because they capture their own decode-style graphs separately.
         """
+
+        # #631 operator pin 2, STRUCTURAL: the phase flip's PP stack captures
+        # NO graphs at all -- it runs eager prefill exactly like the measured
+        # #625 recipe, and PP decode never runs in steady state (3.6x worse
+        # than TP decode; the whole point of the flip). The carve sits BEFORE
+        # the plan harmonization collective and is rank-uniform (the flag is
+        # boot-arg-uniform), so no rank ever waits in a collective the others
+        # skipped. The capture entry points below additionally REFUSE for
+        # this stack, making a PP decode-graph set unreachable by
+        # construction, not merely configured off.
+        if self.is_phase_flip_pp_stack:
+            self.graph_shared_output = GraphSharedOutput.create_for_model_runner(
+                self
+            )
+            self.eager_runner = EagerRunner(self)
+            self.prefill_cuda_graph_runner = self.eager_runner
+            self.decode_cuda_graph_runner = self.eager_runner
+            self.graph_mem_usage = 0
+            logger.info(
+                "PHASE-FLIP PP stack: no CUDA graphs captured by "
+                "construction (eager prefill per the #625 recipe; decode "
+                "graphs belong exclusively to the TP stack)."
+            )
+            return
 
         # The graph plan must be a GROUP decision, not a per-rank one.
         self._harmonize_cuda_graph_plan()
@@ -3489,6 +3539,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_decode_cuda_graph(self):
         """Capture device graphs."""
+        if self.is_phase_flip_pp_stack:
+            raise RuntimeError(
+                "#631 pin 2 (structural): the phase-flip PP stack must not "
+                "capture a decode CUDA graph set; only the TP stack captures "
+                "decode graphs (once, against its fixed arena addresses). "
+                "Reaching this line means a new code path bypassed the "
+                "init_cuda_graphs carve."
+            )
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
 
@@ -3567,6 +3625,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize prefill CUDA graph runner."""
+        if self.is_phase_flip_pp_stack:
+            raise RuntimeError(
+                "#631 pin 2 (structural): the phase-flip PP stack must not "
+                "capture ANY CUDA graph; init_cuda_graphs routes it to the "
+                "EagerRunner before this method can be reached. Reaching "
+                "this line means a new code path bypassed that carve."
+            )
         self.prefill_cuda_graph_runner = None
 
         # Weightless-KV fast lane (#133): only the DECODE phase is captured, as

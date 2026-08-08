@@ -194,6 +194,61 @@ def pack_into_arena(
     return views
 
 
+def image_from_tensors(
+    named: Dict[str, torch.Tensor], layout: ArenaLayout, pin: bool = False
+) -> torch.Tensor:
+    """Host image of a layout built DIRECTLY from live tensors.
+
+    Same format as :func:`arena_image` (payload + 8-byte checksum), but
+    without requiring the tensors to be packed in a device arena first.
+    This is the boot-order enabler on VRAM-tight ranks: the PP layout is
+    snapshotted to host and its device originals freed BEFORE the second
+    layout loads and the arena is allocated -- packing both layouts
+    through the arena would need weights x3 resident at once (PP originals
+    + TP originals + arena), which does not fit the 5090
+    (14.7 + 12.4 + 14.7 GB > 31.8). Alignment-gap bytes are zeroed, so
+    the checksum is deterministic."""
+    total = layout.total_bytes + _CHECKSUM_BYTES
+    host = torch.zeros(total, dtype=torch.uint8, pin_memory=pin)
+    for slot in layout.slots:
+        t = named[slot.name]
+        seg = host[slot.offset : slot.offset + slot.nbytes]
+        view = torch.as_strided(seg.view(slot.dtype), slot.shape, slot.stride)
+        view.copy_(t)
+    payload = host[: layout.total_bytes]
+    csum = int(payload.to(torch.int64).sum().item()) if payload.numel() else 0
+    host[layout.total_bytes :] = (
+        torch.tensor([csum], dtype=torch.int64).view(torch.uint8)
+    )
+    return host
+
+
+def bind_arena_views(
+    layout: ArenaLayout,
+    arena: torch.Tensor,
+    rebind: Iterable[Tuple[str, torch.nn.Parameter]],
+) -> Dict[str, torch.Tensor]:
+    """Rebind parameters to arena views WITHOUT copying any bytes.
+
+    The pure-rebind sibling of :func:`pack_into_arena`: contents are
+    expected to arrive via :func:`arena_refill` (before or after -- the
+    views are address-stable either way). Used for the layout whose bytes
+    live in a host image while the OTHER layout occupies the arena."""
+    if layout.total_bytes > int(arena.numel()):
+        raise WeightsArenaError(
+            f"layout needs {layout.total_bytes} bytes but the arena holds "
+            f"{int(arena.numel())}"
+        )
+    views: Dict[str, torch.Tensor] = {}
+    for slot in layout.slots:
+        views[slot.name] = _slot_view(arena, slot)
+    for alias, canon in layout.aliases:
+        views[alias] = views[canon]
+    for name, param in rebind:
+        param.data = views[name]
+    return views
+
+
 def arena_image(
     arena: torch.Tensor, layout: ArenaLayout, pin: bool = False
 ) -> torch.Tensor:

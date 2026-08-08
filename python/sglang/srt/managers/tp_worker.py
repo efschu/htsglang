@@ -242,6 +242,7 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
+        is_phase_flip_tp_stack: bool = False,
     ):
         # Parse args
         self.server_args = server_args
@@ -255,6 +256,11 @@ class TpModelWorker(BaseTpWorker):
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
+        # #631: the phase flip's TP decode stack is the TARGET model rebuilt
+        # under the flip group set, constructed through the is_draft_worker
+        # secondary-runner gates -- but it is NOT a draft model: it loads the
+        # target checkpoint and its config is the target's.
+        self.is_phase_flip_tp_stack = is_phase_flip_tp_stack
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -363,19 +369,23 @@ class TpModelWorker(BaseTpWorker):
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
 
+        # #631: the phase-flip TP stack rides the draft-worker construction
+        # gates but is the TARGET model -- target path, target revision, not
+        # a draft config.
+        use_target_model = not self.is_draft_worker or self.is_phase_flip_tp_stack
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
             model_path=(
                 self.server_args.model_path
-                if not self.is_draft_worker
+                if use_target_model
                 else self.server_args.speculative_draft_model_path
             ),
             model_revision=(
                 self.server_args.revision
-                if not self.is_draft_worker
+                if use_target_model
                 else self.server_args.speculative_draft_model_revision
             ),
-            is_draft_model=self.is_draft_worker,
+            is_draft_model=self.is_draft_worker and not self.is_phase_flip_tp_stack,
             context_length=self.context_length,
         )
 
@@ -400,6 +410,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            is_phase_flip_tp_stack=self.is_phase_flip_tp_stack,
         )
 
     def _num_multi_layer_eagle_draft_runners(self) -> int:

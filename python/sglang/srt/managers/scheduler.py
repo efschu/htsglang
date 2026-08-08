@@ -1198,6 +1198,20 @@ class Scheduler(
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 
+        # #631 Route A: build the phase flip's SECONDARY (TP decode) stack
+        # beside the fully-constructed primary PP stack -- weights arena,
+        # TP pools, and the flip's ONLY decode-graph set (pin 2). Placed
+        # BEFORE the post-capture pool resize below so the resize sees the
+        # TP stack's VRAM as taken, never as free to grow into. Default
+        # path: flag off, no import, nothing built.
+        self.phase_flip_stacks = None
+        if self.server_args.enable_phase_flip:
+            from sglang.srt.managers.phase_flip_boot import (
+                build_phase_flip_tp_stack,
+            )
+
+            self.phase_flip_stacks = build_phase_flip_tp_stack(self)
+
         model_runner = self.tp_worker.model_runner
         # post_capture_kv_active gate: the #330 vram-dial lane also sets the
         # pool's post_capture_active (its buffers are VMM-backed), but its
