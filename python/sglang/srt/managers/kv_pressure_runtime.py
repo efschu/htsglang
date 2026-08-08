@@ -516,13 +516,18 @@ def default_collective_min(tp_cpu_group) -> Callable[[List[int]], List[int]]:
         bounded_collective,
     )
 
-    def _reduce(vals: List[int]) -> List[int]:
+    def _reduce(vals: List[int], timeout_s: Optional[float] = None) -> List[int]:
+        # timeout_s lets a CALLER bound its own join (#631(c): a rank that
+        # enters this reduction and finds no peers must be able to give up
+        # from inside, since every other deadline is checked before entry).
+        # None keeps the channel's own default.
         t = torch.tensor(vals, dtype=torch.int64)
         bounded_collective(
             lambda: dist.all_reduce(
                 t, op=dist.ReduceOp.MIN, group=tp_cpu_group, async_op=True
             ),
             "kv_pressure_ladder.consensus",
+            timeout_s=timeout_s,
         )
         return [int(v) for v in t.tolist()]
 

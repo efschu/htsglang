@@ -69,6 +69,16 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-FLIP"
 
+
+class PhaseFlipJoinTimeout(RuntimeError):
+    """#631(c): the consensus round did not assemble within the bound.
+
+    Caught inside ``on_round`` and turned into a loud abandonment; it never
+    escapes to the event loop, because the flip is optional and the parked
+    requests are not.
+    """
+
+
 PHASE_PP = "pp"
 PHASE_TP = "tp"
 
@@ -92,6 +102,12 @@ _DIR_OF_PHASE = {PHASE_PP: PP_TO_TP, PHASE_TP: TP_TO_PP}
 #: chunked prefill (exempt from parking, because a chunk that stops mid-way
 #: could never satisfy the quiescence predicate at all).
 DEFAULT_PARK_DEADLINE_S = 30.0
+# #631(c): how long a rank waits INSIDE the flip's consensus reduction for
+# the rest of the group. Generous on purpose -- a peer draining a long
+# prefill is normal and must not trip it. This is a wedge breaker, not a
+# latency control: without it, a rank that enters and finds no peers waits
+# for ever, because every other flip deadline is checked BEFORE entry.
+DEFAULT_JOIN_DEADLINE_S = 45.0
 
 #: Env override for the above. Non-positive disables the deadline, which
 #: restores the old unbounded wait -- available deliberately for debugging a
@@ -883,6 +899,8 @@ class PhaseFlipRuntime:
         self._phase = boot_phase
         self._interval = int(consensus_interval)
         self._collective_min = collective_min
+        self._join_deadline_s = DEFAULT_JOIN_DEADLINE_S
+        self.join_deadline_aborts = 0
         self._exchange = exchange
         self._pp = pp_pool_view
         self._tp = tp_pool_view
@@ -1035,7 +1053,24 @@ class PhaseFlipRuntime:
             [armed, ready, expired, self._epoch, dir_id, self._fp, *self._vec]
         )
         self.desync_checks += 1
-        reduced = self._collective_min(payload)
+        # #631(c): the join is a BOUNDED wait that abandons from INSIDE.
+        #
+        # Every deadline the flip had was evaluated BEFORE entering this
+        # reduction, so a rank that got in and found no peers waited for
+        # ever: measured 0 % GPU with the park deadline unreachable
+        # because the code that checks it sits above the blocking call.
+        # An unbounded wait in a coordination path is against this fork's
+        # canon (#610/#615/#653) for exactly this reason.
+        #
+        # On expiry: abandon LOUDLY, naming the ranks that never joined,
+        # disarm, and return to cycling. The policy is then free to
+        # re-arm, so residual skew costs a logged retry instead of a
+        # wedge. This is unconditional -- it backstops every delivery
+        # design, including one that is believed correct.
+        try:
+            reduced = self._join_bounded(payload)
+        except PhaseFlipJoinTimeout as exc:
+            return self._abandon_unjoined_flip(str(exc))
         if len(reduced) != len(payload):
             raise KvReshardError(
                 f"consensus channel returned {len(reduced)} values for a "
@@ -1109,6 +1144,63 @@ class PhaseFlipRuntime:
         if self._armed_at is None:
             return False
         return (self._clock() - self._armed_at) >= self._park_deadline_s
+
+    def _join_bounded(self, payload):
+        """#631(c): the consensus reduction under a deadline.
+
+        Raises ``PhaseFlipJoinTimeout`` when peers do not join in time,
+        instead of blocking for ever. The bound is deliberately generous
+        (``DEFAULT_JOIN_DEADLINE_S``): a slow peer draining a long
+        prefill is normal and must NOT trip it -- this is a wedge
+        breaker, not a latency control.
+        """
+        from sglang.srt.distributed.device_communicators.barlink_liveness import (
+            PeerLostError,
+        )
+
+        try:
+            return self._collective_min(payload, timeout_s=self._join_deadline_s)
+        except TypeError:
+            # An injected channel from a test/older builder that does not
+            # take a deadline. Do not silently drop the bound: the whole
+            # point is that this wait cannot be unbounded.
+            logger.warning(
+                "%s consensus channel takes no timeout; joining unbounded "
+                "(a wedge here cannot be broken from inside)",
+                LOG_PREFIX,
+            )
+            return self._collective_min(payload)
+        except PeerLostError as exc:
+            raise PhaseFlipJoinTimeout(
+                f"no group-wide join within {self._join_deadline_s:g}s "
+                f"({exc})"
+            ) from exc
+
+    def _abandon_unjoined_flip(self, why: str) -> None:
+        """Give up on a flip whose consensus round never assembled.
+
+        Same contract as ``_abandon_parked_flip``: disarm, log loudly,
+        return to serving, and NEVER raise -- the flip is optional, the
+        requests are not. The policy may re-arm at its next evaluation,
+        so a transient skew costs one logged retry.
+        """
+        direction = self._pending
+        self._pending = None
+        self._armed_at = None
+        self._last_hold_reason = None
+        self.join_deadline_aborts += 1
+        logger.error(
+            "%s FLIP ABANDONED (join): %s never assembled a consensus "
+            "round -- %s. Serving continues on the %s stack and no request "
+            "was touched; the arm is dropped and may be retried. A peer "
+            "that never joins is a peer that never reached its round hook: "
+            "look for a rank blocked upstream of it, not for a slow flip.",
+            LOG_PREFIX,
+            direction,
+            why,
+            self._phase,
+        )
+        return None
 
     def _abandon_parked_flip(self, ready: int) -> None:
         """Give up on an armed flip that never reached quiescence.
