@@ -6248,12 +6248,53 @@ class Scheduler(
         """Zero the attention KV data buffers during an idle flush (default,
         SGLANG_FLUSH_ZERO_KV=0 opts out), so a flushed server matches a
         freshly booted one bit-for-bit even if some kernel folds residual
-        bytes beyond the valid sequence region into its result."""
+        bytes beyond the valid sequence region into its result.
+
+        #631: with the phase flip there are TWO KV layouts and, since the
+        backing became exclusive, at most one of them holds physical pages.
+        Two consequences, both load-bearing:
+
+          * an UNBACKED pool must be skipped. Writing into it is a write to
+            unmapped VA -- cudaErrorIllegalAddress, which kills every rank.
+            Measured: a flush_cache issued in the TP decode phase died here,
+            because this method zeroed the scheduler's pool and the
+            scheduler's pool is the PP stack's, released while TP serves.
+          * the pool that IS backed must still be zeroed, and in the TP
+            phase that is the flip stack's, which the scheduler's allocator
+            does not reach. Zeroing only what the allocator can see would
+            leave the active layout un-zeroed and quietly break the
+            bit-for-bit property this exists for.
+
+        So the set is "every KV pool that currently holds pages", not "the
+        scheduler's pool".
+        """
         from sglang.srt.mem_cache.memory_pool import zero_kv_data_buffers
 
-        zeroed = zero_kv_data_buffers(self.token_to_kv_pool_allocator.get_kvcache())
+        zeroed = 0
+        skipped = 0
+        for pool in self._kv_pools_for_flush():
+            if not getattr(pool, "backing_is_resident", True):
+                skipped += 1
+                continue
+            zeroed += zero_kv_data_buffers(pool)
         current_platform.synchronize()
-        logger.info("flush: zeroed %d KV data buffers", zeroed)
+        logger.info(
+            "flush: zeroed %d KV data buffers (%d unbacked layout(s) skipped)",
+            zeroed,
+            skipped,
+        )
+
+    def _kv_pools_for_flush(self):
+        """The KV pools a flush may touch: the scheduler's, plus the phase
+        flip's TP stack when one was built. Residency is checked by the
+        caller -- this only enumerates."""
+        pools = [self.token_to_kv_pool_allocator.get_kvcache()]
+        stacks = getattr(self, "phase_flip_stacks", None)
+        if stacks is not None and getattr(stacks, "tp_worker", None) is not None:
+            flip_pool = stacks.tp_worker.model_runner.token_to_kv_pool
+            if flip_pool is not None and all(flip_pool is not p for p in pools):
+                pools.append(flip_pool)
+        return pools
 
     def _flush_scrub_free_memory(self):
         """SGLANG_FLUSH_SCRUB_FREE_MEMORY debug lever: after empty_cache,

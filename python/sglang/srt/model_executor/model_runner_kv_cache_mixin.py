@@ -3816,6 +3816,23 @@ class ModelRunnerKVCacheMixin:
                         self.post_capture_kv_active or _dial_initial_rows is not None
                     ),
                     vmm_commit_chunk_bytes=_dial_chunk,
+                    # #631: under the phase flip the two layouts' KV pools
+                    # must be able to hold physical pages EXCLUSIVELY --
+                    # otherwise both are resident for process life and each
+                    # can only be sized against half the per-rank budget.
+                    # This is the VA-backed allocation only; sizing is
+                    # unchanged (post-capture sizing stays gated off here).
+                    # Both stacks must qualify, and they answer to DIFFERENT
+                    # signals: derive_tp_stack_server_args deliberately
+                    # clears enable_phase_flip on the TP copy (it DESCRIBES
+                    # a TP stack, it does not enable a nested flip), so the
+                    # flag alone catches only the PP side and the TP pool
+                    # would come up unswappable -- which is exactly how this
+                    # first failed on metal.
+                    swappable_backing=bool(
+                        self.server_args.enable_phase_flip
+                        or getattr(self, "is_phase_flip_tp_stack", False)
+                    ),
                     **extra_args,
                 )
                 if _dial_initial_rows is not None:
