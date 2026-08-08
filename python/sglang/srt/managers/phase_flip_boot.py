@@ -81,6 +81,67 @@ def parse_flip_vector(server_args) -> List[int]:
     return vec
 
 
+def parse_flip_token_vector(server_args) -> List[int]:
+    """The KV TOKEN split for the TP decode phase.
+
+    Defaults to the flip vector, which is what the V1 one-vector rule
+    asked for -- but the two ratios optimise against different resources
+    and their optima do not coincide:
+
+      * the weight shard follows COMPUTE, so the 5090 takes the largest
+        share (30 of 64);
+      * the token split must follow each rank's REMAINING memory once its
+        weights are placed, and the rank with the biggest weight shard has
+        the LEAST left over.
+
+    Sizing KV with the compute vector therefore makes the most
+    compute-loaded rank the binding one, and the allocator's min-reduce
+    then drags every other rank down to its unit. Measured on this rig at
+    vector 30,17,17 (per-rank profiled capacity 12779 / 68661 / 30517
+    tokens):
+
+        rank 0: 12750 tok / 30 = unit  425   <- binds the group
+        rank 1: 68646 tok / 17 = unit 4038
+        rank 2: 30515 tok / 17 = unit 1795
+        -> global max_total_num_tokens 27200, ranks 1 and 2 left idle.
+
+    The token-proportional vector 7,39,18 reaches ~108480 tokens (4.0x)
+    out of the same physical memory. The server already computes and logs
+    that vector after profiling; this is the lane that lets an operator
+    act on it, via SGLANG_UNEVEN_TOKEN_VECTOR.
+
+    Unset -> the flip vector, byte-identical to the previous behaviour.
+    """
+    from sglang.srt import environ as _environ
+
+    raw = _environ.envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+    flip_vec = parse_flip_vector(server_args)
+    if not raw:
+        return flip_vec
+
+    try:
+        vec = [int(x) for x in str(raw).split(",")]
+    except ValueError as e:
+        raise PhaseFlipBootError(
+            f"SGLANG_UNEVEN_TOKEN_VECTOR={raw!r} is not a comma-separated "
+            f"list of integers"
+        ) from e
+    if len(vec) != len(flip_vec):
+        raise PhaseFlipBootError(
+            f"SGLANG_UNEVEN_TOKEN_VECTOR={raw!r} has {len(vec)} entries but "
+            f"the flip vector has {len(flip_vec)}. The token split is a "
+            f"per-rank ratio over the SAME ranks as the weight split, so "
+            f"the lengths must agree."
+        )
+    if any(x < 1 for x in vec):
+        raise PhaseFlipBootError(
+            f"SGLANG_UNEVEN_TOKEN_VECTOR={raw!r} has a non-positive entry. "
+            f"A rank with token ratio 0 would own no KV rows while still "
+            f"holding a weight shard, which the owner rule cannot express."
+        )
+    return vec
+
+
 # Fields the TP-stack copy overrides, and ONLY these (the #470 REACH
 # discipline: every context reader inside the build sees exactly these
 # values changed and nothing else). Pinned by test.
@@ -375,6 +436,7 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             "stack whose owner rule would silently fall back to even-modulo"
         )
     vec = parse_flip_vector(server_args)
+    tok_vec = parse_flip_token_vector(server_args)
     n = len(vec)
     world_rank = get_world_group().rank_in_group
     primary_runner = scheduler.tp_worker.model_runner
@@ -385,8 +447,21 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     # path) and its runtime reads are gated on its own cached tp_size=1 /
     # dcp_size=1. Step-6 watch item: any PP-phase code path that consults
     # the global plan with a non-rank-local size would be a bug HERE.
+    # The weight shard follows compute; the token split follows what each
+    # rank has left after its weights land. Same vector unless an operator
+    # overrides the token side (see parse_flip_token_vector).
     set_tp_partition_ratios(list(vec), families=None)
-    set_cp_token_ratios(list(vec))
+    set_cp_token_ratios(list(tok_vec))
+    if tok_vec != vec:
+        logger.info(
+            "%s KV token split %s differs from the weight shard split %s "
+            "(SGLANG_UNEVEN_TOKEN_VECTOR). The weight shard follows "
+            "compute; the token split follows each rank's memory left "
+            "after its weights land.",
+            LOG_PREFIX,
+            tok_vec,
+            vec,
+        )
 
     # 2. Snapshot the PP checkpoint weights to host, free device originals
     # (VRAM ledger: PP originals + TP originals + arena never coexist).
@@ -427,20 +502,46 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             )
 
             # 4. Arena: sized max(both layouts), fixed for process life.
+            #
+            # SNAPSHOT-THEN-ALLOCATE, exactly as step 2 does for the PP
+            # layout. Packing the live TP originals straight into a fresh
+            # arena holds BOTH at once -- originals + arena -- and that
+            # transient, not any runtime shape, is what sets the per-rank
+            # VRAM budget for the whole process life. Measured on this rig
+            # before the reorder (torch allocated_peak_bytes per rank):
+            #
+            #   rank 0 (5090):  14.70 GiB weights + 14936 MiB arena = 29.27
+            #   rank 1 (3080a):  8.91 GiB weights +  7924 MiB arena = 16.64
+            #   rank 2 (3080b):  8.91 GiB weights +  9115 MiB arena = 17.81
+            #
+            # The peak never recurs at runtime -- serving at
+            # max_running_requests 4 / chunked_prefill_size 2048 stays
+            # ~7 GiB below it -- but because the corridor floor is a
+            # CONTINUOUS minimum, the boot spike alone forced
+            # --rank-gpu-memory-mib down to roughly half of each card, and
+            # every MiB of it was permanent KV pool given away.
+            #
+            # Snapshotting first makes the peak max(originals, arena)
+            # instead of their sum. It costs no extra host RAM: the host
+            # image was already built one line later (arena_image), so
+            # this is a reordering, not a new allocation. image_from_tensors
+            # exists precisely for this and says so in its docstring.
             tp_named = checkpoint_param_dict(tp_worker.model_runner.model)
             layout_tp = plan_arena_layout(tp_named)
+            image_tp = snapshot_and_free(tp_named, layout_tp, pin=True)
+            if device == "cuda":
+                torch.cuda.empty_cache()
             arena = allocate_arena(
                 max(layout_pp.total_bytes, layout_tp.total_bytes),
                 tp_worker.model_runner.device,
             )
-            pack_into_arena(
-                tp_named, layout_tp, arena, rebind=list(tp_named.items())
+            # Pure rebind, then one contiguous refill from the host image;
+            # arena_refill verifies the checksum on the arena's device
+            # after the copy.
+            bind_arena_views(
+                layout_tp, arena, rebind=list(tp_named.items())
             )
-            if device == "cuda":
-                torch.cuda.empty_cache()
-            from sglang.srt.model_executor.weights_arena import arena_image
-
-            image_tp = arena_image(arena, layout_tp, pin=True)
+            arena_refill(arena, layout_tp, image_tp)
 
             # 4b. The TP-phase draft worker (#631 speculation slice).
             # Constructed AFTER the arena is packed, mirroring the boot

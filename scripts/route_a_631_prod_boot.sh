@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# #631 Route A PRODUCTION boot on port 30030.
+#
+# This is route_a_631_flip_boot.sh (the accepted acceptance recipe, commit
+# 89bd1c569f / FINAL_631.md) plus the serving-facing surface and the
+# environment carried over from the previous production recipe
+# /root/bin/start-serving-30030.sh.
+#
+# ONE instance, THREE ranks: PP=3 prefill (stage ratio 2,1,1) -> live flip
+# -> TP=3 decode (vector 30,17,17) with NEXTN speculation. The flip is
+# armed by POST /phase_flip; there is no automatic cadence.
+#
+# DEVICE SELECTION IS BY UUID, NEVER BY NVML INDEX (measured drift on this
+# rig moved the 5090 between indices across boots). The 5090 is ordered
+# FIRST in CUDA_VISIBLE_DEVICES; --rank-gpu-id indexes INTO the visible
+# set, which is ordering-independent.
+#
+# CORRIDOR: RANK_MIB 16150,10550,10550 is the corridor-confirmed budget
+# (FINAL_631 §1, boot 23: minimum NVML free 2338/1221/1130 MiB at 100 ms
+# sampling through boot, flip and a speculating decode). The higher
+# 16400,10750,10750 used for the acceptance ladder breached the 1024 MiB
+# corridor at the boot peak. Do not raise without re-sampling.
+set -euo pipefail
+
+WT="${WT:-/spinning/wt-631-routea}"
+PY="${PY:-/spinning/htsglang-gpu/.venv/bin/python}"
+MODEL="${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8}"
+PORT="${PORT:-30030}"
+RANK_MIB="${RANK_MIB:-16150,10550,10550}"
+CTX="${CTX:-262144}"
+MAX_RUNNING="${MAX_RUNNING:-4}"
+MAMBA_SLOTS="${MAMBA_SLOTS:-20}"
+LOGDIR="${LOGDIR:-/tmp/route-a-631}"
+LOG="${SERVING_LOG:-/spinning/serving-30030.boot.log}"
+mkdir -p "$LOGDIR"
+
+# The production stop guard. Same contract as start-serving-30030.sh: while
+# the marker exists, production must not be restored.
+if [ -f /spinning/PRODUCTION_STOPPED ]; then
+  echo "REFUSED: production is stopped by operator order." >&2
+  cat /spinning/PRODUCTION_STOPPED >&2
+  exit 3
+fi
+
+# Single-instance guard (the 19:44 Bar1Failed was a second boot racing a
+# live instance for the aperture).
+if pgrep -f "sglang.launch_server.*--port $PORT" >/dev/null 2>&1; then
+  echo "REFUSE: a serving instance for port $PORT is already running." >&2
+  echo "Read /spinning/gpu-arb/holder for the owner; stop it with" >&2
+  echo "kill -TERM -- -<pgid> before rebooting." >&2
+  exit 1
+fi
+
+export PYTHONPATH="$WT/python"
+export LD_LIBRARY_PATH="/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
+export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+# The flip's TP phase token-shards KV under the WEIGHTED owner rule; the
+# boot builder REFUSES without this pair (phase_flip_boot).
+export SGLANG_UNEVEN_DCP=1
+export SGLANG_UNEVEN_DCP_WEIGHTED=1
+# Mixed 5090+3080 group is the CONFIGURATION, not a symptom.
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+
+# --- decode-phase KV token split -------------------------------------------
+# The flip's TP vector 30,17,17 drives BOTH the weight shard plan and, by
+# default, the KV token split. Those two want different ratios: the weight
+# shard follows compute, while the token split must follow each rank's
+# REMAINING memory after its weights are placed. Sizing KV with the compute
+# vector makes the most compute-loaded rank the binding one and min-reduces
+# the whole pool to its unit:
+#
+#   rank 0 local capacity 12750 tok / ratio 30 = unit 425  <- binds
+#   rank 1 local capacity 68646 tok / ratio 17 = unit 4038
+#   rank 2 local capacity 30515 tok / ratio 17 = unit 1795
+#   -> global max_total_num_tokens 27200, with ranks 1 and 2 left idle.
+#
+# The server computes the token-proportional vector itself and prints it as
+# a restart hint; 7,39,18 lifts the same physical memory to ~108480 tokens
+# (4.0x) with no extra VRAM, by giving each rank a share of the token
+# vector matched to what it can actually hold.
+export SGLANG_UNEVEN_TOKEN_VECTOR="${SGLANG_UNEVEN_TOKEN_VECTOR:-7,39,18}"
+
+# --- transport ---------------------------------------------------------------
+# barlink is the standing default transport: defects are fixed forward,
+# never worked around by falling back to NCCL. Note that the #631
+# acceptance boots ran with SGLANG_BARLINK UNSET, i.e. on NCCL -- the
+# barlink build-window lines in those logs come from build_window_enabled()
+# which defaults True independently of the transport, so they do not
+# evidence barlink. Production therefore runs a transport the acceptance
+# ladder did not exercise; that is deliberate (parity with the previous
+# production decode optimum) and is the reason BARLINK=0 must stay
+# explicitly reachable for an A/B rather than by accident.
+BARLINK="${BARLINK:-1}"
+if [ "$BARLINK" = "1" ]; then
+  if [ ! -e /dev/dmabuf_holder ]; then
+    echo "REFUSE: SGLANG_BARLINK_TRANSPORT=bar1 requested but" >&2
+    echo "/dev/dmabuf_holder is missing. Run /root/smallbar_reload.sh on the" >&2
+    echo "Proxmox host (never silent-degrade to the device sub-transport)." >&2
+    exit 1
+  fi
+  export SGLANG_BARLINK=1
+  export SGLANG_BARLINK_TRANSPORT=bar1
+  # Interim #603b mitigation: 5x collective deadline covers a full cold
+  # flashinfer sampling JIT build. The abort check stays armed.
+  export SGLANG_BARLINK_BAR1_CAP_CYCLES=300000000000
+
+  # --- BAR1 aperture budget (REQUIRED with --enable-phase-flip) ------------
+  # The phase flip DOUBLES the number of wire-carrying process groups: on
+  # top of world:0 and pp:0 it builds flip_tp:0 and flip_dcp:0 (groups of
+  # world_size 1 -- here tp:0/dcp:0 in the PP phase and flip_pp:0 in the TP
+  # phase -- short-circuit and take no window). The stock per-group default
+  # of 96 MiB was sized for the non-flip topology and does not fit four
+  # groups into this card's aperture:
+  #
+  #   BAR1 free per NVML 248 MiB - reserve 32 MiB = 216 MiB usable, versus
+  #   4 x 96 = 384 MiB requested. Measured consequence (boot 15:26:40Z):
+  #   world:0 96, pp:0 96, flip_tp:0 clipped to 24, flip_dcp:0 clipped to
+  #   0 -> Bar1Failed, all three ranks dead at group build.
+  #
+  # The 3080s' 256 MiB gross aperture is the binding constraint (window_for
+  # takes the minimum across the group), not the 5090's.
+  #
+  # So the windows are budgeted by the payload each group actually carries,
+  # rather than left on a one-size default:
+  #   pp:0       chunked prefill activations, chunked_prefill_size 2048 x
+  #              hidden x 2 B ~ 20 MiB per hop -- the LARGEST payload on the
+  #              rig, and PP send/recv is the prefill hot path. Keeps the
+  #              full 96 MiB (largest payload ~24 MiB at that window).
+  #   flip_tp:0  TP decode all_reduce. Decode payloads are bs x hidden x
+  #              2 B, i.e. tens of KiB at --max-running-requests 4; 48 MiB
+  #              is already far above need and leaves room for a wider bs.
+  #   flip_dcp:0 decode-phase KV all_to_all under the weighted owner rule,
+  #              also decode-sized.
+  #   world:0    control-plane broadcasts (default below).
+  # Total 24 + 96 + 48 + 32 = 200 MiB against 216 MiB usable.
+  #
+  # NOTE these are EXPLICIT windows, so a shortfall REFUSES at group build
+  # with the arithmetic in hand instead of silently clipping to a number
+  # nobody chose. That is the intended contract; if a future topology adds
+  # a group, this budget must be recomputed, not widened by reflex.
+  export SGLANG_BARLINK_BAR1_WINDOW_MIB="${SGLANG_BARLINK_BAR1_WINDOW_MIB:-24}"
+  export SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0="${SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0:-96}"
+  export SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0="${SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0:-48}"
+  export SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0="${SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0:-32}"
+else
+  export SGLANG_BARLINK=0
+  unset SGLANG_BARLINK_TRANSPORT || true
+  echo "NOTE: barlink DISABLED for this boot (NCCL transport), BARLINK=0." >&2
+fi
+
+# Census cadence back to the near-free default (the cadence-1 diagnostic
+# window is closed, #650).
+export SGLANG_COLLECTIVE_CENSUS_INTERVAL="${SGLANG_COLLECTIVE_CENSUS_INTERVAL:-50}"
+# #581 standing falsifier: ack_write must stay ~0 in idle.
+export SGLANG_MAMBA_PIN_TRACE="${SGLANG_MAMBA_PIN_TRACE:-50}"
+# #605 VRAM flight-recorder marks are permanently armed (budgets computed,
+# not guessed).
+export SGLANG_VRAM_FLIGHT_DIR="${SGLANG_VRAM_FLIGHT_DIR:-/spinning/flight_605}"
+
+# --- resolve cards by NAME -> UUID, 5090 FIRST -------------------------------
+BIG_UUID=""; SMALL_UUID=()
+while IFS=, read -r _idx name uuid _tot; do
+    name="$(echo "$name" | xargs)"; uuid="$(echo "$uuid" | xargs)"
+    case "$name" in *5090*) BIG_UUID="$uuid" ;; *3080*) SMALL_UUID+=("$uuid") ;; esac
+done < <(nvidia-smi --query-gpu=index,name,uuid,memory.total --format=csv,noheader)
+[[ -n "$BIG_UUID" && ${#SMALL_UUID[@]} -ge 2 ]] || {
+    echo "FATAL: expected one 5090 and two 3080s from NVML" >&2; exit 1; }
+
+# --- boot provenance ---------------------------------------------------------
+: > "$LOG"
+BOOT_COMMIT="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+BOOT_BRANCH="$(git -C "$WT" branch --show-current 2>/dev/null || echo detached)"
+BOOT_DIRTY="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+export SGLANG_BOOT_COMMIT="$BOOT_COMMIT"
+{
+  printf '=== BOOT PROVENANCE %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf 'tree=%s commit=%s branch=%s dirty_files=%s\n' \
+         "$WT" "$BOOT_COMMIT" "$BOOT_BRANCH" "$BOOT_DIRTY"
+  printf 'barlink=%s transport=%s rank_mib=%s ctx=%s max_running=%s\n' \
+         "$BARLINK" "${SGLANG_BARLINK_TRANSPORT:-nccl}" "$RANK_MIB" "$CTX" "$MAX_RUNNING"
+  printf 'cuda:0=5090=%s\ncuda:1=3080a=%s\ncuda:2=3080b=%s\n' \
+         "$BIG_UUID" "${SMALL_UUID[0]}" "${SMALL_UUID[1]}"
+} >> "$LOG"
+
+cd "$WT"
+CUDA_VISIBLE_DEVICES="$BIG_UUID,${SMALL_UUID[0]},${SMALL_UUID[1]}" \
+setsid "$PY" -m sglang.launch_server \
+    --model-path "$MODEL" --trust-remote-code \
+    --served-model-name Qwen3.6-27B \
+    --tp-size 1 --pp-size 3 \
+    --pp-stage-ratio 2,1,1 \
+    --rank-gpu-id 0,1,2 \
+    --rank-gpu-memory-mib "$RANK_MIB" \
+    --enable-phase-flip \
+    --phase-flip-tp-vector 30,17,17 \
+    --disable-overlap-schedule \
+    --kv-cache-dtype fp8_e4m3 --context-length "$CTX" \
+    --max-running-requests "$MAX_RUNNING" \
+    `# The GDN/mamba state pool pins CONCURRENCY, not token capacity: the` \
+    `# auto-sized pool gave 5 slots and the admission ratio (radix cache` \
+    `# on) needs 5 per request, so max_running_requests was silently` \
+    `# reduced 4 -> 1 and decode ran bs=1. Size it for the real bs.` \
+    --max-mamba-cache-size "$MAMBA_SLOTS" \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
+    --chat-template-default-kwargs '{"preserve_thinking": true}' \
+    --enable-cache-report \
+    --enable-metrics --host 127.0.0.1 --port "$PORT" \
+    "$@" >> "$LOG" 2>&1 &
+echo "serving pgid $!  log $LOG"

@@ -27,6 +27,7 @@ The load-bearing gates, mapped to DESIGN_631 sections 3.3/3.6a/5.2:
 """
 
 import dataclasses
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -47,6 +48,8 @@ from sglang.srt.managers.phase_flip_boot import (
     assert_row_schema_compatible,
     checkpoint_param_dict,
     derive_tp_stack_server_args,
+    parse_flip_token_vector,
+    parse_flip_vector,
     snapshot_and_free,
 )
 from sglang.srt.model_executor.weights_arena import (
@@ -516,3 +519,55 @@ class TestTpScopeEnvMask(CustomTestCase):
         if "inside" in seen:
             self.assertIsNone(seen["inside"], "env var visible inside scope")
         self.assertEqual(seen["after"], "32,16,16", "env var not restored")
+
+
+class TestFlipTokenVector(CustomTestCase):
+    """The KV token split may differ from the weight shard split.
+
+    Sizing KV with the compute vector lets the most compute-loaded rank
+    bind the allocator's min-reduce and drags the whole pool down to its
+    unit (measured on the rig: 27200 tokens at 30,17,17 against a
+    token-proportional 108480 at 7,39,18, same physical memory).
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR")
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
+        else:
+            os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = self._saved
+
+    def test_unset_is_the_flip_vector(self):
+        """Backward compatibility: unset must change nothing at all."""
+        os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
+        args = _flip_args()
+        self.assertEqual(
+            parse_flip_token_vector(args), parse_flip_vector(args)
+        )
+
+    def test_env_overrides_only_the_token_split(self):
+        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "7,39,18"
+        args = _flip_args()
+        self.assertEqual(parse_flip_token_vector(args), [7, 39, 18])
+        # The weight shard must be untouched -- that is the whole point of
+        # separating them.
+        self.assertEqual(parse_flip_vector(args), [30, 17, 17])
+
+    def test_length_mismatch_refuses(self):
+        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "7,39"
+        with self.assertRaises(PhaseFlipBootError):
+            parse_flip_token_vector(_flip_args())
+
+    def test_zero_entry_refuses(self):
+        """A rank owning no KV rows while still holding a weight shard is
+        not expressible by the owner rule."""
+        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "0,39,18"
+        with self.assertRaises(PhaseFlipBootError):
+            parse_flip_token_vector(_flip_args())
+
+    def test_garbage_refuses(self):
+        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "7,not-a-number,18"
+        with self.assertRaises(PhaseFlipBootError):
+            parse_flip_token_vector(_flip_args())
