@@ -63,6 +63,11 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    # #631: returns a PhaseFlipReqInput when the automatic phase policy
+    # wants a flip, else None. Optional and defaulted so every existing
+    # construction (and every test that builds this receiver) is unchanged
+    # and the default path costs one `is None` compare per poll.
+    phase_policy_hook: Optional[Callable[[], Any]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -83,6 +88,21 @@ class SchedulerRequestReceiver:
                 return []
 
         recv_reqs = self._pull_raw_reqs()
+
+        # #631 automatic phase policy. This is the ONE seam that serves
+        # both layouts: _pull_raw_reqs returns a list exactly on the rank
+        # that owns the intake -- pp_rank 0 in the PP phase, tp_rank 0 in
+        # the TP phase (the cutover swaps ps, so the same physical rank 0
+        # is the origin either way) -- and None on every rank that instead
+        # RECEIVES the stream. Injecting here therefore rides whichever
+        # distribution is live: the P2P stage chain under event_loop_pp,
+        # the TP broadcast under event_loop_normal. Both are the paths the
+        # manual POST /phase_flip already uses, so an automatic flip is
+        # delivered exactly like a human one, and no rank can arm alone.
+        if recv_reqs is not None and self.phase_policy_hook is not None:
+            policy_req = self.phase_policy_hook()
+            if policy_req is not None:
+                recv_reqs.append(policy_req)
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
