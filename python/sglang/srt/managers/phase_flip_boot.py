@@ -312,7 +312,17 @@ class PhaseFlipStacks:
     layout_tp: ArenaLayout
     image_pp: torch.Tensor
     image_tp: torch.Tensor
+    #: The WEIGHT shard vector (--phase-flip-tp-vector): how the TP layout
+    #: splits heads/compute across the ranks.
     vector: Tuple[int, ...]
+    #: The KV TOKEN vector: how the TP layout splits token ROWS across the
+    #: ranks under the weighted owner rule. Equal to :attr:`vector` unless
+    #: SGLANG_UNEVEN_TOKEN_VECTOR overrides it (parse_flip_token_vector).
+    #: These are NOT interchangeable -- the owner rule and the flip's
+    #: transition plan are token-space quantities and must use THIS one,
+    #: or rows are routed under a different split than the pools were
+    #: sized for.
+    token_vector: Tuple[int, ...]
     #: The speculative draft worker for the TP DECODE phase, or None when
     #: the instance runs without speculation. Built on the TP stack and
     #: swapped into the scheduler at cutover (#631); it never participates
@@ -647,5 +657,6 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         image_pp=image_pp,
         image_tp=image_tp,
         vector=tuple(vec),
+        token_vector=tuple(tok_vec),
         draft_worker=draft_worker,
     )

@@ -404,7 +404,13 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
 
         # 2. Owner rule: the vector is boot-constant; refresh the bounds
         # consumers so the TP backends read the (re)installed vector.
-        set_cp_token_ratios(list(stacks.vector))
+        # This is a TOKEN-space quantity, so it must be the token vector,
+        # not the weight shard vector. They are equal unless
+        # SGLANG_UNEVEN_TOKEN_VECTOR overrides the token side; reinstalling
+        # the weight vector here would leave the owner rule splitting rows
+        # under a different vector than the pools were SIZED under, which
+        # is an out-of-bounds slot id, not a slow path.
+        set_cp_token_ratios(list(stacks.token_vector))
         refresh_all_owner_bounds()
 
         # 3. Scheduler topology snapshot (frozen dataclass -> new instance).
@@ -694,7 +700,11 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         rank=world.rank_in_group,
         layer_map=layer_map,
         n_layers=len(full_ids),
-        tp_vector=stacks.vector,
+        # build_phase_flip_transition documents this as "the weighted DCP
+        # token vector of the TP layout" -- which rank OWNS which rows, a
+        # token-space question. The weight shard vector answers a different
+        # one.
+        tp_vector=stacks.token_vector,
         boot_phase=PHASE_PP,
         consensus_interval=int(
             getattr(server_args, "kv_reshard_consensus_interval", 8)
