@@ -1,0 +1,72 @@
+{
+  "boot": {
+    "url": "http://127.0.0.1:30023"
+  },
+  "phase_before": null,
+  "pp_prefill": {
+    "phase": "pp_prefill",
+    "lengths": {
+      "2048": {
+        "ms_median": 472.5,
+        "ms_all": [
+          471.1,
+          472.5,
+          472.7
+        ],
+        "tok_s": 4334.6
+      },
+      "8192": {
+        "ms_median": 1101.2,
+        "ms_all": [
+          1099.7,
+          1101.2,
+          1102.9
+        ],
+        "tok_s": 7439.4
+      },
+      "32768": {
+        "ms_median": 4621.8,
+        "ms_all": [
+          4604.8,
+          4621.8,
+          4637.2
+        ],
+        "tok_s": 7089.8
+      }
+    }
+  },
+  "flush_ms": 7.9,
+  "flip_pp_to_tp": {
+    "direction": "pp_to_tp",
+    "arm_rpc_ms": 1.7,
+    "commit_ms_from_arm": 1585.8,
+    "committed": true,
+    "response": {
+      "success": true,
+      "message": "phase flip armed: pp_to_tp (source rpc); commits at the next consensus boundary where every rank is quiescent, or is abandoned after 30s parked"
+    }
+  },
+  "phase_after_flip": null,
+  "tp_decode": {
+    "ttft_ms": 295.9,
+    "wall_ms": 296.0,
+    "completion_tokens": 1,
+    "decode_tok_s": null,
+    "spec_accept_length": null,
+    "spec_accept_rate": null,
+    "spec_verify_ct": null,
+    "phase": "tp_decode",
+    "prompt_tokens": 512
+  },
+  "flip_tp_to_pp": {
+    "direction": "tp_to_pp",
+    "arm_rpc_ms": 1.8,
+    "commit_ms_from_arm": 1371.7,
+    "committed": true,
+    "response": {
+      "success": true,
+      "message": "phase flip armed: tp_to_pp (source rpc); commits at the next consensus boundary where every rank is quiescent, or is abandoned after 30s parked"
+    }
+  },
+  "phase_after_return": null
+}

@@ -1,0 +1,11 @@
+{
+  "ttft_ms": 295.3,
+  "wall_ms": 6764.1,
+  "completion_tokens": 512,
+  "decode_tok_s": 78.99,
+  "spec_accept_length": null,
+  "spec_accept_rate": null,
+  "spec_verify_ct": null,
+  "phase": "tp_decode",
+  "prompt_tokens": 512
+}
