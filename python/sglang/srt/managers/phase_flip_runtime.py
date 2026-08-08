@@ -108,6 +108,12 @@ DEFAULT_PARK_DEADLINE_S = 30.0
 # latency control: without it, a rank that enters and finds no peers waits
 # for ever, because every other flip deadline is checked BEFORE entry.
 DEFAULT_JOIN_DEADLINE_S = 45.0
+# #631 option 2(b): how long an armed rank polls for the whole group to
+# reach the flip entry before giving up. Generous: a peer finishing a long
+# prefill chunk is normal. This bound is PRE-ENTRY and therefore legal --
+# abandoning a poll costs nothing, whereas abandoning an ENTERED
+# all_reduce aborts every rank (see the withdrawn (c)).
+DEFAULT_PRESENCE_DEADLINE_S = 60.0
 
 #: Env override for the above. Non-positive disables the deadline, which
 #: restores the old unbounded wait -- available deliberately for debugging a
@@ -671,6 +677,7 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         get_world_group,
     )
     from sglang.srt.managers.kv_pressure_runtime import default_collective_min
+    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
     from sglang.srt.managers.kv_reshard import _dist_exchange
 
     stacks = scheduler.phase_flip_stacks
@@ -727,6 +734,13 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         ),
         park_deadline_s=park_deadline_s(),
         collective_min=default_collective_min(flip_tp.cpu_group),
+        # #631 option 2(b): the pollable entry gate, and the non-blocking
+        # pump that delivers this rank's arm forward while it waits.
+        presence=PhaseFlipPresence(
+            n_ranks=world.world_size,
+            rank=world.rank_in_group,
+        ),
+        pump_fn=getattr(scheduler, "pp_pump_send_req_work", None),
         exchange=_dist_exchange(flip_tp.device_group, pp_view.device),
         pp_pool_view=pp_view,
         tp_pool_view=tp_view,
@@ -823,6 +837,9 @@ class PhaseFlipRuntime:
         boot_phase: str = PHASE_PP,
         consensus_interval: int = 8,
         park_deadline_s: float = DEFAULT_PARK_DEADLINE_S,
+        presence=None,
+        pump_fn: Optional[Callable[[], None]] = None,
+        presence_deadline_s: float = DEFAULT_PRESENCE_DEADLINE_S,
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         exchange: Optional[
             Callable[[Dict[int, torch.Tensor], Dict[int, int]], Dict[int, torch.Tensor]]
@@ -899,6 +916,12 @@ class PhaseFlipRuntime:
         self._phase = boot_phase
         self._interval = int(consensus_interval)
         self._collective_min = collective_min
+        # #631 option 2(b): the pollable entry gate.
+        self._presence = presence
+        self._pump_fn = pump_fn
+        self._presence_deadline_s = float(presence_deadline_s)
+        self._presence_wait_started = None
+        self.presence_timeouts = 0
         self._join_deadline_s = DEFAULT_JOIN_DEADLINE_S
         self.join_deadline_aborts = 0
         self._exchange = exchange
@@ -1053,6 +1076,14 @@ class PhaseFlipRuntime:
             [armed, ready, expired, self._epoch, dir_id, self._fp, *self._vec]
         )
         self.desync_checks += 1
+        # #631 THE ENTRY GATE. Do not enter the blocking reduction until
+        # every rank is provably AT this entry. See _await_group_presence:
+        # the wait is non-blocking and bounded BEFORE entry, which is the
+        # only side of the entry where a bound is implementable at all.
+        if self._pending is not None:
+            gate = self._await_group_presence()
+            if gate is not True:
+                return gate  # None (keep polling) or an abandonment
         # #631(c) WITHDRAWN -- measured fatal, kept as a warning.
         #
         # Bounding this join and abandoning from inside CANNOT work on a
@@ -1140,6 +1171,110 @@ class PhaseFlipRuntime:
         if self._armed_at is None:
             return False
         return (self._clock() - self._armed_at) >= self._park_deadline_s
+
+    def _await_group_presence(self):
+        """#631 option 2(b): the non-blocking armed wait, and the gate.
+
+        Returns True when every rank is at the entry and the caller may
+        safely enter the blocking reduction; None to keep polling on later
+        rounds; or the result of an abandonment when the pre-entry bound
+        expires.
+
+        NOTHING IN THIS LOOP BLOCKS, which is the whole point -- it is the
+        construction that satisfies the design law (no rank blocks on any
+        channel while a peer may be in a different one). Concretely, per
+        iteration this rank only:
+          * announces its own presence for this epoch (a file create),
+          * PUMPS its outstanding arm-forward -- progresses it
+            non-blockingly, never a blocking commit. A blocking commit
+            here is corpse B' (boot 13): rank 0 blocked in
+            _pp_commit_comm_work while its peers sat in the hidden-states
+            exchange, because "the peer is waiting for the arm" is simply
+            not true -- it may be in another channel entirely,
+          * polls peers' flags (file existence),
+          * sleeps briefly.
+
+        Once all flags are up, entering is safe by CONSTRUCTION rather
+        than by argument: every rank that will participate is in this
+        same loop -- not blocked elsewhere -- flags are monotone so every
+        rank observes the same all-ready fact, and each rank's own chain
+        send was pumped to completion before it entered.
+
+        The bound is PRE-ENTRY and therefore legal, unlike the withdrawn
+        (c): abandoning a poll costs nothing, because nothing has been
+        entered and no peer is owed anything. Abandoning an ENTERED
+        all_reduce aborts the whole group, which is why that bound was
+        withdrawn and pinned.
+        """
+        if self._presence is None:
+            # No presence channel wired (unit tests, or a builder that
+            # predates the gate): fall through to the old behaviour rather
+            # than silently never flipping.
+            return True
+
+        epoch = self._epoch
+        self._presence.announce(epoch, note=f"pending={self._pending}")
+        if self._presence_wait_started is None:
+            self._presence_wait_started = self._clock()
+
+        if self._pump_fn is not None:
+            # Progress our own arm forward WITHOUT blocking on it. This is
+            # what actually delivers the arm to the next stage while we
+            # wait, and it is the difference between this design and
+            # corpse B'.
+            try:
+                self._pump_fn()
+            except Exception as exc:  # noqa: BLE001 - pumping is best effort
+                logger.warning("%s pump failed: %s", LOG_PREFIX, exc)
+
+        if self._presence.all_present(epoch):
+            waited = self._clock() - self._presence_wait_started
+            self._presence_wait_started = None
+            logger.warning(
+                "%s group present for epoch %d after %.2fs; entering the "
+                "consensus round",
+                LOG_PREFIX,
+                epoch,
+                waited,
+            )
+            return True
+
+        waited = self._clock() - self._presence_wait_started
+        if waited >= self._presence_deadline_s:
+            missing = self._presence.missing(epoch)
+            self._presence_wait_started = None
+            return self._abandon_no_quorum(epoch, missing, waited)
+        return None
+
+    def _abandon_no_quorum(self, epoch: int, missing, waited: float):
+        """Pre-entry abandonment: loud, safe, and retryable.
+
+        Safe precisely because nothing was entered -- no peer is waiting
+        on a collective this rank owes. Disarms and returns to normal
+        cycling; the policy may re-arm, which mints a NEW epoch, so the
+        stale flags of this one are never consulted again.
+        """
+        direction = self._pending
+        self._pending = None
+        self._armed_at = None
+        self._last_hold_reason = None
+        self.presence_timeouts += 1
+        logger.error(
+            "%s FLIP ABANDONED (no quorum): %s waited %.1fs for epoch %d "
+            "and rank(s) %s never reached the flip entry (deadline %gs). "
+            "NOTHING was entered and no request was touched -- serving "
+            "continues on the %s stack and the policy may re-arm, which "
+            "mints a new epoch. A rank that never reaches the entry is "
+            "blocked upstream of it: look there, not at the flip.",
+            LOG_PREFIX,
+            direction,
+            waited,
+            epoch,
+            missing,
+            self._presence_deadline_s,
+            self._phase,
+        )
+        return None
 
     def _join_bounded(self, payload):
         """#631(c): the consensus reduction under a deadline.

@@ -708,15 +708,44 @@ class SchedulerPPMixin:
                     recv_reqs,
                     async_send=True,
                 )
-            if carries_flip_arm:
-                # (ii): this one handle, now -- so the downstream stage
-                # HAS the arm before this rank can block on its join.
-                self._pp_commit_comm_work(self.send_req_work)
-                self.send_req_work = None
+            # NOTE: no blocking commit here, deliberately. Committing the
+            # arm-carrying send in-pass is corpse B' (boot 13): this rank
+            # blocked in _pp_commit_comm_work while its peers sat in the
+            # HIDDEN-STATES exchange, because "the peer is waiting for the
+            # arm" is false -- it may be in another channel entirely. The
+            # arm forward is instead PUMPED non-blockingly by the armed
+            # poll loop (PhaseFlipRuntime._await_group_presence), which
+            # delivers it without this rank blocking on anything.
 
         # (i): arm in this same pass; the flip hook at the end of this
         # microbatch iteration then joins without an intervening recv.
         self.process_input_requests(recv_reqs)
+
+    def pp_pump_send_req_work(self: Scheduler) -> None:
+        """#631: progress the outstanding request-chain send WITHOUT
+        blocking on it. Called from the armed poll loop.
+
+        Polls the work handle and only reaps it once it reports complete,
+        so this never waits on a peer. A blocking commit here is corpse
+        B'; an unpumped async send is corpse A (it is progressed by the
+        commit at the top of the NEXT pass, which never arrives once this
+        rank is armed and polling).
+        """
+        works = getattr(self, "send_req_work", None)
+        if not works:
+            return
+        try:
+            pending = []
+            for w in works:
+                handle = getattr(w, "work", w)
+                done = getattr(handle, "is_completed", None)
+                if done is None or done():
+                    continue
+                pending.append(w)
+            if not pending:
+                self.send_req_work = None
+        except Exception:  # noqa: BLE001 - pumping is strictly best effort
+            return
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
