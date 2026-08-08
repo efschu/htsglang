@@ -381,13 +381,14 @@ def test_bad_env_number_is_named(monkeypatch):
         pp.config_from_env(enabled=False)
 
 
-# -- wiring: every rank decides for itself, and no message is sent -------------
+# -- wiring: DELIVERY-BEFORE-BLOCK --------------------------------------------
 #
-# The design that shipped first -- one rank decides and delivers its verdict to
-# the others as a control request -- deadlocked twice on metal, because it put a
-# second blocking channel (the PP point-to-point chain) alongside the flip's
-# group reduction with no order between them. It is gone. These tests pin what
-# replaced it: the policy arms THIS rank, from replicated state, sending nothing.
+# The arm rides the same chain a manual POST /phase_flip uses, because
+# forwarding it is what WAKES the downstream stages out of their blocking
+# chain recv. The invariant that makes that safe: no rank may enter the
+# blocking flip reduction while it still owes, or has uncommitted, chain
+# sends. Measured failures behind every assertion here are named in the
+# docstrings -- all three were live wedges, not hypotheticals.
 
 
 class _StubRuntime:
@@ -410,7 +411,6 @@ class _StubReq:
 
 
 def _sched(cfg_kw=None, phase=PHASE_TP, pending=None, queue=(), running=0):
-    """A stub carrying only what maybe_arm_phase_policy touches."""
     from sglang.srt.managers.scheduler import Scheduler
 
     class S:
@@ -422,92 +422,264 @@ def _sched(cfg_kw=None, phase=PHASE_TP, pending=None, queue=(), running=0):
     s.phase_flip_runtime = _StubRuntime(phase=phase, pending=pending)
     s.waiting_queue = list(queue)
     s.running_batch = _StubBatch(running)
-    s.armed = []
-    s.arm_phase_flip = lambda d, source: (
-        s.armed.append((d, source)) or (True, f"armed {d}")
-    )
     s.maybe_arm_phase_policy = Scheduler.maybe_arm_phase_policy.__get__(s, S)
     return s
 
 
-def test_policy_arms_this_rank_and_returns_no_request():
-    """The verdict is actuated locally; nothing is emitted to be delivered."""
+def test_policy_emits_the_same_request_the_rpc_path_produces():
+    """The automatic path differs from the proven manual one only in who
+    originates the arm."""
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
     s = _sched(queue=[_StubReq(N + 1000)], running=1)
-    assert s.maybe_arm_phase_policy() is None, "the policy must send nothing"
-    assert s.armed == [(TP_TO_PP, "policy")]
+    req = s.maybe_arm_phase_policy()
+    assert isinstance(req, PhaseFlipReqInput)
+    assert req.direction == TP_TO_PP
+    assert req.source == "policy"  # evidence in the log that no human flipped
+    assert req.internal is True  # must never be answered
 
 
-def test_every_rank_reaches_the_same_verdict_from_replicated_state():
-    """Three ranks, identical replicated inputs -> identical arms.
-
-    This is the whole correctness argument now that no message is sent:
-    under PP every stage carries the same request stream and runs the same
-    scheduling decisions, so waiting_queue and running_batch agree, and
-    ``decide`` is pure. Skew in WHEN each rank arms is legal (the flip
-    reduction absorbs it); disagreement is not, and is impossible here.
-    """
-    ranks = [_sched(queue=[_StubReq(N + 1000)], running=1) for _ in range(3)]
-    for r in ranks:
-        r.maybe_arm_phase_policy()
-    assert [r.armed for r in ranks] == [[(TP_TO_PP, "policy")]] * 3
-
-
-def test_policy_does_not_arm_below_the_threshold():
+def test_policy_emits_nothing_below_the_threshold():
     s = _sched(queue=[_StubReq(N - 1)], running=1)
-    s.maybe_arm_phase_policy()
-    assert s.armed == []
+    assert s.maybe_arm_phase_policy() is None
 
 
 def test_policy_is_silent_before_the_flip_runtime_exists():
     s = _sched(queue=[_StubReq(N * 10)], running=1)
     s.phase_flip_runtime = None
     assert s.maybe_arm_phase_policy() is None
-    assert s.armed == []
 
 
 def test_policy_does_not_rearm_a_flip_already_pending():
-    """Re-arming would restart the park clock and hold requests longer."""
     s = _sched(queue=[_StubReq(N * 10)], running=1, pending=TP_TO_PP)
-    s.maybe_arm_phase_policy()
-    assert s.armed == []
+    assert s.maybe_arm_phase_policy() is None
 
 
-def test_disabled_policy_arms_nothing():
+def test_disabled_policy_emits_nothing():
     s = _sched(queue=[_StubReq(N * 10)], running=1)
     s.phase_policy_cfg = PhasePolicyConfig(enabled=False)
-    s.maybe_arm_phase_policy()
-    assert s.armed == []
+    assert s.maybe_arm_phase_policy() is None
 
 
-def test_a_refused_arm_releases_the_dwell_so_the_policy_can_retry():
-    """A refusal is not a flip; it must not consume the dwell window."""
-    s = _sched(queue=[_StubReq(N + 1000)], running=1)
-    s.arm_phase_flip = lambda d, source: (False, "refused (guards)")
-    s.maybe_arm_phase_policy()
-    assert s.phase_policy_state.last_flip_at == 0.0
+def _fwd_harness(is_last_rank=False):
+    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+    sends = []
+    processed = []
+
+    class _Grp:
+        pass
+
+    _Grp.is_last_rank = is_last_rank
+
+    class S:
+        pp_group = _Grp()
+        send_req_work = None
+
+        def _pp_commit_comm_work(self, work):
+            pass
+
+        def _pp_send_pyobj_to_next_stage(self, data, async_send=False):
+            sends.append((async_send, list(data) if data else []))
+            return ["work"]
+
+        def process_input_requests(self, reqs):
+            processed.append(list(reqs) if reqs else [])
+
+    s = S()
+    fwd = SchedulerPPMixin._pp_forward_and_process_input_requests.__get__(s, S)
+    return s, fwd, sends, processed
 
 
-def test_the_policy_sends_no_control_message_anywhere():
-    """REGRESSION for the two measured deadlocks.
+def test_delivery_before_block_arm_is_forwarded_now_acted_on_next_pass():
+    """THE INVARIANT, pinned. Specimen: boot 10, 2026-08-08.
 
-    Both came from delivering the verdict as a request on the PP chain.
-    The receiver must therefore carry no policy hook at all, and the PP
-    forward must be the untouched upstream one -- no internal-arm special
-    case, no deferral, no conditional async_send.
+    Acting on the arm in the pass that forwards it means this rank arms,
+    is quiescent, therefore parked, and enters the BLOCKING reduction --
+    which stops it forwarding the batch its peers are blocked on. Measured
+    rank 0 in bounded_collective, ranks 1-2 in _pull_raw_reqs, 0 % GPU,
+    /generate dead at 45 s, with no escape because the park deadline is
+    evaluated before entry.
     """
-    import inspect
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
-    from sglang.srt.managers.scheduler_components import request_receiver
-    from sglang.srt.managers import scheduler_pp_mixin
+    arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
+    s, fwd, sends, processed = _fwd_harness()
 
-    recv_src = inspect.getsource(request_receiver.SchedulerRequestReceiver)
-    assert "phase_policy" not in recv_src, (
-        "the request receiver grew a policy hook again; injecting a control "
-        "message on the PP chain is what deadlocked twice"
+    fwd(["ordinary", arm])
+    assert sends[0][0] is True, "the forward must stay async"
+    assert arm in sends[0][1], "the arm must be forwarded in this pass"
+    assert arm not in processed[0], (
+        "acted on the arm in the pass that forwarded it -- this rank can "
+        "now arm and block before its peers are woken; the measured wedge"
     )
-    fwd_src = inspect.getsource(
-        scheduler_pp_mixin.SchedulerPPMixin._pp_forward_and_process_input_requests
+    assert "ordinary" in processed[0], "ordinary traffic must not be delayed"
+
+    fwd([])
+    assert arm in processed[1], "the deferred arm must be acted on next pass"
+    fwd([])
+    assert arm not in processed[2], "the arm must be acted on exactly once"
+
+
+def test_delivery_before_block_holds_on_an_intermediate_stage():
+    """Intermediate stages obey the same rule on receipt: forward the arm
+    downstream BEFORE acting on it, so the wake propagates strictly ahead
+    of every rank's block."""
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
+    arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
+    s, fwd, sends, processed = _fwd_harness(is_last_rank=False)
+    fwd([arm])
+    assert arm in sends[0][1] and arm not in processed[0]
+    fwd([])
+    assert arm in processed[1]
+
+
+def test_last_rank_owes_no_forward_and_still_defers_exactly_once():
+    """The last stage has nobody to wake, so the deferral is a one-pass
+    no-op -- but it must not drop or duplicate the arm."""
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
+    arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
+    s, fwd, sends, processed = _fwd_harness(is_last_rank=True)
+    fwd([arm])
+    assert sends == [], "the last rank must not forward"
+    assert arm not in processed[0]
+    fwd([])
+    assert arm in processed[1]
+
+
+def test_a_human_flip_request_is_never_deferred():
+    """The RPC is delivered by the tokenizer to every rank already; only
+    the internally originated arm needs the ordering."""
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
+    rpc = PhaseFlipReqInput(direction=PP_TO_TP)
+    s, fwd, sends, processed = _fwd_harness()
+    fwd([rpc])
+    assert rpc in processed[0]
+
+
+def test_only_the_zmq_intake_rank_injects():
+    """Origin guard. A list is NOT the origin signal: in the PP phase
+    every stage gets a list, so a list-based guard made each stage inject
+    its own arm -- measured 1/2/3 arms on PP0/PP1/PP2 and a self-kill.
+    """
+    from contextlib import ExitStack
+    from unittest import mock
+
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from sglang.srt.managers.scheduler_components.request_receiver import (
+        SchedulerRequestReceiver,
     )
-    assert "internal" not in fwd_src and "async_send=True" in fwd_src, (
-        "the PP forward grew an internal-arm special case again"
+
+    sentinel = PhaseFlipReqInput(
+        direction=TP_TO_PP, source="policy", internal=True
     )
+
+    def run(pp_rank, pulled):
+        calls = []
+
+        class _PS:
+            pass
+
+        _PS.pp_rank = pp_rank
+        _PS.attn_tp_rank = 0
+        _PS.attn_cp_rank = 0
+
+        recv = SchedulerRequestReceiver(
+            recv_from_tokenizer=None,
+            recv_from_rpc=None,
+            recv_skipper=None,
+            input_blocker=None,
+            mm_receiver=None,
+            ps=_PS(),
+            tp_group=None,
+            tp_cpu_group=None,
+            attn_tp_group=None,
+            attn_tp_cpu_group=None,
+            attn_cp_group=None,
+            attn_cp_cpu_group=None,
+            world_group=None,
+            server_args=None,
+            model_config=None,
+            max_recv_per_poll=-1,
+            stream_output=lambda *a, **kw: None,
+            get_last_forward_mode=lambda: None,
+            phase_policy_hook=lambda: (calls.append(1), sentinel)[1],
+        )
+        cls = SchedulerRequestReceiver
+        with ExitStack() as st:
+            for p in (
+                mock.patch.object(cls, "_pull_raw_reqs", lambda self: pulled),
+                mock.patch.object(
+                    cls, "_broadcast_reqs_across_ranks", lambda self, r: r
+                ),
+                mock.patch.object(
+                    cls, "unwrap_pickle_wrapper", lambda self, r: None
+                ),
+                mock.patch.object(cls, "_apply_mm_receiver", lambda self, r: r),
+                mock.patch.object(
+                    cls, "_finalize_shm_features", lambda self, r: None
+                ),
+            ):
+                st.enter_context(p)
+            return recv.recv_requests(), calls
+
+    out, calls = run(0, ["existing"])
+    assert out == ["existing", sentinel] and calls == [1]
+
+    # A downstream stage gets a populated list off the wire and must add
+    # nothing of its own.
+    out, calls = run(1, ["from-upstream"])
+    assert out == ["from-upstream"], "a downstream stage injected its own arm"
+    assert calls == []
+
+
+# -- (c) bounded join: a wedge is a logged retry, never 0 % GPU ---------------
+
+
+def test_join_timeout_abandons_loudly_and_keeps_serving():
+    """A rank that enters the reduction and finds no peers must give up
+    FROM INSIDE. Every other flip deadline is evaluated before entry, so
+    without this the wait is unbounded by construction."""
+    from sglang.srt.managers.phase_flip_runtime import (
+        PhaseFlipJoinTimeout,
+        PhaseFlipRuntime,
+    )
+
+    class R:
+        pass
+
+    r = R()
+    r._pending = TP_TO_PP
+    r._armed_at = 1.0
+    r._last_hold_reason = None
+    r._phase = PHASE_TP
+    r.join_deadline_aborts = 0
+    out = PhaseFlipRuntime._abandon_unjoined_flip.__get__(r, R)("peer 2 never joined")
+    assert out is None, "abandonment must never raise into the event loop"
+    assert r._pending is None, "the flip must be disarmed so it can be retried"
+    assert r.join_deadline_aborts == 1
+    assert PhaseFlipJoinTimeout is not None
+
+
+def test_join_deadline_is_passed_to_the_channel():
+    """The bound must actually reach the collective, not be dropped."""
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    seen = {}
+
+    class R:
+        pass
+
+    r = R()
+    r._join_deadline_s = 45.0
+
+    def chan(payload, timeout_s=None):
+        seen["timeout_s"] = timeout_s
+        return payload
+
+    r._collective_min = chan
+    PhaseFlipRuntime._join_bounded.__get__(r, R)([1, 2, 3])
+    assert seen["timeout_s"] == 45.0, "the join ran without its deadline"

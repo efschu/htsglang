@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.io_struct import PhaseFlipReqInput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -655,6 +656,54 @@ class SchedulerPPMixin:
         is committed on the next pass) and removes the cycle: every stage has
         the request in flight before any stage blocks on it.
         """
+        # #631 DELIVERY-BEFORE-BLOCK.
+        #
+        # THE INVARIANT: no rank may enter the flip's BLOCKING consensus
+        # reduction while it still owes, or has uncommitted, chain sends.
+        # Concretely: a rank acts on a phase-flip arm only in the pass
+        # AFTER _pp_commit_comm_work has committed the forward that
+        # carries that arm downstream.
+        #
+        # Why it is an invariant and not an ordering patch. The chain
+        # forward is what WAKES the downstream stages -- they spend idle
+        # time blocked in the chain recv, and the arm's delivery is the
+        # only thing that makes them runnable. Acting on the arm in the
+        # pass that forwards it means this rank arms, is quiescent,
+        # therefore parked, and enters the blocking reduction -- which
+        # stops it forwarding, so the peers it is now waiting for never
+        # wake. Measured 2026-08-08: rank 0 in bounded_collective, ranks
+        # 1-2 in _pull_raw_reqs, 0 % GPU, and no escape because the park
+        # deadline is evaluated before entry, never from inside the wait.
+        #
+        # Two other routes were measured and rejected. Forwarding the arm
+        # SYNCHRONOUSLY deadlocks worse: a peer need not be in the chain
+        # recv at all, and was found blocked in the hidden-states
+        # exchange while this rank blocked in send. BOUNDING the chain
+        # recv decouples a 1:1 send/consume contract -- the consumer can
+        # skip a consume, unmatched sends accumulate, and the SENDERS
+        # block instead (ranks 0+1 in _pp_commit_comm_work).
+        #
+        # With this ordering the automatic path is byte-for-byte the
+        # manual one -- same message, same chain, same wake, same
+        # drain-park-meet -- and the manual one has always worked.
+        #
+        # Intermediate stages obey the same rule on receipt: the arm is
+        # forwarded downstream in this pass and acted on in the next, so
+        # the wake propagates strictly ahead of every rank's block.
+        deferred = getattr(self, "_pp_deferred_flip_arms", None) or []
+        self._pp_deferred_flip_arms = []
+        local_reqs = recv_reqs
+        if recv_reqs:
+            arms = [
+                r
+                for r in recv_reqs
+                if isinstance(r, PhaseFlipReqInput)
+                and getattr(r, "internal", False)
+            ]
+            if arms:
+                self._pp_deferred_flip_arms = arms
+                local_reqs = [r for r in recv_reqs if r not in arms]
+
         if not self.pp_group.is_last_rank:
             self._pp_commit_comm_work(self.send_req_work)
             with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -662,10 +711,23 @@ class SchedulerPPMixin:
                     recv_reqs,
                     async_send=True,
                 )
+        if deferred:
+            # The commit above completed the forward that carried these,
+            # so the downstream stage has them and this rank may now act
+            # -- and, if it arms, block. On the LAST rank there is no
+            # forward to owe, so the deferral is a one-pass no-op.
+            assert (
+                self.pp_group.is_last_rank or self.send_req_work is not None
+            ), "delivery-before-block: acting on an arm with no forward issued"
+            local_reqs = list(local_reqs) + deferred
 
-        self.process_input_requests(recv_reqs)
+        self.process_input_requests(local_reqs)
 
     def init_pp_loop_state(self: Scheduler):
+        # #631 DELIVERY-BEFORE-BLOCK: arms forwarded in the previous pass
+        # and acted on in this one. Re-initialised here (boot AND every
+        # cutover) so no arm survives a topology change.
+        self._pp_deferred_flip_arms: List = []
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (

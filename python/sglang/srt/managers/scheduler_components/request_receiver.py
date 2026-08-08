@@ -63,6 +63,10 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    # #631: returns a PhaseFlipReqInput when the automatic phase policy
+    # wants a flip, else None. Optional and defaulted so every existing
+    # construction is unchanged and the default path costs one compare.
+    phase_policy_hook: Optional[Callable[[], Any]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -83,6 +87,32 @@ class SchedulerRequestReceiver:
                 return []
 
         recv_reqs = self._pull_raw_reqs()
+
+        # #631 automatic phase policy. The arm rides the SAME chain a
+        # manual POST /phase_flip uses, because forwarding it is what
+        # WAKES the downstream stages out of their blocking chain recv --
+        # see maybe_arm_phase_policy. The ordering that makes it safe is
+        # DELIVERY-BEFORE-BLOCK, enforced in scheduler_pp_mixin.
+        #
+        # THE GUARD IS THE ZMQ-INTAKE TEST, never "did I get a list". In
+        # the PP phase _pull_raw_reqs returns a list on EVERY stage --
+        # rank 0 from zmq, ranks 1..n-1 from point_to_point_pyobj -- so a
+        # list-based guard is true everywhere and every stage injects its
+        # own arm. Measured 2026-08-08: 1/2/3 arms on PP0/PP1/PP2, a
+        # 12765-line capture-census flood, and a self-kill.
+        is_request_origin = (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+        if (
+            is_request_origin
+            and recv_reqs is not None
+            and self.phase_policy_hook is not None
+        ):
+            policy_req = self.phase_policy_hook()
+            if policy_req is not None:
+                recv_reqs.append(policy_req)
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
