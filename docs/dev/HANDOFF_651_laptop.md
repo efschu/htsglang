@@ -1293,3 +1293,42 @@ load/assembly path, the non-ggml forward kernels (GDN triton family — the
 one major unvalidated block on gfx1103), or a Q4_K_M-specific interaction.
 Next instrument: activation bisection (llama-eval-callback CPU reference vs
 debug_tensor_dump), built and ready on the laptop.
+
+### 12.11 Rig-window discriminator: design and honesty bounds (prepped, queued)
+
+Window granted by the coordinator (5090-only, TP=1, ~30-45 min, START ONLY ON
+THE EXPLICIT GO-SIGNAL after the crashfix merge-soak). Turnkey script
+`docs/dev/651/rig_window_probe.sh` (smoke-tested: tree pinned to branch HEAD
+via PYTHONPATH assert, 5090 index resolved at runtime, arb protocol with pgid
++ 10-min markers + 0-MiB teardown). Vehicle: the rig's
+`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, sha256 `55983c5a...` == upstream LFS oid
+(bit-perfect), laptop-shaped flags (eager, triton attention, pytorch
+sampling, ctx 8192).
+
+What it proves, honestly: the rig file's type census {Q8_0 260, F32 368,
+Q5_K 40, Q4_K 80, Q6_K 3, BF16 2} is near-identical to the laptop Q4_K_M mix
+{259/368/38/82/4/2}; the SAME three Q6_K expert stacks (blk.34/38/39); the
+one delta is the lm_head (Q8_0 in XL vs Q6_K in M). Q6_K is healthy on CUDA,
+so the original file serves as-is there.
+- COHERENT on rig -> the shared adapter + runtime are healthy on CUDA for
+  this layer/quant shape -> laptop defect is ROCm/gfx1103-device-side. The
+  residual "Q4_K_M-specific" arm is then only the Q6_K lm_head delta — which
+  the laptop ALREADY neutralized (derived file, lm_head Q8_0) with
+  incoherence persisting — so that arm is effectively closed too.
+- INCOHERENT on rig -> tree-level runtime regression since dff1ef16c0,
+  device-agnostic -> commit bisect on the rig; the laptop is not even needed
+  for the hunt.
+
+Laptop arm: BLOCKED — suspended during the API-limit window, Wi-Fi (ath11k),
+WoL from the PVE host (real MAC 8c:3b:4a:4f:3b:b2) did not wake it. Needs a
+physical touch; return-watch armed. On return: REBOOT first (§12.3), then
+`systemctl mask sleep.target suspend.target hibernate.target
+hybrid-sleep.target` so a headless target can never auto-suspend again, then
+guard, then resume. Ready-to-run on return:
+`docs/dev/651/verify_device_weights.py` — reconstruction of the deleted #644
+`_host_verify` oracle (its .pyc survives on the laptop at
+`sglang/srt/__pycache__/_host_verify.cpython-312.pyc`; recover the bytecode
+too when reachable): in-process weight-only load, byte-compares
+device-resident packed expert bytes (incl. LAST expert of LAST layer) and
+plain-linear/lm_head bytes against GGUFReader. Exonerates or indicts the
+device-side load/assembly (early-materialization suspect) in one run.
