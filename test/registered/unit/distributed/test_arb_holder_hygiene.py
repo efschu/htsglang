@@ -54,23 +54,33 @@ REAL_ARB_PATHS = (
 
 
 def _snapshot(paths=REAL_ARB_PATHS):
-    """``{path: (exists, is_dir, inode)}`` for the real arbitration paths.
+    """``{path: (exists, is_dir)}`` for the real arbitration paths.
 
-    Deliberately NOT mtime. A window held by another session runs its own
-    heartbeat, which legitimately refreshes an existing holder's mtime while
-    an unrelated test run is in progress; asserting on mtime would make this
-    guard fail for something no test did. Creation, deletion and a change of
-    type or inode cannot happen that way -- those are writes, and a write to
-    these paths from inside pytest is the bug.
+    Deliberately NOT mtime, and deliberately NOT the inode. The inode was
+    here on the claim that "creation, deletion and a change of type or
+    inode cannot happen [from a foreign heartbeat]". That claim is false
+    (#654): another session's heartbeat refreshes its holder by writing a
+    temp file and renaming it over the target -- the correct atomic
+    update, and one that mints a new inode each time. Asserting on the
+    inode made this tearDown fail for something no test did, which is
+    exactly the failure mode the mtime exclusion was already guarding
+    against.
+
+    Existence and type are the only foreign-safe invariants; a content
+    hash would false-positive identically.
+
+    The trade, named: a test REPLACING the holder via rename is no longer
+    caught. Catching tests that CREATE or DELETE real arbitration files --
+    the reason this guard exists -- is unaffected.
     """
     out = {}
     for path in paths:
         try:
-            st = os.stat(path, follow_symlinks=False)
+            os.stat(path, follow_symlinks=False)
         except FileNotFoundError:
-            out[path] = (False, False, None)
+            out[path] = (False, False)
         else:
-            out[path] = (True, os.path.isdir(path), st.st_ino)
+            out[path] = (True, os.path.isdir(path))
     return out
 
 
