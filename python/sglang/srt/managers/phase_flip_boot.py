@@ -570,6 +570,52 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             # ONLY this stack captures decode graphs).
             tp_worker.alloc_memory_pool()
 
+            # 5-guard. THE SLOT-ID SPACE MUST FIT BOTH POOLS.
+            #
+            # The scheduler keeps ONE allocator for process life -- the PP
+            # stack's, built by Scheduler.build_kv_cache before this stack
+            # exists and never swapped at cutover. That is not an oversight:
+            # the flip's transition maps GLOBAL slot ids to each layout's
+            # physical rows, so a single id space is what makes a row
+            # identifiable across the flip at all.
+            #
+            # The consequence is an invariant nothing was checking: every id
+            # the allocator can issue must be addressable in BOTH layouts.
+            # The TP stack derives its own capacity from its own budget and
+            # token vector, so it can come out SMALLER than the id space --
+            # and then the first decode that touches a high id runs off the
+            # end of the TP pool.
+            #
+            # That is not a graceful failure. It surfaces inside
+            # store_kvcache as SGL_DEVICE_ASSERT(index >= 0 && index <
+            # size_limit), a device-side assert that takes down all three
+            # ranks with an async CUDA error whose traceback points at
+            # whatever host call happened to synchronise next. Observed on
+            # this rig: PP/allocator C = 46422 against TP C = 27200, which
+            # died mid-benchmark exactly as described.
+            #
+            # Checked here, at boot, where both numbers are on hand and the
+            # message can name them. The comparison is deterministic across
+            # ranks -- both capacities are group-consistent, each having been
+            # min-reduced over the world group by _apply_token_constraints --
+            # so a local raise aborts the whole boot identically on every
+            # rank rather than half of it.
+            pp_capacity = int(primary_runner.max_total_num_tokens)
+            tp_capacity = int(tp_worker.model_runner.max_total_num_tokens)
+            if tp_capacity < pp_capacity:
+                raise PhaseFlipBootError(
+                    f"the TP decode stack addresses {tp_capacity} tokens but "
+                    f"the scheduler's allocator issues slot ids up to "
+                    f"{pp_capacity} (the PP stack's capacity, which is the "
+                    f"process-wide id space). Ids above {tp_capacity} would "
+                    f"be written past the end of the TP KV pool and abort "
+                    f"every rank inside store_kvcache's bounds assert on the "
+                    f"first decode that reaches one. Raise the TP stack's "
+                    f"capacity (SGLANG_UNEVEN_TOKEN_VECTOR matched to the "
+                    f"per-rank profiled capacities, or a larger "
+                    f"--rank-gpu-memory-mib) until it is >= {pp_capacity}."
+                )
+
             # 5a. Share the REQUEST MAPPINGS by tensor rebind: both stacks
             # must read the same request->token rows and request->mamba
             # slot mapping (the scheduler writes them ONCE, into the

@@ -611,3 +611,38 @@ class TestStacksCarryBothVectors(CustomTestCase):
         # The transition plan's tp_vector argument.
         self.assertIn("tp_vector=stacks.token_vector", src)
         self.assertNotIn("tp_vector=stacks.vector", src)
+
+
+class TestSlotIdSpaceFitsBothPools(CustomTestCase):
+    """The allocator's id space must be addressable in BOTH layouts.
+
+    The scheduler keeps ONE allocator for process life -- the PP stack's --
+    because the flip identifies a row by its GLOBAL slot id across both
+    layouts. So the TP stack, which derives its capacity independently from
+    its own budget and token vector, must not come out smaller: ids above
+    its capacity land past the end of its KV pool and abort every rank
+    inside store_kvcache's bounds assert.
+
+    Observed on the rig at PP/allocator C = 46422 vs TP C = 27200.
+    """
+
+    def test_guard_message_names_both_capacities_and_the_consequence(self):
+        import inspect
+
+        from sglang.srt.managers import phase_flip_boot as pfb
+
+        src = inspect.getsource(pfb.build_phase_flip_tp_stack)
+        self.assertIn("tp_capacity < pp_capacity", src)
+        # The raise must state both numbers and where it would otherwise
+        # fail, so a boot refusal is actionable without reading the source.
+        self.assertIn("store_kvcache", src)
+        self.assertIn("SGLANG_UNEVEN_TOKEN_VECTOR", src)
+
+    def test_equal_capacity_is_allowed(self):
+        """The bound is >=, not >: an exactly-fitting TP pool is legal."""
+        pp_capacity, tp_capacity = 278104, 278104
+        self.assertFalse(tp_capacity < pp_capacity)
+
+    def test_smaller_tp_capacity_is_the_refused_shape(self):
+        pp_capacity, tp_capacity = 46422, 27200
+        self.assertTrue(tp_capacity < pp_capacity)
