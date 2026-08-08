@@ -3503,6 +3503,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
             return
 
+        # #651 W3: the CPU stage of a mixed-device pipeline runs EAGER.
+        # CPUGraphRunner asserts pp_size == 1, and that assertion is correct --
+        # its capture machinery is genuinely single-stage. Lifting it would
+        # claim a PP-capable CPU graph runner that does not exist, so the CPU
+        # stage skips capture instead. This costs nothing that matters: after
+        # the phase flip decode runs GPU-only, and the GPU stage below is
+        # untouched and still captures its decode graphs. Same-device worlds
+        # never reach this branch, because they do not mix a "cpu" device with
+        # pp_size > 1.
+        if self.device == "cpu" and self.pp_size > 1:
+            logger.info(
+                "Skipping CPU graph capture: this rank is the CPU stage of a "
+                "pipeline (pp_size=%d) and runs eager (#651 W3).",
+                self.pp_size,
+            )
+            return
+
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         graph_backend = defaultdict(
