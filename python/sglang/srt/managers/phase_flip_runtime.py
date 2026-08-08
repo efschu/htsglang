@@ -747,7 +747,8 @@ class PhaseFlipRuntime:
     enumeration (tree values UNION parked requests' rows -- DESIGN_631
     section 3.5), ``ready_fn`` the flip quiescence predicate,
     ``cutover_fn(direction)`` the snapshot-cache installer,
-    ``pre_cutover_fns`` the ordered extra movers (weights arena, GDN
+    ``pre_write_fns`` run at the read/write seam (cross-phase KV backing
+    swap); ``pre_cutover_fns`` the ordered extra movers (weights arena, GDN
     state) executed inside the no-return region before cutover.
     """
 
@@ -772,6 +773,7 @@ class PhaseFlipRuntime:
         ready_fn: Optional[Callable[[], bool]] = None,
         cutover_fn: Optional[Callable[[str], None]] = None,
         pre_cutover_fns: Sequence[Callable[[str], None]] = (),
+        pre_write_fns: Sequence[Callable[[str], None]] = (),
         guards: Sequence[str] = (),
         clock: Callable[[], float] = time.perf_counter,
     ):
@@ -844,6 +846,10 @@ class PhaseFlipRuntime:
         self._ready_fn = ready_fn
         self._cutover_fn = cutover_fn
         self._pre_cutover_fns = tuple(pre_cutover_fns)
+        # #631: run at the read/write seam, where the source pool is fully
+        # drained and the destination not yet touched -- the only safe
+        # instant to move physical backing between the two layouts.
+        self._pre_write_fns = tuple(pre_write_fns)
         self.blocking_guards = tuple(guards)
         self._clock = clock
 
@@ -1258,6 +1264,21 @@ class PhaseFlipRuntime:
             src.read_rows(self._src_layer_idx(direction, f), local_src)
             for f in tr.local_layers
         ]
+
+        # #631 CROSS-PHASE BACKING SWAP. Every byte this transition owes has
+        # now been read: the peer legs are materialised above and the local
+        # leg immediately before this line. Nothing further reads the SOURCE
+        # pool, and the DESTINATION pool is written from here on -- so this
+        # instant, and only this instant, is where the physical pages may
+        # move from one layout to the other.
+        #
+        # Without it the two layouts' pools both hold pages for the whole
+        # process life, which is what forced each of them to be sized against
+        # half the per-rank budget. The VA reservations do not move, so
+        # addresses baked into captured decode graphs stay valid.
+        for fn in self._pre_write_fns:
+            fn(direction)
+
         for f, data in zip(tr.local_layers, local_data):
             dst.write_rows(self._dst_layer_idx(direction, f), local_dst, data)
         for peer, rows in tr.recv_rows.items():
