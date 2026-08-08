@@ -1403,3 +1403,22 @@ Options for using Q3_K_XL as the laptop fallback quant (§6.0):
    IQ. Only worth checking if option 1's IQ MoE audit fails.
 
 Rig discriminator arm 1 is UNAFFECTED (CUDA covers IQ natively).
+
+### 12.15b CORRECTION to 12.15: the serving-level IQ hazard is the MoE dispatch, not MMQ
+
+Reading the recovered gguf.py dispatch sets: `MMQ_QUANT_TYPES = STANDARD |
+KQUANT` — IMATRIX (IQ) types are NEVER routed to MMQ by the python dispatch;
+the broken IQ-MMQ kernel (§12.2) is unreachable in serving (my audit called
+the kernel raw). The REAL hazard: `MMVQ_QUANT_TYPES` INCLUDES the IQ types,
+and the fused-MoE dispatch's fast branches gate on those sets — so IQ expert
+stacks (Q2_K_XL/Q3_K_XL are IQ-dominated) reach `ggml_moe_a8_vec` with a
+type whose `ggml_moe_get_block_size` returns 0 (observed on-laptop) —
+undefined launch geometry. This also SHARPENS the Q2 boot-crash hypothesis
+(§12.2 aftermath): the hipErrorLaunchFailure surfaced at a Q8_0 linear's
+torch.cat, but the async fault plausibly came from the PREVIOUS layer's IQ
+MoE call. Falsifier at next laptop access: call ggml_moe_a8_vec with an
+IQ3_XXS stack directly — expect context death; then gate the MoE fast
+branches on `ggml_moe_get_block_size(type) > 0` (falls back to the slow
+dequant MoE path, IQ dequant is clean) and re-boot Q2 — expect no crash.
+Q3-as-laptop-fallback then costs slow-path MoE for IQ experts; whether that
+is usable is a measurement, not an assumption.
