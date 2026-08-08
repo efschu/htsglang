@@ -538,12 +538,22 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         live_slots_fn=build_flip_live_slots_fn(scheduler),
         ready_fn=build_flip_quiescence_fn(scheduler),
         cutover_fn=build_production_flip_cutover(scheduler),
+        # DESIGN_631 3.6 order inside the no-return region: GDN state move
+        # (5.3b mover -- its preconditions re-validate on every flip and
+        # refuse loudly, the reachable-refusal contract), then the arena
+        # refill. The full-attn KV move ran before these by the runtime.
         pre_cutover_fns=(
-            build_gdn_flip_guard(scheduler),
+            _build_gdn_leg(scheduler),
             stacks.refill,
         ),
         guards=flip_blocking_guards(scheduler),
     )
+
+
+def _build_gdn_leg(scheduler) -> Callable[[str], None]:
+    from sglang.srt.managers.gdn_flip_mover import build_gdn_flip_mover
+
+    return build_gdn_flip_mover(scheduler)
 
 
 class PhaseFlipRuntime:

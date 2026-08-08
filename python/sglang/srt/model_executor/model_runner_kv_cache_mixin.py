@@ -2786,7 +2786,7 @@ class ModelRunnerKVCacheMixin:
         from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
 
         if not draft_pool_is_replicated(
-            self.is_draft_worker, self.server_args
+            self.is_draft_pool_worker, self.server_args
         ) and uneven_dcp_kv_replicated(self.dcp_size):
             return self.model_config.get_total_num_kv_heads()
         return self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
@@ -2819,7 +2819,7 @@ class ModelRunnerKVCacheMixin:
         # ratio-proportional row count. Default 'replicated' keeps the early
         # return, i.e. the full global context per rank, byte-identical.
         if draft_pool_is_replicated(
-            self.is_draft_worker, self.server_args
+            self.is_draft_pool_worker, self.server_args
         ) or not uneven_dcp_active(self.dcp_size):
             return int(global_rows)
         if not uneven_dcp_kv_replicated(self.dcp_size):
@@ -3597,7 +3597,7 @@ class ModelRunnerKVCacheMixin:
                 from sglang.srt.layers.dcp.owner import draft_pool_is_replicated
 
                 _draft_non_dcp = draft_pool_is_replicated(
-                    self.is_draft_worker, self.server_args
+                    self.is_draft_pool_worker, self.server_args
                 )
                 # Weightless-KV fast lane (Option-B): the head rank projects the
                 # FULL kv-heads (built under the weight-TP=1 override) and
@@ -3792,7 +3792,10 @@ class ModelRunnerKVCacheMixin:
                     # needs every full-attention layer's kv pool.
                     full_attention_layer_ids=(
                         [0]
-                        if self.is_draft_worker
+                        # A dual-group lane TARGET and the #631 phase-flip
+                        # TP stack are draft-gated secondary runners that
+                        # run the FULL model: every full-attention layer.
+                        if self.is_draft_pool_worker
                         and not getattr(self, "is_dual_group_lane_target", False)
                         else [
                             i

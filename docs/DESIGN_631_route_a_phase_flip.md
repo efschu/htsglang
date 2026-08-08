@@ -506,6 +506,25 @@ REFUSAL placeholder (flip with live requests refuses; empty flip works)
 -- slice 5.3b implements the real mover before the one-request rung.
 122 green tests; canonical family runner: scripts/run_631_flip_family.sh.
 
+5.3b DONE (session 2): production GDN mover landed
+(managers/gdn_flip_mover.py) and wired as the flip's first pre_cutover
+leg. DEVIATION from 3.4's blob route, deliberate: the mover works on the
+conv/temporal pool tensors directly with the gdn_flip_plan primitives
+(the landed, tested route) instead of export/import_state_blob -- the
+blob's extra fields are covered by REFUSAL preconditions instead
+(ReplaySSM ring buffers, int8 mamba checkpoint pool, multi-conv layouts
+all refuse loudly; V1 scope). The reachable-refusal contract holds by
+construction: gdn_flip_preconditions re-validates per flip and checks the
+plan-derived shard spec against the TP pool's ACTUAL tensor shapes.
+POOL-SHAPE FIXES uncovered while wiring (would have been silent #345
+corruption, caught at desk): the TP stack rode is_draft_worker into
+draft-shaped pools -- [0]-layer full-attn list, head-sharded KV via
+draft_pool_is_replicated, and the shared req pool's PP-shaped mamba pool.
+Fixed with is_draft_pool_worker (pool-geometry sites only) and by giving
+the TP stack its OWN HybridReqToTokenPool (TP-shaped mamba) while
+sharing the request-mapping TENSORS by rebind (req_to_token,
+req_index_to_mamba_index_mapping; slot spaces asserted equal). 135 green.
+
 Step-6 watch items added in session 2: (a) the uneven plan + cp token
 vector are process-globals installed AFTER the primary PP build --
 PP-phase code paths must never consult them with a non-rank-local size;

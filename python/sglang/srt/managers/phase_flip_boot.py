@@ -324,6 +324,13 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     ctx.set_server_args(tp_args)
     try:
         with phase_flip_tp_scope(world_rank, n):
+            # NO pool sharing at construction: the TP stack builds its OWN
+            # HybridReqToTokenPool so its mamba pool gets the TP geometry
+            # (ALL linear layers, head-sharded) through the normal path --
+            # the shared PP req pool carries a PP-shaped mamba pool (stage
+            # layers, full heads), which would silently mis-shape every
+            # linear-state access. Request-mapping SHARING happens below by
+            # tensor rebind instead.
             tp_worker = TpModelWorker(
                 server_args=tp_args,
                 gpu_id=scheduler.gpu_id,
@@ -336,7 +343,6 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                 nccl_port=scheduler.tp_worker.nccl_port,
                 is_draft_worker=True,
                 is_phase_flip_tp_stack=True,
-                req_to_token_pool=primary_runner.req_to_token_pool,
             )
 
             # 4. Arena: sized max(both layouts), fixed for process life.
@@ -359,6 +365,41 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             # bytes live (graphs bake the fixed arena addresses; pin 2:
             # ONLY this stack captures decode graphs).
             tp_worker.alloc_memory_pool()
+
+            # 5a. Share the REQUEST MAPPINGS by tensor rebind: both stacks
+            # must read the same request->token rows and request->mamba
+            # slot mapping (the scheduler writes them ONCE, into the
+            # primary pool's tensors; slot ids are the cross-layout keys).
+            # The pools themselves stay layout-specific; only the mapping
+            # tensors alias. The slot SPACES agree by construction (same
+            # max_num_reqs / max_mamba_cache_size in the args copy) --
+            # asserted here, loudly.
+            pp_req_pool = primary_runner.req_to_token_pool
+            tp_req_pool = tp_worker.model_runner.req_to_token_pool
+            if tp_req_pool.req_to_token.shape != pp_req_pool.req_to_token.shape:
+                raise PhaseFlipBootError(
+                    f"req_to_token shapes diverge between stacks: PP "
+                    f"{tuple(pp_req_pool.req_to_token.shape)} vs TP "
+                    f"{tuple(tp_req_pool.req_to_token.shape)}"
+                )
+            tp_req_pool.req_to_token = pp_req_pool.req_to_token
+            if hasattr(pp_req_pool, "req_index_to_mamba_index_mapping"):
+                pp_map = pp_req_pool.req_index_to_mamba_index_mapping
+                tp_map = tp_req_pool.req_index_to_mamba_index_mapping
+                if tp_map.shape != pp_map.shape:
+                    raise PhaseFlipBootError(
+                        f"mamba index mapping shapes diverge: PP "
+                        f"{tuple(pp_map.shape)} vs TP {tuple(tp_map.shape)}"
+                    )
+                tp_req_pool.req_index_to_mamba_index_mapping = pp_map
+                if pp_req_pool.mamba_pool.size != tp_req_pool.mamba_pool.size:
+                    raise PhaseFlipBootError(
+                        f"mamba slot spaces diverge: PP "
+                        f"{pp_req_pool.mamba_pool.size} vs TP "
+                        f"{tp_req_pool.mamba_pool.size} -- the flip relies "
+                        f"on slot-id identity across layouts"
+                    )
+
             tp_worker.init_attention_backends()
             tp_worker.init_cuda_graphs()
     finally:

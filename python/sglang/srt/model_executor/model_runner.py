@@ -497,6 +497,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "A phase-flip TP-stack runner must be constructed with "
                 "is_draft_worker=True (the existing secondary-runner gates)."
             )
+        # POOL GEOMETRY effective draft flag: the flip's TP stack rides the
+        # draft construction gates (distributed init, process globals) but
+        # its POOLS take the identical target-model treatment -- full
+        # full-attention layer set, replicated-KV uneven-DCP geometry, its
+        # own TP-shaped mamba pool. The pool-shape decision sites consult
+        # THIS flag, never is_draft_worker directly (a draft-shaped [0]-
+        # layer, head-sharded pool here would be the #345 corruption class,
+        # caught only by the pin-3 boot assert).
+        self.is_draft_pool_worker = is_draft_worker and not is_phase_flip_tp_stack
 
         # Parse args
         self.mem_fraction_static = mem_fraction_static

@@ -1,0 +1,579 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Production GDN/mamba state mover for the #631 phase flip (slice 5.3b).
+
+Moves linear-attention conv/ssm state between the PP layout (stage owns
+its linear layers, FULL heads/channels) and the TP layout (every rank
+owns ALL linear layers, head-sharded) at the flip boundary, using the
+pure primitives of ``layers/dcp/gdn_flip_plan.py``. Runs as a
+``pre_cutover_fn`` of PhaseFlipRuntime, inside the no-return region,
+BEFORE the weights refill.
+
+HONESTY CONTRACT (operator hold, 2026-08-08): the 5.3 placeholder's loud
+refusal stays REACHABLE. ``gdn_flip_preconditions`` re-validates every
+structural assumption (single-conv GDN layout, derivable sub-block spec,
+shard vectors matching the TP pool's ACTUAL tensor shapes, equal slot
+spaces, no replayssm ring buffers, no int8 mamba checkpoint pool, no
+speculative scratch expectations) on EVERY flip, and any violation is a
+loud KvReshardError before a byte moves -- a future regression degrades
+to refusal, never to a silent no-move (#212 Store-Route lesson).
+
+Payload convention per (stage s, shard rank r) pair, both directions:
+slots ascending; per slot, s's linear layers ascending; per layer,
+compact conv shard bytes then temporal head-shard bytes
+(``pack_gdn_pair_payload`` semantics); one 8-byte checksum trailer per
+pair. Receivers derive expected byte counts from replicated inputs only.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import torch
+
+from sglang.srt.layers.dcp.gdn_flip_plan import (
+    GdnShardSpec,
+    conv_slice,
+    conv_scatter,
+    temporal_slice,
+    temporal_scatter,
+)
+from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+from sglang.srt.managers.kv_reshard import _CHECKSUM_BYTES, _checksum
+
+logger = logging.getLogger(__name__)
+
+LOG_PREFIX = "PHASE-FLIP-GDN"
+
+
+def derive_pp_linear_layer_map(
+    linear_layer_ids: Sequence[int], num_hidden_layers: int, pp_size: int
+) -> Tuple[Tuple[int, ...], ...]:
+    """Per-stage GLOBAL linear-layer ids -- the GDN sibling of
+    derive_pp_full_attn_layer_map (same get_pp_indices bounds, but global
+    ids because pool addressing goes through each pool's mamba_map)."""
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    ids = [int(x) for x in linear_layer_ids]
+    if ids != sorted(set(ids)):
+        raise KvReshardError(
+            f"linear layer ids must be strictly ascending, got {ids}"
+        )
+    bounds = [get_pp_indices(num_hidden_layers, r, pp_size) for r in range(pp_size)]
+    if bounds[0][0] != 0 or bounds[-1][1] != num_hidden_layers:
+        raise KvReshardError(
+            f"PP stage bounds {bounds} do not span [0, {num_hidden_layers})"
+        )
+    stage_ids = tuple(
+        tuple(gid for gid in ids if start <= gid < end) for start, end in bounds
+    )
+    covered = sorted(g for stage in stage_ids for g in stage)
+    if covered != ids:
+        raise KvReshardError(
+            f"stage map {stage_ids} does not cover the linear ids exactly "
+            f"once (bounds {bounds})"
+        )
+    return stage_ids
+
+
+@dataclass(frozen=True)
+class GdnFlipPools:
+    """Validated handles into both layouts' mamba pools.
+
+    PP side: FULL-width per-layer state for THIS stage's linear layers.
+    TP side: this rank's COMPACT shard for ALL linear layers. ``*_index``
+    maps a GLOBAL linear layer id to the pool's layer axis index."""
+
+    spec: GdnShardSpec
+    pp_conv: torch.Tensor  # [L_stage, S, conv_dim_full, W]
+    pp_temporal: torch.Tensor  # [L_stage, S, H_full, D, N]
+    pp_index: Dict[int, int]
+    tp_conv: torch.Tensor  # [L_all, S, conv_shard, W]
+    tp_temporal: torch.Tensor  # [L_all, S, H_shard, D, N]
+    tp_index: Dict[int, int]
+    n_slots: int
+
+
+def gdn_flip_preconditions(
+    pp_req_pool, tp_req_pool, n_ranks: int, rank: int
+) -> GdnFlipPools:
+    """Validate every structural assumption; refuse loudly otherwise.
+
+    THE reachable-refusal seam: called on every flip, before any byte
+    moves. Takes the two HybridReqToTokenPools (which own mamba_pool and
+    mamba_map). Returns the validated pool handles + the shard spec
+    derived from the process-global plan and CHECKED against the TP
+    pool's actual tensor shapes -- a spec/pool disagreement is the
+    mis-sliced-conv-state bug class and dies here."""
+    from sglang.srt.distributed.utils import tp_partition_size
+
+    reasons: List[str] = []
+
+    def _fail():
+        raise KvReshardError(
+            f"{LOG_PREFIX} refusing to move GDN state: "
+            f"{'; '.join(reasons)}. A flip must never proceed past a "
+            f"broken linear-state assumption (silent truncation, #212)."
+        )
+
+    pp_pool = pp_req_pool.mamba_pool
+    tp_pool = tp_req_pool.mamba_pool
+    for name, req_pool, pool in (
+        ("PP", pp_req_pool, pp_pool),
+        ("TP", tp_req_pool, tp_pool),
+    ):
+        if getattr(pool, "enable_linear_replayssm", False) or (
+            getattr(pool.mamba_cache, "replayssm_d", None) is not None
+        ):
+            reasons.append(
+                f"{name} pool has ReplaySSM ring buffers (mover does not "
+                f"carry them yet -- V1 scope)"
+            )
+        if getattr(req_pool, "mamba_ckpt_pool", None) is not None:
+            reasons.append(
+                f"{name} side has an int8 mamba checkpoint pool (cached "
+                f"prefix states would not be moved -- V1 scope)"
+            )
+    if reasons:
+        _fail()
+
+    pp_conv_list = pp_pool.mamba_cache.conv
+    tp_conv_list = tp_pool.mamba_cache.conv
+    if len(pp_conv_list) != 1 or len(tp_conv_list) != 1:
+        reasons.append(
+            f"expected the single-conv GDN layout, got "
+            f"{len(pp_conv_list)}/{len(tp_conv_list)} conv tensors"
+        )
+        _fail()
+    pp_conv, tp_conv = pp_conv_list[0], tp_conv_list[0]
+    pp_temporal, tp_temporal = (
+        pp_pool.mamba_cache.temporal,
+        tp_pool.mamba_cache.temporal,
+    )
+
+    spec_tuple = pp_pool.get_conv_subblock_spec()
+    if spec_tuple is None:
+        reasons.append(
+            "PP pool does not expose the GDN [q|k|v] conv structure "
+            "(get_conv_subblock_spec returned None)"
+        )
+        _fail()
+    sub_sizes, units, conv_dim = spec_tuple
+    if int(pp_conv.shape[2]) != conv_dim:
+        reasons.append(
+            f"PP conv tensor has {int(pp_conv.shape[2])} channels, spec "
+            f"says {conv_dim} -- the PP pool must hold the FULL width"
+        )
+        _fail()
+
+    sub_shards = tuple(
+        tuple(
+            tp_partition_size(sub_full, n_ranks, r, units)
+            for r in range(n_ranks)
+        )
+        for sub_full in sub_sizes
+    )
+    num_heads = int(pp_temporal.shape[2])
+    value_dim = sub_sizes[-1]
+    if value_dim % num_heads != 0:
+        reasons.append(
+            f"value sub-block ({value_dim}) not divisible by temporal "
+            f"heads ({num_heads})"
+        )
+        _fail()
+    head_dim_units = value_dim // num_heads
+    head_shards = tuple(s // head_dim_units for s in sub_shards[-1])
+    spec = GdnShardSpec(
+        sub_block_sizes=tuple(sub_sizes),
+        sub_block_shards=sub_shards,
+        head_shards=head_shards,
+        num_heads=num_heads,
+    )
+
+    # The derived spec must match the TP pool's ACTUAL shapes.
+    if int(tp_conv.shape[2]) != spec.conv_shard_channels(rank):
+        reasons.append(
+            f"TP conv tensor has {int(tp_conv.shape[2])} channels but the "
+            f"plan gives rank {rank} {spec.conv_shard_channels(rank)}"
+        )
+    if int(tp_temporal.shape[2]) != spec.head_shards[rank]:
+        reasons.append(
+            f"TP temporal tensor has {int(tp_temporal.shape[2])} heads but "
+            f"the plan gives rank {rank} {spec.head_shards[rank]}"
+        )
+    if int(pp_conv.shape[1]) != int(tp_conv.shape[1]):
+        reasons.append(
+            f"slot spaces differ (PP {int(pp_conv.shape[1])} vs TP "
+            f"{int(tp_conv.shape[1])}) -- the flip relies on slot-id "
+            f"identity across layouts"
+        )
+    if pp_conv.dtype != tp_conv.dtype or pp_temporal.dtype != tp_temporal.dtype:
+        reasons.append("state dtypes differ between layouts")
+    if reasons:
+        _fail()
+
+    return GdnFlipPools(
+        spec=spec,
+        pp_conv=pp_conv,
+        pp_temporal=pp_temporal,
+        pp_index=dict(pp_req_pool.mamba_map),
+        tp_conv=tp_conv,
+        tp_temporal=tp_temporal,
+        tp_index=dict(tp_req_pool.mamba_map),
+        n_slots=int(pp_conv.shape[1]),
+    )
+
+
+def _pair_nbytes(
+    spec: GdnShardSpec,
+    shard_rank: int,
+    n_layers: int,
+    n_slots: int,
+    conv_width: int,
+    conv_elem: int,
+    temporal_tail: int,
+    temporal_elem: int,
+) -> int:
+    conv_b = spec.conv_shard_channels(shard_rank) * conv_width * conv_elem
+    temp_b = spec.head_shards[shard_rank] * temporal_tail * temporal_elem
+    return (conv_b + temp_b) * n_layers * n_slots
+
+
+class GdnFlipMover:
+    """One rank's GDN leg of the flip. ``exchange`` has the KV runtime's
+    channel contract (outgoing payloads -> received payloads by peer)."""
+
+    def __init__(
+        self,
+        *,
+        n_ranks: int,
+        rank: int,
+        stage_layer_ids: Sequence[Sequence[int]],
+        pools_fn: Callable[[], GdnFlipPools],
+        slots_fn: Callable[[], torch.Tensor],
+        exchange: Callable[
+            [Dict[int, torch.Tensor], Dict[int, int]], Dict[int, torch.Tensor]
+        ],
+    ):
+        self._n = int(n_ranks)
+        self._rank = int(rank)
+        self._stage_ids = tuple(tuple(int(g) for g in s) for s in stage_layer_ids)
+        if len(self._stage_ids) != self._n:
+            raise KvReshardError(
+                f"{len(self._stage_ids)} stages for {self._n} ranks"
+            )
+        self._pools_fn = pools_fn
+        self._slots_fn = slots_fn
+        self._exchange = exchange
+        self.last_stats: Optional[dict] = None
+
+    # -- helpers -------------------------------------------------------------
+
+    def _slot_list(self) -> List[int]:
+        slots = self._slots_fn()
+        slots = torch.unique(slots.detach().to("cpu", torch.int64))
+        return [int(s) for s in slots.tolist()]
+
+    def _pack_pp_side(
+        self, pools: GdnFlipPools, slots: List[int], dst: int
+    ) -> torch.Tensor:
+        """My stage's layers x dst's shard, slots ascending (PP->TP)."""
+        parts = []
+        for s in slots:
+            for gid in self._stage_ids[self._rank]:
+                li = pools.pp_index[gid]
+                parts.append(
+                    conv_slice(pools.pp_conv[li, s], pools.spec, dst)
+                    .contiguous()
+                    .view(torch.uint8)
+                    .reshape(-1)
+                )
+                parts.append(
+                    temporal_slice(pools.pp_temporal[li, s], pools.spec, dst)
+                    .contiguous()
+                    .view(torch.uint8)
+                    .reshape(-1)
+                )
+        flat = (
+            torch.cat(parts) if parts else torch.empty(0, dtype=torch.uint8)
+        )
+        return torch.cat([flat, _checksum(flat)])
+
+    def _pack_tp_side(
+        self, pools: GdnFlipPools, slots: List[int], dst_stage: int
+    ) -> torch.Tensor:
+        """dst_stage's layers x MY shard, from my compact tensors (TP->PP)."""
+        parts = []
+        for s in slots:
+            for gid in self._stage_ids[dst_stage]:
+                li = pools.tp_index[gid]
+                parts.append(
+                    pools.tp_conv[li, s].contiguous().view(torch.uint8).reshape(-1)
+                )
+                parts.append(
+                    pools.tp_temporal[li, s]
+                    .contiguous()
+                    .view(torch.uint8)
+                    .reshape(-1)
+                )
+        flat = (
+            torch.cat(parts) if parts else torch.empty(0, dtype=torch.uint8)
+        )
+        return torch.cat([flat, _checksum(flat)])
+
+    def _verify(self, payload: torch.Tensor, want: int, peer: int) -> torch.Tensor:
+        if payload is None or payload.numel() != want:
+            got = 0 if payload is None else payload.numel()
+            raise KvReshardError(
+                f"{LOG_PREFIX} peer {peer} sent {got} bytes, expected "
+                f"{want} -- layer map, shard spec or slot set diverged"
+            )
+        data = payload[:-_CHECKSUM_BYTES]
+        stored = int(
+            payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item()
+        )
+        have = int(data.to(torch.int64).sum().item()) if data.numel() else 0
+        if stored != have:
+            raise KvReshardError(
+                f"{LOG_PREFIX} payload checksum mismatch from peer {peer} "
+                f"(stored {stored}, computed {have}); refusing to scatter"
+            )
+        return data
+
+    def _write_tp_side(
+        self,
+        pools: GdnFlipPools,
+        slots: List[int],
+        src_stage: int,
+        data: torch.Tensor,
+    ) -> None:
+        """Scatter a stage's payload (my shard) into my compact TP pool."""
+        spec = pools.spec
+        conv_w = int(pools.tp_conv.shape[3])
+        conv_c = spec.conv_shard_channels(self._rank)
+        conv_b = conv_c * conv_w * pools.tp_conv.element_size()
+        h = spec.head_shards[self._rank]
+        d, n = int(pools.tp_temporal.shape[3]), int(pools.tp_temporal.shape[4])
+        temp_b = h * d * n * pools.tp_temporal.element_size()
+        off = 0
+        for s in slots:
+            for gid in self._stage_ids[src_stage]:
+                li = pools.tp_index[gid]
+                chunk = data[off : off + conv_b]
+                pools.tp_conv[li, s] = chunk.view(pools.tp_conv.dtype).view(
+                    conv_c, conv_w
+                )
+                off += conv_b
+                chunk = data[off : off + temp_b]
+                pools.tp_temporal[li, s] = chunk.view(
+                    pools.tp_temporal.dtype
+                ).view(h, d, n)
+                off += temp_b
+        if off != data.numel():
+            raise KvReshardError(
+                f"{LOG_PREFIX} stage {src_stage} payload has trailing bytes"
+            )
+
+    def _write_pp_side(
+        self,
+        pools: GdnFlipPools,
+        slots: List[int],
+        src_rank: int,
+        data: torch.Tensor,
+    ) -> None:
+        """Scatter shard rank's payload into my stage's FULL tensors."""
+        spec = pools.spec
+        conv_w = int(pools.pp_conv.shape[3])
+        conv_c = spec.conv_shard_channels(src_rank)
+        conv_b = conv_c * conv_w * pools.pp_conv.element_size()
+        h = spec.head_shards[src_rank]
+        d, n = int(pools.pp_temporal.shape[3]), int(pools.pp_temporal.shape[4])
+        temp_b = h * d * n * pools.pp_temporal.element_size()
+        off = 0
+        for s in slots:
+            for gid in self._stage_ids[self._rank]:
+                li = pools.pp_index[gid]
+                chunk = data[off : off + conv_b]
+                conv_scatter(
+                    pools.pp_conv[li, s],
+                    chunk.view(pools.pp_conv.dtype).view(conv_c, conv_w),
+                    spec,
+                    src_rank,
+                )
+                off += conv_b
+                chunk = data[off : off + temp_b]
+                temporal_scatter(
+                    pools.pp_temporal[li, s],
+                    chunk.view(pools.pp_temporal.dtype).view(h, d, n),
+                    spec,
+                    src_rank,
+                )
+                off += temp_b
+        if off != data.numel():
+            raise KvReshardError(
+                f"{LOG_PREFIX} shard {src_rank} payload has trailing bytes"
+            )
+
+    # -- the move ------------------------------------------------------------
+
+    def move(self, direction: str) -> dict:
+        pools = self._pools_fn()  # re-validates preconditions EVERY flip
+        slots = self._slot_list()
+        spec = pools.spec
+        conv_w = int(pools.pp_conv.shape[3])
+        conv_e = pools.pp_conv.element_size()
+        d, n = int(pools.pp_temporal.shape[3]), int(pools.pp_temporal.shape[4])
+        temp_tail = d * n
+        temp_e = pools.pp_temporal.element_size()
+
+        if direction == PP_TO_TP:
+            outgoing = {
+                r: self._pack_pp_side(pools, slots, r)
+                for r in range(self._n)
+                if r != self._rank
+            }
+            incoming = {
+                s: _pair_nbytes(
+                    spec,
+                    self._rank,
+                    len(self._stage_ids[s]),
+                    len(slots),
+                    conv_w,
+                    conv_e,
+                    temp_tail,
+                    temp_e,
+                )
+                + _CHECKSUM_BYTES
+                for s in range(self._n)
+                if s != self._rank
+            }
+        elif direction == TP_TO_PP:
+            outgoing = {
+                s: self._pack_tp_side(pools, slots, s)
+                for s in range(self._n)
+                if s != self._rank
+            }
+            incoming = {
+                r: _pair_nbytes(
+                    spec,
+                    r,
+                    len(self._stage_ids[self._rank]),
+                    len(slots),
+                    conv_w,
+                    conv_e,
+                    temp_tail,
+                    temp_e,
+                )
+                + _CHECKSUM_BYTES
+                for r in range(self._n)
+                if r != self._rank
+            }
+        else:
+            raise KvReshardError(f"unknown GDN flip direction {direction!r}")
+
+        received = self._exchange(outgoing, incoming)
+        verified = {
+            peer: self._verify(received.get(peer), incoming[peer], peer)
+            for peer in incoming
+        }
+
+        # Local leg (my stage <-> my shard), pools disjoint per direction.
+        if direction == PP_TO_TP:
+            local = self._pack_pp_side(pools, slots, self._rank)
+            self._write_tp_side(
+                pools, slots, self._rank, local[:-_CHECKSUM_BYTES]
+            )
+            for peer, data in verified.items():
+                self._write_tp_side(pools, slots, peer, data)
+        else:
+            local = self._pack_tp_side(pools, slots, self._rank)
+            self._write_pp_side(
+                pools, slots, self._rank, local[:-_CHECKSUM_BYTES]
+            )
+            for peer, data in verified.items():
+                self._write_pp_side(pools, slots, peer, data)
+
+        stats = {
+            "direction": direction,
+            "slots": len(slots),
+            "sent_bytes": sum(int(t.numel()) for t in outgoing.values()),
+            "received_bytes": sum(incoming.values()),
+        }
+        self.last_stats = stats
+        logger.info(
+            "%s moved %d slot(s) %s: sent %.2f MiB, received %.2f MiB",
+            LOG_PREFIX,
+            len(slots),
+            direction,
+            stats["sent_bytes"] / 1048576.0,
+            stats["received_bytes"] / 1048576.0,
+        )
+        return stats
+
+
+def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
+    """Production pre_cutover_fn: preconditions re-validated per flip,
+    slots from the replicated running batch, exchange over the flip
+    device group (a second closure of the KV runtime's channel)."""
+    from sglang.srt.distributed.parallel_state import (
+        get_phase_flip_group,
+        get_world_group,
+    )
+    from sglang.srt.managers.kv_reshard import _dist_exchange
+
+    stacks = scheduler.phase_flip_stacks
+    world = get_world_group()
+    n, rank = world.world_size, world.rank_in_group
+    pp_req_pool = scheduler.tp_worker.model_runner.req_to_token_pool
+    tp_req_pool = stacks.tp_worker.model_runner.req_to_token_pool
+    tp_model_config = stacks.tp_worker.model_config
+    linear_ids = sorted(pp_pool_ids_union(tp_req_pool))
+    stage_ids = derive_pp_linear_layer_map(
+        linear_ids,
+        int(tp_model_config.num_hidden_layers),
+        int(scheduler.server_args.pp_size),
+    )
+
+    def _pools() -> GdnFlipPools:
+        return gdn_flip_preconditions(pp_req_pool, tp_req_pool, n, rank)
+
+    def _slots() -> torch.Tensor:
+        running = getattr(scheduler, "running_batch", None)
+        reqs = list(getattr(running, "reqs", []) or []) if running else []
+        vals = []
+        for req in reqs:
+            idx = getattr(req, "mamba_pool_idx", None)
+            if idx is None:
+                raise KvReshardError(
+                    f"{LOG_PREFIX} live request {getattr(req, 'rid', '?')} "
+                    f"has no mamba slot -- refusing to flip past unmoved "
+                    f"linear state"
+                )
+            vals.append(int(idx.item() if hasattr(idx, "item") else idx))
+        return torch.tensor(sorted(set(vals)), dtype=torch.int64)
+
+    flip_tp = get_phase_flip_group("tp")
+    device = pp_req_pool.mamba_pool.mamba_cache.temporal.device
+    mover = GdnFlipMover(
+        n_ranks=n,
+        rank=rank,
+        stage_layer_ids=stage_ids,
+        pools_fn=_pools,
+        slots_fn=_slots,
+        exchange=_dist_exchange(flip_tp.device_group, device),
+    )
+    scheduler.phase_flip_gdn_mover = mover
+
+    def _leg(direction: str) -> None:
+        mover.move(direction)
+
+    return _leg
+
+
+def pp_pool_ids_union(tp_req_pool) -> List[int]:
+    """ALL linear layer ids, read from the TP req pool's mamba_map (the
+    TP stack holds every linear layer; the PP pool holds only its
+    stage)."""
+    return [int(gid) for gid in tp_req_pool.mamba_map]
