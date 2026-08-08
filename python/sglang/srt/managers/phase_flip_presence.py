@@ -21,7 +21,7 @@ THE DESIGN LAW THIS SERVES
 The PP loop has at least two independent blocking channels -- the request
 chain and the hidden-states exchange -- with no global order between them,
 and the flip's consensus reduction is a third. Every design that let a
-rank block anywhere while a peer might be elsewhere has deadlocked. Seven
+rank block anywhere while a peer might be elsewhere has deadlocked. Eight
 measured corpses, 2026-08-08:
 
   A   arm same-pass, async forward       rank0 in reduction, peers in chain recv
@@ -41,6 +41,45 @@ measured corpses, 2026-08-08:
   --  bounded join (abandon from inside) FATAL: a rank that has entered an
                                          all_reduce owes it; walking away closed
                                          the gloo pairs and aborted every rank
+  E   presence announced while still
+      owing a chain send             the gate ASSEMBLED and still wedged
+                                         (boot 18). Fixed by clauses (i)+(ii)
+                                         in
+                                         PhaseFlipRuntime._await_group_presence.
+
+WHAT BOOT 18 ACTUALLY SHOWED, and what it did not
+-------------------------------------------------
+OBSERVED (py-spy, tree cf478d1634):
+  rank 0  inside the consensus reduction (_reduce -> bounded_collective)
+  rank 1  blocked in p2p_work.work.wait() (scheduler_pp_mixin :1109) from
+          the ORDINARY top-of-pass commit :705 of the previous pass's
+          chain forward
+NOT OBSERVED:
+  rank 2's stack. It was never recorded, the serving log was truncated by
+  the next boot, and no dump survives. Rank 2 is the LAST PP stage, so
+  :705 is structurally unreachable for it -- but what it WAS doing is
+  unknown and is not reconstructable.
+
+The inference the fix rests on, stated as an inference: rank 1's forward
+to rank 2 was not completing, so rank 2 had stopped consuming the chain;
+and rank 0 was inside the reduction, so it had observed a full quorum,
+which means rank 1's flag was already up while rank 1 still owed that
+send. TWO lessons follow, both structural and both independently
+sufficient reasons to change the code:
+
+  * a flag must mean "I OWE NO SEND", not merely "I am armed" -- otherwise
+    the quorum a peer enters on is a promise the flagged rank has not
+    kept;
+  * an armed rank must KEEP CONSUMING, because the moment it stops, its
+    upstream blocks at a point that PRECEDES the gate, where no gate can
+    reach it.
+
+THE GATE IS NOT THE WHOLE OBLIGATION. That is the general form, and it is
+why this entry is not merely a bug report: a gate can only make ENTRY
+safe. It cannot help a rank that never reaches the entry because it is
+blocked at an ordinary channel operation upstream of it. Every blocking
+point between arming and the reduction has to be removed on its own
+terms.
 
 This module is the other half of the only shape left: make the ENTRY to
 the blocking reduction conditional on knowing that every peer is already

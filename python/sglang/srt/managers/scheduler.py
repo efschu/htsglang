@@ -2420,7 +2420,69 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
+    def _build_pp_chain_receiver(self):
+        """#631: the single owner of this rank's request-chain receive
+        stream, or None to keep the unmodified upstream path.
+
+        Built ONLY with the phase flip on and only on a PP stage that has
+        an upstream, because it exists to serve one requirement: an armed
+        rank must keep consuming the chain WITHOUT blocking on it, so its
+        upstream never blocks committing a forward to it (boot 18). A boot
+        without the flip has no armed state, so it keeps the direct
+        point_to_point_pyobj call and is byte-for-byte unchanged.
+
+        It must be built ONCE per rank and used by BOTH the blocking and
+        the non-blocking consumer: two consumers posting their own irecv
+        on one stream would misframe it the moment a message was split
+        across them.
+
+        OFF BY DEFAULT, and that is a finding, not caution. The armed path
+        this receiver serves rests on progressing a posted ``irecv`` by
+        polling ``is_completed()``, and on this build that NEVER completes
+        -- measured, and pinned in
+        test_pp_chain_receiver.test_measured_gloo_does_not_progress_a_posted_irecv_by_polling.
+        Wired live it would absorb nothing, while the matching
+        announce-when-flushed clause withheld presence for ever, so every
+        flip would abandon at the presence deadline: strictly worse than
+        the defect it was written to fix. The same measurement also shows
+        an unconsumed forward does NOT block the upstream here, so the
+        premise that this receiver was built for is itself unconfirmed.
+
+        Kept, gated, and tested rather than deleted: the state machine is
+        correct on its own terms and is the piece any future design needs,
+        whatever drives progress. Set SGLANG_PP_CHAIN_RECEIVER=1 to
+        exercise it.
+        """
+        if os.environ.get("SGLANG_PP_CHAIN_RECEIVER", "0") != "1":
+            return None
+        if not self.server_args.enable_phase_flip:
+            return None
+        if self.ps.pp_size <= 1 or self.ps.pp_rank == 0:
+            return None
+        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+            return None
+        from sglang.srt.managers.pp_chain_receiver import PpChainReceiver
+
+        dp_offset = self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+        return PpChainReceiver(
+            group=self.world_group.cpu_group,
+            src=(self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+            dst=self.ps.pp_rank * self.ps.tp_size + dp_offset,
+        )
+
+    def phase_flip_is_armed(self) -> bool:
+        """#631: is a flip armed on this rank right now?
+
+        Read straight off the runtime rather than mirrored into a flag:
+        the runtime's ``_pending`` is the one authority for arming, and a
+        second copy would be a state to keep in sync. Absent runtime (not
+        yet lazily built) means not armed.
+        """
+        runtime = getattr(self, "phase_flip_runtime", None)
+        return runtime is not None and runtime.is_armed()
+
     def init_request_receiver(self) -> None:
+        self.pp_chain_receiver = self._build_pp_chain_receiver()
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -2450,6 +2512,22 @@ class Scheduler(
                 if (
                     getattr(self, "phase_policy_cfg", None) is not None
                     and self.phase_policy_cfg.enabled
+                )
+                else None
+            ),
+            # #631: both None unless the flip is enabled, so the default
+            # intake path is unchanged.
+            chain_receiver=self.pp_chain_receiver,
+            # Same gate as the receiver above, and for the same reason:
+            # the armed intake rule and the armed forward rule are one
+            # mechanism with it. Enabling them without a working drain
+            # would leave an armed rank consuming NOTHING, which is the
+            # boot-18 shape made permanent.
+            phase_flip_armed_hook=(
+                self.phase_flip_is_armed
+                if (
+                    self.server_args.enable_phase_flip
+                    and self.pp_chain_receiver is not None
                 )
                 else None
             ),

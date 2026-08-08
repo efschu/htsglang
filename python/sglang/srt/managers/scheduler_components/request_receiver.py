@@ -67,6 +67,15 @@ class SchedulerRequestReceiver:
     # wants a flip, else None. Optional and defaulted so every existing
     # construction is unchanged and the default path costs one compare.
     phase_policy_hook: Optional[Callable[[], Any]] = None
+    # #631: the single owner of this rank's request-chain receive stream
+    # (PpChainReceiver), installed only when the phase flip is enabled.
+    # None restores the direct point_to_point_pyobj call, i.e. the exact
+    # upstream behaviour for every boot without the flip.
+    chain_receiver: Optional[Any] = None
+    # #631: True while a phase flip is armed on this rank. An armed rank
+    # must not take on new work and must not block on the chain -- see
+    # _pull_raw_reqs.
+    phase_flip_armed_hook: Optional[Callable[[], bool]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -128,7 +137,43 @@ class SchedulerRequestReceiver:
 
         return recv_reqs
 
+    def _phase_flip_armed(self) -> bool:
+        if self.phase_flip_armed_hook is None:
+            return False
+        try:
+            return bool(self.phase_flip_armed_hook())
+        except Exception:  # noqa: BLE001 - never let a probe break intake
+            return False
+
     def _pull_raw_reqs(self) -> Optional[List]:
+        # #631 THE ARMED INTAKE RULE. A rank with a flip armed admits NO
+        # new work and BLOCKS ON NOTHING:
+        #
+        #   rank 0    leaves its requests in the zmq socket. Not reading
+        #             them is what buffers them -- there is no queue to
+        #             manage and nothing can be lost.
+        #   rank k>0  keeps CONSUMING the chain non-blockingly into the
+        #             receiver's inbox, and reports no new work. Consuming
+        #             is not optional: boot 18 measured what happens when
+        #             an armed rank stops. Rank 2 armed and stopped
+        #             reading, so rank 1's ordinary top-of-pass commit of
+        #             the previous forward blocked in work.wait() BEFORE
+        #             rank 1 could announce presence. The gate never
+        #             assembled and rank 0 sat in the reduction alone.
+        #             The blocking point preceded the gate, so the gate
+        #             could never have covered it -- the fix has to be
+        #             here, at the obligation itself.
+        #
+        # Both halves return an EMPTY list rather than None: empty means
+        # "no new work this pass", which every downstream step already
+        # handles, whereas None means "not the intake rank".
+        if self._phase_flip_armed():
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                if self.ps.pp_rank != 0 and self.chain_receiver is not None:
+                    self.chain_receiver.poll()
+                return []
+            return None
+
         if self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
@@ -157,13 +202,23 @@ class SchedulerRequestReceiver:
                 dp_offset = (
                     self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
                 )
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
+                if self.chain_receiver is not None:
+                    # #631: ONE owner of this stream. The receiver drains
+                    # its inbox first, so messages it absorbed while a
+                    # flip was armed are handed over here in arrival
+                    # order before anything new is taken off the wire.
+                    # Routing the blocking path through it as well is
+                    # what keeps a half-received message from being
+                    # misframed by a second, competing irecv.
+                    recv_reqs = self.chain_receiver.recv()
+                else:
+                    recv_reqs = point_to_point_pyobj(
+                        [],
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    )
             else:
                 recv_reqs = None
         return recv_reqs

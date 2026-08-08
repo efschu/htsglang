@@ -741,6 +741,27 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
             rank=world.rank_in_group,
         ),
         pump_fn=getattr(scheduler, "pp_pump_send_req_work", None),
+        # #631 the boot-18 pair. (ii) keep consuming so no peer can block
+        # on this armed rank; (i) withhold presence until this rank's own
+        # forward is flushed, so the flag means "I owe no send".
+        #
+        # BOTH are gated on the chain receiver, and both must stay off
+        # together. (i) without (ii) is the dangerous half: with the
+        # ordinary forward still being issued every pass, send_req_work is
+        # non-empty whenever the round hook runs, so presence would be
+        # withheld for ever and EVERY flip would abandon at the presence
+        # deadline -- a server that silently stops flipping. See
+        # Scheduler._build_pp_chain_receiver for why the pair is off.
+        drain_fn=(
+            getattr(scheduler, "pp_drain_chain_nonblocking", None)
+            if getattr(scheduler, "pp_chain_receiver", None) is not None
+            else None
+        ),
+        owes_send_fn=(
+            getattr(scheduler, "pp_owes_chain_send", None)
+            if getattr(scheduler, "pp_chain_receiver", None) is not None
+            else None
+        ),
         exchange=_dist_exchange(flip_tp.device_group, pp_view.device),
         pp_pool_view=pp_view,
         tp_pool_view=tp_view,
@@ -839,6 +860,13 @@ class PhaseFlipRuntime:
         park_deadline_s: float = DEFAULT_PARK_DEADLINE_S,
         presence=None,
         pump_fn: Optional[Callable[[], None]] = None,
+        # #631 clause (ii): consume whatever the upstream has already sent,
+        # without blocking, so no peer can block on this armed rank.
+        drain_fn: Optional[Callable[[], None]] = None,
+        # #631 clause (i): True while this rank still owes a chain send.
+        # Presence is withheld until it reads False, so the flag means
+        # "my chain is flushed; I owe no send".
+        owes_send_fn: Optional[Callable[[], bool]] = None,
         presence_deadline_s: float = DEFAULT_PRESENCE_DEADLINE_S,
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         exchange: Optional[
@@ -919,10 +947,16 @@ class PhaseFlipRuntime:
         # #631 option 2(b): the pollable entry gate.
         self._presence = presence
         self._pump_fn = pump_fn
+        self._drain_fn = drain_fn
+        self._owes_send_fn = owes_send_fn
         self._presence_deadline_s = float(presence_deadline_s)
         self._presence_wait_started = None
         self._gate_open_epoch = None
         self.presence_timeouts = 0
+        #: Diagnostics: rounds in which presence was WITHHELD because this
+        #: rank still owed a chain send (clause (i)). A non-zero count on a
+        #: healthy boot is normal -- it is the flush being waited out.
+        self.presence_withheld_rounds = 0
         self._join_deadline_s = DEFAULT_JOIN_DEADLINE_S
         self.join_deadline_aborts = 0
         self._exchange = exchange
@@ -1162,6 +1196,17 @@ class PhaseFlipRuntime:
         self._last_hold_reason = None
         return self._execute()
 
+    def is_armed(self) -> bool:
+        """#631: is a flip armed on this rank right now?
+
+        The scheduler's intake asks this every pass to decide whether it
+        may admit new work and whether it may block on the chain. It is a
+        read of ``_pending``, the one authority for arming -- deliberately
+        not a mirrored flag, which would be a second state to keep in
+        sync.
+        """
+        return self._pending is not None
+
     def _park_expired(self, armed: int, ready: int) -> bool:
         """Has this rank been armed-but-unparked past the deadline?
 
@@ -1191,21 +1236,33 @@ class PhaseFlipRuntime:
         construction that satisfies the design law (no rank blocks on any
         channel while a peer may be in a different one). Concretely, per
         iteration this rank only:
-          * announces its own presence for this epoch (a file create),
           * PUMPS its outstanding arm-forward -- progresses it
             non-blockingly, never a blocking commit. A blocking commit
             here is corpse B' (boot 13): rank 0 blocked in
             _pp_commit_comm_work while its peers sat in the hidden-states
             exchange, because "the peer is waiting for the arm" is simply
             not true -- it may be in another channel entirely,
-          * polls peers' flags (file existence),
-          * sleeps briefly.
+          * DRAINS its incoming chain non-blockingly (clause (ii)),
+            buffering what arrives. An armed rank that stops consuming
+            makes its UPSTREAM block on the ordinary top-of-pass commit,
+            upstream of the gate, where no gate can help it (boot 18),
+          * announces its own presence for this epoch (a file create) --
+            but ONLY once it owes no send (clause (i)), so the flag means
+            "my chain is flushed", not merely "I am armed",
+          * polls peers' flags (file existence).
 
         Once all flags are up, entering is safe by CONSTRUCTION rather
         than by argument: every rank that will participate is in this
         same loop -- not blocked elsewhere -- flags are monotone so every
         rank observes the same all-ready fact, and each rank's own chain
-        send was pumped to completion before it entered.
+        send was pumped to completion before it announced.
+
+        THE THREE CLAUSES ARE ONE MECHANISM, not three precautions. (i)
+        alone is unsatisfiable: a rank cannot flush a forward to a peer
+        that has stopped reading. (ii) alone leaves the flag a lie, which
+        is what let the peers enter on a rank that was still blocked.
+        Together they close boot 18: every announced rank owes nothing,
+        and no rank can be prevented from announcing.
 
         The bound is PRE-ENTRY and therefore legal, unlike the withdrawn
         (c): abandoning a poll costs nothing, because nothing has been
@@ -1220,7 +1277,6 @@ class PhaseFlipRuntime:
             return True
 
         epoch = self._epoch
-        self._presence.announce(epoch, note=f"pending={self._pending}")
         if self._presence_wait_started is None:
             self._presence_wait_started = self._clock()
 
@@ -1234,7 +1290,59 @@ class PhaseFlipRuntime:
             except Exception as exc:  # noqa: BLE001 - pumping is best effort
                 logger.warning("%s pump failed: %s", LOG_PREFIX, exc)
 
-        if self._presence.all_present(epoch):
+        # #631 CLAUSE (ii), and the boot-18 fix. An armed rank must keep
+        # servicing EVERY channel obligation it has, or a peer blocks on
+        # it. Pumping alone covers only what this rank SENDS; the other
+        # half of the obligation is what it RECEIVES. Boot 18: rank 2
+        # armed and stopped consuming the chain, so rank 1's ordinary
+        # top-of-pass commit of the previous pass's forward blocked in
+        # work.wait() -- a blocking point that PRECEDES the gate, which is
+        # why the gate could never cover it. Rank 1 therefore never
+        # announced, the gate never assembled, and rank 0 waited in the
+        # reduction. Draining here is what keeps the upstream free to
+        # reach its own announce.
+        if self._drain_fn is not None:
+            try:
+                self._drain_fn()
+            except Exception as exc:  # noqa: BLE001 - draining is best effort
+                logger.warning("%s drain failed: %s", LOG_PREFIX, exc)
+
+        # #631 CLAUSE (i). ANNOUNCE ONLY ONCE THIS RANK OWES NO SEND, so a
+        # raised flag means "my chain is flushed", not merely "I am armed".
+        # Announcing while a forward is still outstanding is what made the
+        # boot-18 flag a lie: the rank announced, went back around the
+        # pass, and blocked on the top-of-pass commit of that very send
+        # before it could reach the reduction its flag had promised. The
+        # peers, seeing a full quorum, entered and waited for a rank that
+        # was blocked elsewhere.
+        #
+        # Withholding is safe: presence is monotone, so a later announce is
+        # simply a later fact, and the pre-entry deadline still bounds the
+        # wait. A rank that can never flush abandons LOUDLY instead of
+        # dragging the group into a reduction it cannot join.
+        #
+        # WITHHOLDING MUST FALL THROUGH TO THE DEADLINE, never return
+        # early. Returning from here skips the pre-entry bound below and
+        # turns "wait until flushed" into a NEW unbounded wait -- the same
+        # shape as the wedge this clause exists to remove. Caught by
+        # test_can_fail_a_rank_that_never_flushes_abandons_instead_of_wedging
+        # while building it.
+        owes = False
+        if self._owes_send_fn is not None:
+            try:
+                owes = bool(self._owes_send_fn())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s owes-send probe failed: %s", LOG_PREFIX, exc)
+                owes = False
+
+        if owes:
+            self.presence_withheld_rounds += 1
+        else:
+            self._presence.announce(epoch, note=f"pending={self._pending}")
+
+        # A rank that is withholding cannot be part of a full quorum (its
+        # own flag is down), so this is skipped rather than merely false.
+        if not owes and self._presence.all_present(epoch):
             waited = self._clock() - self._presence_wait_started
             self._presence_wait_started = None
             # RE-BASE THE PARK CLOCK ON GROUP ASSEMBLY. The park deadline
