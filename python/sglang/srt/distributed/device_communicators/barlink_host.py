@@ -58,9 +58,13 @@ FIVE PROPERTIES THAT ARE LOAD-BEARING
    consumption flags — but for op ``seq-2``, which in steady state is long
    done, so the check is a few loads and never a spin.
 4. **Cycle deadline instead of a hang.** Every spin is bounded by
-   ``clock64()``; a diverged peer traps the kernel, exactly as in
-   ``barlink_device``. Deadlock safety otherwise rests on the same invariant
-   NCCL kernels use: all ranks issue the same sequence of collectives (SPMD).
+   ``clock64()``; on expiry the kernel writes an abort code into ``seq_dev[1]``
+   and RETURNS, and :meth:`BarlinkHostTransport.check_aborted` turns that word
+   into a structured ``HostCollectiveAborted`` on the host — exactly as in
+   ``barlink_device`` (#583) and the BAR1 transport (#431 fix 2). It must
+   never ``__trap()``: see the comment on ``wait_ge``. Deadlock safety
+   otherwise rests on the same invariant NCCL kernels use: all ranks issue the
+   same sequence of collectives (SPMD).
 5. **Point-to-point too.** ``send``/``recv`` use per-ordered-pair buffers and
    per-pair sequence counters, so they do not have to be group-uniform. The
    communicator in ``barlink.py`` does not dispatch p2p today; the methods are
@@ -68,8 +72,9 @@ FIVE PROPERTIES THAT ARE LOAD-BEARING
    actually measures.
 
 The CUDA below sticks to constructs hipify translates 1:1
-(``__threadfence_system``, ``clock64``, volatile loads, ``abort()`` instead of
-``__trap()``), so the same file serves a ROCm rank.
+(``__threadfence_system``, ``clock64``, volatile loads, ``__shared__``,
+``__syncthreads``), so the same file serves a ROCm rank. There is deliberately
+no device-side trap of any kind left to translate (#653).
 
 NOT A "HOST-STAGED" TRANSPORT
 =============================
@@ -91,7 +96,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed.device_communicators import barlink_liveness
+from sglang.srt.distributed.device_communicators import (
+    barlink_abort_gate,
+    barlink_liveness,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +118,7 @@ def _info_once(msg: str, *args) -> None:
 # Tunables. RANK-UNIFORM, like every other SGLANG_BARLINK* knob: the ranks agree
 # on a flag protocol and on the slot geometry, so a rank that reads a
 # different value does not return a wrong answer, it hangs until the cycle
-# deadline traps it.
+# deadline fires and the abort word is raised on the host.
 # ---------------------------------------------------------------------------
 
 #: Per-rank staging slot (MiB). Unset -> inherit SGLANG_BARLINK_SLOT_MIB, which
@@ -146,15 +154,6 @@ _CUDA_SRC = r"""
 
 #define BARLINK_HOST_MAX_RANKS 8
 #define BARLINK_HOST_COLS 32
-
-// __trap() is CUDA-only and hipify does NOT translate it; abort() is HIP's
-// device-side equivalent and lowers to s_trap on amdgcn. Same reasoning (and
-// the same past failure) as in barlink_device.py.
-#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
-#define BARLINK_HOST_TRAP() abort()
-#else
-#define BARLINK_HOST_TRAP() __trap()
-#endif
 
 using u64 = unsigned long long;
 
@@ -207,12 +206,33 @@ __device__ __forceinline__ long long from_acc<long long>(long long v) {
 template <typename T>
 struct alignas(16) Vec16 { T x[16 / sizeof(T)]; };
 
-__device__ __forceinline__ void wait_ge(const volatile u64* flags, int idx,
-                                        u64 target, u64 timeout) {
+// Bounded spin on one flag column. Returns TRUE when the deadline expired,
+// false when the awaited value arrived.
+//
+// #583/#653: on expiry this writes an abort code into seq_dev[1] and RETURNS
+// -- it must never __trap(). A device trap destroys the CUDA context, and
+// from that moment every later CUDA call in the process returns a sticky
+// cudaErrorLaunchFailure ("unspecified launch failure") at whatever unrelated
+// call site happens to be next: #583 is a production boot in which a barlink
+// expiry surfaced inside Triton's load_binary and named a kernel that was
+// only the victim. The device transport was cured on 2026-08-05
+// (barlink_device.py::barlink_begin_kernel); this transport kept the trap
+// until #653. The host reads the word in
+// BarlinkHostTransport.check_aborted and raises a structured
+// HostCollectiveAborted instead. Same contract as the BAR1 transport's
+// ctlStatus word (#431 fix 2).
+//
+// The caller must consume the return value -- see the shared-abort pattern at
+// the three call sites, which is what turns "thread 0 gave up" into "the
+// whole block leaves without touching the payload".
+__device__ __forceinline__ bool wait_ge(const volatile u64* flags, int idx,
+                                        u64 target, u64 timeout, u64* seq_dev,
+                                        u64 code) {
   u64 start = clock64();
   while (vload(&flags[idx]) < target) {
-    if ((u64)(clock64() - start) > timeout) { BARLINK_HOST_TRAP(); }
+    if ((u64)(clock64() - start) > timeout) { seq_dev[1] = code; return true; }
   }
+  return false;
 }
 
 // "Am I the block that finished last?" -- the __threadfence + atomicAdd
@@ -240,15 +260,46 @@ __global__ void barlink_host_put_kernel(
     unsigned* blk_ctr, int pub_idx, int cons_idx0, int cons_stride,
     int cons_count, int lag, u64 timeout, int bump_seq) {
   const u64 seq = *seq_dev;
+  // THE SHARED-ABORT PATTERN (#653), used identically at all three spin
+  // sites of this file and taken from bar1_mesh_kernel's K_1BLK arm.
+  //
+  // Only thread 0 spins -- but a spin that gives up must take the WHOLE
+  // block with it, because thread 0 returning alone would leave its peers at
+  // a __syncthreads() only it was going to reach. So the outcome is
+  // published in shared memory and every thread acts on it after the
+  // barrier, before any payload work and before last_block()'s own
+  // __syncthreads().
+  //
+  // ONE barrier, not two: `abortS` is written by thread 0 only, and every
+  // other thread's first read of it is after the __syncthreads() below, so
+  // the initialization needs no barrier of its own. That keeps the barrier
+  // count of this kernel exactly what it was before the fix.
+  //
+  // TERMINAL-ABORT CONTRACT. After an abort the host raises and the process
+  // is done -- HostCollectiveAborted is not recoverable, the output buffers
+  // are partially written by construction. Cross-BLOCK skew is therefore
+  // acceptable residue: some blocks may abort while others found the flag in
+  // time, moved their share of the payload and even won last_block() and
+  // published, and blk_ctr is left stale because the aborting blocks never
+  // counted themselves in. None of that is repaired here. The abort word is
+  // set in every one of those interleavings, which is the only thing the
+  // host's raise needs; adding cross-block coordination would buy a tidier
+  // post-mortem state for a process that is about to die anyway.
+  __shared__ int abortS;
   // Reuse guard: the buffer we are about to overwrite was last READ during
   // op seq-lag (lag = 2, because the slot is double-buffered by parity). In
   // steady state every peer is long past it and this is a handful of loads.
-  if (threadIdx.x == 0 && seq > (u64)lag) {
-    for (int k = 0; k < cons_count; ++k) {
-      wait_ge(flags, cons_idx0 + k * cons_stride, seq - (u64)lag, timeout);
+  if (threadIdx.x == 0) {
+    abortS = 0;
+    if (seq > (u64)lag) {
+      for (int k = 0; k < cons_count; ++k) {
+        if (wait_ge(flags, cons_idx0 + k * cons_stride, seq - (u64)lag,
+                    timeout, seq_dev, 1ull)) { abortS = 1; break; }
+      }
     }
   }
   __syncthreads();
+  if (abortS) return;
 
   char* dst = slots.p[slot_pair * 2 + (int)(seq & 1ULL)];
   const size_t stride = (size_t)gridDim.x * blockDim.x;
@@ -279,13 +330,21 @@ __global__ void barlink_host_reduce_kernel(
     HostSlots slots, int world, int rank, volatile u64* flags, u64* seq_dev,
     unsigned* blk_ctr, u64 timeout) {
   const u64 seq = *seq_dev;
+  // Shared-abort pattern (#653) -- see barlink_host_put_kernel for the rule
+  // and for the terminal-abort contract. Code 2 = "waiting for a peer to
+  // publish its slot", distinct from the put kernel's reuse-guard wait
+  // because the two point at different culprits.
+  __shared__ int abortS;
   if (threadIdx.x == 0) {
+    abortS = 0;
     for (int r = 0; r < world; ++r) {
       if (r == rank) continue;
-      wait_ge(flags, r * BARLINK_HOST_COLS + 0, seq, timeout);
+      if (wait_ge(flags, r * BARLINK_HOST_COLS + 0, seq, timeout, seq_dev,
+                  2ull)) { abortS = 1; break; }
     }
   }
   __syncthreads();
+  if (abortS) return;
   // Acquire side of the release above. Mapped host memory is not cached on
   // the device, so ordering is all that is needed here -- no invalidation.
   __threadfence_system();
@@ -347,14 +406,21 @@ __global__ void barlink_host_copyout_kernel(
     volatile u64* flags, u64* seq_dev, unsigned* blk_ctr, int pub_base,
     int pub_stride, int cons_idx, u64 timeout) {
   const u64 seq = *seq_dev;
+  // Shared-abort pattern (#653) -- see barlink_host_put_kernel. Code 3 =
+  // "waiting for a source rank to publish", which is the all_gather /
+  // broadcast / recv side of the same protocol.
+  __shared__ int abortS;
   if (threadIdx.x == 0) {
+    abortS = 0;
     for (int k = 0; k < rn; ++k) {
       const int r = r0 + k;
       if (r == self_rank) continue;
-      wait_ge(flags, pub_base + r * pub_stride, seq, timeout);
+      if (wait_ge(flags, pub_base + r * pub_stride, seq, timeout, seq_dev,
+                  3ull)) { abortS = 1; break; }
     }
   }
   __syncthreads();
+  if (abortS) return;
   __threadfence_system();
 
   const int par = (int)(seq & 1ULL);
@@ -785,6 +851,42 @@ def _unregister(ptr: int) -> None:
     fn(ctypes.c_void_p(ptr))
 
 
+class HostCollectiveAborted(RuntimeError):
+    """A host-transport spin kernel hit its deadline and gave up.
+
+    Carries the same structured context as the device transport's
+    ``DeviceCollectiveAborted`` (#583) and the BAR1 transport's
+    ``Bar1CollectiveAborted`` (#431 fix 2): which rank, which world, which
+    wait. Raised from :meth:`BarlinkHostTransport.check_aborted`.
+    """
+
+    def __init__(self, message: str, *, rank: int, world: int, code: int,
+                 where: str):
+        super().__init__(message)
+        self.rank = rank
+        self.world = world
+        self.code = code
+        self.where = where
+
+
+#: seq_dev[1] codes written by the three spin sites on deadline expiry.
+#: Distinct on purpose: the three point at different culprits.
+_ABORT_WAITS = {
+    1: (
+        "barlink_host_put_kernel (reuse guard: waiting for the peers to "
+        "consume the op whose slot is about to be overwritten)"
+    ),
+    2: (
+        "barlink_host_reduce_kernel (waiting for a peer to publish its slot "
+        "for this op)"
+    ),
+    3: (
+        "barlink_host_copyout_kernel (waiting for a source rank to publish "
+        "its slot -- the all_gather / broadcast / recv side)"
+    ),
+}
+
+
 class BarlinkHostTransport:
     """Collectives and point-to-point over one pinned, portable host segment.
 
@@ -793,9 +895,22 @@ class BarlinkHostTransport:
     seam documented in barlink.py.
     """
 
-    #: ~30 s at 2 GHz. A diverged peer traps the spin kernel instead of
-    #: hanging the GPU forever.
+    #: ~30 s at 2 GHz. On expiry a spin kernel writes the abort word into
+    #: `seq_dev[1]` and RETURNS, instead of hanging the GPU forever -- and
+    #: instead of trapping, which is what #653 removed: a device trap
+    #: destroys the CUDA context and every later CUDA call in the process
+    #: then fails with a sticky "unspecified launch failure" at an unrelated
+    #: site (#583). `check_aborted` turns the word into a raise.
     _TIMEOUT_CYCLES = 60_000_000_000
+
+    #: At CLASS level on purpose, like the device transport's abort-poll
+    #: state: `check_aborted` and `close` must answer for every construction
+    #: path, including the ones that never run `__init__` (the #653 suite
+    #: builds transports through `__new__` to exercise the guard without a
+    #: card). A guard whose first statement can raise AttributeError is not a
+    #: guard, and "not registered / no counters" is the correct default.
+    _registered_in_gate = False
+    _seq_all = None
 
     # -- pluggable-transport interface (see barlink.py "transport seam") ------
     #
@@ -882,12 +997,35 @@ class BarlinkHostTransport:
         # Device-side state first: allocating it creates this rank's CUDA
         # context, which cudaHostRegister below needs.
         with torch.cuda.device(device):
+            # ONE backing tensor, TWO words per counter (#653).
+            #
+            # Word 0 is the sequence number; word 1 is the abort word a
+            # tripped spin kernel writes instead of trapping. Every kernel
+            # already receives its counter as `seq_dev`, so the abort path
+            # needed no new parameter on any launcher or entry point and no
+            # captured graph changes shape -- the same argument the device
+            # transport's two-element `_seq_dev` carries (#583).
+            #
+            # ONE tensor rather than three is what makes `check_aborted` a
+            # single read: every abort word this transport can produce --
+            # collective, per-destination send, per-source recv -- lives in
+            # column 1 of this tensor. The rows are handed to the extension as
+            # 2-element CONTIGUOUS views (`self._seq_all[i]`), which is
+            # exactly the [seq, abort] pair the kernels index.
+            #
+            # Row 0 = collectives, rows 1.._MAX_RANKS = send-to-dst,
+            # the remainder = recv-from-src.
+            self._seq_all = torch.zeros(
+                1 + 2 * _MAX_RANKS, 2, dtype=torch.int64, device=device
+            )
             # seq starts at 1, so the put kernel's reuse guard (which only
             # applies from seq > 2) is trivially satisfied for the first two
-            # ops -- the buffers were never used then.
-            self._seq = torch.ones(1, dtype=torch.int64, device=device)
-            self._send_seq = torch.ones(_MAX_RANKS, dtype=torch.int64, device=device)
-            self._recv_seq = torch.ones(_MAX_RANKS, dtype=torch.int64, device=device)
+            # ops -- the buffers were never used then. The abort column stays
+            # 0: nothing has aborted yet, and the word is one-way.
+            self._seq_all[:, 0] = 1
+            self._seq = self._seq_all[0]
+            self._send_seq = self._seq_all[1 : 1 + _MAX_RANKS]
+            self._recv_seq = self._seq_all[1 + _MAX_RANKS :]
             # Last-block election counter, reset by the block that wins it.
             # ONE counter is enough because the two kernels of an op run in
             # stream order and therefore never overlap -- which also states
@@ -939,6 +1077,15 @@ class BarlinkHostTransport:
             "barlink host bring-up barrier",
             table=self._peer_table,
         )
+        # #653: join the abort gate, exactly as the device transport does
+        # (barlink_device.py, "#583: join the abort gate"). `_after_transport`
+        # in barlink.py already reaches `check_aborted` after every dispatched
+        # collective; the gate covers the case that dispatch site cannot -- a
+        # collective that only ever runs inside a REPLAYED CUDA graph, where
+        # no host code runs between the kernels. This transport is in
+        # CAPTURABLE_BARLINK_TRANSPORTS, so that case is not hypothetical.
+        barlink_abort_gate.register(self)
+        self._registered_in_gate = True
         _info_once(
             "barlink host transport up: %d ranks, %d MiB slots (x2, "
             "double-buffered), %d MiB p2p pairs, pinned portable+mapped "
@@ -1109,7 +1256,11 @@ class BarlinkHostTransport:
         chunk = self.p2p_bytes // inp.element_size()
         addrs = self._pair_addrs[(self.rank, dst)]
         timeout = self._timeout()
-        seq = self._send_seq[dst : dst + 1]
+        # A ROW, not a 1-element slice: `seq_dev[1]` is this pair's abort word
+        # (#653), so the view handed to the kernel must be the [seq, abort]
+        # pair. A `[dst:dst+1]` slice of a flat counter array would make the
+        # kernel's abort store land on the NEXT destination's sequence number.
+        seq = self._send_seq[dst]
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
             self._ext.barlink_host_send(
@@ -1129,7 +1280,8 @@ class BarlinkHostTransport:
         chunk = self.p2p_bytes // out.element_size()
         addrs = self._pair_addrs[(src, self.rank)]
         timeout = self._timeout()
-        seq = self._recv_seq[src : src + 1]
+        # A ROW, not a 1-element slice -- see `send` for why.
+        seq = self._recv_seq[src]
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
             self._ext.barlink_host_recv(
@@ -1157,11 +1309,106 @@ class BarlinkHostTransport:
         return int(self._flags_np[r, 1])
 
     # ------------------------------------------------------------------
+    # abort guard (#653)
+    # ------------------------------------------------------------------
+
+    def check_aborted(self, where: str) -> None:
+        """Raise if a spin kernel took its abort path. Called after collectives.
+
+        WHAT IT READS. Column 1 of ``_seq_all`` -- the abort word of the
+        collective counter and of every p2p counter in one strided read. A
+        kernel that exceeds its cycle deadline writes its code there and
+        returns, leaving the output buffer partially written; nothing else in
+        the process would ever notice, which is exactly the state #583
+        described and the reason a trap felt like the alternative.
+
+        IMPLEMENTATION CHOICE: A PLAIN IN-LINE READ, deliberately, and NOT
+        the device transport's watchdog-staged read. That machinery (#517)
+        exists because ``BarlinkDeviceTransport.check_aborted`` sits on the
+        production serving path, where an in-line device read synchronizes
+        the compute stream and costs the overlap scheduler its run-ahead --
+        task #600 measured it at ~7 ms of a 46.5 ms bs=1 round. This
+        transport is not that path: it is an explicitly-selected measurement
+        vehicle (``SGLANG_BARLINK_TRANSPORT=host``, see the no-fallback note
+        in barlink.py), reached only when somebody chose it on purpose. A
+        staged read here would add a private stream, a pinned destination and
+        a watchdog dependency to a guard nobody would ever exercise in that
+        shape, and the first bug in it would be found by the incident it was
+        supposed to report. One read that is obviously correct is worth more.
+
+        WHAT IT SKIPS, mirroring the device transport exactly:
+        * ``graph_capture_running()`` -- reading a device word inside a stream
+          capture is illegal, not merely slow. The CUDA-graph replay boundary
+          picks those kernels up instead, through ``barlink_abort_gate``,
+          which this transport registers with at bring-up.
+        * ``barlink_abort_gate.abort_check_enabled()`` -- one switch for every
+          transport's guard.
+        """
+        seq_all = self._seq_all
+        if seq_all is None:
+            return
+        from sglang.srt.distributed.device_communicators.barlink import (
+            graph_capture_running,
+        )
+
+        if graph_capture_running():
+            return
+        if not barlink_abort_gate.abort_check_enabled():
+            return
+        code = int(seq_all[:, 1].max())
+        if code == 0:
+            return
+        self._raise_aborted(where, code)
+
+    def _raise_aborted(self, where: str, code: int) -> None:
+        """The report. Named separately from ``check_aborted`` so the message
+        has ONE definition, the way the device transport's does."""
+        wait = _ABORT_WAITS.get(code, f"unknown abort code {code}")
+        # #650: the PEER STATEMENT. Everything above is rank-local; the
+        # lockstep sentinel's sidecar keeps exchanging while a peer's main
+        # thread hangs, so its last gather states every peer's ring position
+        # -- the one line that lets a survivor's report say WHERE the wedged
+        # rank last was. Warn-never-raise, and imported here rather than at
+        # module level because this module must stay importable without
+        # creating a CUDA context.
+        try:
+            from sglang.srt.distributed.device_communicators import (
+                lockstep_sentinel,
+            )
+
+            peer_stmt = lockstep_sentinel.peer_statement()
+        except Exception:  # noqa: BLE001 - an instrument must not mask the abort
+            peer_stmt = "peer statement: <unavailable>"
+        raise HostCollectiveAborted(
+            f"barlink host collective aborted at {where}: rank "
+            f"{self.rank}/{self.world_size} gave up in {wait} after "
+            f"{self._TIMEOUT_CYCLES} device cycles (~30 s at 2 GHz). "
+            f"PEER POSITIONS (#650): {peer_stmt}. "
+            f"The output buffer of that collective is partially written -- "
+            f"the kernel returned mid-op -- so every result computed from it "
+            f"is garbage, which is why this raises instead of logging. A peer "
+            f"either died, diverged from the collective sequence, or was "
+            f"starved of PCIe bandwidth long enough to miss the deadline. Set "
+            f"{barlink_abort_gate.ENV_ENABLE}=0 to silence this check and "
+            f"restore the behaviour of continuing over corrupt buffers; it "
+            f"does not make the collective succeed.",
+            rank=int(self.rank),
+            world=int(self.world_size),
+            code=int(code),
+            where=where,
+        )
+
+    # ------------------------------------------------------------------
     # teardown
     # ------------------------------------------------------------------
 
     def close(self) -> None:
         """Unpin and release the segment (see BarlinkCommunicator.close)."""
+        # Withdraw from the gate BEFORE the tensors go, or a replay-boundary
+        # check could reach a transport whose counters are being torn down.
+        if self._registered_in_gate:
+            barlink_abort_gate.unregister(self)
+            self._registered_in_gate = False
         try:
             del self._flags_np
         except Exception:
