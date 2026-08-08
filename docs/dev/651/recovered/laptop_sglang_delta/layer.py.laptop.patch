@@ -1,0 +1,144 @@
+--- /spinning/wt-gguf-q4-651/python/sglang/srt/layers/moe/fused_moe_triton/layer.py	2026-08-07 16:35:55.804004789 +0000
++++ /tmp/651-laptop-files/sglang/srt/layers/moe/fused_moe_triton/layer.py	2026-08-07 13:08:14.000000000 +0000
+@@ -105,6 +105,11 @@
+ #: gain from a per-layer lock -- while a per-layer lock would itself need to be
+ #: created by a check-then-build.
+ _GGUF_STREAM_LATCH_LOCK = threading.Lock()
++# Guards the early materialization of a completed GGUF MoE expert stack. The
++# weight loaders run on a thread pool (#391), so gate and up of one layer can
++# both observe the last expert arriving and would otherwise materialize the
++# same parameter twice.
++_GGUF_EARLY_MATERIALIZE_LOCK = threading.Lock()
+ 
+ 
+ def _get_deepep_comm_group(a2a_backend):
+@@ -1322,10 +1327,109 @@
+             key = (expert_id, shard_id)
+             param.expert_data_map[key] = loaded_weight
+             param.data_container.append(loaded_weight)
++            self._gguf_try_early_materialize(param, shard_id)
+             return True
+ 
+         return False
+ 
++    def _gguf_fill_expert_stack(self, name, param, count, row_shape, dtype, get, drop):
++        """Fill an ``[E, ...]`` GGUF MoE parameter one expert at a time.
++
++        The bytes are identical to the ``torch.stack(...)`` + single ``copy_``
++        this replaces: row i of the stack is ``get(i)``, and that is what lands
++        in slot i here. What changes is LIFETIME. Each expert's host tensor is
++        released as soon as its rows exist on the device, and the full-size
++        host-side ``stacked`` intermediate never exists at all.
++
++        ``data_container`` is dropped FIRST, for the same reason the offload
++        staging path drops it first: the loaded tensor is held by that list AND
++        by ``expert_data_map``, so releasing one of two holders returns nothing.
++        """
++        param.data_container = []
++        param.materialize((count,) + tuple(row_shape), dtype=dtype)
++        for i in range(count):
++            src = get(i)
++            assert tuple(src.shape) == tuple(row_shape), (
++                f"GGUF MoE expert {i} of {name} has shape {tuple(src.shape)}, "
++                f"expected {tuple(row_shape)}"
++            )
++            param.data[i].copy_(src)
++            # For w2 there is a single key, so ``src`` IS the loaded tensor;
++            # this local has to go before ``drop`` can be the last holder.
++            del src
++            drop(i)
++        param.expert_data_map = {}
++
++    def _gguf_try_early_materialize(self, param, shard_id) -> None:
++        """Materialize an expert stack the moment its last expert arrives.
++
++        Releasing the host copies in ``process_weights_after_loading`` is too
++        late. That hook runs only once the WHOLE model has been loaded, so the
++        host side still peaks at one full model's worth of expert tensors while
++        the device side is also filling up. Measured on this laptop: Qwen3.6-
++        35B-A3B UD-Q4_K_M (21.11 GiB) was OOM-killed inside ``load_weights``
++        at 15 459 904 kB of anonymous RSS, before the post-load hook ever ran.
++
++        Doing it here bounds the host residency to the experts of the ONE
++        parameter currently being filled. The result is the same object the
++        post-load hook would have built, so that hook simply finds the
++        parameter already materialized and skips it.
++
++        Deliberately narrow: only the plain fully-resident path. Expert-dim
++        sharding (#82), the expert-offload plan (#123) and stream staging
++        (#391c) each need the complete expert set at post-load time to decide
++        placement, so they keep the old timing.
++
++        On a discrete GPU this only returns host memory sooner. On a unified-
++        memory part -- where GPU memory comes from GTT, GTT comes from system
++        RAM, and GTT is not charged to the process cgroup -- the host and
++        device copies are additive against the same DRAM, which is what made
++        any model above roughly half of RAM unloadable.
++        """
++        if getattr(self, "_gguf_expert_shard", False):
++            return
++        attr = self._GGUF_SHARD_TO_ATTR.get(shard_id)
++        if attr is None or getattr(self, attr, None) is not param:
++            return
++        if not isinstance(param, UninitializedParameter):
++            return
++        tensor_shape = getattr(param, "tensor_shape", None)
++        if tensor_shape is None:
++            return
++        try:
++            if self._gguf_stream_staging_enabled() or self._gguf_moe_offload_eligible():
++                return
++        except Exception:
++            return
++        keys = ("w1", "w3") if "w13" in attr else ("w2",)
++        expected = int(tensor_shape[0])
++        emap = getattr(param, "expert_data_map", None)
++        if not emap or len(emap) < expected * len(keys):
++            return
++
++        with _GGUF_EARLY_MATERIALIZE_LOCK:
++            # Re-checked under the lock: the sibling shard's loader thread may
++            # have completed the same parameter while this one waited.
++            if not isinstance(param, UninitializedParameter):
++                return
++            emap = param.expert_data_map
++            if len(emap) < expected * len(keys):
++                return
++            expert_weights: dict = {}
++            for (eid, sid), w in emap.items():
++                expert_weights.setdefault(eid, {})[sid] = w
++            source = self._gguf_expert_source(
++                attr, expert_weights, expected, False, expert_data_map=emap
++            )
++            if source is None:
++                return
++            count, row_shape, dtype, get, drop = source
++            if count != expected:
++                # Not every expert is present after all; leave it to the
++                # post-load hook rather than materializing a short stack.
++                return
++            self._gguf_fill_expert_stack(attr, param, count, row_shape, dtype, get, drop)
++
+     # -- #391c: streaming staging into the expert-offload tiers -------------
+     #
+     # The GGUF weight iterator's first pass yields EVERY qweight_type marker
+@@ -2756,10 +2860,15 @@
+                     )
+ 
+                     if plan is None:
+-                        # Default path: one [E, ...] stack, unchanged.
+-                        stacked = torch.stack([get(i) for i in range(count)], dim=0)
+-                        param.materialize(stacked.shape, dtype=stacked.dtype)
+-                        param.data.copy_(stacked)
++                        # Default path: same [E, ...] stack, built by the same
++                        # release-as-you-copy filler the load loop uses for
++                        # parameters it can complete early. Reached only for
++                        # parameters early materialization declined (expert-dim
++                        # shard, or an incomplete expert set).
++                        self._gguf_fill_expert_stack(
++                            name, param, count, row_shape, dtype, get, drop
++                        )
++                        expert_weights.clear()
+                         continue
+ 
+                     # The loader's flat list is only read for the truthiness

@@ -1,0 +1,24 @@
+--- /spinning/wt-gguf-q4-651/python/sglang/jit_kernel/csrc/moe/moe_align_kernel.cu	2026-08-07 16:35:55.652003584 +0000
++++ /tmp/651-laptop-files/sglang/jit_kernel/csrc/moe/moe_align_kernel.cu	2026-08-07 13:19:31.000000000 +0000
+@@ -43,7 +43,20 @@
+ 
+ namespace moe {
+ 
+-__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
++// HIP's __shfl_*_sync takes a 64-bit lane mask and static_asserts on the
++// width, so a 32-bit CUDA-style mask does not compile there ("The mask must be
++// a 64-bit integer"). The value is a full-warp mask either way; only the type
++// differs, so CUDA keeps exactly the mask it had.
++#ifdef USE_ROCM
++using sgl_shfl_mask_t = unsigned long long;
++#define SGL_FULL_WARP_MASK 0xffffffffffffffffULL
++#else
++using sgl_shfl_mask_t = unsigned;
++#define SGL_FULL_WARP_MASK 0xffffffffu
++#endif
++
++__device__ __forceinline__ int warp_exclusive_scan(
++    int v, sgl_shfl_mask_t mask = SGL_FULL_WARP_MASK) {
+   int original = v;
+ #pragma unroll
+   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {

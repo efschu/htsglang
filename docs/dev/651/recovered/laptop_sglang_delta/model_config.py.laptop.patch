@@ -1,0 +1,24 @@
+--- /spinning/wt-gguf-q4-651/python/sglang/srt/configs/model_config.py	2026-08-07 16:35:55.729004194 +0000
++++ /tmp/651-laptop-files/sglang/srt/configs/model_config.py	2026-08-07 11:29:55.000000000 +0000
+@@ -1629,6 +1629,21 @@
+             "awq",
+             "gptq",
+             "fp8",
++            # GGUF on ROCm is a build-wiring question, not a platform one. The
++            # llama.cpp-derived sources in csrc/quantization/gguf already carry
++            # USE_ROCM branches and compile for gfx11 unmodified; they were
++            # simply never added to sgl-kernel's ROCm source list. Validated on
++            # gfx1103 against the numpy reference on real model weights: Q4_K,
++            # Q5_K and Q8_0 correct for dequantise, MMVQ and MMQ; Q6_K correct
++            # for MMVQ and MMQ, with its dequantise entry point contained via
++            # ROCM_BROKEN_DEQUANT_TYPES.
++            #
++            # A host that lacks the kernels is still refused -- but by
++            # GGUFConfig.supports_current_device(), which answers functionally
++            # (_has_sgl_gguf_kernels) and names the actual problem, rather than
++            # by this blanket platform check which cannot tell a working ROCm
++            # box from a broken one.
++            "gguf",
+             "compressed_tensors",
+             "compressed-tensors",
+             "fbgemm_fp8",

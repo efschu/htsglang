@@ -1,0 +1,101 @@
+--- /spinning/wt-gguf-q4-651/python/sglang/srt/model_loader/weight_utils.py	2026-08-07 16:35:55.888005455 +0000
++++ /tmp/651-laptop-files/sglang/srt/model_loader/weight_utils.py	2026-08-07 14:14:51.000000000 +0000
+@@ -1352,6 +1352,56 @@
+     return f"{head}{sep}{leaf}"
+ 
+ 
++#: HF parameter names whose module sglang builds DENSE unconditionally -- not
++#: because of the quantization config, but because the model code hard-codes it.
++#: The MoE router gates are constructed with ``quant_config=None``
++#: (``Qwen2MoeSparseMoeBlock.gate``, ``Qwen3MoeSparseMoeBlock.gate``) or as a
++#: plain ``torch.nn.Linear`` (``shared_expert_gate``), so the module owns a
++#: dense ``.weight`` parameter and there is no ``.qweight``/``.qweight_type``
++#: pair for the stream to fill.
++#:
++#: This is matched as a SUFFIX, so ``.mlp.gate_proj.weight`` does not match --
++#: it ends in ``.gate_proj.weight``. Expert projections never reach this test
++#: at all: they are split out by ``MOE_WEIGHT_PATTERNS``, which only lists the
++#: ``ffn_*_exps`` tensors.
++GGUF_ALWAYS_DENSE_HF_SUFFIXES = (
++    ".mlp.gate.weight",
++    ".mlp.shared_expert_gate.weight",
++)
++
++#: ggml types that store elements densely rather than in quantized blocks, and
++#: the torch dtype their raw bytes reinterpret as. F32 is deliberately absent:
++#: the reader already hands F32 back as a shaped float32 array, so it never
++#: needs reinterpreting and never enters the branch guarded by this map.
++GGUF_DENSE_NON_F32_TORCH_DTYPES = {
++    "F16": torch.float16,
++    "BF16": torch.bfloat16,
++}
++
++
++def gguf_is_dense_unquantized_target(name: str, weight_type) -> bool:
++    """True when a GGUF tensor must be streamed as a dense ``.weight``.
++
++    The iterator decides packed-vs-dense naming from the ggml TYPE alone
++    (``!= F32`` -> ``.qweight``). That works only because the unquantized
++    modules and the F32 tensors happen to be the same set -- a coupling by
++    convention, not by construction. A MoE router gate breaks it: the module is
++    dense no matter what, so a gate stored F16/BF16 gets named ``.qweight``,
++    reaches no parameter, and the draft-completeness guard rejects the load
++    (task #647; observed on a Qwen3.6 MTP GGUF whose ``blk.40.ffn_gate_inp``
++    and ``blk.40.ffn_gate_inp_shexp`` are the file's only BF16 tensors, every
++    other router gate in it being F32).
++
++    Narrow on purpose. Dense F16/BF16 shards of ordinary projections stay
++    quantized-resident (mixed-dtype, task #64), so only the hard-coded-dense
++    modules above are rescued, and only for dense non-F32 types. The F32 path
++    is untouched in both directions.
++    """
++    if weight_type.name not in GGUF_DENSE_NON_F32_TORCH_DTYPES:
++        return False
++    return name.endswith(GGUF_ALWAYS_DENSE_HF_SUFFIXES)
++
++
+ def gguf_quant_weights_iterator(
+     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
+ ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+@@ -1445,7 +1495,12 @@
+             # Normal weight handling
+             name = gguf_to_hf_name_map[tensor_name]
+ 
+-            if weight_type.name != "F32":
++            # #647: a hard-coded-dense module (MoE router gate) has no
++            # `.qweight_type` parameter, so emitting one for a dense F16/BF16
++            # gate would address nothing. Pass 2 yields its dense `.weight`.
++            if weight_type.name != "F32" and not gguf_is_dense_unquantized_target(
++                name, weight_type
++            ):
+                 weight_type_name = gguf_quantized_name(name, "qweight_type")
+                 yield weight_type_name, torch.tensor(weight_type)
+ 
+@@ -1514,11 +1569,22 @@
+                 # Normal weight handling
+                 name = gguf_to_hf_name_map[tensor_name]
+ 
+-                if weight_type.name != "F32":
+-                    name = gguf_quantized_name(name, "qweight")
+-                param = torch.tensor(
+-                    repacked_gguf_bytes(source_type, weight, tensor_name)
+-                )
++                if gguf_is_dense_unquantized_target(name, weight_type):
++                    # #647: the reader hands a dense non-F32 tensor back as RAW
++                    # BYTES (a BF16 [256, 2048] gate arrives as uint8
++                    # [256, 4096]), unlike F32, which arrives already shaped and
++                    # typed. Reinterpret the trailing axis to recover the
++                    # logical shape and dtype, and keep the dense `.weight`
++                    # name so it reaches the parameter the model actually built.
++                    param = torch.tensor(
++                        repacked_gguf_bytes(source_type, weight, tensor_name)
++                    ).view(GGUF_DENSE_NON_F32_TORCH_DTYPES[weight_type.name])
++                else:
++                    if weight_type.name != "F32":
++                        name = gguf_quantized_name(name, "qweight")
++                    param = torch.tensor(
++                        repacked_gguf_bytes(source_type, weight, tensor_name)
++                    )
+                 yield name, param
+ 
+         if previous_origin is not None:

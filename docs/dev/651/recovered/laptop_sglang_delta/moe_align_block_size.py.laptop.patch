@@ -1,0 +1,42 @@
+--- /spinning/wt-gguf-q4-651/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py	2026-08-07 16:35:55.816004884 +0000
++++ /tmp/651-laptop-files/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py	2026-08-07 13:20:12.000000000 +0000
+@@ -19,6 +19,30 @@
+     from sglang.kernels.ops.moe import moe_align_block_size as sgl_moe_align_block_size
+ 
+ 
++def _aot_moe_align_available() -> bool:
++    """Is the AOT `moe.moe_align_block_size` kernel loadable on this host?
++
++    It is bound through `KernelBackend.CUDA_AOT`, which imports `sgl_kernel`.
++    The ROCm extension is built from a source list that omits the MoE kernels,
++    so on a HIP host the import raises at the FIRST forward -- after the model
++    is loaded and the server has reported itself ready. Probing once here lets
++    the JIT kernel below, which does build for HIP, take over instead.
++    """
++    try:
++        from sglang.kernels.selector import select_kernel
++        from sglang.kernels.spec import KernelBackend
++
++        select_kernel(
++            "moe.moe_align_block_size", backend=KernelBackend.CUDA_AOT
++        ).load()
++        return True
++    except Exception:
++        return False
++
++
++_AOT_MOE_ALIGN_AVAILABLE = _aot_moe_align_available()
++
++
+ def moe_align_block_size(
+     topk_ids: torch.Tensor, block_size: int, num_experts: int
+ ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@@ -83,7 +107,7 @@
+         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+ 
+         use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+-    if use_jit_align:
++    if use_jit_align or not _AOT_MOE_ALIGN_AVAILABLE:
+         from sglang.jit_kernel.moe_align import (
+             moe_align_block_size as jit_moe_align_block_size,
+         )

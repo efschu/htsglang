@@ -1,0 +1,62 @@
+--- /spinning/wt-gguf-q4-651/python/sglang/srt/model_loader/loader.py	2026-08-07 16:35:55.888005455 +0000
++++ /tmp/651-laptop-files/sglang/srt/model_loader/loader.py	2026-08-07 14:07:01.000000000 +0000
+@@ -2188,6 +2188,51 @@
+         return model.eval()
+ 
+ 
++def _release_gguf_loader_arena(tp_rank: int) -> None:
++    """Return the loader's freed host pages to the kernel.
++
++    Dropping the last reference to a host weight tensor frees it inside the
++    process; it does not necessarily give the memory back to the OS. glibc
++    raises its dynamic mmap threshold once it has seen many large blocks
++    freed, after which the loader's per-expert tensors are served from the
++    heap and ``free()`` returns them to the arena. RSS then stays at the load
++    peak for the life of the server even though every reference is gone.
++
++    Measured on Qwen3.6-35B-A3B UD-Q2_K_XL: after
++    ``process_weights_after_loading`` had released every host expert (10 187
++    MiB of live tensors down to 98 MiB), RssAnon was still 11 926 MiB;
++    ``malloc_trim`` returned 9 455 MiB of that to the kernel.
++
++    On a discrete GPU this is only host RSS the process no longer needs. On a
++    unified-memory part it is the same DRAM the GPU allocates from, so the
++    pages have to come back or the release buys nothing. Runs once per rank at
++    the end of the GGUF load; a platform without ``malloc_trim`` is a no-op.
++    """
++    import ctypes
++    import ctypes.util
++
++    try:
++        libc_path = ctypes.util.find_library("c") or "libc.so.6"
++        libc = ctypes.CDLL(libc_path)
++        trim = getattr(libc, "malloc_trim", None)
++        if trim is None:
++            return
++        trim.argtypes = [ctypes.c_size_t]
++        trim.restype = ctypes.c_int
++        t0 = time.perf_counter()
++        released = trim(0)
++        logger.info(
++            "GGUF loader arena trimmed (rank %s): malloc_trim returned %s in "
++            "%.2f s (host pages given back to the kernel after the weight "
++            "copies; on unified memory this is the RAM the GPU allocates from)",
++            tp_rank,
++            released,
++            time.perf_counter() - t0,
++        )
++    except Exception as e:  # pragma: no cover - platform dependent
++        logger.debug("GGUF loader arena trim skipped: %s", e)
++
++
+ class GGUFModelLoader(BaseModelLoader):
+     """
+     Model loader that can load GGUF files. This is useful for loading models
+@@ -2444,6 +2489,7 @@
+                 self.load_config.tp_rank,
+                 _t_pw,
+             )
++            _release_gguf_loader_arena(self.load_config.tp_rank)
+             logger.info(
+                 "[#89 STEP-0] SUMMARY rank %s: namemap=%.2f struct=%.2f "
+                 "load_weights=%.2f (producer=%.2f) process_weights=%.2f | "

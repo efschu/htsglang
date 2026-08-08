@@ -1,0 +1,45 @@
+--- /spinning/wt-gguf-q4-651/python/sglang/srt/layers/moe/topk.py	2026-08-07 16:35:55.818004900 +0000
++++ /tmp/651-laptop-files/sglang/srt/layers/moe/topk.py	2026-08-07 13:14:29.000000000 +0000
+@@ -132,6 +132,29 @@
+ _is_npu = is_npu()
+ _is_xpu = is_xpu()
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
++
++
++def _aot_topk_available() -> bool:
++    """Is the AOT `moe.topk_softmax` kernel actually loadable here?
++
++    `fused_topk` binds it unconditionally through `KernelBackend.CUDA_AOT`,
++    which imports `sgl_kernel`. The ROCm extension is built from a source list
++    that does not include the MoE routing kernels, so on a HIP host the import
++    raises `ModuleNotFoundError: No module named 'sgl_kernel'` at the FIRST
++    forward -- long after weights are loaded and the KV pool is sized. Probing
++    once at import time turns that late crash into a routing decision.
++    """
++    try:
++        from sglang.kernels.selector import select_kernel
++        from sglang.kernels.spec import KernelBackend
++
++        select_kernel("moe.topk_softmax", backend=KernelBackend.CUDA_AOT).load()
++        return True
++    except Exception:
++        return False
++
++
++_AOT_TOPK_AVAILABLE = _aot_topk_available()
+ _is_musa = is_musa()
+ 
+ # Experimental: skip the HIP padded-token routing-weight masking entirely.
+@@ -1995,6 +2018,12 @@
+     custom_routing_function = topk_config.custom_routing_function
+     correction_bias = topk_config.correction_bias
+     torch_native = topk_config.torch_native
++    if not torch_native and not _AOT_TOPK_AVAILABLE:
++        # No AOT routing kernel on this host (HIP: the ROCm extension does not
++        # build the MoE sources). The torch implementation computes the same
++        # top-k over the same logits; taking it here is what lets the MoE run
++        # at all, instead of raising on the first forward.
++        torch_native = True
+     routed_scaling_factor = topk_config.routed_scaling_factor
+     apply_routed_scaling_factor_on_output = (
+         topk_config.apply_routed_scaling_factor_on_output
