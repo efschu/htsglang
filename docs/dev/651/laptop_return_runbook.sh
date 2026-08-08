@@ -47,3 +47,8 @@ cat << 'EOF'
   c) If (a) and (b) are both clean: activation bisection
      (llama-eval-callback reference vs debug_tensor_dump).
 EOF
+
+echo "== 6. GGUF inventory sweep (user hint: earlier downloads may have left files) =="
+$SSH 'cat /root/lh/dl_q3.log /root/lh/dl_q2.log 2>/dev/null | tail -6; find / -xdev \( -name "*.gguf" -o -name "*.gguf.part" -o -name "*.incomplete" \) -size +1G 2>/dev/null | head -20; du -sh /root/.cache/huggingface 2>/dev/null'
+echo "== if Q3_K_XL is NOT on the laptop: push the rig copy over LAN (20x faster than WAN) =="
+echo "   scp /spinning/llm_stuff/club-3090/models-cache/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf root@192.168.0.116:/root/651-p2/models/"
