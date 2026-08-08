@@ -136,6 +136,58 @@ class PPBatchMetadata:
 
 class SchedulerPPMixin:
     @DynamicGradMode()
+    def _pp_round_trace_init(self: Scheduler):
+        """Per-stage round accounting for the #651 co-run split measurement.
+
+        WHY WALL TIME PER STAGE, SPLIT INTO WAIT VS WORK. On an APU the CPU and
+        the iGPU share one memory system, so each stage's SOLO speed does not
+        predict its speed while the other stage is running -- they contend for
+        DDR5 bandwidth and package power. The layer split therefore has to be
+        driven by CO-RUN cost, and the optimum is the split where both stages
+        spend the same time per chunk (ms-per-round canon).
+
+        The decomposition that answers it is cheap: time spent blocked in
+        `_pp_recv_proxy_tensors` is time this stage waited for the OTHER stage,
+        and the rest of the iteration is its own work. The stage that waits
+        least is the bottleneck and should shed layers. No device timers and no
+        profiler are needed for that comparison, which matters because the CPU
+        stage has no CUDA events to record.
+
+        Off unless SGLANG_PP_ROUND_TRACE=1, so the default serving path pays
+        nothing.
+        """
+        import os
+
+        self._pp_trace_on = os.environ.get("SGLANG_PP_ROUND_TRACE", "0") == "1"
+        self._pp_trace_wait: List[float] = []
+        self._pp_trace_round: List[float] = []
+        self._pp_trace_every = int(os.environ.get("SGLANG_PP_ROUND_TRACE_EVERY", "20"))
+
+    def _pp_round_trace_record(self: Scheduler, wait_s: float, round_s: float):
+        if not getattr(self, "_pp_trace_on", False):
+            return
+        self._pp_trace_wait.append(wait_s * 1000.0)
+        self._pp_trace_round.append(round_s * 1000.0)
+        if len(self._pp_trace_round) < self._pp_trace_every:
+            return
+        import statistics
+
+        wait = self._pp_trace_wait
+        rnd = self._pp_trace_round
+        work = [r - w for r, w in zip(rnd, wait)]
+        logger.info(
+            "PP-ROUND stage=%d n=%d round_ms=%.2f wait_ms=%.2f work_ms=%.2f "
+            "(wait share %.1f%%)",
+            self.ps.pp_rank,
+            len(rnd),
+            statistics.median(rnd),
+            statistics.median(wait),
+            statistics.median(work),
+            100.0 * statistics.median(wait) / max(statistics.median(rnd), 1e-9),
+        )
+        self._pp_trace_wait = []
+        self._pp_trace_round = []
+
     def event_loop_pp(self: Scheduler):
         """
         A scheduler loop for pipeline parallelism.
@@ -161,9 +213,12 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        self._pp_round_trace_init()
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                _t_round0 = time.perf_counter()
+                _t_wait = 0.0
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -182,7 +237,9 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
+                    _t_w0 = time.perf_counter()
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    _t_wait = time.perf_counter() - _t_w0
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -232,6 +289,10 @@ class SchedulerPPMixin:
                             )
 
                 self.pp_outputs = next_pp_outputs
+                if cur_batch:
+                    self._pp_round_trace_record(
+                        _t_wait, time.perf_counter() - _t_round0
+                    )
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:

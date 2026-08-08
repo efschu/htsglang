@@ -13,6 +13,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     verify_tree_greedy_kernel_triton,
 )
 from sglang.srt.debug_utils import index_race_guard
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     alloc_paged_token_slots_extend_npu,
 )
@@ -204,17 +205,47 @@ def decide_spec_kernel_backend(topk: int, tp_group=None) -> str:
     backend = SPEC_KERNEL_BACKEND_NATIVE if group_ok else SPEC_KERNEL_BACKEND_TRITON
 
     if backend == SPEC_KERNEL_BACKEND_TRITON and topk > 1:
-        # REFUSED until trees are validated on the Triton path. L0 runs
-        # topk=1 chains, so nothing is lost today. The Triton tree build has
-        # been exercised on XPU only; it has never run on sm75 or gfx900, and
-        # it does not implement QLEN_ONLY_BITPACKING at all. Booting a tree on
-        # it would put an unvalidated kernel in charge of accept counts.
-        raise ValueError(
-            f"speculative_eagle_topk={topk} (tree drafts) is not supported when "
-            "the group falls back to the Triton spec kernels: at least one rank "
-            "lacks sgl_kernel's build_tree/verify ops (sm75 and gfx900 have no "
-            "sgl-kernel code), and the Triton tree path is not yet validated on "
-            "those architectures. Use --speculative-eagle-topk 1 (chain drafts)."
+        # REFUSED BY DEFAULT until trees are validated on the Triton path. L0
+        # runs topk=1 chains, so nothing is lost by the default. The Triton
+        # tree build has been exercised on XPU only; it has never run on sm75
+        # or gfx900, and it does not implement QLEN_ONLY_BITPACKING. Booting a
+        # tree on it would put an unvalidated kernel in charge of accept
+        # counts.
+        #
+        # #651: on the gfx1103 APU laptop there is no sgl_kernel build at all,
+        # so this branch is the ONLY way to run tree drafts there, and tree
+        # drafts (k>1) are a requirement for that target. Both halves of the
+        # path do exist in Triton -- `sgl_build_tree_kernel_triton` and
+        # `verify_tree_greedy_triton` -- and the mode this configuration uses
+        # is FULL_MASK (see `default_tree_mask_mode`, which only selects
+        # QLEN_ONLY on CPU), i.e. NOT the bitpacking mode the paragraph above
+        # names as missing. So the blocker is validation, not implementation.
+        #
+        # The opt-in below therefore unblocks it EXPLICITLY and loudly, and it
+        # is not a licence to trust the result: greedy speculative decoding is
+        # exact by construction, so the operator must verify that temperature-0
+        # output is token-identical to a non-speculative run before believing
+        # any accept count or throughput number from this path.
+        if not envs.SGLANG_ALLOW_TRITON_SPEC_TREE.get():
+            raise ValueError(
+                f"speculative_eagle_topk={topk} (tree drafts) is not supported "
+                "when the group falls back to the Triton spec kernels: at least "
+                "one rank lacks sgl_kernel's build_tree/verify ops (sm75 and "
+                "gfx900 have no sgl-kernel code), and the Triton tree path is "
+                "not yet validated on those architectures. Use "
+                "--speculative-eagle-topk 1 (chain drafts), or set "
+                "SGLANG_ALLOW_TRITON_SPEC_TREE=1 to opt in -- and then VERIFY "
+                "that temperature-0 output is token-identical to a "
+                "non-speculative run, because this path decides accept counts."
+            )
+        logger.warning(
+            "SGLANG_ALLOW_TRITON_SPEC_TREE=1: running topk=%d TREE drafts on "
+            "the UNVALIDATED Triton spec kernels (no sgl_kernel build on this "
+            "rank). This kernel decides accept counts. Greedy speculative "
+            "decoding is exact, so temperature-0 output MUST be token-identical "
+            "to a non-speculative run -- verify that before trusting any "
+            "number from this configuration.",
+            topk,
         )
 
     set_spec_kernel_backend(backend)

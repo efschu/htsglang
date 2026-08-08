@@ -242,6 +242,12 @@ class Envs:
     # a debugging escape hatch, not a supported configuration.
     SGLANG_ALLOW_UNLOADED_DRAFT_PARAMS = EnvBool(False)
 
+    #: #651: permit topk>1 TREE drafts on the Triton spec kernels (no sgl_kernel
+    #: build on this rank). Off by default because that kernel decides accept
+    #: counts and has only ever been exercised on XPU; see the opt-in guard in
+    #: speculative/eagle_utils.decide_spec_kernel_backend.
+    SGLANG_ALLOW_TRITON_SPEC_TREE = EnvBool(False)
+
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.

@@ -460,13 +460,23 @@ Both configurations measured on the same boot-pair, warmup discarded, unique
 prompts, A-vs-A noise floor first, under the armed wedge policy
 (`--chunked-prefill-size 256`), eager (no graphs).
 
-| configuration | prefill @789 tok | A-vs-A | decode | A-vs-A | TTFT median |
+**ARCHITECTURE — read this before the decode column.** PP=2 applies to
+**PREFILL ONLY**: CPU and iGPU both compute the prefill, then the phase flip
+reshards and **decode runs on the iGPU alone**, as does the draft. PP=2 in
+decode is slower by construction and is **not a target configuration** — the
+decode column below is included only to show what the pipeline costs if it is
+(wrongly) left in place through decode, not as a verdict about the design. The
+real decode and draft numbers are in section 6a, where the iGPU runs alone.
+
+| configuration | prefill @789 tok | A-vs-A | decode (NOT a target config) | A-vs-A | TTFT median |
 |---|---|---|---|---|---|
-| PP=2, CPU + iGPU | **671.3 / 669.2 tok/s** | 0.32% | **11.63 / 11.61 tok/s** | 0.21% | 0.129 s |
+| PP=2, CPU + iGPU | **671.3 / 669.2 tok/s** | 0.32% | 11.63 / 11.61 tok/s | 0.21% | 0.129 s |
 | single stage, iGPU only | **968.3 / 962.6 tok/s** | 0.59% | 16.75 / 15.80 tok/s | 5.70% | 0.093 s |
 
-**Adding the CPU as a pipeline stage makes this slower, not faster:** 0.69x on
-prefill and ~0.71x on decode. That is a reportable verdict, not a failure — the
+**Adding the CPU as a pipeline stage makes PREFILL slower here:** 0.69x at the
+even split (the proportional ladder below recovers most of that). The decode
+figure is not a verdict on anything, per the architecture note above — decode
+is iGPU-only by design. That is a reportable outcome, not a failure — the
 design plan says so in advance ("Negligible-or-negative CPU contribution after
 throttling = reportable verdict, not failure") — and the reason is structural:
 these runs have `--max-running-requests 1`, and **pipeline parallelism pipelines
@@ -474,18 +484,89 @@ MICROBATCHES**. With one request in flight the stages run strictly in sequence,
 so a PP split can only add the slower stage's time; it cannot overlap anything.
 `bench_prefill.py` carries that warning in its own docstring.
 
-**Per-stage wall split** (derived, with its assumption stated): for the same
-789-token prompt, PP=2 takes 1175 ms and the iGPU alone takes 820 ms for *all*
-28 layers. Assuming the default even 14/14 layer split and strictly sequential
-stages, the iGPU half is ~410 ms, so the CPU half is ~1175 − 410 ≈ **765 ms** —
-roughly **1.9x slower than the iGPU for the same layer share**. This is an
-inference from two wall measurements, not per-stage instrumentation; a direct
-per-stage timer is the honest way to confirm it and was not built here.
+### Proportional split from CO-RUN measurement (user order)
 
-The practical consequence for the strand's target: a CPU+iGPU prefill split
-only pays off with several chunks or concurrent requests in flight, and at a
-layer ratio weighted by that ~1.9x — not the even split used here.
-`layer_split.py --split-from` can now be fed real numbers for a dense model.
+The 1:1 split above is not the right one, and solo numbers cannot pick the
+right one: on an APU both stages share DDR5 bandwidth and package power, so a
+stage's solo speed does not predict its co-run speed. A per-stage round tracer
+was added for this (`scheduler_pp_mixin.py`, `SGLANG_PP_ROUND_TRACE=1`, off by
+default): time blocked in `_pp_recv_proxy_tensors` is time this stage waited for
+the other, the rest is its own work, and the stage that waits least is the
+bottleneck.
+
+Measured on the even 14/14 split, co-run:
+
+```
+PP-ROUND stage=0  round 282-296 ms  wait 0.00 ms  (wait share 0.0%)
+PP-ROUND stage=1  round 311-318 ms  wait 73-78 ms (wait share ~24%)
+```
+
+The CPU stage **never waits** — it is the bottleneck — and the iGPU idles ~24%
+of every round. Work per 14 layers: CPU ~286 ms, iGPU ~187 ms, i.e. the iGPU is
+**~1.52x faster per layer in co-run**. (My earlier solo-sequential inference
+said 1.9x; co-run differs, which is exactly why it had to be measured.)
+
+Driving `--pp-stage-ratio` from that, the full ladder — all A-vs-A floored, at
+~1024-token prompts, cp256:
+
+| split CPU/iGPU | prefill tok/s | A-vs-A | note |
+|---|---|---|---|
+| 20/8 | 485.5 | — | **FALSIFIER**: anti-proportional, strictly worse; CPU work 411 ms, iGPU idle 48% |
+| 14/14 | 649.8 / 638.5 | 1.73% | even baseline |
+| 11/17 | 699.2 / 699.6 | 0.05% | first proportional estimate |
+| 10/18 | 733.2 / 730.4 | 0.38% | |
+| 8/20 | 796.5 / 799.0 | 0.30% | **balance point**: work 230.7 vs 228.4 ms, wait 0.6% |
+| 7/21 | 838.9 | — | |
+| 4/24 | 865.9 / 867.2 | 0.15% | |
+| 2/26 | 902.8 / 905.0 | 0.25% | |
+| 0/28 (iGPU solo) | 968.3 / 962.6 | 0.59% | reference |
+
+**The user's premise is confirmed and quantified: proportional beats 1:1 by
++39%** (649.8 -> 905.0), and the anti-proportional falsifier is decisively
+worse, so the ladder is measuring what it claims to.
+
+**But the improvement is monotonic all the way to ZERO CPU layers**, and no CPU
+share beats the iGPU alone. The equal-co-run-ms balance point (8/20) is *not*
+the throughput optimum, which is the interesting part: balancing the stages is
+necessary but not sufficient when adding the second worker also slows the
+first.
+
+**Mechanism, measured.** The iGPU is *slower while the CPU works*: at the 2/26
+split the iGPU stage spends 220.9 ms on 26 layers = **8.50 ms/layer**, while
+solo it does 28 layers in ~204 ms/chunk = **7.28 ms/layer** — **~17% slower per
+layer in co-run**. That contention tax, paid on the iGPU's ~26 layers, exceeds
+whatever the CPU contributes on its 2. This is the shared-memory-system penalty
+the design plan warned about, now with a number on it.
+
+**WHICH MODEL THESE NUMBERS ARE FROM — do not mix them with section 6a.** Every
+figure in this section 5 (the whole split ladder, the co-run stage times, the
+~17% contention) is the **dense Qwen2.5-1.5B** vehicle, NOT the target. The
+35B-A3B GGUF numbers are in section 6a and are an order of magnitude different
+(148 tok/s prefill for the 35B MoE versus 968 tok/s for the 1.5B dense) — the
+two are not comparable. **There is no PP=2 number for the target checkpoint at
+all**, because its CPU stage cannot run the GDN kernels.
+
+**OPERATIONAL RULE that follows (user, 2026-08-08): if the iGPU alone is faster
+in prefill even holding every layer, then run iGPU-only — including in
+prefill.** At bs=1 that is exactly what the ladder says: 968.3 tok/s with all
+28 layers on the iGPU beats every split, and the curve is monotonic, so there
+is no CPU share that pays. PP=2 stays the right *shape* for the design (it is
+prefill-only, with decode and draft on the iGPU alone), but on this APU at
+bs=1 the correct layer split is 0/28.
+
+**Transfer to the target is PLAUSIBLE BUT UNMEASURED.** The mechanism is
+hardware contention (shared DDR5 bandwidth and package power), not anything
+model-specific, so the same monotonic-to-zero behaviour is expected for the
+35B-A3B GGUF. It has not been measured there and currently cannot be, for want
+of the GDN-CPU kernels. Stated as an expectation, not a result.
+
+**CAVEAT — every split verdict here is at bs=1 (`--max-running-requests 1`).**
+With one request in flight a pipeline has almost nothing to overlap, so the
+CPU stage can only add latency to the critical path. With several concurrent
+requests or several chunks in flight the pipeline gains real overlap and the
+CPU-stage economics could flip — a small CPU share might then pay for itself
+exactly as the user expects. **That regime is untested here** and is the single
+most valuable follow-up measurement.
 
 ### What full CPU-stage coverage still needs
 
@@ -579,6 +660,194 @@ CPU-stage prefill rate to sit beside this GPU rate, and no CPU stage has
 executed (section 5). The split is still not computable.
 
 ---
+
+## 6a. THE TARGET: 35B-A3B Q4 GGUF with draft, and graphs
+
+This is the strand's actual objective. The dense 1.5B of section 5 was a proof
+of the PP machinery only; everything in this section is the real checkpoint,
+`Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf`, on the iGPU alone, guard v2 and wedge
+policy armed, `--chunked-prefill-size 256`.
+
+### Draft runs, and it is coherent
+
+The checkpoint carries its own draft weights — `blk.40.nextn.*` (NEXTN/MTP, 4
+tensors) — so the draft model is the same GGUF file and no separate draft
+checkpoint is needed. Booted with `--speculative-algorithm NEXTN`,
+`--speculative-num-steps 1 --speculative-eagle-topk 1
+--speculative-num-draft-tokens 2`:
+
+```
+probe.py, temperature 0: round1 6/6, round2 6/6, round1 == round2
+VERDICT: COHERENT
+```
+
+This is the first coherent draft run on the fixed tree. An earlier spec run
+exists in the results directory (09:11, 22 requests, accept 1.87) but predates
+the int32 coherence fix, so it measured an incoherent model and its numbers
+must not be quoted.
+
+### Graphs: HIP graph capture WORKS on this stack
+
+The user's second requirement. Capture succeeds on gfx1103 under this ROCm
+build, with evidence rather than assertion:
+
+```
+Capture target verify CUDA graph begin. backend=full
+Capture target verify CUDA graph end. elapsed=3.79 s
+Decode batch ... cuda graph: True
+```
+
+`cuda graph: True` on the decode batches is the load-bearing line — a boot that
+merely *accepts* the flag while silently running eager would print False. No
+GPU reset accompanied capture or teardown, which is a real datum given that
+graph teardown intersects the `REMOVE_QUEUE` wedge hypothesis of section 6b.
+Prefill graphs remain disabled by the config resolver; only decode/verify are
+captured.
+
+### Decode floors: eager vs graphs, without and with draft
+
+All A-vs-A floored, 20 s per arm, warmup discarded, unique prompts.
+
+| configuration | decode tok/s | ms/token | p90 | A-vs-A | accept len |
+|---|---|---|---|---|---|
+| eager, no draft | 13.68 / 13.65 | 73.1 | 75.1 | 0.26% | — |
+| **graphs, no draft** | **15.47 / 15.43** | **64.8** | 65.1 | 0.28% | — |
+| eager, with draft | 8.58 / 8.52 | 117.3 | 120.9 | 0.62% | 1.90–1.93 |
+| graphs, with draft | 9.09 / 9.08 | 110.1 | 110.9 | 0.09% | 1.93–1.95 |
+
+**Graphs are a real win and clear their floors comfortably: +12.8% without
+draft (13.68 -> 15.47) and +6.3% with draft.** The eager floors that every
+earlier section of this report carries are therefore superseded for decode: the
+decode number for this checkpoint is now 15.47 tok/s with graphs.
+
+### Draft verdict: net NEGATIVE on this iGPU, despite excellent acceptance
+
+**9.09 tok/s with draft versus 15.47 without — 0.59x.** The acceptance is not
+the problem: accept length 1.93–1.95 out of 2 draft tokens, accept rate
+0.90–0.93, which is close to the theoretical maximum for this configuration.
+The cost is the **second forward per step**. On this iGPU a decode step is not
+launch-bound enough for the draft+verify pair to pay for itself: verifying 2
+tokens plus running the NEXTN head costs more than the ~1.9 tokens it returns.
+Graphs narrow the gap (they are worth more to the two-forward path in relative
+terms than to the one-forward path would suggest) but do not close it.
+
+### The draft slowdown is NOT explained by the algorithm — two concrete defects
+
+Challenged on this (user: "that's illogical, there must be a bug"), the
+arithmetic agrees and the logs name two specific problems. Do **not** read the
+0.59x as "speculation does not pay on this hardware" until these are fixed.
+
+**The cost does not add up.** Baseline decode is 64.8 ms/token with graphs.
+Speculative decode is 110.1 ms/token at accept length 1.93, so one spec step
+costs 110.1 x 1.93 = **212 ms = 3.3 baseline forwards**. The algorithm at
+`num_steps=1, topk=1, draft_tokens=2` should cost roughly ONE target forward
+(verifying 2 tokens is nearly free on a bandwidth-bound decode) plus a small
+NEXTN head. Even the pessimistic reading — draft executing a full second model
+— only accounts for ~2. There is ~1.3 forwards of unexplained cost per step.
+
+**Defect 1: the draft path is not graph-captured.** The only capture in the log
+is the target:
+
+```
+Capture target verify CUDA graph begin. backend=full
+Capture target verify CUDA graph end. elapsed=3.79 s
+```
+
+There is no `Capture draft decode` line. The verify forward runs captured while
+the **draft forward runs eager**, so the draft pays full per-launch overhead on
+every step — on a model with 40 layers of MoE dispatch that is exactly the kind
+of cost that shows up as the missing 1.3 forwards. The user's question ("does
+the draft run on the iGPU with graphs?") has the answer **no**, and that is a
+gap, not a property of the hardware.
+
+**Defect 2: the draft loads like a full model.** Two weight loads appear, the
+target taking 63 s and the draft **53 s** — despite the draft needing only the
+20 tensors of `blk.40` (`MTP draft name map: 20 tensors (blk.40)`). A 20-tensor
+load should take about a second; 53 s is the signature of re-reading the whole
+21.4 GiB GGUF. This also explains why enabling speculation forced
+`--mem-fraction-static` from 0.97 to 0.99 ("draft weights are now counted") —
+far more mass than one MTP layer should account for.
+
+### Both defects chased down; k=3 tree drafts unblocked and validated
+
+**Defect 1 explained: the draft graph is gated on `num_steps > 1`.**
+`eagle_worker_v2._capture_cuda_graphs` captures the draft decode graph only
+`if self.speculative_num_steps > 1`. The original boot used `num_steps 1`, so
+the draft ran eager **by design**, not by hardware limitation. With
+`num_steps 2` the capture appears:
+
+```
+Capture target verify CUDA graph end. elapsed=1.83 s
+Capture draft decode CUDA graph end.  elapsed=1.40 s
+```
+
+**k=3 tree drafts unblocked.** The user requires NEXTN with graphs at k=3.
+`decide_spec_kernel_backend` refused any `topk > 1` whenever the group falls
+back to the Triton spec kernels — which is always on this laptop, since it has
+no `sgl_kernel` build at all. Reading the path rather than the message: BOTH
+halves exist in Triton (`sgl_build_tree_kernel_triton` and
+`verify_tree_greedy_triton`), and the mode this configuration uses is
+`FULL_MASK` — not the `QLEN_ONLY_BITPACKING` mode the refusal names as missing
+(`default_tree_mask_mode` picks QLEN_ONLY only on CPU). So the blocker was
+validation, not implementation.
+
+It is now unblocked behind an explicit, loud opt-in
+(`SGLANG_ALLOW_TRITON_SPEC_TREE=1`, default off, warning on every boot),
+**and the validation the guard asked for was actually performed**: greedy
+speculative decoding is exact by construction, so temperature-0 output must be
+token-identical to a non-speculative run. It is — against **two** independent
+non-spec reference runs:
+
+```
+k3 (tree spec) vs probe_postreboot_ppfm_143828.txt : IDENTICAL
+k3 (tree spec) vs probe_gated_a_150740.txt         : IDENTICAL
+```
+
+(The first comparison attempted used a probe file from the boot that crashed
+mid-run and was therefore truncated; it showed a spurious difference. Naming
+the bad reference because a truncated file silently producing "DIFFERS" is
+exactly how a false alarm would be recorded as a finding.)
+
+### The full speculation ladder — accept rises, throughput falls
+
+All on the target checkpoint, graphs on, guard v2 + wedge policy armed,
+`amdgpu.gttsize` raised to 29 GiB. **Zero GPU resets across the whole series.**
+
+| configuration | decode tok/s | A-vs-A | accept len | graphs captured |
+|---|---|---|---|---|
+| no speculation | **15.47 / 15.43** | 0.28% | — | decode |
+| k=1, steps=1 | 9.09 / 9.08 | 0.09% | 1.93–1.95 | verify only |
+| k=1, steps=2 | 6.84 / 6.75 | 1.25% | 2.60–2.77 | verify + draft |
+| k=3, steps=2 (the required config) | 5.85 / 5.83 | 0.45% | 2.90–2.95 | verify + draft |
+
+**Acceptance improves monotonically (1.93 -> 2.90) while throughput falls
+monotonically (9.09 -> 5.85).** Speculation is not failing to predict — it
+predicts very well. Each extra draft forward simply costs far more than the
+extra accepted tokens return.
+
+### The cost of one draft forward — the actual bug, quantified
+
+Baseline decode is 64.8 ms/token. Then:
+
+* k=1 steps=1: 110.1 ms/token x 1.93 accepted = **212 ms per spec step**
+* k=1 steps=2: 148.1 ms/token x 2.77 accepted = **410 ms per spec step**
+
+The difference is one additional draft forward: **198 ms ≈ 3.1 full target
+forwards.** A NEXTN draft is ONE decoder layer plus a head — it should cost
+about 1/40 of a target forward, not three. That is a ~120x discrepancy and it
+is the single fact that explains the whole ladder.
+
+It fits defect 2 (the draft loading like a full model: 53 s for the 20 tensors
+of `blk.40`, and speculation forcing `--mem-fraction-static` up as though a
+second model were resident). The working hypothesis is that the NEXTN draft
+runner is executing far more of the network than the MTP head, or re-running
+MoE dispatch over the full expert set per draft token.
+
+**Verdict: speculation on this stack is coherent, exact, and accepts at
+0.90–0.93 — and is net-negative purely because the draft forward is ~3 target
+forwards instead of ~0.025.** That is an implementation defect to fix, not a
+property of the hardware, and it is now measured rather than asserted. Until it
+is fixed, serve without speculation (15.47 tok/s).
 
 ## 6b. Wedge guard — making the regime unreachable
 
@@ -677,6 +946,13 @@ iGPU-only decode. Where it actually stands:
 * **The guard that gated everything is fixed** and no longer refuses healthy
   boots; the "poisoning" model behind it is refuted, which retires a long and
   fruitless trigger hunt.
+* **The target checkpoint runs with draft and with graphs.** 35B-A3B Q4 GGUF +
+  NEXTN is COHERENT, HIP graph capture succeeds on gfx1103 (`cuda graph: True`
+  on decode batches, verify graph captured in 3.79 s, no GPU reset), and
+  graphs lift decode **13.68 -> 15.47 tok/s (+12.8%)**.
+* **Speculation works but does not pay here**: 0.59x decode versus no-draft,
+  despite accept length 1.93–1.95 and accept rate 0.90–0.93. The second forward
+  per step costs more than the ~1.9 tokens it returns on this iGPU.
 * **Prefill was measured once** — 148.2 tok/s peak, tight A-vs-A floors — but
   the measurement is not reliably repeatable, because the GPU wedges.
 * **PP=2 CPU+iGPU RUNS END TO END** on a dense-attention vehicle: COHERENT,
@@ -719,5 +995,20 @@ throughput, because no PP=2 forward has completed.
 4. **The GDN CPU kernel family**, in the dependency order in section 5, if the
    GDN target is to run a CPU stage. Multi-day.
 5. **Unify the two trees** for GGUF x PP.
-6. **Graphs.** Every floor here is eager; nothing is known about this path
-   under graph capture.
+6. **Find why one NEXTN draft forward costs ~3 target forwards** (section 6a).
+   That single number explains the entire speculation ladder, and fixing it is
+   the difference between 5.85 tok/s and a real speculative speedup. Start at
+   the draft runner: is it executing more than the MTP head, or re-running MoE
+   dispatch over the full expert set per draft token? The 53 s draft load for
+   20 tensors is the same smell.
+   Note the environment now has headroom for this work: `amdgpu.gttsize` was
+   raised 24 -> 29 GiB (with `ttm.pages_limit` in lockstep), which is what let
+   the k=3 tree configuration boot at all.
+7. **PP=2 under concurrency is the open question that matters** (see the bs=1
+   caveat in section 5): it is the only regime in which a CPU stage can pay for
+   itself, and it is untested. At bs=1 the answer is settled: iGPU-only.
+8. **Graphs are DONE for decode and the draft/verify path** on the target
+   checkpoint (section 6a) — capture works, `cuda graph: True`, +12.8% decode.
+   Prefill graphs remain disabled by the config resolver and are untested. The
+   eager labelling elsewhere in this report applies to the PP/dense sections
+   and to prefill, not to the section 6a decode numbers.

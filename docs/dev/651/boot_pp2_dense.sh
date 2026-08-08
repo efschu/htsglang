@@ -27,12 +27,28 @@ CHUNKED_PREFILL=${CHUNKED_PREFILL:-256}
 python /root/651-p2/scripts/wedge_policy.py "$CHUNKED_PREFILL" || {
   echo "Wedge policy refused this configuration"; exit 1; }
 
+# Per-stage round accounting for the co-run split measurement (#651). Off by
+# default; set to 1 for measurement boots.
+export SGLANG_PP_ROUND_TRACE=${SGLANG_PP_ROUND_TRACE:-0}
+export SGLANG_PP_ROUND_TRACE_EVERY=${SGLANG_PP_ROUND_TRACE_EVERY:-20}
+
+# Capability scores per stage, highest = most layers. Empty means the default
+# even split. Driven by the CO-RUN measurement, never by solo numbers: on an
+# APU both stages share DDR5 bandwidth and package power, so solo speed does
+# not predict co-run speed.
+STAGE_RATIO=${STAGE_RATIO:-}
+
 MODEL=${MODEL:-/root/651-p2/models-dense/Qwen2.5-1.5B-Instruct}
 # The GPU stage holds only its layer share of a ~3 GB bf16 model, so it needs
 # very little of the 24 GiB GTT budget.
 MEMFRAC=${MEMFRAC:-0.35}
 PORT=${PORT:-31651}
 PPMAP=${PPMAP:-cpu,cuda}
+
+RATIO_ARGS=()
+if [ -n "$STAGE_RATIO" ]; then
+  RATIO_ARGS=(--pp-stage-ratio "$STAGE_RATIO")
+fi
 
 exec python -m sglang.launch_server \
   --model-path "$MODEL" \
@@ -41,6 +57,7 @@ exec python -m sglang.launch_server \
   --tp-size 1 \
   --pp-size 2 \
   --pp-device-map "$PPMAP" \
+  "${RATIO_ARGS[@]}" \
   --context-length 4096 \
   --max-running-requests 1 \
   --attention-backend torch_native \
