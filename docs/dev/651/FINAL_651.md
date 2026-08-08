@@ -1497,3 +1497,75 @@ likely to be over-read:
 * On the laptop the prefill wedge still gates actually filling a large context
   (9.6). The memory argument and the wedge are independent problems, and this
   section only settles the memory one.
+
+### 9.8 Checkpoint choice, and why the smaller quant is NOT an option here
+
+The obvious response to "22.7 GiB of weights on a 29.5 GiB machine" is a
+smaller quant. It was tried, and it is not available on this stack for a reason
+that has nothing to do with answer quality.
+
+**Q2_K_XL is numerically broken here.** The audit the earlier session already
+ran (`results/audit_q2file_083022.txt`) shows the checkpoint carries IQ-class
+tensors whose `mmq` path produces NON-FINITE values:
+
+| tensor type | path | deterministic | worst abs diff | non-finite |
+|---|---|---|---|---|
+| IQ2_XS  | mmq | no  | 6.550e+04 | 131 |
+| IQ3_XXS | mmq | no  | 6.541e+04 | 96 |
+| IQ4_XS  | mmq | no  | 5.121e+02 | 0 |
+| Q2_K    | mmq | yes | 1.757e-03 | 0 |
+| Q3_K    | mmq | yes | 7.560e-04 | 0 |
+
+Booting it confirms this in the crudest way: it dies at warmup with
+`torch.AcceleratorError: HIP error: unspecified launch failure` inside
+`gguf.py:1634 apply`, reached through `qwen3_5.py:560 _forward_input_proj`.
+
+That crash also **refutes the memory-pressure explanation** for the launch
+failures. It happened with `available_gpu_mem=8.17 GB` and `GPU reset` count
+still at 0 -- four times the wedge policy's 2048 MiB floor. The 719-class
+"unspecified launch failure" is therefore NOT simply a consequence of running
+GEMMs at ~5% free, which is what section 9.6 tentatively attributed it to. The
+honest position is the one section 8 already held: the trigger is broader than
+memory pressure, and this is now a second measurement saying so.
+
+**Consequence for the service default.** The default stays
+`Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf`. That checkpoint is not merely the bigger
+one -- it was requantized BY this strand to remove the Q6_K tensors this ROCm
+build mishandles, which is the same class of defect as the IQ types above. It
+is the only checkpoint on this machine proven to emit coherent output.
+
+The checkpoint is selectable without touching the unit body, via
+`Environment=MODEL=` in
+`/etc/systemd/system/htsglang-ondemand.service.d/20-model.conf` (committed here
+as `service/systemd-dropin-20-model.conf`), with both paths and this reasoning
+written into the file.
+
+**Is there a middle quant?** Not on disk. The machine holds exactly three
+checkpoints: `Q4KM-noQ6K` (21917 MB, the default), `Q4_K_M` (21614 MB, the
+un-requantized original), and `Q2_K_XL` (11992 MB, unusable per above). No
+Q3-class file exists and nothing was downloaded. The audit above does say a
+Q3_K-based quant would be numerically sound on this stack (`det=True`, no
+non-finites), so **producing a Q3 requant locally, in the way `noQ6K` was
+produced, is the concrete next step** for fitting this model onto this machine
+with real headroom. That is a build job, not a config change.
+
+### 9.9 oh-my-pi: the honest state
+
+It does NOT run yet, and the acceptance the user asked for is NOT met.
+
+What is done: installed as efeu, owned by efeu, configured against the local
+endpoint, two configuration faults found and fixed (`baseUrl` needs `/v1`; the
+17029-token full tool surface exceeds an 8192 context).
+
+What blocks it: a real agent prompt is thousands of tokens of sustained
+prefill, and that is the regime this GPU fails in -- `Triton HIP 719` /
+`torch.AcceleratorError`, with `GPU reset ... device wedged` in dmesg on the Q4
+path. The attempt to escape it by dropping to Q2 failed for an unrelated and
+more basic reason (9.8).
+
+What was NOT established, and should not be claimed: a safe prefill-length
+envelope on Q4. The sweep written for it (`service/prefill_sweep.sh`) never
+produced a single row, because every attempt to run it was consumed by load
+failures -- the KV lottery (a 44-token pool on one boot), OOM-class kills, and
+the mamba-cache floor. The envelope question from the coordinator's program is
+therefore still open, and the sweep is committed ready to run.

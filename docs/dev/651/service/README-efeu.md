@@ -5,6 +5,10 @@ this machine's own GPU. Nothing you type goes to the internet.
 
 ## Read this first: the agent does not work yet
 
+**Status: not usable.** Everything is installed and wired correctly, but a real
+coding request still fails on this laptop's GPU. Short questions to the model
+work; the agent does not. Details below.
+
 `omp` is installed and correctly pointed at the local model, but a real coding
 request currently **crashes the GPU** and does not return an answer. This is a
 firmware fault in this laptop's graphics chip, not a setup mistake, and it is
@@ -121,3 +125,20 @@ firmware fault under heavy prefill (documented as the "MES wedge"); the service
 runs with the mitigations for it applied on every single load, but if the
 screen or GPU misbehaves after a long request, `dmesg | grep -i "GPU reset"`
 will say so plainly.
+
+
+## Which model file is served, and why not a smaller one
+
+The service runs `Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf` (22.7 GB). That file was
+specially rebuilt for this machine to remove tensor types its GPU driver
+mishandles, and it is the only checkpoint here that produces correct output.
+
+There is a much smaller file on the machine (`Q2_K_XL`, 11.7 GB) which would
+leave far more memory free. **It must not be used.** It contains tensor types
+whose arithmetic on this GPU produces non-finite garbage, and it crashes on
+startup. Smaller is the right instinct for this laptop, but it needs a
+correctly rebuilt file, not this one.
+
+To change the checkpoint, edit `MODEL=` in
+`/etc/systemd/system/htsglang-ondemand.service.d/20-model.conf` and
+`sudo systemctl restart htsglang-ondemand`.
