@@ -30,6 +30,18 @@ RANK_MIB="${RANK_MIB:-16150,10550,10550}"
 CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-4}"
 MAMBA_SLOTS="${MAMBA_SLOTS:-20}"
+HICACHE="${HICACHE:-1}"
+HICACHE_RATIO="${HICACHE_RATIO:-2}"
+# --kv-pressure-ladder auto REFUSES on this rig: it cannot map ranks to
+# cards when the node holds different card models (3080 20480 + 5090
+# 32607) without an explicit rank->card vector. Off by default here; pass
+# KV_LADDER=<vector> deliberately if you have one.
+KV_LADDER="${KV_LADDER:-}"
+if [ "$HICACHE" = "1" ]; then
+  HICACHE_FLAGS="--enable-hierarchical-cache --hicache-ratio $HICACHE_RATIO --hicache-write-policy write_through --hicache-mem-layout page_first_direct --hicache-io-backend direct"
+else
+  HICACHE_FLAGS=""
+fi
 LOGDIR="${LOGDIR:-/tmp/route-a-631}"
 LOG="${SERVING_LOG:-/spinning/serving-30030.boot.log}"
 mkdir -p "$LOGDIR"
@@ -206,6 +218,16 @@ setsid "$PY" -m sglang.launch_server \
     --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
     --chat-template-default-kwargs '{"preserve_thinking": true}' \
     --enable-cache-report \
+    `# SPILL OFFLOAD (standard stack): the device KV pool is the working` \
+    `# set, not the ceiling. HiCache keeps a host-RAM tier behind it at` \
+    `# --hicache-ratio x the device pool, so KV pressure spills to host` \
+    `# instead of evicting or refusing. The file/disk backend stays OFF:` \
+    `# it crashed the 2026-08-05 proof run (rank desync on the DCP group` \
+    `# via the storage-prefetch collective) and that root is not closed.` \
+    $HICACHE_FLAGS \
+    `# Graduated response to KV pressure rather than a cliff (opt-in:` \
+    `# 'auto' cannot map ranks to cards on a mixed-model node).` \
+    ${KV_LADDER:+--kv-pressure-ladder "$KV_LADDER"} \
     --enable-metrics --host 127.0.0.1 --port "$PORT" \
     "$@" >> "$LOG" 2>&1 &
 echo "serving pgid $!  log $LOG"
