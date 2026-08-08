@@ -461,11 +461,12 @@ def test_disabled_policy_emits_nothing():
     assert s.maybe_arm_phase_policy() is None
 
 
-def _fwd_harness(is_last_rank=False):
+def _fwd_harness(is_last_rank=False, track_commits=False):
     from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     sends = []
     processed = []
+    commits = []
 
     class _Grp:
         pass
@@ -477,7 +478,10 @@ def _fwd_harness(is_last_rank=False):
         send_req_work = None
 
         def _pp_commit_comm_work(self, work):
-            pass
+            # "post-send" means: committed AFTER this pass issued its own
+            # forward, i.e. the targeted in-pass commit rather than the
+            # ordinary top-of-pass commit of the PREVIOUS pass's handle.
+            commits.append("post-send" if sends else "top-of-pass")
 
         def _pp_send_pyobj_to_next_stage(self, data, async_send=False):
             sends.append((async_send, list(data) if data else []))
@@ -488,76 +492,97 @@ def _fwd_harness(is_last_rank=False):
 
     s = S()
     fwd = SchedulerPPMixin._pp_forward_and_process_input_requests.__get__(s, S)
+    if track_commits:
+        return s, fwd, sends, processed, commits
     return s, fwd, sends, processed
 
 
-def test_delivery_before_block_arm_is_forwarded_now_acted_on_next_pass():
-    """THE INVARIANT, pinned. Specimen: boot 10, 2026-08-08.
+def test_arm_is_armed_in_the_same_pass_it_arrives():
+    """(i) SAME-PASS JOIN. Specimen: boot 12, 2026-08-08.
 
-    Acting on the arm in the pass that forwards it means this rank arms,
-    is quiescent, therefore parked, and enters the BLOCKING reduction --
-    which stops it forwarding the batch its peers are blocked on. Measured
-    rank 0 in bounded_collective, ranks 1-2 in _pull_raw_reqs, 0 % GPU,
-    /generate dead at 45 s, with no escape because the park deadline is
-    evaluated before entry.
+    Deferring the arm by one pass is a GUARANTEED miss: the downstream
+    stage must re-enter the chain recv to reach the pass where it acts,
+    and that recv blocks because upstream is already inside the
+    reduction. All three ranks armed, cutovers=0, dead at 40 s.
     """
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
     arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
     s, fwd, sends, processed = _fwd_harness()
-
     fwd(["ordinary", arm])
-    assert sends[0][0] is True, "the forward must stay async"
-    assert arm in sends[0][1], "the arm must be forwarded in this pass"
-    assert arm not in processed[0], (
-        "acted on the arm in the pass that forwarded it -- this rank can "
-        "now arm and block before its peers are woken; the measured wedge"
+    assert arm in processed[0], (
+        "the arm was not acted on in the pass it arrived; a deferred arm "
+        "needs another pass, and that pass begins with a recv that blocks"
     )
-    assert "ordinary" in processed[0], "ordinary traffic must not be delayed"
-
-    fwd([])
-    assert arm in processed[1], "the deferred arm must be acted on next pass"
-    fwd([])
-    assert arm not in processed[2], "the arm must be acted on exactly once"
+    assert "ordinary" in processed[0]
 
 
-def test_delivery_before_block_holds_on_an_intermediate_stage():
-    """Intermediate stages obey the same rule on receipt: forward the arm
-    downstream BEFORE acting on it, so the wake propagates strictly ahead
-    of every rank's block."""
+def test_arm_carrying_send_is_committed_before_the_join():
+    """(ii) TARGETED COMMIT. Specimen: variant A, 2026-08-08.
+
+    An async forward is progressed by _pp_commit_comm_work at the TOP of
+    the NEXT pass -- which never comes if this rank arms and blocks in
+    the reduction first. py-spy: rank 0 in bounded_collective, ranks 1-2
+    in _pull_raw_reqs, 0 % GPU. So the arm-carrying handle must be
+    committed in THIS pass, before the flip hook can join.
+    """
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
     arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
-    s, fwd, sends, processed = _fwd_harness(is_last_rank=False)
+    s, fwd, sends, processed, commits = _fwd_harness(track_commits=True)
     fwd([arm])
-    assert arm in sends[0][1] and arm not in processed[0]
-    fwd([])
-    assert arm in processed[1]
+    assert sends[0][0] is True, (
+        "the forward must stay ASYNC -- a blanket synchronous send is "
+        "variant B and deadlocks against the hidden-states exchange"
+    )
+    assert commits, "the arm-carrying send was never committed"
+    assert commits[-1] == "post-send", (
+        "the arm-carrying handle was not committed in this pass; the peer "
+        "cannot have the arm before this rank joins"
+    )
 
 
-def test_last_rank_owes_no_forward_and_still_defers_exactly_once():
-    """The last stage has nobody to wake, so the deferral is a one-pass
-    no-op -- but it must not drop or duplicate the arm."""
+def test_ordinary_traffic_keeps_the_uncommitted_async_forward():
+    """The targeted commit is for arm batches ONLY. Committing every
+    forward would serialise the pipeline on each poll."""
+    s, fwd, sends, processed, commits = _fwd_harness(track_commits=True)
+    fwd(["ordinary"])
+    assert sends[0][0] is True
+    assert "post-send" not in commits, (
+        "an ordinary batch was committed in-pass; that serialises the chain"
+    )
+
+
+def test_manual_flip_takes_the_same_committed_path():
+    """(d) The manual RPC gets the invariant too.
+
+    Strictly safer, and it removes manual's latent at-idle deadlock:
+    manual has only ever run UNDER TRAFFIC, where the loop keeps cycling
+    and the commit happens by accident rather than by construction.
+    """
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
+    rpc = PhaseFlipReqInput(direction=PP_TO_TP)  # internal=False
+    s, fwd, sends, processed, commits = _fwd_harness(track_commits=True)
+    fwd([rpc])
+    assert rpc in processed[0], "the manual arm must also be same-pass"
+    assert commits[-1] == "post-send", (
+        "the manual flip skipped the targeted commit"
+    )
+
+
+def test_last_stage_owes_no_forward_and_joins_directly():
+    """(iii) The last rank has nobody to wake; it must not try to commit
+    a send it never issued, and must still arm in-pass."""
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
     arm = PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)
-    s, fwd, sends, processed = _fwd_harness(is_last_rank=True)
+    s, fwd, sends, processed, commits = _fwd_harness(
+        is_last_rank=True, track_commits=True
+    )
     fwd([arm])
     assert sends == [], "the last rank must not forward"
-    assert arm not in processed[0]
-    fwd([])
-    assert arm in processed[1]
-
-
-def test_a_human_flip_request_is_never_deferred():
-    """The RPC is delivered by the tokenizer to every rank already; only
-    the internally originated arm needs the ordering."""
-    from sglang.srt.managers.io_struct import PhaseFlipReqInput
-
-    rpc = PhaseFlipReqInput(direction=PP_TO_TP)
-    s, fwd, sends, processed = _fwd_harness()
-    fwd([rpc])
-    assert rpc in processed[0]
+    assert arm in processed[0], "the last rank must still arm in-pass"
 
 
 def test_only_the_zmq_intake_rank_injects():
