@@ -540,6 +540,66 @@ def test_cross_boundary_internal_arm_sends_nothing_to_the_tokenizer():
     assert len(sent) == 1 and sent[0].success is True
 
 
+def test_policy_arm_is_forwarded_synchronously_to_peers():
+    """DEADLOCK regression, measured on metal 2026-08-08.
+
+    The async forward's completion is committed only on the NEXT pass.
+    The injecting rank arms itself in the SAME pass and, being quiescent,
+    walks straight into the flip's blocking consensus reduction -- so
+    with an async send the peers were still parked in
+    point_to_point_pyobj waiting for the batch whose send sat behind
+    that reduction. py-spy: rank 0 in bounded_collective, ranks 1 and 2
+    in _pull_raw_reqs, 0 % GPU, every request stuck behind a flip that
+    could neither commit nor abandon.
+
+    So: a batch carrying an internal arm MUST be forwarded synchronously,
+    while ordinary batches must stay async (the async path is what keeps
+    the pipeline from serialising on every poll).
+    """
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+    sends = []
+
+    class _Grp:
+        is_last_rank = False
+
+    class S:
+        pp_group = _Grp()
+        send_req_work = None
+
+        def _pp_commit_comm_work(self, work):
+            pass
+
+        def _pp_send_pyobj_to_next_stage(self, data, async_send=False):
+            sends.append(async_send)
+            return []
+
+        def process_input_requests(self, reqs):
+            pass
+
+    s = S()
+    fwd = SchedulerPPMixin._pp_forward_and_process_input_requests.__get__(s, S)
+
+    # Ordinary traffic stays asynchronous.
+    fwd(["an-ordinary-request"])
+    assert sends == [True], "ordinary batches must keep the async forward"
+
+    # A policy arm forces a synchronous forward.
+    sends.clear()
+    fwd([PhaseFlipReqInput(direction=PP_TO_TP, source="policy", internal=True)])
+    assert sends == [False], (
+        "a policy arm was forwarded asynchronously; the peers cannot learn "
+        "of the flip before the injecting rank blocks in the reduction, "
+        "which is the measured deadlock"
+    )
+
+    # A HUMAN flip request is not internal and keeps the async path.
+    sends.clear()
+    fwd([PhaseFlipReqInput(direction=PP_TO_TP)])
+    assert sends == [True]
+
+
 def test_internal_request_unanswered_even_when_arming_fails():
     """A refusal must not become a reply either."""
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
