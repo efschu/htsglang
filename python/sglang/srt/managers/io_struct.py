@@ -1446,9 +1446,16 @@ class PhaseFlipReqInput(BaseReq, kw_only=True):
     --enable-phase-flip). ``direction`` is ``pp_to_tp`` or ``tp_to_pp``
     and must be the legal transition for the current phase. Arming
     returns immediately; the flip commits at the next consensus boundary
-    where every rank is quiescent (requests parked, no partial chunk)."""
+    where every rank is quiescent (requests parked, no partial chunk).
+
+    ``source`` names who asked. It defaults to ``rpc`` so an external
+    caller (and every existing test) is unchanged, and the automatic
+    phase policy sets ``policy`` -- which is what lets a reader of the
+    log tell a policy flip from a human one, and is therefore the
+    evidence that an acceptance run issued no manual flips."""
 
     direction: str
+    source: str = "rpc"
 
 
 class PhaseFlipReqOutput(BaseReq, kw_only=True):

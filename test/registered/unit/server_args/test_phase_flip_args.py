@@ -187,6 +187,50 @@ class TestFlipV1SpeculationBlockers(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "dp-size"):
             self._flip(dp_size=2)
 
+    # -- #631 automatic phase policy ------------------------------------
+
+    def test_policy_defaults_to_manual(self):
+        """The default must not change behaviour: a flip boot still flips
+        only when a human says so."""
+        args = make_args(
+            enable_phase_flip=True,
+            phase_flip_tp_vector="30,17,17",
+            pp_size=3,
+        )
+        args._handle_phase_flip()
+        self.assertEqual(args.phase_flip_policy, "manual")
+
+    def test_policy_auto_is_accepted_on_a_flip_boot(self):
+        args = make_args(
+            enable_phase_flip=True,
+            phase_flip_tp_vector="30,17,17",
+            pp_size=3,
+            phase_flip_policy="auto",
+        )
+        args._handle_phase_flip()
+        self.assertEqual(args.phase_flip_policy, "auto")
+
+    def test_policy_auto_without_the_flip_flag_is_refused(self):
+        """Refused rather than ignored: silently accepting it would read
+        as 'the policy is running' when no secondary stack exists."""
+        args = make_args(phase_flip_policy="auto")
+        with self.assertRaisesRegex(ValueError, "requires --enable-phase-flip"):
+            args._handle_phase_flip()
+
+    def test_policy_manual_without_the_flip_flag_is_silent(self):
+        args = make_args(phase_flip_policy="manual")
+        args._handle_phase_flip()  # no raise
+
+    def test_unknown_policy_mode_is_named(self):
+        args = make_args(
+            enable_phase_flip=True,
+            phase_flip_tp_vector="30,17,17",
+            pp_size=3,
+            phase_flip_policy="sometimes",
+        )
+        with self.assertRaisesRegex(ValueError, "not a known mode"):
+            args._handle_phase_flip()
+
 
 if __name__ == "__main__":
     unittest.main()

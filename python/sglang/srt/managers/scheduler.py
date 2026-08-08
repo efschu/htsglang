@@ -437,6 +437,25 @@ class Scheduler(
             )
 
             self.phase_flip_abort_window = AbortDeferralWindow()
+        # #631 automatic phase policy: the thing that decides WHEN to flip.
+        # Built from boot config on every rank (so the state objects exist
+        # and the code path is uniform), but only the request-origin rank
+        # ever evaluates it -- see maybe_arm_phase_policy. Config is built
+        # even when disabled so a bad env value is found at boot rather
+        # than on the first busy round.
+        from sglang.srt.managers.phase_policy import config_from_env
+
+        self.phase_policy_cfg = config_from_env(
+            enabled=(
+                getattr(server_args, "enable_phase_flip", False)
+                and getattr(server_args, "phase_flip_policy", "manual") == "auto"
+            )
+        )
+        self.phase_policy_state = None
+        if self.phase_policy_cfg.enabled:
+            from sglang.srt.managers.phase_policy import PhasePolicyState
+
+            self.phase_policy_state = PhasePolicyState()
         # #261 live session handover runtime: None on every default path;
         # built lazily on the first /session_handover control request. The
         # admission hook in handle_generate_request is a no-op while this
@@ -2424,6 +2443,15 @@ class Scheduler(
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
+            # #631: wired only when the policy is on, so a manual-flip or
+            # non-flip boot carries a None here and the receiver's default
+            # path is untouched.
+            phase_policy_hook=(
+                self.maybe_arm_phase_policy
+                if getattr(self, "phase_policy_cfg", None) is not None
+                and self.phase_policy_cfg.enabled
+                else None
+            ),
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -6198,7 +6226,9 @@ class Scheduler(
                 ),
             )
         try:
-            ok, msg = self.arm_phase_flip(recv_req.direction, source="rpc")
+            ok, msg = self.arm_phase_flip(
+                recv_req.direction, source=recv_req.source or "rpc"
+            )
         except Exception as e:
             # Arming performs no collective and moves no byte; every rank
             # computes the same verdict from the same replicated input.
@@ -6694,6 +6724,72 @@ class Scheduler(
 
         barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
+
+    def maybe_arm_phase_policy(self):
+        """#631: evaluate the automatic phase policy. Returns a
+        ``PhaseFlipReqInput`` to inject into the request stream, or None.
+
+        WHY THIS RETURNS A REQUEST INSTEAD OF ARMING DIRECTLY. Arming is a
+        REPLICATED call: the flip commits only at a consensus boundary
+        where every rank is armed, and an unarmed rank performs no
+        collective at all. So a rank that arms alone parks its own
+        requests and blocks in a reduction its peers never enter, bounded
+        only by barlink liveness -- a tree kill, not a refusal. Under this
+        deployment (pp_size=3, tp_size=1) nothing else establishes that
+        agreement: the #363 observer's cross-rank interlocks are no-ops at
+        tp_size=1, and the PP ranks' local round counters are measured to
+        diverge, so a per-rank policy verdict is exactly the divergence
+        that wedges the tree.
+
+        Therefore only the request-ORIGIN rank decides, and its verdict
+        travels as the SAME control request a POST /phase_flip produces,
+        through the SAME distribution the RPC path already uses on metal:
+        the P2P stage chain in the PP phase, the TP broadcast in the TP
+        phase. Every rank then arms via handle_phase_flip, one proven code
+        path, and no rank can arm alone by construction.
+        """
+        cfg = getattr(self, "phase_policy_cfg", None)
+        if cfg is None or not cfg.enabled:
+            return None
+        runtime = self.phase_flip_runtime
+        if runtime is None:
+            # No round has run yet, so there is no layout to flip from.
+            return None
+        if runtime.pending is not None:
+            # A flip is already armed and waiting for its consensus
+            # boundary; re-arming it would only restart the park clock.
+            return None
+
+        from sglang.srt.managers.phase_policy import (
+            PhasePolicyInputs,
+            decide,
+            note_flip_armed,
+            observe_idle,
+        )
+
+        running = self.running_batch
+        running_bs = running.batch_size() if running is not None else 0
+        inp = PhasePolicyInputs(
+            phase=runtime.phase,
+            # The same quantity the #363 observer reads, and the one the
+            # break-even N is denominated in: prompt tokens admitted but
+            # not yet computed.
+            pending_prefill_tokens=sum(
+                len(req.origin_input_ids) for req in self.waiting_queue
+            ),
+            running_bs=int(running_bs or 0),
+            now=time.perf_counter(),
+        )
+        state = self.phase_policy_state
+        observe_idle(state, inp)
+        decision = decide(cfg, state, inp)
+        if not decision.wants_flip:
+            return None
+        note_flip_armed(state, decision, inp.now)
+        logger.warning(
+            "PHASE-POLICY arming %s: %s", decision.direction, decision.reason
+        )
+        return PhaseFlipReqInput(direction=decision.direction, source="policy")
 
     def arm_phase_flip(self, direction: str, source: str):
         """#631: replicated arming entry (RPC / regime gate). Activates the

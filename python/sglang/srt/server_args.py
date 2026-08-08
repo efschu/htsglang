@@ -5253,6 +5253,30 @@ class ServerArgs:
             "secondary machinery is built, byte-identical to today.",
         ),
     ] = False
+    phase_flip_policy: A[
+        str,
+        Arg(
+            help="#631: who decides when to flip. 'manual' (default) means "
+            "nothing flips unless a POST /phase_flip says so -- the server "
+            "then rests in whatever layout the last call left it in, which "
+            "is why a production instance could serve long prefills from "
+            "the TP layout indefinitely. 'auto' installs the phase policy: "
+            "PP rank 0 (the rank that owns the request intake) reads the "
+            "pending prefill queue each round and arms flips by injecting "
+            "the SAME control request the RPC path uses, so every rank "
+            "arms through one already-proven code path and no rank can "
+            "decide alone. Thresholds are env-tunable: "
+            "SGLANG_PHASE_POLICY_FLIP_TOKENS (the break-even token count "
+            "N, derived from the measured flip cost and the two prefill "
+            "throughputs), SGLANG_PHASE_POLICY_MIN_DWELL_S (the thrash "
+            "bound, independent of N), SGLANG_PHASE_POLICY_IDLE_DWELL_S "
+            "and HTSGLANG_PHASE_IDLE_STATE (prefill|decode -- which layout "
+            "a drained server returns to; prefill is the default because "
+            "an idle flip is free while a flip inside a request's TTFT is "
+            "not). Requires --enable-phase-flip.",
+            choices=["manual", "auto"],
+        ),
+    ] = "manual"
     phase_flip_tp_vector: A[
         Optional[str],
         Arg(
@@ -7182,12 +7206,25 @@ class ServerArgs:
         DESIGN_631 section 5.1: everything checkable without boot facts is
         checked here, loudly. Semantic boot-time checks (group formation
         order, pool sizing, arena fit) live with the builders."""
+        if self.phase_flip_policy not in ("manual", "auto"):
+            raise ValueError(
+                f"--phase-flip-policy={self.phase_flip_policy!r} is not a "
+                f"known mode; use 'manual' or 'auto'."
+            )
         if not self.enable_phase_flip:
             if self.phase_flip_tp_vector is not None:
                 raise ValueError(
                     "--phase-flip-tp-vector requires --enable-phase-flip "
                     "(the vector configures the flip's TP layout; alone it "
                     "does nothing, which would silently mask a typo)."
+                )
+            if self.phase_flip_policy != "manual":
+                raise ValueError(
+                    "--phase-flip-policy=auto requires --enable-phase-flip: "
+                    "there is no secondary stack to flip to, so the policy "
+                    "would decide against a layout that does not exist. "
+                    "Refused rather than ignored, so a typo cannot read as "
+                    "'the policy is running'."
                 )
             return
         if self.phase_flip_tp_vector is None:
