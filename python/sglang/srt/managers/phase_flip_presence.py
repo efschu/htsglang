@@ -83,12 +83,54 @@ that needs an armed rank to make progress on a channel without blocking
 must supply its own progress engine -- a thread, or a different transport
 -- and may not assume the handle advances on its own.
 
-A SECOND MEASUREMENT bears on boot 18's diagnosis and is not yet
-explained: an upstream's commit of an UNCONSUMED forward returns in
-0.00 s (8 B and 512 KiB). So "the downstream stopped consuming" does not
-by itself block an upstream here, and what rank 1 was actually waiting on
-at :705 -> :1109 is an OPEN QUESTION. Do not build on the boot-18 story
-until a reproduction with all three stacks on disk says what it is.
+A SECOND MEASUREMENT looked like it undercut boot 18's diagnosis: an
+upstream's commit of an UNCONSUMED forward returns in 0.00 s (8 B and
+512 KiB). The reproduction below resolves it -- in that probe the receiver
+had POSTED an irecv and merely never polled it to completion. When the
+receiver has posted NO matching irecv at all, the sender's wait() does
+block. Both facts are needed, and only together do they describe the wire.
+
+THE REPRODUCTION, 2026-08-08 23:12:38Z (boot POLICY=auto, tree 526e53cffc)
+-------------------------------------------------------------------------
+All three stacks on disk this time, in
+/spinning/evidence-631/wedge_20260808T231450Z_INSIDE_REDUCTION:
+
+  rank 0  bounded_collective -> _reduce -> on_round  (in the reduction)
+  rank 2  bounded_collective -> _reduce -> on_round  (in the reduction)
+  rank 1  _pp_commit_comm_work <- _pp_forward_and_process_input_requests
+          (blocked in work.wait() on ONE P2PWork, the top-of-pass commit)
+
+Boot 18's inferred geometry is CONFIRMED, and rank 2 -- the datum that was
+missing -- is in the reduction beside rank 0, exactly as was guessed.
+
+BUT THE CAUSE IS NOT WHAT WAS INFERRED, and this is the finding. The log
+shows all three ranks announcing and the gate opening on all three
+("group present for epoch 0 after 0.00s"), so rank 1 DID pass the gate and
+DID complete a consensus round. The deadlock is in the NEXT one:
+
+  round N    all three enter, reduce, agree "armed but not ready", hold
+  pass N+1   rank 1 must traverse its top-of-pass commit to get back to
+             the hook. That commit blocks: rank 2 has posted no matching
+             irecv, because rank 2 is inside round N+1's reduction
+  round N+1  ranks 0 and 2 re-open the gate INSTANTLY on the epoch-0 flags
+             that are still up from round N -- flags are never cleared --
+             and enter. They wait for rank 1, which is blocked behind
+             rank 2's missing recv. Cycle closed.
+
+THE GATE'S GUARANTEE IS PER-ROUND; ITS EVIDENCE IS PER-EPOCH. That is the
+defect, and it is structural. Monotone flags are what make a poll safe
+against a racing writer -- and that same never-cleared property makes a
+round-N quorum re-open the gate for round N+1 while proving nothing about
+it. The gate is sound exactly once per epoch and is a rubber stamp after
+that. Neither deadline saves it: both are evaluated BEFORE entry, and the
+gate opens in 0.00 s on stale evidence.
+
+Note for anyone re-reading the decided clause (i)/(ii) fix: it would not
+have prevented this. Clause (i) gates the FIRST announce; rank 1's flag was
+already up from round N, so the peers still enter round N+1 on it. And
+clause (ii) cannot help, because the rank that must consume (rank 2) is
+inside the blocking reduction, not in the poll loop where a drain runs.
+The next design must address the inter-round interval, not the entry.
 
 WHAT BOOT 18 ACTUALLY SHOWED, and what it did not
 -------------------------------------------------
