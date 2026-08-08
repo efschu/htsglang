@@ -832,22 +832,72 @@ Baseline decode is 64.8 ms/token. Then:
 * k=1 steps=1: 110.1 ms/token x 1.93 accepted = **212 ms per spec step**
 * k=1 steps=2: 148.1 ms/token x 2.77 accepted = **410 ms per spec step**
 
-The difference is one additional draft forward: **198 ms ≈ 3.1 full target
-forwards.** A NEXTN draft is ONE decoder layer plus a head — it should cost
-about 1/40 of a target forward, not three. That is a ~120x discrepancy and it
-is the single fact that explains the whole ladder.
+The difference is **198 ms ≈ 3.1 full target forwards**, and the first reading
+of that was "a NEXTN draft is one decoder layer, it should cost ~1/40 of a
+target forward, so this is ~120x off — a bug". **That reading was wrong**, and
+the next subsection is how it was falsified. Two corrections came out of it:
+the 198 ms is the FIRST real draft forward (steps 1 -> 2), not an extra one,
+and a draft forward is not comparable to 1/40 of a target forward because the
+target verify it replaces is itself not a single-token forward.
 
-It fits defect 2 (the draft loading like a full model: 53 s for the 20 tensors
-of `blk.40`, and speculation forcing `--mem-fraction-static` up as though a
-second model were resident). The working hypothesis is that the NEXTN draft
-runner is executing far more of the network than the MTP head, or re-running
-MoE dispatch over the full expert set per draft token.
+### Chasing that number: three hypotheses falsified, and what it actually is
 
-**Verdict: speculation on this stack is coherent, exact, and accepts at
-0.90–0.93 — and is net-negative purely because the draft forward is ~3 target
-forwards instead of ~0.025.** That is an implementation defect to fix, not a
-property of the hardware, and it is now measured rather than asserted. Until it
-is fixed, serve without speculation (15.47 tok/s).
+**(a) GGUF MoE falling to the dequant/Python fallback — FALSIFIED.** That
+branch of `fused_moe_gguf` logs "There is no support for fast MoE kernel";
+the server log contains it **zero** times. The draft layer's quant types are
+also perfectly ordinary — `blk.40` carries Q4_K expert tensors and a Q5_K
+`ffn_down_exps`, the same pattern as `blk.0` — so the MMVQ path is taken, not
+the per-expert Python loop.
+
+**(b) The draft holding the whole model — FALSIFIED.** Weight load reports
+**0.41 GB for the draft** against 22.75 GB for the target. It really does hold
+one layer. (The 53 s load is then a file-scan cost for pulling 20 tensors out
+of a 21.4 GiB GGUF, i.e. a startup wart, not a per-forward cost.)
+
+**(c) A capturable-but-uncaptured draft forward at steps=1 — FALSIFIED, and
+this reframes the whole measurement.** Upstream skips the draft graph at
+`speculative_num_steps == 1` for a reason stated in its own comment: *"Skip
+attention backend init for 1-step draft, `draft_forward` only does sample in
+this case."* At steps=1 **the draft performs no forward at all**. Implementing
+the capture anyway (attempted, then reverted) fails at
+`'NoneType' object has no attribute 'init_cuda_graph_state'` — the draft
+attention backend is not even constructed, because nothing uses it.
+
+So the 198 ms is **not an "extra" draft forward**: it is the FIRST real one,
+appearing when steps goes 1 -> 2. And the more interesting number is the one
+that was hiding behind it: **at steps=1, where the draft does nothing at all, a
+spec step still costs 212 ms against a 64.8 ms plain decode step.** That cost
+is entirely target verify plus tree/sample machinery.
+
+**What it actually is — two structural costs, neither a bug in our code:**
+
+1. **Verify does not scale like a dense model on a sparse MoE.** This
+   checkpoint activates 8 of 256 experts per token. Verifying k draft tokens
+   can touch up to k x 8 distinct experts, so the expert weight traffic — which
+   dominates a bandwidth-bound decode — grows with the number of draft tokens
+   instead of staying flat. On a dense model verifying 2 tokens is nearly free;
+   here it is not. Linear scaling alone predicts 2 x 64.8 = 130 ms of the
+   212 ms.
+2. **The spec kernels are the Triton fallback.** This laptop has no
+   `sgl_kernel` build, so tree build and verify run the Triton path rather than
+   the native ops. That is the remaining ~80 ms, and it is a cost we are forced
+   into on this machine, not a defect either.
+
+**Consequence for the success bar.** Beating the 15.47 tok/s no-draft floor
+would require the per-step overhead to fall below what accept length can repay,
+and both contributors above are structural: the first is a property of sparse
+MoE at batch size 1, the second needs an sgl_kernel ROCm port. So the honest
+verdict is that **speculation cannot win here at bs=1 by fixing a site in this
+tree** — the earlier "~120x off, implementation defect" framing was wrong, and
+is corrected here. The remaining genuinely actionable items are an sgl_kernel
+gfx1103 build (large) and the 53 s draft load (startup only, no throughput
+effect).
+
+**Verdict: speculation on this stack is coherent, exact, accepts at 0.90-0.93,
+and is net-negative for STRUCTURAL reasons** — sparse-MoE verify cost that
+grows with draft-token count, plus Triton-fallback spec kernels for want of an
+sgl_kernel ROCm build. It is not a fixable site in this tree. Serve without
+speculation (15.47 tok/s).
 
 ## 6b. Wedge guard — making the regime unreachable
 
@@ -995,12 +1045,10 @@ throughput, because no PP=2 forward has completed.
 4. **The GDN CPU kernel family**, in the dependency order in section 5, if the
    GDN target is to run a CPU stage. Multi-day.
 5. **Unify the two trees** for GGUF x PP.
-6. **Find why one NEXTN draft forward costs ~3 target forwards** (section 6a).
-   That single number explains the entire speculation ladder, and fixing it is
-   the difference between 5.85 tok/s and a real speculative speedup. Start at
-   the draft runner: is it executing more than the MTP head, or re-running MoE
-   dispatch over the full expert set per draft token? The 53 s draft load for
-   20 tensors is the same smell.
+6. **An sgl_kernel build for gfx1103** is the only lever left that could make
+   speculation pay here: it replaces the Triton fallback spec kernels (tree
+   build + verify) with native ops and would also lift the topk>1 opt-in.
+   Large. The sparse-MoE verify scaling underneath it does not go away.
    Note the environment now has headroom for this work: `amdgpu.gttsize` was
    raised 24 -> 29 GiB (with `ttm.pages_limit` in lockstep), which is what let
    the k=3 tree configuration boot at all.
