@@ -3349,6 +3349,36 @@ def initialize_model_parallel(
         recovered_rank=recovered_rank,
     )
 
+    # #622: lockstep sentinel (env-gated, off by default). Its sidecar needs
+    # a DEDICATED gloo group: the census's cpu_group is used by the scheduler
+    # thread, and two threads issuing collectives on one gloo group corrupt
+    # each other's op ordering. Created here because every rank passes
+    # through this function, making the new_group call collective. V1 scope:
+    # single-node pure TP (world == tp size) — the positional merge of the
+    # world/tp/dcp streams is only comparable when every group spans the
+    # same ranks.
+    from sglang.srt.distributed.device_communicators import lockstep_sentinel
+
+    if lockstep_sentinel.enabled():
+        _world = torch.distributed.get_world_size()
+        if _world == tensor_model_parallel_size and pipeline_model_parallel_size == 1:
+            _sentinel_pg = torch.distributed.new_group(
+                ranks=list(range(_world)),
+                backend="gloo",
+                timeout=timedelta(seconds=60),
+            )
+            lockstep_sentinel.install(
+                torch.distributed.get_rank(), _world, _sentinel_pg
+            )
+        else:
+            logger.warning(
+                "lockstep sentinel requested but world_size (%d) != "
+                "tensor_parallel_size (%d) or PP > 1 — NOT armed (the "
+                "positional stream merge requires identical group membership)",
+                torch.distributed.get_world_size(),
+                tensor_model_parallel_size,
+            )
+
 
 def phase_flip_groups_initialized() -> bool:
     return _FLIP_TP is not None

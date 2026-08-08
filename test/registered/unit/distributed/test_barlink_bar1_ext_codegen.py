@@ -47,6 +47,11 @@ _PARAM_ARRAYS = (
     "nzRecvAG",
     "nzFlagTo",
     "nzFlagFrom",
+    # #622: the acknowledgment lines are indexed with a running index too --
+    # in the entry wait and again when the ack is published at kernel end --
+    # so they fall under the same rule and are staged with the rest.
+    "ackTo",
+    "ackFrom",
 )
 
 
@@ -162,7 +167,10 @@ class TestMeshKernelHasNoParamSpill(CustomTestCase):
 _DEADLINE = "> A.capCycles"
 #: Expected number of spin loops per source. A change here is a change to the
 #: kernel's wait structure and should be a deliberate edit, not a surprise.
-_SPIN_LOOPS = {"barlink_bar1_ext.py": 5, "barlink_bar1_pipe_ext.py": 3}
+#: 5 -> 7 with #622: the mesh and the a2a kernel each gained an ENTRY wait
+#: (the consumption acknowledgment) in front of their send phase. Both carry
+#: the same deadline and the same host probe as the payload barriers.
+_SPIN_LOOPS = {"barlink_bar1_ext.py": 7, "barlink_bar1_pipe_ext.py": 3}
 
 
 class TestHostAbortProbeInEverySpinLoop(CustomTestCase):
