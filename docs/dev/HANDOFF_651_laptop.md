@@ -611,11 +611,144 @@ survive:
 
 ---
 
-## 6. Achievable-goal restatement
+## 6. THE GOAL (user, 2026-08-08) — CPU+iGPU PP prefill, iGPU-only decode
 
-Given §2 and §3, the goal must be restated in two tiers.
+This supersedes every earlier "achievable goal" in this file, including
+revision 1's "CPU as a memory tier, not a compute stage". The user's design,
+near-verbatim:
 
-### 6.1 What is achievable once a backend exists
+> Prefill runs **pipeline-parallel across the APU with two workers**: the CPU
+> part and the iGPU part are the two PP stages. Decode: **only the iGPU
+> computes**. **Reshard** between the phases. Rationale: prefill is
+> compute-bound, so PP **adds** the APU's two compute pools; decode is
+> memory-bandwidth-bound, where two workers on the *same* DDR5 buy nothing —
+> the compute decode needs is done by the iGPU alone.
+
+**The CPU is explicitly NOT a fallback and NOT a memory tier. It is an active
+PP-prefill stage.**
+
+### 6.0 This reopens the CPU question — §3's verdict was scoped too widely
+
+§3 proves a CPU stage cannot hold **all 40 layers** dense (~67 GiB vs 29.5 GiB).
+A PP stage holds a **layer share k**, and at realistic k the arithmetic is
+completely different. Reproduce with `docs/dev/651/cpu_stage_k.py`.
+
+**Route A — dense-materialize only the CPU stage's layers** (no porting; the
+measured 3.17x applies to that share only):
+
+| Checkpoint | packed/layer | **max k** | max CPU layers | iGPU MiB |
+|---|---:|---:|---:|---:|
+| Q4_K_M | 502.0 MiB | **0.119** | **4.8** | 19,216 |
+| Q2_K_XL | 278.5 MiB | **0.281** | **11.2** | 8,864 |
+
+Both leave the iGPU share well under the 25,600 MiB GTT ceiling, so **RAM, not
+the GTT window, is what binds route A.**
+
+Is that share *enough*? The balanced split is `L_cpu = 40/(R+1)` with
+`R = prefill_igpu / prefill_cpu`, and the ceiling is `1 + 1/R`:
+
+| R | balanced L_cpu | max speedup | fits Q2_K_XL? | fits Q4_K_M? |
+|---:|---:|---:|:--:|:--:|
+| 3 | 10.0 | **+33%** | **YES** | no |
+| 4 | 8.0 | +25% | **YES** | no |
+| 5 | 6.7 | +20% | **YES** | no |
+| 8 | 4.4 | +12% | **YES** | **YES** |
+| 10 | 3.6 | +10% | **YES** | **YES** |
+
+**Route A is viable on Q2_K_XL for any R >= ~3**, and on Q4_K_M only for
+R >= ~8, where the payoff has already shrunk to ~+12%.
+
+**Route B — CPU-native K-quant compute.** llama.cpp's `ggml-cpu` kernels are the
+existence proof, and the 8840HS is Zen4 so the AVX-512 paths apply. No 3.17x at
+all: the CPU stage costs only its *packed* share, which the machine already
+holds (5,263 MiB spare on Q4_K_M, 14,885 on Q2_K_XL). **k is then bounded purely
+by the balance point, not by memory, and Q4_K_M stays on the table.**
+
+**Effort/yield, stated rather than silently chosen:**
+
+- **Route A** is nearly free to try — it needs only a load-time dense
+  materialization path (generalize the Ascend helper, `gguf.py:1557-1581`). It
+  buys a *measurement of R on real layers* cheaply. But it caps k, forces
+  Q2_K_XL, and burns RAM that the iGPU wants.
+- **Route B** is real work (vendor `ggml-quants` CPU kernels + a CPU linear
+  method) but it is the correct destination: no memory penalty, works with
+  Q4_K_M, and the same kernels would make CPU offload/tiering good everywhere.
+
+**Recommendation: use A as the probe that measures R, then commit to B if R
+justifies it.** Do not build A as the destination.
+
+### 6.0.1 R must be MEASURED before choosing `--pp-layer-ratio`
+
+`--pp-layer-ratio` exists, sums to backbone depth **40**, and should be set
+**proportional to measured stage prefill throughput — not to core counts**.
+Known so far: iGPU prefill ~157-172 tok/s (§1.5.2). **CPU prefill on real layers
+is unmeasured**, so R is unknown and every speedup figure above is conditional.
+On this APU the iGPU:CPU ratio is far smaller than on a dGPU rig, so the ceiling
+is plausibly meaningful — but that is a hypothesis, not a result.
+`docs/dev/651/bench_prefill.py` already does the A-vs-A noise floor and the
+`--split-from` balance arithmetic this needs.
+
+### 6.0.2 The phase flip, and what PP+spec exclusivity actually binds
+
+Decode after the flip is a **single-worker** regime, so the PP-vs-speculation
+conflict is a property of the **prefill** phase's world shape only — *in
+principle*. **In this tree it is not, and this is the crux:**
+
+`server_args.py:16264-16269` asserts `speculative_algorithm is None` whenever
+`pp_size > 1`. That is a **server-level argument check evaluated once at
+startup**, not a per-phase condition. A single server booted `pp_size=2` for
+prefill therefore cannot have speculation *at all*, however single-worker its
+decode phase is. So the flip design needs either the assert made phase-aware, or
+two world shapes inside one process.
+
+That is precisely the **#297 envelope / Route A (#631)** question, and its
+**laptop degenerate case may be trivial exactly because bytes never move**
+(§5) — the rig's hard part is moving weights and KV between layouts, which does
+not exist here. **Check what Route A's work already gives you before building
+any flip machinery.** Do not re-derive it.
+
+### 6.0.3 Engineering unknowns to map before building
+
+Findings from reading this tree, marked honestly — these are **blockers to
+verify**, not assumptions:
+
+- **Mixed-device world (one PP rank on CPU, one on ROCm) is not expressible
+  today.** `--device` is a single string for the whole server
+  (`server_args.py:1623-1626`); the only per-rank value is a GPU *index*. Worse,
+  `GroupCoordinator` picks its device from a platform probe, not from
+  `server_args.device` (`parallel_state.py:656-668`:
+  `if is_cuda_alike(): self.device = torch.device(f"cuda:{device_id}")`). So
+  `--device cpu` puts **both** stages on CPU. This needs a per-rank device
+  vector threaded through `ModelRunner.device` -> `GroupCoordinator.device` ->
+  `get_default_distributed_backend`.
+- **The p2p wire itself is fine.** A gloo `cpu_group` is created unconditionally
+  for every group (`parallel_state.py:701-717`) and the PP send/recv already
+  branches on tensor residency (`:2334-2364`,
+  `comm_group = metadata_group if tensor.is_cpu else group`).
+- **The concrete break is the receive side**: the receiver allocates on the
+  *sender's* device type (`:238-246`, `:2395`), so a GPU stage receiving from a
+  CPU stage gets a CPU tensor and **nothing inserts the `.to(device)`**. Small
+  fix, but it will not work until someone writes it.
+- **Zero-copy stage-to-stage over shared DDR5 is unbuilt.** gloo will memcpy.
+  True handover would need shared-memory tensors or HIP host-registered memory.
+  This is the same latent optimization as the PD KV copy in §5.
+- **`cpu_graph_runner.py:609-610` asserts `pp_size == 1`**, so a CPU stage would
+  have to run eager.
+- **PP stages must occupy disjoint GPU groups** (`server_args.py:9066-9098`).
+
+### 6.0.4 Staging
+
+Prerequisite #1 is **the ROCm port for the iGPU part, regardless of everything
+above** — decode is iGPU-only, so nothing serves without it. It is already
+working out-of-tree (§1.5.1) and needs recovering, not rebuilding.
+
+Then, incrementally: **iGPU-only boot -> verify coherence -> spec stable ->
+measure both stages' prefill floors -> add the CPU stage as PP=2 -> the phase
+flip.**
+
+---
+
+## 6.1 What was achievable before this correction (superseded, kept for context)
 
 **GGUF Q4 35B, TP=1, PP=1, iGPU-only, with NEXTN speculation.** Stages a and b
 of `docs/dev/651/boot.sh`. Specifically:
@@ -636,7 +769,7 @@ of `docs/dev/651/boot.sh`. Specifically:
   so the offload machinery has nothing to grab (`expert_offload.py:1245`,
   `:1447`, `:2130`; `planner/rejected.py:289`). That is a rebuild, not a flag.
 
-### 6.2 PP + speculation is closed tree-wide, and is not this strand's job
+### 6.2 PP + speculation: closed tree-wide (see 6.0.2 for what this binds)
 
 Both routes are shut, on **every** machine:
 

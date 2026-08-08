@@ -1,0 +1,26 @@
+[
+ {
+  "name": "q4_K",
+  "type": 12,
+  "rows": 512,
+  "cols": 2048,
+  "row_bytes": 1152,
+  "path": "/root/lh/ggufbuild/slice_q4_K.bin"
+ },
+ {
+  "name": "q5_K",
+  "type": 13,
+  "rows": 512,
+  "cols": 512,
+  "row_bytes": 352,
+  "path": "/root/lh/ggufbuild/slice_q5_K.bin"
+ },
+ {
+  "name": "q6_K",
+  "type": 14,
+  "rows": 512,
+  "cols": 512,
+  "row_bytes": 420,
+  "path": "/root/lh/ggufbuild/slice_q6_K.bin"
+ }
+]

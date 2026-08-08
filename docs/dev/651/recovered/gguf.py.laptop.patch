@@ -1,0 +1,291 @@
+--- python/sglang/srt/layers/quantization/gguf.py	2026-08-07 16:35:55.827004971 +0000
++++ /root/651-v2/recovered/gguf.py.laptop	2026-08-07 11:47:02.000000000 +0000
+@@ -72,11 +72,85 @@
+         ggml_mul_mat_a8,
+         ggml_mul_mat_vec_a8,
+     )
++elif _is_hip:
++    # ROCm: the GGUF kernels are the same llama.cpp-derived sources the CUDA
++    # build uses and they already carry USE_ROCM branches (vecdotq.cuh's __dp4a
++    # guards, mmq.cuh/moe.cuh tile sizes and __launch_bounds__), which torch's
++    # HIP extension path enables via -DUSE_ROCM=1. They were simply never added
++    # to sgl-kernel's ROCm source list, so upstream ROCm wheels carry no ggml_*
++    # op at all -- hence the two-source probe below.
++    #
++    # ggml-common.h hardcodes WARP_SIZE_GGUF 32, which matches RDNA3/RDNA4
++    # wave32 exactly; it does NOT match CDNA's wave64, so a gfx90a/gfx942 build
++    # of these kernels needs its own validation before being trusted.
++    try:
++        try:
++            from sgl_kernel.quantization import (
++                ggml_dequantize,
++                ggml_moe_a8,
++                ggml_moe_a8_vec,
++                ggml_moe_get_block_size,
++                ggml_mul_mat_a8,
++                ggml_mul_mat_vec_a8,
++            )
++        except ImportError:
++            # Standalone ROCm build of csrc/quantization/gguf, for hosts whose
++            # sgl-kernel wheel predates the ROCm GGUF sources.
++            from sglang_gguf_rocm import (
++                ggml_dequantize,
++                ggml_moe_a8,
++                ggml_moe_a8_vec,
++                ggml_moe_get_block_size,
++                ggml_mul_mat_a8,
++                ggml_mul_mat_vec_a8,
++            )
++        _has_sgl_gguf_kernels = True
++    except ImportError:
++        ggml_dequantize = ggml_moe_a8 = ggml_moe_a8_vec = None
++        ggml_moe_get_block_size = ggml_mul_mat_a8 = ggml_mul_mat_vec_a8 = None
++
++    # moe_sum is not registered in sgl-kernel's ROCm extension
++    # (common_extension_rocm.cc), and the op is a plain reduction over the
++    # top-k axis -- `out` is (tokens, top_k, hidden), `dst` is (tokens, hidden).
++    # torch.sum with out= is dispatch-complete on HIP and CUDA-graph-capture
++    # safe (no host<->device copy), so the fallback is exact rather than
++    # approximate.
++    def moe_sum(out: torch.Tensor, dst: torch.Tensor) -> None:
++        torch.sum(out, dim=1, out=dst)
++
++    try:
++        from sgl_kernel import gelu_and_mul, silu_and_mul
++    except ImportError:
++        # Both ARE registered in common_extension_rocm.cc; this covers a host
++        # running the fork's no-sgl-kernel fallback path (FEATURES_VS_UPSTREAM
++        # row 23) where the wheel is absent entirely.
++        #
++        # Built on FIRST CALL, never at import: these are nn.Modules whose
++        # __init__ reads global server args (activation.py:118), and this
++        # module is imported from server_args.__post_init__ itself -- i.e.
++        # before any server args exist. Constructing them here deadlocks the
++        # import with "Global server args is not set yet!".
++        _native_act_cache: dict = {}
++
++        def _native_act(kind: str):
++            fn = _native_act_cache.get(kind)
++            if fn is None:
++                from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
++
++                fn = {"gelu": GeluAndMul, "silu": SiluAndMul}[kind]().forward_native
++                _native_act_cache[kind] = fn
++            return fn
++
++        def gelu_and_mul(x: torch.Tensor) -> torch.Tensor:
++            return _native_act("gelu")(x)
++
++        def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
++            return _native_act("silu")(x)
++
+ elif _is_npu:
+     from gguf import dequantize as gguf_dequantize
+ else:
+-    if not _is_hip:
+-        warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
++    warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -86,8 +160,13 @@
+ 
+     def __init__(self, modules_to_not_convert: list[str] | None = None) -> None:
+         super().__init__()
+-        if _is_hip:
+-            warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
++        if _is_hip and not _has_sgl_gguf_kernels:
++            warnings.warn(
++                "GGUF on ROCm needs the ggml_* kernels, and neither "
++                "sgl_kernel.quantization nor a standalone sglang_gguf_rocm "
++                "build provides them in this environment. Build "
++                "csrc/quantization/gguf for your gfx target."
++            )
+         self.modules_to_not_convert = modules_to_not_convert or []
+         # Uneven-TP (--rank-tp-ratio) block alignment, consumed by
+         # linear._quant_block_aligned_units([out_block, in_block]).
+@@ -142,12 +221,19 @@
+         this exists to catch (#212). Reusing it here means the fail-fast gate
+         and the reason the import guard exists can never drift apart.
+ 
+-        None off CUDA (MUSA/NPU/CPU take their own path in
++        None off CUDA/ROCm (MUSA/NPU/CPU take their own path in
+         _enforce_capability_floor / _get_quantization_config and are not this
+         hook's concern; returning None there defers to get_min_capability()'s
+         MUSA-specific floor above instead of reporting a false negative).
++
++        ROCm answers here for the same reason CUDA does, and needs it MORE: a
++        gfx target is not expressible as a numeric floor at all
++        (utils/common.py:718-722 says so for sgl_kernel_runnable), and
++        get_min_capability()'s 80 is an NVIDIA number that a HIP capability
++        tuple must never be compared against -- gfx1103 reports (11, 0), i.e.
++        110, which would sail past the floor while the kernels are absent.
+         """
+-        if _is_cuda:
++        if _is_cuda or _is_hip:
+             return _has_sgl_gguf_kernels
+         return None
+ 
+@@ -245,6 +331,72 @@
+ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
+ MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+ 
++#: ggml types whose ``ggml_dequantize`` kernel is KNOWN-BAD on ROCm/gfx11.
++#:
++#: CONTAINMENT, NOT A FIX. Q6_K dequantise returns non-deterministically wrong
++#: values on gfx1103 (Radeon 780M): eight runs on one fixed input tensor differ
++#: from each other, worst max|d| 5.8e-01 against the numpy reference, up to 75
++#: non-finite values in 262144, and it is wrong on the FIRST call in a fresh
++#: process, so it is not state accumulation. Q4_K and Q5_K are byte-identical
++#: across the same eight runs.
++#:
++#: The root cause is NOT established. Falsified by experiment, each separately:
++#:   -O3 miscompile (device-side -O1 rebuild: unchanged); HSA_OVERRIDE artefact
++#:   (a native gfx1103 build is worse -- Q5_K becomes affected too); a
++#:   64-thread-block hazard (a standalone HIP reproducer with 32/64/128 threads
++#:   writing disjoint half values is fully deterministic); unreliable GPU memory
++#:   (2 GiB memtest, 12 rounds, 0 mismatches across host-write, kernel-write and
++#:   kernel-verify); out-of-bounds read (4 KiB zeroed trailing pad: unchanged);
++#:   incomplete output coverage (sentinel-poisoned buffer: 0 of 262144 elements
++#:   left untouched); host ordering (explicit synchronize around every step);
++#:   launch concurrency (AMD_SERIALIZE_KERNEL=3); device->host readback
++#:   (GPU-side reduction agrees with the host copy run for run, and five
++#:   repeated host reads of one result are byte-identical).
++#:
++#: dequantize_block_q6_K (sgl-kernel dequantize.cuh:244-272) is structurally
++#: race-free -- no shared memory, no cross-thread communication, and its write
++#: pattern covers all 256 superblock elements exactly once.
++#:
++#: Scope is narrow: only the DEQUANTISE entry point. ggml_mul_mat_vec_a8 (decode
++#: GEMV) and ggml_mul_mat_a8 (prefill GEMM) both pass for Q6_K against real
++#: model weights, so excluding the type here costs the third dispatch branch
++#: only. In Qwen3.6-35B-A3B-UD-Q4_K_M, Q6_K is 4 tensors out of 753.
++#:
++#: THIS CONTAINMENT IS NOT UNCONDITIONAL -- it has two consumers, and the right
++#: answer differs between them. Read this before extending it:
++#:
++#:   PER-FORWARD (``fused_mul_mat_gguf``): the type is dropped from
++#:     DEQUANT_TYPES and rescued by ``_DEQUANT_EXCLUDED_NEEDS_MMQ``, which keeps
++#:     it on MMQ at ANY token count. Correct, because MMQ is validated for Q6_K.
++#:
++#:   LOAD-TIME (``GGUFLinearMethod.process_weights_after_loading``, inherited by
++#:     GGUFEmbeddingMethod and so by ParallelLMHead): there is no dispatch to
++#:     reroute -- the layer is simply REJECTED by the type check. Qwen3.6-35B-A3B
++#:     ships a Q6_K lm_head, so subtracting the type here alone made the model
++#:     unloadable ("Unsupported GGUF quantization type 14 in layer
++#:     ParallelLMHead"). Handled by ``_cpu_dequantize_contained_type``, a
++#:     one-time exact CPU dequantise via the numpy reference.
++#:
++#: A future addition to this set must answer BOTH. Adding a type here without
++#: giving the load-time path somewhere to go is a load-time crash, not a
++#: degraded forward.
++ROCM_BROKEN_DEQUANT_TYPES = {WeightType.Q6_K}
++
++#: Types removed from DEQUANT_TYPES that must therefore keep using MMQ at ANY
++#: token count, since the dequant+GEMM branch is no longer available to them.
++#: Empty off ROCm, so the CUDA dispatch is untouched. Consumed by
++#: fused_mul_mat_gguf's MMQ branch.
++_DEQUANT_EXCLUDED_NEEDS_MMQ: frozenset = frozenset()
++
++if _is_hip:
++    DEQUANT_TYPES = DEQUANT_TYPES - ROCM_BROKEN_DEQUANT_TYPES
++    # Only the types that actually HAVE an MMQ kernel can be rescued this way;
++    # one without would still hit the NotImplementedError, which is the honest
++    # outcome rather than a silently wrong result.
++    _DEQUANT_EXCLUDED_NEEDS_MMQ = frozenset(
++        ROCM_BROKEN_DEQUANT_TYPES & MMQ_QUANT_TYPES
++    )
++
+ 
+ def _mxfp4_kernels_present() -> bool:
+     """Whether the INSTALLED sgl-kernel wheel carries the #398 MXFP4 kernels.
+@@ -928,7 +1080,20 @@
+     # MMQ (quantized GEMM) only for small batches (standard + k-quants): it is
+     # weight-bandwidth-bound and does not scale with token count, so above
+     # _MMQ_MAX_TOKENS the dequant + cuBLAS branch below is far faster.
+-    elif qweight_type in MMQ_QUANT_TYPES and x.shape[0] <= _MMQ_MAX_TOKENS:
++    #
++    # The second disjunct is the other half of the ROCm Q6_K containment: those
++    # types were removed from DEQUANT_TYPES because their dequantise kernel is
++    # wrong on gfx11, which would otherwise drop a >_MMQ_MAX_TOKENS Q6_K matmul
++    # through every branch and into the NotImplementedError below. MMQ is
++    # VALIDATED correct for Q6_K on gfx1103 (max|d| 5.5e-04 against the numpy
++    # reference on real model weights), so keeping MMQ for any M is correct;
++    # it is merely slower than dequant+GEMM at large M, which is the right
++    # trade for 4 tensors out of 753. Empty on CUDA, so the CUDA dispatch is
++    # unchanged.
++    elif qweight_type in MMQ_QUANT_TYPES and (
++        x.shape[0] <= _MMQ_MAX_TOKENS
++        or qweight_type in _DEQUANT_EXCLUDED_NEEDS_MMQ
++    ):
+         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
+     # Large batch (or a type without an MMQ kernel): dequantize once, then a
+     # single fp16 cuBLAS GEMM. All MMQ types are also in DEQUANT_TYPES, so
+@@ -1211,7 +1376,67 @@
+         set_weight_attrs(qweight_type, extra_weight_attrs)
+         layer.register_parameter("qweight_type", qweight_type)
+ 
++    def _cpu_dequantize_contained_type(self, layer: torch.nn.Module):
++        """One-time CPU dequantise for a type whose GPU dequant is contained.
++
++        ROCM_BROKEN_DEQUANT_TYPES is subtracted from DEQUANT_TYPES because the
++        gfx11 ``ggml_dequantize`` kernel is wrong for those types. That is
++        correct for the PER-FORWARD consumer (``fused_mul_mat_gguf``), which
++        then routes to MMQ instead. It is WRONG for THIS consumer, which runs
++        ONCE at load: the type check below would reject the layer outright, and
++        Qwen3.6-35B-A3B ships a Q6_K lm_head, so the whole model became
++        unloadable.
++
++        Dequantising here on the CPU with ``gguf.quants.dequantize`` -- the
++        numpy reference that DEFINES the on-disk format, and the oracle every
++        correctness claim about these kernels was measured against -- is exact.
++        It costs seconds once at load and nothing per forward, since the result
++        is dense from then on. The broken kernel is never re-admitted; it is
++        simply not the thing doing the work.
++        """
++        if not _is_hip:
++            return
++        qweight_type = layer.qweight_type.weight_type
++        if qweight_type not in ROCM_BROKEN_DEQUANT_TYPES:
++            return
++        qweight = layer.qweight
++        if getattr(layer, "_gguf_shard_views", None) or isinstance(
++            qweight, UninitializedParameter
++        ):
++            return
++
++        import numpy as np
++
++        params_dtype = getattr(self, "params_dtype", None) or torch.float16
++        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
++        rows = qweight.shape[0]
++        cols = qweight.shape[1] // type_size * block_size
++        dense = gguf.quants.dequantize(
++            qweight.data.cpu().numpy(), WeightType(qweight_type)
++        )
++        tensor = (
++            torch.from_numpy(np.ascontiguousarray(dense, dtype=np.float32))
++            .reshape(rows, cols)
++            .to(params_dtype)
++            .to(qweight.device)
++        )
++        new_param = Parameter(tensor, requires_grad=False)
++        set_weight_attrs(new_param, vars(qweight))
++        layer.register_parameter("qweight", new_param)
++        layer.qweight_type.weight_type = int(_weight_type_for_dtype(params_dtype))
++        logger.info(
++            "GGUF ROCm containment: dequantised a %s layer (%d x %d) once on "
++            "the CPU at load; its GPU dequant kernel is known-bad on gfx11.",
++            WeightType(qweight_type).name,
++            rows,
++            cols,
++        )
++
+     def process_weights_after_loading(self, layer: torch.nn.Module):
++        # Must run BEFORE the type check: it turns a contained type into a
++        # dense one, which is what lets the check pass legitimately rather
++        # than by widening it.
++        self._cpu_dequantize_contained_type(layer)
+         qweight_type = layer.qweight_type.weight_type
+         if not (qweight_type in UNQUANTIZED_TYPES or qweight_type in DEQUANT_TYPES):
+             qweight_type = WeightType(qweight_type)
