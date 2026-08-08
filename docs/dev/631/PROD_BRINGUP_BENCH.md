@@ -1,0 +1,352 @@
+# Route A (#631) in production on 30030: bring-up, KV sizing, benchmarks
+
+2026-08-08. Qwen3.6-27B-INT8-W8A8 on the main rig (1x RTX 5090 32 GB,
+2x RTX 3080 20 GB, no P2P/NVLink). ONE instance, three ranks: PP=3
+prefill (stage ratio 2,1,1) -> live flip -> TP=3 decode (weight shard
+30,17,17) with NEXTN speculation. Transport barlink BAR1. Tree
+`feat/route-a-631`.
+
+The production stop guard `/spinning/PRODUCTION_STOPPED` was lifted by
+operator order for this bring-up; the crash watchdog stays
+DECOMMISSIONED (inactive + disabled) and was not re-armed.
+`/spinning/COUNTERTEST_NCCL` was cleared deliberately — the barlink-vs-NCCL
+counter-test moved into the crashfix strand's own vehicle, so leaving the
+toggle armed would have silently booted production on NCCL.
+
+---
+
+## 1. Boot recipe
+
+`scripts/route_a_631_prod_boot.sh`, invoked as:
+
+```
+HICACHE=0 RANK_MIB=20800,12500,13600 SGLANG_UNEVEN_TOKEN_VECTOR=13,11,8 \
+  bash scripts/route_a_631_prod_boot.sh
+```
+
+which launches:
+
+```
+--model-path .../Qwen3.6-27B-INT8-W8A8 --trust-remote-code
+--served-model-name Qwen3.6-27B
+--tp-size 1 --pp-size 3 --pp-stage-ratio 2,1,1
+--rank-gpu-id 0,1,2 --rank-gpu-memory-mib 20800,12500,13600
+--enable-phase-flip --phase-flip-tp-vector 30,17,17
+--disable-overlap-schedule
+--kv-cache-dtype fp8_e4m3 --context-length 262144
+--max-running-requests 4 --max-mamba-cache-size 20
+--speculative-algorithm NEXTN --speculative-num-steps 3
+--speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+--reasoning-parser qwen3 --tool-call-parser qwen3_coder
+--chat-template-default-kwargs '{"preserve_thinking": true}'
+--enable-cache-report --enable-metrics --host 127.0.0.1 --port 30030
+```
+
+Environment that matters: `SGLANG_BARLINK=1`,
+`SGLANG_BARLINK_TRANSPORT=bar1`, `SGLANG_UNEVEN_DCP=1`,
+`SGLANG_UNEVEN_DCP_WEIGHTED=1`, `SGLANG_UNEVEN_TOKEN_VECTOR=13,11,8`,
+`SGLANG_MAMBA_SSM_DTYPE=bfloat16`,
+`SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0`,
+`SGLANG_COLLECTIVE_CENSUS_INTERVAL=50`, `SGLANG_MAMBA_PIN_TRACE=50`,
+`SGLANG_VRAM_FLIGHT_DIR=/spinning/flight_605`.
+
+Cards are resolved by NVML **UUID**, 5090 first, never by index.
+
+### BAR1 aperture budget (new, required)
+
+barlink BAR1 had never been run with the flip: the acceptance boots set no
+`SGLANG_BARLINK*` at all, so they ran NCCL. (The `barlink build window`
+lines in those logs come from `build_window_enabled()`, which defaults
+True independently of the transport — they do not evidence barlink.)
+
+The flip doubles the wire-carrying process groups, and the stock 96 MiB
+per-group default does not fit four groups into a 3080's aperture:
+
+```
+BAR1 free per NVML 248 MiB - reserve 32 MiB = 216 MiB usable
+vs 4 x 96 = 384 MiB requested
+-> world:0 96, pp:0 96, flip_tp:0 clipped to 24, flip_dcp:0 clipped to 0
+-> Bar1Failed, all three ranks dead at group build (boot 15:26:40Z)
+```
+
+Budgeted by the payload each group carries — `pp:0` 96 (chunked prefill
+activations, ~20 MiB/hop, the largest payload on the rig), `flip_tp:0` 48
+and `flip_dcp:0` 32 (decode-sized), `world:0` 24 — total 200 of 216 MiB.
+All four groups then report `ACHIEVED=bar1`.
+
+---
+
+## 2. The KV pool: what was wrong and what it is now
+
+The pool was 15-25x too small. Two defects, both fixed in `512273a38f`.
+
+### 2a. The weights arena was allocated on top of the live TP weights
+
+`phase_flip_boot` step 4 allocated the arena while the freshly loaded TP
+weights were still resident, so boot peaked at `originals + arena`
+(torch `allocated_peak_bytes`): **29.27 GiB** on the 5090, **16.64** and
+**17.81 GiB** on the 3080s. Confirmed against the 100 ms NVML trace: a
+single sample at 15:30:59.842 read free `[2304, 3843, 1096]` MiB, matching
+the arena size to within 83 MiB on both 3080s.
+
+The peak never recurs at runtime — serving sits ~7 GiB below it — but the
+corridor floor is a **continuous** minimum, so that one boot sample forced
+`--rank-gpu-memory-mib` down to roughly half of each card, permanently.
+
+Step 2 already did snapshot-then-free for the PP layout; step 4 did not do
+it for TP. `image_from_tensors` exists precisely for this and says so.
+Since the host image was already built one line later, the fix is a
+reordering, not a new allocation: peak becomes `max(originals, arena)`.
+
+### 2b. One vector drove both the weight shard and the KV token split
+
+The flip installed the same vector for `set_tp_partition_ratios` and
+`set_cp_token_ratios`. These optimise against different resources — the
+weight shard follows COMPUTE, the token split follows each rank's memory
+left AFTER its weights land — so the most compute-loaded rank bound the
+allocator's min-reduce:
+
+```
+rank 0: 12750 tok / ratio 30 = unit  425   <- binds
+rank 1: 68646 tok / ratio 17 = unit 4038
+rank 2: 30515 tok / ratio 17 = unit 1795
+-> global max_total_num_tokens 27200, ranks 1 and 2 left idle
+```
+
+The server already computes the token-proportional vector and logs it as a
+restart hint, but nothing could act on it because that line overwrote it.
+`parse_flip_token_vector` now reads `SGLANG_UNEVEN_TOKEN_VECTOR`; unset, it
+returns the flip vector, so the default path is byte-identical.
+
+### 2c. Result
+
+| quantity | before | now |
+|---|---|---|
+| max_total_num_tokens, PP phase | 46422 | **278104** |
+| max_total_num_tokens, TP phase | 27200 | **318176** |
+| context length | 65536 | **262144** |
+| max_running_requests | 4 requested, **1 effective** | **4** |
+| per-rank budget MiB | 16150 / 10550 / 10550 | 20800 / 12500 / 13600 |
+
+`max_running_requests` was being silently reduced 4 -> 1: the auto-sized
+GDN/mamba pool gave 5 state slots and the admission ratio (radix cache on)
+needs 5 per request. `--max-mamba-cache-size 20` restores a real bs=4.
+
+### 2d. Why it is not bigger yet — the honest ceiling
+
+278104 tokens is ~1.06 sessions of 262144. Plain TP=3 production reached
+669440 at the same context. The difference is structural, not tuning:
+**both phases' KV pools and both mamba pools are resident simultaneously**
+(`phase_flip_boot.py:465-500`: "The pools themselves stay layout-specific;
+only the mapping tensors alias"; `kv_reshard.py:21`: "the PP pool and the
+TP pool coexist"). Each pool therefore gets roughly half the budget.
+
+Two further ceilings were measured, not guessed:
+
+- **Per-stack budget double-spend.** Each stack calls
+  `_profile_available_bytes` with its own `pre_model_load_memory`
+  reference, and the TP stack's is taken after the PP pools are already
+  resident. Raising rank 0 to 24800 MiB was refused at TP-stack build
+  ("5.36 GiB free ... 3.81 GiB short of the budget") even though the 5090
+  showed 4 GiB free at idle. The 5090's slack is unreachable until this is
+  fixed.
+- **Corridor.** At 22300/13500/13500 with vector 13,11,8 the idle minimum
+  was `971 / 120 / 851` MiB free — a breach on all three cards. The
+  committed budget is the largest that held.
+
+---
+
+## 3. Nenngroessen (read from the server, not assumed)
+
+- **Max context:** 262144 booted; `max_req_input_len` follows the pool.
+- **KV pool:** 278104 tokens global (PP phase), 318176 (TP phase).
+  Per-rank PP allocation 26362 / 146874 / 67788 rows of full-attention KV
+  (K 0.40 / 2.24 / 1.03 GB, V likewise); TP phase 240960-row token split.
+- **Hybrid cap:** `max_running_requests x (context_len + 8)` =
+  4 x 262152 = **1572912** tokens — no longer the binding term (it was
+  262176 at ctx 65536).
+- **GDN/mamba slots:** 20 (`--max-mamba-cache-size 20`). Per rank
+  conv_state 0.03/0.01 GB, ssm_state 0.74/0.37 GB, intermediate ssm 0.70/0.35 GB.
+- **Spill:** **none armed.** Every tier reports absent via the dashboard's
+  `/api/live_snapshot`: `kv_session_host_ram` (flag off),
+  `hicache_host_ram` and `hicache_file_disk` (not booted with a
+  hierarchical cache), `remote_rig_*` (no destination configured).
+  `--enable-hierarchical-cache` is **hard-refused** with
+  `--enable-phase-flip` (`server_args.py:7230`, citing "#630: PP x disk
+  HiCache wedges at warmup"), and `--kv-pressure-ladder auto` refuses on
+  this rig because it cannot map ranks to cards on a mixed-model node.
+  This is the open item, see section 6.
+- **Radix/prefix cache:** on (`disable_radix_cache` False),
+  `--enable-cache-report`.
+- **CUDA graphs:** decode `full`, max_bs 24, captured bs
+  `[1,2,3,4,5,6,7,8,10,12,14,16,18,20,22,24]`; prefill graphs disabled.
+  `cuda graph: True` observed in every post-flip decode record.
+- **Speculation:** NEXTN, 3 steps, eagle-topk 1, 4 draft tokens. Present
+  only in the TP phase — the PP scheduler boots `spec_algorithm` NONE with
+  no draft worker, which is what makes an accept-length reading a
+  structural proof of the phase.
+- **Flip policy:** no automatic cadence. Armed by `POST /phase_flip`
+  (`{"direction":"pp_to_tp"|"tp_to_pp"}`); commits at the next consensus
+  boundary where every rank is quiescent, else abandons after 30 s parked.
+  Measured commit: 955 / 1203 / 1678 ms per rank, empty live set.
+- **Corridor:** idle `2323 / 2158 / 2075` MiB free; under bench load
+  `2255 / 2146 / 2029` MiB. Floor 1024, held continuously.
+
+---
+
+## 4. Benchmarks
+
+Instrument: the original club-3090 `scripts/bench.sh` against
+`http://127.0.0.1:30030` (`URL`/`MODEL` overridden; it defaults to 8020 and
+a vLLM container name). Quality suites were NOT run. Prefill is measured in
+the PP phase and decode in the TP phase — a run reporting both from one
+phase has not measured Route A.
+
+### 4a. Prefill, PP=3 phase
+
+`scripts/route_a_631_prefill_ladder.py` — random `input_ids` per draw so
+prefix caching cannot contaminate a repeat, `max_new_tokens=1` to isolate
+prefill, warm-up discarded, 3 kept draws, median.
+
+| input tokens | median ms | tok/s | draws (ms) |
+|---|---|---|---|
+| 2048 | 484.4 | **4227.8** | 485.9 / 484.4 / 484.1 |
+| 8192 | 1140.3 | **7183.8** | 1140.3 / 1139.7 / 1143.0 |
+| 32768 | 4881.4 | **6712.8** | 4795.3 / 4881.4 / 4923.0 |
+
+Within 3-5 % of the acceptance ladder (4335 / 7439 / 7090) despite 4x the
+context and ~6x the pool.
+
+### 4b. Decode, TP=3 phase, NEXTN live, bs=1
+
+club-3090 `bench.sh`, 3 warm-ups + 5 measured per prompt class.
+
+| config | class | decode TPS | wall TPS | TTFT | CV |
+|---|---|---|---|---|---|
+| ctx 65536, small pool | narrative | 79.50 | 78.80 | 112 ms | 2.9 % |
+| ctx 65536, small pool | code | 100.18 | 98.17 | 111 ms | 1.3 % |
+| **ctx 262144, big pool** | narrative | **74.02** | 73.42 | 109 ms | 8.2 % |
+| **ctx 262144, big pool** | code | **96.44** | 95.14 | 111 ms | 3.5 % |
+
+Reference: production's last measured state (2026-08-05, window 10,
+barlink **device** sub-transport) was 67.4-68.5 narrative / 88.1-88.6 code.
+The big-pool config is **+8 % narrative / +9 % code** against it, and the
+small-pool config was +16 / +13 %. The 4-7 % given back for 4x context and
+6x pool sits partly inside the narrative CV of 8.2 %.
+
+Content axis matters and is reported per class deliberately: accept length
+tracks output content on this rig, so a single decode figure without its
+content class is a fiction.
+
+### 4c. Concurrency ladder (client aggregate, TP phase)
+
+`scripts/gpu_battery/s14_decode_punkt.py`, 2048-token context, 6 s ramp,
+15 s window, two independent passes = the A-vs-A floor.
+
+| bs | pass A tok/s | pass B tok/s | A-vs-A spread |
+|---|---|---|---|
+| 1 | 117.33 | 118.27 | 0.8 % |
+| 2 | 215.47 | 209.27 | 2.9 % |
+| 3 | 279.13 | 263.87 | 5.5 % |
+| 4 | 284.33 | 284.80 | 0.2 % |
+
+Scheduler-side records for the same window: `accept len 4.00, accept rate
+1.00, cuda graph: True, gen throughput 281-288 tok/s` at
+`#running-req: 3` (the s14 probe's repetitive content accepts every draft
+position; natural prose in 4b runs 2.85-3.57).
+
+Aggregate throughput scales ~2.4x from bs=1 to bs=4 and flattens between 3
+and 4.
+
+### 4d. Phase proof
+
+Required, because an unproven phase makes every decode number meaningless.
+`/get_server_info` is NOT a valid witness — it still reports the PP-phase
+`tp_size`/pool after a committed flip (named residual: scheduler
+token/memory info is not re-read at cutover). The proof used instead is
+structural: the PP phase boots with `spec_algorithm` NONE and no draft
+worker, so a non-empty `accept len` in a scheduler decode record can only
+come from the TP phase. Every decode point above was taken after a logged
+`PHASE-FLIP DONE pp_to_tp` with no subsequent `tp_to_pp`, and every decode
+record carried an accept length.
+
+---
+
+## 5. Defects found and fixed
+
+1. **barlink BAR1 x phase flip could not boot** — four wire-carrying
+   groups x 96 MiB default vs 216 MiB usable aperture. Config fix in the
+   boot script, with the arithmetic recorded.
+2. **Weights arena allocated on top of live TP weights** (`512273a38f`) —
+   halved every rank's VRAM budget for the whole process life.
+3. **One vector for weight shard and KV token split** (`512273a38f`) —
+   min-reduced the decode pool to 27200 tokens.
+4. **`--kv-pressure-ladder auto` refuses on a mixed-model node** — made
+   opt-in in the boot script rather than defaulted.
+
+Open, not fixed here:
+
+5. **KV slot OOB under pool exhaustion.** At the 27200-token pool, a
+   benchmark run drove `store_kvcache` into its own guard —
+   `SGL_DEVICE_ASSERT(index >= 0 && index < size_limit)`,
+   `jit_kernel/csrc/elementwise/kvcache.cuh:112` — killing all three ranks
+   with a device-side assert. The pool handed back an invalid slot instead
+   of retracting. The bigger pool makes it far less reachable but does not
+   fix the allocator's behaviour at exhaustion.
+6. **Per-stack budget double-spend** (section 2d).
+7. **Both phases' pools resident** (section 2d) — the main remaining lever.
+
+---
+
+## 6. Open: reuse and spill across the flip
+
+The requirement: on the PP -> TP switch, reuse what both layouts share and
+spill what the inactive layout does not need, so the KV pool becomes big
+again.
+
+The weights already work this way — one arena sized `max(both layouts)`
+plus pinned host images, refilled at the flip. The KV and mamba pools never
+received the same treatment, which is exactly the duplication in 2d.
+
+Two candidate mechanisms, under evaluation:
+
+- **HiCache as the cross-phase carrier.** `write_through` already pushes
+  KV pages to the host tier as prefill produces them; the TP phase would
+  load from there after the reshard. Blocked today only by the blanket
+  refusal at `server_args.py:7230`, whose stated justification is a
+  **disk**-tier wedge (#630) — the host-RAM tier is not named by it, and
+  the RAM tier ran in plain TP=3 production for a long time. Open
+  questions: whether host-tier pages are layout-specific (the PP layout is
+  layer-sharded by stage, the TP layout token-sharded under the weighted
+  owner rule), and whether GDN/mamba state can use the same path at all.
+- **Shared KV/mamba arena** across phases, sized `max(PP, TP)` with the
+  inactive layout's rows spilled to a pinned host image — the same shape
+  as the weights arena, with `KvVmmBufferOwner` providing address-stable
+  remapping for the captured decode graphs.
+
+---
+
+## 7. Reproduce
+
+```
+# production boot (leaves the server in the PP prefill phase)
+HICACHE=0 RANK_MIB=20800,12500,13600 SGLANG_UNEVEN_TOKEN_VECTOR=13,11,8 \
+  bash scripts/route_a_631_prod_boot.sh
+
+# prefill, PP phase
+python3 scripts/route_a_631_prefill_ladder.py --port 30030
+
+# flip to decode
+curl "http://127.0.0.1:30030/flush_cache?timeout=60"
+curl -X POST http://127.0.0.1:30030/phase_flip \
+     -H 'Content-Type: application/json' -d '{"direction":"pp_to_tp"}'
+
+# decode, TP phase
+URL=http://127.0.0.1:30030 MODEL=Qwen3.6-27B RUNS=5 WARMUPS=3 \
+  bash /spinning/llm_stuff/club-3090/scripts/bench.sh
+
+# dashboard
+python3 -m sglang.planner --serve --port 8780
+```
+
+Test family: `bash scripts/run_631_flip_family.sh` — 266/266.
