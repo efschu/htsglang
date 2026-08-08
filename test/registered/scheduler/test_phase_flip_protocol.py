@@ -142,6 +142,10 @@ class _StubScheduler:
         self.phase_flip_stacks = SimpleNamespace(
             tp_worker=SimpleNamespace(name=f"tp_worker[{rank}]"),
             vector=VEC,
+            # The KV token vector. Equal to the weight vector unless
+            # SGLANG_UNEVEN_TOKEN_VECTOR overrides it; the cutover's owner
+            # rule and the transition plan both read THIS one.
+            token_vector=VEC,
             refill=lambda direction: self.log.append(("refill", direction)),
             # #631 speculation slice: None unless a test arms it.
             draft_worker=None,

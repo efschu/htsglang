@@ -451,6 +451,7 @@ class TestPhaseFlipStacksRefill(CustomTestCase):
                 image_pp=image_a,
                 image_tp=image_b,
                 vector=(30, 17, 17),
+                token_vector=(30, 17, 17),
             ),
             named_a,
             named_b,
@@ -571,3 +572,42 @@ class TestFlipTokenVector(CustomTestCase):
         os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "7,not-a-number,18"
         with self.assertRaises(PhaseFlipBootError):
             parse_flip_token_vector(_flip_args())
+
+
+class TestStacksCarryBothVectors(CustomTestCase):
+    """The weight shard vector and the KV token vector are NOT the same
+    quantity, and the flip consumes them in different places.
+
+    ``PhaseFlipStacks.vector`` answers "how are heads/compute split".
+    ``PhaseFlipStacks.token_vector`` answers "which rank OWNS which token
+    rows" -- the owner rule reinstalled at cutover and the flip's
+    transition plan are both token-space, so both must read the token
+    vector. Feeding them the weight vector routes rows under a different
+    split than the pools were SIZED under, which surfaces as an
+    out-of-bounds KV slot id, not as a slow path.
+
+    Regression pin: this diverges only when SGLANG_UNEVEN_TOKEN_VECTOR is
+    set, so it was unreachable until the token side became overridable.
+    """
+
+    def test_both_vectors_are_carried_separately(self):
+        import dataclasses as _dc
+
+        fields = {f.name for f in _dc.fields(PhaseFlipStacks)}
+        self.assertIn("vector", fields)
+        self.assertIn("token_vector", fields)
+
+    def test_cutover_and_transition_read_the_token_vector(self):
+        """Pins the two consumers by source, because exercising them needs
+        a live three-rank group."""
+        import inspect
+
+        from sglang.srt.managers import phase_flip_runtime as pfr
+
+        src = inspect.getsource(pfr)
+        # The owner rule reinstalled at cutover.
+        self.assertIn("set_cp_token_ratios(list(stacks.token_vector))", src)
+        self.assertNotIn("set_cp_token_ratios(list(stacks.vector))", src)
+        # The transition plan's tp_vector argument.
+        self.assertIn("tp_vector=stacks.token_vector", src)
+        self.assertNotIn("tp_vector=stacks.vector", src)
