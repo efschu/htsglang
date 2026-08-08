@@ -710,44 +710,87 @@ fewer layers than the iGPU, and the optimum must be measured.** Critically:
 > **Solo measurements of each part do not predict co-run behaviour — under
 > parallel operation both parts throttle each other.**
 
-On this APU that coupling is **threefold**, and it is the mechanism, not a
-caveat:
+On this APU the coupling is **threefold** — shared TDP/thermal envelope (CPU load
+steals the iGPU's power budget and vice versa), shared DDR5 bandwidth, and shared
+memory-controller contention, which is distinct from raw bandwidth.
 
-1. **Shared TDP / thermal envelope** — CPU load steals the iGPU's power budget
-   and vice versa. (Recorded host smoke shows headroom today: `temp_max 57 C`,
-   `ppt_max 19.14 W` — but that was a *quiescent* sample, not a co-run.)
-2. **Shared DDR5 bandwidth** — one pool, both consumers.
-3. **Shared memory-controller contention** — distinct from raw bandwidth.
+### The only quantity that counts: co-run **ms per round, per stage**
 
-**The plan, in order:**
+**User, 2026-08-08, verbatim:**
 
-- **(a) Solo baselines per stage** — prefill ms per layer-block on *real* layers,
-  each stage alone.
-- **(b) CO-RUN measurement** with both stages active simultaneously at
-  representative shares. **The co-run numbers, not the solo ones, feed
-  `--pp-layer-ratio`.**
-- **(c) Sweep 2-3 candidate splits around the co-run-derived optimum**, because
-  contention shifts the optimum away from the solo ratio.
+> *"es muss nicht der takt mitgeschrieben werden sondern die ms zeiten der karten
+> selbst. der takt sagt nichts aus über die verteilung die wir später brauchen.
+> einzig und allein ms 'runden' zeiten."*
 
-**Record clocks and power alongside every point** — on this hardware they *are*
-the mechanism. `docs/dev/651/bench_prefill.py` already provides the A-vs-A noise
-floor, warmup discard, unique prompts and time-bounded runs this needs; the
-co-run harness is the piece that does not exist yet.
+**Do NOT record clocks or power as the measurement basis.** Clock and power
+telemetry says nothing about the distribution we actually need, and it is
+**redundant**: the entire throttling interaction — all three coupling mechanisms
+above — is **already fully captured in the measured ms times**. That redundancy
+is precisely *why* co-run ms is the number that matters and why solo ms and
+derived clock models are not substitutes.
 
-**If the co-run measurement says the CPU stage's net contribution is negligible
+This is the rig's standing **ms-per-round doctrine** applied to the APU:
+
+- Measure **ms per round per worker** — for each stage, the wall-clock ms to
+  forward *its own layer share* for one pipeline round.
+- Split each worker's round into **compute time vs wait time**. The wait
+  component is what exposes an unbalanced split.
+- **Runs >= 10 s**, warmup discarded.
+- Never tok/s. Note that the one existing iGPU figure (~157-172 tok/s prefill,
+  §1.5.2) is in the wrong unit for this purpose and **must be restated as
+  ms/round** before it can feed a split decision.
+
+### The optimum condition
+
+For a 2-stage pipeline the optimum is exactly:
+
+```
+co-run ms per round (CPU stage)  ==  co-run ms per round (iGPU stage)
+```
+
+Derive `--pp-layer-ratio` so those two come out **equal**. Nothing else — not
+core counts, not solo throughput, not FLOP estimates — is a valid basis.
+
+### Plan, in order
+
+- **(a) Solo baselines** — ms/round per stage on *real* layers, each alone.
+  Diagnostic only: it brackets the search and exposes gross errors. It does
+  **not** set the ratio.
+- **(b) CO-RUN measurement** — both stages active simultaneously at
+  representative shares, ms/round captured per stage. **These are the numbers
+  that feed `--pp-layer-ratio`.**
+- **(c) Sweep 2-3 candidate splits** around the co-run-derived optimum, since
+  contention moves the optimum away from wherever the solo ratio pointed.
+
+`docs/dev/651/bench_prefill.py` supplies the A-vs-A noise floor, warmup discard,
+unique prompts and time-bounded runs. **But it measures TTFT, not per-stage
+ms/round** — the per-worker round instrumentation is the piece that does not
+exist yet and is the thing to build.
+
+**If the co-run measurement shows the CPU stage's net contribution is negligible
 or negative after throttling, that is a reportable verdict, not a failure.** The
 user wants the real optimum, whatever it turns out to be.
 
-### 6.0.3 R must be MEASURED before choosing `--pp-layer-ratio`
+### 6.0.3 R is a derived quantity, not the measurement
 
-`--pp-layer-ratio` exists, sums to backbone depth **40**, and should be set
-**proportional to measured stage prefill throughput — not to core counts**.
-Known so far: iGPU prefill ~157-172 tok/s (§1.5.2). **CPU prefill on real layers
-is unmeasured**, so R is unknown and every speedup figure above is conditional.
-On this APU the iGPU:CPU ratio is far smaller than on a dGPU rig, so the ceiling
-is plausibly meaningful — but that is a hypothesis, not a result.
-`docs/dev/651/bench_prefill.py` already does the A-vs-A noise floor and the
-`--split-from` balance arithmetic this needs.
+`--pp-layer-ratio` exists and sums to backbone depth **40**. Set it by the
+**equal-co-run-ms condition of §6.0.2** — *not* proportional to core counts, and
+not proportional to a throughput number.
+
+`R` as used in the §6.0.1 tables is a **sweep parameter for pricing the routes**,
+and at most a *derived* summary of a completed measurement
+(`R = ms_cpu_per_layer / ms_igpu_per_layer` under co-run). It is not itself the
+thing to measure, and a solo-derived `R` is not valid input to a split decision.
+
+Known so far: the iGPU prefill figure is ~157-172 tok/s (§1.5.2) — **the wrong
+unit**, and it must be restated as ms/round before use. **CPU prefill on real
+layers has never been measured at all**, so every speedup figure in §6.0.1 is
+conditional. On this APU the iGPU:CPU gap is far smaller than on a dGPU rig, so
+the ceiling is plausibly meaningful — but that is a hypothesis, not a result.
+
+`docs/dev/651/bench_prefill.py` supplies the A-vs-A noise floor and the
+`--split-from` balance arithmetic; the **per-stage ms/round instrumentation it
+lacks** is the piece to build (§6.0.2).
 
 ### 6.0.4 The phase flip, and what PP+spec exclusivity actually binds
 

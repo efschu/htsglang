@@ -27,7 +27,13 @@ config stops fitting is a Q3 variant (needs a download), never Q2.
 
 NOTE: solo stage speeds do NOT predict co-run -- CPU and iGPU throttle each
 other through shared TDP, DDR5 bandwidth and memory-controller contention.
-R here is a PARAMETER to sweep, not a measurement. See HANDOFF section 6.0.2.
+R here is a PARAMETER to sweep, not a measurement.
+
+The split is set by the equal-co-run-ms condition, NOT by this table and NOT by
+throughput: measure ms per ROUND per stage under co-run, and choose the layer
+split so both stages' co-run ms per pipeline round come out EQUAL. Clocks and
+power are deliberately NOT recorded -- the throttling interaction is already
+fully captured in the ms times. See HANDOFF section 6.0.2.
 
 Everything lives in ONE physical DDR5 pool, so both stages plus the OS are
 charged against MemTotal. The iGPU share is additionally capped by the GTT
