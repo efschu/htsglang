@@ -921,6 +921,7 @@ class PhaseFlipRuntime:
         self._pump_fn = pump_fn
         self._presence_deadline_s = float(presence_deadline_s)
         self._presence_wait_started = None
+        self._gate_open_epoch = None
         self.presence_timeouts = 0
         self._join_deadline_s = DEFAULT_JOIN_DEADLINE_S
         self.join_deadline_aborts = 0
@@ -1253,14 +1254,23 @@ class PhaseFlipRuntime:
             # presence bound governs assembly, the park bound governs
             # quiescence, and they now run in sequence rather than
             # concurrently.
-            self._armed_at = self._clock()
-            logger.warning(
-                "%s group present for epoch %d after %.2fs; park clock "
-                "re-based, entering the consensus round",
-                LOG_PREFIX,
-                epoch,
-                waited,
-            )
+            # ONCE PER ARM, never per round. Re-basing on every gate
+            # opening makes the park deadline unreachable: the gate opens
+            # each round, the clock resets each round, and a flip that can
+            # never reach quiescence holds FOR EVER with its requests
+            # parked -- measured 2026-08-08 (boot 17): repeated "group
+            # present after 0.00s" on every rank, cutovers=0,
+            # abandoned=0, and the server answering nothing.
+            if self._gate_open_epoch != epoch:
+                self._gate_open_epoch = epoch
+                self._armed_at = self._clock()
+                logger.warning(
+                    "%s group present for epoch %d after %.2fs; park clock "
+                    "re-based once, entering the consensus round",
+                    LOG_PREFIX,
+                    epoch,
+                    waited,
+                )
             return True
 
         waited = self._clock() - self._presence_wait_started

@@ -771,6 +771,7 @@ def _runtime_stub(presence, deadline=60.0, pending="pp_to_tp", clock=None):
     r._pump_fn = None
     r._presence_deadline_s = deadline
     r._presence_wait_started = None
+    r._gate_open_epoch = None
     r._epoch = 1
     r._pending = pending
     r._armed_at = 0.0
@@ -927,4 +928,34 @@ def test_presence_wait_does_not_count_toward_the_park_deadline():
         "the park expiry is computed before the entry gate; time spent "
         "waiting for the group to assemble would count as a failure to "
         "reach quiescence, and the flip is abandoned as the gate opens"
+    )
+
+
+def test_park_clock_is_rebased_once_per_arm_not_once_per_round(tmp_path):
+    """BOOT-17 SPECIMEN: a per-round re-base makes the park deadline
+    unreachable.
+
+    The gate opens every round once the group is present. Re-basing the
+    park clock each time means a flip that can NEVER reach quiescence
+    holds for ever with its requests parked -- measured as repeated
+    "group present after 0.00s" on every rank, cutovers=0, abandoned=0,
+    and a server answering nothing. The re-base is a per-ARM event.
+    """
+    now = {"t": 0.0}
+    r = _runtime_stub(_presence(tmp_path, rank=0), clock=lambda: now["t"])
+    _presence(tmp_path, rank=1).announce(1)
+    _presence(tmp_path, rank=2).announce(1)
+    r._gate_open_epoch = None
+
+    now["t"] = 5.0
+    assert r._await_group_presence() is True
+    assert r._armed_at == 5.0
+
+    # Later rounds re-open the gate; the clock must NOT move again, or
+    # the park deadline can never expire.
+    now["t"] = 40.0
+    assert r._await_group_presence() is True
+    assert r._armed_at == 5.0, (
+        "the park clock was re-based on a later round; the park deadline "
+        "becomes unreachable and a stuck flip parks requests for ever"
     )
