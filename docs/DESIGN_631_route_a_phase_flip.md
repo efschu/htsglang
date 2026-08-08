@@ -310,6 +310,26 @@ ceilings ~329k/283k/255k. BINDING: 3080 rank 2 at ~255k global tokens =
 production cap (327700, itself the mamba cap of 4 x 65536 + headroom).
 Not halved -- the #625 arms sized pools into luxury free VRAM.
 
+MEASURED TERMS (first real-metal boots, 2026-08-08):
+* NCCL two-group sets: 198 / 112 / 112 MiB per card (5090: pp 188 +
+  flip_tp 6 + flip_dcp 4; 3080s: 104 + 4 + 4). The ~500 MiB guess is
+  RETIRED -- it was 2.5-4x high; ~300-390 MiB per card come back to the
+  KV budgets.
+* HOST PINNED IMAGES (new ledger term, was absent): 28.1 / 14.6 / 17.0
+  GiB pinned host RAM per rank (PP image + TP image, logged by the
+  build) -- ~60 GiB total on a 120 GiB no-swap box. Unreclaimable while
+  the server runs; every host-RAM consumer (kv-session offload budgets,
+  weights CPU backup, hicache) must be priced against it.
+* Flip wall time (pp_to_tp, epoch 1): 22.3 / 23.1 / 33.6 s per rank --
+  10x the ~2-2.3 s estimate. Decomposition from the logs: consensus +
+  KV move (read 1.2-1.4 ms, exchange 67 ms, write 1.8-2.2 ms) + GDN leg
+  all complete within ~1 s of arming; the remainder was the HOST-side
+  image checksum in arena_refill (single-core uint8 sum, 0.82 GiB/s
+  measured, worse with 3 ranks summing concurrently) -- NOT the H2D
+  copy. Fixed by verify-after-copy on the arena's device (restore pair
+  keeps the clean-abort contract); expected post-fix flip time ~ H2D +
+  ~0.1 s, to be re-measured with per-leg CUDA events next window.
+
 BUILD TRANSIENT (measured 2026-08-08, first real-metal boot): the ledger
 above prices the STEADY state only. At build step 4 the TP checkpoint
 originals and the freshly-allocated arena COEXIST (the arena must exist

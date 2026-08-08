@@ -158,6 +158,25 @@ class _StubScheduler:
         self.attn_tp_cpu_group = None
         self.pp_group = None
         self.dp_tp_group = None
+        # step-4b component holders (rebuilt via dataclasses.replace, so
+        # they must be real dataclasses carrying the touched fields)
+        import dataclasses as _dc
+
+        @_dc.dataclass
+        class _ReceiverStub:
+            ps: object
+            tp_group: object = None
+            tp_cpu_group: object = None
+            attn_tp_group: object = None
+            attn_tp_cpu_group: object = None
+
+        @_dc.dataclass
+        class _PsHolderStub:
+            ps: object
+
+        self.request_receiver = _ReceiverStub(ps=self.ps)
+        self.output_streamer = _PsHolderStub(ps=self.ps)
+        self.load_inquirer = _PsHolderStub(ps=self.ps)
 
     def init_pp_loop_state(self):
         self.log.append(("init_pp_loop_state", self.ps.pp_size))

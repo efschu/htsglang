@@ -290,11 +290,28 @@ def arena_image(
 
 
 def arena_refill(
-    arena: torch.Tensor, layout: ArenaLayout, image: torch.Tensor
+    arena: torch.Tensor,
+    layout: ArenaLayout,
+    image: torch.Tensor,
+    restore: Optional[Tuple[ArenaLayout, torch.Tensor]] = None,
 ) -> None:
     """The flip: ONE contiguous copy of the other layout's image into the
-    arena. Checksum-verified BEFORE the copy touches the arena -- a
-    corrupted image aborts with the arena byte-identical."""
+    arena, verified AFTER the copy on the ARENA's device.
+
+    Ordering rationale (flip-time economics, measured 2026-08-08): the
+    old verify-BEFORE-copy summed the multi-GB image on the HOST -- a
+    single-core uint8 reduction at ~0.8 GiB/s, worse with all ranks
+    summing concurrently. It was the dominant flip leg: 22-33 s of the
+    measured per-rank flip wall time against a ~2 s design estimate. On a
+    CUDA arena the post-copy checksum runs at device bandwidth instead.
+
+    Abort contract: size/shape violations still abort BEFORE any byte
+    moves. A checksum mismatch is detected after the copy; with
+    ``restore`` (the CURRENT phase's (layout, image), creation-time
+    verified) the active layout's bytes are rewritten so every live view
+    of the restoring layout is byte-identical again, then the same clean
+    WeightsArenaError raises. Without ``restore`` the mismatch error is
+    marked FATAL for the arena content."""
     want_numel = layout.total_bytes + _CHECKSUM_BYTES
     if image.numel() != want_numel:
         raise WeightsArenaError(
@@ -310,10 +327,23 @@ def arena_refill(
     want = int(
         image[layout.total_bytes :].clone().view(torch.int64).item()
     )
-    have = uint8_checksum(payload)
+    dst = arena[: layout.total_bytes]
+    dst.copy_(payload)
+    have = uint8_checksum(dst)
     if want != have:
+        restored = ""
+        if restore is not None:
+            r_layout, r_image = restore
+            arena[: r_layout.total_bytes].copy_(
+                r_image[: r_layout.total_bytes]
+            )
+            restored = (
+                "; the current phase's layout was restored into the arena "
+                "(its views are byte-identical again)"
+            )
+        else:
+            restored = "; ARENA CONTENT IS NOW UNDEFINED (no restore image)"
         raise WeightsArenaError(
             f"arena image checksum mismatch (stored {want}, computed "
-            f"{have}); refusing to refill from a corrupted image"
+            f"{have}); refusing to serve from a corrupted image{restored}"
         )
-    arena[: layout.total_bytes].copy_(payload)

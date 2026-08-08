@@ -194,14 +194,28 @@ class TestFlipSemantics(CustomTestCase):
         for name, t in named_b.items():
             self.assertTrue(torch.equal(views_b[name], t), f"{name} mismatch")
 
-    def test_corrupted_image_refused_arena_untouched(self):
-        _, _, la, lb, arena, _, _, img_a, _ = self._packed_images()
-        snapshot = arena.clone()
+    def test_corrupted_image_refused_and_current_layout_restored(self):
+        # Verify-after-copy contract (flip-time economics, 2026-08-08):
+        # the mismatch is detected after the copy, and with a restore
+        # pair the ACTIVE layout's views must be byte-identical again --
+        # that, not raw arena bytes, is what a clean abort must preserve.
+        named_b = _named_set_b()
+        _, _, la, lb, arena, _, views_b, img_a, img_b = self._packed_images()
         bad = img_a.clone()
         bad[3] ^= 0xFF
         with self.assertRaisesRegex(WeightsArenaError, "checksum"):
+            arena_refill(arena, la, bad, restore=(lb, img_b))
+        for name, t in named_b.items():
+            self.assertTrue(
+                torch.equal(views_b[name], t), f"{name} not restored"
+            )
+
+    def test_corrupted_image_without_restore_is_flagged_fatal(self):
+        _, _, la, _, arena, _, _, img_a, _ = self._packed_images()
+        bad = img_a.clone()
+        bad[3] ^= 0xFF
+        with self.assertRaisesRegex(WeightsArenaError, "UNDEFINED"):
             arena_refill(arena, la, bad)
-        self.assertTrue(torch.equal(arena, snapshot))
 
     def test_wrong_size_image_refused(self):
         _, _, la, _, arena, _, _, img_a, _ = self._packed_images()

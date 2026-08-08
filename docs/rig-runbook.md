@@ -2482,19 +2482,30 @@ WEIGHTED owner rule, which does not reach `dcp_even_write_mask` at all ("The
 WEIGHTED rule needs none of this", `owner.py`) and is required by
 `--draft-kv-layout dcp` -- but it was not what cleared the wedge either.
 
-**Worker processes do NOT inherit your exported environment.** sglang
-rebuilds a curated env for the scheduler workers -- checked on a running
-production boot, whose workers carry `SGLANG_RANK_CARD_UUIDS` and
-`SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=True` that sglang injected, and carry
-NONE of `SGLANG_BARLINK` / `SGLANG_UNEVEN_DCP*` / `SGLANG_MAMBA_SSM_DTYPE`
-that the launch script exported. This does not break the DCP vars, because
-`SGLANG_UNEVEN_DCP` is read by `server_args.__post_init__` in the PARENT
-(`server_args.py:8030`, `:10353`) at argument-resolution time. It does mean
-that reading a worker's `/proc/<pid>/environ` and concluding "that setting is
-not in force" is unsound -- check WHERE the variable is read first.
-(Corollary: sglang resolves cards by UUID itself and hands each worker a
-single visible device, which is the same conclusion the device-order trap
-above forces on any launcher.)
+**Worker processes DO inherit the parent environment — do not conclude
+otherwise from `/proc/<pid>/environ`.** An earlier version of this section
+claimed sglang rebuilds a curated env for scheduler workers, on the evidence
+that a running boot's workers carried `SGLANG_RANK_CARD_UUIDS` and
+`SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` (sglang-injected) but none of
+`SGLANG_BARLINK` / `SGLANG_UNEVEN_DCP*` / `SGLANG_MAMBA_SSM_DTYPE`. That
+inference was wrong: the boot being inspected had been launched by a script
+that does not export those, so their absence said nothing about inheritance.
+
+The code is explicit the other way. `entrypoints/engine.py:666-667`: "the
+channel is the environment, and a spawned scheduler inherits it only if it is
+set by now"; `:1549`: "spawned so the environment variables are inherited by
+every worker" — with `mp.set_start_method("spawn")` at `:1460`, which passes
+the parent environment. So a variable read in the WORKER (e.g.
+`SGLANG_NCCL_SO_PATH` at
+`distributed/device_communicators/pynccl_wrapper.py:48`) does reach it, as
+long as it is exported before the spawn loop.
+
+The sound version of the original warning survives: check WHERE a variable is
+read before reasoning about it. Some are parent-only (`SGLANG_UNEVEN_DCP` is
+consumed by `server_args.__post_init__`, `server_args.py:8030`/`:10353`, at
+argument-resolution time); others are worker-side. Comparing a worker's
+environ against your launch script tells you about the launch script, not
+about sglang.
 
 A decode TP group spanning a 5090 and a 3080 also trips sglang's TP
 memory-balance check (`model_runner.py:1880-1890`), which assumes a
@@ -2551,16 +2562,55 @@ a PP prefill arm: PP>1 x Disk-HiCache wedges silently at warmup and health
 stays 503 forever. If a PP prefill arm never comes up, check this before
 debugging anything else.
 
-**A PP>=2 prefill group AND a TP>=2 decode group cannot both exist on three
-cards.** Two persistent groups need two servers, and two servers on three
-cards without co-location is three ranks TOTAL. So the split is 2+1 or 1+2 --
-a real PP prefill group or a real TP decode group, not both. This is a
-hardware ceiling, not a configuration choice, and it is worth stating plainly
-because the two obvious ways around it are both closed:
+**A PP>=2 prefill group AND a TP>=2 decode group DO both fit on three cards.**
+An earlier version of this section said they could not, calling it "a hardware
+ceiling, not a configuration choice". That was wrong, and the error is worth
+naming: the arithmetic (two servers, no co-location, three ranks) was right,
+but the premise that co-location was unavailable was never checked against the
+code. This fork has co-location machinery — task #82 built multi-rank-per-GPU
+placement precisely to emulate TP=5 on three cards, and
+`FEATURES_VS_UPSTREAM.md:214/340/856` records "TP=4 co-located on 3 cards" as
+boot-checked. A rank-count argument is weak evidence; a named refusal in the
+code is strong evidence. Only the latter closes a route.
 
-- `--disaggregation-topology colocated-process` would allow more ranks per
-  card but needs NCCL >= 2.30 (runtime here is 2.28.9) and an MPS daemon.
-- `colocated-congruent` needs NEITHER of those -- but it cannot express Route
+The layout that expresses Route A as written, 4 ranks on 3 cards:
+
+    prefill  PP=2, TP=1   --rank-gpu-id <3080a>,<3080b>    (no duplicates)
+    decode   TP=2         --rank-gpu-id <5090>,<5090>      (co-located pair)
+
+Prefill and decode never share a card, so `--disaggregation-topology
+colocated-process` — the only mode that gates on MPS — is not involved at all.
+The decode server's duplicate `--rank-gpu-id` is the plain TP co-location path,
+where:
+
+- **No boot gate refuses it.** `probe_nccl_colocation` / `probe_mps` are
+  reachable only through `check_process_colocation_prerequisites`
+  (`disaggregation/topology.py:683`), called only for `colocated-process`
+  (`:743-744`). The `--rank-gpu-id` validation block contains no NCCL or MPS
+  check. Exercised at `test/registered/unit/server_args/
+  test_uneven_tp_args.py:298-302` with `rank_gpu_id=[0,0,1,2]`, asserting the
+  handler does not raise.
+- **MPS is a WARNING, not a requirement.** `entrypoints/engine.py:1599-1610`
+  logs ">20x slowdown" when the MPS control daemon does not answer. That is a
+  throughput statement, not a correctness one, and nothing refuses.
+- **NCCL >= 2.30 IS a real requirement**, and it is the whole constraint.
+  `engine.py` sets `NCCL_MULTI_RANK_GPU_ENABLE=1` unconditionally and notes
+  that older NCCL "ignores it and fails later with a clear 'Duplicate GPU
+  detected' error". `FEATURES_VS_UPSTREAM.md:340` lists the requirement as
+  "NCCL >= 2.30, shipped in the fork's container image". The venv here runs
+  **2.28.9**, so co-location fails at communicator build unless NCCL is
+  raised.
+- **It can be raised without touching the shared venv.** `pynccl_wrapper.py:41-53`
+  honours `SGLANG_NCCL_SO_PATH`, read in the worker, which inherits the parent
+  environment (see the environment note above). `pip download
+  nvidia-nccl-cu13==2.30.7` gives a `libnccl.so.2` that `ncclGetVersion`
+  reports as 23007; point `SGLANG_NCCL_SO_PATH` at it for the decode server
+  only. MPS remains optional and costs throughput, not correctness.
+
+So the route is open and the constraint is a library version, not the hardware.
+What remains genuinely closed are the two mechanisms that refuse BY NAME:
+
+- `colocated-congruent` cannot express Route
   A. It refuses `--disaggregation-mode` outright ("there are no two servers",
   `disaggregation/topology.py:247-253`), refuses a layer split because "the
   lane computes with the decode sharding" (`:255-262`), and its lane tick runs

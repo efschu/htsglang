@@ -260,10 +260,25 @@ class PhaseFlipStacks:
         TP_TO_PP)."""
         from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 
+        # restore = the CURRENT phase's pair: on a checksum mismatch the
+        # refill rewrites the active layout so its views stay byte-exact
+        # and the abort is clean (verify-after-copy contract; the
+        # verify-before-copy host sum was the dominant flip leg, 22-33 s
+        # measured 2026-08-08).
         if direction == PP_TO_TP:
-            arena_refill(self.arena, self.layout_tp, self.image_tp)
+            arena_refill(
+                self.arena,
+                self.layout_tp,
+                self.image_tp,
+                restore=(self.layout_pp, self.image_pp),
+            )
         elif direction == TP_TO_PP:
-            arena_refill(self.arena, self.layout_pp, self.image_pp)
+            arena_refill(
+                self.arena,
+                self.layout_pp,
+                self.image_pp,
+                restore=(self.layout_tp, self.image_tp),
+            )
         else:
             raise PhaseFlipBootError(f"unknown flip direction {direction!r}")
 

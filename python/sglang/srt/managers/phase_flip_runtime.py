@@ -374,6 +374,33 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
         # dp-attention is a flip arming guard; the dp routing group is tp.
         scheduler.dp_tp_group = scheduler.tp_group
 
+        # 4b. Scheduler COMPONENTS holding ps / group snapshots (found on
+        # the first post-flip serving attempt, 2026-08-08): the request
+        # receiver kept the boot ps and relayed requests PP-chain-style
+        # while rank 0 ran TP semantics -- one rank in the pool-budget
+        # all_reduce, another in the relay's point_to_point recv, wedge.
+        # The output streamer's stale ps mis-gated the detokenizer send
+        # (heartbeat loss). Both are plain dataclasses over ps + group
+        # handles; rebuild them against the freshly-routed handles. The
+        # completeness self-check (step 9) pins each one.
+        import dataclasses as _dc2
+
+        scheduler.request_receiver = _dc2.replace(
+            scheduler.request_receiver,
+            ps=scheduler.ps,
+            tp_group=scheduler.tp_group,
+            tp_cpu_group=scheduler.tp_cpu_group,
+            attn_tp_group=scheduler.attn_tp_group,
+            attn_tp_cpu_group=scheduler.attn_tp_cpu_group,
+        )
+        scheduler.output_streamer = _dc2.replace(
+            scheduler.output_streamer, ps=scheduler.ps
+        )
+        if getattr(scheduler, "load_inquirer", None) is not None:
+            scheduler.load_inquirer = _dc2.replace(
+                scheduler.load_inquirer, ps=scheduler.ps
+            )
+
         # 5. pp_max_micro_batch_size for the new pp_size (boot formula).
         get_server_args().override(
             "phase_flip.pp_max_micro_batch_size",
@@ -464,6 +491,24 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
     want_worker = stacks.tp_worker if tp_phase else scheduler.tp_worker
     if scheduler.model_worker is not want_worker:
         stale.append("model_worker (wrong stack)")
+    # Component ps/group snapshots (step 4b): each holder rebuilt at
+    # cutover must reference the CURRENT ps object and routed groups --
+    # a stale receiver relays requests in the other phase's topology
+    # (measured wedge, first post-flip serving attempt 2026-08-08).
+    receiver = getattr(scheduler, "request_receiver", None)
+    if receiver is not None:
+        if receiver.ps is not scheduler.ps:
+            stale.append("request_receiver.ps")
+        if receiver.attn_tp_group is not scheduler.attn_tp_group:
+            stale.append("request_receiver.attn_tp_group")
+        if receiver.tp_cpu_group is not scheduler.tp_cpu_group:
+            stale.append("request_receiver.tp_cpu_group")
+    streamer = getattr(scheduler, "output_streamer", None)
+    if streamer is not None and streamer.ps is not scheduler.ps:
+        stale.append("output_streamer.ps")
+    inquirer = getattr(scheduler, "load_inquirer", None)
+    if inquirer is not None and inquirer.ps is not scheduler.ps:
+        stale.append("load_inquirer.ps")
     window = getattr(scheduler, "phase_flip_abort_window", None)
     if window is not None and window.active:
         stale.append("abort window still active (drain missed)")
