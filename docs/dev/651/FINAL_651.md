@@ -1440,3 +1440,46 @@ KV, filling that context is sustained prefill, and sustained prefill wedges
 this GPU in firmware (section 3, and reproduced again in 9.6 by an agent-sized
 prompt). A large context is only worth building toward here once the MES fault
 is addressed; on the rig the constraint does not apply.
+
+#### 9.7.1 MEASURED: the cold tail exists, and it is deep
+
+Census taken with `--expert-distribution-recorder-mode stat` over 566 generated
+tokens from five short prompts (decode-shaped on purpose -- a long prompt is
+sustained prefill and would have wedged the GPU mid-measurement).
+214,400 routing events, 40 layers x 256 experts = 10,240 experts.
+
+| spill (coldest, by measured frequency) | share of expert LOOKUPS hitting disk |
+|---|---|
+| 5%  | 0.00% |
+| 10% | 0.00% |
+| 15% | 0.00% |
+| 20% | 0.03% |
+| 30% | 0.81% |
+| 50% | 6.87% |
+
+**1980 of 10,240 experts (19.3%) were never routed to at all.** A flat
+distribution would make miss% equal spill%; the measured skew ratio at a 10%
+spill is 0.000. The distribution is not merely skewed, it has a large dead
+region.
+
+Against the sizing in 9.7: experts total ~18 GiB, so ~1.8 MB each. Spilling the
+coldest **20% is ~3.6 GiB**, which exceeds the 2.86 GiB that 150k tokens of KV
+needs, at a measured 0.03% miss rate. The feature is therefore viable in
+principle, and viable in the CHEAP regime rather than the 162 ms/token one.
+
+HOW FAR THIS CONCLUSION REACHES, stated plainly, because it is the part most
+likely to be over-read:
+
+* The sample is NARROW -- five prompts, 566 tokens, one language, no code, no
+  long context. The 19.3% never-routed figure is an upper bound that will
+  shrink under a broader mix; some of those experts are certainly reachable by
+  inputs this census never presented.
+* Therefore the spill SET must not be frozen from a census like this one. What
+  the census licenses is the SHAPE (deep cold tail, cheap at 10-20%), not a
+  specific list of experts. A production design needs either a much broader
+  census or an adaptive hot/cold policy with promotion on miss.
+* Nothing here measures the I/O path, only the miss RATE. The per-miss cost on
+  this NVMe is still unmeasured.
+* On the laptop the prefill wedge still gates actually filling a large context
+  (9.6). The memory argument and the wedge are independent problems, and this
+  section only settles the memory one.

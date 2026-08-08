@@ -72,6 +72,17 @@ CTX=${CTX:-8192}
 # pinned-host reserve is now configurable; the ROCm layout collision is pinned
 # to page_first_direct), and the remaining wall is the machine, not the code.
 # HICACHE=1 re-arms it for a host with RAM to spare; see FINAL_651.md.
+# Opt-in expert-routing census (#651 9.7). Off by default and inert when off.
+# The MoE disk-spill question turns on ONE property of this checkpoint: whether
+# expert access has a genuine cold tail, or is flat. "stat" keeps running
+# per-expert counts that /dump_expert_distribution_record returns, which is the
+# cheapest way to answer it -- no instrumentation of our own, and nothing to
+# get wrong in the counting.
+EXPERT_STAT_ARGS=()
+if [ "${EXPERT_STAT:-0}" = "1" ]; then
+  EXPERT_STAT_ARGS=(--expert-distribution-recorder-mode stat)
+fi
+
 HICACHE_ARGS=()
 if [ "${HICACHE:-0}" = "1" ]; then
   HICACHE_ARGS=(
@@ -120,6 +131,7 @@ exec python -m sglang.launch_server \
   --mem-fraction-static "$MEMFRAC" \
   --chunked-prefill-size "$CHUNKED_PREFILL" \
   "${HICACHE_ARGS[@]}" \
+  "${EXPERT_STAT_ARGS[@]}" \
   --enable-metrics \
   --host 127.0.0.1 --port "$PORT" \
   --log-level info
