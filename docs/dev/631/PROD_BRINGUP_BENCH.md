@@ -225,8 +225,17 @@ club-3090 `bench.sh`, 3 warm-ups + 5 measured per prompt class.
 |---|---|---|---|---|---|
 | ctx 65536, small pool | narrative | 79.50 | 78.80 | 112 ms | 2.9 % |
 | ctx 65536, small pool | code | 100.18 | 98.17 | 111 ms | 1.3 % |
-| **ctx 262144, big pool** | narrative | **74.02** | 73.42 | 109 ms | 8.2 % |
-| **ctx 262144, big pool** | code | **96.44** | 95.14 | 111 ms | 3.5 % |
+| ctx 262144, big pool, divergent vectors | narrative | 74.02 | 73.42 | 109 ms | 8.2 % |
+| ctx 262144, big pool, divergent vectors | code | 96.44 | 95.14 | 111 ms | 3.5 % |
+| **ctx 262144, big pool, vectors fixed** | narrative | **79.02** | — | 112 ms | **0.9 %** |
+| **ctx 262144, big pool, vectors fixed** | code | **103.21** | — | 109 ms | 2.7 % |
+
+The last pair is the shipped configuration. Fixing the token-vector
+divergence (section 5.5) is worth +6.8 % narrative and +7.0 % code AND
+collapses the narrative CV from 8.2 % to 0.9 % -- the wrong owner rule was
+also the source of the run-to-run instability. At ctx 262144 with a 6x
+pool it now beats the ctx-65536 small-pool config on code (103.21 vs
+100.18) and matches it on narrative.
 
 Reference: production's last measured state (2026-08-05, window 10,
 barlink **device** sub-transport) was 67.4-68.5 narrative / 88.1-88.6 code.
@@ -283,18 +292,34 @@ record carried an accept length.
    min-reduced the decode pool to 27200 tokens.
 4. **`--kv-pressure-ladder auto` refuses on a mixed-model node** — made
    opt-in in the boot script rather than defaulted.
+5. **The cutover reinstalled the WEIGHT vector as the owner rule**
+   (`f0df756788`). `PhaseFlipStacks` carried one vector; both
+   `set_cp_token_ratios(...)` at cutover and the `tp_vector` handed to
+   `build_phase_flip_transition` read it — and the latter's own docstring
+   calls that argument "the weighted DCP token vector of the TP layout".
+   So after every cutover the owner rule and the row-routing plan split
+   rows under a vector the pools were not sized under. Latent while the
+   two vectors were equal by construction; making the token side
+   overridable is what made it reachable, and it is almost certainly the
+   mechanism behind defect 6 below. Fixed by carrying both vectors,
+   named for the question each answers.
 
 Open, not fixed here:
 
-5. **KV slot OOB under pool exhaustion.** At the 27200-token pool, a
+6. **KV slot OOB under pool exhaustion.** At the 27200-token pool, a
    benchmark run drove `store_kvcache` into its own guard —
    `SGL_DEVICE_ASSERT(index >= 0 && index < size_limit)`,
    `jit_kernel/csrc/elementwise/kvcache.cuh:112` — killing all three ranks
    with a device-side assert. The pool handed back an invalid slot instead
    of retracting. The bigger pool makes it far less reachable but does not
    fix the allocator's behaviour at exhaustion.
-6. **Per-stack budget double-spend** (section 2d).
-7. **Both phases' pools resident** (section 2d) — the main remaining lever.
+7. **Per-stack budget double-spend** (section 2d). Each `ModelRunner`
+   reads its own `pre_model_load_memory`, and the TP stack's reading is
+   taken after the PP pools are resident, so those bytes are never
+   charged: device use is roughly `2*B - W_pp` against a flag value `B`.
+   Under a shared arena this becomes mandatory to fix — one allocation
+   must mean one budget.
+8. **Both phases' pools resident** (section 2d) — the main remaining lever.
 
 ---
 
@@ -308,21 +333,96 @@ The weights already work this way — one arena sized `max(both layouts)`
 plus pinned host images, refilled at the flip. The KV and mamba pools never
 received the same treatment, which is exactly the duplication in 2d.
 
-Two candidate mechanisms, under evaluation:
+### 6a. HiCache as the cross-phase carrier: evaluated, rejected
 
-- **HiCache as the cross-phase carrier.** `write_through` already pushes
-  KV pages to the host tier as prefill produces them; the TP phase would
-  load from there after the reshard. Blocked today only by the blanket
-  refusal at `server_args.py:7230`, whose stated justification is a
-  **disk**-tier wedge (#630) — the host-RAM tier is not named by it, and
-  the RAM tier ran in plain TP=3 production for a long time. Open
-  questions: whether host-tier pages are layout-specific (the PP layout is
-  layer-sharded by stage, the TP layout token-sharded under the weighted
-  owner rule), and whether GDN/mamba state can use the same path at all.
-- **Shared KV/mamba arena** across phases, sized `max(PP, TP)` with the
-  inactive layout's rows spilled to a pinned host image — the same shape
-  as the weights arena, with `KvVmmBufferOwner` providing address-stable
-  remapping for the captured decode graphs.
+Attractive because `write_through` already pushes every completed node's
+KV to the host tier as prefill produces it. It does not work, for two
+independent reasons, either alone fatal:
+
+- **It never removes a device pool.** HiCache's model is *device = L1,
+  host = L2*. The duplication exists because `phase_flip_boot` calls
+  `tp_worker.alloc_memory_pool()` while the PP stack's pools are live;
+  no host tier changes that. `max_total_num_tokens` is a DEVICE quantity,
+  so the carrier idea moves it by exactly zero.
+- **Host tiers are layout-specific and per-process.** `pool_host/mha.py`
+  derives `size_per_token` from `device_pool.layer_num` and takes
+  `start_layer`/`end_layer` from the writing pool. Under PP those are the
+  stage's 8/4/4 layers; the TP pool has 16. Different bytes per token,
+  different layer identity. And the three ranks are separate processes:
+  PP rank 0's host tier holds layers 0-7 for ALL tokens, while TP rank 0
+  needs all 16 layers for ITS ~40 % of tokens, 8 of which physically live
+  in another process. Reconstructing that IS the flip, plus a D2H and an
+  H2D per byte — against the ~5 ms the device-side move measures today.
+
+The disk tier cannot serve as the carrier either: `hicache_storage.py`
+appends `_{pp_size}_{pp_rank}` to the KV key when PP is enabled, so
+PP-phase pages are written under a namespace the TP phase (pp_size 1)
+never looks up. A clean miss — safe, and useless as a carrier.
+
+Mamba is not the exception one might hope for. HiCache does know about
+mamba state (`hybrid_pool_assembler.py` wires a `MambaPoolHost` as a
+`PoolName.MAMBA` entry), but `MambaPoolHost.__init__` derives
+`num_mamba_layers` and both state shapes from the writing device pool.
+The PP mamba pool is *stage layers x full width*; the TP pool is *all
+layers x this rank's head shard*. Both axes differ, so it is even more
+layout-locked than KV.
+
+What HiCache IS worth: the plain host-RAM L2 that production always ran,
+for prefix-hit rate. Its blanket refusal cites #630, whose actual root
+cause (`9da9dfd025`, already an ancestor of HEAD) was an unbounded
+`work.wait()` in `_drain_async_work` against its deadline-polling sibling,
+plus a `torch.distributed.recv` with no timeout — on the write-through
+ACK path, which runs whenever hierarchical cache is on, RAM tier or not.
+Disk was the configuration it was observed in, not the mechanism. The
+gate can be narrowed to `hicache_storage_backend is not None`, but only
+after three other sites are closed: the cutover does not invalidate
+`cache_controller._dcp_owner_ctx_cache` (the #297 cutover does, and
+`dcp_size` changes 1->3 across the flip), the flip's quiescence predicate
+carries no HiCache term while `is_fully_idle` does, and the tree cache and
+controller are bound to the PP stack's pools for process life.
+
+### 6b. Shared KV/mamba arena: the answer
+
+Sized `max(PP, TP)` rather than their sum, with the inactive layout's
+backing released — the same shape as the weights arena.
+`DESIGN_631:388-393` already prices this as the named capacity follow-up.
+
+Do NOT overlay two view sets on one flat region: that works for weights
+because a flip replaces all bytes from an image, whereas here the flip
+permutes live rows in place. Use instead two VA reservations with mutually
+exclusive physical backing — `KvVmmBufferOwner` already provides it, and
+`runtime_set_backing_tokens` states the needed invariant verbatim:
+"Addresses never move, so captured CUDA graphs keep replaying."
+
+One real ordering bug must be fixed first: in `PhaseFlipRuntime._execute`
+the local leg reads and writes per layer in one loop, the only place where
+a destination write precedes a source read. Harmless with disjoint pools,
+fatal under sharing. Hoisting the reads is a two-line change.
+
+Spill, decisively: correctness does not need it. The live set (radix
+values union parked requests' rows) is everything the allocator considers
+referenced, and the flip already moves it. What remains in the source pool
+is by definition unreferenced, so "spill the inactive layout" means
+optionally preserving the PREFIX CACHE across a flip, never correctness.
+The design is therefore: evict to the protected set before deriving the
+transition (which also bounds the transit buffers — `_dist_exchange`
+allocates whole payloads on device, fine at today's 7 MiB, GBs at
+C~520k), and treat host-side prefix carry as a skippable performance
+add-on.
+
+Projected, per the byte model (cost per global token is the SUM of both
+layouts today, the MAX when shared):
+
+| step | expected max_total_num_tokens |
+|---|---|
+| today | 278104 |
+| shared KV arena | ~520k (1.9x) |
+| + token vector 16,8,8 (makes cTP == cPP per rank) | ~537k |
+| + shared mamba arena | ~626k (2.25x) |
+| + budget double-spend fix | bounded by 669440, the TP-only reference |
+
+Treat 669440 as the ceiling, not more: the model omits activation reserve,
+graphs, NCCL buffers and the continuous corridor minimum at boot peak.
 
 ---
 
