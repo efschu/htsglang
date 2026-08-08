@@ -98,7 +98,7 @@ class GdnFlipPools:
 
 
 def gdn_flip_preconditions(
-    pp_req_pool, tp_req_pool, n_ranks: int, rank: int
+    pp_req_pool, tp_req_pool, n_ranks: int, rank: int, gdn_geometry=None
 ) -> GdnFlipPools:
     """Validate every structural assumption; refuse loudly otherwise.
 
@@ -107,7 +107,17 @@ def gdn_flip_preconditions(
     mamba_map). Returns the validated pool handles + the shard spec
     derived from the process-global plan and CHECKED against the TP
     pool's actual tensor shapes -- a spec/pool disagreement is the
-    mis-sliced-conv-state bug class and dies here."""
+    mis-sliced-conv-state bug class and dies here.
+
+    ``gdn_geometry`` is the model's hybrid HF text config (or any object
+    with ``linear_num_key_heads``, ``linear_num_value_heads`` and the
+    model-stashed ``gdn_tp_units``). When given, the shard derivation
+    replicates the MODEL's own head split -- tp_partition_size over HEAD
+    counts in gdn_tp_units, exactly the qwen3_5 local_num_*_heads calls.
+    Splitting the channel totals instead (the legacy fallback below)
+    rounds differently and produced head shards (22, 12, 12) for 48 heads
+    on the first real-metal flip (2026-08-08): the uneven-TP-head-geometry
+    class -- per-rank geometry comes from the model, never recomputed."""
     from sglang.srt.distributed.utils import tp_partition_size
 
     reasons: List[str] = []
@@ -169,13 +179,6 @@ def gdn_flip_preconditions(
         )
         _fail()
 
-    sub_shards = tuple(
-        tuple(
-            tp_partition_size(sub_full, n_ranks, r, units)
-            for r in range(n_ranks)
-        )
-        for sub_full in sub_sizes
-    )
     num_heads = int(pp_temporal.shape[2])
     value_dim = sub_sizes[-1]
     if value_dim % num_heads != 0:
@@ -184,8 +187,48 @@ def gdn_flip_preconditions(
             f"heads ({num_heads})"
         )
         _fail()
-    head_dim_units = value_dim // num_heads
-    head_shards = tuple(s // head_dim_units for s in sub_shards[-1])
+    if gdn_geometry is not None:
+        # Model-identical head split (see docstring).
+        num_k_heads = int(gdn_geometry.linear_num_key_heads)
+        num_v_heads = int(gdn_geometry.linear_num_value_heads)
+        gdn_units = getattr(gdn_geometry, "gdn_tp_units", None)
+        if num_v_heads != num_heads:
+            reasons.append(
+                f"config says {num_v_heads} linear value heads but the PP "
+                f"temporal pool holds {num_heads}"
+            )
+            _fail()
+        if sub_sizes[0] % num_k_heads != 0:
+            reasons.append(
+                f"key sub-block ({sub_sizes[0]}) not divisible by "
+                f"{num_k_heads} key heads"
+            )
+            _fail()
+        head_k_dim = sub_sizes[0] // num_k_heads
+        head_v_dim = value_dim // num_v_heads
+        k_shards = tuple(
+            tp_partition_size(num_k_heads, n_ranks, r, gdn_units)
+            for r in range(n_ranks)
+        )
+        head_shards = tuple(
+            tp_partition_size(num_v_heads, n_ranks, r, gdn_units)
+            for r in range(n_ranks)
+        )
+        sub_shards = (
+            tuple(k * head_k_dim for k in k_shards),
+            tuple(k * head_k_dim for k in k_shards),
+            tuple(v * head_v_dim for v in head_shards),
+        )
+    else:
+        sub_shards = tuple(
+            tuple(
+                tp_partition_size(sub_full, n_ranks, r, units)
+                for r in range(n_ranks)
+            )
+            for sub_full in sub_sizes
+        )
+        head_dim_units = value_dim // num_heads
+        head_shards = tuple(s // head_dim_units for s in sub_shards[-1])
     spec = GdnShardSpec(
         sub_block_sizes=tuple(sub_sizes),
         sub_block_shards=sub_shards,
@@ -540,7 +583,16 @@ def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
     )
 
     def _pools() -> GdnFlipPools:
-        return gdn_flip_preconditions(pp_req_pool, tp_req_pool, n, rank)
+        return gdn_flip_preconditions(
+            pp_req_pool,
+            tp_req_pool,
+            n,
+            rank,
+            # The hybrid HF text config: linear_num_*_heads plus the
+            # model-stashed gdn_tp_units -- the mover replicates the
+            # model's own head split (uneven-TP-head-geometry rule).
+            gdn_geometry=tp_model_config.hf_text_config,
+        )
 
     def _slots() -> torch.Tensor:
         running = getattr(scheduler, "running_batch", None)

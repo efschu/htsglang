@@ -393,3 +393,86 @@ class TestLinearLayerMap(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRealConfigHeadGeometry(CustomTestCase):
+    """3.4b item 3 + first-real-metal refusal (2026-08-08): with the
+    Qwen3.6-27B GDN constants (conv 10240 = 2x2048 + 6144, 16 key heads,
+    48 value heads x 128, INT8 -> gdn_tp_units passes through as 16) and
+    the 30,17,17 vector, the channel-total split floors 48*30/64 = 22.5
+    down to head shards (22, 12, 12) -- sum 46, loud refusal on metal.
+    The model splits HEADS in whole gdn_tp_units: (24, 12, 12). The mover
+    must replicate the model split when given the geometry."""
+
+    K_HEADS, V_HEADS, HEAD_DIM, UNITS_R = 16, 48, 128, 16
+    KEY_DIM = K_HEADS * HEAD_DIM  # 2048
+    VALUE_DIM = V_HEADS * HEAD_DIM  # 6144
+    CONV_R = 2 * KEY_DIM + VALUE_DIM  # 10240
+    W, S, STATE = 4, 2, 128
+
+    def setUp(self):
+        set_tp_partition_ratios([30, 17, 17], families=None)
+        set_cp_token_ratios([30, 17, 17])
+
+    def tearDown(self):
+        set_tp_partition_ratios(None, families=None)
+        set_cp_token_ratios(None)
+
+    def _pool_pair(self, rank, k_shard, v_shard):
+        def _stub(conv, temporal):
+            return SimpleNamespace(
+                mamba_cache=SimpleNamespace(
+                    conv=[conv], temporal=temporal, replayssm_d=None
+                ),
+                enable_linear_replayssm=False,
+                get_conv_subblock_spec=lambda: (
+                    [self.KEY_DIM, self.KEY_DIM, self.VALUE_DIM],
+                    None,  # partition_units absent -- the real-metal case
+                    self.CONV_R,
+                ),
+                size=self.S,
+            )
+
+        pp = _stub(
+            torch.zeros(1, self.S, self.CONV_R, self.W, dtype=DTYPE),
+            torch.zeros(
+                1, self.S, self.V_HEADS, self.HEAD_DIM, self.STATE, dtype=DTYPE
+            ),
+        )
+        conv_shard = 2 * k_shard * self.HEAD_DIM + v_shard * self.HEAD_DIM
+        tp = _stub(
+            torch.zeros(1, self.S, conv_shard, self.W, dtype=DTYPE),
+            torch.zeros(
+                1, self.S, v_shard, self.HEAD_DIM, self.STATE, dtype=DTYPE
+            ),
+        )
+        return (
+            _req_pool_stub(pp, {7: 0}),
+            _req_pool_stub(tp, {7: 0}),
+        )
+
+    def test_model_identical_head_split(self):
+        geometry = SimpleNamespace(
+            linear_num_key_heads=self.K_HEADS,
+            linear_num_value_heads=self.V_HEADS,
+            gdn_tp_units=self.UNITS_R,
+        )
+        expected_v = (24, 12, 12)
+        expected_k = (8, 4, 4)
+        for rank in range(3):
+            pp_req, tp_req = self._pool_pair(
+                rank, expected_k[rank], expected_v[rank]
+            )
+            pools = gdn_flip_preconditions(
+                pp_req, tp_req, 3, rank, gdn_geometry=geometry
+            )
+            self.assertEqual(pools.spec.head_shards, expected_v)
+            self.assertEqual(sum(pools.spec.head_shards), self.V_HEADS)
+
+    def test_channel_split_without_geometry_still_refuses(self):
+        # Negative control: the legacy channel-total derivation with the
+        # real constants and no partition_units yields (22, 12, 12) and
+        # must refuse loudly -- the exact metal failure, kept reachable.
+        pp_req, tp_req = self._pool_pair(0, 8, 24)
+        with self.assertRaisesRegex(KvReshardError, "do not partition"):
+            gdn_flip_preconditions(pp_req, tp_req, 3, 0)
