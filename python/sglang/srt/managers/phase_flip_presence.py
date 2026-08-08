@@ -110,9 +110,63 @@ class PhaseFlipPresence:
         self.rank = int(rank)
         # The instance tag keeps two servers on one box (a test boot beside
         # production) from reading each other's flags as their own quorum.
-        self.instance = instance or str(os.environ.get("SGLANG_PHASE_FLIP_INSTANCE", os.getpid() // 100000))
+        # THE INSTANCE TAG MUST BE UNIQUE PER BOOT AND IDENTICAL ACROSS
+        # RANKS. Both halves matter, and getting the first wrong is a
+        # measured failure: it was os.getpid()//100000, which collided
+        # across consecutive boots (PIDs 3163115 and 3180590 both give
+        # 31). Boot 15 then read boot 14's leftover markers, the gate
+        # opened "after 0.00s" on STALE evidence before its peers had
+        # armed, and rank 0 entered the reduction alone -- the exact
+        # failure the gate exists to prevent, caused by the gate.
+        #
+        # It must be identical across ranks because the flags are a
+        # rendezvous: a per-process value would make every rank look at a
+        # different quorum and none would ever assemble. So it comes from
+        # the environment, which the boot script sets ONCE and every rank
+        # inherits. The fallback is deliberately NOT process-derived --
+        # it uses the boot's own start time, shared via the parent.
+        self.instance = instance or os.environ.get("SGLANG_PHASE_FLIP_INSTANCE")
+        if not self.instance:
+            try:
+                # Start time of the process group leader: the same value
+                # on every rank of this boot, different on the next one.
+                with open(f"/proc/{os.getpgrp()}/stat") as fh:
+                    self.instance = "pg" + fh.read().split()[21]
+            except (OSError, IndexError):
+                self.instance = "default"
         self.directory = directory
         os.makedirs(self.directory, exist_ok=True)
+        # Drop anything left by an earlier boot before the first poll can
+        # read it as quorum. Best effort: a marker that survives is at
+        # worst re-swept next time, but one that is READ is a false gate.
+        self.sweep_foreign_instances()
+
+    def sweep_foreign_instances(self) -> int:
+        """Remove markers from other instances (i.e. earlier boots).
+
+        Called at construction, before anything can poll. A stale marker
+        that is merely present is harmless; one that is READ as quorum
+        opens the gate on a peer that is not there.
+        """
+        removed = 0
+        try:
+            names = os.listdir(self.directory)
+        except OSError:
+            return 0
+        mine = f"{self.instance}."
+        for name in names:
+            if name.startswith(mine):
+                continue
+            try:
+                os.unlink(os.path.join(self.directory, name))
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            logger.warning(
+                "%s swept %d marker(s) from earlier boots", LOG_PREFIX, removed
+            )
+        return removed
 
     def _path(self, epoch: int, rank: int) -> str:
         return os.path.join(
