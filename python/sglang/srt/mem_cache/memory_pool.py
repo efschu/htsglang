@@ -2097,6 +2097,7 @@ class MHATokenToKVPool(KVCache):
         kv_cache_layout: Optional[str] = None,
         post_capture_active: bool = False,
         vmm_commit_chunk_bytes: Optional[int] = None,
+        swappable_backing: bool = False,
     ):
         if post_capture_active:
             # Reserved upper bound only (unbacked VA): page-align UP so
@@ -2113,6 +2114,11 @@ class MHATokenToKVPool(KVCache):
             end_layer,
         )
         self.post_capture_active = post_capture_active
+        # #631: allocate on a VA reservation so the physical pages can be
+        # swapped between the two phase layouts, WITHOUT the deferred
+        # post-capture sizing (self.size is final at construction).
+        self.swappable_backing = swappable_backing
+        self._backing_released = False
         self._post_capture_owner = None
         # #330 dial: chunked physical commits make the tail releasable at
         # runtime; None keeps one handle per extension (stock post-capture).
@@ -2251,8 +2257,12 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        if self.post_capture_active:
+        if self.post_capture_active or self.swappable_backing:
             self._alloc_post_capture_buffers()
+            if self.swappable_backing and not self.post_capture_active:
+                # Sizing is already final; back the whole span now. Only the
+                # BACKING is dynamic afterwards (#631 cross-phase swap).
+                self._post_capture_owner.finalize(int(self.size))
         else:
             self._create_buffers_normal()
         self._kv_buffer_descs = self._build_kv_buffer_descs()
@@ -2417,6 +2427,60 @@ class MHATokenToKVPool(KVCache):
         """Token-count primitive shared by composite pools (e.g. SWA sub-pools)."""
         self._post_capture_owner.finalize(final_num_tokens)
         self.size = int(final_num_tokens)
+
+    # -- #631 cross-phase backing swap ---------------------------------------
+    #
+    # The phase flip runs TWO layouts over the SAME ranks but only ever one at
+    # a time, and until now both layouts' KV pools held physical pages for the
+    # whole process life. That is what halved the pool: each layout could only
+    # be sized against half the per-rank budget.
+    #
+    # These two calls make the backing exclusive instead. The VA reservation --
+    # and therefore every address a captured CUDA graph baked in -- is
+    # untouched; only the physical pages behind it are unmapped and remapped,
+    # which is precisely the property KvVmmBufferOwner exists for
+    # ("addresses never move, so captured CUDA graphs keep replaying").
+    #
+    # SIZING IS NOT TOUCHED. ``self.size`` stays what the constructor computed
+    # (already DCP-translated through ModelRunner._dcp_token_sharded_pool_rows),
+    # so the #592 resize-translation gap on finalize_backing does not apply
+    # here: the span released and restored is always this pool's OWN row count.
+
+    def release_backing(self) -> int:
+        """Unmap this pool's physical pages; return bytes handed back.
+
+        Caller must hold an idle boundary for this pool: every row it owes
+        the other layout must already have been READ (the flip's read region
+        completes before its write region for exactly this reason), and no
+        kernel may touch these rows until :meth:`restore_backing`.
+        """
+        if self._post_capture_owner is None:
+            raise RuntimeError(
+                "release_backing on a pool that was not allocated on a VA "
+                "reservation; construct it with swappable_backing=True"
+            )
+        if self._backing_released:
+            return 0
+        # page_size is the floor the owner accepts; the residue is one page
+        # plus at most one commit chunk per buffer, not the pool.
+        released = self._post_capture_owner.shrink(self.page_size)
+        self._backing_released = True
+        return released
+
+    def restore_backing(self) -> None:
+        """Remap this pool's full span at its unchanged addresses."""
+        if self._post_capture_owner is None:
+            raise RuntimeError(
+                "restore_backing on a pool that was not allocated on a VA "
+                "reservation; construct it with swappable_backing=True"
+            )
+        self._post_capture_owner.finalize(int(self.size))
+        self._backing_released = False
+
+    @property
+    def backing_is_resident(self) -> bool:
+        """False only between a release and its matching restore."""
+        return not self._backing_released
 
     @property
     def post_capture_backed_bytes(self) -> int:

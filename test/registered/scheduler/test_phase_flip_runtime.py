@@ -213,6 +213,8 @@ def _build_runtimes(
     ready_fns=None,
     exchange_factory=None,
     cutover_log=None,
+    pre_write_fns=(),
+    pre_write_fns_for=None,
 ):
     n = len(VEC)
     channel = _BarrierMinChannel(n)
@@ -241,6 +243,9 @@ def _build_runtimes(
                     ready_fns[r] if ready_fns else (lambda: True)
                 ),
                 cutover_fn=lambda d, r=r: cutover_log[r].append(d),
+                pre_write_fns=(
+                    pre_write_fns_for(r) if pre_write_fns_for else pre_write_fns
+                ),
             )
         )
     return runtimes, cutover_log
@@ -1295,3 +1300,71 @@ class TestSharedArenaReadsPrecedeWrites(CustomTestCase):
                     torch.equal(tp_pools_a[r][1][f][rows], tp_pools_b[r][1][f][rows]),
                     f"rank {r} ordinal {f} V differs between aliased and disjoint",
                 )
+
+
+class TestPreWriteSeamOrdering(CustomTestCase):
+    """The read/write seam is where cross-phase KV backing may be swapped.
+
+    Swapping physical pages between the two layouts is only safe at an
+    instant where the SOURCE pool has been fully drained and the
+    DESTINATION pool has not been touched. ``pre_write_fns`` exists to be
+    that instant, so this pins it: on EVERY rank the hook must fire after
+    that rank's last source read and before its first destination write.
+    If it ever drifts to either side, a swap wired to it reads or writes
+    unmapped memory.
+
+    Ordering is checked per rank: the ranks run concurrently, so a global
+    event order would interleave and prove nothing.
+    """
+
+    def test_hook_fires_between_last_read_and_first_write(self):
+        ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 300
+        )
+        events = {r: [] for r in range(len(VEC))}
+
+        class _Recorder:
+            def __init__(self, inner, tag, rank):
+                self._inner = inner
+                self._tag = tag
+                self._rank = rank
+
+            def read_rows(self, *a, **kw):
+                events[self._rank].append(f"read:{self._tag}")
+                return self._inner.read_rows(*a, **kw)
+
+            def write_rows(self, *a, **kw):
+                events[self._rank].append(f"write:{self._tag}")
+                return self._inner.write_rows(*a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        rec_pp = [_Recorder(v, "pp", r) for r, v in enumerate(pp_views)]
+        rec_tp = [_Recorder(v, "tp", r) for r, v in enumerate(tp_views)]
+
+        def _fns_for(rank):
+            return (lambda direction, rank=rank: events[rank].append("SWAP"),)
+
+        runtimes, _ = _build_runtimes(
+            rec_pp, rec_tp, live, pre_write_fns_for=_fns_for
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+
+        for r, log in events.items():
+            self.assertIn("SWAP", log, f"rank {r} never reached the seam: {log}")
+            seam = log.index("SWAP")
+            self.assertEqual(
+                [e for e in log[seam + 1 :] if e.startswith("read:")],
+                [],
+                f"rank {r}: a source read happened AFTER the seam: {log}",
+            )
+            self.assertEqual(
+                [e for e in log[:seam] if e.startswith("write:")],
+                [],
+                f"rank {r}: a destination write happened BEFORE the seam: {log}",
+            )
+
+        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
+        self.assertTrue(ok, msg)
