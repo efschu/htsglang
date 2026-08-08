@@ -317,9 +317,44 @@ MEASURED TERMS (first real-metal boots, 2026-08-08):
   KV budgets.
 * HOST PINNED IMAGES (new ledger term, was absent): 28.1 / 14.6 / 17.0
   GiB pinned host RAM per rank (PP image + TP image, logged by the
-  build) -- ~60 GiB total on a 120 GiB no-swap box. Unreclaimable while
-  the server runs; every host-RAM consumer (kv-session offload budgets,
-  weights CPU backup, hicache) must be priced against it.
+  build) = 59.7 GiB total. RAM BASIS (corrected 2026-08-08): the box has
+  98 GiB and NO swap; lxcfs reports 120 GiB in /proc/meminfo -- a KNOWN
+  LIE on this rig, only cgroup memory.stat is truthful. So the pinned
+  images take >60% OF THE MACHINE, unreclaimable for process life.
+  Remaining host budget: 98 - 59.7 (pinned) - ~8 (OS + router + tenant
+  anon, cgroup-observed ~5.5 idle + server-process anon, to be measured
+  at serving next window) ~= ~30 GiB for ALL host-RAM consumers
+  TOGETHER: kv-session-offload host tiers, hicache-host, weights CPU
+  backup, AND the checkpoint page-cache working set (reclaimable but
+  performance-relevant). Every host-RAM flag must be priced against
+  ~30 GiB, not against the lxcfs total.
+
+  IMAGE RESIDENCY DECISION (priced 2026-08-08, coordinator question):
+  do both images need to stay PINNED post-cutover? Measured rig disk
+  rate (ZFS pool "spinning", model file, sequential): 869 MB/s O_DIRECT
+  / 1.6 GB/s buffered ~= 0.6-1.1 ms/MiB -- 2-4x slower than the laptop
+  NVMe figure (0.29 ms/MiB). Options:
+  (a) both images disk-backed: the NEXT-FLIP TARGET image is on the HOT
+      path (every flip refills from it); +9-15 s per flip at ~1 GB/s --
+      would undo the flip-time fix. REJECTED.
+  (b) cold-image spill: at any moment one image per rank is HOT (the
+      other phase's -- the next flip's refill source) and one is COLD
+      (the current phase's -- needed only for the rare abort-restore).
+      Spill the cold one to disk (a real file write + free; merely
+      unpinning saves nothing on a no-swap box), keep the hot one
+      pinned. Abort-restore then costs a ~7-15 s checksummed re-read --
+      acceptable for a rare-by-construction event. After each flip the
+      roles swap: the newly-hot image is promoted back to pinned RAM in
+      the BACKGROUND (flip cadence is regime-scale, minutes+). Saves
+      ~28 GiB steady (14.9 / 6.7 / 9.1 -- the smaller image per rank
+      stays, roles alternating): host budget ~30 -> ~58 GiB.
+  DECISION: (b) is the design, DEFERRED as the named follow-up
+  "cold-image disk spill with background promotion". Not implemented
+  now: the corrected ~30 GiB budget suffices for the current slice (the
+  NEXTN draft-KV pool is a VRAM term, not host), and the spill's
+  write/promote choreography deserves its own falsifiers (torn-write
+  detection, promotion-not-finished-at-flip refusal). Re-prioritize the
+  moment any host-RAM consumer collides with the ~30 GiB line.
 * Flip wall time (pp_to_tp, epoch 1): 22.3 / 23.1 / 33.6 s per rank --
   10x the ~2-2.3 s estimate. Decomposition from the logs: consensus +
   KV move (read 1.2-1.4 ms, exchange 67 ms, write 1.8-2.2 ms) + GDN leg
