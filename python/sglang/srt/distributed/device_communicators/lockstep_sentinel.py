@@ -298,6 +298,29 @@ class LockstepSentinel:
                     max(seqs),
                     seqs,
                 )
+                # Wedge anatomy (specimen 20260808T052850Z: all ranks abort at
+                # the same replay with ring positions one apart and NO
+                # divergence — the desync is below op granularity). Each
+                # rank's LAST recorded events name the op it is stuck in or
+                # before; the sidecars still run while the main threads hang,
+                # so the exchange works mid-wedge. Notes are written BEFORE
+                # the launch, so a rank's last entry is the op it entered.
+                tail_n = 40
+                lo = max(0, self._seq - tail_n)
+                tails = self._gather(
+                    (lo, [self._tags[i % self.ring_len] for i in range(lo, self._seq)])
+                )
+                if tails is not None:
+                    for r, (rlo, rtags) in enumerate(tails):
+                        last3 = " | ".join(repr(t) for t in rtags[-3:])
+                        logger.error(
+                            "SENTINEL STALL anatomy: rank %d last events "
+                            "(from seq %d): ... %s",
+                            r,
+                            rlo,
+                            last3,
+                        )
+                    self._dump_stall(tails)
         # chain compare at position m-1 (chain AFTER the first m events)
         if self._seq - m >= self.ring_len - 8:
             return False  # peer too far behind to compare from our ring
@@ -367,6 +390,23 @@ class LockstepSentinel:
         self.last_divergence = (div_seq, culprits, div_tags)
         self.diverged = True
         return True
+
+    def _dump_stall(self, tails: List[Tuple[int, List[Any]]]) -> None:
+        """Write every rank's ring tail at stall time (wedge anatomy)."""
+        try:
+            os.makedirs(self.dump_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            path = os.path.join(
+                self.dump_dir, f"sentinel_stall_{ts}_rank{self.rank}.log"
+            )
+            with open(path, "w") as f:
+                for r, (rlo, rtags) in enumerate(tails):
+                    f.write(f"rank {r} tail from seq {rlo}:\n")
+                    for k, t in enumerate(rtags):
+                        f.write(f"  seq {rlo + k}: {t!r}\n")
+            logger.error("SENTINEL stall dump written: %s", path)
+        except Exception:  # noqa: BLE001 - evidence writing must not raise
+            logger.exception("lockstep sentinel: stall dump failed")
 
     def _dump(self, div_seq: int, eff: int, rows: List[List[Any]]) -> None:
         try:
