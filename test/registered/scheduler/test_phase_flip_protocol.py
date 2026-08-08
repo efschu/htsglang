@@ -183,6 +183,17 @@ class _StubScheduler:
         class _PsHolderStub:
             ps: object
 
+        @_dc.dataclass
+        class _BatchResultProcessorStub:
+            model_worker: object
+            draft_worker: object
+
+        # On the decode hot path and holds the WORKERS, so the cutover
+        # must rebuild it per phase (#631: with speculation it calls into
+        # the spec worker).
+        self.batch_result_processor = _BatchResultProcessorStub(
+            model_worker=self.tp_worker, draft_worker=None
+        )
         self.request_receiver = _ReceiverStub(ps=self.ps)
         self.output_streamer = _PsHolderStub(ps=self.ps)
         self.load_inquirer = _PsHolderStub(ps=self.ps)

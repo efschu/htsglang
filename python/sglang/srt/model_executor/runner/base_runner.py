@@ -386,13 +386,13 @@ class BaseRunner(ABC):
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
         if mr.spec_algorithm.is_speculative():
-            if mr.is_draft_worker:
+            if mr.is_draft_model_runner:
                 if not mr.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_bs = (
                 mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
+                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_model_runner
                 )
             )
 
@@ -519,7 +519,7 @@ class BaseRunner(ABC):
             mr.server_args,
             buffers.custom_mask,
             num_tokens_per_bs,
-            mr.is_draft_worker,
+            mr.is_draft_model_runner,
         )
         if spec_info is not None and (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()

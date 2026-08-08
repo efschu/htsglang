@@ -205,7 +205,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             self.capture_hidden_mode = (
                 CaptureHiddenMode.LAST
-                if model_runner.is_draft_worker
+                if model_runner.is_draft_model_runner
                 else CaptureHiddenMode.FULL
             )
 
@@ -306,7 +306,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # width when the draft model exposes it.
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
-            and model_runner.is_draft_worker
+            and model_runner.is_draft_model_runner
             and model_runner.spec_algorithm.is_eagle()
         ):
             hidden_dim = get_draft_input_from_target_hidden_dim(model_runner)

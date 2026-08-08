@@ -134,8 +134,25 @@ class KvPoolView:
         return sum(self.row_nbytes(layer) for layer in range(self.num_layers))
 
     @staticmethod
-    def _as_bytes(rows_data: torch.Tensor) -> torch.Tensor:
+    def _as_bytes(rows_data: torch.Tensor, row_nbytes: int) -> torch.Tensor:
+        """Flatten ``[n, ...]`` rows to a ``[n, row_nbytes]`` uint8 view.
+
+        The width is passed IN rather than inferred with ``view(n, -1)``:
+        at n == 0 there is nothing to infer it from, and torch refuses the
+        ambiguous -1 ("cannot reshape tensor of 0 elements into shape
+        [0, -1]").
+
+        An empty move is not an error. Flipping a server whose live set is
+        empty -- idle, or with the prefix cache just flushed -- is the most
+        ordinary case there is, and it is the one a caller reaches when it
+        makes room for the flip first. Every rank died here on exactly
+        that (#631 boot 20, 2026-08-08).
+        """
         n = rows_data.shape[0]
+        if n == 0:
+            return torch.empty(
+                (0, row_nbytes), dtype=torch.uint8, device=rows_data.device
+            )
         return rows_data.contiguous().view(n, -1).view(torch.uint8)
 
     @property
@@ -148,7 +165,13 @@ class KvPoolView:
         test channels ever see host tensors)."""
         k, v = self._k[layer], self._v[layer]
         idx = rows.to(k.device)
-        return torch.cat([self._as_bytes(k[idx]), self._as_bytes(v[idx])], dim=1)
+        return torch.cat(
+            [
+                self._as_bytes(k[idx], self._row_nbytes(k)),
+                self._as_bytes(v[idx], self._row_nbytes(v)),
+            ],
+            dim=1,
+        )
 
     def write_rows(self, layer: int, rows: torch.Tensor, data: torch.Tensor) -> None:
         """Inverse of ``read_rows``: scatter packed bytes into layer rows."""

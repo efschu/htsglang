@@ -98,20 +98,51 @@ def cmd_ladder(args):
 # -- flip ---------------------------------------------------------------
 
 
-def cmd_flip(args):
-    """Arm a flip and time it from the client side.
+def _count_done(log_path, direction):
+    """How many ranks have logged a completed flip in this direction."""
+    if not log_path:
+        return 0
+    try:
+        with open(log_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return 0
+    return data.count(f"PHASE-FLIP DONE {direction}".encode())
 
-    The client-side number includes the arm RPC and the wait for a
-    quiescent boundary; the authoritative per-rank move cost is the
-    server's PHASE-FLIP DONE record, parsed offline by
-    route_a_631_step6_bench.py flip-stats.
+
+def cmd_flip(args):
+    """Arm a flip and wait until it has actually COMMITTED.
+
+    Arming returns immediately by design -- the flip commits at the next
+    consensus boundary where every rank is quiescent -- so the arm RPC's
+    round trip is not the reshard duration and must not be reported as
+    one. With a --log the driver waits for the per-rank ``PHASE-FLIP
+    DONE`` records instead, which is also what keeps a following decode
+    measurement from silently including the flip wait in its TTFT.
+
+    The authoritative per-rank move decomposition stays the server's own
+    record, parsed offline by route_a_631_step6_bench.py flip-stats.
     """
+    log = getattr(args, "log", None)
+    ranks = getattr(args, "ranks", 3)
+    before = _count_done(log, args.direction)
     t0 = time.perf_counter()
     resp = _post(args.url, "/phase_flip", {"direction": args.direction}, timeout=600.0)
-    ms = (time.perf_counter() - t0) * 1000.0
+    arm_ms = (time.perf_counter() - t0) * 1000.0
+
+    committed = None
+    if log:
+        deadline = time.time() + getattr(args, "commit_timeout_s", 300.0)
+        while time.time() < deadline:
+            if _count_done(log, args.direction) >= before + ranks:
+                committed = (time.perf_counter() - t0) * 1000.0
+                break
+            time.sleep(0.05)
     return {
         "direction": args.direction,
-        "client_ms": round(ms, 1),
+        "arm_rpc_ms": round(arm_ms, 1),
+        "commit_ms_from_arm": round(committed, 1) if committed else None,
+        "committed": committed is not None,
         "response": resp,
     }
 
@@ -127,7 +158,17 @@ def decode_stream(url, prompt_ids, max_new, timeout=1800.0):
     """
     payload = {
         "input_ids": prompt_ids,
-        "sampling_params": {"temperature": 0.0, "max_new_tokens": max_new},
+        "sampling_params": {
+            "temperature": 0.0,
+            "max_new_tokens": max_new,
+            # A decode-rate measurement must decode a KNOWN number of
+            # tokens. Random input_ids are uncached by construction, but
+            # they are also nonsense to the model, which happily emits EOS
+            # on the first step -- one run returned completion_tokens=1 and
+            # a tok/s of None. ignore_eos makes the length the independent
+            # variable it is supposed to be.
+            "ignore_eos": True,
+        },
         "stream": True,
     }
     req = urllib.request.Request(
@@ -209,8 +250,38 @@ def cmd_full(args):
     )
 
     # 2. The flip.
+    #
+    # Flush the prefix cache first when asked. The flip moves the LIVE
+    # set, which is the radix tree's resident rows unioned with the
+    # parked requests' -- so a ladder run just before the flip leaves
+    # thousands of cached rows that the target pool must also hold. That
+    # is a real constraint, not an artefact (the flip refuses loudly and
+    # keeps serving when the set does not fit), but it belongs to the
+    # ladder, not to the flip being measured here. Off by default so the
+    # unflushed case stays measurable.
+    if args.flush_before_flip:
+        t_flush = time.perf_counter()
+        try:
+            # timeout MATTERS: /flush_cache refuses outright while any
+            # request is running or waiting ("the operation will not be
+            # performed"), and a refused flush leaves the ladder's rows
+            # resident -- which is precisely what made the flip abandon
+            # for want of pool space (measured, boot 22). The timeout
+            # makes it wait for the idle window instead of declining.
+            _get(
+                args.url,
+                f"/flush_cache?timeout={args.flush_timeout_s:g}",
+                timeout=args.flush_timeout_s + 30.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            rec["flush_error"] = repr(exc)
+        rec["flush_ms"] = round((time.perf_counter() - t_flush) * 1000.0, 1)
+
     rec["flip_pp_to_tp"] = cmd_flip(
-        argparse.Namespace(url=args.url, direction="pp_to_tp")
+        argparse.Namespace(
+            url=args.url, direction="pp_to_tp", log=args.log,
+            ranks=args.ranks, commit_timeout_s=args.commit_timeout_s,
+        )
     )
     rec["phase_after_flip"] = _phase(args.url)
 
@@ -225,7 +296,10 @@ def cmd_full(args):
     # 4. Return trip, so the record covers a round trip like rung b.
     if args.round_trip:
         rec["flip_tp_to_pp"] = cmd_flip(
-            argparse.Namespace(url=args.url, direction="tp_to_pp")
+            argparse.Namespace(
+                url=args.url, direction="tp_to_pp", log=args.log,
+                ranks=args.ranks, commit_timeout_s=args.commit_timeout_s,
+            )
         )
         rec["phase_after_return"] = _phase(args.url)
     return rec
@@ -246,6 +320,9 @@ def main(argv=None):
 
     p = sub.add_parser("flip")
     p.add_argument("--direction", default="pp_to_tp")
+    p.add_argument("--log", default=None)
+    p.add_argument("--ranks", type=int, default=3)
+    p.add_argument("--commit-timeout-s", type=float, default=300.0)
     p.set_defaults(fn=cmd_flip)
 
     p = sub.add_parser("decode")
@@ -263,6 +340,11 @@ def main(argv=None):
     p.add_argument("--vocab", type=int, default=100000)
     p.add_argument("--seed", type=int, default=631)
     p.add_argument("--round-trip", action="store_true")
+    p.add_argument("--flush-before-flip", action="store_true")
+    p.add_argument("--flush-timeout-s", type=float, default=60.0)
+    p.add_argument("--log", default=None)
+    p.add_argument("--ranks", type=int, default=3)
+    p.add_argument("--commit-timeout-s", type=float, default=300.0)
     p.set_defaults(fn=cmd_full)
 
     args = ap.parse_args(argv)

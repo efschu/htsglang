@@ -35,6 +35,7 @@ from sglang.srt.layers.dcp.reshard_plan import KvReshardError, owner_of, rows_of
 from sglang.srt.managers.kv_reshard import KvPoolView
 from sglang.srt.managers.phase_flip_runtime import (
     PHASE_PP,
+    PHASE_TP,
     PhaseFlipRuntime,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -460,7 +461,20 @@ class TestValidationAndBounds(CustomTestCase):
                 )
             )
 
-    def test_undersized_tp_pool_is_loud_sizing_error(self):
+    def test_undersized_tp_pool_abandons_the_flip_without_killing_serving(self):
+        """The bound is checked before any byte moves, so the answer to
+        "it does not fit" is to abandon the FLIP, unanimously.
+
+        This used to raise. Two things were wrong with that (#631 window
+        3, boot 19, where it killed a server that was serving fine): the
+        reading is RANK-LOCAL, so a rank that raised while a peer
+        proceeded would leave the group half-flipped; and the raise
+        climbed into the event loop and took the instance down with every
+        request on it. Whether the live set fits is a RUNTIME quantity --
+        it grows with the resident prefix cache, and the TP pool shrinks
+        when a draft-KV allocation shares its budget -- so it is not a
+        boot-time-only sizing bug that may abort the process.
+        """
         ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 120, seed=29
         )
@@ -479,8 +493,20 @@ class TestValidationAndBounds(CustomTestCase):
         runtimes, _ = _build_runtimes(pp_views, small_tp_views, live)
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         for r, e in enumerate(exceptions):
-            self.assertIsInstance(e, KvReshardError, f"rank {r}: {e}")
-            self.assertIn("sizing bug", str(e))
+            self.assertIsNone(e, f"rank {r} raised instead of abandoning: {e}")
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.fit_aborts, 1, f"rank {r} did not abandon")
+            self.assertEqual(rt.completed, 0, f"rank {r} flipped anyway")
+            self.assertEqual(rt.epoch, 0, f"rank {r} advanced the epoch")
+            self.assertIsNone(rt.pending, f"rank {r} stayed armed")
+            self.assertEqual(rt.phase, PHASE_PP, f"rank {r} changed phase")
+        # And the pools are untouched: the abandon happens before the plan
+        # is executed, so this is a no-op, not a partial move.
+        for r in range(3):
+            for buf in small_tp_views[r]._k:
+                self.assertEqual(
+                    float(buf.abs().sum()), 0.0, f"rank {r} wrote bytes"
+                )
 
 
 class TestSchedulerSideHelpers(CustomTestCase):
@@ -1085,3 +1111,54 @@ class TestParkDeadline(CustomTestCase):
         self.assertEqual(payload[0], 1, "armed")
         self.assertEqual(payload[2], 0, "ready")
 
+
+
+class TestEmptyLiveSetFlip(CustomTestCase):
+    """Flipping with NOTHING live must work, and must move nothing.
+
+    This is not an exotic case: it is an idle server, and it is exactly
+    what a caller reaches when it flushes the prefix cache to make room
+    for the flip. It nevertheless killed every rank -- the byte view
+    inferred its row width with view(n, -1), which torch refuses at n == 0
+    ("cannot reshape tensor of 0 elements", #631 boot 20). The plan layer
+    already handled the empty set correctly (max row -1); only the byte
+    view did not."""
+
+    def test_read_rows_of_no_rows_is_an_empty_payload(self):
+        k = [torch.zeros(8, HEADS, DIM, dtype=torch.bfloat16)]
+        v = [torch.zeros(8, HEADS, DIM, dtype=torch.bfloat16)]
+        view = KvPoolView(k, v)
+        empty = view.read_rows(0, torch.empty(0, dtype=torch.int64))
+        self.assertEqual(tuple(empty.shape), (0, view.row_nbytes(0)))
+        self.assertEqual(empty.dtype, torch.uint8)
+        # And the width still agrees with a non-empty read, which is the
+        # property the exchange's size check depends on.
+        one = view.read_rows(0, torch.tensor([0], dtype=torch.int64))
+        self.assertEqual(one.shape[1], empty.shape[1])
+
+    def test_write_rows_accepts_the_empty_payload_and_changes_nothing(self):
+        k = [torch.ones(8, HEADS, DIM, dtype=torch.bfloat16)]
+        v = [torch.ones(8, HEADS, DIM, dtype=torch.bfloat16)]
+        view = KvPoolView(k, v)
+        before = k[0].clone()
+        view.write_rows(
+            0,
+            torch.empty(0, dtype=torch.int64),
+            torch.empty((0, view.row_nbytes(0)), dtype=torch.uint8),
+        )
+        self.assertTrue(torch.equal(k[0], before))
+
+    def test_full_flip_with_an_empty_live_set(self):
+        """End to end on the real runtime: an empty flip COMMITS."""
+        _, _, _, pp_views, _, tp_views = _make_layout_pools(
+            MAP_625, VEC, 64, seed=77
+        )
+        live = torch.empty(0, dtype=torch.int64)
+        runtimes, _ = _build_runtimes(pp_views, tp_views, live)
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        for r, e in enumerate(exceptions):
+            self.assertIsNone(e, f"rank {r} raised on an empty flip: {e}")
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.completed, 1, f"rank {r} did not complete")
+            self.assertEqual(rt.phase, PHASE_TP, f"rank {r} did not change phase")
+            self.assertEqual(rt.fit_aborts, 0)

@@ -72,7 +72,7 @@ class EagerRunner(BaseRunner):
         if mr.spec_algorithm.is_speculative():
             # speculative_adaptive can grow draft tokens at runtime; size to the max.
             num_draft_tokens = sa.max_speculative_num_draft_tokens or 1
-            if mr.is_draft_worker:
+            if mr.is_draft_model_runner:
                 # Multi-layer EAGLE term: sized to the LADDER CEILING, not the
                 # boot k -- adaptive draft length can upshift at runtime and the
                 # pool is allocated once (#138).
@@ -88,7 +88,7 @@ class EagerRunner(BaseRunner):
             else:
                 num_tokens_per_bs = (
                     mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                        num_draft_tokens, mr.is_draft_worker
+                        num_draft_tokens, mr.is_draft_model_runner
                     )
                 )
         else:
@@ -98,7 +98,7 @@ class EagerRunner(BaseRunner):
                 num_tokens_per_bs = dllm_config.block_size
         max_bs = mr.max_running_requests
         if (
-            mr.is_draft_worker
+            mr.is_draft_model_runner
             and mr.spec_algorithm.is_frozen_kv_mtp()
             and sa.speculative_eagle_topk > 1
         ):
@@ -155,7 +155,7 @@ class EagerRunner(BaseRunner):
         if mr.spec_algorithm.is_speculative():
             num_tokens_per_bs = (
                 mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
+                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_model_runner
                 )
             )
         return (

@@ -2414,8 +2414,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         i: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
+        # The list must be long enough BEFORE it is indexed -- the same
+        # length check the sibling list two lines down already had.
+        # Presence of the attribute says the output TYPE carries the field,
+        # not that this batch filled it: a scheduler running without
+        # speculation emits the field empty, and a spec-configured instance
+        # can produce such a batch. #631 makes that ordinary rather than
+        # exotic -- a phase-flip instance prefills in a PP phase with no
+        # draft worker and decodes in a TP phase with one, so outputs of
+        # both kinds arrive at the same tokenizer manager, and every PP
+        # response died here with IndexError (measured, boot 18).
         if (
-            hasattr(recv_obj, "spec_verify_ct")
+            getattr(recv_obj, "spec_verify_ct", None)
+            and len(recv_obj.spec_verify_ct) > i
             and recv_obj.spec_verify_ct[i] > 0
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i

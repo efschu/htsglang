@@ -104,6 +104,8 @@ def park_deadline_s() -> float:
         return float(os.environ.get(ENV_PARK_DEADLINE, DEFAULT_PARK_DEADLINE_S))
     except ValueError:
         return DEFAULT_PARK_DEADLINE_S
+
+
 _PHASE_AFTER = {PP_TO_TP: PHASE_TP, TP_TO_PP: PHASE_PP}
 
 
@@ -373,6 +375,29 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
         n = len(stacks.vector)
         world_rank = _ps.get_world_group().rank_in_group
 
+        # The phase's speculation state, decided ONCE here because two
+        # separate steps below need the same answer: the component rebuild
+        # (4b) and the scheduler's own swap (7). Speculation belongs to the
+        # TP DECODE phase (#631) -- the draft worker was built on the flip's
+        # TP stack at boot and is armed with it; the PP phase carries none,
+        # which is bit-for-bit the state of an instance without speculation.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        want_draft = stacks.draft_worker if tp_phase else None
+        want_spec_algo = (
+            scheduler.flip_spec_algorithm
+            if (tp_phase and want_draft is not None)
+            else SpeculativeAlgorithm.from_string(None)
+        )
+        if tp_phase:
+            # Mirrors the boot dispatch: with speculation the model worker
+            # IS the draft worker, which drives the target through it.
+            want_model_worker = (
+                want_draft if want_draft is not None else stacks.tp_worker
+            )
+        else:
+            want_model_worker = boot_model_worker
+
         # 1. Module-level group routing (forward collectives resolve
         # through the parallel_state getters; see phase_flip_boot).
         _ps.set_phase_flip_tp_active(tp_phase)
@@ -431,6 +456,21 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             scheduler.load_inquirer = _dc2.replace(
                 scheduler.load_inquirer, ps=scheduler.ps
             )
+        # The batch result processor caches the WORKERS, and it is on the
+        # decode hot path: with speculation it calls back into the spec
+        # worker (on_verify_complete_cpu) to resolve verified tokens. Built
+        # at boot, when a phase-flip instance deliberately has no draft
+        # worker, so without this rebuild the first post-flip decode died
+        # with "'TpModelWorker' object has no attribute
+        # 'on_verify_complete_cpu'" -- the boot-cached target being asked
+        # to behave like the draft stack that had just been armed around
+        # it (measured, boot 21, 2026-08-08).
+        if getattr(scheduler, "batch_result_processor", None) is not None:
+            scheduler.batch_result_processor = _dc2.replace(
+                scheduler.batch_result_processor,
+                draft_worker=want_draft,
+                model_worker=want_model_worker,
+            )
         # 4c. Census round realign: the detector's cadence counter drifted
         # per-rank under the pp loop; the cutover is group-aligned, so
         # re-zero here or the post-flip detector fires its gloo
@@ -463,20 +503,9 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
         # dispatch in Scheduler.init_model_worker: with speculation the
         # model worker IS the draft worker, which drives the target
         # through it.
-        if tp_phase:
-            scheduler.spec_algorithm = scheduler.flip_spec_algorithm
-            scheduler.draft_worker = stacks.draft_worker
-            scheduler.model_worker = (
-                stacks.draft_worker
-                if stacks.draft_worker is not None
-                else stacks.tp_worker
-            )
-        else:
-            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-            scheduler.spec_algorithm = SpeculativeAlgorithm.from_string(None)
-            scheduler.draft_worker = None
-            scheduler.model_worker = boot_model_worker
+        scheduler.spec_algorithm = want_spec_algo
+        scheduler.draft_worker = want_draft
+        scheduler.model_worker = want_model_worker
         scheduler.phase_flip_active_stack = PHASE_TP if tp_phase else PHASE_PP
 
         # 8. Deferred aborts drain in the first post-flip round.
@@ -588,6 +617,13 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
     streamer = getattr(scheduler, "output_streamer", None)
     if streamer is not None and streamer.ps is not scheduler.ps:
         stale.append("output_streamer.ps")
+    brp = getattr(scheduler, "batch_result_processor", None)
+    if brp is not None:
+        # On the decode hot path, and it calls into the SPEC worker.
+        if brp.model_worker is not scheduler.model_worker:
+            stale.append("batch_result_processor.model_worker")
+        if brp.draft_worker is not scheduler.draft_worker:
+            stale.append("batch_result_processor.draft_worker")
     inquirer = getattr(scheduler, "load_inquirer", None)
     if inquirer is not None and inquirer.ps is not scheduler.ps:
         stale.append("load_inquirer.ps")
@@ -815,6 +851,9 @@ class PhaseFlipRuntime:
         #: Flips abandoned because the park deadline expired. A counter, so
         #: "this never happens in practice" stops being an assumption.
         self.park_deadline_aborts = 0
+        #: Flips abandoned because the live set did not fit the target
+        #: pool. Same reason for counting it.
+        self.fit_aborts = 0
 
         logger.info(
             "%s armed at boot: rank %d/%d, phase %s, layer map %s, vector "
@@ -1066,7 +1105,7 @@ class PhaseFlipRuntime:
         return self._map[self._rank].index(ordinal)
 
     # -- the move -------------------------------------------------------------
-    def _execute(self) -> dict:
+    def _execute(self) -> Optional[dict]:
         direction = self._pending
         assert direction is not None
         t0 = self._clock()
@@ -1077,20 +1116,59 @@ class PhaseFlipRuntime:
         )
 
         src, dst = self._src_dst(direction)
-        # Bounds BEFORE any byte moves: both layouts' pools are pre-sized
-        # at boot; an overflow here is a sizing bug, not a runtime state.
+        # Bounds BEFORE any byte moves, and GROUP-AGREED before acting on
+        # them. Both pools are pre-sized at boot, but whether the live set
+        # FITS is a runtime quantity: it grows with the resident prefix
+        # cache, and the TP pool shrank once speculation put a draft KV
+        # allocation inside the same budget (#631 window 3, boot 19 --
+        # "needs TP row 10896 but the TP pool holds 7719").
+        #
+        # Two things were wrong with raising here. First, the reading is
+        # RANK-LOCAL (each rank has its own pool sizes and its own compact
+        # rows), so a rank that raised while a peer proceeded would leave
+        # the group half-flipped -- the same rank-local-state-feeds-
+        # collective shape this file keeps having to fix. Second, raising
+        # climbs into the event loop and takes the INSTANCE down; it killed
+        # a healthy server that was serving fine in its current phase.
+        #
+        # Nothing has been mutated at this point -- the transition is a
+        # plan, not a move -- so the safe answer is unanimous: reduce the
+        # local verdict, and if ANY rank does not fit, every rank abandons
+        # the flip and keeps serving. The flip is the optional thing here.
+        too_small = []
         if tr.max_pp_row() >= self._pp.num_rows:
-            raise KvReshardError(
-                f"{LOG_PREFIX} flip needs PP row {tr.max_pp_row()} but the "
-                f"PP pool holds {self._pp.num_rows} rows (sizing bug: the "
-                f"PP pool must cover every live global slot id)"
+            too_small.append(
+                f"PP row {tr.max_pp_row()} vs pool {self._pp.num_rows} rows "
+                f"(the PP pool must cover every live global slot id)"
             )
         if tr.max_tp_row() >= self._tp.num_rows:
-            raise KvReshardError(
-                f"{LOG_PREFIX} flip needs TP row {tr.max_tp_row()} but the "
-                f"TP pool holds {self._tp.num_rows} rows (sizing bug: the "
-                f"TP pool must cover the compact rows of vector {self._vec})"
+            too_small.append(
+                f"TP row {tr.max_tp_row()} vs pool {self._tp.num_rows} rows "
+                f"(the TP pool must cover the compact rows of vector "
+                f"{self._vec})"
             )
+        fits = 0 if too_small else 1
+        reduced_fit = self._collective_min([fits, -fits])
+        if reduced_fit[0] == 0:
+            self._pending = None
+            self._armed_at = None
+            self._last_hold_reason = None
+            self.fit_aborts += 1
+            logger.error(
+                "%s FLIP ABANDONED (pool too small for the live set): %s. "
+                "This rank: %s. No bytes were moved -- the bound is checked "
+                "before the plan is executed -- and serving continues on the "
+                "%s stack with every request intact. The live set grows with "
+                "the resident prefix cache, so flushing the cache or sizing "
+                "the target pool up are both real answers; a smaller TP pool "
+                "is also what a draft-KV allocation inside the same budget "
+                "produces.",
+                LOG_PREFIX,
+                direction,
+                "; ".join(too_small) if too_small else "fits (a peer did not)",
+                self._phase,
+            )
+            return None
 
         # PACK (reads only): per peer, layers ascending, one row list.
         t_read0 = self._clock()

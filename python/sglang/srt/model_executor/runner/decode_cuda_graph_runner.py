@@ -319,17 +319,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_draft_tokens=self.speculative_num_draft_tokens
         )
         if model_runner.spec_algorithm.is_speculative():
-            if getattr(self.model_runner, "is_draft_model_runner", False):
+            if self.model_runner.is_draft_model_runner:
                 # Draft workers can use TARGET_VERIFY mode.
                 #
-                # is_draft_MODEL_runner, not is_draft_worker: the #631
-                # phase-flip TP stack rides the is_draft_worker
-                # construction gate but holds the TARGET model, and it
-                # captures ordinary target TARGET_VERIFY graphs. Asking
-                # the construction gate sent it down the draft branch and
-                # every rank died on "This should not happen" -- which was
-                # true: it should not, and the runner was not a draft one
-                # (measured, boot 16, 2026-08-08).
+                # THROUGHOUT THIS FILE (and the sibling runners) the
+                # draft/target question is asked as is_draft_MODEL_runner,
+                # never is_draft_worker. The latter is a CONSTRUCTION gate
+                # with three producers -- a speculative draft worker, the
+                # #274 dual-group lane, and the #631 phase-flip TP stack --
+                # and only the first holds draft weights. This code means
+                # "am I the draft model or the target", which for the flip
+                # stack is unambiguously the target: it holds the full
+                # target model and captures ordinary target TARGET_VERIFY
+                # graphs. Asking the construction gate sent it down the
+                # draft branch and every rank died on "This should not
+                # happen" -- true, and the runner was not a draft one
+                # (measured, boots 16 and 17, 2026-08-08). The two other
+                # producers are unaffected: for them the two flags are
+                # equal by definition.
                 if (
                     not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
                 ):
@@ -412,7 +419,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         _wl_ab = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
         if (
             (model_runner.is_weightless_head or model_runner.is_weightless_worker)
-            and not model_runner.is_draft_worker
+            and not model_runner.is_draft_model_runner
             and getattr(_wl_ab, "_wl_chunk_block_size", 0)
         ):
             self._wl_block_graph = True
@@ -479,7 +486,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         _sess_ab = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
         if (
             getattr(_sess_ab, "_sess_graph_enabled", False)
-            and not model_runner.is_draft_worker
+            and not model_runner.is_draft_model_runner
         ):
             self._sess_block_graph = True
             self._sess_attn = _sess_ab
@@ -487,7 +494,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
-            and not self.model_runner.is_draft_worker
+            and not self.model_runner.is_draft_model_runner
         )
         self.capture_num_tokens: Optional[list[int]] = (
             self._build_ragged_verify_token_buckets()
@@ -706,7 +713,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         DP rank drafts independently with no cross-DP collective, so its
         hand-built batches carry no dp-global metadata and must key graphs by
         local batch size. Everything else keeps the dp-global padding path."""
-        if not model_runner.is_draft_worker:
+        if not model_runner.is_draft_model_runner:
             return False
         if not model_runner.spec_algorithm.is_dspark():
             return False
@@ -1262,7 +1269,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attn_selftest = getattr(_sess_ab, "_sess_attn_selftest", None)
         if (
             attn_selftest is not None
-            and not self.model_runner.is_draft_worker
+            and not self.model_runner.is_draft_model_runner
             and getattr(_sess_ab, "_sess_enabled", False)
         ):
             try:
@@ -1715,7 +1722,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     )
                 if (
                     self.model_runner.spec_algorithm.is_dflash_family()
-                    and self.model_runner.is_draft_worker
+                    and self.model_runner.is_draft_model_runner
                     and "input_embeds" in inspect.signature(forward).parameters
                     and not hasattr(self.model_runner.model, "forward_embed")
                 ):
@@ -1937,7 +1944,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
-                and self.model_runner.is_draft_worker
+                and self.model_runner.is_draft_model_runner
                 and forward_batch.input_embeds is not None
             ):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
@@ -2001,7 +2008,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             not is_ragged
             and self.model_runner.spec_algorithm.is_dflash_family()
-            and self.model_runner.is_draft_worker
+            and self.model_runner.is_draft_model_runner
             and forward_batch.input_embeds is not None
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
@@ -2091,7 +2098,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
-                    "draft" if self.model_runner.is_draft_worker else "target",
+                    "draft" if self.model_runner.is_draft_model_runner else "target",
                     self._replay_graph_key.size,
                     "num_tokens" if self.ragged_verify_mode else "bs",
                     forward_batch.forward_mode.name,
@@ -2181,7 +2188,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
-            if self.model_runner.is_draft_worker:
+            if self.model_runner.is_draft_model_runner:
                 raise RuntimeError("This should not happen.")
             else:
 
@@ -2228,12 +2235,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token_num=self.num_tokens_per_bs,
                 custom_mask=(
                     None
-                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    if (self.model_runner.is_draft_model_runner or not build_custom_mask)
                     else self.buffers.custom_mask
                 ),
                 capture_hidden_mode=(
                     CaptureHiddenMode.NULL
-                    if self.model_runner.is_draft_worker
+                    if self.model_runner.is_draft_model_runner
                     else CaptureHiddenMode.FULL
                 ),
                 ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),

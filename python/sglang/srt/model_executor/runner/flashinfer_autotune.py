@@ -110,7 +110,7 @@ def should_run_flashinfer_autotune(
         return False
 
     if mr.spec_algorithm.is_speculative():
-        return mr.is_draft_worker if for_speculative_draft else not mr.is_draft_worker
+        return mr.is_draft_model_runner if for_speculative_draft else not mr.is_draft_model_runner
 
     return True
 
@@ -135,7 +135,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
-    if mr.is_draft_worker:
+    if mr.is_draft_model_runner:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
     model_key = "|".join(model_key_parts)
     cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
@@ -214,7 +214,7 @@ def maybe_flashinfer_autotune_speculative_draft(
         return
     if (
         not mr.spec_algorithm.is_speculative()
-        or not mr.is_draft_worker
+        or not mr.is_draft_model_runner
         or not should_run_flashinfer_autotune(mr, for_speculative_draft=True)
     ):
         return
