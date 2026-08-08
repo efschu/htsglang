@@ -59,7 +59,12 @@ CHUNKED_PREFILL=${CHUNKED_PREFILL:-256}
 python /root/651-p2/scripts/wedge_policy.py "$CHUNKED_PREFILL" || {
   echo "Wedge policy refused this configuration"; exit 1; }
 
-MODEL=/root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf
+# The checkpoint is overridable because the choice is a real trade on this
+# machine, not a preference. Q4_K_M is 22.7 GiB against 29.5 GiB of RAM shared
+# with the GPU, which leaves ~1.3 GiB free and puts every load at the mercy of
+# whatever else the host is doing. A smaller quant trades answer quality for a
+# machine that is not permanently at its limit.
+MODEL=${MODEL:-/root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf}
 MEMFRAC=${MEMFRAC:-0.99}
 PORT=${PORT:-31661}
 CTX=${CTX:-8192}

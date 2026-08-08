@@ -1298,27 +1298,41 @@ on a host with RAM to spare). No hit-rate evidence is claimed, because the
 feature was never armed in a serving run — reporting a hit rate here would be
 reporting a number that does not exist.
 
-### 9.5 Panel blanking
+### 9.5 Panel blanking -- ATTEMPTED, REVERTED, AND IT BROKE THE LOGIN
 
-Not a driver fault and not the GPU. The machine sits at the GDM greeter, and
-the GREETER blanks the panel on its own idle timer; the panel then reads as
-dead (`/sys/class/drm/card1-eDP-1` -> `dpms=Off, enabled=disabled`) to anyone
-who did not know it was merely asleep. `dmesg` shows no eDP link-training
-failure at any point.
+The diagnosis stands and is useful; the fix was wrong and has been backed out.
 
-The user account `efeu` already had `idle-delay=0` and
-`sleep-inactive-ac-type='nothing'`, so its own session never blanked — only
-the greeter did, which is why the symptom looked like hardware.
+DIAGNOSIS (unchanged): this is not a driver fault and not the GPU. The machine
+sits at the GDM greeter, the GREETER blanks the panel on its own idle timer,
+and the panel then reads as dead (`/sys/class/drm/card1-eDP-1` -> `dpms=Off,
+enabled=disabled`) to anyone who did not know it was asleep. `dmesg` shows no
+eDP link-training failure at any point. The account `efeu` already had
+`idle-delay=0`, so its own session never blanked -- only the greeter did, which
+is why the symptom looked like hardware.
 
-Fix: a greeter dconf override (`/etc/dconf/db/gdm.d/10-no-idle-blank`) that
-disables the idle blank, the screensaver, and idle dim for the greeter only.
-The lid switch and explicit suspend are untouched — this disables the idle
-BLANK, not power management.
+WHAT I DID WRONG. To apply a greeter dconf override I wrote
+`/etc/dconf/profile/gdm`, guarding only on whether it already contained
+`user-db:user`. The distro file has THREE lines, and the third is
 
-Honest limit: whether the panel wakes on a keypress cannot be verified from a
-remote session, because it needs a physical keypress. The durable choice made
-here is therefore to stop the idle blank from happening rather than to claim a
-wake path was repaired.
+    file-db:/usr/share/gdm/greeter-dconf-defaults
+
+which is what supplies the greeter its defaults. My write dropped it. The
+result was a login screen that no longer presented a normal login page, which
+the user hit directly. A config file belonging to a component I was only
+touching incidentally is exactly the wrong thing to rewrite from a template;
+the correct move was to APPEND a missing line, or to leave the profile alone
+and place the override where it needs no profile edit.
+
+CURRENT STATE: profile restored to the distro default including the file-db
+line, `/etc/dconf/db/gdm.d/10-no-idle-blank` and the compiled `db/gdm` removed,
+`dconf update` run, gdm restarted. Verified afterwards: greeter session live on
+seat0/tty1 and the panel reads `enabled=enabled dpms=On`.
+
+So the greeter's idle blank is NOT fixed and is left exactly as it was. That is
+the right trade -- a login page the user can actually log in through outranks a
+panel that sleeps when idle. Anyone retrying this should note that the blank is
+cosmetic (the panel wakes; it only looks dead to an observer) and that the
+override must be added WITHOUT rewriting `/etc/dconf/profile/gdm`.
 
 ### 9.6 oh-my-pi for efeu
 
