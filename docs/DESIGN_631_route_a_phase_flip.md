@@ -488,6 +488,24 @@ at the boot build scope and at cutover; activation without built flip
 groups REFUSES loudly. Both mechanisms together are the geometry scope
 (phase_flip_boot.phase_flip_tp_scope).
 
+5.3 DONE (session 2): scheduler flip protocol landed --
+build_phase_flip_runtime factory (channels over the flip_tp world-spanning
+set, both pool views, landed helpers, pre_cutover = GDN guard + arena
+refill), on_round hook beside the #297 block raising PhaseFlipLoopExit
+after commit, production cutover with the FULL rebuild list closed by a
+verify_flip_cutover completeness self-check (every rebuilt reference
+checked against the routed source of truth as the cutover's last step;
+red arms prove one stale handle/ps/worker/window is caught loudly),
+abort deferral through the real Scheduler.abort_request router
+(arm_phase_flip activates the window, refused arm drains immediately),
+maybe_sleep_on_idle flip-pending skip, run_phase_flip_event_loops
+re-dispatch wrapper. Pin 4 discharged at scheduler level: real router ->
+real window -> real runtime threads -> real production cutover, aborts
+apply in order with the TP stack already active. GDN mover is a LOUD
+REFUSAL placeholder (flip with live requests refuses; empty flip works)
+-- slice 5.3b implements the real mover before the one-request rung.
+122 green tests; canonical family runner: scripts/run_631_flip_family.sh.
+
 Step-6 watch items added in session 2: (a) the uneven plan + cp token
 vector are process-globals installed AFTER the primary PP build --
 PP-phase code paths must never consult them with a non-rank-local size;

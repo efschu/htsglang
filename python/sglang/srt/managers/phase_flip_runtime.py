@@ -227,6 +227,325 @@ def flip_blocking_guards(scheduler) -> List[str]:
     return guards
 
 
+class PhaseFlipLoopExit(Exception):
+    """Control-flow signal: a flip COMMITTED this round; the current event
+    loop must exit to the re-dispatching wrapper (dispatch_event_loop picks
+    its loop ONCE from pp_size, so a changed topology needs a fresh
+    dispatch). Raised by the scheduler's on_round hook AFTER
+    PhaseFlipRuntime.on_round returned commit stats -- never from inside
+    the runtime, whose epoch/phase bookkeeping must complete first. The
+    quiescence predicate guarantees the loop holds no half-processed batch
+    state when this propagates."""
+
+    def __init__(self, direction: str):
+        super().__init__(direction)
+        self.direction = direction
+
+
+def derive_pp_full_attn_layer_map(
+    full_attention_layer_ids: Sequence[int],
+    num_hidden_layers: int,
+    pp_size: int,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Per-stage FULL-ATTENTION ORDINALS from the global layer geometry.
+
+    A pure replicated function of (the model's global full-attention layer
+    ids, the layer count, the PP stage split) -- every rank derives the
+    same map, which the consensus fingerprint then pins at runtime. The
+    stage split comes from get_pp_indices, the SAME function the PP model
+    build used (env-uniform SGLANG_PP_LAYER_PARTITION included), so the
+    map cannot drift from the actual stage windows.
+
+    IMPORTANT SOURCE RULE: ``full_attention_layer_ids`` must be the
+    UNMUTATED global list (e.g. from the TP stack's model_config, whose
+    pp_size=1 adjust is the identity) -- the PP stack's model_config was
+    rewritten in place to its stage-local slice
+    (adjust_hybrid_swa_layers_for_pp)."""
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    ids = [int(x) for x in full_attention_layer_ids]
+    if ids != sorted(set(ids)):
+        raise KvReshardError(
+            f"full_attention_layer_ids must be strictly ascending, got {ids}"
+        )
+    if ids and not (0 <= ids[0] and ids[-1] < num_hidden_layers):
+        raise KvReshardError(
+            f"full_attention_layer_ids {ids} outside [0, {num_hidden_layers})"
+        )
+    bounds = [get_pp_indices(num_hidden_layers, r, pp_size) for r in range(pp_size)]
+    flat = [b for pair in bounds for b in pair]
+    if flat != sorted(flat) or bounds[0][0] != 0 or bounds[-1][1] != num_hidden_layers:
+        raise KvReshardError(
+            f"PP stage bounds {bounds} do not partition [0, {num_hidden_layers})"
+        )
+    layer_map = []
+    for start, end in bounds:
+        layer_map.append(
+            tuple(i for i, gid in enumerate(ids) if start <= gid < end)
+        )
+    covered = sorted(o for stage in layer_map for o in stage)
+    if covered != list(range(len(ids))):
+        raise KvReshardError(
+            f"stage map {layer_map} does not cover every full-attention "
+            f"ordinal exactly once (bounds {bounds}, ids {ids})"
+        )
+    return tuple(layer_map)
+
+
+def build_gdn_flip_guard(scheduler) -> Callable[[str], None]:
+    """5.3 PLACEHOLDER for the GDN state mover, honest by refusal.
+
+    The full mover (layer-axis -> head-axis re-shard of conv/ssm state via
+    MambaPool blobs, DESIGN_631 3.4) lands as slice 5.3b. Until then a
+    flip with LIVE linear-attention state must refuse LOUDLY inside the
+    no-return region's first step -- before any pool byte moved -- never
+    proceed and silently truncate GDN state (the #212 Store-Route lesson).
+    The 5.5 validation ladder's first rung (flip empty -> flip back) is
+    exactly what this permits."""
+
+    def _guard(direction: str) -> None:
+        running = getattr(scheduler, "running_batch", None)
+        reqs = list(getattr(running, "reqs", []) or []) if running else []
+        if reqs:
+            raise KvReshardError(
+                f"{LOG_PREFIX} flip {direction} refused: {len(reqs)} live "
+                f"request(s) hold GDN conv/ssm state and the GDN state "
+                f"mover is not wired yet (slice 5.3b); flipping now would "
+                f"silently truncate linear-attention state. Drain or wait."
+            )
+
+    return _guard
+
+
+def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
+    """The cutover leg (DESIGN_631 3.6 step 5): everything the scheduler
+    snapshotted from the boot topology is rebuilt for the target phase.
+    Runs inside PhaseFlipRuntime._execute after KV/GDN/arena moves; the
+    loop exit is raised LATER by the on_round hook (the runtime's
+    epoch/phase bookkeeping must finish first)."""
+    import dataclasses as _dc
+
+    # Boot-phase snapshot for the return trip, taken ONCE at build time
+    # (the scheduler's ps still holds the boot topology then).
+    boot_ps = scheduler.ps
+    boot_model_worker = scheduler.tp_worker
+
+    def _cutover(direction: str) -> None:
+        from sglang.srt.distributed import parallel_state as _ps
+        from sglang.srt.distributed.utils import set_cp_token_ratios
+        from sglang.srt.layers.dcp.owner import refresh_all_owner_bounds
+        from sglang.srt.runtime_context import get_server_args
+
+        stacks = scheduler.phase_flip_stacks
+        tp_phase = direction == PP_TO_TP
+        n = len(stacks.vector)
+        world_rank = _ps.get_world_group().rank_in_group
+
+        # 1. Module-level group routing (forward collectives resolve
+        # through the parallel_state getters; see phase_flip_boot).
+        _ps.set_phase_flip_tp_active(tp_phase)
+
+        # 2. Owner rule: the vector is boot-constant; refresh the bounds
+        # consumers so the TP backends read the (re)installed vector.
+        set_cp_token_ratios(list(stacks.vector))
+        refresh_all_owner_bounds()
+
+        # 3. Scheduler topology snapshot (frozen dataclass -> new instance).
+        if tp_phase:
+            scheduler.ps = _dc.replace(
+                boot_ps,
+                tp_rank=world_rank,
+                tp_size=n,
+                pp_rank=0,
+                pp_size=1,
+                attn_tp_rank=world_rank,
+                attn_tp_size=n,
+            )
+        else:
+            scheduler.ps = boot_ps
+
+        # 4. Cached group handles, re-derived through the ROUTED getters.
+        scheduler.tp_group = _ps.get_tp_group()
+        scheduler.tp_cpu_group = scheduler.tp_group.cpu_group
+        scheduler.attn_tp_group = _ps.get_attn_tp_group()
+        scheduler.attn_tp_cpu_group = scheduler.attn_tp_group.cpu_group
+        scheduler.pp_group = _ps.get_pp_group()
+        # dp-attention is a flip arming guard; the dp routing group is tp.
+        scheduler.dp_tp_group = scheduler.tp_group
+
+        # 5. pp_max_micro_batch_size for the new pp_size (boot formula).
+        get_server_args().override(
+            "phase_flip.pp_max_micro_batch_size",
+            pp_max_micro_batch_size=max(
+                scheduler.max_running_requests // scheduler.ps.pp_size, 1
+            ),
+        )
+
+        # 6. PP loop arrays: re-initialized clean for the new topology
+        # (idempotent pure reassignment; reads the NEW ps.pp_size).
+        scheduler.init_pp_loop_state()
+
+        # 7. Active stack swap: the forward path follows model_worker.
+        scheduler.model_worker = (
+            stacks.tp_worker if tp_phase else boot_model_worker
+        )
+        scheduler.phase_flip_active_stack = PHASE_TP if tp_phase else PHASE_PP
+
+        # 8. Deferred aborts drain in the first post-flip round.
+        window = getattr(scheduler, "phase_flip_abort_window", None)
+        if window is not None and window.active:
+            drained = window.deactivate_and_drain()
+            if drained:
+                logger.info(
+                    "%s drained %d deferred abort(s) after cutover",
+                    LOG_PREFIX,
+                    drained,
+                )
+
+        # 9. Completeness self-check: every snapshot the rebuild list names
+        # is verified against the routed source of truth, HERE, before the
+        # first post-flip round can touch a stale handle. A missed rebuild
+        # is a loud KvReshardError, never later corruption.
+        verify_flip_cutover(scheduler, tp_phase)
+        logger.warning(
+            "%s cutover complete: active stack %s, ps tp=%d pp=%d",
+            LOG_PREFIX,
+            scheduler.phase_flip_active_stack,
+            scheduler.ps.tp_size,
+            scheduler.ps.pp_size,
+        )
+
+    return _cutover
+
+
+def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
+    """Post-cutover invariants (the coordinator's completeness pin): every
+    scheduler snapshot on the 5.3 rebuild list must AGREE with the routed
+    source of truth for the now-active phase. Any single stale reference
+    -- a cached group handle still pointing at the other phase's group, a
+    ps that kept the old topology, a model_worker from the wrong stack --
+    fails HERE, loudly, before any round runs on it."""
+    from sglang.srt.distributed import parallel_state as _ps
+
+    stale = []
+    if _ps.phase_flip_tp_routing_active() != tp_phase:
+        stale.append(
+            f"module routing active={_ps.phase_flip_tp_routing_active()} "
+            f"but tp_phase={tp_phase}"
+        )
+    expect_tp = _ps.get_tp_group()
+    expect_attn = _ps.get_attn_tp_group()
+    expect_pp = _ps.get_pp_group()
+    if scheduler.tp_group is not expect_tp:
+        stale.append("tp_group")
+    if scheduler.tp_cpu_group is not expect_tp.cpu_group:
+        stale.append("tp_cpu_group")
+    if scheduler.attn_tp_group is not expect_attn:
+        stale.append("attn_tp_group")
+    if scheduler.attn_tp_cpu_group is not expect_attn.cpu_group:
+        stale.append("attn_tp_cpu_group")
+    if scheduler.pp_group is not expect_pp:
+        stale.append("pp_group")
+    if scheduler.dp_tp_group is not scheduler.tp_group:
+        stale.append("dp_tp_group")
+    stacks = scheduler.phase_flip_stacks
+    n = len(stacks.vector)
+    want_tp_size = n if tp_phase else 1
+    want_pp_size = 1 if tp_phase else n
+    if scheduler.ps.tp_size != want_tp_size or scheduler.ps.pp_size != want_pp_size:
+        stale.append(
+            f"ps topology (tp={scheduler.ps.tp_size}, "
+            f"pp={scheduler.ps.pp_size}; want tp={want_tp_size}, "
+            f"pp={want_pp_size})"
+        )
+    if scheduler.ps.attn_tp_size != want_tp_size:
+        stale.append(f"ps.attn_tp_size ({scheduler.ps.attn_tp_size})")
+    want_worker = stacks.tp_worker if tp_phase else scheduler.tp_worker
+    if scheduler.model_worker is not want_worker:
+        stale.append("model_worker (wrong stack)")
+    window = getattr(scheduler, "phase_flip_abort_window", None)
+    if window is not None and window.active:
+        stale.append("abort window still active (drain missed)")
+    if stale:
+        raise KvReshardError(
+            f"{LOG_PREFIX} CUTOVER INCOMPLETE ({'tp' if tp_phase else 'pp'} "
+            f"phase): stale after rebuild: {', '.join(stale)}. A stale "
+            f"snapshot surviving cutover is the silent-corruption class "
+            f"this check exists to catch -- refusing to run a round on it."
+        )
+
+
+def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
+    """Factory mirroring build_kv_reshard_runtime (kv_reshard.py): wires
+    the scheduler's real state into PhaseFlipRuntime. Called lazily from
+    the first scheduler round (house pattern); by then the boot builder
+    has installed scheduler.phase_flip_stacks."""
+    from sglang.srt.distributed.parallel_state import (
+        get_phase_flip_group,
+        get_world_group,
+    )
+    from sglang.srt.managers.kv_pressure_runtime import default_collective_min
+    from sglang.srt.managers.kv_reshard import _dist_exchange
+
+    stacks = scheduler.phase_flip_stacks
+    if stacks is None:
+        raise KvReshardError(
+            "build_phase_flip_runtime before build_phase_flip_tp_stack "
+            "(the boot builder owns pools, arena and images)"
+        )
+    server_args = scheduler.server_args
+    flip_tp = get_phase_flip_group("tp")
+    world = get_world_group()
+
+    pp_pool = scheduler.tp_worker.model_runner.token_to_kv_pool
+    tp_pool = stacks.tp_worker.model_runner.token_to_kv_pool
+    for name, pool in (("PP", pp_pool), ("TP", tp_pool)):
+        if not hasattr(pool, "full_kv_pool"):
+            raise KvReshardError(
+                f"the {name} stack's pool {type(pool).__name__} has no "
+                f"full_kv_pool; the flip moves hybrid-model full-attention "
+                f"KV only (DESIGN_631 scope)"
+            )
+    pp_full = pp_pool.full_kv_pool
+    tp_full = tp_pool.full_kv_pool
+    pp_view = KvPoolView(pp_full.k_buffer, pp_full.v_buffer)
+    tp_view = KvPoolView(tp_full.k_buffer, tp_full.v_buffer)
+
+    # Global full-attention geometry from the TP stack's config (pp=1 ->
+    # unmutated; the PP stack's was rewritten to its stage-local slice).
+    tp_model_config = stacks.tp_worker.model_config
+    full_ids = list(tp_model_config.full_attention_layer_ids)
+    layer_map = derive_pp_full_attn_layer_map(
+        full_ids,
+        int(tp_model_config.num_hidden_layers),
+        int(server_args.pp_size),
+    )
+
+    return PhaseFlipRuntime(
+        n_ranks=world.world_size,
+        rank=world.rank_in_group,
+        layer_map=layer_map,
+        n_layers=len(full_ids),
+        tp_vector=stacks.vector,
+        boot_phase=PHASE_PP,
+        consensus_interval=int(
+            getattr(server_args, "kv_reshard_consensus_interval", 8)
+        ),
+        collective_min=default_collective_min(flip_tp.cpu_group),
+        exchange=_dist_exchange(flip_tp.device_group, pp_view.device),
+        pp_pool_view=pp_view,
+        tp_pool_view=tp_view,
+        live_slots_fn=build_flip_live_slots_fn(scheduler),
+        ready_fn=build_flip_quiescence_fn(scheduler),
+        cutover_fn=build_production_flip_cutover(scheduler),
+        pre_cutover_fns=(
+            build_gdn_flip_guard(scheduler),
+            stacks.refill,
+        ),
+        guards=flip_blocking_guards(scheduler),
+    )
+
+
 class PhaseFlipRuntime:
     """Drives one group's PP<->TP KV layout flip at a quiescent boundary.
 

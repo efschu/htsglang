@@ -420,6 +420,21 @@ class Scheduler(
         # built lazily on the first scheduler iteration when
         # --kv-reshard-vectors is set.
         self.kv_reshard_runtime = None
+        # #631 phase flip: runtime built lazily on the first scheduler
+        # iteration when --enable-phase-flip is set (the boot builder must
+        # have installed phase_flip_stacks by then). The abort deferral
+        # window exists from boot so abort routing never races the lazy
+        # build; it only defers while ACTIVE (armed flip). active_stack
+        # tracks the serving phase for the event-loop re-dispatch.
+        self.phase_flip_runtime = None
+        self.phase_flip_abort_window = None
+        self.phase_flip_active_stack = "pp"
+        if getattr(server_args, "enable_phase_flip", False):
+            from sglang.srt.managers.phase_flip_runtime import (
+                AbortDeferralWindow,
+            )
+
+            self.phase_flip_abort_window = AbortDeferralWindow()
         # #261 live session handover runtime: None on every default path;
         # built lazily on the first /session_handover control request. The
         # admission hook in handle_generate_request is a no-op while this
@@ -4204,6 +4219,30 @@ class Scheduler(
                 self.kv_reshard_runtime = build_kv_reshard_runtime(self)
             self.kv_reshard_runtime.on_round()
 
+        # #631 phase flip: same lazy-build and cadence discipline as the
+        # #297 block above (bounded consensus every consensus_interval-th
+        # round; the move itself only from a group-agreed armed+quiescent
+        # state). When on_round returns commit stats, THIS ROUND flipped
+        # the topology: exit the current event loop to the re-dispatching
+        # wrapper (dispatch picks its loop once from pp_size) -- raised
+        # here, after the runtime's epoch/phase bookkeeping completed, at
+        # a quiescent boundary by construction. Flag unset = attribute
+        # stays None, no collective, byte-identical to today.
+        if self.server_args.enable_phase_flip:
+            if self.phase_flip_runtime is None:
+                from sglang.srt.managers.phase_flip_runtime import (
+                    build_phase_flip_runtime,
+                )
+
+                self.phase_flip_runtime = build_phase_flip_runtime(self)
+            flip_stats = self.phase_flip_runtime.on_round()
+            if flip_stats is not None:
+                from sglang.srt.managers.phase_flip_runtime import (
+                    PhaseFlipLoopExit,
+                )
+
+                raise PhaseFlipLoopExit(flip_stats["direction"])
+
         # #330 VRAM dial / KV capacity runtime: same lazy-build and cadence
         # discipline. Runs AFTER the reshard block so a #297 cutover in this
         # round is already visible to the capacity math (the C re-raise arms
@@ -6517,7 +6556,38 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
+    def arm_phase_flip(self, direction: str, source: str):
+        """#631: replicated arming entry (RPC / regime gate). Activates the
+        abort deferral window BEFORE arming so no abort can slip between
+        the arm and the first consensus round (pin 4); the window drains
+        at cutover, or deactivates here if arming is refused."""
+        if self.phase_flip_runtime is None:
+            return False, (
+                "phase-flip runtime not built yet (no scheduler round has "
+                "run); retry after the first round"
+            )
+        window = self.phase_flip_abort_window
+        if window is not None:
+            window.activate()
+        ok, msg = self.phase_flip_runtime.arm(direction, source)
+        if not ok and window is not None:
+            window.deactivate_and_drain()
+        return ok, msg
+
     def abort_request(self, recv_req: AbortReq):
+        # #631 pin 4: while a flip is armed/executing, abort work is
+        # DEFERRED -- an abort applied on one rank before its peers
+        # diverges the replicated live set mid-flip. The queue preserves
+        # order and drains in the first post-cutover round (or on refused
+        # arming). Inactive window (or no flip boot) = direct call,
+        # byte-identical to today.
+        window = self.phase_flip_abort_window
+        if window is not None and window.active:
+            window.submit(lambda: self._abort_request_now(recv_req))
+            return
+        self._abort_request_now(recv_req)
+
+    def _abort_request_now(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -6835,6 +6905,16 @@ class Scheduler(
             and self.kv_reshard_runtime.pending is not None
         ):
             return
+        # #631: identical rationale for an armed phase flip -- the commit
+        # fires at a consensus boundary and a parked loop never reaches
+        # one. pending is replicated (armed via broadcast RPC or the
+        # regime gate's replicated decision), so every rank skips the
+        # sleep in the same rounds.
+        if (
+            self.phase_flip_runtime is not None
+            and self.phase_flip_runtime.pending is not None
+        ):
+            return
         # #330: same rationale for a pending capacity change -- the commit
         # needs consensus boundaries, and a parked loop never reaches one.
         # pending_work() is a pure function of replicated state, so every
@@ -6900,8 +6980,53 @@ class Scheduler(
         pass
 
 
+def run_phase_flip_event_loops(scheduler: Scheduler):
+    """#631: the re-dispatching wrapper around the event loops.
+
+    dispatch_event_loop picks its loop ONCE from server_args.pp_size, so a
+    flipped topology has no representation there -- this wrapper wraps
+    (never patches) that decision: each phase runs its own loop, and a
+    committed flip exits the current loop via PhaseFlipLoopExit (raised by
+    the on_round hook at a quiescent boundary, after all cutover rebuilds)
+    to be re-dispatched here under the new phase. A normal loop return
+    (shutdown) returns from the wrapper."""
+    from sglang.srt.managers.phase_flip_runtime import (
+        PHASE_TP,
+        PhaseFlipLoopExit,
+    )
+
+    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
+        "phase flip x PD disaggregation is refused at argument time"
+    )
+    assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
+    while True:
+        try:
+            if scheduler.phase_flip_active_stack == PHASE_TP:
+                # TP decode phase: the non-PP production loop family.
+                if scheduler.enable_overlap:
+                    scheduler.event_loop_overlap()
+                else:
+                    scheduler.event_loop_normal()
+            else:
+                # PP prefill phase: the boot topology's loop.
+                scheduler.event_loop_pp()
+            return
+        except PhaseFlipLoopExit as e:
+            logger.warning(
+                "PHASE-FLIP event loop re-dispatch after %s (active stack "
+                "now %s)",
+                e.direction,
+                scheduler.phase_flip_active_stack,
+            )
+            continue
+
+
 def dispatch_event_loop(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
+    # #631: a phase-flip boot re-dispatches per phase; wrapper, not patch.
+    if getattr(scheduler.server_args, "enable_phase_flip", False):
+        run_phase_flip_event_loops(scheduler)
+        return
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
