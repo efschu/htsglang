@@ -1456,6 +1456,14 @@ class PhaseFlipReqInput(BaseReq, kw_only=True):
 
     direction: str
     source: str = "rpc"
+    # True when the scheduler generated this request itself (the automatic
+    # phase policy) rather than receiving it from the tokenizer. Such a
+    # request MUST NOT be answered: the reply path appends to a
+    # _Communicator's _result_values, which only exists while a caller is
+    # awaiting that RPC. Answering a request nobody sent dereferences None
+    # and kills the TokenizerManager -- and with it the server. Measured
+    # 2026-08-08.
+    internal: bool = False
 
 
 class PhaseFlipReqOutput(BaseReq, kw_only=True):
