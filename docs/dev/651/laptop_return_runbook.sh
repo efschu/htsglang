@@ -5,7 +5,7 @@
 #   docs/dev/651/laptop_return_runbook.sh          # full sequence
 #   docs/dev/651/laptop_return_runbook.sh --no-reboot   # if it just rebooted
 set -u
-SSH="ssh -i /root/.ssh/id_ed25519_root@192.168.0.116 -o BatchMode=yes root@192.168.0.116"
+SSH="ssh -i /root/.ssh/id_ed25519_root@efeu-TP14.fritz.box -o BatchMode=yes root@efeu-TP14.fritz.box"
 TREE=/spinning/wt-gguf-q4-651
 
 if [ "${1:-}" != "--no-reboot" ]; then
@@ -27,8 +27,8 @@ echo "== 3. GPU sanity guard (must PASS on the fresh boot) =="
 $SSH 'cd /root/lh/ggufbuild && source /root/lh/venv/bin/activate && HSA_OVERRIDE_GFX_VERSION=11.0.0 PYTHONPATH=/root/lh/ggufbuild python /root/651-p2/scripts/gpu_sanity_guard.py' | grep -v libdrm || exit 1
 
 echo "== 4. recover the #644 _host_verify pyc (unversioned bytecode) =="
-scp -q -i /root/.ssh/id_ed25519_root@192.168.0.116 \
-  root@192.168.0.116:/root/lh/sglang_src/python/sglang/srt/__pycache__/_host_verify.cpython-312.pyc \
+scp -q -i /root/.ssh/id_ed25519_root@efeu-TP14.fritz.box \
+  root@efeu-TP14.fritz.box:/root/lh/sglang_src/python/sglang/srt/__pycache__/_host_verify.cpython-312.pyc \
   "$TREE/docs/dev/651/recovered/laptop_sglang_delta/_host_verify.cpython-312.pyc.laptop" \
   && echo "pyc recovered into the worktree (commit it)"
 
@@ -51,4 +51,4 @@ EOF
 echo "== 6. GGUF inventory sweep (user hint: earlier downloads may have left files) =="
 $SSH 'cat /root/lh/dl_q3.log /root/lh/dl_q2.log 2>/dev/null | tail -6; find / -xdev \( -name "*.gguf" -o -name "*.gguf.part" -o -name "*.incomplete" \) -size +1G 2>/dev/null | head -20; du -sh /root/.cache/huggingface 2>/dev/null'
 echo "== if Q3_K_XL is NOT on the laptop: push the rig copy over LAN (20x faster than WAN) =="
-echo "   scp /spinning/llm_stuff/club-3090/models-cache/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf root@192.168.0.116:/root/651-p2/models/"
+echo "   scp /spinning/llm_stuff/club-3090/models-cache/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf root@efeu-TP14.fritz.box:/root/651-p2/models/"

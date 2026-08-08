@@ -1496,3 +1496,7 @@ Standing protective posture: every boot runs the guard and refuses to
 serve on a poisoned GPU, so no wrong number can leak while attribution
 is open. Next: make the GFXOFF disable stick (write format / ppfeaturemask
 / kernel param), then a 5x-guard + 30-min-idle battery for closure.
+
+OPERATIONAL (user, 2026-08-08): reach the laptop as efeu-TP14.fritz.box
+(DNS via the router; survives DHCP drift — the .116->.164 episode). The ssh
+KEY FILE keeps its historical name id_ed25519_root@192.168.0.116.

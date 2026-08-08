@@ -93,7 +93,7 @@ setsid env CUDA_VISIBLE_DEVICES="$IDX" PYTHONPATH="$TREE/python" \
   --disable-cuda-graph --disable-radix-cache \
   --mamba-radix-cache-strategy no_buffer \
   --disable-overlap-schedule --page-size 1 \
-  --mem-fraction-static 0.85 --chunked-prefill-size 1024 \
+  --mem-fraction-static 0.93 --chunked-prefill-size 1024 \
   --host 127.0.0.1 --port $PORT --log-level info > "$LOG" 2>&1 &
 SERVER_PID=$!
 SERVER_PGID=$(ps -o pgid= -p $SERVER_PID | tr -d " ")
