@@ -1240,3 +1240,24 @@ quiet machine; (b) the future CPU+iGPU PP co-run must re-validate kernel
 correctness UNDER CONTENTION before any co-run measurement counts; (c) the
 Q5_K tensors (38 in the Q4_K_M file) are a latent hazard under co-run load —
 candidate for the same Q8_0 requant treatment if co-run validation shows it.
+
+### 12.9 The NEXTN spec fault heals with Q6_K gone [MEASURED]
+
+On the no-Q6K derived checkpoint, NEXTN serving (same lean spec recipe:
+steps 1 / topk 1 / draft tokens 2, draft = same file, ctx 2048) survived
+**186 s of continuous generation: 22 requests, 2816 completion tokens,
+accept_length 1.87 (completion/spec_verify_ct), zero errors, zero HIP
+faults** — where the original file died in 10-40 s twice with a clean
+no-spec control (§1.5.3). The draft path exercises the lm_head every draft
+step; on the original file that head is Q6_K, i.e. the broken kernel family.
+Caveat: the old fault was intermittent within 10-40 s; 186 s clean is strong
+but a longer soak on the eventual coherent base should confirm. AMD_SERIALIZE
+was never needed — elimination via the containment localized it first.
+
+Floors note: bandwidth_floor.py measured iGPU read **79.3 GB/s** (spread
+1.2%; ~88% of dual-channel DDR5-5600 theory) — but the copy arm was
+contaminated by a concurrent llama-server build (spread 25.7%); re-run quiet
+before quoting. Implied MoE decode ceiling ~43 tok/s against measured ~12.5:
+current serving is launch/compute-bound (graphs off), NOT bandwidth-bound.
+Every future measurement session must include an under-load determinism arm
+(run pins_gfx1103.py concurrently with a saturating load once per session).
