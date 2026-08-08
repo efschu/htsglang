@@ -24,7 +24,7 @@ statements, and confusing them is the main hazard in this area:
 |---|---|
 | **This tree (`feat/gguf-q4-bringup-651`)** | GGUF has **no ROCm path**. Kernels absent from the ROCm build, ops never registered, `sgl-kernel` refuses gfx1103 outright. Fully evidenced in §2. |
 | **The laptop, right now** | **Works** for Q4_K_M without speculation, via an out-of-tree port that supplies exactly what §2 says is missing. §1.5 |
-| **CPU-only, either way** | **Impossible.** Dense materialization needs ~67 GiB against 29.5 GiB of RAM, a 2.3x overshoot. §3 |
+| **CPU compute, via this fork's only current path** | Dense materialization needs ~67 GiB against 29.5 GiB. But that is a **missing-kernel gap, not physics** — llama.cpp computes on quantized blocks and Q4 stays ~22 GB. §3 |
 
 **The two real problems now are:**
 
@@ -108,9 +108,12 @@ In `/root/lh/models/` — note these are **not** the rig's file:
 The rig carries `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (21,795 MiB) instead. The
 2026-08-07 claim that "there is no smaller fallback without a new download" is
 **false for the laptop**: a Q2_K_XL at 11,992 MiB is already there, and it
-halves the weight budget. It is the obvious vehicle for proving a pipeline works
-before spending the full Q4 budget on it — quality is materially worse, so it is
-a bring-up instrument, not the destination.
+halves the weight budget. **But per the checkpoint policy (§6.0), Q4_K_M is the
+target and Q2 is "zu dumm" — Q2_K_XL is a DEBUG vehicle only** (kernel
+validation, spec-fault hunting, fast iteration). No Q2 number may be quoted as a
+result. If a configuration stops fitting once the CPU stage takes memory, the
+fallback is a **Q3 variant (UD-Q3_K_XL class), which is NOT on the laptop and
+would need a download** — not Q2.
 
 `config.json`, `tokenizer.json` and `chat_template.jinja` are present beside
 them, which is what `--tokenizer-path` needs.
@@ -491,9 +494,25 @@ echo $HSA_OVERRIDE_GFX_VERSION              # gfx1103 is not officially ROCm-
 
 ---
 
-## 3. The CPU-only fallback is physically impossible here [MEASURED]
+## 3. The 67 GiB figure is a property of THIS FORK, not of CPUs [MEASURED]
 
-Not "slow" — impossible, by arithmetic that needs no hardware.
+**Read this section carefully — its headline was wrong in revisions 1 and 2 and
+the wrong version is easy to quote.**
+
+The ~67 GiB is the cost of **the fork's only currently existing CPU path**:
+dense bf16 materialization at the measured 3.17x, forced because **this tree has
+no CPU K-quant kernels**. It is *not* an inherent cost of running this model on
+a CPU. **llama.cpp computes directly on quantized blocks on CPU, where Q4 stays
+~22 GB.** So the correct statement is:
+
+| Claim | Status |
+|---|---|
+| "A CPU stage costs 3.17x memory" | True **only** of the dense-materialization stopgap |
+| "This model cannot run on CPU in 32 GB" | **FALSE.** llama.cpp is the existence proof |
+| "This *fork* cannot today run a CPU stage without dense materialization" | **True**, and it is a missing-kernel gap, not physics |
+
+The arithmetic below therefore prices **one implementation route among two**
+(§6.0), and it is the route we do *not* intend to ship.
 
 There is no CPU K-quant kernel (§2.3 — `get_quant_method`, `gguf.py:165-192`,
 branches only on `_is_npu`; a grep of the whole file for `is_cpu` or
@@ -627,57 +646,99 @@ near-verbatim:
 **The CPU is explicitly NOT a fallback and NOT a memory tier. It is an active
 PP-prefill stage.**
 
-### 6.0 This reopens the CPU question — §3's verdict was scoped too widely
+### 6.0 Checkpoint policy (user, 2026-08-08) — Q4 is the target
 
-§3 proves a CPU stage cannot hold **all 40 layers** dense (~67 GiB vs 29.5 GiB).
-A PP stage holds a **layer share k**, and at realistic k the arithmetic is
-completely different. Reproduce with `docs/dev/651/cpu_stage_k.py`.
+**Q2 is "zu dumm" and is not the quality target.** Order of preference:
 
-**Route A — dense-materialize only the CPU stage's layers** (no porting; the
-measured 3.17x applies to that share only):
+1. **Q4_K_M — primary.** It already serves on the iGPU (21,614 MiB, ~3.1 GiB
+   slack). Everything meant to *stand* is measured here.
+2. **A Q3 variant** (UD-Q3_K_XL class) — the fallback if a configuration stops
+   fitting once the CPU stage takes memory. **Would need a download; not on the
+   laptop today.**
+3. Anything smaller, only after that.
+
+**Q2_K_XL stays useful as a cheap DEBUG vehicle** — kernel validation,
+spec-fault hunting, fast iteration — because it halves load time and leaves
+huge headroom. But **every measurement meant to stand must be re-run on Q4**
+(or Q3 if that becomes the shipping fallback). Do not quote a Q2 number as a
+result.
+
+### 6.0.1 Pricing the CPU stage — quant-compute is the PRIMARY route
+
+§3 priced a CPU stage holding **all 40 layers** *dense*. A PP stage holds a
+**layer share k**, and the dense assumption is the wrong one to build on.
+Reproduce with `docs/dev/651/cpu_stage_k.py`.
+
+**ROUTE B (PRIMARY) — CPU-native quantized compute.** Port or adapt ggml's CPU
+quant kernels, or write an equivalent minimal CPU quant-matmul. **No 3.17x at
+all**: the CPU stage costs `~k x quant-size`, memory the machine already holds
+(5,263 MiB spare on Q4_K_M). **k is bounded purely by the balance point, not by
+memory, and Q4_K_M stays the target.**
+
+Three things make this much smaller than "port the GGUF surface to CPU":
+
+- **The CPU stage needs far fewer ops than the full GGUF surface** — only the
+  quant types this checkpoint actually uses, on the layers the CPU will own.
+- llama.cpp's `ggml-cpu` is the existence proof and the reference
+  implementation, and the 8840HS is **Zen4**, so the AVX-512 paths apply.
+- **CPU compute sidesteps the gfx1103 Q6_K bug entirely** for the tensors it
+  owns — and the CPU dequant is already the *validated-correct reference* the
+  containment in §1.5.4 leans on.
+
+**ROUTE A (STOPGAP COMPARATOR ONLY) — dense-materialize the CPU stage's layers.**
+Nearly free to try (generalize the Ascend load-time helper,
+`gguf.py:1557-1581`), and useful as a cheap way to get real co-run numbers
+before committing to B. But it caps k hard and forces the debug checkpoint:
 
 | Checkpoint | packed/layer | **max k** | max CPU layers | iGPU MiB |
 |---|---:|---:|---:|---:|
-| Q4_K_M | 502.0 MiB | **0.119** | **4.8** | 19,216 |
-| Q2_K_XL | 278.5 MiB | **0.281** | **11.2** | 8,864 |
+| Q4_K_M (target) | 502.0 MiB | **0.119** | **4.8** | 19,216 |
+| Q2_K_XL (debug) | 278.5 MiB | **0.281** | **11.2** | 8,864 |
 
-Both leave the iGPU share well under the 25,600 MiB GTT ceiling, so **RAM, not
-the GTT window, is what binds route A.**
+Against the balanced split `L_cpu = 40/(R+1)` and ceiling `1 + 1/R`, route A is
+viable on the debug checkpoint for R >= ~3, but **on the Q4 target only for
+R >= ~8, where the payoff is already down to ~+12%**. That is precisely why it
+is a comparator and not the destination.
 
-Is that share *enough*? The balanced split is `L_cpu = 40/(R+1)` with
-`R = prefill_igpu / prefill_cpu`, and the ceiling is `1 + 1/R`:
+**Decision: build B. Use A only if it buys co-run numbers sooner.**
 
-| R | balanced L_cpu | max speedup | fits Q2_K_XL? | fits Q4_K_M? |
-|---:|---:|---:|:--:|:--:|
-| 3 | 10.0 | **+33%** | **YES** | no |
-| 4 | 8.0 | +25% | **YES** | no |
-| 5 | 6.7 | +20% | **YES** | no |
-| 8 | 4.4 | +12% | **YES** | **YES** |
-| 10 | 3.6 | +10% | **YES** | **YES** |
+### 6.0.2 Measurement discipline — solo numbers do NOT predict co-run
 
-**Route A is viable on Q2_K_XL for any R >= ~3**, and on Q4_K_M only for
-R >= ~8, where the payoff has already shrunk to ~+12%.
+The user's explicit expectation: **the CPU part will be much slower and take far
+fewer layers than the iGPU, and the optimum must be measured.** Critically:
 
-**Route B — CPU-native K-quant compute.** llama.cpp's `ggml-cpu` kernels are the
-existence proof, and the 8840HS is Zen4 so the AVX-512 paths apply. No 3.17x at
-all: the CPU stage costs only its *packed* share, which the machine already
-holds (5,263 MiB spare on Q4_K_M, 14,885 on Q2_K_XL). **k is then bounded purely
-by the balance point, not by memory, and Q4_K_M stays on the table.**
+> **Solo measurements of each part do not predict co-run behaviour — under
+> parallel operation both parts throttle each other.**
 
-**Effort/yield, stated rather than silently chosen:**
+On this APU that coupling is **threefold**, and it is the mechanism, not a
+caveat:
 
-- **Route A** is nearly free to try — it needs only a load-time dense
-  materialization path (generalize the Ascend helper, `gguf.py:1557-1581`). It
-  buys a *measurement of R on real layers* cheaply. But it caps k, forces
-  Q2_K_XL, and burns RAM that the iGPU wants.
-- **Route B** is real work (vendor `ggml-quants` CPU kernels + a CPU linear
-  method) but it is the correct destination: no memory penalty, works with
-  Q4_K_M, and the same kernels would make CPU offload/tiering good everywhere.
+1. **Shared TDP / thermal envelope** — CPU load steals the iGPU's power budget
+   and vice versa. (Recorded host smoke shows headroom today: `temp_max 57 C`,
+   `ppt_max 19.14 W` — but that was a *quiescent* sample, not a co-run.)
+2. **Shared DDR5 bandwidth** — one pool, both consumers.
+3. **Shared memory-controller contention** — distinct from raw bandwidth.
 
-**Recommendation: use A as the probe that measures R, then commit to B if R
-justifies it.** Do not build A as the destination.
+**The plan, in order:**
 
-### 6.0.1 R must be MEASURED before choosing `--pp-layer-ratio`
+- **(a) Solo baselines per stage** — prefill ms per layer-block on *real* layers,
+  each stage alone.
+- **(b) CO-RUN measurement** with both stages active simultaneously at
+  representative shares. **The co-run numbers, not the solo ones, feed
+  `--pp-layer-ratio`.**
+- **(c) Sweep 2-3 candidate splits around the co-run-derived optimum**, because
+  contention shifts the optimum away from the solo ratio.
+
+**Record clocks and power alongside every point** — on this hardware they *are*
+the mechanism. `docs/dev/651/bench_prefill.py` already provides the A-vs-A noise
+floor, warmup discard, unique prompts and time-bounded runs this needs; the
+co-run harness is the piece that does not exist yet.
+
+**If the co-run measurement says the CPU stage's net contribution is negligible
+or negative after throttling, that is a reportable verdict, not a failure.** The
+user wants the real optimum, whatever it turns out to be.
+
+### 6.0.3 R must be MEASURED before choosing `--pp-layer-ratio`
 
 `--pp-layer-ratio` exists, sums to backbone depth **40**, and should be set
 **proportional to measured stage prefill throughput — not to core counts**.
@@ -688,7 +749,7 @@ is plausibly meaningful — but that is a hypothesis, not a result.
 `docs/dev/651/bench_prefill.py` already does the A-vs-A noise floor and the
 `--split-from` balance arithmetic this needs.
 
-### 6.0.2 The phase flip, and what PP+spec exclusivity actually binds
+### 6.0.4 The phase flip, and what PP+spec exclusivity actually binds
 
 Decode after the flip is a **single-worker** regime, so the PP-vs-speculation
 conflict is a property of the **prefill** phase's world shape only — *in
@@ -707,7 +768,7 @@ That is precisely the **#297 envelope / Route A (#631)** question, and its
 not exist here. **Check what Route A's work already gives you before building
 any flip machinery.** Do not re-derive it.
 
-### 6.0.3 Engineering unknowns to map before building
+### 6.0.5 Engineering unknowns to map before building
 
 Findings from reading this tree, marked honestly — these are **blockers to
 verify**, not assumptions:
@@ -736,7 +797,7 @@ verify**, not assumptions:
   have to run eager.
 - **PP stages must occupy disjoint GPU groups** (`server_args.py:9066-9098`).
 
-### 6.0.4 Staging
+### 6.0.6 Staging
 
 Prerequisite #1 is **the ROCm port for the iGPU part, regardless of everything
 above** — decode is iGPU-only, so nothing serves without it. It is already
@@ -769,7 +830,7 @@ of `docs/dev/651/boot.sh`. Specifically:
   so the offload machinery has nothing to grab (`expert_offload.py:1245`,
   `:1447`, `:2130`; `planner/rejected.py:289`). That is a rebuild, not a flag.
 
-### 6.2 PP + speculation: closed tree-wide (see 6.0.2 for what this binds)
+### 6.2 PP + speculation: closed tree-wide (see 6.0.4 for what this binds)
 
 Both routes are shut, on **every** machine:
 
@@ -847,14 +908,15 @@ before use. Its *staging logic* is still the right shape:
 
 | Stage | Config | Answers |
 |---|---|---|
-| **a** | TP=1, no spec, eager, **Q2_K_XL** | loader / kernels / checkpoint |
-| **b** | TP=1, NEXTN spec, Q2_K_XL | the #647 router-gate fix (§9.1) |
-| **c** | TP=1, NEXTN spec, **Q4_K_M** | the real memory budget (§4) |
-| **d** | + `--cpu-offload-gb` | does offload compose with GGUF (§6.1) |
+| **a** | TP=1, no spec, eager, Q2_K_XL (debug) | loader / kernels / checkpoint |
+| **b** | TP=1, NEXTN spec, Q2_K_XL (debug) | the #647 router-gate fix (§9.1), spec fault |
+| **c** | TP=1, NEXTN spec, **Q4_K_M** — **counts** | the real memory budget (§4) |
+| **d** | **Q4_K_M** + co-run CPU stage | the PP split (§6.0.2) — **counts** |
 
-Start on **Q2_K_XL**, not Q4 — it halves the budget and isolates "does anything
-work at all" from "does it fit". This inverts the 2026-08-07 staging, which had
-no smaller checkpoint available to it.
+Q2_K_XL may be used to isolate "does anything work at all" from "does it fit",
+because it halves load time and leaves huge headroom. **But it is a debug
+vehicle only (§6.0): every stage whose result is meant to stand must be re-run
+on Q4_K_M.** Stages c and d below are the ones that count.
 
 Flags that still apply: `--model-path` must be the **`.gguf` FILE**, not its
 directory (`_prepare_weights` requires `os.path.isfile`, commit `d274bbe9ce`);

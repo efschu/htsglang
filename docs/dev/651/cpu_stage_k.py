@@ -10,12 +10,24 @@ prices k properly, for both implementation routes.
 
     python3 docs/dev/651/cpu_stage_k.py
 
-ROUTE A -- dense-materialize the CPU stage's layers (bf16).
-  No CPU K-quant kernel exists, so the CPU stage's layers must be unpacked.
-  Costs the measured 3.17x, but ONLY on the CPU share.
-ROUTE B -- CPU-native K-quant compute (llama.cpp's ggml-cpu is the existence
-  proof). No memory penalty at all; k is then bounded only by the balance
-  point, not by RAM. More porting work.
+ROUTE B (PRIMARY) -- CPU-native quantized compute. llama.cpp computes directly
+  on quantized blocks, so Q4 stays ~22 GB; there is NO 3.17x. The CPU stage
+  costs ~k * quant-size and k is bounded by the BALANCE POINT, not by RAM.
+  Needs only the quant types this checkpoint uses on the layers the CPU owns --
+  far less than the full GGUF surface. Also sidesteps the gfx1103 Q6_K bug,
+  since CPU dequant is the already-validated-correct reference.
+ROUTE A (STOPGAP COMPARATOR) -- dense-materialize the CPU stage's layers (bf16)
+  because THIS FORK has no CPU K-quant kernel. Costs the measured 3.17x on the
+  CPU share only. Caps k hard and forces the debug checkpoint. Not the
+  destination; useful only to get co-run numbers sooner.
+
+CHECKPOINT POLICY (user, 2026-08-08): Q4_K_M is the TARGET. Q2 is "zu dumm" and
+is a DEBUG vehicle only -- no Q2 number may be quoted as a result. Fallback if a
+config stops fitting is a Q3 variant (needs a download), never Q2.
+
+NOTE: solo stage speeds do NOT predict co-run -- CPU and iGPU throttle each
+other through shared TDP, DDR5 bandwidth and memory-controller contention.
+R here is a PARAMETER to sweep, not a measurement. See HANDOFF section 6.0.2.
 
 Everything lives in ONE physical DDR5 pool, so both stages plus the OS are
 charged against MemTotal. The iGPU share is additionally capped by the GTT
@@ -41,8 +53,8 @@ Q4KXL_TOTAL = 22853663008 / MiB
 _LAYER_FRACTION = (N_LAYERS * Q4KXL_PACKED_PER_LAYER) / Q4KXL_TOTAL
 
 CKPT = {
-    "Q4_K_M": 22663387424 / MiB,
-    "Q2_K_XL": 12574128416 / MiB,
+    "Q4_K_M (TARGET)": 22663387424 / MiB,
+    "Q2_K_XL (debug only)": 12574128416 / MiB,
 }
 
 # Runtime overhead: KV at ctx 8192 (20.00 KiB/token fp16) + activations +
@@ -95,12 +107,12 @@ def main() -> None:
     print("  Max prefill speedup = 1 + 1/R. R MUST BE MEASURED (see plan).")
     print()
     print(f"  {'R':>5s} {'balanced L_cpu':>15s} {'max speedup':>12s}"
-          f" {'fits Q2_K_XL?':>14s} {'fits Q4_K_M?':>13s}")
+          f" {'fits Q2(dbg)?':>14s} {'fits Q4(TGT)?':>13s}")
     for R in (2, 3, 4, 5, 8, 10, 20):
         l_bal = N_LAYERS / (R + 1)
         speedup = 1.0 + 1.0 / R
-        ok2 = "YES" if l_bal <= results["Q2_K_XL"] * N_LAYERS else "no"
-        ok4 = "YES" if l_bal <= results["Q4_K_M"] * N_LAYERS else "no"
+        ok2 = "YES" if l_bal <= results["Q2_K_XL (debug only)"] * N_LAYERS else "no"
+        ok4 = "YES" if l_bal <= results["Q4_K_M (TARGET)"] * N_LAYERS else "no"
         print(f"  {R:5d} {l_bal:15.1f} {speedup:11.0%} {ok2:>14s} {ok4:>13s}")
     print()
     print("  Read: route A is viable on Q2_K_XL for any R >= ~3, and on Q4_K_M")
