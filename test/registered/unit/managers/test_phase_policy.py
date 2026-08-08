@@ -792,6 +792,9 @@ def _runtime_stub(
     r._drain_fn = drain_fn
     r._owes_send_fn = owes_send_fn
     r.presence_withheld_rounds = 0
+    # #631 round-scoped entry evidence: the gate reads (epoch, round).
+    r._entry_round = 0
+    r._presence_wait_stamp = None
     r._presence_deadline_s = deadline
     r._presence_wait_started = None
     r._gate_open_epoch = None
@@ -1124,3 +1127,95 @@ def test_unarmed_forward_path_is_unchanged():
     assert commits == ["top-of-pass"]
     assert sends == [(True, ["req"])]
     assert s.pumps == []
+
+
+# -- round-scoped entry evidence ----------------------------------------------
+#
+# THE RULE: evidence must have the same scope as the guarantee it licenses.
+# The gate's guarantee is per ROUND; epoch-scoped flags made round N's
+# quorum a standing authorisation for every later round, because flags are
+# never cleared. Reproduced on metal 2026-08-08 23:12:38Z with all three
+# stacks (evidence-631/wedge_20260808T231450Z_INSIDE_REDUCTION): ranks 0
+# and 2 inside round N+1's reduction, rank 1 blocked at its top-of-pass
+# commit between rounds, gate re-opened in 0.00s on stale flags.
+
+
+def test_can_fail_a_completed_round_does_not_open_the_next_one(tmp_path):
+    """THE REPRODUCTION, as a unit falsifier.
+
+    Round N assembles and the gate opens. The rank then completes that
+    reduction and moves to round N+1. The SAME flags are still on disk --
+    they are never cleared -- and they must NOT open round N+1, because
+    they are evidence about N and say nothing about where the peers are
+    now. This is the exact cycle the metal wedge closed.
+    """
+    presence = _presence(tmp_path, rank=0)
+    peers = [_presence(tmp_path, rank=r) for r in (1, 2)]
+    r = _runtime_stub(presence)
+
+    # Round 0: the whole group announces, the gate opens.
+    for p in peers:
+        p.announce(1, round_=0)
+    assert r._await_group_presence() is True
+
+    # The reduction completes; the rank advances to round 1. on_round does
+    # this increment right after the collective returns.
+    r._entry_round = 1
+
+    assert r._await_group_presence() is not True, (
+        "round 0's quorum opened round 1. Flags are never cleared, so an "
+        "epoch-scoped read makes the gate a rubber stamp after its first "
+        "use -- and the peers then enter a reduction that a rank stuck at "
+        "its top-of-pass commit can never join (metal wedge 23:12:38Z)"
+    )
+    assert presence.observe(1, round_=0) == {0, 1, 2}, "round 0 stays a fact"
+    assert presence.observe(1, round_=1) == {0}, "only this rank has reached round 1"
+
+    # And round 1 opens on ITS OWN quorum, not before.
+    for p in peers:
+        p.announce(1, round_=1)
+    assert r._await_group_presence() is True
+
+
+def test_round_stamped_flags_stay_monotone_within_their_stamp(tmp_path):
+    """Round-scoping must not cost the racing-writer safety that motivated
+    monotonicity. Within a stamp a flag is still set once and never
+    unset; a later round simply asks a NEW question."""
+    presence = _presence(tmp_path, rank=0)
+    for _ in range(5):
+        presence.announce(1, round_=3)
+    assert presence.observe(1, round_=3) == {0}
+    # Earlier and later rounds are untouched by it.
+    assert presence.observe(1, round_=2) == set()
+    assert presence.observe(1, round_=4) == set()
+    # And a retraction still mints a new EPOCH rather than clearing.
+    assert presence.all_present(2, round_=3) is False
+
+
+def test_pre_entry_bound_is_per_round_not_per_arm(tmp_path):
+    """A fresh round is a fresh question and gets its own budget. Carrying
+    the previous round's elapsed time forward would abandon a healthy
+    round for time spent waiting in an earlier one."""
+    now = {"t": 0.0}
+    presence = _presence(tmp_path, rank=0)
+    r = _runtime_stub(presence, deadline=30.0, clock=lambda: now["t"])
+
+    # Round 0 waits almost the whole budget without assembling.
+    assert r._await_group_presence() is None
+    now["t"] = 29.0
+    assert r._await_group_presence() is None
+    assert r.presence_timeouts == 0
+
+    # Move to round 1: the clock restarts, so this round is not condemned
+    # by round 0's wait.
+    r._entry_round = 1
+    now["t"] = 40.0
+    assert r._await_group_presence() is None
+    assert r.presence_timeouts == 0, (
+        "the new round inherited the previous round's elapsed time and "
+        "abandoned immediately"
+    )
+    # It does still expire on its OWN budget.
+    now["t"] = 71.0
+    assert r._await_group_presence() is None
+    assert r.presence_timeouts == 1

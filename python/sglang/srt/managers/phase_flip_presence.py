@@ -188,15 +188,68 @@ killed designs here: this fork's async SENDS demonstrably do not progress
 without an explicit commit (that is corpse A). Betting the gate on the
 reduction transport behaving differently, unverified, is the same bet.
 
-EPOCHS, AND WHY FLAGS ARE NEVER CLEARED
----------------------------------------
-Flags are monotone within an epoch: a rank sets its own and never unsets
-it. Retraction -- a policy that changes its mind, a disarm on timeout --
-mints a NEW epoch instead. That is what makes a poll safe against a stale
-read: a flag observed for epoch E is a fact about E forever, so no reader
-can be fooled by a racing writer, and no writer has to coordinate a clear.
-Clearing would reintroduce exactly the ordering problem the flags exist to
-remove.
+EVIDENCE MUST HAVE THE SAME SCOPE AS THE GUARANTEE IT LICENSES
+--------------------------------------------------------------
+THE RULE, and the one that cost the most to learn. A flag is evidence.
+The gate's guarantee -- "every participant is at THIS reduction's entry"
+-- is per ROUND. Stamping the evidence per EPOCH made round N's quorum a
+standing authorisation for round N+1 and every round after it, because
+flags are never cleared. The gate was then sound exactly once and a rubber
+stamp thereafter, and the reproduction (corpse E) is what that buys: rank
+1 blocked at its top-of-pass commit BETWEEN rounds while ranks 0 and 2
+re-opened the gate in 0.00 s on stale flags and entered round N+1 without
+it. Markers are therefore stamped ``(epoch, round)``.
+
+THE INDUCTION, AND WHY IT NOW CLOSES
+------------------------------------
+Round-scoping is not merely a tighter check; it makes the announce mean
+something it could not mean before. Announcing for round R is only
+REACHABLE after this rank has completed its round-R top-of-pass commit --
+that commit sits on the path to the hook -- so a round-stamped flag says
+"my chain is settled for R". Hence:
+
+  rank k announces R  =>  k's send to k+1 is settled for R
+  all ranks announced R  =>  the whole chain 0->1->2 is settled for R
+  => no rank inside round R's reduction is owed any chain operation
+  => the blocking reduction is safe, per round, BY CONSTRUCTION
+
+That is the same intent as the withdrawn "announce only once you owe no
+send" clause, obtained at the correct granularity and with no new
+machinery -- no drain, no progress engine, no predicate the transport
+cannot honour (see corpse F).
+
+The remaining failure mode is a rank that never REACHES round R because it
+is busy with real work. The per-round pre-entry bound converts that into a
+loud, unanimous abandonment and a later retry -- the designed outcome, and
+free, because nothing has been entered.
+
+EPOCHS, ROUNDS, AND WHY FLAGS ARE NEVER CLEARED
+-----------------------------------------------
+Flags are monotone WITHIN AN (epoch, round) STAMP: a rank sets its own and
+never unsets it. Retraction -- a policy that changes its mind, a disarm on
+timeout -- mints a NEW epoch instead. That is what makes a poll safe
+against a stale read: a flag observed for (E, R) is a fact about (E, R)
+forever, so no reader can be fooled by a racing writer, and no writer has
+to coordinate a clear. Clearing would reintroduce exactly the ordering
+problem the flags exist to remove.
+
+Round-scoping does NOT weaken that. Monotonicity was never about the flag
+outliving its question -- it is about no reader ever seeing a flag go
+backwards. Narrowing the stamp keeps every bit of that safety and removes
+only the over-reach: the flag stops answering a question it was never
+evidence for. A later round simply asks a NEW question, and gets no answer
+until its own quorum forms.
+
+WHERE THE ROUND NUMBER COMES FROM, and why the ranks agree on it
+---------------------------------------------------------------
+NOT from any rank's local loop counter. Under event_loop_pp those diverge
+in absolute value (pipeline fill, conditional per-slot ops) -- that
+divergence is the reason the armed/parked gate exists at all, so building
+the stamp on it would be circular. The round index is instead the count of
+CONSENSUS REDUCTIONS this arm has completed, and the ranks agree on it by
+construction: a completed reduction is a synchronisation point that every
+participant leaves together, so all of them enter the next one with the
+same count. The very collective being gated is what numbers the gate.
 """
 
 from __future__ import annotations
@@ -292,26 +345,30 @@ class PhaseFlipPresence:
             )
         return removed
 
-    def _path(self, epoch: int, rank: int) -> str:
+    def _path(self, epoch: int, rank: int, round_: int = 0) -> str:
         return os.path.join(
-            self.directory, f"{self.instance}.e{int(epoch)}.r{int(rank)}"
+            self.directory,
+            f"{self.instance}.e{int(epoch)}.n{int(round_)}.r{int(rank)}",
         )
 
-    def announce(self, epoch: int, note: str = "") -> None:
-        """Publish THIS rank's readiness for ``epoch``. Idempotent.
+    def announce(self, epoch: int, note: str = "", round_: int = 0) -> None:
+        """Publish THIS rank's readiness for ``(epoch, round_)``. Idempotent.
 
         Written via a temp file and an atomic rename, so a reader can never
         observe a partially created marker. Announcing twice is a no-op by
         construction, which matters because the armed poll loop calls this
         every iteration rather than tracking whether it already did.
         """
-        path = self._path(epoch, self.rank)
+        path = self._path(epoch, self.rank, round_)
         if os.path.exists(path):
             return
         tmp = f"{path}.tmp.{os.getpid()}"
         try:
             with open(tmp, "w") as fh:
-                fh.write(f"rank={self.rank} epoch={epoch} pid={os.getpid()} {note}\n")
+                fh.write(
+                    f"rank={self.rank} epoch={epoch} round={round_} "
+                    f"pid={os.getpid()} {note}\n"
+                )
             os.replace(tmp, path)
         except OSError as exc:  # pragma: no cover - disk-full etc.
             logger.error("%s could not announce %s: %s", LOG_PREFIX, path, exc)
@@ -320,20 +377,20 @@ class PhaseFlipPresence:
             except OSError:
                 pass
 
-    def observe(self, epoch: int) -> Set[int]:
-        """Which ranks have announced for ``epoch``. Never blocks."""
+    def observe(self, epoch: int, round_: int = 0) -> Set[int]:
+        """Which ranks have announced for ``(epoch, round_)``. Never blocks."""
         present: Set[int] = set()
         for r in range(self.n_ranks):
-            if os.path.exists(self._path(epoch, r)):
+            if os.path.exists(self._path(epoch, r, round_)):
                 present.add(r)
         return present
 
-    def missing(self, epoch: int) -> List[int]:
-        present = self.observe(epoch)
+    def missing(self, epoch: int, round_: int = 0) -> List[int]:
+        present = self.observe(epoch, round_)
         return [r for r in range(self.n_ranks) if r not in present]
 
-    def all_present(self, epoch: int) -> bool:
-        return len(self.observe(epoch)) == self.n_ranks
+    def all_present(self, epoch: int, round_: int = 0) -> bool:
+        return len(self.observe(epoch, round_)) == self.n_ranks
 
     def sweep(self, keep_epoch: Optional[int] = None) -> int:
         """Drop markers from older epochs. Housekeeping only.
@@ -353,7 +410,8 @@ class PhaseFlipPresence:
             if not name.startswith(prefix):
                 continue
             try:
-                epoch_part = name.split(".e", 1)[1].split(".r", 1)[0]
+                # {instance}.e{epoch}.n{round}.r{rank}
+                epoch_part = name.split(".e", 1)[1].split(".n", 1)[0]
                 epoch = int(epoch_part)
             except (IndexError, ValueError):
                 continue
