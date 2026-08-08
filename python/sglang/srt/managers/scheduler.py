@@ -2443,15 +2443,6 @@ class Scheduler(
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
-            # #631: wired only when the policy is on, so a manual-flip or
-            # non-flip boot carries a None here and the receiver's default
-            # path is untouched.
-            phase_policy_hook=(
-                self.maybe_arm_phase_policy
-                if getattr(self, "phase_policy_cfg", None) is not None
-                and self.phase_policy_cfg.enabled
-                else None
-            ),
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -4118,6 +4109,14 @@ class Scheduler(
             )
 
             self.phase_flip_runtime = build_phase_flip_runtime(self)
+        # #631 automatic phase policy: evaluated on EVERY rank, from the
+        # replicated scheduler state, immediately before the consensus
+        # round that would carry the resulting arm. No message is sent --
+        # see maybe_arm_phase_policy for why a control message here is
+        # the thing that deadlocks.
+        if getattr(self, "phase_policy_cfg", None) is not None:
+            if self.phase_policy_cfg.enabled:
+                self.maybe_arm_phase_policy()
         flip_stats = self.phase_flip_runtime.on_round(
             require_armed_and_parked=require_armed_and_parked
         )
@@ -6746,27 +6745,44 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def maybe_arm_phase_policy(self):
-        """#631: evaluate the automatic phase policy. Returns a
-        ``PhaseFlipReqInput`` to inject into the request stream, or None.
+        """#631: evaluate the automatic phase policy and arm THIS rank.
 
-        WHY THIS RETURNS A REQUEST INSTEAD OF ARMING DIRECTLY. Arming is a
-        REPLICATED call: the flip commits only at a consensus boundary
-        where every rank is armed, and an unarmed rank performs no
-        collective at all. So a rank that arms alone parks its own
-        requests and blocks in a reduction its peers never enter, bounded
-        only by barlink liveness -- a tree kill, not a refusal. Under this
-        deployment (pp_size=3, tp_size=1) nothing else establishes that
-        agreement: the #363 observer's cross-rank interlocks are no-ops at
-        tp_size=1, and the PP ranks' local round counters are measured to
-        diverge, so a per-rank policy verdict is exactly the divergence
-        that wedges the tree.
+        EVERY rank runs this, and each one arms itself. No control
+        message is sent, and that is the whole point.
 
-        Therefore only the request-ORIGIN rank decides, and its verdict
-        travels as the SAME control request a POST /phase_flip produces,
-        through the SAME distribution the RPC path already uses on metal:
-        the P2P stage chain in the PP phase, the TP broadcast in the TP
-        phase. Every rank then arms via handle_phase_flip, one proven code
-        path, and no rank can arm alone by construction.
+        The obvious design -- one rank decides and ships its verdict to
+        the others -- was built and measured, and it deadlocks in two
+        different ways, because it adds a SECOND blocking channel (a
+        control message on the PP point-to-point chain) alongside the
+        flip's group reduction, with no global order between them. Rank 0
+        armed itself in the pass that injected the message and entered
+        the blocking reduction while its peers were still waiting to
+        RECEIVE that message (py-spy: rank 0 in bounded_collective, ranks
+        1-2 in _pull_raw_reqs, 0 % GPU). Forwarding the message
+        synchronously to fix that deadlocked worse, against the
+        hidden-states exchange. This is the fork's standing
+        collective-family pattern (#431, #616, #639): patching the
+        ordering case by case fights it, removing the channel ends it.
+
+        There is no need for the channel, because the SIGNAL IS ALREADY
+        REPLICATED. Under PP every stage receives the same request stream
+        over the chain and runs the same scheduling decisions on it, so
+        waiting_queue and running_batch hold the same values on every
+        rank -- measured directly in the scheduler's own log, where the
+        three stages print identical ``#running-req``, ``#queue-req`` and
+        ``#pending-token`` at the same timestamp. ``decide`` is a pure
+        function of those values, so identical inputs give an identical
+        verdict on every rank, with zero messages.
+
+        The existing arm machinery then does exactly what it was designed
+        for: ranks arm at slightly different rounds, an armed rank enters
+        the reduction only once locally PARKED (owing no pipeline send),
+        and the peers converge on their own arm+drain -- "MIN-skew is
+        legal" per PhaseFlipRuntime.on_round. Skew is absorbed; only
+        DISAGREEMENT is fatal, and disagreement is impossible from
+        identical inputs. The reduction's equality family (epoch,
+        config_fp, direction once armed) is the standing loud check that
+        this assumption still holds.
         """
         cfg = getattr(self, "phase_policy_cfg", None)
         if cfg is None or not cfg.enabled:
@@ -6809,11 +6825,17 @@ class Scheduler(
         logger.warning(
             "PHASE-POLICY arming %s: %s", decision.direction, decision.reason
         )
-        # internal=True: nobody is awaiting a reply to this, and answering
-        # it would kill the TokenizerManager. See handle_phase_flip.
-        return PhaseFlipReqInput(
-            direction=decision.direction, source="policy", internal=True
-        )
+        # Arm THIS rank, through the same entry the RPC path ultimately
+        # calls. Every rank reaches this line from its own identical
+        # verdict, so the group is armed without a single message.
+        ok, msg = self.arm_phase_flip(decision.direction, source="policy")
+        if not ok:
+            # A refusal is normal (guards, or a phase that moved under
+            # us). Roll the dwell clock back so the policy can re-decide
+            # rather than sit out a dwell it never used.
+            state.last_flip_at = 0.0
+            logger.warning("PHASE-POLICY arm refused: %s", msg)
+        return None
 
     def arm_phase_flip(self, direction: str, source: str):
         """#631: replicated arming entry (RPC / regime gate). Activates the
