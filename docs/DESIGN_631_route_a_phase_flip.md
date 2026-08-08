@@ -421,3 +421,23 @@ in the boot check rather than assuming.
    protocol + regime-gate wiring (integration; first GPU boots).
 6. Rig validation: PP=3 prefill -> flip -> TP=3 decode, token-exact vs
    no-flip reference, measured flip cost vs the section 1 budget.
+
+   MEASUREMENT DOCTRINE (standing user order, 2026-08-08, applies to
+   every decision-feeding number in this step): all timings are
+   MS PER ROUND PER RANK, split into COMPUTE vs WAIT, taken with
+   CollectiveClock (#252 -- 0.13% overhead, graph-replay-honest).
+   Never tok/s as a decision basis. Specifically:
+   - prefill before/after: ms/Prefill per rank compute+wait (the #625
+     baseline is already in this form -- comparisons stay in it);
+   - decode before/after: ms/Verify per rank compute+wait, with accept
+     length and verify_ct recorded alongside EVERY decode round;
+   - flip cost: per-phase ms on every rank (KV pack/exchange/write from
+     the runtime stats, arena refill, GDN move, cutover), reported per
+     rank so the binding rank is identified, not averaged away;
+   - the two unmeasured ledger terms (NCCL two-group-sets, activation)
+     measured on the same boots;
+   - every run >= 10 s, and an A-vs-A same-boot noise floor is
+     established BEFORE any delta is read (the 0.10% #625 floor is the
+     reference shape);
+   - the 8k-prefill break-even line of section 1 is verified in these
+     units (flip round-trip ms vs PP-vs-TP ms/Prefill delta at 2k/8k/32k).
