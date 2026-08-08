@@ -154,6 +154,12 @@ class LockstepSentinel:
         self._last_min = -1
         self._last_min_t = time.monotonic()
         self._last_stall_log = 0.0
+        # all-frozen detection (specimen 20260808T060219Z: every ring froze
+        # at the same seq — no leader, so the leader-ahead stall check is
+        # structurally blind to the mutual-deadlock shape)
+        self._last_seqs: Optional[List[int]] = None
+        self._last_seqs_t = time.monotonic()
+        self._freeze_dumped = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         if self._fault_seq >= 0:
@@ -321,6 +327,39 @@ class LockstepSentinel:
                             last3,
                         )
                     self._dump_stall(tails)
+        # all-frozen: NO rank advanced — the mutual-deadlock wedge shape.
+        # Gated on prior traffic so an idle server stays silent; the farm
+        # drives continuous load, so 8 s of global freeze is a wedge.
+        if seqs == self._last_seqs:
+            frozen_for = now - self._last_seqs_t
+            if frozen_for > 8.0 and not self._freeze_dumped and m > 0:
+                self._freeze_dumped = True
+                logger.error(
+                    "SENTINEL FREEZE: no rank advanced for %.1fs (all at %s) — "
+                    "mutual-deadlock shape; dumping ring tails",
+                    frozen_for,
+                    seqs,
+                )
+                tail_n = 40
+                lo = max(0, self._seq - tail_n)
+                tails = self._gather(
+                    (lo, [self._tags[i % self.ring_len] for i in range(lo, self._seq)])
+                )
+                if tails is not None:
+                    for r, (rlo, rtags) in enumerate(tails):
+                        logger.error(
+                            "SENTINEL FREEZE anatomy: rank %d last events "
+                            "(from seq %d): ... %s",
+                            r,
+                            rlo,
+                            " | ".join(repr(t) for t in rtags[-3:]),
+                        )
+                    self._dump_stall(tails)
+        else:
+            self._last_seqs = list(seqs)
+            self._last_seqs_t = now
+            self._freeze_dumped = False
+
         # chain compare at position m-1 (chain AFTER the first m events)
         if self._seq - m >= self.ring_len - 8:
             return False  # peer too far behind to compare from our ring
