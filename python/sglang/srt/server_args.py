@@ -5236,6 +5236,34 @@ class ServerArgs:
             "read when --kv-reshard-vectors is set.",
         ),
     ] = 8
+    enable_phase_flip: A[
+        bool,
+        Arg(
+            help="#631 Route A: PP-prefill <-> TP-decode phase flip. The "
+            "server boots as the PP topology (pp_size ranks, tp=1) and "
+            "additionally builds a SECONDARY tp/dcp group set over the same "
+            "ranks plus a TP-shaped runner stack; at a quiescent regime "
+            "boundary the SAME ranks flip layout (weights arena refill, KV "
+            "and GDN state redistribution on the #297 consensus envelope), "
+            "serve decode as TP, and flip back for the next prefill regime. "
+            "Requires --phase-flip-tp-vector. V1 scope: single node, pure "
+            "PP boot topology (tp_size 1), no PD, no hierarchical cache, "
+            "no dual-group lane, no dp/ep, no speculation (the TP+NEXTN "
+            "decode arm is the named follow-up). Default off = none of the "
+            "secondary machinery is built, byte-identical to today.",
+        ),
+    ] = False
+    phase_flip_tp_vector: A[
+        Optional[str],
+        Arg(
+            help="#631: the weighted uneven-DCP token vector of the TP "
+            "decode phase, one comma-separated entry per rank (e.g. "
+            "'30,17,17'). Mandatory with --enable-phase-flip, refused "
+            "without it. Length must equal pp_size (the same ranks flip). "
+            "Also the TP layout's KV owner rule -- both phase pools are "
+            "sized at boot from it (DESIGN_631 section 3.4a).",
+        ),
+    ] = None
     enable_vram_dial: A[
         bool,
         Arg(
@@ -5991,6 +6019,10 @@ class ServerArgs:
         # server that cannot justify acting must fail to start rather than
         # start and quietly observe under an acting flag.
         self._handle_regime_controller()
+
+        # #631 Route A: validate the phase-flip surface at argument time
+        # (an invalid flip config fails the boot, not the first flip).
+        self._handle_phase_flip()
 
         # Erg. 9/9b KV pressure ladder: validate the step spec, the two
         # water marks and the asymmetric windows at argument time (a typo
@@ -7143,6 +7175,78 @@ class ServerArgs:
         # resolve_objective raises ValueError on an unknown value and returns
         # the enum member otherwise; store back the canonical string.
         self.objective = resolve_objective(self).value
+
+    def _handle_phase_flip(self):
+        """#631 Route A: argument-time validation of the phase flip.
+
+        DESIGN_631 section 5.1: everything checkable without boot facts is
+        checked here, loudly. Semantic boot-time checks (group formation
+        order, pool sizing, arena fit) live with the builders."""
+        if not self.enable_phase_flip:
+            if self.phase_flip_tp_vector is not None:
+                raise ValueError(
+                    "--phase-flip-tp-vector requires --enable-phase-flip "
+                    "(the vector configures the flip's TP layout; alone it "
+                    "does nothing, which would silently mask a typo)."
+                )
+            return
+        if self.phase_flip_tp_vector is None:
+            raise ValueError(
+                "--enable-phase-flip requires --phase-flip-tp-vector (the "
+                "TP decode layout's weighted DCP vector; there is no "
+                "default because pool sizing derives from it)."
+            )
+        try:
+            vec = [int(x) for x in self.phase_flip_tp_vector.split(",")]
+        except ValueError:
+            raise ValueError(
+                f"--phase-flip-tp-vector {self.phase_flip_tp_vector!r} is "
+                f"not a comma-separated integer vector."
+            ) from None
+        if not vec or any(v < 1 for v in vec):
+            raise ValueError(
+                f"--phase-flip-tp-vector entries must be >= 1, got "
+                f"{self.phase_flip_tp_vector!r}."
+            )
+        if self.pp_size <= 1:
+            raise ValueError(
+                "--enable-phase-flip boots as the PP topology and needs "
+                f"pp_size > 1, got pp_size={self.pp_size}."
+            )
+        if len(vec) != self.pp_size:
+            raise ValueError(
+                f"--phase-flip-tp-vector has {len(vec)} entries but "
+                f"pp_size is {self.pp_size}; the flip re-uses the SAME "
+                f"ranks, so the counts must match."
+            )
+        if self.tp_size != 1:
+            raise ValueError(
+                f"--enable-phase-flip V1 boots pure PP (tp_size 1), got "
+                f"tp_size={self.tp_size}."
+            )
+        blockers = []
+        if self.disaggregation_mode != "null":
+            blockers.append("--disaggregation-mode")
+        if self.enable_hierarchical_cache:
+            blockers.append(
+                "--enable-hierarchical-cache (#630: PP x disk HiCache "
+                "wedges at warmup)"
+            )
+        if getattr(self, "dual_group_lane", False):
+            blockers.append("--dual-group-lane")
+        if self.dp_size > 1:
+            blockers.append("--dp-size > 1")
+        if self.ep_size > 1:
+            blockers.append("--ep-size > 1")
+        if self.speculative_algorithm is not None:
+            blockers.append(
+                "--speculative-algorithm (TP+NEXTN decode arm is the named "
+                "phase-flip follow-up)"
+            )
+        if blockers:
+            raise ValueError(
+                f"--enable-phase-flip V1 refuses: {', '.join(blockers)}."
+            )
 
     def _handle_regime_controller(self):
         """#363: validate the mode and, for 'act', the entry gate.
