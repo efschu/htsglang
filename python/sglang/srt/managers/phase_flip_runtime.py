@@ -952,6 +952,18 @@ class PhaseFlipRuntime:
         self._presence_deadline_s = float(presence_deadline_s)
         self._presence_wait_started = None
         self._gate_open_epoch = None
+        #: #631 THE ROUND STAMP. Counts the consensus reductions this arm
+        #: has COMPLETED, and is the second half of the presence marker's
+        #: identity. The ranks agree on it without exchanging it: a
+        #: completed reduction is a synchronisation point they all leave
+        #: together, so they all enter the next one carrying the same
+        #: count. Never a local loop counter -- those diverge under
+        #: event_loop_pp, which is the very reason the gate exists.
+        self._entry_round = 0
+        #: The (epoch, round) whose pre-entry wait is currently being
+        #: timed. The bound is PER ROUND: a fresh round is a fresh
+        #: question and gets its own budget.
+        self._presence_wait_stamp = None
         self.presence_timeouts = 0
         #: Diagnostics: rounds in which presence was WITHHELD because this
         #: rank still owed a chain send (clause (i)). A non-zero count on a
@@ -1049,6 +1061,11 @@ class PhaseFlipRuntime:
                 source,
             )
         self._pending = direction
+        # A fresh arm starts a fresh round sequence. The epoch already
+        # distinguishes this arm from any earlier one, so the round
+        # simply restarts at 0 rather than having to be globally unique.
+        self._entry_round = 0
+        self._presence_wait_stamp = None
         # The park clock starts at ARMING, not at the first unparked round:
         # the deadline bounds how long the requests are held, and they are
         # held from the moment this rank starts withholding work.
@@ -1139,6 +1156,14 @@ class PhaseFlipRuntime:
         # to be joining), or the reduction has to become a non-blocking
         # poll that a rank re-enters, which is a different design.
         reduced = self._collective_min(payload)
+        # THE ROUND ADVANCES HERE, and only here. Reaching this line
+        # means every participant completed the SAME reduction, so this
+        # is the one instant at which the ranks provably agree -- which
+        # is exactly what makes the count usable as a shared stamp
+        # without ever being exchanged. Incrementing anywhere else (a
+        # local loop counter, a clock) would reintroduce the absolute
+        # divergence between ranks that the gate exists to tolerate.
+        self._entry_round += 1
         if len(reduced) != len(payload):
             raise KvReshardError(
                 f"consensus channel returned {len(reduced)} values for a "
@@ -1277,6 +1302,15 @@ class PhaseFlipRuntime:
             return True
 
         epoch = self._epoch
+        entry_round = self._entry_round
+        # PER-ROUND PRE-ENTRY BOUND. A new round is a new question, so it
+        # gets its own budget; carrying the previous round's elapsed time
+        # forward would abandon a perfectly healthy later round for time
+        # spent waiting on an earlier one.
+        stamp = (epoch, entry_round)
+        if self._presence_wait_stamp != stamp:
+            self._presence_wait_stamp = stamp
+            self._presence_wait_started = self._clock()
         if self._presence_wait_started is None:
             self._presence_wait_started = self._clock()
 
@@ -1338,11 +1372,13 @@ class PhaseFlipRuntime:
         if owes:
             self.presence_withheld_rounds += 1
         else:
-            self._presence.announce(epoch, note=f"pending={self._pending}")
+            self._presence.announce(
+                epoch, note=f"pending={self._pending}", round_=entry_round
+            )
 
         # A rank that is withholding cannot be part of a full quorum (its
         # own flag is down), so this is skipped rather than merely false.
-        if not owes and self._presence.all_present(epoch):
+        if not owes and self._presence.all_present(epoch, round_=entry_round):
             waited = self._clock() - self._presence_wait_started
             self._presence_wait_started = None
             # RE-BASE THE PARK CLOCK ON GROUP ASSEMBLY. The park deadline
@@ -1383,7 +1419,7 @@ class PhaseFlipRuntime:
 
         waited = self._clock() - self._presence_wait_started
         if waited >= self._presence_deadline_s:
-            missing = self._presence.missing(epoch)
+            missing = self._presence.missing(epoch, round_=entry_round)
             self._presence_wait_started = None
             return self._abandon_no_quorum(epoch, missing, waited)
         return None
