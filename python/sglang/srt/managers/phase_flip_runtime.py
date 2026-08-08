@@ -1053,24 +1053,20 @@ class PhaseFlipRuntime:
             [armed, ready, expired, self._epoch, dir_id, self._fp, *self._vec]
         )
         self.desync_checks += 1
-        # #631(c): the join is a BOUNDED wait that abandons from INSIDE.
+        # #631(c) WITHDRAWN -- measured fatal, kept as a warning.
         #
-        # Every deadline the flip had was evaluated BEFORE entering this
-        # reduction, so a rank that got in and found no peers waited for
-        # ever: measured 0 % GPU with the park deadline unreachable
-        # because the code that checks it sits above the blocking call.
-        # An unbounded wait in a coordination path is against this fork's
-        # canon (#610/#615/#653) for exactly this reason.
-        #
-        # On expiry: abandon LOUDLY, naming the ranks that never joined,
-        # disarm, and return to cycling. The policy is then free to
-        # re-arm, so residual skew costs a logged retry instead of a
-        # wedge. This is unconditional -- it backstops every delivery
-        # design, including one that is believed correct.
-        try:
-            reduced = self._join_bounded(payload)
-        except PhaseFlipJoinTimeout as exc:
-            return self._abandon_unjoined_flip(str(exc))
+        # Bounding this join and abandoning from inside CANNOT work on a
+        # gloo collective. Measured 2026-08-08: the 45 s bound fired
+        # (CollectiveTimeoutError), and the moment this rank walked away
+        # its peers saw "gloo/transport/tcp/pair.cc:547 Connection closed
+        # by peer" and every rank died with "Fatal Python error: Aborted".
+        # A rank that has ENTERED an all_reduce owes that all_reduce; the
+        # group has no way to un-enter it. So a wedge here cannot be
+        # broken from inside the collective -- any bound has to be
+        # applied BEFORE entry (do not enter unless the peers are known
+        # to be joining), or the reduction has to become a non-blocking
+        # poll that a rank re-enters, which is a different design.
+        reduced = self._collective_min(payload)
         if len(reduced) != len(payload):
             raise KvReshardError(
                 f"consensus channel returned {len(reduced)} values for a "

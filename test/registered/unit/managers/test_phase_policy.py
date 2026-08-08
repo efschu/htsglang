@@ -636,50 +636,28 @@ def test_only_the_zmq_intake_rank_injects():
     assert calls == []
 
 
-# -- (c) bounded join: a wedge is a logged retry, never 0 % GPU ---------------
+# -- (c) bounded join: WITHDRAWN, measured fatal ------------------------------
 
 
-def test_join_timeout_abandons_loudly_and_keeps_serving():
-    """A rank that enters the reduction and finds no peers must give up
-    FROM INSIDE. Every other flip deadline is evaluated before entry, so
-    without this the wait is unbounded by construction."""
-    from sglang.srt.managers.phase_flip_runtime import (
-        PhaseFlipJoinTimeout,
-        PhaseFlipRuntime,
-    )
+def test_the_flip_join_is_not_bounded_and_that_is_deliberate():
+    """A bounded join that abandons from inside KILLS THE GROUP.
 
-    class R:
-        pass
+    Measured 2026-08-08: the bound fired (CollectiveTimeoutError) and the
+    moment the rank walked away its peers saw "Connection closed by peer"
+    from gloo and every rank died with "Fatal Python error: Aborted". A
+    rank that has ENTERED an all_reduce owes that all_reduce. Any bound
+    must therefore be applied BEFORE entry, or the reduction must become
+    a non-blocking poll -- a different design, not a timeout.
 
-    r = R()
-    r._pending = TP_TO_PP
-    r._armed_at = 1.0
-    r._last_hold_reason = None
-    r._phase = PHASE_TP
-    r.join_deadline_aborts = 0
-    out = PhaseFlipRuntime._abandon_unjoined_flip.__get__(r, R)("peer 2 never joined")
-    assert out is None, "abandonment must never raise into the event loop"
-    assert r._pending is None, "the flip must be disarmed so it can be retried"
-    assert r.join_deadline_aborts == 1
-    assert PhaseFlipJoinTimeout is not None
+    This test exists so nobody re-adds the timeout believing it is the
+    obvious missing safety net. It is the opposite.
+    """
+    import inspect
 
-
-def test_join_deadline_is_passed_to_the_channel():
-    """The bound must actually reach the collective, not be dropped."""
     from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
-    seen = {}
-
-    class R:
-        pass
-
-    r = R()
-    r._join_deadline_s = 45.0
-
-    def chan(payload, timeout_s=None):
-        seen["timeout_s"] = timeout_s
-        return payload
-
-    r._collective_min = chan
-    PhaseFlipRuntime._join_bounded.__get__(r, R)([1, 2, 3])
-    assert seen["timeout_s"] == 45.0, "the join ran without its deadline"
+    src = inspect.getsource(PhaseFlipRuntime.on_round)
+    assert "_join_bounded" not in src, (
+        "the flip join was bounded again; abandoning an entered gloo "
+        "all_reduce aborts every rank in the group"
+    )
