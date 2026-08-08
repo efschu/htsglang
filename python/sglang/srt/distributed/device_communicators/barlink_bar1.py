@@ -1710,6 +1710,7 @@ class BarlinkBar1Transport:
         #: nothing at all.
         self._abort_poll_stream = None  # private stream for the watchdog read
         self._abort_poll_dst = None     # pinned host destination of that read
+        self._round_mirror = None       # pinned (round, mesh wm, a2a wm) mirror
         self._abort_poll_active = False
         self._abort_code_seen = 0
         #: How often the staged read hit its deadline with the copy still in
@@ -4715,6 +4716,9 @@ class BarlinkBar1Transport:
         try:
             self._abort_poll_stream = torch.cuda.Stream(device=self.device)
             self._abort_poll_dst = torch.zeros(1, dtype=ctl.dtype, pin_memory=True)
+            # #622: pinned mirror of (round, mesh watermark, a2a watermark),
+            # refreshed by the same watchdog poll; read by the launch dump.
+            self._round_mirror = torch.zeros(3, dtype=torch.int64, pin_memory=True)
         except Exception as e:  # noqa: BLE001 - degrade to the in-line read
             logger.warning(
                 "barlink-BAR1 group %s: no watchdog abort poll (%s); keeping "
@@ -4724,6 +4728,7 @@ class BarlinkBar1Transport:
             )
             self._abort_poll_stream = None
             self._abort_poll_dst = None
+            self._round_mirror = None
             return
         self._abort_poll_active = True
 
@@ -4749,6 +4754,15 @@ class BarlinkBar1Transport:
 
         with torch.cuda.stream(self._abort_poll_stream):
             self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
+            # #622: stage the three round words (round, mesh watermark, a2a
+            # watermark) alongside the abort word, on the same private
+            # stream. This gives the SIGUSR1 launch dump a host-resident
+            # mirror to print — the live monotonicity probe for the ack
+            # barrier's capture-safety proof — without ever violating the
+            # dump's no-device-sync constraint.
+            if self._round_dev is not None and self._round_mirror is not None:
+                n = min(3, self._round_dev.numel())
+                self._round_mirror[:n].copy_(self._round_dev[:n], non_blocking=True)
         # Waits for THIS copy on THIS stream only -- not for the model.
         self._abort_poll_stream.synchronize()
         code = int(self._abort_poll_dst[0])
