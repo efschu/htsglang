@@ -319,8 +319,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_draft_tokens=self.speculative_num_draft_tokens
         )
         if model_runner.spec_algorithm.is_speculative():
-            if self.model_runner.is_draft_worker:
+            if getattr(self.model_runner, "is_draft_model_runner", False):
                 # Draft workers can use TARGET_VERIFY mode.
+                #
+                # is_draft_MODEL_runner, not is_draft_worker: the #631
+                # phase-flip TP stack rides the is_draft_worker
+                # construction gate but holds the TARGET model, and it
+                # captures ordinary target TARGET_VERIFY graphs. Asking
+                # the construction gate sent it down the draft branch and
+                # every rank died on "This should not happen" -- which was
+                # true: it should not, and the runner was not a draft one
+                # (measured, boot 16, 2026-08-08).
                 if (
                     not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
                 ):

@@ -79,9 +79,12 @@ class TestPhaseFlipArgs(CustomTestCase):
         base = dict(
             enable_phase_flip=True, phase_flip_tp_vector="30,17,17", pp_size=3
         )
+        # NEXTN used to be on this list, refused as "the named phase-flip
+        # follow-up". That follow-up shipped: speculation now runs in the
+        # TP decode phase and is allowed here. See
+        # TestFlipV1SpeculationBlockers for what stays refused and why.
         for extra, pat in (
             ({"enable_hierarchical_cache": True}, "#630"),
-            ({"speculative_algorithm": "NEXTN"}, "follow-up"),
             ({"dp_size": 2}, "dp-size"),
             ({"disaggregation_mode": "prefill"}, "disaggregation"),
         ):
@@ -146,6 +149,43 @@ class TestSpecInTpDecodePhaseGate(CustomTestCase):
         except Exception:
             hit = None
         self.assertIsNotNone(hit, "PP + overlap schedule must stay refused")
+
+
+class TestFlipV1SpeculationBlockers(CustomTestCase):
+    """The flip's own V1 blocker list. Speculation used to be refused here
+    outright, naming "the TP+NEXTN decode arm" as a follow-up; that arm
+    exists now, so the blanket refusal is replaced by the two shapes for
+    which "armed in the TP phase only" is not a complete answer."""
+
+    def _flip(self, **kwargs):
+        args = make_args(
+            enable_phase_flip=True,
+            phase_flip_tp_vector="30,17,17",
+            pp_size=3,
+            **kwargs,
+        )
+        args._handle_phase_flip()
+
+    def test_nextn_is_allowed(self):
+        self._flip(speculative_algorithm="NEXTN")
+
+    def test_eagle_is_allowed(self):
+        self._flip(speculative_algorithm="EAGLE")
+
+    def test_ngram_is_refused_naming_the_corpus_manager(self):
+        with self.assertRaisesRegex(ValueError, "ngram"):
+            self._flip(speculative_algorithm="NGRAM")
+
+    def test_solo_draft_placement_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "solo"):
+            self._flip(
+                speculative_algorithm="NEXTN",
+                speculative_draft_placement="solo",
+            )
+
+    def test_other_v1_blockers_are_untouched(self):
+        with self.assertRaisesRegex(ValueError, "dp-size"):
+            self._flip(dp_size=2)
 
 
 if __name__ == "__main__":

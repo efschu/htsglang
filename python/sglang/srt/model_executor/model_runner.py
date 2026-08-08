@@ -506,6 +506,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # layer, head-sharded pool here would be the #345 corruption class,
         # caught only by the pin-3 boot assert).
         self.is_draft_pool_worker = is_draft_worker and not is_phase_flip_tp_stack
+        # The same distinction, stated once for the sites that mean
+        # draft-NESS rather than pool geometry. ``is_draft_worker`` is a
+        # CONSTRUCTION gate with three producers -- a speculative draft
+        # worker, the #274 dual-group lane, and the #631 phase-flip TP
+        # stack -- and only the first actually holds draft weights. A site
+        # that asks the construction gate when it means "is this a draft
+        # model" gets the wrong answer for the other two producers; that
+        # has now cost five separate boot failures (#631 window 3).
+        self.is_draft_model_runner = is_draft_worker and not is_phase_flip_tp_stack
 
         # Parse args
         self.mem_fraction_static = mem_fraction_static

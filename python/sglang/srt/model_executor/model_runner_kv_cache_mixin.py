@@ -5715,7 +5715,20 @@ class ModelRunnerKVCacheMixin:
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
         if getattr(self, "is_dual_group_lane", False):
             self.memory_pool_config = self._resolve_dual_group_lane_pool_config()
-        elif not self.spec_algorithm.is_none() and self.is_draft_worker:
+        elif not self.spec_algorithm.is_none() and self.is_draft_pool_worker:
+            # is_draft_POOL_worker, not is_draft_worker: this is a
+            # pool-shape decision, and the flip's TP stack rides the
+            # is_draft_worker construction gates while its POOLS take the
+            # target-model treatment (see ModelRunner.is_draft_pool_worker,
+            # which exists to make exactly this distinction).
+            #
+            # Before #631 armed speculation on the flip stack, spec was
+            # refused alongside the flip, so this branch could not be
+            # reached by a flip runner and the wrong flag was harmless. It
+            # is reachable now: the TP stack would have demanded a
+            # caller-supplied pool config it is supposed to RESOLVE, and
+            # every rank died here with "Draft worker requires
+            # memory_pool_config" (measured, boot 15, 2026-08-08).
             assert self.memory_pool_config is not None, (
                 "Draft worker requires memory_pool_config"
             )

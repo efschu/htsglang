@@ -7238,11 +7238,25 @@ class ServerArgs:
             blockers.append("--dp-size > 1")
         if self.ep_size > 1:
             blockers.append("--ep-size > 1")
+        # Speculation IS supported now -- in the TP decode phase, which is
+        # what the follow-up this blocker used to name was about. The draft
+        # worker is built on the flip's TP stack and armed at cutover; the
+        # PP prefill phase carries none. Two shapes stay refused, because
+        # for them "armed in one phase only" is not a complete answer:
         if self.speculative_algorithm is not None:
-            blockers.append(
-                "--speculative-algorithm (TP+NEXTN decode arm is the named "
-                "phase-flip follow-up)"
-            )
+            algo = str(self.speculative_algorithm).upper()
+            if algo == "NGRAM":
+                blockers.append(
+                    "--speculative-algorithm ngram (its external corpus "
+                    "manager is wired to the tokenizer channel and is not "
+                    "on the cutover rebuild list)"
+                )
+            if self.speculative_draft_placement == "solo":
+                blockers.append(
+                    "--speculative-draft-placement solo (solo/shadow rank "
+                    "identity is not modelled across a phase flip, where "
+                    "every rank changes topology)"
+                )
         if blockers:
             raise ValueError(
                 f"--enable-phase-flip V1 refuses: {', '.join(blockers)}."
