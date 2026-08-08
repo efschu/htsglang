@@ -1012,6 +1012,18 @@ def fused_moe_gguf(
             return gelu_and_mul(x)
         raise ValueError(f"Unsupported activation: {activation}")
 
+    # #651 root cause (2026-08-08): the ggml MoE kernels index expert weights
+    # through int32 ids. The in-tree AOT op enforces the dtype, but a
+    # standalone binding (e.g. the ROCm sglang_gguf_rocm extension) forwards
+    # the tensor unchecked -- int64 ids are then read as (value, 0) word
+    # pairs and every second expert lookup lands on garbage. Bit-for-bit
+    # reproduced on gfx1103: int64 ids give corr 0.5431 vs the fp64 oracle
+    # (== the incoherent serving output exactly), int32 ids corr 1.0000
+    # (docs/dev/651/p2/results/moe_real_geometry_*). Cast at the function
+    # boundary so every kernel path below is safe regardless of binding.
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (

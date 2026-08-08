@@ -19,6 +19,16 @@ int64_t ggml_moe_get_block_size(int64_t type);
 int64_t ggml_mmvq_kq_tuned();
 int64_t ggml_mxfp4_native();
 
+// #651 RECONCILIATION REQUIREMENT (2026-08-08): this minimal binding forwards
+// tensors WITHOUT dtype checks, and that is not a cosmetic gap -- the ggml MoE
+// kernels index expert weights through int32 ids, so an int64 topk_ids tensor
+// silently corrupts every second expert lookup (bit-for-bit reproduced on
+// gfx1103; the entire laptop incoherence traced to this). The in-tree AOT op
+// enforces dtypes; any rebuild of this binding MUST add TORCH_CHECK dtype
+// assertions for topk_ids (kInt) and the other integer args of ggml_moe_a8 /
+// ggml_moe_a8_vec (sorted_token_ids, expert_ids, num_tokens_post_padded).
+// The python-side guard (fused_moe_gguf casts to int32) is the first line of
+// defense, but the binding must not rely on it.
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_dequantize", &ggml_dequantize, "",
         pybind11::arg("W"), pybind11::arg("type"), pybind11::arg("m"), pybind11::arg("n"),
