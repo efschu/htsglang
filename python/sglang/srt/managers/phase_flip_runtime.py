@@ -1151,6 +1151,7 @@ class PhaseFlipRuntime:
         breaker, not a latency control.
         """
         from sglang.srt.distributed.device_communicators.barlink_liveness import (
+            CollectiveTimeoutError,
             PeerLostError,
         )
 
@@ -1166,7 +1167,10 @@ class PhaseFlipRuntime:
                 LOG_PREFIX,
             )
             return self._collective_min(payload)
-        except PeerLostError as exc:
+        except (CollectiveTimeoutError, PeerLostError) as exc:
+            # BOTH, because the channel raises CollectiveTimeoutError and
+            # catching only PeerLostError let it escape as a bare
+            # "Fatal Python error: Aborted" (measured 2026-08-08).
             raise PhaseFlipJoinTimeout(
                 f"no group-wide join within {self._join_deadline_s:g}s "
                 f"({exc})"

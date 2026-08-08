@@ -656,53 +656,50 @@ class SchedulerPPMixin:
         is committed on the next pass) and removes the cycle: every stage has
         the request in flight before any stage blocks on it.
         """
-        # #631 DELIVERY-BEFORE-BLOCK.
+        # #631 ARM-DELIVERED-THEN-SAME-PASS-JOIN.
         #
-        # THE INVARIANT: no rank may enter the flip's BLOCKING consensus
-        # reduction while it still owes, or has uncommitted, chain sends.
-        # Concretely: a rank acts on a phase-flip arm only in the pass
-        # AFTER _pp_commit_comm_work has committed the forward that
-        # carries that arm downstream.
+        # THE INVARIANT, in three parts:
+        #  (i)  a rank that receives or originates a flip arm must arm AND
+        #       reach the consensus reduction within the SAME pass, never
+        #       returning to the chain recv in between;
+        #  (ii) before joining, a rank that owes an arm forward must have
+        #       THAT SPECIFIC send completed -- a targeted commit of the
+        #       one work handle, never a blanket synchronous send;
+        #  (iii) the last stage owes no forward and joins directly.
         #
-        # Why it is an invariant and not an ordering patch. The chain
-        # forward is what WAKES the downstream stages -- they spend idle
-        # time blocked in the chain recv, and the arm's delivery is the
-        # only thing that makes them runnable. Acting on the arm in the
-        # pass that forwards it means this rank arms, is quiescent,
-        # therefore parked, and enters the blocking reduction -- which
-        # stops it forwarding, so the peers it is now waiting for never
-        # wake. Measured 2026-08-08: rank 0 in bounded_collective, ranks
-        # 1-2 in _pull_raw_reqs, 0 % GPU, and no escape because the park
-        # deadline is evaluated before entry, never from inside the wait.
+        # WHY THE BLOCKING REDUCTION IS THEN SAFE, by induction: when rank
+        # k enters the reduction, (ii) guarantees rank k+1 already HAS the
+        # arm in its recv buffer. Rank k+1 processes it at the top of its
+        # current or next pass and, by (i)+(ii), arms, completes its own
+        # forward and joins within that pass. No rank inside the reduction
+        # is owed anything by a rank outside it except the join itself,
+        # which arrives by induction. The worst case is LATENCY (a peer
+        # mid-prefill-chunk finishes its pass first), never a deadlock.
         #
-        # Two other routes were measured and rejected. Forwarding the arm
-        # SYNCHRONOUSLY deadlocks worse: a peer need not be in the chain
-        # recv at all, and was found blocked in the hidden-states
-        # exchange while this rank blocked in send. BOUNDING the chain
-        # recv decouples a 1:1 send/consume contract -- the consumer can
-        # skip a consume, unmatched sends accumulate, and the SENDERS
-        # block instead (ranks 0+1 in _pp_commit_comm_work).
+        # Each clause is a measured failure, not a precaution:
+        #  * omitting (ii) is variant A -- rank 0 issued an async forward,
+        #    armed, and blocked in the reduction before the send was ever
+        #    progressed (_pp_commit_comm_work runs at the TOP of the next
+        #    pass, which never came). py-spy: rank 0 in bounded_collective,
+        #    ranks 1-2 in _pull_raw_reqs, 0 % GPU.
+        #  * deferring the arm by a pass to satisfy (ii) breaks (i) and is
+        #    a GUARANTEED miss: the downstream stage must re-enter the
+        #    chain recv to reach the pass where it acts, and that recv
+        #    blocks because upstream is already inside the reduction
+        #    (boot 12: all three ranks armed, cutovers=0, dead at 40 s).
+        #  * satisfying (ii) with async_send=False is variant B and
+        #    deadlocks against the HIDDEN-STATES exchange, because a peer
+        #    need not be in the chain recv at all. Hence "targeted": commit
+        #    the request-chain handle only, leaving every other channel
+        #    async.
         #
-        # With this ordering the automatic path is byte-for-byte the
-        # manual one -- same message, same chain, same wake, same
-        # drain-park-meet -- and the manual one has always worked.
-        #
-        # Intermediate stages obey the same rule on receipt: the arm is
-        # forwarded downstream in this pass and acted on in the next, so
-        # the wake propagates strictly ahead of every rank's block.
-        deferred = getattr(self, "_pp_deferred_flip_arms", None) or []
-        self._pp_deferred_flip_arms = []
-        local_reqs = recv_reqs
-        if recv_reqs:
-            arms = [
-                r
-                for r in recv_reqs
-                if isinstance(r, PhaseFlipReqInput)
-                and getattr(r, "internal", False)
-            ]
-            if arms:
-                self._pp_deferred_flip_arms = arms
-                local_reqs = [r for r in recv_reqs if r not in arms]
+        # This applies to the MANUAL flip too, not only the policy's. It is
+        # strictly safer, and it removes manual's latent at-idle deadlock:
+        # manual has only ever been exercised UNDER TRAFFIC, where the loop
+        # keeps cycling and the commit happens naturally.
+        carries_flip_arm = bool(recv_reqs) and any(
+            isinstance(r, PhaseFlipReqInput) for r in recv_reqs
+        )
 
         if not self.pp_group.is_last_rank:
             self._pp_commit_comm_work(self.send_req_work)
@@ -711,23 +708,17 @@ class SchedulerPPMixin:
                     recv_reqs,
                     async_send=True,
                 )
-        if deferred:
-            # The commit above completed the forward that carried these,
-            # so the downstream stage has them and this rank may now act
-            # -- and, if it arms, block. On the LAST rank there is no
-            # forward to owe, so the deferral is a one-pass no-op.
-            assert (
-                self.pp_group.is_last_rank or self.send_req_work is not None
-            ), "delivery-before-block: acting on an arm with no forward issued"
-            local_reqs = list(local_reqs) + deferred
+            if carries_flip_arm:
+                # (ii): this one handle, now -- so the downstream stage
+                # HAS the arm before this rank can block on its join.
+                self._pp_commit_comm_work(self.send_req_work)
+                self.send_req_work = None
 
-        self.process_input_requests(local_reqs)
+        # (i): arm in this same pass; the flip hook at the end of this
+        # microbatch iteration then joins without an intervening recv.
+        self.process_input_requests(recv_reqs)
 
     def init_pp_loop_state(self: Scheduler):
-        # #631 DELIVERY-BEFORE-BLOCK: arms forwarded in the previous pass
-        # and acted on in this one. Re-initialised here (boot AND every
-        # cutover) so no arm survives a topology change.
-        self._pp_deferred_flip_arms: List = []
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
