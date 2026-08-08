@@ -694,6 +694,47 @@ exclusive backing, never will hold at the same time. Whether that check
 can safely account for the swap is the follow-up; it is a different
 question from the one this commit answered.
 
+## 6g. The sizing lever, examined and NOT taken (final)
+
+The next lever after exclusive backing looked like
+`_assert_budget_physically_available`: make it aware that the two phases
+never hold pages together, so it stops sizing against their sum. It does
+not work, because it was never summing them.
+
+`Scheduler.init_model_worker` sizes the PP pool at `scheduler.py:1232`
+(`init_memory_pools`) and builds the flip's TP stack only afterwards at
+`:1249`. So when the check runs there is **no TP pool resident to
+discount**. The check computes
+
+    reachable = used_by_me + device_free / ranks_on_gpu
+
+and on the 5090 that reads `8.68 GiB held + 13.26 GiB free = 21.94 GiB`
+of a 32.6 GiB card -- roughly 9.4 GiB accounted as "held outside this
+process" on a card carrying exactly one rank. That is the deferred **#652**
+residual (the 5090's CUDA context seeing only 19.58 GiB total), not phase
+double-residency, and it is what caps rank 0 at ~22.4 GiB.
+
+So the honest ceiling for this mechanism is the shipped 367704, and the
+next real lever is #652, not the flip. Recorded here so the next attempt
+starts from the evidence instead of re-deriving it.
+
+## 6h. Final acceptance (commit bc3016595d, production)
+
+| quantity | value |
+|---|---|
+| **serving capacity (id space)** | **367704** |
+| TP capacity | 500000 (capped; 788026 uncapped) |
+| corridor min, 100 ms, prefill rung + flip + decode bench | **2286 / 4001 / 2380** (floor 1024, HELD) |
+| prefill 2048 / 8192 / 32768 | 4236.8 / 7245.5 / 6842.6 tok/s |
+| decode narrative / code | 76.67 (CV 0.9 %) / 101.99 (CV 2.5 %) |
+| flip pp_to_tp per rank | 997 / 1246 / 1720 ms |
+| probe (temperature 0) | 217 |
+
+A-vs-A against the previous shipped state: prefill +0.0 / +1.0 / +1.9 %,
+decode -2.5 % narrative and -1.2 % code (both within the run-to-run band
+these points have shown all session), flips unchanged. Dashboard up on
+8780, crash watchdog still decommissioned.
+
 ## 7. Reproduce
 
 ```

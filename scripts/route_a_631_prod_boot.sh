@@ -37,7 +37,10 @@ CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-4}"
 MAMBA_SLOTS="${MAMBA_SLOTS:-20}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-500000}"
-HICACHE="${HICACHE:-1}"
+# OFF by default and not a preference: --enable-phase-flip hard-refuses
+# --enable-hierarchical-cache at argument time (#630). A default of 1 made
+# the script unbootable without an explicit HICACHE=0.
+HICACHE="${HICACHE:-0}"
 HICACHE_RATIO="${HICACHE_RATIO:-2}"
 # --kv-pressure-ladder auto REFUSES on this rig: it cannot map ranks to
 # cards when the node holds different card models (3080 20480 + 5090
