@@ -1056,6 +1056,20 @@ class PhaseFlipRuntime:
         self._round += 1
         armed = 1 if self._pending is not None else 0
         ready = 1 if (armed and self._ready_fn()) else 0
+        # #631 THE ENTRY GATE, and it must run BEFORE the park expiry is
+        # computed. The park deadline asks "armed but never quiescent?",
+        # which is only meaningful once the group is assembled -- so the
+        # time spent WAITING for assembly must not count toward it.
+        # Measured 2026-08-08 (boot 16): with the gate after this line, a
+        # rank that waited out the presence poll was already flagged
+        # expired, and the flip was abandoned the instant the gate opened
+        # ("armed for 0.0s", because _armed_at had just been re-based).
+        # The gate re-bases the park clock on assembly, so evaluating
+        # expiry after it is what makes the two bounds sequential.
+        if armed:
+            gate = self._await_group_presence()
+            if gate is not True:
+                return gate  # None (keep polling) or a pre-entry abandonment
         expired = 1 if self._park_expired(armed, ready) else 0
         # The PP-phase entry gate, widened by the deadline: an armed rank
         # enters once it is PARKED, or -- if it has been armed past the
@@ -1076,14 +1090,6 @@ class PhaseFlipRuntime:
             [armed, ready, expired, self._epoch, dir_id, self._fp, *self._vec]
         )
         self.desync_checks += 1
-        # #631 THE ENTRY GATE. Do not enter the blocking reduction until
-        # every rank is provably AT this entry. See _await_group_presence:
-        # the wait is non-blocking and bounded BEFORE entry, which is the
-        # only side of the entry where a bound is implementable at all.
-        if self._pending is not None:
-            gate = self._await_group_presence()
-            if gate is not True:
-                return gate  # None (keep polling) or an abandonment
         # #631(c) WITHDRAWN -- measured fatal, kept as a warning.
         #
         # Bounding this join and abandoning from inside CANNOT work on a
