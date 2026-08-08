@@ -456,3 +456,77 @@ in the boot check rather than assuming.
      reference shape);
    - the 8k-prefill break-even line of section 1 is verified in these
      units (flip round-trip ms vs PP-vs-TP ms/Prefill delta at 2k/8k/32k).
+
+## 5. Integration wiring plan (remaining step-5 slices, file:line from
+## the 2026-08-08 survey; each slice lands with tests before the next)
+
+### 5.1 Server args surface
+- New flags: --phase-flip (off default; gates EVERYTHING below),
+  --phase-flip-tp-vector (the decode DCP vector, e.g. 30,17,17),
+  reuse --pp-stage-ratio/--pp-layer-ratio for the prefill split.
+- Validation in a _handle_phase_flip: refuse with PD, hierarchical
+  cache, dual-group lane, dp/ep > 1; require pp_size == world == vector
+  length. Early and loud (server_args.py handler family).
+
+### 5.2 Dual-runner boot (tp_worker/model_runner)
+- Boot as the PP topology (pp_size=3, tp=1) exactly like the measured
+  #625 recipe. After the primary stack is up, call
+  initialize_phase_flip_secondary_groups(tp_size=3, pp_size=1,
+  dcp_size=3) -- eager, before ANY backend constructor caches dcp state
+  (the attn_dcp_size silent-1 hazard; assert group formed).
+- Build the TP-shaped ModelRunner (+ NEXTN draft) under
+  get_parallel().override(tp_group=flip_tp, dcp fields, tp_size=3,
+  pp_size=1) -- the lane build precedent (dual_group_lane.py:5874,
+  lane_geometry_override); each runner gets its OWN model_config copy
+  (adjust_hybrid_swa_layers_for_pp mutates in place,
+  model_runner.py:1493).
+- Weights: load PP layout, plan+pack arena (weights_arena.py), image;
+  load TP layout THROUGH THE SAME arena (pack, image); leave the boot
+  phase's image live. Non-checkpoint params excluded (marlin workspace,
+  marlin_utils.py:861-879). Draft (NEXTN) weights TP-only, OUTSIDE the
+  arena, permanently resident.
+- Pools: PP stack allocates its stage pools (existing PP path); TP
+  stack allocates full-attn TP pool + TP mamba pool under the 3.4a
+  ledger. Decode CUDA graphs captured ONCE on the TP stack after its
+  arena image is live (pin 2: PP stack captures NOTHING).
+- Real-config row-schema pin (operator pin 3) lands here: both pools
+  exist in one process -> assert per-token row byte-layout equality
+  from the actual configs, red if head replication changes.
+
+### 5.3 Scheduler flip protocol
+- Scheduler holds active_stack ("pp"|"tp"), both worker stacks, and the
+  PhaseFlipRuntime built by a build_phase_flip_runtime(scheduler)
+  factory (mirror build_kv_reshard_runtime, kv_reshard.py:697):
+  channels = default_collective_min(tp_cpu_group of the WORLD-spanning
+  set) + _dist_exchange over the flip_tp device group; views = both
+  pools; live_slots/ready/guards = the landed helpers; pre_cutover_fns
+  = [arena refill H2D, GDN blob move]; cutover_fn = production cutover.
+- on_round hook next to the kv_reshard hook (scheduler.py:4186 block);
+  AbortDeferralWindow activated at arm, drained after cutover/disarm;
+  abort handling routed through window.submit while active.
+- Cutover rebuilds: ParallelState frozen dataclass (scheduler.py:499),
+  cached tp_group/pp_group handles (scheduler.py:1269-1276),
+  pp_max_micro_batch_size (:1261), init/clear PP loop state
+  (scheduler_pp_mixin.py:640), set_cp_token_ratios + owner-bounds
+  refresh (the #297 cutover, kv_reshard.py:675), then EXIT the current
+  event loop to a re-dispatching wrapper around dispatch_event_loop
+  (scheduler.py:6889 reads pp_size once -- wrap, do not patch).
+- maybe_sleep_on_idle must also skip while phase-flip pending
+  (scheduler.py:6820 precedent for kv_reshard.pending).
+
+### 5.4 Regime gate
+- regime_act.py gains the flip action beside KvReshardRuntime.arm:
+  prefill_heavy + queued_prompt_tokens above threshold -> arm pp
+  direction; decode_heavy sustained -> arm tp direction; hysteresis from
+  RegimeSensor/DwellGate (regime_classifier.py:273/:478). Evidence-gated
+  act mode unchanged (server_args.py:7147).
+
+### 5.5 GPU validation order (step 6)
+- Boot flip-enabled, NO flip armed: PP phase must reproduce #625 PP
+  prefill numbers (A-vs-A floor first).
+- Manual /phase_flip RPC (mirror /kv_reshard, http_server.py:1200):
+  flip empty -> flip back, measure per-phase ms per rank.
+- One request: PP prefill -> flip -> TP decode, token-exact vs no-flip
+  reference at temperature 0.
+- Then the regime-gated automatic flip under mixed load, ms/round
+  compute-vs-wait doctrine throughout.
