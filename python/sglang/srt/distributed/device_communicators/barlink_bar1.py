@@ -167,6 +167,7 @@ from sglang.srt.distributed.device_communicators import (
     barlink_abort_gate,
     barlink_env_guard,  # noqa: F401  (rejects retired SGLANG_HTCCL* vars)
     barlink_liveness,
+    lockstep_sentinel,
 )
 from sglang.srt.distributed.device_communicators.barlink_liveness import (
     PeerLivenessError,
@@ -5382,10 +5383,21 @@ class BarlinkBar1Transport:
                 logger.error("%s", peer_snapshot)
         except Exception:  # noqa: BLE001 - an instrument must not mask the abort
             pass
+        # #650: the PEER STATEMENT. Everything above is rank-local or raw
+        # flag words; the census heartbeat (a scheduler-thread collective)
+        # is structurally silent in the hang case. The lockstep sentinel's
+        # sidecar keeps exchanging while a peer's main thread hangs, so its
+        # last gather states every peer's ring position — the one line that
+        # lets a survivor's dump say WHERE the wedged rank last was.
+        try:
+            _peer_stmt = lockstep_sentinel.peer_statement()
+        except Exception:  # noqa: BLE001 - an instrument must not mask the abort
+            _peer_stmt = "peer statement: <unavailable>"
         raise Bar1CollectiveAborted(
             f"barlink-BAR1 rank {self.rank}/{self.world} group "
             f"{self.group or '<unnamed>'}: a spin kernel took its abort path, "
-            f"observed at {where}. {attribution}{staged} {cause}"
+            f"observed at {where}. {attribution}{staged} {cause} "
+            f"PEER POSITIONS (#650): {_peer_stmt}."
             " The output buffer of that collective is partially written; "
             "every result computed from it is garbage, which is why this "
             "raises instead of logging. Set "

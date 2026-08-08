@@ -148,6 +148,12 @@ class LockstepSentinel:
         #: (div_seq, culprit_ranks, per_rank_tags) of the named divergence.
         self.last_divergence: Optional[Tuple[int, List[int], List[Any]]] = None
         self.sync_lost = False
+        # #650: peer-observable state retained from sidecar exchanges, for
+        # the hang-case peer statement (see peer_statement()).
+        self.last_peer_seqs: Optional[List[int]] = None
+        self.last_peer_seqs_t: float = 0.0
+        self.last_peer_tails: Optional[List[Tuple[int, List[Any]]]] = None
+        self.last_peer_tails_t: float = 0.0
         self._verified = -1  # highest seq proven equal across ranks
         self._fault_seq, self._fault_mode = _parse_fault(rank)
         self._fault_fired = False
@@ -283,6 +289,14 @@ class LockstepSentinel:
         seqs = self._gather(self._seq)
         if seqs is None:
             return False
+        # #650: retain the gather — this is the PEER-OBSERVABLE state the
+        # hang case needs. The sidecars keep exchanging while a wedged
+        # rank's main thread hangs, so a survivor's last successful gather
+        # is a true statement about every peer's ring position, readable
+        # at abort time when the census (a scheduler-thread collective)
+        # is structurally silent.
+        self.last_peer_seqs = list(seqs)
+        self.last_peer_seqs_t = time.monotonic()
         m = min(seqs)
         if m <= 0:
             return False
@@ -317,6 +331,8 @@ class LockstepSentinel:
                     (lo, [self._tags[i % self.ring_len] for i in range(lo, self._seq)])
                 )
                 if tails is not None:
+                    self.last_peer_tails = tails
+                    self.last_peer_tails_t = time.monotonic()
                     for r, (rlo, rtags) in enumerate(tails):
                         last3 = " | ".join(repr(t) for t in rtags[-3:])
                         logger.error(
@@ -346,6 +362,8 @@ class LockstepSentinel:
                     (lo, [self._tags[i % self.ring_len] for i in range(lo, self._seq)])
                 )
                 if tails is not None:
+                    self.last_peer_tails = tails
+                    self.last_peer_tails_t = time.monotonic()
                     for r, (rlo, rtags) in enumerate(tails):
                         logger.error(
                             "SENTINEL FREEZE anatomy: rank %d last events "
@@ -429,6 +447,51 @@ class LockstepSentinel:
         self.last_divergence = (div_seq, culprits, div_tags)
         self.diverged = True
         return True
+
+    def peer_statement(self) -> str:
+        """One line of PEER-observable state for the hang-case dump (#650).
+
+        The census heartbeat is a scheduler-thread collective and dies with
+        the hung rank; the abort dump used to speak only rank-local state.
+        This statement is built from the sidecar's last successful exchanges
+        — which keep working while a main thread hangs (proven mid-wedge)
+        — so a SURVIVOR's abort dump can state where every peer last was:
+        ring position, its age, and (when an anatomy exchange ran) the last
+        op each peer entered. Never raises; formatting a diagnostic must
+        not replace the error it decorates.
+        """
+        try:
+            if self.last_peer_seqs is None:
+                return (
+                    "peer statement: no sidecar exchange completed yet "
+                    "(sentinel armed but no data)"
+                )
+            age = time.monotonic() - self.last_peer_seqs_t
+            parts = []
+            for r, s in enumerate(self.last_peer_seqs):
+                bit = f"rank {r} at ring seq {s}"
+                if (
+                    self.last_peer_tails is not None
+                    and r < len(self.last_peer_tails)
+                    and self.last_peer_tails[r][1]
+                ):
+                    try:
+                        bit += f", last op {self.last_peer_tails[r][1][-1]!r}"
+                    except Exception:  # noqa: BLE001
+                        pass
+                parts.append(bit)
+            stmt = (
+                f"peer statement (sidecar gather {age:.1f}s ago): "
+                + "; ".join(parts)
+            )
+            if self.sync_lost:
+                stmt += (
+                    " [SYNC LOST after that gather: a peer's sidecar is "
+                    "gone — the listed positions are its last life sign]"
+                )
+            return stmt
+        except Exception:  # noqa: BLE001 - never mask the abort being built
+            return "peer statement: <unavailable>"
 
     def _dump_stall(self, tails: List[Tuple[int, List[Any]]]) -> None:
         """Write every rank's ring tail at stall time (wedge anatomy)."""
@@ -515,6 +578,17 @@ def note_replay(kind: str, key: Any, index: int) -> None:
     s = _SENTINEL
     if s is not None:
         s.note_replay(kind, key, index)
+
+
+def peer_statement() -> str:
+    """Module-level accessor for the abort path. Safe when disarmed (#650)."""
+    s = _SENTINEL
+    if s is None:
+        return (
+            "peer statement: lockstep sentinel not armed "
+            "(SGLANG_LOCKSTEP_SENTINEL=1 enables peer-observable positions)"
+        )
+    return s.peer_statement()
 
 
 def note_decision(kind: str, *fields: Any) -> None:
