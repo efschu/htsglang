@@ -859,3 +859,48 @@ def test_park_clock_is_rebased_when_the_group_assembles(tmp_path):
         "the park clock was not re-based on assembly; it would expire "
         "mid-quiescence and desync the group around the collective"
     )
+
+
+def test_stale_markers_from_an_earlier_boot_never_open_the_gate(tmp_path):
+    """BOOT-15 SPECIMEN: the gate opened on a previous boot's flags.
+
+    The instance tag was os.getpid()//100000, which COLLIDES across
+    consecutive boots (3163115 and 3180590 both give 31). Boot 15 read
+    boot 14's markers, the gate opened "after 0.00s" before its peers had
+    armed, and rank 0 entered the reduction alone -- the gate causing the
+    exact failure it exists to prevent.
+    """
+    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
+
+    # An earlier boot left a full quorum behind.
+    old = [
+        PhaseFlipPresence(
+            n_ranks=3, rank=r, directory=str(tmp_path), instance="boot-14"
+        )
+        for r in range(3)
+    ]
+    for o in old:
+        o.announce(0)
+    assert old[0].all_present(0) is True
+
+    # A NEW boot must not see any of it.
+    fresh = PhaseFlipPresence(
+        n_ranks=3, rank=0, directory=str(tmp_path), instance="boot-15"
+    )
+    assert fresh.all_present(0) is False, (
+        "the gate opened on an earlier boot's markers"
+    )
+    assert fresh.missing(0) == [0, 1, 2]
+
+
+def test_the_instance_tag_is_identical_across_ranks_of_one_boot(monkeypatch, tmp_path):
+    """The flags are a RENDEZVOUS: a per-process tag would give every
+    rank a different quorum and none would ever assemble."""
+    from sglang.srt.managers.phase_flip_presence import PhaseFlipPresence
+
+    monkeypatch.setenv("SGLANG_PHASE_FLIP_INSTANCE", "boot-xyz")
+    tags = {
+        PhaseFlipPresence(n_ranks=3, rank=r, directory=str(tmp_path)).instance
+        for r in range(3)
+    }
+    assert tags == {"boot-xyz"}, f"ranks disagreed on the rendezvous tag: {tags}"

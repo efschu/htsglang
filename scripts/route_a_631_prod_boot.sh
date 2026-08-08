@@ -108,6 +108,14 @@ export SGLANG_UNEVEN_DCP_WEIGHTED=1
 # Mixed 5090+3080 group is the CONFIGURATION, not a symptom.
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
+# #631: the phase-flip presence rendezvous tag. Set ONCE here so every
+# rank of this boot inherits the SAME value, and so a LATER boot gets a
+# different one. Both properties are load-bearing: identical across ranks
+# because the flags are a rendezvous, unique per boot because a colliding
+# tag let boot 15 read boot 14's leftover markers and open the entry gate
+# on peers that were not there.
+export SGLANG_PHASE_FLIP_INSTANCE="${SGLANG_PHASE_FLIP_INSTANCE:-$(date +%s)-$$}"
+
 # #631 phase policy tuning. Exported only when set, so an unset knob keeps
 # the module default rather than exporting an empty string that the
 # parser would have to special-case.
