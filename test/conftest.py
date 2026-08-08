@@ -25,22 +25,35 @@ _ARB_PATHS = (
 
 
 def _arb_state():
-    """``{path: (exists, is_dir, inode)}``.
+    """``{path: (exists, is_dir)}``.
 
-    Deliberately not mtime: a window held by ANOTHER session runs its own
-    heartbeat, which legitimately refreshes an existing holder while an
-    unrelated test run is in progress. Creation, deletion, and a change of
-    type or inode cannot happen that way -- each of those is a write, and a
-    write to these paths from inside pytest is the bug this guard is for.
+    Deliberately not mtime, and deliberately NOT the inode either. The
+    inode was here on the reasoning that "creation, deletion, and a change
+    of type or inode cannot happen [from a foreign heartbeat]". That claim
+    is false and was falsified in practice (#654): a window held by ANOTHER
+    session refreshes its holder by writing a temp file and renaming it
+    over the target, which is the correct atomic way to do it and which
+    mints a NEW inode every time. A long test run overlapping a foreign
+    heartbeat therefore failed at sessionfinish with zero test failures --
+    the guard accusing the run of a write it never made.
+
+    Existence and type are the only invariants a foreign writer cannot
+    disturb, so they are all this guard asserts. A content hash would have
+    the same false positive as the inode, for the same reason.
+
+    The trade, named: a test that REPLACED the holder via rename would no
+    longer be caught here. The guard's primary purpose -- catching tests
+    that CREATE arbitration files (the 0-byte-holder class, #438b) or
+    delete them -- is unaffected.
     """
     state = {}
     for path in _ARB_PATHS:
         try:
-            st = os.stat(path, follow_symlinks=False)
+            os.stat(path, follow_symlinks=False)
         except OSError:
-            state[path] = (False, False, None)
+            state[path] = (False, False)
         else:
-            state[path] = (True, os.path.isdir(path), st.st_ino)
+            state[path] = (True, os.path.isdir(path))
     return state
 
 
