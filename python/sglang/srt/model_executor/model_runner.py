@@ -81,7 +81,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    monkey_patch_vllm_parallel_state,
+    should_pre_warm_nccl,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
@@ -1750,6 +1753,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
         backend = get_default_distributed_backend(self.device)
+        # #651 W1: in a mixed-device pipeline the WORLD backend must be the
+        # SAME string on every rank. Derived per process (the line above) it
+        # would be "gloo" on the CPU stage and "nccl" on the GPU stage, and
+        # init_process_group deadlocks on that rather than reporting it. The
+        # override is computed from the CLI, so every rank agrees. None on
+        # every default boot.
+        backend_override = self.server_args.distributed_backend_override()
+        if backend_override is not None:
+            backend = backend_override
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
             if self.server_args.mooncake_ib_device:
@@ -1839,8 +1851,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
-            if self.server_args.pre_warm_nccl and (
-                self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
+            # #651 W1 made this per-rank: the flag's own guard runs in the
+            # PARENT, which only knows the global device, so a CPU pipeline
+            # stage used to reach this and die on torch.cuda.current_device().
+            if should_pre_warm_nccl(
+                self.server_args.pre_warm_nccl,
+                self.device,
+                self.tp_size,
+                self.pp_size,
+                self.moe_ep_size,
             ):
                 warmup_start = time.perf_counter()
                 tp_group_handle = get_tp_group().device_group

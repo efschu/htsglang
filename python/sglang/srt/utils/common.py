@@ -1713,6 +1713,48 @@ def maybe_reindex_device_id(gpu_id: int, extra_gpu_ids: Optional[Sequence[int]] 
         del os.environ["CUDA_VISIBLE_DEVICES"]
 
 
+#: Vendor visibility variables a child process must have EMPTY to be truly
+#: accelerator-free. CUDA_VISIBLE_DEVICES alone is not enough on ROCm.
+_DEVICE_VISIBILITY_ENV_VARS = (
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+)
+
+
+@contextmanager
+def hide_all_devices(gpu_id: int = 0):
+    """Make the child process see NO accelerator at all (#651 W1).
+
+    The counterpart of ``maybe_reindex_device_id`` for a CPU-mapped pipeline
+    stage. That helper cannot express this: it always leaves exactly one card
+    visible, and an empty value is not "some card". Isolation happens at the
+    process level, before ``proc.start()``, for the same reason as there --
+    visibility cannot be narrowed once the process exists.
+
+    Emptying the visibility variables is what makes the platform probes tell
+    the truth in that child. It is not sufficient on its own: ``is_hip()`` /
+    ``is_cuda()`` answer for the BUILD, so the per-rank device string still
+    has to be installed inside the child (see
+    ``parallel_state.set_local_device_override``).
+
+    Yields ``gpu_id`` unchanged (0 by default): with no device visible the
+    value only ever serves as a rank-local label from here on.
+    """
+    saved = {name: os.environ.get(name) for name in _DEVICE_VISIBILITY_ENV_VARS}
+    for name in _DEVICE_VISIBILITY_ENV_VARS:
+        os.environ[name] = ""
+    logger.debug("Hiding all accelerators from the next child process.")
+    try:
+        yield gpu_id
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 cached_device_index = -1
 
 

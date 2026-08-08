@@ -39,6 +39,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Sequence,
     Tuple,
     Union,
     cast,
@@ -101,6 +102,7 @@ from sglang.srt.utils import (
     assert_pkg_version,
     configure_logger,
     get_bool_env_var,
+    hide_all_devices,
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
@@ -730,7 +732,9 @@ class Engine(EngineScoreMixin, EngineBase):
                                 lane_extra_gpus,
                             )
 
-                    with maybe_reindex_device_id(gpu_id, lane_extra_gpus) as gpu_id:
+                    with _rank_device_visibility(
+                        server_args, pp_rank, gpu_id, lane_extra_gpus
+                    ) as gpu_id:
                         proc = mp.Process(
                             target=run_scheduler_process_func,
                             args=(
@@ -1643,6 +1647,28 @@ def _calculate_rank_ranges(
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _rank_device_visibility(
+    server_args: ServerArgs,
+    pp_rank: int,
+    gpu_id: int,
+    lane_extra_gpus: Optional[Sequence[int]] = None,
+):
+    """Device visibility a scheduler child is started with.
+
+    Visibility is set in the PARENT around ``proc.start()`` and cannot be
+    narrowed afterwards, so the choice has to be made here.
+
+    #651 W1: a CPU-mapped pipeline stage must see NO accelerator at all.
+    ``maybe_reindex_device_id`` always leaves exactly one card visible and
+    cannot express that, so that case takes ``hide_all_devices`` instead.
+    Without ``--pp-device-map`` ``device_for_pp_rank`` is None and this
+    reduces to the historical call, unchanged.
+    """
+    if server_args.device_for_pp_rank(pp_rank) == "cpu":
+        return hide_all_devices(gpu_id)
+    return maybe_reindex_device_id(gpu_id, lane_extra_gpus)
 
 
 def _compute_parallelism_ranks(

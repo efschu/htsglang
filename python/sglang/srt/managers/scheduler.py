@@ -6926,6 +6926,48 @@ def uneven_family_plans(server_args) -> dict:
     return family_plans
 
 
+def install_pp_stage_device(server_args: ServerArgs, pp_rank: int) -> Optional[str]:
+    """Install this worker process's device before anything reads it (#651 W1).
+
+    Two installs, one per-rank and one rank-uniform:
+
+    * ``server_args.device`` is what ``ModelRunner.__init__`` copies into
+      ``self.device`` -- the single point where the device is still global.
+      Everything downstream (backend choice, memory probes, attention/sampling
+      backends) is already parameterized on it, so overriding the field here
+      is enough for the runner half.
+    * the distributed groups derive their device from a PLATFORM probe, which
+      answers for the BUILD rather than for this process, so
+      ``set_local_device_override`` has to say it separately. Its companion
+      ``set_mixed_device_world`` is deliberately rank-uniform: it gates PyNccl
+      construction, and a rank-divergent answer there hangs.
+
+    Returns the installed device string, or None on the default path (no
+    ``--pp-device-map``), where nothing is touched.
+    """
+    stage_device = server_args.device_for_pp_rank(pp_rank)
+    if stage_device is None:
+        return None
+
+    from sglang.srt.distributed.parallel_state import (
+        set_local_device_override,
+        set_mixed_device_world,
+    )
+
+    # Through override(), not a bare assignment: after __post_init__ the
+    # fields ARE the resolved configuration, and the strict harness raises on
+    # a raw write (ServerArgs.__setattr__).
+    server_args.override("pp_device_map.stage_device", device=stage_device)
+    set_local_device_override(stage_device)
+    set_mixed_device_world(server_args.mixed_device_world())
+    logger.info(
+        "Pipeline stage PP%d runs on device %r (--pp-device-map).",
+        pp_rank,
+        stage_device,
+    )
+    return stage_device
+
+
 def configure_scheduler_process(
     server_args: ServerArgs,
     gpu_id: int,
@@ -6942,6 +6984,8 @@ def configure_scheduler_process(
         dp_rank
     """
     kill_itself_when_parent_died()
+
+    install_pp_stage_device(server_args, pp_rank)
 
     # Generate the logger prefix
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
@@ -7063,7 +7107,13 @@ def configure_scheduler_process(
             pp_rank,
             tp_rank,
             rank_fraction,
-            server_args.rank_gpu_id[world_rank],
+            # Guarded: the budget vector and the placement vector are set
+            # together today, but a rank without a physical card (#651) has
+            # no entry to index -- a log line must not be the thing that
+            # raises.
+            server_args.rank_gpu_id[world_rank]
+            if server_args.rank_gpu_id is not None
+            else "n/a",
         )
 
     # Config the process

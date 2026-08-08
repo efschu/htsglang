@@ -266,6 +266,166 @@ def _move_received_tensor(tensor: torch.Tensor, device: torch.device) -> torch.T
     return tensor.to(device)
 
 
+#: Backends whose process group can only carry HOST memory. A p2p payload
+#: routed over such a group has to be a CPU tensor on the wire.
+_CPU_ONLY_BACKENDS = frozenset({"gloo", "mpi"})
+
+
+def _p2p_route(tensor_device_type: str, backend: str) -> str:
+    """Pick the process group a p2p payload tensor crosses on.
+
+    Returns ``"wire_cpu"`` (send over the coordinator's ``cpu_group``, with
+    the payload staged onto host memory first if it is not there already) or
+    ``"device_group"`` (send over the device group as-is).
+
+    Pre-#651 this was the inline expression
+    ``metadata_group if tensor.is_cpu else group``, which assumed the device
+    group can always carry a device tensor. In a mixed-device PP world (#651
+    W2b) the WORLD backend is rank-uniformly gloo -- a CPU stage cannot join
+    an NCCL world -- so the device group of the GPU rank is a gloo group and
+    gloo cannot send a CUDA tensor. Routing by the group's BACKEND instead of
+    by the tensor alone closes that gap.
+
+    Same-device worlds are unchanged by construction: with an nccl/rccl
+    device group a CPU tensor still takes ``wire_cpu`` and a device tensor
+    still takes ``device_group``, exactly as the old expression did.
+    """
+    if tensor_device_type == "cpu":
+        return "wire_cpu"
+    if str(backend).lower() in _CPU_ONLY_BACKENDS:
+        return "wire_cpu"
+    return "device_group"
+
+
+def _p2p_wire_backend(coordinator: Any) -> str:
+    """Backend string of a coordinator's device group, cached on it.
+
+    A process group's backend is fixed for its lifetime, so the lookup runs
+    once per coordinator and then costs one attribute read on the p2p hot
+    path. Module-level (rather than a method) so it also works on the
+    lightweight coordinator stubs the p2p tests drive the codec through.
+    """
+    backend = getattr(coordinator, "_cached_device_group_backend", None)
+    if backend is None:
+        try:
+            backend = str(
+                torch.distributed.get_backend(getattr(coordinator, "device_group", None))
+            )
+        except Exception:  # no group / not initialized: keep the old route
+            backend = ""
+        coordinator._cached_device_group_backend = backend
+    return backend
+
+
+def _stage_tensor_dict_for_wire(
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]], backend: str
+) -> Dict[str, Union[torch.Tensor, Any]]:
+    """Move payload tensors to host memory when the wire demands it.
+
+    #651 W2b. Staging happens BEFORE ``_split_tensor_dict`` on purpose: the
+    metadata then declares ``cpu`` as the tensor's device type, so the
+    receiver allocates a CPU buffer and receives it over the same
+    ``cpu_group`` this side sends it on -- the wire stays symmetric. The
+    receiver's own ``_move_received_tensor`` hop (#651 W2) then lifts the
+    payload onto the RECEIVING rank's device. Declaring the sender's original
+    device type instead would make the receiver allocate a CUDA buffer and
+    pick the device group, i.e. re-open the very mismatch this fixes.
+
+    Returns the input dict unchanged (the same object) whenever nothing needs
+    staging, which is every non-mixed boot.
+    """
+    if backend.lower() not in _CPU_ONLY_BACKENDS:
+        return tensor_dict
+    staged: Optional[Dict[str, Union[torch.Tensor, Any]]] = None
+    for key, value in tensor_dict.items():
+        if not isinstance(value, torch.Tensor) or value.device.type == "cpu":
+            continue
+        if _p2p_route(value.device.type, backend) != "wire_cpu":
+            continue
+        if staged is None:
+            staged = dict(tensor_dict)
+        staged[key] = value.cpu()
+    return tensor_dict if staged is None else staged
+
+
+#: Per-process device string installed before distributed init (#651 W1).
+#: See ``set_local_device_override``.
+_LOCAL_DEVICE_OVERRIDE: Optional[str] = None
+
+
+def set_local_device_override(device: Optional[str]) -> None:
+    """Pin the device every GroupCoordinator in THIS process runs on.
+
+    ``GroupCoordinator.__init__`` otherwise derives its device from a
+    PLATFORM probe (``is_cuda_alike()`` and friends), and that probe is a
+    BUILD property: a process on a ROCm/CUDA build still answers "cuda-alike"
+    when it has no card visible at all. A mixed-device pipeline (#651: rank0
+    on CPU, rank1 on the GPU) therefore needs the per-rank device string to
+    win over the probe.
+
+    A module-level override rather than a constructor argument because the
+    coordinators are built deep inside ``init_distributed_environment`` /
+    ``initialize_model_parallel`` from many call sites; the child process
+    installs it once, before distributed init, in
+    ``configure_scheduler_process``. ``None`` (the default) restores the
+    platform probe, so every non-mixed boot is unchanged.
+    """
+    global _LOCAL_DEVICE_OVERRIDE
+    _LOCAL_DEVICE_OVERRIDE = device
+
+
+def get_local_device_override() -> Optional[str]:
+    """The device string installed by ``set_local_device_override``."""
+    return _LOCAL_DEVICE_OVERRIDE
+
+
+def _coordinator_device(local_rank: int) -> torch.device:
+    """Device a GroupCoordinator built in THIS process runs on.
+
+    The per-rank override outranks the platform probe below, and that order
+    is the whole point (#651 W1): ``is_cuda_alike()`` reports what the wheel
+    was BUILT for, so a process with no accelerator visible at all still
+    answers True on a CUDA/ROCm build and would claim ``cuda:0`` here. Without
+    an override the function is the pre-#651 chain verbatim.
+    """
+    if _LOCAL_DEVICE_OVERRIDE is not None:
+        return torch.device(_LOCAL_DEVICE_OVERRIDE)
+    if is_cuda_alike():
+        device_id = (
+            0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+        )
+        return torch.device(f"cuda:{device_id}")
+    if _is_npu:
+        return torch.device(f"npu:{local_rank}")
+    if _is_xpu:
+        return torch.device(f"xpu:{local_rank}")
+    if _is_musa:
+        return torch.device(f"musa:{local_rank}")
+    return torch.device("cpu")
+
+
+#: True when this boot is a mixed CPU/GPU pipeline (#651 W1). Derived from
+#: --pp-device-map, hence identical on every rank.
+_MIXED_DEVICE_WORLD: bool = False
+
+
+def set_mixed_device_world(enabled: bool) -> None:
+    """Declare that this boot's world spans CPU and GPU stages.
+
+    Installed by every rank from ``ServerArgs.mixed_device_world()`` before
+    distributed init, so the decisions it gates stay rank-uniform. Today it
+    gates exactly one thing: PyNccl communicator construction, which cannot
+    span a group whose members do not all have an NCCL device.
+    """
+    global _MIXED_DEVICE_WORLD
+    _MIXED_DEVICE_WORLD = bool(enabled)
+
+
+def in_mixed_device_world() -> bool:
+    """The flag installed by ``set_mixed_device_world``."""
+    return _MIXED_DEVICE_WORLD
+
+
 _group_name_counter: Dict[str, int] = {}
 
 
@@ -506,7 +666,10 @@ def should_build_barlink(world_size: int) -> bool:
 
 
 def should_build_pynccl(
-    use_pynccl: bool, world_size: int, barlink_active: bool
+    use_pynccl: bool,
+    world_size: int,
+    barlink_active: bool,
+    mixed_device_world: bool = False,
 ) -> bool:
     """Whether GroupCoordinator should CONSTRUCT a PyNccl communicator.
 
@@ -526,10 +689,47 @@ def should_build_pynccl(
     CLI/env. A rank-divergent answer here would produce a hang rather than a
     crash -- quieter and worse.
 
-    Flag OFF reduces exactly to the original `use_pynccl and world_size > 1`,
+    `mixed_device_world` (#651 W1) -> do not build, for the same reason one
+    step further out: a group spanning a CPU stage and a GPU stage has a
+    member with no NCCL device at all, and the world backend is gloo. It is
+    derived from --pp-device-map, i.e. from the same CLI on every rank, so it
+    keeps the rank-uniformity above.
+
+    Flags OFF reduces exactly to the original `use_pynccl and world_size > 1`,
     so same-vendor rigs keep pynccl, which is their faster path.
     """
-    return use_pynccl and world_size > 1 and not barlink_active
+    return (
+        use_pynccl
+        and world_size > 1
+        and not barlink_active
+        and not mixed_device_world
+    )
+
+
+def should_pre_warm_nccl(
+    enabled: bool,
+    device: str,
+    tp_size: int,
+    pp_size: int,
+    moe_ep_size: int,
+) -> bool:
+    """Whether a rank should run the NCCL/RCCL/HCCL warmup all-reduce.
+
+    Module-level for the same reason as ``should_build_pynccl``: one
+    definition, asserted on directly.
+
+    ``device`` (#651 W1) is what the parent-side guard on ``--pre-warm-nccl``
+    cannot see. That guard runs against the GLOBAL device in ServerArgs, so a
+    CPU pipeline stage still arrives here, calls
+    ``torch.cuda.current_device()`` and dies -- and in a gloo world there is
+    no device communicator to warm up in the first place.
+
+    Flag OFF reduces exactly to the original
+    ``pre_warm_nccl and (tp_size > 1 or pp_size > 1 or moe_ep_size > 1)``.
+    """
+    if not enabled or device == "cpu":
+        return False
+    return tp_size > 1 or pp_size > 1 or moe_ep_size > 1
 
 
 def should_build_custom_allreduce(
@@ -668,19 +868,10 @@ class GroupCoordinator:
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
-        if is_cuda_alike():
-            device_id = (
-                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
-            )
-            self.device = torch.device(f"cuda:{device_id}")
-        elif _is_npu:
-            self.device = torch.device(f"npu:{local_rank}")
-        elif _is_xpu:
-            self.device = torch.device(f"xpu:{local_rank}")
-        elif _is_musa:
-            self.device = torch.device(f"musa:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
+        # One helper rather than an inline chain, so the #651 rule "the
+        # per-rank override outranks the BUILD probe" is testable without a
+        # ROCm build and without a card (see _coordinator_device).
+        self.device = _coordinator_device(local_rank)
         self.device_module = torch.get_device_module(self.device)
 
         for ranks in group_ranks:
@@ -897,7 +1088,9 @@ class GroupCoordinator:
         # only relocate the crash.
         _barlink_active = self.barlink_comm is not None
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if should_build_pynccl(use_pynccl, self.world_size, _barlink_active):
+        if should_build_pynccl(
+            use_pynccl, self.world_size, _barlink_active, _MIXED_DEVICE_WORLD
+        ):
             # The ledger's NCCL term cannot be derived -- libnccl sizes these
             # buffers itself, outside the torch allocator -- so the only way it
             # ever reaches "priced" is a measurement taken right here, around
@@ -2354,6 +2547,12 @@ class GroupCoordinator:
         assert isinstance(tensor_dict, dict), (
             f"Expecting a dictionary, got {type(tensor_dict)}"
         )
+        # #651 W2b: with a host-only device-group backend (a mixed-device PP
+        # world is rank-uniformly gloo) a device tensor cannot go on the wire
+        # as-is; stage it to host memory first so metadata, comm group and
+        # buffer all agree. No-op with an nccl/rccl device group.
+        wire_backend = _p2p_wire_backend(self)
+        tensor_dict = _stage_tensor_dict_for_wire(tensor_dict, wire_backend)
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
@@ -2374,7 +2573,11 @@ class GroupCoordinator:
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-            comm_group = metadata_group if tensor.is_cpu else group
+            comm_group = (
+                metadata_group
+                if _p2p_route(tensor.device.type, wire_backend) == "wire_cpu"
+                else group
+            )
             work = send_func(tensor, self.ranks[dst], group=comm_group)
             if async_send:
                 p2p_works.append(P2PWork(work, tensor))

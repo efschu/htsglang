@@ -437,6 +437,11 @@ def _parse_mib_scalar_or_list(value: str) -> Union[int, List[int]]:
     return int(value)
 
 
+def _parse_pp_device_map(value: str) -> List[str]:
+    """Parse --pp-device-map: a comma-separated device string per PP stage."""
+    return [part.strip().lower() for part in value.split(",") if part.strip()]
+
+
 def _parse_rank_tp_ratio(value: str) -> Union[str, List[int]]:
     """Parse --rank-tp-ratio: 'auto', 'auto-performance', or a
     comma-separated integer list."""
@@ -1668,6 +1673,23 @@ class ServerArgs:
             "on rigs where the two enumerations diverge. Conflicts "
             "with an explicitly set --mem-fraction-static.",
             type_parser=_parse_mib_scalar_or_list,
+        ),
+    ] = None
+    pp_device_map: A[
+        Optional[List[str]],
+        Arg(
+            help="EXPERIMENTAL (#651): comma-separated device string per "
+            "PIPELINE stage, in pp_rank order (e.g. --pp-device-map cpu,cuda "
+            "for a CPU prefill stage feeding a GPU stage). Length must equal "
+            "--pp-size; allowed values are 'cpu' and 'cuda'; at least one "
+            "stage must be 'cuda'. Restricted to pure pipeline parallelism "
+            "for now: --tp-size must be 1 and DP/EP/DCP must be off. When the "
+            "map mixes 'cpu' and 'cuda', the distributed WORLD backend is "
+            "forced to gloo on EVERY rank (a CPU rank cannot join an NCCL "
+            "world, and deriving the backend per process would deadlock "
+            "init_process_group). Unset (the default) leaves every existing "
+            "path byte-identical.",
+            type_parser=_parse_pp_device_map,
         ),
     ] = None
     weightless_kv_fastlane: A[
@@ -5951,6 +5973,11 @@ class ServerArgs:
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
+        # Mixed-device pipeline placement (#651). Before _handle_uneven_tp so
+        # the "--pp-device-map plus --rank-gpu-id" refusal fires before the
+        # GPU-shaped resolution of the latter touches NVML.
+        self._handle_pp_device_map()
+
         # Validate heterogeneous rank placement / uneven TP flags. Must run
         # before _handle_gpu_memory_settings so an explicitly passed
         # --mem-fraction-static is still distinguishable (None = unset).
@@ -8814,6 +8841,113 @@ class ServerArgs:
             + ((pp_rank % pp_size_per_node) * tp_size_per_node)
             + (tp_rank % tp_size_per_node) * self.gpu_id_step
         )
+
+    #: Device strings --pp-device-map accepts (#651 W1 slice).
+    PP_DEVICE_MAP_CHOICES = ("cpu", "cuda")
+
+    def _handle_pp_device_map(self) -> None:
+        """Validate --pp-device-map and derive the mixed-world flag.
+
+        Scope of this slice is deliberately narrow (see DESIGN_651 section 2,
+        W1/W4): pure pipeline parallelism, single node, one device string per
+        stage. Everything outside that is refused by name here, before a rank
+        is spawned, rather than left to surface as a late NCCL hang.
+        """
+        if self.pp_device_map is None:
+            return
+
+        if self.pp_size <= 1:
+            raise ValueError(
+                "--pp-device-map requires --pp-size > 1 (it maps PIPELINE "
+                f"stages to devices; current --pp-size {self.pp_size})."
+            )
+        if len(self.pp_device_map) != self.pp_size:
+            raise ValueError(
+                f"--pp-device-map length ({len(self.pp_device_map)}) must "
+                f"equal --pp-size ({self.pp_size}): one device string per "
+                "pipeline stage, in pp_rank order."
+            )
+        unknown = [d for d in self.pp_device_map if d not in self.PP_DEVICE_MAP_CHOICES]
+        if unknown:
+            raise ValueError(
+                f"--pp-device-map got unsupported device(s) {unknown}; "
+                f"allowed values are {list(self.PP_DEVICE_MAP_CHOICES)}."
+            )
+        if not any(d == "cuda" for d in self.pp_device_map):
+            raise ValueError(
+                "--pp-device-map must place at least one stage on 'cuda'; "
+                f"got {self.pp_device_map}. An all-CPU pipeline is the "
+                "existing --device cpu path, not this one."
+            )
+        if self.tp_size != 1:
+            raise ValueError(
+                f"--pp-device-map requires --tp-size 1 (current: "
+                f"{self.tp_size}). A mixed-device world is pure pipeline "
+                "parallelism for now (#651 W1)."
+            )
+        for name, size in (
+            ("--dp-size", self.dp_size),
+            ("--ep-size", self.ep_size),
+            ("--dcp-size", getattr(self, "dcp_size", 1)),
+        ):
+            if size > 1:
+                raise ValueError(
+                    f"--pp-device-map is not compatible with {name} > 1 "
+                    f"(current: {size}). Only pure pipeline parallelism is "
+                    "supported."
+                )
+        if self.nnodes > 1:
+            raise ValueError(
+                f"--pp-device-map is single-node only (current: --nnodes "
+                f"{self.nnodes})."
+            )
+        if self.rank_gpu_id is not None or self.rank_gpu_memory_mib is not None:
+            # The --rank-gpu-id family is GPU-shaped throughout (NVML totals,
+            # one physical card per world rank, disjoint per-stage GPU groups)
+            # and a CPU stage has no card to index. Rather than half-exempt
+            # those checks, the combination is refused for this slice; the
+            # per-stage exemptions land with the CPU-stage memory budget
+            # (#651 W4).
+            raise ValueError(
+                "--pp-device-map cannot be combined with --rank-gpu-id / "
+                "--rank-gpu-memory-mib yet: those flags describe a physical "
+                "card per world rank, which a 'cpu' stage does not have. Use "
+                "--pp-device-map alone (with --mem-fraction-static for the "
+                "GPU stage) in this slice."
+            )
+
+        self._mixed_device_world = len(set(self.pp_device_map)) > 1
+        if self._mixed_device_world:
+            logger.info(
+                "Mixed-device pipeline: stage -> device %s. The distributed "
+                "world backend is forced to gloo on every rank.",
+                dict(enumerate(self.pp_device_map)),
+            )
+
+    def device_for_pp_rank(self, pp_rank: int) -> Optional[str]:
+        """Device string this pipeline stage's processes must run on.
+
+        ``None`` without --pp-device-map, i.e. every rank keeps the global
+        ``--device`` -- the default path."""
+        if self.pp_device_map is None:
+            return None
+        return self.pp_device_map[pp_rank]
+
+    def mixed_device_world(self) -> bool:
+        """True when --pp-device-map mixes 'cpu' and 'cuda' stages.
+
+        The one flag that must force the distributed backend RANK-UNIFORMLY
+        to gloo: deriving it per process from that process's own device would
+        have the CPU rank ask for gloo while the GPU rank asks for nccl, and
+        ``init_process_group`` would deadlock instead of erroring."""
+        return bool(getattr(self, "_mixed_device_world", False))
+
+    def distributed_backend_override(self) -> Optional[str]:
+        """World backend every rank must use, or ``None`` for the default.
+
+        The single place the mixed-device rule turns into a backend string,
+        so the rank-uniformity claim is checkable without booting a rank."""
+        return "gloo" if self.mixed_device_world() else None
 
     def uneven_memory_budgets_active(self) -> bool:
         """True when --rank-gpu-memory-mib per-rank budgets are in force.
