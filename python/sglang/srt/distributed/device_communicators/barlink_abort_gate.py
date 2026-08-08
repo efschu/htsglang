@@ -50,6 +50,8 @@ import os
 import threading
 from typing import Any, List, Optional
 
+from sglang.srt.distributed.device_communicators import lockstep_sentinel
+
 logger = logging.getLogger(__name__)
 
 #: Environment kill switch for the whole family. "0" restores the pre-#431
@@ -479,6 +481,10 @@ def note_replay(kind: str, key: Any = None, index: int = -1) -> None:
     _replay_key = key
     _replay_index = index
     _replay_seq += 1
+    # #622: feed the lockstep sentinel's positional ring. Replays make no
+    # host calls, so divergence enters exactly through WHICH graph each rank
+    # selects per step — this is the only point that knows the selection.
+    lockstep_sentinel.note_replay(kind, key, index)
 
 
 def current_replay():
