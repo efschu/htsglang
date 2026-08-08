@@ -114,6 +114,11 @@ DEFAULT_JOIN_DEADLINE_S = 45.0
 # abandoning a poll costs nothing, whereas abandoning an ENTERED
 # all_reduce aborts every rank (see the withdrawn (c)).
 DEFAULT_PRESENCE_DEADLINE_S = 60.0
+# #631: how long the armed spin sleeps between flag reads. Small enough
+# that assembly is prompt at idle, large enough not to burn a core while
+# a peer finishes draining. The spin touches no channel, so this is a
+# pacing knob only -- it cannot affect correctness, just latency.
+DEFAULT_PRESENCE_POLL_INTERVAL_S = 0.005
 
 #: Env override for the above. Non-positive disables the deadline, which
 #: restores the old unbounded wait -- available deliberately for debugging a
@@ -733,7 +738,11 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
             getattr(server_args, "kv_reshard_consensus_interval", 8)
         ),
         park_deadline_s=park_deadline_s(),
-        collective_min=default_collective_min(flip_tp.cpu_group),
+        # Label it as OURS: a shared helper reporting under its own
+        # module's name sent a live wedge into the wrong subsystem.
+        collective_min=default_collective_min(
+            flip_tp.cpu_group, label="phase_flip.consensus"
+        ),
         # #631 option 2(b): the pollable entry gate, and the non-blocking
         # pump that delivers this rank's arm forward while it waits.
         presence=PhaseFlipPresence(
@@ -881,6 +890,10 @@ class PhaseFlipRuntime:
         pre_write_fns: Sequence[Callable[[str], None]] = (),
         guards: Sequence[str] = (),
         clock: Callable[[], float] = time.perf_counter,
+        # #631: injected so the spin can be driven deterministically in
+        # tests. The spin blocks on no channel; this only paces it.
+        sleep: Callable[[float], None] = time.sleep,
+        presence_poll_interval_s: float = DEFAULT_PRESENCE_POLL_INTERVAL_S,
     ):
         if n_ranks < 2:
             raise KvReshardError(
@@ -960,6 +973,8 @@ class PhaseFlipRuntime:
         #: count. Never a local loop counter -- those diverge under
         #: event_loop_pp, which is the very reason the gate exists.
         self._entry_round = 0
+        self._sleep = sleep
+        self._presence_poll_interval_s = float(presence_poll_interval_s)
         #: The (epoch, round) whose pre-entry wait is currently being
         #: timed. The bound is PER ROUND: a fresh round is a fresh
         #: question and gets its own budget.
@@ -1108,21 +1123,41 @@ class PhaseFlipRuntime:
         self._round += 1
         armed = 1 if self._pending is not None else 0
         ready = 1 if (armed and self._ready_fn()) else 0
-        # #631 THE ENTRY GATE, and it must run BEFORE the park expiry is
-        # computed. The park deadline asks "armed but never quiescent?",
-        # which is only meaningful once the group is assembled -- so the
-        # time spent WAITING for assembly must not count toward it.
-        # Measured 2026-08-08 (boot 16): with the gate after this line, a
-        # rank that waited out the presence poll was already flagged
-        # expired, and the flip was abandoned the instant the gate opened
-        # ("armed for 0.0s", because _armed_at had just been re-based).
-        # The gate re-bases the park clock on assembly, so evaluating
-        # expiry after it is what makes the two bounds sequential.
-        if armed:
-            gate = self._await_group_presence()
-            if gate is not True:
-                return gate  # None (keep polling) or a pre-entry abandonment
         expired = 1 if self._park_expired(armed, ready) else 0
+        # #631 QUIESCENT-ANNOUNCE. An armed rank that is NOT yet quiescent
+        # must go back around the pass loop -- that is how it drains -- and
+        # must NOT announce on the way. Announcing before quiescence is
+        # what made the flag mean "I was at the entry once": the rank
+        # published presence, returned to the loop, and met its top-of-pass
+        # commit before it could come back and ENTER. The last announcer
+        # then entered the reduction and every earlier one blocked behind
+        # it (measured 23:39Z, three stacks).
+        #
+        # An EXPIRED rank is exempt: it has been armed past the park
+        # deadline without ever draining, and it must be allowed to reach
+        # the reduction to carry that fact into a group-agreed
+        # abandonment. It owes no fresh work by then, having withheld
+        # admissions for the whole deadline.
+        # Scoped to a wired presence channel ON PURPOSE. This early
+        # return exists solely to stop a rank ANNOUNCING before it is
+        # quiescent; with no presence channel there is no announce, so
+        # applying it would change the readiness-skew behaviour of the
+        # plain consensus path (which holds uniformly inside the
+        # reduction) for no gain. Caught by
+        # TestConsensusDiscipline::test_readiness_skew_holds_uniformly.
+        if armed and self._presence is not None and not ready and not expired:
+            return None
+        # #631 THE ENTRY GATE, evaluated AFTER park expiry now that
+        # announcing requires quiescence. It SPINS: once this rank has
+        # announced it does not return to the pass loop at all, because
+        # that interval is exactly what kills it. The spin blocks on no
+        # channel -- it reads flags and sleeps -- and is bounded per round,
+        # so a group that never assembles abandons loudly instead of
+        # hanging.
+        if armed:
+            gate = self._spin_for_group_presence()
+            if gate is not True:
+                return gate  # a pre-entry abandonment, or None if disarmed
         # The PP-phase entry gate, widened by the deadline: an armed rank
         # enters once it is PARKED, or -- if it has been armed past the
         # deadline without ever parking -- to carry that fact into the
@@ -1220,6 +1255,52 @@ class PhaseFlipRuntime:
             return None
         self._last_hold_reason = None
         return self._execute()
+
+    def _spin_for_group_presence(self):
+        """#631: announce, then SPIN here until the group assembles.
+
+        THE POINT, and the whole reason this is a loop rather than one poll
+        per pass: a rank that announces and then returns to the pass loop
+        meets its top-of-pass commit before it can come back and ENTER, and
+        that commit blocks behind whichever rank has already entered. The
+        announce-to-entry interval must contain NO blocking channel
+        operation, so the rank simply does not leave.
+
+        WHY LEAVING THE LOOP IS SAFE HERE, and only here: this is reached
+        only once ready_fn holds (or the park deadline has expired), i.e.
+        the rank is drained -- no in-flight microbatches, no admissions, no
+        owed payload. It therefore owes its peers neither hidden states nor
+        chain data, and the only per-pass message it stops producing is the
+        empty keep-alive forward. Peers that need nothing are either
+        quiescent and spinning here too, or not yet quiescent -- and that
+        second case is a BOUNDED RETRY, not a wedge: a mid-drain rank that
+        stalls on its recv is released when the spinners' per-round bound
+        expires, they abandon loudly, return to the loop and resume
+        forwarding, it drains, and a later epoch retries with everyone
+        genuinely quiescent. At true idle every rank is quiescent at once,
+        so the gate opens on live evidence and the flip commits in the
+        first epoch.
+
+        Delegates each iteration to _await_group_presence, which stays the
+        single-shot primitive: same announce, same round-scoped read, same
+        pre-entry bound, same abandonment. Nothing new is invented here --
+        this only stops the rank from going away between iterations.
+        """
+        while True:
+            gate = self._await_group_presence()
+            if gate is not True:
+                if gate is not None:
+                    return gate  # pre-entry abandonment: loud, nothing entered
+                if self._pending is None:
+                    # Disarmed underneath us (abandonment elsewhere).
+                    return None
+                # Not assembled yet. Sleep briefly and ask again WITHOUT
+                # touching any channel. The pre-entry deadline inside
+                # _await_group_presence is what ends this loop if the group
+                # never arrives.
+                self._sleep(self._presence_poll_interval_s)
+                continue
+            return True
 
     def is_armed(self) -> bool:
         """#631: is a flip armed on this rank right now?

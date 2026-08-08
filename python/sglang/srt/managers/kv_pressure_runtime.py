@@ -501,7 +501,9 @@ class KvPressureRuntime:
             )
 
 
-def default_collective_min(tp_cpu_group) -> Callable[[List[int]], List[int]]:
+def default_collective_min(
+    tp_cpu_group, label: str = "kv_pressure_ladder.consensus"
+) -> Callable[[List[int]], List[int]]:
     """The production consensus channel: one bounded MIN all-reduce of the
     packed proposal over the TP CPU (gloo) group.
 
@@ -516,6 +518,12 @@ def default_collective_min(tp_cpu_group) -> Callable[[List[int]], List[int]]:
         bounded_collective,
     )
 
+    # #631: the LABEL is a parameter because this helper is shared. The
+    # phase flip builds its consensus channel from here, and with the name
+    # hardcoded its reduction timed out as "kv_pressure_ladder.consensus"
+    # -- which reads like a different subsystem and sent a live wedge
+    # investigation into the wrong module for an hour (2026-08-08 23:30Z).
+    # A collective must report under the name of whoever is USING it.
     def _reduce(vals: List[int], timeout_s: Optional[float] = None) -> List[int]:
         # timeout_s lets a CALLER bound its own join (#631(c): a rank that
         # enters this reduction and finds no peers must be able to give up
@@ -526,7 +534,7 @@ def default_collective_min(tp_cpu_group) -> Callable[[List[int]], List[int]]:
             lambda: dist.all_reduce(
                 t, op=dist.ReduceOp.MIN, group=tp_cpu_group, async_op=True
             ),
-            "kv_pressure_ladder.consensus",
+            label,
             timeout_s=timeout_s,
         )
         return [int(v) for v in t.tolist()]

@@ -934,27 +934,54 @@ def test_the_instance_tag_is_identical_across_ranks_of_one_boot(monkeypatch, tmp
 
 
 def test_presence_wait_does_not_count_toward_the_park_deadline():
-    """BOOT-16 SPECIMEN: the gate must run BEFORE the park expiry.
+    """BOOT-16 SPECIMEN, re-pinned as BEHAVIOUR after the quiescent-announce
+    inversion.
 
-    The park deadline asks "armed but never quiescent?", meaningful only
-    once the group is assembled. With the gate evaluated after it, a rank
-    that waited out the presence poll was ALREADY flagged expired, and
-    the flip was abandoned the instant the gate opened -- logged as
-    "armed for 0.0s", because _armed_at had just been re-based. All three
-    ranks abandoned unanimously and the cutover never happened.
+    The lesson stands: the park deadline asks "armed but never
+    quiescent?", and time spent waiting for the GROUP to assemble must
+    never be counted as a failure to quiesce. With the gate once evaluated
+    after the expiry, a rank that waited out the presence poll was already
+    flagged expired and the flip was abandoned the instant the gate opened
+    -- logged as "armed for 0.0s". All three ranks abandoned unanimously
+    and the cutover never happened.
+
+    This used to be pinned as a SOURCE ORDER (gate before expiry). That
+    proxy is now wrong, because announcing requires quiescence: expiry is
+    computed first so a never-draining rank can still reach the reduction
+    and make the abandonment group-agreed. The invariant it stood for is
+    pinned directly instead, and it now holds by CONSTRUCTION -- the two
+    waits are disjoint. A rank is either draining (park clock) or spinning
+    at the gate (per-round presence clock), never both, because a
+    non-quiescent rank returns to the pass loop without announcing.
     """
-    import inspect
-
     from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
-    src = inspect.getsource(PhaseFlipRuntime.on_round)
-    gate_at = src.index("_await_group_presence")
-    expiry_at = src.index("_park_expired(armed, ready)")
-    assert gate_at < expiry_at, (
-        "the park expiry is computed before the entry gate; time spent "
-        "waiting for the group to assemble would count as a failure to "
-        "reach quiescence, and the flip is abandoned as the gate opens"
+    class R:
+        pass
+
+    r = R()
+    now = {"t": 0.0}
+    r._clock = lambda: now["t"]
+    r._park_deadline_s = 30.0
+    r._armed_at = 0.0
+    expired = PhaseFlipRuntime._park_expired.__get__(r, R)
+
+    # A QUIESCENT rank is never expired, however long it then waits at the
+    # gate. This is what stops assembly time from being read as a failure
+    # to drain.
+    now["t"] = 10_000.0
+    assert expired(armed=1, ready=1) is False, (
+        "a quiescent rank was flagged expired; time spent waiting for the "
+        "group to assemble is being counted as a failure to quiesce, and "
+        "the flip is abandoned as the gate opens (boot 16)"
     )
+
+    # A rank that never drains DOES expire -- that is the deadline's whole
+    # job, and it is what carries a group-agreed abandonment.
+    assert expired(armed=1, ready=0) is True
+
+    # And an unarmed rank is never expired.
+    assert expired(armed=0, ready=0) is False
 
 
 def test_park_clock_is_rebased_once_per_arm_not_once_per_round(tmp_path):
@@ -1219,3 +1246,177 @@ def test_pre_entry_bound_is_per_round_not_per_arm(tmp_path):
     now["t"] = 71.0
     assert r._await_group_presence() is None
     assert r.presence_timeouts == 1
+
+
+# -- quiescent-announce + bounded spin at the hook -----------------------------
+#
+# THE FLAG'S MEANING: "I am at the entry, quiescent, and owe nothing" --
+# not "I was at the entry once". Round-scoping stops stale evidence ACROSS
+# rounds; quiescent-announce stops it WITHIN a round.
+
+
+class _StopHere(Exception):
+    """Marks that control reached the reduction, without running one."""
+
+
+def _onround_stub(presence, ready, clock=None, deadline=60.0, pending="pp_to_tp"):
+    """A runtime whose on_round can be driven without a collective."""
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    class R:
+        pass
+
+    r = R()
+    r._round = 0
+    r._interval = 1
+    r._pending = pending
+    r._ready_fn = ready
+    r._presence = presence
+    r._pump_fn = None
+    r._drain_fn = None
+    r._owes_send_fn = None
+    r.presence_withheld_rounds = 0
+    r._entry_round = 0
+    r._presence_wait_stamp = None
+    r._presence_deadline_s = deadline
+    r._presence_wait_started = None
+    r._gate_open_epoch = None
+    r._epoch = 1
+    r._armed_at = 0.0
+    r._park_deadline_s = 30.0
+    r._last_hold_reason = None
+    r._phase = PHASE_PP
+    r.presence_timeouts = 0
+    r._clock = clock or (lambda: 0.0)
+    r._sleep = lambda _s: None
+    r._presence_poll_interval_s = 0.0
+    for name in (
+        "_await_group_presence",
+        "_spin_for_group_presence",
+        "_abandon_no_quorum",
+        "_park_expired",
+    ):
+        setattr(r, name, getattr(PhaseFlipRuntime, name).__get__(r, R))
+    return r
+
+
+def test_can_fail_a_non_quiescent_rank_does_not_announce(tmp_path):
+    """THE INVERSION, and the 23:39Z three-stack specimen.
+
+    A rank that is not yet drained must go back around the pass loop to
+    drain -- and must NOT publish presence on the way. Announcing early is
+    what made the flag mean "I was at the entry once": the rank published,
+    returned to the loop, met its top-of-pass commit, and the rank that
+    had already entered the reduction was no longer consuming, so it
+    blocked there for ever.
+    """
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    presence = _presence(tmp_path, rank=0)
+    now = {"t": 0.0}
+    r = _onround_stub(
+        presence, ready=lambda: False, clock=lambda: now["t"], deadline=5.0
+    )
+    # The clock advances only when something SLEEPS, i.e. only if this rank
+    # wrongly entered the spin. That keeps the mutation (announce without
+    # quiescence) terminating on the pre-entry bound and FAILING the
+    # assertion below, rather than hanging the suite -- a pin that hangs
+    # tells you nothing.
+    def _advance(_s):
+        now["t"] += 1.0
+
+    r._sleep = _advance
+    assert PhaseFlipRuntime.on_round(r, require_armed_and_parked=True) is None
+    assert presence.observe(1, round_=0) == set(), (
+        "a NON-QUIESCENT rank announced presence. Its peers may now enter "
+        "the reduction on a quorum that includes a rank which still has to "
+        "traverse a blocking top-of-pass commit to get there (23:39Z)"
+    )
+
+
+def test_a_quiescent_rank_announces_and_the_gate_opens_on_live_evidence(tmp_path):
+    """At true idle every rank is quiescent at once, so the gate opens on
+    evidence that is current rather than remembered."""
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    presence = _presence(tmp_path, rank=0)
+    for peer in (1, 2):
+        _presence(tmp_path, rank=peer).announce(1, round_=0)
+    r = _onround_stub(presence, ready=lambda: True)
+    reached = {"collective": False}
+
+    def _collective(payload):
+        reached["collective"] = True
+        raise _StopHere()
+
+    r._collective_min = _collective
+    r._fp = 0
+    r._vec = (1,)
+    r._n = 1
+    r.desync_checks = 0
+    # Reaching the collective at all means the gate opened on this round's
+    # own evidence; the reduction itself is pinned elsewhere.
+    try:
+        PhaseFlipRuntime.on_round(r, require_armed_and_parked=True)
+    except _StopHere:
+        pass
+    assert reached["collective"] is True, "the gate did not open"
+    assert presence.observe(1, round_=0) == {0, 1, 2}
+
+
+def test_can_fail_mid_drain_skew_abandons_within_the_bound_and_keeps_serving(
+    tmp_path,
+):
+    """CASE (b) OF THE SAFETY ARGUMENT: a peer that is not yet quiescent.
+
+    The spinners must NOT wait for ever. Their per-round pre-entry bound
+    expires, they abandon LOUDLY, and -- this is the part that matters --
+    the abandonment is non-fatal and leaves the rank disarmed and serving,
+    so the loop resumes forwarding and the straggler can drain. A later
+    epoch then retries with everyone genuinely quiescent.
+    """
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    now = {"t": 0.0}
+    presence = _presence(tmp_path, rank=0)
+    # Peers never arrive: they are still draining.
+    r = _onround_stub(
+        presence, ready=lambda: True, clock=lambda: now["t"], deadline=30.0
+    )
+
+    def _advance(_s):
+        now["t"] += 1.0
+
+    r._sleep = _advance
+
+    assert PhaseFlipRuntime.on_round(r, require_armed_and_parked=True) is None
+    assert r.presence_timeouts == 1, (
+        "the spin did not end on its per-round bound; a mid-drain peer "
+        "would hold the spinners for ever instead of yielding a bounded "
+        "retry"
+    )
+    assert r._pending is None, "abandonment must disarm, so serving resumes"
+    assert now["t"] >= 30.0, "it abandoned before its bound was actually spent"
+
+
+def test_spin_does_not_return_to_the_caller_between_polls(tmp_path):
+    """The announce-to-entry interval must contain no return to the pass
+    loop -- that interval is where the top-of-pass commit lives."""
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    presence = _presence(tmp_path, rank=0)
+    polls = {"n": 0}
+    r = _onround_stub(presence, ready=lambda: True)
+
+    def _sleep_then_let_peers_arrive(_s):
+        polls["n"] += 1
+        if polls["n"] == 3:
+            for peer in (1, 2):
+                _presence(tmp_path, rank=peer).announce(1, round_=0)
+
+    r._sleep = _sleep_then_let_peers_arrive
+    assert r._spin_for_group_presence() is True
+    assert polls["n"] == 3, (
+        "the gate returned to its caller instead of spinning; the rank "
+        "would meet its top-of-pass commit before it could enter"
+    )
