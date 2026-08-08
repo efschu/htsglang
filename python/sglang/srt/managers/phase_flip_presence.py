@@ -223,6 +223,51 @@ is busy with real work. The per-round pre-entry bound converts that into a
 loud, unanimous abandonment and a later retry -- the designed outcome, and
 free, because nothing has been entered.
 
+MEASURED ON METAL, 2026-08-08 23:28Z (boot POLICY=auto, tree b51480f177).
+The rubber stamp is gone: the markers left on disk were e0.n0.r0/r1/r2 and
+NOTHING for round 1, so no rank re-entered a reduction on round 0's
+evidence, and the ranks progressed PAST the flip reduction instead of
+wedging inside it as they did at 23:12:38Z on the epoch-scoped build.
+
+IT IS NOT SUFFICIENT, and the same boot proves that too. Round-scoping
+closes the stale-evidence hole and nothing else; the flip still wedges,
+for a reason that lives INSIDE a single round.
+
+A NOTE ON A MISREADING, kept because it cost an hour and would cost the
+next reader the same. The log reports this timeout as the collective
+'kv_pressure_ladder.consensus', which reads like a different subsystem
+diverging. It is not. The flip's consensus channel is built from
+kv_pressure_runtime.default_collective_min (phase_flip_runtime, the
+collective_min= argument), and that helper hardcodes its own module's
+label. The timing-out collective IS the flip's own reduction, wearing
+another feature's name. Do not go looking for a second bug.
+
+THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
+----------------------------------------------------------
+Measured 2026-08-08 23:39Z, all three stacks
+(evidence-631/wedge_20260808T233910Z_KVPRESSURE_DIVERGENCE), markers
+e0.n0.r0/r1/r2 -- one round, full quorum:
+
+  rank 2  in the reduction for round 0
+  rank 1  blocked at its top-of-pass commit (:724 -> :1187)
+  rank 0  blocked at its top-of-pass commit (:724 -> :1187)
+
+Announcing and ENTERING are not the same instant, and a whole pass can sit
+between them. A rank announces at the hook; if the quorum is not yet
+complete it returns and goes around the loop, and the NEXT thing it meets
+is the top-of-pass commit. So the LAST rank to announce enters
+immediately, while every rank that announced EARLIER must traverse a
+blocking chain commit to get back to the entry -- a commit that blocks
+precisely because the rank which already entered is no longer consuming.
+Cycle: rank 2 in the reduction -> does not recv -> rank 1 stuck committing
+to rank 2 -> does not recv -> rank 0 stuck committing to rank 1.
+
+So the flag means "I was at the entry once", not "I am at the entry". The
+gate's evidence is now correctly scoped in TIME (per round) and still
+wrong in PLACE: nothing keeps a rank at the entry between announcing and
+entering. Any fix must remove the blocking chain operation from that
+interval -- not tighten the stamp again.
+
 EPOCHS, ROUNDS, AND WHY FLAGS ARE NEVER CLEARED
 -----------------------------------------------
 Flags are monotone WITHIN AN (epoch, round) STAMP: a rank sets its own and
