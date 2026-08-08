@@ -23,7 +23,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
-from sglang.srt.managers.io_struct import PhaseFlipReqInput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -656,46 +655,12 @@ class SchedulerPPMixin:
         is committed on the next pass) and removes the cycle: every stage has
         the request in flight before any stage blocks on it.
         """
-        # #631: an INTERNAL phase-flip arm (the automatic policy) must be
-        # forwarded SYNCHRONOUSLY, and this is a deadlock fix, not a
-        # preference.
-        #
-        # The async send's completion is only committed on the NEXT pass.
-        # For ordinary requests that is free, because the loop keeps
-        # cycling. A policy arm is different: the rank that injects it
-        # arms itself in this same pass, and an armed+quiescent rank goes
-        # straight into the flip's BLOCKING consensus reduction. With an
-        # async forward the peers have not received the arm yet, so they
-        # sit in point_to_point_pyobj waiting for the batch whose send
-        # sits behind this rank's reduction -- the exact circular wait
-        # the on_round docstring warns about. Measured 2026-08-08 on an
-        # idle server: rank 0 in bounded_collective, ranks 1 and 2 in
-        # _pull_raw_reqs, 0 % GPU, every request parked behind a flip
-        # that could never commit and never abandon.
-        #
-        # The manual RPC path escapes this only by luck: it arrives under
-        # traffic, so the loop cycles and the send completes. The policy
-        # arms into an idle server, which is precisely when it cannot.
-        #
-        # A synchronous forward makes the arm's DELIVERY precede this
-        # rank's block. It cannot itself hang: the downstream stage is
-        # already blocked in the matching recv. Every stage applies the
-        # same rule, so the arm walks the chain ahead of the reduction.
-        carries_internal_arm = False
-        if recv_reqs:
-            for _r in recv_reqs:
-                if isinstance(_r, PhaseFlipReqInput) and getattr(
-                    _r, "internal", False
-                ):
-                    carries_internal_arm = True
-                    break
-
         if not self.pp_group.is_last_rank:
             self._pp_commit_comm_work(self.send_req_work)
             with torch.profiler.record_function("send_reqs_to_next_stage"):
                 self.send_req_work = self._pp_send_pyobj_to_next_stage(
                     recv_reqs,
-                    async_send=not carries_internal_arm,
+                    async_send=True,
                 )
 
         self.process_input_requests(recv_reqs)
