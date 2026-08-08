@@ -460,6 +460,15 @@ in the boot check rather than assuming.
 ## 5. Integration wiring plan (remaining step-5 slices, file:line from
 ## the 2026-08-08 survey; each slice lands with tests before the next)
 
+STATE 2026-08-08 (session 1 of the restaffed strand): steps 1-4 DONE and
+committed with 79 green tests + falsifiers across two dirs; 5.1 DONE
+(args surface, 8 tests); 5.2 STARTED -- the secondary-group boot wiring
+in model_runner.init_torch_distributed is committed (desk-written,
+first-boot-validated in step 6); NEXT SLICE: the TP-shaped runner stack
+built under geometry override (5.2 remainder), then 5.3. Pin status:
+1 discharged (manifest), 3 pending (lands with 5.2 pools), 4 discharged
+at unit level (scheduler-level replay in 5.3).
+
 ### 5.1 Server args surface
 - New flags: --phase-flip (off default; gates EVERYTHING below),
   --phase-flip-tp-vector (the decode DCP vector, e.g. 30,17,17),
