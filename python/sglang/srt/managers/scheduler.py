@@ -4053,6 +4053,31 @@ class Scheduler(
             )
         return int(self.token_to_kv_pool_allocator.available_size())
 
+    def _phase_flip_on_round(self):
+        """One phase-flip runtime round (#631): lazy-build, bounded
+        consensus every consensus_interval-th call, loop exit on commit.
+
+        Two call sites, one per loop family, both rank-uniform in call
+        COUNT: get_next_batch_to_run for event_loop_normal (lockstep TP
+        rounds), and the END of the event_loop_pp microbatch iteration --
+        after every send of the iteration is flushed -- because a blocking
+        world-reduction entered before this rank's sends closes a cycle
+        with the pipeline p2p chain (measured 2026-08-08; see the call-site
+        comment in get_next_batch_to_run)."""
+        if self.phase_flip_runtime is None:
+            from sglang.srt.managers.phase_flip_runtime import (
+                build_phase_flip_runtime,
+            )
+
+            self.phase_flip_runtime = build_phase_flip_runtime(self)
+        flip_stats = self.phase_flip_runtime.on_round()
+        if flip_stats is not None:
+            from sglang.srt.managers.phase_flip_runtime import (
+                PhaseFlipLoopExit,
+            )
+
+            raise PhaseFlipLoopExit(flip_stats["direction"])
+
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
@@ -4231,20 +4256,22 @@ class Scheduler(
         # here, after the runtime's epoch/phase bookkeeping completed, at
         # a quiescent boundary by construction. Flag unset = attribute
         # stays None, no collective, byte-identical to today.
-        if self.server_args.enable_phase_flip:
-            if self.phase_flip_runtime is None:
-                from sglang.srt.managers.phase_flip_runtime import (
-                    build_phase_flip_runtime,
-                )
-
-                self.phase_flip_runtime = build_phase_flip_runtime(self)
-            flip_stats = self.phase_flip_runtime.on_round()
-            if flip_stats is not None:
-                from sglang.srt.managers.phase_flip_runtime import (
-                    PhaseFlipLoopExit,
-                )
-
-                raise PhaseFlipLoopExit(flip_stats["direction"])
+        # PP-LOOP ORDERING (first real-metal flip boot, 2026-08-08): under
+        # event_loop_pp this hook is DEFERRED to the end of the microbatch
+        # iteration (scheduler_pp_mixin sets _defer_flip_round_to_pp_loop).
+        # get_next_batch_to_run sits at the TOP of the pp iteration, before
+        # this rank's sends are issued; entering the bounded world-reduction
+        # there closes a cycle with the pipeline's p2p chain (measured
+        # wedge: PP0+PP1 in the consensus, PP2 in recv-from-PP1, barlink
+        # liveness killed the tree after 120 s). The invariant is the
+        # rank-local-state-feeds-collective family rule in PP form: a
+        # blocking group reduction may only be entered once every send a
+        # peer needs to reach ITS reduction of the same round is flushed --
+        # i.e. as the LAST blocking op of the iteration.
+        if self.server_args.enable_phase_flip and not getattr(
+            self, "_defer_flip_round_to_pp_loop", False
+        ):
+            self._phase_flip_on_round()
 
         # #330 VRAM dial / KV capacity runtime: same lazy-build and cadence
         # discipline. Runs AFTER the reshard block so a #297 cutover in this

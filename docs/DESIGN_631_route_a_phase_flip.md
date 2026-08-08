@@ -310,6 +310,21 @@ ceilings ~329k/283k/255k. BINDING: 3080 rank 2 at ~255k global tokens =
 production cap (327700, itself the mamba cap of 4 x 65536 + headroom).
 Not halved -- the #625 arms sized pools into luxury free VRAM.
 
+BUILD TRANSIENT (measured 2026-08-08, first real-metal boot): the ledger
+above prices the STEADY state only. At build step 4 the TP checkpoint
+originals and the freshly-allocated arena COEXIST (the arena must exist
+before pack_into_arena starts freeing originals per-slot), so the boot
+peak carries an extra term of TP-original size (~12.4/7/7 GiB per rank)
+on top of the already-allocated PP pools. With the pool budgets at
+22000/13000/13000 MiB the arena allocation CUDA-OOMed on every rank
+(measured deficits: rank0 4.4 GiB, rank2 1.7 GiB); 17000/11000/11000
+fits and boots. Consequence: the POOL budget must satisfy
+  pools(RANK_MIB) + tp_originals + arena <= usable VRAM
+at build time, i.e. the KV ceilings drop below the steady-state ledger's
+numbers until a leaner build order (e.g. pack-during-load) reclaims the
+transient. Do not tune RANK_MIB by trial on this point again -- this
+term is the reason.
+
 DECISION: two resident pools (option a). The ~22% ceiling price is the
 KV analog of the arena's +2.34 GB and is recoverable: the 4016 activation
 term is known-conservative and the 500 NCCL term is a guess -- both are

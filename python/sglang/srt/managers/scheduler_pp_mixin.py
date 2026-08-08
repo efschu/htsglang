@@ -161,6 +161,22 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        # #631: the phase-flip consensus must not run inside
+        # get_next_batch_to_run here -- that is the TOP of the iteration,
+        # before this rank's sends are issued, and a blocking world-
+        # reduction there deadlocks against the pipeline p2p chain
+        # (measured wedge 2026-08-08: two ranks in the reduction, one in
+        # recv-from-prev). It runs at the END of each microbatch iteration
+        # instead (all sends flushed -> every peer can reach its own
+        # reduction of the same round). The flag is reset on ANY exit so a
+        # post-flip event_loop_normal runs the hook inline again.
+        self._defer_flip_round_to_pp_loop = True
+        try:
+            self._event_loop_pp_body()
+        finally:
+            self._defer_flip_round_to_pp_loop = False
+
+    def _event_loop_pp_body(self):
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -232,6 +248,18 @@ class SchedulerPPMixin:
                             )
 
                 self.pp_outputs = next_pp_outputs
+
+                # #631 phase-flip round hook, deferred from
+                # get_next_batch_to_run: every send of this iteration is
+                # flushed above (output dict committed, proxy isend issued,
+                # request forward sent at the top), so the bounded
+                # consensus is now the LAST blocking op of the iteration
+                # and cannot close a cycle with a peer's pending recv. A
+                # commit raises PhaseFlipLoopExit here -- a quiescent
+                # boundary by construction (ready_fn gates on drained
+                # microbatches).
+                if self.server_args.enable_phase_flip:
+                    self._phase_flip_on_round()
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:

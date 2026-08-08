@@ -716,3 +716,130 @@ class TestAbortDeferral(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPpLoopConsensusOrdering(CustomTestCase):
+    """Family pin (rank-local-state-feeds-collective, PP form; measured
+    wedge 2026-08-08): under a pipeline, entering the bounded consensus
+    at the TOP of the iteration -- before this rank's send -- closes a
+    cycle with the p2p chain (two ranks in the reduction, one blocked in
+    recv-from-prev). The fix places the hook at the END of the iteration,
+    after every send is flushed. Both orderings are driven here against
+    the REAL on_round consensus through a bounded barrier channel: the
+    top placement must deadlock (negative control, can-fail proof), the
+    end placement must complete."""
+
+    N_ITERS = 4  # consensus_interval=2 -> two consensus boundaries
+
+    def _drive(self, hook_position):
+        import queue
+
+        n = len(VEC)
+        _, live, _, pp_views, _, tp_views = _make_layout_pools(
+            MAP_625, VEC, 200, seed=29
+        )
+        barrier = threading.Barrier(n, timeout=3.0)
+
+        def _channel_for(r):
+            lows = [None] * n
+
+            def _reduce(vals, r=r):
+                lows[r] = list(vals)
+                barrier.wait()  # BrokenBarrierError after 3 s = deadlock
+                agg = [
+                    min(lows[q][i] for q in range(n) if lows[q] is not None)
+                    for i in range(len(vals))
+                ]
+                return agg
+
+            return _reduce
+
+        runtimes = []
+        for r in range(n):
+            runtimes.append(
+                PhaseFlipRuntime(
+                    n_ranks=n,
+                    rank=r,
+                    layer_map=MAP_625,
+                    n_layers=N_LAYERS,
+                    tp_vector=VEC,
+                    boot_phase=PHASE_PP,
+                    consensus_interval=2,
+                    collective_min=_channel_for(r),
+                    exchange=lambda peers, payloads: {},
+                    pp_pool_view=pp_views[r],
+                    tp_pool_view=tp_views[r],
+                    live_slots_fn=lambda: live,
+                    ready_fn=lambda: False,
+                    cutover_fn=lambda d: None,
+                )
+            )
+
+        # Measured wedge composition (2026-08-08): the last stage blocks in
+        # a mid-iteration recv BEFORE its round hook, while the middle
+        # stage's send to it trails the middle stage's own hook. With the
+        # hook at the TOP the middle stage enters the bounded reduction
+        # still owing that send -> the last stage can never reach its
+        # reduction and the barrier breaks (the wedge). With the hook at
+        # the END every send precedes every hook, so the recv is always
+        # satisfiable and the reduction completes.
+        pipes = [queue.Queue() for _ in range(n)]
+        outcomes = [None] * n
+
+        last, middle = n - 1, n - 2
+
+        def _worker(r):
+            try:
+                for i in range(self.N_ITERS):
+                    if hook_position == "top" and r != last:
+                        runtimes[r].on_round()
+                    if r == last:
+                        pipes[middle].get(timeout=3.0)  # mid-iteration recv
+                    if r == middle:
+                        pipes[middle].put(i)  # send to last
+                    if hook_position == "end" and r != last:
+                        runtimes[r].on_round()
+                    if r == last:
+                        runtimes[r].on_round()  # hook always after its recv
+                outcomes[r] = "done"
+            except BaseException as e:  # noqa: BLE001
+                outcomes[r] = e
+
+        threads = [
+            threading.Thread(target=_worker, args=(r,), daemon=True)
+            for r in range(n)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+        return outcomes
+
+    def test_top_placement_deadlocks_negative_control(self):
+        import queue as queue_mod
+
+        outcomes = self._drive("top")
+        self.assertNotEqual(
+            outcomes,
+            ["done"] * len(VEC),
+            "top-of-iteration consensus completed under pipeline skew -- "
+            "the negative control lost its teeth; re-derive the ordering "
+            "argument before trusting the end placement",
+        )
+        broken = [
+            o
+            for o in outcomes
+            if isinstance(o, (threading.BrokenBarrierError, queue_mod.Empty))
+        ]
+        self.assertTrue(
+            broken,
+            f"expected a bounded deadlock signature, got {outcomes}",
+        )
+
+    def test_end_placement_completes(self):
+        outcomes = self._drive("end")
+        self.assertEqual(
+            outcomes,
+            ["done"] * len(VEC),
+            f"end-of-iteration consensus must complete: {outcomes}",
+        )
