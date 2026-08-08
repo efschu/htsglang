@@ -6217,7 +6217,23 @@ class Scheduler(
         the runtime's MIN-semantics on the armed flag. Routed through
         arm_phase_flip so the abort deferral window activates atomically
         with the arm (pin 4)."""
+        # An INTERNALLY generated request (the automatic phase policy) is
+        # answered with None, never with a PhaseFlipReqOutput. The reply
+        # path ends at _Communicator.handle_recv, which appends to
+        # _result_values -- an attribute that only exists while a caller
+        # is awaiting that RPC. The policy is not a caller: it synthesised
+        # this request inside the scheduler, so there is no awaiting
+        # future, _result_values is None, and answering raises
+        # AttributeError in the TokenizerManager's handle_loop. That
+        # exception is fatal to the tokenizer and takes the whole server
+        # with it (measured 2026-08-08: three consecutive boots died
+        # seconds after health, each one immediately after the policy's
+        # first arm). The outcome is logged by arm_phase_flip either way,
+        # so suppressing the reply loses nothing.
+        internal = bool(getattr(recv_req, "internal", False))
         if not self.server_args.enable_phase_flip:
+            if internal:
+                return None
             return PhaseFlipReqOutput(
                 success=False,
                 message=(
@@ -6233,7 +6249,11 @@ class Scheduler(
             # Arming performs no collective and moves no byte; every rank
             # computes the same verdict from the same replicated input.
             logger.warning("PHASE-FLIP arm failed: %s", e)
+            if internal:
+                return None
             return PhaseFlipReqOutput(success=False, message=str(e))
+        if internal:
+            return None
         return PhaseFlipReqOutput(success=ok, message=msg)
 
     def handle_vram_budget(self, recv_req: VramBudgetReqInput) -> VramBudgetReqOutput:
@@ -6789,7 +6809,11 @@ class Scheduler(
         logger.warning(
             "PHASE-POLICY arming %s: %s", decision.direction, decision.reason
         )
-        return PhaseFlipReqInput(direction=decision.direction, source="policy")
+        # internal=True: nobody is awaiting a reply to this, and answering
+        # it would kill the TokenizerManager. See handle_phase_flip.
+        return PhaseFlipReqInput(
+            direction=decision.direction, source="policy", internal=True
+        )
 
     def arm_phase_flip(self, direction: str, source: str):
         """#631: replicated arming entry (RPC / regime gate). Activates the

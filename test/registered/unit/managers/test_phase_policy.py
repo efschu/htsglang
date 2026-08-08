@@ -437,6 +437,135 @@ def test_policy_emits_the_same_control_request_the_rpc_path_uses():
     assert req.source == "policy"
 
 
+def test_policy_request_is_marked_internal():
+    """internal=True is what stops the scheduler answering it."""
+    s = _sched(queue=[_StubReq(N + 1000)], running=1)
+    req = s.maybe_arm_phase_policy()
+    assert req.internal is True
+
+
+def test_internal_request_is_never_answered():
+    """REGRESSION, measured on metal 2026-08-08.
+
+    The reply path ends at _Communicator.handle_recv, which appends to
+    _result_values -- present only while a caller awaits that RPC. The
+    policy synthesises its request inside the scheduler, so nothing
+    awaits it: answering raised
+    ``AttributeError: 'NoneType' object has no attribute 'append'`` in
+    the TokenizerManager and killed three consecutive boots seconds
+    after health. handle_phase_flip must return None for internal
+    requests so process_input_requests sends nothing.
+    """
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from sglang.srt.managers.scheduler import Scheduler
+
+    class _Args:
+        enable_phase_flip = True
+
+    class S:
+        pass
+
+    s = S()
+    s.server_args = _Args()
+    s.arm_phase_flip = lambda d, source: (True, f"armed {d} from {source}")
+    handler = Scheduler.handle_phase_flip.__get__(s, S)
+
+    internal = PhaseFlipReqInput(
+        direction=TP_TO_PP, source="policy", internal=True
+    )
+    assert handler(internal) is None, "an internal arm must not be answered"
+
+    # The human RPC path must still get its reply, or /phase_flip hangs.
+    rpc = PhaseFlipReqInput(direction=TP_TO_PP)
+    out = handler(rpc)
+    assert out is not None and out.success is True
+
+
+def test_cross_boundary_internal_arm_sends_nothing_to_the_tokenizer():
+    """CROSS-BOUNDARY regression, measured on metal 2026-08-08.
+
+    handle_phase_flip returning None is only half the contract; what
+    actually killed the server was the SEND. process_input_requests is
+    the boundary: ``if output is not None: send_to_tokenizer.send_output``.
+    So this drives the real dispatcher loop and asserts on the wire, not
+    on a return value -- an internal arm must put ZERO objects on the
+    tokenizer socket, while a human RPC still gets exactly one.
+
+    A unit test of handle_phase_flip alone cannot catch a regression that
+    reintroduces the send (e.g. by returning a falsy-but-not-None
+    output), which is why this exists separately.
+    """
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from sglang.srt.managers.scheduler import Scheduler
+
+    sent = []
+
+    class _Sock:
+        def send_output(self, output, recv_req):
+            sent.append(output)
+
+    class _Ipc:
+        send_to_tokenizer = _Sock()
+        recv_from_rpc = None
+
+    class _Args:
+        enable_phase_flip = True
+
+    class S:
+        pass
+
+    s = S()
+    s.server_args = _Args()
+    s.ipc_channels = _Ipc()
+    s.session_controller = type("_SC", (), {"maybe_reap": lambda self, n: None})()
+    s.return_health_check_ipcs = []
+    s.flush_wrapper = type("_FW", (), {"check_pending": lambda self: None})()
+    s.external_corpus_manager = None
+    s.arm_phase_flip = lambda d, source: (True, f"armed {d} from {source}")
+    handler = Scheduler.handle_phase_flip.__get__(s, S)
+    s._request_dispatcher = handler
+
+    process = Scheduler.process_input_requests.__get__(s, S)
+
+    # The policy's own arm: nothing may reach the tokenizer.
+    process([PhaseFlipReqInput(direction=TP_TO_PP, source="policy", internal=True)])
+    assert sent == [], (
+        "an internal arm reached the tokenizer; this is the send that "
+        "raised NoneType.append in _Communicator.handle_recv and killed "
+        "the server"
+    )
+
+    # The human path must still be answered, or POST /phase_flip hangs.
+    process([PhaseFlipReqInput(direction=TP_TO_PP)])
+    assert len(sent) == 1 and sent[0].success is True
+
+
+def test_internal_request_unanswered_even_when_arming_fails():
+    """A refusal must not become a reply either."""
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+    from sglang.srt.managers.scheduler import Scheduler
+
+    class _Args:
+        enable_phase_flip = True
+
+    class S:
+        pass
+
+    def _boom(d, source):
+        raise RuntimeError("no runtime yet")
+
+    s = S()
+    s.server_args = _Args()
+    s.arm_phase_flip = _boom
+    handler = Scheduler.handle_phase_flip.__get__(s, S)
+
+    internal = PhaseFlipReqInput(
+        direction=TP_TO_PP, source="policy", internal=True
+    )
+    assert handler(internal) is None
+    assert handler(PhaseFlipReqInput(direction=TP_TO_PP)).success is False
+
+
 def test_policy_emits_nothing_below_the_threshold():
     s = _sched(queue=[_StubReq(N - 1)], running=1)
     assert s.maybe_arm_phase_policy() is None
