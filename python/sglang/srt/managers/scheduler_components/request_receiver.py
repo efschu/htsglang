@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import time
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -63,6 +64,16 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+    # #631(a): seconds to wait for a chain batch before returning empty so
+    # this stage can re-evaluate its own round hooks. 0.0 = the upstream
+    # unbounded wait, which is the default and every non-policy boot.
+    chain_recv_poll_s: float = 0.0
+    # In-flight chain receive, carried ACROSS iterations. A posted irecv
+    # cannot be abandoned -- the sender will still deliver into it -- so a
+    # bounded poll must keep the same Work and re-poll it next time, never
+    # post a second one. dict (not a plain attr) because this dataclass is
+    # frozen.
+    chain_recv_state: dict = field(default_factory=dict)
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -98,6 +109,62 @@ class SchedulerRequestReceiver:
 
         return recv_reqs
 
+    def _chain_recv_bounded(self, src: int, dst: int) -> List:
+        """#631(a): one bounded step of the PP request-chain receive.
+
+        Returns the batch when one has arrived, or ``[]`` when the poll
+        window expired with nothing in flight yet. Returning empty is a
+        NORMAL outcome, not an error: it hands control back to the event
+        loop so this stage can run its round hooks (notably the phase
+        flip's consensus join) and come back here.
+
+        THE INVARIANT: a posted ``irecv`` is a standing promise to the
+        sender, which will deliver into that exact tensor. It can never
+        be abandoned on a timeout. So the Work and its tensor live in
+        ``chain_recv_state`` and are re-polled on later calls; a second
+        irecv is never posted while one is outstanding. Getting this
+        wrong desynchronises the chain rather than merely slowing it.
+
+        Only the SIZE header is polled. Once it lands, the sender is
+        already committed to the payload, so the body is read with the
+        ordinary blocking wait -- it is in flight by construction and
+        bounding it would buy nothing.
+        """
+        import pickle
+
+        import numpy as np
+        import torch
+        import torch.distributed as dist
+
+        st = self.chain_recv_state
+        work = st.get("work")
+        if work is None:
+            tensor_size = torch.tensor([0], dtype=torch.long)
+            work = dist.irecv(
+                tensor_size, src=src, group=self.world_group.cpu_group
+            )
+            st["work"] = work
+            st["tensor_size"] = tensor_size
+
+        deadline = time.perf_counter() + self.chain_recv_poll_s
+        while not work.is_completed():
+            if time.perf_counter() >= deadline:
+                # Still outstanding: keep it for the next call and let
+                # this stage get on with its round.
+                return []
+            time.sleep(0.001)
+        work.wait()
+
+        size = int(st["tensor_size"].item())
+        st.clear()
+        if size == 0:
+            return []
+        tensor_data = torch.empty(size, dtype=torch.uint8)
+        dist.irecv(
+            tensor_data, src=src, group=self.world_group.cpu_group
+        ).wait()
+        return pickle.loads(tensor_data.numpy().tobytes())
+
     def _pull_raw_reqs(self) -> Optional[List]:
         if self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -127,13 +194,41 @@ class SchedulerRequestReceiver:
                 dp_offset = (
                     self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
                 )
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
+                if self.chain_recv_poll_s:
+                    # #631(a): BOUNDED chain recv, so an idle downstream
+                    # stage is a CYCLING stage.
+                    #
+                    # The unbounded wait below is what makes an automatic
+                    # flip impossible at idle. Measured 2026-08-08 (boot
+                    # 10): all three ranks armed identically, rank 0's
+                    # park predicate went true first and it entered the
+                    # flip's blocking reduction -- and entering it stops
+                    # rank 0 forwarding the very batch ranks 1 and 2 are
+                    # blocked on here. They had already evaluated
+                    # on_round once while NOT yet parked, returned, and
+                    # come back here to block forever. No one can join,
+                    # and rank 0 cannot time out because the park
+                    # deadline is checked before entry, not from inside.
+                    #
+                    # An unbounded wait in a coordination path is also
+                    # against this fork's bounded-wait canon (#610/#615/
+                    # #653). With a bound, a stage that has nothing to
+                    # receive returns empty, re-reaches its own
+                    # on_round -- by then parked -- and joins. Idle
+                    # coordination then needs no chain message at all,
+                    # which is what lets the policy stay message-free.
+                    recv_reqs = self._chain_recv_bounded(
+                        src=(self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+                        dst=self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    )
+                else:
+                    recv_reqs = point_to_point_pyobj(
+                        [],
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    )
             else:
                 recv_reqs = None
         return recv_reqs

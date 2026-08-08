@@ -511,3 +511,122 @@ def test_the_policy_sends_no_control_message_anywhere():
     assert "internal" not in fwd_src and "async_send=True" in fwd_src, (
         "the PP forward grew an internal-arm special case again"
     )
+
+
+# -- #631(a): the bounded chain recv that makes idle stages cycle -------------
+
+
+class _FakeWork:
+    """A dist Work that completes after N polls."""
+
+    def __init__(self, completes_after):
+        self.polls = 0
+        self._after = completes_after
+        self.waited = False
+
+    def is_completed(self):
+        self.polls += 1
+        return self.polls > self._after
+
+    def wait(self):
+        self.waited = True
+
+
+def _bounded_receiver(poll_s):
+    from sglang.srt.managers.scheduler_components.request_receiver import (
+        SchedulerRequestReceiver,
+    )
+
+    class _PS:
+        pp_rank = 1
+        attn_tp_rank = 0
+        attn_cp_rank = 0
+        tp_size = 1
+        attn_dp_rank = 0
+        attn_cp_size = 1
+        attn_tp_size = 1
+
+    class _WG:
+        cpu_group = object()
+
+    return SchedulerRequestReceiver(
+        recv_from_tokenizer=None,
+        recv_from_rpc=None,
+        recv_skipper=None,
+        input_blocker=None,
+        mm_receiver=None,
+        ps=_PS(),
+        tp_group=None,
+        tp_cpu_group=None,
+        attn_tp_group=None,
+        attn_tp_cpu_group=None,
+        attn_cp_group=None,
+        attn_cp_cpu_group=None,
+        world_group=_WG(),
+        server_args=None,
+        model_config=None,
+        max_recv_per_poll=-1,
+        stream_output=lambda *a, **kw: None,
+        get_last_forward_mode=lambda: None,
+        chain_recv_poll_s=poll_s,
+    )
+
+
+def test_bounded_chain_recv_returns_empty_instead_of_blocking_forever():
+    """The fix for the boot-10 wedge.
+
+    An idle downstream stage must hand control back so it can re-reach its
+    own on_round -- by then parked -- and join the flip. Blocking here is
+    what made rank 0's reduction unjoinable.
+    """
+    from unittest import mock
+
+    recv = _bounded_receiver(0.02)
+    never = _FakeWork(completes_after=10**9)
+    with mock.patch("torch.distributed.irecv", return_value=never):
+        out = recv._chain_recv_bounded(src=0, dst=1)
+    assert out == [], "a bounded recv must return empty, not block"
+    assert never.waited is False, "an incomplete Work must not be waited on"
+
+
+def test_bounded_chain_recv_never_posts_a_second_irecv():
+    """A posted irecv is a promise to the sender and cannot be abandoned.
+
+    Re-polling MUST reuse the same Work; posting a second one would leave
+    two buffers claiming one send and desynchronise the chain.
+    """
+    from unittest import mock
+
+    recv = _bounded_receiver(0.01)
+    never = _FakeWork(completes_after=10**9)
+    with mock.patch("torch.distributed.irecv", return_value=never) as irecv:
+        recv._chain_recv_bounded(src=0, dst=1)
+        recv._chain_recv_bounded(src=0, dst=1)
+        recv._chain_recv_bounded(src=0, dst=1)
+    assert irecv.call_count == 1, (
+        f"posted {irecv.call_count} irecvs for one pending receive; the "
+        f"in-flight Work must be carried across calls"
+    )
+    assert recv.chain_recv_state.get("work") is never
+
+
+def test_bounded_chain_recv_delivers_an_empty_batch_when_it_lands():
+    """size==0 is the idle heartbeat the upstream stage forwards."""
+    from unittest import mock
+
+    import torch
+
+    recv = _bounded_receiver(0.5)
+    landed = _FakeWork(completes_after=1)
+    with mock.patch("torch.distributed.irecv", return_value=landed):
+        out = recv._chain_recv_bounded(src=0, dst=1)
+    assert out == []
+    assert landed.waited is True
+    # State cleared, so the next call posts a fresh receive.
+    assert recv.chain_recv_state == {}
+
+
+def test_unset_poll_keeps_the_upstream_unbounded_path():
+    """Default boots must not change behaviour at all."""
+    recv = _bounded_receiver(0.0)
+    assert recv.chain_recv_poll_s == 0.0
