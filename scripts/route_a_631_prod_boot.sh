@@ -40,6 +40,20 @@ MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-500000}"
 # OFF by default and not a preference: --enable-phase-flip hard-refuses
 # --enable-hierarchical-cache at argument time (#630). A default of 1 made
 # the script unbootable without an explicit HICACHE=0.
+# Who decides when to flip. 'manual' reproduces every boot before the
+# policy existed: nothing flips unless a POST /phase_flip says so, which
+# is why an unattended instance rested in whatever layout the last call
+# left. 'auto' installs the #631 phase policy. The policy REFUSES to boot
+# without a threshold, so PHASE_POLICY_TP_TOK_S (the measured TP-phase
+# prefill throughput at the 8k rung) or PHASE_POLICY_FLIP_TOKENS (an
+# explicit N) must accompany POLICY=auto -- a threshold is a measurement,
+# not a default.
+POLICY="${POLICY:-manual}"
+PHASE_POLICY_TP_TOK_S="${PHASE_POLICY_TP_TOK_S:-}"
+PHASE_POLICY_FLIP_TOKENS="${PHASE_POLICY_FLIP_TOKENS:-}"
+PHASE_POLICY_MIN_DWELL_S="${PHASE_POLICY_MIN_DWELL_S:-}"
+PHASE_POLICY_IDLE_DWELL_S="${PHASE_POLICY_IDLE_DWELL_S:-}"
+PHASE_IDLE_STATE="${PHASE_IDLE_STATE:-}"
 HICACHE="${HICACHE:-0}"
 HICACHE_RATIO="${HICACHE_RATIO:-2}"
 # --kv-pressure-ladder auto REFUSES on this rig: it cannot map ranks to
@@ -82,6 +96,15 @@ export SGLANG_UNEVEN_DCP=1
 export SGLANG_UNEVEN_DCP_WEIGHTED=1
 # Mixed 5090+3080 group is the CONFIGURATION, not a symptom.
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+
+# #631 phase policy tuning. Exported only when set, so an unset knob keeps
+# the module default rather than exporting an empty string that the
+# parser would have to special-case.
+[ -n "$PHASE_POLICY_TP_TOK_S" ] && export SGLANG_PHASE_POLICY_TP_TOK_S="$PHASE_POLICY_TP_TOK_S"
+[ -n "$PHASE_POLICY_FLIP_TOKENS" ] && export SGLANG_PHASE_POLICY_FLIP_TOKENS="$PHASE_POLICY_FLIP_TOKENS"
+[ -n "$PHASE_POLICY_MIN_DWELL_S" ] && export SGLANG_PHASE_POLICY_MIN_DWELL_S="$PHASE_POLICY_MIN_DWELL_S"
+[ -n "$PHASE_POLICY_IDLE_DWELL_S" ] && export SGLANG_PHASE_POLICY_IDLE_DWELL_S="$PHASE_POLICY_IDLE_DWELL_S"
+[ -n "$PHASE_IDLE_STATE" ] && export HTSGLANG_PHASE_IDLE_STATE="$PHASE_IDLE_STATE"
 
 # --- decode-phase KV token split -------------------------------------------
 # The flip's TP vector 30,17,17 drives BOTH the weight shard plan and, by
@@ -215,6 +238,7 @@ setsid "$PY" -m sglang.launch_server \
     --rank-gpu-memory-mib "$RANK_MIB" \
     --enable-phase-flip \
     --phase-flip-tp-vector 30,17,17 \
+    --phase-flip-policy "$POLICY" \
     --disable-overlap-schedule \
     --kv-cache-dtype fp8_e4m3 --context-length "$CTX" \
     --max-running-requests "$MAX_RUNNING" \

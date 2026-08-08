@@ -128,7 +128,18 @@ DEFAULT_PP_PREFILL_TOK_S = 7245.5
 # PROD_BRINGUP_BENCH. Overridable so a different rig can re-derive N from
 # its own ladder without editing code.
 ENV_TP_TOK_S = "SGLANG_PHASE_POLICY_TP_TOK_S"
-DEFAULT_TP_PREFILL_TOK_S = float(os.environ.get(ENV_TP_TOK_S, "0") or 0)
+# TP-phase prefill at the 8192-token rung, tok/s. MEASURED on this rig
+# (2026-08-08, commit 2bcc6b7d25, quiet-gated ladder with zero contended
+# draws): 2134.1 / 1681.0 / 1484.1 at 2048 / 8192 / 32768, spreads 0.25 /
+# 0.14 / 0.03 %. Against the PP ladder's 4236.8 / 7245.5 / 6842.6 that is
+# a 2.0x / 4.3x / 4.6x prefill penalty for serving a long prompt from the
+# decode layout -- a 32768-token prefill costs 22.08 s in TP against
+# 4.79 s in PP. This is the number that makes the policy worth having,
+# and it is why the resting layout is PP.
+#
+# Overridable so another rig re-derives N from its own ladder rather than
+# inheriting this one's (see scripts/route_a_631_prefill_ladder_quiet.py).
+DEFAULT_TP_PREFILL_TOK_S = float(os.environ.get(ENV_TP_TOK_S, "1681.0") or 1681.0)
 
 ENV_ENABLE = "SGLANG_PHASE_POLICY"
 ENV_FLIP_TOKENS = "SGLANG_PHASE_POLICY_FLIP_TOKENS"
@@ -140,10 +151,20 @@ ENV_REST_STATE = "HTSGLANG_PHASE_IDLE_STATE"
 # one round trip: a server that flips, and is allowed to flip straight back,
 # spends more wall clock moving KV than serving.
 DEFAULT_MIN_DWELL_S = 10.0
-# The idle return is a convenience, not a race: nothing waits on it, so it
-# is set long enough that a brief gap between two requests of the same
-# conversation does not pay a flip round trip.
-DEFAULT_IDLE_DWELL_S = 20.0
+# The idle return is the OTHER half of resting in PP, and it has to be
+# fast to be worth anything. The serving cycle is: prefill in PP -> flip
+# to TP so the draft/verify of speculation runs where the decode CUDA
+# graphs are -> decode -> and then back to PP so the NEXT request's
+# prefill is already in the fast layout. If this dwell is long, the last
+# step does not happen in time and the next request prefills in TP at
+# 1681 tok/s instead of 7245 -- which is the whole defect the policy
+# exists to remove.
+#
+# 3 s is just under two flip round trips: a gap shorter than the flip
+# itself cannot trigger a return (there would be no time to profit from
+# it), while any real inter-request gap does. Nothing waits on this flip,
+# so its cost is not in anyone's latency path.
+DEFAULT_IDLE_DWELL_S = 3.0
 
 
 class PhasePolicyError(ValueError):
@@ -303,14 +324,25 @@ def decide(
         return _no("decoding in tp")
 
     if inp.phase == PHASE_PP:
-        # The prefill queue drained and there is decode work -> the decode
-        # layout is strictly better (speculation and decode CUDA graphs
-        # exist only there), so go, regardless of N: N prices a prefill
-        # against a flip, and there is no prefill left to price.
-        if inp.pending_prefill_tokens == 0 and inp.running_bs > 0:
+        # Prefill is done (or what is left is not worth staying for) and
+        # there is decode work -> go to the decode layout, where the
+        # draft/verify of speculation and the decode CUDA graphs live.
+        #
+        # The test is ``<= N`` rather than ``== 0`` because of BATCHING.
+        # Under continuous arrivals the queue may never reach exactly
+        # zero, and an ``== 0`` rule would pin the server in PP and decode
+        # there -- with no speculation and no decode graphs, which is the
+        # mirror of the defect this policy exists to remove. ``<= N`` is
+        # the same break-even that governs the other direction, read the
+        # other way: prefill worth less than a flip is prefill worth
+        # running in whatever layout we are about to be in anyway. That
+        # makes the two rules one hysteresis band around N instead of two
+        # unrelated thresholds, so no arrival pattern can satisfy both.
+        if inp.pending_prefill_tokens <= cfg.flip_tokens and inp.running_bs > 0:
             return PhasePolicyDecision(
                 PP_TO_TP,
-                f"prefill queue drained, {inp.running_bs} req decoding",
+                f"prefill down to {inp.pending_prefill_tokens} tok "
+                f"(<= N={cfg.flip_tokens}), {inp.running_bs} req decoding",
             )
         if idle and cfg.rest_phase == PHASE_TP:
             if state.idle_since is None:
