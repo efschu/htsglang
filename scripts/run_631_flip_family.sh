@@ -18,6 +18,7 @@ FAMILY=(
     test/registered/scheduler/test_gdn_flip_mover.py
     test/registered/scheduler/test_weights_arena.py
     test/registered/scheduler/test_kv_reshard.py
+    test/registered/scheduler/test_step6_harness.py
     test/registered/unit/managers/test_regime_act.py
     test/registered/unit/server_args/test_phase_flip_args.py
     test/registered/unit/distributed/test_phase_flip_groups.py
