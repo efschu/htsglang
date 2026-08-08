@@ -1,0 +1,2 @@
+decode 256 tokens in 16.6s -> 15.4 tok/s (incl. prefill of a short prompt)
+decode 256 tokens in 16.7s -> 15.3 tok/s (incl. prefill of a short prompt)

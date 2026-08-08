@@ -1,0 +1,97 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+In file included from /root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12/Python.h:12,
+                 from /tmp/tmp56m8xc1z/__triton_launcher.c:5:
+ 1877 | #define _POSIX_C_SOURCE 200809L
+      |         ^~~~~~~~~~~~~~~
+In file included from /usr/include/x86_64-linux-gnu/bits/libc-header-start.h:33,
+                 from /usr/include/stdint.h:26,
+                 from /usr/lib/gcc/x86_64-linux-gnu/15/include/stdint.h:11,
+                 from /root/lh/venv/lib/python3.12/site-packages/triton/backends/amd/include/hip/hip_runtime.h:48,
+                 from /tmp/tmp56m8xc1z/__triton_launcher.c:3:
+/usr/include/features.h:319:10: note: this is the location of the previous definition
+  319 | # define _POSIX_C_SOURCE        202405L
+      |          ^~~~~~~~~~~~~~~
+In file included from /root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12/Python.h:12,
+                 from /tmp/tmp7y8l8jo4/__triton_launcher.c:5:
+ 1877 | #define _POSIX_C_SOURCE 200809L
+      |         ^~~~~~~~~~~~~~~
+In file included from /usr/include/x86_64-linux-gnu/bits/libc-header-start.h:33,
+                 from /usr/include/stdint.h:26,
+                 from /usr/lib/gcc/x86_64-linux-gnu/15/include/stdint.h:11,
+                 from /root/lh/venv/lib/python3.12/site-packages/triton/backends/amd/include/hip/hip_runtime.h:48,
+                 from /tmp/tmp7y8l8jo4/__triton_launcher.c:3:
+/usr/include/features.h:319:10: note: this is the location of the previous definition
+  319 | # define _POSIX_C_SOURCE        202405L
+      |          ^~~~~~~~~~~~~~~
+In file included from /root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/include/python3.12/Python.h:12,
+                 from /tmp/tmp4bszro0i/__triton_launcher.c:5:
+ 1877 | #define _POSIX_C_SOURCE 200809L
+      |         ^~~~~~~~~~~~~~~
+In file included from /usr/include/x86_64-linux-gnu/bits/libc-header-start.h:33,
+                 from /usr/include/stdint.h:26,
+                 from /usr/lib/gcc/x86_64-linux-gnu/15/include/stdint.h:11,
+                 from /root/lh/venv/lib/python3.12/site-packages/triton/backends/amd/include/hip/hip_runtime.h:48,
+                 from /tmp/tmp4bszro0i/__triton_launcher.c:3:
+/usr/include/features.h:319:10: note: this is the location of the previous definition
+  319 | # define _POSIX_C_SOURCE        202405L
+      |          ^~~~~~~~~~~~~~~
+Traceback (most recent call last):
+  File "/root/651-p2/scripts/gdn_triton_falsifier.py", line 31, in <module>
+    o, s = chunk_gated_delta_rule(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/attention/fla/chunk.py", line 248, in chunk_gated_delta_rule
+    o, h = ChunkGatedDeltaRuleFunction.apply(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/attention/fla/utils.py", line 182, in wrapper
+    return fn(*contiguous_args, **contiguous_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/venv/lib/python3.12/site-packages/torch/amp/autocast_mode.py", line 477, in decorate_fwd
+    return fwd(*args, **kwargs)  # pyrefly: ignore [not-callable]
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/attention/fla/chunk.py", line 117, in forward
+    g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/attention/fla/chunk.py", line 62, in chunk_gated_delta_rule_fwd
+    h, v_new = chunk_gated_delta_rule_fwd_h(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/attention/fla/chunk_delta_h.py", line 340, in chunk_gated_delta_rule_fwd_h
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+  File "/root/lh/venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 370, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/venv/lib/python3.12/site-packages/triton/runtime/autotuner.py", line 252, in run
+    ret = self.fn.run(
+          ^^^^^^^^^^^^
+  File "/root/lh/venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 720, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/venv/lib/python3.12/site-packages/triton/runtime/jit.py", line 849, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/venv/lib/python3.12/site-packages/triton/compiler/compiler.py", line 304, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/venv/lib/python3.12/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 63:20:
+    h += ((boh * H + i_h) * V * K).to(tl.int64)
+    v += ((bos * H + i_h) * V).to(tl.int64)
+    k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
+    w += ((bos * H + i_h) * K).to(tl.int64)
+    if SAVE_NEW_VALUE:
+        v_new += ((bos * H + i_h) * V).to(tl.int64)
+    stride_v = H * V
+    stride_h = H * V * K
+    stride_k = Hg * K
+    stride_w = H * K
+
+    index = tl.load(initial_state_indices + i_n).to(tl.int32)
+                    ^
+AttributeError("'NoneType' object has no attribute 'type'")

@@ -1,0 +1,65 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+Failed to load generation config for /root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf'. Use `repo_type` argument if needed.. Proceeding without generation config.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+gguf quantization is not fully optimized yet. The speed can be slower than non-quantized models.
+gguf quantization is not fully optimized yet. The speed can be slower than non-quantized models.
+Failed to import amdsmi with ModuleNotFoundError("No module named 'amdsmi'")
+Failed to import from custom_ar with ModuleNotFoundError("No module named 'sgl_kernel'")
+/root/lh/sglang_src/python/sglang/srt/distributed/parallel_state.py:671: UserWarning: expandable_segments not supported on this platform (Triggered internally at /pytorch/c10/hip/HIPAllocatorConfig.h:40.)
+  active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+using attn output gate!
+ok   L0 exp0 gate: 589824 bytes identical
+ok   L0 exp0 up: 589824 bytes identical
+ok   L0 exp0 down: 720896 bytes identical
+ok   L0 exp128 gate: 589824 bytes identical
+ok   L0 exp128 up: 589824 bytes identical
+ok   L0 exp128 down: 720896 bytes identical
+ok   L0 exp255 gate: 589824 bytes identical
+ok   L0 exp255 up: 589824 bytes identical
+ok   L0 exp255 down: 720896 bytes identical
+ok   L20 exp0 gate: 589824 bytes identical
+ok   L20 exp0 up: 589824 bytes identical
+ok   L20 exp0 down: 720896 bytes identical
+ok   L20 exp128 gate: 589824 bytes identical
+ok   L20 exp128 up: 589824 bytes identical
+ok   L20 exp128 down: 720896 bytes identical
+ok   L20 exp255 gate: 589824 bytes identical
+ok   L20 exp255 up: 589824 bytes identical
+ok   L20 exp255 down: 720896 bytes identical
+ok   L34 exp0 gate: 589824 bytes identical
+ok   L34 exp0 up: 589824 bytes identical
+ok   L34 exp0 down: 1114112 bytes identical
+ok   L34 exp128 gate: 589824 bytes identical
+ok   L34 exp128 up: 589824 bytes identical
+ok   L34 exp128 down: 1114112 bytes identical
+ok   L34 exp255 gate: 589824 bytes identical
+ok   L34 exp255 up: 589824 bytes identical
+ok   L34 exp255 down: 1114112 bytes identical
+ok   L38 exp0 gate: 589824 bytes identical
+ok   L38 exp0 up: 589824 bytes identical
+ok   L38 exp0 down: 1114112 bytes identical
+ok   L38 exp128 gate: 589824 bytes identical
+ok   L38 exp128 up: 589824 bytes identical
+ok   L38 exp128 down: 1114112 bytes identical
+ok   L38 exp255 gate: 589824 bytes identical
+ok   L38 exp255 up: 589824 bytes identical
+ok   L38 exp255 down: 1114112 bytes identical
+ok   L39 exp0 gate: 589824 bytes identical
+ok   L39 exp0 up: 589824 bytes identical
+ok   L39 exp0 down: 1114112 bytes identical
+ok   L39 exp128 gate: 589824 bytes identical
+ok   L39 exp128 up: 589824 bytes identical
+ok   L39 exp128 down: 1114112 bytes identical
+ok   L39 exp255 gate: 589824 bytes identical
+ok   L39 exp255 up: 589824 bytes identical
+ok   L39 exp255 down: 1114112 bytes identical
+note: skip blk.0.attn_q.weight -> model.layers.0.self_attn.q_proj.qweight (file=False param=False)
+ok   blk.0.ffn_down_shexp.weight: 1114112 bytes identical
+ok   output.weight: 540344320 bytes identical
+
+checked 47 tensors, failures 0
+VERDICT: DEVICE BYTES MATCH FILE
+[rank0]:[W808 13:26:27.119505593 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

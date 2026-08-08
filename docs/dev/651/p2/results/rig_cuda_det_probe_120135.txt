@@ -1,0 +1,21 @@
+run 0: text='\n\n<think>\n\n</think>\n\n42'
+       first-token top4=[[-0.048399943858385086, 271, None], [-3.1733999252319336, 220, None], [-6.923399925231934, 198, None], [-7.610899925231934, 357, None]]
+run 1: text='\n\n<think>\n\n</think>\n\n42'
+       first-token top4=[[-0.048399943858385086, 271, None], [-3.1733999252319336, 220, None], [-6.923399925231934, 198, None], [-7.610899925231934, 357, None]]
+run 2: text='\n\n<think>\n\n</think>\n\n42'
+       first-token top4=[[-0.048399943858385086, 271, None], [-3.1733999252319336, 220, None], [-6.923399925231934, 198, None], [-7.610899925231934, 357, None]]
+run 3: text='\n\n<think>\n\n</think>\n\n42'
+       first-token top4=[[-0.048399943858385086, 271, None], [-3.1733999252319336, 220, None], [-6.923399925231934, 198, None], [-7.610899925231934, 357, None]]
+run 4: text='\n\n<think>\n\n</think>\n\n42'
+       first-token top4=[[-0.048399943858385086, 271, None], [-3.1733999252319336, 220, None], [-6.923399925231934, 198, None], [-7.610899925231934, 357, None]]
+run 5: text='\n\n<think>\n\n</think>\n\n42'
+       first-token top4=[[-0.048399943858385086, 271, None], [-3.1733999252319336, 220, None], [-6.923399925231934, 198, None], [-7.610899925231934, 357, None]]
+run 6: text='\n\n<think>\n\n</think>\n\n42'
+       first-token top4=[[-0.048399943858385086, 271, None], [-3.1733999252319336, 220, None], [-6.923399925231934, 198, None], [-7.610899925231934, 357, None]]
+run 7: text='\n\n<think>\n\n</think>\n\n42'
+       first-token top4=[[-0.048399943858385086, 271, None], [-3.1733999252319336, 220, None], [-6.923399925231934, 198, None], [-7.610899925231934, 357, None]]
+
+distinct texts: 1 of 8
+  x8: '\n\n<think>\n\n</think>\n\n42'
+distinct first-token logprob sets: 1 of 8
+VERDICT: DETERMINISTIC

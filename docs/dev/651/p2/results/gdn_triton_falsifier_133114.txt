@@ -1,0 +1,6 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+kernel out absmax 0.0845, ref absmax 0.0843, corr 1.0000
+chunk_gated_delta_rule (triton, 35B geometry 1x128x16/32x128):
+  8-run identical=True run-spread 0.000e+00
+  vs naive ref: max|d| 6.710e-04 (ref absmax 0.084, rel 7.96e-03) nonfin 0
+VERDICT: GDN-CHUNK CLEAN

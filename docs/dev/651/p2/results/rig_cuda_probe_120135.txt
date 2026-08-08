@@ -1,0 +1,20 @@
+=== round 1 (port 31655) ===
+  [PASS] What is the capital of France? Answer with o -> Paris
+  [PASS] What is 14 * 3? Reply with just the number.  -> 42
+  [PASS] What is 31 * 7? Reply with just the number.  -> 217
+  [PASS] Which planet is known as the Red Planet? One -> Mars
+  [PASS] Complete the sequence with one number: 2, 4, -> The sequence follows a pattern where each number is multiplied by 2 to get the next number (powers of 2): * $2
+  [PASS] In one short sentence: why does ice float on -> Ice floats on water because it is less dense than liquid water.
+  round 1: 6/6 content-correct
+=== round 2 (greedy determinism) ===
+  [PASS] What is the capital of France? Answer with o -> Paris
+  [PASS] What is 14 * 3? Reply with just the number.  -> 42
+  [PASS] What is 31 * 7? Reply with just the number.  -> 217
+  [PASS] Which planet is known as the Red Planet? One -> Mars
+  [PASS] Complete the sequence with one number: 2, 4, -> The sequence follows a pattern where each number is multiplied by 2 to get the next number (powers of 2): * $2
+  [PASS] In one short sentence: why does ice float on -> Ice floats on water because it is less dense than liquid water.
+  round 2: 6/6 content-correct
+
+content round1 = 6/6   round2 = 6/6
+greedy deterministic (round1 == round2): True
+VERDICT: COHERENT

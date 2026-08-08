@@ -1449,3 +1449,50 @@ return-watch pinged a dead address. Rule: reach the laptop by both IPs (or
 fix its lease) before declaring it down. Q3_K_XL WAS once downloaded on the
 laptop (dl_q3.log: 17,227,569,440 B, rc=0 into /root/lh/models/) and was
 deleted later; current laptop inventory: Q4_K_M, Q2_K_XL, the derived noQ6K.
+
+### 12.17 THE INCOHERENCE ROOT CAUSE: int64 topk_ids through the standalone binding [MEASURED, bit-for-bit]
+
+Proof chain (evidence files in docs/dev/651/p2/results/, scripts in .../scripts/):
+1. Activation bisection vs llama.cpp (same derived file, CPU reference):
+   embed EXACT, layer-0 GDN chain to 3-4 digits, router logits equal,
+   selected expert ids EXACTLY equal (sum 5109), weights normalized to
+   1.0/token — routing fully healthy.
+2. fp64 oracle recompute of layer-0's routed-expert block from file weights
+   + dumped inputs: serving output corr 0.54 (WRONG); shared-expert
+   recompute from the same input corr 0.99993 (method + input validated).
+3. Standalone fused_moe_gguf (the REAL serving function) with REAL distinct
+   experts at real geometry: int32 topk_ids -> corr 1.0000; int64 topk_ids
+   -> corr 0.5431 == the serving dump BIT-FOR-BIT (sum 0.4666).
+
+Mechanism: the standalone `sglang_gguf_rocm` binding declares topk_ids as a
+plain Tensor with no dtype check; the ggml MoE kernels read expert indices
+as int32 — int64 ids arrive as (value, 0) word pairs, so half the expert
+lookups hit expert 0 / garbage. The in-tree sgl_kernel AOT op ENFORCES
+int32, which is why identical python code was always coherent on CUDA
+(window-2 arm 1 re-proved that today: Q3_K_XL TP=1 on the 5090 COHERENT
+6/6 + greedy-deterministic; tree-regression branch closed, arm 2 moot).
+
+Fix: cast topk_ids to int32 at the top of fused_moe_gguf (defensive at the
+function boundary, correct for both binding and AOT paths). Applied in the
+laptop overlay tree /root/651-p2/sglang_src (hardlink farm; only gguf.py
+replaced; /root/lh originals untouched, sha re-verified 550798f6...).
+Belt-and-suspenders follow-up for reconciliation: the binding itself should
+also assert dtypes (binding.cpp), and the same audit applies to every other
+tensor arg the standalone binding forwards.
+
+AUDIT LESSON (standing): synthetic kernel audits with REPLICATED expert
+stacks cannot see expert-index bugs — every index reads the same bytes.
+Real-distinct-weight fixtures are mandatory for MoE kernel validation.
+
+### 12.18 Poisoning attribution, round 3: GFXOFF, not (only) runtime PM — OPEN
+
+power/control=on did NOT stop idle-poisoning (guard failed after ~15 min
+idle despite it). Writing 0 to debugfs amdgpu_gfxoff was followed by an
+IMMEDIATE guard PASS without reboot — but the file read back 1 shortly
+after and the next guard failed; either the write does not stick on this
+stack or single-run guard results are intermittency luck (my own
+"instant cure" claim is hereby downgraded per Erfolgsmeldung-vs-Zustand).
+Standing protective posture: every boot runs the guard and refuses to
+serve on a poisoned GPU, so no wrong number can leak while attribution
+is open. Next: make the GFXOFF disable stick (write format / ppfeaturemask
+/ kernel param), then a 5x-guard + 30-min-idle battery for closure.

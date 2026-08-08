@@ -1,0 +1,27 @@
+packed shapes: (256, 512, 1152) (256, 512, 1152) (256, 2048, 352)
+types: 12 13
+Traceback (most recent call last):
+  File "/root/651-p2/scripts/moe_real_geometry_falsifier.py", line 32, in <module>
+    out = fused_moe_gguf(
+          ^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/quantization/gguf.py", line 1264, in fused_moe_gguf
+    out = act(out)
+          ^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/quantization/gguf.py", line 1175, in act
+    return silu_and_mul(x)
+           ^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/quantization/gguf.py", line 148, in silu_and_mul
+    return _native_act("silu")(x)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/quantization/gguf.py", line 140, in _native_act
+    fn = {"gelu": GeluAndMul, "silu": SiluAndMul}[kind]().forward_native
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/layers/activation.py", line 118, in __init__
+    if get_server_args().rl_on_policy_target is not None:
+       ^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/runtime_context.py", line 919, in get_server_args
+    return _CONTEXT.server_args
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/root/lh/sglang_src/python/sglang/srt/runtime_context.py", line 777, in server_args
+    raise ValueError("Global server args is not set yet!")
+ValueError: Global server args is not set yet!

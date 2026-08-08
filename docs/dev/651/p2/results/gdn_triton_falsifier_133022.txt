@@ -1,0 +1,5 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+chunk_gated_delta_rule (triton, 35B geometry 1x128x16/32x128):
+  8-run identical=True run-spread 0.000e+00
+  vs naive ref: max|d| 2.639e+03 (ref absmax 2638.589, rel 1.00e+00) nonfin 0
+VERDICT: GDN-CHUNK SUSPECT

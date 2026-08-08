@@ -1,0 +1,2 @@
+elapsed 186s requests_ok=22 errors=0 completion_tokens=2816
+accept_length (completion/verify_ct): mean 1.87 over 22 reqs

@@ -1,0 +1,7 @@
+Failed to load generation config for /root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf'. Use `repo_type` argument if needed.. Proceeding without generation config.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+gguf quantization is not fully optimized yet. The speed can be slower than non-quantized models.
+packed shapes: (256, 512, 1152) (256, 512, 1152) (256, 2048, 352)
+types: 12 13
+standalone fused_moe_gguf: corr 1.0000 rel 0.004 sum 0.7239 (ref 0.7274)
+serving dump: corr 0.5431 rel 0.642 sum 0.4666 (ref 0.7274)

@@ -1,0 +1,9 @@
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+Traceback (most recent call last):
+  File "/root/651-p2/scripts/gdn_triton_falsifier.py", line 23, in <module>
+    ref_out, ref_state = torch_chunk_gated_delta_rule(
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/651-p2/scripts/test_mamba.py", line 61, in torch_chunk_gated_delta_rule
+    k_beta = key * beta.unsqueeze(-1)
+             ~~~~^~~~~~~~~~~~~~~~~~~~
+RuntimeError: The size of tensor a (16) must match the size of tensor b (32) at non-singleton dimension 1

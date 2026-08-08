@@ -1,0 +1,17 @@
+device: AMD Radeon 780M Graphics (gfx1100), pool 24.00 GiB
+
+A-vs-A noise floor (same measurement twice, warmup discarded):
+  run 1: copy   70.2 GB/s   read   79.6 GB/s
+  run 2: copy   70.3 GB/s   read   80.0 GB/s
+  spread: copy 0.04%   read 0.55%
+  -> any A/B delta below this spread is not readable.
+
+iGPU achievable bandwidth (best of the two runs):
+  copy (r+w):   70.3 GB/s
+  read-only :   80.0 GB/s   <- the decode-relevant one
+
+CPU (16 threads) copy (r+w):   35.4 GB/s
+
+Decode ceiling implied by iGPU read bandwidth:
+  Q4_K_M weights 21.11 GiB (all active):   283.3 ms/token ->    3.5 tok/s
+  MoE active ~3B params at 4.5 bit ~1.7 GiB:    22.8 ms/token ->   43.8 tok/s

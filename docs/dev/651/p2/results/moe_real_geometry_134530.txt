@@ -1,0 +1,18 @@
+Failed to load generation config for /root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf'. Use `repo_type` argument if needed.. Proceeding without generation config.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+gguf quantization is not fully optimized yet. The speed can be slower than non-quantized models.
+Traceback (most recent call last):
+  File "/root/651-p2/scripts/moe_real_geometry_falsifier.py", line 13, in <module>
+    _CONTEXT.set_server_args(ServerArgs(
+                             ^^^^^^^^^^^
+  File "<string>", line 608, in __init__
+  File "/root/lh/sglang_src/python/sglang/srt/server_args.py", line 6004, in __post_init__
+    self._handle_model_specific_adjustments()
+  File "/root/lh/sglang_src/python/sglang/srt/server_args.py", line 12954, in _handle_model_specific_adjustments
+    self._handle_mamba_radix_cache(model_arch=model_arch)
+  File "/root/lh/sglang_src/python/sglang/srt/server_args.py", line 13034, in _handle_mamba_radix_cache
+    self._validate_mamba_extra_buffer(view, model_arch)
+  File "/root/lh/sglang_src/python/sglang/srt/server_args.py", line 12996, in _validate_mamba_extra_buffer
+    assert is_cuda() or is_musa() or is_npu(), (
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: extra_buffer needs CUDA/MUSA/NPU (FLA).
