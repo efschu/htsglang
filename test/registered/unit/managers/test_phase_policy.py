@@ -904,3 +904,27 @@ def test_the_instance_tag_is_identical_across_ranks_of_one_boot(monkeypatch, tmp
         for r in range(3)
     }
     assert tags == {"boot-xyz"}, f"ranks disagreed on the rendezvous tag: {tags}"
+
+
+def test_presence_wait_does_not_count_toward_the_park_deadline():
+    """BOOT-16 SPECIMEN: the gate must run BEFORE the park expiry.
+
+    The park deadline asks "armed but never quiescent?", meaningful only
+    once the group is assembled. With the gate evaluated after it, a rank
+    that waited out the presence poll was ALREADY flagged expired, and
+    the flip was abandoned the instant the gate opened -- logged as
+    "armed for 0.0s", because _armed_at had just been re-based. All three
+    ranks abandoned unanimously and the cutover never happened.
+    """
+    import inspect
+
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    src = inspect.getsource(PhaseFlipRuntime.on_round)
+    gate_at = src.index("_await_group_presence")
+    expiry_at = src.index("_park_expired(armed, ready)")
+    assert gate_at < expiry_at, (
+        "the park expiry is computed before the entry gate; time spent "
+        "waiting for the group to assemble would count as a failure to "
+        "reach quiescence, and the flip is abandoned as the gate opens"
+    )
