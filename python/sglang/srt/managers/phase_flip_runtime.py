@@ -725,8 +725,52 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
             _build_gdn_leg(scheduler),
             stacks.refill,
         ),
+        pre_write_fns=(_build_kv_backing_swap(scheduler, stacks),),
         guards=flip_blocking_guards(scheduler),
     )
+
+
+def _build_kv_backing_swap(scheduler, stacks) -> Callable[[str], None]:
+    """The runtime half of exclusive KV backing (#631).
+
+    Runs at the read/write seam, the one instant where the source pool has
+    been fully drained and the destination not yet touched, so the physical
+    pages may move from one layout to the other. The VA reservations are
+    untouched, so every address the TP stack's decode graphs baked in stays
+    valid across any number of flips.
+
+    Inert unless both pools were built VA-backed (swappable_backing, set
+    under --enable-phase-flip): without it there is nothing to swap and the
+    old both-resident behaviour stands.
+    """
+    pp_pool = scheduler.tp_worker.model_runner.token_to_kv_pool
+    tp_pool = stacks.tp_worker.model_runner.token_to_kv_pool
+
+    def _swap(direction: str) -> None:
+        src, dst = (
+            (pp_pool, tp_pool) if direction == PP_TO_TP else (tp_pool, pp_pool)
+        )
+        if not hasattr(src, "release_backing"):
+            return
+        # SOURCE FIRST, and the order is the whole point. Restoring the
+        # destination first would hold both layouts' pages for the width of
+        # the swap, which is precisely the residency being removed -- and
+        # the corridor floor is a CONTINUOUS minimum, so a peak that lasts
+        # only a few milliseconds still counts against it.
+        #
+        # Releasing first is safe because every row this transition owes has
+        # already been read into the payloads above; nothing reads the
+        # source pool again. The window where neither layout is backed is
+        # bounded by these two calls and no kernel runs inside it.
+        #
+        # The restore cannot fail for want of memory: boot sized the budget
+        # for max(PP, TP) and the source's pages were just handed back, so
+        # the destination's span is covered. If it raises anyway it raises
+        # loudly here, inside the flip, rather than corrupting anything.
+        src.release_backing()
+        dst.restore_backing()
+
+    return _swap
 
 
 def _build_gdn_leg(scheduler) -> Callable[[str], None]:

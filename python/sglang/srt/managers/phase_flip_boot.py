@@ -568,6 +568,39 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             # 5. TP pools + backends + decode graphs, with the TP arena
             # bytes live (graphs bake the fixed arena addresses; pin 2:
             # ONLY this stack captures decode graphs).
+            #
+            # BOOT-TIME EXCLUSIVE BACKING (#631). The PP pool's physical
+            # pages come out HERE, before the TP stack allocates its own
+            # pools and captures its decode graphs, and go back in once the
+            # TP pages are released again. Without this the boot holds both
+            # layouts' KV at once, and because the corridor floor is a
+            # CONTINUOUS minimum that one peak -- not any runtime shape --
+            # is what caps --rank-gpu-memory-mib for the whole process
+            # life. Peak becomes max(PP, TP) instead of PP + TP.
+            #
+            # Safe on the PP side by construction: the PP stack captures NO
+            # cuda graphs (model_runner logs "PHASE-FLIP PP stack: no CUDA
+            # graphs captured by construction"), so no baked address can go
+            # stale, and nothing is serving yet at boot. Safe on the TP side
+            # because the release is a VMM unmap behind a fixed VA
+            # reservation: the graphs captured below bake addresses that
+            # never move.
+            pp_kv_pool = primary_runner.token_to_kv_pool
+            _swappable = hasattr(pp_kv_pool, "release_backing") and getattr(
+                pp_kv_pool, "backing_is_resident", False
+            )
+            if _swappable:
+                released = pp_kv_pool.release_backing()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                logger.info(
+                    "%s released the PP KV backing (%.2f MiB) for the TP "
+                    "stack's allocation and graph capture; boot peak is "
+                    "max(PP, TP), not PP + TP.",
+                    LOG_PREFIX,
+                    released / 1048576.0,
+                )
+
             tp_worker.alloc_memory_pool()
 
             # 5-guard. THE SLOT-ID SPACE MUST FIT BOTH POOLS.
@@ -671,8 +704,60 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             tp_worker.init_cuda_graphs()
             if draft_worker is not None:
                 draft_worker.init_cuda_graphs()
+
+            # 5c. EXCLUSIVE-BACKING PIN, measured rather than intended.
+            # Between the release above and the restore below exactly one
+            # layout may hold pages. Asserting it here -- with the TP pool
+            # allocated and its graphs captured, the worst moment -- is what
+            # makes "exclusive" a checked property instead of a claim about
+            # the code's shape.
+            tp_kv_pool = tp_worker.model_runner.token_to_kv_pool
+            if _swappable:
+                pp_backed = int(getattr(pp_kv_pool, "backed_bytes", 0))
+                tp_backed = int(getattr(tp_kv_pool, "backed_bytes", 0))
+                if pp_kv_pool.backing_is_resident:
+                    raise PhaseFlipBootError(
+                        f"PP KV backing is resident while the TP stack holds "
+                        f"its own ({pp_backed} B PP, {tp_backed} B TP). The "
+                        f"boot peak is then PP + TP, which is the residency "
+                        f"this sequence exists to remove."
+                    )
+                # The floor left behind is one page plus at most one commit
+                # chunk per buffer; anything near the TP pool's size means
+                # the release did not actually reach the driver.
+                if tp_backed and pp_backed > tp_backed // 8:
+                    raise PhaseFlipBootError(
+                        f"the PP KV release returned only down to "
+                        f"{pp_backed} B against the TP pool's {tp_backed} B "
+                        f"-- the pages were not handed back to the driver, "
+                        f"so the boot peak is still both layouts."
+                    )
     finally:
         ctx.set_server_args(saved_args)
+
+    # 5d. Hand the pages back to the boot phase. The TP stack is fully
+    # built and captured; from here until the first pp_to_tp flip only the
+    # PP layout runs, so only it may hold pages. Ordering is load-bearing:
+    # the PP pool must be backed again BEFORE anything can prefill into it,
+    # which is why this sits inside the boot path and not on a lazy path.
+    if _swappable:
+        tp_kv_pool = tp_worker.model_runner.token_to_kv_pool
+        tp_released = tp_kv_pool.release_backing()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        primary_runner.token_to_kv_pool.restore_backing()
+        if not primary_runner.token_to_kv_pool.backing_is_resident:
+            raise PhaseFlipBootError(
+                "the PP KV backing did not come back after the TP stack was "
+                "built; the boot phase is PP and would prefill into unmapped "
+                "pages"
+            )
+        logger.info(
+            "%s boot-time backing swap done: TP released (%.2f MiB), PP "
+            "restored. Exactly one layout is resident from here on.",
+            LOG_PREFIX,
+            tp_released / 1048576.0,
+        )
 
     # 6. Pin 3 on the real pools.
     assert_row_schema_compatible(

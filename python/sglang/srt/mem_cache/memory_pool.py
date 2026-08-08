@@ -3367,6 +3367,7 @@ class HybridLinearKVPool(KVCache):
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
         vmm_commit_chunk_bytes: Optional[int] = None,
+        swappable_backing: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -3411,6 +3412,11 @@ class HybridLinearKVPool(KVCache):
                 if post_capture_active
                 else {}
             )
+            # #631: VA-backed so the two phase layouts can hold physical
+            # pages exclusively. Independent of post-capture SIZING, which
+            # is gated off for this config anyway.
+            if swappable_backing:
+                post_capture_kwargs["swappable_backing"] = True
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -3457,6 +3463,27 @@ class HybridLinearKVPool(KVCache):
     @property
     def post_capture_active(self) -> bool:
         return getattr(self.full_kv_pool, "post_capture_active", False)
+
+    # -- #631 cross-phase backing swap, forwarded to the full-attention pool --
+    #
+    # Only the full-attention KV rows are swapped here. The mamba/GDN state
+    # pool lives on req_to_token_pool and is handled separately.
+
+    def release_backing(self) -> int:
+        return self.full_kv_pool.release_backing()
+
+    def restore_backing(self) -> None:
+        self.full_kv_pool.restore_backing()
+
+    @property
+    def backing_is_resident(self) -> bool:
+        return getattr(self.full_kv_pool, "backing_is_resident", True)
+
+    @property
+    def backed_bytes(self) -> int:
+        """Physically committed bytes -- the number the exclusive-backing
+        falsifier asserts on, so it measures allocation rather than intent."""
+        return getattr(self.full_kv_pool, "post_capture_backed_bytes", 0)
 
     @property
     def post_capture_backed_bytes(self) -> int:
