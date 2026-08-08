@@ -831,3 +831,31 @@ def test_a_failing_pump_never_breaks_the_gate(tmp_path):
 
     r._pump_fn = boom
     assert r._await_group_presence() is None  # no raise
+
+
+def test_park_clock_is_rebased_when_the_group_assembles(tmp_path):
+    """BOOT-14 SPECIMEN: two bounds must not race.
+
+    The park deadline measures "armed but never quiescent" -- meaningful
+    only once the group is assembled. Left measuring from the arm, it
+    races the presence gate: a rank whose peers are slow to arrive
+    abandons on the PARK deadline while they are still polling, the ranks
+    then disagree around a gloo collective, and "Connection closed by
+    peer" aborts every rank. Measured: all three announced presence, then
+    abandoned at exactly 30.0 s and the group died.
+    """
+    now = {"t": 0.0}
+    r = _runtime_stub(_presence(tmp_path, rank=0), clock=lambda: now["t"])
+    r._armed_at = 0.0
+    now["t"] = 25.0
+    assert r._await_group_presence() is None  # peers not here yet
+    assert r._armed_at == 0.0, "the park clock moved before assembly"
+
+    _presence(tmp_path, rank=1).announce(1)
+    _presence(tmp_path, rank=2).announce(1)
+    now["t"] = 28.0
+    assert r._await_group_presence() is True
+    assert r._armed_at == 28.0, (
+        "the park clock was not re-based on assembly; it would expire "
+        "mid-quiescence and desync the group around the collective"
+    )
