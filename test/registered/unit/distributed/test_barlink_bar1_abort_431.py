@@ -80,7 +80,12 @@ def _transport(*, cap=CAP, world=3, rank=0, group="dcp:0", aborted=0):
     t._peers = {}
     t._own = (0x1000, 0, 0)
     t._own_flag = (0x2000, 0, 0)
-    t._round_dev = torch.zeros(1, dtype=torch.int64)
+    # #622: three words -- 0 the round counter, 1 the last completed mesh
+    # round, 2 the last completed a2a round -- and the two ack-bank offsets
+    # the launch passes down. __new__ skips the __init__ that sets them.
+    t._round_dev = torch.zeros(3, dtype=torch.int64)
+    t._ackbase_mesh = 0
+    t._ackbase_a2a = 0
     t._ctl_dev = torch.tensor([aborted, 0], dtype=torch.int32)
     t._abort_window = None
     t._last_op = ""

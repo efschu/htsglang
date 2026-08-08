@@ -1067,9 +1067,26 @@ def geometry(world: int, max_bytes: int, with_a2a: bool = True,
     }
 
 
+def _flags_base(world: int, with_a2a: bool, with_pipe: bool) -> int:
+    """Everything in the flag region BEFORE the #622 acknowledgment banks.
+
+    The one arithmetic source for that size. ``flags_requirement`` adds the
+    two ack banks on top, ``ackbase_mesh`` returns exactly this value as the
+    offset of the first of them -- a second copy of the formula would be
+    precisely the place where the allocation and the offset drift apart.
+    """
+    from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
+        pipe_flags_extra,
+    )
+
+    base = (2 + 2 * (world - 1) + (1 if with_a2a else 0)) * world * 256
+    return base + (pipe_flags_extra(world) if with_pipe else 0)
+
+
 def flags_requirement(world: int, with_a2a: bool = True,
                    with_pipe: bool = False) -> int:
-    """``(2 + 2(R-1) [+ 1]) * R * 256`` bytes, plus ``5 R * 256`` for the pipe.
+    """``(2 + 2(R-1) [+ 1]) * R * 256`` bytes, plus ``5 R * 256`` for the pipe,
+    plus ``2 R * 256`` for the two acknowledgment banks (#622).
 
     One 256-byte line per (topology, step, sender): no false sharing between
     senders, none between steps, none between topologies. Mesh has 2 steps,
@@ -1081,13 +1098,45 @@ def flags_requirement(world: int, with_a2a: bool = True,
     K and T**, because it is a sliding window with one counter per
     connection, not a flag per chunk. Appended at the end so every existing
     line offset stays byte-for-byte the same.
-    """
-    from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
-        pipe_flags_extra,
-    )
 
-    base = (2 + 2 * (world - 1) + (1 if with_a2a else 0)) * world * 256
-    return base + (pipe_flags_extra(world) if with_pipe else 0)
+    #622 appends TWO more banks of one line per rank, behind the pipe rows
+    and thus behind everything that existed before: the mesh consumption
+    acknowledgment and the a2a one. Same discipline -- appended, never
+    inserted, so no line that a peer already addresses can move. They are
+    allocated unconditionally (independent of ``with_a2a``/``with_pipe``),
+    because the entry barrier they carry belongs to the transport, not to a
+    topology that may or may not be enabled; their OFFSET does depend on the
+    two switches, which is why ``ackbase_mesh`` takes the same arguments.
+    """
+    return _flags_base(world, with_a2a, with_pipe) + 2 * world * 256
+
+
+def ackbase_mesh(world: int, with_a2a: bool = True,
+                 with_pipe: bool = False) -> int:
+    """Offset of the MESH acknowledgment bank -- one line per rank (#622).
+
+    Behind every pre-#622 line, i.e. exactly the flag-region size as it was
+    before the acknowledgment banks existed. Rank ``r`` publishes into line
+    ``r`` of every PEER's bank and reads line ``z`` of its OWN bank to learn
+    which round peer ``z`` has finished consuming.
+
+    Depends on ``with_a2a`` and ``with_pipe`` exactly as the region size
+    does; both are forwarded to ``_flags_base``, the single place the
+    pre-ack arithmetic lives.
+    """
+    return _flags_base(world, with_a2a, with_pipe)
+
+
+def ackbase_a2a(world: int, with_a2a: bool = True,
+                with_pipe: bool = False) -> int:
+    """Offset of the A2A acknowledgment bank -- one line per rank (#622).
+
+    Directly behind the mesh bank. Two separate banks and not one shared
+    one: mesh and a2a advance independently (the round counter is global,
+    the CONSUMPTION watermark is per topology), and a shared line would let
+    an a2a acknowledgment satisfy a mesh entry wait.
+    """
+    return ackbase_mesh(world, with_a2a, with_pipe) + world * 256
 
 
 def fbase_a2a(world: int) -> int:
@@ -1584,6 +1633,10 @@ class BarlinkBar1Transport:
         self._proofs_hold = False
         self._round_dev = None
         self._ctl_dev = None
+        # #622: acknowledgment-bank offsets. Only valid after _build_up, like
+        # the geometry they are derived from.
+        self._ackbase_mesh = 0
+        self._ackbase_a2a = 0
         # Peer liveness. Both stay None when SGLANG_BARLINK_PEER_LIVENESS=0 or
         # when the identity exchange fails; every use site then falls back to
         # the behaviour this transport had before task #312.
@@ -2289,6 +2342,14 @@ class BarlinkBar1Transport:
         self.max_bytes = max_bytes
         region = self._geo["region_bytes"]
         flag_bytes = flags_requirement(self.world, self.a2a_on, self.pipe_on)
+        # #622: the offsets of the two acknowledgment banks, computed ONCE
+        # from the same (world, a2a_on, pipe_on) that sized the region above.
+        # Kept as attributes and passed into the kernels as arguments -- the
+        # C++ side must not recompute them, for the same reason `fbase_a2a`
+        # is passed in: a second version of the formula is exactly where
+        # sender and receiver end up pointing at different lines.
+        self._ackbase_mesh = ackbase_mesh(self.world, self.a2a_on, self.pipe_on)
+        self._ackbase_a2a = ackbase_a2a(self.world, self.a2a_on, self.pipe_on)
 
         # 2. Two receive regions, two exports. Separate, because the probe
         # measured them separately.
@@ -2349,7 +2410,17 @@ class BarlinkBar1Transport:
 
         # 8. Round counter and status word. Both LOCAL in VRAM -- they are
         # never touched by a peer.
-        self._round_dev = torch.zeros(1, dtype=torch.int64, device=self.device)
+        # #622: THREE words, not one. Word 0 is the running round counter as
+        # before -- every kernel reads it at start and advances it at end, and
+        # `bar1_all_reduce`/`bar1_all_to_all`/the pipe kernel all take the
+        # tensor's base pointer, so word 0 keeps its meaning byte-for-byte.
+        # Word 1 is the last MESH round this rank finished, word 2 the last
+        # A2A round. They are the local half of the consumption acknowledgment:
+        # a kernel entering mesh (a2a) waits until every peer has acknowledged
+        # the round in word 1 (word 2), which is the round whose payload lines
+        # it is about to overwrite. Local VRAM, never touched by a peer -- what
+        # crosses the aperture are the ack lines in the flag region.
+        self._round_dev = torch.zeros(3, dtype=torch.int64, device=self.device)
         self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
         # #517: arm the deferred status read now that the word exists.
         self._arm_status_stage()
@@ -3163,6 +3234,10 @@ class BarlinkBar1Transport:
             self._deadline_cycles(), int(self.threads), int(kernel_variant),
             int(self.load_shape), int(self.read_flush),
             int(self._abort_host),
+            # #622: appended, not inserted. Every existing positional index
+            # into this call stays where it was -- the same discipline the
+            # flag region follows for its new banks.
+            int(self._ackbase_mesh),
         )
         return out
 
@@ -4228,6 +4303,8 @@ class BarlinkBar1Transport:
             self._deadline_cycles(), int(self.threads), int(kernel_variant),
             int(self.load_shape),
             int(self._abort_host),
+            # #622: appended, not inserted -- see _all_reduce_one_round.
+            int(self._ackbase_a2a),
         )
         return output
 
@@ -4935,9 +5012,23 @@ class BarlinkBar1Transport:
         try:
             rd = getattr(self, "_round_dev", None)
             if rd is not None and self._cuda is not None:
-                rbuf = (ctypes.c_ubyte * 8)()
-                self._cuda.memcpy(ctypes.addressof(rbuf), int(rd.data_ptr()), 8)
-                round_txt = str(int.from_bytes(bytes(rbuf), "little"))
+                # #622: THREE words now -- the counter and the two consumption
+                # watermarks (mesh, a2a). The sentence below already told the
+                # reader to compare the counter against the per-topology
+                # watermarks; before the acknowledgment protocol there were
+                # none to compare against. Read only as many words as the
+                # tensor actually has, so a transport built by an older path
+                # still yields its counter instead of an unreadable dump.
+                words = min(3, int(rd.numel()))
+                rbuf = (ctypes.c_ubyte * (8 * words))()
+                self._cuda.memcpy(ctypes.addressof(rbuf), int(rd.data_ptr()),
+                                  8 * words)
+                raw = bytes(rbuf)
+                vals = [int.from_bytes(raw[8 * i:8 * i + 8], "little")
+                        for i in range(words)]
+                names = ("round", "mesh_consumed", "a2a_consumed")
+                round_txt = ", ".join(f"{names[i]}={vals[i]}"
+                                      for i in range(words))
         except Exception as exc:  # noqa: BLE001 - never lose the flag dump
             # The flag words above are the primary evidence; failing to read an
             # 8-byte counter must never suppress them.
@@ -4945,14 +5036,17 @@ class BarlinkBar1Transport:
         return (
             f"barlink-BAR1 abort flag snapshot rank {self.rank}/{self.world} "
             f"group {self.group or '<unnamed>'}: {n_lines} lines of "
-            f"{int(fsize)} bytes, roundDev={round_txt}, first dword per line "
+            f"{int(fsize)} bytes, roundDev[{round_txt}], first dword per line "
             f"-- {shown}. "
             "Compare against the peers': a rank waiting on a generation its "
             "peers have already passed is a sequence mismatch, whereas "
             "all-equal values mean the flags agree and the wait is elsewhere. "
             "roundDev is this rank's own counter at dump time; compare it "
             "against the per-topology watermarks rather than assuming which "
-            "round the spin awaited."
+            "round the spin awaited. mesh_consumed/a2a_consumed (#622) are "
+            "the last rounds of those topologies this rank COMPLETED; a "
+            "watermark far behind the counter means the rank is waiting to be "
+            "let into a collective, not inside one."
         )
 
     def _abort_peer_flag_snapshot(self, max_lines: int = 64) -> Optional[str]:
@@ -5088,7 +5182,12 @@ class BarlinkBar1Transport:
         self._unchecked_launches = 0
         self._deferred_launches += pending
         status = self._read_status_for_check()
-        if status != 1:
+        # #622: the kernels now write TWO non-zero codes. 1 is the historical
+        # one (a payload barrier gave up); 2 is the entry acknowledgment wait.
+        # Both mean "a spin kernel took its abort path", so both must raise --
+        # a `!= 1` test here would have made the new code an invisible abort,
+        # which is worse than the deadlock it reports on.
+        if status not in (1, 2):
             if status is not None:
                 # A RESOLVED clean read closes the window it covered; an
                 # unresolved one (None) must not, or the raise would
@@ -5179,6 +5278,24 @@ class BarlinkBar1Transport:
                 f"Cause: {deadline}. The host abort word exists on this rank "
                 f"and was NOT set, which excludes it: no peer was declared "
                 f"dead and no host wait gave up. A peer did not arrive."
+            )
+        # #622: WHERE in the kernel. Status 1 is a payload barrier -- this
+        # rank had already published its own data and was waiting for the
+        # peers' contribution to the collective it is IN. Status 2 is the
+        # entry acknowledgment wait, which is a different sentence about a
+        # different collective: this rank had not yet sent anything for the
+        # current one, it was waiting for the peers to finish consuming the
+        # payload of the PREVIOUS same-topology collective before overwriting
+        # the slots. A rank stuck there is downstream of a peer that is
+        # behind, not the origin of the stall -- look at the peer whose ack
+        # line is short, not at this rank's own last collective.
+        if status == 2:
+            cause += (
+                " PHASE: the abort fired in the ENTRY ack wait (#622): this "
+                "rank waited for peers to consume its PREVIOUS collective's "
+                "payload, before publishing anything for the collective named "
+                "above. The peer that did not acknowledge is the one to chase; "
+                "its own report, if it produced one, names the phase it was in."
             )
         # #583: dump THIS rank's collective census before raising. No
         # collective is taken here on purpose -- by now a peer is very likely
@@ -5286,10 +5403,19 @@ class BarlinkBar1Transport:
         to go back to accepting a half-written buffer as a result. The only
         way to reach this raise is a run that was already broken.
         """
-        if self.status() != 1:
+        code = self.status()
+        # #622: 1 = a payload barrier gave up, 2 = the entry acknowledgment
+        # wait did. Both are abort paths; only the phase differs.
+        if code not in (1, 2):
             return
         window = self._abort_window
         reason = window.reason if window is not None and window.tripped else None
+        phase = (
+            " The abort fired in the ENTRY ack wait (#622): this rank waited "
+            "for the peers to consume its PREVIOUS collective's payload."
+            if code == 2
+            else ""
+        )
         raise Bar1KernelAborted(
             f"barlink-BAR1 {label}: a spin kernel took its abort path. Either "
             f"it exceeded SGLANG_BARLINK_BAR1_CAP_CYCLES "
@@ -5297,11 +5423,16 @@ class BarlinkBar1Transport:
             f"the host abort word was set"
             + (f" -- {reason}" if reason else "")
             + ". The output buffer of that call is partially written and "
-            "must not be used."
+            "must not be used." + phase
         )
 
     def status(self) -> int:
-        """``1`` if a kernel ever hit the time limit.
+        """``1`` if a kernel ever hit the time limit, ``2`` (#622) if it hit
+        it in the entry acknowledgment wait.
+
+        Both are non-zero and both are sticky; the value only says WHICH spin
+        gave up, so every caller that used to test ``== 1`` must test
+        membership instead.
 
         Deliberately a separate query and not on the hot path: it reads a
         device word and thereby synchronizes -- exactly what the direct

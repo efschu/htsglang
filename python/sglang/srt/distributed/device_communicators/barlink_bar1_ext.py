@@ -403,7 +403,7 @@ struct Bar1Args {
     const uint4 *in;          // local, VRAM
     uint4       *out;         // local, VRAM
     u64         *roundDev;    // one word, local: the running round number
-    unsigned int *ctlStatus;  // 1 = time limit exceeded
+    unsigned int *ctlStatus;  // 1 = time limit exceeded, 2 = in the entry ack wait
     unsigned int *abortDev; // K_GRID only: grid-wide abort bit
     // Host-set abort word (pinned, device-mapped). nullptr = absent, and then
     // the spin loops keep only their cycle deadline. Set to 1 by the peer
@@ -428,6 +428,16 @@ struct Bar1Args {
     const uint4 *rgRecv   [BARLINK_BAR1_MAX_STEPS];
     u64         *rgFlagTo [BARLINK_BAR1_MAX_STEPS];
     const u64   *rgFlagFrom[BARLINK_BAR1_MAX_STEPS];
+
+    // #622, mesh only: the consumption acknowledgment. `ackTo[z]` is MY line
+    // in peer z's ack bank, `ackFrom[z]` is peer z's line in MY OWN bank.
+    // Indexed by rank number, own entry unused. `lastRoundDev` points at the
+    // MESH watermark word (roundDev + 1): the last mesh round this rank
+    // completed, i.e. the round whose payload slots the next mesh call is
+    // about to overwrite. Filled but unused by the ring kernel.
+    u64         *ackTo  [BARLINK_BAR1_MAX_RANKS];
+    const u64   *ackFrom[BARLINK_BAR1_MAX_RANKS];
+    u64         *lastRoundDev;
 };
 
 // ---------------------------------------------------------------------------
@@ -585,6 +595,8 @@ __global__ void bar1_mesh_kernel(Bar1Args A)
     __shared__ const uint4 *sRecvAG[BARLINK_BAR1_MAX_RANKS];
     __shared__ u64         *sFlagTo [2][BARLINK_BAR1_MAX_RANKS];
     __shared__ const u64   *sFlagFrom[2][BARLINK_BAR1_MAX_RANKS];
+    __shared__ u64         *sAckTo  [BARLINK_BAR1_MAX_RANKS];
+    __shared__ const u64   *sAckFrom[BARLINK_BAR1_MAX_RANKS];
     if (threadIdx.x == 0) {
         for (int z = 0; z < R; ++z) {
             sSendRS[z] = A.nzSendRS[z];
@@ -595,9 +607,103 @@ __global__ void bar1_mesh_kernel(Bar1Args A)
             sFlagTo [1][z] = A.nzFlagTo [1][z];
             sFlagFrom[0][z] = A.nzFlagFrom[0][z];
             sFlagFrom[1][z] = A.nzFlagFrom[1][z];
+            sAckTo[z]   = A.ackTo[z];
+            sAckFrom[z] = A.ackFrom[z];
         }
     }
     __syncthreads();
+
+    // --- 0. ENTRY BARRIER: the consumption acknowledgment (#622) -----------
+    //
+    // WHY THIS EXISTS. The two payload barriers below wait for a CONJUNCTION
+    // over all peers, on flag lines addressed by (topology, step, sender) --
+    // one line per sender, reused by every mesh collective. The wait is for
+    // EQUALITY with this call's round number, and the round counter is
+    // GLOBAL across topologies: it advances once per collective, whichever
+    // topology ran. So a rank that gets ahead can enter its NEXT mesh
+    // collective and overwrite the very line a slow peer is still waiting
+    // on. The peer is waiting for round N, the line already reads N+2 -- and
+    // flags only ever grow, so the awaited value never comes back. That is a
+    // permanent deadlock of the whole group, and it is the #622/#632
+    // specimen.
+    //
+    // WHAT FIXES IT. A rank may only overwrite the lines of its previous
+    // mesh collective once every peer has confirmed it consumed them. Each
+    // rank publishes, at the END of a mesh collective, the round it just
+    // finished into every peer's ack bank, and here at the START waits until
+    // every peer's line has reached the round THIS rank last finished. From
+    // then on the equality waits below cannot race: no line can be rewritten
+    // before its previous value has been read by all who needed it.
+    //
+    // MONOTONIC, NOT EQUALITY. The comparison is `>=`, deliberately: an ack
+    // line carries a watermark, not a token. A peer that has already run
+    // further (its watermark is higher) has by construction also consumed the
+    // older round, so `>=` accepts it instead of waiting forever for a value
+    // that has already been passed. `prev == 0` is the first mesh collective
+    // on this rank -- the ack region is zero-initialized at bring-up, so the
+    // loop is skipped and the first call pays nothing.
+    //
+    // WHY THIS WAIT CANNOT ITSELF DEADLOCK (#622 new-edge audit). This wait
+    // introduces a new blocking edge -- writer waits for acks -- and a new
+    // edge in a protocol that already blocks on flags must be shown acyclic.
+    // The argument is an ordering, not a hope: the ack a writer waits for
+    // here is written by a peer strictly AFTER that peer's RECEIVE phase for
+    // round `prev`, and that receive phase depends only on round-`prev`
+    // flags, which every participant of round `prev` -- including this
+    // writer -- published before completing it. Nothing in the peer's path
+    // to the ack can depend on anything this writer does AFTER round
+    // `prev`; the awaited work is fully enabled before the wait begins. The
+    // only way the ack never arrives is a peer that is genuinely dead or
+    // stuck OUTSIDE this protocol -- and that case does not hang: the
+    // deadline fires and status 2 names this phase.
+    //
+    // COST. One extra spin per mesh collective, executed by ONE thread, and
+    // in the steady state the peers' acks are already in place when it is
+    // read: it is a load of R-1 flag lines, not a wait. Capture/replay safe,
+    // because everything -- the watermark, the acks, the decision -- lives in
+    // device memory and is re-evaluated on every replay; no host value is
+    // baked into the graph.
+    if (isFirst) {
+        const u64 prev = *(const volatile u64 *)A.lastRoundDev;
+        bool ab = false;
+        long long t0 = clock64();
+        unsigned int probeCounter = 0u;
+        while (prev != 0ull) {
+            bool allAcked = true;
+            for (int s = 0; s < R; ++s) {
+                if (s == r) continue;
+                const bool acked = readFlag<LA>(sAckFrom[s]) >= prev;
+                if (!acked) { allAcked = false; break; }
+            }
+            if (allAcked) break;
+            if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+            if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
+        }
+        if (ab) {
+            if (GRID == K_1BLK) abortS = 1;
+            else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
+        }
+    }
+    barrier<GRID>();
+    {
+        const int aborted = (GRID == K_1BLK)
+                                ? abortS
+                                : (int)*(volatile unsigned int *)A.abortDev;
+        if (aborted) {
+            if (isFirst) {
+                // 2, not 1: the host distinguishes the phase. Status 1 means
+                // a payload barrier gave up -- this rank had already sent and
+                // was waiting for the peers' contribution. Status 2 means the
+                // rank had not sent anything yet and was waiting for the
+                // peers to finish consuming the PREVIOUS collective. The two
+                // point at different culprits, so they must not share a code.
+                *A.ctlStatus = 2u;
+                writeRound(A, round);
+            }
+            return;
+        }
+    }
 
     int offR, lenR;
     chunkBounds(n4, r, R, &offR, &lenR);
@@ -726,13 +832,53 @@ __global__ void bar1_mesh_kernel(Bar1Args A)
         takeOverPhase(A.out + off, sRecvAG[s], len, tid, nth);
     }
     barrier<GRID>();
-    if (isFirst) writeRound(A, round);
+    if (isFirst) {
+        // #622: the acknowledgment. AFTER the barrier that closes the receive
+        // phase, i.e. after every byte this rank had to read out of its
+        // receive slots has been read -- that is exactly the fact the ack
+        // asserts, and publishing it any earlier would license a peer to
+        // overwrite slots still being read.
+        //
+        // Order matters twice here. The peers' lines go out first, then a
+        // system fence, and only then the local watermark: if the watermark
+        // moved first and this kernel were pre-empted, a peer could see an
+        // entry wait satisfied against acks that had not yet crossed the
+        // aperture. The round advance stays last, unchanged.
+        for (int z = 0; z < R; ++z) {
+            if (z == r) continue;
+            writeU64(sAckTo[z], round);
+        }
+        __threadfence_system();
+        *(volatile u64 *)A.lastRoundDev = round;
+        writeRound(A, round);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // TOPOLOGY 'ring' -- ring reduce-scatter + ring allgather, 2*(R-1) barriers.
 // Always sends to (r+1)%R, always receives from (r-1+R)%R.
 // Unchanged from ar3_ring_kernel, only RANGE_N -> A.R and without the check.
+//
+// WHY THE RING NEEDS NO CONSUMPTION ACKNOWLEDGMENT (#622)
+// -------------------------------------------------------
+// The mesh and a2a kernels carry an entry ack barrier because a fast rank
+// can overwrite a flag line a slow peer is still waiting on. The ring
+// cannot get into that state, and not by luck:
+//
+// Each of its 2(R-1) steps is a SINGLE-peer wait -- rank r waits only on its
+// predecessor, and its own flag write is what releases its successor. The
+// steps chain: to finish step k, r needs prev(r) at step k; prev(r) needed
+// prev(prev(r)) at step k-1, and after R-1 links that chain has passed
+// through every rank in the group. A ring collective therefore cannot
+// complete on ANY rank without every rank having entered it, so no rank can
+// be a whole collective ahead -- the distance between the leading and the
+// trailing rank is bounded by one step, not by one collective. A rank still
+// stuck in an earlier collective blocks every later ring completion long
+// before any line it is watching could be rewritten.
+//
+// The ack pointers in Bar1Args are filled on the mesh path only; this kernel
+// never reads them. Adding a barrier here would cost a spin per step for a
+// race the step structure already excludes.
 // ---------------------------------------------------------------------------
 template<typename T, int LA, int FLUSH, int GRID>
 __global__ void bar1_ring_kernel(Bar1Args A)
@@ -928,6 +1074,12 @@ struct A2aArgs {
     const unsigned char *ownBase;                 // own a2a region
     u64          *flagTo [BARLINK_BAR1_MAX_RANKS];
     const u64    *flagFrom[BARLINK_BAR1_MAX_RANKS];
+
+    // #622: the consumption acknowledgment, same shape as in Bar1Args but
+    // over the a2a bank and the A2A watermark word (roundDev + 2).
+    u64          *ackTo  [BARLINK_BAR1_MAX_RANKS];
+    const u64    *ackFrom[BARLINK_BAR1_MAX_RANKS];
+    u64          *lastRoundDev;
 };
 
 // Assemble a 16-byte packet from at most 16 bytes. The remainder stays 0;
@@ -1010,6 +1162,61 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
         }
     }
     __syncthreads();
+
+    // --- 0. ENTRY BARRIER: the consumption acknowledgment (#622) -----------
+    //
+    // Same defect and same fix as in bar1_mesh_kernel; here it also closes a
+    // gap the double-buffer argument above leaves open. That argument derives
+    // "the slot is free" from stream order plus the flag of round N-1 -- but
+    // it says nothing about the FLAG LINES, which are single, not doubled.
+    // The single barrier below waits for equality with this round on a line
+    // per sender, and the round counter is global across topologies, so a
+    // rank running ahead can rewrite that line while a peer still awaits the
+    // previous value. Flags only grow, so the awaited value never returns.
+    //
+    // The wait is `>=` against a watermark, not equality against a token; a
+    // peer that has moved further has by construction consumed the older
+    // round. `prev == 0` -- the first a2a collective on this rank -- skips
+    // the loop against the zero-initialized bank. One thread, one load of
+    // R-1 lines in the steady state, and entirely device-side, so a captured
+    // graph re-evaluates it on every replay.
+    if (isFirst) {
+        const u64 prev = *(const volatile u64 *)A.lastRoundDev;
+        bool ab = false;
+        long long t0 = clock64();
+        unsigned int probeCounter = 0u;
+        while (prev != 0ull) {
+            bool allAcked = true;
+            for (int s = 0; s < R; ++s) {
+                if (s == r) continue;
+                const bool acked = readFlag<LA>(A.ackFrom[s]) >= prev;
+                if (!acked) { allAcked = false; break; }
+            }
+            if (allAcked) break;
+            if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+            if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
+        }
+        if (ab) {
+            if (GRID == K_1BLK) abortS = 1;
+            else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
+        }
+    }
+    barrier<GRID>();
+    {
+        const int aborted = (GRID == K_1BLK)
+                                ? abortS
+                                : (int)*(volatile unsigned int *)A.abortDev;
+        if (aborted) {
+            if (isFirst) {
+                // 2 = the entry ack wait, see bar1_mesh_kernel. Nothing has
+                // been sent yet on this rank when this fires.
+                *A.ctlStatus = 2u;
+                writeRound(A, round);
+            }
+            return;
+        }
+    }
 
     // --- 1. Send phase: all targets in the same flat index space -----------
     {
@@ -1107,7 +1314,20 @@ __global__ void bar1_a2a_kernel(A2aArgs A)
         }
     }
     barrier<GRID>();
-    if (isFirst) writeRound(A, round);
+    if (isFirst) {
+        // #622: acknowledge AFTER the barrier that closes the receive phase --
+        // every byte out of the own slots has been read by then, which is the
+        // fact the ack asserts. Peers first, system fence, then the local
+        // watermark, then the round advance; see bar1_mesh_kernel for why
+        // that order is not interchangeable.
+        for (int z = 0; z < R; ++z) {
+            if (z == r) continue;
+            writeU64(A.ackTo[z], round);
+        }
+        __threadfence_system();
+        *(volatile u64 *)A.lastRoundDev = round;
+        writeRound(A, round);
+    }
 }
 
 // ===========================================================================
@@ -1198,7 +1418,8 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      int64_t chunk_max, int64_t off_mesh, int64_t off_ring,
                      at::Tensor round_dev, at::Tensor ctl_dev,
                      int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
-                     int64_t load_shape, int64_t read_flush, int64_t abort_host)
+                     int64_t load_shape, int64_t read_flush, int64_t abort_host,
+                     int64_t ackbase_mesh)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= BARLINK_BAR1_MAX_RANKS,
@@ -1241,6 +1462,12 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                     " bytes does not fit in the slot of ", chunk_max,
                     " bytes. The caller should have asked handles().");
     }
+
+    // #622: three words, and the kernels index word 1 and 2 of them.
+    TORCH_CHECK(round_dev.scalar_type() == at::kLong && round_dev.numel() >= 3,
+                "barlink-bar1: round_dev must be an int64 tensor with at least "
+                "three elements (0 = round counter, 1 = last completed mesh "
+                "round, 2 = last completed a2a round)");
 
     Bar1Args A;
     std::memset(&A, 0, sizeof(A));
@@ -1299,7 +1526,25 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                                                    FSLOT(fbase_mesh, ph, s));
             }
         }
+        // #622: the acknowledgment bank. One line per rank, same addressing
+        // rule as the flag lines -- I write MY line at the receiver, I read
+        // THEIR line locally. `ackbase_mesh` comes from Python and is NOT
+        // recomputed here: the offset depends on whether a2a and the pipe
+        // families are present, and a second version of that arithmetic is
+        // exactly where sender and receiver end up on different lines.
+        TORCH_CHECK(ackbase_mesh >= 0, "barlink-bar1: negative ackbase_mesh");
+        for (int z = 0; z < R; ++z) {
+            if (z == r) continue;
+            A.ackTo[z] = (u64 *)((char *)(uintptr_t)peer_flag[z] +
+                                 (size_t)ackbase_mesh + (size_t)r * 256u);
+            A.ackFrom[z] = (const u64 *)((char *)(uintptr_t)own_flag +
+                                         (size_t)ackbase_mesh + (size_t)z * 256u);
+        }
+        A.lastRoundDev = ((u64 *)round_dev.data_ptr()) + 1;   // word 1 = mesh
     } else {
+        // Ring: no acknowledgment bank. The pointers stay null from the
+        // memset above and the kernel never reads them -- see the derivation
+        // above bar1_ring_kernel.
         const int next_rank = (r + 1) % R;
         const int prev_rank  = (r + R - 1) % R;
         char *zb = (char *)(uintptr_t)peer_payload[next_rank];
@@ -1393,7 +1638,8 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      int64_t slot, int64_t off_a2a, int64_t fbase_a2a,
                      at::Tensor round_dev, at::Tensor ctl_dev,
                      int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
-                     int64_t load_shape, int64_t abort_host)
+                     int64_t load_shape, int64_t abort_host,
+                     int64_t ackbase_a2a)
 {
     const int R = (int)world, r = (int)rank;
     TORCH_CHECK(R >= 2 && R <= BARLINK_BAR1_MAX_RANKS,
@@ -1454,6 +1700,13 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                 send_len[r], " bytes when sending and ", recv_len[r],
                 " bytes when receiving -- the split sizes do not match");
 
+    // #622: word 2 of round_dev is this kernel's consumption watermark.
+    TORCH_CHECK(round_dev.scalar_type() == at::kLong && round_dev.numel() >= 3,
+                "barlink-bar1 a2a: round_dev must be an int64 tensor with at "
+                "least three elements (0 = round counter, 1 = last completed "
+                "mesh round, 2 = last completed a2a round)");
+    TORCH_CHECK(ackbase_a2a >= 0, "barlink-bar1 a2a: negative ackbase_a2a");
+
     A2aArgs A;
     std::memset(&A, 0, sizeof(A));
     A.in           = (const unsigned char *)inp.data_ptr();
@@ -1495,7 +1748,15 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                                fbase_a2a + (size_t)r * 256u);
         A.flagFrom[z] = (const u64 *)((char *)(uintptr_t)own_flag +
                                      fbase_a2a + (size_t)z * 256u);
+        // #622: the acknowledgment bank, addressed by the same rule as the
+        // flag line above and, like `fbase_a2a`, passed in rather than
+        // recomputed here.
+        A.ackTo[z]  = (u64 *)((char *)(uintptr_t)peer_flag[z] +
+                              (size_t)ackbase_a2a + (size_t)r * 256u);
+        A.ackFrom[z] = (const u64 *)((char *)(uintptr_t)own_flag +
+                                     (size_t)ackbase_a2a + (size_t)z * 256u);
     }
+    A.lastRoundDev = ((u64 *)round_dev.data_ptr()) + 2;       // word 2 = a2a
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     startA2a(vec, (int)kernel_variant, (int)load_shape, A, (int)threads, packets, stream);
@@ -1511,7 +1772,8 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
                      int64_t chunk_max, int64_t off_mesh, int64_t off_ring,
                      at::Tensor round_dev, at::Tensor ctl_dev,
                      int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
-                     int64_t load_shape, int64_t read_flush, int64_t abort_host);
+                     int64_t load_shape, int64_t read_flush, int64_t abort_host,
+                     int64_t ackbase_mesh);
 
 void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      int64_t rank, int64_t world,
@@ -1525,7 +1787,8 @@ void bar1_all_to_all(at::Tensor inp, at::Tensor out,
                      int64_t slot, int64_t off_a2a, int64_t fbase_a2a,
                      at::Tensor round_dev, at::Tensor ctl_dev,
                      int64_t cap_cycles, int64_t threads, int64_t kernel_variant,
-                     int64_t load_shape, int64_t abort_host);
+                     int64_t load_shape, int64_t abort_host,
+                     int64_t ackbase_a2a);
 """
 
 
