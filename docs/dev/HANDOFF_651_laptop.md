@@ -1354,3 +1354,18 @@ carries a desk-time capacity gate (CUDA-visible total vs model size + 1.5 GiB
 margin) and takes `MODEL=` override, defaulting to the Q3 file. Caveat for
 the laptop arm only: UD-Q3 quant mixes may include IQ types whose MMQ is
 broken on gfx1103 (§12.2) — census the file before any laptop use.
+
+### 12.13 Window 2 (granted): Q3_K_XL discriminator — verdict semantics
+
+Granted: 5090-only, ~25 min, next gap after Route A; claim only on the
+coordinator's poke with the holder re-verified. Vehicle: UD-Q3_K_XL
+(sha256-verified against upstream before use; capacity-gated). VERDICT MUST
+STATE BOTH HALVES: (1) a coherent Q3 run on CUDA exonerates the shared 35B
+runtime path — adapter + GDN kernels at K-quant shapes — pointing the laptop
+incoherence at the ROCm/gfx1103 device side; (2) the Q4_K_M-specific-
+interaction suspect stays FORMALLY OPEN until the laptop runs the SAME file
+(same-file cross-platform closure is the laptop-return runbook's job). An
+incoherent Q3 run = tree runtime regression, bisect on the rig (106-commit
+list pre-scoped, GDN/model-code first). The 19.58-GiB CUDA-context ceiling
+is task #652 (planner/ledger must budget context total, not NVML total) —
+owned by the queue, not this strand.
