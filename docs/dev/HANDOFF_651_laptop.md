@@ -1128,3 +1128,80 @@ cross-device claim, warmup discarded, time-bounded runs, and a length sweep.
    budget term never priced.
 7. **Is the vision tower worth fixing now** (#651b, §9.4)? §1.5.3 turned this from
    a nice-to-have into the concrete source of the headroom the spec arm lacks.
+
+---
+
+## 12. Phase 2 findings (2026-08-08, the boot session) [MEASURED]
+
+### 12.1 COHERENCE VERDICT: the "working" Q4_K_M serving was NOT coherent
+
+`probe.py` against the proven no-spec recipe: **2/6 then 1/6 content-correct,
+greedy rounds differ** — fluent, grammatical, wrong, exactly the predicted
+failure class. First-token top-4 logprobs differ across 8 identical greedy
+requests (8/8 distinct), run-to-run logit wobble ~1e-1 — large enough to flip
+argmax. The ~12.5 tok/s serving of §1.5.2 was serving noise. All evidence in
+`/root/651-p2/results/` on the laptop.
+
+### 12.2 Root cause: the Q6_K defect family is wider than the containment
+
+8-run fixed-input harnesses (`det_mm.py`, `det_moe.py`, `det_moe_gemm.py` in
+`/root/651-p2/scripts/`), all on real block fixtures:
+
+| op | Q4_K | Q5_K | Q6_K |
+|---|---|---|---|
+| dequantize | clean | clean* | **broken** (known) |
+| MMVQ (GEMV) | clean | clean | **non-det, spread 2.3e-02** |
+| MMQ (GEMM) | clean | clean | clean (the one validated op) |
+| ggml_moe_a8 | clean | clean | **non-det, spread 3.4e-02** |
+| ggml_moe_a8_vec | clean | clean | **non-det, spread 1.1e-01** |
+
+The checkpoint's four Q6_K tensors are the lm_head (MMQ-pinned, contained) and
+**three MoE expert down-proj stacks (blk.34/38/39)** — those three run through
+the defective MoE kernels on EVERY forward. That is the incoherence.
+
+Debug battery re-run (predecessor's q6k3/q6k4/q6k5, outputs now saved):
+kernel writes ALL output elements (not a coverage bug); corruption is in
+device memory, not readback; syncs/fixed-buffer/chunked launches don't help;
+**AMD_SERIALIZE_KERNEL=3 does not help** (intra-kernel, not inter-kernel).
+O-level dependence: the O1 build breaks Q5_K too; predecessor's native gfx1103
+build likewise. Codegen-sensitive → instruction-pattern-level misexecution.
+
+### 12.3 (*) Suspend/resume poisons the GPU: reboot before believing anything
+
+The laptop suspended overnight and resumed 06:42; post-resume, **Q5_K
+dequantize went non-deterministic too (2e-02) even idle**, and yesterday's
+clean Q5_K baseline could not be reproduced — until a REBOOT restored it
+(3x8 runs byte-identical again). Operational law for this machine: **after
+any suspend/resume, reboot before serving or measuring.** The defect family
+is marginal-execution-like; resume state widens it.
+
+### 12.4 Containment shipped: a Q6_K-free derived checkpoint
+
+`docs/dev/651/requant_no_q6k.py` requantizes exactly the four Q6_K tensors to
+Q8_0 (validated byte-identical on this GPU; +~250 MiB; requant error ~5e-4,
+two orders below the removed noise). Derived file on the laptop:
+`/root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf`. Prediction it must
+satisfy: coherent AND greedy-deterministic serving. If NEXTN's HIP fault was
+Q6_K-driven (the draft shares the Q6_K lm_head), the spec arm may heal too.
+
+### 12.5 Recovery completed: 7 more unversioned laptop files secured
+
+The first recovery captured only `gguf.py`. mtime sweep + git-blob provenance
+found seven more unique laptop-authored files — including the load-bearing
+early expert-stack materialization (without it Q4_K_M cannot load at all on
+unified memory) and the malloc_trim arena release. All verbatim + SHA-256 in
+`docs/dev/651/recovered/laptop_sglang_delta/` (commit 0200388983).
+
+### 12.6 DESIGN DIRECTIVE (user, 2026-08-08): disk-park across the phase flip
+
+For the PP/reshard phase flip on the APU: anything PHASE-EXCLUSIVE that must
+survive the flip (inactive phase's graph pools/workspaces, CPU-stage buffers
+during decode, drafter state during prefill, unused vision tower) parks on
+**DISK, not RAM** — GTT and system RAM are the same DDR5 here, so every byte
+parked is direct headroom for the resharding; small contiguous blobs re-read
+fast. Per item decide by MEASURED ms among (a) keep resident, (b) disk-park +
+sequential reload, (c) drop + reconstruct (e.g. re-capture graphs); write the
+table down; flip budget = park-write ms + reload ms. Reuse the #286 offload
+register classes, #89 hibernate VRAM-to-disk with #456 sparse-write, #407
+registry doctrine — no new spill path. Explicit named park files, never the
+8 GB swap. Flips are regime-wide and rare, so write volume is negligible.
