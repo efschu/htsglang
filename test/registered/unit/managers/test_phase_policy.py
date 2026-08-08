@@ -161,7 +161,7 @@ def test_drain_falsifier_prefill_queue_drained_flips_to_decode_layout():
     st = PhasePolicyState()
     d = decide(c, st, inp(PHASE_PP, pending=0, running=3))
     assert d.direction == PP_TO_TP
-    assert "drained" in d.reason
+    assert "3 req decoding" in d.reason
 
 
 def test_drain_ignores_n_because_there_is_no_prefill_left_to_price():
@@ -172,12 +172,27 @@ def test_drain_ignores_n_because_there_is_no_prefill_left_to_price():
     assert decide(c, st, inp(PHASE_PP, pending=0, running=1)).direction == PP_TO_TP
 
 
-def test_pp_with_pending_prefill_stays_in_pp():
+def test_pp_with_a_worthwhile_prefill_backlog_stays_in_pp():
+    """Above N, the backlog is worth finishing in the fast layout."""
     c = cfg()
     st = PhasePolicyState()
-    d = decide(c, st, inp(PHASE_PP, pending=5000, running=1))
+    d = decide(c, st, inp(PHASE_PP, pending=N + 1, running=1))
     assert d.direction is None
     assert "prefilling in pp" in d.reason
+
+
+def test_batching_small_residual_prefill_does_not_pin_the_server_in_pp():
+    """Continuous arrivals must not trap decode in the prefill layout.
+
+    Falsifier for an ``== 0`` drain rule: under batching the queue may
+    never reach exactly zero, and decoding in PP means decoding with no
+    speculation and no decode CUDA graphs.
+    """
+    c = cfg()
+    st = PhasePolicyState()
+    d = decide(c, st, inp(PHASE_PP, pending=N - 1, running=2))
+    assert d.direction == PP_TO_TP
+    assert "decoding" in d.reason
 
 
 # -- falsifier 3: in-flight safety --------------------------------------------
@@ -446,7 +461,7 @@ def test_disabled_policy_emits_nothing():
     assert s.maybe_arm_phase_policy() is None
 
 
-def _receiver(hook, pulled):
+def _receiver(hook, pulled, pp_rank=0, attn_tp_rank=0):
     """A real SchedulerRequestReceiver whose intake is stubbed.
 
     Built as the real frozen dataclass so the code under test is the
@@ -459,7 +474,11 @@ def _receiver(hook, pulled):
     )
 
     class _PS:
-        pp_rank = 0
+        pass
+
+    _PS.pp_rank = pp_rank
+    _PS.attn_tp_rank = attn_tp_rank
+    _PS.attn_cp_rank = 0
 
     recv = SchedulerRequestReceiver(
         recv_from_tokenizer=None,
@@ -528,12 +547,7 @@ def test_receiver_without_a_policy_is_byte_identical():
 
 
 def test_non_origin_rank_never_consults_the_policy():
-    """A rank whose _pull_raw_reqs returned None must not inject.
-
-    Injecting there would mint a second, unreplicated arm request that no
-    peer sees -- the exact divergence that parks a lone rank in a
-    reduction its peers never enter.
-    """
+    """A rank whose _pull_raw_reqs returned None must not inject."""
     from contextlib import ExitStack
 
     calls = []
@@ -549,3 +563,53 @@ def test_non_origin_rank_never_consults_the_policy():
         out = recv.recv_requests()
     assert calls == [], "the policy was consulted on a non-origin rank"
     assert out is None
+
+
+def test_downstream_pp_stage_never_injects_even_though_it_got_a_list():
+    """REGRESSION, measured on metal 2026-08-08.
+
+    In the PP phase _pull_raw_reqs returns a LIST on every stage: rank 0
+    reads zmq, ranks 1..n-1 read point_to_point_pyobj from upstream. A
+    guard of "recv_reqs is not None" is therefore true on EVERY rank, so
+    each stage armed its own flip and forwarded it on -- 1/2/3 arms
+    across PP0/PP1/PP2, a 12765-line capture-census flood, and the server
+    killed itself.
+
+    A downstream stage must forward the origin's request untouched and
+    contribute none of its own, however non-empty its list is.
+    """
+    from contextlib import ExitStack
+
+    calls = []
+
+    def hook():
+        calls.append(1)
+        return "MUST-NOT-BE-INJECTED"
+
+    for stage in (1, 2):
+        calls.clear()
+        # What a downstream PP stage really sees: a populated list that
+        # arrived over the wire from the stage above it.
+        forwarded = ["req-from-upstream"]
+        recv, patches = _receiver(hook, forwarded, pp_rank=stage)
+        with ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            out = recv.recv_requests()
+        assert calls == [], f"PP stage {stage} consulted the policy"
+        assert out == ["req-from-upstream"], (
+            f"PP stage {stage} injected its own arm request"
+        )
+
+
+def test_non_attention_tp_rank_never_injects():
+    """The zmq-intake branch also requires attn_tp_rank 0."""
+    from contextlib import ExitStack
+
+    calls = []
+    recv, patches = _receiver(lambda: calls.append(1), ["x"], attn_tp_rank=1)
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        recv.recv_requests()
+    assert calls == []

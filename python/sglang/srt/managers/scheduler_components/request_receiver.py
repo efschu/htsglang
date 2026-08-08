@@ -89,17 +89,34 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._pull_raw_reqs()
 
-        # #631 automatic phase policy. This is the ONE seam that serves
-        # both layouts: _pull_raw_reqs returns a list exactly on the rank
-        # that owns the intake -- pp_rank 0 in the PP phase, tp_rank 0 in
-        # the TP phase (the cutover swaps ps, so the same physical rank 0
-        # is the origin either way) -- and None on every rank that instead
-        # RECEIVES the stream. Injecting here therefore rides whichever
+        # #631 automatic phase policy. Injecting here rides whichever
         # distribution is live: the P2P stage chain under event_loop_pp,
-        # the TP broadcast under event_loop_normal. Both are the paths the
+        # the TP broadcast under event_loop_normal -- both the paths the
         # manual POST /phase_flip already uses, so an automatic flip is
-        # delivered exactly like a human one, and no rank can arm alone.
-        if recv_reqs is not None and self.phase_policy_hook is not None:
+        # delivered exactly like a human one.
+        #
+        # THE GUARD IS THE WHOLE CORRECTNESS ARGUMENT. It must be the
+        # ZMQ-INTAKE test, not "did I get a list". A list is NOT the
+        # origin signal: in the PP phase _pull_raw_reqs returns a list on
+        # every stage -- rank 0 from zmq, ranks 1..n-1 from
+        # point_to_point_pyobj -- so "recv_reqs is not None" is true
+        # everywhere and every rank injects its OWN arm. Measured
+        # 2026-08-08: each stage armed its own flip and forwarded it on,
+        # giving 1/2/3 arms on PP0/PP1/PP2, a 12765-line capture-census
+        # flood and a self-kill. That is the lone-rank divergence this
+        # design exists to prevent, reintroduced through the guard.
+        #
+        # This condition is exactly the branch in _pull_raw_reqs that
+        # reads the sockets, so the policy is consulted on precisely the
+        # one rank that owns the request stream: pp_rank 0 in the PP
+        # phase, and in the TP phase the cutover swaps ps to pp_size=1 so
+        # the same physical rank 0 is again the only puller.
+        is_request_origin = (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+        if is_request_origin and recv_reqs is not None and self.phase_policy_hook is not None:
             policy_req = self.phase_policy_hook()
             if policy_req is not None:
                 recv_reqs.append(policy_req)
