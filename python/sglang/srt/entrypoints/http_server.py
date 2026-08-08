@@ -136,6 +136,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
+    PhaseFlipReqInput,
     SessionHandoverReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
@@ -1195,6 +1196,23 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
+
+
+@app.api_route("/phase_flip", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def phase_flip(obj: Annotated[PhaseFlipReqInput, Body()], request: Request):
+    """#631: arm a PP-prefill <-> TP-decode phase flip (obj.direction is
+    pp_to_tp or tp_to_pp; requires --enable-phase-flip). The flip commits
+    at the next consensus boundary where every rank is quiescent; watch
+    the PHASE-FLIP log lines for the DONE record."""
+    try:
+        ret = await _global_state.tokenizer_manager.phase_flip(obj.direction)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        {"success": ret.success, "message": ret.message},
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/kv_reshard", methods=["POST"])

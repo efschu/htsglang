@@ -512,6 +512,62 @@ class TestEventLoopRedispatch(CustomTestCase):
             run_phase_flip_event_loops(sched)
 
 
+class TestPhaseFlipRpc(CustomTestCase):
+    """The /phase_flip control plane (5.5 ladder rung 2 prerequisite):
+    the REAL Scheduler.handle_phase_flip on stubs -- flag off refuses
+    naming the flag, pre-round arming reports not-built, an armed verdict
+    passes through, an arm exception is wrapped, never raised."""
+
+    def _handle(self, sched, direction="pp_to_tp"):
+        from sglang.srt.managers.io_struct import PhaseFlipReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        return Scheduler.handle_phase_flip(
+            sched, PhaseFlipReqInput(direction=direction)
+        )
+
+    def test_flag_off_refuses_naming_the_flag(self):
+        sched = SimpleNamespace(
+            server_args=SimpleNamespace(enable_phase_flip=False)
+        )
+        out = self._handle(sched)
+        self.assertFalse(out.success)
+        self.assertIn("--enable-phase-flip", out.message)
+
+    def test_pre_round_arm_reports_not_built(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        sched = _StubScheduler(0)
+        sched.server_args = SimpleNamespace(enable_phase_flip=True)
+        sched.arm_phase_flip = lambda d, source: Scheduler.arm_phase_flip(
+            sched, d, source
+        )
+        out = self._handle(sched)
+        self.assertFalse(out.success)
+        self.assertIn("not built yet", out.message)
+
+    def test_armed_verdict_passes_through(self):
+        sched = SimpleNamespace(
+            server_args=SimpleNamespace(enable_phase_flip=True),
+            arm_phase_flip=lambda d, source: (True, f"armed {d} ({source})"),
+        )
+        out = self._handle(sched, "tp_to_pp")
+        self.assertTrue(out.success)
+        self.assertIn("armed tp_to_pp (rpc)", out.message)
+
+    def test_arm_exception_is_wrapped_not_raised(self):
+        def _boom(d, source):
+            raise RuntimeError("wiring hole")
+
+        sched = SimpleNamespace(
+            server_args=SimpleNamespace(enable_phase_flip=True),
+            arm_phase_flip=_boom,
+        )
+        out = self._handle(sched)
+        self.assertFalse(out.success)
+        self.assertIn("wiring hole", out.message)
+
+
 class TestSleepOnIdleSkip(CustomTestCase):
     def test_pending_flip_keeps_loop_ticking(self):
         """A parked loop never reaches a consensus boundary (#297 lesson):

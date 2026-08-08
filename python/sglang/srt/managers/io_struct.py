@@ -1441,6 +1441,21 @@ class KvReshardReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class PhaseFlipReqInput(BaseReq, kw_only=True):
+    """#631: arm a PP-prefill <-> TP-decode phase flip (requires
+    --enable-phase-flip). ``direction`` is ``pp_to_tp`` or ``tp_to_pp``
+    and must be the legal transition for the current phase. Arming
+    returns immediately; the flip commits at the next consensus boundary
+    where every rank is quiescent (requests parked, no partial chunk)."""
+
+    direction: str
+
+
+class PhaseFlipReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
 class SessionHandoverReqInput(BaseReq, kw_only=True):
     """#261: live session handover without server stop.
 

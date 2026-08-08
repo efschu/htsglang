@@ -136,6 +136,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
     KvReshardReqOutput,
+    PhaseFlipReqInput,
+    PhaseFlipReqOutput,
     SessionHandoverReqInput,
     SessionHandoverReqOutput,
     ListExternalCorporaReqInput,
@@ -1888,6 +1890,7 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
                 (KvReshardReqInput, self.handle_kv_reshard),
+                (PhaseFlipReqInput, self.handle_phase_flip),
                 (SessionHandoverReqInput, self.handle_session_handover),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
@@ -6107,6 +6110,32 @@ class Scheduler(
             logger.warning("KV-RESHARD arm failed: %s", e)
             return KvReshardReqOutput(success=False, message=str(e))
         return KvReshardReqOutput(success=ok, message=msg)
+
+    def handle_phase_flip(self, recv_req: PhaseFlipReqInput) -> PhaseFlipReqOutput:
+        """#631 control plane: arm a phase flip (mirror of handle_kv_reshard).
+
+        Replicated call through the broadcast pipe; arming does no
+        collective work -- the flip commits at a consensus boundary where
+        every rank is armed and quiescent. Delivery skew is absorbed by
+        the runtime's MIN-semantics on the armed flag. Routed through
+        arm_phase_flip so the abort deferral window activates atomically
+        with the arm (pin 4)."""
+        if not self.server_args.enable_phase_flip:
+            return PhaseFlipReqOutput(
+                success=False,
+                message=(
+                    "--enable-phase-flip is not set; this server has no "
+                    "secondary stack to flip to. Enable it at boot."
+                ),
+            )
+        try:
+            ok, msg = self.arm_phase_flip(recv_req.direction, source="rpc")
+        except Exception as e:
+            # Arming performs no collective and moves no byte; every rank
+            # computes the same verdict from the same replicated input.
+            logger.warning("PHASE-FLIP arm failed: %s", e)
+            return PhaseFlipReqOutput(success=False, message=str(e))
+        return PhaseFlipReqOutput(success=ok, message=msg)
 
     def handle_vram_budget(self, recv_req: VramBudgetReqInput) -> VramBudgetReqOutput:
         """#330 control plane: dial a card's VRAM budget or query the state.
