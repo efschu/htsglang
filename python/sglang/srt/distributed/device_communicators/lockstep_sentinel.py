@@ -436,3 +436,20 @@ def note_replay(kind: str, key: Any, index: int) -> None:
     s = _SENTINEL
     if s is not None:
         s.note_replay(kind, key, index)
+
+
+def note_decision(kind: str, *fields: Any) -> None:
+    """One batch-membership decision (drop/admit, with reason).
+
+    Under pure TP these decisions MUST be rank-uniform — every rank runs the
+    same batch — so they belong in the position chain: a rank that finishes,
+    aborts, retracts or admits a request its peers do not has ALREADY
+    diverged, steps before the graph-selection mismatch makes it visible in
+    the replay stream. Recording the decision names the diverging code path
+    and its reason instead of its downstream symptom (proven need: specimen
+    20260808T051733Z diverged at a bs 5-vs-6 full-graph selection with the
+    entire preceding host-op stream still in lockstep).
+    """
+    s = _SENTINEL
+    if s is not None:
+        s._record(("d", kind) + fields)
