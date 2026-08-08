@@ -644,6 +644,49 @@ class TestAbortDeferral(CustomTestCase):
             louds,
         )
 
+    def test_can_fail_batch_membership_disagreement_is_refused_loudly(self):
+        # Cross-strand hazard (#622 root cause, first-token no-sync): on a
+        # mixed-arch rig ranks can read DIFFERENT first tokens and so
+        # DISAGREE whether a request hit EOS -- one rank believes the
+        # request FINISHED (freed its rows), peers still hold it parked.
+        # The flip's replicated-live-set assumption is then false. This
+        # test pins the required behavior: the flip REFUSES loudly (the
+        # shrunken pair payloads mismatch the peers' expectations), it
+        # never commits a mixed-membership layout silently.
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 140, seed=37
+        )
+        # "Request X" = a contiguous run of slots; rank 2 believes it
+        # finished and enumerates a live set WITHOUT those rows.
+        req_rows = live[3:9]
+        mask = torch.ones(live.numel(), dtype=torch.bool)
+        for i in range(live.numel()):
+            if live[i] in req_rows:
+                mask[i] = False
+        live_rank2 = live[mask]
+        self.assertLess(int(live_rank2.numel()), int(live.numel()))
+        live_per_rank = [live, live, live_rank2]
+        runtimes = self._runtimes_with_per_rank_live(
+            live_per_rank, pp_views, tp_views
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        louds = [e for e in exceptions if isinstance(e, KvReshardError)]
+        self.assertTrue(
+            louds,
+            f"membership disagreement went undetected: {exceptions}",
+        )
+        # Nobody may have cut over to the new layout on a divergent set...
+        # except ranks whose pair payloads happened to be consistent; the
+        # LOUD failure on at least one rank is what kills the group before
+        # the mixed layout serves. The binding assertion: no hang, loud.
+        self.assertTrue(
+            any(
+                "size mismatch" in str(e) or "checksum" in str(e)
+                for e in louds
+            ),
+            louds,
+        )
+
     def test_deferral_keeps_flip_clean_then_applies_abort(self):
         # WITH deferral: the disconnect arrives mid-flip on rank 0, is
         # QUEUED, the flip commits byte-identically on every rank, and

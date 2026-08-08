@@ -530,6 +530,27 @@ at unit level (scheduler-level replay in 5.3).
   RegimeSensor/DwellGate (regime_classifier.py:273/:478). Evidence-gated
   act mode unchanged (server_args.py:7147).
 
+### 5.4a Cross-strand dependency (#622, recorded 2026-08-08)
+
+The crashfix strand root-caused the rig's async bug to first-token
+NO-SYNC in the base sampler (_sync_token_ids_across_tp default-off): on
+this mixed-arch rig, ranks can read DIFFERENT first tokens and so
+DISAGREE about batch membership (one rank sees EOS, peers do not). The
+flip's replicated-live-set assumption is FALSE under the unfixed bug.
+Defenses and consequences:
+- The consensus envelope + receiver-derived payload sizes make a
+  membership disagreement a LOUD refusal, never a silent mixed layout --
+  pinned by test_can_fail_batch_membership_disagreement_is_refused_loudly
+  (one rank believes a whole request finished -> size-mismatch
+  KvReshardError, no hang).
+- Step-6 rig validation runs on a tree that INCLUDES the crashfix
+  token-sync fix (fix/collective-stream-622 merge, operator coordinates
+  the order); soaking on an unfixed tree would make every flip anomaly
+  ambiguous.
+- Graph asymmetry (pin 2) is STRUCTURAL in 5.2: the PP stack's runner is
+  built with decode-graph capture absent (no decode graph runner
+  constructed), not merely configured off.
+
 ### 5.5 GPU validation order (step 6)
 - Boot flip-enabled, NO flip armed: PP phase must reproduce #625 PP
   prefill numbers (A-vs-A floor first).
