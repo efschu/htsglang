@@ -1,33 +1,48 @@
 # Handoff #651 — Qwen3.6-35B-A3B GGUF bring-up on the APU laptop
 
 Branch: `feat/gguf-q4-bringup-651`
-Revised 2026-08-08 by the #651 strand, after the user supplied the real target
-hardware. The 2026-08-07 revision of this file assumed a discrete-NVIDIA laptop
-and is wrong in its conclusions; the geometry, the #647 fix and the parallelism
-analysis survive unchanged and are kept below.
+Revised 2026-08-08 by the #651 strand. Revision 1 folded in the real target
+hardware (an AMD APU, not a discrete-NVIDIA laptop). Revision 2 — this one —
+folded in the prior session's working setup found on the laptop itself, which
+inverts revision 1's "cannot run" conclusion. The geometry, the #647 fix and
+the parallelism analysis are unchanged throughout.
 
 ---
 
 ## 0. The headline, before anything else
 
-**The bring-up as specified cannot run on this laptop with this tree today.**
-Both possible backends are closed, each for an independent and fully-evidenced
-reason:
+**It already works.** Qwen3.6-35B-A3B **Q4_K_M GGUF serves on the Radeon 780M
+iGPU** through htsglang at **~12.5 tok/s decode and ~165 tok/s prefill**, bs=1,
+ctx 8192, TP=1, no speculation. Measured on the machine, 2026-08-07 — see §1.5.
 
-| Path | Status | Why |
-|---|---|---|
-| **iGPU via ROCm/HIP** | **Closed** | The GGUF K-quant kernels are not in the ROCm build at all — not broken, absent. And `sgl-kernel`'s ROCm build refuses this GPU architecture outright. §2 |
-| **CPU-only** | **Closed** | No CPU K-quant kernel exists, so a CPU stage must materialize weights dense: **~67 GiB against 29.5 GiB of RAM**, a 2.3x overshoot. §3 |
+That is true **despite** this tree having no ROCm GGUF path at all. The gap was
+closed *outside* the repository: the laptop runs a modified sglang copy plus a
+purpose-built `sglang_gguf_rocm` extension. So there are two different true
+statements, and confusing them is the main hazard in this area:
 
-This is not a tuning problem and no runtime flag changes it. What *is* true, and
-is the constructive half of this handoff: the ROCm port is **mechanically
-shallow** (§2.4) — the kernels contain no CUDA-only hardware intrinsics, the
-AMD shims are already written and inherited from upstream, and the hardcoded
-wave size is already correct for this GPU. The blocker is build-system
-plumbing and an architecture allow-list, not kernel physics.
+| | Status |
+|---|---|
+| **This tree (`feat/gguf-q4-bringup-651`)** | GGUF has **no ROCm path**. Kernels absent from the ROCm build, ops never registered, `sgl-kernel` refuses gfx1103 outright. Fully evidenced in §2. |
+| **The laptop, right now** | **Works** for Q4_K_M without speculation, via an out-of-tree port that supplies exactly what §2 says is missing. §1.5 |
+| **CPU-only, either way** | **Impossible.** Dense materialization needs ~67 GiB against 29.5 GiB of RAM, a 2.3x overshoot. §3 |
 
-**So the honest next step is not "boot it". It is "port the GGUF kernels to
-ROCm and widen the gfx allow-list" (§7).**
+**The two real problems now are:**
+
+1. **Speculation (NEXTN/MTP) hard-faults the HIP context.** It boots, serves a
+   batch, then dies with `hipErrorLaunchFailure` within 10-40 s — twice, at two
+   context lengths, with a same-config no-spec control that runs clean. §1.5.3
+2. **The working code is unversioned and its provenance is unrecoverable.**
+   `/root/lh/sglang_src` is **not a git repo** and carries no baked commit id.
+   The port that makes this machine work cannot currently be diffed against any
+   rig commit. §1.5.4
+
+So the next step is **not** "port the kernels" — that is done. It is: localize
+the speculation fault with `AMD_SERIALIZE_KERNEL=3`, and get the out-of-tree work
+back into the repository before it is lost. §7.
+
+*(The 2026-08-08 first revision of this file concluded "cannot run". That was
+right about the tree and wrong about the machine, because it was written before
+the laptop was inspected. Corrected here.)*
 
 ### Verification markers used throughout
 
@@ -37,8 +52,12 @@ ROCm and widen the gfx allow-list" (§7).**
 | **[CODE]** | Verified by reading this tree, with file:line. |
 | **[UNVERIFIED]** | Reasoning or arithmetic only. Treat as hypothesis. |
 
-The model has still **never generated a token** on this hardware. Nothing below
-claims it is coherent.
+**Correction to the previous revisions:** the model *has* now generated tokens on
+this hardware (§1.5.2). What is still **[UNVERIFIED]** is its **coherence** — no
+content-checked probe run survives. `docs/dev/651/probe.py` exists for exactly
+this and has never been run against the laptop. Serving 200s and a plausible
+tok/s are not evidence of correct output, and this checkpoint's specific failure
+mode (§9.1) is fluent, grammatical, wrong text.
 
 ---
 
@@ -98,7 +117,170 @@ them, which is what `--tokenizer-path` needs.
 
 ---
 
+## 1.5 What is ALREADY RUNNING on the laptop [MEASURED 2026-08-07/08]
+
+A prior session left a complete working setup in `/root/lh/`. Nobody had
+recorded it here. This section is the single most important part of this
+handoff, because it inverts the conclusion of §2.
+
+### 1.5.1 The out-of-tree stack
+
+| Component | State |
+|---|---|
+| venv | `/root/lh/venv/` (Python 3.12.13, uv-managed); every boot script sources it |
+| torch | **2.10.0+rocm7.0**, `torch.version.hip = 7.0.51831`, `torch.version.cuda = None` |
+| device | `torch.cuda.is_available() = True`, **`AMD Radeon 780M Graphics`**, `gcnArchName='gfx1103'`, `total_memory=24576MB` (that is GTT, not the 1 GiB carve-out), 6 CUs, 2 MB L2 |
+| sglang | **editable from `/root/lh/sglang_src/python`** via a `_htsglang_fork.pth`; version `0.0.0.dev0` |
+| `sgl_kernel` | **NOT installed** |
+| GGUF kernels | **`sglang_gguf_rocm.cpython-312-x86_64-linux-gnu.so`**, a standalone extension built for **gfx1100** in `/root/lh/ggufbuild` |
+
+The extension exports `ggml_dequantize`, `ggml_mul_mat_a8`,
+`ggml_mul_mat_vec_a8`, `ggml_mmvq_kq_tuned`, `ggml_moe_a8`, `ggml_moe_a8_vec`,
+`ggml_moe_get_block_size`, `ggml_mxfp4_native`. The modified `gguf.py` imports
+it at `:99` behind an **`elif _is_hip:`** arm at `:75` — i.e. exactly the missing
+binding that §2.3 and §7 item 3 describe, already written, just not in this repo.
+
+**`HSA_OVERRIDE_GFX_VERSION=11.0.0` is load-bearing and verified.** It is set in
+8 boot scripts, not in the ambient environment. Without it a 64x64 matmul fails
+with `hipErrorInvalidDeviceFunction`; with it, `gcnArchName` reports `gfx1100`
+and the matmul returns. The script comment states the reason: *"torch ROCm
+carries no gfx1103 code objects and the sglang_gguf_rocm extension is built for
+gfx1100"* (`boot_q4_spec.sh:3-4`).
+
+### 1.5.2 It serves, and the numbers
+
+Eight logs contain `The server is fired up and ready to roll!`. The clean runs
+are Q4_K_M **without** speculation (`q4_d`, `q4_e`, `q4_f`, 15:22-16:17, all
+ended by operator SIGTERM, no exception), answering real `POST /generate 200 OK`.
+
+```
+q4_f.log  Load weight begin. avail mem=24.76 GB
+          Load weight end. elapsed=74.33 s, avail mem=3.38 GB, mem usage=21.38 GB
+          max_total_num_tokens=8192, context_len=8192, available_gpu_mem=2.86 GB
+```
+
+| Metric | Measured |
+|---|---|
+| decode, bs=1, steady state | **~12.3-12.8 tok/s** |
+| prefill, pure compute (`#new-token: 841`, gpu-ms 4880-5347) | **~157-172 tok/s** |
+| weight load | 74.33 s, **21.38 GB** resident |
+| free for KV after weights, ctx 8192 | 2.86 GB |
+
+**This validates §4's budget model.** Predicted room under the 25,600 MiB
+ceiling was 3,137 MiB; measured free-after-weights was 3.38 GB. The model is
+sound and can be trusted for the remaining planning.
+
+Flags actually used (`boot_q4_lean_nospec.sh`): `--device cuda` (HIP), `--tp-size
+1`, `--load-format gguf --quantization gguf`, `--attention-backend triton`,
+`--sampling-backend pytorch`, `--disable-cuda-graph`, `--disable-radix-cache`,
+`--mamba-radix-cache-strategy no_buffer`, `--disable-overlap-schedule`,
+`--page-size 1`, `--mem-fraction-static 0.95/0.97`, `--chunked-prefill-size 1024`,
+`--max-running-requests 1`. Env: `HSA_OVERRIDE_GFX_VERSION=11.0.0`,
+`PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` (torch warns it is
+unsupported on this platform), `OMP_NUM_THREADS=12`. Wrapped in
+`systemd-run --scope -p CPUQuota=1200%`. **`--device cpu` was never used.**
+
+### 1.5.3 The live blocker: speculation faults the HIP context
+
+The decisive evidence is an A/B four minutes apart with **identical flags except
+speculation**:
+
+| Run | Config | Outcome |
+|---|---|---|
+| `q4speclean_a` 16:33 | NEXTN, ctx 2048, memfrac 0.97 | ready 16:33:22, **dead 16:33:31** |
+| `q4ctrl` 16:37 | **same, spec removed** | **ran fine**, produced tokens, SIGTERM |
+
+```
+[16:33:28] Prefill rank batch, #new-token: 2, #chunks: 1, gpu-ms: 215.2
+scheduler.py:5206: UserWarning: HIP warning: unspecified launch failure
+[16:33:31] Scheduler hit an exception:
+    batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+torch.AcceleratorError: HIP error: unspecified launch failure
+```
+
+The context is then unrecoverable — even `torch.cuda.set_stream` in the
+`__exit__` handler raises, and the process aborts. The same fault hit
+`q4spec_fix647` at ctx 8192 (ready 16:22:17, dead 16:22:53). **[UNVERIFIED]**
+the crash *site* is meaningless: `.to("cpu")` is merely where an async fault
+surfaces. The offending kernel is upstream in the draft/verify step.
+
+Two earlier speculation problems were found and fixed on the way, and are worth
+keeping:
+
+- **Draft checkpoint quantization**: `ValueError: Draft checkpoint left 2
+  parameter(s) of Qwen3_5ForCausalLMMTP unloaded:
+  ['model.layers.0.mlp.gate.weight', 'model.layers.0.mlp.shared_expert_gate.weight']`
+  — i.e. **exactly the #647 pair of §9.1, observed live**. Fixed by passing
+  **`--speculative-draft-model-quantization gguf`**. Carry this flag.
+- **Mamba state cache at ctx 8192 under spec**: `max_mamba_cache_size=0
+  (total_rest_memory=0.56 GB, mamba_cache_per_req=61.41 MB)`. The spec arm needs
+  headroom the no-spec arm does not — which is precisely where the 818 MiB
+  vision tower (§9.4) would pay for itself.
+
+Also fixed earlier: `ModuleNotFoundError: No module named 'sgl_kernel'` reached
+from `kernels/selector.py:64` on the MoE path (`fused_moe_triton/layer.py:2202`).
+
+### 1.5.4 A real correctness finding: Q6_K dequant is broken on gfx11
+
+Contained, **not fixed**. From the modified `gguf.py:334-345`:
+
+> *"CONTAINMENT, NOT A FIX. Q6_K dequantise returns non-deterministically wrong
+> values on gfx1103 (Radeon 780M): eight runs on one fixed input tensor differ
+> from each other, worst max|d| 5.8e-01 against the numpy reference, up to 75
+> non-finite values in 262144, and it is wrong on the FIRST call in a fresh
+> process... Q4_K and Q5_K are byte-identical across the same eight runs."*
+
+Eight hypotheses are recorded as falsified, including that it is an
+`HSA_OVERRIDE` artefact — *"a native gfx1103 build is worse — Q5_K becomes
+affected too"*. Scope is narrow: **Q6_K is 4 tensors of 753**, but one of them is
+the **lm_head**, which this checkpoint ships as Q6_K. Handling:
+
+- `ggml_mul_mat_a8` (MMQ) is **validated correct for Q6_K on gfx1103**, max|d|
+  5.5e-04 against the numpy reference on real weights, so Q6_K is pinned to MMQ
+  at any token count.
+- The load-time path is rescued by an exact one-time **CPU** dequantise:
+  `q4_f.log` — *"GGUF ROCm containment: dequantised a Q6_K layer (248320 x 2048)
+  once on the CPU at load; its GPU dequant kernel is known-bad on gfx11."*
+
+This is an open root-cause question and a good candidate for the first real
+kernel investigation on this hardware.
+
+### 1.5.5 What is NOT evidence
+
+`boot_pd631.sh` runs `MODEL=/root/lh/models-2b`, a **safetensors 2B model, not
+the GGUF** (the script says so itself). Its success proves PD plumbing only.
+**Do not cite it as GGUF or as 35B evidence.**
+
+Likewise: `bench.py`, `bench_spec.py` and `bandwidth_floor.py` exist and are
+correctly written — `bench_spec.py` even takes accept length as
+`completion_tokens/spec_verify_ct` rather than the `spec_ema_accept_len` trap —
+but **no result file exists anywhere and no log contains their output**. Their
+stdout went to a lost session. **There is no bandwidth-floor number and no
+accept-rate number.** The ~12.5 tok/s decode figure therefore has no denominator:
+it implies ~20-22 GB/s effective read bandwidth, plausible for dual-channel
+DDR5-5600 on an APU, but until `bandwidth_floor.py` is run and *saved* it cannot
+be called good or bad.
+
+### 1.5.6 Machine state as of this writing
+
+No server running; no listening port beyond sshd/resolved/cupsd. GPU idle
+(`mem_info_vram_used` 359.7 MiB of 1024, `mem_info_gtt_used` 59.9 MiB of 24576),
+so the full 22 GB footprint is free to re-take. `free -m`: 30210 total, 1674
+used, 28536 available.
+
+Housekeeping left behind, harmless but untidy: `laws_sampler.py` (pid 13802) is
+still appending to a **43.9 MB and growing** `laws_boot.jsonl`, and **12 orphaned
+`triple.sh` samplers** are still writing `q4_*.csv` (which is why those files
+carry current mtimes).
+
+---
+
 ## 2. Backend verdict: GGUF has no ROCm path in this tree [CODE]
+
+**Scope note:** everything in this section is about **this repository**. It is
+all verified and all still true — and it is exactly the gap the laptop's
+out-of-tree port (§1.5.1) fills. Read it as the specification of what must be
+brought back into the tree, not as a statement that the laptop cannot run.
 
 This is the question the 2026-08-07 revision could not answer because it
 predates knowing the GPU is AMD. It is now answered, and the answer is
@@ -273,12 +455,28 @@ python -c "import torch, sgl_kernel; \
   print('ggml op registered:', hasattr(torch.ops.sgl_kernel, 'ggml_dequantize'))"
 ```
 
-Expected on any ROCm build of this tree: `hip= 7.x  cuda= None` and
-`ggml op registered: False`. `False` means GGUF is unusable on that machine and
-no flag will change it — the kernel is not in the binary.
+**Actually run on the laptop, 2026-08-08 [MEASURED]:**
 
-If `sgl-kernel` cannot even be installed, that is `setup_rocm.py:77-81` exiting
-on the gfx gate (§2.3.1) — a prior blocker with a different fix.
+```
+hip= 7.0.51831 cuda= None
+sgl_kernel: NOT INSTALLED -> No module named 'sgl_kernel'
+sglang_gguf_rocm: /root/lh/venv/lib/python3.12/site-packages/sglang_gguf_rocm.cpython-312-x86_64-linux-gnu.so
+  exports: ['ggml_dequantize', 'ggml_mmvq_kq_tuned', 'ggml_moe_a8',
+            'ggml_moe_a8_vec', 'ggml_moe_get_block_size', 'ggml_mul_mat_a8',
+            'ggml_mul_mat_vec_a8', 'ggml_mxfp4_native']
+```
+
+This is the whole story in six lines. `torch.version.cuda is None` confirms
+`_is_cuda` is False and `_is_hip` is True, exactly as §2.3 predicts. **`sgl_kernel`
+is not installed at all** — it cannot be, because of the gfx gate (§2.3.1) — so
+the in-tree question "is the ggml op registered" is moot on this machine. The
+ops are supplied instead by the **out-of-tree `sglang_gguf_rocm` extension**
+(§1.5.1), which exports every operator the GGUF path needs, plus a tuned
+`ggml_mmvq_kq_tuned` and `ggml_mxfp4_native` that have no in-tree counterpart.
+
+So on a machine running **this tree unmodified**, the check would report
+`ggml op registered: False` and GGUF would be unusable. On the laptop as it
+stands, it is usable — through code that lives outside the repository.
 
 Supporting checks, in order:
 
@@ -333,7 +531,7 @@ not the problem; this tree's kernel coverage is.
 
 ---
 
-## 4. Memory budget, if and when a backend exists [MEASURED]
+## 4. Memory budget [MEASURED, and validated against a real load in section 1.5.2]
 
 Reproduce with `docs/dev/651/apu_budget.py`. Ceiling is the 25,600 MiB
 GPU-addressable window of §1, not `MemTotal` — that is the binding constraint.
@@ -455,31 +653,58 @@ PP+spec goal. **Do not build it here.**
 
 ---
 
-## 7. What would actually unblock this laptop, in order
+## 7. The actual work queue
 
-1. **Widen the `sgl-kernel` ROCm gfx allow-list** (`setup_rocm.py:77-81`) to
-   admit RDNA3 / gfx110x, and get a build to complete. Smallest item; blocks
-   everything else. Verify with §2.6.
-2. **Add `csrc/quantization/gguf/gguf_kernel.cu` to `setup_rocm.py`'s source
-   list**, hipify the three CUDA headers in `gguf_kernel.cu:3-5`, and register
-   the ops in `common_extension_rocm.cc`. §2.4 says the kernel bodies themselves
-   should largely survive: the `USE_ROCM` shims and `__dp4a` are already there
-   and `WARP_SIZE_GGUF 32` is already right for wave32.
-3. **Bind the Python path for HIP** — `gguf.py:41-62` needs an `elif _is_hip:`
-   import arm, and `supports_current_device()` (`:134-152`) must stop returning
-   `None` on ROCm so the failure is loud at load instead of a `NameError`
-   mid-forward. **Do this even if nothing else is done**, because the current
-   silent-load-then-`NameError` behaviour will waste somebody's day.
-4. **Validate numerics on RDNA** — `__builtin_amdgcn_sdot4` paths and the
-   CDNA-tuned `moe.cuh` constants (§2.4).
-5. Only then: the staged boot of §8.
+Rewritten after §1.5. The port is **done**; it is just not in the repository.
 
-Item 3 is cheap and is worth landing on its own merits regardless of whether
-anyone finishes the port.
+### Immediate, on the laptop
+
+1. **Localize the speculation fault.** Re-run `boot_q4_spec_lean.sh` with
+   **`AMD_SERIALIZE_KERNEL=3`** (and ideally `TORCH_USE_HIP_DSA`) to turn the
+   async `unspecified launch failure` into a synchronous fault at the real
+   kernel. The previous session never did this, so the recorded crash site
+   (`scheduler.py:5206`, a `.to("cpu")`) is meaningless. **Prime suspect: the
+   NEXTN draft path reusing a GGUF op that was only ever validated on the target
+   path** — which is doubly plausible given §1.5.4, where one op is already known
+   to be silently wrong on this GPU. Keep
+   `--speculative-draft-model-quantization gguf`.
+2. **Run `bandwidth_floor.py` and `bench.py` against a no-spec boot and SAVE the
+   output to a file.** Cheap, and currently the whole perf picture rests on a
+   single unanchored 12.5 tok/s. `bench_spec.py`'s accept-length instrument has
+   never once executed.
+3. **Give the spec arm its headroom** — at ctx 8192 it could not fit the mamba
+   state cache (§1.5.3). Dropping the 818 MiB vision tower (#651b, §9.4) is the
+   obvious source, and this is now a concrete motivation rather than a
+   nice-to-have.
+
+### Repository hygiene, and it is urgent
+
+4. **Recover `/root/lh/sglang_src` into version control.** It is **not a git
+   repo**, has no baked commit id, and came from a `.tgz`. The work that makes
+   this machine run — the `elif _is_hip:` arm, the `sglang_gguf_rocm` extension,
+   the Q6_K containment, the MoE-path `sgl_kernel` fix — exists in exactly one
+   unversioned copy on one laptop. **This is the largest risk in the whole
+   ticket.** Diff it against this branch and land it.
+5. **Bring the kernel build in-tree**: widen the ROCm gfx allow-list
+   (`setup_rocm.py:77-81`) to admit gfx110x, add
+   `csrc/quantization/gguf/gguf_kernel.cu` to the ROCm source list, and register
+   the ops in `common_extension_rocm.cc`. §2.4 says the kernel bodies should
+   largely survive as-is. The laptop's standalone extension is the working
+   reference for what this must produce.
+6. **Bind the Python path for HIP in-tree** — `gguf.py:41-62` needs the
+   `elif _is_hip:` arm, and `supports_current_device()` (`:134-152`) must stop
+   returning `None` on ROCm so a missing kernel fails loudly at load instead of
+   as a `NameError` mid-forward. Worth landing on its own merits regardless.
+
+### Open kernel question
+
+7. **Root-cause the Q6_K dequant non-determinism on gfx11** (§1.5.4). Eight
+   hypotheses are already falsified. It is contained, not fixed, and it is the
+   kind of defect that will resurface somewhere else on this GPU.
 
 ---
 
-## 8. Staged boot, for when there is a backend
+## 8. Staged boot
 
 `docs/dev/651/boot.sh` is **NVML/CUDA-only** — it resolves devices via
 `pynvml` UUIDs, exports `CUDA_VISIBLE_DEVICES` and points `LD_LIBRARY_PATH` at
@@ -648,15 +873,20 @@ cross-device claim, warmup discarded, time-bounded runs, and a length sweep.
 
 ## 11. Open questions
 
-1. **Does anyone want to do the ROCm port (§7)?** That is the real decision.
-   Until it is answered, #651 has no path on this machine.
-2. **Does `--cpu-offload-gb` compose with GGUF?** (§6.1) — cheap to test once a
-   backend exists, and it is the difference between Q4 fitting comfortably and
-   fitting with 3.1 GiB of slack.
-3. **Dequant scratch at the intended prefill batch size** (§9.3) — the one
-   budget term still unpriced.
-4. **Is `HSA_OVERRIDE_GFX_VERSION=11.0.0` needed** for the rest of the ROCm
-   stack on gfx1103, and does it interact with a gfx1103-targeted `sgl-kernel`
-   build? (§2.6)
-5. **Is the vision tower worth fixing now** (#651b, §9.4) rather than later, given
-   the tight Q4 budget?
+1. **What kernel actually faults under NEXTN?** (§1.5.3, §7 item 1) — the one
+   question standing between this machine and the stated #651 goal.
+2. **What is the memory-bandwidth floor**, and is 12.5 tok/s decode near it or
+   far from it? (§1.5.2, §7 item 2) — without this the perf picture has no
+   denominator.
+3. **Why is Q6_K dequant non-deterministic on gfx11?** (§1.5.4) — contained, root
+   cause unknown, eight hypotheses already falsified.
+4. **Can `/root/lh/sglang_src` be reconciled with this branch at all**, given it
+   is not a git repo and carries no commit id? (§7 item 4) — if not, the port
+   may have to be re-derived from the extension source in `/root/lh/ggufbuild`.
+5. **Does `--cpu-offload-gb` compose with GGUF?** (§6.1) — now testable, since a
+   working backend exists. Q4_K_M runs with only ~3 GiB of slack, so this is the
+   difference between comfortable and tight.
+6. **Dequant scratch at the intended prefill batch size** (§9.3) — still the one
+   budget term never priced.
+7. **Is the vision tower worth fixing now** (#651b, §9.4)? §1.5.3 turned this from
+   a nice-to-have into the concrete source of the headroom the spec arm lacks.
