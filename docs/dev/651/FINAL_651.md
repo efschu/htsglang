@@ -1569,3 +1569,100 @@ produced a single row, because every attempt to run it was consumed by load
 failures -- the KV lottery (a 44-token pool on one boot), OOM-class kills, and
 the mamba-cache floor. The envelope question from the coordinator's program is
 therefore still open, and the sweep is committed ready to run.
+
+## 10. Expert-to-disk tier (#655 follow-on, instructed)
+
+### 10.1 The tier is ~80% already built and simply unwired
+
+The main finding. `srt/layers/moe/lazy_expert_staging.py` (#396a) is already a
+file-backed, on-demand cold-expert tier: `ExpertFileRef(path, offset, nbytes,
+shape, dtype)` reading via `os.pread`, and `LazySpillPool` materialising a row
+on first touch behind a latch. It is fully unit-tested. `stage_experts_into_tiers`
+accepts `lazy_refs=` -- and **no production caller passes it**.
+
+What is missing is small and specific:
+
+1. `model_loader/weight_utils.py:1355-1527` yields expert BYTES and discards
+   their LOCATION. `GGUFReader` has `(tensor.data_offset, tensor.n_bytes)`
+   right there; it must be captured to build the refs. This is the only
+   genuinely new code.
+2. `fused_moe_triton/layer.py:2774` must pass `lazy_refs=`. One line plus the
+   local-to-global expert id mapping (uneven-TP shards and the #82 zero-pad
+   expert mean local index != GGUF expert id).
+3. `StreamingExpertStager` (`expert_offload.py:1810`) is the door that actually
+   runs (`SGLANG_MOE_GGUF_STREAM_STAGING` defaults True) and has no lazy path.
+4. `spill_tiers.py` needs `TIER_EXPERT_DISK`; today `expert_host_bytes` sums
+   `_pinned` blindly and would report a disk tier as host RAM.
+
+The fused kernel is NOT a blocker: `install()` already compacts the device
+tensor to `[R+C]` rows and rewrites `layer.num_local_experts`, so experts are
+addressable as rows and a disk tier inherits that for free.
+
+### 10.2 What is built here
+
+`mem_cache/expert_disk_tier.py` + 21 unit tests (all passing, CPU only).
+
+It implements the residency policy the existing code does NOT have. The agent
+mapping named this precisely: *"first-touch is not eviction -- LazySpillPool
+reads each row once and keeps it forever, so steady-state host footprint
+converges on today's"*. That defeats the entire purpose on this APU. So this
+module provides a hot region plus a bounded LRU staging pool, faulting and
+evicting per layer, with `refresh_from_counts()` re-deriving the hot set from
+live routing counters.
+
+That refresh is a direct answer to this strand's own census caveat: 566 tokens
+from five prompts licenses the SHAPE of the distribution, not a spill list, so
+residency is a CACHE that follows the workload rather than a partition frozen
+from a sample.
+
+### 10.3 Known blockers, from the code, not from guesswork
+
+* **CUDA graphs are refused by name.** `expert_offload.py:2449` raises if a
+  `LazySpillPool` meets `SGLANG_MOE_OFFLOAD_CUDA_GRAPH`: a captured graph reads
+  the pool by address and would bypass materialise-on-touch. Decode graphs are
+  worth +12.8% here, so this is a real trade, not a footnote.
+* **The disk read lands on the forward thread inside a CUDA stream.** `_fetch`
+  copies under `with torch.cuda.stream(...)`, and `LazySpillPool` does a fresh
+  `open()`/`pread`/`close()` per read. Every miss is a synchronous stall. A
+  cached fd is the minimum; prefetch via `plan_expert_waves` is the real fix.
+* **RAM is deferred, not freed.** `_stage_spill_lazily` still allocates the
+  full cold pool. On this APU a pinned pool occupies the same DRAM as the GPU,
+  so the only route that frees anything is an mmap-backed pool on NVMe:
+  `cold_tier_shm.shm_dir()` reads `SGLANG_MOE_COLD_TIER_SHM_DIR`, and pointing
+  it at NVMe makes `spill[row]` demand-page from disk with no further change --
+  but `ColdTierOwner` is only constructed for a multi-rank cold shard, so a
+  single-rank construction path is needed.
+
+NOT YET MEASURED, and not claimed: the ms/token cost at the operating point.
+That needs the wiring above; the 0.03% miss projection from the census is a
+projection, and the per-miss NVMe read latency is unmeasured.
+
+## 11. Coding agent for efeu
+
+oh-my-pi does not fit (17029-token tool surface vs the prefill regime this GPU
+fails in). aider does not install: this machine runs Python 3.14 and numpy has
+no wheel for it. So the agent is `service/efeu_code.py`, installed as
+`/home/efeu/.local/bin/efeu-code`, owned by efeu, stdlib-only.
+
+Its design point is prefill: the whole system prompt is a few hundred tokens
+and the protocol is line-oriented (WRITE / RUN / DONE) rather than JSON tool
+schemas, because schemas cost prefill before the model has said anything and a
+quantized model's malformed JSON costs it twice.
+
+## 12. llmchess -- selection recorded, install queued
+
+"llmchess" names several unrelated projects. Surveyed: `ricardo-agz/LLMChess`
+(LLM-vs-LLM benchmark), `TheReconPilot/LLM-Chess` (vs Stockfish experiments),
+`yachty66/llmchess` (Flask demo), `llm-chess-arena/llm-chess-arena` (browser,
+client-side), `carlini/chess-llm` (OpenAI text-completion only, GPT-3.5-era),
+`pkeffect/open-chess` (Node, any OpenAI-compatible endpoint, validates and
+retries illegal moves), `maxim-saplin/llm_chess` (Python, local models,
+maintained, published).
+
+CHOICE: `maxim-saplin/llm_chess` -- Python (this box has no Node), explicitly
+supports local OpenAI-compatible endpoints, and is the most actively maintained
+of the Python options. `pkeffect/open-chess` is the fallback if its Autogen
+dependency hits the same Python 3.14 wall aider did, which is a live risk.
+
+Queued behind a reliably serving model per the agreed ordering. A chess prompt
+is small, so it is expected to be an easier customer than the coding agent.
