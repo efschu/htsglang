@@ -2443,17 +2443,6 @@ class Scheduler(
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
-            # #631(a): only the automatic policy needs idle stages to keep
-            # cycling, so only it pays the poll. Every other boot keeps the
-            # upstream unbounded chain recv, byte-identical.
-            chain_recv_poll_s=(
-                0.05
-                if (
-                    getattr(self, "phase_policy_cfg", None) is not None
-                    and self.phase_policy_cfg.enabled
-                )
-                else 0.0
-            ),
         )
 
     def init_dp_attn_adapter(self) -> None:
