@@ -461,12 +461,13 @@ def test_disabled_policy_emits_nothing():
     assert s.maybe_arm_phase_policy() is None
 
 
-def _fwd_harness(is_last_rank=False, track_commits=False):
+def _fwd_harness(is_last_rank=False, track_commits=False, armed=False):
     from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     sends = []
     processed = []
     commits = []
+    pumps = []
 
     class _Grp:
         pass
@@ -476,6 +477,14 @@ def _fwd_harness(is_last_rank=False, track_commits=False):
     class S:
         pp_group = _Grp()
         send_req_work = None
+
+        def pp_phase_flip_armed(self):
+            # #631: the real predicate reads the runtime's _pending; the
+            # harness pins the two branches directly.
+            return armed
+
+        def pp_pump_send_req_work(self):
+            pumps.append(True)
 
         def _pp_commit_comm_work(self, work):
             # "post-send" means: committed AFTER this pass issued its own
@@ -491,6 +500,7 @@ def _fwd_harness(is_last_rank=False, track_commits=False):
             processed.append(list(reqs) if reqs else [])
 
     s = S()
+    s.pumps = pumps
     fwd = SchedulerPPMixin._pp_forward_and_process_input_requests.__get__(s, S)
     if track_commits:
         return s, fwd, sends, processed, commits
@@ -760,7 +770,14 @@ def test_sweep_never_drops_the_epoch_in_flight(tmp_path):
     assert ranks[0].all_present(1) is False
 
 
-def _runtime_stub(presence, deadline=60.0, pending="pp_to_tp", clock=None):
+def _runtime_stub(
+    presence,
+    deadline=60.0,
+    pending="pp_to_tp",
+    clock=None,
+    drain_fn=None,
+    owes_send_fn=None,
+):
     from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
     class R:
@@ -769,6 +786,12 @@ def _runtime_stub(presence, deadline=60.0, pending="pp_to_tp", clock=None):
     r = R()
     r._presence = presence
     r._pump_fn = None
+    # #631 boot 18: (ii) keep consuming while armed, (i) announce only
+    # once this rank owes no send. Default None/absent keeps the stub on
+    # the old behaviour, so the pre-existing gate pins keep their meaning.
+    r._drain_fn = drain_fn
+    r._owes_send_fn = owes_send_fn
+    r.presence_withheld_rounds = 0
     r._presence_deadline_s = deadline
     r._presence_wait_started = None
     r._gate_open_epoch = None
@@ -959,3 +982,145 @@ def test_park_clock_is_rebased_once_per_arm_not_once_per_round(tmp_path):
         "the park clock was re-based on a later round; the park deadline "
         "becomes unreachable and a stuck flip parks requests for ever"
     )
+
+
+# -- boot 18: the gate assembled and the group still wedged -------------------
+#
+# THE SPECIMEN. Rank 0 sat inside the consensus reduction while rank 1 was
+# blocked on the ORDINARY top-of-pass commit of the previous pass's chain
+# forward (scheduler_pp_mixin :1109 from :705), because rank 2 had armed
+# and stopped consuming. That commit PRECEDES the gate, so no gate could
+# ever cover it: rank 1 had already announced, gone back around the pass,
+# and blocked before it could reach the reduction its own flag promised.
+#
+# Two clauses close it, and neither works alone:
+#   (i)  announce only once this rank owes no send -- the flag must mean
+#        "my chain is flushed", not "I am armed";
+#   (ii) an armed rank keeps CONSUMING non-blockingly, or its upstream can
+#        never flush and so can never satisfy (i).
+
+
+def test_can_fail_presence_is_withheld_while_this_rank_owes_a_send(tmp_path):
+    """CLAUSE (i). Announcing while a forward is outstanding is a LIE, and
+    boot 18 is what the lie costs: the peers see a full quorum, enter the
+    blocking reduction, and wait on a rank that is blocked at a channel
+    operation upstream of the gate."""
+    owes = {"v": True}
+    presence = _presence(tmp_path, rank=0)
+    r = _runtime_stub(presence, owes_send_fn=lambda: owes["v"])
+
+    assert r._await_group_presence() is None
+    assert presence.observe(1) == set(), (
+        "this rank announced presence while it still owed a chain send. "
+        "That is the boot-18 flag: the peers enter the reduction on a "
+        "quorum that includes a rank still blocked in work.wait() at its "
+        "top-of-pass commit, and the group wedges with the gate OPEN"
+    )
+    assert r.presence_withheld_rounds == 1
+
+    # Once the pump has drained the handle, the flag becomes true and may
+    # be raised. Withholding is safe because presence is monotone: a later
+    # announce is simply a later fact.
+    owes["v"] = False
+    r._await_group_presence()
+    assert presence.observe(1) == {0}
+
+
+def test_can_fail_armed_round_consumes_the_chain_before_it_announces(tmp_path):
+    """CLAUSE (ii), and the ORDER. An armed rank that stops reading makes
+    its upstream block at the top-of-pass commit -- upstream of the gate,
+    where no gate can reach it. Consuming must happen every armed round,
+    and before the announce, so the rank is never merely waiting."""
+    order = []
+    presence = _presence(tmp_path, rank=0)
+
+    def _drain():
+        order.append("drain")
+
+    def _owes():
+        order.append("owes-probe")
+        return False
+
+    r = _runtime_stub(presence, drain_fn=_drain, owes_send_fn=_owes)
+    r._await_group_presence()
+    assert order and order[0] == "drain", (
+        "the armed round did not consume the chain first; an armed rank "
+        "that stops consuming blocks its upstream (boot 18)"
+    )
+    assert presence.observe(1) == {0}
+
+    # And it keeps consuming on EVERY later round, not only the first --
+    # the upstream keeps sending for as long as this rank is at the gate.
+    r._await_group_presence()
+    assert order.count("drain") == 2
+
+
+def test_a_failing_drain_never_breaks_the_gate(tmp_path):
+    """Draining is best effort. A drain that raises must not take the flip
+    down -- the gate still has a bounded, loud abandonment of its own."""
+
+    def _boom():
+        raise RuntimeError("chain drain exploded")
+
+    presence = _presence(tmp_path, rank=0)
+    r = _runtime_stub(presence, drain_fn=_boom, owes_send_fn=lambda: False)
+    assert r._await_group_presence() is None
+    assert presence.observe(1) == {0}
+
+
+def test_can_fail_a_rank_that_never_flushes_abandons_instead_of_wedging(tmp_path):
+    """Withholding presence must not become a NEW unbounded wait. A rank
+    that can never flush its forward has to give up loudly and leave
+    serving alone -- pre-entry abandonment is free, because nothing was
+    entered and no peer is owed anything."""
+    now = {"t": 0.0}
+    presence = _presence(tmp_path, rank=0)
+    r = _runtime_stub(
+        presence,
+        deadline=30.0,
+        clock=lambda: now["t"],
+        owes_send_fn=lambda: True,
+    )
+    assert r._await_group_presence() is None
+    now["t"] = 31.0
+    assert r._await_group_presence() is None
+    assert r.presence_timeouts == 1, (
+        "a rank that never flushes waited past its pre-entry deadline "
+        "without abandoning; withholding presence must stay bounded"
+    )
+    assert r._pending is None, "the flip must be disarmed after abandonment"
+    assert presence.observe(1) == set()
+
+
+def test_armed_forward_path_pumps_and_issues_no_new_forward():
+    """THE BOOT-18 FIX, downstream half. While armed, the top-of-pass
+    commit must not block: it is replaced by the non-blocking pump, and no
+    new forward is issued, because an armed rank admits no new work."""
+    s, fwd, sends, processed, commits = _fwd_harness(
+        track_commits=True, armed=True
+    )
+    fwd([])
+    assert commits == [], (
+        "the armed path performed a BLOCKING commit; that is the exact "
+        "call (scheduler_pp_mixin :705 -> :1109) rank 1 was found "
+        "blocked in while ranks 0 and 2 sat in the reduction"
+    )
+    assert s.pumps == [True], "the armed path must still flush by pumping"
+    assert sends == [], (
+        "the armed path issued a new chain forward; an armed rank admits "
+        "no new work, so it has nothing to forward, and a fresh unmatched "
+        "send would be a new obligation nobody can satisfy"
+    )
+
+
+def test_unarmed_forward_path_is_unchanged():
+    """BACKWARD COMPATIBILITY. Without an armed flip the path must keep
+    its exact shape: the ordinary top-of-pass commit, then the async
+    forward."""
+    s, fwd, sends, processed, commits = _fwd_harness(
+        track_commits=True, armed=False
+    )
+    fwd(["req"])
+    assert commits == ["top-of-pass"]
+    assert sends == [(True, ["req"])]
+    assert s.pumps == []

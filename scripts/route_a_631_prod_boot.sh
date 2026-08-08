@@ -231,6 +231,18 @@ done < <(nvidia-smi --query-gpu=index,name,uuid,memory.total --format=csv,nohead
     echo "FATAL: expected one 5090 and two 3080s from NVML" >&2; exit 1; }
 
 # --- boot provenance ---------------------------------------------------------
+# ROTATE, NEVER TRUNCATE. This was ": > $LOG", and it cost the boot-18
+# diagnosis outright: the wedge was investigated from a py-spy that lived
+# only in an agent's context, and the serving log that would have carried
+# the presence/gate timeline was overwritten by the NEXT boot four minutes
+# later. Rank 2's state is now permanently unknown, so the fix for that
+# wedge had to rest on inference. Keeping the previous log costs a few MiB.
+if [ -s "$LOG" ]; then
+  PREV_STAMP="$(date -u -r "$LOG" '+%Y%m%dT%H%M%SZ' 2>/dev/null || date -u '+%Y%m%dT%H%M%SZ')"
+  mv "$LOG" "${LOG%.log}.${PREV_STAMP}.log" 2>/dev/null || true
+  # Keep the last 15 boots; that spans a full debugging session.
+  ls -1t "${LOG%.log}".*.log 2>/dev/null | tail -n +16 | xargs -r rm -f
+fi
 : > "$LOG"
 BOOT_COMMIT="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BOOT_BRANCH="$(git -C "$WT" branch --show-current 2>/dev/null || echo detached)"

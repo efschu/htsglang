@@ -702,12 +702,31 @@ class SchedulerPPMixin:
         )
 
         if not self.pp_group.is_last_rank:
-            self._pp_commit_comm_work(self.send_req_work)
-            with torch.profiler.record_function("send_reqs_to_next_stage"):
-                self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                    recv_reqs,
-                    async_send=True,
-                )
+            if self.pp_phase_flip_armed():
+                # #631 THE BOOT-18 FIX, downstream half. This commit is
+                # the ORDINARY top-of-pass flush of the previous pass's
+                # forward, and it is where rank 1 was found blocked while
+                # rank 0 sat in the consensus reduction. It blocks
+                # whenever the downstream stage has stopped consuming --
+                # which is exactly what that stage does once IT is armed
+                # and waiting at the gate. Because this point PRECEDES
+                # the gate, no gate could ever have covered it.
+                #
+                # An armed rank therefore flushes the same send by
+                # PUMPING it (non-blocking, reaped only when the handle
+                # reports complete) and issues no new forward: it is
+                # admitting no new work, so it has nothing to forward.
+                # Presence is then withheld until this pump has drained
+                # the handle, which is what makes the flag mean "my chain
+                # is flushed" (clause (i), PhaseFlipRuntime).
+                self.pp_pump_send_req_work()
+            else:
+                self._pp_commit_comm_work(self.send_req_work)
+                with torch.profiler.record_function("send_reqs_to_next_stage"):
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs,
+                        async_send=True,
+                    )
             # NOTE: no blocking commit here, deliberately. Committing the
             # arm-carrying send in-pass is corpse B' (boot 13): this rank
             # blocked in _pp_commit_comm_work while its peers sat in the
@@ -746,6 +765,51 @@ class SchedulerPPMixin:
                 self.send_req_work = None
         except Exception:  # noqa: BLE001 - pumping is strictly best effort
             return
+
+    def pp_phase_flip_armed(self: Scheduler) -> bool:
+        """#631: does the ARMED forward rule apply on this rank?
+
+        False on every boot without the flip, so the default PP path keeps
+        its exact shape -- and false as well unless the chain receiver is
+        installed, because the armed forward rule (pump instead of commit,
+        issue no new forward) is only safe when something is still
+        CONSUMING the chain. Without that, an armed rank would neither
+        send nor receive, which is the boot-18 shape made permanent. See
+        Scheduler._build_pp_chain_receiver for why that is off by default.
+        """
+        if not self.server_args.enable_phase_flip:
+            return False
+        if getattr(self, "pp_chain_receiver", None) is None:
+            return False
+        return self.phase_flip_is_armed()
+
+    def pp_owes_chain_send(self: Scheduler) -> bool:
+        """#631 clause (i): does this rank still owe a request-chain send?
+
+        The last stage never forwards, so it owes nothing and announces
+        immediately. Everyone else owes until the pump has reaped the
+        handle -- and ``send_req_work`` is precisely the handle the
+        ordinary top-of-pass commit would have blocked on, which is what
+        makes emptying it the right definition of "flushed".
+        """
+        return bool(getattr(self, "send_req_work", None))
+
+    def pp_drain_chain_nonblocking(self: Scheduler) -> None:
+        """#631 clause (ii): consume whatever upstream has already sent.
+
+        NEVER blocks. Messages land in the receiver's inbox and are handed
+        to the scheduler by the ordinary blocking receive once the flip is
+        over, so nothing is dropped -- the rank simply declines to ACT on
+        them while a flip is armed, which is what its quiescence requires.
+
+        Without this, an armed rank stops reading and its upstream blocks
+        committing a forward to it before that upstream can announce
+        (boot 18).
+        """
+        receiver = getattr(self, "pp_chain_receiver", None)
+        if receiver is None:
+            return
+        receiver.poll()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
