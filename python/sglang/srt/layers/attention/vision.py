@@ -1113,7 +1113,16 @@ class VisionAttention(nn.Module):
             else:
                 backend = "triton_attn"
         elif _is_hip:
-            if get_device_capability() >= (9, 4) and _use_aiter:
+            # #651 W1: `_use_aiter` is tested FIRST so the capability compare is
+            # not reached in a process with no accelerator. `_is_hip` is a BUILD
+            # property, so this branch is taken by the CPU stage of a
+            # mixed-device pipeline too, and there `get_device_capability()`
+            # answers (None, None) BY DESIGN -- it is documented as the raw
+            # reader -- which made `>= (9, 4)` raise
+            # "'>=' not supported between instances of 'NoneType' and 'int'".
+            # Reordering also matches this module's own doctrine that a vendor
+            # statement is checked before a capability number is compared.
+            if _use_aiter and get_device_capability() >= (9, 4):
                 backend = "aiter_attn"
             else:
                 backend = "triton_attn"

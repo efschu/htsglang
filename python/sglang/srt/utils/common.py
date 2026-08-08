@@ -539,6 +539,18 @@ def get_device_capability_no_init(
         info = _nvml_cuda_device0()
         if info is not None:
             return info.capability
+    # #651 W1: this is called at IMPORT time by capability-gated modules (e.g.
+    # kernels/ops/attention/prefill_attention.py), so it also runs inside a
+    # process that deliberately has NO accelerator visible -- the CPU stage of
+    # a mixed-device pipeline. The torch fallback below initializes CUDA and
+    # raises "No HIP GPUs are available" there, which makes the CPU rank unable
+    # to import the model package at all. A process with no device has no
+    # capability; report (0, 0) so capability gates evaluate to "nothing
+    # supported" instead of exploding. Ranks that do have a card are unchanged,
+    # and this cannot mask a real problem on them: it only triggers when torch
+    # reports no devices whatsoever.
+    if not torch.cuda.is_available():
+        return (0, 0)
     return torch.cuda.get_device_capability(device)
 
 

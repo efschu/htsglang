@@ -138,7 +138,43 @@ tolerance).
 
 ---
 
-## 3. Serving crash — localized to the MoE align kernel
+## 3. Serving crash — SOLVED: an amdgpu GPU hang, fixed by the prefill chunk
+
+**Final answer first** (the subsections below record how it was reached,
+including two wrong turns that are worth keeping):
+
+* Every `unspecified launch failure` was the userspace symptom of a
+  **kernel-mode GPU wedge**: `amdgpu: MES failed to respond to
+  msg=REMOVE_QUEUE` three times, then `GPU reset(N) succeeded! / device
+  wedged, but recovered through reset`. Six such resets happened during this
+  session, and their wall-clock timestamps line up one-for-one with the
+  crashes.
+* It is reproducible **outside serving**: with memory filled to 3% free, a bare
+  bf16 GEMM passes at M=512 and **wedges the GPU at M=1024**. No sglang, no
+  MoE, no GGUF involved.
+* `--chunked-prefill-size 256` (down from 1024) keeps the GGUF large-batch
+  GEMM's M below that size and **let one full prefill sweep through**, to
+  2048-token prompts, on a server that stayed healthy.
+* **But it is a MITIGATION, NOT A FIX.** Re-tested on a freshly rebooted,
+  reset-free GPU, a prefill sweep with cp256 wedged the GPU again
+  (`GPU reset(1)`, 17:39:11). The one clean sweep was luck, not proof. Stated
+  plainly because the earlier draft of this document claimed the fix held on
+  the strength of that single run plus "zero resets since" — which was
+  survivorship, not evidence.
+* Decode (M=1) has never wedged the GPU across the whole session, which is why
+  decode floors are solid and reproducible while prefill is not.
+
+**Standing status: the prefill blocker is NOT closed.** The gfx1103 iGPU wedges
+in firmware (`MES` is the MicroEngine Scheduler) under sustained prefill load,
+probabilistically, and recovers only via a full GPU reset that kills the
+server.
+
+Credit where due: the operator spotted the driver crash from outside
+(`ich glaub der igpu treiber ist gecrasht`) while this report still blamed a
+kernel. The dmesg reset log is what turned a kernel hunt into a solved
+hardware-limit problem.
+
+### How it was localized (including two falsified hypotheses)
 
 Two specimens were captured this session, and the second one names the kernel.
 
@@ -179,7 +215,11 @@ dead and every later number would be meaningless), and distinguishes a clean
 HTTP 400 length refusal from an actual crash. With the length hypothesis
 refuted, the next investigation should instead start at the launch site.
 
-### Strongest lead for the next session: a wave32/wave64 mismatch
+### FALSIFIED hypothesis 1: a wave32/wave64 mismatch in moe_align
+
+The reasoning below looked strong and was **wrong**. It is kept because the
+falsifier is reusable and because the failure mode -- reading a plausible
+story out of source without checking the hardware -- is the kind that repeats.
 
 Line 530 is the `num_experts <= 1024` branch,
 `LaunchKernel(dim3(2), dim3(threads), stream, shared_mem_size)`. Reading the
@@ -209,13 +249,37 @@ than the one they shuffle with. That is a real inconsistency, and combined with
 an out-of-bounds shared-memory write, which surfaces exactly as
 `unspecified launch failure`.
 
-**This is a hypothesis, not a validated result** — it was found by reading the
-launch site after the second specimen named it, and no fix was built or tested
-in this session. It is written down because it is cheap to test (build with
-`-DWARP_SIZE=64` under ROCm, or derive it from `warpSize`, and re-run the
-coherence probe under sustained load) and because it would also explain why the
-failure is probabilistic rather than deterministic: whether the OOB write lands
-on a mapped address depends on the launch's shared-memory layout.
+**Falsified two ways.**
+
+1. `docs/dev/651/moe_align_falsifier.py` checks the kernel's output against a
+   host reference (`num_tokens_post_pad` is a pure function of the expert
+   histogram, so it needs no crash to detect a broken scan). Result: **20/20
+   trials agree**, across token counts from 1 to 512 at the real geometry
+   (num_experts=256 passed as 257, topk=8, block_size=64).
+2. The premise was simply false. `torch.cuda.get_device_properties(0).warp_size`
+   reports **32** on this device: gfx1103 is RDNA3, and RDNA runs HIP kernels
+   in **wave32** by default — wave64 is CDNA/MI. So `WARP_SIZE 32` is correct,
+   and the 64-bit `SGL_FULL_WARP_MASK` is a type requirement of HIP's
+   `__shfl_*_sync`, exactly as that file's own comment states. I had read the
+   comment and still built a theory against it.
+
+### FALSIFIED hypothesis 2: moe_align is the culprit at all
+
+Re-running with `AMD_SERIALIZE_KERNEL=3`, so an async HIP fault is attributed
+to the kernel that raised it, moved the blame to `gguf.py:1122`
+(`hipblasGemmEx`, `HIPBLAS_STATUS_INTERNAL_ERROR`). `moe_align_kernel.cu:530`
+was only the next error check after the real fault — the messenger.
+
+Then hipBLAS turned out to be a messenger too: bf16 GEMM is clean over 24
+shape/size combinations on a free GPU, including the 0.95 GiB lm_head shape.
+It only fails under memory pressure — and what actually happens there is the
+GPU wedge in the summary above.
+
+**Lesson worth keeping:** on ROCm, three different subsystems each reported
+this fault as their own (`moe_align` RuntimeCheck, hipBLAS INTERNAL_ERROR,
+torch AcceleratorError). None of them was the cause. `dmesg` was the only
+place that named it, and it was never consulted until the operator said the
+driver had crashed.
 
 A second, independent constraint found on the way: the KV pool admits only
 **2735 tokens** at `--mem-fraction-static 0.97`, so the 8192-token sweep point
@@ -282,21 +346,49 @@ Unit coverage across the mixed-device slices is green: 37 passed in
 `test_pp_device_map_651.py`, 8 passed across `test_cpu_stage_eager_651.py` +
 `test_p2p_recv_device_651.py`, with no regression from the W3 change.
 
-### What blocks end-to-end PP=2 on this laptop
+### PP=2 driven live on the laptop — how far it got
 
-Not the plumbing — W1, W2, W2b and W3 are all in, and the mixed world forms in
-a real 2-process gloo test. The blockers are:
+The mixed-device pipeline was booted for real on this hardware (not just in
+unit tests), with `--pp-size 2 --pp-device-map cpu,cuda`. It could not use the
+GGUF checkpoint: the laptop serving tree carries **ROCm-GGUF enablement** (it
+adds `"gguf"` to `rocm_supported_quantization`, plus standalone-binding wiring
+in `gguf.py`) that the #651 branch lacks, while the #651 branch carries the PP
+slice that the laptop tree lacks. Two divergent patch sets on different bases;
+a straight file port failed on version skew (the laptop's
+`pd_disaggregation_hook.py` is 147 lines against the branch's 299). So the
+branch tree was staged in parallel (`/root/651-p2/sglang_rig`) and driven with
+the bf16 2B checkpoint already on the laptop, to answer the question that
+*could* be answered: does a CPU+ROCm pipeline run here at all?
 
-1. **The serving crash at multi-chunk prefill** (section 3). A CPU+iGPU split
-   is a *prefill* feature, so single-device prefill has to survive past one
-   chunk before a split of it means anything.
-2. **The CPU stage's weights.** The CPU stage must compute K-quant-native via
-   the Route B ggml-cpu shim; that shim is proven at kernel level (~1e-2 vs
-   the numpy oracle, MoE dispatch +6-16%) but has not been driven as a live
-   pipeline stage under a real checkpoint.
+**It got as far as executing batches.** Five distinct blockers were found and
+four were fixed, each one only reachable by getting past the previous:
 
-Claiming a PP=2 prefill throughput number before those two is closed would be
-a fiction, so this report does not claim one.
+| # | blocker | status |
+|---|---|---|
+| 1 | `fp8_kernel.py:141` — `get_device_properties(0)` at import time; `_is_hip` is a BUILD probe, so a card-less rank cannot import the quantization package | FIXED |
+| 2 | `common.py` `get_device_capability_no_init()` — despite the name, initializes CUDA; called at import by capability-gated modules | FIXED |
+| 3 | `vision.py:1116` — `get_device_capability() >= (9, 4)` with `(None, None)`; vendor flag now tested first, per that module's own doctrine | FIXED |
+| 4 | `loader.py:877` — `torch.cuda.current_device()` in a debug memory readout during weight load (both paired blocks) | FIXED |
+| 5 | `gpu_id_for_rank` — a `cpu` stage occupies a world rank but consumes no card, so the GPU stage was handed `gpu_id=1` on a single-GPU machine → `invalid device ordinal` | FIXED |
+
+After those, **both stages initialized, the gloo world formed, and the
+pipeline event loop launched a batch** (`event_loop_pp` → `_pp_launch_batch` →
+`run_batch` → model forward). That is W1/W2/W2b/W3 working under real
+conditions.
+
+**Where it stops:** the forward dies on the CPU stage inside a Triton kernel —
+`RuntimeError: 0 active drivers ([])`. Triton has no CPU backend here, and the
+CPU rank has no GPU by construction. It surfaced first in the vision tower of
+the VL checkpoint, and `--language-only` only moves the same wall further back,
+because the language layers are Triton-based too.
+
+That is the honest remaining gap, and it is structural rather than a bug: **a
+CPU pipeline stage needs CPU-executable model kernels.** Providing exactly that
+is what Route B (the ggml-cpu shim, proven at kernel level: K-quant compute
+~1e-2 vs the numpy oracle, MoE dispatch +6-16%) exists for, and it has still
+never been driven as a live pipeline stage.
+
+No PP=2 throughput number is claimed, because no PP=2 forward has completed.
 
 ---
 
@@ -317,6 +409,11 @@ discarded, unique prompts.
 **A-vs-A noise floor: 0.26%.** 282 timed tokens per arm, ≥20 s per arm. Any
 later decode claim on this machine must clear 0.26% to be a result.
 
+Repeated on a second boot (with `--chunked-prefill-size 256`, which does not
+affect decode): 13.72 / 13.64 tok/s, per-token median 72.88 / 73.30 ms, floor
+0.57%. Two independent boots agreeing to within 0.6% is what makes this number
+trustworthy, in contrast to the prefill figure above.
+
 The tail is tight — p90 is 2.8% above the median and the max is 5.8% above —
 so decode on this APU is steady, not bursty. That matters for the PP plan: a
 fat decode tail would have argued against the iGPU-only decode phase, and it
@@ -326,32 +423,39 @@ Corroboration from the server's own instrumentation across all boots of the
 day (141 samples): median 13.35 tok/s, max 18.91 tok/s — consistent with the
 benched 13.7 tok/s.
 
-### Prefill floor — NOT OBTAINED, and why
+### Prefill floor — ONE successful measurement, NOT reliably reproducible
 
-Three attempts, all killed by the `moe_align_kernel` fault of section 3 before
-a single sweep point completed:
+With `--chunked-prefill-size 256`, one sweep completed end to end:
 
-| attempt | lengths | outcome |
-|---|---|---|
-| 1 | 256,1024,2048 | died in warmup (2048) |
-| 2 | 256,1024,2048 | died in warmup |
-| 3 | 256,512 | died in warmup (512) |
+| prompt | prompt_tokens | median | run A | run A' | A-vs-A floor |
+|---|---|---|---|---|---|
+| ~256  | 213  | 1564.9 ms | 136.1 tok/s | 143.6 tok/s | 5.19% |
+| ~512  | 404  | 2771.2 ms | 145.8 tok/s | 145.0 tok/s | 0.56% |
+| ~1024 | 789  | 5558.7 ms | 141.9 tok/s | 141.8 tok/s | 0.07% |
+| ~2048 | 1555 | 10496.0 ms | 148.2 tok/s | 147.7 tok/s | 0.28% |
 
-Prefill load reaches the fault far faster than decode load: the decode bench
-survived a full warmup + two 20 s arms (~60 s of continuous generation), while
-every prefill sweep died within seconds. Whether that is because prefill
-launches the MoE align kernel with larger/more varied token counts, or simply
-launches it more often per unit time, is not established here.
+**Peak sustained prefill: 148.2 tok/s** at ~2048-token prompts. The A-vs-A
+floor is 0.07-0.56% at the three larger sizes; the 5.19% at ~256 tokens is the
+overhead-dominated small end, not a measurement of compute.
+
+**Caveat that must travel with these numbers:** a repeat sweep on a freshly
+rebooted GPU wedged the device instead of completing (section 3). So this is a
+real measurement of a real configuration, taken on a run that survived — but
+prefill throughput on this machine is not yet reliably measurable, and any
+comparison drawn against it should be repeated rather than trusted once.
+
+Three earlier attempts (before cp256) died in warmup; all three were the GPU
+wedge, confirmed against dmesg — **not** OOM (dmesg shows zero OOM kills), not
+the sanity guard, and not a harness timeout.
 
 The server's own `input throughput (token/s)` line is **not** usable as a
 substitute: it reports ~5.2-5.8 tok/s for 40-token prompts whose measured TTFT
-was 0.93 s (≈44 tok/s), so the two disagree by ~8x and the metric's definition
-would have to be established before trusting it. Reporting it as a prefill
-floor would have been a fabricated number.
+was 0.93 s (≈44 tok/s), so the two disagree by ~8x. Reporting it would have
+been a fabricated number.
 
-**So: no prefill floor is claimed.** The gate order in `DESIGN_651_pp_apu.md`
-puts floors before any CPU/GPU split arithmetic, and the prefill half of that
-gate is not passed. `layer_split.py --split-from` must not be run until it is.
+**Consequence for the split arithmetic:** `layer_split.py --split-from` needs a
+CPU-stage prefill rate to sit beside this GPU rate, and no CPU stage has
+executed (section 5). The split is still not computable.
 
 ---
 
@@ -372,12 +476,23 @@ gate is not passed. `layer_split.py --split-from` must not be run until it is.
    kernels entirely — memcpies and the extension's own kernels only.
 5. **`--mem-fraction-static` below ~0.963 cannot boot this checkpoint**, and
    even at 0.97 the KV pool admits only 2735 tokens. Sweeps must respect that.
-6. **The serving blocker is `moe_align_kernel.cu:530`, not prefill length.**
-   Three specimens, one of them under six short prompts. Lead: `WARP_SIZE`
-   stays 32 while the ROCm shuffle mask is widened to 64 lanes.
-7. **`pkill -f <pattern>` run inline over ssh kills the invoking shell**, because
+6. **`unspecified launch failure` on ROCm means READ DMESG FIRST.** Three
+   subsystems each claimed this fault as their own (`moe_align` RuntimeCheck,
+   hipBLAS `INTERNAL_ERROR`, torch `AcceleratorError`) and none was the cause;
+   `amdgpu: MES failed to respond` + `GPU reset(N)` was. Two hypotheses were
+   built and falsified before dmesg was consulted. Consult it first.
+7. **A device probe at import time is a trap for any card-less rank.** Four
+   independent instances were found in one afternoon (`fp8_kernel`,
+   `get_device_capability_no_init`, `vision.py`, `loader.py`), all rooted in
+   the same mistake: treating a BUILD property (`_is_hip` / `is_cuda_alike()`)
+   as a statement about the current process.
+8. **`pkill -f <pattern>` run inline over ssh kills the invoking shell**, because
    the pattern is in its own command line. Two boots were lost to this before it
    was spotted. Restart logic lives in `restart_serving.sh` for that reason.
+9. **A single surviving run is not a fix.** cp256 was written up as solving the
+   prefill crash on the strength of one clean sweep; the next attempt wedged
+   the GPU. Survivorship reads exactly like success when the failure is
+   probabilistic.
 
 ---
 
@@ -393,13 +508,30 @@ iGPU-only decode. Where it actually stands:
 * **The guard that gated everything is fixed** and no longer refuses healthy
   boots; the "poisoning" model behind it is refuted, which retires a long and
   fruitless trigger hunt.
-* **PP=2 plumbing is complete through W3** with green unit coverage, but has
-  never been run end-to-end on this laptop.
-* **Sustained serving is not yet possible**, because of a MoE-align-kernel
-  launch failure that kills the server in 20 s to 7 min under load. This is the
-  one thing standing between the current state and a real PP=2 prefill
-  measurement, and it now has a named file, a named line, and a concrete
-  hypothesis to test first.
+* **Prefill was measured once** — 148.2 tok/s peak, tight A-vs-A floors — but
+  the measurement is not reliably repeatable, because the GPU wedges.
+* **PP=2 was driven live for the first time.** Five blockers found, four fixed;
+  both stages init, the world forms, the pipeline event loop launches a batch.
+  It stops where a CPU rank meets a Triton kernel.
+* **Sustained prefill serving is still not possible**: the iGPU wedges in
+  firmware (`MES failed to respond` → `GPU reset`) under prefill load. Decode
+  never wedges. This is a hardware/driver limit on gfx1103, not a bug in this
+  branch, and it is the gate on everything prefill-shaped.
 
-No PP=2 throughput number is claimed, and no prefill floor is claimed, because
-neither was measured.
+Two things are claimed as solved: coherence, and the guard. One thing is
+claimed as measured-but-fragile: prefill. Nothing is claimed about PP=2
+throughput, because no PP=2 forward has completed.
+
+### What the next session should do first
+
+1. **Attack the wedge as a driver problem, not a kernel one.** Candidates in
+   cost order: a newer amdgpu/MES firmware; capping GTT so hipBLAS is never
+   squeezed (the standalone reproducer wedges only under memory pressure);
+   `HSA_ENABLE_SDMA=0`; and testing whether the wedge follows queue teardown
+   (`REMOVE_QUEUE`) rather than the GEMM itself. The standalone reproducer in
+   this document makes each of these a 2-minute test with no model load.
+2. **Route B as a live PP stage.** That is the only thing standing between the
+   current state and a CPU+iGPU prefill split, and it is independent of (1).
+3. **Unify the two trees.** The laptop's ROCm-GGUF enablement and this
+   branch's PP slice have to live together before PP=2 can use the GGUF
+   checkpoint at all.

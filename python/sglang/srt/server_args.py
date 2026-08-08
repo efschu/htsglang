@@ -8836,6 +8836,32 @@ class ServerArgs:
         """
         if self.rank_gpu_id is not None:
             return self.rank_gpu_id[self.world_rank(pp_rank, tp_rank)]
+        if self.pp_device_map is not None:
+            # #651 W1: a 'cpu' stage occupies a WORLD RANK but consumes NO
+            # CARD, so device indices have to be handed out by position among
+            # the CUDA-mapped stages rather than by pp_rank. The classic
+            # formula below counts every stage as a card and hands
+            # `--pp-device-map cpu,cuda` a gpu_id of 1 for its GPU stage; on a
+            # single-GPU machine set_device(1) then fails with "invalid device
+            # ordinal" (measured on the APU laptop, PP1 init).
+            #
+            # For a CPU stage the value is inert -- that process is started
+            # with no accelerator visible at all -- so base_gpu_id is returned
+            # simply to keep the signature total.
+            if self.device_for_pp_rank(pp_rank) == "cpu":
+                return self.base_gpu_id
+            cuda_stages_before = sum(
+                1
+                for earlier in range(pp_rank)
+                if self.device_for_pp_rank(earlier) == "cuda"
+            )
+            # --pp-device-map enforces tp_size == 1, so the tp term is 0 here;
+            # it is written out to stay correct if that restriction is lifted.
+            return (
+                self.base_gpu_id
+                + cuda_stages_before * tp_size_per_node
+                + (tp_rank % tp_size_per_node) * self.gpu_id_step
+            )
         return (
             self.base_gpu_id
             + ((pp_rank % pp_size_per_node) * tp_size_per_node)

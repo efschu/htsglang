@@ -137,6 +137,19 @@ logger = logging.getLogger(__name__)
 @lru_cache()
 def is_fp8_fnuz() -> bool:
     if _is_hip:
+        # #651 W1: this runs at IMPORT time (see the module-level `if
+        # is_fp8_fnuz():` below), and `_is_hip` is a BUILD property, so on a
+        # ROCm build it fires even in a process that deliberately has no
+        # accelerator visible -- the CPU stage of a mixed-device pipeline,
+        # which is started with empty CUDA/HIP/ROCR_VISIBLE_DEVICES. There
+        # `get_device_properties(0)` raises "No HIP GPUs are available" and
+        # the CPU rank cannot even import the quantization package.
+        #
+        # The question being asked is "is device 0 an MI300-class card". With
+        # no device at all the answer is simply False, so answer it rather
+        # than crashing. Ranks that do have a card are unaffected.
+        if not torch.cuda.is_available():
+            return False
         # only device 0 is checked, this assumes MI300 platforms are homogeneous
         return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
     return False

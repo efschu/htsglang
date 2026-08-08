@@ -867,7 +867,14 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device, model_config=None):
         # Used in tests to verify memory savings when using online quantization.
-        if is_cuda_alike():
+        # #651 W1: `is_cuda_alike()` is a BUILD probe, so it is True in the CPU
+        # stage of a mixed-device pipeline as well -- a process started with no
+        # accelerator visible, whose `target_device` is cpu. The block below is
+        # purely a debug memory reading, but `torch.cuda.current_device()`
+        # inside it initializes CUDA and raises "No HIP GPUs are available"
+        # there, killing the CPU rank during weight loading. Gate on the
+        # device this load actually targets as well.
+        if is_cuda_alike() and target_device.type != "cpu":
             peak_memory = torch.cuda.max_memory_allocated()
             logger.debug(
                 "Peak GPU memory before loading weights: %s GiB",
@@ -907,7 +914,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         # Used in tests to verify memory savings when using online quantization.
-        if is_cuda_alike():
+        # Same #651 W1 gate as the opening block: this one also consumes
+        # `memory_start`, which is only bound when that block ran.
+        if is_cuda_alike() and target_device.type != "cpu":
             memory_end = get_available_gpu_memory(
                 target_device.type, gpu_id=torch.cuda.current_device()
             )
