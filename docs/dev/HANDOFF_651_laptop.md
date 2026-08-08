@@ -1218,10 +1218,27 @@ kernel this file dispatches (Q4_K/Q5_K/Q8_0 x dequant/MMVQ/MMQ/moe_a8/
 moe_a8_vec), rocBLAS fp16 GEMM at serving shapes, the JIT moe_align kernel
 (invariant-checked at T=1..1024), the attention backend (torch_native swap:
 byte-identical degeneracy). Conclusion: a weight-transform/assignment defect
-in the fork's 35B (qwen35moe) GGUF path. The 27B (qwen35) adapter needed six
-coherence-critical inverse-transforms (memory: htsglang-gguf); the 35B path
-goes through a different map (gguf_deepseek4.py machinery) and was never
-content-verified on ANY platform. Transform audit in flight.
+in the fork's 35B (qwen35moe) GGUF path.
+
+CORRECTIONS from the two evidence hunts (2026-08-08, both subagent-audited):
+
+- **The 27B and 35B share ONE adapter** (`gguf_qwen35.py` via the registry;
+  the `gguf_deepseek4.py` premise was wrong — that log line comes from the
+  shared base class). Transform-by-transform audit: the 35B applies the
+  complete 27B-critical inverse-transform set, gate/up swap ruled out,
+  733/733 mapped, blk.40 skipped twice. The transforms are NOT the defect.
+- **"Never content-verified" is FALSE for the rig**: four commit ledgers
+  (8290c8a490, b97e60b25e, 1d689439f6, dff1ef16c0) content-verified 35B-A3B
+  UD-Q4_K_XL at uneven TP=3 on 2026-07-17/18 — temp-0 battery (Paris / 391 /
+  Shakespeare / German), 15k-token needle HIT, full-perf graphs+MTP.
+- **But NO 35B-GGUF on-card run exists after 2026-07-18.** Prime localization
+  candidates in the drift window: the 07-20 registry refactor d68d8075cd
+  (rewrote the adapter; its byte-identity gate covered only the dense 27B +
+  Gemma-4, never the 35B MoE arm), the 07-28 sibling-config reconcile
+  682fd850f6, checkpoint delta (rig Q4_K_XL vs laptop Q4_K_M), and the ROCm
+  platform itself. The refactor's byte-identity gate is now being re-run FOR
+  the 35B (docs/dev/651/stream_digest_gate.py, current tree vs dff1ef16c0,
+  CPU-only on the rig).
 
 Operational note: llama-cli's modern TUI prints a block-glyph banner and an
 interactive "> " prompt loop on EOF stdin — use `-st -p "..."` for
@@ -1261,3 +1278,18 @@ before quoting. Implied MoE decode ceiling ~43 tok/s against measured ~12.5:
 current serving is launch/compute-bound (graphs off), NOT bandwidth-bound.
 Every future measurement session must include an under-load determinism arm
 (run pins_gfx1103.py concurrently with a saturating load once per session).
+
+### 12.10 Byte-identity gate re-run FOR the 35B: stream is identical [MEASURED]
+
+`docs/dev/651/stream_digest_gate.py` on the rig (CPU-only), file
+`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`: current tree (b23b5d2885 state) vs the
+last on-card-verified tree (dff1ef16c0, 2026-07-18): **63,841 stream tensors,
+ordered digest 8aaa592250f43568 on BOTH, per-tensor diff EMPTY.** The
+registry refactor (d68d8075cd) and everything after it did NOT drift the 35B
+weight pipeline; the CPU-side map + transforms + per-expert split emit
+byte-identical weights to the state that answered the temp-0 battery on the
+rig. Remaining suspect surface for the laptop incoherence: the DEVICE-side
+load/assembly path, the non-ggml forward kernels (GDN triton family — the
+one major unvalidated block on gfx1103), or a Q4_K_M-specific interaction.
+Next instrument: activation bisection (llama-eval-callback CPU reference vs
+debug_tensor_dump), built and ready on the laptop.
