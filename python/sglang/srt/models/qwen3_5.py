@@ -576,9 +576,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
+        # #651 W1: route on THIS TENSOR'S device, not on the module-level
+        # `_is_cpu` build global. In a mixed-device pipeline the CPU stage runs
+        # inside a ROCm build, so `_is_cpu` is False there and the CPU rank
+        # took the Triton branch below -- Triton has no CPU backend and dies
+        # with "0 active drivers ([])". The pure-torch `else` branch already
+        # computes exactly this; it was simply unreachable from a CPU rank of a
+        # GPU build. Same-device deployments are unaffected: with everything on
+        # the accelerator `on_cpu` is False and the branch order is unchanged.
+        on_cpu = projected_states_qkvz.device.type == "cpu"
         if (
             self.num_v_heads // self.num_k_heads in [1, 2, 4]
-            and not _is_cpu
+            and not on_cpu
             and not _is_npu
         ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
@@ -589,7 +598,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_k_dim,
                 self.head_v_dim,
             )
-        elif _is_cpu and _is_amx_available:
+        elif on_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
                 torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
                     projected_states_qkvz,

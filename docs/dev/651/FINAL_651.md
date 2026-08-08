@@ -169,10 +169,9 @@ in firmware (`MES` is the MicroEngine Scheduler) under sustained prefill load,
 probabilistically, and recovers only via a full GPU reset that kills the
 server.
 
-Credit where due: the operator spotted the driver crash from outside
-(`ich glaub der igpu treiber ist gecrasht`) while this report still blamed a
-kernel. The dmesg reset log is what turned a kernel hunt into a solved
-hardware-limit problem.
+The dmesg reset log is what turned a kernel hunt into a driver finding. It was
+consulted only after two kernel hypotheses had already been built and
+falsified -- see the lesson in section 7.
 
 ### How it was localized (including two falsified hypotheses)
 
@@ -294,10 +293,14 @@ Measured on the guard-v2-gated boot. Method follows the standing rules:
 A-vs-A noise floor first, warmup discarded, unique prompts (no prefix cache),
 time-bounded runs ≥ 10 s per point.
 
-**These are EAGER floors.** The design's gate order asks for floors *with*
-graphs, but the coherent boot recipe runs `--disable-cuda-graph`; graphs on
-this path are not yet trustworthy. Labelled accordingly rather than quietly
-compared against graph-mode numbers.
+**THESE ARE EAGER FLOORS — NO CUDA/HIP GRAPHS.** Every boot in this report runs
+`--disable-cuda-graph`, so both the decode and prefill numbers below are
+eager-mode. The design's gate order (`DESIGN_651_pp_apu.md` section 5) asks for
+floors *with* graphs, and that gate is **not** satisfied. Graph capture on this
+path has never been validated here, and the standing project rule that
+validation runs with graphs + spec (not eager) is therefore also unmet. Do not
+compare these numbers against graph-mode measurements from any other machine or
+branch.
 
 `docs/dev/651/bench_decode.py` was added for the decode side — prefill is
 timed by TTFT with `max_tokens=1`, which says nothing about the steady-state
@@ -370,25 +373,75 @@ four were fixed, each one only reachable by getting past the previous:
 | 3 | `vision.py:1116` — `get_device_capability() >= (9, 4)` with `(None, None)`; vendor flag now tested first, per that module's own doctrine | FIXED |
 | 4 | `loader.py:877` — `torch.cuda.current_device()` in a debug memory readout during weight load (both paired blocks) | FIXED |
 | 5 | `gpu_id_for_rank` — a `cpu` stage occupies a world rank but consumes no card, so the GPU stage was handed `gpu_id=1` on a single-GPU machine → `invalid device ordinal` | FIXED |
+| 6 | `qwen3_5.py` GDN projection — selected Triton via the module-level `_is_cpu` BUILD global, making an existing pure-torch fallback unreachable from a CPU rank | FIXED |
 
 After those, **both stages initialized, the gloo world formed, and the
 pipeline event loop launched a batch** (`event_loop_pp` → `_pp_launch_batch` →
 `run_batch` → model forward). That is W1/W2/W2b/W3 working under real
 conditions.
 
-**Where it stops:** the forward dies on the CPU stage inside a Triton kernel —
-`RuntimeError: 0 active drivers ([])`. Triton has no CPU backend here, and the
-CPU rank has no GPU by construction. It surfaced first in the vision tower of
-the VL checkpoint, and `--language-only` only moves the same wall further back,
-because the language layers are Triton-based too.
+**Where it stops, and why that is structural.** The CPU stage dies inside a
+Triton kernel — `RuntimeError: 0 active drivers ([])` — because Triton has no
+CPU backend and the CPU rank has no GPU by construction. Walking that wall
+back one layer at a time:
 
-That is the honest remaining gap, and it is structural rather than a bug: **a
-CPU pipeline stage needs CPU-executable model kernels.** Providing exactly that
-is what Route B (the ggml-cpu shim, proven at kernel level: K-quant compute
-~1e-2 vs the numpy oracle, MoE dispatch +6-16%) exists for, and it has still
-never been driven as a live pipeline stage.
+| depth | site | outcome |
+|---|---|---|
+| vision tower | `qwen3_vl.py` blocks | avoided via `--skip-server-warmup` (the warmup request carries a dummy image; text-only probes never enter it) |
+| GDN input projection | `gdn_fused_proj.py:296` | **FIXED** — see below |
+| GDN causal conv | `causal_conv1d_triton.py:514` | no CPU implementation exists |
+| GDN recurrence | `fla/` (chunk, fused_recurrent, gating, l2norm, norm-gate) | no CPU implementation exists |
 
-No PP=2 throughput number is claimed, because no PP=2 forward has completed.
+The projection fix is the same bug class as the five above, and worth stating
+because it is general: `qwen3_5.py` already contained a **pure-torch fallback**
+for the split/reshape/cat, but selected it with the module-level `_is_cpu`
+BUILD global. In a mixed-device pipeline the CPU stage runs inside a ROCm
+build, so `_is_cpu` is False there and the CPU rank took the Triton branch. It
+now routes on `projected_states_qkvz.device.type`, and the torch path — which
+was correct all along — became reachable.
+
+The remaining two entries are not reachable the same way, and this is the
+honest cut:
+
+* `causal_conv1d.py` only dispatches between the sgl_kernel CUDA extension and
+  Triton. There is **no torch implementation** to make reachable.
+* the linear-attention backends are `flashinfer`, `flashkda`, `triton` — all
+  GPU. The `fla/` directory is entirely Triton kernels with no naive reference.
+
+So a CPU GDN stage means **writing the fla kernel family in torch**
+(causal_conv1d with varlen/conv-state semantics, gated-delta gating, l2norm,
+the chunked delta-rule recurrence with state propagation, fused norm-gate).
+That is multi-day work with real correctness risk, not a dispatch fix.
+
+**Route B does not close this gap either**, and the earlier framing that it
+would was wrong: the shim (`docs/dev/651/cpu_stage/`, a C `libqmatmul_shim.so`)
+provides CPU-native **K-quant dequant + matmul for GGUF weights**. The PP
+vehicle is bf16 and has no K-quant weights, and the missing kernels are
+*linear-attention recurrences*, not quantized matmuls. Route B is necessary for
+a GGUF CPU stage and not sufficient for a GDN one.
+
+**No PP=2 throughput number is claimed, because no PP=2 forward has
+completed.** What is claimed: the mixed-device pipeline initializes, forms its
+world, and launches batches on this hardware, and six device-routing defects
+that blocked it are fixed.
+
+### What full CPU-stage coverage still needs
+
+For a Qwen3.5-family (GDN hybrid) checkpoint, in dependency order:
+
+1. `causal_conv1d_fn` / `causal_conv1d_update` in torch, including varlen
+   (`query_start_loc`), `cache_indices`, `has_initial_state` and in-place
+   `conv_states` update;
+2. `fused_gdn_gating`, `l2norm`, `fused_norm_gate` in torch;
+3. the chunked gated-delta-rule recurrence (`fla/chunk*.py`) — the substantial
+   one — or a `fused_recurrent` torch equivalent for the prefill path;
+4. a `--linear-attn-backend torch_native` option to select them per rank.
+
+A dense-attention checkpoint (standard attention + MLP, no GDN, no mamba)
+would need **none** of this and would close the end-to-end PP=2 probe
+immediately, since those layers already have torch paths. No such checkpoint is
+on the laptop; fetching one is the cheapest route to the "it runs" bar and is
+named as follow-up rather than started here.
 
 ---
 
@@ -459,6 +512,41 @@ executed (section 5). The split is still not computable.
 
 ---
 
+## 6b. Wedge guard — making the regime unreachable
+
+The MES hang is an amdgpu firmware bug and out of scope to fix. So the
+triggering regime is refused instead, loudly, before a model is loaded:
+`docs/dev/651/wedge_policy.py`, armed in `boot_v2gated.sh` next to guard v2.
+
+It enforces two things on affected hardware:
+
+* **prefill chunk cap** — `--chunked-prefill-size <= 256`, because that chunk
+  is the M of the GGUF large-batch bf16 GEMM and M=1024 wedges the GPU
+  (M=512 passes);
+* **free-memory floor** — at least 2048 MiB free before a large GEMM, an order
+  of magnitude above the ~3% free (736 MiB) at which the wedge was reproduced.
+
+Two details that make it honest rather than decorative:
+
+* It resolves the **physical** architecture. `HSA_OVERRIDE_GFX_VERSION=11.0.0`
+  makes torch report gfx1103 silicon as `gfx1100`, so a naive arch check would
+  pass the very machine it is meant to protect; the policy identifies the
+  Radeon 780M by device name and answers `gfx1103`. A bare `gfx1100` that
+  cannot be resolved further gets an explicit warning instead of silent
+  approval.
+* It never claims a fix. On a passing configuration it still prints that the
+  cap is a MITIGATION and that a sweep which survived once has wedged on a
+  later run.
+
+Unaffected architectures are deliberately untouched — capping every ROCm card
+"just in case" would be a silent throughput regression with no measurement
+behind it, and a unit test pins that (`test_wedge_policy_651.py`, 7 tests,
+can-fail verified by widening `WEDGE_ARCHS`).
+
+Verified on the machine: a boot with `CHUNKED_PREFILL=1024` is refused after
+the sanity guard and before the model loads; the default 256 boots and serves
+a COHERENT probe with no new GPU reset.
+
 ## 7. Canon corrections this session contributes
 
 1. **"GPU poisoning" is not a state.** Delete the reboot ritual. The observable
@@ -510,9 +598,11 @@ iGPU-only decode. Where it actually stands:
   fruitless trigger hunt.
 * **Prefill was measured once** — 148.2 tok/s peak, tight A-vs-A floors — but
   the measurement is not reliably repeatable, because the GPU wedges.
-* **PP=2 was driven live for the first time.** Five blockers found, four fixed;
-  both stages init, the world forms, the pipeline event loop launches a batch.
-  It stops where a CPU rank meets a Triton kernel.
+* **PP=2 was driven live for the first time.** Six device-routing blockers
+  found and fixed; both stages init, the world forms, the pipeline event loop
+  launches batches. It stops where a CPU rank meets a Triton kernel that has no
+  torch equivalent anywhere in the tree.
+* **The wedge regime is now refused at boot** rather than hit at runtime.
 * **Sustained prefill serving is still not possible**: the iGPU wedges in
   firmware (`MES failed to respond` → `GPU reset`) under prefill load. Decode
   never wedges. This is a hardware/driver limit on gfx1103, not a bug in this
@@ -524,14 +614,22 @@ throughput, because no PP=2 forward has completed.
 
 ### What the next session should do first
 
-1. **Attack the wedge as a driver problem, not a kernel one.** Candidates in
-   cost order: a newer amdgpu/MES firmware; capping GTT so hipBLAS is never
-   squeezed (the standalone reproducer wedges only under memory pressure);
-   `HSA_ENABLE_SDMA=0`; and testing whether the wedge follows queue teardown
-   (`REMOVE_QUEUE`) rather than the GEMM itself. The standalone reproducer in
-   this document makes each of these a 2-minute test with no model load.
-2. **Route B as a live PP stage.** That is the only thing standing between the
-   current state and a CPU+iGPU prefill split, and it is independent of (1).
-3. **Unify the two trees.** The laptop's ROCm-GGUF enablement and this
-   branch's PP slice have to live together before PP=2 can use the GGUF
-   checkpoint at all.
+1. **Close the PP=2 end-to-end probe with a dense-attention checkpoint.** This
+   is by far the cheapest remaining step: a standard attention+MLP model needs
+   none of the missing GDN kernels, so the mixed CPU+iGPU pipeline — already
+   proven to init, form its world and launch batches — should complete a
+   determined-answer probe as soon as it is pointed at one. That closes the
+   strand's "it runs" bar. Nothing on the laptop qualifies today.
+2. **Then the GDN CPU kernel family**, in the dependency order listed in
+   section 5, if a GDN checkpoint on a CPU stage is actually wanted. This is
+   the multi-day item, and it is what the Qwen3.6 target needs.
+3. **Attack the wedge as a driver problem, not a kernel one.** Candidates in
+   cost order: newer amdgpu/MES firmware; capping GTT so hipBLAS is never
+   squeezed; `HSA_ENABLE_SDMA=0`; and testing whether the wedge follows queue
+   teardown (`REMOVE_QUEUE`) rather than the GEMM itself. The standalone
+   reproducer makes each a 2-minute test with no model load.
+4. **Unify the two trees.** The laptop's ROCm-GGUF enablement and this branch's
+   PP slice must live together before PP=2 can use the GGUF checkpoint at all
+   — GGUF x PP is explicitly follow-up, not part of this leg.
+5. **Graphs.** Every floor here is eager. Nothing is known about this path
+   under graph capture.

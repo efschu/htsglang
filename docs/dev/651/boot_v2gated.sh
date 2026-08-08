@@ -18,6 +18,12 @@ export PYTHONPATH=/root/651-p2/sglang_src/python
 PYTHONPATH=/root/lh/ggufbuild python /root/651-p2/scripts/gpu_sanity_guard_v2.py || {
   echo "GPU sanity guard v2 failed - dequantize is not fit to serve"; exit 1; }
 
+# #651: refuse the amdgpu MES-wedge regime (gfx1103). The prefill chunk is the
+# M of the GGUF large-batch bf16 GEMM, and M=1024 wedges this GPU in firmware.
+CHUNKED_PREFILL=${CHUNKED_PREFILL:-256}
+python /root/651-p2/scripts/wedge_policy.py "$CHUNKED_PREFILL" || {
+  echo "Wedge policy refused this configuration"; exit 1; }
+
 MODEL=/root/651-p2/models/Qwen3.6-35B-A3B-UD-Q4KM-noQ6K.gguf
 # 0.95 is NOT viable for this checkpoint: the loader computes a minimum of
 # 0.963 (weights, plus a 0.95 GiB GGUF dequant-scratch reservation) and aborts
@@ -43,7 +49,7 @@ exec python -m sglang.launch_server \
   --disable-overlap-schedule \
   --page-size 1 \
   --mem-fraction-static "$MEMFRAC" \
-  --chunked-prefill-size 1024 \
+  --chunked-prefill-size "$CHUNKED_PREFILL" \
   --max-total-tokens 8192 \
   --enable-metrics \
   --host 127.0.0.1 --port "$PORT" \
