@@ -1230,9 +1230,27 @@ class PhaseFlipRuntime:
         if self._presence.all_present(epoch):
             waited = self._clock() - self._presence_wait_started
             self._presence_wait_started = None
+            # RE-BASE THE PARK CLOCK ON GROUP ASSEMBLY. The park deadline
+            # measures "armed but never reached quiescence" -- a question
+            # that is only meaningful once the group is actually
+            # assembled. Left measuring from the arm, it races this gate:
+            # a rank whose peers took longer than park_deadline_s to
+            # arrive would abandon on the park deadline while those peers
+            # were still polling, and the ranks would then disagree
+            # around a gloo collective -- which is fatal, not merely
+            # wrong ("Connection closed by peer" -> every rank aborts).
+            # Measured 2026-08-08, boot 14: all three ranks announced
+            # presence correctly, then abandoned at exactly 30.0s and the
+            # group died.
+            #
+            # Re-basing keeps the two bounds from overlapping at all: the
+            # presence bound governs assembly, the park bound governs
+            # quiescence, and they now run in sequence rather than
+            # concurrently.
+            self._armed_at = self._clock()
             logger.warning(
-                "%s group present for epoch %d after %.2fs; entering the "
-                "consensus round",
+                "%s group present for epoch %d after %.2fs; park clock "
+                "re-based, entering the consensus round",
                 LOG_PREFIX,
                 epoch,
                 waited,
