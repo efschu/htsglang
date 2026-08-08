@@ -41,6 +41,7 @@ from sglang.srt.layers.dcp.gdn_flip_plan import (
 )
 from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+from sglang.srt.model_executor.weights_arena import uint8_checksum
 from sglang.srt.managers.kv_reshard import _CHECKSUM_BYTES, _checksum
 
 logger = logging.getLogger(__name__)
@@ -334,7 +335,9 @@ class GdnFlipMover:
         stored = int(
             payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item()
         )
-        have = int(data.to(torch.int64).sum().item()) if data.numel() else 0
+        # Bounded-transient checksum (the weights_arena host-OOM family,
+        # 2026-08-08): GDN payloads are GB-scale, a converted copy is 8x.
+        have = uint8_checksum(data)
         if stored != have:
             raise KvReshardError(
                 f"{LOG_PREFIX} payload checksum mismatch from peer {peer} "

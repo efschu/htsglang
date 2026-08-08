@@ -46,6 +46,28 @@ from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 ARENA_ALIGN = 256
 _CHECKSUM_BYTES = 8
 
+# Chunk size for uint8_checksum. torch's sum(dtype=int64) over an integral
+# tensor CASTS THE INPUT FIRST (measured: +8x the payload as one transient,
+# CPU and CUDA alike), so the checksum walks the payload in chunks and the
+# transient is bounded by 8x this constant (128 MiB) instead of 8x the
+# payload. With the naive idiom the 27B vehicle allocated ~117 GB host RAM
+# per rank at flip-boot; the host OOM killer SIGKILLed rank 2, reproduced
+# twice with a memory trace (2026-08-08).
+_CHECKSUM_CHUNK_BYTES = 16 * 1024 * 1024
+
+
+def uint8_checksum(payload: torch.Tensor) -> int:
+    """Exact int64 sum of a uint8 payload without materializing a
+    converted copy of it (see _CHECKSUM_CHUNK_BYTES). Device-agnostic;
+    a single host sync at the end."""
+    if payload.numel() == 0:
+        return 0
+    parts = [
+        chunk.sum(dtype=torch.int64)
+        for chunk in payload.split(_CHECKSUM_CHUNK_BYTES)
+    ]
+    return int(torch.stack(parts).sum().item())
+
 
 class WeightsArenaError(KvReshardError):
     """Loud failure of the weights-arena family (#631)."""
@@ -216,7 +238,7 @@ def image_from_tensors(
         view = torch.as_strided(seg.view(slot.dtype), slot.shape, slot.stride)
         view.copy_(t)
     payload = host[: layout.total_bytes]
-    csum = int(payload.to(torch.int64).sum().item()) if payload.numel() else 0
+    csum = uint8_checksum(payload)
     host[layout.total_bytes :] = (
         torch.tensor([csum], dtype=torch.int64).view(torch.uint8)
     )
@@ -260,7 +282,7 @@ def arena_image(
         pin_memory=pin,
     )
     host[: layout.total_bytes].copy_(used)
-    total = int(used.to(torch.int64).sum().item()) if used.numel() else 0
+    total = uint8_checksum(used)
     host[layout.total_bytes :] = (
         torch.tensor([total], dtype=torch.int64).view(torch.uint8)
     )
@@ -288,7 +310,7 @@ def arena_refill(
     want = int(
         image[layout.total_bytes :].clone().view(torch.int64).item()
     )
-    have = int(payload.to(torch.int64).sum().item()) if payload.numel() else 0
+    have = uint8_checksum(payload)
     if want != have:
         raise WeightsArenaError(
             f"arena image checksum mismatch (stored {want}, computed "

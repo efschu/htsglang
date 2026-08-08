@@ -56,6 +56,7 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
     validate_layer_map,
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+from sglang.srt.model_executor.weights_arena import uint8_checksum
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
     KvPoolView,
@@ -890,7 +891,7 @@ class PhaseFlipRuntime:
                 )
             data = payload[:-_CHECKSUM_BYTES]
             want = int(payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item())
-            have = int(data.to(torch.int64).sum().item()) if data.numel() else 0
+            have = uint8_checksum(data)
             if want != have:
                 raise KvReshardError(
                     f"{LOG_PREFIX} payload checksum mismatch from peer "

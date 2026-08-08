@@ -24,6 +24,7 @@ import unittest
 import torch
 
 from sglang.srt.model_executor.weights_arena import (
+    image_from_tensors,
     ARENA_ALIGN,
     WeightsArenaError,
     allocate_arena,
@@ -206,6 +207,63 @@ class TestFlipSemantics(CustomTestCase):
         _, _, la, _, arena, _, _, img_a, _ = self._packed_images()
         with self.assertRaisesRegex(WeightsArenaError, "refusing to refill"):
             arena_refill(arena, la, img_a[:-3])
+
+
+class TestChecksumMemory(CustomTestCase):
+    """Falsifier for the checksum 8x-materialization family (found on the
+    first real-metal INT8 flip boot, 2026-08-08): ``payload.to(int64).sum()``
+    materializes an int64 COPY of the whole payload -- 8x the image size as
+    a transient. On the 27B vehicle that is a ~117 GB host allocation per
+    rank during boot; the host OOM killer SIGKILLed rank 2 (reproduced
+    twice, memory trace on file). Checksums must be computed with an
+    accumulator dtype (``payload.sum(dtype=int64)``), which allocates
+    nothing payload-sized."""
+
+    def test_checksum_value_matches_reference(self):
+        # The accumulator-dtype sum must equal the materializing reference
+        # bit-for-bit, or every existing image trailer would be invalidated.
+        g = torch.Generator().manual_seed(20260808)
+        payload = torch.randint(0, 256, (65537,), dtype=torch.uint8, generator=g)
+        ref = int(payload.to(torch.int64).sum().item())
+        named = {"w": payload.clone()}
+        layout = plan_arena_layout(named)
+        img = image_from_tensors(named, layout)
+        stored = int(img[layout.total_bytes :].clone().view(torch.int64).item())
+        self.assertEqual(stored, ref)
+
+    def test_checksum_does_not_materialize_int64_copy(self):
+        # Peak-RSS gate in a FRESH interpreter (ru_maxrss is monotonic, so
+        # in-process deltas are unusable). 256 MiB payload: the blown-up
+        # idiom peaks >= 256 MiB * (1 payload + 8 int64 copy) ~ 2.3 GiB;
+        # the accumulator idiom stays near payload + image ~ 0.6 GiB.
+        # Gate at 1.5 GiB -- fails on the old code, passes on the fix.
+        import subprocess
+        import sys
+
+        snippet = (
+            "import torch, resource\n"
+            "from sglang.srt.model_executor.weights_arena import (\n"
+            "    plan_arena_layout, image_from_tensors)\n"
+            "named = {'w': torch.zeros(256 * 1024 * 1024, dtype=torch.uint8)}\n"
+            "layout = plan_arena_layout(named)\n"
+            "img = image_from_tensors(named, layout)\n"
+            "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)\n"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", snippet],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        peak_kib = int(out.stdout.strip().splitlines()[-1])
+        self.assertLess(
+            peak_kib,
+            1536 * 1024,
+            f"image_from_tensors peaked at {peak_kib / 1024:.0f} MiB for a "
+            f"256 MiB payload -- the checksum is materializing an int64 "
+            f"copy of the payload again (8x blowup, host-OOM on real boots)",
+        )
 
 
 if __name__ == "__main__":

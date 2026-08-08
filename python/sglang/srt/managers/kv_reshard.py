@@ -58,6 +58,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError, build_transition
+from sglang.srt.model_executor.weights_arena import uint8_checksum
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +170,9 @@ class KvPoolView:
 
 def _checksum(payload: torch.Tensor) -> torch.Tensor:
     """8-byte trailer: int64 sum of the uint8 payload (packing-order pin)."""
-    total = int(payload.to(torch.int64).sum().item()) if payload.numel() else 0
+    # Bounded-transient checksum (the weights_arena host-OOM family,
+    # 2026-08-08): KV payloads are GB-scale, a converted copy is 8x.
+    total = uint8_checksum(payload)
     return torch.tensor([total], dtype=torch.int64).view(torch.uint8).to(payload.device)
 
 
@@ -499,7 +502,7 @@ class KvReshardRuntime:
             # clone(): a tail slice's storage offset is not 8-byte aligned in
             # general, and dtype-view requires alignment.
             want = int(payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item())
-            have = int(data.to(torch.int64).sum().item()) if data.numel() else 0
+            have = uint8_checksum(data)
             if want != have:
                 raise KvReshardError(
                     f"{LOG_PREFIX} payload checksum mismatch from peer "
