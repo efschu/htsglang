@@ -14,7 +14,7 @@ set -u
 TREE=/spinning/wt-gguf-q4-651
 EXPECTED_BRANCH=feat/gguf-q4-bringup-651
 VENV=/spinning/htsglang-gpu/.venv
-MODEL=/spinning/llm_stuff/club-3090/models-cache/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+MODEL=${MODEL:-/spinning/llm_stuff/club-3090/models-cache/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf}
 TOKDIR=$(dirname "$MODEL")
 PORT=31655
 ARB=/spinning/gpu-arb
@@ -39,6 +39,13 @@ $PY -c "import ast; ast.parse(open('$TREE/docs/dev/651/probe.py').read())" \
 IDX=$(nvidia-smi --query-gpu=index,name --format=csv,noheader | awk -F', ' '/5090/{print $1; exit}')
 [ -n "$IDX" ] || fail "no 5090 found via nvidia-smi"
 echo "desk checks ok: tree=$head 5090=index $IDX model=$(basename "$MODEL")"
+# Capacity gate: the rig 5090's CUDA-VISIBLE total is ~19.58 GiB (BAR1-pinned
+# environment), NOT the 32 GiB nvidia-smi shows. Weights must fit it TP=1.
+CUDA_TOTAL_GIB=$(env CUDA_VISIBLE_DEVICES="$IDX" PYTHONPATH="$TREE/python" "$VENV/bin/python" -c "import torch; print(torch.cuda.mem_get_info(0)[1] / 2**30)")
+MODEL_GIB=$(python3 -c "import os; print(os.path.getsize('$MODEL') / 2**30)")
+python3 -c "import sys; t, m = float('$CUDA_TOTAL_GIB'), float('$MODEL_GIB'); sys.exit(0 if m + 1.5 < t else 1)" \
+  || fail "capacity: model ${MODEL_GIB%.*} GiB + margin exceeds CUDA-visible ${CUDA_TOTAL_GIB%.*} GiB on the 5090 (BAR1-pinned env). Use a smaller quant (Q3_K_XL) or a TP>=2 window."
+echo "capacity ok: model ${MODEL_GIB} GiB vs CUDA-visible ${CUDA_TOTAL_GIB} GiB"
 
 if [ "${1:-}" = "--smoke" ]; then
   echo "SMOKE OK (no cards touched)"

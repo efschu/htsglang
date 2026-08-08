@@ -1332,3 +1332,25 @@ too when reachable): in-process weight-only load, byte-compares
 device-resident packed expert bytes (incl. LAST expert of LAST layer) and
 plain-linear/lm_head bytes against GGUFReader. Exonerates or indicts the
 device-side load/assembly (early-materialization suspect) in one run.
+
+### 12.12 Rig window 1 outcome: NO VERDICT — environment capacity, not code
+
+The 09:52Z window boot OOMed in `materialize_gguf_weights` (torch.empty on
+the expert stack). Classification, verified idle afterwards: **the 5090's
+CUDA-VISIBLE memory total is 19.58 GiB** (`torch.cuda.mem_get_info`), not the
+32,607 MiB nvidia-smi shows — the rig's barlink/BAR1-pinned environment caps
+every CUDA context. 21.8 GiB of Q4_K_XL weights can never fit TP=1 there;
+the 2026-07 verified 35B runs were all TP>=3 splits. The laptop boots the
+identical recipe only because GTT exposes 24.6 GiB. So: **boot fault =
+capacity, zero coherence signal, discriminator NOT consumed.** Window
+released on time, cards at 0 MiB, holder freed.
+
+Re-queue plan (next gap after Route A): `Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf`
+(16.04 GiB, fits TP=1 under 19.58 with >1.5 GiB margin) — downloading to the
+rig models-cache now; verify sha256 `3fba9ab5...` vs upstream before use.
+Q3_K_XL is ALSO the designated laptop fallback quant (§6.0), so the same
+file later serves the laptop comparison arm. `rig_window_probe.sh` now
+carries a desk-time capacity gate (CUDA-visible total vs model size + 1.5 GiB
+margin) and takes `MODEL=` override, defaulting to the Q3 file. Caveat for
+the laptop arm only: UD-Q3 quant mixes may include IQ types whose MMQ is
+broken on gfx1103 (§12.2) — census the file before any laptop use.
