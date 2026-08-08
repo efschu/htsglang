@@ -596,6 +596,104 @@ A-vs-A against the previous shipped numbers: prefill within noise
 (4227.8 / 7183.8 / 6712.8), decode narrative -1.9 % at CV 2.8 % and code
 +0.2 % at CV 1.1 %, flip timings unchanged. No regression from the guard.
 
+## 6f. Exclusive KV backing, shipped (commit 89572e996d)
+
+The double residency is gone. Exactly one phase layout holds physical KV
+pages at a time, on a fixed VA reservation so no address a captured graph
+baked in ever moves:
+
+```
+boot   back PP -> RELEASE PP -> build TP pools + capture TP decode graphs
+       -> release TP -> restore PP (the boot phase)
+flip   at the read/write seam: release source, restore destination
+```
+
+Source-then-destination at the seam is deliberate. The reverse holds both
+layouts for the width of the swap, and a corridor minimum is CONTINUOUS --
+a few milliseconds counts. Releasing first is safe because every row the
+transition owes is already in the payloads (93ee1e2310).
+
+Measured page movement per rank: PP release hands back 4320 MiB (5090) /
+2160 MiB (3080); TP release 5888 / 4480 MiB.
+
+### What the falsifiers caught
+
+**flush_cache killed every rank with cudaErrorIllegalAddress in the TP
+phase.** `_flush_zero_kv_buffers` zeroed the scheduler's pool -- and the
+scheduler's pool is the PP stack's, released while TP serves. This is the
+answer to "does anything touch the PP pool during TP decode": yes, and it
+was found by arming the release and letting it fail loudly rather than by
+reasoning about call graphs. Fixed by zeroing every layout that HOLDS
+pages and skipping the unbacked one, which also closes the converse gap
+(zeroing only what the allocator reaches would leave the active TP layout
+un-zeroed and quietly break the bit-for-bit-after-flush property).
+
+**The TP stack's pool came up unswappable.**
+`derive_tp_stack_server_args` deliberately clears `enable_phase_flip` on
+the TP copy, so keying the flag on it caught only the PP side.
+
+**256-token byte-identity is not a valid instrument on this rig.** Three
+draws in ONE phase with NO flip give three different hashes -- the
+documented upstream GDN prefill nondeterminism. The address-stability
+check therefore runs inside the reproducible regime (short deterministic
+answers), where output is byte-identical across a full flip round trip
+with `cuda graph: True`.
+
+### Capping the TP pool
+
+The TP layout can only ever address ids the scheduler's allocator issues,
+and that allocator is the PP stack's. Left uncapped the TP pool sizes
+itself to its own budget -- measured **788026** against an id space of
+367704 -- and hoards the VRAM the PP pool needs. `--max-total-tokens
+500000` costs nothing (the surplus was unaddressable) and moved TP-phase
+free memory from 663/2676/1117 to 3231/5528/3109 MiB. That is what let
+the id space grow.
+
+### Shipped
+
+`RANK_MIB=22200,14700,14700`, `SGLANG_UNEVEN_TOKEN_VECTOR=28,26,20`,
+`--max-total-tokens 500000` (now the script defaults).
+
+| quantity | before (59540e846e) | shipped |
+|---|---|---|
+| **serving capacity (id space)** | 278104 | **367704 (+32.2 %)** |
+| TP capacity (guard: >= id space) | 340474 | 500000 (capped; 788026 uncapped) |
+| corridor min, prefill rung + 2 flips + decode | 1352/1599/1040 | **2198/4033/2292** |
+| PP-phase free (idle) | ~2000 | 4931/4598/3723 |
+| TP-phase free (idle) | -- | 2359/4476/2429 |
+
+Regression gate, A-vs-A against 59540e846e:
+
+| point | before | shipped |
+|---|---|---|
+| prefill 2048 / 8192 / 32768 tok/s | 4236.2 / 7175.7 / 6718.6 | 4225.7 / 7145.9 / 6715.4 |
+| decode narrative | 77.50 (CV 2.8 %) | 78.64 (CV 1.5 %) |
+| decode code | 103.38 (CV 1.1 %) | 103.19 (CV 1.8 %) |
+| flip pp_to_tp per rank | 950 / 1196 / 1674 ms | 913 / 1138 / 1631 ms |
+
++32 % capacity at no cost: prefill within noise, decode within CV, flips
+slightly faster.
+
+### The honest ceiling, and what binds it now
+
+**Not** the corridor -- 2198/4033/2292 MiB of free memory is 1.2-3.0 GiB
+of unused slack above the floor. The binder is the per-rank
+PHYSICAL-availability check in `_profile_available_bytes`, which refuses a
+budget larger than what is free to that rank AT PP SIZING TIME:
+
+```
+rank 0 (5090):  holds  8.68 GiB + 13.26 free = 21.94 GiB ceiling
+rank 1 (3080a): holds  4.87 GiB +  9.69 free = 14.56 GiB ceiling
+rank 2 (3080b): holds  6.04 GiB +  8.51 free = 14.55 GiB ceiling
+```
+
+The shipped budgets sit just under those. So 367704 rather than the
+~496k class, and the next lever is that ceiling -- the PP stack is being
+sized against memory the TP stack has not yet claimed and, under
+exclusive backing, never will hold at the same time. Whether that check
+can safely account for the swap is the follow-up; it is a different
+question from the one this commit answered.
+
 ## 7. Reproduce
 
 ```

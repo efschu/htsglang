@@ -26,10 +26,17 @@ WT="${WT:-/spinning/wt-631-routea}"
 PY="${PY:-/spinning/htsglang-gpu/.venv/bin/python}"
 MODEL="${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8}"
 PORT="${PORT:-30030}"
-RANK_MIB="${RANK_MIB:-16150,10550,10550}"
+# Shipped 2026-08-08 after exclusive KV backing (89572e996d). Each rank
+# sits just under the per-rank PHYSICAL-availability ceiling that
+# _profile_available_bytes enforces at PP sizing time (~22.4 GiB rank 0,
+# ~14.9 GiB the 3080s) -- that check, not the corridor, is what now caps
+# the pool: corridor acceptance on the binding 32768-token prefill rung
+# still measured 2198/4033/2292 MiB free against a floor of 1024.
+RANK_MIB="${RANK_MIB:-22200,14700,14700}"
 CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-4}"
 MAMBA_SLOTS="${MAMBA_SLOTS:-20}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-500000}"
 HICACHE="${HICACHE:-1}"
 HICACHE_RATIO="${HICACHE_RATIO:-2}"
 # --kv-pressure-ladder auto REFUSES on this rig: it cannot map ranks to
@@ -90,7 +97,7 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 # a restart hint; 7,39,18 lifts the same physical memory to ~108480 tokens
 # (4.0x) with no extra VRAM, by giving each rank a share of the token
 # vector matched to what it can actually hold.
-export SGLANG_UNEVEN_TOKEN_VECTOR="${SGLANG_UNEVEN_TOKEN_VECTOR:-7,39,18}"
+export SGLANG_UNEVEN_TOKEN_VECTOR="${SGLANG_UNEVEN_TOKEN_VECTOR:-28,26,20}"
 
 # --- transport ---------------------------------------------------------------
 # barlink is the standing default transport: defects are fixed forward,
@@ -213,6 +220,14 @@ setsid "$PY" -m sglang.launch_server \
     `# on) needs 5 per request, so max_running_requests was silently` \
     `# reduced 4 -> 1 and decode ran bs=1. Size it for the real bs.` \
     --max-mamba-cache-size "$MAMBA_SLOTS" \
+    `# The TP layout can only ever address ids the scheduler's allocator` \
+    `# issues, and that allocator is the PP stack's. Left uncapped the TP` \
+    `# pool sizes itself to its own budget -- measured 788026 against an id` \
+    `# space of 367704 -- and hoards the VRAM the PP pool needs. Capping` \
+    `# costs nothing (the surplus was unaddressable) and is what let the id` \
+    `# space grow. Keep it comfortably ABOVE the id space: the boot guard` \
+    `# refuses a TP capacity below it.` \
+    --max-total-tokens "$MAX_TOTAL_TOKENS" \
     --speculative-algorithm NEXTN --speculative-num-steps 3 \
     --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
