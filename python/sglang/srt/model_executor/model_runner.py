@@ -1834,6 +1834,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
                 model_config=self.model_config,
             )
+            # #631 Route A: build the SECONDARY (flip-target) group set NOW,
+            # right after the primary topology and before ANY attention
+            # backend constructor caches dcp state (the attn_dcp_size
+            # silent-1 hazard, DESIGN_631 3.2). Eager on every rank -- the
+            # create is a collective; the flag is env-uniform, so reaching
+            # this line is rank-uniform. The verify-then-create manifest
+            # inside dies loudly on any divergence before creating anything.
+            if self.server_args.enable_phase_flip:
+                from sglang.srt.distributed.parallel_state import (
+                    initialize_phase_flip_secondary_groups,
+                    phase_flip_groups_initialized,
+                )
+
+                if not phase_flip_groups_initialized():
+                    flip_vec = [
+                        int(x)
+                        for x in self.server_args.phase_flip_tp_vector.split(",")
+                    ]
+                    initialize_phase_flip_secondary_groups(
+                        tp_size=len(flip_vec),
+                        pp_size=1,
+                        dcp_size=len(flip_vec),
+                    )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
