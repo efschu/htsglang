@@ -426,6 +426,99 @@ graphs, NCCL buffers and the continuous corridor minimum at boot peak.
 
 ---
 
+## 6c. Shipped after the capacity pass (2026-08-08, commit fa6ceab7b3)
+
+Re-budgeted to take up the corridor slack and, more importantly, to match
+the KV TOKEN vector to each rank's MEASURED capacity rather than to the
+weight shard. The units the allocator min-reduces over are what matter:
+
+| config | per-rank units | TP pool |
+|---|---|---|
+| vector 13,11,8 | 9696 / 13058 / 16386 | 310272 |
+| vector 25,25,20 | 5426 / 5463 / 4666 | 326620 |
+| **vector 28,26,20 (shipped)** | 4601 (min) | **340474** |
+| vector 21,24,22, budget +1.1 GiB/card | 7679 / 7451 / 7413 | **496671** -- OOM, corridor breach |
+
+The 496671 boot is the load-bearing measurement: with the vector matched
+to capacity the units equalise (7679 / 7451 / 7413) and the pool reaches
+the ~520k the shared-arena design predicted -- **the allocator is not the
+limit, the corridor is**. It OOMed because both phases' pools were
+resident, which is exactly the duplication the arena removes. So the
+arena's projected payoff is now measured rather than modelled.
+
+Shipped: `RANK_MIB=20800,12650,13000`, `SGLANG_UNEVEN_TOKEN_VECTOR=28,26,20`.
+
+| quantity | previous | shipped |
+|---|---|---|
+| TP pool | 318176 | **340474** (+7.0 %) |
+| PP pool | 278104 | 278104 |
+| corridor min under decode load | 2318/2187/2068 | 1986/2197/1672 |
+| corridor min under 32768-tok prefill | not isolated | **1430/1633/1118** |
+
+Corridor verified against the WORST load, which is the 32768-token
+prefill rung, not decode: the prefill activation transient costs ~600 MiB
+per card while decode costs ~70. An earlier candidate passed a
+decode-only sample at 1986/2197/1672 and still breached at 716/1097/856
+once the prefill ladder ran. A corridor number without the prefill rung
+in it is not a corridor number.
+
+Regression gate against the previous shipped config (A-vs-A, same script):
+
+| point | previous | shipped | delta |
+|---|---|---|---|
+| decode narrative | 79.02 | 78.62 | -0.5 % (CV 2.3 %) |
+| decode code | 103.21 | 101.31 | -1.8 % (CV 0.7 %) |
+| prefill 2048 / 8192 / 32768 tok/s | 4227.8 / 7183.8 / 6712.8 | 4227.1 / 7184.7 / 6747.9 | within noise |
+| flip pp_to_tp per rank | 955/1203/1678 ms | 958/1206/1681 ms | unchanged |
+
+Pool growth cost nothing measurable: prefill is identical, decode is
+inside its own CV with a slight negative trend worth re-checking if the
+pool grows again.
+
+## 6d. Cross-phase backing swap: what is built, what is not
+
+Built and committed (`93ee1e2310`, `fa6ceab7b3`), 271/271:
+
+- **Reads before writes at the flip.** The local leg read and wrote per
+  layer in one loop, justified by "source and destination are different
+  pools" -- the premise sharing removes. Hoisted, with an aliasing
+  falsifier that builds both layouts as overlapping views into one arena
+  and checks byte-identity against the disjoint reference. Proven red on
+  the old loop.
+- **Pool primitives.** `swappable_backing` allocates on a VA reservation
+  and backs it fully at construction; `release_backing()` /
+  `restore_backing()` unmap and remap physical pages behind UNCHANGED
+  addresses. Sizing is untouched, so the #592 resize-translation gap does
+  not apply -- the span is always the pool's own row count.
+- **The seam.** `pre_write_fns` fires between the last source read and
+  the first destination write: the only instant where backing may move.
+  Pinned per rank (the ranks run concurrently, so a global event order
+  proves nothing). Empty by default -- no behaviour change.
+
+NOT yet wired, and each is a real step:
+
+1. Construct both stacks' pools with `swappable_backing=True` and forward
+   the two calls through `HybridLinearKVPool`.
+2. Register the swap at the seam.
+3. **Settle the allocator / tree-cache binding first.** `scheduler.tree_cache`
+   and the allocator are bound to the PP stack's pools for process life,
+   and the cutover does not rebind them (it swaps ps, groups, the batch
+   result processor and the model worker; `scheduler.tp_worker` stays the
+   PP stack). The TP forward uses the TP stack's pool, so the PP pool
+   looks idle during decode -- but "looks idle" is not evidence, and
+   releasing pages under a live reader corrupts KV silently. This needs
+   proof before it is armed on production.
+4. Re-budget: with exclusive backing, each pool may size against the FULL
+   per-rank budget. Today's per-stack "double-spend" (the TP stack cannot
+   see the PP pools already resident) stops being a bug and becomes the
+   correct accounting.
+5. Same treatment for the mamba pools (0.74+0.70 GB on rank 0). Note
+   `GdnFlipMover` already packs every outgoing payload before writing, so
+   it satisfies the reads-before-writes invariant with no change.
+
+Expected on completion: the 496671-token measurement above, inside the
+corridor instead of OOMing it.
+
 ## 7. Reproduce
 
 ```
