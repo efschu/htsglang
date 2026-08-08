@@ -259,7 +259,7 @@ class SchedulerPPMixin:
                 # boundary by construction (ready_fn gates on drained
                 # microbatches).
                 if self.server_args.enable_phase_flip:
-                    self._phase_flip_on_round()
+                    self._phase_flip_on_round(require_armed_and_parked=True)
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:

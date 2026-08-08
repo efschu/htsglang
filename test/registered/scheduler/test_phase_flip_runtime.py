@@ -843,3 +843,64 @@ class TestPpLoopConsensusOrdering(CustomTestCase):
             ["done"] * len(VEC),
             f"end-of-iteration consensus must complete: {outcomes}",
         )
+
+
+class TestArmedParkedGate(CustomTestCase):
+    """PP-phase entry gate (boots 9+10, 2026-08-08): the end-of-iteration
+    placement alone still wedged because the ranks' ABSOLUTE round counts
+    diverge under the pp loop. Under require_armed_and_parked, an unarmed
+    or unparked rank must touch the collective channel ZERO times; an
+    armed+parked rank must enter every round (no interval gating -- the
+    counters are not comparable across ranks there)."""
+
+    def _runtime(self, *, ready, channel_calls):
+        _, live, _, pp_views, _, tp_views = _make_layout_pools(
+            MAP_625, VEC, 200, seed=31
+        )
+
+        def _min(vals):
+            channel_calls.append(list(vals))
+            return list(vals)
+
+        return PhaseFlipRuntime(
+            n_ranks=len(VEC),
+            rank=0,
+            layer_map=MAP_625,
+            n_layers=N_LAYERS,
+            tp_vector=VEC,
+            boot_phase=PHASE_PP,
+            consensus_interval=2,
+            collective_min=_min,
+            exchange=lambda peers, payloads: {},
+            pp_pool_view=pp_views[0],
+            tp_pool_view=tp_views[0],
+            live_slots_fn=lambda: live,
+            ready_fn=lambda: ready,
+            cutover_fn=lambda d: None,
+        )
+
+    def test_unarmed_rounds_touch_no_collective(self):
+        calls = []
+        rt = self._runtime(ready=True, channel_calls=calls)
+        for _ in range(16):
+            rt.on_round(require_armed_and_parked=True)
+        self.assertEqual(calls, [], "unarmed pp round entered the channel")
+
+    def test_armed_unparked_rounds_touch_no_collective(self):
+        calls = []
+        rt = self._runtime(ready=False, channel_calls=calls)
+        rt.arm(PP_TO_TP, source="test")
+        for _ in range(16):
+            rt.on_round(require_armed_and_parked=True)
+        self.assertEqual(calls, [], "unparked pp round entered the channel")
+
+    def test_armed_parked_rounds_enter_every_round(self):
+        calls = []
+        rt = self._runtime(ready=True, channel_calls=calls)
+        rt.arm(PP_TO_TP, source="test")
+        for _ in range(3):
+            try:
+                rt.on_round(require_armed_and_parked=True)
+            except Exception:
+                break  # commit path may proceed further than this stub
+        self.assertTrue(calls, "armed+parked pp round never entered")

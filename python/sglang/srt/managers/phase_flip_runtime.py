@@ -746,11 +746,32 @@ class PhaseFlipRuntime:
         return True, msg
 
     # -- the per-round hook ---------------------------------------------------
-    def on_round(self) -> Optional[dict]:
+    def on_round(self, require_armed_and_parked: bool = False) -> Optional[dict]:
         """One scheduler round; see KvReshardRuntime.on_round. Returns move
-        stats when a flip executed this round, else ``None``."""
+        stats when a flip executed this round, else ``None``.
+
+        ``require_armed_and_parked`` is the PP-phase entry gate (measured
+        wedges 2026-08-08, boots 9 and 10): under event_loop_pp the local
+        round counters of the ranks diverge in ABSOLUTE value (pipeline
+        fill, conditional per-slot ops), so ANY blocking reduction entered
+        at a local cadence can pair with a peer blocked in a pipeline recv
+        whose satisfying send sits behind this rank's reduction -- moving
+        the hook inside the iteration only moved the wedge. With the gate,
+        an UNARMED rank performs NO collective at all (there is nothing to
+        agree on; arming state arrives via the broadcast RPC on every
+        rank), and an armed rank enters only once it is locally PARKED
+        (ready_fn: drained microbatches, no partial chunk) -- a parked
+        rank owes no pipeline send, so no recv/reduction cycle can close.
+        Peers converge on their own arm+drain, MIN-skew is legal, and the
+        liveness bound turns a lost peer into a loud error. A flip under
+        continuous load needs the posted-async two-phase consensus -- a
+        named follow-up, not this gate."""
         self._round += 1
-        if self._round % self._interval != 0:
+        if require_armed_and_parked and (
+            self._pending is None or not self._ready_fn()
+        ):
+            return None
+        if not require_armed_and_parked and self._round % self._interval != 0:
             return None
         armed = 1 if self._pending is not None else 0
         ready = 1 if (armed and self._ready_fn()) else 0

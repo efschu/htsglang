@@ -4053,24 +4053,27 @@ class Scheduler(
             )
         return int(self.token_to_kv_pool_allocator.available_size())
 
-    def _phase_flip_on_round(self):
+    def _phase_flip_on_round(self, require_armed_and_parked: bool = False):
         """One phase-flip runtime round (#631): lazy-build, bounded
-        consensus every consensus_interval-th call, loop exit on commit.
+        consensus, loop exit on commit.
 
-        Two call sites, one per loop family, both rank-uniform in call
-        COUNT: get_next_batch_to_run for event_loop_normal (lockstep TP
-        rounds), and the END of the event_loop_pp microbatch iteration --
-        after every send of the iteration is flushed -- because a blocking
-        world-reduction entered before this rank's sends closes a cycle
-        with the pipeline p2p chain (measured 2026-08-08; see the call-site
-        comment in get_next_batch_to_run)."""
+        Two call sites, one per loop family: get_next_batch_to_run for
+        event_loop_normal (lockstep TP rounds, periodic consensus), and
+        the END of the event_loop_pp microbatch iteration with
+        require_armed_and_parked=True -- under PP the ranks' local round
+        counters diverge absolutely, so the reduction is entered only from
+        an armed AND locally-parked state, where this rank owes no
+        pipeline send (measured wedges 2026-08-08, boots 9+10; see
+        PhaseFlipRuntime.on_round)."""
         if self.phase_flip_runtime is None:
             from sglang.srt.managers.phase_flip_runtime import (
                 build_phase_flip_runtime,
             )
 
             self.phase_flip_runtime = build_phase_flip_runtime(self)
-        flip_stats = self.phase_flip_runtime.on_round()
+        flip_stats = self.phase_flip_runtime.on_round(
+            require_armed_and_parked=require_armed_and_parked
+        )
         if flip_stats is not None:
             from sglang.srt.managers.phase_flip_runtime import (
                 PhaseFlipLoopExit,
