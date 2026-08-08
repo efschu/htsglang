@@ -904,3 +904,184 @@ class TestArmedParkedGate(CustomTestCase):
             except Exception:
                 break  # commit path may proceed further than this stub
         self.assertTrue(calls, "armed+parked pp round never entered")
+
+
+class _FakeClock:
+    """Injectable monotonic clock. Tests advance time explicitly rather
+    than sleeping, so the deadline is exercised in milliseconds."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+class TestParkDeadline(CustomTestCase):
+    """An armed flip withholds new work so the in-flight state drains; the
+    flip can then interpose BETWEEN a request's prefill and its decode
+    instead of only after every stream has finished. That park must be
+    BOUNDED: a rank that never reaches quiescence would otherwise hold its
+    requests forever.
+
+    The contract under test, in the words of the requirement: on deadline
+    expiry the FLIP aborts loudly; the user request is never aborted."""
+
+    def _runtime(self, *, ready_seq, clock, deadline, channel_calls, rank=0):
+        _, live, _, pp_views, _, tp_views = _make_layout_pools(
+            MAP_625, VEC, 200, seed=41
+        )
+
+        def _min(vals):
+            channel_calls.append(list(vals))
+            return list(vals)
+
+        def _ready():
+            # A never-finishing stream: quiescence never arrives.
+            return ready_seq.pop(0) if ready_seq else False
+
+        return PhaseFlipRuntime(
+            n_ranks=len(VEC),
+            rank=rank,
+            layer_map=MAP_625,
+            n_layers=N_LAYERS,
+            tp_vector=VEC,
+            boot_phase=PHASE_PP,
+            consensus_interval=2,
+            park_deadline_s=deadline,
+            collective_min=_min,
+            exchange=lambda peers, payloads: {},
+            pp_pool_view=pp_views[0],
+            tp_pool_view=tp_views[0],
+            live_slots_fn=lambda: live,
+            ready_fn=_ready,
+            cutover_fn=lambda d: None,
+            clock=clock,
+        )
+
+    def test_never_quiescent_stream_abandons_the_flip_loudly(self):
+        """THE falsifier: a synthetic never-finishing stream.
+
+        RED before the deadline existed: the armed rank returned None
+        every round forever, never entering the channel, and the requests
+        it had parked never resumed."""
+        clock = _FakeClock()
+        calls = []
+        rt = self._runtime(
+            ready_seq=[], clock=clock, deadline=5.0, channel_calls=calls
+        )
+        ok, _ = rt.arm(PP_TO_TP, source="test")
+        self.assertTrue(ok)
+
+        # Inside the deadline: parked, silent, no collective at all.
+        for _ in range(10):
+            self.assertIsNone(rt.on_round(require_armed_and_parked=True))
+        self.assertEqual(calls, [], "an unparked rank must not enter early")
+        self.assertEqual(rt.pending, PP_TO_TP, "must stay armed inside the deadline")
+
+        # Past the deadline: it enters ONCE, carrying `expired`, and the
+        # group-agreed answer is to abandon.
+        clock.advance(5.0)
+        with self.assertLogs(
+            "sglang.srt.managers.phase_flip_runtime", level="ERROR"
+        ) as log:
+            self.assertIsNone(rt.on_round(require_armed_and_parked=True))
+        self.assertEqual(len(calls), 1, "expired rank must enter the consensus once")
+        self.assertIn("FLIP ABANDONED", "\n".join(log.output))
+        self.assertIsNone(rt.pending, "an abandoned flip must disarm")
+        self.assertEqual(rt.park_deadline_aborts, 1)
+
+    def test_abandon_does_not_raise_so_requests_survive(self):
+        """The flip is optional; the parked requests are not.
+
+        A raise here would climb into the event loop and take the instance
+        down -- killing exactly the requests the deadline protects."""
+        clock = _FakeClock()
+        calls = []
+        rt = self._runtime(
+            ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls
+        )
+        rt.arm(PP_TO_TP, source="test")
+        clock.advance(2.0)
+        # No exception, and serving continues in the SAME phase.
+        self.assertIsNone(rt.on_round(require_armed_and_parked=True))
+        self.assertEqual(rt.phase, PHASE_PP)
+        self.assertEqual(rt.epoch, 0, "no flip happened")
+        self.assertEqual(rt.completed, 0)
+
+    def test_re_arming_after_abandon_restarts_the_clock(self):
+        clock = _FakeClock()
+        calls = []
+        rt = self._runtime(
+            ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls
+        )
+        rt.arm(PP_TO_TP, source="test")
+        clock.advance(2.0)
+        rt.on_round(require_armed_and_parked=True)
+        self.assertIsNone(rt.pending)
+
+        rt.arm(PP_TO_TP, source="retry")
+        self.assertEqual(rt.pending, PP_TO_TP)
+        before = len(calls)
+        for _ in range(5):
+            rt.on_round(require_armed_and_parked=True)
+        self.assertEqual(
+            len(calls), before, "the re-armed clock must start from zero"
+        )
+
+    def test_parked_rank_is_unaffected_by_the_deadline(self):
+        """The healthy path must not change: parked ranks enter as before."""
+        clock = _FakeClock()
+        calls = []
+        rt = self._runtime(
+            ready_seq=[True] * 8, clock=clock, deadline=1.0, channel_calls=calls
+        )
+        rt.arm(PP_TO_TP, source="test")
+        clock.advance(99.0)  # long past the deadline, but it PARKED
+        try:
+            rt.on_round(require_armed_and_parked=True)
+        except Exception:
+            pass  # the commit path runs further than this stub supports
+        self.assertTrue(calls, "a parked rank must still enter the consensus")
+        self.assertEqual(
+            rt.park_deadline_aborts, 0, "a parked rank must never abandon"
+        )
+
+    def test_zero_deadline_restores_the_unbounded_wait(self):
+        clock = _FakeClock()
+        calls = []
+        rt = self._runtime(
+            ready_seq=[], clock=clock, deadline=0.0, channel_calls=calls
+        )
+        rt.arm(PP_TO_TP, source="test")
+        clock.advance(10_000.0)
+        for _ in range(10):
+            self.assertIsNone(rt.on_round(require_armed_and_parked=True))
+        self.assertEqual(calls, [])
+        self.assertEqual(rt.pending, PP_TO_TP)
+
+    def test_expired_field_rides_the_consensus_payload(self):
+        """Group-agreed, not rank-local: the flag must be IN the payload.
+
+        A rank-local abandon would disarm one rank against still-armed
+        peers -- the same rank-local-state-feeds-collective shape this
+        family keeps producing."""
+        clock = _FakeClock()
+        calls = []
+        rt = self._runtime(
+            ready_seq=[], clock=clock, deadline=1.0, channel_calls=calls
+        )
+        rt.arm(PP_TO_TP, source="test")
+        clock.advance(2.0)
+        rt.on_round(require_armed_and_parked=True)
+        self.assertEqual(len(calls), 1)
+        payload = calls[0]
+        # _encode packs (v, -v) pairs; expired is field index 2.
+        self.assertEqual(payload[4], 1, "expired must be encoded in the payload")
+        self.assertEqual(payload[5], -1)
+        self.assertEqual(payload[0], 1, "armed")
+        self.assertEqual(payload[2], 0, "ready")
+

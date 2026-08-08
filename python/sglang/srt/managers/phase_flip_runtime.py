@@ -43,6 +43,7 @@ no-return region.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -73,6 +74,36 @@ PHASE_TP = "tp"
 
 _DIR_ID = {PP_TO_TP: 1, TP_TO_PP: 2}
 _DIR_OF_PHASE = {PHASE_PP: PP_TO_TP, PHASE_TP: TP_TO_PP}
+
+#: How long an ARMED flip may wait for a group-wide quiescent boundary
+#: before it gives up -- seconds, wall clock, measured on whichever rank is
+#: still unparked.
+#:
+#: An armed flip withholds new work so the in-flight state drains; that is
+#: what makes the flip interposable BETWEEN a request's prefill and its
+#: decode instead of only after every stream has finished. The cost is that
+#: a rank which never reaches quiescence withholds work forever, and the
+#: requests it is holding never resume. This deadline bounds that: when it
+#: expires the FLIP is abandoned, loudly, and serving continues. The user's
+#: requests are never aborted -- they are the thing being protected.
+#:
+#: 30 s is chosen against the legitimate worst case: a drain is a handful of
+#: iterations plus, at most, the continuation of one already-half-written
+#: chunked prefill (exempt from parking, because a chunk that stops mid-way
+#: could never satisfy the quiescence predicate at all).
+DEFAULT_PARK_DEADLINE_S = 30.0
+
+#: Env override for the above. Non-positive disables the deadline, which
+#: restores the old unbounded wait -- available deliberately for debugging a
+#: slow drain, and named so a reader sees that "no deadline" is a choice.
+ENV_PARK_DEADLINE = "SGLANG_PHASE_FLIP_PARK_DEADLINE_S"
+
+
+def park_deadline_s() -> float:
+    try:
+        return float(os.environ.get(ENV_PARK_DEADLINE, DEFAULT_PARK_DEADLINE_S))
+    except ValueError:
+        return DEFAULT_PARK_DEADLINE_S
 _PHASE_AFTER = {PP_TO_TP: PHASE_TP, TP_TO_PP: PHASE_PP}
 
 
@@ -400,6 +431,15 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             scheduler.load_inquirer = _dc2.replace(
                 scheduler.load_inquirer, ps=scheduler.ps
             )
+        # 4c. Census round realign: the detector's cadence counter drifted
+        # per-rank under the pp loop; the cutover is group-aligned, so
+        # re-zero here or the post-flip detector fires its gloo
+        # all_gather_object at per-rank rounds and mispairs with the
+        # request broadcasts on the same group FIFO (measured wedge,
+        # window-2 boot 13). See CollectiveCensus.realign_round.
+        from sglang.srt.distributed.collective_census import census as _census
+
+        _census().realign_round()
 
         # 5. pp_max_micro_batch_size for the new pp_size (boot formula).
         get_server_args().override(
@@ -581,6 +621,7 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         consensus_interval=int(
             getattr(server_args, "kv_reshard_consensus_interval", 8)
         ),
+        park_deadline_s=park_deadline_s(),
         collective_min=default_collective_min(flip_tp.cpu_group),
         exchange=_dist_exchange(flip_tp.device_group, pp_view.device),
         pp_pool_view=pp_view,
@@ -632,6 +673,7 @@ class PhaseFlipRuntime:
         tp_vector: Sequence[int],
         boot_phase: str = PHASE_PP,
         consensus_interval: int = 8,
+        park_deadline_s: float = DEFAULT_PARK_DEADLINE_S,
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         exchange: Optional[
             Callable[[Dict[int, torch.Tensor], Dict[int, int]], Dict[int, torch.Tensor]]
@@ -724,6 +766,13 @@ class PhaseFlipRuntime:
         self.desync_checks = 0
         self.completed = 0
         self.last_stats: Optional[dict] = None
+        #: Wall-clock bound on the parked wait; see DEFAULT_PARK_DEADLINE_S.
+        self._park_deadline_s = float(park_deadline_s)
+        #: Clock reading of the moment this rank armed, or None when idle.
+        self._armed_at: Optional[float] = None
+        #: Flips abandoned because the park deadline expired. A counter, so
+        #: "this never happens in practice" stops being an assumption.
+        self.park_deadline_aborts = 0
 
         logger.info(
             "%s armed at boot: rank %d/%d, phase %s, layer map %s, vector "
@@ -783,9 +832,14 @@ class PhaseFlipRuntime:
                 source,
             )
         self._pending = direction
+        # The park clock starts at ARMING, not at the first unparked round:
+        # the deadline bounds how long the requests are held, and they are
+        # held from the moment this rank starts withholding work.
+        self._armed_at = self._clock()
         msg = (
             f"phase flip armed: {direction} (source {source}); commits at "
-            f"the next consensus boundary where every rank is quiescent"
+            f"the next consensus boundary where every rank is quiescent, or "
+            f"is abandoned after {self._park_deadline_s:g}s parked"
         )
         logger.warning("%s %s", LOG_PREFIX, msg)
         return True, msg
@@ -810,19 +864,34 @@ class PhaseFlipRuntime:
         Peers converge on their own arm+drain, MIN-skew is legal, and the
         liveness bound turns a lost peer into a loud error. A flip under
         continuous load needs the posted-async two-phase consensus -- a
-        named follow-up, not this gate."""
+        named follow-up, not this gate.
+
+        The wait is BOUNDED (see DEFAULT_PARK_DEADLINE_S): a rank armed
+        past the deadline without parking joins the reduction anyway
+        carrying ``expired``, and every participating rank abandons the
+        flip on the reduced maximum. Abandoning the flip is the whole
+        point -- the parked requests are never abandoned."""
         self._round += 1
-        if require_armed_and_parked and (
-            self._pending is None or not self._ready_fn()
-        ):
+        armed = 1 if self._pending is not None else 0
+        ready = 1 if (armed and self._ready_fn()) else 0
+        expired = 1 if self._park_expired(armed, ready) else 0
+        # The PP-phase entry gate, widened by the deadline: an armed rank
+        # enters once it is PARKED, or -- if it has been armed past the
+        # deadline without ever parking -- to carry that fact into the
+        # consensus. Entering unparked is what makes the abandonment
+        # GROUP-AGREED: the peers are already blocked in this reduction
+        # waiting for exactly this rank, so the flag reaches them, every
+        # rank abandons the same flip in the same round, and nobody is left
+        # armed against a disarmed peer. It is safe here because an armed
+        # rank has been withholding new work for the whole deadline, so it
+        # owes no fresh pipeline send.
+        if require_armed_and_parked and not (armed and (ready or expired)):
             return None
         if not require_armed_and_parked and self._round % self._interval != 0:
             return None
-        armed = 1 if self._pending is not None else 0
-        ready = 1 if (armed and self._ready_fn()) else 0
         dir_id = _DIR_ID[self._pending] if self._pending is not None else 0
         payload = _encode(
-            [armed, ready, self._epoch, dir_id, self._fp, *self._vec]
+            [armed, ready, expired, self._epoch, dir_id, self._fp, *self._vec]
         )
         self.desync_checks += 1
         reduced = self._collective_min(payload)
@@ -832,9 +901,14 @@ class PhaseFlipRuntime:
                 f"{len(payload)}-value payload; the channel contract is "
                 f"element-wise MIN of the packed proposal."
             )
-        fields = ["armed", "ready", "epoch", "direction", "config_fp"] + [
-            f"vector[{i}]" for i in range(self._n)
-        ]
+        fields = [
+            "armed",
+            "ready",
+            "expired",
+            "epoch",
+            "direction",
+            "config_fp",
+        ] + [f"vector[{i}]" for i in range(self._n)]
         lo = {f: reduced[2 * i] for i, f in enumerate(fields)}
         hi = {f: -reduced[2 * i + 1] for i, f in enumerate(fields)}
 
@@ -857,6 +931,14 @@ class PhaseFlipRuntime:
                 f"disagrees across ranks must fail loudly HERE, before any "
                 f"rank moves a byte under the wrong layout."
             )
+        # Park deadline, decided on the MAX: one rank out of time is enough
+        # to abandon the flip, and every rank in this reduction reads the
+        # same max, so the abandonment is unanimous by construction.
+        # Checked before the armed/ready holds -- those are the states the
+        # deadline exists to stop waiting in.
+        if hi["expired"] == 1:
+            return self._abandon_parked_flip(ready)
+
         if lo["armed"] == 0:
             if hi["armed"] == 1:
                 self._hold("waiting for every rank to arm (delivery skew)")
@@ -869,6 +951,57 @@ class PhaseFlipRuntime:
             return None
         self._last_hold_reason = None
         return self._execute()
+
+    def _park_expired(self, armed: int, ready: int) -> bool:
+        """Has this rank been armed-but-unparked past the deadline?
+
+        Wall clock, not a round count: rounds are what the PP loop makes
+        incomparable across ranks in the first place, and the quantity the
+        operator cares about is how long a request may be held. The reading
+        is rank-local and does NOT need to be replicated -- one rank
+        raising the flag is enough, because the DECISION to abandon is
+        taken from the reduced maximum in on_round, which every
+        participating rank reads identically.
+        """
+        if not armed or ready or self._park_deadline_s <= 0:
+            return False
+        if self._armed_at is None:
+            return False
+        return (self._clock() - self._armed_at) >= self._park_deadline_s
+
+    def _abandon_parked_flip(self, ready: int) -> None:
+        """Give up on an armed flip that never reached quiescence.
+
+        Disarms and returns to serving. Deliberately NOT an exception: the
+        flip is the optional thing here, the requests are not. A raise
+        would climb into the event loop and take the instance down with it,
+        which is precisely the outcome this deadline exists to prevent --
+        the parked requests would die with it.
+        """
+        waited = (
+            self._clock() - self._armed_at if self._armed_at is not None else float("nan")
+        )
+        direction = self._pending
+        self._pending = None
+        self._armed_at = None
+        self._last_hold_reason = None
+        self.park_deadline_aborts += 1
+        logger.error(
+            "%s FLIP ABANDONED: %s was armed for %.1fs without the group "
+            "reaching a quiescent boundary (deadline %gs; this rank "
+            "ready=%d). The requests are NOT affected -- they were parked, "
+            "not aborted, and serving resumes on the %s stack now. A rank "
+            "that cannot park is holding work that never drains: look for a "
+            "microbatch or a chunked prefill that never completes. Re-arm "
+            "to try again.",
+            LOG_PREFIX,
+            direction,
+            waited,
+            self._park_deadline_s,
+            ready,
+            self._phase,
+        )
+        return None
 
     def _hold(self, reason: str) -> None:
         if reason != self._last_hold_reason:
@@ -1000,6 +1133,7 @@ class PhaseFlipRuntime:
         self._cutover_fn(direction)
         self._phase = _PHASE_AFTER[direction]
         self._pending = None
+        self._armed_at = None
         self._epoch += 1
         self.completed += 1
         total_ms = (self._clock() - t0) * 1000.0

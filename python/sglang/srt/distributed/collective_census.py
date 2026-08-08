@@ -76,6 +76,7 @@ from sglang.srt.distributed.device_communicators import lockstep_sentinel
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ROUND_KEY",
     "CollectiveCensus",
     "Divergence",
     "census",
@@ -120,6 +121,12 @@ DEFAULT_HEARTBEAT = 10000
 #: of tuples per rank and costs one deque append per collective, which is the
 #: same hot-path cost as before.
 DEFAULT_HISTORY_LEN = 4096
+
+#: Reserved snapshot key carrying the DETECTOR's own round number across the
+#: comparison, so a drifted cadence is caught by the instrument itself
+#: rather than by the wedge it would otherwise cause (#631). Not a
+#: collective family: excluded from the diff.
+ROUND_KEY = "__census_round__"
 
 
 def census_enabled() -> bool:
@@ -195,6 +202,10 @@ class CollectiveCensus:
         #: Ring buffer of the most recent (family, nbytes) entries, bounded
         #: at DEFAULT_HISTORY_LEN. Per-instance, not global shared state.
         self._history: deque = deque(maxlen=DEFAULT_HISTORY_LEN)
+        #: Set once the detector observes its own cadence premise broken.
+        #: From then on the periodic comparison STANDS DOWN; see
+        #: :meth:`compare_across_ranks`.
+        self._cadence_broken = False
 
     # -- declaration ----------------------------------------------------
 
@@ -278,8 +289,37 @@ class CollectiveCensus:
         self._round += 1
         return self._round
 
+    def realign_round(self) -> None:
+        """Re-zero the round counter from a RANK-UNIFORM event.
+
+        The next_round docstring's premise -- every rank advances once per
+        iteration from an unconditional point -- fails under a PIPELINE
+        loop: the pp ranks' get_next_batch_to_run cadences skew (pipeline
+        fill, conditional slots), so their counters drift apart in absolute
+        value. That was harmless while the compare group had size 1, but a
+        phase-flip cutover swaps in a REAL gloo group: the detector then
+        fired its all_gather_object at per-rank rounds and MISPAIRED with
+        the request broadcasts on the same group FIFO -- the instrument
+        seeded the exact desync it exists to catch (measured, window-2 boot
+        13, 2026-08-08). The flip cutover is itself group-aligned, so
+        re-zeroing here restores the replicated-cadence premise for the
+        post-flip loop."""
+        self._round = 0
+
     def due(self, interval: int) -> bool:
         return interval > 0 and self._round % interval == 0
+
+    @property
+    def round(self) -> int:
+        return self._round
+
+    @property
+    def cadence_broken(self) -> bool:
+        """True once the detector caught its OWN cadence drifting.
+
+        See :meth:`compare_across_ranks`. Exposed so a test (or a boot log
+        reader) can tell "healthy and quiet" apart from "stood down"."""
+        return self._cadence_broken
 
     def announce_armed_once(self, rank: int, interval: int, heartbeat: int) -> None:
         """One INFO line per scheduler rank, the first time the tick runs."""
@@ -328,16 +368,31 @@ class CollectiveCensus:
         says so and gets out of the way. It must never be the reason a
         healthy forward fails, and it must never mask the defect it is
         watching for by raising something else first.
+
+        SELF-CHECK ON ITS OWN CADENCE (#631). This comparison is a BLOCKING
+        collective on a group that also carries payload traffic (the
+        request broadcast, the budget all_reduce). It is safe only while
+        every rank fires it in the same round -- the premise
+        :meth:`next_round` states. When that premise breaks, rank A gathers
+        while rank B broadcasts, the group FIFO mispairs, and the
+        instrument SEEDS the desync it exists to catch (measured, window-2
+        boot 13, 2026-08-08). So the round number now rides in the payload
+        under :data:`ROUND_KEY`: if the rounds disagree the detector says
+        so once and STANDS DOWN permanently, leaving the wedge-proof local
+        dump -- which takes no collective -- armed. Standing down loses
+        detection; continuing would cause outages.
         """
         try:
             import torch.distributed as dist
 
-            if group is None or world_size <= 1:
+            if group is None or world_size <= 1 or self._cadence_broken:
                 return None
             local = self.snapshot()
+            local[ROUND_KEY] = self._round
             gathered: List[Optional[Dict[str, int]]] = [None] * world_size
             dist.all_gather_object(gathered, local, group=group)
             self.comparisons += 1
+            self._check_cadence(gathered, rank)
             found = self._diff(gathered)
             if found:
                 self.divergences_seen += 1
@@ -353,6 +408,34 @@ class CollectiveCensus:
             )
             return None
 
+    def _check_cadence(
+        self, gathered: Sequence[Optional[Dict[str, int]]], rank: int
+    ) -> None:
+        """Stand the detector down if the ranks fired it in different rounds.
+
+        The rounds having paired at all means this particular gather got
+        away with it; the next one is under no such obligation. See the
+        method docstring for why the answer is to stop rather than to
+        carry on with a warning.
+        """
+        rounds = [int((per_rank or {}).get(ROUND_KEY, -1)) for per_rank in gathered]
+        if len(set(rounds)) <= 1:
+            return
+        self._cadence_broken = True
+        logger.error(
+            "collective census STANDING DOWN (rank %d): the detector fired "
+            "in different rounds on different ranks (%s). Its comparison is "
+            "a blocking collective on a group that also carries payload "
+            "traffic, so a drifted cadence makes the INSTRUMENT mispair the "
+            "group FIFO and wedge the very ranks it is watching. Counting "
+            "and the abort-time local dump stay armed; the periodic "
+            "cross-rank comparison is now off for the rest of this process. "
+            "The cause is a scheduler loop that does not advance the census "
+            "round exactly once per iteration on every rank.",
+            rank,
+            rounds,
+        )
+
     @staticmethod
     def _diff(gathered: Sequence[Optional[Dict[str, int]]]) -> List[Divergence]:
         """Diff over the UNION of families.
@@ -365,6 +448,10 @@ class CollectiveCensus:
         for per_rank in gathered:
             if per_rank:
                 families.update(per_rank.keys())
+        # The detector's own round rides in the same dict; it is metadata
+        # about the instrument, not a collective family, and it is EXPECTED
+        # to differ exactly when _check_cadence has something to say.
+        families.discard(ROUND_KEY)
         out: List[Divergence] = []
         for family in sorted(families):
             counts = [int((per_rank or {}).get(family, 0)) for per_rank in gathered]

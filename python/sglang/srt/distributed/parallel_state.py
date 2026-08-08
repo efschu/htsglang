@@ -637,14 +637,6 @@ class GroupCoordinator:
             self._clock_family_all_to_all,
         ) = _clock_families
 
-        # #583: declare this group's families to the census from REPLICATED
-        # config, at construction, before any of them can fire. Every rank
-        # builds the same groups under the same names, so the census payload
-        # width is fixed by configuration rather than by which collectives a
-        # rank has happened to reach (#610).
-        if _CENSUS_ON:
-            _CENSUS.declare_families(_clock_families)
-
         # Set rank info
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
@@ -727,6 +719,33 @@ class GroupCoordinator:
 
         assert self.cpu_group is not None
         assert self.device_group is not None
+
+        # #631: does this group have a WIRE at all? The census counts
+        # collectives so the counts can be compared ACROSS ranks; a
+        # world_size==1 group short-circuits every collective below
+        # (``if self.world_size == 1: return input_``) and never touches
+        # the wire, so its counts measure this rank's local work and
+        # nothing that could pair with a peer. Comparing them across ranks
+        # is therefore a category error, and it produced a real false
+        # positive: under PP=3/TP=1 the size-1 "tp" group reported
+        # ``tp.all_gather: counts [536, 1096, 1096]`` -- the stage ratio
+        # 2,1,1 giving rank 0 a different local layer count, exactly as it
+        # should (measured, window-2 boot 13, 2026-08-08).
+        #
+        # This EXCLUDES non-wire events from a wire census; it does not
+        # weaken the check on any group that can actually desync. Computed
+        # once, here, because world_size is only known after the loop
+        # above -- an earlier read raised AttributeError inside __init__
+        # and turned every group construction into a retry storm.
+        self._census_wire = _CENSUS_ON and self.world_size > 1
+
+        # #583: declare this group's families to the census from REPLICATED
+        # config, at construction, before any of them can fire. Every rank
+        # builds the same groups under the same names, so the census payload
+        # width is fixed by configuration rather than by which collectives a
+        # rank has happened to reach (#610).
+        if self._census_wire:
+            _CENSUS.declare_families(_clock_families)
 
         # Import communicators
         self.use_pynccl = use_pynccl
@@ -1195,8 +1214,11 @@ class GroupCoordinator:
 
         # #583 collective census. Placed AFTER the clock's re-entry guard so
         # every collective is counted exactly once: the armed path re-enters
-        # with the clock disarmed and falls through to here.
-        if _CENSUS_ON:
+        # with the clock disarmed and falls through to here. Gated on
+        # _census_wire because the size-1 bypass sits immediately below:
+        # counting a call that returns without touching the wire would put
+        # a purely local event into a cross-rank comparison (#631).
+        if self._census_wire:
             _CENSUS.bump(self._clock_family_all_reduce)
 
         # Bypass the function if we are using only 1 GPU.
@@ -1559,7 +1581,7 @@ class GroupCoordinator:
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
-        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+        if self._census_wire:  # #583/#631: see all_reduce for the placement rule.
             _CENSUS.bump(self._clock_family_all_to_all)
         if self.world_size == 1:
             output.copy_(input)
@@ -1597,7 +1619,7 @@ class GroupCoordinator:
         # Same family as the even form: what the census compares is how many
         # times each rank entered this wire family, and a rank that skips an
         # uneven a2a has skipped an a2a.
-        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+        if self._census_wire:  # #583/#631: see all_reduce for the placement rule.
             _CENSUS.bump(self._clock_family_all_to_all)
         if self.world_size == 1:
             output.copy_(input)
@@ -1636,7 +1658,7 @@ class GroupCoordinator:
             # See all_reduce for why this re-enters.
             with _COLLECTIVE_CLOCK.span(self._clock_family_reduce_scatterv):
                 return self.reduce_scatterv(input_, output=output, sizes=sizes)
-        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+        if self._census_wire:  # #583/#631: see all_reduce for the placement rule.
             _CENSUS.bump(self._clock_family_reduce_scatterv)
         if self.barlink_comm is not None:
             self._barlink_unsupported("reduce_scatterv")
@@ -1776,7 +1798,7 @@ class GroupCoordinator:
                 return self.all_gather(
                     input_, dim=dim, output_tensor_list=output_tensor_list
                 )
-        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+        if self._census_wire:  # #583/#631: see all_reduce for the placement rule.
             _CENSUS.bump(self._clock_family_all_gather)
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
@@ -1871,7 +1893,7 @@ class GroupCoordinator:
             # See all_reduce for why this re-enters.
             with _COLLECTIVE_CLOCK.span(self._clock_family_all_gatherv):
                 return self.all_gatherv(input_, sizes=sizes, output=output)
-        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+        if self._census_wire:  # #583/#631: see all_reduce for the placement rule.
             _CENSUS.bump(self._clock_family_all_gatherv)
         if self.barlink_comm is not None:
             self._barlink_unsupported("all_gatherv")
@@ -1974,7 +1996,7 @@ class GroupCoordinator:
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        if _CENSUS_ON:  # #583: see all_reduce for the placement rule.
+        if self._census_wire:  # #583/#631: see all_reduce for the placement rule.
             _CENSUS.bump(self._clock_family_broadcast)
 
         # Bypass the function if we are using only 1 GPU.

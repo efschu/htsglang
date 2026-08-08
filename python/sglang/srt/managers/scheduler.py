@@ -4411,6 +4411,26 @@ class Scheduler(
                     rank_forward_ms=rank_forward_ms_from(self),
                 )
 
+        # #631 PARKING: an ARMED flip withholds all new work -- no prefill
+        # batch is built and the decode batch is not launched -- so the
+        # in-flight state drains and ready_fn's quiescence becomes
+        # reachable BETWEEN a request's prefill and its decode (the
+        # design's core promise; without this, an armed flip waited for
+        # every stream to FINISH -- measured on the first rung-c attempt,
+        # 2026-08-08). A half-written chunk is exempt: its continuation
+        # must complete or ready_fn could never go true. Rank-uniform:
+        # pending arrives via the broadcast RPC in the same round on every
+        # rank, and chunked_req is replicated batch state. The park is
+        # BOUNDED by the runtime's park deadline (group-agreed abort of
+        # the FLIP, never of the requests).
+        if (
+            self.server_args.enable_phase_flip
+            and self.phase_flip_runtime is not None
+            and self.phase_flip_runtime.pending is not None
+            and self.chunked_req is None
+        ):
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif (
