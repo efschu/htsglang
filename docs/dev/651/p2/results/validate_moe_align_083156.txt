@@ -1,0 +1,5 @@
+T=1 topk=8 E=256 bs=8: npost=64 PASS
+T=8 topk=8 E=256 bs=8: npost=472 PASS
+T=64 topk=8 E=256 bs=8: npost=1760 PASS
+T=1024 topk=8 E=256 bs=8: npost=9072 PASS
+VERDICT: moe_align OK

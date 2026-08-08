@@ -1,0 +1,6 @@
+q4_K   MMVQ 8 runs: identical=True  run-spread 0.000e+00  worst|d|vs-ref 7.058e-04  non-finite 0
+q4_K   MMQ  8 runs: identical=True  run-spread 0.000e+00  worst|d|vs-ref 1.685e-03  non-finite 0
+q5_K   MMVQ 8 runs: identical=True  run-spread 0.000e+00  worst|d|vs-ref 2.284e-04  non-finite 0
+q5_K   MMQ  8 runs: identical=True  run-spread 0.000e+00  worst|d|vs-ref 1.038e-03  non-finite 0
+q6_K   MMVQ 8 runs: identical=False run-spread 2.338e-02  worst|d|vs-ref 2.350e-02  non-finite 0
+q6_K   MMQ  8 runs: identical=True  run-spread 0.000e+00  worst|d|vs-ref 5.355e-04  non-finite 0

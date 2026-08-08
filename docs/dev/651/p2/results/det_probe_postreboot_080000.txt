@@ -1,0 +1,22 @@
+run 0: text=' Answer is 14 * 3 ='
+       first-token top4=[[-2.229994773864746, 21134, None], [-2.354994773864746, 15380, None], [-2.542494773864746, 220, None], [-2.542494773864746, 369, None]]
+run 1: text=' Answer is 14 * 3 ='
+       first-token top4=[[-2.2168776988983154, 21134, None], [-2.3418776988983154, 15380, None], [-2.5293776988983154, 369, None], [-2.6543776988983154, 220, None]]
+run 2: text=' Question: What is 14 * 3?\n\n<think>\n\n</think>\n\n'
+       first-token top4=[[-2.287015914916992, 15380, None], [-2.287015914916992, 21134, None], [-2.537015914916992, 369, None], [-2.662015914916992, 220, None]]
+run 3: text=' Answer is 14 * 3 ='
+       first-token top4=[[-2.362745761871338, 21134, None], [-2.487745761871338, 369, None], [-2.487745761871338, 15380, None], [-2.612745761871338, 220, None]]
+run 4: text=' Answer is 14 * 3 ='
+       first-token top4=[[-2.2076311111450195, 21134, None], [-2.2701311111450195, 15380, None], [-2.5826311111450195, 220, None], [-2.5826311111450195, 369, None]]
+run 5: text=' Answer is 14 * 3 ='
+       first-token top4=[[-2.2348690032958984, 21134, None], [-2.3598690032958984, 15380, None], [-2.5473690032958984, 369, None], [-2.6098690032958984, 220, None]]
+run 6: text=' Answer is 14 * 3 ='
+       first-token top4=[[-2.250971794128418, 21134, None], [-2.375971794128418, 15380, None], [-2.563471794128418, 220, None], [-2.563471794128418, 369, None]]
+run 7: text=' Answer is 14 * 3 ='
+       first-token top4=[[-2.237267255783081, 21134, None], [-2.299767255783081, 15380, None], [-2.549767255783081, 220, None], [-2.549767255783081, 369, None]]
+
+distinct texts: 2 of 8
+  x7: ' Answer is 14 * 3 ='
+  x1: ' Question: What is 14 * 3?\n\n<think>\n\n</think>\n\n'
+distinct first-token logprob sets: 8 of 8
+VERDICT: NON-DETERMINISTIC

@@ -1,0 +1,43 @@
+=====debug_q6k3=====
+--- A: fresh allocation each call (as the earlier test did) ---
+  run 0: non-finite   26  max|d| 5.433e-01
+  run 1: non-finite   59  max|d| 4.756e-01
+  run 2: non-finite    0  max|d| 2.545e-02
+--- B: caller-supplied buffer, ZEROED before each call ---
+  run 0: non-finite    0  max|d| 2.745e-02  exact-zero outputs 6866
+  run 1: non-finite    0  max|d| 2.390e-05  exact-zero outputs 6864
+  run 2: non-finite   25  max|d| 5.319e-01  exact-zero outputs 6867
+--- C: caller-supplied buffer, POISONED with a sentinel before each call ---
+  run 0: untouched-by-kernel elements 0 / 262144  max|d| 4.304e-01
+  run 1: untouched-by-kernel elements 0 / 262144  max|d| 2.390e-05
+  run 2: untouched-by-kernel elements 0 / 262144  max|d| 7.363e-01
+=====debug_q6k4=====
+AMD_SERIALIZE_KERNEL=None
+no extra sync : 3.14e-01 3.00e-02 4.39e-01 4.15e-02 5.54e-01 3.50e-01
+sync around   : 5.04e-01 2.74e-02 5.34e-01 3.39e-01 5.16e-01 2.87e-02
+one fixed buf : 3.15e-01 3.59e-02 3.09e-02 2.06e-02 5.99e-01 3.93e-01
+chunked 256   : 3.17e-02
+chunked 256   : 5.98e-01
+chunked 256   : 2.61e-02
+=====debug_q6k5=====
+run  gpu-side max|d|  gpu-side nonfinite  host-side max|d|  host nonfinite          gpu sum
+  0              inf                  49         4.365e-01              49           0.8138
+  1              inf                  26         5.726e-01              26           1.6524
+  2              inf                  54         5.351e-01              54          -0.4417
+  3              inf                  72         4.725e-01              72           6.2722
+  4              inf                  26         2.226e-01              26           0.1382
+  5              inf                  52         5.254e-01              52          -0.9822
+  6              inf                  53         5.437e-01              53          -1.4956
+  7        5.624e-02                   0         5.624e-02               0           1.0098
+
+If gpu-side and host-side agree run by run, the corruption is in device
+memory (kernel). If gpu-side is stable while host-side varies, it is the
+device->host path.
+
+5 repeated host reads of ONE kernel result identical: True
+=====oneshot_q6k=====
+Traceback (most recent call last):
+  File "/root/lh/ggufbuild/oneshot_q6k.py", line 8, in <module>
+    nm = sys.argv[1]
+         ~~~~~~~~^^^
+IndexError: list index out of range

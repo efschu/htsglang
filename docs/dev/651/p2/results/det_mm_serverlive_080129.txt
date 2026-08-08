@@ -1,0 +1,4 @@
+  File "/root/651-p2/scripts/det_mm.py", line 38
+    print(f"{s[\"name\"]:<6} {name:<4} {N} runs: identical={ident!s:<5} "
+                ^
+SyntaxError: unexpected character after line continuation character

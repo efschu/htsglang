@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/root/651-p2/scripts/audit_all_types.py", line 45, in <module>
+    npad = ((T + b - 1) // b) * b
+            ~~~~~~~~~~~~^^~~
+ZeroDivisionError: integer division or modulo by zero

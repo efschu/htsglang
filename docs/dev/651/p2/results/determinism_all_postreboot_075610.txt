@@ -1,0 +1,9 @@
+q4_K   512x2048  8 runs: identical=True  worst max|d| 5.364e-05  worst non-finite 0
+q5_K   512x512   8 runs: identical=True  worst max|d| 3.862e-05  worst non-finite 0
+q6_K   512x512   8 runs: identical=False worst max|d| 7.706e-01  worst non-finite 84
+q4_K   512x2048  8 runs: identical=True  worst max|d| 5.364e-05  worst non-finite 0
+q5_K   512x512   8 runs: identical=True  worst max|d| 3.862e-05  worst non-finite 0
+q6_K   512x512   8 runs: identical=False worst max|d| 6.573e-01  worst non-finite 53
+q4_K   512x2048  8 runs: identical=True  worst max|d| 5.364e-05  worst non-finite 0
+q5_K   512x512   8 runs: identical=True  worst max|d| 3.862e-05  worst non-finite 0
+q6_K   512x512   8 runs: identical=False worst max|d| 8.788e-01  worst non-finite 79

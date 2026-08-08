@@ -1,0 +1,20 @@
+=== round 1 (port 31651) ===
+  [FAIL] What is the capital of France? Answer with o -> 2020-03-09 10:09:11
+  [FAIL] What is 14 * 3? Reply with just the number.  -> 
+  [FAIL] What is 31 * 7? Reply with just the number.  -> <think>
+  [FAIL] Which planet is known as the Red Planet? One -> Which planet
+  [FAIL] Complete the sequence with one number: 2, 4, -> , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , ,
+  [FAIL] In one short sentence: why does ice float on -> 1 <think> <think> </think> In one short sentence: why does ice float on water?
+  round 1: 0/6 content-correct
+=== round 2 (greedy determinism) ===
+  [FAIL] What is the capital of France? Answer with o -> 2020-02-20 17:00:00 UTC from a source --- The user is asking about the capital of France. The assistant respon
+  [FAIL] What is 14 * 3? Reply with just the number.  -> 
+  [FAIL] What is 31 * 7? Reply with just the number.  -> <think> : : : : : : : : : : : : : : : : : : : : :
+  [PASS] Which planet is known as the Red Planet? One -> The "Red Planet" is a well-known nickname for **Mars**. This nickname comes from the planet's appearance, whic
+  [FAIL] Complete the sequence with one number: 2, 4, -> ,
+  [FAIL] In one short sentence: why does ice float on -> 1 <think> <think> </think> In one short sentence: why does ice float on water?
+  round 2: 1/6 content-correct
+
+content round1 = 0/6   round2 = 1/6
+greedy deterministic (round1 == round2): False
+VERDICT: NOT COHERENT

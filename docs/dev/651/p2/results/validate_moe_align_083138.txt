@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/root/651-p2/scripts/validate_moe_align.py", line 45, in <module>
+    allok &= check(T, topk, 256, 8)
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/651-p2/scripts/validate_moe_align.py", line 40, in check
+    print(f"T={T} topk={topk} E={E} bs={bs}: npost={npost_v} {PASS if ok else FAIL}")
+                                                              ^^^^
+NameError: name 'PASS' is not defined

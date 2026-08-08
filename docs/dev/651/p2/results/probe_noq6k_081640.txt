@@ -1,0 +1,20 @@
+=== round 1 (port 31651) ===
+  [FAIL] What is the capital of France? Answer with o -> 250 words
+  [FAIL] What is 14 * 3? Reply with just the number.  -> 
+  [FAIL] What is 31 * 7? Reply with just the number.  -> <think>
+  [FAIL] Which planet is known as the Red Planet? One -> Which planet is known as the Red Planet? One word.
+  [FAIL] Complete the sequence with one number: 2, 4, -> , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , ,
+  [FAIL] In one short sentence: why does ice float on -> 1 <think> <think> </think> In one short sentence: why does ice float on water?
+  round 1: 0/6 content-correct
+=== round 2 (greedy determinism) ===
+  [FAIL] What is the capital of France? Answer with o -> 250 words
+  [FAIL] What is 14 * 3? Reply with just the number.  -> 
+  [FAIL] What is 31 * 7? Reply with just the number.  -> <think>
+  [FAIL] Which planet is known as the Red Planet? One -> Which planet is known as the Red Planet? One word.
+  [FAIL] Complete the sequence with one number: 2, 4, -> , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , , ,
+  [FAIL] In one short sentence: why does ice float on -> 1 <think> <think> </think> In one short sentence: why does ice float on water?
+  round 2: 0/6 content-correct
+
+content round1 = 0/6   round2 = 0/6
+greedy deterministic (round1 == round2): True
+VERDICT: NOT COHERENT

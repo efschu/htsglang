@@ -1,0 +1,3 @@
+q4_K   moe_a8_vec 8 runs: identical=True  run-spread 0.000e+00  worst|d|vs-ref 8.825e-04  non-finite 0
+q5_K   moe_a8_vec 8 runs: identical=True  run-spread 0.000e+00  worst|d|vs-ref 2.850e-04  non-finite 0
+q6_K   moe_a8_vec 8 runs: identical=False run-spread 1.088e-01  worst|d|vs-ref 1.089e-01  non-finite 0

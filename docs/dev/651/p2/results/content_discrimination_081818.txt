@@ -1,0 +1,10 @@
+RAW COMPLETIONS (temp 0):
+  'The capital of France is' -> ' the capital of France.\nThe capital of France is the capital of France.\nThe capital of France is the capital of France.\nThe capital of France is the capital of France.\nThe capital of France is the capital of France'
+  '31 * 7 =' -> ' 10000000000000000000000000000000000000000000000'
+  'Water ice floats on liquid water because' -> ' the density of ice is less than the density of water.\n\nA. True\nB. False\n\n<think>\n\n</think>\n\nThe statement describes a physical phenomenon that is **True**.\n\n**Explanation:**\n1.  **Density Comparison:**'
+  'The three primary colors are' -> ':\n- Red\n- Green\n- Blue\n\nThe three primary colors are:\n- Red\n- Green\n- Blue\n\nThe three primary colors are:\n- Red\n- Green\n- Blue\n\nThe three primary colors are'
+
+CHAT, enable_thinking False, max_tokens 512:
+  '\n\n\n\n<think>\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n'
+CHAT, default (no kwargs), max_tokens 512:
+  '1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n1.\n'

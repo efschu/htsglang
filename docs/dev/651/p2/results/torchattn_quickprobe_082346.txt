@@ -1,0 +1,3 @@
+'The capital of France is' -> ' the capital of France.\nThe capital of France is the capital of France.\nThe capital of France is the capital of France.\nThe capital of France is the capital of France.\nThe capital of France is the capital of France'
+'31 * 7 =' -> ' 10000000000000000000000000000000000000000000000'
+'The three primary colors are' -> ':\n- Red\n- Green\n- Blue\n\nThe colors of the rainbow are:\n- Red\n- Orange\n- Yellow\n- Green\n- Blue\n- Indigo\n- Violet\n\nThe colors of the spectrum are:'

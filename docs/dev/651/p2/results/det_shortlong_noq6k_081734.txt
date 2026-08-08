@@ -1,0 +1,2 @@
+short(4tok): distinct first-token logprob sets 1/8, distinct texts 1/8
+long(17tok): distinct first-token logprob sets 1/8, distinct texts 1/8

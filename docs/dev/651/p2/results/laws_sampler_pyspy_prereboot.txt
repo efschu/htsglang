@@ -1,0 +1,6 @@
+Process 13802: python /root/lh/laws_sampler.py --out /root/lh/laws_boot.jsonl
+Python v3.12.13 (/root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/bin/python3.12)
+
+Thread 13802 (idle): "MainThread"
+    main (laws_sampler.py:132)
+    <module> (laws_sampler.py:207)

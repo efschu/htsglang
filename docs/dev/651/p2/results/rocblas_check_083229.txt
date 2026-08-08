@@ -1,0 +1,6 @@
+rocBLAS fp16 GEMM vs fp64 CPU reference, serving shapes:
+  (   17,2048,  4096) det=True max|d| 8.803e-04 (rel 4.37e-04)
+  ( 1024,2048,  4096) det=True max|d| 9.779e-04 (rel 4.26e-04)
+  (   17,2048,248320) det=True max|d| 1.103e-03 (rel 4.88e-04)
+  (    1,2048,  5120) det=True max|d| 6.305e-04 (rel 3.64e-04)
+  ( 1024,512,  2048) det=True max|d| 4.940e-04 (rel 4.39e-04)

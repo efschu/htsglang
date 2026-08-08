@@ -1,0 +1,48 @@
+=== IQ2_XS (blk.0.ffn_gate_exps.weight, 512x2048) ===
+  dequant     det=True  worst|d| 3.013e-05 (rel 3.25e-04) nonfin 0
+  mmvq        det=True  worst|d| 7.773e-04 (rel 5.56e-03) nonfin 0
+  mmq         det=False worst|d| 6.550e+04 (rel 3.83e+05) nonfin 131
+=== IQ3_XXS (blk.0.ffn_down_exps.weight, 512x512) ===
+  dequant     det=True  worst|d| 1.517e-05 (rel 2.70e-04) nonfin 0
+  mmvq        det=True  worst|d| 2.187e-04 (rel 4.61e-03) nonfin 0
+  mmq         det=False worst|d| 6.541e+04 (rel 1.08e+06) nonfin 96
+=== IQ4_XS (blk.34.ffn_down_exps.weight, 512x512) ===
+  dequant     det=True  worst|d| 1.717e-05 (rel 1.25e-04) nonfin 0
+  mmvq        det=True  worst|d| 3.414e-04 (rel 3.91e-03) nonfin 0
+  mmq         det=False worst|d| 5.121e+02 (rel 4.44e+03) nonfin 0
+=== Q2_K (blk.40.ffn_gate_exps.weight, 512x2048) ===
+  dequant     det=True  worst|d| 4.578e-05 (rel 2.93e-04) nonfin 0
+  mmvq        det=True  worst|d| 1.433e-03 (rel 4.77e-03) nonfin 0
+  mmq         det=True  worst|d| 1.757e-03 (rel 5.16e-03) nonfin 0
+  moe_a8      det=True  worst|d| 1.788e-03 (rel 5.70e-03) nonfin 0
+  moe_a8_vec  det=True  worst|d| 1.788e-03 (rel 5.70e-03) nonfin 0
+=== Q3_K (blk.40.ffn_down_exps.weight, 512x512) ===
+  dequant     det=True  worst|d| 2.670e-05 (rel 2.50e-04) nonfin 0
+  mmvq        det=True  worst|d| 5.502e-04 (rel 5.04e-03) nonfin 0
+  mmq         det=True  worst|d| 7.560e-04 (rel 5.97e-03) nonfin 0
+  moe_a8      det=True  worst|d| 7.535e-04 (rel 5.64e-03) nonfin 0
+  moe_a8_vec  det=True  worst|d| 7.535e-04 (rel 5.64e-03) nonfin 0
+=== Q4_K (output.weight, 512x2048) ===
+  dequant     det=True  worst|d| 2.005e-04 (rel 7.85e-04) nonfin 0
+  mmvq        det=True  worst|d| 1.484e-03 (rel 5.27e-03) nonfin 0
+  mmq         det=True  worst|d| 4.332e-03 (rel 1.09e-02) nonfin 0
+  moe_a8      det=True  worst|d| 5.403e-03 (rel 1.56e-02) nonfin 0
+  moe_a8_vec  det=True  worst|d| 1.876e-03 (rel 5.43e-03) nonfin 0
+=== Q5_K (token_embd.weight, 512x2048) ===
+  dequant     det=True  worst|d| 1.619e-04 (rel 5.45e-04) nonfin 0
+  mmvq        det=True  worst|d| 7.887e-04 (rel 4.88e-03) nonfin 0
+  mmq         det=True  worst|d| 2.969e-03 (rel 1.47e-02) nonfin 0
+  moe_a8      det=True  worst|d| 2.528e-03 (rel 1.17e-02) nonfin 0
+  moe_a8_vec  det=True  worst|d| 1.085e-03 (rel 5.02e-03) nonfin 0
+=== Q6_K (blk.0.ffn_down_shexp.weight, 512x512) ===
+  dequant     det=False worst|d| 8.613e-01 (rel 7.44e+00) nonfin 78
+  mmvq        det=False worst|d| 2.835e-02 (rel 3.40e-01) nonfin 0
+  mmq         det=True  worst|d| 5.669e-04 (rel 5.10e-03) nonfin 0
+  moe_a8      det=False worst|d| 1.743e-02 (rel 1.41e-01) nonfin 0
+  moe_a8_vec  det=False worst|d| 3.281e-02 (rel 2.65e-01) nonfin 0
+=== Q8_0 (blk.39.attn_k.weight, 512x2048) ===
+  dequant     det=True  worst|d| 6.008e-05 (rel 2.62e-04) nonfin 0
+  mmvq        det=True  worst|d| 1.349e-03 (rel 5.83e-03) nonfin 0
+  mmq         det=True  worst|d| 1.707e-03 (rel 5.65e-03) nonfin 0
+  moe_a8      det=True  worst|d| 1.553e-03 (rel 4.59e-03) nonfin 0
+  moe_a8_vec  det=True  worst|d| 1.553e-03 (rel 4.59e-03) nonfin 0

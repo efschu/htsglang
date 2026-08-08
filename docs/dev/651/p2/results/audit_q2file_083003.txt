@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/root/651-p2/scripts/audit_all_types.py", line 48, in <module>
+    eids = torch.full((npad // b,), 2, dtype=torch.int32)
+                       ~~~~~^^~~
+ZeroDivisionError: integer division or modulo by zero
