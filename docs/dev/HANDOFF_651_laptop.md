@@ -1369,3 +1369,37 @@ incoherent Q3 run = tree runtime regression, bisect on the rig (106-commit
 list pre-scoped, GDN/model-code first). The 19.58-GiB CUDA-context ceiling
 is task #652 (planner/ledger must budget context total, not NVML total) —
 owned by the queue, not this strand.
+
+### 12.14 Standing falsifier rule: corruption proofs use TARGETED byte flips
+
+From the Route B shim falsification (docs/dev/651/cpu_stage/): a can-fail
+proof that flips a RANDOM byte in packed quant data often stays under the
+error gate (low-order nibble) or lands as NaN that nan_to_num masks. The
+standing rule for every packed-weight falsifier in this strand: flip a
+BLOCK-SCALE byte (fp16 `d` at the block head for Q8_0/Q4_K/Q5_K, block tail
+for Q6_K) and require detection as rel >= gate OR non-finite — the same two
+criteria the real gate uses. A falsifier that cannot fail proves nothing;
+a falsifier that only fails on lucky bytes barely proves more.
+
+### 12.15 Q3 fallback on the laptop: decision point (resolve BEFORE relying on it)
+
+Census of UD-Q3_K_XL: {Q6_K 4, Q8_0 259, IQ4_XS 39, IQ3_XXS 78, Q4_K 1,
+Q3_K 2, F32 368, BF16 2} — 117 IQ tensors. On gfx1103 IQ MMQ is
+catastrophically broken (§12.2) while IQ dequantize AND MMVQ audit clean.
+Options for using Q3_K_XL as the laptop fallback quant (§6.0):
+
+1. **PREFERRED: routing containment, no derived file.** Pin IQ types AWAY
+   from MMQ in gguf.py dispatch — dequant+rocBLAS above the token threshold,
+   MMVQ at/below it — the exact inverse of the Q6_K pin (which pins TO MMQ
+   because only MMQ is clean there). Zero size cost; needs the MoE-kernel
+   audit repeated for IQ on gfx1103 before trust (moe_a8/moe_a8_vec were
+   never IQ-audited — the audit harness covers it in minutes at next laptop
+   access).
+2. Requant IQ->Q8_0 derived file: NOT viable — 117 tensors at 3.1-4.3 bpw ->
+   8.5 bpw inflates the file by roughly 2-2.5 GiB per stack class and defeats
+   the point of Q3.
+3. A pure-K-quant Q3 file: upstream also ships UD-Q3_K_M (17,104,402,720 B);
+   its mix is unknown without downloading — census before assuming it avoids
+   IQ. Only worth checking if option 1's IQ MoE audit fails.
+
+Rig discriminator arm 1 is UNAFFECTED (CUDA covers IQ natively).
