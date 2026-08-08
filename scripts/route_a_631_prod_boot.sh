@@ -26,6 +26,17 @@ WT="${WT:-/spinning/wt-631-routea}"
 PY="${PY:-/spinning/htsglang-gpu/.venv/bin/python}"
 MODEL="${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8}"
 PORT="${PORT:-30030}"
+# Bind ALL interfaces so the server is reachable from the local network,
+# not just from this box (operator request 2026-08-08). It previously bound
+# 127.0.0.1, which made it localhost-only: every LAN client -- laptop,
+# phone, the hetero hosts -- got connection refused with no indication why.
+#
+# NOTE, deliberately not hidden: 0.0.0.0 exposes the OpenAI-compatible API
+# to everything that can route to this host, and this server runs without
+# --api-key. That is acceptable on this private rig LAN and is the
+# requested behaviour; put an --api-key (or a firewall rule) in front of it
+# before this box ever sits on an untrusted network.
+HOST="${HOST:-0.0.0.0}"
 # Shipped 2026-08-08 after exclusive KV backing (89572e996d). Each rank
 # sits just under the per-rank PHYSICAL-availability ceiling that
 # _profile_available_bytes enforces at PP sizing time (~22.4 GiB rank 0,
@@ -270,6 +281,6 @@ setsid "$PY" -m sglang.launch_server \
     `# Graduated response to KV pressure rather than a cliff (opt-in:` \
     `# 'auto' cannot map ranks to cards on a mixed-model node).` \
     ${KV_LADDER:+--kv-pressure-ladder "$KV_LADDER"} \
-    --enable-metrics --host 127.0.0.1 --port "$PORT" \
+    --enable-metrics --host "$HOST" --port "$PORT" \
     "$@" >> "$LOG" 2>&1 &
 echo "serving pgid $!  log $LOG"
