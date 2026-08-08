@@ -35,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -62,6 +63,18 @@ is finished."""
 MAX_OUTPUT_CHARS = 4000
 
 
+#: The iGPU wedges intermittently -- `MES failed to respond to msg=REMOVE_QUEUE`
+#: in dmesg, then `GPU reset(N) succeeded` and `device wedged, but recovered
+#: through reset`. Measured rate is low (2 faults in ~35 requests) and the
+#: driver recovers on its own, after which the on-demand service reloads the
+#: model. The user-visible symptom without this retry is a single HTTP 500 that
+#: kills an otherwise fine coding session, so a wedge is treated as a slow
+#: request rather than a failure. RETRY_SLEEP exceeds nothing in particular; the
+#: reload itself takes ~150 s and the wake is what the loop actually waits on.
+WEDGE_RETRIES = 3
+RETRY_SLEEP = 20
+
+
 def call_model(endpoint: str, model: str, messages: list, max_tokens: int) -> str:
     body = json.dumps(
         {
@@ -74,17 +87,38 @@ def call_model(endpoint: str, model: str, messages: list, max_tokens: int) -> st
             "chat_template_kwargs": {"enable_thinking": False},
         }
     ).encode()
-    req = urllib.request.Request(
-        f"{endpoint}/chat/completions",
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    # No timeout ceiling by default: the endpoint is an on-demand service and a
-    # cold model load legitimately takes minutes. A client timeout here would
-    # look like a broken agent.
-    with urllib.request.urlopen(req, timeout=1800) as resp:
-        payload = json.load(resp)
-    return payload["choices"][0]["message"]["content"]
+
+    last: Exception | None = None
+    for attempt in range(1, WEDGE_RETRIES + 1):
+        req = urllib.request.Request(
+            f"{endpoint}/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            # No timeout ceiling by default: the endpoint is an on-demand
+            # service and a cold model load legitimately takes minutes. A client
+            # timeout here would look like a broken agent.
+            with urllib.request.urlopen(req, timeout=1800) as resp:
+                payload = json.load(resp)
+            return payload["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as exc:
+            # 4xx is our own bad request and will fail identically on a retry.
+            if exc.code < 500:
+                raise
+            last = exc
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            # The backend is torn down and relaunched around a reset, so the
+            # socket itself goes away for a while.
+            last = exc
+        if attempt < WEDGE_RETRIES:
+            print(
+                f"[efeu-code] endpoint fault ({last}); the GPU likely reset. "
+                f"Waiting for the model to reload (attempt {attempt}/{WEDGE_RETRIES})."
+            )
+            time.sleep(RETRY_SLEEP)
+
+    raise RuntimeError(f"endpoint failed {WEDGE_RETRIES}x, last error: {last}")
 
 
 def parse_action(text: str):

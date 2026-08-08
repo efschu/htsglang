@@ -82,6 +82,14 @@ BACKEND_LOG_DIR = os.environ.get("HTSGLANG_BACKEND_LOG_DIR", "/root/651-p2/logs"
 #: rejects everything.
 MIN_KV_TOKENS = int(os.environ.get("HTSGLANG_MIN_KV_TOKENS", "4096"))
 
+#: How many times a load may be retried when it comes up under MIN_KV_TOKENS.
+#: Measured pools across identical boots on this box: 13715, 9335, 8351, 4242,
+#: 3578, 1126 -- so a usable pool is likely but not certain on any one attempt,
+#: and three attempts were observed to exhaust themselves in a row while the
+#: user's request waited. Each attempt costs ~150 s, which is the reason this is
+#: a small number rather than an unbounded loop.
+LOAD_ATTEMPTS = int(os.environ.get("HTSGLANG_LOAD_ATTEMPTS", "6"))
+
 #: Paths that must NOT wake the model and must NOT count as activity.
 #: A monitoring probe or a browser tab polling /health would otherwise pin
 #: 22 GiB of RAM forever -- the exact failure this service exists to avoid.
@@ -186,26 +194,30 @@ class Backend:
         return env
 
     async def _start(self) -> None:
-        """Load the model, retrying once if the load lost a race for memory.
+        """Load the model, retrying while the load loses its race for memory.
 
         The retry is not defensive padding. This machine loads 22.7 GiB into
         29.5 GiB of RAM shared with the GPU, and the loader's own KV-budget
         check is decided by how much happened to be free at that instant: the
         SAME configuration has produced a 15070-token pool on one boot and been
         refused on the next. The boot script drops the page cache first, which
-        removes most of that variance; a single retry covers the rest. A second
-        failure is a real refusal and is reported as one rather than looped on,
-        because retrying a configuration that genuinely does not fit would turn
-        a clear error into a hang.
+        does NOT remove the variance -- pools of 1126 and 3578 tokens were
+        measured with that already in place, so the page cache is not the whole
+        story and the lottery is real.
+
+        Three attempts were observed to exhaust themselves in a row, which
+        surfaces to the user as a failed request rather than a slow one, so the
+        budget is LOAD_ATTEMPTS. It stays bounded on purpose: a configuration
+        that genuinely does not fit must end in a clear refusal, not a hang.
         """
         last: Optional[Exception] = None
-        for attempt in (1, 2, 3):
+        for attempt in range(1, LOAD_ATTEMPTS + 1):
             try:
                 await self._start_once(attempt)
                 return
             except web.HTTPBadGateway as exc:
                 last = exc
-                if attempt < 3:
+                if attempt < LOAD_ATTEMPTS:
                     LOG.warning(
                         "load attempt %d failed (%s); retrying", attempt, exc.reason
                     )
@@ -409,9 +421,18 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
     # KB of JSON and the client has already sent it.
     body = await request.read()
 
-    await backend.ensure_up()
+    # Count the request as in-flight BEFORE the load, not after it. A cold load
+    # takes ~150 s and the idle window is 60 s, so a request that arrives to a
+    # parked model used to spend the whole load invisible: _inflight stayed 0
+    # and the idle clock kept running. The watcher then parked the model the
+    # moment the load released the lock -- re-reading the conditions under the
+    # lock does not help, because nothing had touched them. That produced an
+    # endless load -> park -> load loop in which no request was ever served,
+    # and each park tore down live GPU queues (dmesg: MES failed to respond to
+    # msg=REMOVE_QUEUE).
     backend.enter()
     try:
+        await backend.ensure_up()
         headers = {
             k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP
         }
