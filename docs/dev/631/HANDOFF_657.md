@@ -25,6 +25,36 @@ plus corpse I here). Do not re-walk any corpse.
 |---|---|
 | `7eaf003ca3` | **Corpse I**: the TP→PP seam left draft state reachable |
 | `ceb1b6f720` | Armed tp_to_pp now stops prefilling (defect O's other half) |
+| `ae38a0518f` | #652 falsified + soak/corridor tooling |
+| `8d964b060f` | Phase-evidence extract (correlated, not rate-inferred) |
+| `54b688aa95` | **Corpse J**: `int(getattr(req, "req_pool_idx", -1))` on a present-and-None attribute |
+
+### CORPSE J — read this before trusting a soak verdict
+
+The first soak on the corpse-I fix ran **5 minutes** and then killed all
+three ranks at 20:59:45Z on the first line of `_cutover`:
+
+```
+resident_req_identity  ->  int(getattr(req, "req_pool_idx", -1))
+TypeError: int() argument must be ... not 'NoneType'
+```
+
+`req_pool_idx` is `Optional[int] = None`; a Req is visible in
+`last_batch`/`running_mbs`/`chunked_req` from ADMISSION, before its slot is
+allocated. The `-1` default only fires when the attribute is absent, and it
+is not — it is present and None.
+
+**Honest attribution**: the bug is latent in the previous build too, but
+the armed-park narrowing (`ceb1b6f720`) is what began letting flips commit
+BETWEEN prefill chunks, which is the window where an
+admitted-but-unallocated request is reachable. The change created the
+reachability, not the bug. It is the same Optional-None trap that
+`build_flip_live_slots_fn` documents at length one file over.
+
+**This is why the 60-minute bar exists.** The corpse-I fix looked fully
+proven at 4 minutes (219 flip records, 0 deaths, the seam clearing real
+resident requests) and was still one minute away from a different death.
+Do not call a soak green early.
 
 ---
 
@@ -191,6 +221,29 @@ Capture draft decode CUDA graph begin. backend=full
 Capture draft verify CUDA graph begin. backend=full   (num_tokens_per_bs=4, bs=[1,2,3,4])
 ```
 
+**AMENDED ORDER (user, mid-shift): do NOT leave draft graphs on just
+because they capture. Measure, and if they bring nothing, take them out
+and record the number.** So the task is an A/B, not a gap-closure.
+
+Levers found so far:
+
+- `envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH` — gates the draft EXTEND
+  leg only (`eagle_worker_v2.py:965, 2528`;
+  `multi_layer_eagle_worker_v2.py:284`). The decode and verify legs need
+  their own gate identified before a clean three-way A/B.
+- Graphs are captured at BOOT, so "same boot" A/B is impossible in the
+  literal sense. Read the instruction as "same thermal state": this tree
+  has a recorded trap where a boot measured from COLD decays 4106 → 3809
+  tok/s across six reps of one build, which reads as an 8 % regression
+  that does not exist. Interleave A/B/A/B across boots and discard warmup,
+  or the number is worthless.
+- Metric: decode tok/s AND accept-len together. Graphs cannot change
+  accept-len; if accept-len moves, the A/B is contaminated.
+
+**DFLASH x graphs** (also ordered): prior fork history has DFLASH as
+solo-draft neutral-to-negative. A graph win could overturn that verdict;
+a null result closes it. Not started.
+
 **PP prefill graphs**: currently `prefill.backend='disabled'`, and the
 reason is NOT a deliberate choice —
 `Breakable CUDA graph is incompatible with multimodal model; disabling
@@ -209,11 +262,33 @@ Under the soak's 4 s prefill cadence the policy committed **epochs 4→12 in
 injected prompt. Stability held (0 deaths), but the instance spends a large
 fraction of wall time in cutovers.
 
-The prefill hold (§3) is correct and necessary, but it makes arming cheaper
-to satisfy, so the dwell/hysteresis in `phase_policy.py` is now the next
-thing that needs a number. Do not tune it without a measured
-work-done-per-second comparison — the flip is only worth paying for when
-the prefill it moves is larger than the cutover cost.
+Measured consequence under that load: **no decode stream finished 512
+tokens in four minutes** (`decode_tok=0` at 20:58 with `ok=29`), while
+prefill sailed to 413k tokens. Roughly 39 % of wall clock went into
+cutovers (73 real flips x ~1.3 s in ~4 min).
+
+**DO NOT "FIX" THIS BY RAISING `min_dwell`.** I started to and stopped: the
+boot script's `PHASE_POLICY_MIN_DWELL_S=3` is a *measured, deliberate*
+choice, and its own comment carries the falsifier:
+
+```
+min dwell 15s -> ~14300 of 32768 tokens already computed in TP; 1485 tok/s
+min dwell  2s -> policy arms after the FIRST chunk;              4524 tok/s
+```
+
+`min_dwell` gates ARMING, and the §3 admission hold only takes effect once
+armed — so a longer dwell puts prefill straight back in TP at 1485 tok/s,
+re-breaking the very thing this shift fixed. The code comment already names
+the right lever: *"The structural thrash protection is the hysteresis band
+around N, not this."*
+
+**And the finding is partly an artifact of the driver.** A 12000-token
+prompt every 4 s is far more prefill-dominant than real agent traffic;
+each prompt genuinely wants PP and each decode genuinely wants TP, so at
+that cadence the "thrash" is the design working as specified under a load
+no agent produces. The honest next step is to measure the flip-overhead
+fraction under the REAL agent traffic of the green criterion (§8.2) before
+touching any policy constant.
 
 ---
 
