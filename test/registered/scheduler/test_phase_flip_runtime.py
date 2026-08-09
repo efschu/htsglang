@@ -565,12 +565,46 @@ class TestSchedulerSideHelpers(CustomTestCase):
         for over in (
             {"chunked_req": object()},
             {"result_queue": [object()]},
-            {"last_batch": SimpleNamespace(is_empty=lambda: False)},
+            # A request that exists ONLY in last_batch: not yet merged
+            # into the resident set the carry harvests, so flipping now
+            # would leave it behind. Clears itself in one iteration.
+            {"last_batch": SimpleNamespace(reqs=[SimpleNamespace(rid="new")])},
             # An in-flight PP microbatch: the pipeline is not quiet.
             {"mbs": [SimpleNamespace(is_empty=lambda: False)]},
         ):
             sched = self._fake_scheduler(**over)
             self.assertFalse(build_flip_quiescence_fn(sched)(), over)
+
+    def test_last_batch_mirroring_the_resident_set_does_not_block_the_flip(self):
+        """#631 DEFECT L, the regression arm.
+
+        Under event_loop_normal (the TP decode phase) the result is
+        processed in the SAME iteration as the forward, and last_batch is
+        then set to that batch. So at the hook a non-empty last_batch
+        means "requests are resident", not "work is in flight" -- and the
+        old predicate refused on it, which made tp_to_pp unable to reach a
+        quiescent boundary while anything was decoding. Measured on metal
+        03:11:22Z and 03:12:52Z: "NOT QUIESCENT: last_batch is not empty
+        (1 req(s) visible)" on all three ranks, abandoned at the park
+        deadline both times, minutes after pp_to_tp had carried the very
+        same request across the other way.
+
+        The same category error as the _pp_microbatches_drained one: a
+        term that refuses because requests EXIST.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+
+        req = SimpleNamespace(seqlen=3, req_pool_idx=0, rid="r0")
+        running = SimpleNamespace(reqs=[req])
+        sched = self._fake_scheduler(running_batch=running, last_batch=running)
+        self.assertTrue(build_flip_quiescence_fn(sched)())
+        # Same requests, a DIFFERENT batch object: still not an orphan.
+        sched = self._fake_scheduler(
+            running_batch=running, last_batch=SimpleNamespace(reqs=[req])
+        )
+        self.assertTrue(build_flip_quiescence_fn(sched)())
 
     def test_a_resident_decode_set_alone_does_not_block_the_flip(self):
         """THE CONTRACT, and the correction of a measured contradiction.

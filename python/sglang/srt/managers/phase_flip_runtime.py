@@ -224,12 +224,41 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         """
         if getattr(scheduler, "chunked_req", None) is not None:
             return "a chunked prefill is half-written"
-        last_batch = getattr(scheduler, "last_batch", None)
-        if last_batch is not None and not last_batch.is_empty():
-            # Length via getattr: the predicate's contract is is_empty(),
-            # and the diagnostic must not impose a wider one on callers.
-            n = len(getattr(last_batch, "reqs", ()) or ())
-            return f"last_batch is not empty ({n} req(s) visible)"
+        # #631 DEFECT L, and it is the SAME CATEGORY ERROR as the
+        # _pp_microbatches_drained one two paragraphs down -- found the
+        # same way, by a leg that could never commit.
+        #
+        # This used to read "last_batch is not empty". Under
+        # event_loop_normal (the TP decode phase) the result is processed
+        # in the SAME iteration as the forward and ``last_batch = batch``
+        # is set afterwards, so at the hook a non-empty last_batch means
+        # "requests are resident", NOT "work is in flight". A decoding
+        # request makes it non-empty on every iteration for ever, so
+        # tp_to_pp could never reach a quiescent boundary: armed at
+        # 03:11:22Z and 03:12:52Z on all three ranks, "NOT QUIESCENT:
+        # last_batch is not empty (1 req(s) visible)", abandoned at the
+        # park deadline both times, while pp_to_tp had just carried the
+        # same request across the other way without trouble.
+        #
+        # The genuine evidence of pending work is already checked: the
+        # overlap loop's result_queue below, and the PP loop's in-flight
+        # ``mbs`` further down. What remains -- and it is narrower -- is
+        # whether every live request is reachable through the handle the
+        # CARRY harvests. Right after a prefill the new requests are still
+        # only in last_batch and are merged into the running batch by the
+        # next get_next_batch_to_run: a real reason to wait, self-clearing
+        # in one iteration.
+        from sglang.srt.managers.phase_flip_resident_carry import (
+            orphan_resident_reqs,
+        )
+
+        orphans = orphan_resident_reqs(scheduler)
+        if orphans:
+            return (
+                f"{len(orphans)} request(s) are still only in "
+                f"last_batch/last_mbs ({orphans[:4]}) and not yet merged "
+                f"into the resident set the carry harvests"
+            )
         result_queue = getattr(scheduler, "result_queue", None)
         if result_queue is not None and len(result_queue) > 0:
             return f"result_queue holds {len(result_queue)} result(s)"

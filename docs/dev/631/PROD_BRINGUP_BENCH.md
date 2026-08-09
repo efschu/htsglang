@@ -759,3 +759,82 @@ python3 -m sglang.planner --serve --port 8780
 ```
 
 Test family: `bash scripts/run_631_flip_family.sh` — 266/266.
+
+---
+
+## 8. Flipping UNDER LOAD (#631 J.3 and after, 2026-08-09)
+
+Until this section every flip in the feature's history committed with an
+EMPTY pipeline, so "the flip works" was a statement about the flip and
+never about the requests. Three defects sat between that and a flip under
+load, and each was found by a leg that could not commit rather than by
+reading code.
+
+**J.3 -- the cutover dropped the resident decode set.** Step 6 of the
+cutover calls `init_pp_loop_state()`, which rebinds `running_mbs` to
+fresh empty batches -- and under `event_loop_pp` that array IS the
+resident decode set. The stranded KV page and the stranded mamba lock
+(`x_lru.full_lock_ref=1` -> SIGQUIT) were two symptoms of that one
+omission. The carry now lives inside `init_pp_loop_state` itself, because
+`event_loop_pp` calls it again at its own entry and would otherwise wipe
+a carry installed at the cutover. See `phase_flip_resident_carry.py`.
+
+**L -- `tp_to_pp` could not reach quiescence under load.** Under
+`event_loop_normal` the result is processed in the SAME iteration and
+`last_batch = batch` is set afterwards, so a non-empty `last_batch` at
+the hook means "requests are resident", not "work is in flight". The
+predicate refused on it, so the return leg parked and abandoned for as
+long as anything was decoding. Same category error as the
+`_pp_microbatches_drained` one that blocked every automatic flip before
+it. Quiescence now asks the narrower question the carry needs: is every
+live request reachable through the handle the carry harvests?
+
+**M -- the PP chain's ring was read off the live `ps`.** The cutover
+rewrites `ps` per phase and the TP phase gets `pp_rank=0, pp_size=1`, so
+`(pp_rank - 1) % pp_size` made UPSTREAM == SELF on every rank. The
+flip-commit hygiene check then compared a rank's own dict SEND counter
+against its own dict CONSUME counter -- two different wires -- and rank 0,
+the first PP stage, sends proxy dicts and consumes none. Measured: 8889
+withheld rounds, "tensor-dict wire has 24 unconsumed message(s) from rank
+0" (itself), `tp_to_pp` abandoned for want of a quorum it could not form.
+The counters are built once from the PP topology at boot and are now the
+ring's one authority.
+
+### The survival oracle
+
+`scripts/route_a_631_survival_oracle.py` is the standing harness: a
+determined counting probe (chat, thinking off) decodes while the flip
+happens underneath it.
+
+```
+# reference: no flip, records what the build answers when nothing moves
+python3 scripts/route_a_631_survival_oracle.py --port 30030 --reference
+
+# one leg, and both legs under ONE request
+python3 scripts/route_a_631_survival_oracle.py --port 30030 \
+    --direction pp_to_tp --flip-after 15 --limit 700
+python3 scripts/route_a_631_survival_oracle.py --port 30030 --round-trip
+```
+
+Two properties of it are worth keeping, because both were bought with a
+misleading result:
+
+* **It reads COMMIT evidence from the serving log, not from the HTTP
+  response.** `/phase_flip` returns 200 for ARMED; a leg that parks and
+  abandons returns 200 too. A refused leg once read as a green round
+  trip.
+* **The verdict is anchored to the flip point**, not to total length: it
+  counts how many integers are still CORRECT after each cutover. The
+  first probe was a raw completion, and the model editorialised about how
+  far to count -- the no-flip control drifted EARLIER (32 numbers) than
+  the flip run (43), which is what proved the drift was the model and not
+  the cutover.
+
+### `SPEC=off`
+
+`SPEC=off bash scripts/route_a_631_prod_boot.sh` boots the TP decode
+phase without the NEXTN draft worker. It is not a convenience knob: a
+request that prefills in the PP phase has no draft KV, because the PP
+phase carries no draft worker at all, so a carried request entering a
+speculating TP phase raises a second question on top of the carry.
+SPEC=off answers the carry alone.

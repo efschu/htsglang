@@ -862,11 +862,41 @@ class SchedulerPPMixin:
         if counters is not None:
             counters.bump_consumed(chan)
 
+    def _pp_flip_ring(self: Scheduler) -> Tuple[int, int]:
+        """(this rank, ring size) of the PP CHAIN -- not of the live ps.
+
+        #631 DEFECT M. These two helpers used to read ``self.ps``
+        directly, and the cutover REWRITES ps per phase: the TP phase gets
+        pp_rank=0, pp_size=1. The ring then degenerated to
+        ``(0 - 1) % 1 == 0`` on every rank, i.e. UPSTREAM == SELF, and the
+        flip-commit hygiene check compared a rank's own dict SEND counter
+        against its own dict CONSUME counter -- two different wires. Rank
+        0 is the first PP stage: it sends proxy dicts downstream and
+        consumes none, so its imbalance was permanent and grew with the PP
+        phase's traffic.
+
+        Measured 2026-08-09 03:21:08-03:22:08Z: rank 0 WITHHELD presence
+        for 8889 rounds with "tensor-dict wire has 24 unconsumed
+        message(s) from rank 0" -- itself -- and tp_to_pp abandoned for
+        want of a quorum it could never form. No message was ever
+        unconsumed; the ring was.
+
+        The counters are built ONCE from the PP topology at boot, so they
+        are the ring's one authority; everything that needs it reads it
+        from there rather than from a ps the flip rewrites.
+        """
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is not None:
+            return counters.rank, counters.n_ranks
+        return self.ps.pp_rank, self.ps.pp_size
+
     def _pp_flip_upstream(self: Scheduler) -> int:
-        return (self.ps.pp_rank - 1) % self.ps.pp_size
+        rank, n = self._pp_flip_ring()
+        return (rank - 1) % n
 
     def _pp_flip_downstream(self: Scheduler) -> int:
-        return (self.ps.pp_rank + 1) % self.ps.pp_size
+        rank, n = self._pp_flip_ring()
+        return (rank + 1) % n
 
     def pp_flip_consume_inbound(self: Scheduler) -> int:
         """Greedily take every inbound message the upstream says it posted.
