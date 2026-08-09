@@ -1300,3 +1300,32 @@ The goal is very likely reachable by this route alone. It will stop
 earlier than the arithmetic suggests -- `_profile_available_bytes` (bench
 6f's "honest ceiling") binds the PP budget independently of the corridor
 -- so the number to trust is the next measurement, not this paragraph.
+
+### The capacity ladder, measured (successor 17, 2026-08-09)
+
+Three boots, same model / CTX 393216 / token vector, `MAX_TOTAL_TOKENS`
+set equal to the target so it binds BOTH pools (zero unaddressable
+surplus, 6e satisfied as an equality):
+
+| RANK_MIB | cap | serving capacity | corridor min (TP phase) |
+|---|---|---|---|
+| 22700,11920,11970 | 500000 | 253528 | 2739 / 4848 / 2693 |
+| 22700,11920,11970 | 260000 | 253528 | 4931 / 6466 / 4373 |
+| 25700,13920,13970 | 300000 | **300000** | 4483 / 5688 / 4051 |
+| 29200,15920,15970 | 360000 | **360000** | 3803 / 4700 / 3499 |
+
+**+42.0 % serving capacity over the shipped baseline**, with the corridor
+minimum still 2779 / 3676 / 2475 MiB above the 1024 MiB floor. Card 2 is
+the binding one throughout.
+
+Marginal cost, 300000 -> 360000: 680 / 988 / 552 MiB of continuous
+corridor per 60000 tokens. At that rate card 2's remaining 2475 MiB is
+worth roughly 269000 further tokens, i.e. a ~629000-token class -- which
+would meet the >600k full-KV goal. Treat that as the next experiment, not
+a result: `_profile_available_bytes` (6f's "honest ceiling") binds the PP
+budget independently of the corridor and is expected to stop the ladder
+before the corridor does.
+
+Note what did NOT have to happen for any of this: no zero-allocation
+staging, no new machinery, no change to the seam. The capacity was behind
+a cap that had been set above the pools' own sizing.
