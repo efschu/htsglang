@@ -52,6 +52,16 @@ sync
 echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || \
   echo "note: could not drop caches (not root?); load margin will be tighter"
 
+# SNAP655: #655 instrumentation. The KV pool on this APU is the thin residual
+# left after the weights, so what the pool ends up being is decided by host
+# memory state at THIS instant -- after the cache drop, before the 22.7 GiB
+# allocation. Recording it here rather than from outside is the difference
+# between correlating against the real starting condition and correlating
+# against a snapshot taken some seconds and one cache drop earlier.
+if [ -n "${SNAP655_FILE:-}" ]; then
+  /root/651-p2/scripts/memsnap655.sh "postdrop" >> "$SNAP655_FILE" 2>/dev/null || true
+fi
+
 PYTHONPATH=/root/lh/ggufbuild python /root/651-p2/scripts/gpu_sanity_guard_v2.py || {
   echo "GPU sanity guard v2 failed - dequantize is not fit to serve"; exit 1; }
 
@@ -118,6 +128,34 @@ if [ "${HICACHE:-0}" = "1" ]; then
   )
 fi
 
+# KV cache storage dtype. Default "auto" keeps the model dtype and appends
+# NOTHING to the command line, so the established operating point is bit-for-bit
+# the same command it was before this variable existed. fp8_e5m2 / fp8_e4m3
+# halve the per-token cell, which on this machine is the only lever that changes
+# the pool arithmetic at all: the pool is available_bytes // cell_size, and
+# available_bytes here is a ~1.2 GiB residual that no tuning has been able to
+# enlarge. Halving the divisor is worth twice the context from the same residual
+# -- at the cost of a lossy KV, so it stays opt-in.
+# Mamba state slots. Auto-sizing gives this checkpoint 15 slots (0.96 GB of
+# ssm_state) out of a post-weights budget of ~2.3 GB, while the service runs
+# --max-running-requests 1. Everything above the hard demand floor
+# (1 active + 1 ping-pong + 1 donation + 1 pinned checkpoint = 4 slots at this
+# concurrency, see mamba_pool_floor.py) is reuse cache, and on this machine it
+# is cache bought with the entire KV pool: the pool is what survives after the
+# mamba reservation and the GGUF dequant scratch are taken out, which is why it
+# has been landing in the low thousands of tokens. Empty = auto, i.e. unchanged.
+MAMBASLOTS=${MAMBASLOTS:-}
+MAMBA_ARGS=()
+if [ -n "$MAMBASLOTS" ]; then
+  MAMBA_ARGS=(--max-mamba-cache-size "$MAMBASLOTS")
+fi
+
+KVDTYPE=${KVDTYPE:-auto}
+KV_ARGS=()
+if [ "$KVDTYPE" != "auto" ]; then
+  KV_ARGS=(--kv-cache-dtype "$KVDTYPE")
+fi
+
 exec python -m sglang.launch_server \
   --model-path "$MODEL" \
   --served-model-name "${SERVED_NAME:-qwen36-35b-a3b}" \
@@ -134,6 +172,8 @@ exec python -m sglang.launch_server \
   --disable-overlap-schedule \
   --page-size 1 \
   --mem-fraction-static "$MEMFRAC" \
+  "${KV_ARGS[@]}" \
+  "${MAMBA_ARGS[@]}" \
   --chunked-prefill-size "$CHUNKED_PREFILL" \
   "${HICACHE_ARGS[@]}" \
   "${EXPERT_STAT_ARGS[@]}" \
