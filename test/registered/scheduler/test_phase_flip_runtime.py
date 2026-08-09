@@ -606,6 +606,48 @@ class TestSchedulerSideHelpers(CustomTestCase):
         )
         self.assertTrue(build_flip_quiescence_fn(sched)())
 
+    def test_speculating_tp_phase_waits_for_the_resident_set_to_drain(self):
+        """#631: a carried request has NO DRAFT STATE.
+
+        It prefilled in the PP phase, which carries no draft worker by
+        design, so nothing ran the draft_extend a spec instance gives a
+        request after its target extend. Carrying it into a speculating TP
+        phase killed the instance one pass later -- measured 03:32:14Z on
+        all three ranks, "output with shape [1, 1] doesn't match the
+        broadcast shape [0, 1]" inside the draft graph runner's
+        foreach_copy, then SIGQUIT.
+
+        So the rank is NOT READY while anything is resident -- waiting,
+        not refusing at arm time: a rank-local refusal would let one rank
+        decline while its peers armed, and diverging epochs is corpse H.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.phase_flip_runtime import (
+            PP_TO_TP,
+            build_flip_quiescence_fn,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        req = SimpleNamespace(seqlen=3, req_pool_idx=0, rid="r0")
+        running = SimpleNamespace(reqs=[req])
+
+        def _sched(algo, reqs):
+            s = self._fake_scheduler(running_batch=SimpleNamespace(reqs=reqs))
+            s.flip_spec_algorithm = SpeculativeAlgorithm.from_string(algo)
+            s.phase_flip_runtime = SimpleNamespace(pending=PP_TO_TP)
+            return s
+
+        # Speculating TP phase + a resident request -> hold.
+        sched = _sched("NEXTN", [req])
+        self.assertFalse(build_flip_quiescence_fn(sched)())
+        self.assertIn("no draft state", build_flip_quiescence_fn(sched).why_not())
+        # Speculating, but nothing to carry -> the flip may go (this is
+        # the regime every flip before the carry ran in).
+        self.assertTrue(build_flip_quiescence_fn(_sched("NEXTN", []))())
+        # No speculation -> the carry handles it; residents do not hold.
+        self.assertTrue(build_flip_quiescence_fn(_sched(None, [req]))())
+
     def test_a_resident_decode_set_alone_does_not_block_the_flip(self):
         """THE CONTRACT, and the correction of a measured contradiction.
 
