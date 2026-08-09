@@ -18,6 +18,7 @@ import faulthandler
 import logging
 import math
 import os
+import re
 import signal
 import sys
 import time
@@ -324,6 +325,11 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+#: #631: the phase policy's hold reasons carry live numbers, so the log
+#: throttle keys on the reason with its digits removed -- the SHAPE of the
+#: hold rather than its instantaneous value.
+_POLICY_REASON_DIGITS = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 
 # Runtime HiCache resize requests are expressed in GiB.
 _GIB = 1024**3
@@ -6985,12 +6991,23 @@ class Scheduler(
             # reason readable from the same log as everything else -- the
             # same bet as the withhold reason and the quiescence reason,
             # both of which named a defect in a single boot.
+            #
+            # THROTTLE ON A NUMBER-FREE KEY. The reason string carries live
+            # quantities ("min dwell: 13.4s since last flip"), so keying on
+            # the string itself made every call look like a NEW reason and
+            # the throttle never engaged -- three identical lines inside one
+            # second, measured on the very boot that introduced it. A
+            # 12765-line log flood has already cost this feature a self-kill
+            # once (see the origin guard in request_receiver), so the key is
+            # the reason with its digits removed: the SHAPE of the hold, not
+            # its instantaneous value.
             now_mono = inp.now
             last = getattr(self, "_phase_policy_last_log", 0.0)
             prev = getattr(self, "_phase_policy_last_reason", None)
-            if decision.reason != prev or now_mono - last >= 10.0:
+            key = _POLICY_REASON_DIGITS.sub("#", decision.reason)
+            if key != prev or now_mono - last >= 10.0:
                 self._phase_policy_last_log = now_mono
-                self._phase_policy_last_reason = decision.reason
+                self._phase_policy_last_reason = key
                 logger.info(
                     "PHASE-POLICY holding in %s: %s (pending prefill %d tok, "
                     "running bs %d)",
