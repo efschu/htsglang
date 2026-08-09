@@ -126,6 +126,25 @@ fi
 
 export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH="/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
+# THE CORRIDOR KNOB, and it is not --rank-gpu-memory-mib (#631, measured
+# 2026-08-09). torch's caching allocator expands into whatever the KV pool
+# does not take and, with the default segment allocator, never returns
+# those pages to the driver -- so the free-VRAM minimum on a card doing
+# heavy prefill converges toward zero no matter how the per-rank budget is
+# set. Two shifts iterated the budget against this. Same load, same
+# budget, only this variable changed:
+#
+#   card    MIN free default -> expandable_segments    breaches
+#   3080a        54 ->  146                             2356 -> 2447
+#   5090        804 -> 1672                             1400 ->    0
+#   3080b       292 ->  448                             2355 ->  703
+#
+# The 5090 goes from breaching to HOLDING the 1024 MiB floor outright.
+# 100/100 requests ok, 0 aborted, and the post-idle 32768-token probe
+# still prefills in PP at 4507 tok/s, so nothing was paid for it here.
+# Overridable because it interacts with CUDA graph capture and the VMM
+# arena, and an A/B needs the old behaviour reachable on purpose.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 # The flip's TP phase token-shards KV under the WEIGHTED owner rule; the
 # boot builder REFUSES without this pair (phase_flip_boot).
