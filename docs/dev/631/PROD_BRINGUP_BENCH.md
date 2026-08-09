@@ -905,3 +905,36 @@ A flip attempted minutes after such a session takes the instance down in
 `phase_flip_runtime._live` (`torch.cat` of a 1-D and a 3-D part). See
 HANDOFF_656 v14 section 4 for the reproduction and for why reshaping is the
 wrong fix.
+
+### Long-context configuration: the full acceptance run (2026-08-09, updated)
+
+The recipe above is now the configuration serving runs on, and its
+acceptance evidence is one unattended log carrying every axis at once:
+`/spinning/evidence-631/unmanned_acceptance_20260809T160920Z/`.
+
+    33 PHASE-FLIP DONE tp + 36 DONE pp    both directions, policy-driven
+    126 armed, 57 abandoned (38 for staging room while the pool was full)
+    150 accept-len lines, 150 CUDA-graph decode passes
+    WIRE accept-len: spec_accept_length 9.52, rate 0.36, 7 requests
+    bs=1 session 276255 tokens, three depth needles verbatim
+    80/80 requests ok, 0 aborted, health 200 at the end
+    CORRIDOR HELD: 1210 / 3310 / 1386 MiB min free, 0 breaches
+
+Two measurement notes worth keeping:
+
+* **accept-len is not on the OpenAI route.** `/v1/chat/completions` returns
+  an empty `meta_info`; the counters are on native `/generate`, and only for
+  a request that actually speculated -- which here means one that verified
+  in TP. A short request at rest runs entirely in PP and returns nothing,
+  which is correct and looks exactly like a broken wire. Use
+  `scripts/route_a_631_wire_accept_probe.py`, which issues concurrent decode
+  work to move the policy into TP first.
+* **A flip at full pool is refused, not attempted.** 38 of the 57 abandons
+  in this run were the staging guard: at 0.99+ occupancy the exchange wants
+  4887-6984 MiB of staging and cannot have it without eating the 1024 MiB
+  reserve. Serving continues in the current layout. This is why the long
+  session no longer takes the instance down.
+
+The `_live()` crash that kept this configuration off the default in the
+previous entry is fixed (`ce61812870`); the reproduction now runs as PHASE 3
+of the unmanned acceptance script.

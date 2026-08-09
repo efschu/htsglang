@@ -3008,3 +3008,114 @@ the reproduction:
 2. The `/generate`-in-TP step in the orchestrator, so the ONE log carries
    the wire accept-len too.
 3. The A-vs-A gate, then `PROD_BRINGUP_BENCH.md`.
+
+---
+---
+
+# HANDOFF v15 — written 2026-08-09 by successor #12 (second stretch)
+
+Coordinator's three gaps after v14. **Two are closed, the third is not
+started and is set up ready to run.**
+
+## 1. THE `_live()` DEFECT IS ROOT-CAUSED AND FIXED (`ce61812870`)
+
+Not a reshape. The cause is that `Req.req_pool_idx` is `Optional[int]` and
+starts as None, while a Req is visible in `last_batch` / `running_mbs` /
+`chunked_req` from the moment it is ADMITTED — before a slot exists for it.
+And `None` as an index is **numpy-style newaxis**, so
+
+    req_to_token[None, :n]   on a (R, C) table  ->  (1, n, C), i.e. 3-D
+
+which is what met the tree's 1-D values in `torch.cat`. It is the ONLY
+producer of a 3-D part there (the tree's values are a cat of 1-D node
+values; every other part is a 1-D row slice), and the error's own wording
+agrees — "got 1 and 3" means the first part was 1-D and a LATER one, i.e. a
+row slice, was 3-D.
+
+Fixed by skipping requests without a slot, with a logged count. **Skipping
+is correct, not convenient**: `req_to_token` is indexed BY `req_pool_idx`,
+so a request without one cannot own a row and holds no KV a flip could
+leave behind — the silent-wrong-context class this function exists to
+prevent. Reshaping to 1-D, the tempting fix, would have injected
+`max_context_len` worth of unrelated integers into the live set as if they
+were slot ids: the flip moves the wrong rows and corrupts quietly.
+
+Note for the corpse table: **this was never long-context-specific.** The
+long session only made flips arm and re-attempt far more often (each
+abandoned for staging room while the pool was full), which widened the
+window in which the hook coincides with an admission.
+
+**Can-fail proven by mutation**: with the guard line deleted, 3 of the 6 new
+cases fail and the first reproduces `got 1 and 3` exactly; restored, 6 pass.
+
+**METAL-UNCONFIRMED, and it must not be written up as more than it is:** the
+skip path has **not been observed firing**. Its counter read 0 through the
+whole acceptance run and through a deliberate 48-request arrival burst
+afterwards. The race needs a flip to be EXECUTING at the moment a request is
+admitted-but-unallocated, and it did not recur. What IS metal-proven is that
+the recipe which killed the previous instance now completes with the server
+healthy. The guard is a proven-possible state handled correctly, not an
+observed-and-then-handled one.
+
+## 2. THE UNMANNED ACCEPTANCE LOG, ALL AXES, ON THE LONG-CONTEXT CONFIG
+
+`/spinning/evidence-631/unmanned_acceptance_20260809T160920Z/` — one
+unattended run on the target configuration (YaRN overlay, ctx 393216,
+`--gdn-resident-state-slots 10`), no client ever posted `/phase_flip`:
+
+    PHASE-FLIP DONE tp : 33      PHASE-FLIP DONE pp : 36   (both directions)
+    armed 126, abandoned 57, of those 38 for staging room
+    accept-len lines 150, CUDA-graph decode passes 150
+    WIRE accept-len (meta_info, native /generate):
+        spec_accept_length 9.52, spec_accept_rate 0.36, over 7 requests
+    bs=1 long session: 276255 tokens (> 262144), three depth-planted
+        needles (3 % / 55 % / 95 %) all returned VERBATIM
+    KV pool per phase: size=277468, free 267160..273001 at arm
+    80/80 requests ok, 0 ABORTED; health 200 at the end
+    live-slot dimension errors: 0
+    CORRIDOR: 100 ms sampling, floor 1024
+        min free 1210 / 3310 / 1386 MiB, 0 breaches on every card
+        CORRIDOR HELD: True
+
+The wire gate needed its own step and here is why, so nobody re-derives it:
+`/v1/chat/completions` returns an **empty `meta_info`**; the spec counters
+are on native `/generate`, and only for a request that actually
+speculated — which on this instance means one that verified in **TP**. A
+single short request at rest runs entirely in PP, draws no drafts, and
+returns no counters. That is correct behaviour that looks exactly like a
+missing wire. `scripts/route_a_631_wire_accept_probe.py` therefore issues
+concurrent decode work to move the policy into TP, and it is deliberately
+placed AFTER the long session so it doubles as section 1's reproduction.
+
+**Serving is left on this long-context configuration**, healthy, as ordered.
+
+## 3. A-vs-A GATE vs `9a929352c9` — NOT RUN, and set up ready
+
+Honest: I stopped rather than start a three-boot sequence I could not
+finish, which would have ended with serving on a baseline config instead of
+the target one.
+
+What is already done: the worktree exists at **`/spinning/wt-631-baseline`**
+(detached at `9a929352c9`, an ancestor 91 commits back).
+
+The recipe, and the one design point that needs deciding rather than
+assuming: the gate is about the **non-flip default path**, so BOTH boots
+must run WITHOUT `--enable-phase-flip`. `route_a_631_prod_boot.sh` always
+passes it, so neither tree's script can be used as-is — a plain PP=3 boot
+command is needed, identical apart from `WT`/`PYTHONPATH`. Then, per the
+benchmark rules: A-vs-A noise floor INSIDE each boot first (warmup
+discarded, back-to-back reps, content axis fixed), and only then quote the
+cross-commit delta against that spread. `scripts/route_a_631_prefill_ab.py`
+has the same-boot discipline to copy but measures PP-vs-TP, not
+commit-vs-commit.
+
+## 4. State
+
+- HEAD `ce61812870` on `feat/route-a-631`, tree clean.
+- **Suite 565 passed** (was 559 at v14, 540 at v13).
+- Serving: the long-context config, health 200.
+- Remaining before ship: the A-vs-A gate, and then whether the staging
+  abandons (38 in this run, all while the pool was full) should feed back
+  into the policy so it stops arming a flip it cannot afford — right now the
+  policy arms, the runtime refuses, and the cost is only log volume, but it
+  is arming 126 times to commit 69.
