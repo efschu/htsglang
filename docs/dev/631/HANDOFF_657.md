@@ -477,6 +477,25 @@ pending prefill, then let `min_dwell` bound the return. The correct
 constant is a measurement: compare tokens-delivered-per-second across the
 whole mix, not prefill throughput alone.
 
+**DECIDE THIS BEFORE ANYTHING ELSE: does defect K manifest under REAL
+traffic?** The soak load is 12000 prefill tokens every 4 s, which is
+prefill-SATURATED and keeps pending permanently above N. Real agent
+traffic arrives in bursts and is then decode-dominated, so pending should
+fall below N between bursts and `pp_to_tp` should arm normally. It is
+therefore genuinely unclear whether K is a production defect or an
+artifact of my driver. Run the green-criterion traffic (§8.2) FIRST and
+read the same extract:
+
+  * if decode lands in TP under real traffic -> K is a driver artifact,
+    keep the hold, tune the policy term at leisure;
+  * if decode still parks in PP -> K is a production defect and the
+    policy term becomes the top blocker.
+
+**Do NOT revert `ceb1b6f720` reflexively.** It fixed a measured defect
+(prefill 1016 -> 4043 tok/s) and reverting restores the 73-flips-in-4-min
+thrash. Both behaviours are the one policy gap; pick the fix, not the
+rollback.
+
 **Verdict impact.** Criterion (c) of §8.1 is **NOT met** in its intended
 sense: flips do commit in both directions (6/6), but decode is not landing
 in TP. Stability (a), (b) and the corridor (d) are green so far. A soak
