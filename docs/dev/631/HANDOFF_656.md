@@ -3250,3 +3250,38 @@ is: with the feedback removed, a full-pool fixture arms repeatedly.
 - Serving: the long-context target config of section 1, health 200,
   auto-flipping.
 - GPU arbitration holder released, heartbeat stopped first.
+
+## 7. Ship record (2026-08-09)
+
+- Gate commit `4813e7b371`, wheel/gitignore commit `b7dbfb9c0c` (the tip).
+- Pushed to the fork as a **fast-forward**: `89bd1c569f..b7dbfb9c0c` on
+  `feat/route-a-631`. No force-push; the published base is untouched.
+
+**Why the branch had not been pushable, and what was done about it.** Two
+independent pre-receive rejections stood between this work and the fork, both
+inherited rather than introduced by this shift:
+
+1. A **206 MB `nvidia_nccl_cu13` wheel** under `.deps/` had been committed by
+   accident. GitHub rejects any blob over 100 MB (GH001).
+2. **71 of the 109 unpushed commits carried a private email address**
+   (`...@googlemail.com`) as author and committer, which GitHub's email
+   privacy protection refuses (GH007). The already-published history uses
+   `efschu@users.noreply.github.com`; the divergence started after
+   `89bd1c569f`, which is exactly why nothing had been pushed since.
+
+Both were fixed by rewriting **only the unpushed range** `89bd1c569f..HEAD`
+with `git filter-branch` (an index-filter for the blob, an env-filter for the
+address), so the published base is preserved and the push stays a
+fast-forward. Verified after each rewrite: the content diff against the
+pre-rewrite tree is the single blob and nothing else, all commits are
+preserved, no blob above 20 MB remains in the range, every author and
+committer is `efschu`, and no commit carries a trailer. Backup refs
+`backup/pre-deps-strip-s13` and `backup/pre-email-fix-s13` are kept locally.
+
+`.deps/*.whl` is now gitignored so this cannot recur; the wheel itself was
+restored to disk as an untracked artifact and the tracked
+`.deps/nccl2307/` headers are unaffected.
+
+**Set `git config user.email` correctly before committing here** -- the repo
+config already holds the right address; the two commits above initially went
+in with an explicit override that had to be undone.
