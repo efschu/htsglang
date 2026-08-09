@@ -476,6 +476,108 @@ class PhaseFlipPresence:
     def all_present(self, epoch: int, round_: int = 0) -> bool:
         return len(self.observe(epoch, round_)) == self.n_ranks
 
+    # -- H: publishable withdrawal, as a SECOND monotone marker -----------
+    #
+    # Monotonicity survives PER MARKER: presence is still write-once and is
+    # never mutated or cleared. Withdrawal and entry are their own
+    # write-once markers, each with a single writer (its own rank). Nothing
+    # here reintroduces the ordering problem that made flags monotone.
+    #
+    # WHY A WITHDRAWAL MARKER AT ALL (corpse H, measured 00:07:34Z): a
+    # pre-entry abandonment is rank-local and mints a new epoch, but it
+    # cannot retract the presence marker it already wrote. Rank 0 abandoned
+    # epoch 0 and re-armed at epoch 1 while ranks 1 and 2 formed a full
+    # epoch-0 quorum ON RANK 0'S STALE FLAG and entered a reduction it
+    # would never join. Evidence that a rank has LEFT is exactly as
+    # load-bearing as evidence that it arrived.
+    #
+    # THE INVARIANT that makes the two-phase dance sound:
+    #   A WITHDRAWAL IS ONLY EFFECTIVE IF NOBODY COMMITTED ON IT.
+    #   Any commit converts every committed-or-withdrawing rank into an
+    #   enterer.
+    # Concretely: WITHDRAWN(rank) counts only while ENTERING(rank) does not
+    # exist. A rank that has published both is ENTERING -- it discovered a
+    # peer had already committed on its presence, so it follows through.
+    # That is what makes the outcome deterministic instead of a race: there
+    # is no interleaving in which one rank enters and another stays out.
+
+    def _marker(self, kind: str, epoch: int, rank: int, round_: int) -> str:
+        return os.path.join(
+            self.directory,
+            f"{self.instance}.e{int(epoch)}.n{int(round_)}.{kind}{int(rank)}",
+        )
+
+    def _write_once(self, path: str, body: str) -> None:
+        if os.path.exists(path):
+            return
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w") as fh:
+                fh.write(body)
+            os.replace(tmp, path)
+        except OSError as exc:  # pragma: no cover - disk-full etc.
+            logger.error("%s could not write %s: %s", LOG_PREFIX, path, exc)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def declare_entering(self, epoch: int, round_: int = 0) -> None:
+        """Publish that THIS rank is committing to enter (e, round_).
+
+        Written BEFORE the final quorum re-check, so a peer contemplating
+        withdrawal can always see that someone is on the way in.
+        """
+        self._write_once(
+            self._marker("g", epoch, self.rank, round_),
+            f"entering rank={self.rank} epoch={epoch} round={round_}\n",
+        )
+
+    def declare_withdrawn(self, epoch: int, round_: int = 0) -> None:
+        """Publish that THIS rank is leaving (e, round_) without entering."""
+        self._write_once(
+            self._marker("w", epoch, self.rank, round_),
+            f"withdrawn rank={self.rank} epoch={epoch} round={round_}\n",
+        )
+
+    def entering(self, epoch: int, round_: int = 0) -> Set[int]:
+        return {
+            r
+            for r in range(self.n_ranks)
+            if os.path.exists(self._marker("g", epoch, r, round_))
+        }
+
+    def withdrawn(self, epoch: int, round_: int = 0) -> Set[int]:
+        """Ranks that have EFFECTIVELY withdrawn.
+
+        A rank carrying both markers is an enterer, not a withdrawer -- see
+        the invariant above. Resolving the conflict HERE, in one place,
+        is what keeps every caller from having to reason about the race.
+        """
+        going_in = self.entering(epoch, round_)
+        return {
+            r
+            for r in range(self.n_ranks)
+            if os.path.exists(self._marker("w", epoch, r, round_))
+            and r not in going_in
+        }
+
+    def quorum(self, epoch: int, round_: int = 0) -> bool:
+        """The entry predicate: everyone present AND nobody withdrawn."""
+        return self.all_present(epoch, round_) and not self.withdrawn(
+            epoch, round_
+        )
+
+    def may_withdraw(self, epoch: int, round_: int = 0) -> bool:
+        """May this rank still leave without entering?
+
+        No, once ANY peer has declared it is entering: that peer committed
+        on this rank's presence and is now on its way into a blocking
+        reduction. Leaving would strand it there -- the exact shape of the
+        fatal timeout at 00:09:39Z.
+        """
+        return not (self.entering(epoch, round_) - {self.rank})
+
     def sweep(self, keep_epoch: Optional[int] = None) -> int:
         """Drop markers from older epochs. Housekeeping only.
 

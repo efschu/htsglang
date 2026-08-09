@@ -805,8 +805,10 @@ def _runtime_stub(
     r._phase = PHASE_PP
     r.presence_timeouts = 0
     r._clock = clock or (lambda: 0.0)
-    r._await_group_presence = PhaseFlipRuntime._await_group_presence.__get__(r, R)
-    r._abandon_no_quorum = PhaseFlipRuntime._abandon_no_quorum.__get__(r, R)
+    r._sleep = lambda _s: None
+    r._presence_poll_interval_s = 0.0
+    for _n in ("_await_group_presence", "_abandon_no_quorum", "_commit_to_entering"):
+        setattr(r, _n, getattr(PhaseFlipRuntime, _n).__get__(r, R))
     return r
 
 
@@ -1295,6 +1297,7 @@ def _onround_stub(presence, ready, clock=None, deadline=60.0, pending="pp_to_tp"
         "_spin_for_group_presence",
         "_abandon_no_quorum",
         "_park_expired",
+        "_commit_to_entering",
     ):
         setattr(r, name, getattr(PhaseFlipRuntime, name).__get__(r, R))
     return r
@@ -1420,3 +1423,112 @@ def test_spin_does_not_return_to_the_caller_between_polls(tmp_path):
         "the gate returned to its caller instead of spinning; the rank "
         "would meet its top-of-pass commit before it could enter"
     )
+
+
+# -- H: publishable withdrawal, and the tie-break ------------------------------
+#
+# THE INVARIANT: a withdrawal is only effective if nobody committed on it.
+# Any commit converts every committed-or-withdrawing rank into an enterer,
+# so there is no interleaving in which one rank enters and another stays
+# out. Monotonicity survives per marker -- presence, WITHDRAWN and ENTERING
+# are each write-once with a single writer.
+
+
+def test_can_fail_a_stale_flag_from_a_withdrawn_rank_does_not_form_a_quorum(
+    tmp_path,
+):
+    """CORPSE H, measured 00:07:34Z. Rank 0 abandoned epoch 0 and re-armed
+    at epoch 1 while ranks 1 and 2 formed a full epoch-0 quorum on rank 0's
+    STALE presence flag and entered a reduction it would never join."""
+    ranks = [_presence(tmp_path, rank=r) for r in range(3)]
+    for r in ranks:
+        r.announce(1, round_=0)
+    assert ranks[1].quorum(1, round_=0) is True
+
+    # Rank 0 hits its pre-entry bound and leaves. Its presence marker is
+    # NOT cleared -- it never can be -- so only a published withdrawal can
+    # stop the others counting it.
+    ranks[0].declare_withdrawn(1, round_=0)
+    assert ranks[1].quorum(1, round_=0) is False, (
+        "a rank that has withdrawn still counted toward the quorum; its "
+        "peers enter a reduction it will never join and the group dies on "
+        "the collective timeout (00:09:39Z)"
+    )
+    assert ranks[1].all_present(1, round_=0) is True, "presence stays monotone"
+    assert ranks[1].withdrawn(1, round_=0) == {0}
+
+
+def test_tie_break_forces_the_withdrawer_in_when_a_peer_committed(tmp_path):
+    """THE RACE, and the rule that closes it. A peer that has published
+    ENTERING committed on this rank's presence and is on its way into a
+    blocking reduction. This rank may no longer leave."""
+    ranks = [_presence(tmp_path, rank=r) for r in range(3)]
+    for r in ranks:
+        r.announce(1, round_=0)
+
+    ranks[1].declare_entering(1, round_=0)
+    assert ranks[0].may_withdraw(1, round_=0) is False, (
+        "a rank was allowed to withdraw after a peer had committed to "
+        "entering on its presence -- that strands the peer"
+    )
+
+    # It follows through instead. Even having already published WITHDRAWN
+    # (the write/re-check race), ENTERING wins and it stops counting as
+    # withdrawn -- so the quorum re-forms rather than deadlocking.
+    ranks[0].declare_withdrawn(1, round_=0)
+    ranks[0].declare_entering(1, round_=0)
+    assert ranks[0].withdrawn(1, round_=0) == set(), (
+        "a rank carrying BOTH markers was treated as withdrawn; the "
+        "invariant is that any commit converts it into an enterer"
+    )
+    assert ranks[1].quorum(1, round_=0) is True
+
+
+def test_withdrawal_is_permitted_while_nobody_has_committed(tmp_path):
+    ranks = [_presence(tmp_path, rank=r) for r in range(3)]
+    ranks[0].announce(1, round_=0)
+    assert ranks[0].may_withdraw(1, round_=0) is True
+    # This rank's OWN entering marker must not block its own withdrawal.
+    ranks[0].declare_entering(1, round_=0)
+    assert ranks[0].may_withdraw(1, round_=0) is True
+
+
+def test_withdrawal_is_scoped_to_its_own_round(tmp_path):
+    """A withdrawal from round 0 must not condemn round 1 -- same scoping
+    discipline as presence."""
+    ranks = [_presence(tmp_path, rank=r) for r in range(3)]
+    for r in ranks:
+        r.announce(1, round_=0)
+        r.announce(1, round_=1)
+    ranks[0].declare_withdrawn(1, round_=0)
+    assert ranks[1].quorum(1, round_=0) is False
+    assert ranks[1].quorum(1, round_=1) is True
+
+
+def test_can_fail_entering_rank_waits_out_a_withdrawal_then_enters(tmp_path):
+    """The entering side of the tie-break: seeing a WITHDRAWN at the final
+    re-check, the rank waits -- and that wait TERMINATES by construction,
+    because its own ENTERING marker forces the withdrawer to follow
+    through."""
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    presence = _presence(tmp_path, rank=0)
+    peers = [_presence(tmp_path, rank=r) for r in (1, 2)]
+    for p in peers:
+        p.announce(1, round_=0)
+    # Rank 2 withdrew just before rank 0 committed.
+    peers[1].declare_withdrawn(1, round_=0)
+
+    r = _runtime_stub(presence)
+    polls = {"n": 0}
+
+    def _sleep(_s):
+        polls["n"] += 1
+        if polls["n"] == 2:
+            # The tie-break fires: rank 2 sees rank 0 ENTERING and follows.
+            peers[1].declare_entering(1, round_=0)
+
+    r._sleep = _sleep
+    r._commit_to_entering(1, 0)
+    assert polls["n"] == 2, "the enterer did not wait for the withdrawal to resolve"
+    assert presence.withdrawn(1, round_=0) == set()

@@ -1459,7 +1459,11 @@ class PhaseFlipRuntime:
 
         # A rank that is withholding cannot be part of a full quorum (its
         # own flag is down), so this is skipped rather than merely false.
-        if not owes and self._presence.all_present(epoch, round_=entry_round):
+        # #631 H: the predicate is now "everyone present AND nobody
+        # withdrawn". A stale presence flag from a rank that has since
+        # abandoned must not form a quorum -- that is corpse H.
+        if not owes and self._presence.quorum(epoch, round_=entry_round):
+            self._commit_to_entering(epoch, entry_round)
             waited = self._clock() - self._presence_wait_started
             self._presence_wait_started = None
             # RE-BASE THE PARK CLOCK ON GROUP ASSEMBLY. The park deadline
@@ -1500,10 +1504,71 @@ class PhaseFlipRuntime:
 
         waited = self._clock() - self._presence_wait_started
         if waited >= self._presence_deadline_s:
+            # #631 H, THE WITHDRAWAL SIDE. Leaving is only permitted while
+            # no peer has committed on this rank's presence. If one has,
+            # this rank is still at the hook and owes it the reduction --
+            # so it follows through instead of stranding it. That is the
+            # invariant: any commit converts a withdrawing rank into an
+            # enterer, and there is no interleaving where one enters and
+            # another stays out.
+            if not self._presence.may_withdraw(epoch, round_=entry_round):
+                logger.warning(
+                    "%s pre-entry bound expired for epoch %d round %d, but a "
+                    "peer is already ENTERING on this rank's presence -- "
+                    "following through into the reduction rather than "
+                    "stranding it",
+                    LOG_PREFIX,
+                    epoch,
+                    entry_round,
+                )
+                self._commit_to_entering(epoch, entry_round)
+                self._presence_wait_started = None
+                return True
+            self._presence.declare_withdrawn(epoch, round_=entry_round)
+            # Re-check AFTER publishing: a peer may have committed in the
+            # window between the check and the write.
+            if not self._presence.may_withdraw(epoch, round_=entry_round):
+                logger.warning(
+                    "%s withdrawal raced a peer's entry for epoch %d round "
+                    "%d -- following through into the reduction",
+                    LOG_PREFIX,
+                    epoch,
+                    entry_round,
+                )
+                self._commit_to_entering(epoch, entry_round)
+                self._presence_wait_started = None
+                return True
             missing = self._presence.missing(epoch, round_=entry_round)
             self._presence_wait_started = None
             return self._abandon_no_quorum(epoch, missing, waited)
         return None
+
+    def _commit_to_entering(self, epoch: int, entry_round: int) -> None:
+        """#631 H phase one: publish the intent to enter, then settle.
+
+        Written BEFORE this rank actually enters, so a peer at its own
+        pre-entry bound can see that someone has committed on its presence
+        and is therefore forbidden from withdrawing. If a withdrawal is
+        already visible, waiting is SAFE and terminates by construction:
+        this rank's ENTERING marker forces that withdrawer to follow
+        through, at which point it stops counting as withdrawn.
+        """
+        self._presence.declare_entering(epoch, round_=entry_round)
+        if not self._presence.withdrawn(epoch, round_=entry_round):
+            return
+        deadline = self._clock() + self._presence_deadline_s
+        while self._presence.withdrawn(epoch, round_=entry_round):
+            if self._clock() >= deadline:
+                logger.error(
+                    "%s epoch %d round %d: a peer stayed WITHDRAWN despite "
+                    "this rank ENTERING. The tie-break should have forced "
+                    "it in; entering anyway would strand this rank.",
+                    LOG_PREFIX,
+                    epoch,
+                    entry_round,
+                )
+                return
+            self._sleep(self._presence_poll_interval_s)
 
     def _abandon_no_quorum(self, epoch: int, missing, waited: float):
         """Pre-entry abandonment: loud, safe, and retryable.
