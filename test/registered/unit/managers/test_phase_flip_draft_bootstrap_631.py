@@ -37,9 +37,11 @@ from sglang.srt.managers.phase_flip_draft_bootstrap import (
     batch_needs_bootstrap,
     build_bootstrap_draft_input,
     clear_bootstrap,
+    bootstrap_clock_report,
     committed_slots,
     draft_kv_layer_ids,
     draft_kv_pool,
+    pending_tokens,
     retune_carried_batches_for_phase,
     scrub_draft_kv,
 )
@@ -79,10 +81,18 @@ class FakeReq:
 
 
 class FakeBatch:
-    def __init__(self, reqs, seq_lens):
+    def __init__(self, reqs, seq_lens, input_ids=None):
         self.reqs = list(reqs)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64)
         self.spec_info = None
+        # The pending token per request, exactly as a decode batch carries
+        # it. Defaults to each request's last output token, which is what
+        # the two clocks look like when they AGREE.
+        if input_ids is None:
+            input_ids = [
+                (r.output_ids or r.origin_input_ids)[-1] for r in self.reqs
+            ]
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int64)
 
 
 class FakeReqToTokenPool:
@@ -299,10 +309,51 @@ def test_seed_falls_back_to_the_prompt_tail_before_any_output():
     assert seed.bonus_tokens.tolist() == [32]
 
 
-def test_seed_refuses_a_request_with_no_tokens_at_all():
+def test_the_root_is_the_batch_s_pending_token_not_the_output_tail():
+    """The two clocks, disagreeing -- which is the case that corrupts.
+
+    ``output_ids`` is written by the batch RESULT processor and
+    ``input_ids`` at the end of the previous run_batch, so at a boundary
+    where a forward advanced the KV but its result was not processed they
+    differ by one token. The trivial verify ALWAYS accepts its root, so
+    taking the wrong one commits a wrong token with no target check to
+    catch it.
+    """
     sched, _ = make_scheduler()
-    batch = FakeBatch([FakeReq("d", 0, [], [])], seq_lens=[0])
-    with pytest.raises(DraftBootstrapError, match="last committed token"):
+    batch = FakeBatch(
+        [FakeReq("a", 0, [11, 12, 13], [14])], seq_lens=[3], input_ids=[99]
+    )
+    assert pending_tokens(batch) == [99]
+    seed = build_bootstrap_draft_input(sched, batch, topk=1)
+    assert seed.bonus_tokens.tolist() == [99]
+
+
+def test_can_fail_the_output_tail_is_a_different_token_at_a_skewed_boundary():
+    """Proof the distinction above is real and not a rename."""
+    batch = FakeBatch(
+        [FakeReq("a", 0, [11, 12, 13], [14])], seq_lens=[3], input_ids=[99]
+    )
+    assert batch.reqs[0].output_ids[-1] == 14
+    assert pending_tokens(batch) == [99]
+
+
+def test_pending_falls_back_when_input_ids_do_not_match_the_resident_set():
+    batch = make_batch()
+    batch.input_ids = torch.tensor([7], dtype=torch.int64)  # bs mismatch
+    assert pending_tokens(batch) == [14, 24]
+
+
+def test_clock_report_names_both_clocks_per_request():
+    batch = make_batch()
+    line = bootstrap_clock_report(batch)
+    assert "seq_lens=3" in line and "seqlen=4" in line and "input_id=14" in line
+
+
+def test_seed_refuses_a_request_with_no_pending_token_at_all():
+    sched, _ = make_scheduler()
+    batch = FakeBatch([FakeReq("d", 0, [], [])], seq_lens=[0], input_ids=[])
+    batch.input_ids = None
+    with pytest.raises(DraftBootstrapError, match="no pending token"):
         build_bootstrap_draft_input(sched, batch, topk=1)
 
 

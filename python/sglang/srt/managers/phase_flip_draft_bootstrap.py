@@ -257,6 +257,93 @@ def scrub_draft_kv(pool, slot_rows: Sequence[torch.Tensor]) -> tuple:
     return rows, layer_ids
 
 
+def pending_tokens(batch) -> List[int]:
+    """The token each carried request has NOT yet fed through the model.
+
+    THE ROOT OF THE BOOTSTRAP VERIFY, and the trivial verify ALWAYS ACCEPTS
+    ITS ROOT -- so a wrong value here is committed unconditionally, with no
+    target check to catch it. It is the one quantity in this module that
+    can corrupt an answer rather than merely cost acceptance.
+
+    Taken from ``batch.input_ids``, not from ``output_ids[-1]``.
+    ``input_ids`` on a decode batch IS the pending token by construction --
+    "set at the end of the previous run_batch" -- so it agrees with
+    ``seq_lens`` whatever the boundary looks like. ``output_ids`` is a
+    different clock: it is written by the batch RESULT processor, so at a
+    boundary where a forward has advanced the KV but its result has not
+    been processed the two disagree by exactly one token, in whichever
+    direction the timing fell.
+
+    That disagreement is not hypothetical. It is what the counting probe
+    caught at 09:21:59Z with the scrub disabled -- '...18 19 0 21 22...',
+    the " 2" of "20" gone, everything after it correct, and in another
+    request a duplicated "28 28": one token lost and one token repeated,
+    the two directions of the same off-by-one.
+
+    Falls back to ``output_ids[-1]`` only when the batch carries no usable
+    input_ids, and refuses when neither exists rather than rooting a verify
+    at a guess.
+    """
+    reqs = _reqs_of(batch)
+    ids_t = getattr(batch, "input_ids", None)
+    pending: Optional[List[int]] = None
+    if ids_t is not None:
+        try:
+            flat = [int(x) for x in ids_t.tolist()]
+        except AttributeError:
+            flat = [int(x) for x in ids_t]
+        if len(flat) == len(reqs):
+            pending = flat
+    out: List[int] = []
+    for i, req in enumerate(reqs):
+        if pending is not None:
+            out.append(pending[i])
+            continue
+        tail = getattr(req, "output_ids", None) or getattr(
+            req, "origin_input_ids", None
+        ) or []
+        if not tail:
+            raise DraftBootstrapError(
+                f"{LOG_PREFIX} carried request {getattr(req, 'rid', '?')} has "
+                f"no pending token: the batch's input_ids do not match the "
+                f"resident set and the request has no tokens of its own"
+            )
+        out.append(int(tail[-1]))
+    return out
+
+
+def bootstrap_clock_report(batch) -> str:
+    """The two clocks, side by side, for the boot log.
+
+    Written because the off-by-one above was diagnosed from generated TEXT
+    rather than from the state, which cost a boot. Whoever reads this line
+    can see directly whether seq_lens, output_ids and input_ids agree at
+    the cutover, per request.
+    """
+    reqs = _reqs_of(batch)
+    seq_lens = getattr(batch, "seq_lens", None)
+    lens = [int(x) for x in seq_lens.tolist()] if seq_lens is not None else []
+    ids_t = getattr(batch, "input_ids", None)
+    try:
+        inp = [int(x) for x in ids_t.tolist()] if ids_t is not None else []
+    except AttributeError:
+        inp = list(ids_t or [])
+    parts = []
+    for i, req in enumerate(reqs):
+        out_ids = getattr(req, "output_ids", None) or []
+        parts.append(
+            "%s: seq_lens=%s seqlen=%s out[-2:]=%s input_id=%s"
+            % (
+                getattr(req, "rid", "?")[:8],
+                lens[i] if i < len(lens) else "?",
+                len(getattr(req, "origin_input_ids", None) or []) + len(out_ids),
+                list(out_ids[-2:]),
+                inp[i] if i < len(inp) else "?",
+            )
+        )
+    return " | ".join(parts)
+
+
 def build_bootstrap_draft_input(scheduler, batch, topk: int):
     """A shape-complete ``EagleDraftInput`` for a batch with no draft state.
 
@@ -273,20 +360,7 @@ def build_bootstrap_draft_input(scheduler, batch, topk: int):
 
     reqs = _reqs_of(batch)
     device = scheduler.device
-    last_tokens: List[int] = []
-    for req in reqs:
-        ids = getattr(req, "output_ids", None) or []
-        if ids:
-            last_tokens.append(int(ids[-1]))
-            continue
-        origin = getattr(req, "origin_input_ids", None) or []
-        if not origin:
-            raise DraftBootstrapError(
-                f"{LOG_PREFIX} carried request {getattr(req, 'rid', '?')} has "
-                f"neither output_ids nor origin_input_ids; it has no last "
-                f"committed token to root a verify at"
-            )
-        last_tokens.append(int(origin[-1]))
+    last_tokens = pending_tokens(batch)
 
     bs = len(reqs)
     bonus = torch.tensor(last_tokens, dtype=torch.int64, device=device)
@@ -360,6 +434,7 @@ def arm_draft_bootstrap(scheduler, batch, draft_worker) -> dict:
     for req in reqs:
         setattr(req, BOOTSTRAP_ATTR, True)
 
+    logger.info("%s cutover clocks -- %s", LOG_PREFIX, bootstrap_clock_report(batch))
     logger.info(
         "%s bootstrapped %d carried request(s) into the speculating TP "
         "phase: %d stale draft KV row(s) scrubbed across layer(s) %s of "
