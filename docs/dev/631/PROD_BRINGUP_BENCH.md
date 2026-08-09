@@ -938,3 +938,86 @@ Two measurement notes worth keeping:
 The `_live()` crash that kept this configuration off the default in the
 previous entry is fixed (`ce61812870`); the reproduction now runs as PHASE 3
 of the unmanned acceptance script.
+
+---
+
+## A-vs-A REGRESSION GATE: `7ed8abfddc` vs `9a929352c9` (2026-08-09) — PASS
+
+The ship gate. It asks one question and only that one: **does carrying the
+phase-flip build cost anything on the path a user gets when they do not ask
+for the flip?** Evidence:
+`/spinning/evidence-631/ava_gate_20260809/`.
+
+### How it was run, and why that shape
+
+* **Both boots run WITHOUT `--enable-phase-flip`.** `route_a_631_prod_boot.sh`
+  always passes it, so the gate has its own boot script,
+  `scripts/route_a_631_ava_boot.sh`, parameterised by `WT`. Every other knob
+  is identical; the only difference between the two invocations is the tree.
+* **Speculation is OFF, and that is not a choice.** `check_server_args`
+  refuses speculation under pipeline parallelism unless the flip is enabled,
+  because the draft worker only exists on the flip's TP stack. The non-flip
+  default path at `pp_size 3` cannot speculate in EITHER tree.
+* **The two boots sized identically**: `max_total_num_tokens=302072` and per
+  rank `available_gpu_mem` 9.94 / 9.30 / 6.92 GB, the same numbers on both
+  commits. The flip build does not move the non-flip memory plan.
+* **Per-rank ms/round, split compute vs wait.** The usual
+  `Prefill rank batch ... gpu-ms (compute, wait)` line is NOT available here:
+  `_install_rank_prefill_timer` returns early for `pp_size != 1`, identically
+  in both trees. What every PP rank does emit under
+  `SGLANG_ENABLE_METRICS_DEVICE_TIMER=1` is `fwd occupancy` — GPU-busy time
+  over the wall window, i.e. the compute fraction of that rank's round.
+  Harvested by `scripts/route_a_631_ava_rounds.py`.
+
+### THE FINDING THAT ALMOST BECAME A FALSE REGRESSION
+
+The baseline's first pass looked like the flip build was **8 % faster than it
+should be**, i.e. a regression of the same size in the flip build. It was not.
+The baseline pass had been started on cold cards and decayed monotonically as
+the 3080s reached their thermal ceiling:
+
+    baseline, from cold:   4106 -> 4011 -> 3953 -> 3887 -> 3834 -> 3809 tok/s
+    same boot, after soak: 3756 -> 3762 -> 3770 -> 3773 -> 3780 -> 3776 tok/s
+
+The flip boot had, by accident of sequencing, soaked before its measured
+block and so was already at steady state. **The A/A design is what caught
+this**: the cold pass's own two blocks disagree by -4.47 %, seventy times the
+soaked pass's +0.38 %. A cold pass is therefore INADMISSIBLE by rule
+(`STEADY_STATE_TOLERANCE_PCT = 1.0` in `route_a_631_ava_verdict.py`), in
+either direction — whichever build happens to be measured cold looks worse,
+and quoting either number would have been a fabricated finding. The cold pass
+is kept on disk as `base.pass1_cold.json` precisely so nobody re-derives it.
+
+### The numbers
+
+Content axis fixed (one 48400-token prompt, cache flushed per rep; one greedy
+512-token continuation), warmup discarded, 2 x 3 back-to-back reps per rung,
+every rep above the 10 s floor (12.8 s prefill, 16.7 s decode).
+
+| rung | baseline `9a929352c9` | flip `7ed8abfddc` | delta | same-boot floor | verdict |
+|---|---|---|---|---|---|
+| prefill tok/s | 3769.48 | 3769.40 | **-0.002 %** | 0.655 % | inside |
+| decode tok/s | 30.602 | 30.624 | **+0.071 %** | 0.279 % | inside |
+
+Per-rank ms/round, compute vs wait — the two commits are the same machine:
+
+| rung | rank | baseline ms/round (compute/wait) | flip ms/round (compute/wait) |
+|---|---|---|---|
+| prefill | PP0 (5090) | 624.1 (221.8 / 402.3) | 624.1 (221.1 / 403.0) |
+| prefill | PP1 (3080a) | 624.1 (607.3 / 16.8) | 624.1 (606.5 / 17.6) |
+| prefill | PP2 (3080b) | 619.4 (585.3 / 34.1) | 614.8 (575.7 / 39.2) |
+| decode | PP0 | 34.1 (9.3 / 24.8) | 34.1 (9.3 / 24.8) |
+| decode | PP1 | 34.1 (10.0 / 24.1) | 34.1 (10.0 / 24.1) |
+| decode | PP2 | 34.1 (13.9 / 20.2) | 34.1 (13.9 / 20.2) |
+
+Read the wait SPREAD, not its level: the 5090 sits at 35 % occupancy and
+waits 403 ms of every 624 ms prefill round for the 3080s, which are at 94-97 %.
+The pacemaker is the 3080 pair, on both commits equally.
+
+One more datum that is not a throughput number: the greedy 512-token
+continuation returned the **same output hash (`9db721974590`) on both
+commits**, every rep of both boots. The non-flip path is not merely as fast
+as before, it is bit-stable across the 91 commits.
+
+**VERDICT: PASS.** Both rungs admissible, both deltas inside the same-boot
+floor. The flip build does not regress the non-flip default path.

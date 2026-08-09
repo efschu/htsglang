@@ -3119,3 +3119,134 @@ commit-vs-commit.
   into the policy so it stops arming a flip it cannot afford — right now the
   policy arms, the runtime refuses, and the cost is only log volume, but it
   is arming 126 times to commit 69.
+
+---
+---
+
+# HANDOFF v16 — written 2026-08-09 by successor #13. THE STRAND IS DONE.
+
+The two items v15 left are closed: the A-vs-A regression gate ran and
+passed, and this is the ship writeup. One minor item is deliberately NOT
+taken, and section 5 says why in enough detail to just do it.
+
+## 1. THE TARGET CONFIGURATION — exact boot command
+
+This is the standing end state, and it is what is serving right now on port
+30030 (health 200, verified with a real `/generate`, not just `/health`):
+
+    MODEL=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5 \
+    CTX=393216 \
+    POLICY=auto \
+    SPEC=on \
+    PHASE_POLICY_TP_TOK_S=1681.0 \
+    bash scripts/route_a_631_prod_boot.sh --gdn-resident-state-slots 10
+
+Verified live from `/get_server_info` after the reboot: `context_length
+393216`, `enable_phase_flip True`, `phase_flip_policy auto`,
+`phase_flip_tp_vector 30,17,17`, `gdn_resident_state_slots 10`,
+`max_running_requests 4`, speculation on.
+
+**The guard that has bitten two shifts**: `route_a_631_prod_boot.sh`'s
+single-instance check matches the launcher only, not `sglang::scheduler_PP`.
+After any reboot, verify the NEW pid AND the served `context_length` before
+measuring anything.
+
+## 2. WHAT IS PROVEN, and by what
+
+1. **The flip works, both directions, unattended, on the target config.**
+   `/spinning/evidence-631/unmanned_acceptance_20260809T160920Z/`: 33 DONE tp
+   + 36 DONE pp, 150 CUDA-graph decode passes, wire `spec_accept_length`
+   9.52, a 276255-token bs=1 session with three depth needles returned
+   verbatim, 80/80 requests ok, corridor minima 1210/3310/1386 MiB with 0
+   breaches. (v15 §2.)
+2. **The `_live()` crash is root-caused and fixed** (`ce18...` = `ce61812870`):
+   `Req.req_pool_idx` is `Optional` and `None` indexes as numpy newaxis.
+   Mutation-proven can-fail. Still METAL-UNCONFIRMED in the sense that the
+   skip path has never been *observed* firing — its counter read 0 through
+   the acceptance run and a deliberate 48-request burst. What is metal-proven
+   is that the recipe which killed the previous instance now completes
+   healthy. (v15 §1.)
+3. **The non-flip default path is not regressed** — section 3.
+4. **Suite**: `bash scripts/run_631_flip_family.sh` -> **565 passed** in 101 s,
+   re-run at ship time on this exact tree.
+
+## 3. THE A-vs-A GATE — PASS, and the trap inside it
+
+Full writeup with both tables: `docs/dev/631/PROD_BRINGUP_BENCH.md`,
+final section. Evidence: `/spinning/evidence-631/ava_gate_20260809/`.
+Tools, all new and all in `scripts/`: `route_a_631_ava_boot.sh` (the
+non-flip PP=3 boot, either tree via `WT`), `route_a_631_ava_gate.py` (the
+client), `route_a_631_ava_rounds.py` (per-rank ms/round from the log),
+`route_a_631_ava_verdict.py` (the rule).
+
+    prefill  3769.48 -> 3769.40 tok/s   -0.002 %   floor 0.655 %   inside
+    decode     30.602 -> 30.624 tok/s   +0.071 %   floor 0.279 %   inside
+
+**READ THIS BEFORE RE-RUNNING ANY BENCHMARK ON THIS RIG.** The gate very
+nearly produced a false regression. A boot measured from cold decays
+monotonically as the 3080s reach their thermal ceiling — 4106 -> 3809 tok/s
+across six reps of the SAME build — and the flip boot had, by accident of
+sequencing, soaked before its measured block. Compared naively that is an
+8 % regression that does not exist. The same-boot A/A block delta is what
+exposed it (-4.47 % cold versus +0.38 % soaked), and a pass whose own two
+blocks disagree by more than 1 % is now INADMISSIBLE by rule in
+`route_a_631_ava_verdict.py`. Do not delete `base.pass1_cold.json`; it is
+the specimen.
+
+Two structural facts the gate established on the way, worth more than the
+throughput numbers:
+
+* Both commits size **identically** (`max_total_num_tokens=302072`, same
+  per-rank available memory), so the flip build does not move the non-flip
+  memory plan at all.
+* The greedy 512-token continuation returns the **same output hash on both
+  commits**, every rep of both boots. Bit-stable across 91 commits.
+
+Note for whoever extends this: the `Prefill rank batch ... gpu-ms (compute,
+wait)` line does NOT work at `pp_size > 1` (`_install_rank_prefill_timer`
+returns early), in either tree. The per-rank compute/wait split used here
+comes from `fwd occupancy` under `SGLANG_ENABLE_METRICS_DEVICE_TIMER=1`,
+which every PP rank emits.
+
+## 4. Also established, cheaply, and easy to forget
+
+The non-flip default path at `pp_size 3` **cannot speculate at all**:
+`check_server_args` refuses speculation under PP unless `--enable-phase-flip`
+is set, because the draft worker is built on the flip's TP stack. So the
+flip is not merely a throughput lever on this rig -- it is the only way this
+topology speculates.
+
+## 5. THE ONE OPEN ITEM (minor, and deliberately not taken)
+
+In the acceptance run the policy **armed 126 flips to commit 69**; of the 57
+abandons, 38 were the runtime's staging guard refusing at a full KV pool
+(0.99+ occupancy, exchange wanting 4887-6984 MiB it cannot have without
+eating the 1024 MiB reserve). This is CORRECT behaviour -- the guard is doing
+its job and serving continues in the current layout -- but wasteful: the
+policy arms something the runtime then refuses, and the cost today is log
+volume.
+
+**Why I did not ship it:** it changes flip ARMING, which is the one thing the
+unmanned acceptance run proves. A unit test would not re-prove it; it needs
+another unmanned cycle on metal. Trading a proven end state for a log-volume
+saving is the wrong trade at ship time.
+
+**The design, ready to implement.** `phase_policy.decide` is pure and its
+state is committed by the caller (`note_flip_armed`), which is exactly the
+seam: add `note_flip_refused(state, direction, now, pool_occupancy)` on the
+staging-refusal path in `phase_flip_runtime`, recording the occupancy at
+which the refusal happened. Then have `decide` return `_no(...)` for that
+direction while the pool is at or above that occupancy — occupancy-gated,
+not time-gated, so the moment the pool drains the policy arms again without
+waiting out a backoff. Ships only with a regression test added to
+`scripts/run_631_flip_family.sh` (the family list is canonical; two
+under-collections have already happened from ad-hoc globs), and the can-fail
+is: with the feedback removed, a full-pool fixture arms repeatedly.
+
+## 6. State at end of shift
+
+- HEAD on `feat/route-a-631`, tree clean, pushed to `origin` (the fork).
+- Suite 565 passed.
+- Serving: the long-context target config of section 1, health 200,
+  auto-flipping.
+- GPU arbitration holder released, heartbeat stopped first.
