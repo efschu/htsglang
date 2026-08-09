@@ -153,6 +153,15 @@ the worktree.
 
 ## 5. MY ERRORS, ranked — the chain works because these are written down
 
+0. **I hit the `-f` self-match trap TWICE**, the second time with
+   `pkill -f`, which my own briefing forbids outright. Both calls matched
+   my own shell's command line and killed my process group (exit 144).
+   Writing the lesson down in §5 after the first occurrence did not stop
+   the second: what stops it is never passing a pattern that can match the
+   invoking shell. Use a `/proc` scan that skips `$$`, or a bracketed
+   pattern (`sglang[.]launch_server`), and never `pkill -f` at all. The
+   habit is the fix, not the note.
+
 1. **I killed serving with a `pgrep -f` self-match.** `pgrep -f
    "sglang.launch_server.*--port 30030"` matched **my own shell's command
    line**; the loop TERM'd my own process group and the tool returned exit
