@@ -1101,3 +1101,70 @@ microbatch), which is the real design question and is not yet answered.
 
 **Defect Q is now PARKED, not closed** -- and the run above is the first
 evidence that its drift can reach the microbatch phase.
+
+## 8. THE RECEIVE-SIDE FIX: variant B chosen, A rejected, NOT YET BUILT
+
+Both shapes were weighed against the corpse table rather than by
+preference. **B is chosen.** Neither is built yet -- this section is the
+design decision, not a claim of work done.
+
+### A (rejected): consume on the upstream's CHAN_DICT counter, buffer
+proxies this rank has no batch for
+
+**Rejection reason.** It rebuilds sequencing discipline IMPLICITLY: the
+buffer must be a strict FIFO whose head is consumed exactly once per
+upstream send, an invariant maintained at two ends that can disagree --
+which is the precise shape of the bug being fixed, re-created one layer up.
+It also decides WHEN a buffered proxy is released ("once this rank's own
+batch materializes"), i.e. it moves per-rank timing, and §7 is what that
+costs: the refined law says any mechanism that changes when a rank
+proceeds relative to its peers can drive adjacent ranks into different
+blocking channels, whether or not the mechanism itself waits. It is
+additionally adjacent to the bounded-recv corpse (unconsumed messages
+accumulating while an upstream keeps sending).
+
+### B (chosen): make the pairing NON-POSITIONAL -- stamp the proxy
+
+Stamp each proxy with `mb_id` plus a monotone per-channel seqno and the
+row count. The consumer matches on the stamp; a leftover from an abandoned
+window matches nothing and is dropped LOUDLY with its identity logged.
+
+**Why it satisfies the refined law**: no launch timing moves and no new
+synchronization point exists. A strand becomes harmless BY CONSTRUCTION
+rather than fenced, so the off-by-one class dies permanently.
+
+**It is also the corpse table's own recurring lesson.** "The gate's
+guarantee is per-round; its evidence is per-epoch" and "any quantity
+derived from `ps` is phase-scoped now" are the same error: an identity
+INFERRED from context instead of carried. Positional pairing is exactly
+that -- evidence whose scope does not cover its guarantee.
+
+### The implementation vehicle, already located
+
+`PPProxyTensors` (forward_batch_info.py:1572) is a plain
+`tensors: Dict[str, torch.Tensor]`, and the send site transmits that dict
+directly (`_pp_send_dict_to_next_stage(result.pp_hidden_states_proxy_tensors
+.tensors, ...)`). **So the stamp can ride as an extra tensor entry in the
+dict -- no header to invent and no transport change.** Construction sites
+are few (scheduler_pp_mixin.py:1305, 1733, 1903, 1954).
+
+**THE ONE RISK TO CHECK FIRST, before writing anything**: any consumer that
+iterates the dict blindly rather than reading known keys (a model forward
+doing `for k, v in tensors.items()`, a cuda-graph buffer copy, or the
+`__getitem__` slice path at :1587 which maps over ALL entries and would
+try to slice a scalar stamp). A grep of the model/executor paths did not
+show proxy-dict iteration, but that check is not complete and must be
+finished before the stamp is added. If a blind consumer exists, keep the
+stamp in a sibling field rather than inside `tensors`.
+
+`self.mb_metadata: List[Optional[PPBatchMetadata]]` is RANK-LOCAL and never
+crosses the wire, so it is not the vehicle -- it cannot carry the identity.
+
+### Acceptance for whichever lands
+
+The on-demand reproducer: 5 s park deadline, repeated `pp_to_tp` arms with
+resident decode (so every arm abandons), mixed acceptance load. Require N
+abandon cycles with no strand, ranks resuming aligned, and the
+`model_runner.forward` shape check never firing. **Keep that check as a
+standing tripwire regardless** -- it is what turned this class from silent
+corruption into a named defect.
