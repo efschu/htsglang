@@ -1375,3 +1375,33 @@ The active 28,26,20 over-weights rank 0, which is precisely the card whose
 corridor now binds. Re-balancing toward 31,17,16 moves KV rows off the 5090
 and should convert directly into corridor headroom on the binding card.
 That is the next experiment, and it is a one-variable boot.
+
+### Final rung this shift: 540000 tokens (+113 %), corridor held
+
+One variable against the 460000 boot (cap 460000 -> 540000; `RANK_MIB`
+unchanged at 31800,17400,17450), which the budget supports because the
+engine's own capacity at these budgets is 1096606 tokens.
+
+| quantity | 460000 | 540000 |
+|---|---|---|
+| serving capacity (id space) | 460000 | **540000 (+113.0 % on baseline)** |
+| corridor min, card 0 | 2655 MiB | 1719 MiB |
+| corridor min, card 1 (5090) | 3034 MiB | 1686 MiB |
+| corridor min, card 2 | 2609 MiB | 1865 MiB |
+| TP-phase hold | 1434 / 1792 / 282 | 1706 / 2080 / 448 |
+
+Every card stays above the 1024 MiB floor, with 695 / 662 / 841 MiB of
+margin. That is the direction the corridor rule asks for -- "never breach
+AND as full as possible" -- and the capacity ladder for this shift is:
+
+    253528 -> 300000 -> 360000 -> 460000 -> 540000    (+113.0 %)
+
+**READ THIS BEFORE SHIPPING 540000.** The corridor figure above comes from
+ONE 1200-token generation at bs=1. It is NOT a sustained-load measurement
+and it is NOT the >=60-min bar. The design point in the user spec is bs=4,
+where four concurrent requests and a fuller prefix cache will push the
+minimum lower than a single stream does, and 662 MiB of margin on the
+binding card is not much to give away. Treat 540000 as the measured
+CEILING and 460000 (margin 1631/2010/1585) as the conservative fallback
+until a sustained bs=4 run has held the corridor for an hour. The
+instrument for that is a load generator, not `phase_plateau_measure.sh`.
