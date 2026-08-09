@@ -71,9 +71,44 @@ violation; `PHASE_PURITY_ASSERT=0` to report only.
 |---|---|
 | Purity gates compile, parse, arm on all 3 ranks | **PROVEN** (log 21:37:10Z, all of PP0/PP1/PP2) |
 | Pre-purity build violates purity | **PROVEN**: 581 decode records in PP, 10266 tokens prefilled in TP (`evidence-631/phase_evidence_prepurity_defectK.txt`) — this is also the proof the new gate CAN fail |
-| Purity HOLDS under real traffic | **METAL-UNPROVEN** — this is the next step |
-| Both queues drain in bounded windows | **METAL-UNPROVEN** |
+| Purity HOLDS under load | **FIRST SIGNAL POSITIVE** (see below); the >=60 min verdict is PENDING |
+| Both queues drain in bounded windows | **FIRST SIGNAL POSITIVE**, 60-min verdict PENDING |
 | Spill ladder | **NOT IMPLEMENTED** — module written, no rung wired |
+
+### FIRST LIVE SIGNAL on the purity build (boot 21:43:45Z, b55b34ba73)
+
+Measured 21:46:38Z, ~30 s into the green run, on the window log only:
+
+```
+  DECODE records
+    in TP:      4 records, cuda graph True on 4 (100.0%), mean accept len 2.96
+
+  STRICT PHASE PURITY VERDICT
+    ok: no decode record executed in the PP layout
+    ok: not a single token prefilled in the TP layout
+    => PURITY HELD, both layouts used
+```
+
+6 flips inside the first 30 s, both directions. Against the pre-purity
+baseline this is an exact inversion:
+
+| | pre-purity | purity build |
+|---|---|---|
+| decode records in PP | 581 | **0** |
+| tokens prefilled in TP | 10266 | **0** |
+| CUDA graphs on decode | 0 % | **100 %** |
+| mean accept len | 0.00 | **2.96** |
+
+**This is 30 seconds, not 60 minutes.** The standing law of this task is
+that a soak green at 4 minutes means nothing (corpse J appeared at minute
+5, corpse L at minute 2 of the previous boot). The verdict that counts is
+written by the green run at ~22:51Z into
+`/spinning/evidence-631/green_20260809T214342Z.verdict.txt`; treat
+anything before that as a first signal only.
+
+Pool on this boot: `max_total_num_tokens` **263768** at ctx 262144
+(RANK_MIB 22700,11920,11970) — well below the >600k target, and §4 explains
+why the spill ladder cannot close that gap without a real runtime grow.
 
 ### The pre-purity baseline, for comparison
 
