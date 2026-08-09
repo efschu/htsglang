@@ -948,6 +948,44 @@ class PhaseFlipPresence:
             f"withdrawn rank={self.rank} epoch={epoch} round={round_}\n",
         )
 
+    def declare_disarmed(self, epoch: int, round_: int = 0) -> None:
+        """Publish that THIS rank has left the ARMED state for `epoch`.
+
+        #631 THE RESUME GATE. An abandon is RANK-LOCAL -- every rank times
+        out on its own clock -- so the ranks stop being armed at different
+        instants. A rank that disarms early resumes launching and sends its
+        proxy hidden states while a peer is still armed and still
+        withholding; that peer's `cur_batch` is None, its proxy recv is
+        guarded by its OWN batch rather than by whether the upstream sent,
+        and the message strands. The proxy stream is purely positional, so
+        every later receive on that rank is off by one -- silently, for the
+        rest of the loop's life. Measured 2026-08-09 06:26:34-35Z: PP0 and
+        PP2 abandoned, PP1 abandoned LAST, and PP1 is the rank that faulted
+        one second later
+        (/spinning/evidence-631/pp_proxy_mispair_20260809T0626Z).
+
+        This marker is what lets a rank answer "has EVERYONE stopped?"
+        before it resumes. It is a PUBLICATION, never a rendezvous: nobody
+        waits on it, nobody blocks in it. See `PhaseFlipRuntime.
+        resume_withheld` for why that distinction is the whole safety
+        argument.
+        """
+        self._write_once(
+            self._marker("d", epoch, self.rank, round_),
+            f"disarmed rank={self.rank} epoch={epoch} round={round_}\n",
+        )
+
+    def disarmed(self, epoch: int, round_: int = 0) -> Set[int]:
+        """Ranks that have published a disarm for `epoch`."""
+        return {
+            r
+            for r in range(self.n_ranks)
+            if os.path.exists(self._marker("d", epoch, r, round_))
+        }
+
+    def all_disarmed(self, epoch: int, round_: int = 0) -> bool:
+        return len(self.disarmed(epoch, round_)) >= self.n_ranks
+
     def entering(self, epoch: int, round_: int = 0) -> Set[int]:
         return {
             r

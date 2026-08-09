@@ -4609,11 +4609,27 @@ class Scheduler(
         # rank, and chunked_req is replicated batch state. The park is
         # BOUNDED by the runtime's park deadline (group-agreed abort of
         # the FLIP, never of the requests).
+        #
+        # #631 THE RESUME GATE is the second disjunct below. An abandon is
+        # rank-local, so the ranks stop being armed at different instants,
+        # and the rank that disarms FIRST would otherwise resume launching
+        # and send proxy hidden states to a peer that is still armed, still
+        # withholding, and therefore not receiving. That message strands and
+        # the positional proxy stream is off by one from then on -- silently
+        # (specimen: /spinning/evidence-631/pp_proxy_mispair_20260809T0626Z).
+        # So the withhold continues past the disarm until every rank has
+        # published its own. It is a PREDICATE, not a barrier: a gated rank
+        # keeps cycling and servicing its channels and merely declines to
+        # launch, exactly as it did one pass earlier. Bounded and loud --
+        # see PhaseFlipRuntime.resume_withheld.
         if (
             self.server_args.enable_phase_flip
             and self.phase_flip_runtime is not None
-            and self.phase_flip_runtime.pending is not None
             and self.chunked_req is None
+            and (
+                self.phase_flip_runtime.pending is not None
+                or self.phase_flip_runtime.resume_withheld() is not None
+            )
         ):
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 

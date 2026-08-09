@@ -15,6 +15,7 @@ FAMILY=(
     test/registered/scheduler/test_phase_flip_boot.py
     test/registered/scheduler/test_phase_flip_protocol.py
     test/registered/scheduler/test_phase_flip_resident_carry.py
+    test/registered/scheduler/test_phase_flip_resume_gate.py
     test/registered/scheduler/test_gdn_flip_plan.py
     test/registered/scheduler/test_gdn_flip_mover.py
     test/registered/scheduler/test_weights_arena.py

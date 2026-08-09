@@ -1443,6 +1443,132 @@ class PhaseFlipRuntime:
     def epoch(self) -> int:
         return self._epoch
 
+    # -- #631 THE RESUME GATE ------------------------------------------
+    #
+    # THE DEFECT IT CLOSES (reproduced 2026-08-09 06:26:34-35Z, specimen
+    # /spinning/evidence-631/pp_proxy_mispair_20260809T0626Z). An abandon is
+    # RANK-LOCAL: every rank times out on its own clock, so the ranks stop
+    # being armed at different instants. The rank that disarms FIRST resumes
+    # launching and sends its proxy hidden states. A peer still armed is
+    # still withholding, so its ``cur_batch`` is None -- and the proxy recv
+    # in _event_loop_pp_body is guarded by THAT rank's own batch, never by
+    # whether the upstream sent. The message is not taken. It strands in
+    # _pp_tensor_dict_inbox, and because the proxy stream is PURELY
+    # POSITIONAL (no mb_id, no sequence number, no length; demultiplexed
+    # only on __msg_type__) every later receive on that rank is off by one,
+    # silently, for the rest of the loop is life. Observed: PP0 and PP2
+    # abandoned, PP1 abandoned LAST, PP1 faulted.
+    #
+    # A COMMIT never showed this because the cutover re-enters
+    # event_loop_pp and init_pp_loop_state resets every buffer, the inbox
+    # included. The abandon paths reset nothing -- which is correct, and
+    # must stay correct: unlike a commit, an abandon has NO quiescence
+    # guarantee, so resetting loop state there would discard in-flight
+    # microbatches. The fix therefore belongs at the RESUME, not at the
+    # abandon.
+    #
+    # WHY THIS CANNOT RECREATE THE DEADLOCK CLASS, which is the first thing
+    # to check when adding anything group-wide to this feature. THE DESIGN
+    # LAW IS "no rank may block on any channel while a peer may be in a
+    # different blocking channel". This gate BLOCKS ON NOTHING. It is a
+    # PREDICATE, re-evaluated on each pass by the same code that already
+    # decides whether to launch a batch: a gated rank keeps cycling its
+    # loop, keeps servicing its channels, keeps answering health -- it
+    # merely declines to LAUNCH NEW WORK, which is exactly what it was
+    # already doing one pass earlier while armed. There is no rendezvous,
+    # no barrier primitive and no wait. Marker writes are single-writer
+    # /dev/shm files, reads are os.path.exists. Nothing here can be waited
+    # on, so nothing here can deadlock.
+    #
+    # IT IS STILL BOUNDED, AND THE BOUND IS LOUD. A rank that dies while
+    # armed would otherwise hold its peers out of service for ever, which
+    # would be a worse failure than the one being fixed. On expiry the gate
+    # opens anyway and says so at error level.
+
+    #: How long a disarmed rank waits for its peers to publish their own
+    #: disarm before resuming regardless. Deliberately short: the skew this
+    #: closes is milliseconds (all three ranks abandoned inside the same
+    #: logged second), so a second is already generous, and the cost of
+    #: over-waiting is withheld throughput on a live server.
+    RESUME_GATE_S = 1.0
+
+    def _open_resume_gate(self) -> None:
+        """Publish this rank's disarm and start gating its own resume.
+
+        TOTALLY DEFENSIVE, and that is a requirement rather than caution.
+        This runs on the ABANDON path, whose whole point is that the flip
+        is the optional thing and the requests are not: an abandon must
+        never raise, or the parked requests die with the instance --
+        precisely what the park deadline exists to prevent. A gate that
+        cannot arm degrades to "no gate" (the old behaviour), never to an
+        exception.
+        """
+        try:
+            clock = getattr(self, "_clock", None)
+            if clock is None:
+                return
+            epoch = getattr(self, "_epoch", 0)
+            self._resume_gate_epoch = epoch
+            self._resume_gate_until = clock() + self.RESUME_GATE_S
+            self._resume_gate_warned = False
+            presence = getattr(self, "_presence", None)
+            if presence is None:
+                return
+            presence.declare_disarmed(epoch)
+        except Exception as exc:  # noqa: BLE001 - an abandon may never raise
+            logger.error("%s could not arm the resume gate: %s", LOG_PREFIX, exc)
+
+    def resume_withheld(self) -> Optional[str]:
+        """Must this rank keep withholding new work? Reason if so.
+
+        Called from the scheduler is parking test on every pass. Returns
+        None the moment the group has all disarmed, or when the bound
+        expires.
+        """
+        until = getattr(self, "_resume_gate_until", None)
+        if until is None:
+            return None
+        epoch = getattr(self, "_resume_gate_epoch", 0)
+        presence = getattr(self, "_presence", None)
+
+        if presence is not None:
+            try:
+                if presence.all_disarmed(epoch):
+                    self._resume_gate_until = None
+                    return None
+                seen = sorted(presence.disarmed(epoch))
+            except Exception:  # noqa: BLE001 - a probe may not break serving
+                self._resume_gate_until = None
+                return None
+        else:
+            self._resume_gate_until = None
+            return None
+
+        if getattr(self, "_clock", lambda: until)() >= until:
+            self._resume_gate_until = None
+            if not getattr(self, "_resume_gate_warned", False):
+                self._resume_gate_warned = True
+                logger.error(
+                    "%s RESUME GATE EXPIRED after %gs: epoch %d disarm seen "
+                    "from ranks %s of %d. Resuming anyway -- a peer that "
+                    "never publishes is either dead or wedged, and holding "
+                    "this rank out of service for ever would be worse than "
+                    "the mispairing this gate prevents. If the missing rank "
+                    "is alive, expect a stranded proxy message and a "
+                    "PP proxy/batch mismatch shortly.",
+                    LOG_PREFIX,
+                    self.RESUME_GATE_S,
+                    epoch,
+                    seen,
+                    getattr(presence, "n_ranks", -1),
+                )
+            return None
+
+        return (
+            f"waiting for the group to disarm before resuming (epoch "
+            f"{epoch}: ranks {seen} have disarmed)"
+        )
+
     @property
     def pending(self) -> Optional[str]:
         return self._pending
@@ -2178,6 +2304,9 @@ class PhaseFlipRuntime:
         self._armed_at = None
         self._last_hold_reason = None
         self.presence_timeouts += 1
+        # Defensive: the abandon path is borrowed by duck-typed unit
+        # fakes, and an abandon may never raise. See _open_resume_gate.
+        getattr(self, "_open_resume_gate", lambda: None)()
         logger.error(
             "%s FLIP ABANDONED (no quorum): %s waited %.1fs for epoch %d "
             "and rank(s) %s never reached the flip entry (deadline %gs). "
@@ -2243,6 +2372,9 @@ class PhaseFlipRuntime:
         self._armed_at = None
         self._last_hold_reason = None
         self.join_deadline_aborts += 1
+        # Defensive: the abandon path is borrowed by duck-typed unit
+        # fakes, and an abandon may never raise. See _open_resume_gate.
+        getattr(self, "_open_resume_gate", lambda: None)()
         logger.error(
             "%s FLIP ABANDONED (join): %s never assembled a consensus "
             "round -- %s. Serving continues on the %s stack and no request "
@@ -2273,6 +2405,9 @@ class PhaseFlipRuntime:
         self._armed_at = None
         self._last_hold_reason = None
         self.park_deadline_aborts += 1
+        # Defensive: the abandon path is borrowed by duck-typed unit
+        # fakes, and an abandon may never raise. See _open_resume_gate.
+        getattr(self, "_open_resume_gate", lambda: None)()
         logger.error(
             "%s FLIP ABANDONED: %s was armed for %.1fs without the group "
             "reaching a quiescent boundary (deadline %gs; this rank "
@@ -2360,6 +2495,9 @@ class PhaseFlipRuntime:
             self._armed_at = None
             self._last_hold_reason = None
             self.fit_aborts += 1
+            # Defensive: the abandon path is borrowed by duck-typed unit
+            # fakes, and an abandon may never raise. See _open_resume_gate.
+            getattr(self, "_open_resume_gate", lambda: None)()
             logger.error(
                 "%s FLIP ABANDONED (pool too small for the live set): %s. "
                 "This rank: %s. No bytes were moved -- the bound is checked "
