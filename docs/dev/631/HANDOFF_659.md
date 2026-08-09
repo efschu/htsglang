@@ -58,6 +58,38 @@ Reusable instrument (written this shift, no new machinery needed):
 sample `nvidia-smi --query-gpu=memory.free` at 100 ms, POST one flip,
 take baseline = median of the pre-flip samples and trough = min.
 
+## 1a. ANSWER (measured after the above was written): it SCALES
+
+Point 2, pool 126000, produced by replaying the point-1 launch with ONE
+substitution (`--max-total-tokens 500000 -> 126000`; per-card budget, ctx,
+weights and corridor all unchanged):
+
+| card | seam peak @ pool 253528 | seam peak @ pool 126000 |
+|---|---|---|
+| gpu0 5090  | 2980 MiB | **368 MiB** |
+| gpu1 3080a | 1376 MiB | **0 MiB** |
+| gpu2 3080b | 1828 MiB | **48 MiB** |
+
+Pool x0.497 -> peak x0.12 / x0.0 / x0.026. Far more than proportional.
+
+Direction confound EXCLUDED by log, not by assumption: both windows
+straddle the same pair (epoch 3 `pp_to_tp`, epoch 4 `tp_to_pp`).
+
+**Mechanism, which matters more than the ratio.** The instrument measures
+the DRIVER-visible transient, and that is the correct observable because
+it is exactly what refuses a `cuMemCreate`. The driver is asked for
+(staging size) - (slack torch already holds). A bigger pool grows the
+staging and shrinks the slack simultaneously, so the driver-visible peak
+grows much faster than the pool. This is precisely how defect N died:
+`empty_cache()` handed back the slack, and the next 128 MiB ask went to
+the driver and was refused.
+
+**So the branch is decided.** Full-KV >600k cannot be reached by sizing
+around the seam peak. It needs pre-reserved, zero-allocation staging so
+the cutover never asks the driver for anything. The affordability
+pre-flight (§7.2) is still needed regardless, because until the staging
+is pre-reserved an unaffordable flip must abandon rather than die.
+
 ---
 
 ## 2. Defect M — guard SHIPPED, source still open (as expected)
@@ -221,9 +253,9 @@ an explicit file-level split. Neither happened here.
 
 ## 7. Exact next steps
 
-1. **Measure the seam peak at a second pool size** (§1). Two boots, one
-   scripted flip each. This decides whether full-KV and auto-flip can
-   coexist, and everything below depends on the answer.
+1. ~~Measure the seam peak at a second pool size~~ **DONE, see §1a. The
+   peak SCALES with the pool, steeply, so full-KV needs a zero-allocation
+   seam rather than a bigger headroom allowance.**
 2. **Seam affordability pre-flight** covering the TP re-backing path, so
    an unaffordable flip abandons cleanly. With a 1.4–3.0 GiB peak this is
    needed whether or not the staging is later pre-reserved.

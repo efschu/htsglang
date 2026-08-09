@@ -1089,3 +1089,52 @@ NUMERIC tension with auto-flip rather than suspected tension.
 
 Caveat carried honestly: one cutover, one direction, one pool size. It is
 not a distribution, and the direction may not be symmetric.
+
+### Point 2 — pool 126000, everything else IDENTICAL (boot 22:14:12Z)
+
+Produced by `scripts/seam_scaling_reboot.py`, which replays the live
+launch read back from `/proc` (85 env vars, 56 arguments) with exactly
+one substitution: `--max-total-tokens 500000 -> 126000`. The per-card
+budget stayed `22700,11920,11970`, ctx stayed 393216, weights and
+corridor untouched. Pool went 253528 -> 126000 (x0.497).
+
+| card | baseline free | trough free | SEAM PEAK | vs point 1 |
+|---|---|---|---|---|
+| gpu0 5090  | 6893 MiB | 6525 MiB | **368 MiB** | 2980 -> 368 (x0.12) |
+| gpu1 3080a | 8586 MiB | 8586 MiB | **0 MiB**   | 1376 -> 0 |
+| gpu2 3080b | 5677 MiB | 5629 MiB | **48 MiB**  | 1828 -> 48 (x0.026) |
+
+**Direction confound checked and excluded.** Both windows straddle the
+same PAIR of cutovers, verified from the logs rather than assumed:
+
+* point 1, window 22:08:37-22:08:52 — epoch 3 `pp_to_tp` 22:08:41,
+  epoch 4 `tp_to_pp` 22:08:43;
+* point 2, window 22:16:56-22:17:11 — epoch 3 `pp_to_tp` 22:17:05,
+  epoch 4 `tp_to_pp` 22:17:06.
+
+Same directions, same instrument, same window length. (A passive 40 s
+sample taken afterwards caught NO cutover at all: an idle instance stops
+flipping, so the flips must be driven, not waited for.)
+
+### ANSWER: the seam peak SCALES with the pool, steeply
+
+Halving the pool cut the driver-visible cutover transient by 8x to 38x —
+far more than proportionally. **The seam peak is not a fixed budget line
+that a bigger pool can be sized around.**
+
+The mechanism this implies, and it matters more than the ratio: the
+instrument measures the DRIVER-visible transient, which is the right
+observable because that is exactly what refuses a `cuMemCreate`. What the
+seam must ask the DRIVER for is (staging size) minus (slack torch already
+holds). A bigger pool grows the staging AND shrinks the slack, so the two
+terms move against each other and the driver-visible peak grows much
+faster than the pool. That is the same mechanism defect N died of: the
+backing path called `empty_cache()`, handing back the very slack that
+would have absorbed the next 128 MiB, and the driver then refused it.
+
+**Consequence for full-KV.** A >600k pool cannot be reached by sizing
+around this peak, because the peak grows as the pool does. It requires a
+fundamentally cheaper seam — pre-reserved, zero-allocation staging so the
+cutover never asks the driver for anything — not a bigger headroom
+allowance. The pool-ceiling formula from point 1 stands, but with a
+seam_peak term that is a function of the pool rather than a constant.
