@@ -2436,24 +2436,30 @@ class Scheduler(
         on one stream would misframe it the moment a message was split
         across them.
 
-        OFF BY DEFAULT, and that is a finding, not caution. The armed path
-        this receiver serves rests on progressing a posted ``irecv`` by
-        polling ``is_completed()``, and on this build that NEVER completes
-        -- measured, and pinned in
+        ON when the flip is enabled (#631 G). It was parked for one
+        design generation because the only consumer it offered was
+        ``poll()``, which rests on progressing a posted ``irecv`` by
+        polling ``is_completed()`` -- MEASURED FALSE on this build and
+        pinned in
         test_pp_chain_receiver.test_measured_gloo_does_not_progress_a_posted_irecv_by_polling.
-        Wired live it would absorb nothing, while the matching
-        announce-when-flushed clause withheld presence for ever, so every
-        flip would abandon at the presence deadline: strictly worse than
-        the defect it was written to fix. The same measurement also shows
-        an unconsumed forward does NOT block the upstream here, so the
-        premise that this receiver was built for is itself unconfirmed.
+        Wired live back then it would have absorbed nothing while the
+        matching announce-when-flushed clause withheld presence for ever,
+        so every flip would have abandoned at the presence deadline:
+        strictly worse than the defect it was written to fix.
 
-        Kept, gated, and tested rather than deleted: the state machine is
-        correct on its own terms and is the piece any future design needs,
-        whatever drives progress. Set SGLANG_PP_CHAIN_RECEIVER=1 to
-        exercise it.
+        What changed is the READINESS SIGNAL, not the transport. The armed
+        path no longer asks the transport whether a message arrived; it
+        reads the sender's published counter (``phase_flip_counters``) and
+        only then makes a deliberate BLOCKING receive, bounded by transfer
+        time. This class's two-step size-then-payload state machine is
+        exactly what that path needs, and it is why it was kept rather
+        than deleted.
+
+        ``SGLANG_PP_CHAIN_RECEIVER=0`` disables it as a kill switch --
+        which also disables the armed intake rule on this rank, so it is a
+        diagnostic, not a supported serving mode.
         """
-        if os.environ.get("SGLANG_PP_CHAIN_RECEIVER", "0") != "1":
+        if os.environ.get("SGLANG_PP_CHAIN_RECEIVER", "1") != "1":
             return None
         if not self.server_args.enable_phase_flip:
             return None
@@ -2464,11 +2470,51 @@ class Scheduler(
         from sglang.srt.managers.pp_chain_receiver import PpChainReceiver
 
         dp_offset = self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+        counters = self.pp_flip_counters
         return PpChainReceiver(
             group=self.world_group.cpu_group,
             src=(self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
             dst=self.ps.pp_rank * self.ps.tp_size + dp_offset,
+            # Publish the consumed count as each message leaves the wire,
+            # so the upstream learns its send is gone and can reap it with
+            # a bounded blocking commit instead of a speculative one.
+            on_consumed=(
+                (lambda _n: counters.bump_consumed(CHAN_REQ))
+                if counters is not None
+                else None
+            ),
         )
+
+    def _build_pp_flip_counters(self):
+        """#631 G: the pollable message-count channel, or None.
+
+        Built on EVERY rank of a flip-enabled PP boot -- including rank 0,
+        which has no upstream chain receiver but does have sends to reap
+        and is the rank whose starvation defined corpse G.
+        """
+        if not self.server_args.enable_phase_flip:
+            return None
+        if self.ps.pp_size <= 1:
+            return None
+        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
+            return None
+        from sglang.srt.managers.phase_flip_counters import PhaseFlipCounters
+        from sglang.srt.managers.phase_flip_presence import (
+            DEFAULT_PRESENCE_DIR,
+            resolve_instance_tag,
+        )
+
+        counters = PhaseFlipCounters(
+            n_ranks=self.ps.pp_size,
+            rank=self.ps.pp_rank,
+            directory=DEFAULT_PRESENCE_DIR,
+            instance=resolve_instance_tag(),
+        )
+        # A previous boot's counts on this instance tag would be read as
+        # messages in flight and send this rank into a blocking recv for
+        # nothing. Same hazard the presence sweep exists for (boot 15).
+        counters.sweep()
+        return counters
 
     def phase_flip_is_armed(self) -> bool:
         """#631: is a flip armed on this rank right now?
@@ -2482,6 +2528,9 @@ class Scheduler(
         return runtime is not None and runtime.is_armed()
 
     def init_request_receiver(self) -> None:
+        # #631 G: counters BEFORE the receiver -- the receiver publishes
+        # its consumed count through them.
+        self.pp_flip_counters = self._build_pp_flip_counters()
         self.pp_chain_receiver = self._build_pp_chain_receiver()
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
@@ -2518,18 +2567,22 @@ class Scheduler(
             # #631: both None unless the flip is enabled, so the default
             # intake path is unchanged.
             chain_receiver=self.pp_chain_receiver,
-            # Same gate as the receiver above, and for the same reason:
-            # the armed intake rule and the armed forward rule are one
-            # mechanism with it. Enabling them without a working drain
-            # would leave an armed rank consuming NOTHING, which is the
-            # boot-18 shape made permanent.
+            # #631 G: gated on the FLIP, not on the receiver. The receiver
+            # exists only on ranks with an upstream, so gating on it left
+            # the armed intake rule off on rank 0 -- the intake rank, the
+            # one that must stop admitting work for the group to reach a
+            # quiescent boundary at all, and the rank whose starvation
+            # defined corpse G.
             phase_flip_armed_hook=(
                 self.phase_flip_is_armed
-                if (
-                    self.server_args.enable_phase_flip
-                    and self.pp_chain_receiver is not None
-                )
+                if self.server_args.enable_phase_flip
                 else None
+            ),
+            # #631 G: one service turn -- consume every inbound message
+            # the upstream's counter accounts for, then reap this rank's
+            # own sends that the downstream's counter proves consumed.
+            phase_flip_service_hook=(
+                self.pp_flip_service if self.server_args.enable_phase_flip else None
             ),
         )
 

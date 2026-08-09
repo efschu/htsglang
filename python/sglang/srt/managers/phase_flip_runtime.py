@@ -749,28 +749,25 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
             n_ranks=world.world_size,
             rank=world.rank_in_group,
         ),
-        pump_fn=getattr(scheduler, "pp_pump_send_req_work", None),
-        # #631 the boot-18 pair. (ii) keep consuming so no peer can block
-        # on this armed rank; (i) withhold presence until this rank's own
-        # forward is flushed, so the flag means "I owe no send".
+        # #631 G: ONE mechanism where there used to be two half-working
+        # ones. pump_fn and drain_fn are gone from the wiring -- both were
+        # built on is_completed(), which never fires on this transport in
+        # either direction (corpse F), so neither ever moved a byte. The
+        # service turn does their job with a predicate the transport can
+        # honour: a counter published on /dev/shm strictly after each
+        # isend is posted.
         #
-        # BOTH are gated on the chain receiver, and both must stay off
-        # together. (i) without (ii) is the dangerous half: with the
-        # ordinary forward still being issued every pass, send_req_work is
-        # non-empty whenever the round hook runs, so presence would be
-        # withheld for ever and EVERY flip would abandon at the presence
-        # deadline -- a server that silently stops flipping. See
-        # Scheduler._build_pp_chain_receiver for why the pair is off.
-        drain_fn=(
-            getattr(scheduler, "pp_drain_chain_nonblocking", None)
-            if getattr(scheduler, "pp_chain_receiver", None) is not None
-            else None
-        ),
-        owes_send_fn=(
-            getattr(scheduler, "pp_owes_chain_send", None)
-            if getattr(scheduler, "pp_chain_receiver", None) is not None
-            else None
-        ),
+        # It is wired on EVERY rank, unlike the pair it replaces, which
+        # were gated on the chain receiver and were therefore off on rank
+        # 0 -- the intake rank, the one whose starvation defined corpse G.
+        service_fn=getattr(scheduler, "pp_flip_service", None),
+        channels_empty_fn=getattr(scheduler, "pp_flip_channels_empty", None),
+        # (i) withhold presence until this rank's own forward is flushed,
+        # so the flag means "I owe no send" rather than merely "I am
+        # armed". This is now a condition that can be REACHED: the service
+        # turn reaps the handle once the downstream's counter proves the
+        # message consumed, where the pump could only ever fail to.
+        owes_send_fn=getattr(scheduler, "pp_owes_chain_send", None),
         exchange=_dist_exchange(flip_tp.device_group, pp_view.device),
         pp_pool_view=pp_view,
         tp_pool_view=tp_view,
@@ -876,6 +873,17 @@ class PhaseFlipRuntime:
         # Presence is withheld until it reads False, so the flag means
         # "my chain is flushed; I owe no send".
         owes_send_fn: Optional[Callable[[], bool]] = None,
+        # #631 G: ONE TURN OF THE ARMED SERVICE LOOP. Consume every inbound
+        # message the upstream's counter accounts for, then reap this
+        # rank's own sends the downstream's counter proves consumed. It
+        # subsumes pump_fn and drain_fn, which were the same intent built
+        # on is_completed() -- a predicate this transport never satisfies
+        # (corpse F), so they moved nothing.
+        service_fn: Optional[Callable[[], None]] = None,
+        # #631 G: returns None when every channel of this rank is empty,
+        # else a human-readable reason. Flip-commit hygiene: a message in
+        # flight across the re-formation misframes the post-flip stream.
+        channels_empty_fn: Optional[Callable[[], Optional[str]]] = None,
         presence_deadline_s: float = DEFAULT_PRESENCE_DEADLINE_S,
         collective_min: Optional[Callable[[List[int]], List[int]]] = None,
         exchange: Optional[
@@ -962,6 +970,13 @@ class PhaseFlipRuntime:
         self._pump_fn = pump_fn
         self._drain_fn = drain_fn
         self._owes_send_fn = owes_send_fn
+        self._service_fn = service_fn
+        self._channels_empty_fn = channels_empty_fn
+        #: Diagnostics: how often presence was withheld because a channel
+        #: was not yet empty, and how often the entry check actually
+        #: caught a non-empty channel at the gate (which should be never).
+        self.presence_withheld_channels = 0
+        self.entry_channel_violations = 0
         self._presence_deadline_s = float(presence_deadline_s)
         self._presence_wait_started = None
         self._gate_open_epoch = None
@@ -1395,6 +1410,23 @@ class PhaseFlipRuntime:
         if self._presence_wait_started is None:
             self._presence_wait_started = self._clock()
 
+        # #631 G: THE SERVICE TURN, and the reason this loop is no longer a
+        # starvation source. A spinning rank used to stop issuing its
+        # per-pass chain forward, and its downstream reached the hook ONLY
+        # by returning from the blocking recv that forward satisfied -- so
+        # the first rank to quiesce blocked every rank behind it, every
+        # epoch, identically. The answer is not to keep sending (an armed
+        # rank has nothing to forward) but to make the downstream not NEED
+        # the send: it services its channels here and reaches the hook by
+        # its own poll. Blocking inside this call is bounded by transfer
+        # time, never by peer scheduling, because a counter proved the
+        # message exists before the receive was made.
+        if self._service_fn is not None:
+            try:
+                self._service_fn()
+            except Exception as exc:  # noqa: BLE001 - servicing is best effort
+                logger.warning("%s service turn failed: %s", LOG_PREFIX, exc)
+
         if self._pump_fn is not None:
             # Progress our own arm forward WITHOUT blocking on it. This is
             # what actually delivers the arm to the next stage while we
@@ -1450,7 +1482,25 @@ class PhaseFlipRuntime:
                 logger.warning("%s owes-send probe failed: %s", LOG_PREFIX, exc)
                 owes = False
 
-        if owes:
+        # #631 G, FLIP-COMMIT HYGIENE. Quiescent AND fully serviced implies
+        # every channel is empty; a rank that is not there yet withholds
+        # presence exactly as a rank that owes a send does. Withholding
+        # rather than abandoning is what keeps this CONVERGENT: a message
+        # still in flight is normally reaped by the next service turn, and
+        # the pre-entry deadline below still bounds the wait, so a rank
+        # that can never empty its channels abandons loudly instead of
+        # dragging the group into a reduction it cannot join.
+        unclean = None
+        if not owes and self._channels_empty_fn is not None:
+            try:
+                unclean = self._channels_empty_fn()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s channel probe failed: %s", LOG_PREFIX, exc)
+                unclean = None
+        if unclean:
+            self.presence_withheld_channels += 1
+
+        if owes or unclean:
             self.presence_withheld_rounds += 1
         else:
             self._presence.announce(
@@ -1462,7 +1512,42 @@ class PhaseFlipRuntime:
         # #631 H: the predicate is now "everyone present AND nobody
         # withdrawn". A stale presence flag from a rank that has since
         # abandoned must not form a quorum -- that is corpse H.
-        if not owes and self._presence.quorum(epoch, round_=entry_round):
+        if not owes and not unclean and self._presence.quorum(epoch, round_=entry_round):
+            # #631 G, THE ASSERT. Re-checked HERE, at the instant of entry,
+            # because the withholding check above proves nothing about the
+            # moment a quorum forms: a peer's message can land in between.
+            # This is the cheap catch for the nastiest silent failure this
+            # change can introduce -- a half-consumed two-step
+            # point_to_point_pyobj message, or an unreaped isend, crossing
+            # the re-formation and misframing the post-flip stream long
+            # after the flip is forgotten. It also catches a sender that
+            # died between posting its message and publishing its counter.
+            #
+            # Loud, and pre-entry: nothing has been entered, so abandoning
+            # costs nothing and no peer is owed a collective. Crossing the
+            # re-formation with a live channel would cost everything.
+            late = None
+            if self._channels_empty_fn is not None:
+                try:
+                    late = self._channels_empty_fn()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("%s entry channel probe failed: %s", LOG_PREFIX, exc)
+            if late:
+                self.entry_channel_violations += 1
+                logger.error(
+                    "%s CHANNELS NOT EMPTY AT ENTRY for epoch %d round %d: "
+                    "%s. A quiescent, fully serviced rank owes nothing on "
+                    "any channel, so this is a framing or quiescence bug, "
+                    "not a slow peer. Abandoning BEFORE entry -- nothing "
+                    "was entered and no request was touched.",
+                    LOG_PREFIX,
+                    epoch,
+                    entry_round,
+                    late,
+                )
+                waited = self._clock() - self._presence_wait_started
+                self._presence_wait_started = None
+                return self._abandon_no_quorum(epoch, [], waited)
             self._commit_to_entering(epoch, entry_round)
             waited = self._clock() - self._presence_wait_started
             self._presence_wait_started = None

@@ -21,6 +21,8 @@ FAMILY=(
     test/registered/scheduler/test_step6_harness.py
     test/registered/unit/managers/test_regime_act.py
     test/registered/unit/managers/test_phase_policy.py
+    test/registered/unit/managers/test_phase_flip_counters.py
+    test/registered/unit/managers/test_pp_chain_receiver.py
     test/registered/unit/server_args/test_phase_flip_args.py
     test/registered/unit/distributed/test_phase_flip_groups.py
     test/registered/unit/distributed/test_census_wire_domain_631.py

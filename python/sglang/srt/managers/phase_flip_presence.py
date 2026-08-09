@@ -37,7 +37,21 @@ measured corpses, 2026-08-08:
                                          never woken (boot 10)
   --  bounded chain recv                 breaks the 1:1 send/consume contract;
                                          unmatched sends pile up and the SENDERS
-                                         block
+                                         block.
+                                         NOT RESURRECTED BY THE ARMED SERVICE
+                                         LOOP (#631 G), and it will look like it
+                                         is. This corpse's failure DRIVER was
+                                         completing iterations WITHOUT consuming
+                                         while the upstream kept sending: the two
+                                         rates decoupled and the backlog grew
+                                         without bound. The service loop is
+                                         GREEDY -- it consumes every message the
+                                         sender's counter accounts for and never
+                                         skips an available one -- and it exists
+                                         ONLY in the armed state, where
+                                         admissions are held and armed upstreams
+                                         issue no new forwards. The driver is
+                                         absent by construction, not by tuning.
   --  bounded join (abandon from inside) FATAL: a rank that has entered an
                                          all_reduce owes it; walking away closed
                                          the gloo pairs and aborted every rank
@@ -261,11 +275,46 @@ neither is a variant of anything above.
       the same starvation recurs every epoch, because the same rank
       always drains first. The safety argument's case (b) is correct that
       this is not a wedge; what it did not predict is that the condition
-      reproduces identically on each attempt. A quiescent spinner
-      evidently must keep EMITTING the keep-alive forward (an isend needs
-      no peer and never blocks) even though it must not CONSUME -- but
-      that is a design decision, not a tweak, and it owes an answer for
-      the sends that then accumulate unconsumed.
+      reproduces identically on each attempt.
+
+      RESOLVED by the ARMED SERVICE LOOP with a MONOTONE SEND-COUNTER, and
+      the resolution is worth stating because the obvious fix is the wrong
+      one. The obvious fix is to keep EMITTING the keep-alive forward
+      while spinning; it fails on its own terms, because it owes an answer
+      for the sends that then accumulate unconsumed -- it converts a
+      starvation into the bounded-chain-recv corpse. The right fix is the
+      other side: stop the downstream from NEEDING the forward. While
+      armed, a rank replaces its blocking pass-loop waits with a service
+      loop that greedily consumes every inbound channel and reaches the
+      hook BY ITS OWN POLL, so no rank's readiness depends on a peer's
+      traffic at all.
+
+      HOW IT CONSUMES WITHOUT is_completed(), which is the load-bearing
+      part. It cannot ask the transport whether a message arrived -- that
+      predicate is corpse F. It asks a POLLABLE SIDE CHANNEL instead:
+      every sender publishes a monotone per-message counter in /dev/shm,
+      STRICTLY AFTER posting its isend, and a receiver makes the BLOCKING
+      recv() only once that counter exceeds its own consumed count. The
+      message then provably exists, so the block is bounded by transfer
+      time rather than by peer scheduling -- deliberate use of the one
+      transport behaviour with positive evidence (fact 5: the recv side's
+      wait() drives the transfer; arms propagated by exactly this route
+      across boots 14-18).
+
+      THE ORDERING IS THE DESIGN. Publish-after-post leaves only
+      counter-lags-send, i.e. a real message seen one poll late, which is
+      harmless. Publish-first would advertise a message nobody posted and
+      send a peer into an unbounded blocking recv -- the wedge class this
+      whole feature exists to remove. Pinned by
+      test_can_fail_publishing_before_the_post_wedges_the_receiver.
+
+      Spin-at-the-hook degenerates to this same loop with the gate already
+      open, which is why there is ONE mechanism here and not two. See
+      phase_flip_counters for the channel, and note the entry assert: a
+      quiescent, fully serviced rank owes nothing on any channel, so a
+      non-empty channel at entry is a framing or quiescence bug and
+      abandons the flip BEFORE entry rather than misframing the post-flip
+      stream.
 
   H   A PRE-ENTRY ABANDONMENT LEAVES A LIVE FLAG. _abandon_no_quorum is
       rank-local BY DESIGN -- nothing was entered, so no peer is owed
@@ -351,6 +400,27 @@ LOG_PREFIX = "PHASE-FLIP-PRESENCE"
 DEFAULT_PRESENCE_DIR = "/dev/shm/sglang-phase-flip-presence"
 
 
+def resolve_instance_tag(instance: str = "") -> str:
+    """The boot's rendezvous tag: unique per boot, IDENTICAL across ranks.
+
+    Factored out because the flip now has TWO /dev/shm channels -- the
+    presence markers and the message counters (#631 G) -- and they are one
+    rendezvous with one lifetime. Two independently derived tags would be
+    two ways to get the same thing subtly wrong, and getting it wrong is a
+    measured failure (see the constructor comment below, boot 15).
+    """
+    tag = instance or os.environ.get("SGLANG_PHASE_FLIP_INSTANCE")
+    if tag:
+        return tag
+    try:
+        # Start time of the process group leader: the same value on every
+        # rank of this boot, different on the next one.
+        with open(f"/proc/{os.getpgrp()}/stat") as fh:
+            return "pg" + fh.read().split()[21]
+    except (OSError, IndexError):
+        return "default"
+
+
 class PhaseFlipPresence:
     """Epoch-stamped, monotone, pollable per-rank ready markers.
 
@@ -386,15 +456,7 @@ class PhaseFlipPresence:
         # the environment, which the boot script sets ONCE and every rank
         # inherits. The fallback is deliberately NOT process-derived --
         # it uses the boot's own start time, shared via the parent.
-        self.instance = instance or os.environ.get("SGLANG_PHASE_FLIP_INSTANCE")
-        if not self.instance:
-            try:
-                # Start time of the process group leader: the same value
-                # on every rank of this boot, different on the next one.
-                with open(f"/proc/{os.getpgrp()}/stat") as fh:
-                    self.instance = "pg" + fh.read().split()[21]
-            except (OSError, IndexError):
-                self.instance = "default"
+        self.instance = resolve_instance_tag(instance)
         self.directory = directory
         os.makedirs(self.directory, exist_ok=True)
         # Drop anything left by an earlier boot before the first poll can
@@ -611,4 +673,9 @@ class PhaseFlipPresence:
         return removed
 
 
-__all__ = ["PhaseFlipPresence", "DEFAULT_PRESENCE_DIR", "LOG_PREFIX"]
+__all__ = [
+    "PhaseFlipPresence",
+    "DEFAULT_PRESENCE_DIR",
+    "LOG_PREFIX",
+    "resolve_instance_tag",
+]
