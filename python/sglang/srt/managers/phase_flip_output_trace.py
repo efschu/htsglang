@@ -332,11 +332,23 @@ def trace_round(kind: str, reqs, next_token_ids, result=None) -> None:
             tok = tok.tolist()
         if not isinstance(tok, (list, tuple)):
             tok = [tok]
+        # kv AGAINST have, per request, because the two clocks desyncing
+        # by one is the whole defect family. kv_committed_len counts the
+        # prefix this request has actually committed to the KV pool;
+        # len(origin_input_ids) + len(output_ids) counts what it has
+        # ADMITTED to having produced. A round that advances one and not
+        # the other leaves a token in the cache that the answer never
+        # shows -- which reads downstream as a wrong token rather than a
+        # missing one, because the model keeps generating from the cache.
+        out_ids = getattr(req, "output_ids", None) or []
+        origin = getattr(req, "origin_input_ids", None) or []
         parts.append(
-            "%s have=%d +%s"
+            "%s have=%d kv=%s seen=%d +%s"
             % (
                 str(getattr(req, "rid", "?"))[:8],
-                len(getattr(req, "output_ids", None) or []),
+                len(out_ids),
+                getattr(req, "kv_committed_len", "?"),
+                len(origin) + len(out_ids),
                 [int(x) for x in tok],
             )
         )
@@ -349,9 +361,22 @@ def trace_round(kind: str, reqs, next_token_ids, result=None) -> None:
         lens = getattr(result, "accept_lens", None)
         if lens is not None and hasattr(lens, "tolist"):
             lens = lens.tolist()
-        extra = " [accept_lens=%s stride=%s]" % (
+        # THE FLAT ROW TENSOR, before any per-request slicing. When the
+        # accept lengths are UNEQUAL, stride indexing (i*width) and
+        # cumulative indexing (sum of earlier accept_lens) disagree for
+        # every row but row 0 -- offset 0 is right in both coordinate
+        # systems, which is why row 0 is accidentally correct in this
+        # tree's whole family of row-offset defects. Printing the flat
+        # tensor decides it in one round: if a row's expected token sits
+        # at a DIFFERENT index, the defect is indexing; if it appears
+        # nowhere, the forward really produced what was committed.
+        flat = getattr(result, "next_token_ids", None)
+        if flat is not None and hasattr(flat, "tolist"):
+            flat = flat.tolist()
+        extra = " [accept_lens=%s stride=%s flat=%s]" % (
             lens,
             getattr(result, "speculative_num_draft_tokens", None),
+            flat,
         )
     logger.info("%s round kind=%s%s -- %s", LOG_PREFIX, kind, extra, " | ".join(parts))
 

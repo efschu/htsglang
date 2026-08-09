@@ -2140,11 +2140,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         # this draft extend has one token row per request
                         # and must stride over that, not over the
                         # instance's configured 4.
-                        verify_width=(
-                            int(verify_input.draft_token_num)
-                            if flip_bootstrap
-                            else None
-                        ),
+                        #
+                        # Passed UNCONDITIONALLY (#631): the two are equal
+                        # on every ordinary round, so this is byte-identical
+                        # there, and making it conditional on flip_bootstrap
+                        # left the correct width one `or` away from any
+                        # future narrowed caller. State the width, always.
+                        verify_width=int(verify_input.draft_token_num),
                     )
 
             # The bootstrap is discharged only HERE -- after the
@@ -2777,7 +2779,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.req_pool_indices,
                 batch.seq_lens,
                 accept_lens,
-                self.speculative_num_draft_tokens,
+                # THE WIDTH THAT RAN (#631). Same substitution as the
+                # returned result's stride below: this clears per-request
+                # draft state at `i * width` offsets, and the rows exist
+                # in the width THIS verify ran, not the configured one.
+                int(verify_input.draft_token_num),
             )
 
         # Update mamba state for hybrid GDN models after verification.
@@ -2792,7 +2798,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch,
                 accept_lens,
                 accept_index,
-                self.speculative_num_draft_tokens,
+                # THE WIDTH THAT RAN (#631), and on a hybrid GDN model
+                # this one is the ANSWER-CORRUPTING member of the family.
+                # The consumer computes
+                #   accept_index[req, accept_lens-1] - arange(0, bs*W, W)
+                # to recover each request's accepted STEP. accept_index
+                # holds GLOBAL node ids minted in the width this verify
+                # ran; subtracting an offset built from the CONFIGURED
+                # width yields `i - 4i` on a 1-wide bootstrap round --
+                # negative step ids for every request except i=0, whose
+                # offset is 0 in either coordinate system.
+                #
+                # The damage is a RECURRENT state written from the wrong
+                # step, so it does not surface at the cutover: the row
+                # decodes on from a subtly wrong linear-attention state
+                # and drifts. Measured as a wrong token ~28 tokens later,
+                # sparing batch row 0, with the KV/append clocks in
+                # perfect agreement (kv == seen - 1 on every row) --
+                # which is what ruled out an accounting desync and left
+                # the state itself.
+                int(verify_input.draft_token_num),
             )
 
         if not batch.forward_mode.is_idle():
@@ -2830,8 +2855,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # result.logits_output is None on the lane).
             and not _wl_worker
         ):
+            # THE WIDTH THAT RAN (#631), fourth site. The callee builds
+            # `arange(bs * (steps + 1))` over a tensor whose real row count
+            # is `bs * accept_index.shape[1]`; taking the step count from
+            # the tensor itself keeps the two equal by construction. Equal
+            # on every ordinary round (accept_index.shape[1] == steps + 1),
+            # so byte-identical outside a narrowed verify.
             compute_spec_v2_logprobs(
-                batch, logits_output, predict, accept_index, self.speculative_num_steps
+                batch,
+                logits_output,
+                predict,
+                accept_index,
+                accept_index.shape[1] - 1,
             )
 
         if not batch.forward_mode.is_idle() and self.topk > 1:
