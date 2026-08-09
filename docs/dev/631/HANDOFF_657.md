@@ -233,6 +233,15 @@ is exactly a spill/restore pair, already used at boot for the two model
 layouts. Rung 1 is that pair applied to `draft_worker`'s model at the seam
 instead of at boot.
 
+**The exact handle** (already documented by `draft_kv_pool`'s docstring, so
+do not re-derive it): the cutover's `draft_worker` is the `EAGLEWorkerV2`;
+its `.draft_worker` is the `EagleDraftWorker`; that worker's
+`.draft_runner` is the `ModelRunner`. Rung 1 therefore spills
+`draft_runner.model` via `checkpoint_param_dict(...)` →
+`plan_arena_layout` → `snapshot_and_free`. Reach it defensively: a
+phase-flip instance may be built with no speculation at all, in which case
+every rung is a no-op, not an `AttributeError` inside the no-return region.
+
 **Why rung 1 is safe and why it is first.** The PP phase has *no draft
 worker at all* — `build_flip_draft_worker` returns None there, and the
 cutover already documents the PP phase as "bit-for-bit the state an
@@ -388,10 +397,28 @@ touching any policy constant.
 
 ## 8. Exact next steps
 
-1. **Finish the soak** (ends ~21:59Z), then push. Verdict criteria: 0
-   scheduler exceptions, flips both directions, corridor floor 1024 held.
-   Corridor series: `/spinning/evidence-631/corridor_soak.csv`, summary in
-   `corridor_soak.summary`.
+1. **THE SOAK IN FLIGHT.** Started **21:05:08Z**, 65 minutes, ends
+   **~22:10Z**, on build `54b688aa95` (code identical to `e5e14be9e2`;
+   later commits are docs only). Evidence files, all still being written:
+
+   - driver: `/spinning/evidence-631/soak_final.log`
+   - corridor 100 ms series: `/spinning/evidence-631/corridor_final.csv`,
+     summary appears in `corridor_final.summary` when it ends
+   - server: `/spinning/evidence-631/server_info_final.json`
+     (pool 277468, ctx 393216)
+   - serving log: `/spinning/serving-30030.boot.log`
+
+   **Verdict criteria, all four required:**
+   (a) `grep -c "Scheduler hit an exception" /spinning/serving-30030.boot.log`
+       == 0 for the whole window;
+   (b) `err=0` on the final soak line;
+   (c) flips committed in BOTH directions
+       (`bash scripts/phase_evidence_extract.sh` — prefill records in PP,
+       decode records in TP with graphs);
+   (d) corridor min free >= 1024 MiB on every card, 0 breaches.
+
+   At T+2.5 min: `ok=6 err=0`, 0 exceptions, decode completing, health 200.
+   **A 4-minute green means nothing here — corpse J appeared at minute 5.**
 2. **Green criterion (user, item 5)**: real Qwen agents through the router
    (30099 → 30030) completing tasks, with a phase-evidence extract showing
    prefill tok/s tagged PP and decode tagged TP with graphs live. NOT DONE.
