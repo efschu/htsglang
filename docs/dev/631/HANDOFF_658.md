@@ -110,6 +110,20 @@ Pool on this boot: `max_total_num_tokens` **263768** at ctx 262144
 (RANK_MIB 22700,11920,11970) — well below the >600k target, and §4 explains
 why the spill ladder cannot close that gap without a real runtime grow.
 
+### KNOWN CONSEQUENCE: /health flaps 200 <-> 503 under purity
+
+Expected, not a wedge. The health probe is an ordinary generate: its
+prefill runs in a PP window and its decode is DEFERRED to the next TP
+window, so a probe issued mid-PP-window can exceed the endpoint's own
+timeout and return 503 (and can log "Health check failed. Server couldn't
+get a response from detokenizer"). Judge liveness by the soak's advancing
+`ok=` counter, not by a single probe. Anything monitoring 30030 with a
+strict health gate needs a timeout longer than one PP window (15 s).
+
+Distinguishing this from the real corpse-L wedge: there, health NEVER
+recovered and the policy logged the same "holding in tp: pending prefill 1
+tok" line every 10 s with `running bs 0` forever. Here the counters move.
+
 ### The pre-purity baseline, for comparison
 
 Serving log archived at `evidence-631/serving_prepurity_defectK.log`, soak
