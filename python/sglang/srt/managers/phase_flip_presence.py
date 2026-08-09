@@ -433,6 +433,28 @@ alone holding the flip.
       previous boot ever got far enough to allocate against the TP stack
       with a resident decode set.
 
+      THE ARITHMETIC POINTS SOMEWHERE SPECIFIC, so start there rather
+      than reading the whole allocator. The checker's invariant is
+      available + evictable + protected + session_held + uncached ==
+      total. Here 367623 + 0 + 80 + 0 + 0 = 367703 against total 367704:
+      EXACTLY ONE full page unaccounted, and exactly one mamba page
+      (18 + 1 against 20 -- note two are missing there, 2 = 20 - 18, so
+      the mamba side is off by one AFTER its own protected count of 1).
+      The flip moved "80 live slots" and protected is also 80, so the
+      moved set and the protected set agree with each other and disagree
+      with the pool by one row.
+
+      HYPOTHESIS, stated as one and not as a finding:
+      build_flip_live_slots_fn enumerates ``rows = req_to_token[idx, :n]``
+      with ``n = int(req.seqlen)``. During decode the allocator has
+      typically already reserved the row for the token being generated,
+      which is at index n and therefore OUTSIDE that slice. Such a row is
+      allocated in the source stack, never enumerated, never moved, and
+      in the destination stack belongs to neither the tree nor a
+      protected request -- which is precisely "leaked". Verify against
+      the real allocated extent before changing anything; seqlen is the
+      obvious suspect but it is not yet evidence.
+
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
 Measured 2026-08-08 23:39Z, all three stacks
