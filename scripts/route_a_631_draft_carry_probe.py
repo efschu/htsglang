@@ -98,20 +98,36 @@ def count_request(idx, results):
 
 
 def check_count(text):
-    """Return (ok, detail). The prompt primes '1', so the reply starts at 2."""
+    """Return (ok, detail, reached). The prompt primes '1' so the reply
+    starts at 2.
+
+    ONLY THE TASK IS CHECKED, not everything the model emits. asked for
+    1..COUNT_TO with max_new_tokens well above it, so whatever follows the
+    target is the model carrying on past its instruction -- degenerate
+    repetition, powers of two, whatever -- and judging that as corruption
+    would report the model's habits as a flip defect. The count is
+    truncated at the first number that reaches COUNT_TO.
+    """
     nums = [int(x) for x in re.findall(r"\d+", text or "")]
     if not nums:
-        return False, "no digits in reply"
+        return False, "no digits in reply", 0
+    cut = len(nums)
+    for i, v in enumerate(nums):
+        if v >= COUNT_TO:
+            cut = i + 1
+            break
+    nums = nums[:cut]
     want = list(range(nums[0], nums[0] + len(nums)))
-    if nums == want and nums[0] <= 3 and nums[-1] >= COUNT_TO - 2:
-        return True, f"{nums[0]}..{nums[-1]} unbroken ({len(nums)} numbers)"
+    reached = nums[-1]
+    if nums == want and nums[0] <= 3 and reached >= COUNT_TO:
+        return True, f"{nums[0]}..{reached} unbroken ({len(nums)} numbers)", reached
     for i, (a, b) in enumerate(zip(nums, want)):
         if a != b:
             return False, (
                 f"BREAK at position {i}: got {a}, expected {b}; "
                 f"reply starts {nums[:6]} ends {nums[-6:]}"
-            )
-    return False, f"short: {nums[0]}..{nums[-1]} ({len(nums)} numbers)"
+            ), reached
+    return False, f"short: {nums[0]}..{reached} ({len(nums)} numbers)", reached
 
 
 def log_slice(since_line):
@@ -129,6 +145,12 @@ def main():
     ap.add_argument("--concurrency", type=int, default=3)
     ap.add_argument("--delay", type=float, default=4.0,
                     help="seconds of decode before the flip is armed")
+    ap.add_argument("--no-flip", action="store_true",
+                    help="THE CONTROL. Same load, same checker, no flip. "
+                         "Required before any verdict about content: this "
+                         "strand has already had a run where the no-flip "
+                         "control drifted EARLIER than the flip run, which "
+                         "is what proved the drift was the model.")
     args = ap.parse_args()
 
     with open(LOG, "r", errors="replace") as fh:
@@ -150,8 +172,11 @@ def main():
         print(f"[{time.strftime('%H:%M:%SZ', time.gmtime())}] arming "
               f"{direction} with {args.concurrency} request(s) decoding",
               flush=True)
-        resp = flip(direction)
-        print(f"  /phase_flip -> {json.dumps(resp)[:200]}", flush=True)
+        if args.no_flip:
+            print("  CONTROL: no flip armed", flush=True)
+        else:
+            resp = flip(direction)
+            print(f"  /phase_flip -> {json.dumps(resp)[:200]}", flush=True)
         for t in threads:
             t.join()
 
@@ -162,10 +187,26 @@ def main():
                 print(f"  req{i}: ERROR {r['error']}")
                 ok_all = False
                 continue
-            ok, detail = check_count(r["text"])
+            ok, detail, _ = check_count(r["text"])
+            if not ok:
+                # The raw window, because a break says WHERE and the text
+                # says WHAT -- a dropped separator and a wrong token read
+                # identically as a number mismatch.
+                m = re.search(r"BREAK at position (\d+)", detail)
+                if m:
+                    nums = re.findall(r"\d+", r["text"] or "")
+                    pos = int(m.group(1))
+                    for mm in re.finditer(r"\d+", r["text"] or ""):
+                        pos -= 1
+                        if pos < 0:
+                            a = max(0, mm.start() - 40)
+                            print(f"    raw: ...{r['text'][a:mm.end() + 40]!r}...")
+                            break
             ok_all = ok_all and ok
+            spec = {k: v for k, v in r["meta"].items() if "accept" in k or "spec" in k}
             print(f"  req{i}: {'OK ' if ok else 'BAD'} {detail}  "
-                  f"({r['s']}s, {r['meta'].get('completion_tokens')} tok)")
+                  f"({r['s']}s, {r['meta'].get('completion_tokens')} tok"
+                  f"{', ' + json.dumps(spec) if spec else ''})")
         verdicts.append((direction, ok_all))
 
     new, _ = log_slice(mark)
@@ -186,7 +227,7 @@ def main():
 
     ok = (
         all(v for _, v in verdicts)
-        and facts["bootstrapped"] > 0
+        and (args.no_flip or facts["bootstrapped"] > 0)
         and facts["faults"] == 0
         and facts["collective_timeouts"] == 0
         and health() == 200

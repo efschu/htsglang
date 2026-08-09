@@ -109,6 +109,7 @@ region and a new collective there is a new wedge class.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, List, Optional, Sequence
 
 import torch
@@ -334,7 +335,25 @@ def arm_draft_bootstrap(scheduler, batch, draft_worker) -> dict:
         return {"reqs": len(reqs), "rows": 0, "armed": False}
 
     slot_rows = committed_slots(scheduler, batch)
-    rows, layer_ids = scrub_draft_kv(pool, slot_rows)
+    # THE SCRUB IS SEPARABLE ON PURPOSE, and this switch is a measuring
+    # instrument rather than a preference. Content correctness does not
+    # depend on it: the target verifies every proposed token, so stale
+    # draft rows cost acceptance and nothing else. A corrupted ANSWER
+    # therefore cannot be caused by skipping the scrub -- but it CAN be
+    # caused by performing one, if the draft pool turned out to alias the
+    # target's KV bytes. Running the probe once with the scrub off
+    # separates those two, and nothing else does it as cheaply.
+    if os.environ.get("SGLANG_PHASE_FLIP_DRAFT_SCRUB", "1") == "0":
+        rows, layer_ids = 0, []
+        logger.warning(
+            "%s SCRUB DISABLED by SGLANG_PHASE_FLIP_DRAFT_SCRUB=0: the "
+            "carried requests' draft KV keeps the previous occupants' "
+            "bytes. Acceptance only -- answers are unaffected because the "
+            "target verifies every proposed token.",
+            LOG_PREFIX,
+        )
+    else:
+        rows, layer_ids = scrub_draft_kv(pool, slot_rows)
 
     topk = int(getattr(draft_worker, "topk", 1) or 1)
     batch.spec_info = build_bootstrap_draft_input(scheduler, batch, topk)
