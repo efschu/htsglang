@@ -98,6 +98,7 @@ def turn(
     n_out = 0
     prompt_tokens = 0
     cached_tokens = 0
+    completion_tokens = 0
     phase_at_first = "?"
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
@@ -118,6 +119,9 @@ def turn(
                 cached_tokens = int(
                     details.get("cached_tokens") or cached_tokens
                 )
+                completion_tokens = int(
+                    usage.get("completion_tokens") or completion_tokens
+                )
             choices = obj.get("choices") or []
             if not choices:
                 continue
@@ -136,17 +140,23 @@ def turn(
     fresh = max(prompt_tokens - cached_tokens, 0)
     prefill_s = first_at - t0
     decode_s = max(last_at - first_at, 1e-9)
+    # TOKENS, NOT STREAM CHUNKS. Counting chunks undercounts decode by
+    # exactly the accept length whenever speculation is on: measured
+    # 29.0 "tok/s" by chunk against the server's own 106.16 token/s at
+    # accept len 3.70 (29.0 x 3.70 = 107). The completion count from the
+    # usage block is the honest numerator.
+    n_tokens = completion_tokens or n_out
     return {
         "ok": True,
         "text": text,
-        "n_out": n_out,
+        "n_out": n_tokens,
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
         "fresh_tokens": fresh,
         "prefill_s": prefill_s,
         "prefill_rate": (fresh / prefill_s) if prefill_s > 0 else 0.0,
         "phase_prefill": phase_at_first,
-        "decode_rate": (n_out - 1) / decode_s if n_out > 1 else 0.0,
+        "decode_rate": (n_tokens - 1) / decode_s if n_tokens > 1 else 0.0,
         "phase_decode": read_phase(log),
     }
 
@@ -158,7 +168,7 @@ def main() -> int:
     ap.add_argument("--turns", type=int, default=5)
     ap.add_argument("--doc-words", type=int, default=9000,
                     help="size of the document the agent carries in turn 1")
-    ap.add_argument("--max-tokens", type=int, default=192)
+    ap.add_argument("--max-tokens", type=int, default=800)
     ap.add_argument("--timeout", type=float, default=600.0)
     args = ap.parse_args()
 
@@ -168,23 +178,28 @@ def main() -> int:
     words = [f"item{random.randint(0, 99999)}" for _ in range(args.doc_words)]
     doc = " ".join(words)
 
+    # AN AGENT WRITES CODE, and the first version of this harness asked
+    # for "one short sentence" -- 14 to 33 tokens per turn, which does not
+    # measure decode at all. The turns below are real generation work, so
+    # the decode rate is measured over hundreds of tokens per turn, which
+    # is also the only regime where speculation's accept length matters.
     messages: List[Dict[str, str]] = [
         {
             "role": "user",
             "content": (
                 "Here is a list of inventory tokens:\n\n" + doc +
-                "\n\nAnswer briefly, in one short sentence: how would you "
-                "describe the structure of this list?"
+                "\n\nWrite a complete Python module that indexes this kind "
+                "of list: a class with add/lookup/remove, a duplicate "
+                "detector, and docstrings. Write the full code."
             ),
         }
     ]
     follow_ups = [
-        "Now, in one short sentence: what would a good index for it be?",
-        "In one short sentence: how would you detect duplicates?",
-        "In one short sentence: how would you shard it across three nodes?",
-        "In one short sentence: what would you cache first?",
-        "In one short sentence: how would you compress it?",
-        "In one short sentence: what would you monitor about it?",
+        "Now add sharding across three nodes to that module. Full code.",
+        "Add an LRU cache layer to it, with eviction. Full code.",
+        "Add compression of the stored keys. Full code.",
+        "Add a metrics/monitoring surface to it. Full code.",
+        "Add unit tests covering all of the above. Full code.",
     ]
 
     f0 = count_flips(args.log)
