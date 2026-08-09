@@ -60,6 +60,17 @@ MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-500000}"
 # explicit N) must accompany POLICY=auto -- a threshold is a measurement,
 # not a default.
 POLICY="${POLICY:-manual}"
+# SPEC=off boots the TP decode phase WITHOUT the NEXTN draft worker.
+#
+# Not a convenience knob: it isolates the resident-request carry (#631
+# J.3) from the draft state question. A request that prefills in the PP
+# phase has no draft KV, because the PP phase carries no draft worker at
+# all -- so a carried request entering a SPECULATING TP phase raises a
+# second, independent question on top of the carry. SPEC=off answers the
+# carry alone; the speculating boot is the rung after it. The cutover
+# already treats a draft-less instance as a first-class shape
+# ("bit-for-bit the state an instance without speculation has").
+SPEC="${SPEC:-on}"
 PHASE_POLICY_TP_TOK_S="${PHASE_POLICY_TP_TOK_S:-}"
 PHASE_POLICY_FLIP_TOKENS="${PHASE_POLICY_FLIP_TOKENS:-}"
 PHASE_POLICY_MIN_DWELL_S="${PHASE_POLICY_MIN_DWELL_S:-}"
@@ -76,6 +87,11 @@ if [ "$HICACHE" = "1" ]; then
   HICACHE_FLAGS="--enable-hierarchical-cache --hicache-ratio $HICACHE_RATIO --hicache-write-policy write_through --hicache-mem-layout page_first_direct --hicache-io-backend direct"
 else
   HICACHE_FLAGS=""
+fi
+if [ "$SPEC" = "off" ]; then
+  SPEC_FLAGS=""
+else
+  SPEC_FLAGS="--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
 fi
 LOGDIR="${LOGDIR:-/tmp/route-a-631}"
 LOG="${SERVING_LOG:-/spinning/serving-30030.boot.log}"
@@ -286,8 +302,7 @@ setsid "$PY" -m sglang.launch_server \
     `# space grow. Keep it comfortably ABOVE the id space: the boot guard` \
     `# refuses a TP capacity below it.` \
     --max-total-tokens "$MAX_TOTAL_TOKENS" \
-    --speculative-algorithm NEXTN --speculative-num-steps 3 \
-    --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+    $SPEC_FLAGS \
     --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
     --chat-template-default-kwargs '{"preserve_thinking": true}' \
     --enable-cache-report \

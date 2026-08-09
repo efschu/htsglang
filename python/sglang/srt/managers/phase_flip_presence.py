@@ -576,6 +576,55 @@ alone holding the flip.
       probe on a request that decodes ACROSS a cutover is the cheap oracle
       and is owed before any acceptance claim.
 
+  K   THE RESIDENT CARRY, which is J.3's fix and the first design here
+      that did NOT need a new mechanism. The drop site is one line:
+      cutover step 6 calls Scheduler.init_pp_loop_state(), which rebinds
+      running_mbs to fresh empty ScheduleBatch objects. Under
+      event_loop_pp running_mbs IS the resident decode set (running_batch
+      and last_batch are per-slot aliases -- J.1), so that rebind dropped
+      every resident request: unreachable Req objects whose KV rows stay
+      allocated and whose mamba slot locks stay held. The stranded page
+      and the stranded lock were never two bugs.
+
+      WHERE THE FIX LIVES IS THE DESIGN. Not in the cutover:
+      init_pp_loop_state has THREE callers -- boot, the cutover, and
+      event_loop_pp's own entry -- and the TP->PP leg re-dispatches into
+      that loop immediately after the cutover, so a carry installed only
+      at the cutover would be wiped microseconds later by the loop it was
+      installed for. The rule is stated at the function that destroys the
+      state ("init must never destroy a resident request"), harvesting
+      before the rebind and re-seeding after it. At boot nothing is
+      resident, so the default path is bit-for-bit unchanged.
+
+      THE HAZARD IS DUPLICATION, NOT LOSS, once the carry exists.
+      merge_batch extends self.reqs IN PLACE, so it is not idempotent,
+      while init_pp_loop_state is called repeatedly. A second merge of the
+      same list enters the same Req twice: duplicate rows, a double free,
+      silently corrupt context. Hence harvest dedupes by batch IDENTITY
+      (running_batch is normally an ALIAS of a slot) and REFUSES loudly if
+      one Req is reachable through two distinct batches. Pinned by
+      test_repeated_init_does_not_duplicate_requests.
+
+      NOTHING IS REMAPPED, and that is a property of the boot, not an
+      omission: phase_flip_boot step 5a rebinds both stacks' req_to_token
+      and req_index_to_mamba_index_mapping to the SAME tensors, and both
+      layouts key on global slot ids. Every handle a carried Req holds
+      stays valid across the layout swap by construction; the movers
+      relocate the bytes behind those ids.
+
+      SECOND OCCURRENCE OF J.1, FOUND BY AUDIT WHILE BUILDING THIS, and
+      worse than the first because it is silent. gdn_flip_mover's slot
+      enumeration read scheduler.running_batch -- one microbatch slot --
+      so the GDN leg moved the conv/ssm state of whichever slot was
+      current and LEFT BEHIND the linear state of every request resident
+      elsewhere. Since J.1 the KV move carries those requests correctly,
+      so the request decodes on with its linear state truncated at the
+      flip point: #212's shape, and nothing raises. Now a named function
+      (resident_mamba_slots) over the same _live_reqs authority the KV
+      enumeration uses. THE GENERAL LESSON STANDS AND IS NOT CLOSED: any
+      code reading running_batch/last_batch from a per-slot hook is making
+      this mistake, and two instances are now confirmed.
+
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
 Measured 2026-08-08 23:39Z, all three stacks

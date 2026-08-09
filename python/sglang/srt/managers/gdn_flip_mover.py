@@ -559,6 +559,40 @@ class GdnFlipMover:
         return stats
 
 
+def resident_mamba_slots(scheduler) -> "torch.Tensor":
+    """The mamba slots the flip must move: THE RESIDENT SET's, not one slot's.
+
+    #631 J.1, SECOND OCCURRENCE, and the reason this is a named function
+    with a pin rather than a closure. This used to read
+    ``scheduler.running_batch``. Under ``event_loop_pp`` that attribute is
+    rebound to ``running_mbs[mb_id]`` at the top of every slot iteration,
+    so it names ONE microbatch slot -- and the flip's hook fires at the end
+    of an arbitrary one. The GDN leg therefore moved the conv/ssm state of
+    whichever slot happened to be current and LEFT BEHIND the linear state
+    of every request resident in another slot.
+
+    THAT FAILURE IS SILENT, which is why it is called out rather than
+    quietly corrected: since J.1 the KV move carries the request's
+    attention cache correctly, so the request would decode on -- with its
+    linear-attention state truncated at the flip point. #212's exact
+    shape, and nothing raises. ``_live_reqs`` is the one authority for
+    "who is resident" and the KV enumeration already uses it; so does this.
+    """
+    from sglang.srt.managers.phase_flip_runtime import _live_reqs
+
+    vals = []
+    for req in _live_reqs(scheduler):
+        idx = getattr(req, "mamba_pool_idx", None)
+        if idx is None:
+            raise KvReshardError(
+                f"{LOG_PREFIX} live request {getattr(req, 'rid', '?')} "
+                f"has no mamba slot -- refusing to flip past unmoved "
+                f"linear state"
+            )
+        vals.append(int(idx.item() if hasattr(idx, "item") else idx))
+    return torch.tensor(sorted(set(vals)), dtype=torch.int64)
+
+
 def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
     """Production pre_cutover_fn: preconditions re-validated per flip,
     slots from the replicated running batch, exchange over the flip
@@ -595,19 +629,7 @@ def build_gdn_flip_mover(scheduler) -> Callable[[str], None]:
         )
 
     def _slots() -> torch.Tensor:
-        running = getattr(scheduler, "running_batch", None)
-        reqs = list(getattr(running, "reqs", []) or []) if running else []
-        vals = []
-        for req in reqs:
-            idx = getattr(req, "mamba_pool_idx", None)
-            if idx is None:
-                raise KvReshardError(
-                    f"{LOG_PREFIX} live request {getattr(req, 'rid', '?')} "
-                    f"has no mamba slot -- refusing to flip past unmoved "
-                    f"linear state"
-                )
-            vals.append(int(idx.item() if hasattr(idx, "item") else idx))
-        return torch.tensor(sorted(set(vals)), dtype=torch.int64)
+        return resident_mamba_slots(scheduler)
 
     flip_tp = get_phase_flip_group("tp")
     device = pp_req_pool.mamba_pool.mamba_cache.temporal.device

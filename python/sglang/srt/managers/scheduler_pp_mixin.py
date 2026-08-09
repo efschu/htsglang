@@ -1003,6 +1003,30 @@ class SchedulerPPMixin:
         return "; ".join(reasons) if reasons else None
 
     def init_pp_loop_state(self: Scheduler):
+        # #631 J.3: THIS REBIND IS WHERE THE RESIDENT DECODE SET DIED.
+        #
+        # ``running_mbs`` is not scratch space -- under event_loop_pp it IS
+        # the rank's resident set (running_batch/last_batch are per-slot
+        # aliases, #631 J.1). Rebinding it to fresh empty batches drops
+        # every resident request: unreachable Req objects whose KV rows
+        # stay allocated (the leaked page the idle checker reports) and
+        # whose mamba slot locks stay held (x_lru.full_lock_ref=1 ->
+        # SIGQUIT). Two symptoms, one omission, measured at the cutover of
+        # 2026-08-09 02:36Z.
+        #
+        # The rule is stated HERE and not at the cutover because this
+        # function has three callers -- boot, the cutover's topology swap,
+        # and event_loop_pp's own entry -- and the TP->PP leg re-dispatches
+        # into that loop immediately after the cutover, so a carry
+        # installed only there would be wiped by the loop it was for.
+        # At boot nothing is resident and the harvest is empty, so the
+        # default path is bit-for-bit unchanged.
+        from sglang.srt.managers.phase_flip_resident_carry import (
+            carry_across_pp_loop_init,
+            harvest_resident_batches,
+        )
+
+        carried = harvest_resident_batches(self)
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
@@ -1025,6 +1049,9 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        # Re-seed what the rebind above destroyed (#631 J.3). No-op unless
+        # requests were resident, i.e. always a no-op at boot.
+        carry_across_pp_loop_init(self, carried)
 
     def profile_and_init_predictor(self: Scheduler):
         """
