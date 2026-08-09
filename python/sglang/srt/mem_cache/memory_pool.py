@@ -26,6 +26,7 @@ import abc
 import dataclasses
 import logging
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -2394,6 +2395,23 @@ class MHATokenToKVPool(KVCache):
     def _alloc_post_capture_buffers(self):
         dev = torch.device(self.device)
         device_id = dev.index if dev.index is not None else torch.cuda.current_device()
+        # #631 ZERO-ALLOCATION SEAM (SGLANG_FLIP_SEAM_CHUNK_MIB, default 0 =
+        # off, so this is inert unless asked for and the A/B is ONE
+        # variable). The flip's cutover releases the source layout's
+        # physical pages and immediately re-commits the destination's,
+        # which today means 2*L monolithic cuMemCreate calls served only
+        # from driver-free pages -- the allocation that has to succeed
+        # inside the no-return region. Setting a chunk makes every handle
+        # the same size, and retention then re-maps the source's handles
+        # for the destination instead of asking the driver at all.
+        #
+        # Deliberately ONE knob for two settings: retention without a chunk
+        # is a no-op that costs memory (the sizes never match), so exposing
+        # them separately only creates a broken combination to choose.
+        # Only swappable pools qualify -- a pool that never releases has
+        # nothing to park and would just pin its own pages forever.
+        chunk_mib = int(os.environ.get("SGLANG_FLIP_SEAM_CHUNK_MIB", "0") or 0)
+        seam_chunk = (chunk_mib << 20) if (chunk_mib > 0 and self.swappable_backing) else None
         self._post_capture_owner = KvVmmBufferOwner(
             device=self.device,
             device_id=device_id,
@@ -2401,7 +2419,8 @@ class MHATokenToKVPool(KVCache):
             page_size=self.page_size,
             reserved_num_tokens=self.size,
             buffer_descs=self._build_kv_buffer_descs(),
-            commit_chunk_bytes=self._vmm_commit_chunk_bytes,
+            commit_chunk_bytes=self._vmm_commit_chunk_bytes or seam_chunk,
+            retain_handles=seam_chunk is not None,
         )
         self._assign_post_capture_tensors(self._post_capture_owner.tensors)
 

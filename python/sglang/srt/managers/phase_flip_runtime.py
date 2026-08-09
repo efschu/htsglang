@@ -57,6 +57,7 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
     validate_layer_map,
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+from sglang.srt.managers import phase_flip_seam_census as seam_census
 from sglang.srt.model_executor.weights_arena import uint8_checksum
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.managers.kv_reshard import (
@@ -1398,9 +1399,9 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         # (5.3b mover -- its preconditions re-validate on every flip and
         # refuse loudly, the reachable-refusal contract), then the arena
         # refill. The full-attn KV move ran before these by the runtime.
-        pre_cutover_fns=(
-            _build_gdn_leg(scheduler),
-            stacks.refill,
+        pre_cutover_fns=_labelled_movers(
+            (_build_gdn_leg(scheduler), "gdn_state"),
+            (stacks.refill, "weights_refill"),
         ),
         pre_write_fns=(_build_kv_backing_swap(scheduler, stacks),),
         guards=flip_blocking_guards(scheduler),
@@ -1408,6 +1409,26 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
     # #631 J: read-only handle for the pool census straddling the cutover.
     runtime._census_scheduler = scheduler
     return runtime
+
+
+def _labelled_movers(*pairs) -> Tuple[Callable[[str], None], ...]:
+    """Tag each pre-cutover mover with the name the seam census reports.
+
+    A closure per pair rather than ``setattr`` on the callables: one of
+    them is a BOUND METHOD (``stacks.refill``), and setting an attribute
+    on a bound method either fails or silently lands on the underlying
+    function and is then shared by every instance. Wrapping keeps the
+    label a property of THIS wiring, which is what it actually is.
+    """
+    movers = []
+    for fn, label in pairs:
+
+        def _mover(direction: str, _fn=fn) -> None:
+            _fn(direction)
+
+        _mover.census_label = label
+        movers.append(_mover)
+    return tuple(movers)
 
 
 def _build_kv_backing_swap(scheduler, stacks) -> Callable[[str], None]:
@@ -1458,8 +1479,17 @@ def _build_kv_backing_swap(scheduler, stacks) -> Callable[[str], None]:
         # torch's unused blocks back to the driver rather than dying.
         # If it raises after that, the card is genuinely full and it raises
         # loudly here, inside the flip, rather than corrupting anything.
+        # The two halves are censused SEPARATELY and that separation is the
+        # point: the release hands physical pages back to the driver and the
+        # restore asks for them again (2*L monolithic cuMemCreate calls for
+        # the destination span, since the flip pools carry no commit chunk).
+        # A single mark around the pair would net them out and report the
+        # difference of the spans -- which is exactly the reading that hides
+        # a re-commit that cannot be served.
         src.release_backing()
+        seam_census.mark("backing_release")
         dst.restore_backing()
+        seam_census.mark("backing_restore")
 
     return _swap
 
@@ -2714,6 +2744,10 @@ class PhaseFlipRuntime:
         direction = self._pending
         assert direction is not None
         t0 = self._clock()
+        # #631 seam census: per-STAGE memory attribution across this cutover.
+        # The aggregate cost was measured from outside the process; which
+        # STAGE spends it was not, and the candidates have different fixes.
+        seam_census.begin(direction, self._rank)
         slots = self._live_slots_fn()
         slots = torch.unique(slots.detach().to("cpu", torch.int64))
         tr: PhaseFlipTransition = build_phase_flip_transition(
@@ -2799,9 +2833,12 @@ class PhaseFlipRuntime:
                 "; ".join(too_small) if too_small else "fits (a peer did not)",
                 self._phase,
             )
+            # Abandoned before any byte moved: there is no seam to attribute.
+            seam_census.reset()
             return None
 
         # PACK (reads only): per peer, layers ascending, one row list.
+        seam_census.mark("plan")
         t_read0 = self._clock()
         outgoing_payloads: Dict[int, torch.Tensor] = {}
         for peer in tr.send_layers:
@@ -2815,6 +2852,7 @@ class PhaseFlipRuntime:
             flat = torch.cat(parts)
             outgoing_payloads[peer] = torch.cat([flat, _checksum(flat)])
         read_ms = (self._clock() - t_read0) * 1000.0
+        seam_census.mark("kv_pack")
 
         # Expected incoming sizes from MY OWN pool's row widths -- the
         # runtime pin of row byte-compatibility across layouts.
@@ -2868,6 +2906,7 @@ class PhaseFlipRuntime:
         # source row that has not been read yet. Hoisting the reads costs
         # one list of already-materialised payloads, which the peer legs
         # above hold anyway.
+        seam_census.mark("kv_exchange")
         t_write0 = self._clock()
         local_src = (
             tr.local_pp_rows if direction == PP_TO_TP else tr.local_tp_rows
@@ -2891,6 +2930,7 @@ class PhaseFlipRuntime:
         # process life, which is what forced each of them to be sized against
         # half the per-rank budget. The VA reservations do not move, so
         # addresses baked into captured decode graphs stay valid.
+        seam_census.mark("kv_local_read")
         for fn in self._pre_write_fns:
             fn(direction)
 
@@ -2915,10 +2955,16 @@ class PhaseFlipRuntime:
         # destination allocator", and those have opposite fixes. Straddling
         # the cutover answers it directly: if the unaccounted page is
         # already there BEFORE, the enumeration is innocent.
+        seam_census.mark("kv_write")
         self._pool_census("pre-cutover", direction)
         for fn in self._pre_cutover_fns:
             fn(direction)
+            # Labelled per mover: the GDN state leg and the weights refill
+            # have different sizes AND different fixes, so one combined
+            # "pre_cutover" bar would be unattributable.
+            seam_census.mark(getattr(fn, "census_label", "pre_cutover_fn"))
         self._cutover_fn(direction)
+        seam_census.mark("cutover")
         self._pool_census("post-cutover", direction)
         self._phase = _PHASE_AFTER[direction]
         self._pending = None
@@ -2958,4 +3004,11 @@ class PhaseFlipRuntime:
             xfer_ms,
             write_ms,
         )
+        census = seam_census.end()
+        if census is not None:
+            peak = census.peak_bytes()
+            if peak is not None:
+                stats["seam_transient_bytes"] = int(peak)
+                low = census.trough()
+                stats["seam_trough_stage"] = low[0] if low else ""
         return stats

@@ -36,7 +36,12 @@ def _check(result, label: str):
     return result[1] if isinstance(result, tuple) and len(result) > 1 else None
 
 
-def _mem_create_reclaiming(step: int, prop, label: str = "cuMemCreate"):
+def _mem_create_reclaiming(
+    step: int,
+    prop,
+    label: str = "cuMemCreate",
+    reclaim: Optional[callable] = None,
+):
     """``cuMemCreate``, and on OUT_OF_MEMORY reclaim torch's cache and retry.
 
     THE COMPETITION THIS RESOLVES, measured on metal (#631, 2026-08-09
@@ -82,6 +87,18 @@ def _mem_create_reclaiming(step: int, prop, label: str = "cuMemCreate"):
             torch.cuda.memory_allocated() / (1 << 30),
         )
         torch.cuda.empty_cache()
+        if reclaim is not None:
+            # #631: the arena's own parked handles are the other thing that
+            # can be sitting on the pages this create needs. Dropping them
+            # costs the zero-allocation property until the next release
+            # re-parks -- strictly better than failing the flip.
+            freed = reclaim()
+            if freed:
+                logger.warning(
+                    "%s: released %.2f GiB of parked handles as well.",
+                    label,
+                    freed / (1 << 30),
+                )
         result = drv.cuMemCreate(step, prop, 0)
     return _check(result, label)
 
@@ -158,6 +175,7 @@ class KvVmmArena:
         device_id: int,
         reserve_bytes: int = _DEFAULT_RESERVE_BYTES,
         commit_chunk_bytes: Optional[int] = None,
+        retain_handles: bool = False,
     ):
         self.device_id = int(device_id)
         # Unique per (process, arena instance): the stub .so lives in a host-shared
@@ -206,6 +224,27 @@ class KvVmmArena:
             self._chunk = (
                 None if commit_chunk_bytes is None else self._align(commit_chunk_bytes)
             )
+            # #631 ZERO-ALLOCATION SEAM. With retention on, decommit_range
+            # UNMAPS an extent but does not cuMemRelease its physical
+            # handle: the handle is parked here, keyed by its exact byte
+            # size, and the next commit of that size re-maps it instead of
+            # asking the driver for pages.
+            #
+            # WHY THE SIZE KEY IS EXACT AND WHY THAT NEEDS A COMMIT CHUNK.
+            # A CUDA physical handle is created at a fixed size; there is
+            # no API to split or merge one, so a parked handle can only
+            # serve a request of the SAME size. With commit_chunk_bytes
+            # unset the arena makes ONE monolithic handle per buffer, so
+            # the PP span and the TP span produce differently-sized
+            # handles and nothing is ever reusable -- retention alone
+            # would park memory and still allocate. Chunked commits make
+            # every handle the same granule, and only then are the pages
+            # fungible between the two layouts. The two settings are one
+            # feature; enabling retention without a chunk is a no-op that
+            # costs memory, which is why _back_spans logs the pairing.
+            self._retain_handles = bool(retain_handles)
+            self._retained = {}
+            self._retained_bytes = 0
 
         self._lib = self._build_stub()
         self._fn_set_base(ctypes.c_void_p(self.base))
@@ -295,7 +334,18 @@ class KvVmmArena:
                 if self._chunk is not None:
                     step = min(step, self._chunk)
                 addr = self.base + offset + pos
-                handle = _mem_create_reclaiming(step, self._prop)
+                handle = self._take_retained(step)
+                reused = handle is not None
+                if handle is None:
+                    # The park is checked FIRST and the driver only after,
+                    # so the steady state after one round trip is zero
+                    # driver allocations. On a genuine miss the park itself
+                    # may be what is holding the pages this create needs
+                    # (sizes changed), so it is offered as a reclaim source
+                    # alongside torch's cache.
+                    handle = _mem_create_reclaiming(
+                        step, self._prop, reclaim=self.drop_retained
+                    )
                 try:
                     _check(drv.cuMemMap(addr, step, 0, handle, 0), "cuMemMap")
                     _check(
@@ -307,8 +357,16 @@ class KvVmmArena:
                     # far (the watermark below reflects them truthfully).
                     unmap = drv.cuMemUnmap(addr, step)
                     unmap = unmap[0] if isinstance(unmap, tuple) else unmap
-                    rel = drv.cuMemRelease(handle)
-                    rel = rel[0] if isinstance(rel, tuple) else rel
+                    # A REUSED handle goes back to the park, not to the
+                    # driver. Releasing it here would silently shrink the
+                    # retained pool on every failed map, so a transient
+                    # mapping error would degrade the seam to allocating
+                    # again -- with no log line saying so.
+                    if reused:
+                        self._park_retained(step, handle)
+                    else:
+                        rel = drv.cuMemRelease(handle)
+                        rel = rel[0] if isinstance(rel, tuple) else rel
                     raise
                 extents.append((pos, step, handle))
                 pos += step
@@ -339,7 +397,10 @@ class KvVmmArena:
                     _check(
                         drv.cuMemUnmap(self.base + offset + rel, size), "cuMemUnmap"
                     )
-                    _check(drv.cuMemRelease(handle), "cuMemRelease")
+                    if self._retain_handles:
+                        self._park_retained(size, handle)
+                    else:
+                        _check(drv.cuMemRelease(handle), "cuMemRelease")
                     released += size
                     self._range_backed -= size
                 else:
@@ -349,6 +410,55 @@ class KvVmmArena:
             (rel + size for rel, size, _ in kept), default=0
         )
         return released
+
+    def _park_retained(self, size: int, handle) -> None:
+        self._retained.setdefault(int(size), []).append(handle)
+        self._retained_bytes += int(size)
+
+    def _take_retained(self, size: int):
+        """A parked handle of EXACTLY ``size`` bytes, or None."""
+        if not self._retain_handles:
+            return None
+        bucket = self._retained.get(int(size))
+        if not bucket:
+            return None
+        handle = bucket.pop()
+        self._retained_bytes -= int(size)
+        return handle
+
+    @property
+    def retained_bytes(self) -> int:
+        """Physical bytes parked: unmapped, still owned, NOT driver-free.
+
+        This is the honest name for what retention costs. ``decommit_range``
+        keeps returning bytes UNMAPPED, which is what its callers log, and
+        with retention on those bytes are no longer the same thing as bytes
+        handed back to the driver -- so a caller that reports "released N
+        MiB" while this is non-zero is reporting address space, not free
+        memory. Read both or neither.
+        """
+        return int(self._retained_bytes)
+
+    def drop_retained(self) -> int:
+        """Release every parked handle to the driver; return bytes freed.
+
+        The escape hatch for the one case retention cannot serve: a commit
+        whose size never matches anything parked (a layout resize), where
+        the park would otherwise hold pages the commit needs.
+        """
+        drv = _driver()
+        freed = 0
+        for size, bucket in self._retained.items():
+            for handle in bucket:
+                err = drv.cuMemRelease(handle)
+                err = err[0] if isinstance(err, tuple) else err
+                if err != drv.CUresult.CUDA_SUCCESS:  # pragma: no cover
+                    logger.warning("cuMemRelease(retained) -> %s", err)
+                else:
+                    freed += int(size)
+        self._retained.clear()
+        self._retained_bytes = 0
+        return freed
 
     def committed_bytes(self, offset: int) -> int:
         """The contiguous physically-committed watermark at ``offset``."""
@@ -383,6 +493,9 @@ class KvVmmArena:
                 if err != drv.CUresult.CUDA_SUCCESS:
                     logger.warning("cuMemRelease range -> %s", err)
         self._extents_by_offset.clear()
+        # Parked handles are owned physical memory; skipping them here
+        # leaks the entire retention pool for the life of the process.
+        self.drop_retained()
         err = drv.cuMemAddressFree(self.base, self.reserved)
         err = err[0] if isinstance(err, tuple) else err
         if err != drv.CUresult.CUDA_SUCCESS:
@@ -431,6 +544,7 @@ class KvVmmBufferOwner:
         reserved_num_tokens: int,
         buffer_descs: Sequence[KvBufferDesc],
         commit_chunk_bytes: Optional[int] = None,
+        retain_handles: bool = False,
     ):
         self.device = device
         self.device_id = int(device_id)
@@ -448,10 +562,24 @@ class KvVmmBufferOwner:
             reserved_spans = [d.reserved_span_bytes(itemsize) for d in buffer_descs]
             aligned = [align_up(s, gran) for s in reserved_spans]
             reserve_bytes = sum(a + _PER_BUFFER_VA_SLACK for a in aligned) + gran
+            if retain_handles and commit_chunk_bytes is None:
+                # Named loudly rather than silently tolerated: retention
+                # with one monolithic handle per buffer parks memory that
+                # the other layout's differently-sized commit can never
+                # reuse, so it is pure cost. See KvVmmArena.__init__.
+                logger.warning(
+                    "KvVmmBufferOwner: retain_handles was requested without a "
+                    "commit chunk. Handles are then per-buffer monoliths whose "
+                    "sizes differ between the PP and TP layouts, so nothing is "
+                    "reusable and the park is pure cost. Retention is DISABLED "
+                    "for this owner; set a commit chunk to enable it."
+                )
+                retain_handles = False
             self._arena = KvVmmArena(
                 self.device_id,
                 reserve_bytes=reserve_bytes,
                 commit_chunk_bytes=commit_chunk_bytes,
+                retain_handles=retain_handles,
             )
             assert self._arena.granularity == gran, (self._arena.granularity, gran)
 
