@@ -4612,17 +4612,50 @@ class Scheduler(
         # reachable BETWEEN a request's prefill and its decode (the
         # design's core promise; without this, an armed flip waited for
         # every stream to FINISH -- measured on the first rung-c attempt,
-        # 2026-08-08). A half-written chunk is exempt: its continuation
-        # must complete or ready_fn could never go true. Rank-uniform:
-        # pending arrives via the broadcast RPC in the same round on every
-        # rank, and chunked_req is replicated batch state. The park is
-        # BOUNDED by the runtime's park deadline (group-agreed abort of
-        # the FLIP, never of the requests).
+        # 2026-08-08). Rank-uniform: pending arrives via the broadcast RPC
+        # in the same round on every rank, and chunked_req is replicated
+        # batch state. The park is BOUNDED by the runtime's park deadline
+        # (group-agreed abort of the FLIP, never of the requests).
+        #
+        # THE CHUNK EXEMPTION, NARROWED 2026-08-09 -- defect O's other half.
+        # This condition used to be `self.chunked_req is None`, on the
+        # reasoning that "a half-written chunk is exempt: its continuation
+        # must complete or ready_fn could never go true". Defect O retired
+        # that premise IN THE SAME SESSION and this site was never
+        # revisited: ready_fn no longer blocks on a chunked request at all,
+        # only on one that has no pool row yet (mid-admission), because
+        # BETWEEN CHUNKS IS A SETTLED BOUNDARY -- committed KV, a fully
+        # accounted extend_range, exactly the state the carry moves.
+        #
+        # Left wide, the exemption defeated the very flip it was meant to
+        # protect. MEASURED, production, 2026-08-09 20:31:38-48Z: tp_to_pp
+        # armed BECAUSE "pending prefill 12747 tok > N=7004", and then the
+        # scheduler kept building the next 2048-token chunk every round for
+        # ten seconds until all 12747 tokens had been prefilled in the TP
+        # layout at ~1500 tok/s (PP does the same work at ~4200). The
+        # cutover committed into PP with 459 tokens left, whereupon the
+        # policy immediately armed pp_to_tp again ("prefill down to 459
+        # tok"). Two cutovers paid to move work already done in the slow
+        # layout -- and those back-to-back epochs 6/7/8 are the interleaving
+        # that exposed corpse I and killed PP0 at 20:31:48.
+        #
+        # The exemption now covers exactly what ready_fn still blocks on
+        # and nothing more. Once the request holds a pool row the park
+        # applies, the boundary arrives within a round or two, and the
+        # pending prefill lands in PP -- which is the entire point of
+        # arming tp_to_pp.
+        # The predicate lives next to the quiescence rule it must agree
+        # with (chunk_blocks_quiescence), so the two cannot drift apart
+        # again the way they did between defect O and 20:31:48.
+        from sglang.srt.managers.phase_flip_runtime import (
+            chunk_blocks_quiescence,
+        )
+
         if (
             self.server_args.enable_phase_flip
             and self.phase_flip_runtime is not None
             and self.phase_flip_runtime.pending is not None
-            and self.chunked_req is None
+            and not chunk_blocks_quiescence(self.chunked_req)
         ):
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
