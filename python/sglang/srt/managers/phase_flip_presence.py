@@ -387,6 +387,52 @@ Boot POLICY=auto, tree 088d4dddfa + the counter-publish fix.
       server stayed answering. The bounded pre-entry machinery held
       throughout.
 
+THE FIRST AUTOMATIC FLIP EVER COMMITTED (2026-08-09 01:37:12Z)
+---------------------------------------------------------------
+Boot POLICY=auto. The gate assembled 0.01 s after arming and the flip
+went through on all three ranks:
+
+  PHASE-FLIP cutover complete: active stack tp, ps tp=3 pp=1
+  PHASE-FLIP DONE pp_to_tp (epoch 1) in 1038.8 / 1265.0 / 1762.0 ms:
+      80 live slots, sent 368 cells / 0.72 MiB, received 272 / 0.53 MiB
+      (read 2.6 ms, exchange 117.6 ms, ...)
+  PHASE-FLIP event loop re-dispatch after pp_to_tp (active stack now tp)
+
+WHAT UNBLOCKED IT was not another gate fix. It was a CONTRADICTION IN THE
+QUIESCENCE PREDICATE, and it had been silently defeating every automatic
+flip for as long as the policy has existed. build_flip_quiescence_fn
+called Scheduler._pp_microbatches_drained -- the FULLY-IDLE predicate,
+which also requires every ``running_mbs`` slot to be empty. ``running_mbs``
+is the RESIDENT DECODE SET and empties only when requests FINISH. But the
+policy arms pp_to_tp precisely BECAUSE requests are decoding. Arming
+condition and quiescence condition could therefore never hold together:
+the group assembled, entered the reduction, agreed, and abandoned on the
+park deadline with ready=0 on every rank, for ever.
+
+It also contradicted the function's own docstring two lines above ("does
+NOT require ... an empty running batch") and the rest of the design:
+build_flip_live_slots_fn exists specifically to move the KV rows of
+requests that are resident at the flip. What must be quiet is the
+PIPELINE -- no forward in flight, no half-written chunk -- which is what
+``mbs`` answers. Diagnosed from the per-rank quiescence reason that this
+build now logs: "NOT QUIESCENT: PP microbatches not drained (live mb
+slots [], running_mbs slots [0])" -- nothing in flight, the decode set
+alone holding the flip.
+
+  J   POST-FLIP POOL ACCOUNTING FOR THE CARRIED DECODE SET. Exposed
+      immediately by the commit above, and the next thing to fix. One
+      pass after the cutover, on_idle's invariant checker raised:
+        pool memory leak detected! [full] total=367704, available=367623,
+        protected=80, leaked_full_pages={81}, leaked_mamba_pages={2}
+      i.e. one full page and one mamba page unaccounted after 80 live
+      slots crossed the flip. The KV move itself reported balanced cells;
+      what does not survive is the ALLOCATOR-SIDE bookkeeping for the
+      carried rows in the destination stack. Every rank raised it and the
+      group went down on SIGQUIT. This is the direct and expected
+      consequence of the flip finally carrying live requests -- no
+      previous boot ever got far enough to allocate against the TP stack
+      with a resident decode set.
+
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
 Measured 2026-08-08 23:39Z, all three stacks

@@ -566,10 +566,48 @@ class TestSchedulerSideHelpers(CustomTestCase):
             {"chunked_req": object()},
             {"result_queue": [object()]},
             {"last_batch": SimpleNamespace(is_empty=lambda: False)},
-            {"_pp_microbatches_drained": lambda: False},
+            # An in-flight PP microbatch: the pipeline is not quiet.
+            {"mbs": [SimpleNamespace(is_empty=lambda: False)]},
         ):
             sched = self._fake_scheduler(**over)
             self.assertFalse(build_flip_quiescence_fn(sched)(), over)
+
+    def test_a_resident_decode_set_alone_does_not_block_the_flip(self):
+        """THE CONTRACT, and the correction of a measured contradiction.
+
+        This used to call Scheduler._pp_microbatches_drained, the
+        FULLY-IDLE predicate, which also requires every ``running_mbs``
+        slot to be empty. ``running_mbs`` is the RESIDENT DECODE SET: it
+        empties only when the requests FINISH. So quiescence could not
+        hold while anything was decoding -- and the automatic policy arms
+        pp_to_tp precisely BECAUSE requests are decoding. The two
+        conditions were mutually exclusive, and every automatic flip
+        abandoned at the park deadline.
+
+        Measured 2026-08-09 01:29:50Z under POLICY=auto with one request
+        decoding: ranks 0 and 1 reported "PP microbatches not drained
+        (live mb slots [], running_mbs slots [0])" -- nothing in flight,
+        the resident decode set alone holding the flip. The gate
+        assembled, all three ranks entered the reduction, and the group
+        agreed to abandon with ready=0 everywhere.
+
+        Carrying a resident decode set across is what the rest of the
+        design already assumes: build_flip_live_slots_fn exists to move
+        exactly those requests' KV rows.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+
+        sched = self._fake_scheduler(
+            mbs=[None, None, None],
+            running_mbs=[SimpleNamespace(is_empty=lambda: False)],
+        )
+        self.assertTrue(
+            build_flip_quiescence_fn(sched)(),
+            "a resident decode set blocked quiescence; the flip can then "
+            "never commit under the policy that arms it",
+        )
 
     def test_live_slots_union_tree_and_parked_rows(self):
         from types import SimpleNamespace
