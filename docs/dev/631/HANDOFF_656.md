@@ -1049,3 +1049,55 @@ quiescence guarantee, so it would discard in-flight microbatches.
 `model_runner.forward`, the single funnel every PP stage's forward passes
 through. The model asserted the proxy's presence but never its shape.
 0 false positives across a full boot with cuda-graph capture; suite 425.
+
+## 7. THE RESUME GATE: built, unit-proven, METAL-FALSIFIED, parked
+
+Branch `feat/route-a-631-resume-gate` (do NOT merge). The feature branch
+stays at `2e7131de7d`, which is verified healthy and is what serves.
+
+**What it does.** Holds the withhold past the disarm until every rank has
+published a disarm marker (/dev/shm, presence-gate discipline), closing
+the §6 skew. Built deliberately as a PREDICATE re-evaluated per pass, not
+a rendezvous -- a gated rank keeps cycling and servicing its channels --
+and bounded at 1 s with a loud expiry so a dead peer cannot hold the
+survivors out of service.
+
+**Unit evidence**: suite **433 passed** (425 + 8 gate tests); the falsifier
+is mutation-proven (forcing the gate open fails 5 tests); a boot came up
+clean with 0 false positives.
+
+**METAL FALSIFIED IT.** Under the reproducer the instance WEDGED at
+06:47:37Z. py-spy, specimen
+`/spinning/evidence-631/gate_wedge_20260809T0647Z`:
+
+    rank 0  _pp_commit_comm_work <- _pp_forward_and_process_input_requests
+            (the BLOCKING top-of-pass chain flush, unarmed branch)
+    rank 1  _pp_recv_proxy_tensors -> _pp_recv_typed_dict
+    rank 2  _pp_recv_proxy_tensors -> _pp_recv_typed_dict
+
+That is the corpse table's founding deadlock class verbatim: rank 0 blocked
+on the request chain while its peers sit in the HIDDEN-STATES exchange.
+
+**THE LESSON, and it is a general one about this feature.** The gate blocks
+on nothing, and I still recreated the deadlock class. **The design law is
+about the SKEW, not only about who calls wait().** Any mechanism that
+changes WHEN a rank launches relative to its peers can drive adjacent ranks
+into different blocking channels, whether or not the mechanism itself
+waits. Withholding is therefore the wrong lever.
+
+The same run also produced the first PASS-CLOCK line where the microbatch
+phase actually diverged (previously always `mb_id=0`):
+
+    rank 1 ran 5932 slot iterations, rank 2 ran 10957,
+    armed at mb_id=0, DISARMED AT mb_id=2
+
+**NAMED DIRECTION FOR THE NEXT ATTEMPT**: fix the RECEIVE side, not the
+launch side. Consume a proxy when the UPSTREAM says it sent one -- the
+`CHAN_DICT` counters already publish exactly that -- instead of when this
+rank happens to have a batch. That removes the strand without moving any
+rank's launch timing, so it cannot manufacture skew. It needs a decision
+about what a rank does with a proxy it has no batch for (discarding loses a
+microbatch), which is the real design question and is not yet answered.
+
+**Defect Q is now PARKED, not closed** -- and the run above is the first
+evidence that its drift can reach the microbatch phase.
