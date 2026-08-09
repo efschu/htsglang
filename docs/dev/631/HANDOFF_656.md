@@ -2740,3 +2740,82 @@ supports ~459k) and run one session past 262144, watching the corridor.
 I did not start it because a 12-minute boot-plus-measure cycle would have
 outrun my remaining context, and the rule is that serving is left on the
 last PROVEN configuration rather than mid-experiment.
+
+## 6. BS1-SPILL IS STRUCTURALLY BLOCKED IN THIS TREE — three specimens
+
+The operator authorised "if something is structurally blocked, name it
+with a specimen". It is, and here they are. This is a code-reading
+result, corroborated by the §5 measurement; it is not a metal run.
+
+**SPECIMEN 1 — a vacated GDN slot never becomes KV.** `#364`
+(`--gdn-resident-state-slots`) is the idle-vacate feature, and its own
+comment forecloses the goal
+(`python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py:2136-2140`):
+
+    What the cap does NOT do is grow the KV pool at RUNTIME when a
+    session vacates -- the pool is fixed at boot; a vacated slot is
+    reused by another session, not returned to the KV pool.
+
+So the ladder's KV benefit is BOOT-TIME only (cap the state pool, spend
+the remainder on KV). At bs1 the fifteen idle slots do vacate, but their
+bytes go to the next session, never to the lone session's context.
+
+**SPECIMEN 2 — a single session is refused a spill, by design.**
+`python/sglang/srt/managers/kv_session_offload.py:1076-1085`:
+
+    BY-DESIGN CONSEQUENCE (a SINGLE session never self-spills): under
+    plain decode-OOM with exactly one running session, that session IS
+    the oldest -> untouchable -> no victim -> ... Spill is a
+    SCHEDULER-PRESSURE relief ... not a single-session context extender.
+    A lone request > the device KV budget therefore truncates; it does
+    not spill.
+
+That is the leg's premise stated and rejected in the source. The only
+single-session route is born-spilled prefill
+(`--kv-session-offload-prefill`), which admits only when the prompt
+ALREADY exceeds device KV at admission.
+
+**SPECIMEN 3 — turning kvso on would kill the flip.**
+`python/sglang/srt/managers/phase_flip_runtime.py:585-612`
+(`flip_blocking_guards`, enforced in `arm()` at :1597):
+
+    if getattr(scheduler, "kv_session_offload", None) is not None:
+        guards.append("kv-session-offload")
+
+kvso BOOTS with `--enable-phase-flip` (no argument-time refusal) but then
+permanently disarms every flip: `phase flip refused (guards):
+kv-session-offload`. So kvso and Route A are mutually exclusive in
+practice, and a boot that enables it would silently become a non-flipping
+instance. Hierarchical cache is refused outright at argument time
+(#630); PD disaggregation and dual-group lane are likewise guarded.
+
+**WHAT DOES COMPOSE with `--enable-phase-flip`** (no arg guard, no runtime
+guard): `--gdn-resident-state-slots N` (GDN state crosses the flip via
+`gdn_flip_mover.py`), and `--kv-pressure-ladder <explicit vector>` in the
+form `relief:<name>[,...]` — but NOT the `session_offload` rung, which
+forces kvso on and thus disarms the flip. `--kv-pressure-ladder auto`
+still refuses on this mixed-card node.
+
+**CONCLUSION FOR THE LEG.** As specified — "reserves for requests 2-4
+spill so the single session's usable KV grows at runtime" — it cannot be
+built from the existing machinery without new code: no path returns
+vacated bytes to the KV pool at runtime, and the one component that moves
+KV to host explicitly refuses to do it for a lone session. Combined with
+§5 (the lone session is capped by `context_length`, not by a reserve),
+the honest route to "a single session gets max KV" on this rig is the
+CONTEXT CEILING plus a boot-time state-pool cap:
+
+    --gdn-resident-state-slots 4      (boot-time KV gain, bs=4 preserved
+                                       via the pre-cap admission ceiling)
+    --context-length <raised>          (#543 split; the 459392 pool
+                                       already exceeds 262144)
+
+Both compose with the flip. Neither is measured yet.
+
+**METAL-UNPROVEN / NOT RUN:** the YaRN boot. I attempted it and the boot
+was REFUSED by the single-instance guard because the previous instance
+had not finished dying; the 10-minute call budget expired inside that
+refusal, and no experimental configuration ever ran. Serving was brought
+back on the proven config (health 200) rather than left down. The next
+shift should run exactly the two flags above, together, and measure a
+single session past 262144 with the corridor sampler attached.
