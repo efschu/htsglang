@@ -32,6 +32,7 @@ FAMILY=(
     test/registered/unit/managers/test_phase_flip_decode_relay_631.py
     test/registered/unit/managers/test_spec_verify_width_631.py
     test/registered/unit/managers/test_kv_arena_reclaim_631.py
+    test/registered/unit/managers/test_spec_counter_wire_631.py
     test/registered/unit/managers/test_spec_mamba_commit_width_631.py
     test/registered/unit/server_args/test_phase_flip_args.py
     test/registered/unit/distributed/test_phase_flip_groups.py

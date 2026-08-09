@@ -1,0 +1,38 @@
+{
+  "samples": 3715,
+  "elapsed_s": 374.16732454299927,
+  "floor_mib": 1024.0,
+  "held": false,
+  "cards": [
+    {
+      "gpu": 0,
+      "name": "NVIDIA GeForce RTX 3080",
+      "total_mib": 20480.0,
+      "min_free_mib": 922.375,
+      "mean_free_mib": 10439.571954912517,
+      "max_free_mib": 20052.0625,
+      "breaches": 893,
+      "min_at_s": 133.88190960884094
+    },
+    {
+      "gpu": 1,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_mib": 32607.0,
+      "min_free_mib": 815.6875,
+      "mean_free_mib": 15895.997240915209,
+      "max_free_mib": 32085.5625,
+      "breaches": 920,
+      "min_at_s": 85.95309329032898
+    },
+    {
+      "gpu": 2,
+      "name": "NVIDIA GeForce RTX 3080",
+      "total_mib": 20480.0,
+      "min_free_mib": 904.375,
+      "mean_free_mib": 10250.491655450875,
+      "max_free_mib": 20052.0,
+      "breaches": 893,
+      "min_at_s": 133.88190960884094
+    }
+  ]
+}

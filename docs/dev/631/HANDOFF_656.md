@@ -2585,3 +2585,112 @@ Still metal-unproven: `meta_info` accept-len end to end (the scheduler log
 carries it; the wire does not), the arena reclaim on metal (fired 0 times
 across four runs), the bs=1 spill leg, the bs=1 YaRN leg beyond 262144,
 and the A-vs-A gate against `9a929352c9`.
+
+---
+
+# HANDOFF v13 — written 2026-08-09 by successor #11 (second shift)
+
+Ordered work from the operator: spend the two capacity credits together,
+close the second accept-len gate, then the bs1-spill and YaRN legs. One
+is closed, one is a MEASURED WALL, and the legs are untouched — context
+exhausted. Everything below is labelled by what it is.
+
+## 1. THE SECOND ACCEPT-LEN GATE IS CLOSED (code + tests; metal unproven)
+
+v12 §2 left `meta_info` empty even after the streamer's stale
+`spec_algorithm` copy was fixed, and named the remaining gate. It was in
+`_GenerationStreamAccumulator`: the spec-counter appends were gated on
+the LIVE phase. A phase-flip instance speculates only in TP, so a request
+that verified in TP and FINISHED after the return flip had its counters
+dropped — the numbers were on the Req and the phase active at completion
+decided they would not be shipped. Under POLICY=auto that is a large
+share of all traffic (observed directly: `phase_before tp phase_after
+pp`).
+
+Fixed by keying the predicate on the SERVER CONFIG
+(`server_args.speculative_algorithm is not None`), threaded into the
+accumulator as `spec_configured`. Constant for the life of the process,
+so the lists stay BATCH-ALIGNED — which matters because
+`tokenizer_manager` indexes them by request position, and the ragged
+appends are exactly what made its defensive `len(...) > i` guard
+necessary. A non-speculating server is byte-identical (predicate false).
+
+Caught during implementation and worth recording: the first version read
+`self.server_args` inside the accumulator, which has no such field — it
+would have raised AttributeError on the first streamed batch. The
+accumulator takes a plain bool instead.
+
+TESTS: `test/registered/unit/managers/test_spec_counter_wire_631.py`, 4
+cases — the PP-finish case, the batch-alignment pin, the can-fail that
+the old predicate drops them, and the non-speculating byte-identity.
+Suite 540 passed.
+
+**METAL-UNPROVEN.** Every boot after this fix was a capacity experiment
+that crashed before a clean `meta_info` read could be taken. The next
+shift should simply probe `/generate` on the restored boot and check for
+`spec_accept_length`.
+
+## 2. THE CREDITS ARE MOSTLY NOT SPENDABLE — a measured wall
+
+The server prints a restart hint
+(`SGLANG_UNEVEN_TOKEN_VECTOR=... to raise max_total_num_tokens from X to
+~Y`) and both this shift and the operator read it as free capacity. IT IS
+NOT. The hint maximizes CAPACITY UTILISATION and knows nothing about the
+corridor. Three attempts, all crashed:
+
+    run  vector      RANK_MIB              max_total  MIN free        result
+    4    28,26,20    22700,11920,11970       459392   1034/2824/1228  HELD
+    5    34,17,13    24400,11920,11970       607680   1952/  16/1994  OOM crash
+    6    34,17,13    23050,11920,11970       607680   1950/  34/1852  OOM crash
+    7    28,20,16    22700,11920,11970       500800    922/ 816/ 904  breach+crash
+
+WHY, and this is the part that was not understood before: the vector
+does not merely re-label ratios, it sets each rank's ALLOCATED pool as
+`unit x ratio`. Moving rank 0 from 28/64 to 34/64 grew its pool from
+173824 to 322830 tokens — roughly +4.6 GiB on the 5090, against the
+2824 MiB of slack that existed. Backing the BUDGET off 1350 MiB barely
+moved the minimum (16 -> 34 MiB), because the budget only caps capacity
+while the vector decides the allocation. That is the same
+budget-is-not-the-lever lesson as v12 §3, in a second costume.
+
+Run 5's crash is `torch.OutOfMemoryError` in the allocator, NOT the arena
+path — the reclaim correctly did not fire (0 events), so it is still
+metal-unproven.
+
+MEASURED CEILING. Using the run 4 numbers and the budget sweep's
+32 tokens/MiB on rank 0, the per-rank pool ceiling that keeps every card
+at the floor is [231436, 161415, 125203] tokens, i.e. an achievable total
+around 510k, vector ~29,20,15 — about +11%, not the +32% the hint
+advertised. Run 7 tested the conservative 28,20,16 (predicted
+1409/1187/1196) and measured 922/816/904: the model is optimistic by
+~400 MiB per card, uniformly. So the REAL ceiling is below +9%, and the
+honest reading is that **the current layout is already within ~10% of
+what this rig can hold at the corridor floor.** Do not spend another
+shift chasing the hint; if the pool must grow materially it needs the
+PP3-phase KV layout rebuild (#297/#635) the spec authorises, not vector
+tuning.
+
+## 3. State at end of shift
+
+HEAD `76e93a62a6` plus the §1 fix (committed on top). Suite **540
+passed**. SERVING HEALTHY on the PROVEN configuration — `RANK_MIB=
+22700,11920,11970`, vector 28,26,20 (the prod_boot defaults),
+`expandable_segments:True`, POLICY=auto, SPEC=on, graphs on,
+`max_total_num_tokens=459392`, health 200. That is the run-4 config whose
+corridor HELD at 1034/2824/1228 with 87/87 requests and 0 aborts.
+
+Prod boot defaults were NOT changed by this shift's experiments; the
+crashed configurations exist only as evidence logs
+(`docs/dev/631/evidence/s11_run5..7_*`).
+
+## 4. Untouched, and why
+
+The bs1-spill leg and the YaRN leg were not started: the capacity
+experiments consumed the shift, and each crash cost a boot plus a 390 s
+measurement. They are unblocked — nothing found here stands in their
+way — and should be taken FIRST next shift, before any further capacity
+tuning, since §2 says the remaining capacity upside is small while those
+two legs are entirely unmeasured.
+
+Also still open: the A-vs-A gate vs `9a929352c9`, `PROD_BRINGUP_BENCH.md`,
+and the one unmanned log carrying everything at once.

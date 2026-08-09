@@ -140,6 +140,7 @@ class SchedulerOutputStreamer:
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
             spec_algorithm=self.spec_algorithm,
+            spec_configured=self.server_args.speculative_algorithm is not None,
             disaggregation_mode=self.disaggregation_mode,
             default_stream_interval=self.server_args.stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
@@ -252,6 +253,13 @@ class _GenerationStreamAccumulator:
     return_routed_experts: bool
     return_indexer_topk: bool
     spec_algorithm: Any
+    #: Whether this SERVER was configured with speculation, as opposed to
+    #: whether it is speculating right now. Constant for the life of the
+    #: process, which is what keeps the spec counter lists batch-aligned on
+    #: a phase-flip instance whose PP phase carries no draft worker. See
+    #: the comment at the append site. Defaults False so every existing
+    #: construction site keeps the non-speculating behaviour exactly.
+    spec_configured: bool = False
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
@@ -418,7 +426,30 @@ class _GenerationStreamAccumulator:
 
         self.time_stats.append(req.time_stats)
 
-        if not self.spec_algorithm.is_none():
+        # WHETHER THIS SERVER SPECULATES AT ALL, not whether it is
+        # speculating in this instant (#631). These lists are indexed BY
+        # REQUEST POSITION in tokenizer_manager, so they must be
+        # batch-aligned: appending for some requests and not others is what
+        # made the defensive `len(...) > i` guard necessary there.
+        #
+        # The live-phase condition broke that on a phase-flip instance. Its
+        # PP phase carries no speculation, so a request that verified
+        # normally in the TP phase and FINISHED after the return flip had
+        # its counters silently dropped -- the numbers were on the Req, and
+        # the phase active at completion decided they would not be shipped.
+        # Under POLICY=auto that is a large share of all traffic (measured:
+        # requests routinely start in TP and finish in PP), which is why
+        # meta_info carried no spec_accept_length even after the streamer's
+        # stale spec_algorithm copy was fixed.
+        #
+        # Keyed on server_args, the predicate is constant for the life of
+        # the process, so the lists are always batch-aligned and the
+        # non-speculating server is byte-identical to before (the condition
+        # is simply false). Requests that never speculated contribute 0,
+        # and tokenizer_manager's `spec_verify_ct[i] > 0` check is what
+        # selects the ones that did -- a request-level question answered
+        # with request-level data.
+        if self.spec_configured:
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
             self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
