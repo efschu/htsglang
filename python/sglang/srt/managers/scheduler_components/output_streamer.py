@@ -25,6 +25,7 @@ from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
 )
+from sglang.srt.managers.phase_flip_output_trace import trace_emit
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -373,6 +374,17 @@ class _GenerationStreamAccumulator:
         self.read_offsets.append(read_offset)
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
+        # #631: what this rank actually handed over, recorded only inside a
+        # post-cutover window (a no-op module global otherwise). The slices
+        # are half-open and consecutive, so their lengths must sum to the
+        # final len(output_ids); the trace is what proves the client's
+        # array against this rank's own list rather than assuming it.
+        trace_emit(
+            req.rid,
+            send_token_offset,
+            len(output_ids_) - send_token_offset,
+            len(req.output_ids),
+        )
         self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
         self.spaces_between_special_tokens.append(
             req.sampling_params.spaces_between_special_tokens

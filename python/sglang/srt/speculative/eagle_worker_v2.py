@@ -2851,7 +2851,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
-            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            # THE WIDTH THAT RAN, not the instance's configured one (#631,
+            # and it is the SAME general form as the _draft_extend_for_decode
+            # defect fixed in 4147972205 -- one consumer further along).
+            # Every row-strided quantity downstream of this result divides
+            # its tensors by this number: _resolve_spec_v2_tokens slices
+            # each request's accepted run at [i*stride, i*stride+accept_len),
+            # and the return_hidden_states lane slices the same way. Those
+            # tensors have `verify_input.draft_token_num` rows per request,
+            # because that is the tree this verify actually verified.
+            #
+            # The two are equal on every ordinary round, which is why the
+            # static value stood in. The phase-flip BOOTSTRAP round is the
+            # first caller for which they differ: it runs a 1-node trivial
+            # verify on an instance configured for 4, so `predict` has bs
+            # rows while the consumer strode over 4. Request 0 sliced its
+            # single token correctly and every later request sliced PAST
+            # THE END and got an EMPTY LIST -- output_ids.extend([]) -- so
+            # each carried request beyond the first silently lost exactly
+            # the one token that round produced. Measured 2026-08-09
+            # 10:13:17Z, all three ranks agreeing:
+            #   round kind=decode -- 3367da51 have=49 +[220]
+            #                      | bcf3eb14 have=49 +[]
+            #                      | 6772dc40 have=49 +[]
+            # The KV still advanced, so the answer resumed correctly one
+            # token short: "...19 2021" where "19 20 21" was due.
+            speculative_num_draft_tokens=int(verify_input.draft_token_num),
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,

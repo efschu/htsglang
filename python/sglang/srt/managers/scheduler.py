@@ -4257,6 +4257,15 @@ class Scheduler(
             )
 
             self.phase_flip_runtime = build_phase_flip_runtime(self)
+        # #631: the per-rank output_ids clock, once per pass. Both loop
+        # families reach this line exactly once per pass, which is what
+        # makes the three ranks' lines comparable; the site name records
+        # WHERE in the pass the sample was taken, because the PP hook sits
+        # at the END of the iteration (after that pass's result was
+        # processed) and the TP one at the top (before this pass ran).
+        from sglang.srt.managers.phase_flip_output_trace import trace_tick
+
+        trace_tick(self, "pp_end" if require_armed_and_parked else "tp_top")
         flip_stats = self.phase_flip_runtime.on_round(
             require_armed_and_parked=require_armed_and_parked
         )

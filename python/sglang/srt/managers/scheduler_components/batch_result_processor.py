@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.phase_flip_output_trace import trace_round
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -738,6 +739,11 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+
+        # #631: what this round produced, recorded only inside a
+        # post-cutover window. A round that appends nothing and a round
+        # that produced nothing look identical in output_ids alone.
+        trace_round("decode", batch.reqs, next_token_ids, result)
 
         for i, req in enumerate(batch.reqs):
             req: Req

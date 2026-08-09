@@ -998,6 +998,12 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
         from sglang.srt.managers.phase_flip_presence import publish_active_phase
 
         publish_active_phase(world_rank, scheduler.phase_flip_active_stack)
+        # #631: dump the pre-cutover output clocks and arm the post-cutover
+        # countdown. Placed after verify so the trace's own state cannot
+        # sit between a failed completeness check and the exception.
+        from sglang.srt.managers.phase_flip_output_trace import trace_cutover
+
+        trace_cutover(scheduler, direction)
         logger.warning(
             "%s cutover complete: active stack %s, ps tp=%d pp=%d",
             LOG_PREFIX,
