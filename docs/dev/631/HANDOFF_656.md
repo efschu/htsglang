@@ -2700,3 +2700,43 @@ two legs are entirely unmeasured.
 
 Also still open: the A-vs-A gate vs `9a929352c9`, `PROD_BRINGUP_BENCH.md`,
 and the one unmanned log carrying everything at once.
+
+## 5. BS1-SPILL LEG: the binding constraint is NOT a KV reserve (measured)
+
+First metal measurement of the leg, on the proven boot
+(`max_total_num_tokens=459392`, `--max-running-requests 4`,
+`--max-mamba-cache-size 20`, all spill machinery OFF):
+
+    one session, 131072 input tokens, no other traffic
+      -> completed in 50.7 s, prompt_tokens=131072
+      -> scheduler log peak "full token usage: 0.50"
+
+131072 / 0.50 = 262144. The denominator a single session is measured
+against is 262144 — i.e. `--context-length` — NOT the 459392 global pool.
+131072 is already 0.285 of the global pool, comfortably past the 0.25 a
+"reserve for requests 2-4 is held back" model would predict.
+
+CONSEQUENCE, and it redirects the leg: at bs1 the single session is NOT
+capped by KV reserved for the other three request slots. It is capped by
+`context_length`, with roughly 197k tokens of global pool (459392 -
+262144) that a single session cannot address at all. So "make the single
+session's usable KV grow" is, on this configuration, the SAME action as
+the YaRN leg: raise the per-session context ceiling so it can reach into
+the pool that already exists. That is the #543 split, and the pool at
+459392 supports a >262144 single session WITHOUT the #297/#635 KV layout
+rebuild — which is what the operator asked to check first.
+
+What remains genuinely spill-shaped is the MAMBA/GDN state pool, not KV:
+20 slots at ~5 per admitted request is what pins bs=4, and at bs1 fifteen
+of those slots are idle. Vacating them (#364 ladder / #104 RAM offload)
+is a state-pool question, and its VRAM would have to be converted into
+KV pool at runtime to show up as usable context. That conversion is the
+piece to look for; it is not evidenced yet.
+
+METAL-UNPROVEN and untouched: the vacate/restore transition itself, the
+return path as concurrency rises to 4, and the YaRN boot. The next step
+is concrete and cheap: boot with a raised `--context-length` (the pool
+supports ~459k) and run one session past 262144, watching the corridor.
+I did not start it because a 12-minute boot-plus-measure cycle would have
+outrun my remaining context, and the rule is that serving is left on the
+last PROVEN configuration rather than mid-experiment.
