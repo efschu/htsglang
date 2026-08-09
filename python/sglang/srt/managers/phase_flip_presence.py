@@ -625,6 +625,57 @@ alone holding the flip.
       code reading running_batch/last_batch from a per-slot hook is making
       this mistake, and two instances are now confirmed.
 
+  L   THE RETURN LEG COULD NEVER REACH QUIESCENCE. Found the way every
+      defect in this table was found -- by a leg that could not commit,
+      not by reading code. With K landed, pp_to_tp carried a decoding
+      request across without trouble; tp_to_pp, armed on the same request
+      minutes later, parked and abandoned twice (03:11:22Z, 03:12:52Z),
+      all three ranks reporting "NOT QUIESCENT: last_batch is not empty
+      (1 req(s) visible)".
+
+      Under event_loop_normal -- the TP decode phase's loop -- the result
+      is processed in the SAME iteration as the forward, and
+      ``last_batch = batch`` is set AFTERWARDS. So at the hook a
+      non-empty last_batch means "requests are resident", not "work is in
+      flight", and a decoding request makes it non-empty on every
+      iteration for ever.
+
+      THIS IS THE SAME CATEGORY ERROR as the _pp_microbatches_drained one
+      that blocked every automatic flip before it, in a second term: a
+      quiescence term that refuses because requests EXIST. Twice now, so
+      the general form is worth stating -- WHAT MUST BE QUIET IS THE
+      MACHINERY, NEVER THE WORKLOAD. Any term that goes false merely
+      because a request is alive contradicts the feature, which exists to
+      flip WHILE requests are alive.
+
+      The replacement is the narrowest true question, and it is the
+      carry's own: is every live request reachable through the handle the
+      carry harvests? Briefly false right after a prefill (the new
+      requests are still only in last_batch), self-clearing in one
+      iteration, and it composes with K instead of duplicating it.
+
+  M   THE PP CHAIN'S RING WAS READ OFF THE LIVE ps. With L fixed the
+      return leg reached the entry and then WITHHELD there -- 8889 rounds,
+      "tensor-dict wire has 24 unconsumed message(s) from rank 0", logged
+      BY rank 0, about itself. The abandonment then blamed a rank that had
+      in fact arrived: "rank(s) [0] never reached the flip entry".
+
+      The cutover rewrites ps per phase (step 3) and the TP phase gets
+      pp_rank=0, pp_size=1. ``(pp_rank - 1) % pp_size`` is therefore 0 on
+      every rank in the TP phase: UPSTREAM == SELF. The flip-commit
+      hygiene check then compared a rank's own dict SEND counter against
+      its own dict CONSUME counter -- two different wires. Rank 0 is the
+      first PP stage: it sends proxy dicts downstream and consumes none,
+      so its imbalance was permanent and grew with the PP phase's
+      traffic. No message was ever unconsumed. The RING was wrong.
+
+      THE LESSON GENERALISES BEYOND THIS RING, and is the flip's own
+      version of the running_batch audit note above: ANY quantity derived
+      from ``ps`` is phase-scoped now, because the cutover rewrites ps.
+      The PP chain is a property of the PP topology and must be read from
+      something that does not move -- the counters, which are built once
+      from the boot PP topology and are now the ring's one authority.
+
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
 Measured 2026-08-08 23:39Z, all three stacks
