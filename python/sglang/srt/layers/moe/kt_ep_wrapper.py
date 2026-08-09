@@ -31,6 +31,34 @@ try:
 except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+# kt_kernel's submit_with_cuda_stream / sync_with_cuda_stream order the CPU
+# expert work against the GPU stream through cudaLaunchHostFunc, which the
+# prebuilt kt_kernel wheel resolves by symbol at runtime. On a ROCm build there
+# is no such symbol in the process (torch exports the hip* names), so both calls
+# degrade to a no-op: the MoE task is never handed to the worker pool and
+# sync_forward hands back an untouched zero buffer. That is silent -- the server
+# starts, every kt call "succeeds", and the CPU experts contribute exactly
+# nothing to the logits. Measured on gfx1103: absmean 0.0 out, 0.024 ms/layer.
+#
+# On ROCm we therefore drive the same MOE object through cpu_infer.submit /
+# cpu_infer.sync, the stream-free pair kt itself uses for load_weights. Those
+# are still asynchronous with respect to each other -- submit hands the task to
+# the worker pool and returns -- so CPU experts still overlap the GPU expert
+# GEMM. What is lost is stream ORDERING, so the D2H copy of the hidden states
+# has to be forced to completion with an explicit stream sync before the CPU
+# may read the pinned buffer. One sync per MoE layer.
+_KT_IS_ROCM = bool(getattr(torch.version, "hip", None))
+_KT_STREAM_MODE = os.environ.get("KT_STREAM_MODE", "auto")
+if _KT_STREAM_MODE == "auto":
+    _KT_USE_CUDA_STREAM = not _KT_IS_ROCM
+else:
+    _KT_USE_CUDA_STREAM = _KT_STREAM_MODE == "cuda"
+
 
 @dataclass
 class KTConfig:
@@ -151,7 +179,40 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
-        self.num_gpu_experts = kt_config.num_gpu_experts
+
+        # num_gpu_experts == 0 means "every expert runs on the CPU", and on the
+        # GGUF path that is the ONLY split that works. mask_cpu_expert_ids sets
+        # every CPU-bound routed id to -1, and the GGUF decode kernel
+        # (ggml_moe_a8_vec) indexes its expert table with those ids without any
+        # skip semantics -- a -1 is read as an address, and the load dies with
+        # hipErrorIllegalAddress during decode-graph capture. Only the MMQ
+        # prefill branch sanitizes. So a partial GPU/CPU split needs a kernel
+        # that can skip an expert, which GGUF here does not have.
+        #
+        # All-CPU is handled by never calling the GPU expert kernel at all,
+        # which is also the only variant that actually removes expert GEMM work
+        # from the GPU: remapping CPU experts onto a zero-pad expert (the
+        # uneven-TP trick) would keep every top_k GEMM on the card and buy
+        # nothing but correctness.
+        self.kt_all_cpu = (kt_config.num_gpu_experts or 0) == 0
+        # ... but the checkpoint loader still needs somewhere to put an expert:
+        # FusedMoE.weight_loader gates on quant_method.num_gpu_experts, and a 0
+        # there drops every expert tensor on the floor, leaving the GGUF
+        # parameters uninitialized and process_weights_after_loading with an
+        # empty data_container. Keep one resident expert (~1/256 of the expert
+        # bytes) so the GGUF parameter machinery sees a well-formed layer. It is
+        # never read: apply() returns the CPU result directly.
+        self.num_gpu_experts = 1 if self.kt_all_cpu else kt_config.num_gpu_experts
+        if not self.kt_all_cpu and type(gpu_method).__name__ == "GGUFMoEMethod":
+            raise ValueError(
+                "--kt-num-gpu-experts must be 0 with --quantization gguf: the "
+                "GGUF decode kernel ggml_moe_a8_vec has no skip semantics for "
+                "the -1 ids this wrapper uses to route an expert to the CPU, "
+                f"so a partial split (got {kt_config.num_gpu_experts}) dies "
+                "with an illegal memory access on the first decode. Use 0 to "
+                "run every expert on the CPU."
+            )
+
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_parallel().tp_rank
@@ -216,13 +277,34 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
-            self.wrapper = KTMoEWrapper(
+            # kt_kernel >= 0.6 takes a per-expert boolean mask instead of the
+            # scalar num_gpu_experts this call site was written against; the
+            # scalar survives only on the SFT path. This wrapper's contract is
+            # positional -- experts [0, num_gpu_experts) run on GPU, the rest on
+            # CPU (see mask_cpu_expert_ids) -- so the mask is that same split
+            # expressed per expert. Older kt_kernel is still accepted.
+            if layer_max_deferred > 0 and not _KT_USE_CUDA_STREAM:
+                # Deferral relies on sync_with_cuda_stream(stream, allow_pending)
+                # to leave the second task outstanding across a layer boundary.
+                # cpu_infer.sync() has no allow_pending argument and waits for
+                # every submitted task, so on the stream-free path deferral
+                # would cost the extra submit and buy nothing while still
+                # perturbing the numerics. Refuse rather than pretend.
+                raise ValueError(
+                    "--kt-max-deferred-experts-per-token is not supported on the "
+                    "stream-free (ROCm) kt path; pass 0."
+                )
+
+            gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
+            if not self.kt_all_cpu:
+                gpu_experts_mask[: self.num_gpu_experts] = True
+
+            kt_kwargs = dict(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
@@ -230,6 +312,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
             )
+            try:
+                self.wrapper = KTMoEWrapper(
+                    gpu_experts_mask=gpu_experts_mask, **kt_kwargs
+                )
+            except TypeError:
+                self.wrapper = KTMoEWrapper(
+                    num_gpu_experts=self.num_gpu_experts, **kt_kwargs
+                )
+            if self.kt_config.layer_idx == 0:
+                logger.info(
+                    "[KT] engaged: method=%s experts=%d gpu_experts=%d cpu_experts=%d "
+                    "cpuinfer=%d threadpool=%d deferred=%s backend=%s stream_mode=%s "
+                    "weight_path=%s",
+                    self.kt_config.method,
+                    num_experts,
+                    0 if self.kt_all_cpu else self.num_gpu_experts,
+                    num_experts if self.kt_all_cpu else num_experts - self.num_gpu_experts,
+                    self.kt_config.cpuinfer_threads,
+                    self.kt_config.threadpool_count,
+                    layer_max_deferred,
+                    type(self.wrapper).__name__,
+                    "cuda_stream" if _KT_USE_CUDA_STREAM else "rocm_stream_free",
+                    self.kt_config.weight_path,
+                )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -297,10 +403,63 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
+        if not _KT_USE_CUDA_STREAM:
+            self._submit_stream_free(x, topk_ids, topk_weights)
+            return
+
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
         )
+
+    def _kt_buffers(self, x: torch.Tensor):
+        from kt_kernel.experts_base import KExpertsCPUBuffer
+
+        flat = x.view(-1, x.shape[-1])
+        buffers = KExpertsCPUBuffer.get_buffer(flat, self.wrapper.num_experts_per_tok)
+        slot = self.wrapper.layer_idx % KExpertsCPUBuffer.buffer_depth
+        return flat, buffers, slot
+
+    def _submit_stream_free(
+        self,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        """submit_forward without the cudaLaunchHostFunc bridge (ROCm).
+
+        Stream ordering is replaced by one explicit stream sync: the pinned
+        staging buffers are filled by D2H copies on the current stream, and the
+        CPU worker pool reads them directly, so the copies must have LANDED
+        before the task is submitted. After the submit this returns immediately
+        and the GPU expert GEMM runs concurrently with the CPU experts, which is
+        the overlap the stream path was there to provide.
+        """
+        flat, (inp, imm, _defr, wts, out_cpu, bsz, _out_gpu), slot = self._kt_buffers(x)
+
+        inp[slot].copy_(flat, non_blocking=True)
+        wts[slot].copy_(topk_weights.to(torch.float32), non_blocking=True)
+        imm[slot].copy_(topk_ids.to(torch.long), non_blocking=True)
+        bsz[slot].fill_(flat.shape[0])
+        torch.cuda.current_stream(x.device).synchronize()
+
+        self.wrapper.cpu_infer.submit(
+            self.wrapper.moe.forward_task(
+                bsz[slot].data_ptr(),
+                imm[slot].size(-1),
+                imm[slot].data_ptr(),
+                wts[slot].data_ptr(),
+                inp[slot].data_ptr(),
+                out_cpu[slot].data_ptr(),
+                False,
+            )
+        )
+
+    def _sync_stream_free(self, x: torch.Tensor) -> torch.Tensor:
+        flat, (_i, _im, _d, _w, out_cpu, _b, out_gpu), slot = self._kt_buffers(x)
+        self.wrapper.cpu_infer.sync()
+        out_gpu[slot].copy_(out_cpu[slot], non_blocking=True)
+        return out_gpu[slot].view(x.shape)
 
     def sync(self, x: torch.Tensor) -> torch.Tensor:
         """Synchronize and retrieve CPU expert computation results.
@@ -315,6 +474,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(x)
+
+        if not _KT_USE_CUDA_STREAM:
+            return self._sync_stream_free(x)
 
         # Wait for CPU computation and retrieve results
         return self.wrapper.sync_forward(
@@ -348,6 +510,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
+
+        if self.kt_all_cpu:
+            # No expert runs on the GPU, so there is no GPU expert kernel to
+            # launch and nothing to merge with -- the CPU result IS the layer
+            # output. Skipping the kernel is the entire point: it is the expert
+            # GEMM work that moves off the card.
+            if self.tp_rank == 0:
+                return StandardCombineInput(hidden_states=self.sync(x))
+            return StandardCombineInput(hidden_states=torch.zeros_like(x))
 
         # Step 2: Prepare GPU computation by masking CPU expert IDs
         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them

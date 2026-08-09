@@ -32,6 +32,14 @@ export SGLANG_NUM_THREADS=12
 source /root/lh/venv/bin/activate
 export PYTHONPATH=/root/651-p2/sglang_src/python
 
+# #655: kt_kernel lives outside the venv on purpose -- it was installed with
+# --no-deps so that its CUDA torch dependency could not shadow this machine's
+# ROCm torch, which means it is reachable only by path. APPEND, never replace:
+# the sglang source path above is what the service actually runs.
+if [ -d /opt/ktk ]; then
+  export PYTHONPATH="$PYTHONPATH:/opt/ktk"
+fi
+
 # HiCache: the file backend's staging tier. The pinned-host guard reserves
 # 10 GiB by default -- a figure sized for the rig, where RAM is plentiful and
 # there is no swap. This laptop has 29.5 GiB total with ~22.7 GiB held by GGUF
@@ -150,6 +158,43 @@ if [ -n "$MAMBASLOTS" ]; then
   MAMBA_ARGS=(--max-mamba-cache-size "$MAMBASLOTS")
 fi
 
+# #655: CPU expert offload via kt_kernel. Unset = appends NOTHING, so the
+# established command line is byte-for-byte what it was. KTMETHOD=LLAMAFILE
+# consumes the GGUF checkpoint directly -- no per-layer conversion step, the
+# same file the GPU loads -- and is the only method this CPU can run: the
+# default AMXINT4 needs Intel AMX, and kt_kernel reports __cpu_variant__
+# avx512_bf16 on this Zen4 part.
+#
+# KTEXPERTS is POSITIONAL, not hotness-ranked: experts [0, KTEXPERTS) stay on
+# GPU and every higher expert id goes to the CPU (mask_cpu_expert_ids in
+# kt_ep_wrapper.py). A routing census cannot be used to pick WHICH experts run
+# where without an EPLB permutation, so this number is a memory/throughput
+# knob only.
+KTMETHOD=${KTMETHOD:-}
+KT_ARGS=()
+if [ -n "$KTMETHOD" ]; then
+  KT_ARGS=(
+    --kt-method "$KTMETHOD"
+    --kt-weight-path "${KTWEIGHTS:-$MODEL}"
+    --kt-num-gpu-experts "${KTEXPERTS:-0}"
+    --kt-cpuinfer "${KTCPUINFER:-8}"
+    --kt-threadpool-count "${KTPOOLS:-1}"
+    --kt-max-deferred-experts-per-token "${KTDEFER:-0}"
+    # Decode CUDA graphs and CPU experts are mutually exclusive here. A graph
+    # replays GPU work; the CPU expert call is host work, and the stream-free
+    # ROCm path additionally has to synchronize the stream to know the pinned
+    # staging buffer has landed -- which is illegal inside a capture
+    # (hipErrorStreamCaptureUnsupported, then the capture is invalidated and
+    # the load dies). The CUDA path gets around this with cudaLaunchHostFunc,
+    # a capturable host node; that entry point does not exist on ROCm.
+    # This is a REAL COST of the offload on this machine, not a config
+    # preference: decode graphs are worth ~12.8% decode here, so kt has to win
+    # that back before it wins anything.
+    --disable-cuda-graph
+  )
+  echo "note: kt CPU experts force --disable-cuda-graph (host work cannot be captured)"
+fi
+
 KVDTYPE=${KVDTYPE:-auto}
 KV_ARGS=()
 if [ "$KVDTYPE" != "auto" ]; then
@@ -177,6 +222,7 @@ exec python -m sglang.launch_server \
   --chunked-prefill-size "$CHUNKED_PREFILL" \
   "${HICACHE_ARGS[@]}" \
   "${EXPERT_STAT_ARGS[@]}" \
+  "${KT_ARGS[@]}" \
   --enable-metrics \
   --host 127.0.0.1 --port "$PORT" \
   --log-level info
