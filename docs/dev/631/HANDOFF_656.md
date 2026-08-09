@@ -532,3 +532,61 @@ misleading results and must not be simplified away:
   Check `committed legs` before believing any verdict.
 - `SPEC=off` on the boot script isolates the carry from the draft
   question. Use it for any carry work.
+
+## 6. THE ACCEPTANCE PROGRAM — where it actually stands
+
+Run 2026-08-09 03:45-03:50Z, `POLICY=auto SPEC=off`, N=4096, min dwell
+15 s, idle dwell 5 s, `scripts/route_a_631_policy_acceptance.py`
+(1 prefill worker on 8k/32k rungs, 3 decode workers, 180 s mixed then
+60 s idle). The script issues NO flip call of any kind.
+
+    phase at start: tp
+    observed phase timeline (10 transitions):
+      t=  2.0s tp   18.0s pp   44.0s tp   70.0s pp   76.0s tp
+        108.1s pp  110.1s tp  134.1s pp  162.1s tp  208.8s pp
+    phase after idle: pp
+    post-idle 32768-tok probe from rest: 7216.5 ms (4540.7 tok/s)
+    requests: 27 total, 27 ok, 0 ABORTED
+
+Against the operator's bar, item by item:
+
+| Required | Status |
+|---|---|
+| one automatic PP->TP->PP cycle under mixed load | **YES** -- five of them |
+| POLICY=auto, ZERO manual flips | **YES** |
+| flip cadence | **YES** -- 12 arms, every interval >= the 15 s min dwell (23, 31, 16, 15, 15, 19, 17, 37, 16, 15, 15 s); no thrash |
+| PP-class prefill throughput | **YES** -- 4540.7 tok/s on the 32k rung from rest, in PP |
+| idle-return-to-PP leg | **YES** -- returns to the resting layout and stays |
+| abort count | **YES** -- 0 of 27 |
+| TP decode **with accept length** | **NO** -- `SPEC=off`. Blocked by section 3's wall. |
+
+**So the honesty bar is met for everything except accept length**, and
+that one item is blocked by a named, reproduced defect rather than by
+anything unmeasured. Do not report this as a full acceptance.
+
+**The 2 s gap at t=108.1->110.1 is a sampling artifact, not thrash**: the
+timeline is sampled from the log while the arm-to-commit latency varies,
+and the ARM timestamps are all >= 15 s apart.
+
+### Defect N, which this run exists because of
+
+The FIRST attempt at this run (03:36-03:39Z) produced 2 transitions and
+spent its entire 186 s mixed phase in the TP layout -- prefill-heavy load
+served by the decode layout. **The operator spotted it from the outside**
+("der Last zufolge läuft gerade das tp layout und nicht das pp layout")
+before the run had even finished.
+
+The cause was the fourth instance of this feature's recurring shape:
+`pending_prefill_tokens` summed the WAITING QUEUE while the comment at
+its use site said "admitted but not yet computed". A long prompt under
+chunked prefill sits on `scheduler.chunked_req`, not in the queue, so the
+policy read 0 pending prefill for the whole duration of exactly the work
+the PP layout exists for, and the TP->PP rule could not fire. The metric
+now adds the unfilled remainder (`len(origin_input_ids) -
+extend_range.end`, the scheduler's own chunked-prefill basis).
+
+**A declining policy was also silent** -- only arming decisions were
+logged -- so "wrong layout under load" and "the hook never runs" looked
+identical, and the second was my first hypothesis and was wrong. The
+throttled hold reason now carries the standing reason with its two
+inputs; it is what made the fix verifiable in one boot.
