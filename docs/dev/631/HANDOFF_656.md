@@ -1965,3 +1965,25 @@ four buffers.
   round PRODUCED next to what it APPENDED. "Appended nothing" and
   "produced nothing" are different defects, and no amount of reasoning
   about `len(output_ids)` separates them.
+
+## 8. Two more eliminations, added after v9 was written
+
+- **The draft KV scrub is INNOCENT for the remaining defect.** Re-run
+  with `SGLANG_PHASE_FLIP_DRAFT_SCRUB=0` (confirmed live: three "SCRUB
+  DISABLED" lines, one per rank): the corruption is IDENTICAL, same
+  position 28, same shape. Predecessors ran this switch against the
+  WIDTH defect; this is a fresh measurement against the one that is
+  left, and it closes the same door again.
+- **`--speculative-num-steps 0 --speculative-num-draft-tokens 1` FAULTS
+  the instance** when a flip bootstrap runs (3 faults, health 0,
+  11:01Z). It was tried as a cheap way to make the bootstrap round's
+  width equal the configured width and so test whether the 1->4
+  TRANSITION is what breaks. It is not a usable probe on this build and
+  the question stays open. Do not re-walk it as written; if the
+  transition hypothesis is worth testing, test it with an instrument on
+  the allocation (section 5, step 2) rather than by reconfiguring the
+  drafter.
+
+Serving left on `SPEC=on POLICY=manual RANK_MIB=21000,13300,13100`,
+health 200, on this commit — the configuration the next shift wants for
+the hunt. `SPEC=off` is the configuration that is content-clean today.
