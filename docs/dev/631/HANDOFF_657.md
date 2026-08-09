@@ -431,6 +431,52 @@ touching any policy constant.
 
 ---
 
+## 7a. DEFECT K (NEW, TOP PRIORITY) — the instance sticks in PP and
+## decodes there with no graphs and no speculation
+
+**This is a consequence of my own commit `ceb1b6f720` and it is not fixed.
+Do not read the soak's "0 deaths" as the feature working.**
+
+Measured, 21:05-21:21Z soak, `scripts/phase_evidence_extract.sh`:
+
+```
+  PREFILL  in PP: 765 records, mean 4043.4 tok/s     <- the hold works
+           in TP:   5 records, mean 1147.3 tok/s
+  DECODE   in PP: 412 records, cuda graph True 0.0%, accept len 0.00
+           in TP:   1 record
+  flips: 6 tp_to_pp, 6 pp_to_tp  (12 total in 16 minutes)
+```
+
+Decode is running **in the PP phase**, eagerly, with no CUDA graphs and no
+draft chain — i.e. at the ~16 tok/s PP decode rate instead of the ~100
+tok/s TP+NEXTN rate. That is the exact opposite of the feature's purpose.
+
+**Mechanism.** The policy arms `pp_to_tp` on "prefill down to X tok <= N".
+Before the admission hold, the armed window drained pending prefill *in
+TP*, so pending fell, `pp_to_tp` armed, and the instance thrashed (73 flips
+in 4 minutes — see §7). With the hold, pending prefill is no longer
+consumed during the armed window, so under a prefill-saturated load it
+never falls below N and `pp_to_tp` never arms. The instance parks in PP and
+every resident request decodes there.
+
+**Both behaviours are the same policy defect seen from two sides**: the
+policy decides on *pending prefill alone* and never weighs the cost it is
+imposing on resident decodes. The hold did not create that; it moved which
+end of it you fall off. §7's conclusion stands and is reinforced — the
+lever is the hysteresis band and a decode-starvation term, NOT `min_dwell`.
+
+**Suggested shape (unimplemented, do not land without metal):** give the
+policy a decode-starvation term — if requests have been resident and
+decoding in PP for longer than some bound, arm `pp_to_tp` regardless of
+pending prefill, then let `min_dwell` bound the return. The correct
+constant is a measurement: compare tokens-delivered-per-second across the
+whole mix, not prefill throughput alone.
+
+**Verdict impact.** Criterion (c) of §8.1 is **NOT met** in its intended
+sense: flips do commit in both directions (6/6), but decode is not landing
+in TP. Stability (a), (b) and the corridor (d) are green so far. A soak
+that survives is not the same as a soak that serves.
+
 ## 8. Exact next steps
 
 1. **THE SOAK IN FLIGHT.** Started **21:05:08Z**, 65 minutes, ends
