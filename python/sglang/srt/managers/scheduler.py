@@ -2467,6 +2467,7 @@ class Scheduler(
             return None
         if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
             return None
+        from sglang.srt.managers.phase_flip_counters import CHAN_REQ
         from sglang.srt.managers.pp_chain_receiver import PpChainReceiver
 
         dp_offset = self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size

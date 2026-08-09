@@ -977,6 +977,7 @@ class PhaseFlipRuntime:
         #: caught a non-empty channel at the gate (which should be never).
         self.presence_withheld_channels = 0
         self.entry_channel_violations = 0
+        self._last_withhold_log = None
         self._presence_deadline_s = float(presence_deadline_s)
         self._presence_wait_started = None
         self._gate_open_epoch = None
@@ -1502,7 +1503,33 @@ class PhaseFlipRuntime:
 
         if owes or unclean:
             self.presence_withheld_rounds += 1
+            # SAY WHY, PERIODICALLY. A withholding rank is invisible in the
+            # log -- it simply does not announce -- and the only symptom is
+            # an abandonment 60 s later naming it as "never reached the
+            # entry", which points at the wrong place: it DID reach the
+            # entry and chose not to announce. The first metal run of this
+            # design cost a log-dig for exactly that reason. Throttled by
+            # the presence deadline so a healthy withhold of a few rounds
+            # stays silent and a stuck one is on the record before the
+            # abandonment that follows it.
+            now = self._clock()
+            if (
+                self._last_withhold_log is None
+                or (now - self._last_withhold_log) >= self._presence_deadline_s / 4.0
+            ):
+                self._last_withhold_log = now
+                logger.warning(
+                    "%s epoch %d round %d: WITHHOLDING presence (%d rounds so "
+                    "far) -- %s. This rank is AT the entry and declining to "
+                    "announce; it is not blocked upstream of it.",
+                    LOG_PREFIX,
+                    epoch,
+                    entry_round,
+                    self.presence_withheld_rounds,
+                    "still owes a chain send" if owes else unclean,
+                )
         else:
+            self._last_withhold_log = None
             self._presence.announce(
                 epoch, note=f"pending={self._pending}", round_=entry_round
             )

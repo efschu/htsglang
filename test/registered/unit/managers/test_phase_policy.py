@@ -800,6 +800,7 @@ def _runtime_stub(
     r.presence_withheld_rounds = 0
     r.presence_withheld_channels = 0
     r.entry_channel_violations = 0
+    r._last_withhold_log = None
     # #631 round-scoped entry evidence: the gate reads (epoch, round).
     r._entry_round = 0
     r._presence_wait_stamp = None
@@ -1299,6 +1300,7 @@ def _onround_stub(presence, ready, clock=None, deadline=60.0, pending="pp_to_tp"
     r.presence_withheld_rounds = 0
     r.presence_withheld_channels = 0
     r.entry_channel_violations = 0
+    r._last_withhold_log = None
     r._entry_round = 0
     r._presence_wait_stamp = None
     r._presence_deadline_s = deadline
