@@ -590,3 +590,33 @@ logged -- so "wrong layout under load" and "the hook never runs" looked
 identical, and the second was my first hypothesis and was wrong. The
 throttled hold reason now carries the standing reason with its two
 inputs; it is what made the fix verifiable in one boot.
+
+## 7. J.2 IS STILL OPEN, and the wall is why
+
+v2 left J.2 with an explicit instruction: take the row-extent measurement
+with the **spec reserve LIVE** (`get_alloc_reserve_per_decode` = W + L,
+W = 4 on this rig's NEXTN config), and only then cut
+`build_flip_live_slots_fn`'s enumeration from `seqlen` to
+`kv_allocated_len`. **That measurement was NOT taken and the cut was NOT
+made.**
+
+The reason is structural rather than an omission, and it is worth
+stating so the next reader does not go looking for the boot that was
+skipped: the probe only reports when a flip ENUMERATES A RESIDENT
+REQUEST, and with speculation armed a flip with a resident request now
+deliberately WAITS (section 3). So `SPEC=on` never produces the reading,
+and `SPEC=off` produces it with the reserve at rest -- which is exactly
+the reading v2 already had and already ruled insufficient.
+
+**J.2 is therefore blocked behind the same wall as the acceptance's
+accept-length item.** Clearing the draft-state question unblocks both at
+once, which is the strongest reason to do that build next rather than
+anything else in this file.
+
+The enumeration meanwhile still moves `req_to_token[idx, :seqlen]`, one
+row beyond what the allocator owns on the one config measured. That is a
+known over-read of a stale row, not an under-read: it moves a row nobody
+owns rather than missing a live one, which is the safe direction of the
+two and is why shipping it while the measurement is owed is defensible.
+Do not "fix" it on the strength of the SPEC=off reading alone -- that is
+precisely the one-config re-cut v2 refused, and the errors are silent.
