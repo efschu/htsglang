@@ -206,12 +206,34 @@ def resident_req_identity(scheduler) -> List[Tuple]:
     Sorted so two readings of the same set compare equal regardless of
     slot order (the slot ARRANGEMENT legitimately changes at a flip; the
     membership may not).
+
+    UNALLOCATED IS -1, AND THE DEFAULT ARGUMENT DID NOT DELIVER THAT.
+    ``getattr(req, "req_pool_idx", -1)`` returns the -1 only when the
+    attribute is ABSENT. It is not: ``schedule_batch`` declares
+    ``req_pool_idx: Optional[int] = None``, and a Req is visible in
+    ``last_batch`` / ``running_mbs`` / ``chunked_req`` from the moment it
+    is admitted, which is BEFORE its slot is allocated. So the attribute
+    is present and None, the default never fires, and ``int(None)`` raised
+
+        TypeError: int() argument must be ... not 'NoneType'
+
+    taking all three ranks down at 2026-08-09 20:59:45Z, mid-cutover, on
+    the very first line of ``_cutover``. The same Optional-None trap the
+    live-slot enumeration documents at length (a request without a pool
+    slot owns no rows); this function simply never got the memo, and only
+    started reaching that state once the armed park began letting flips
+    commit between prefill chunks.
+
+    -1 is the right identity for "admitted, not yet allocated": it is
+    stable across the cutover (a cutover allocates nothing), it compares
+    equal to itself in the before/after pin, and it is visibly not a row.
     """
     ident: List[Tuple] = []
     for batch in harvest_resident_batches(scheduler):
         for req in _reqs_of(batch):
+            idx = getattr(req, "req_pool_idx", None)
             ident.append(
-                (str(getattr(req, "rid", "?")), int(getattr(req, "req_pool_idx", -1)))
+                (str(getattr(req, "rid", "?")), -1 if idx is None else int(idx))
             )
     return sorted(ident)
 

@@ -318,3 +318,50 @@ def test_seam_is_idempotent_and_silent_on_an_already_clean_phase():
     sched = scheduler_at_cutover(real_batch(["r1"], spec_info=None))
     assert clear_spec_info_for_unspeculated_phase(sched) == (0, [])
     assert clear_spec_info_for_unspeculated_phase(sched) == (0, [])
+
+
+# --------------------------------------------------------------------------
+# 3. ADMITTED BUT NOT YET ALLOCATED (the 20:59:45Z death).
+# --------------------------------------------------------------------------
+
+
+def test_resident_identity_tolerates_an_unallocated_request():
+    """req_pool_idx is Optional and is None between admission and alloc.
+
+    MEASURED: all three ranks died at 2026-08-09 20:59:45Z on the first
+    line of _cutover with
+
+        TypeError: int() argument must be ... not 'NoneType'
+
+    because `getattr(req, "req_pool_idx", -1)` supplies its default only
+    when the attribute is ABSENT, and this one is present-and-None. The
+    armed park's narrowing is what began letting flips commit between
+    prefill chunks, which is where such a request is reachable.
+    """
+    from sglang.srt.managers.phase_flip_resident_carry import (
+        resident_req_identity,
+    )
+
+    allocated = FakeReq("alloc")
+    allocated.req_pool_idx = 7
+    pending = FakeReq("pending")
+    pending.req_pool_idx = None  # admitted, slot not yet allocated
+
+    batch = real_batch([], spec_info=None)
+    batch.reqs = [allocated, pending]
+    sched = scheduler_at_cutover(batch, running_mbs=[batch])
+
+    ident = resident_req_identity(sched)
+    assert ident == [("alloc", 7), ("pending", -1)]
+
+
+def test_can_fail_the_old_getattr_default_still_raises():
+    """CAN-FAIL: prove the default argument never fired on a None value.
+
+    If this stops raising, `req_pool_idx` stopped being present-and-None
+    and the fix above has become a tautology.
+    """
+    pending = FakeReq("pending")
+    pending.req_pool_idx = None
+    with pytest.raises(TypeError):
+        int(getattr(pending, "req_pool_idx", -1))
