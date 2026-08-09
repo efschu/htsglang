@@ -54,6 +54,10 @@ from test_phase_flip_runtime import (  # noqa: E402  (sibling harness)
     _MailboxExchange,
     _make_layout_pools,
 )
+from test_phase_flip_resident_carry import (  # noqa: E402  (sibling harness)
+    _FakeBatch as _CarryFakeBatch,
+    _req as _carry_req,
+)
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -624,6 +628,104 @@ class TestPin4SchedulerLevelReplay(CustomTestCase):
             build_gdn_flip_guard(sched)(PP_TO_TP)
         sched.running_batch = SimpleNamespace(reqs=[])
         build_gdn_flip_guard(sched)(PP_TO_TP)  # empty flip allowed
+
+
+class _ResidentStubScheduler(_StubScheduler):
+    """The stub with the REAL ``init_pp_loop_state``.
+
+    The defect under test is invisible at the call site -- step 6 reads as
+    "re-initialise the loop arrays" and happens to destroy the resident
+    decode set -- so a stub that merely LOGS the call cannot pin it. This
+    subclass runs the production method, which also exercises the
+    3-slot -> 1-slot shrink the TP topology forces.
+    """
+
+    def __init__(self, rank, reqs_per_slot=()):
+        super().__init__(rank)
+        from types import SimpleNamespace as _SN
+
+        self.server_args = _SN(
+            pp_async_batch_depth=0,
+            enable_dsa_prefill_context_parallel=False,
+        )
+        self.running_mbs = [_CarryFakeBatch(r) for r in reqs_per_slot]
+        self.last_mbs = [None] * len(self.running_mbs)
+        self.running_batch = _CarryFakeBatch()
+        self.last_batch = None
+
+    from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+        SchedulerPPMixin as _PPMixin,
+    )
+
+    init_pp_loop_state = _PPMixin.init_pp_loop_state
+
+
+class TestResidentSetSurvivesTheCutover(CustomTestCase):
+    """#631 J.3, the blocker: a flip under load was IMPOSSIBLE because any
+    request resident at the cutover was destroyed. Measured on metal
+    2026-08-09 02:36Z (resident_reqs 1 -> 1 -> 0 across the census
+    bracket), and these are the pins that keep it dead."""
+
+    def tearDown(self):
+        set_cp_token_ratios(None)
+
+    def test_the_resident_set_crosses_into_the_tp_phase(self):
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = _ResidentStubScheduler(
+                0, ([_carry_req("a", 1)], [_carry_req("b", 2)], [])
+            )
+            build_production_flip_cutover(sched)(PP_TO_TP)
+            # The TP loops read running_batch, and NOTHING may be left in
+            # the slot array (a second, ageing view of the same requests).
+            self.assertEqual(
+                sorted(r.rid for r in sched.running_batch.reqs), ["a", "b"]
+            )
+            self.assertTrue(all(mb.is_empty() for mb in sched.running_mbs))
+            self.assertIsNone(sched.last_batch)
+
+    def test_the_resident_set_crosses_back_into_the_pp_phase(self):
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = _ResidentStubScheduler(0)
+            cutover = build_production_flip_cutover(sched)
+            cutover(PP_TO_TP)
+            # Decode happened in the TP phase; the set now lives in
+            # running_batch, which is where the return trip must find it.
+            sched.running_batch = _CarryFakeBatch(
+                [_carry_req("a", 1), _carry_req("c", 3)]
+            )
+            cutover(TP_TO_PP)
+            self.assertEqual(
+                sorted(r.rid for r in sched.running_mbs[0].reqs), ["a", "c"]
+            )
+
+    def test_can_fail_a_cutover_that_drops_the_set_is_refused(self):
+        """THE REGRESSION ARM: restore the pre-fix behaviour (rebind the
+        slot array with no carry) and the membership pin must fail loudly
+        at the cutover -- not a pass later as a stranded page plus a
+        stranded mamba lock, which is how it cost three boots."""
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = _ResidentStubScheduler(0, ([_carry_req("a", 1)], [], []))
+
+            def _dropping_init():
+                sched.running_mbs = [_CarryFakeBatch() for _ in range(1)]
+                sched.last_mbs = [None]
+
+            sched.init_pp_loop_state = _dropping_init
+            with self.assertRaisesRegex(
+                KvReshardError, "DROPPED THE RESIDENT DECODE SET"
+            ):
+                build_production_flip_cutover(sched)(PP_TO_TP)
+
+    def test_can_fail_a_set_left_in_the_wrong_phases_handle_is_refused(self):
+        """Surviving is not enough: it has to survive INTO the handle the
+        now-active loop reads, or the requests never decode again."""
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = _ResidentStubScheduler(0, ([_carry_req("a", 1)], [], []))
+            build_production_flip_cutover(sched)(PP_TO_TP)
+            # Put it back where only the PP loop would look.
+            sched.running_mbs[0] = _CarryFakeBatch([_carry_req("a", 1)])
+            with self.assertRaisesRegex(KvReshardError, "PP slot array"):
+                verify_flip_cutover(sched, tp_phase=True)
 
 
 class TestEventLoopRedispatch(CustomTestCase):

@@ -688,9 +688,51 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             ),
         )
 
-        # 6. PP loop arrays: re-initialized clean for the new topology
-        # (idempotent pure reassignment; reads the NEW ps.pp_size).
+        # 6. PP loop arrays: re-initialized for the new topology (reads the
+        # NEW ps.pp_size).
+        #
+        # #631 J.3: this step USED TO DESTROY THE RESIDENT DECODE SET, and
+        # that is the whole reason a flip under load was impossible. The
+        # carry now lives inside init_pp_loop_state (it has three callers,
+        # and the TP->PP leg re-enters event_loop_pp, which calls it again);
+        # here we only bracket it with the evidence.
+        #
+        # The orphan check runs BEFORE the swap on purpose: a request
+        # reachable only through last_mbs would mean the quiescence
+        # predicate admitted a boundary that is not quiescent, and that is
+        # a predicate bug to be raised, not a carry to be widened.
+        from sglang.srt.managers.phase_flip_resident_carry import (
+            assert_no_orphan_resident_reqs,
+            promote_slot_zero_to_running_batch,
+            resident_req_identity,
+        )
+
+        assert_no_orphan_resident_reqs(scheduler)
+        resident_before = resident_req_identity(scheduler)
         scheduler.init_pp_loop_state()
+        # 6b. The TP loops read ``running_batch``, not the slot array, so
+        # the TP leg moves the re-seeded set over (and empties the slots,
+        # or the next flip's harvest would resurrect a stale view of it).
+        if tp_phase:
+            promote_slot_zero_to_running_batch(scheduler)
+        # 6c. MEMBERSHIP PIN, before the deferred aborts of step 8 are
+        # allowed to change the set legitimately. Identity is (rid,
+        # req_pool_idx): the slot ARRANGEMENT changes at a flip by design,
+        # the MEMBERSHIP may not. A dropped request must fail here, loudly,
+        # not surface a pass later as a stranded page and a stranded mamba
+        # lock with the evidence already stale.
+        resident_after = resident_req_identity(scheduler)
+        if resident_after != resident_before:
+            lost = [r for r in resident_before if r not in resident_after]
+            gained = [r for r in resident_after if r not in resident_before]
+            raise KvReshardError(
+                f"{LOG_PREFIX} CUTOVER DROPPED THE RESIDENT DECODE SET "
+                f"({direction}): {len(resident_before)} request(s) before, "
+                f"{len(resident_after)} after; lost {lost[:8]}, gained "
+                f"{gained[:8]}. Every request resident at a cutover must "
+                f"survive it -- a dropped one strands its KV rows and its "
+                f"mamba slot lock and its answer is simply never finished."
+            )
 
         # 7. Active stack swap: the forward path follows model_worker.
         #
@@ -829,6 +871,27 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
     window = getattr(scheduler, "phase_flip_abort_window", None)
     if window is not None and window.active:
         stale.append("abort window still active (drain missed)")
+    # The resident decode set must live in the handle the ACTIVE phase's
+    # event loop reads, and nowhere else (#631 J.3). The TP loops read
+    # ``running_batch``; ``event_loop_pp`` reads the slot array and rebinds
+    # ``running_batch`` per slot. A set left in the other phase's handle is
+    # not merely untidy: it is invisible to the loop that is now running,
+    # so those requests never decode again, and it is a second ageing view
+    # that the next flip's harvest would resurrect.
+    slots = list(getattr(scheduler, "running_mbs", []) or [])
+    slot_resident = [i for i, mb in enumerate(slots) if len(getattr(mb, "reqs", []) or [])]
+    running = getattr(scheduler, "running_batch", None)
+    running_n = len(getattr(running, "reqs", []) or [])
+    if tp_phase and slot_resident:
+        stale.append(
+            f"resident requests left in the PP slot array {slot_resident} "
+            f"while the TP loop reads running_batch"
+        )
+    if not tp_phase and running_n and not any(running is mb for mb in slots):
+        stale.append(
+            f"running_batch holds {running_n} resident request(s) that are "
+            f"in no PP slot, so event_loop_pp will never see them"
+        )
     if stale:
         raise KvReshardError(
             f"{LOG_PREFIX} CUTOVER INCOMPLETE ({'tp' if tp_phase else 'pp'} "
