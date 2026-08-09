@@ -186,18 +186,39 @@ so it binds both pools (zero unaddressable surplus; 6e's
 | 22700,11920,11970 | 260000 | 253528 | 4931 / 6466 / 4373 |
 | 25700,13920,13970 | 300000 | **300000** | 4483 / 5688 / 4051 |
 | 29200,15920,15970 | 360000 | **360000** | 3803 / 4700 / 3499 |
+| 32200,17700,17750 | 520000 | **REFUSED AT BOOT** | -- |
+| 31800,17400,17450 | 460000 | **460000** | 2655 / 3034 / 2609 |
+| 31800,17400,17450 | 540000 | **540000 (+113.0 %)** | 1719 / 1686 / 1865 |
 
-**+42.0 % serving capacity**, corridor minimum still 2779 / 3676 / 2475
-MiB above the 1024 MiB floor. Card 2 binds throughout. A fourth boot
-(`RANK_MIB=32200,17700,17750`, cap 520000) was in flight when this was
-written -- **check the holder and the bench for its outcome.**
+**+113.0 % serving capacity**, every card still above the 1024 MiB floor
+(margin 695 / 662 / 841 MiB).
 
-Marginal cost over the last rung is 680 / 988 / 552 MiB per 60000 tokens,
-so card 2's remaining headroom is worth roughly 269000 further tokens, a
-~629000-token class. That would meet the >600k full-KV goal. Treat it as
-the next experiment: `_profile_available_bytes` (bench 6f's "honest
-ceiling") binds the PP budget independently of the corridor and is
-expected to stop the ladder before the corridor does.
+The ladder's binder changed TWICE, and both are identified:
+
+1. `_profile_available_bytes` (bench 6f's "honest ceiling") refused the
+   520000 boot CLEANLY -- *"the per-rank budget of 32200 MiB (31.45 GiB)
+   for rank 0 ... is not physically available ... 31.34 GiB total"*. The
+   5090 tops out near 32000 MiB. Fail-fast earned its keep: no crash, and
+   the message names the numbers needed to pick the next rung.
+2. **Now the CORRIDOR.** At `RANK_MIB=31800,17400,17450` the engine reports
+   its own capacity as **1096606 tokens**, so the budget is no longer the
+   constraint -- only the cap is, and the corridor decides how far the cap
+   may go.
+
+**The lever for the last stretch to >600k is the TOKEN VECTOR, and the
+engine computes the recommendation itself:** *"restart with
+`SGLANG_UNEVEN_TOKEN_VECTOR=31,17,16` to raise max_total_num_tokens from
+1096606 to ~1396288 ... active vector [28, 26, 20] leaves ranks idle"*.
+The active vector over-weights rank 0, which is exactly the card whose
+corridor binds, so re-balancing should convert directly into headroom
+where it is needed. One-variable boot, and it is the next step.
+
+**READ BEFORE SHIPPING 540000.** Its corridor figure is ONE 1200-token
+bs=1 generation. Not sustained load, not the >=60-min bar. The spec's
+design point is bs=4, where concurrency and a fuller prefix cache push the
+minimum below what a single stream shows, and 662 MiB on the binding card
+is thin. 540000 is the measured CEILING; **460000** (margin 1631 / 2010 /
+1585) is the conservative fallback.
 
 **None of this needed the zero-allocation staging the previous handoff
 called the keystone.** The capacity was behind a cap that had been set
@@ -220,12 +241,10 @@ payload is negligible.
 
 ## 7. State at handover
 
-* HEAD `420159fd87` and later, pushed to fork. Suite 641 passed (plus 2
-  further census pins added after that run; re-run to confirm 643).
-* Serving: rebooted four times this shift. The last KNOWN-GOOD
-  configuration is `RANK_MIB=29200,15920,15970` + `MAX_TOTAL_TOKENS=360000`
-  (pool 360000, healthy, corridor 3803/4700/3499). **If the in-flight boot
-  4 failed, restore that one.**
+* HEAD `420159fd87` and later, pushed to fork. Suite **643 passed**, exit 0.
+* Serving is UP at **pool 540000**, health 200
+  (`RANK_MIB=31800,17400,17450`, `MAX_TOTAL_TOKENS=540000`), subject to the
+  bs=4 caveat above. Conservative fallback: cap 460000, same RANK_MIB.
 * Boot recipe: `/tmp/s17_boot.sh` replays the proven yarn1.5 / CTX=393216
   config from a live `/proc` environ; pass `MAX_TOTAL_TOKENS` and
   `RANK_MIB` to move a rung. The boot script DEFAULTS to CTX 262144.
@@ -235,9 +254,11 @@ payload is negligible.
 
 ## 8. Next steps, in order
 
-1. Continue the ladder to the >600k class, one rung per boot, cap set
-   equal to the target each time. Expect `_profile_available_bytes` to be
-   the brake; when it refuses it names the numbers, which is a free probe.
+1. FIRST: hold the corridor under **bs=4 sustained load** at 540000 for an
+   hour. If it breaches 1024 on any card, drop to 460000. Only then is the
+   capacity number real -- everything above is bs=1.
+2. Then the token-vector rung (`SGLANG_UNEVEN_TOKEN_VECTOR=31,17,16`) for
+   the last stretch to >600k. One variable.
 2. Re-enable the fairness windows and `--phase-flip-purity strict` (the
    user's hard default, must be ON in the ship config) and prove on >=60
    min with minutes-scale settle windows. Note the previous shift disabled
