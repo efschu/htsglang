@@ -730,7 +730,25 @@ alone holding the flip.
       zero illegal accesses, zero aborts, health 200. The same reproducer
       wedged the instance in six seconds against corpse R.
 
-      THE GENERAL FORM, worth more than the fix: A QUANTITY IS ONLY IN
+      Q.2 THE SAME DEFECT HAS A SECOND HOST, and it is the one that kills
+      the instance AFTER a committed flip -- so fixing the slot alone
+      would have moved the failure rather than removed it.
+      ``PhaseFlipRuntime._round`` is also a rank-local counter, and
+      ``_round % _interval`` gates ENTRY TO A BLOCKING COLLECTIVE. The
+      armed window called ``on_round`` 37371 / 28677 / 32344 times in one
+      5 s window, so the ranks emerged incongruent mod 8, their periodic
+      entries never coincided again, and the first periodic consensus
+      after the cutover deadlocked: "barlink collective
+      'phase_flip.consensus' made no progress for 120s", rank 0 inside
+      the reduction, its peers inside the broadcast rank 0 owes them,
+      then SIGQUIT (2026-08-09 08:09:39-08:11:39Z). The cadence now
+      counts only the rounds it gates -- the periodic caller, which is
+      paced -- and NOT the per-pass hook of event_loop_pp. See the
+      comment at that increment, including the first cut, which froze the
+      counter while armed and thereby stopped a flip armed in the TP
+      phase from ever committing.
+
+      THE GENERAL FORM, worth more than either fix: A QUANTITY IS ONLY IN
       LOCKSTEP WHILE SOMETHING KEEPS IT THERE. The slot index was never
       synchronised by design -- it was synchronised by the chain receive,
       as a side effect. Remove the traffic, as the armed window does, and
