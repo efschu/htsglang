@@ -2513,3 +2513,75 @@ budget. Take it as its own change, with its own corridor run.
 4. the bs=1 YaRN leg beyond 262144 — untouched;
 5. the A-vs-A gate against `9a929352c9` — untouched;
 6. the arena reclaim on metal — see §4.
+
+---
+
+# HANDOFF v12 ADDENDUM (same shift): THE CORRIDOR HOLDS
+
+Written after v12 above. Sections 3 and 5 of v12 said the corridor was
+the open item and that the budget knob would not close it. Both stand —
+and the corridor is now CLOSED, by the knob section 3 named.
+
+## The result
+
+    #631 VRAM CORRIDOR -- 3901 samples over 390.3s at 100 ms, floor 1024
+    gpu  name                  total   MIN free    mean   breaches
+    0    RTX 3080              20480     1034.4  2620.1          0
+    1    RTX 5090              32607     2823.7  3645.3          0
+    2    RTX 3080              20480     1228.4  2219.2          0
+    per-card MINIMUM free: 1034, 2824, 1228 MiB   (floor 1024)
+    CORRIDOR HELD: True
+
+Under the acceptance load itself — POLICY=auto, SPEC=on, CUDA graphs on,
+1 long-prefill worker over 8192/32768, 3 decode workers, bs<=4, 300 s
+mixed + 60 s idle. 87/87 requests ok, 0 ABORTED, 23 policy-driven phase
+transitions, 129 accept-len log lines. Returned to the PP resting layout
+on its own; the post-idle 32768-token probe prefilled in PP at
+4481.0 tok/s, so the flip is not in the latency path from rest.
+
+Config: `RANK_MIB=22700,11920,11970`,
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, both now the defaults
+in `scripts/route_a_631_prod_boot.sh`.
+
+## How it was reached, and the ONE lever that mattered
+
+Four runs of the SAME load, changing one variable at a time:
+
+    run  RANK_MIB              alloc      MIN free per card    held
+    1    23000,13780,13540     default      50 /  114 /   42   no
+    2    22090,12800,12550     default      54 /  804 /  292   no
+    3    22090,12800,12550     expandable  146 / 1672 /  448   no
+    4    22700,11920,11970     expandable 1034 / 2824 / 1228   YES
+
+Run 1 -> 2 is the budget lever alone: ~1 GiB off each card bought +690,
++250 and +4 MiB of floor. Run 2 -> 3 is the allocator lever alone, same
+budgets: +92, +868, +156 MiB, and the 5090 went from 1400 breaches to
+zero. The allocator is what governs the minimum, because torch's caching
+allocator expands into whatever the KV pool does not take and the default
+segment allocator never returns those pages to the driver.
+
+Only AFTER the allocator was fixed did the budget lever become
+predictive: run 3 -> 4 moved each card by very nearly the distance it was
+short, which is what let the final numbers land on the floor rather than
+near it.
+
+## What this cost, and the two ways to win it back
+
+`max_total_num_tokens` is 459392 at the corridor-compliant budget, down
+from 739186 at the breaching one. That is the honest price of the floor.
+Two named, unspent credits:
+
+1. The 5090 finishes the run with ~1800 MiB above the floor. rank 0 can
+   take most of that. On its own it will NOT raise the global pool while
+   rank 1 is the min-reducing rank.
+2. `SGLANG_UNEVEN_TOKEN_VECTOR=30,19,15`, which the server prints as its
+   own restart hint (+18% at the old budget). This is the change that
+   relieves the min-reduction, so it is the one that makes credit 1
+   spendable. Take them TOGETHER, in one boot, with its own corridor run.
+
+## Unchanged from v12 section 7
+
+Still metal-unproven: `meta_info` accept-len end to end (the scheduler log
+carries it; the wire does not), the arena reclaim on metal (fired 0 times
+across four runs), the bs=1 spill leg, the bs=1 YaRN leg beyond 262144,
+and the A-vs-A gate against `9a929352c9`.

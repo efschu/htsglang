@@ -43,7 +43,26 @@ HOST="${HOST:-0.0.0.0}"
 # ~14.9 GiB the 3080s) -- that check, not the corridor, is what now caps
 # the pool: corridor acceptance on the binding 32768-token prefill rung
 # still measured 2198/4033/2292 MiB free against a floor of 1024.
-RANK_MIB="${RANK_MIB:-22200,14700,14700}"
+# CORRIDOR-CONFIRMED UNDER THE ACCEPTANCE LOAD (#631, 2026-08-09), which
+# is the only load a corridor number may be quoted against. Sampled at
+# 100 ms for 390 s through boot, 23 policy-driven flips and a speculating
+# decode with CUDA graphs on:
+#
+#   per-card MINIMUM free 1034 / 2824 / 1228 MiB, floor 1024, 0 breaches
+#   on every card. 87/87 requests ok, 0 aborted.
+#
+# Derived, not guessed: each rank's budget was moved by that card's
+# measured distance from the floor under this same load, twice. Note the
+# 5090 still shows ~1800 MiB of headroom -- rank 0 can go up, but raising
+# it alone does not raise max_total_num_tokens while rank 1 is the
+# min-reducing rank (see SGLANG_UNEVEN_TOKEN_VECTOR below).
+#
+# DO NOT raise any entry without re-sampling under the acceptance load,
+# and do not try to buy corridor by LOWERING these: measured on this rig,
+# cutting ~1 GiB of budget moved the free minimum by +690 / +250 / +4 MiB
+# on the three cards. The allocator, not the budget, governs the floor --
+# which is why PYTORCH_CUDA_ALLOC_CONF is set below.
+RANK_MIB="${RANK_MIB:-22700,11920,11970}"
 CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-4}"
 MAMBA_SLOTS="${MAMBA_SLOTS:-20}"
