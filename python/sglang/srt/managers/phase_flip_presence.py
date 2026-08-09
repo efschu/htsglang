@@ -522,7 +522,52 @@ alone holding the flip.
       whose errors are silent, and the change is a one-liner once a second
       flip confirms the sign.
 
-      J.3 STILL OPEN, and it is the one that matters most. After the
+      AUDIT CANDIDATE, flagged and deliberately NOT chased here. The false
+      assumption behind J.1 -- that ``scheduler.running_batch`` names the
+      rank's resident set -- is available to any code that runs under
+      event_loop_pp, because the attribute is rebound per slot rather than
+      being slot-qualified at its use sites. Anything that reads
+      running_batch/last_batch from a per-slot hook (admission accounting,
+      metrics, pressure decisions) may be sampling one slot and calling it
+      the whole rank. Worth an audit pass of its own; not part of #631.
+
+      J.3 ANSWERED, AND THE ANSWER IS "IT DIES". The survival oracle, run
+      2026-08-09 02:36:05-07Z with the idle leak check in WARN mode
+      (SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0) so the accounting
+      crash could not mask the result, and a determined-answer request
+      decoding across the flip:
+
+        POOL CENSUS at-arm        cur_slot_reqs=1 resident_reqs=1 slots=[0]
+        POOL CENSUS pre-cutover   cur_slot_reqs=1 resident_reqs=1 slots=[0]
+        POOL CENSUS post-cutover  cur_slot_reqs=0 resident_reqs=0 slots=[]
+        cutover complete x3, then:
+        AssertionError: x_lru should not be locked when idle,
+            x_lru.full_lock_ref=1, x_lru.id=5
+        -> Mamba Radix tree sanity check failed -> SIGQUIT
+
+      THE RESIDENT DECODE SET DOES NOT SURVIVE THE CUTOVER. It is present
+      and enumerated right up to the cutover and gone immediately after,
+      and what it leaves behind is a stranded KV page AND a stranded mamba
+      lock (full_lock_ref=1 with the tree idle). The request never
+      continues, so no content-corruption verdict was reachable -- the
+      oracle terminated at the "it dies" branch.
+
+      THIS RELOCATES THE DEFECT AGAIN, and away from the enumeration for
+      the second time. live_slots_fn (with J.1 fixed) enumerated the
+      request correctly; the MOVE reported balanced cells; the loss
+      happens in the CUTOVER, which swaps stacks and scheduler topology
+      without carrying the resident requests across. The pool leak and the
+      mamba lock are two symptoms of that one omission, which is why
+      fixing either in isolation would have been treating a shadow.
+
+      CONSEQUENCE FOR THE ACCEPTANCE PROGRAM, stated plainly: a flip under
+      load is not merely unproven, it is currently IMPOSSIBLE -- any
+      request resident at the cutover is destroyed. Every flip observed so
+      far committed only because nothing had to survive it. The acceptance
+      bar (a PP->TP->PP cycle under load in one unmanned log) cannot be
+      met until the cutover carries the resident set.
+
+      (Superseded framing kept for the record:) After the
       cutover the census reports resident_reqs=0 while the unaccounted
       page persists -- so the resident request appears NOT to survive the
       flip. No flip has yet been observed carrying a request through to
