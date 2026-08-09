@@ -1168,3 +1168,136 @@ abandon cycles with no strand, ranks resuming aligned, and the
 `model_runner.forward` shape check never firing. **Keep that check as a
 standing tripwire regardless** -- it is what turned this class from silent
 corruption into a named defect.
+
+---
+---
+
+# HANDOFF v6 — written 2026-08-09 by successor #6
+
+**The stamp's DETECTION is metal-proven. Its DISPOSAL is metal-falsified.**
+Variant B as shipped in `d733266b5d` wedges the instance. The two halves
+must be judged separately, because one of them is right.
+
+## 1. What was proven first, off metal
+
+Three unit pins the variant B commit named as required and did not have
+(`test_pp_proxy_stamp_631.py`, registered in the family script; suite
+**439 passed**, was 425). Writing them found a real defect in the shipped
+fix: **the stamp was left in the dict and travelled on into model
+compute.** The commit had argued this was safe by the `__msg_type__`
+precedent, but that precedent shows a non-tensor entry SURVIVES THE WIRE
+-- it does not show one is safe to COMPUTE ON.
+`PPProxyTensors.__getitem__`'s slice path maps `v[key]` over every entry,
+and a tuple slices to a shorter tuple instead of raising, so the failure
+mode would have been silent nonsense. The stamp is now popped at the
+delivery boundary (`5474f60622`).
+
+A full consumer sweep settled the transport question that was left open as
+"the one risk to check first": `_split_tensor_dict`
+(`distributed/parallel_state.py:227-250`) has exactly ONE branch point,
+`isinstance(value, torch.Tensor)`, and everything else is carried verbatim
+through a generic `pickle.dumps`/`pickle.loads` of the metadata list.
+A tuple is therefore transported identically to the `__msg_type__` string
+-- **not** str-specific handling that happens to work. Every compute-path
+consumer reads known keys (`hidden_states`, `residual`, `topk_indices`)
+or iterates a fixed, locally-allocated buffer key set
+(`runner_utils/buffers.py:134-144`), never the wire dict's own keys. The
+single blind consumer of a received proxy is the opt-in
+`debug_utils/dumper.py:1775`, which is already broken for `__msg_type__`
+today; the strip closes it for the stamp.
+
+## 2. THE DETECTION WORKS. This is the metal line, and it is exact
+
+Boot of `5474f60622`, SPEC=on POLICY=manual, park deadline 5 s, the
+abandon-under-load reproducer (now a script, see §5):
+
+    07:19:23 PP1] PHASE-FLIP PROXY LEFTOVER DROPPED: stamp mb_id=2
+                  seq=2811 rows=1 arrived while this rank is on mb_id=1
+
+**`rows=1` is the specimen's own signature** -- a one-row decode hidden
+state arriving for a different microbatch, which is precisely the pair
+that used to reach `causal_conv1d_update`. PP1 is again the rank that
+strands. The message was named and refused instead of computed on:
+**0 proxy/batch mispairs**, 0 conv1d guard hits, 0 illegal memory
+accesses, across 3 abandons.
+
+**The same-boot CONTROL is clean too**: same load, zero arms, therefore
+zero abandons -> **0 drops**, 14 requests, 2240 tokens, 0 aborts, health
+200. So the stamp does not fire on healthy traffic; it fires on exactly
+the condition it was built for.
+
+## 3. THE DISPOSAL WEDGES THE INSTANCE — corpse R
+
+Six seconds after the drop the instance stopped. Specimen
+`/spinning/evidence-631/wedge_20260809T072021Z_stamp_drop_wedge_20260809T0719Z`
+(all three stacks, presence markers, timeline).
+
+    PP1  _pp_recv_proxy_tensors (scheduler_pp_mixin.py:1790)  <- the
+         SECOND recv, the one the drain loop makes after dropping
+    PP2  _pp_recv_proxy_tensors (scheduler_pp_mixin.py:1790)
+    PP0  _pp_recv_dict_from_prev_stage (scheduler_pp_mixin.py:1987)
+         <- the OUTPUT channel, waiting on PP2
+
+A closed cycle: PP0 waits for PP2's output, PP2 waits for PP1's proxy,
+PP1 waits for a proxy from PP0 that **was never sent and never will be**.
+
+**THE MECHANISM, and it is the bounded-recv corpse read backwards.** That
+corpse said: complete a pass without consuming and unmatched SENDS pile
+up until the senders block. Its dual is what happened here: consume TWICE
+in one pass and the surplus RECV blocks for ever, because the wire owes
+exactly one message per pass and no more. Dropping a message and then
+taking "the next one" silently assumes a next one exists. On this wire it
+does not.
+
+**So the drain loop is the defect, not the stamp.** `for _ in range(8)`
+looked like a bound on a spin; it is actually a licence to make up to
+eight blocking calls where the contract permits one.
+
+## 4. THE NAMED DIRECTION: void the SLOT, never the message
+
+The invariant the receive side may not break is **exactly one message
+consumed per pass**. The stamp does not need to break it to do its job:
+it only has to change what the rank DOES with the message it was always
+going to take.
+
+    take one message per pass, as before;
+    if the stamp names this slot   -> compute on it, as before;
+    if it does not                 -> this slot is VOID: do not compute,
+                                      and pass the void downstream as
+                                      this pass's proxy send.
+
+No extra recv, no missing send, 1:1 preserved end to end, and no rank's
+launch timing moves -- which is what the refined law demands. The void
+propagates one hop per pass exactly like real hidden states do, so the
+pipeline drains it instead of deadlocking on it.
+
+Open sub-questions, honestly: what the void does to the requests in that
+microbatch (retract vs re-queue), and whether `_pp_make_skip_output_result`
+-- which already exists for the output channel's skip -- is the right
+shape to reuse for the last rank's return leg.
+
+## 5. THE SIBLING WIRE HAS THE SAME HOLE, still unstamped
+
+`_pp_recv_dict_from_prev_stage` (the last rank's `next_token_ids` return
+to rank 0) is guarded at `scheduler_pp_mixin.py:1979` by
+`mbs[next_mb_id] is None` -- i.e. by **this rank's own batch**, which is
+the identical guard shape that produced the proxy strand. It carries no
+stamp. Rank 0 is the rank that arms first and disarms last in these runs,
+so it is the natural victim. A mispair there is worse than a shape error:
+`next_token_ids` for the wrong microbatch is plausible-looking wrong
+output. Stamp it with the same mechanism once the disposal is settled.
+
+## 6. Reproducer and control are now a script, not a recipe
+
+`scripts/route_a_631_proxy_strand_repro.py`. `--cycles N` runs N
+arm/abandon cycles against sustained decode; `--cycles 0` is the CONTROL
+(same load, no arms). It prints a PASS/FAIL verdict over: abandons
+occurred, zero mispairs, no drain gave up, no IMA, server healthy, zero
+aborts. Both runs above came from it. Results:
+`/tmp/route-a-631/control_stamp.json` (PASS),
+`/tmp/route-a-631/repro_stamp.log` (the wedged run).
+
+**Note the verdict design**: leftover drops are reported but are NOT a
+pass condition in either direction. A drop is the fix working; zero drops
+in a run with abandons means the strand did not occur on that schedule.
+The pass condition is the absence of the MISPAIR.

@@ -1778,11 +1778,44 @@ class SchedulerPPMixin:
         later receive off by one. It is now dropped, LOUDLY and with its
         identity, and the next message is taken instead.
 
-        Bounded: a handful of drops, then give up rather than spin. Dropping
-        is safe precisely because the sender is not waiting on us -- the
-        proxy send is async and its handle is reaped by the sender's own
-        commit, so discarding a message it already posted costs that
-        microbatch and nothing else.
+        CORPSE R -- READ THIS BEFORE TOUCHING THE LOOP BELOW.
+        =====================================================
+        THE DETECTION IS METAL-PROVEN. THE DISPOSAL BELOW IS METAL-
+        FALSIFIED and is kept only until the replacement lands.
+
+        The paragraph that used to stand here argued that dropping is safe
+        "because the sender is not waiting on us". That is true and it is
+        beside the point. The sender is not what blocks; WE are. The wire
+        owes exactly ONE message per pass, so a rank that discards a
+        message and then takes "the next one" makes a second blocking call
+        against a debt of one, and there is nothing to take.
+
+        Measured 2026-08-09 07:19:29Z, specimen
+        /spinning/evidence-631/wedge_20260809T072021Z_stamp_drop_wedge_20260809T0719Z:
+
+            PP1  here, line 1790, in the SECOND recv after a drop
+            PP2  here, same
+            PP0  _pp_recv_dict_from_prev_stage -- the OUTPUT wire
+
+        a closed cycle: PP0 waits on PP2's output, PP2 on PP1's proxy, PP1
+        on a proxy from PP0 that was never sent. The drop itself was
+        CORRECT -- "stamp mb_id=2 seq=2811 rows=1 arrived while this rank
+        is on mb_id=1", a one-row decode hidden state, the mispair
+        specimen's own signature, refused instead of computed on.
+
+        THIS IS THE BOUNDED-RECV CORPSE READ BACKWARDS. That corpse:
+        complete a pass without consuming, unmatched SENDS pile up, the
+        senders block. Its dual: consume TWICE in one pass, and the
+        surplus RECV blocks for ever. ``for _ in range(8)`` reads like a
+        bound on a spin; it is a licence to make eight blocking calls
+        where the contract permits one.
+
+        THE REPLACEMENT, so it is not re-derived: take exactly one message
+        per pass, as always, and let the STAMP decide what to do with it
+        -- compute on it when it names this slot, and otherwise treat the
+        SLOT as void and pass the void downstream as this pass's proxy
+        send. One recv, one send, 1:1 preserved, no launch timing moved.
+        VOID THE SLOT, NEVER THE MESSAGE.
         """
         if self.pp_group.is_first_rank:
             return None
