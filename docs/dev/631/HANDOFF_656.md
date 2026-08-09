@@ -1553,3 +1553,162 @@ SPEC on, the quiescence predicate deliberately refuses to carry a resident
 request into a speculating TP phase, so every armed window under load
 still abandons by design. That is the next build, and it is unchanged by
 this shift.
+
+---
+---
+
+# HANDOFF v8 — written 2026-08-09 by successor #8
+
+**The draft-state carry is BUILT and the wall is down.** A flip now COMMITS
+under load with `SPEC=on`, repeatedly, in both directions, and the instance
+survives. That was item 1 of the program and it had blocked every armed
+window under load by design.
+
+One defect remains, it is precisely located, and it is **not** the draft
+carry: a request crossing a `pp_to_tp` cutover loses **exactly one output
+token** on the way to the client, while its own scheduler state is provably
+consistent.
+
+## 1. State right now
+
+- **HEAD** `6045bb77cf`, branch `feat/route-a-631`. Box SERVING on it,
+  `POLICY=manual SPEC=on RANK_MIB=21000,13300,13100`, PP phase, health 200.
+- **Suite** `bash scripts/run_631_flip_family.sh` -> **492 passed** (was
+  460). New file `test_phase_flip_draft_bootstrap_631.py`, 32 pins,
+  6 of them can-fail proofs.
+- Commits this shift, in order: `9430d2e4e2` (the bootstrap),
+  `18adc81cb4` (hybrid pool layer ids), `9e9f0affde` + `4147972205` (the
+  verify-width defect), `1fa147e525` (the scrub falsifier switch),
+  `6045bb77cf` (pending-token root + the clock report).
+
+## 2. What is proven on metal
+
+`scripts/route_a_631_draft_carry_probe.py`, three counting requests
+decoding, flip armed 4 s in, run 09:28:54-09:29:27Z:
+
+    cycle 0  pp_to_tp under load   COMMITTED, bootstrap on all 3 ranks
+    cycle 1  tp_to_pp under load   COMMITTED, 3/3 answers CLEAN
+    bootstrapped 3 | retuned 6 | cutovers 33 | abandoned 0
+    faults 0 | collective timeouts 0 | health 200
+
+**The return leg is content-correct under load.** Both legs commit with
+requests resident and speculating. Nothing parks, nothing abandons,
+nothing faults.
+
+## 3. The mechanism, and why this cut
+
+The draft KV pool is indexed by the TARGET's slot ids -- `req_to_token`
+and the allocator are SHARED, only the KV buffers are separate -- so a
+carried request's draft rows are allocated but hold the previous
+occupant's bytes, and the draft decode reads `[0, seq_lens)`
+unconditionally. They are scrubbed to zero. And the draft chain needs a
+hidden state the PP phase never captured, so the first post-flip round
+runs the in-tree 1-node trivial verify (always accepts its root,
+functionally a plain decode, captures FULL) and the ordinary
+`_draft_extend_for_decode` seeds the real chain from it. It is the
+kv-session-offload BOOTSTRAP TICK at a different boundary.
+
+Rejected: carrying the last target hidden (v3 §3 option 2). It needs
+`capture_hidden_mode = LAST` on PP decode batches, which perturbs the
+default path and is what makes `recapture_if_needed` re-record every plain
+decode graph. One eager round per flip is cheaper.
+
+Given up, deliberately: the scrubbed prefix reads as zeros, so a carried
+request's ACCEPTANCE starts low and recovers behind the cutover point. Its
+ANSWER is unaffected -- the target verifies every proposed token.
+
+## 4. Three defects found on metal, each by a loud failure
+
+1. **The draft pool is HYBRID** (`18adc81cb4`). The scrub derived a layer
+   range from `start_layer + layer_num`, the MHA shape. This model's draft
+   pool is a `HybridLinearKVPool` with no `layer_num` at all -- it carries
+   `full_attention_layer_id_mapping`, and `get_key_buffer` refuses any id
+   outside it. It refused before a byte moved.
+2. **The verify WIDTH is not the configured width** (`4147972205`, and it
+   is the general one). `_draft_extend_for_decode` strides every quantity
+   it builds over `speculative_num_draft_tokens`. What they stride over is
+   the number of token rows the verify JUST PRODUCED. Equal in every
+   ordinary round; the bootstrap is the first caller for which they
+   differ. Ruling out the graph is what found it -- the same failure
+   reappeared on the eager path. The width is now a parameter, and a
+   narrowed round takes the eager path END TO END (one decision, because
+   `prepare_for_draft_extend` uses the graph runner's verdict to decide
+   whether to build attention metadata at all).
+3. **`ScheduleBatch.spec_algorithm` is a per-batch FIELD** (`9430d2e4e2`),
+   copied at construction, so a batch built in PP carries NONE across the
+   cutover while `prepare_for_decode` branches on it. Retuned in both
+   directions. The TP->PP mirror has the same hole and was never hit
+   because every flip that had ever committed committed on an idle server.
+
+## 5. THE REMAINING DEFECT, located but not fixed
+
+A request crossing `pp_to_tp` under load loses **one output token**.
+Raw text, 09:28:54Z (`19` `2` `21`: the `0` of "20" is gone, everything
+after it correct):
+
+    ...16 17 18 19 2 21 22 23 24 25 26 27 28 29 30 31 32...
+
+**It is not the model.** The no-flip CONTROL is clean: 3/3 counts 2..120
+unbroken, same load, same checker (`--no-flip`). Run it before believing
+anything about content -- this strand has already had a control that
+drifted EARLIER than the flip run.
+
+**It is not the scrub.** A run with `SGLANG_PHASE_FLIP_DRAFT_SCRUB=0` was
+corrupted identically. That switch exists for exactly this separation:
+content cannot depend on the scrub, because the target verifies every
+proposed token.
+
+**It is not a state off-by-one.** This is the finding that redirects the
+next attempt, and it comes from the clock report the cutover now logs:
+
+    2ede3499: seq_lens=79 seqlen=80 out[-2:]=[17, 15] input_id=15
+    f200dd30: seq_lens=78 seqlen=79 out[-2:]=[220, 17] input_id=17
+    731abd1a: seq_lens=78 seqlen=79 out[-2:]=[220, 17] input_id=17
+
+Every request has `seqlen == seq_lens + 1` and `input_id ==
+output_ids[-1]`. The two clocks AGREE. The token is in `output_ids`; it
+does not reach the client.
+
+**So look at the OUTPUT path across the cutover, not at the KV or the
+draft state.** `scheduler.output_streamer` is rebuilt at cutover step 4b
+(`_dc2.replace(..., ps=...)`), and the per-request send offsets and the
+detokenizer's incremental state are what decide which appended tokens are
+actually emitted. Note what disappears: a digit token INSIDE a multi-digit
+number, which is precisely what incremental detokenization buffers.
+
+Two more datapoints for whoever picks this up:
+- The `tp_to_pp` leg is CLEAN. Only the leg that leaves the PP loop loses
+  a token, which puts the PP loop's own result/stream handling at the
+  cutover in the frame.
+- Changing the root token source (output tail -> `batch.input_ids`)
+  changed WHICH of the two tokens of "20" was lost, and the clock report
+  then showed the two sources are equal for these requests -- so that
+  change was a no-op and the loss is upstream of the root choice. Do not
+  re-walk it.
+
+## 6. The program from here
+
+1. **The lost token.** Section 5 says where to look and what has already
+   been ruled out. The probe and its control are one script.
+2. Then acceptance at `POLICY=auto` with graphs + spec + max KV in one
+   unmanned log, and the budget tightened toward 1024 MiB (still ~7 GiB
+   loose; this shift ran 21000,13300,13100 to stay clear of the spec OOM
+   and did not touch the corridor).
+3. A-vs-A vs `9a929352c9`, then ship.
+
+Accept length after a flip into TP is still UNMEASURED -- the probe greps
+for it and found nothing, so the log key is wrong or the metric is not
+emitted per request. Fix the probe's `accept_len` extraction (use
+`meta_info`, not the log; `spec_ema_accept_len` is NOT the accept length)
+before claiming the TP phase speculates after a carry.
+
+## 7. Tools this shift leaves behind
+
+- `scripts/route_a_631_draft_carry_probe.py` -- counting task under load,
+  flip armed mid-decode, `--no-flip` control, raw text window at a break.
+  A count is a determined sequence, so a corruption is LOCATED instead of
+  argued about; that is what made section 5 possible.
+- `SGLANG_PHASE_FLIP_DRAFT_SCRUB=0` -- separates the scrub from the seed
+  in one boot.
+- The cutover clock report -- `seq_lens`, `seqlen`, output tail and
+  `input_id` per request, printed where the flip happens.
