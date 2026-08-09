@@ -886,3 +886,109 @@ Until then the useful configurations are:
 * `SPEC=off POLICY=auto` -- switches, pays, 0 aborts (the 3x/2.6x ledger);
 * `SPEC=on POLICY=manual` -- speculating decode at 113 tok/s, no automatic
   layout changes.
+
+---
+---
+
+# HANDOFF v5 — written 2026-08-09 by successor #5
+
+**Supersedes v4 §2(b) and §3.1.** The abandon-path "illegal memory access"
+is diagnosed, the corrupting kernel is named, and the corruption hole is
+closed and shipped (`118cdf2cbb`). Read the corpse table entries P and Q
+in `phase_flip_presence.py`'s neighbours (they are recorded in
+`test_phase_policy.py` and `scheduler_pp_mixin.py` respectively).
+
+## 1. The IMA is NOT the flip moving KV, and the log order proves it
+
+v4 wrote "abandonment is immediately followed by a device-side illegal
+memory access". The order in the specimen is the other way round:
+
+    05:21:16  FLIP ABANDONED (30 s deadline), all three ranks
+    05:21:16  PP2  ValueError from fused_recurrent_gated_delta_rule_packed_decode
+                   `ssm_state_indices` must have shape [B]
+                   (got (1,); expected (2048,))
+    05:21:16  SIGQUIT
+    05:21:17  ONLY NOW the IMA, x156, ALL inside barlink's BAR1 status poll
+    05:21:17  PP0/PP1 die of gloo "Connection closed by peer" -- teardown
+
+There is **no OOM in that boot at all** (0 hits for OutOfMemory / "Tried to
+allocate"). The first fault is a shape mismatch: a decode batch of ONE
+request carrying **2048** rows of hidden state, and 2048 is exactly that
+boot's `chunked_prefill_size`.
+
+**THE KERNEL THAT ACTUALLY WROTE.** One call *before* the guarded
+`packed_decode`, `gdn_backend.forward_decode` hands the same mismatched
+pair to `causal_conv1d_update`. It launches one program per row of `x`,
+each reading `conv_state_indices[row]`: with 2048 rows and a 1-element
+index tensor, 2047 reads run off the end and the garbage becomes a
+conv-state line number — an out-of-bounds READ and then an out-of-bounds
+**WRITE** into another request's state. The assert for exactly this
+existed, behind `validate_data`, which defaults to False.
+
+**Fixed unconditionally on both paths.** Only the SHORT direction is
+refused; a longer index tensor is harmless and refusing it would break
+correct callers. Pinned by a mutation-proven can-fail
+(`test/registered/unit/layers/test_causal_conv1d_bounds_631.py`).
+
+**Standing trap, it cost the first investigation an hour:** the barlink
+BAR1 poll is where a sticky CUDA fault SURFACES, never where it happens.
+
+## 2. Defect Q: the armed window has no pass clock (measured, real, and
+   NOT the cause)
+
+`mb_id` is a purely rank-local loop index; there is no shared pass
+counter. What holds the PP stages in phase is the BLOCKING chain receive.
+The armed intake rule returns `[]` immediately on every rank, so nothing
+blocks and every rank free-runs for the whole armed window.
+
+Measured on metal, one 30 s armed window that abandoned under load:
+
+    rank 0: 266486 slot iterations   rank 1: 204194   rank 2: 226334
+    SPREAD 62292        (a second abandon: 62241, same shape)
+
+Control, same boot pattern: **51 committed flips, every pass-clock window
+SPREAD 0** — a commit re-forms loop state via `init_pp_loop_state`, an
+abandon does not.
+
+**SAY THIS PLAINLY, because it is the honest limit of this session:** the
+drift is real and reproducible, and it is **NOT shown to cause the shape
+mismatch**. Two abandons under load — one with a 40k-token prefill fired
+mid-window, reproducing the specimen's backlog — produced those spreads
+and **no fault**, and all three ranks disarmed at `mb_id=0`, so the
+microbatch phase survived. **The origin of the 2048-vs-1 pairing is still
+open.** The corruption it caused can no longer happen silently; the
+mismatch itself can.
+
+Instrument: `CHAN_PASS` gauge + the `PASS-CLOCK` log line, reported from
+one rank for the whole group. Reader: `scripts/route_a_631_pass_clock_report.sh`.
+
+## 3. Corpse P, so it is not re-derived
+
+"The armed rank drops requests off the chain" is the obvious reading of
+the armed branch and is wrong twice over: `_pull_raw_reqs` returns `[]` on
+every rank while armed (rank 0 leaves its requests in the zmq socket,
+which IS the buffer), and `PpChainReceiver.recv()` drains its inbox before
+touching the wire. Nothing is lost. Full record in `test_phase_policy.py`.
+
+## 4. Where to go next, in order
+
+1. **Find the origin of the batch/metadata mismatch.** The guard now turns
+   it into a loud ValueError instead of a silent write, so the next
+   occurrence is safe to catch and names itself. Re-run the SPEC=on wait
+   variant under sustained agentic load until it fires. Do NOT assume
+   defect Q is the cause — it is measured and it did not reproduce it.
+2. **The draft-state carry** (v3 §3, still the blocker for SPEC=on+auto).
+   v4's measurement stands: waiting is worth nothing under sustained
+   decode.
+3. Then acceptance at SPEC=on POLICY=auto, the budget give-back toward the
+   1024 MiB corridor, and the A-vs-A gate vs `9a929352c9`.
+
+## 5. Tests and state
+
+- `scripts/run_631_flip_family.sh` -> **425 passed** (was 417).
+- Metal, this tree, SPEC=on POLICY=manual: boot healthy, PP decode,
+  `pp_to_tp` cutover committed on all three ranks, TP decode with MTP at
+  **accept len 3.27**, correct answer, **0 guard false positives, 0 faults**.
+- Evidence: `/spinning/evidence-631/abandon_q_20260809T0556Z/`
+  (`control_specoff_commits.log` = 51 commits, all SPREAD 0;
+  `abandon_specon_drift.log` = the two abandons with SPREAD 62292/62241).
