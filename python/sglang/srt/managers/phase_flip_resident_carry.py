@@ -130,8 +130,76 @@ class ResidentCarryError(RuntimeError):
     """
 
 
+# No batch on this server holds more requests than max_running_requests
+# (4 on the production recipe), and no plausible configuration approaches
+# this number. It exists only to separate "a request list" from "an object
+# that is not one", cheaply, without trusting the caller to pass a
+# scheduler. The scheduler-aware, much tighter bound lives in
+# ``harvest_resident_batches``.
+IMPLAUSIBLE_RESIDENT_REQS = 65536
+
+
 def _reqs_of(batch) -> List:
-    return list(getattr(batch, "reqs", []) or [])
+    """The requests resident in ``batch``, or a loud refusal.
+
+    DEFECT M (2026-08-09 21:47:29Z) -- the reason this is not a one-liner
+    -------------------------------------------------------------------
+    The body used to be ``list(getattr(batch, "reqs", []) or [])``. On
+    metal it once returned 10485760 entries, and once 12582912. Those are
+    not request counts: they are exactly 10 MiB and 12 MiB expressed in
+    bytes (10 x 2^20, 12 x 2^20). Something that is not a request list had
+    been left reachable as a batch's ``reqs``.
+
+    The same wrong number then did two separate kinds of damage, which is
+    why the guard belongs HERE and not at either consumer:
+
+      * ``Scheduler.maybe_arm_phase_policy`` sums these lengths into
+        ``running_bs``, so a genuinely IDLE instance armed a pp_to_tp
+        flip; and
+      * the cutover handed the same resident set to
+        ``arm_draft_bootstrap``, whose ``committed_slots`` allocates one
+        tensor PER REQUEST. Against a claimed 10.5 M requests the rank
+        never came back: host RAM reached 112 GiB of 120 GB, the cgroup
+        OOM killer took rank 0 (exit code -9), and ranks 1 and 2 spun on
+        a broken TCPStore pipe until the instance was gone.
+
+    THE ORDER OF THE CHECKS IS THE FIX. The hang happened INSIDE that
+    ``list()`` call -- materialising ten million elements is itself the
+    damage -- so any validation written after it is validation that never
+    runs. This checks the TYPE first, and then a length that is O(1) to
+    read, and only then materialises.
+
+    NOT A CLAMP, deliberately. Substituting a plausible count for a wrong
+    one would let the flip proceed against a resident set nobody can name,
+    leaving the leaking handle in place and moving the next symptom
+    further from its cause. This names the offending object's type and
+    refuses.
+    """
+    reqs = getattr(batch, "reqs", None)
+    if reqs is None:
+        return []
+    if isinstance(reqs, (list, tuple)):
+        return list(reqs)
+
+    # Anything else is the defect-M shape. Report what it actually is --
+    # the type and, when it is cheap and safe, the length -- because the
+    # whole point of this refusal is to name the object that the next
+    # reader has to go and fix.
+    try:
+        size = len(reqs)  # type: ignore[arg-type]
+        size_note = f"len={size}"
+        if size and size % (1 << 20) == 0:
+            size_note += f" (= {size // (1 << 20)} MiB in bytes)"
+    except TypeError:
+        size_note = "no len()"
+    raise ResidentCarryError(
+        f"{LOG_PREFIX} batch {type(batch).__name__} has a 'reqs' attribute "
+        f"that is not a request list: type={type(reqs).__name__}, "
+        f"{size_note}. Refusing to iterate it. This is defect M: the "
+        f"resident harvest must never materialise an object it cannot "
+        f"identify, because the cutover allocates one tensor per resident "
+        f"request."
+    )
 
 
 def _is_resident(batch) -> bool:
@@ -150,17 +218,39 @@ def harvest_resident_batches(scheduler) -> List:
     out: List = []
     seen_batches: Set[int] = set()
 
-    def _take(batch) -> None:
+    # The tight, scheduler-aware half of the defect-M guard. ``_reqs_of``
+    # can only ask "is this a request list at all"; here the real ceiling
+    # is known, so a batch claiming more requests than the server is ever
+    # allowed to run concurrently is refused BY SLOT NAME. A list of the
+    # right type but an impossible length is still a corrupted resident
+    # set, and it reaches ``committed_slots`` just the same.
+    ceiling = getattr(scheduler, "max_running_requests", None)
+    try:
+        ceiling = int(ceiling) if ceiling else None
+    except (TypeError, ValueError):
+        ceiling = None
+
+    def _take(batch, origin: str) -> None:
         if not _is_resident(batch):
             return
+        if ceiling is not None:
+            n = len(_reqs_of(batch))
+            if n > ceiling:
+                raise ResidentCarryError(
+                    f"{LOG_PREFIX} {origin} claims {n} resident request(s), "
+                    f"above max_running_requests={ceiling}. Refusing to "
+                    f"carry it. This is defect M: a corrupted resident set "
+                    f"arms a flip that no load justifies and then makes the "
+                    f"cutover allocate one tensor per claimed request."
+                )
         if id(batch) in seen_batches:
             return
         seen_batches.add(id(batch))
         out.append(batch)
 
-    for mb in getattr(scheduler, "running_mbs", []) or []:
-        _take(mb)
-    _take(getattr(scheduler, "running_batch", None))
+    for slot, mb in enumerate(getattr(scheduler, "running_mbs", []) or []):
+        _take(mb, f"running_mbs[{slot}]")
+    _take(getattr(scheduler, "running_batch", None), "running_batch")
 
     # Refuse a request reachable through two DISTINCT batches. Merging
     # those would enter the same Req twice -- duplicate KV rows and a

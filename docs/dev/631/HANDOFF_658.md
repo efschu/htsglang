@@ -332,6 +332,46 @@ site (running_bs may not exceed `max_running_requests`) and let it raise
 with the offending batch's type and attribute — the same
 loud-over-plausible discipline the merge_batch guard uses.
 
+## 4d. DEFECT N — flip-time cuMemCreate OOM at ctx 262144 (distinct from M)
+
+Do not conflate this with defect M. Different build, different signature.
+
+Booted `--phase-flip-purity off` at 21:51:41Z on the boot script's
+DEFAULTS (non-yarn model, ctx 262144, pool 263768). Healthy 21:54:06Z,
+dead 21:55:19Z on a real out-of-memory during the pp_to_tp cutover:
+
+```
+_swap -> dst.restore_backing() (phase_flip_runtime.py:1462)
+  full_kv_pool.restore_backing() (memory_pool.py:2477)
+    _post_capture_owner.finalize -> _back_spans -> commit_range
+RuntimeError: cuMemCreate failed: <CUresult.CUDA_ERROR_OUT_OF_MEMORY: 2>
+
+PP1: cuMemCreate: 163577856 bytes refused by the driver; releasing
+torch's cached blocks and retrying once. torch reserved 21.68 GiB /
+allocated 20.87 GiB
+```
+
+The retry-after-empty_cache path fired and still failed. So the TP KV
+backing could not be re-committed at the seam: 156 MiB refused with torch
+holding ~21 GiB reserved. This is HANDOFF_657 §5c's law biting — sizing
+-time headroom is not runtime slack — now at the FLIP rather than at boot.
+
+**MY ERROR, recorded because it cost a boot**: I called this configuration
+"the build that survived load". It was not. The config that ran clean
+earlier today is `MODEL=...-INT8-W8A8-yarn1.5` at `CTX=393216` (pool
+277468); I booted the script's defaults instead and changed both the model
+and the context without noticing. **The boot script's defaults are NOT the
+proven config.** Always pass MODEL and CTX explicitly, or read them off
+the last known-good process with `ps`.
+
+Open question for the next shift, and it matters for the ship config:
+whether the OOM is caused by ctx 262144 + pool 263768 specifically, or by
+the new fairness windows flipping MORE often than before and so hitting
+the seam more often. The second reading is testable cheaply: boot the
+proven yarn1.5/393216 config with the windows ON and see whether the seam
+OOM reappears. Evidence:
+`/spinning/evidence-631/serving_fallback_flipOOM.log`.
+
 ## 5. Exact next steps
 
 0. **Defect M above** — it gates the fairness rules; explain before fixing.
