@@ -1113,11 +1113,16 @@ class SchedulerPPMixin:
         which is what the resume gate got wrong by holding ranks out of
         launching (HANDOFF §7).
 
-        The demultiplexer is bypassed deliberately: this is a discard, so
-        the message's kind does not matter, and routing it through
-        ``_pp_recv_typed_dict`` would make it hunt for an expected kind and
-        block. Rank 0's upstream wire carries the output return and the
-        others' carry proxies; both are equally void while armed.
+        DISABLED -- CORPSE S. The paragraph that stood here said the
+        demultiplexer was bypassed deliberately because "both kinds are
+        equally void while armed". METAL FALSIFIED THAT SENTENCE within one
+        arm: the upstream wire MULTIPLEXES the proxy forward and the output
+        return, and an output belongs to work launched BEFORE the arm. This
+        function ate one (kind=output, PP1, 07:33:30Z) and PP1 then blocked
+        for ever waiting for it, with PP2 behind it. See the call site in
+        ``pp_flip_service`` for the full specimen and for what a correct
+        version would have to do instead. It is left here, uncalled, so the
+        next reader inherits the measurement rather than the idea.
         """
         counters = getattr(self, "pp_flip_counters", None)
         if counters is None:
@@ -1168,10 +1173,32 @@ class SchedulerPPMixin:
             self.pp_flip_consume_inbound()
         except Exception as exc:  # noqa: BLE001
             logger.error("%s armed consume failed: %s", "#631", exc)
-        try:
-            self.pp_flip_drain_tensor_dicts()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("%s armed tensor-dict drain failed: %s", "#631", exc)
+        # CORPSE S -- THE ARMED DRAIN IS DISABLED, and must not be re-enabled
+        # in this shape. Metal, 2026-08-09 07:33:30Z, specimen
+        # /spinning/evidence-631/wedge_20260809T073423Z_armed_drain_ate_output_20260809T0733Z:
+        #
+        #     PP1] #631 armed drain took a tensor dict off the wire and
+        #          discarded it: kind=OUTPUT stamp=None
+        #
+        # and 20 s later PP1 AND PP2 were both blocked in
+        # _pp_recv_dict_from_prev_stage while PP0 spun at the flip gate.
+        # PP1 was waiting for the output its own drain had eaten.
+        #
+        # THE FALSE SENTENCE, verbatim from the docstring below: "both kinds
+        # are equally void while armed". They are NOT. The upstream wire
+        # MULTIPLEXES two streams -- the proxy forward and the output return,
+        # relayed stage by stage and demultiplexed by __msg_type__ AFTER
+        # coming off the wire. A proxy for a pass an armed rank never ran is
+        # void. An OUTPUT belongs to work that was launched BEFORE the arm
+        # and is still owed to a real consumer. Discarding it destroys a
+        # microbatch's results and strands every rank waiting behind it.
+        #
+        # The repair is not a bigger hammer: a drain that wants to be
+        # kind-blind cannot be, and one that discards must demultiplex first
+        # (stash 'output' in the inbox, where its consumer already looks) and
+        # then decide about 'proxy' alone -- for which in-flight microbatches
+        # launched before the arm raise the same question a second time.
+        # self.pp_flip_drain_tensor_dicts()  # corpse S
         try:
             self.pp_flip_flush_drained_sends()
         except Exception as exc:  # noqa: BLE001
