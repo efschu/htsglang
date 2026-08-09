@@ -291,18 +291,20 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
         values = scheduler.tree_cache.all_values_flatten()
         if values is not None and values.numel():
             parts.append(values.detach().to("cpu", torch.int64))
-        # UNCHANGED, and that is a MEASURED decision rather than an
-        # oversight. Defect J looked exactly like a missed row here --
-        # ``seqlen`` is a property of the sequence while the allocator
-        # hands out ``kv_allocated_len``, and under #486 the spec reserve
-        # makes those structurally different. The census bracket
-        # (at-arm / pre-cutover / post-cutover, 2026-08-09 02:08Z) falsified
-        # it: the unaccounted page is already unaccounted BEFORE the flip
-        # touches anything, and a no-flip control boot stays clean. Widening
-        # this enumeration would have moved rows nobody asked for, on a
-        # guess, in the one place where a wrong guess corrupts silently.
-        running = getattr(scheduler, "running_batch", None)
-        reqs = list(getattr(running, "reqs", []) or []) if running else []
+        # ALL RESIDENT SLOTS, not scheduler.running_batch (#631 J). That
+        # attribute is the CURRENT microbatch slot under event_loop_pp, and
+        # the flip's hook fires at the end of an arbitrary slot iteration,
+        # so reading it sampled an empty slot while a request sat resident
+        # in another one -- and that request's rows were then never moved.
+        # See _live_reqs for the measurement.
+        #
+        # The ROW EXTENT below is still req.seqlen, deliberately: the
+        # allocator-owned extent is kv_allocated_len and the two differ
+        # under #486's spec reserve, but that delta has not yet been
+        # measured on a flip where a resident request was actually
+        # enumerated (it could not be -- none ever was). _probe_allocated_
+        # extent reports it every flip; change this only on that evidence.
+        reqs = _live_reqs(scheduler)
         req_to_token = scheduler.req_to_token_pool.req_to_token
         for req in reqs:
             n = int(req.seqlen)
@@ -310,7 +312,7 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
                 continue
             rows = req_to_token[req.req_pool_idx, :n]
             parts.append(rows.detach().to("cpu", torch.int64))
-        _probe_allocated_extent(scheduler, _live_reqs(scheduler))
+        _probe_allocated_extent(scheduler, reqs)
         if not parts:
             return torch.empty(0, dtype=torch.int64)
         return torch.unique(torch.cat(parts))
@@ -319,24 +321,53 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
 
 
 def _live_reqs(scheduler) -> List:
-    """The requests the pool charges to this rank. DIAGNOSTICS ONLY.
+    """Every request RESIDENT on this rank, across ALL microbatch slots.
 
-    ``running_batch`` AND ``last_batch``, deduplicated by identity,
-    because that is the pair the invariant checker walks -- so a census
-    built on it can be compared with the checker's arithmetic directly.
+    SLOT SCOPE IS THE DEFECT THIS EXISTS FOR (#631 J, measured 2026-08-09
+    02:21:03Z). Under ``event_loop_pp``, ``scheduler.running_batch`` and
+    ``scheduler.last_batch`` are rebound to ``running_mbs[mb_id]`` and
+    ``last_mbs[mb_id]`` at the TOP of every slot iteration. They therefore
+    describe ONE microbatch slot -- whichever slot's iteration happens to
+    be running -- and NOT the rank's resident set. The flip's round hook
+    fires at the END of a slot iteration, so reading ``running_batch``
+    there samples an arbitrary slot, and an empty one is indistinguishable
+    from "no requests resident".
 
-    Deliberately NOT used to decide what the flip MOVES. That decision is
-    unchanged and stays with ``_live``; see the note there.
+    Measured at a real cutover:
+
+        at-arm       cur_slot_reqs=1 resident_reqs=1 resident_slots=[1]
+        pre-cutover  cur_slot_reqs=0 resident_reqs=1 resident_slots=[1]
+
+    The request was resident in slot 1 throughout; the hook simply ran for
+    a different, empty slot. Enumerating from ``running_batch`` alone
+    therefore missed its rows entirely.
+
+    THIS IS NOT MERELY AN ACCOUNTING BUG. Rows that are not enumerated are
+    not MOVED, so the resident request's freshest KV is left behind in the
+    source pool and never written into the destination layout. The leak
+    detector notices the arithmetic; the request's CONTEXT would simply be
+    wrong, silently. That is the failure class this feature must never
+    ship.
+
+    ``running_mbs`` is the per-slot resident set and is the authority
+    here; ``running_batch``/``last_batch`` are unioned in for the non-PP
+    event loop, where ``running_mbs`` does not exist. Deduplicated by
+    identity because the same Req object appears in several of these.
     """
     seen = set()
     out: List = []
-    for name in ("running_batch", "last_batch"):
-        batch = getattr(scheduler, name, None)
+
+    def _take(batch) -> None:
         for req in list(getattr(batch, "reqs", []) or []) if batch else []:
             if id(req) in seen:
                 continue
             seen.add(id(req))
             out.append(req)
+
+    for mb in getattr(scheduler, "running_mbs", []) or []:
+        _take(mb)
+    for name in ("running_batch", "last_batch"):
+        _take(getattr(scheduler, name, None))
     return out
 
 
@@ -1447,9 +1478,26 @@ class PhaseFlipRuntime:
             size = int(alloc.size)
             leaked = set(range(1, size + 1)) - free - cached
             reqs = _live_reqs(scheduler)
+            # SLOT SCOPE MATTERS AND IS EASY TO MISREAD. Under
+            # event_loop_pp, scheduler.running_batch / last_batch are
+            # rebound to running_mbs[mb_id] / last_mbs[mb_id] at the TOP of
+            # every slot iteration, so they describe ONE microbatch slot --
+            # the one whose iteration is running -- not the rank's resident
+            # set. A census that reports only those can read 0 while
+            # requests sit in other slots, which is exactly how "the
+            # request finished" got inferred from a slot that was merely
+            # empty. Report both scopes so the two can never be confused.
+            resident = 0
+            slots_with_reqs = []
+            for i, mb in enumerate(getattr(scheduler, "running_mbs", []) or []):
+                n = len(getattr(mb, "reqs", []) or [])
+                if n:
+                    resident += n
+                    slots_with_reqs.append(i)
             logger.warning(
                 "%s POOL CENSUS %s %s: size=%d free=%d cached=%d "
-                "available=%s live_reqs=%d unaccounted=%d %s",
+                "available=%s cur_slot_reqs=%d resident_reqs=%d "
+                "resident_slots=%s unaccounted=%d %s",
                 LOG_PREFIX,
                 when,
                 direction,
@@ -1458,6 +1506,8 @@ class PhaseFlipRuntime:
                 len(cached),
                 getattr(alloc, "available_size", lambda: "?")(),
                 len(reqs),
+                resident,
+                slots_with_reqs,
                 len(leaked),
                 sorted(leaked)[:12],
             )
