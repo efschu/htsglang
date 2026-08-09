@@ -844,3 +844,45 @@ Left on **`SPEC=on POLICY=manual`**, verified serving (`health` 200,
 `health_generate` 200, a real chat completion returned). That is the
 configuration that has served without incident throughout, and it is the
 only one currently proven with speculation.
+
+## 5. The draft-state carry is now PROVEN necessary, both alternatives measured
+
+Two mitigations were tried against the "a carried request has no draft
+state" wall. Both are measured, both are worthless, and between them they
+close the question the coordinator asked.
+
+**(a) ARM AND WAIT** -- readiness holds the flip until nothing is
+resident. Under sustained agentic decode something always is, so
+(2026-08-09 05:21Z) the flip parked the full 30 s deadline, abandoned, and
+the ABANDON PATH FAULTED: `CUDA error: an illegal memory access was
+encountered`, immediately after `FLIP ABANDONED`. Cadence zero, plus a
+memory-safety fault.
+
+**(b) DO NOT ARM** -- the policy declines instead of arming a flip that
+cannot become ready (decided rank-locally, which is safe because only the
+request-origin rank evaluates the policy and the arm is broadcast from
+it; a refusal inside `PhaseFlipRuntime.arm` would risk diverging epochs,
+corpse H). Measured 2026-08-09 05:33Z, agentic multi-turn:
+
+    turn   fresh  pfx phase  prefill tok/s  dec phase  decode tok/s
+    1    53054    pp                3947.4  pp                 16.7
+    2       28    pp                 136.9  pp                 16.9
+    3       30    pp                 142.6  pp                 17.0
+    4       25    pp                 128.3  pp                 16.9
+    automatic flips: 0        decode ran in TP: False
+
+**No crash -- the instance stayed up for the whole run, which is why (b)
+is kept as the safe default -- but the instance is now PINNED IN PP.**
+Decode runs at **16.8 tok/s against the 113 tok/s it does in TP with
+MTP**, because the PP layout carries neither the decode graphs nor the
+draft worker. Prefill is right (3947 tok/s) and decode is 6.7x wrong.
+
+So: waiting costs a fault, declining costs the decode layout, and there
+is no third mitigation. **Build the draft-state carry** (section 3 lists
+the options and the shared hazard; heed #108/#635 -- the draft KV is its
+own coordinate system and must not be mixed with the target pool's).
+
+Until then the useful configurations are:
+* `SPEC=off POLICY=auto` -- switches, pays, 0 aborts (the 3x/2.6x ledger);
+* `SPEC=on POLICY=manual` -- speculating decode at 113 tok/s, no automatic
+  layout changes.
