@@ -387,3 +387,148 @@ completed PP→TP→PP cycle **under load** in one unmanned log, not a report.
   handle. Anything reading it from a per-slot hook and treating it as the
   rank's resident set is making J.1's mistake. Flagged as an audit
   candidate beyond #631; not chased here.
+
+---
+---
+
+# HANDOFF v3 — written 2026-08-09 by successor #4
+
+**Supersedes v2 §5 ("THE NEXT BUILD"): that build is DONE and proven on
+metal.** The corpse table in `phase_flip_presence.py` now carries entries
+K, L and M; read those with this.
+
+## 1. The headline
+
+**A flip under load works, in both directions.** v2 closed with "a flip
+under load is not merely unproven, it is currently IMPOSSIBLE -- any
+request resident at the cutover is destroyed". That is no longer true.
+Measured, one request decoding throughout, `SPEC=off`:
+
+    PHASE-FLIP-CARRY carried 1 resident request(s) ... into the tp phase
+    PHASE-FLIP DONE pp_to_tp (epoch 1)    x3 ranks
+    PHASE-FLIP-CARRY carried 1 resident request(s) ... into the pp phase
+    PHASE-FLIP DONE tp_to_pp (epoch 2)    x3 ranks
+    oracle: committed legs {'pp_to_tp': 3, 'tp_to_pp': 3}
+    oracle: correct prefix 197 numbers (no break: every token was the
+            next integer)
+    oracle: VERDICT PASS
+
+A `PP -> TP -> PP` round trip under a live request, both cutovers
+committed on every rank, and the answer exactly right.
+
+## 2. Three defects stood between v2 and that result
+
+Each was found by a leg that could not commit, never by reading code.
+Full reasoning is in the corpse table; the short form:
+
+- **K (= J.3's fix): the cutover dropped the resident decode set.** Step 6
+  calls `init_pp_loop_state()`, which rebinds `running_mbs` -- and under
+  `event_loop_pp` that array IS the resident set. The stranded KV page and
+  the stranded mamba lock were two symptoms of one omission. The carry
+  lives INSIDE `init_pp_loop_state`, not at the cutover, because
+  `event_loop_pp` calls it again at its own entry and would otherwise wipe
+  a carry installed for it. New module:
+  `managers/phase_flip_resident_carry.py`.
+- **L: `tp_to_pp` could never reach quiescence under load.** `last_batch`
+  non-empty means "requests are resident", not "work is in flight", under
+  `event_loop_normal`. Same category error as the
+  `_pp_microbatches_drained` one v2 fixed. General form, now stated twice
+  and worth remembering: **what must be quiet is the MACHINERY, never the
+  WORKLOAD.**
+- **M: the PP chain's ring was read off the live `ps`.** The cutover
+  rewrites `ps` per phase, so in TP (`pp_size=1`) upstream degenerated to
+  SELF, and the hygiene check compared a rank's own send counter against
+  its own consume counter. Rank 0 withheld presence for 8889 rounds over
+  24 messages nobody had failed to consume. General form: **any quantity
+  derived from `ps` is phase-scoped now.**
+
+**Plus a second, SILENT occurrence of J.1, found by audit** (v2 flagged
+the class as an audit candidate; this is a confirmed second instance):
+`gdn_flip_mover` enumerated `scheduler.running_batch` -- one microbatch
+slot -- so a request resident elsewhere kept correct KV and had its
+conv/ssm state left behind. #212's truncated-GDN shape, and nothing
+raises. Now `resident_mamba_slots()` over the same `_live_reqs`
+authority. **The class is NOT closed**: anything reading
+`running_batch`/`last_batch` from a per-slot hook is still suspect.
+
+## 3. THE WALL: speculation and the carried request
+
+**`SPEC=on` + a carried request KILLS THE INSTANCE.** This is the one
+thing between here and the acceptance program as written, and it is a
+separate build rather than a variant of the carry.
+
+Measured 2026-08-09 03:32:14Z, all three ranks, one pass after a
+committed `pp_to_tp` that carried one request:
+
+    File ".../speculative/eagle_worker_v2.py", line 2067, in
+        forward_batch_generation
+    File ".../speculative/eagle_worker_v2.py", line 1021, in draft
+    File ".../speculative/eagle_draft_cuda_graph_runner.py", line 623,
+        in execute
+    File ".../model_executor/runner_utils/buffers.py", line 47, in
+        foreach_copy
+    RuntimeError: output with shape [1, 1] doesn't match the broadcast
+        shape [0, 1]
+    -> SIGQUIT
+
+**The source is EMPTY where the destination expects one row**: the
+carried request's draft input has no rows. The cause is structural and is
+not a bug in the carry: **speculation belongs to the TP decode phase, so a
+request that prefills in the PP phase has no draft state at all** -- the
+PP phase carries no draft worker by design (`build_flip_draft_worker`
+returns None there, and the cutover documents the PP phase as
+"bit-for-bit the state an instance without speculation has"). In a normal
+spec instance a request gets its draft KV from the `draft_extend` that
+follows its target extend. A carried request never had one.
+
+This is not an edge case -- **it is #631's central path**: every request
+is supposed to prefill in PP and decode in TP.
+
+Options, none of them tried yet, in increasing order of principle:
+
+1. **One non-spec target decode step after the cutover** for carried
+   requests, to produce a hidden state, then `draft_extend` them in. The
+   draft's prefix KV stays empty, so acceptance for those requests starts
+   low and recovers; correctness is unaffected because the target
+   verifies every proposed token.
+2. **Carry the target's last hidden state per resident request across the
+   flip** (one vector per request) and run `draft_extend` at the cutover.
+   Cheaper, and it is the same mechanism sglang already uses at the
+   prefill->decode transition.
+3. Full draft-prefix reconstruction. Requires target hidden states for
+   the whole prefix, which the PP phase discards. Expensive; probably not
+   worth it, since (1) and (2) are exact and only cost acceptance rate.
+
+**The hazard to watch for in ANY of them**: sglang assumes the draft's
+sequence length equals the target's. A carried request whose draft
+context legitimately starts mid-sequence violates that, and getting it
+wrong is the silent kind -- the draft reads uninitialised rows and
+nothing raises, because the target still verifies. Design the draft's own
+seq_len bookkeeping deliberately, and pin it.
+
+## 4. The survival oracle is now a standing harness
+
+`scripts/route_a_631_survival_oracle.py`. Two properties were bought with
+misleading results and must not be simplified away:
+
+- **Commit evidence comes from the serving log, not the HTTP response.**
+  `/phase_flip` returns 200 for ARMED; a leg that parks and abandons
+  returns 200 too. A refused leg once read here as a green round trip.
+- **The verdict is anchored to the FLIP POINT**, not to total length. The
+  first probe was a raw completion and the model editorialised about how
+  far to count -- the no-flip control drifted EARLIER (32 numbers) than
+  the flip run (43). That control is what proved the drift was the model
+  and not the cutover, and it is why the probe is now chat with thinking
+  off.
+
+## 5. Method notes
+
+- **Every defect this session was found by a leg that could not commit,
+  and the permanent diagnostics are what named each one in one boot**:
+  the withhold reason gave M verbatim ("tensor-dict wire has 24
+  unconsumed message(s) from rank 0" -- from rank 0, about itself), the
+  quiescence reason gave L, the pool census bracket gave K. Keep them.
+- **A green oracle that never flipped is the failure mode to fear.**
+  Check `committed legs` before believing any verdict.
+- `SPEC=off` on the boot script isolates the carry from the draft
+  question. Use it for any carry work.
