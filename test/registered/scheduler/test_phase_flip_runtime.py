@@ -639,12 +639,12 @@ class TestSchedulerSideHelpers(CustomTestCase):
             return s
 
         # Speculating TP phase + a resident request -> hold.
-        sched = _sched("NEXTN", [req])
+        sched = _sched("EAGLE", [req])
         self.assertFalse(build_flip_quiescence_fn(sched)())
         self.assertIn("no draft state", build_flip_quiescence_fn(sched).why_not())
         # Speculating, but nothing to carry -> the flip may go (this is
         # the regime every flip before the carry ran in).
-        self.assertTrue(build_flip_quiescence_fn(_sched("NEXTN", []))())
+        self.assertTrue(build_flip_quiescence_fn(_sched("EAGLE", []))())
         # No speculation -> the carry handles it; residents do not hold.
         self.assertTrue(build_flip_quiescence_fn(_sched(None, [req]))())
 

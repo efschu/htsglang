@@ -249,8 +249,37 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         unanswerable from the log alone. It costs one string on a path
         that only runs while a flip is armed.
         """
-        if getattr(scheduler, "chunked_req", None) is not None:
-            return "a chunked prefill is half-written"
+        # #631 DEFECT O, and it is the SAME CATEGORY ERROR for the third
+        # time in this function: a term that refuses because WORK EXISTS
+        # rather than because work is IN FLIGHT.
+        #
+        # This used to be "chunked_req is not None -> not quiescent". A
+        # long chunked prefill occupies that attribute for its ENTIRE
+        # duration, so a flip armed BECAUSE of pending prefill could only
+        # commit once the prefill it was meant to accelerate had already
+        # finished. Measured 2026-08-09 04:23:35-04:23:54Z: armed
+        # "pending prefill 26624 tok > N", NOT QUIESCENT "a chunked
+        # prefill is half-written" on all three ranks for 19 s, cutover to
+        # pp at 04:23:54 -- at which instant the policy immediately armed
+        # pp_to_tp again because prefill was "down to 0 tok". The whole
+        # 32768-token prefill ran in the TP layout at 1525 tok/s against
+        # 4553 tok/s measured in PP, and the instance paid two cutovers
+        # for nothing.
+        #
+        # BETWEEN CHUNKS IS A SETTLED BOUNDARY. get_next_batch_to_run
+        # caches ("stashes") the computed prefix every round, so a chunked
+        # request that is not mid-forward holds committed KV and a fully
+        # accounted extend_range -- exactly the state the carry can move.
+        # What must be quiet is the FORWARD, which ``mbs`` and
+        # ``result_queue`` below already answer.
+        #
+        # This is only sound because _live_reqs now enumerates
+        # scheduler.chunked_req: the request is in NO batch, so without
+        # that the flip would move the layout out from under a request
+        # whose KV stayed behind. The two changes are one change.
+        chunked = getattr(scheduler, "chunked_req", None)
+        if chunked is not None and getattr(chunked, "req_pool_idx", None) is None:
+            return "a chunked prefill has no pool row yet (mid-admission)"
         # #631 DEFECT L, and it is the SAME CATEGORY ERROR as the
         # _pp_microbatches_drained one two paragraphs down -- found the
         # same way, by a leg that could never commit.
@@ -464,6 +493,19 @@ def _live_reqs(scheduler) -> List:
         _take(mb)
     for name in ("running_batch", "last_batch"):
         _take(getattr(scheduler, name, None))
+    # THE CHUNKED PREFILL IS RESIDENT AND IS IN NO BATCH (#631 defect O).
+    # get_next_batch_to_run deliberately moves it out ("Move the chunked
+    # request out of the batch so that we can merge only finished requests
+    # to running_batch"), so every batch-based enumeration misses it --
+    # while it holds committed KV for everything computed so far, and a
+    # mamba slot. Enumerating it here is what lets the flip happen BETWEEN
+    # chunks instead of waiting for the whole prefill to finish; without
+    # it, relaxing the quiescence term would move the layout out from
+    # under a request whose KV stayed behind, which is J.3 again.
+    chunked = getattr(scheduler, "chunked_req", None)
+    if chunked is not None and id(chunked) not in seen:
+        seen.add(id(chunked))
+        out.append(chunked)
     return out
 
 
@@ -861,6 +903,15 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
         # first post-flip round can touch a stale handle. A missed rebuild
         # is a loud KvReshardError, never later corruption.
         verify_flip_cutover(scheduler, tp_phase)
+        # 10. Publish the active layout for the API process (#631): the
+        # log line below is the authoritative RECORD, but it is not
+        # QUERYABLE, and utilisation cannot substitute for it -- a
+        # pipelined PP prefill saturates all three cards exactly as TP
+        # does. Published after verify, so what is advertised is a
+        # cutover that passed its completeness check.
+        from sglang.srt.managers.phase_flip_presence import publish_active_phase
+
+        publish_active_phase(world_rank, scheduler.phase_flip_active_stack)
         logger.warning(
             "%s cutover complete: active stack %s, ps tp=%d pp=%d",
             LOG_PREFIX,

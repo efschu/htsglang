@@ -73,7 +73,17 @@ POLICY="${POLICY:-manual}"
 SPEC="${SPEC:-on}"
 PHASE_POLICY_TP_TOK_S="${PHASE_POLICY_TP_TOK_S:-}"
 PHASE_POLICY_FLIP_TOKENS="${PHASE_POLICY_FLIP_TOKENS:-}"
-PHASE_POLICY_MIN_DWELL_S="${PHASE_POLICY_MIN_DWELL_S:-}"
+# MEASURED, NOT GUESSED (2026-08-09, 32768-token prompts, SPEC=off):
+# the minimum dwell is paid IN PREFILL THROUGHPUT, because a prompt that
+# arrives while the instance is in TP keeps prefilling there until the
+# flip is allowed to arm.
+#   min dwell 15s -> policy could not arm for 15s; ~14300 of 32768 tokens
+#                    were already computed in TP; 1485 tok/s
+#   min dwell  2s -> policy arms after the FIRST chunk (30720 tok still
+#                    pending); 4524 tok/s, i.e. the full PP-layout rate
+# 3s keeps a thrash bound while leaving the flip inside one chunk. The
+# structural thrash protection is the hysteresis band around N, not this.
+PHASE_POLICY_MIN_DWELL_S="${PHASE_POLICY_MIN_DWELL_S:-3}"
 PHASE_POLICY_IDLE_DWELL_S="${PHASE_POLICY_IDLE_DWELL_S:-}"
 PHASE_IDLE_STATE="${PHASE_IDLE_STATE:-}"
 HICACHE="${HICACHE:-0}"

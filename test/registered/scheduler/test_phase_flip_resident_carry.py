@@ -255,6 +255,81 @@ class TestGdnSlotsFollowTheResidentSet(CustomTestCase):
         self.assertEqual(resident_mamba_slots(sched).tolist(), [5, 9])
 
 
+class TestChunkedPrefillIsResident(CustomTestCase):
+    """#631 DEFECT O: the chunked prefill is resident and is in NO batch.
+
+    get_next_batch_to_run deliberately moves it out of the batch ("so that
+    we can merge only finished requests to running_batch"), so every
+    batch-based enumeration misses it -- while it holds committed KV and a
+    mamba slot. Until this was enumerated, quiescence had to refuse on
+    chunked_req outright, which meant a flip armed BECAUSE of pending
+    prefill could only commit once that prefill had already finished:
+    measured 19 s of "NOT QUIESCENT: a chunked prefill is half-written",
+    the whole 32768-token prefill running in the TP layout at 1525 tok/s
+    against 4553 tok/s in PP, and two cutovers paid for nothing.
+    """
+
+    def test_live_reqs_enumerates_the_chunked_request(self):
+        from sglang.srt.managers.phase_flip_runtime import _live_reqs
+
+        sched = _PPStub(3, ([_req("a", 1)], [], []))
+        sched.chunked_req = _req("chunk", 7)
+        got = sorted(r.rid for r in _live_reqs(sched))
+        self.assertEqual(got, ["a", "chunk"])
+
+    def test_the_chunked_request_is_not_double_counted(self):
+        """If it IS also reachable through a batch, it is still one row."""
+        from sglang.srt.managers.phase_flip_runtime import _live_reqs
+
+        shared = _req("chunk", 7)
+        sched = _PPStub(3, ([shared], [], []))
+        sched.chunked_req = shared
+        self.assertEqual([r.rid for r in _live_reqs(sched)], ["chunk"])
+
+    def test_a_parked_chunk_does_not_block_quiescence(self):
+        """Between chunks is a SETTLED boundary: the prefix is stashed and
+        the extend range is accounted, which is what the carry can move.
+        What must be quiet is the FORWARD, not the request's existence."""
+        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+
+        sched = _quiescence_stub()
+        sched.chunked_req = _req("chunk", 7)
+        self.assertTrue(build_flip_quiescence_fn(sched)())
+
+    def test_can_fail_a_chunk_without_a_pool_row_still_blocks(self):
+        """Mid-admission, before the allocator has given it a row, there is
+        nothing coherent to carry."""
+        from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+
+        sched = _quiescence_stub()
+        sched.chunked_req = SimpleNamespace(rid="chunk", req_pool_idx=None)
+        fn = build_flip_quiescence_fn(sched)
+        self.assertFalse(fn())
+        self.assertIn("no pool row", fn.why_not())
+
+
+def _quiescence_stub():
+    import torch
+
+    return SimpleNamespace(
+        chunked_req=None,
+        last_batch=None,
+        last_mbs=[],
+        result_queue=[],
+        mbs=[],
+        running_mbs=[],
+        running_batch=SimpleNamespace(reqs=[]),
+        tree_cache=SimpleNamespace(
+            all_values_flatten=lambda: torch.tensor([], dtype=torch.int64)
+        ),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros((4, 10), dtype=torch.int64)
+        ),
+        phase_flip_runtime=None,
+        flip_spec_algorithm=None,
+    )
+
+
 class TestInstallDestinations(CustomTestCase):
     def test_tp_leg_moves_the_set_into_running_batch_and_empties_the_slots(self):
         """The TP loops read running_batch. A copy left in the slot array

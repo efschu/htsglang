@@ -358,6 +358,10 @@ def _flush_harness(tmp_path, wire):
     s.pp_flip_counters = _counters(tmp_path, rank=0)
     s._pp_commit_comm_work = wire.commit
     for name in (
+        # #631 defect M: the ring comes from the COUNTERS, not from ps
+        # (the cutover rewrites ps per phase), so the helper that reads it
+        # has to be bound here too.
+        "_pp_flip_ring",
         "_pp_flip_downstream",
         "_pp_flip_upstream",
         "pp_flip_flush_drained_sends",
