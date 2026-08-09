@@ -28,6 +28,8 @@ FAMILY=(
     test/registered/unit/managers/test_pp_proxy_stamp_631.py
     test/registered/unit/managers/test_pp_flip_slot_hold_631.py
     test/registered/unit/managers/test_phase_flip_draft_bootstrap_631.py
+    test/registered/unit/managers/test_phase_flip_spec_seam_631.py
+    test/registered/unit/managers/test_phase_flip_prefill_hold_631.py
     test/registered/unit/managers/test_phase_flip_output_trace_631.py
     test/registered/unit/managers/test_phase_flip_decode_relay_631.py
     test/registered/unit/managers/test_spec_verify_width_631.py

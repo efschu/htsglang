@@ -489,6 +489,127 @@ def retune_carried_batches_for_phase(scheduler, spec_algorithm) -> int:
     return n
 
 
+# Every scheduler attribute that can hand a ScheduleBatch to the PP event
+# loop. This list is DELIBERATELY WIDER than harvest_resident_batches():
+# that harvest answers "which batches hold requests I must carry", and it
+# filters out empty batches and never looks at ``last_batch``. The question
+# here is the opposite one -- "which batches can the next loop iteration
+# still REACH" -- and ``last_batch`` is precisely the handle that killed
+# PP0 at 2026-08-09 20:31:48 (corpse I below).
+_REACHABLE_BATCH_ATTRS = (
+    "running_batch",
+    "last_batch",
+    "cur_batch",
+    "cur_batch_for_debug",
+)
+
+
+def _reachable_batches(scheduler):
+    """Every batch object the event loop can still reach on this rank.
+
+    Deduplicated by identity: ``running_batch`` is routinely an ALIAS of a
+    ``running_mbs`` slot, and clearing the same object twice would
+    miscount. Empty batches are INCLUDED on purpose -- an empty batch with
+    a stale spec_info is still a live merge target once requests land in
+    it.
+    """
+    out = []
+    seen = set()
+
+    def _take(batch):
+        if batch is None or id(batch) in seen:
+            return
+        seen.add(id(batch))
+        out.append(batch)
+
+    for mb in getattr(scheduler, "running_mbs", None) or []:
+        _take(mb)
+    for attr in _REACHABLE_BATCH_ATTRS:
+        _take(getattr(scheduler, attr, None))
+    return out
+
+
+def clear_spec_info_for_unspeculated_phase(scheduler) -> tuple:
+    """TP->PP leg: leave NO TP draft state reachable from any batch.
+
+    CORPSE I -- MEASURED ON METAL 2026-08-09 20:31:48Z, epoch 8, PP0 dead,
+    two requests decoding and a prefill pending across the cutover:
+
+        get_next_batch_to_run (scheduler.py:4368)
+          -> running_batch.merge_batch(last_batch)   (schedule_batch:3399)
+          -> self.spec_info.merge_batch(other.spec_info)
+          -> eagle_info.py:271  len(spec_info.topk_index)
+        AttributeError: 'NoneType' object has no attribute 'topk_index'
+
+    What was INFERRED and is now falsified: this module's step-7b comment
+    used to read "the TP->PP leg is flipping speculation OFF, and a request
+    carried into a phase with no drafter needs no draft state -- its
+    spec_info is simply not read there." It IS read there. Not by a
+    drafter, which indeed does not exist in PP, but by ``merge_batch``,
+    which branches on ``if self.spec_info:`` (TRUTHINESS OF THE CARRIED
+    BATCH ALONE) and then dereferences ``other.spec_info`` unconditionally.
+    The carried TP batch is the truthy self; the fresh PP prefill batch,
+    built in a phase with no drafter, is the None other.
+
+    Why the retune was not enough: ``retune_carried_batches_for_phase``
+    rewrites the ``spec_algorithm`` FIELD and nothing else. Nothing reads
+    that field on the merge path. The 20:31:48 log shows the retune
+    running and reporting success one line before the crash.
+
+    Why the fix is HERE and not a None-check at eagle_info.py:271: a bare
+    None-guard would let two batches merge while one silently drops its
+    draft state -- a wrong-output bug replacing a crash. The seam is the
+    producer of the inconsistency, so the seam is where it is removed. A
+    loud assertion in ``merge_batch`` exists ADDITIONALLY (it raises, it
+    never continues) so that a future hole in this reach is reported as
+    itself rather than as an AttributeError three frames down.
+
+    Why the acceptance run never saw it: 69 flips, and every one of them
+    committed with either no resident decode or no arriving prefill. The
+    trigger needs BOTH -- a carried batch with live TP spec_info AND a
+    fresh extend batch built after the cutover -- which is exactly the
+    epoch 6/7/8 back-to-back pattern under mixed load.
+
+    Returns (batches cleared, rids whose batches were cleared).
+    """
+    cleared = 0
+    rids = []
+    for batch in _reachable_batches(scheduler):
+        if getattr(batch, "spec_info", None) is None:
+            continue
+        batch.spec_info = None
+        cleared += 1
+        rids.extend(str(getattr(r, "rid", "?")) for r in _reqs_of(batch))
+    return cleared, rids
+
+
+def arm_draft_bootstrap_all_reachable(scheduler, draft_worker) -> list:
+    """PP->TP leg: seed EVERY reachable non-empty batch, not just one.
+
+    THE MIRROR OF CORPSE I, found by reading the other direction after the
+    20:31:48 death rather than by another crash. ``arm_draft_bootstrap``
+    was called with ``scheduler.running_batch`` alone. If a non-empty PP
+    extend batch is sitting in ``last_batch`` at the cutover, the very next
+    ``get_next_batch_to_run`` merges it into the freshly bootstrapped
+    running_batch -- truthy self, None other, the identical AttributeError
+    with the two roles swapped.
+
+    EMPTY batches are correctly skipped: ``get_next_batch_to_run`` merges
+    only ``if not last_batch.is_empty()``, and an empty running_batch is
+    REPLACED by last_batch rather than merged with it. So an empty batch
+    never reaches the dereference, and seeding one would install a draft
+    input for zero requests.
+
+    Returns one report dict per batch armed.
+    """
+    reports = []
+    for batch in _reachable_batches(scheduler):
+        if not _reqs_of(batch):
+            continue
+        reports.append(arm_draft_bootstrap(scheduler, batch, draft_worker))
+    return reports
+
+
 def _harvest(scheduler):
     from sglang.srt.managers.phase_flip_resident_carry import (
         harvest_resident_batches,

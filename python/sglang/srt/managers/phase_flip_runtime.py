@@ -71,6 +71,37 @@ logger = logging.getLogger(__name__)
 LOG_PREFIX = "PHASE-FLIP"
 
 
+def chunk_blocks_quiescence(chunked_req) -> bool:
+    """Does this chunked prefill prevent a rank from being quiescent?
+
+    ONE definition with TWO callers, and they must never disagree:
+
+      * ``ready_fn`` asks it to decide whether this rank may announce
+        itself at the flip entry;
+      * ``get_next_batch_to_run``'s armed park asks it to decide whether
+        the scheduler may build the NEXT chunk while a flip is armed.
+
+    They are the same question -- "is this request at a settled boundary?"
+    -- and when they were written as two separate expressions they drifted
+    apart within one session. Defect O relaxed the quiescence side to
+    "mid-admission only" (between chunks is settled: committed KV, a fully
+    accounted extend_range, exactly the state the carry moves) while the
+    park side kept the old blanket ``chunked_req is None``. The result was
+    an armed tp_to_pp that could commit but was never allowed to stop
+    prefilling, so it prefilled the whole pending queue in the slow layout
+    and committed with nothing left to do -- production, 2026-08-09
+    20:31:38-48Z. Sharing the definition is the fix for the drift; the
+    narrowing is the fix for the behaviour.
+
+    True ONLY while the request is mid-admission -- it has been chosen but
+    has no pool row yet, so its KV has no home the carry could move.
+    """
+    return (
+        chunked_req is not None
+        and getattr(chunked_req, "req_pool_idx", None) is None
+    )
+
+
 class PhaseFlipJoinTimeout(RuntimeError):
     """#631(c): the consensus round did not assemble within the bound.
 
@@ -309,7 +340,7 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         # that the flip would move the layout out from under a request
         # whose KV stayed behind. The two changes are one change.
         chunked = getattr(scheduler, "chunked_req", None)
-        if chunked is not None and getattr(chunked, "req_pool_idx", None) is None:
+        if chunk_blocks_quiescence(chunked):
             return "a chunked prefill has no pool row yet (mid-admission)"
         # #631 DEFECT L, and it is the SAME CATEGORY ERROR as the
         # _pp_microbatches_drained one two paragraphs down -- found the
@@ -1013,11 +1044,16 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
         # post-flip decode read a 0-row idle draft input and the graph
         # runner died (03:32:14Z, foreach_copy [1,1] vs [0,1]).
         #
-        # Only the PP->TP direction: the TP->PP leg is flipping speculation
+        # BOTH directions, since 2026-08-09 20:31:48Z. The sentence that
+        # used to stand here -- "the TP->PP leg is flipping speculation
         # OFF, and a request carried into a phase with no drafter needs no
-        # draft state. Its spec_info is simply not read there.
+        # draft state, its spec_info is simply not read there" -- is
+        # FALSIFIED and cost the instance. spec_info is read on the TP->PP
+        # side by ScheduleBatch.merge_batch, which has no drafter in it at
+        # all. See corpse I in phase_flip_draft_bootstrap.
         from sglang.srt.managers.phase_flip_draft_bootstrap import (
-            arm_draft_bootstrap,
+            arm_draft_bootstrap_all_reachable,
+            clear_spec_info_for_unspeculated_phase,
             retune_carried_batches_for_phase,
         )
 
@@ -1035,10 +1071,26 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             )
 
         if tp_phase:
-            arm_draft_bootstrap(
-                scheduler, scheduler.running_batch, want_draft
-            )
+            arm_draft_bootstrap_all_reachable(scheduler, want_draft)
         else:
+            # THE SEAM MUST LEAVE NO TP DRAFT STATE REACHABLE. Runs before
+            # the relay re-seed, so that nothing between the stack swap and
+            # the next event-loop iteration can observe a half-scrubbed
+            # set of batches.
+            spec_cleared, spec_rids = clear_spec_info_for_unspeculated_phase(
+                scheduler
+            )
+            if spec_cleared:
+                logger.info(
+                    "%s cleared TP spec_info from %d reachable batch(es) "
+                    "entering the PP phase (requests %s); the PP phase has "
+                    "no drafter, and merge_batch dereferences the other "
+                    "side's spec_info unconditionally",
+                    LOG_PREFIX,
+                    spec_cleared,
+                    ", ".join(spec_rids) or "-",
+                )
+
             # THE TP->PP LEG'S OWN HANDOVER. The PP phase's first decode
             # gathers its input token out of the future-map relay, and the
             # speculative phase it is leaving never wrote that relay (the

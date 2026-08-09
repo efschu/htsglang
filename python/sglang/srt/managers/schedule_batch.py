@@ -3396,7 +3396,49 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
+            if other.spec_info is None:
+                # #631 corpse I. This used to dereference other.spec_info
+                # straight through and die as
+                #   AttributeError: 'NoneType' has no attribute 'topk_index'
+                # three frames down in eagle_info.merge_batch, which named
+                # neither batch nor the seam that produced them.
+                #
+                # It RAISES rather than skipping the merge on purpose. The
+                # tempting "if other.spec_info is None: return" turns a
+                # loud crash into a silent one: the two batches would be
+                # merged as requests while one side's draft state was
+                # dropped on the floor, and the wrong tokens would come out
+                # of a server that looked healthy. One-sided spec state is
+                # never a legal batch pair -- it means a phase seam let TP
+                # draft state reach a phase that has no drafter -- so the
+                # only correct action here is to say so by name. The seam
+                # itself is fixed at the producer, in
+                # phase_flip_draft_bootstrap.clear_spec_info_for_unspeculated_phase.
+                raise ValueError(
+                    "merge_batch: one-sided speculative state -- self has "
+                    f"{type(self.spec_info).__name__} for {len(self.reqs)} "
+                    f"request(s) (spec_algorithm={self.spec_algorithm}) but "
+                    f"other has spec_info=None for {len(other.reqs)} "
+                    f"request(s) (spec_algorithm={other.spec_algorithm}). "
+                    "A phase seam left draft state reachable from a batch "
+                    "built in the other phase; fix the seam, not this check."
+                )
             self.spec_info.merge_batch(other.spec_info)
+        elif other.spec_info is not None:
+            # THE MIRROR, and the more dangerous of the two because the
+            # pre-existing code reached it WITHOUT crashing: `if
+            # self.spec_info:` is false, the merge completes, other's
+            # requests enter self.reqs, and other's draft state is dropped
+            # silently. Same illegal pair, opposite roles, no traceback.
+            raise ValueError(
+                "merge_batch: one-sided speculative state -- self has "
+                f"spec_info=None for {len(self.reqs)} request(s) "
+                f"(spec_algorithm={self.spec_algorithm}) but other has "
+                f"{type(other.spec_info).__name__} for {len(other.reqs)} "
+                f"request(s) (spec_algorithm={other.spec_algorithm}). "
+                "Merging would silently discard other's draft state; fix "
+                "the phase seam that produced the pair."
+            )
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
