@@ -1048,3 +1048,44 @@ as before, it is bit-stable across the 91 commits.
 
 **VERDICT: PASS.** Both rungs admissible, both deltas inside the same-boot
 floor. The flip build does not regress the non-flip default path.
+
+## SEAM PEAK: what one PP<->TP cutover costs in VRAM (2026-08-09, successor 16)
+
+The headroom conversation in this task had been conducted entirely in
+units of the 1024 MiB corridor floor. That floor is a STEADY-STATE
+budget, and a cutover is not steady state: it stages KV backing, packs
+GDN slots and checksums the payload, transiently. This is the first
+measurement of that transient.
+
+Instrument: `scripts/seam_peak_measure.sh` — NVML free at 100 ms,
+baseline = median of the pre-flip window, peak = baseline - trough. NVML
+rather than torch's accounting, because the driver-level number is what
+refuses a `cuMemCreate`.
+
+### Point 1 — pool 253528, ctx 393216 (yarn1.5), boot 22:04:14Z
+
+direction `pp_to_tp`, 110 samples over 11.0 s:
+
+| card | baseline free | trough free | SEAM PEAK | trough above floor |
+|---|---|---|---|---|
+| gpu0 5090  | 5705 MiB | 2725 MiB | **2980 MiB** | 1701 MiB |
+| gpu1 3080a | 6248 MiB | 4872 MiB | **1376 MiB** | 3848 MiB |
+| gpu2 3080b | 4507 MiB | 2679 MiB | **1828 MiB** | 1655 MiB |
+
+### What this already changes, before any second point
+
+HANDOFF_658 §4e records ranks sitting ~530-610 MiB above the corridor
+floor at runtime. Against a transient of 1.4-3.0 GiB that is not a thin
+margin — it is a guaranteed death the next time a flip lands, which is
+what three consecutive boots did (21:43Z, 21:51Z, 21:56Z).
+
+The binding constraint on pool size is therefore
+
+    pool_ceiling ~ card_total - corridor_floor(1024) - seam_peak
+
+and NOT the corridor floor alone. Any pool sized against the floor is
+sized to kill the next cutover. This puts the >600k full-KV goal in
+NUMERIC tension with auto-flip rather than suspected tension.
+
+Caveat carried honestly: one cutover, one direction, one pool size. It is
+not a distribution, and the direction may not be symmetric.
