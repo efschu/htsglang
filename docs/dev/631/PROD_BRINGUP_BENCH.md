@@ -838,3 +838,70 @@ request that prefills in the PP phase has no draft KV, because the PP
 phase carries no draft worker at all, so a carried request entering a
 speculating TP phase raises a second question on top of the carry.
 SPEC=off answers the carry alone.
+
+---
+
+## The LONG-CONTEXT configuration (2026-08-09) — one session past 262144
+
+A second boot recipe, alongside the standard one. It trades ~14 % of the
+mixed-traffic KV pool arrangement for a per-session context ceiling above
+the model's native 262144, and it is the configuration the bs=1
+long-context leg was proven on.
+
+```
+MODEL=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5 \
+CTX=393216 POLICY=auto SPEC=on PHASE_POLICY_TP_TOK_S=1681.0 \
+bash scripts/route_a_631_prod_boot.sh --gdn-resident-state-slots 10
+```
+
+Two flags, and NEITHER is optional:
+
+* the **overlay model directory** carries the YaRN rope block
+  (`scripts/dev/543_yarn/make_yarn_overlay.py --factor 1.5`). The flag
+  routes `--json-model-override-args` and `--decrypted-config-file` do not
+  reach `text_config.rope_parameters` on this tree (#543).
+* `--gdn-resident-state-slots 10` is what makes the raised ceiling
+  REACHABLE. Raising `--context-length` alone SHRINKS the PP-phase pool
+  (263768 -> 253528 tokens) and drops `max_req_input_len` BELOW 262144, so
+  the session gets shorter, not longer. The cap moves 0.37 GB (rank 0) /
+  0.18 GB (each 3080) out of the GDN state pool and into KV:
+
+      PP-phase pool        253528 -> 277468 tokens
+      max_req_input_len    253522 -> 277462
+      max_running_requests      4 -> 4       (pre-cap admission ceiling)
+
+### Measured on this configuration
+
+    one session, prompt_tokens 276283 (the server's count)
+      three needles at 3 % / 55 % / 95 % depth, per-run random codes
+      all three returned verbatim, including the 95 % one, i.e. past the
+      native ceiling. Second question on the same prefix: 6.37 s off the
+      prefix cache.
+    prefill of that session: ~1000-1260 tok/s at 2048-token chunks
+      (against 4480 tok/s for a 32768-token prompt from rest -- the cost
+      is the context, not the configuration)
+
+    unmanned acceptance, 564 s, POLICY=auto, no client flip call:
+      27 PHASE-FLIP DONE tp + 27 DONE pp (both directions, 3 ranks)
+      165 accept-len lines (2.92-2.96), 165 graph decode passes
+      109/109 requests ok, 0 aborted
+      CORRIDOR HELD: min free 1250 / 3336 / 1388 MiB, 0 breaches
+
+    evidence: /spinning/evidence-631/unmanned_acceptance_20260809T154146Z/
+
+### Read this before quoting a pool number
+
+`max_total_num_tokens` as printed by `/get_server_info` and by the boot
+banner is the **PP-phase** pool. The larger figure in the uneven-DCP sizing
+lines (459392 on the standard config) is the **TP-phase** pool. A request is
+admitted against the PP one. Three shifts of handoff quoted the TP number as
+"the pool" and concluded that ~197k tokens were unreachable by a single
+session; what was actually true is that the PP pool sat about 1600 tokens
+above the context ceiling.
+
+### Not yet the default, and why
+
+A flip attempted minutes after such a session takes the instance down in
+`phase_flip_runtime._live` (`torch.cat` of a 1-D and a 3-D part). See
+HANDOFF_656 v14 section 4 for the reproduction and for why reshaping is the
+wrong fix.

@@ -2819,3 +2819,192 @@ refusal, and no experimental configuration ever ran. Serving was brought
 back on the proven config (health 200) rather than left down. The next
 shift should run exactly the two flags above, together, and measure a
 single session past 262144 with the corridor sampler attached.
+
+---
+---
+
+# HANDOFF v14 — written 2026-08-09 by successor #12
+
+Ordered work: the YaRN/bs1 long-context leg, then ONE unmanned acceptance
+log, then the A-vs-A gate. **The leg is DONE and metal-proven with verified
+content. The unmanned log exists and carries everything but the wire
+accept-len. The A-vs-A gate was not started.** Two real defects were found
+and fixed on the way, and a third is open and precisely located.
+
+## 1. THE LONG-CONTEXT LEG IS CLOSED — one session past 262144, content verified
+
+    prompt_tokens 276283   (the SERVER's count, not the client's estimate)
+    needles planted at 3%, 55% and 95% depth, codes generated per run
+    answer: VAULT=TCZGG-5378 / VAULT=LLHQG-1010 / VAULT=HYCOV-2238
+    all three verbatim, including the one at 95% depth -- i.e. BEYOND the
+    model's native 262144 ceiling, reachable only with rope scaling live
+    second round (same prefix, different question): HYCOV-2238 in 6.37 s
+    off the prefix cache
+
+The route, and every step of it was necessary:
+
+1. **YaRN via an OVERLAY MODEL DIRECTORY** (`scripts/dev/543_yarn/
+   make_yarn_overlay.py`, factor 1.5 -> derived context 393216). This is
+   #543's finding and it holds: `--json-model-override-args` cannot reach
+   `text_config.rope_parameters` and `--decrypted-config-file` does nothing
+   on this tree. Overlay at
+   `/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5`
+   (symlinks + one patched config.json; no weights copied). Confirmed live:
+   `rope_scaling (type=yarn) ... defaulting to 262144`, `context_length=393216`.
+
+2. **A NUMBER THE PREDECESSORS HAD WRONG, and it matters.** The handoff
+   chain records `max_total_num_tokens=459392` as the pool. That is the
+   **TP-phase** pool. The **PP-phase** pool -- the one a request is admitted
+   against, because `max_req_input_len` is derived from it -- was **263768**
+   on the proven boot. So the single session was never facing 197k of
+   unreachable pool; it was facing a pool about 1600 tokens above the
+   context ceiling. Raising context alone made things WORSE: at ctx 393216
+   the PP pool fell to 253528, i.e. `max_req_input_len` 253522, **below**
+   262144. The leg would have been declared impossible on that reading.
+
+3. **`--gdn-resident-state-slots 10` is what bought the room.** It caps the
+   physical GDN state pool (20 -> 10 slots, 0.37 GB on rank 0 / 0.18 GB per
+   3080) and the bytes go to KV through the existing sizing route:
+   PP pool **253528 -> 277468**, `max_req_input_len` **277462**, and
+   `max_running_requests` stays **4** (the pre-cap admission ceiling). Only
+   `ssm_state` halves under the cap; `intermediate_ssm_state_cache` does
+   not, so the yield is about half of a naive per-slot estimate. Budget the
+   real number, not the arithmetic one.
+
+**BOOT COMMAND (this is the long-context configuration):**
+
+    MODEL=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5 \
+    CTX=393216 POLICY=auto SPEC=on PHASE_POLICY_TP_TOK_S=1681.0 \
+    bash scripts/route_a_631_prod_boot.sh --gdn-resident-state-slots 10
+
+## 2. TWO DEFECTS FOUND ON METAL AND FIXED (commit `d04edc1103`)
+
+### 2a. The state-slot cap and the flip could not boot together
+
+    PhaseFlipBootError: req_to_token shapes diverge between stacks:
+    PP (5, 393224) vs TP (4, 393224)
+
+The cap OVERRIDES `server_args.max_mamba_cache_size`; the pre-cap profiled
+count that #364 slice 3 sizes the concurrency ceiling from lived on the
+MODEL RUNNER. `phase_flip_boot` takes `copy.deepcopy(server_args)` **after**
+that override, so the TP stack had no runner attribute and read an already
+capped pool -- it sized from 10 where PP used 20 (ratio 3 -> 3 vs 4
+requests). Exactly the crater slice 3 exists to prevent, re-entering
+through the copy.
+
+Fixed by moving the memory onto the ARGS, write-once
+(`gdn_slot_ladder.remember_profiled_state_slots` /
+`recall_profiled_state_slots`). Underscore-prefixed, which is what
+`ServerArgs.__setattr__` exempts from the strict mutation guard, and
+`deepcopy` carries it. **Note for the corpse table: the inherited claim
+that these two flags "compose" was a code-reading result (no arg guard, no
+runtime guard). They did not compose. Absence of a guard is not evidence of
+composition.**
+
+### 2b. A flip could kill the instance when the KV pool was full
+
+    one session, 276214 tokens, 0.995 of the PP pool, then a policy flip:
+    kv_reshard._exchange -> torch.empty(584 MiB)
+    -> torch.OutOfMemoryError ("600.38 MiB is free")
+    -> Fatal Python error: Aborted, all three ranks down
+
+The flip is **not free of memory**: it packs its outgoing rows and
+pre-allocates one receive buffer per peer, from the same device memory the
+KV pool fills. Nothing checked that they fit. Free VRAM at the crash was
+600 MiB -- already under the 1024 MiB corridor floor -- so a flip that had
+squeezed through would have broken the corridor anyway.
+
+Affordability is now a second term in the EXISTING pre-flight verdict (the
+one that abandons a flip whose live set does not fit the target pool):
+computed from the plan before a byte is allocated, reduced across ranks so
+the abandon is unanimous, and it abandons the FLIP, never the server.
+Spendable = `cached_free + max(0, driver_free - reserve)` -- allocator-cached
+bytes are invisible to NVML and cannot move the corridor; driver bytes can.
+Reserve comes from `--rank-user-reserve-mib`.
+
+**METAL-PROVEN, and the numbers say why it was needed:** at full occupancy
+the flip wanted **4900-6999 MiB** of staging against 4089-6085 spendable.
+The 584 MiB that killed the earlier boot was the small case. Four abandons,
+instance alive, corridor held.
+
+## 3. THE UNMANNED ACCEPTANCE LOG
+
+`/spinning/evidence-631/unmanned_acceptance_20260809T154146Z/`
+(one run, 564 s, no client ever posted `/phase_flip`):
+
+    PHASE-FLIP DONE tp (entered TP)   : 27   (9 per rank, x3 ranks)
+    PHASE-FLIP DONE pp (returned)     : 27   -- BOTH directions
+    flips armed by the policy         : 60
+    flips ABANDONED                   : 6    (4 of them for staging room)
+    accept-len lines                  : 165  (accept len 2.92-2.96, rate ~0.65)
+    decode passes WITH a cuda graph   : 165
+    KV pool per phase (flip's census) : size=277468, free 242588..273106
+    the bs=1 long session             : #full token 276298, usage 1.00
+    requests                          : 109 total, 109 ok, 0 ABORTED
+    post-idle 32768-tok probe from rest: 4480.7 tok/s (PP class, no flip
+                                         in the latency path)
+
+    CORRIDOR: 5639 samples at 100 ms over 564.2 s, floor 1024
+      3080a MIN free 1250.4   5090 MIN free 3335.7   3080b MIN free 1388.4
+      breaches 0 on every card.   CORRIDOR HELD: True
+
+Harness: `scripts/route_a_631_unmanned_acceptance.sh` (corridor sampler up
+first, mixed load, then the long session ALONE, then collect). Needle probe:
+`scripts/route_a_631_yarn_needle_probe.py` -- it asks the server for
+`max_req_input_len` and calibrates the corpus against a real encode, because
+the first attempt overshot by 1514 tokens and came back as a bare HTTP 400.
+
+**NOT in this log: accept-len ON THE WIRE.** The OpenAI chat route returns
+an empty `meta_info`; the spec counters are on the native `/generate`
+response. A probe issued afterwards on the same instance returned no spec
+fields either -- it ran entirely in PP, where nothing speculates, which is
+consistent and not a defect. The wire gate itself was closed and proven by
+successor 11 (v13 section 1). To carry it in the ONE log, the orchestrator
+needs a `/generate` request placed while the instance is in TP.
+
+## 4. OPEN DEFECT, located precisely — `_live()` cannot enumerate after a
+##    very long session
+
+Three concurrent `/generate` requests issued minutes after the 276k session
+took all three ranks down:
+
+    phase_flip_runtime.py:477 in _live
+      return torch.unique(torch.cat(parts))
+    RuntimeError: Tensors must have same number of dimensions: got 1 and 3
+
+It fires at the FIRST line of `_execute` (`slots = self._live_slots_fn()`),
+before any of this shift's code, so it is not the staging guard. One of the
+parts -- `scheduler.tree_cache.all_values_flatten()` or a `req_to_token`
+row slice -- is 3-dimensional after the long session is resident in the
+radix tree. **Do not "fix" it by reshaping to 1-D**: if the 3-D tensor is
+not KV slot ids, flattening injects wrong ids into the live set and the
+flip moves the wrong rows -- silent corruption instead of a loud crash.
+First step is one print of `[p.shape for p in parts]` at that line under
+the reproduction:
+
+    boot the section-1 command, run scripts/route_a_631_yarn_needle_probe.py,
+    then 3 concurrent /generate of ~400 tokens.
+
+## 5. State at end of shift
+
+- HEAD `7e26a8f855` on `feat/route-a-631`, tree clean.
+- **Suite `bash scripts/run_631_flip_family.sh` -> 559 passed** (was 540).
+  Two new pins, both in the canonical family list:
+  `test/registered/unit/mem_cache/test_gdn_cap_flip_two_stacks_631.py` (11,
+  incl. the can-fail reproducing PP 4 vs TP 3) and
+  `test/registered/unit/managers/test_phase_flip_staging_reserve_631.py`
+  (10, incl. the measured 584-vs-600 MiB refusal).
+- Serving restored on the PREVIOUS PROVEN config (no overlay, no cap,
+  ctx 262144) rather than the long-context one, because of section 4.
+- **NOT DONE: the A-vs-A regression gate vs `9a929352c9`.** Untouched. It
+  needs a second worktree at that commit (it is an ancestor, 91 commits
+  back) and two boots, with the A-vs-A noise floor taken inside each boot
+  before any cross-commit number is quoted.
+
+## 6. What the next shift should take, in order
+
+1. Section 4's defect: one print, then the real fix. It is what stands
+   between the long-context configuration and being the default one.
+2. The `/generate`-in-TP step in the orchestrator, so the ONE log carries
+   the wire accept-len too.
+3. The A-vs-A gate, then `PROD_BRINGUP_BENCH.md`.
