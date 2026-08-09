@@ -15,6 +15,8 @@ returns there on its own, and a short prefill never forces a flip.
 CPU-only; the policy is a pure function and needs no GPU.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from sglang.srt.managers.phase_policy import (
@@ -410,7 +412,18 @@ class _StubReq:
         self.origin_input_ids = [0] * n
 
 
-def _sched(cfg_kw=None, phase=PHASE_TP, pending=None, queue=(), running=0):
+class _StubChunked:
+    """A prompt mid-CHUNKED PREFILL: admitted, partly computed, and NOT in
+    the waiting queue -- the blind spot of #631 defect N."""
+
+    def __init__(self, total, filled):
+        self.origin_input_ids = [0] * total
+        self.extend_range = SimpleNamespace(start=0, end=filled)
+
+
+def _sched(
+    cfg_kw=None, phase=PHASE_TP, pending=None, queue=(), running=0, chunked=None
+):
     from sglang.srt.managers.scheduler import Scheduler
 
     class S:
@@ -422,8 +435,44 @@ def _sched(cfg_kw=None, phase=PHASE_TP, pending=None, queue=(), running=0):
     s.phase_flip_runtime = _StubRuntime(phase=phase, pending=pending)
     s.waiting_queue = list(queue)
     s.running_batch = _StubBatch(running)
+    s.chunked_req = chunked
+    # The REAL metric, not a stub of it: #631 defect N was precisely that
+    # this quantity did not mean what its caller's comment said.
+    s._pending_prefill_tokens = Scheduler._pending_prefill_tokens.__get__(s, S)
     s.maybe_arm_phase_policy = Scheduler.maybe_arm_phase_policy.__get__(s, S)
     return s
+
+
+def test_a_chunked_prefill_is_visible_to_the_policy():
+    """#631 DEFECT N, the regression arm.
+
+    A long prompt under chunked prefill is NOT in the waiting queue -- it
+    hangs off ``scheduler.chunked_req`` while it is filled a chunk per
+    round. Counting only the queue therefore read 0 pending prefill for
+    the whole duration of exactly the work the PP layout exists to do, so
+    the TP->PP rule (pending > N) could not fire.
+
+    Measured 2026-08-09 03:36-03:39Z: POLICY=auto with 8k/32k prompts
+    arriving every 5s ran its ENTIRE 186 s mixed phase in the TP layout,
+    on ONE policy decision, and only corrected itself on the idle return.
+    """
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
+    # Queue empty, but a big prompt is admitted and mostly uncomputed.
+    s = _sched(queue=[], running=1, chunked=_StubChunked(N + 5000, 1000))
+    req = s.maybe_arm_phase_policy()
+    assert isinstance(req, PhaseFlipReqInput), (
+        "an admitted-but-uncomputed prompt larger than N must move the "
+        "instance to the prefill layout"
+    )
+    assert req.direction == TP_TO_PP
+
+
+def test_a_nearly_finished_chunked_prefill_does_not_move_the_layout():
+    """The remainder is what counts, not the prompt's size: a 32k prompt
+    with 200 tokens left is not worth a round trip."""
+    s = _sched(queue=[], running=1, chunked=_StubChunked(N + 5000, N + 4800))
+    assert s.maybe_arm_phase_policy() is None
 
 
 def test_policy_emits_the_same_request_the_rpc_path_produces():

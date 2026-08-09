@@ -6878,6 +6878,42 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
+    def _pending_prefill_tokens(self) -> int:
+        """Prompt tokens ADMITTED BUT NOT YET COMPUTED (#631 defect N).
+
+        This used to be ``sum(len(req.origin_input_ids) for req in
+        self.waiting_queue)`` -- the NOT-YET-ADMITTED queue -- while the
+        comment at its use site said "admitted but not yet computed". The
+        two disagreed, and the disagreement pinned the instance in the
+        wrong layout.
+
+        A long prompt under CHUNKED PREFILL does not sit in the waiting
+        queue: it hangs off ``self.chunked_req`` while it is filled a
+        chunk per round. So for the whole duration of exactly the work PP
+        exists to do, the policy read 0 pending prefill and the TP->PP
+        rule (``pending > N``) could not fire. Measured 2026-08-09
+        03:36-03:39Z, POLICY=auto with 8k/32k prompts arriving every 5s:
+        the acceptance ran its ENTIRE 186 s mixed phase in the TP layout,
+        one single policy decision in the whole run, and the layout only
+        corrected itself on the idle return.
+
+        The fill boundary is ``extend_range.end``, which is what the
+        scheduler's own chunked-prefill code uses
+        (``_compute_chunked_req_next_prompt_token``); the remainder behind
+        it is admitted, uncomputed, and is precisely the work that would
+        be repaid by being in the prefill layout.
+
+        Evaluated on the request-origin rank only (see
+        maybe_arm_phase_policy), so this needs no cross-rank replication.
+        """
+        pending = sum(len(req.origin_input_ids) for req in self.waiting_queue)
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is not None:
+            rng = getattr(chunked, "extend_range", None)
+            filled = int(rng.end) if rng is not None else 0
+            pending += max(0, len(chunked.origin_input_ids) - filled)
+        return pending
+
     def maybe_arm_phase_policy(self):
         """#631: evaluate the automatic phase policy on the intake rank.
 
@@ -6935,9 +6971,7 @@ class Scheduler(
             # The same quantity the #363 observer reads, and the one the
             # break-even N is denominated in: prompt tokens admitted but
             # not yet computed.
-            pending_prefill_tokens=sum(
-                len(req.origin_input_ids) for req in self.waiting_queue
-            ),
+            pending_prefill_tokens=self._pending_prefill_tokens(),
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),
         )
@@ -6945,6 +6979,26 @@ class Scheduler(
         observe_idle(state, inp)
         decision = decide(cfg, state, inp)
         if not decision.wants_flip:
+            # #631 defect N: a policy that DECLINES used to be silent, so
+            # "the layout is wrong under load" was indistinguishable from
+            # "the hook never ran". One throttled line makes the standing
+            # reason readable from the same log as everything else -- the
+            # same bet as the withhold reason and the quiescence reason,
+            # both of which named a defect in a single boot.
+            now_mono = inp.now
+            last = getattr(self, "_phase_policy_last_log", 0.0)
+            prev = getattr(self, "_phase_policy_last_reason", None)
+            if decision.reason != prev or now_mono - last >= 10.0:
+                self._phase_policy_last_log = now_mono
+                self._phase_policy_last_reason = decision.reason
+                logger.info(
+                    "PHASE-POLICY holding in %s: %s (pending prefill %d tok, "
+                    "running bs %d)",
+                    inp.phase,
+                    decision.reason,
+                    inp.pending_prefill_tokens,
+                    inp.running_bs,
+                )
             return None
         note_flip_armed(state, decision, inp.now)
         logger.warning(

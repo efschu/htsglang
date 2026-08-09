@@ -203,6 +203,33 @@ class AbortDeferralWindow:
         return drained
 
 
+def _flip_spec_algo(scheduler):
+    """The algorithm the TP DECODE phase will run, or a NONE sentinel.
+
+    ``scheduler.spec_algorithm`` is NONE in the PP phase by design -- the
+    configured algorithm is parked in ``flip_spec_algorithm`` at boot and
+    swapped in at the cutover -- so the PP-phase question "will the phase
+    I am about to enter speculate?" has to read the parked one.
+    """
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = getattr(scheduler, "flip_spec_algorithm", None)
+    if algo is None:
+        return SpeculativeAlgorithm.from_string(None)
+    return algo
+
+
+def _harvest(scheduler):
+    from sglang.srt.managers.phase_flip_resident_carry import (
+        harvest_resident_batches,
+    )
+
+    try:
+        return harvest_resident_batches(scheduler)
+    except Exception:  # noqa: BLE001 - a readiness probe never breaks a flip
+        return []
+
+
 def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
     """The flip ready predicate (DESIGN_631 3.5) -- NOT #297 fully-idle.
 
@@ -297,6 +324,46 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
             ]
             if live:
                 return f"PP microbatches still in flight (mb slots {live})"
+        # #631: SPECULATION AND THE CARRIED REQUEST -- honest by waiting.
+        #
+        # A request that prefills in the PP phase has NO DRAFT STATE: the
+        # PP phase carries no draft worker by design, so nothing ever ran
+        # the draft_extend that a spec instance gives a request after its
+        # target extend. Carrying such a request into a SPECULATING TP
+        # phase kills the instance one pass later -- measured 03:32:14Z on
+        # all three ranks:
+        #
+        #   eagle_worker_v2.draft -> eagle_draft_cuda_graph_runner.execute
+        #   -> foreach_copy: output with shape [1, 1] doesn't match the
+        #      broadcast shape [0, 1]        -> SIGQUIT
+        #
+        # the draft input having no rows for the carried request. Until
+        # the draft state is built at the flip (HANDOFF_656 v3 section 3),
+        # this rank is simply NOT READY to flip into speculation while
+        # anything is resident.
+        #
+        # WAITING, not refusing at arm time. A rank-local refusal inside
+        # arm() would let one rank decline while its peers armed, and
+        # diverging epochs is corpse H -- fatal. Readiness runs through
+        # the bounded park/abandon machinery, which is unanimous by
+        # construction, and it has the right meaning anyway: the flip
+        # happens as soon as nothing has to survive it, which is exactly
+        # the regime every flip before this one ran in.
+        runtime = getattr(scheduler, "phase_flip_runtime", None)
+        pending = getattr(runtime, "pending", None) if runtime is not None else None
+        if pending == PP_TO_TP and not _flip_spec_algo(scheduler).is_none():
+            n_resident = sum(
+                len(getattr(b, "reqs", []) or [])
+                for b in _harvest(scheduler)
+            )
+            if n_resident:
+                return (
+                    f"{n_resident} resident request(s) would enter a "
+                    f"SPECULATING TP phase with no draft state (they "
+                    f"prefilled in the PP phase, which has no draft "
+                    f"worker); waiting for them to finish rather than "
+                    f"crashing the draft graph runner"
+                )
         return None
 
     def _ready() -> bool:
