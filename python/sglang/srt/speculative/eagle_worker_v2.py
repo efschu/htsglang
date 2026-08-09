@@ -1450,8 +1450,33 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return buf[:num_tokens]
 
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        verify_width: Optional[int] = None,
     ):
+        # THE WIDTH OF THE VERIFY THAT JUST RAN, not the instance's static
+        # one (#631). Every quantity below strides over the verify's token
+        # rows, and those rows are however many that verify produced. The
+        # two are equal for every ordinary round, which is why the static
+        # value stood in for years -- but the phase-flip bootstrap round
+        # runs a 1-node trivial verify on an instance configured for 4, and
+        # the mismatch is not subtle: it reached torch as "The size of
+        # tensor a (3) must match the size of tensor b (12)" (bs against
+        # bs*4) on all three ranks, 09:03:01Z, and again on the eager path
+        # at 09:08:2xZ once the graph was ruled out -- which is what proved
+        # this is the BATCH's shape and never was the graph's.
+        width = int(verify_width or self.speculative_num_draft_tokens)
+        # A NARROWED round takes the eager path END TO END, and that is one
+        # decision rather than two: ``prepare_for_draft_extend`` uses the
+        # graph runner's verdict to decide whether to initialise attention
+        # metadata at all, and its ``can_run_graph`` inspects only the batch
+        # SIZE -- so leaving the runner in place there while the dispatch
+        # below went eager would run an eager forward whose attention
+        # metadata was never built. Withholding the runner from both makes
+        # the two agree by construction.
+        narrowed = width != int(self.speculative_num_draft_tokens)
+        graph_runner = None if narrowed else self.cuda_graph_runner_for_draft_extend
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -1460,14 +1485,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
-            num_tokens_per_req=self.speculative_num_draft_tokens,
-            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            num_tokens_per_req=width,
+            num_tokens_for_logprob_per_req=width,
         )
         select_index = (
             torch.arange(
                 0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
+                len(batch.seq_lens) * width,
+                width,
                 device=self.device,
             )
             + batch_result.accept_lens
@@ -1484,9 +1509,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_extend_input,
                 batch,
                 next_token_ids,
-                self.speculative_num_draft_tokens,
+                width,
                 self.draft_runner,
-                self.cuda_graph_runner_for_draft_extend,
+                graph_runner,
             )
 
         if self.plan_stream:
@@ -1495,15 +1520,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            # #631: the phase-flip bootstrap round's verify was a 1-node
-            # trivial one, so this draft extend carries one token per
-            # request while the captured graph reads bs*num_tokens_per_bs.
-            # can_run_graph checks only the batch size and cannot see it.
-            and not getattr(batch, "phase_flip_draft_bootstrap_round", False)
-            and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
-        )
+        can_cuda_graph = graph_runner and graph_runner.can_run_graph(forward_batch)
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
@@ -1525,9 +1542,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             if can_cuda_graph:
-                draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch
-                )
+                draft_logits_output = graph_runner.execute(forward_batch)
             else:
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch
@@ -2073,19 +2088,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # See managers/phase_flip_draft_bootstrap.py for why this and
             # not a carried hidden state.
             flip_bootstrap = batch_needs_draft_bootstrap(batch)
-            # Carried on the BATCH, because the draft-extend at the end of
-            # this round needs the same answer and reaches it through a
-            # different object. Its captured graph "always reads the FULL
-            # bs*num_tokens_per_bs token rows", and this round's verify
-            # produced ONE token per request instead of num_draft_tokens --
-            # measured 09:03:01Z, all three ranks: "The size of tensor a
-            # (3) must match the size of tensor b (12)", i.e. bs against
-            # bs*4. The flag is read in _draft_extend_for_decode rather
-            # than inferred from token counts there, because in ordinary
-            # operation that batch's width varies with the accept length
-            # and a count-based gate would refuse graphs across normal
-            # speculating decode.
-            batch.phase_flip_draft_bootstrap_round = flip_bootstrap
             if self.speculative_num_steps == 0 or flip_bootstrap:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
@@ -2131,7 +2133,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    self.draft_worker._draft_extend_for_decode(
+                        batch,
+                        batch_output,
+                        # The bootstrap round's verify was 1 node wide, so
+                        # this draft extend has one token row per request
+                        # and must stride over that, not over the
+                        # instance's configured 4.
+                        verify_width=(
+                            int(verify_input.draft_token_num)
+                            if flip_bootstrap
+                            else None
+                        ),
+                    )
 
             # The bootstrap is discharged only HERE -- after the
             # draft_extend that turned this round's hidden states into a
