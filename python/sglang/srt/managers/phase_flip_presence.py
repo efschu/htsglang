@@ -444,16 +444,47 @@ alone holding the flip.
       moved set and the protected set agree with each other and disagree
       with the pool by one row.
 
-      HYPOTHESIS, stated as one and not as a finding:
-      build_flip_live_slots_fn enumerates ``rows = req_to_token[idx, :n]``
-      with ``n = int(req.seqlen)``. During decode the allocator has
-      typically already reserved the row for the token being generated,
-      which is at index n and therefore OUTSIDE that slice. Such a row is
-      allocated in the source stack, never enumerated, never moved, and
-      in the destination stack belongs to neither the tree nor a
-      protected request -- which is precisely "leaked". Verify against
-      the real allocated extent before changing anything; seqlen is the
-      obvious suspect but it is not yet evidence.
+      THAT HYPOTHESIS IS FALSIFIED, and it is worth keeping precisely
+      because it was so plausible. It read: build_flip_live_slots_fn
+      enumerates ``req_to_token[idx, :seqlen]``, while the allocator hands
+      out ``kv_allocated_len`` -- structurally different under #486, whose
+      spec reserve is W + L slots ahead of kv_committed_len (W = the
+      draft/verify write footprint, several slots on this rig's NEXTN
+      config, NOT one). A missed row would be allocated, never moved, and
+      owned by nothing afterwards. It fits the symptom exactly.
+
+      IT IS STILL WRONG. Measured with a census bracket around the flip
+      (POOL CENSUS at-arm / pre-cutover / post-cutover, 2026-08-09
+      02:08:17Z, identical on all three ranks):
+
+        at-arm        live_reqs=1  cached=80  unaccounted=1 [81]
+        pre-cutover   live_reqs=0  cached=80  unaccounted=1 [81]
+        post-cutover  live_reqs=0  cached=80  unaccounted=1 [81]
+
+      Page 81 is ALREADY unaccounted before the flip moves a byte, and the
+      set is unchanged across the move and the cutover. The enumeration
+      and the cutover are both innocent. A no-flip control boot
+      (POLICY=manual, one request served to completion, server idle)
+      stayed clean: leaks=0.
+
+      WHAT THE BRACKET ACTUALLY LOCALISES. At arm the row is legitimately
+      held: live_reqs=1, and the checker charges it as ``uncached =
+      kv_allocated_len - cache_protected_len``, so the invariant balances.
+      By pre-cutover the request has FINISHED (live_reqs=0), its 80
+      committed rows are in the tree, and its one uncached row was never
+      freed -- so nothing owns page 81 and there is no live request left to
+      charge it to. THE DEFECT IS IN THE COMPLETION PATH OF A REQUEST THAT
+      FINISHES WHILE A FLIP IS ARMED, not in the flip's KV move. Look at
+      what the armed state defers or suppresses around request completion
+      (the abort-deferral window is the first suspect, and note the
+      checker's own ``assert req.kv_committed_freed ==
+      req.kv_overallocated_freed``), not at live_slots_fn.
+
+      THE METHOD IS THE POINT. The obvious fix would have widened the
+      enumeration to move rows nobody had shown were missing, in the one
+      place where a wrong guess corrupts a request's context SILENTLY and
+      the leak detector would never have said a word. The census cost one
+      boot.
 
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
