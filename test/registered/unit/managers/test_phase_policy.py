@@ -402,9 +402,16 @@ class _StubRuntime:
 class _StubBatch:
     def __init__(self, n):
         self._n = n
+        # REAL BATCHES CARRY reqs, and the policy's resident count is
+        # taken from them (#631 J.1, third occurrence). A stub with only
+        # batch_size() let the slot-scope fix pass untested.
+        self.reqs = [SimpleNamespace(rid=f"r{i}") for i in range(n)]
 
     def batch_size(self):
         return self._n
+
+    def is_empty(self):
+        return not self.reqs
 
 
 class _StubReq:
@@ -422,7 +429,13 @@ class _StubChunked:
 
 
 def _sched(
-    cfg_kw=None, phase=PHASE_TP, pending=None, queue=(), running=0, chunked=None
+    cfg_kw=None,
+    phase=PHASE_TP,
+    pending=None,
+    queue=(),
+    running=0,
+    chunked=None,
+    running_mbs=None,
 ):
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -436,11 +449,51 @@ def _sched(
     s.waiting_queue = list(queue)
     s.running_batch = _StubBatch(running)
     s.chunked_req = chunked
+    s.running_mbs = list(running_mbs) if running_mbs is not None else []
     # The REAL metric, not a stub of it: #631 defect N was precisely that
     # this quantity did not mean what its caller's comment said.
     s._pending_prefill_tokens = Scheduler._pending_prefill_tokens.__get__(s, S)
     s.maybe_arm_phase_policy = Scheduler.maybe_arm_phase_policy.__get__(s, S)
     return s
+
+
+def test_a_request_decoding_in_another_slot_still_arms_the_flip():
+    """#631 J.1, THIRD occurrence -- found by the audit this feature's own
+    handoff commissioned, and load-bearing rather than cosmetic.
+
+    maybe_arm_phase_policy runs inside recv_requests(), i.e. once per
+    MICROBATCH SLOT under event_loop_pp, right after that slot's rebind of
+    running_batch. The PP->TP rule is "pending <= N AND running_bs > 0",
+    so a request decoding in slot 1 while the hook fires for an empty slot
+    0 read running_bs=0 and the flip was simply not armed: the decision
+    depended on WHICH SLOT the hook happened to sample, not on the load.
+    """
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
+    # The current slot is empty; the resident request lives in slot 1.
+    s = _sched(
+        phase=PHASE_PP,
+        queue=[],
+        running=0,
+        running_mbs=[_StubBatch(0), _StubBatch(1)],
+    )
+    req = s.maybe_arm_phase_policy()
+    assert isinstance(req, PhaseFlipReqInput), (
+        "a request resident in a non-current microbatch slot must still "
+        "count as decode work for the policy"
+    )
+    assert req.direction == PP_TO_TP
+
+
+def test_no_resident_request_anywhere_does_not_arm_the_flip():
+    """The other side of the same pin: PP->TP needs real decode work."""
+    s = _sched(
+        phase=PHASE_PP,
+        queue=[],
+        running=0,
+        running_mbs=[_StubBatch(0), _StubBatch(0)],
+    )
+    assert s.maybe_arm_phase_policy() is None
 
 
 def test_a_chunked_prefill_is_visible_to_the_policy():

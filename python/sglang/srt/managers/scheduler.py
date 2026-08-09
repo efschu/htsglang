@@ -6970,8 +6970,29 @@ class Scheduler(
             observe_idle,
         )
 
-        running = self.running_batch
-        running_bs = running.batch_size() if running is not None else 0
+        # THE RESIDENT SET, NOT self.running_batch (#631 J.1, THIRD
+        # occurrence -- found by the audit this feature's own handoff
+        # commissioned). This hook runs inside recv_requests(), i.e. once
+        # per MICROBATCH SLOT under event_loop_pp, immediately after that
+        # slot's rebind of running_batch/last_batch. Reading running_batch
+        # here therefore counts whichever slot happens to be bound, not
+        # the rank's resident decode set.
+        #
+        # It is load-bearing for the decision, not decoration: the PP->TP
+        # rule is "pending <= N AND running_bs > 0", so a request decoding
+        # in slot 1 while the hook fires for an empty slot 0 reads
+        # running_bs=0 and the flip is not armed. That is the same
+        # arming-condition-cannot-hold shape as the quiescence defects,
+        # arriving from the other side, and it makes the flip depend on
+        # WHICH SLOT the hook samples rather than on the load.
+        from sglang.srt.managers.phase_flip_resident_carry import (
+            harvest_resident_batches,
+        )
+
+        running_bs = sum(
+            len(getattr(b, "reqs", []) or [])
+            for b in harvest_resident_batches(self)
+        )
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the
