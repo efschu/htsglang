@@ -2625,10 +2625,16 @@ cases — the PP-finish case, the batch-alignment pin, the can-fail that
 the old predicate drops them, and the non-speculating byte-identity.
 Suite 540 passed.
 
-**METAL-UNPROVEN.** Every boot after this fix was a capacity experiment
-that crashed before a clean `meta_info` read could be taken. The next
-shift should simply probe `/generate` on the restored boot and check for
-`spec_accept_length`.
+**METAL-PROVEN**, on the restored boot, first request:
+
+    spec_accept_rate 0.6625, spec_accept_length 3.0,
+    spec_num_correct_drafts 159, spec_num_proposed_drafts 240,
+    spec_verify_ct 80, spec_correct_drafts_histogram [11, 18, 12, 39]
+
+So the acceptance log now carries accept-len on the `meta_info` wire for
+every request class, not only in the scheduler log. Both halves of the
+defect are closed: the streamer's stale value copy (v12 section 2) and
+the phase-at-finish gate above.
 
 ## 2. THE CREDITS ARE MOSTLY NOT SPENDABLE — a measured wall
 
