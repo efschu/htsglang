@@ -2321,3 +2321,195 @@ corridor figures do.
 `POLICY=auto SPEC=on RANK_MIB=21500,13780,13540`,
 `PHASE_POLICY_TP_TOK_S=1681.0`, corridor HELD under the flip probe load
 and UNVERIFIED under the acceptance load.
+
+---
+
+# HANDOFF v12 — written 2026-08-09 by successor #11
+
+Three defects closed with can-fail proofs, one wall broken open, and ONE
+NEW STRUCTURAL FINDING that reframes the corridor problem the last two
+shifts were fighting. Read section 3 first if you read nothing else.
+
+## 1. THE 5090 WALL WAS NOT PHYSICAL — it was a per-stack baseline
+
+The refusal
+`the rank holds 7.90 GiB and 13.27 GiB of the device is free to it` was
+read for two shifts as "the card cannot be filled". The arithmetic
+explains itself once written out. With one rank on a card,
+
+    reachable = used_by_me + device_free
+              = (pre_load_free - now_free) + now_free
+              = pre_load_free
+
+exactly. The check was never about the card; it was "does the budget fit
+in whatever was free when THIS STACK began loading". A phase-flip
+instance builds THREE stacks in one process, each re-entering
+`init_torch_distributed` and taking its own pre-load reading with the
+previous stack resident. Measured on the 5090, boot 12:27:
+
+    stack 1 (PP weights)  Load weight begin. avail mem=30.46 GB
+    stack 2 (TP weights)  Load weight begin. avail mem=23.40 GB
+    stack 3 (MTP draft)   Load weight begin. avail mem= 8.78 GB
+
+So the check got STRICTER as the budget grew: a bigger budget makes stack
+1 allocate more, which lowers stack 2's baseline, which refuses the
+budget that caused it. A feedback loop wearing a physical limit's
+clothes.
+
+FIX: read what THIS PROCESS holds from NVML (registry identity map, never
+the CUDA ordinal) plus NVML's free column. Both terms are stack-invariant
+and they count what torch cannot see — CUDA context, VMM arena handles,
+raw workspaces. Delta arithmetic kept as fallback where NVML cannot
+attribute the pid (MPS, pid namespaces); the message names its basis.
+
+METAL: `BUDGET-REACH[nvml] rank 0: budget 23000 MiB, this process holds
+15.62 GiB, card free 15.71 GiB of 31.84 GiB total -> reachable 31.33 GiB,
+shortfall 0.00 GiB`. 23000 boots where >21500 was refused.
+`max_total_num_tokens` 672142 -> 739186.
+
+## 2. THE NULL ACCEPT-LEN WAS A DEAD WIRE, NOT A MISSING MEASUREMENT
+
+The probe was right all along: it uses `/generate` and reads
+`meta_info["spec_accept_length"]` correctly. The server never emitted it,
+while the scheduler LOG printed `accept len: 3.20, accept rate: 0.73,
+cuda graph: True` on the very same boot — because `metrics_reporter`
+reads `scheduler.spec_algorithm` LIVE, and the streamer holds a VALUE
+COPY.
+
+`SchedulerOutputStreamer` is a slots dataclass carrying `spec_algorithm`,
+and `_GenerationStreamAccumulator` gates every per-request spec counter
+on that copy. A phase-flip instance PARKS speculation at boot (it rests in
+PP), so `init_output_streamer` copies NONE; the cutover refreshed only
+`ps`, so the copy stayed NONE for the life of the process. Counters were
+accumulated on the Req and dropped on the way out.
+
+FIX: refresh `spec_algorithm` with the phase being entered, and PIN it in
+`verify_flip_cutover` — a stale copy here is otherwise SILENT (answers
+stay correct, only the evidence vanishes), which is precisely what the
+self-check exists to make loud.
+
+CAN-FAIL PROVEN: with the production line reverted, both new tests go
+red; restored, green.
+
+**HONEST LIMIT — do not claim this closed.** `meta_info` was still empty
+on metal after the fix. The remaining gate is in `tokenizer_manager`:
+shipping requires `spec_verify_ct[i] > 0` AT FINISH TIME, and the
+decision is made by the phase active when the request COMPLETES. Under
+auto policy requests routinely start in TP and finish in PP (observed
+directly: `phase_before tp phase_after pp`), and those can never ship
+their counters. My fix is necessary but not sufficient. THE ACCEPTANCE
+LOG'S ACCEPT-LEN EVIDENCE THEREFORE COMES FROM THE SCHEDULER LOG, which
+carries it reliably (105 and 144 lines in the two runs below).
+
+## 3. THE FINDING THAT MATTERS: the corridor is not the KV budget's to give
+
+The last shift recorded that a budget delta "did not move the minimum at
+all" and attributed it to differing load shapes. That was half the story.
+I ran the SAME load twice, changing only RANK_MIB:
+
+    load: 1 long-prefill worker over 8192/32768, 3 decode workers,
+          bs<=4, 300s mixed + 60s idle, POLICY=auto, SPEC=on, graphs on
+
+    card            budget cut    MIN free before -> after
+    5090            -910 MiB      114 -> 804   (+690)
+    3080b (rank 2)  -990 MiB       42 -> 292   (+250)
+    3080a (rank 1)  -980 MiB       50 ->  54   (+4)
+
+On the 3080a a full gigabyte of KV budget bought FOUR MiB of corridor.
+The recovery is not proportional and on one card it is essentially zero.
+
+MECHANISM, and it is the same one that caused the crash in section 4:
+torch's caching allocator expands into whatever the KV pool did not take
+and, by design, never returns those pages to the driver. Free memory on a
+card doing heavy prefill therefore converges toward zero REGARDLESS of
+the budget — lowering RANK_MIB just hands the freed pages to torch
+instead of to the corridor.
+
+CONSEQUENCE FOR THE NEXT SHIFT: **the corridor floor cannot be held by
+tuning `--rank-gpu-memory-mib`.** Iterating that knob is the trap two
+shifts have now fallen into. The knob that actually governs the minimum is
+torch's allocator growth. Candidates, untested, in the order I would try
+them:
+  * `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` — lets torch
+    return segments to the driver; must be checked against CUDA graph
+    capture and the VMM arena before it is believed;
+  * `garbage_collection_threshold:<f>` paired with
+    `set_per_process_memory_fraction`, so a reserve ceiling exists to
+    collect against;
+  * an explicit `torch.cuda.empty_cache()` at the phase-flip seam, which
+    is a place the code already owns and where a re-warm is affordable.
+Whichever is chosen, measure it with `route_a_631_corridor.py` under the
+load above — the numbers in this section are the baseline to beat.
+
+## 4. A CRASH FOUND, AND ITS FALSE COMMENT CORRECTED
+
+The inherited HEAD DIED under the acceptance load at 12:47:45, ~20 min in
+(evidence: `docs/dev/631/evidence/s11_flip_arena_oom_crash_20260809T1247Z.log`):
+
+    RuntimeError: cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY
+      _swap -> restore_backing -> finalize -> _back_spans -> commit_range
+
+then SIGQUIT, instance lost. `_build_kv_backing_swap` asserted in a
+comment that the restore "cannot fail for want of memory" because boot
+sized the budget for max(PP, TP). That holds only against a static
+allocator, and section 3 is why it is false under load.
+
+FIX: `_mem_create_reclaiming` — on OUT_OF_MEMORY, release torch's cached
+blocks and retry ONCE. Zero cost on the happy path, a genuinely full card
+still raises, a non-OOM error is never retried. The false comment is
+corrected in place.
+
+**METAL-UNPROVEN, labelled as such:** the reclaim fired ZERO times across
+both acceptance runs. It is unit-proven insurance
+(`test_kv_arena_reclaim_631.py`, 4 cases including the ordering pin), not
+a metal-confirmed recovery. Do not report it as a proven crash fix.
+
+## 5. State at end of shift
+
+HEAD `266a09c85b`, suite `scripts/run_631_flip_family.sh` **532 passed**
+(530 inherited + 2 new), working tree clean apart from this handoff.
+
+SERVING HEALTHY on that tree, `RANK_MIB=22090,12800,12550 POLICY=auto
+SPEC=on PHASE_POLICY_TP_TOK_S=1681.0`, graphs on, health 200,
+`max_total_num_tokens=590224`.
+
+Two full acceptance runs, both with ZERO aborted requests:
+
+    run 1  RANK_MIB 23000,13780,13540   max_total 739186
+           77/77 ok, 0 aborted, 29 policy transitions, 90 cutovers,
+           105 accept-len log lines, corridor MIN 50/114/42  BREACH
+    run 2  RANK_MIB 22090,12800,12550   max_total 590224
+           91/91 ok, 0 aborted, 19 policy transitions, 66 cutovers,
+           144 accept-len log lines, corridor MIN 54/804/292 BREACH
+
+Both runs returned to the PP resting layout on their own and the
+post-idle 32768-token probe prefilled in PP at 4467.9 and 4480.2 tok/s —
+the PP-class rate, i.e. the flip is not in the latency path from rest.
+
+Run 2 is the boot left standing: it is the closer of the two to the
+corridor law on every card. NEITHER SATISFIES IT. The corridor is the
+open item, and section 3 says why the obvious knob will not close it.
+
+## 6. Free capacity nobody has taken yet
+
+The server prints its own restart hint and it has been ignored:
+
+    Uneven DCP: restart with SGLANG_UNEVEN_TOKEN_VECTOR=30,19,15 to raise
+    max_total_num_tokens from 739186 to ~871552 (per-rank profiled
+    capacity [408556, 259734, 213910]; active vector [28, 26, 20] leaves
+    ranks idle).
+
++18% KV for free. `route_a_631_prod_boot.sh` pins `28,26,20` as its
+default. I did NOT take it this shift, deliberately: it raises the pool on
+the ranks that are currently UNDER-using their budget, so it moves VRAM
+and must not be bundled into a corridor measurement that is isolating the
+budget. Take it as its own change, with its own corridor run.
+
+## 7. Still METAL-UNPROVEN, in the spec's order
+
+1. the corridor at ~1024 per card under the acceptance load — see §3;
+2. `meta_info` accept-len end to end — see §2;
+3. the bs=1 spill leg (#364 / #104 / kvso / #287) — untouched;
+4. the bs=1 YaRN leg beyond 262144 — untouched;
+5. the A-vs-A gate against `9a929352c9` — untouched;
+6. the arena reclaim on metal — see §4.
