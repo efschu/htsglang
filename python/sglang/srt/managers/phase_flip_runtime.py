@@ -115,6 +115,20 @@ DEFAULT_JOIN_DEADLINE_S = 45.0
 # abandoning a poll costs nothing, whereas abandoning an ENTERED
 # all_reduce aborts every rank (see the withdrawn (c)).
 DEFAULT_PRESENCE_DEADLINE_S = 60.0
+# #631: the VRAM the flip's staging buffers must leave alone. The flip is
+# not a memory-free operation: the exchange packs this rank's outgoing rows
+# and allocates a receive buffer per peer, all from the same device memory
+# the KV pool is filling. MEASURED 2026-08-09 -- one session holding 0.995
+# of the PP pool turned a routine policy flip into
+#
+#   kv_reshard._exchange -> torch.empty(584 MiB) -> torch.OutOfMemoryError
+#   ("600.38 MiB is free") -> Fatal Python error: Aborted, instance down
+#
+# and the free VRAM at that moment was already under the 1024 MiB corridor
+# floor. Defaulting to the same 1024 MiB makes the flip respect the corridor
+# rather than spend it: a flip that cannot be staged without dipping below
+# the reserve is abandoned, and serving continues in the current layout.
+DEFAULT_STAGING_RESERVE_BYTES = 1024 * 1024 * 1024
 # #631: how long the armed spin sleeps between flag reads. Small enough
 # that assembly is prompt at idle, large enough not to burn a core while
 # a peer finishes draining. The spin touches no channel, so this is a
@@ -1246,6 +1260,14 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
             getattr(server_args, "kv_reshard_consensus_interval", 8)
         ),
         park_deadline_s=park_deadline_s(),
+        # The flip must leave the user's reserve alone, so it takes the
+        # number from the same flag the rest of the server does rather than
+        # carrying a second opinion about how much VRAM is not ours.
+        staging_reserve_bytes=int(
+            (getattr(server_args, "rank_user_reserve_mib", None) or 1024)
+        )
+        * 1024
+        * 1024,
         # Label it as OURS: a shared helper reporting under its own
         # module's name sent a live wedge into the wrong subsystem.
         collective_min=default_collective_min(
@@ -1386,6 +1408,13 @@ class PhaseFlipRuntime:
         boot_phase: str = PHASE_PP,
         consensus_interval: int = 8,
         park_deadline_s: float = DEFAULT_PARK_DEADLINE_S,
+        # #631: VRAM the flip's staging buffers must NOT eat into. Mirrors
+        # --rank-user-reserve-mib, because it is the same promise: that many
+        # MiB stay free on the card for everything that is not this server.
+        staging_reserve_bytes: int = DEFAULT_STAGING_RESERVE_BYTES,
+        # () -> (driver_free_bytes, allocator_cached_free_bytes). Injected
+        # in tests; None reads the live CUDA allocator.
+        mem_probe: Optional[Callable[[], Tuple[int, int]]] = None,
         presence=None,
         pump_fn: Optional[Callable[[], None]] = None,
         # #631 clause (ii): consume whatever the upstream has already sent,
@@ -1559,6 +1588,15 @@ class PhaseFlipRuntime:
         #: Flips abandoned because the live set did not fit the target
         #: pool. Same reason for counting it.
         self.fit_aborts = 0
+        #: Flips abandoned because the STAGING buffers would not fit in
+        #: free VRAM above the reserve. Counted separately from fit_aborts:
+        #: "the target pool has no row for this slot" and "there is no room
+        #: to stage the bytes on the way there" are different conditions
+        #: with different answers, and a single counter would hide which
+        #: one a boot is hitting.
+        self.staging_aborts = 0
+        self._staging_reserve_bytes = int(staging_reserve_bytes)
+        self._mem_probe = mem_probe
 
         logger.info(
             "%s armed at boot: rank %d/%d, phase %s, layer map %s, vector "
@@ -2494,6 +2532,93 @@ class PhaseFlipRuntime:
             return ordinal
         return self._map[self._rank].index(ordinal)
 
+    # -- staging affordability ------------------------------------------------
+    def _staging_bytes(self, tr, direction: str, src, dst) -> int:
+        """Device bytes the exchange will hold at once, from the PLAN.
+
+        Counted the way the exchange actually spends them:
+
+        * OUTGOING is counted TWICE. ``_execute`` reads one tensor per
+          layer, then concatenates them, and the per-layer reads are still
+          referenced while the concatenation exists -- so the packed
+          payload is resident twice at the peak, not once.
+        * INCOMING once per peer: ``_exchange`` pre-allocates the full
+          receive buffer before posting the irecv.
+
+        Both use each side's own ``row_nbytes``, the same quantities the
+        exchange itself uses, so this cannot drift from what is allocated.
+        """
+        total = 0
+        for peer in tr.send_layers:
+            n = int(tr.send_rows[peer].numel())
+            payload = (
+                sum(
+                    src.row_nbytes(self._src_layer_idx(direction, f)) * n
+                    for f in tr.send_layers[peer]
+                )
+                + _CHECKSUM_BYTES
+            )
+            total += 2 * payload
+        for peer in tr.recv_layers:
+            n = int(tr.recv_rows[peer].numel())
+            total += (
+                sum(
+                    dst.row_nbytes(self._dst_layer_idx(direction, f)) * n
+                    for f in tr.recv_layers[peer]
+                )
+                + _CHECKSUM_BYTES
+            )
+        return int(total)
+
+    def _staging_affordable(self, staging_bytes: int) -> Tuple[bool, str]:
+        """Can this rank stage ``staging_bytes`` without eating the reserve?
+
+        THE TWO POOLS OF MEMORY ARE NOT EQUIVALENT, and conflating them
+        gives the wrong answer in both directions:
+
+        * bytes the caching allocator already holds but has not handed out
+          are reusable AND invisible to NVML, so spending them cannot move
+          the free-VRAM number the corridor is measured on. They are free
+          to this check.
+        * bytes that must come from the driver DO move it, so only the
+          amount above the reserve may be spent.
+
+        Hence ``usable = cached_free + max(0, driver_free - reserve)``.
+        Using ``driver_free`` alone would abandon flips that fit fine; using
+        the allocator's view alone would spend the corridor.
+
+        Off CUDA (unit stubs) there is nothing to measure and this term is
+        not the one under test, so it abstains rather than inventing a
+        number.
+        """
+        probe = self._mem_probe
+        if probe is None:
+            if not torch.cuda.is_available():  # pragma: no cover - stubs
+                return True, ""
+
+            def probe():
+                free_dev, _total = torch.cuda.mem_get_info()
+                cached_free = (
+                    torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                )
+                return int(free_dev), int(max(0, cached_free))
+
+        driver_free, cached_free = probe()
+        usable = cached_free + max(0, driver_free - self._staging_reserve_bytes)
+        if staging_bytes <= usable:
+            return True, ""
+        mib = 1024 * 1024
+        return False, (
+            f"staging {staging_bytes / mib:.0f} MiB needed but only "
+            f"{usable / mib:.0f} MiB is spendable "
+            f"(driver free {driver_free / mib:.0f} MiB, allocator cache "
+            f"{cached_free / mib:.0f} MiB, reserve "
+            f"{self._staging_reserve_bytes / mib:.0f} MiB kept free). The "
+            f"KV pool is too full to carry its own contents across the "
+            f"flip; serving continues in this layout and the flip is "
+            f"retried when occupancy drops"
+        )
+
     # -- the move -------------------------------------------------------------
     def _execute(self) -> Optional[dict]:
         direction = self._pending
@@ -2537,13 +2662,39 @@ class PhaseFlipRuntime:
                 f"(the TP pool must cover the compact rows of vector "
                 f"{self._vec})"
             )
+        # SECOND TERM OF THE SAME VERDICT: can the bytes be STAGED at all?
+        # The rows fitting in the target pool says nothing about the memory
+        # needed to carry them there. The exchange packs this rank's
+        # outgoing rows and allocates one receive buffer per peer, and it
+        # takes them from the same device memory the KV pool has been
+        # filling. Measured (2026-08-09): a single 276214-token session at
+        # 0.995 pool occupancy left 600 MiB free, the exchange asked for
+        # 584 MiB, and the OutOfMemoryError climbed out of
+        # kv_reshard._exchange into the event loop and killed all three
+        # ranks -- the exact "raising here takes the INSTANCE down" failure
+        # the paragraph above refuses for the row bounds.
+        #
+        # It belongs in THIS verdict, not in a check of its own: the sizes
+        # are known from the plan before a single byte is allocated, and
+        # the answer when they do not fit is the same unanimous abandon.
+        # A rank-local abandon would half-flip the group.
+        staging_bytes = self._staging_bytes(tr, direction, src, dst)
+        affordable, staging_detail = self._staging_affordable(staging_bytes)
+        if not affordable:
+            too_small.append(staging_detail)
+
         fits = 0 if too_small else 1
         reduced_fit = self._collective_min([fits, -fits])
         if reduced_fit[0] == 0:
             self._pending = None
             self._armed_at = None
             self._last_hold_reason = None
-            self.fit_aborts += 1
+            # Which of the two conditions THIS rank hit, so a boot that is
+            # short of staging room is not read as a pool-sizing problem.
+            if staging_detail:
+                self.staging_aborts += 1
+            else:
+                self.fit_aborts += 1
             logger.error(
                 "%s FLIP ABANDONED (pool too small for the live set): %s. "
                 "This rank: %s. No bytes were moved -- the bound is checked "

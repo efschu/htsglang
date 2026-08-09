@@ -248,3 +248,55 @@ def cap_is_binding(resident_cap: Optional[int], profiled_slots: int) -> bool:
         resident_cap is not None
         and int(resident_cap) < int(profiled_slots)
     )
+
+
+#: Where the PRE-CAP profiled slot count is remembered. Underscore-prefixed
+#: on purpose: ``ServerArgs.__setattr__`` exempts private names from the
+#: strict post-resolution mutation guard, and ``copy.deepcopy`` carries it.
+PROFILED_SLOTS_ATTR = "_gdn_profiled_state_slots"
+
+
+def remember_profiled_state_slots(server_args) -> int:
+    """The PRE-CAP profiled slot count, recorded ONCE on ``server_args``.
+
+    WHY THIS IS NOT JUST ``server_args.max_mamba_cache_size``, and why the
+    memory has to live on the ARGS rather than on the model runner:
+
+    Applying the cap OVERRIDES ``max_mamba_cache_size`` to the capped value.
+    That is fine for one stack. A phase-flip instance, however, builds a
+    SECOND stack from ``copy.deepcopy(server_args)`` taken AFTER the first
+    stack was sized (``phase_flip_boot``), so the copy already carries the
+    CAPPED number. A second, naive read there sees ``capped`` where the
+    first read ``profiled``, concludes the cap is not binding, records no
+    profiled count -- and the concurrency ceiling for that stack is then
+    derived from the shrunken pool. The two stacks disagree on
+    ``max_num_reqs``, and the flip's boot guard refuses the instance:
+
+        req_to_token shapes diverge between stacks: PP (5, 393224)
+        vs TP (4, 393224)
+
+    (measured on metal, ``--gdn-resident-state-slots 10``
+    ``--max-mamba-cache-size 20``, ratio 3: PP sized from 20, TP from 10.)
+
+    Write-once is the whole contract: the first caller records the un-capped
+    truth, every later caller -- including one holding a deepcopy made after
+    the override -- reads that same number back.
+    """
+    remembered = getattr(server_args, PROFILED_SLOTS_ATTR, None)
+    if remembered is None:
+        remembered = int(server_args.max_mamba_cache_size)
+        setattr(server_args, PROFILED_SLOTS_ATTR, remembered)
+    return int(remembered)
+
+
+def recall_profiled_state_slots(server_args) -> Optional[int]:
+    """Read the remembered pre-cap count, or ``None``. NEVER writes.
+
+    The read-only twin of :func:`remember_profiled_state_slots`, for call
+    sites on the default path: with the cap unset nothing was ever recorded
+    and nothing must be, so the caller falls back to
+    ``max_mamba_cache_size`` and the un-capped behaviour stays
+    byte-identical.
+    """
+    remembered = getattr(server_args, PROFILED_SLOTS_ATTR, None)
+    return None if remembered is None else int(remembered)

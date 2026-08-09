@@ -2143,9 +2143,18 @@ class ModelRunnerKVCacheMixin:
             from sglang.srt.mem_cache.gdn_slot_ladder import (
                 cap_is_binding,
                 effective_state_slots,
+                remember_profiled_state_slots,
             )
 
-            _profiled = int(server_args.max_mamba_cache_size)
+            # Write-once on the ARGS, not on this runner. A phase-flip
+            # instance sizes a SECOND stack from a deepcopy of these args
+            # taken AFTER the override below, so a plain read of
+            # max_mamba_cache_size would hand that stack the CAPPED count
+            # and it would size its admission ceiling from the shrunken
+            # pool -- the two stacks then disagree on max_num_reqs and the
+            # flip's boot guard refuses the instance. See
+            # remember_profiled_state_slots for the measured failure.
+            _profiled = remember_profiled_state_slots(server_args)
             # #364 slice 3: preserve the PRE-CAP profiled slot count so the
             # concurrency ceiling (max_running_requests) is sized from the
             # SESSION budget, not from the shrunken resident pool. Without
@@ -5512,11 +5521,20 @@ class ModelRunnerKVCacheMixin:
             # profiled to fit), and the KV backing stays guarded by the
             # token_capacity // 2 clamp above.
             from sglang.srt.mem_cache.gdn_slot_ladder import (
+                recall_profiled_state_slots,
                 session_admission_slots,
             )
 
             _resident_cap = getattr(self.server_args, "gdn_resident_state_slots", None)
             _profiled = getattr(self, "_gdn_profiled_state_slots", None)
+            if _profiled is None:
+                # The stack that did not apply the cap ITSELF -- the flip's
+                # TP stack, built from a post-cap deepcopy -- has no runner
+                # attribute, but the args still carry the pre-cap count.
+                # Without this it would size the ceiling from the capped
+                # pool and diverge from the PP stack. Read-only, so the
+                # cap-unset path records nothing and stays byte-identical.
+                _profiled = recall_profiled_state_slots(self.server_args)
             if _profiled is None:
                 _profiled = self.server_args.max_mamba_cache_size
             _budget_slots = session_admission_slots(
