@@ -71,8 +71,8 @@ violation; `PHASE_PURITY_ASSERT=0` to report only.
 |---|---|
 | Purity gates compile, parse, arm on all 3 ranks | **PROVEN** (log 21:37:10Z, all of PP0/PP1/PP2) |
 | Pre-purity build violates purity | **PROVEN**: 581 decode records in PP, 10266 tokens prefilled in TP (`evidence-631/phase_evidence_prepurity_defectK.txt`) — this is also the proof the new gate CAN fail |
-| Purity HOLDS under load | **FIRST SIGNAL POSITIVE** (see below); the >=60 min verdict is PENDING |
-| Both queues drain in bounded windows | **FIRST SIGNAL POSITIVE**, 60-min verdict PENDING |
+| Purity HOLDS under load | **held for 90 s, then the instance wedged on DEFECT M (§4b)** — purity was not the cause, but the run is NOT green |
+| Both queues drain in bounded windows | observed working (both directions, floor and window both fired) for 90 s |
 | Spill ladder | **NOT IMPLEMENTED** — module written, no rung wired |
 
 ### FIRST LIVE SIGNAL on the purity build (boot 21:43:45Z, b55b34ba73)
@@ -226,7 +226,71 @@ arithmetic was built on. Anything deriving a threshold from "what it would
 cost to do X in the other layout" is suspect under purity. Grep for other
 consumers of `flip_tokens` before adding the next feature.
 
-## 4b. OPEN DEFECT M — running_bs read 10485760 once (NOT fixed)
+## 4b. DEFECT M — FATAL, it wedged the instance. Fix this FIRST.
+
+**Status upgraded from "cosmetic log oddity" to "the thing that killed the
+green run", 21:47Z. Read this section before anything else.**
+
+Sequence, all in one boot:
+
+1. 21:46:28Z the policy armed a flip on a garbage input:
+   `arming pp_to_tp: prefill down to 0 tok (<= N=7004), 10485760 req
+   decoding`. 10485760 = 10 x 2^20. True state was IDLE (prefill 0, and
+   the sane samples around it read `running bs 0/2/3`).
+2. The cutover then handed that same bogus resident set to the draft
+   bootstrap. PP1 main thread, py-spy `active+gil` (spinning, NOT
+   blocked):
+
+```
+committed_slots            (phase_flip_draft_bootstrap.py:190)
+arm_draft_bootstrap        (phase_flip_draft_bootstrap.py:411)
+arm_draft_bootstrap_all_reachable (phase_flip_draft_bootstrap.py:609)
+_cutover                   (phase_flip_runtime.py:1074)
+_execute                   (phase_flip_runtime.py:2921)
+on_round                   (phase_flip_runtime.py:1977)
+```
+
+   `committed_slots` builds one slot tensor PER REQUEST
+   (`out.append(req_to_token.new_empty(...))`). Against a claimed 10.5 M
+   requests that is millions of allocations: the rank never returns.
+3. Rank 0's TCPStore died; ranks 1/2 spun on `sendBytes ... Broken pipe`
+   from 21:47:56Z onward. Requests stopped completing at 21:47
+   (`ok=3` frozen, `err` climbing to 47), health went to 000.
+
+**So the same wrong number does two things**: it makes the policy arm a
+flip that should never have been armed, and it feeds the cutover a
+resident set that cannot be iterated. The policy gate is the visible half;
+the draft bootstrap is the lethal half.
+
+**The purity build is therefore NOT green.** Purity itself held perfectly
+for the 90 s it ran (zero decode in PP, zero prefill in TP, 100 % decode
+graphs, accept 2.96) — it was defect M that took the instance down, not
+the purity rule. But the two interact: purity leaves requests
+resident-but-not-decoding across whole PP windows, which is a state the
+resident harvest sees far more often than it used to. That is the most
+likely reason this surfaced now and not in the pre-purity 60-min soak.
+
+**Where to look**: `Scheduler.maybe_arm_phase_policy` (~`scheduler.py:7086`)
+sums `len(getattr(b, "reqs", []) or [])` over
+`harvest_resident_batches` (`phase_flip_resident_carry.py:141`), which
+draws from the PP slot array `running_mbs` and from `running_batch`. It
+was PP0 in the PP phase, so the PP slot side is the first suspect: a slot
+whose `reqs` is not a request list but something tensor-shaped would give
+`len()` a dimension. 2^20 smells like a buffer dimension and the x10 like
+the 10 GDN resident state slots.
+
+**Do NOT fix by clamping.** A clamp turns a wrong input into a plausible
+one and hides the leaking handle — and it would NOT have saved this boot,
+because the lethal consumer is `committed_slots`, not the policy. Add a
+loud assertion where the resident set is built (a batch may not exceed
+`max_running_requests`) so the offending object's type and attribute are
+named, then fix the source. `arm_draft_bootstrap` should additionally
+refuse an implausible resident set rather than iterate it.
+
+Evidence: `/spinning/evidence-631/serving_defectM_wedge.log` (contains the
+full py-spy dumps for all three ranks).
+
+## 4c. Earlier notes on defect M (superseded by 4b)
 
 Live, purity build, 21:46:28Z, the very first `pp_to_tp` arming:
 
