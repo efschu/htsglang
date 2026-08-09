@@ -1793,8 +1793,16 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
             )
-            stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
+            stamp = raw.pop("__stamp__", None) if isinstance(raw, dict) else None
             if stamp is None or mb_id < 0 or int(stamp[0]) == int(mb_id):
+                # POPPED, not read: the identity has done its entire job the
+                # moment the message is accepted, and what remains travels on
+                # into model compute. PPProxyTensors' slice path maps v[key]
+                # over EVERY entry and cuda-graph buffer copies iterate the
+                # dict, so a tuple left in here would slice to nonsense
+                # rather than raise -- the worst available outcome. The
+                # __msg_type__ precedent shows a non-tensor entry SURVIVES
+                # the wire; it does not show one is safe to compute on.
                 return PPProxyTensors(raw)
             self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
             logger.error(
