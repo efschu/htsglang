@@ -190,8 +190,27 @@ ENV_TP_FLOOR = "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S"
 # Cost accounting, and it is deliberate: one 15 s + 10 s cycle carries two
 # round trips (~3.2 s measured), i.e. ~11 % of wall clock in cutovers. That
 # is the price of both sides making progress; it is a knob, not a constant.
-DEFAULT_PP_WINDOW_S = 15.0
-DEFAULT_TP_DECODE_FLOOR_S = 10.0
+#
+# DEFAULTS ARE 0 = DISABLED, and that is a MEASURED retreat, not caution.
+# 15/10 was the first guess and it killed three consecutive boots on this
+# rig (2026-08-09, HANDOFF_658 section 4e), including one running the exact
+# configuration that had survived 40+ minutes with zero exceptions -- the
+# only difference being these windows. Signature was twice an allocation
+# failure at the cutover seam (cuMemCreate / torch OOM with ~100 MiB free
+# on a 3080) after 12 flips in four minutes.
+#
+# The mechanism is structural, not a bad constant: the windows raise the
+# FLIP RATE, every cutover re-commits the KV backing, and that seam has a
+# memory PEAK against ranks measured sitting only ~530-610 MiB above the
+# corridor floor at runtime. Raising the flip rate is the wrong axis for
+# fixing starvation while a cutover costs 1.0-1.7 s/rank AND spikes
+# memory; make the seam memory-flat first, then re-tune these in MINUTES
+# rather than seconds.
+#
+# Set > 0 deliberately, per deployment, with the corridor sampled in the
+# PP phase specifically.
+DEFAULT_PP_WINDOW_S = 0.0
+DEFAULT_TP_DECODE_FLOOR_S = 0.0
 
 # Defaults for the two timers. The minimum dwell is deliberately larger than
 # one round trip: a server that flips, and is allowed to flip straight back,

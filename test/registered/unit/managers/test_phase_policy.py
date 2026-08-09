@@ -565,7 +565,11 @@ def test_a_chunked_prefill_is_visible_to_the_policy():
         now=1000.0,
     )
     observe_idle(fresh, fresh_inp)
-    held = decide(cfg(), fresh, fresh_inp)
+    # The floor is passed EXPLICITLY: its default is 0 (disabled) since it
+    # was measured to kill boots by raising the flip rate (HANDOFF_658
+    # section 4e), and this assertion is about the floor's INTERACTION with
+    # defect N's visibility, not about whether it ships on by default.
+    held = decide(cfg(tp_decode_floor_s=10.0), fresh, fresh_inp)
     assert held.direction is None
     assert "decode floor" in held.reason
 
