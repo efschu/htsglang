@@ -1019,9 +1019,59 @@ class PhaseFlipPresence:
         return removed
 
 
+def _phase_path(rank: int, instance: str = "") -> str:
+    tag = resolve_instance_tag(instance)
+    return os.path.join(DEFAULT_PRESENCE_DIR, f"{tag}.phase.r{int(rank)}")
+
+
+def publish_active_phase(rank: int, phase: str, instance: str = "") -> None:
+    """Publish this rank's ACTIVE LAYOUT so the API process can read it.
+
+    THE QUESTION THIS ANSWERS, asked twice from the outside before it
+    existed: which layout is the instance in right now? There was no way
+    to answer it except by grepping the serving log, and the obvious
+    substitute is actively misleading -- under PP with pp_size=3 the
+    stages are PIPELINED, so during a long chunked prefill all three cards
+    sit near 100% simultaneously exactly as they do under TP. Utilisation
+    cannot distinguish the layouts; only the cutover can.
+
+    Same discipline as the presence markers and the message counters, and
+    the same rendezvous tag: single writer per rank, atomic replace, and
+    best effort -- publishing the phase must never be able to break a
+    flip. The tag derives from the process-group leader, which the API
+    process shares with the scheduler ranks of the same boot.
+    """
+    try:
+        os.makedirs(DEFAULT_PRESENCE_DIR, exist_ok=True)
+        path = _phase_path(rank, instance)
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w") as fh:
+            fh.write(str(phase))
+        os.replace(tmp, path)
+    except OSError as exc:  # noqa: BLE001 - never break a flip over a log
+        logger.debug("%s could not publish phase: %s", LOG_PREFIX, exc)
+
+
+def read_active_phase(rank: int = 0, instance: str = "") -> Optional[str]:
+    """The active layout as last published by ``rank``, or None.
+
+    None means "no flip has published one on this boot", which for a
+    Route A boot is the PP prefill layout -- the caller says so, because
+    only the caller knows the boot layout.
+    """
+    try:
+        with open(_phase_path(rank, instance)) as fh:
+            value = fh.read().strip()
+        return value or None
+    except OSError:
+        return None
+
+
 __all__ = [
     "PhaseFlipPresence",
     "DEFAULT_PRESENCE_DIR",
     "LOG_PREFIX",
+    "publish_active_phase",
+    "read_active_phase",
     "resolve_instance_tag",
 ]
