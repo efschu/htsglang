@@ -24,6 +24,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.io_struct import PhaseFlipReqInput
+from sglang.srt.managers.phase_flip_counters import CHAN_DICT, CHAN_REQ
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -712,14 +713,23 @@ class SchedulerPPMixin:
                 # and waiting at the gate. Because this point PRECEDES
                 # the gate, no gate could ever have covered it.
                 #
-                # An armed rank therefore flushes the same send by
-                # PUMPING it (non-blocking, reaped only when the handle
-                # reports complete) and issues no new forward: it is
-                # admitting no new work, so it has nothing to forward.
-                # Presence is then withheld until this pump has drained
-                # the handle, which is what makes the flag mean "my chain
-                # is flushed" (clause (i), PhaseFlipRuntime).
-                self.pp_pump_send_req_work()
+                # An armed rank issues no new forward -- it is admitting no
+                # new work, so it has nothing to forward -- and reaps the
+                # outstanding one through the SERVICE TURN instead: consume
+                # whatever the upstream posted, then flush this rank's own
+                # send once the downstream's counter proves it is consumed.
+                #
+                # This line used to call pp_pump_send_req_work, which
+                # reaped NOTHING on this build (corpse F): is_completed()
+                # never fires for an isend here, so send_req_work stayed
+                # non-empty, presence was withheld for ever, and every flip
+                # abandoned at the presence deadline. The service turn is
+                # the same intent with a predicate the transport can
+                # actually honour. Presence is still withheld until the
+                # handle is reaped, so the flag still means "my chain is
+                # flushed" (clause (i), PhaseFlipRuntime) -- it is now a
+                # condition that can be REACHED.
+                self.pp_flip_service()
             else:
                 self._pp_commit_comm_work(self.send_req_work)
                 with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -784,16 +794,19 @@ class SchedulerPPMixin:
         """#631: does the ARMED forward rule apply on this rank?
 
         False on every boot without the flip, so the default PP path keeps
-        its exact shape -- and false as well unless the chain receiver is
-        installed, because the armed forward rule (pump instead of commit,
-        issue no new forward) is only safe when something is still
-        CONSUMING the chain. Without that, an armed rank would neither
-        send nor receive, which is the boot-18 shape made permanent. See
-        Scheduler._build_pp_chain_receiver for why that is off by default.
+        its exact shape.
+
+        It used to require a chain receiver as well, because the armed
+        rule was only safe while something still CONSUMED the chain and
+        the poll-based consumer was dead. THAT CONDITION WAS ALSO A BUG
+        (#631 G): rank 0 has no upstream and therefore no receiver, so the
+        armed rule was off on exactly the rank that most needs it -- the
+        intake rank kept admitting new work while armed and could never
+        drain to quiescence under load. The service turn is safe on every
+        rank now: on rank 0 its consume half is a no-op and its flush half
+        is real.
         """
         if not self.server_args.enable_phase_flip:
-            return False
-        if getattr(self, "pp_chain_receiver", None) is None:
             return False
         return self.phase_flip_is_armed()
 
@@ -808,22 +821,186 @@ class SchedulerPPMixin:
         """
         return bool(getattr(self, "send_req_work", None))
 
-    def pp_drain_chain_nonblocking(self: Scheduler) -> None:
-        """#631 clause (ii): consume whatever upstream has already sent.
+    # -- #631 G: the ARMED SERVICE LOOP ----------------------------------
+    #
+    # THE DEFECT (measured 2026-08-09 00:06-00:09Z, corpse G): a rank that
+    # became quiescent and spun at the gate stopped issuing its per-pass
+    # chain forward. Its downstream reached the hook ONLY by returning
+    # from a blocking chain recv that this very forward satisfied, so the
+    # first rank to quiesce -- rank 0, the intake rank, always -- prevented
+    # every rank behind it from ever becoming ready. Bounded (the spinner
+    # abandoned at its deadline) but NOT convergent: the same rank drained
+    # first every epoch, so the starvation reproduced identically.
+    #
+    # THE FIX is not to resume sending -- an armed rank has nothing to
+    # forward and the unconsumed sends would pile up. It is to stop the
+    # downstream from NEEDING that forward: while armed, a rank does not
+    # block on any inbound channel, it SERVICES them. It reaches the hook
+    # by its own poll, so no rank's readiness depends on a peer's traffic.
+    #
+    # WHY THIS IS NOT THE BOUNDED-RECV CORPSE (it will look like one).
+    # That corpse completed iterations WITHOUT consuming while the
+    # upstream kept sending: the rates decoupled, unmatched sends
+    # accumulated, and the SENDERS blocked. Two differences, each
+    # sufficient on its own. (1) This loop is GREEDY -- it consumes every
+    # message the sender's counter accounts for and never skips an
+    # available one. (2) It exists ONLY in the armed state, where
+    # admissions are held and armed upstreams issue no new forwards, so
+    # the accumulation driver is absent by construction rather than by
+    # tuning.
+    #
+    # Spin-at-the-hook is this same loop with the gate already open, which
+    # is why there is one mechanism here and not two.
 
-        NEVER blocks. Messages land in the receiver's inbox and are handed
-        to the scheduler by the ordinary blocking receive once the flip is
-        over, so nothing is dropped -- the rank simply declines to ACT on
-        them while a flip is armed, which is what its quiescence requires.
+    def _pp_flip_bump_sent(self: Scheduler, chan: str) -> None:
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is not None:
+            counters.bump_sent(chan)
 
-        Without this, an armed rank stops reading and its upstream blocks
-        committing a forward to it before that upstream can announce
-        (boot 18).
+    def _pp_flip_bump_consumed(self: Scheduler, chan: str) -> None:
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is not None:
+            counters.bump_consumed(chan)
+
+    def _pp_flip_upstream(self: Scheduler) -> int:
+        return (self.ps.pp_rank - 1) % self.ps.pp_size
+
+    def _pp_flip_downstream(self: Scheduler) -> int:
+        return (self.ps.pp_rank + 1) % self.ps.pp_size
+
+    def pp_flip_consume_inbound(self: Scheduler) -> int:
+        """Greedily take every inbound message the upstream says it posted.
+
+        The request chain only. The tensor-dict wire is deliberately NOT
+        consumed here, and that is a positive design decision rather than
+        an omission: a dict message is a microbatch's hidden states or its
+        outputs, and a rank that has one inbound is BY DEFINITION not
+        quiescent (its own ``mbs`` slot is live, which is what
+        ``_pp_microbatches_drained`` reads). Such a rank is still in the
+        ordinary pass loop, where that recv happens normally. Consuming a
+        dict here would mean buffering a microbatch across a layout change
+        that discards it -- so instead the entry check below PROVES the
+        wire is empty, and a violation abandons the flip rather than
+        crossing the re-formation with a message in flight.
         """
         receiver = getattr(self, "pp_chain_receiver", None)
-        if receiver is None:
+        counters = getattr(self, "pp_flip_counters", None)
+        if receiver is None or counters is None:
+            return 0
+        posted = counters.sent(CHAN_REQ, self._pp_flip_upstream())
+        return receiver.consume_up_to(posted)
+
+    def pp_flip_flush_drained_sends(self: Scheduler) -> None:
+        """Reap this rank's outstanding sends -- but ONLY once consumed.
+
+        ``_pp_commit_comm_work`` is a blocking ``wait()``, and blocking is
+        exactly what an armed rank may not do speculatively: the measured
+        wire fact is that a sender's ``wait()`` blocks when the receiver
+        has posted no matching irecv. Gated on the downstream's published
+        CONSUMED count, the same call is bounded -- the message is already
+        off the wire, so the wait returns immediately.
+
+        This is the working replacement for ``pp_pump_send_req_work``,
+        which reaped nothing because ``is_completed()`` never fires for an
+        isend here (corpse F). Reaping matters beyond tidiness: while
+        ``send_req_work`` is non-empty this rank "owes a send", presence is
+        withheld, and the flip abandons at the presence deadline.
+        """
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is None:
             return
-        receiver.poll()
+        downstream = self._pp_flip_downstream()
+        for chan, attr in (
+            (CHAN_REQ, "send_req_work"),
+            (CHAN_DICT, "send_output_work"),
+            (CHAN_DICT, "send_proxy_work"),
+        ):
+            work = getattr(self, attr, None)
+            if not work:
+                continue
+            if counters.consumed(chan, downstream) < counters.local_sent(chan):
+                continue
+            self._pp_commit_comm_work(work)
+
+    def pp_flip_service(self: Scheduler) -> None:
+        """One turn of the armed service loop: consume, then flush.
+
+        CONSUME FIRST, and the order is load-bearing. Taking the upstream's
+        message off the wire is what lets the UPSTREAM flush its own send
+        on its next turn; flushing first would leave every rank waiting on
+        a peer that is waiting on it. Consuming is also the half that can
+        never block for peer reasons -- the counter proved the message
+        exists -- so doing it first means a rank always makes the group's
+        progress possible before asking anything of it.
+        """
+        try:
+            self.pp_flip_consume_inbound()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("%s armed consume failed: %s", "#631", exc)
+        try:
+            self.pp_flip_flush_drained_sends()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("%s armed flush failed: %s", "#631", exc)
+
+    def pp_flip_channels_empty(self: Scheduler) -> Optional[str]:
+        """Are ALL of this rank's channels empty? None if yes, else why not.
+
+        THE FLIP-COMMIT HYGIENE CHECK. Quiescent plus fully serviced
+        implies every channel is empty; anything else is a framing or
+        quiescence bug, and it is the nastiest one this change can
+        introduce. A half-consumed ``point_to_point_pyobj`` message, or an
+        unreaped isend, crossing the re-formation would misframe the
+        post-flip stream -- silently, and long after the flip.
+
+        Cheap, and it also catches a sender that died between posting its
+        message and publishing its counter: the wire then holds a message
+        nobody will ever account for, and this is where that shows up.
+
+        Reported rather than raised: the caller runs this BEFORE entering
+        the reduction, where abandoning is free and safe.
+        """
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is None:
+            return None
+        reasons: List[str] = []
+
+        receiver = getattr(self, "pp_chain_receiver", None)
+        if receiver is not None:
+            posted = counters.sent(CHAN_REQ, self._pp_flip_upstream())
+            if receiver.consumed < posted:
+                reasons.append(
+                    f"request chain has {posted - receiver.consumed} "
+                    f"unconsumed message(s) from rank "
+                    f"{self._pp_flip_upstream()}"
+                )
+            if receiver.mid_message:
+                reasons.append("request chain is HALF-RECEIVED (mid-message)")
+            if receiver.pending():
+                reasons.append(
+                    f"request-chain inbox holds {receiver.pending()} "
+                    f"unhandled message(s)"
+                )
+
+        dict_posted = counters.sent(CHAN_DICT, self._pp_flip_upstream())
+        dict_taken = counters.local_consumed(CHAN_DICT)
+        if dict_taken < dict_posted:
+            reasons.append(
+                f"tensor-dict wire has {dict_posted - dict_taken} "
+                f"unconsumed message(s) from rank {self._pp_flip_upstream()}"
+            )
+        stashed = sum(
+            len(q) for q in getattr(self, "_pp_tensor_dict_inbox", {}).values()
+        )
+        if stashed:
+            reasons.append(f"tensor-dict inbox holds {stashed} stashed message(s)")
+
+        for attr in ("send_req_work", "send_output_work", "send_proxy_work"):
+            if getattr(self, attr, None):
+                reasons.append(f"{attr} is not reaped")
+        if getattr(self, "last_rank_comm_queue", None):
+            reasons.append("last_rank_comm_queue is not empty")
+
+        return "; ".join(reasons) if reasons else None
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
@@ -1226,6 +1403,14 @@ class SchedulerPPMixin:
                 ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                 async_send=async_send,
             )
+            # #631 G: STRICTLY AFTER THE POST, never before. The isend is
+            # on the wire by the time this line runs, so the only skew a
+            # peer can observe is counter-lags-send -- a real message seen
+            # one poll late. Publishing first would advertise a message
+            # that does not exist yet and send a peer into an UNBOUNDED
+            # blocking recv, which is the wedge class this whole feature
+            # removes. See phase_flip_counters for the full argument.
+            self._pp_flip_bump_sent(CHAN_REQ)
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
@@ -1316,6 +1501,12 @@ class SchedulerPPMixin:
         )
         if stats:
             stats.record("send", tensor_dict, time.perf_counter() - started)
+        # #631 G: after the post, for the same reason as the request
+        # chain. ONE counter for this wire, shared by 'proxy' and 'output'
+        # -- they are demultiplexed by __msg_type__ AFTER coming off it,
+        # so counting them apart would let a rank call a wire empty while
+        # a message of the other kind was still on it.
+        self._pp_flip_bump_sent(CHAN_DICT)
         return p2p_work
 
     def _pp_recv_typed_dict(
@@ -1341,6 +1532,10 @@ class SchedulerPPMixin:
             )
             if stats:
                 stats.record("recv", tensor_dict, time.perf_counter() - started)
+            # #631 G: counted here, off the WIRE, before the demultiplex --
+            # a stashed message has still left the wire, and the upstream's
+            # blocking commit is waiting on exactly that fact.
+            self._pp_flip_bump_consumed(CHAN_DICT)
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":

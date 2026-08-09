@@ -35,9 +35,18 @@ That is also why this class is the SINGLE OWNER of the stream. A design
 where a non-blocking drainer and a blocking ``point_to_point_pyobj`` both
 post their own ``irecv`` would race for the same messages and misframe the
 stream the moment both were in flight. Every consumer therefore goes
-through one instance: ``poll()`` for the armed non-blocking path and
-``recv()`` for the ordinary blocking one, sharing one inbox and one
-in-flight message.
+through one instance, sharing one inbox and one in-flight message.
+
+WHICH CONSUMER TO USE, and why ``poll()`` is not it (#631 G)
+------------------------------------------------------------
+``consume_up_to(sent_count)`` is the ARMED path and ``recv()`` the
+ordinary one. ``poll()`` is neither: it rests on ``is_completed()``
+progressing a posted ``irecv``, which is MEASURED FALSE on this build
+(corpse F), so it absorbs nothing and always has. It is kept only as the
+pinned record of that measurement. The armed path instead learns that a
+message exists from the sender's published counter
+(``phase_flip_counters``) and then blocks deliberately, bounded by
+transfer time.
 
 BUFFERING IS NOT DROPPING
 -------------------------
@@ -79,10 +88,22 @@ class PpChainReceiver:
     the phase flip enabled.
     """
 
-    def __init__(self, group, src: int, dst: int):
+    def __init__(self, group, src: int, dst: int, on_consumed=None):
         self._group = group
         self._src = int(src)
         self._dst = int(dst)
+        #: #631 G: called with the new consumed count each time a whole
+        #: message leaves the wire, so the upstream can learn that its
+        #: send is gone and stop treating its own commit as speculative.
+        #: Fired from ONE place (``_note_consumed``) for every path that
+        #: completes a message, because a count that misses a path is
+        #: worse than no count at all -- it would make a non-empty wire
+        #: look empty at the flip's entry.
+        self._on_consumed = on_consumed
+        #: Whole messages taken off the WIRE by this receiver. Not the
+        #: same as messages handed to the scheduler: the inbox sits
+        #: between them.
+        self.consumed = 0
         self._state = _IDLE
         self._size_tensor: Optional[torch.Tensor] = None
         self._size_work = None
@@ -136,12 +157,29 @@ class PpChainReceiver:
         )
         self._state = _AWAITING_DATA
 
+    def _note_consumed(self) -> None:
+        """One whole message has left the wire. The single accounting point.
+
+        Publishing the count is best effort by contract -- a failed publish
+        costs the upstream one more poll (counter-lags-send, the safe
+        skew) -- but it must never propagate, because the message is
+        already consumed and unwinding here would misframe the stream.
+        """
+        self.consumed += 1
+        if self._on_consumed is None:
+            return
+        try:
+            self._on_consumed(self.consumed)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("%s consumed-counter publish failed: %s", LOG_PREFIX, exc)
+
     def _complete_data(self) -> None:
         serialized = bytes(self._data_tensor.cpu().numpy())
         self._data_tensor = None
         self._data_work = None
         self._state = _IDLE
         self.inbox.append(pickle.loads(serialized))
+        self._note_consumed()
 
     def _advance(self, block: bool) -> bool:
         """Advance the machine by at most one whole message.
@@ -169,6 +207,7 @@ class PpChainReceiver:
                 # upstream send.
                 self._state = _IDLE
                 self.inbox.append([])
+                self._note_consumed()
                 return True
             self._post_data_recv(size)
 
@@ -214,12 +253,56 @@ class PpChainReceiver:
         self.polled_messages += absorbed
         return absorbed
 
+    def consume_up_to(self, sent_count: int, max_messages: int = 64) -> int:
+        """#631 G: take every message the SENDER says it has posted.
+
+        This is the armed path, and it is what ``poll()`` could never be.
+        ``poll()`` asks the transport "has anything arrived?" via
+        ``is_completed()``, which on this build never says yes (corpse F);
+        it therefore absorbs nothing. This asks a POLLABLE SIDE CHANNEL
+        instead -- the sender's published counter -- and only once that
+        counter proves a message is in flight does it call the BLOCKING
+        advance. The block is then bounded by TRANSFER TIME, not by peer
+        scheduling, because the message provably exists and the recv
+        side's ``wait()`` is what drives it across (the one transport
+        behaviour with positive evidence).
+
+        GREEDY BY CONTRACT: it consumes every message the counter accounts
+        for and never leaves one behind. That is what separates it from
+        the bounded-recv corpse, whose failure driver was completing
+        iterations WITHOUT consuming while the upstream kept sending, so
+        unmatched sends piled up and the senders blocked. Here the
+        upstream is armed and issues no new forwards, and this loop
+        finishes the ones already posted.
+
+        ``max_messages`` is a runaway guard, not a policy: it can only be
+        hit if the counter is wrong, and stopping is then better than
+        spinning. It is logged loudly if so.
+        """
+        absorbed = 0
+        while self.consumed < int(sent_count):
+            if absorbed >= max_messages:
+                logger.error(
+                    "%s consume_up_to hit its %d-message guard with "
+                    "consumed=%d < sent=%d; the counter and the wire "
+                    "disagree",
+                    LOG_PREFIX,
+                    max_messages,
+                    self.consumed,
+                    int(sent_count),
+                )
+                break
+            # Blocking, and safe: the counter says this message is posted.
+            self._advance(block=True)
+            absorbed += 1
+        return absorbed
+
     def recv(self) -> List[Any]:
         """Return the next chain message, blocking until one exists.
 
-        Inbox first: messages absorbed by ``poll()`` during a flip are
-        handed over here, in arrival order, before anything new is taken
-        off the wire.
+        Inbox first: messages absorbed while a flip was armed are handed
+        over here, in arrival order, before anything new is taken off the
+        wire.
         """
         while not self.inbox:
             self._advance(block=True)

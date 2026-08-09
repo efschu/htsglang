@@ -467,7 +467,7 @@ def _fwd_harness(is_last_rank=False, track_commits=False, armed=False):
     sends = []
     processed = []
     commits = []
-    pumps = []
+    services = []
 
     class _Grp:
         pass
@@ -483,8 +483,8 @@ def _fwd_harness(is_last_rank=False, track_commits=False, armed=False):
             # harness pins the two branches directly.
             return armed
 
-        def pp_pump_send_req_work(self):
-            pumps.append(True)
+        def pp_flip_service(self):
+            services.append(True)
 
         def _pp_commit_comm_work(self, work):
             # "post-send" means: committed AFTER this pass issued its own
@@ -500,7 +500,7 @@ def _fwd_harness(is_last_rank=False, track_commits=False, armed=False):
             processed.append(list(reqs) if reqs else [])
 
     s = S()
-    s.pumps = pumps
+    s.services = services
     fwd = SchedulerPPMixin._pp_forward_and_process_input_requests.__get__(s, S)
     if track_commits:
         return s, fwd, sends, processed, commits
@@ -777,6 +777,8 @@ def _runtime_stub(
     clock=None,
     drain_fn=None,
     owes_send_fn=None,
+    service_fn=None,
+    channels_empty_fn=None,
 ):
     from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
@@ -791,7 +793,13 @@ def _runtime_stub(
     # the old behaviour, so the pre-existing gate pins keep their meaning.
     r._drain_fn = drain_fn
     r._owes_send_fn = owes_send_fn
+    # #631 G: the armed service turn and the flip-commit hygiene probe.
+    # Default None keeps every pre-existing gate pin on its old meaning.
+    r._service_fn = service_fn
+    r._channels_empty_fn = channels_empty_fn
     r.presence_withheld_rounds = 0
+    r.presence_withheld_channels = 0
+    r.entry_channel_violations = 0
     # #631 round-scoped entry evidence: the gate reads (epoch, round).
     r._entry_round = 0
     r._presence_wait_stamp = None
@@ -1124,10 +1132,13 @@ def test_can_fail_a_rank_that_never_flushes_abandons_instead_of_wedging(tmp_path
     assert presence.observe(1) == set()
 
 
-def test_armed_forward_path_pumps_and_issues_no_new_forward():
-    """THE BOOT-18 FIX, downstream half. While armed, the top-of-pass
-    commit must not block: it is replaced by the non-blocking pump, and no
-    new forward is issued, because an armed rank admits no new work."""
+def test_armed_forward_path_services_and_issues_no_new_forward():
+    """THE BOOT-18 FIX, downstream half, as rebuilt for #631 G. While
+    armed, the top-of-pass commit must not block unconditionally: it is
+    replaced by the SERVICE TURN, which consumes what the upstream posted
+    and reaps this rank's send only once the downstream's counter proves
+    it consumed. No new forward is issued, because an armed rank admits no
+    new work."""
     s, fwd, sends, processed, commits = _fwd_harness(
         track_commits=True, armed=True
     )
@@ -1137,7 +1148,11 @@ def test_armed_forward_path_pumps_and_issues_no_new_forward():
         "call (scheduler_pp_mixin :705 -> :1109) rank 1 was found "
         "blocked in while ranks 0 and 2 sat in the reduction"
     )
-    assert s.pumps == [True], "the armed path must still flush by pumping"
+    assert s.services == [True], (
+        "the armed path must still take its service turn -- that is what "
+        "reaps the outstanding forward, and while it is unreaped this rank "
+        "owes a send and withholds presence for ever"
+    )
     assert sends == [], (
         "the armed path issued a new chain forward; an armed rank admits "
         "no new work, so it has nothing to forward, and a fresh unmatched "
@@ -1155,7 +1170,7 @@ def test_unarmed_forward_path_is_unchanged():
     fwd(["req"])
     assert commits == ["top-of-pass"]
     assert sends == [(True, ["req"])]
-    assert s.pumps == []
+    assert s.services == []
 
 
 # -- round-scoped entry evidence ----------------------------------------------
@@ -1277,7 +1292,13 @@ def _onround_stub(presence, ready, clock=None, deadline=60.0, pending="pp_to_tp"
     r._pump_fn = None
     r._drain_fn = None
     r._owes_send_fn = None
+    # #631 G: absent by default, so this stub keeps exercising the gate
+    # itself rather than the service loop layered on it.
+    r._service_fn = None
+    r._channels_empty_fn = None
     r.presence_withheld_rounds = 0
+    r.presence_withheld_channels = 0
+    r.entry_channel_violations = 0
     r._entry_round = 0
     r._presence_wait_stamp = None
     r._presence_deadline_s = deadline
@@ -1532,3 +1553,135 @@ def test_can_fail_entering_rank_waits_out_a_withdrawal_then_enters(tmp_path):
     r._commit_to_entering(1, 0)
     assert polls["n"] == 2, "the enterer did not wait for the withdrawal to resolve"
     assert presence.withdrawn(1, round_=0) == set()
+
+
+# -- #631 G: the armed service loop, and flip-commit hygiene -------------------
+#
+# THE DEFECT (metal, 2026-08-09 00:06-00:09Z): a spinning rank stopped
+# issuing its per-pass chain forward, and its downstream reached the hook
+# ONLY by returning from the blocking recv that forward satisfied. The
+# first rank to quiesce therefore blocked every rank behind it -- bounded
+# by the pre-entry deadline, but NOT convergent, because the same rank
+# drained first every epoch and the starvation reproduced identically.
+#
+# THE FIX: while armed, a rank SERVICES its channels each turn (consume
+# what the upstream's counter accounts for, reap what the downstream's
+# counter proves consumed) and reaches the hook by its own poll, so no
+# rank's readiness depends on a peer's traffic.
+
+
+def test_the_gate_takes_a_service_turn_on_every_iteration(tmp_path):
+    """The service turn is what makes the spin a service loop rather than
+    a starvation source. If it stops running, corpse G is back."""
+    presence = _presence(tmp_path, rank=0)
+    turns = []
+    r = _runtime_stub(presence, service_fn=lambda: turns.append(1))
+    r._await_group_presence()
+    r._await_group_presence()
+    assert turns == [1, 1], (
+        "the armed gate skipped its service turn; a rank that stops "
+        "consuming blocks its upstream at a point that PRECEDES the gate, "
+        "where no gate can reach it"
+    )
+
+
+def test_a_failing_service_turn_never_breaks_the_gate(tmp_path):
+    """Servicing is best effort; the gate must survive it failing."""
+    presence = _presence(tmp_path, rank=0)
+
+    def _boom():
+        raise RuntimeError("wire fell over")
+
+    r = _runtime_stub(presence, service_fn=_boom)
+    assert r._await_group_presence() is None
+    assert presence.observe(1, round_=0) == {0}, (
+        "a failed service turn must not stop this rank announcing"
+    )
+
+
+def test_presence_is_withheld_while_a_channel_is_not_empty(tmp_path):
+    """FLIP-COMMIT HYGIENE, the withholding half.
+
+    Quiescent AND fully serviced implies every channel is empty. A rank
+    that is not there yet withholds presence exactly as a rank that still
+    owes a send does -- WITHHOLDING, not abandoning, because a message in
+    flight is normally reaped by the next service turn and abandoning on
+    it would be non-convergent.
+    """
+    presence = _presence(tmp_path, rank=0)
+    state = {"why": "send_req_work is not reaped"}
+    r = _runtime_stub(presence, channels_empty_fn=lambda: state["why"])
+
+    assert r._await_group_presence() is None
+    assert presence.observe(1, round_=0) == set(), (
+        "a rank announced while a channel still held a message; the flag "
+        "would then mean 'I was at the entry once', not 'I owe nothing'"
+    )
+    assert r.presence_withheld_channels == 1
+
+    state["why"] = None
+    assert r._await_group_presence() is None
+    assert presence.observe(1, round_=0) == {0}, (
+        "presence was not announced once the channels came up empty"
+    )
+
+
+def test_can_fail_a_non_empty_channel_at_entry_abandons_before_entering(tmp_path):
+    """CAN-FAIL FOR THE ENTRY ASSERT, and the nastiest silent failure this
+    change can introduce.
+
+    The withholding check above proves nothing about the INSTANT a quorum
+    forms: a peer's message can land in between. A half-consumed two-step
+    point_to_point_pyobj message -- or an unreaped isend -- crossing the
+    re-formation would misframe the post-flip stream silently, long after
+    the flip is forgotten.
+
+    The probe here reports CLEAN on the withholding check and DIRTY on the
+    entry re-check, which is exactly that interleaving. The gate must
+    refuse to enter and abandon PRE-ENTRY, where nothing is owed to
+    anyone.
+    """
+    presence = _presence(tmp_path, rank=0)
+    for peer in (1, 2):
+        _presence(tmp_path, rank=peer).announce(1, round_=0)
+
+    answers = [None, "request chain has 1 unconsumed message(s) from rank 2"]
+    r = _runtime_stub(presence, channels_empty_fn=lambda: answers.pop(0))
+
+    assert r._await_group_presence() is None, (
+        "the gate ENTERED the reduction with a live channel; a message in "
+        "flight across the re-formation misframes the post-flip stream"
+    )
+    assert r.entry_channel_violations == 1
+    assert r._pending is None, "a pre-entry abandonment must disarm"
+    assert presence.entering(1, round_=0) == set(), (
+        "the rank published ENTERING and then did not enter -- that is the "
+        "shape that strands a peer inside a gloo collective"
+    )
+
+
+def test_a_rank_that_can_never_empty_its_channels_abandons_instead_of_wedging(
+    tmp_path,
+):
+    """Withholding MUST fall through to the pre-entry deadline.
+
+    Returning early from the withhold would turn 'wait until clean' into a
+    NEW unbounded wait -- the same shape as the wedge it exists to remove.
+    Same lesson as the owes-a-send clause, which learned it the hard way.
+    """
+    presence = _presence(tmp_path, rank=0)
+    now = {"t": 0.0}
+    r = _runtime_stub(
+        presence,
+        deadline=30.0,
+        clock=lambda: now["t"],
+        channels_empty_fn=lambda: "send_output_work is not reaped",
+    )
+    for _ in range(4):
+        assert r._await_group_presence() is None
+        now["t"] += 12.0
+    assert r._pending is None, (
+        "a rank whose channels never empty waited past its pre-entry "
+        "deadline without abandoning"
+    )
+    assert r.presence_timeouts == 1

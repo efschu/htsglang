@@ -76,6 +76,11 @@ class SchedulerRequestReceiver:
     # must not take on new work and must not block on the chain -- see
     # _pull_raw_reqs.
     phase_flip_armed_hook: Optional[Callable[[], bool]] = None
+    # #631 G: one turn of the ARMED SERVICE LOOP -- consume every inbound
+    # message the upstream's counter accounts for, then reap the sends the
+    # downstream's counter proves consumed. Replaces the poll-based drain,
+    # which absorbed nothing (corpse F).
+    phase_flip_service_hook: Optional[Callable[[], None]] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -152,25 +157,33 @@ class SchedulerRequestReceiver:
         #   rank 0    leaves its requests in the zmq socket. Not reading
         #             them is what buffers them -- there is no queue to
         #             manage and nothing can be lost.
-        #   rank k>0  keeps CONSUMING the chain non-blockingly into the
-        #             receiver's inbox, and reports no new work. Consuming
-        #             is not optional: boot 18 measured what happens when
-        #             an armed rank stops. Rank 2 armed and stopped
-        #             reading, so rank 1's ordinary top-of-pass commit of
-        #             the previous forward blocked in work.wait() BEFORE
-        #             rank 1 could announce presence. The gate never
+        #   rank k>0  keeps CONSUMING the chain -- greedily, and bounded by
+        #             transfer time rather than by peer scheduling, because
+        #             the upstream's published counter proves each message
+        #             exists before the blocking receive is made (#631 G).
+        #             Consuming is not optional: boot 18 measured what
+        #             happens when an armed rank stops. Rank 2 armed and
+        #             stopped reading, so rank 1's ordinary top-of-pass
+        #             commit of the previous forward blocked in work.wait()
+        #             BEFORE rank 1 could announce presence. The gate never
         #             assembled and rank 0 sat in the reduction alone.
         #             The blocking point preceded the gate, so the gate
         #             could never have covered it -- the fix has to be
         #             here, at the obligation itself.
+        #
+        # THE SERVICE TURN RUNS ON EVERY RANK, rank 0 included. Its consume
+        # half is a no-op there (no upstream chain) but its flush half is
+        # not: rank 0 still owes the reaping of the forward it issued in
+        # the pass it armed, and while that handle is unreaped it "owes a
+        # send" and withholds presence for ever.
         #
         # Both halves return an EMPTY list rather than None: empty means
         # "no new work this pass", which every downstream step already
         # handles, whereas None means "not the intake rank".
         if self._phase_flip_armed():
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                if self.ps.pp_rank != 0 and self.chain_receiver is not None:
-                    self.chain_receiver.poll()
+                if self.phase_flip_service_hook is not None:
+                    self.phase_flip_service_hook()
                 return []
             return None
 
