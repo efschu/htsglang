@@ -1523,3 +1523,33 @@ per-iteration counter across ranks.
 6. `pp_flip_drain_tensor_dicts` is still present and uncalled. It is
    corpse S, and the re-diagnosis makes it doubly wrong: it disposes of
    something that was never there. Delete it or keep it only as a specimen.
+
+## 6. THE ROUND TRIP IS PROVEN — added after v7 was written
+
+`scripts/route_a_631_roundtrip_probe.sh`, 2026-08-09 08:24:14-08:28:42Z,
+boot SPEC=on POLICY=manual, park deadline 5 s. Evidence
+`/spinning/evidence-631/roundtrip_PASS_20260809T0828Z`.
+
+    STEP 1  6 arm/abandon cycles under load        repro VERDICT PASS
+    STEP 2  commit on an idle server               3 cutovers
+    STEP 3  serve in the TP phase                  "391" (17 x 23)
+    STEP 4  idle soak 150 s                        10/10 health 200
+    STEP 5  serve, then the return leg             6 cutovers total
+            serve in the PP phase again            "13" (8 + 5)
+
+    health 200 | slot AGREED 18 | slot DIVERGED 0 | proxy refusals 0
+    collective timeouts 0 | SIGQUIT/Fatal 0
+
+**Step 4 is the one that matters for the cadence fix.** The previous boot
+died at cutover + 120 s exactly; here the instance was healthy 129 s and
+150 s after its cutover, with zero collective timeouts. **Step 5 is the
+first PP -> TP -> PP round trip on this strand with serving verified in
+BOTH phases.**
+
+What this does NOT show, stated so nobody reads it as more than it is: the
+commit was taken on an IDLE server. A flip that commits while requests are
+resident is still gated by the draft-state carry (item 2 above) -- with
+SPEC on, the quiescence predicate deliberately refuses to carry a resident
+request into a speculating TP phase, so every armed window under load
+still abandons by design. That is the next build, and it is unchanged by
+this shift.
