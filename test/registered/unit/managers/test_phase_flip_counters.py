@@ -463,3 +463,81 @@ def test_the_armed_intake_services_and_never_blocks_on_any_rank(pp_rank):
     assert calls == [pp_rank], (
         "the armed intake skipped its service turn on this rank"
     )
+
+
+def test_the_receiver_wiring_actually_publishes_the_consumed_count(tmp_path):
+    """THE WIRING, not just the pieces. Metal boot 2026-08-09 01:00Z.
+
+    Every unit above passed while the live system never published a single
+    consumed count: the callback that ``Scheduler._build_pp_chain_receiver``
+    hands to the receiver raised ``NameError`` on its first call, was
+    caught as best-effort, and logged. The upstream could therefore never
+    learn its send had been taken, withheld presence for ever, and all
+    three epochs abandoned at the 60 s deadline.
+
+    Nothing in the unit suite touched that lambda. This test builds the
+    receiver THROUGH the real factory and drives one message through the
+    real state machine, so the callback is executed rather than merely
+    constructed.
+    """
+    from sglang.srt.managers import pp_chain_receiver as rxmod
+    from sglang.srt.managers.scheduler import Scheduler
+
+    class _Ps:
+        pp_size = 3
+        pp_rank = 1
+        tp_size = 1
+        attn_tp_rank = 0
+        attn_cp_rank = 0
+        attn_dp_rank = 0
+        attn_cp_size = 1
+        attn_tp_size = 1
+
+    class _Args:
+        enable_phase_flip = True
+
+    class _Grp:
+        cpu_group = None
+
+    class S:
+        ps = _Ps()
+        server_args = _Args()
+        world_group = _Grp()
+
+    s = S()
+    s.pp_flip_counters = _counters(tmp_path, rank=1)
+    rx = Scheduler._build_pp_chain_receiver.__get__(s, S)()
+    assert rx is not None, "the receiver must be built when the flip is on"
+
+    # Drive one whole message through the real machine.
+    monkey = _FakeSizeZeroDist()
+    original = rxmod.dist
+    rxmod.dist = monkey
+    try:
+        rx._advance(block=True)
+    finally:
+        rxmod.dist = original
+
+    assert rx.publish_failures == 0, (
+        "the consumed-counter callback raised; the upstream is then blind "
+        "to this rank's progress and every flip abandons at the deadline"
+    )
+    assert rx.consumed == 1
+    assert _counters(tmp_path, rank=0).consumed(CHAN_REQ, 1) == 1, (
+        "the consumed count never reached /dev/shm, so no peer can read it"
+    )
+
+
+class _FakeSizeZeroDist:
+    """Hands out one empty (size-0) chain message, which is a whole
+    message: an empty forward still carries the pass."""
+
+    def irecv(self, tensor, src=None, group=None):
+        class _W:
+            def wait(self_inner):
+                tensor.zero_()
+
+            def is_completed(self_inner):
+                return True
+
+        return _W()

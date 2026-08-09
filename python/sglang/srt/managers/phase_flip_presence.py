@@ -330,6 +330,63 @@ neither is a variant of anything above.
       as load-bearing as evidence that it arrived, and only one of the
       two currently exists.
 
+G IS FIXED ON METAL, AND WHAT IT UNCOVERED (2026-08-09 01:11-01:16Z)
+--------------------------------------------------------------------
+Boot POLICY=auto, tree 088d4dddfa + the counter-publish fix.
+
+  MEASURED FIXED. All three ranks now REACH THE ENTRY with no traffic
+  driving them there: "group present for epoch 0 after 0.00s/0.01s" on
+  ranks 0, 1 and 2, all three ENTERING markers on disk, and rank 0's
+  stack INSIDE the reduction. Every predecessor boot had at least one
+  rank blocked upstream of the gate. The starvation is gone, and it is
+  gone for the reason the design predicted: no rank's readiness depends
+  on a peer's traffic any more.
+
+  FIRST ATTEMPT FAILED ON A ONE-LINE WIRING BUG, worth recording because
+  the failure MODE is the lesson. The consumed-counter callback raised
+  NameError on its first call (a missing import in the factory, not in
+  the module under test). It was caught as best-effort and logged, so
+  every unit test passed while the live system published no consumed
+  count at all -- and the visible symptom was ranks 0 and 1 "never
+  reaching the flip entry", i.e. the abandonment message pointed at the
+  wrong place: they DID reach it and declined to announce. Two permanent
+  consequences: a rank now LOGS WHY it is withholding, and the receiver
+  wiring is pinned by a test that drives the real factory's callback
+  rather than constructing one
+  (test_the_receiver_wiring_actually_publishes_the_consumed_count).
+
+  I   QUIESCENCE IS RANK-LOCAL, THE OBLIGATION IS PAIRWISE. The defect
+      underneath G, and NOT a variant of it. Three stacks, 01:15Z:
+        rank 0  inside the consensus reduction
+        rank 1  spinning at the gate, WITHHOLDING (still owes a chain
+                send -- its downstream is not consuming)
+        rank 2  blocked in _pp_recv_proxy_tensors -> recv_tensor_dict,
+                i.e. the HIDDEN-STATES channel
+      Rank 2 had launched a microbatch and was waiting for rank 1's
+      hidden states. Rank 1 had meanwhile declared itself quiescent --
+      _pp_microbatches_drained is RANK-LOCAL and cannot see that a
+      downstream is committed to receiving from it -- armed, and gone to
+      the gate, where it will never produce them. The arm that would have
+      armed rank 2 was posted behind that same wedge (req.s1=4441 against
+      req.c2=4440, the one unconsumed message), so rank 2 stayed UNARMED
+      while ranks 0 and 1 re-armed: the epochs diverged, and the group
+      abandoned every 30 s at the park deadline.
+
+      THE GENERAL FORM, and it is why this is structural rather than a
+      missed case: a rank may declare quiescence only for state IT owns,
+      but the pipeline's obligations are PAIRWISE. Rank k+1's committed
+      recv is an obligation on rank k that rank k's own predicate cannot
+      observe. Note this is the SENDER side of the channel the service
+      loop deliberately does not consume -- the argument for not
+      consuming it ("a rank with an inbound dict message is by definition
+      not quiescent") is sound for the RECEIVER and says nothing about a
+      peer that stops SENDING.
+
+      Note also what did NOT go wrong: nothing wedged inside a
+      collective, nothing was aborted, no request was touched, and the
+      server stayed answering. The bounded pre-entry machinery held
+      throughout.
+
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
 Measured 2026-08-08 23:39Z, all three stacks

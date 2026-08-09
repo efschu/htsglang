@@ -104,6 +104,9 @@ class PpChainReceiver:
         #: same as messages handed to the scheduler: the inbox sits
         #: between them.
         self.consumed = 0
+        #: Publishes that failed. Nonzero means the upstream is blind to
+        #: this rank's progress, which stalls every flip.
+        self.publish_failures = 0
         self._state = _IDLE
         self._size_tensor: Optional[torch.Tensor] = None
         self._size_work = None
@@ -171,7 +174,25 @@ class PpChainReceiver:
         try:
             self._on_consumed(self.consumed)
         except Exception as exc:  # noqa: BLE001
-            logger.error("%s consumed-counter publish failed: %s", LOG_PREFIX, exc)
+            # THROTTLED, because this fires per message and a permanent
+            # failure would otherwise bury the log it needs to be found in.
+            # It must still be loud on the FIRST occurrence: a consumed
+            # count that never gets published means the upstream can never
+            # reap its send, so it withholds presence for ever and every
+            # flip abandons at the presence deadline. That is exactly how
+            # the first metal run of this design failed (a NameError in the
+            # publish callback, boot 2026-08-09 01:00Z) -- and this line is
+            # what identified it in two minutes.
+            self.publish_failures += 1
+            if self.publish_failures == 1 or self.publish_failures % 1000 == 0:
+                logger.error(
+                    "%s consumed-counter publish failed (%d so far): %s. The "
+                    "upstream cannot learn its send was taken, so it will "
+                    "withhold presence and every flip will abandon.",
+                    LOG_PREFIX,
+                    self.publish_failures,
+                    exc,
+                )
 
     def _complete_data(self) -> None:
         serialized = bytes(self._data_tensor.cpu().numpy())
