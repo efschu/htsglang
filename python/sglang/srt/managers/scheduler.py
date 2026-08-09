@@ -7007,31 +7007,44 @@ class Scheduler(
         state = self.phase_policy_state
         observe_idle(state, inp)
         decision = decide(cfg, state, inp)
-        # #631: DO NOT ARM a flip that cannot become ready. A carried
-        # request has no draft state, so with speculation armed for the TP
-        # phase the readiness predicate holds the flip until nothing is
-        # resident -- and under sustained decode something always is. The
-        # flip then parks for the full deadline and abandons, EVERY time,
-        # and the abandon path itself faulted on metal (05:21:16Z, a
-        # device-side illegal memory access right after "FLIP ABANDONED").
+        # #631: DO NOT ARM a flip that cannot become ready.
         #
-        # Declining here rather than arming-and-waiting keeps the group out
-        # of that path entirely. It is safe to decide rank-locally because
+        # This used to decline EVERY pp_to_tp flip with anything resident,
+        # because a carried request had no draft state: the readiness
+        # predicate then held the flip until nothing was resident, and
+        # under sustained decode something always is, so the flip parked
+        # for the full deadline and abandoned EVERY time (05:21:16Z, and
+        # the abandon path itself faulted). That pinned the instance in PP
+        # at 16.8 tok/s against the 113 tok/s TP+MTP does.
+        #
+        # The draft-state bootstrap removes the cause
+        # (managers/phase_flip_draft_bootstrap.py), so a resident request
+        # is no longer a reason to decline. What survives is the structural
+        # residue: if the armed draft worker exposes no KV pool, the
+        # cutover cannot bootstrap anything and the old park-and-abandon
+        # would be back -- so keep declining in exactly that case.
+        #
+        # Still decided rank-locally, and still safe for the same reason:
         # only the REQUEST-ORIGIN rank evaluates the policy and the arm is
-        # broadcast from it (see this method's docstring); a refusal inside
-        # PhaseFlipRuntime.arm would be a different thing and would risk
-        # diverging epochs, which is corpse H.
+        # broadcast from it. A refusal inside PhaseFlipRuntime.arm would be
+        # a different thing and would risk diverging epochs, corpse H.
+        from sglang.srt.managers.phase_flip_runtime import (
+            _flip_can_bootstrap_draft,
+        )
+
         if (
             decision.wants_flip
             and decision.direction == PP_TO_TP
             and not self.flip_spec_algorithm.is_none()
             and inp.running_bs > 0
+            and not _flip_can_bootstrap_draft(self)
         ):
             decision = PhasePolicyDecision(
                 None,
                 f"speculating TP phase and {inp.running_bs} request(s) "
-                f"resident: they have no draft state, and arming would "
-                f"park until the deadline and abandon",
+                f"resident, and the armed draft worker exposes no KV pool "
+                f"to bootstrap them into: arming would park until the "
+                f"deadline and abandon",
             )
         if not decision.wants_flip:
             # #631 defect N: a policy that DECLINES used to be silent, so

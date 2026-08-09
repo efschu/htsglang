@@ -219,6 +219,23 @@ def _flip_spec_algo(scheduler):
     return algo
 
 
+def _flip_can_bootstrap_draft(scheduler) -> bool:
+    """Can the cutover give a carried request draft state at all?
+
+    The bootstrap's one structural requirement is a draft KV pool to scrub
+    -- the seed and the trivial-verify round need nothing else. The draft
+    worker itself lives on the flip's TP stack from boot
+    (``PhaseFlipStacks.draft_worker``), not on ``scheduler.draft_worker``,
+    which is None throughout the PP phase by design; asking the live
+    scheduler would answer the wrong question and hold every flip forever.
+    """
+    from sglang.srt.managers.phase_flip_draft_bootstrap import draft_kv_pool
+
+    stacks = getattr(scheduler, "phase_flip_stacks", None)
+    draft = getattr(stacks, "draft_worker", None) if stacks is not None else None
+    return draft_kv_pool(draft) is not None
+
+
 def _harvest(scheduler):
     from sglang.srt.managers.phase_flip_resident_carry import (
         harvest_resident_batches,
@@ -353,31 +370,34 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
             ]
             if live:
                 return f"PP microbatches still in flight (mb slots {live})"
-        # #631: SPECULATION AND THE CARRIED REQUEST -- honest by waiting.
+        # #631: SPECULATION AND THE CARRIED REQUEST.
         #
         # A request that prefills in the PP phase has NO DRAFT STATE: the
         # PP phase carries no draft worker by design, so nothing ever ran
         # the draft_extend that a spec instance gives a request after its
         # target extend. Carrying such a request into a SPECULATING TP
-        # phase kills the instance one pass later -- measured 03:32:14Z on
-        # all three ranks:
+        # phase used to kill the instance one pass later -- measured
+        # 03:32:14Z on all three ranks:
         #
         #   eagle_worker_v2.draft -> eagle_draft_cuda_graph_runner.execute
         #   -> foreach_copy: output with shape [1, 1] doesn't match the
         #      broadcast shape [0, 1]        -> SIGQUIT
         #
-        # the draft input having no rows for the carried request. Until
-        # the draft state is built at the flip (HANDOFF_656 v3 section 3),
-        # this rank is simply NOT READY to flip into speculation while
-        # anything is resident.
+        # THAT IS NOW BUILT, and this predicate no longer holds the flip
+        # for it: managers/phase_flip_draft_bootstrap.py scrubs the stale
+        # draft KV of the carried slots and installs a seed at the cutover,
+        # and the first post-flip round runs a 1-node verify whose hidden
+        # states seed the real draft chain.
         #
-        # WAITING, not refusing at arm time. A rank-local refusal inside
+        # WHAT REMAINS IS THE STRUCTURAL CASE, and it stays a wait rather
+        # than becoming an assumption: an instance whose armed draft worker
+        # exposes no KV pool cannot be bootstrapped, so a resident request
+        # would still meet the draft graph runner with nothing behind it.
+        # Waiting, not refusing at arm time -- a rank-local refusal inside
         # arm() would let one rank decline while its peers armed, and
-        # diverging epochs is corpse H -- fatal. Readiness runs through
-        # the bounded park/abandon machinery, which is unanimous by
-        # construction, and it has the right meaning anyway: the flip
-        # happens as soon as nothing has to survive it, which is exactly
-        # the regime every flip before this one ran in.
+        # diverging epochs is corpse H, fatal. Readiness runs through the
+        # bounded park/abandon machinery, which is unanimous by
+        # construction.
         runtime = getattr(scheduler, "phase_flip_runtime", None)
         pending = getattr(runtime, "pending", None) if runtime is not None else None
         if pending == PP_TO_TP and not _flip_spec_algo(scheduler).is_none():
@@ -385,12 +405,12 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
                 len(getattr(b, "reqs", []) or [])
                 for b in _harvest(scheduler)
             )
-            if n_resident:
+            if n_resident and not _flip_can_bootstrap_draft(scheduler):
                 return (
                     f"{n_resident} resident request(s) would enter a "
-                    f"SPECULATING TP phase with no draft state (they "
-                    f"prefilled in the PP phase, which has no draft "
-                    f"worker); waiting for them to finish rather than "
+                    f"SPECULATING TP phase with no draft state, and the "
+                    f"armed draft worker exposes no KV pool to bootstrap "
+                    f"them into; waiting for them to finish rather than "
                     f"crashing the draft graph runner"
                 )
         return None
@@ -886,6 +906,46 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
         scheduler.draft_worker = want_draft
         scheduler.model_worker = want_model_worker
         scheduler.phase_flip_active_stack = PHASE_TP if tp_phase else PHASE_PP
+
+        # 7b. DRAFT STATE for the requests step 6 just carried in.
+        #
+        # AFTER the swap, deliberately: the pool that gets scrubbed is the
+        # newly armed draft worker's, and the seed is installed for the
+        # algorithm this scheduler now runs. Before the swap there is no
+        # draft worker to ask.
+        #
+        # The PP phase has no draft worker at all, so a carried request has
+        # never had a draft_extend and its draft-pool rows -- addressed by
+        # the TARGET's slot ids, which are shared -- still hold the bytes of
+        # whatever request last owned those slots. Without this the first
+        # post-flip decode read a 0-row idle draft input and the graph
+        # runner died (03:32:14Z, foreach_copy [1,1] vs [0,1]).
+        #
+        # Only the PP->TP direction: the TP->PP leg is flipping speculation
+        # OFF, and a request carried into a phase with no drafter needs no
+        # draft state. Its spec_info is simply not read there.
+        from sglang.srt.managers.phase_flip_draft_bootstrap import (
+            arm_draft_bootstrap,
+            retune_carried_batches_for_phase,
+        )
+
+        # Both directions: a carried batch's OWN spec_algorithm field still
+        # says which phase BUILT it, and prepare_for_decode branches on it.
+        # Retune before the bootstrap, so the batch and the scheduler agree
+        # about the phase before anything reads either.
+        retuned = retune_carried_batches_for_phase(scheduler, want_spec_algo)
+        if retuned:
+            logger.info(
+                "%s retuned %d carried batch(es) to spec_algorithm=%s",
+                LOG_PREFIX,
+                retuned,
+                want_spec_algo,
+            )
+
+        if tp_phase:
+            arm_draft_bootstrap(
+                scheduler, scheduler.running_batch, want_draft
+            )
 
         # 8. Deferred aborts drain in the first post-flip round.
         window = getattr(scheduler, "phase_flip_abort_window", None)

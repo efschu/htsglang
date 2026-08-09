@@ -856,6 +856,45 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
+        # A VERIFY OF A DIFFERENT WIDTH IS A DIFFERENT GRAPH (#631).
+        #
+        # These graphs are recorded at a fixed tokens-per-sequence
+        # (``num_tokens_per_bs`` = num_draft_tokens under speculation), and
+        # every gate below reasons in SEQUENCES: the bs gate divides token
+        # counts by that constant and the buffers were sized by it. A
+        # verify input carrying a DIFFERENT ``draft_token_num`` therefore
+        # replays a graph whose per-sequence token stride does not match
+        # its own -- not a padding question; the tokens land in the wrong
+        # slots.
+        #
+        # Nothing produced such a batch until #631's phase-flip bootstrap
+        # round, which runs a 1-node trivial verify on an instance whose
+        # graphs were captured at 4. It gets eager execution -- correct and
+        # merely slower, for one round per flip -- instead of a silently
+        # misaligned replay.
+        #
+        # THE CONDITION IS DELIBERATELY THE NARROWEST ONE THAT COVERS IT,
+        # and a plain ``draft_token_num != num_tokens_per_bs`` was written
+        # first and rejected: ``num_tokens_per_bs`` is fixed at capture time
+        # from ``speculative_num_draft_tokens``, while adaptive speculative
+        # decoding varies the ACTIVE width at runtime, so the inequality
+        # would have refused graphs across ordinary adaptive operation --
+        # a silent throughput collapse dressed as a safety check. The
+        # 1-node trivial verify is identified by what only it sets:
+        # ``spec_steps == 0`` (no drafting happened) with a width of 1, on
+        # a runner whose graphs are wider than 1. The zero-step config,
+        # where this shape is the NORMAL one, captures at
+        # num_tokens_per_bs == 1 and is excluded by the last clause.
+        spec_info = forward_batch.spec_info
+        spec_width = getattr(spec_info, "draft_token_num", None)
+        if (
+            spec_width is not None
+            and int(spec_width) == 1
+            and getattr(spec_info, "spec_steps", None) == 0
+            and int(self.num_tokens_per_bs) > 1
+        ):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
