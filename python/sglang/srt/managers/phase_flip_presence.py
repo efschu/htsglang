@@ -486,6 +486,51 @@ alone holding the flip.
       the leak detector would never have said a word. The census cost one
       boot.
 
+      J.1 SLOT SCOPE -- PROVEN, AND FIXED. The "the request finished"
+      reading above was itself wrong, and re-testing it is what found the
+      real defect. ``scheduler.running_batch`` and ``last_batch`` are
+      REBOUND to ``running_mbs[mb_id]`` / ``last_mbs[mb_id]`` at the top of
+      every slot iteration under event_loop_pp, so they describe ONE
+      microbatch slot, not the rank's resident set -- and the flip's hook
+      fires at the end of an arbitrary slot. Census with both scopes
+      reported (2026-08-09 02:21:03Z):
+
+        at-arm       cur_slot_reqs=1 resident_reqs=1 resident_slots=[1]
+        pre-cutover  cur_slot_reqs=0 resident_reqs=1 resident_slots=[1]
+
+      The request was resident THROUGHOUT; the hook merely ran for an
+      empty slot, so live_slots_fn enumerated the tree only and the
+      request's rows were never moved. NOT an accounting bug: rows that
+      are not enumerated are not MOVED, so the freshest KV is left in the
+      source pool and never written to the destination layout -- the
+      request's context is then silently wrong. _live_reqs now enumerates
+      every resident slot.
+
+      J.2 THE ROW EXTENT -- MEASURED, AND IT RUNS THE OTHER WAY. With J.1
+      fixed the extent probe finally fires on a real flip (page_size=1):
+
+        seqlen=82  kv_allocated_len=81  kv_committed_len=81
+        cache_protected_len=80  delta_vs_seqlen=-1
+
+      ``seqlen`` OVER-counts by one against the allocator, the opposite of
+      the falsified hypothesis. Enumerating ``req_to_token[idx, :seqlen]``
+      therefore reads one row BEYOND what the allocator owns -- a stale
+      entry that is moved as if it were live KV. The authoritative extent
+      is ``kv_allocated_len`` (page-aligned when page_size > 1), which is
+      also exactly what the invariant checker charges. NOT yet changed:
+      one measurement on one config is not enough to re-cut an enumeration
+      whose errors are silent, and the change is a one-liner once a second
+      flip confirms the sign.
+
+      J.3 STILL OPEN, and it is the one that matters most. After the
+      cutover the census reports resident_reqs=0 while the unaccounted
+      page persists -- so the resident request appears NOT to survive the
+      flip. No flip has yet been observed carrying a request through to
+      the far side, which means the KV-move path has never actually been
+      exercised end to end with a surviving request. A determined-answer
+      probe on a request that decodes ACROSS a cutover is the cheap oracle
+      and is owed before any acceptance claim.
+
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
 Measured 2026-08-08 23:39Z, all three stacks
