@@ -10,14 +10,17 @@ plus corpse I here). Do not re-walk any corpse.
 
 ## 1. State
 
-- **HEAD**: `ceb1b6f720` (two commits this shift, both on top of
-  `e7a15a193f`). **NOT YET PUSHED** — push after the soak verdict.
-- **Tests**: `bash scripts/run_631_flip_family.sh` → **581 passed**
-  (was 565; +16 from the two new files below).
+- **HEAD**: `e9e2a7ff20`, **PUSHED** to the fork (origin) as a
+  fast-forward `e7a15a193f..e9e2a7ff20`. No force-push, no upstream.
+  Last CODE commit is `54b688aa95`; everything after it is docs.
+- **Tests**: `bash scripts/run_631_flip_family.sh` → **583 passed**
+  (was 565 at v16; +18 across three new files).
 - **Serving**: port 30030 UP on the fixed build, POLICY=auto,
-  pool 277468, ctx 393216. Booted 20:51:41Z.
-- **Soak**: started 20:54:27Z, 65 minutes, `scripts/soak_631_mixed_load.py`.
-  At 20:55: **48 flips committed, 0 scheduler exceptions.**
+  pool 277468, ctx 393216. Booted **21:05:07Z**.
+- **Soak**: **IN FLIGHT** — started 21:05:08Z, 65 min, ends ~22:10Z.
+  See section 8.1 for the evidence paths and the four verdict criteria.
+  **Its verdict was NOT captured before this handoff was written; read it
+  from the files.**
 
 ### Commits this shift
 
