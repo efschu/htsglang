@@ -265,3 +265,50 @@ def test_phase_clock_follows_an_unannounced_layout_change():
     assert state.phase_since == 100.0
     assert _drive(cfg, state, PHASE_PP, 302757, 2, 110.0).direction is None
     assert _drive(cfg, state, PHASE_PP, 302757, 2, 115.0).direction == PP_TO_TP
+
+
+# -- THE 21:39:50Z DEADLOCK, pinned ------------------------------------
+
+
+def test_purity_collapses_the_break_even_to_zero():
+    """CORPSE: purity and the break-even N contradicted each other.
+
+    METAL, first purity boot, 2026-08-09 21:39:50Z. A single health-check
+    prompt arrived while the instance sat in TP with nothing decoding:
+
+        PHASE-POLICY holding in tp: pending prefill 1 tok <= N=7004,
+        running it in tp (pending prefill 1 tok, running bs 0)
+
+    ...and the purity gate refused to prefill it in TP. The server was
+    alive, idle, and permanently unable to answer a one-token prompt.
+
+    N is a BREAK-EVEN -- n/X in TP against C + n/P after a flip -- and that
+    comparison presupposes the TP option exists. Purity removes it, so the
+    only threshold that terminates is 0: ANY pending prefill must move the
+    instance to PP, because PP is the only place prefill can happen.
+    """
+    cfg = _cfg(pp_window_s=15.0, tp_decode_floor_s=10.0, prefill_runs_in_tp=False)
+    state = PhasePolicyState()
+    # The exact metal condition: 1 token pending, nothing decoding.
+    out = _drive(cfg, state, PHASE_TP, 1, 0, 0.0)
+    assert out.direction == TP_TO_PP, out.reason
+    assert "purity" in out.reason
+
+
+def test_without_purity_the_break_even_still_governs():
+    """The collapse is purity-conditional, not a change to N itself: an
+    instance running purity=off keeps the measured break-even."""
+    cfg = _cfg(prefill_runs_in_tp=True)
+    state = PhasePolicyState()
+    assert _drive(cfg, state, PHASE_TP, 1, 0, 0.0).direction is None
+
+
+def test_purity_decode_floor_still_protects_an_active_decode():
+    """Collapsing N must NOT collapse the decode floor: with decode work
+    live, a tiny prefill waits for the floor rather than pre-empting it."""
+    cfg = _cfg(tp_decode_floor_s=10.0, prefill_runs_in_tp=False)
+    state = PhasePolicyState()
+    held = _drive(cfg, state, PHASE_TP, 1, 2, 0.0)
+    assert held.direction is None
+    assert "decode floor" in held.reason
+    assert _drive(cfg, state, PHASE_TP, 1, 2, 10.0).direction == TP_TO_PP

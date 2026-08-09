@@ -145,6 +145,38 @@ the seam". Do not restart from the easy version.
 
 ---
 
+## 4a. CORPSE L — purity vs the break-even N (found on the FIRST purity boot)
+
+The first `POLICY=auto` purity boot came up and immediately wedged. Log,
+21:39:50Z onward, repeating every 10 s with the server alive and idle:
+
+```
+PHASE-POLICY holding in tp: pending prefill 1 tok <= N=7004, running it
+in tp (pending prefill 1 tok, running bs 0)
+```
+
+A single health-check prompt arrived while the instance sat in TP with
+nothing decoding. The policy declined to leave TP because 1 token is far
+below the break-even N, and the purity gate refused to prefill it in TP.
+Health timed out; the server could not answer a one-token prompt, forever.
+
+**The root is conceptual, not a typo.** N is a BREAK-EVEN: it weighs `n/X`
+(prefill in TP) against `C + n/P` (flip first, prefill in PP). That
+comparison presupposes the TP option EXISTS. Purity removes it, so "too
+small to be worth a flip" silently became "too small to ever run".
+
+**Fix**: `PhasePolicyConfig.prefill_runs_in_tp`, set False by the scheduler
+whenever purity forbids TP prefill. The TP→PP threshold then collapses to
+0 — ANY pending prefill moves the instance to PP, because PP is the only
+place prefill can happen. The decode floor still applies when decode work
+exists, so a tiny prefill cannot pre-empt an active decode window.
+
+**Generalisable lesson, and the reason this cost a boot**: purity is not a
+local scheduler gate, it INVALIDATES A PREMISE that other components'
+arithmetic was built on. Anything deriving a threshold from "what it would
+cost to do X in the other layout" is suspect under purity. Grep for other
+consumers of `flip_tokens` before adding the next feature.
+
 ## 5. Exact next steps
 
 1. **The green-criterion run.** Serving must be up on `2ce40f86a2` with
@@ -160,6 +192,27 @@ the seam". Do not restart from the easy version.
 3. **Spill ladder**: only via §4's real path, or not at all.
 4. `PROD_BRINGUP_BENCH.md` §6g still carries the falsified #652
    attribution (HANDOFF_657 §4) — correct it.
+5. **PP STAGE IMBALANCE / 5090 UNDER-DRAWN** (user observation, 2026-08-09,
+   after the green run — it COMPOSES with it, the green run's PP windows
+   are the measurement vehicle). During PP prefill the 5090 draws only
+   ~250 W of its 400 W cap. Ranked suspects:
+   - (a) stage imbalance: `pp_layer_ratio [32,16,16]` /
+     `pp_stage_ratio [2,1,1]` gives the 5090 2x the layers, but it is
+     ~2.5-3x faster per layer than a 3080, so stage 0 finishes early and
+     idles on pipeline bubbles;
+   - (b) `chunked_prefill_size 2048` makes small microbatches, deepening
+     the bubble share (#617 is the standing lead on flexible chunks);
+   - (c) `pp_async_batch_depth 0` — no microbatch overlap depth.
+
+   Deliverable in order: FIRST the per-stage compute-vs-wait split for the
+   PP prefill window (the per-rank CollectiveClock machinery already
+   exists — do not build a new instrument). Only if stage 0 is
+   wait-dominated, then ONE A/B each for a heavier 5090 layer share
+   (36/14/14 or 38/13/13) and a larger prefill chunk. Measure prefill
+   tok/s AND per-card power, same-boot A/A noise floor first (this tree
+   has a recorded cold-boot decay of 4106 -> 3809 tok/s across six reps of
+   ONE build, which reads as an 8 % regression that does not exist). Fold
+   the winner into the ship config; record the numbers either way.
 
 ## 6. Rules that bit this shift
 

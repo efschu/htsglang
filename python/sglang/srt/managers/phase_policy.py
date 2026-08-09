@@ -262,6 +262,23 @@ class PhasePolicyConfig:
     #: comment at DEFAULT_PP_WINDOW_S.
     pp_window_s: float = DEFAULT_PP_WINDOW_S
     tp_decode_floor_s: float = DEFAULT_TP_DECODE_FLOOR_S
+    #: False when STRICT PHASE PURITY forbids prefill in the TP layout.
+    #:
+    #: THIS COLLAPSES N TO ZERO, and it must. N is a BREAK-EVEN: it
+    #: compares running a prefill of n tokens in TP (n/X) against flipping
+    #: first (C + n/P). That comparison presupposes the TP option EXISTS.
+    #: Under purity it does not -- prefill in TP is refused by the
+    #: scheduler gate -- so "too small to be worth a flip" becomes "too
+    #: small to ever run", and the request waits forever.
+    #:
+    #: METAL, 2026-08-09 21:39:50Z, the first purity boot: a single
+    #: health-check prompt arrived while the instance sat in TP with
+    #: nothing decoding. "PHASE-POLICY holding in tp: pending prefill 1 tok
+    #: <= N=7004, running it in tp (running bs 0)" -- and purity refused to
+    #: run it. The server was alive, idle, and permanently unable to answer
+    #: a one-token prompt. Under purity ANY pending prefill must move the
+    #: instance to PP, because PP is the only place it can happen.
+    prefill_runs_in_tp: bool = True
 
     def __post_init__(self) -> None:
         if self.rest_state not in REST_STATES:
@@ -364,7 +381,10 @@ def decide(
         # Enough queued prefill to repay the round trip -> go to the prefill
         # layout. Below the threshold the prefill runs in TP as-is, which is
         # the correct answer for short prompts by construction of N.
-        if inp.pending_prefill_tokens > cfg.flip_tokens:
+        # Under purity the break-even is meaningless (see
+        # prefill_runs_in_tp): the only threshold that terminates is zero.
+        tp_threshold = cfg.flip_tokens if cfg.prefill_runs_in_tp else 0
+        if inp.pending_prefill_tokens > tp_threshold:
             # THE DECODE FLOOR. Under purity every token of prefill has to
             # wait for a PP window, so the backlog is essentially always
             # above N and this rule would otherwise fire the instant
@@ -393,7 +413,7 @@ def decide(
             return PhasePolicyDecision(
                 TP_TO_PP,
                 f"pending prefill {inp.pending_prefill_tokens} tok > "
-                f"N={cfg.flip_tokens}",
+                f"{'N=' + str(cfg.flip_tokens) if cfg.prefill_runs_in_tp else '0 (purity: prefill cannot run in tp)'}",
             )
         # Nothing to do, and the resting layout is PP -> return to rest.
         if idle and cfg.rest_phase == PHASE_PP:
@@ -410,6 +430,9 @@ def decide(
                 f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell"
             )
         if inp.pending_prefill_tokens:
+            # Unreachable under purity: tp_threshold is 0 there, so any
+            # non-zero pending already armed above. Reaching it would mean
+            # the deadlock of 21:39:50Z had returned.
             return _no(
                 f"pending prefill {inp.pending_prefill_tokens} tok <= "
                 f"N={cfg.flip_tokens}, running it in tp"

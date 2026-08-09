@@ -482,6 +482,16 @@ class Scheduler(
 
             self._phase_purity = purity_from_server_args(server_args)
             validate_purity_policy_pair(self._phase_purity, self.phase_policy_cfg)
+            # Tell the policy that the TP layout cannot prefill, so its
+            # break-even N collapses to 0 in that direction. Without this
+            # the two features contradict: purity refuses the prefill and
+            # the policy refuses to leave TP for anything below N, so a
+            # prompt smaller than N never runs at all (metal, 21:39:50Z --
+            # a one-token health check wedged an otherwise idle server).
+            if not self._phase_purity.prefill_allowed_in_tp():
+                self.phase_policy_cfg = dataclasses.replace(
+                    self.phase_policy_cfg, prefill_runs_in_tp=False
+                )
         # #261 live session handover runtime: None on every default path;
         # built lazily on the first /session_handover control request. The
         # admission hook in handle_generate_request is a no-op while this
