@@ -1267,3 +1267,36 @@ GiB per card to spend on the PP pool, which is the number that actually
 sets serving capacity. That is the full-KV route, and it needed no new
 machinery -- only the withdrawal of the transient reading that had made it
 look impossible.
+
+### Spending the headroom: serving capacity 253528 -> 300000 (successor 17)
+
+`RANK_MIB=25700,13920,13970` (from 22700,11920,11970) with
+`MAX_TOTAL_TOKENS=300000`. Boot 22:55:44Z, healthy in ~2.5 min.
+
+**A correction to the model in the section above:** `--max-total-tokens`
+is a GLOBAL cap, not a TP-only one. At 300000 it binds BOTH pools, so the
+PP pool (the id space) rose to 300000 AND the TP pool sits at the same
+number -- which means the unaddressable surplus is **zero by
+construction**, while still satisfying 6e's `TP capacity >= PP capacity`
+as an equality. That is a better configuration than "cap just above the id
+space": there is nothing left to hoard.
+
+| quantity | pool 253528 (cap 260000) | pool 300000 (cap 300000) |
+|---|---|---|
+| serving capacity (id space) | 253528 | **300000 (+18.3 %)** |
+| corridor min, card 0 | 4931 MiB | 4483 MiB |
+| corridor min, card 1 (5090) | 6466 MiB | 5688 MiB |
+| corridor min, card 2 | 4373 MiB | 4051 MiB |
+| TP-phase hold | 874 / 864 / 234 | 954 / 1152 / 188 |
+
+So +46472 tokens of real capacity cost ~448 / 778 / 322 MiB of continuous
+corridor. Against the 1024 MiB floor there is still ~3459 / 4664 / 3027
+MiB per card unspent, and card 2 is the binding one.
+
+**What that implies for the >600k full-KV goal**, stated as an
+extrapolation and not a measurement: at ~322 MiB per 46472 tokens on the
+binding card, the remaining 3027 MiB is worth roughly 400k further tokens.
+The goal is very likely reachable by this route alone. It will stop
+earlier than the arithmetic suggests -- `_profile_available_bytes` (bench
+6f's "honest ceiling") binds the PP budget independently of the corridor
+-- so the number to trust is the next measurement, not this paragraph.
