@@ -314,6 +314,39 @@ spends memory that is currently part of that headroom. Raise `RANK_MIB` in
 `/get_server_info`, and re-sample the corridor under the acceptance load
 before quoting any number.
 
+#### 5c. MEASURED CORRECTION — sizing-time headroom is NOT runtime slack
+
+Do not read the 7.9-9.1 GiB of §5b "headroom" as spendable. Measured live
+during the 21:05 soak, 2464 samples at 100 ms (`corridor_final.csv`):
+
+```
+  3080a  min_free = 1553 MiB     breaches(<1024) = 0
+  5090   min_free = 3698 MiB     breaches        = 0
+  3080b  min_free = 1631 MiB     breaches        = 0
+```
+
+So at the RUNTIME PEAK the 3080s hold only ~530-610 MiB above the corridor
+floor, not 7.9 GiB. The sizing-time `reachable` figure is taken before the
+TP stack allocates its pools and captures graphs; almost all of that
+headroom is genuinely consumed later by graphs, activations and
+fragmentation. Anyone who raises `RANK_MIB` by "the headroom" will breach
+the corridor immediately.
+
+**This is exactly why the spill ladder is the right lever and a budget
+bump alone is not.** The pool that IS the serving capacity is the PP pool
+(§6e of PROD_BRINGUP_BENCH), and KV backing is already exclusive per
+phase — so the binding constraint is the **per-phase peak**, not the sum.
+Spilling the drafter's ~2.5 GiB during PP raises the PP phase's peak
+headroom specifically, which is the phase whose pool sets
+`max_total_num_tokens`. The TP phase keeps its drafter and its current
+peak unchanged.
+
+Revised expectation for §5b's projection, therefore: the ~627k figure is
+reachable only if rung 1+2 actually return ~2.4 GiB to the PP phase at
+runtime. **Verify by measuring the corridor min in the PP phase
+specifically (not the whole-run min) before and after the rungs** — the
+whole-run minimum is dominated by the TP phase and will hide the gain.
+
 ---
 
 ## 6. CUDA GRAPHS (item 4)
