@@ -710,13 +710,40 @@ discount**. The check computes
 
 and on the 5090 that reads `8.68 GiB held + 13.26 GiB free = 21.94 GiB`
 of a 32.6 GiB card -- roughly 9.4 GiB accounted as "held outside this
-process" on a card carrying exactly one rank. That is the deferred **#652**
-residual (the 5090's CUDA context seeing only 19.58 GiB total), not phase
-double-residency, and it is what caps rank 0 at ~22.4 GiB.
+process" on a card carrying exactly one rank.
 
-So the honest ceiling for this mechanism is the shipped 367704, and the
-next real lever is #652, not the flip. Recorded here so the next attempt
-starts from the evidence instead of re-deriving it.
+> **CORRECTION, 2026-08-09 (successor 14). The paragraph that used to
+> follow blamed "the deferred #652 residual (the 5090's CUDA context
+> seeing only 19.58 GiB total)". THAT IS FALSIFIED BY MEASUREMENT.**
+>
+> `scripts/probe_652_device_total.py`, bare process, no serving:
+>
+> ```
+> cuda:0  RTX 5090  mem_get_info total = 32088 MiB  NVML total = 32607  shortfall +519
+> cuda:1  RTX 3080  mem_get_info total = 20054 MiB  NVML total = 20480  shortfall +426
+> cuda:2  RTX 3080  mem_get_info total = 20054 MiB  NVML total = 20480  shortfall +426
+> ```
+>
+> The 5090's CUDA context sees **32088 MiB**. The only gap is the
+> ~519/426 MiB driver carve-out the corridor rule already documents.
+> There is no 13 GiB driver wall, so there is no #652 sizing residual to
+> wait on.
+>
+> Where 19.58 GiB actually comes from: it is the **3080s'** `reachable`
+> value, which sits two lines away in the same `BUDGET-REACH[nvml]` log
+> family. The numbers were crossed when this section was written.
+>
+> What binds the pool instead, measured on both boots today, is that
+> `BUDGET-REACH` reports **shortfall 0.00 GiB on every rank** -- the
+> physical check is not binding at all. The binder is the hand-set
+> `RANK_MIB` in `scripts/route_a_631_prod_boot.sh` (22700/11920/11970),
+> which sits ~9.1/7.9/7.8 GiB below the measured reach and was chosen from
+> corridor sampling. Raising it is an empirical boot-and-sample question,
+> not a driver question.
+>
+> See HANDOFF_657.md sections 4 and 5, including the measured spill ladder
+> (draft weights 1.86-2.01 GB/rank and draft graphs ~0.55 GB/rank are
+> resident in BOTH phases while PP has no draft worker at all).
 
 ## 6h. Final acceptance (commit bc3016595d, production)
 
