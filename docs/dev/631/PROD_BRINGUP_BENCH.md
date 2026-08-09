@@ -1233,3 +1233,37 @@ from a phase hold. The separator is cheap and should be standard for any
 future seam measurement: hold the target layout under load for
 substantially longer than one cutover, and check whether the level tracks
 the WORK or the CUTOVER.
+
+### Confirmation on metal: capping the TP pool releases the plateau (successor 17)
+
+One variable changed against the boot above: `MAX_TOTAL_TOKENS=260000`
+(just above the PP id space of 253528, honouring the 6e invariant
+`TP capacity >= PP capacity`). Same model, same CTX 393216, same
+`RANK_MIB=22700,11920,11970`, same token vector. Measured with
+`scripts/phase_plateau_measure.sh` (one 1200-token generation, 100 ms NVML
+sampling, plateaus taken as the dwell-weighted modes rather than the
+endpoints so a cutover sample cannot be mistaken for a level).
+
+| card | TP-phase hold, cap 500000 | TP-phase hold, cap 260000 |
+|---|---|---|
+| 0 | 2960 MiB | **874 MiB** |
+| 1 (5090) | 1400 MiB | **864 MiB** |
+| 2 | 1810 MiB | **234 MiB** |
+
+| card | corridor minimum (TP phase), cap 500000 | cap 260000 |
+|---|---|---|
+| 0 | 2739 MiB | **4931 MiB** |
+| 1 (5090) | 4848 MiB | **6466 MiB** |
+| 2 | 2693 MiB | **4373 MiB** |
+
+PP-phase free also rose (5705/6248/4507 -> 5805/7330/4607). The PP pool is
+unchanged at 253528, as expected: `--max-total-tokens` caps the TP pool
+only, and the id space is the PP pool.
+
+**~1.6-2.2 GiB per card of CONTINUOUS headroom, recovered by a flag that
+was already in the tree and was simply set above the TP pool's own
+sizing.** Against the 1024 MiB floor this leaves roughly 3.9 / 5.4 / 3.3
+GiB per card to spend on the PP pool, which is the number that actually
+sets serving capacity. That is the full-KV route, and it needed no new
+machinery -- only the withdrawal of the transient reading that had made it
+look impossible.
