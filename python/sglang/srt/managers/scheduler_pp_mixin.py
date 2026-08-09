@@ -201,7 +201,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -248,6 +248,7 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                                 msg_type="proxy",
+                                stamp=self._pp_proxy_stamp(mb_id, result),
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -358,7 +359,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -434,6 +435,7 @@ class SchedulerPPMixin:
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                            stamp=self._pp_proxy_stamp(mb_id, result),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -510,7 +512,7 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if not cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
 
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
@@ -617,6 +619,7 @@ class SchedulerPPMixin:
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                            stamp=self._pp_proxy_stamp(mb_id, result),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -1656,6 +1659,7 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        stamp: Optional[tuple] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1664,6 +1668,26 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        # #631 VARIANT B: make the proxy pairing NON-POSITIONAL.
+        #
+        # The consumer used to pair "whatever came off the wire this slot
+        # iteration" with "whatever batch I have this slot iteration".
+        # PPProxyTensors carried no identity, so ONE stranded message put
+        # every later receive off by one, silently and for ever -- the
+        # mispairing root cause (specimen pp_proxy_mispair_20260809T0626Z).
+        #
+        # The stamp gives the message its own identity so a leftover from an
+        # abandoned window matches nothing and is dropped LOUDLY instead of
+        # being computed on. No rank's launch timing moves and no
+        # synchronisation point is added, which is what the refined design
+        # law demands after the resume gate wedged the instance (HANDOFF §7).
+        #
+        # It rides as a dict entry because that is what crosses the wire, and
+        # that is SAFE BY PRECEDENT rather than by hope: __msg_type__ above is
+        # itself a non-tensor entry that has always travelled in this dict and
+        # into PPProxyTensors without a consumer tripping over it.
+        if stamp is not None:
+            tensor_dict["__stamp__"] = stamp
         p2p_work = []
         stats = self._pp_boundary_stats()
         started = time.perf_counter() if stats else 0.0
@@ -1727,18 +1751,70 @@ class SchedulerPPMixin:
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
-    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
-        pp_proxy_tensors = None
-        if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
-                )
+    def _pp_proxy_stamp(self: Scheduler, mb_id: int, result) -> tuple:
+        """#631 VARIANT B: the identity a proxy message carries.
+
+        (mb_id, monotone seqno, row count). The seqno is per rank and never
+        resets, so it distinguishes two messages for the SAME slot -- which
+        is exactly the pair a stranded leftover creates.
+        """
+        self._pp_proxy_seq = getattr(self, "_pp_proxy_seq", 0) + 1
+        rows = -1
+        try:
+            hs = result.pp_hidden_states_proxy_tensors.tensors.get("hidden_states")
+            if hs is not None:
+                rows = int(hs.shape[0])
+        except Exception:  # noqa: BLE001 - a stamp may never break a send
+            pass
+        return (int(mb_id), int(self._pp_proxy_seq), rows)
+
+    def _pp_recv_proxy_tensors(self: Scheduler, mb_id: int = -1) -> Optional[PPProxyTensors]:
+        """Receive this slot's hidden states, and PROVE they are this slot's.
+
+        #631 VARIANT B. A message whose stamp does not name this slot is a
+        LEFTOVER -- almost always one sent by an upstream that had already
+        resumed while this rank was still armed, which under the old
+        positional pairing was consumed as if it belonged here and put every
+        later receive off by one. It is now dropped, LOUDLY and with its
+        identity, and the next message is taken instead.
+
+        Bounded: a handful of drops, then give up rather than spin. Dropping
+        is safe precisely because the sender is not waiting on us -- the
+        proxy send is async and its handle is reaped by the sender's own
+        commit, so discarding a message it already posted costs that
+        microbatch and nothing else.
+        """
+        if self.pp_group.is_first_rank:
+            return None
+        for _ in range(8):
+            raw = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
             )
-        return pp_proxy_tensors
+            stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
+            if stamp is None or mb_id < 0 or int(stamp[0]) == int(mb_id):
+                return PPProxyTensors(raw)
+            self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
+            logger.error(
+                "%s PROXY LEFTOVER DROPPED: stamp mb_id=%s seq=%s rows=%s "
+                "arrived while this rank is on mb_id=%s. This is a message "
+                "from an upstream that resumed before this rank did -- under "
+                "the old positional pairing it would have been computed on "
+                "as if it belonged here, and every later receive would have "
+                "been off by one for the rest of the loop's life. Dropped; "
+                "that microbatch is lost, the stream stays aligned. "
+                "(%d dropped this boot)",
+                "PHASE-FLIP",
+                stamp[0], stamp[1], stamp[2], mb_id, self._pp_proxy_drops,
+            )
+        logger.error(
+            "%s gave up draining proxy leftovers for mb_id=%s after 8 "
+            "messages; the stamps and the slot clock disagree persistently",
+            "PHASE-FLIP", mb_id,
+        )
+        return None
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
