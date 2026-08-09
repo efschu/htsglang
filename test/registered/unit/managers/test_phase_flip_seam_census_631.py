@@ -170,5 +170,45 @@ class TestAttribution(unittest.TestCase):
         self.assertIsNone(census.active())
 
 
+
+class TestTheLabelCannotReSeedTheOriginalError(unittest.TestCase):
+    """A flip that ENDS lower than it started spent a PHASE STEP, not a
+    transient. Conflating the two is precisely what put a withdrawn
+    1.4-3.0 GiB "cutover cost" into three handoffs, so the instrument is
+    pinned against re-seeding it."""
+
+    def setUp(self):
+        census.reset()
+
+    def tearDown(self):
+        census.reset()
+
+    def test_a_flip_that_ends_at_its_low_reports_a_phase_step(self):
+        # Shape measured on metal for tp_to_pp rank 0: free RISES at the
+        # backing release, falls at the restore, and the flip ends there.
+        probe = _probe_sequence(
+            (6819, 0, 0),   # entry
+            (10335, 0, 0),  # backing_release -- source pages handed back
+            (5663, 0, 0),   # backing_restore -- destination committed
+        )
+        census.begin("tp_to_pp", 0, probe=probe)
+        census.mark("backing_release")
+        census.mark("backing_restore")
+        line = census.end().format_line()
+        self.assertIn("phase step", line)
+        self.assertNotIn("transient", line)
+
+    def test_a_genuine_dip_in_the_middle_is_still_a_transient(self):
+        probe = _probe_sequence(
+            (6000, 0, 0),
+            (2000, 0, 0),  # a real dip
+            (6000, 0, 0),  # given back
+        )
+        census.begin("pp_to_tp", 0, probe=probe)
+        census.mark("gdn_state")
+        line = census.end().format_line()
+        self.assertIn("transient", line)
+        self.assertNotIn("phase step", line)
+
 if __name__ == "__main__":
     unittest.main()

@@ -205,9 +205,26 @@ class SeamCensus:
             prev_free = free
         low = self.trough()
         peak = self.peak_bytes()
+        # NAME IT FOR WHAT IT IS. If the least-free stage is the LAST one,
+        # the flip simply ENDED lower than it started and the number is the
+        # PHASE STEP -- the destination layout holding more than the source
+        # -- not a transient the cutover spends and gives back. Calling
+        # both "transient" is exactly the conflation that put a withdrawn
+        # 1.4-3.0 GiB "cutover cost" into three handoffs; the instrument
+        # must not re-seed it.
+        # Compared against the last stage with a VALID reading, not simply
+        # the last row: end() appends a "done" mark whose probe can fail,
+        # and a failed row at the end would otherwise mask a flip that
+        # really did finish at its lowest point.
+        last_valid = None
+        for label_i, free_i, _r, _a in self.stages:
+            if free_i >= 0:
+                last_valid = label_i
+        ended_at_the_low = low is not None and last_valid == low[0]
+        label = "phase step" if ended_at_the_low else "transient"
         head = (
             f"{LOG_PREFIX} {self.direction} rank {self.rank}: "
-            f"transient {(peak or 0) // _MIB} MiB"
+            f"{label} {(peak or 0) // _MIB} MiB"
         )
         if low is not None and base is not None:
             head += (
