@@ -1301,3 +1301,106 @@ aborts. Both runs above came from it. Results:
 pass condition in either direction. A drop is the fix working; zero drops
 in a run with abandons means the strand did not occur on that schedule.
 The pass condition is the absence of the MISPAIR.
+
+---
+
+# HANDOFF v6, part 2 — corpse S, and where this shift actually got to
+
+Written the same day, after v6 above. Read v6 first: it is the corpse-R
+half. **The tree HEAD is `d82d88d1a2` and it SERVES** (health 200, correct
+completion, control PASS at 07:41:20Z).
+
+## 1. Ledger of this shift
+
+| | verdict | evidence |
+|---|---|---|
+| the stamp's DETECTION | **PROVEN on metal** | 07:19:23Z, PP1, `stamp mb_id=2 seq=2811 rows=1` -- the mispair specimen's own signature, named and refused |
+| the stamp reaching model compute | **found and fixed** | `test_the_stamp_is_stripped_before_the_model_sees_it` failed against `d733266b5d` |
+| tuple-over-the-wire safety | **settled, not assumed** | `_split_tensor_dict` has ONE branch, `isinstance(value, torch.Tensor)`; the rest is generic pickle |
+| DISPOSAL: drop and retry | **corpse R** | wedged in 6 s; surplus recv against a one-per-pass debt |
+| PREVENTION: armed drain | **corpse S** | ate an OUTPUT message in one arm; PP1 then waited for it for ever |
+| the box | **serving** | `d82d88d1a2`, SPEC=on POLICY=manual, control PASS |
+
+Two designs died on metal in one shift, and both died of the same family
+of error: **reasoning about this wire from its topology instead of from
+the code that reads it.**
+
+## 2. THE FACT THAT BOTH CORPSES TURN ON, stated once and plainly
+
+**The upstream wire is MULTIPLEXED and it owes exactly one message per
+pass.** Two consequences, and each killed a design:
+
+* **You may not take more than you are owed.** Corpse R dropped a message
+  and took another. The wire had nothing more; PP1 and PP2 blocked in the
+  proxy recv, PP0 in the output recv, a closed cycle.
+* **You may not discard what you cannot identify.** Corpse S discarded by
+  position on the wire rather than by kind. The proxy forward and the
+  output return share that wire and are separated only by `__msg_type__`
+  AFTER coming off it. A proxy for a pass an armed rank never ran is void;
+  an OUTPUT belongs to work launched BEFORE the arm and is still owed.
+
+`_pp_recv_typed_dict` and its inbox exist because of exactly this. Both
+designs treated the demultiplexer as an obstacle to route around. It is
+the statement of the fact they got wrong.
+
+## 3. What the next attempt should and should not do
+
+**Do not** re-enable `pp_flip_drain_tensor_dicts` as written. It is kept,
+uncalled, with the specimen inside it.
+
+**A correct drain must demultiplex first**: stash `output` in the inbox
+where its consumer already looks, and only then decide about `proxy`. That
+decision is still not free -- a microbatch launched before the arm is in
+flight and its proxy is owed too, so "an armed rank runs no passes" does
+not make every proxy void either. The honest form of the remaining
+question is: **which proxies is an armed rank still owed?** Neither corpse
+answered it, and neither did I.
+
+**The detection is worth keeping regardless.** It converted this class
+from silent corruption into a named identity twice in one shift, and it
+costs nothing on the healthy path (three control runs, zero drops, decode
+13.89 vs 14.06 tok/s across builds).
+
+**The residual limit stands**: the match is on `mb_id` alone, cyclic
+modulo `pp_loop_size` = 3 here (`pp_async_batch_depth=0`, confirmed in the
+boot log), so a leftover a whole cycle stale is accepted. The seqno is
+stamped and unused, and the reason it cannot simply be used is worth
+recording: upstream's seqno and this rank's consumed count stay
+CONSECUTIVE across a strand, so equality holds and the stale message is
+accepted anyway. Distinguishing them needs a shared pass clock, which is
+defect Q, which is open.
+
+## 4. Untouched by this shift, in the order the program asked for them
+
+1. **Draft-state carry** -- not started. v4's measurement stands: waiting
+   is worth nothing under sustained decode, declining pins the instance in
+   PP at 16.8 vs 113 tok/s.
+2. **Full acceptance** (auto + graphs + spec + max KV, corridor near
+   1024 MiB) -- not started. The budget is still ~7 GiB loose: measured
+   free at idle on this boot was 5503/5792/4171 MiB against a 1024 floor.
+3. **A-vs-A gate vs `9a929352c9`** -- not started.
+4. **The sibling OUTPUT wire is still unstamped** and has the identical
+   guard shape (`mbs[next_mb_id]` at :1940). Corpse S makes it more
+   interesting, not less: that wire is now known to carry work an armed
+   rank still owes.
+
+## 5. Tools this shift leaves behind
+
+* `scripts/route_a_631_proxy_strand_repro.py` -- the reproducer AND its
+  control, with a PASS/FAIL verdict. `--cycles N` for arm/abandon cycles,
+  `--cycles 0` for the control. It found both corpses.
+* `test/registered/unit/managers/test_pp_proxy_stamp_631.py` -- 17 pins,
+  registered in the family script (442 total). The refusal pin asserts
+  `recv_calls == 1`, so corpse R cannot be reintroduced silently.
+* Specimens: `/spinning/evidence-631/stamp_drop_wedge_20260809T0719Z`
+  (corpse R) and
+  `/spinning/evidence-631/wedge_20260809T073423Z_armed_drain_ate_output_20260809T0733Z`
+  (corpse S).
+
+## 6. Delegation, for the record
+
+One subagent, for the mechanical consumer/transport sweep in §1 of v6.
+Everything else was interactive because it was metal work on a single
+shared instance, which does not parallelise: the three cards are one
+resource and every design question this shift asked was answered by a boot
+rather than by reading.
