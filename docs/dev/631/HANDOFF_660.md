@@ -172,37 +172,79 @@ the worktree.
    holding the layout under load. A falsifier that a wrong hypothesis also
    passes is not a falsifier.
 
-## 6. State at handover
+## 6. RESULT: the capacity ladder, measured
 
-* HEAD `32507a4751`, pushed to fork. Suite 641 green.
-* Serving was rebooted by me with `MAX_TOTAL_TOKENS=260000` (the TP cap, as
-  the single changed variable) to test §2's prediction. **Check
-  `/spinning/serving-30030.boot.log` and the holder for the outcome — if
-  this handoff has no result table in §7, the boot's result was not yet
-  in when it was written.**
+The correction in §1-2 is not just bookkeeping -- it unlocked the thing
+the previous handoff called impossible. Four boots this shift, same model
+/ CTX 393216 / token vector, `MAX_TOTAL_TOKENS` set EQUAL to the target
+so it binds both pools (zero unaddressable surplus; 6e's
+`TP capacity >= PP capacity` satisfied as an equality):
+
+| RANK_MIB | cap | serving capacity | corridor min (TP phase) |
+|---|---|---|---|
+| 22700,11920,11970 | 500000 | 253528 | 2739 / 4848 / 2693 |
+| 22700,11920,11970 | 260000 | 253528 | 4931 / 6466 / 4373 |
+| 25700,13920,13970 | 300000 | **300000** | 4483 / 5688 / 4051 |
+| 29200,15920,15970 | 360000 | **360000** | 3803 / 4700 / 3499 |
+
+**+42.0 % serving capacity**, corridor minimum still 2779 / 3676 / 2475
+MiB above the 1024 MiB floor. Card 2 binds throughout. A fourth boot
+(`RANK_MIB=32200,17700,17750`, cap 520000) was in flight when this was
+written -- **check the holder and the bench for its outcome.**
+
+Marginal cost over the last rung is 680 / 988 / 552 MiB per 60000 tokens,
+so card 2's remaining headroom is worth roughly 269000 further tokens, a
+~629000-token class. That would meet the >600k full-KV goal. Treat it as
+the next experiment: `_profile_available_bytes` (bench 6f's "honest
+ceiling") binds the PP budget independently of the corridor and is
+expected to stop the ladder before the corridor does.
+
+**None of this needed the zero-allocation staging the previous handoff
+called the keystone.** The capacity was behind a cap that had been set
+above the pools' own sizing.
+
+### The census confirms the correction from inside the process
+
+First production firing of the seam census (boot 22:55Z, `tp_to_pp`, per
+rank):
+
+    backing_release   free +2496 / +3520 / +3264 MiB
+    backing_restore   free -2336 / -4672 / -2336 MiB
+    kv_pack / kv_exchange / kv_local_read     0 to -2 MiB
+
+Free memory RISES at the seam and never dips below the lower of the two
+phase levels -- `_build_kv_backing_swap`'s "SOURCE FIRST" ordering does
+what its comment claims. Independent of the plateau measurement, and
+agreeing with it: there is no multi-GiB cutover dip, and the carried
+payload is negligible.
+
+## 7. State at handover
+
+* HEAD `420159fd87` and later, pushed to fork. Suite 641 passed (plus 2
+  further census pins added after that run; re-run to confirm 643).
+* Serving: rebooted four times this shift. The last KNOWN-GOOD
+  configuration is `RANK_MIB=29200,15920,15970` + `MAX_TOTAL_TOKENS=360000`
+  (pool 360000, healthy, corridor 3803/4700/3499). **If the in-flight boot
+  4 failed, restore that one.**
 * Boot recipe: `/tmp/s17_boot.sh` replays the proven yarn1.5 / CTX=393216
-  config from the live `/proc` environ. The boot script **defaults to CTX
-  262144**; successor 15 misbooted on exactly that.
-* Purity is still OFF and the fairness windows are still 0. Nothing about
-  the acceptance criteria has been proven this shift.
+  config from a live `/proc` environ; pass `MAX_TOTAL_TOKENS` and
+  `RANK_MIB` to move a rung. The boot script DEFAULTS to CTX 262144.
+* Purity is still OFF and the fairness windows are still 0. **None of the
+  acceptance criteria (purity strict, >=60 min, real agent traffic,
+  graph A/Bs) has been proven this shift.**
 
-## 7. Next steps, in order
+## 8. Next steps, in order
 
-1. Confirm the TP cap released the plateau: `bash
-   scripts/phase_plateau_measure.sh capped` and compare the two plateaus
-   against the uncapped numbers in §1. Expect the TP plateau to rise to
-   near the PP plateau.
-2. Spend the released headroom on the **PP** pool (`RANK_MIB`, and
-   `--gdn-resident-state-slots 10` which bench documents as
-   253528 → 277468), keeping the cap just above the new id space. Watch
-   `_profile_available_bytes` — bench §6f's "honest ceiling" is the known
-   binder here, not the corridor.
-3. Only then re-enable fairness windows + `--phase-flip-purity strict`
-   (the user's hard default, must be ON in the ship config) and prove on
-   ≥60 min with minutes-scale settle windows.
-4. Graph A/Bs per spec item 8 (NEXTN draft graphs OFF unless measured
-   positive; DFLASH × graphs; PP-prefill graphs) and the 5090
-   stage-imbalance lead (~250 W of 400 W during PP3 prefill).
-5. Final ≥60-min green run with real agent traffic through router 30099;
+1. Continue the ladder to the >600k class, one rung per boot, cap set
+   equal to the target each time. Expect `_profile_available_bytes` to be
+   the brake; when it refuses it names the numbers, which is a free probe.
+2. Re-enable the fairness windows and `--phase-flip-purity strict` (the
+   user's hard default, must be ON in the ship config) and prove on >=60
+   min with minutes-scale settle windows. Note the previous shift disabled
+   the windows because the flip rate they induced was thought unaffordable
+   against a 1.4-3.0 GiB seam -- that reason is now WITHDRAWN, so the
+   windows deserve a fresh trial rather than inheriting the verdict.
+3. Graph A/Bs per spec item 8 and the 5090 stage-imbalance lead.
+4. Final >=60-min green run with real agent traffic through router 30099;
    write "GREEN-RUN STAGE: operator may re-arm qwen traffic agents" into
-   `/spinning/gpu-arb/holder` when that stage is reached.
+   `/spinning/gpu-arb/holder` at that point.
