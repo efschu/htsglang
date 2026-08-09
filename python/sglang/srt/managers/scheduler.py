@@ -4392,7 +4392,44 @@ class Scheduler(
             # Merge the new batch into the running batch.
             if not last_batch.is_empty():
                 if running_batch.is_empty():
+                    # NOTE this ALIASES the two names onto one object. Under
+                    # PP the scheduler then stores that object into BOTH
+                    # running_mbs[mb_id] and (via mbs[mb_id]) last_mbs[mb_id],
+                    # so the next visit to the same slot rebinds
+                    # running_batch and last_batch to the SAME batch -- which
+                    # is what the identity guard below exists to catch.
                     running_batch = last_batch
+                elif last_batch is running_batch:
+                    # SELF-MERGE, and it is fatal rather than wasteful: every
+                    # per-request field would be torch.cat'ed with itself, so
+                    # the batch DOUBLES on each visit to the slot. Measured
+                    # 2026-08-09 23:42:45Z under --phase-flip-purity strict:
+                    # the resident count walked 2^23 -> 2^24 -> 2^25 in three
+                    # seconds and all three ranks died in
+                    # sampling_batch_info.merge_batch's torch.cat, asking for
+                    # 256 MiB with 138 MiB free.
+                    #
+                    # Skipping is not a mitigation, it is the correct answer:
+                    # when the two names are one object its requests are
+                    # ALREADY in running_batch, so merging could only
+                    # double-count them. Strict purity is what made this
+                    # reachable -- it confines prefill to the PP layout, and
+                    # the merge branch above only runs for an extend
+                    # last_batch, so before purity the aliased slot was
+                    # rarely revisited while still carrying an extend batch.
+                    #
+                    # Logged, not silent: scheduler.py's flip-policy guard
+                    # already DETECTED this state ("the resident set is
+                    # corrupted") and correctly refused to arm a flip, but a
+                    # detector that only declines to act cannot stop a
+                    # doubling -- the instance still died. An observable line
+                    # here is what makes the condition attributable.
+                    logger.warning(
+                        "SELF-MERGE REFUSED: last_batch is running_batch "
+                        "(bs=%d). Its requests are already resident; merging "
+                        "would double the batch. See #631/#656.",
+                        running_batch.batch_size(),
+                    )
                 else:
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)

@@ -1405,3 +1405,73 @@ binding card is not much to give away. Treat 540000 as the measured
 CEILING and 460000 (margin 1631/2010/1585) as the conservative fallback
 until a sustained bs=4 run has held the corridor for an hour. The
 instrument for that is a load generator, not `phase_plateau_measure.sh`.
+
+---
+
+## THE bs=4 CORRECTION (successor 18, 2026-08-09): 540000 is not a rung
+
+The previous section closes by asking for the bs=4 run before 540000 is
+believed. That run has now happened, and it does not confirm the rung — it
+retires it.
+
+Instrument: `scripts/route_a_631_bs4_rung.sh`, which drives the DESIGN
+POINT (3 long generations plus one 12000-token prompt worker = the 4
+concurrent requests `--max-running-requests 4` actually admits) while
+sampling the NVML free column at 100 ms and judging the running minimum.
+
+### The measurement
+
+Same boot, same `RANK_MIB=31800,17400,17450`, same CTX 393216, cap 540000:
+
+| card | bs=1 (the inherited number) | bs=4 (the design point) | breaches |
+|---|---|---|---|
+| nvml gpu0 (rank 1, 3080) | 1719 | **355** | 329 |
+| nvml gpu1 (rank 0, 5090) | 1686 | **42**  | 252 |
+| nvml gpu2 (rank 2, 3080) | 1865 | **661** | 465 |
+
+602 samples, floor 1024, **all three cards breach**, the 5090 to 42 MiB.
+The concurrency delta is ~1.3-1.6 GiB per card, which is the whole margin.
+
+Two properties of this measurement are worth keeping:
+
+* **The allocator does not give the peak back.** With the load stopped the
+  5090 still read 42 MiB free. A post-run snapshot therefore cannot clear a
+  configuration that a time series condemns, and "it looks fine now" is not
+  evidence about the corridor.
+* **bs=1 is not a weaker version of bs=4, it is a different measurement.**
+  The +113 % ladder was climbed entirely on single-stream readings. Every
+  rung above 460000 in that table is unproven at the design point, and the
+  top rung is now falsified. A rung is only real when the load that
+  produced it is the load the server is configured to admit.
+
+### What holds instead: 460000, in the SHIP shape
+
+Booted with strict purity and BOTH fairness windows on — the configuration
+the user's spec requires, not a permissive one:
+
+    PHASE_FLIP_PURITY=strict  PP_WINDOW_S=15  TP_DECODE_FLOOR_S=10
+    POLICY=auto  RANK_MIB=31800,17400,17450  MAX_TOTAL_TOKENS=460000
+
+    corridor minimum   1412 / 1459 / 1487 MiB      0 breaches
+    flips              104 in the window, both directions
+    deaths             0        request errors 0
+
+### The fairness windows were never the defect
+
+HANDOFF_658 §4e condemned these windows on three boots that died within
+minutes, and concluded they are "NOT SHIPPABLE on this rig at these
+values". Two of those three deaths were allocation failures at the seam
+(`cuMemCreate` OOM; `torch.OutOfMemoryError` for 128 MiB with 106 MiB
+free), taken on a rig that §657 measured as sitting 530-610 MiB above the
+floor. The same windows, at a pool that leaves ~1450 MiB, produced 104
+flips with zero deaths.
+
+The windows raise the flip rate; the flip rate was never affordable
+because the pool was oversized. **A policy knob was blamed for a sizing
+defect.** The general form is worth naming, because this chain has now
+made it three times in a row: a component measured in a configuration
+that is independently broken will be convicted of the breakage. Restore
+the configuration before judging the component.
+
+(If a seam OOM does return, `SGLANG_FLIP_SEAM_CHUNK_MIB` — successor 17's
+zero-allocation seam — is the targeted mitigation and is still default 0.)
