@@ -1075,6 +1075,84 @@ class SchedulerPPMixin:
                 continue
             self._pp_commit_comm_work(work)
 
+    def pp_flip_drain_tensor_dicts(self: Scheduler) -> int:
+        """Consume the tensor-dict wire while ARMED, and discard what comes.
+
+        THIS IS THE PREVENTION HALF OF THE MISPAIRING FIX, and it is where
+        the strand is actually killed.
+
+        THE STRAND. A flip abandon is rank-local: each rank times out on
+        its own clock. The first rank to disarm resumes launching and sends
+        its proxy hidden states. Its downstream is still armed, so it has
+        no ``cur_batch`` -- and the proxy recv was guarded by THIS rank's
+        batch, never by whether the upstream sent. The message was left on
+        the wire, and every later receive on that rank was off by one,
+        silently, for the rest of the loop's life.
+
+        WHY DISCARDING IS RIGHT HERE, AND ONLY HERE. The open question in
+        the design note was "discarding loses a microbatch". Metal answered
+        it: at THIS point there is no microbatch to lose. An armed rank is
+        withholding admissions and launching nothing, so the message names
+        a pass this rank never ran and there is no batch it could ever pair
+        with -- now or later. That is precisely NOT true at the receive
+        site, where discarding a message you do have a batch for wedged the
+        instance (corpse R).
+
+        WHY THE BLOCKING RECV IS SAFE -- the whole safety argument. It is
+        made ONLY when the upstream's published counter exceeds this rank's
+        consumed count, so the message provably exists and the call is
+        bounded by transfer time rather than by peer scheduling. The
+        publish-after-post ordering makes the only possible skew
+        counter-lags-send, which under-reports and can never invent a
+        message that was not sent. Corpse F rules out polling here; this
+        counter is what replaces it.
+
+        WHY IT MOVES NO LAUNCH TIMING -- the refined design law. It adds
+        consumption during the armed window only, when this rank launches
+        nothing anyway. No rank's decision about WHEN to proceed changes,
+        which is what the resume gate got wrong by holding ranks out of
+        launching (HANDOFF §7).
+
+        The demultiplexer is bypassed deliberately: this is a discard, so
+        the message's kind does not matter, and routing it through
+        ``_pp_recv_typed_dict`` would make it hunt for an expected kind and
+        block. Rank 0's upstream wire carries the output return and the
+        others' carry proxies; both are equally void while armed.
+        """
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is None:
+            return 0
+        drained = 0
+        # Bounded so a counter that runs away cannot pin the rank here.
+        for _ in range(64):
+            posted = counters.sent(CHAN_DICT, self._pp_flip_upstream())
+            if counters.local_consumed(CHAN_DICT) >= posted:
+                break
+            raw = self.pp_group.recv_tensor_dict(
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                )
+            )
+            self._pp_flip_bump_consumed(CHAN_DICT)
+            drained += 1
+            stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
+            logger.info(
+                "%s armed drain took a tensor dict off the wire and "
+                "discarded it: kind=%s stamp=%s. This rank is armed and "
+                "launching nothing, so the message names a pass it never "
+                "ran; leaving it on the wire is what used to strand it and "
+                "put every later receive off by one. (%d this window)",
+                "#631",
+                raw.get("__msg_type__", "default") if isinstance(raw, dict) else "?",
+                stamp,
+                drained,
+            )
+        if drained:
+            self._pp_flip_drained_total = (
+                getattr(self, "_pp_flip_drained_total", 0) + drained
+            )
+        return drained
+
     def pp_flip_service(self: Scheduler) -> None:
         """One turn of the armed service loop: consume, then flush.
 
@@ -1090,6 +1168,10 @@ class SchedulerPPMixin:
             self.pp_flip_consume_inbound()
         except Exception as exc:  # noqa: BLE001
             logger.error("%s armed consume failed: %s", "#631", exc)
+        try:
+            self.pp_flip_drain_tensor_dicts()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("%s armed tensor-dict drain failed: %s", "#631", exc)
         try:
             self.pp_flip_flush_drained_sends()
         except Exception as exc:  # noqa: BLE001
@@ -1771,91 +1853,86 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler, mb_id: int = -1) -> Optional[PPProxyTensors]:
         """Receive this slot's hidden states, and PROVE they are this slot's.
 
-        #631 VARIANT B. A message whose stamp does not name this slot is a
-        LEFTOVER -- almost always one sent by an upstream that had already
-        resumed while this rank was still armed, which under the old
-        positional pairing was consumed as if it belonged here and put every
-        later receive off by one. It is now dropped, LOUDLY and with its
-        identity, and the next message is taken instead.
+        #631 VARIANT B, second cut. The stamp is the DETECTION half of the
+        mispairing fix; the prevention half is ``pp_flip_drain_tensor_dicts``,
+        which stops a message stranding in the first place.
 
-        CORPSE R -- READ THIS BEFORE TOUCHING THE LOOP BELOW.
-        =====================================================
-        THE DETECTION IS METAL-PROVEN. THE DISPOSAL BELOW IS METAL-
-        FALSIFIED and is kept only until the replacement lands.
+        EXACTLY ONE MESSAGE PER PASS. That is the invariant this function
+        may not break, and breaking it is corpse R:
 
-        The paragraph that used to stand here argued that dropping is safe
-        "because the sender is not waiting on us". That is true and it is
-        beside the point. The sender is not what blocks; WE are. The wire
-        owes exactly ONE message per pass, so a rank that discards a
-        message and then takes "the next one" makes a second blocking call
-        against a debt of one, and there is nothing to take.
+        CORPSE R -- THE DROP-AND-RETRY DISPOSAL, metal-falsified
+        2026-08-09 07:19:29Z, specimen
+        /spinning/evidence-631/stamp_drop_wedge_20260809T0719Z.
+        The first cut dropped a non-matching message and looped to take
+        "the next one", bounded at 8. The DETECTION was exactly right --
+        "stamp mb_id=2 seq=2811 rows=1 arrived while this rank is on
+        mb_id=1", a one-row decode hidden state, the mispair specimen's own
+        signature, refused instead of computed on. Six seconds later the
+        instance wedged:
 
-        Measured 2026-08-09 07:19:29Z, specimen
-        /spinning/evidence-631/wedge_20260809T072021Z_stamp_drop_wedge_20260809T0719Z:
-
-            PP1  here, line 1790, in the SECOND recv after a drop
+            PP1  here, in the SECOND recv the loop makes after a drop
             PP2  here, same
             PP0  _pp_recv_dict_from_prev_stage -- the OUTPUT wire
 
         a closed cycle: PP0 waits on PP2's output, PP2 on PP1's proxy, PP1
-        on a proxy from PP0 that was never sent. The drop itself was
-        CORRECT -- "stamp mb_id=2 seq=2811 rows=1 arrived while this rank
-        is on mb_id=1", a one-row decode hidden state, the mispair
-        specimen's own signature, refused instead of computed on.
+        on a proxy from PP0 that was never sent and never will be. The
+        argument "dropping is safe because the sender is not waiting on us"
+        was true and beside the point: the sender is not what blocks, the
+        RECEIVER is. The wire owes one message per pass, so a second
+        blocking call is made against a debt of one.
 
         THIS IS THE BOUNDED-RECV CORPSE READ BACKWARDS. That corpse:
         complete a pass without consuming, unmatched SENDS pile up, the
-        senders block. Its dual: consume TWICE in one pass, and the
-        surplus RECV blocks for ever. ``for _ in range(8)`` reads like a
-        bound on a spin; it is a licence to make eight blocking calls
-        where the contract permits one.
+        senders block. Its dual: consume TWICE in one pass and the surplus
+        RECV blocks for ever. ``for _ in range(8)`` reads like a bound on a
+        spin; it was a licence to make eight blocking calls where the
+        contract permits one.
 
-        THE REPLACEMENT, so it is not re-derived: take exactly one message
-        per pass, as always, and let the STAMP decide what to do with it
-        -- compute on it when it names this slot, and otherwise treat the
-        SLOT as void and pass the void downstream as this pass's proxy
-        send. One recv, one send, 1:1 preserved, no launch timing moved.
-        VOID THE SLOT, NEVER THE MESSAGE.
+        SO WHAT DOES A MISMATCH DO NOW? It REFUSES, loudly, and does not
+        touch the wire again. That is not a repair -- it is a strictly
+        better failure, and it is the same choice the shipped
+        ``model_runner.forward`` shape check already makes for the same
+        pair. It also catches what that check cannot: a leftover of the
+        SAME width, which is silent wrong output rather than a shape error.
+        With the armed drain in place this is not expected to fire at all;
+        if it ever does, the message names itself and the next reader
+        starts from an identity instead of a GDN kernel 30 layers deep.
         """
         if self.pp_group.is_first_rank:
             return None
-        for _ in range(8):
-            raw = self._pp_recv_typed_dict(
-                expected_kind="proxy",
-                all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
-                ),
-            )
-            stamp = raw.pop("__stamp__", None) if isinstance(raw, dict) else None
-            if stamp is None or mb_id < 0 or int(stamp[0]) == int(mb_id):
-                # POPPED, not read: the identity has done its entire job the
-                # moment the message is accepted, and what remains travels on
-                # into model compute. PPProxyTensors' slice path maps v[key]
-                # over EVERY entry and cuda-graph buffer copies iterate the
-                # dict, so a tuple left in here would slice to nonsense
-                # rather than raise -- the worst available outcome. The
-                # __msg_type__ precedent shows a non-tensor entry SURVIVES
-                # the wire; it does not show one is safe to compute on.
-                return PPProxyTensors(raw)
-            self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
-            logger.error(
-                "%s PROXY LEFTOVER DROPPED: stamp mb_id=%s seq=%s rows=%s "
-                "arrived while this rank is on mb_id=%s. This is a message "
-                "from an upstream that resumed before this rank did -- under "
-                "the old positional pairing it would have been computed on "
-                "as if it belonged here, and every later receive would have "
-                "been off by one for the rest of the loop's life. Dropped; "
-                "that microbatch is lost, the stream stays aligned. "
-                "(%d dropped this boot)",
-                "PHASE-FLIP",
-                stamp[0], stamp[1], stamp[2], mb_id, self._pp_proxy_drops,
-            )
-        logger.error(
-            "%s gave up draining proxy leftovers for mb_id=%s after 8 "
-            "messages; the stamps and the slot clock disagree persistently",
-            "PHASE-FLIP", mb_id,
+        raw = self._pp_recv_typed_dict(
+            expected_kind="proxy",
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            ),
         )
-        return None
+        # POPPED, not read: the identity has done its entire job the moment
+        # the message is accepted, and what remains travels on into model
+        # compute. PPProxyTensors' slice path maps v[key] over EVERY entry
+        # and cuda-graph buffer copies iterate the dict, so a tuple left in
+        # here would slice to nonsense rather than raise -- the worst
+        # available outcome. The __msg_type__ precedent shows a non-tensor
+        # entry SURVIVES THE WIRE; it does not show one is safe to compute
+        # on.
+        stamp = raw.pop("__stamp__", None) if isinstance(raw, dict) else None
+        if stamp is None or mb_id < 0 or int(stamp[0]) == int(mb_id):
+            return PPProxyTensors(raw)
+
+        self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
+        raise RuntimeError(
+            f"#631 PROXY LEFTOVER REFUSED: a proxy stamped mb_id={stamp[0]} "
+            f"seq={stamp[1]} rows={stamp[2]} arrived while this rank is on "
+            f"mb_id={mb_id}. It belongs to a pass this rank did not run -- "
+            f"in practice one sent by an upstream that resumed while this "
+            f"rank was still armed. Computing on it would pair one "
+            f"microbatch's hidden states with another's metadata and "
+            f"corrupt memory rather than merely fail; taking another "
+            f"message instead wedges the pipeline (corpse R), because the "
+            f"wire owes exactly one message per pass. The armed drain "
+            f"(pp_flip_drain_tensor_dicts) is what is supposed to prevent "
+            f"this from ever being reached -- if you are reading this, it "
+            f"did not, and THAT is the defect to chase."
+        )
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,

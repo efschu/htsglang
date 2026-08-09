@@ -13,9 +13,26 @@ positional: "whatever came off the wire this slot iteration" met "whatever
 batch I have this slot iteration". ONE stranded message therefore put every
 later receive off by one, SILENTLY, for the rest of the loop's life.
 
-The fix stamps every proxy send with ``(mb_id, monotone seqno, rows)`` and
-matches on the stamp at receive. A leftover names a slot that is not this
-one, matches nothing, and is dropped LOUDLY instead of being computed on.
+THE FIX HAS TWO HALVES, and they are pinned separately because metal
+proved one and falsified the other's first cut.
+
+PREVENTION -- ``pp_flip_drain_tensor_dicts``. While ARMED a rank consumes
+and discards whatever its upstream published, so nothing strands. The
+blocking recv is made ONLY when the upstream's counter exceeds this rank's
+consumed count, so the message provably exists; discarding is right here
+and only here, because an armed rank launches nothing and the message
+names a pass it never ran.
+
+DETECTION -- the stamp. Every proxy send carries ``(mb_id, monotone seqno,
+rows)`` and the receive matches on it. A leftover names a slot that is not
+this one and is REFUSED, loudly and by identity.
+
+REFUSED, NOT DROPPED-AND-RETRIED. The first cut dropped the message and
+looped to take the next one; that wedged the instance on metal (corpse R,
+specimen stamp_drop_wedge_20260809T0719Z) because the wire owes exactly
+one message per pass and the surplus recv closes a cycle with the peers.
+``test_a_planted_leftover_is_REFUSED_and_the_wire_is_not_touched_again``
+pins both halves of that: not computed on, and not replaced.
 
 WHAT THESE TESTS DELIBERATELY ALSO RECORD: the match is on ``mb_id``
 ALONE, and ``mb_id`` is cyclic modulo ``pp_loop_size`` (3 on this rig). A
@@ -179,32 +196,43 @@ def test_the_first_rank_receives_nothing():
 # -- THE DEFECT: a planted leftover --------------------------------------------
 
 
-def test_a_planted_leftover_is_dropped_loudly_and_the_next_message_is_taken(caplog):
-    """THE CAN-FAIL. Under the old positional pairing the FIRST message --
-    the leftover -- was returned and computed on.
+def test_a_planted_leftover_is_REFUSED_and_the_wire_is_not_touched_again(caplog):
+    """THE CAN-FAIL, and it pins BOTH halves of corpse R.
+
+    The leftover must not be computed on (the original defect), and the
+    function must not make a second blocking call to replace it (the
+    disposal that wedged the instance on metal: the wire owes exactly one
+    message per pass, so a second recv closes a cycle with the peers).
     """
     leftover = _msg(mb_id=2, seq=41, rows=1, tag="LEFTOVER")
-    mine = _msg(mb_id=1, seq=42, rows=24, tag="MINE")
-    receiver = _Rank(wire=[leftover, mine])
+    never = _msg(mb_id=1, seq=42, rows=24, tag="MUST_NOT_BE_TAKEN")
+    receiver = _Rank(wire=[leftover, never])
 
-    with caplog.at_level(logging.ERROR):
-        got = receiver._pp_recv_proxy_tensors(mb_id=1)
+    with pytest.raises(RuntimeError, match="PROXY LEFTOVER REFUSED"):
+        receiver._pp_recv_proxy_tensors(mb_id=1)
 
-    assert got["tag"] == "MINE", "the leftover was computed on -- the defect"
-    assert got["hidden_states"].shape[0] == 24
-    assert receiver._pp_proxy_drops == 1
-    text = caplog.text
-    assert "PROXY LEFTOVER DROPPED" in text
-    # the identity must be IN the log, or the next investigation has nothing
+    assert receiver.recv_calls == 1, (
+        "corpse R: the receive took a SECOND message off the wire. The wire "
+        "owes one message per pass; the surplus recv is what wedged PP1/PP2 "
+        "against PP0 on metal."
+    )
+
+
+def test_the_refusal_names_the_message(caplog):
+    receiver = _Rank(wire=[_msg(mb_id=2, seq=41, rows=1)])
+    with pytest.raises(RuntimeError) as exc:
+        receiver._pp_recv_proxy_tensors(mb_id=1)
+    text = str(exc.value)
     assert "mb_id=2" in text and "seq=41" in text and "rows=1" in text
+    assert "mb_id=1" in text
 
 
 def test_forcing_the_match_open_reproduces_the_defect():
     """MUTATION PROOF that the pin above can fail.
 
-    Accept-everything is the pre-fix behaviour; it must hand back the
-    leftover, which is precisely the 1-row-vs-24-token mispairing the
-    specimen recorded.
+    Accept-everything is the pre-fix behaviour; it hands back the leftover,
+    which is precisely the 1-row-vs-24-token mispairing the specimen
+    recorded.
     """
     leftover = _msg(mb_id=2, seq=41, rows=1, tag="LEFTOVER")
     mine = _msg(mb_id=1, seq=42, rows=24, tag="MINE")
@@ -215,28 +243,83 @@ def test_forcing_the_match_open_reproduces_the_defect():
     got = receiver._pp_recv_proxy_tensors(mb_id=-1)
     assert got["tag"] == "LEFTOVER"
     assert got["hidden_states"].shape[0] == 1
-    assert getattr(receiver, "_pp_proxy_drops", 0) == 0
 
 
-def test_several_leftovers_are_drained_and_all_are_counted(caplog):
-    wire = [_msg(mb_id=2, seq=s, rows=1) for s in (10, 11, 12)]
-    wire.append(_msg(mb_id=0, seq=13, rows=24, tag="MINE"))
-    receiver = _Rank(wire=wire)
-    with caplog.at_level(logging.ERROR):
-        got = receiver._pp_recv_proxy_tensors(mb_id=0)
-    assert got["tag"] == "MINE"
-    assert receiver._pp_proxy_drops == 3
+# -- THE PREVENTION HALF: the armed drain -------------------------------------
 
 
-def test_the_drain_is_bounded_and_gives_up_loudly(caplog):
-    """A persistent disagreement must not spin for ever on the wire."""
-    wire = [_msg(mb_id=2, seq=s, rows=1) for s in range(50)]
-    receiver = _Rank(wire=wire)
-    with caplog.at_level(logging.ERROR):
-        got = receiver._pp_recv_proxy_tensors(mb_id=0)
-    assert got is None
-    assert receiver.recv_calls == 8, "the drain bound moved"
-    assert "gave up draining proxy leftovers" in caplog.text
+class _FakeCounters:
+    def __init__(self, posted=0):
+        self.posted = posted
+        self.taken = 0
+
+    def sent(self, chan, rank):
+        return self.posted
+
+    def local_consumed(self, chan):
+        return self.taken
+
+
+class _ArmedRank(_Rank):
+    pp_flip_drain_tensor_dicts = SchedulerPPMixin.pp_flip_drain_tensor_dicts
+
+    def __init__(self, wire=(), posted=0, upstream=0):
+        super().__init__(wire=wire)
+        self.pp_flip_counters = _FakeCounters(posted)
+        self._upstream = upstream
+        self.pp_group = _FakeGroup(False)
+        self.pp_group.wire = list(wire)
+
+        def _recv_tensor_dict(all_gather_group=None):
+            self.recv_calls += 1
+            if not self.pp_group.wire:
+                raise AssertionError("armed drain blocked on an empty wire")
+            return self.pp_group.wire.pop(0)
+
+        self.pp_group.recv_tensor_dict = _recv_tensor_dict
+
+    def _pp_flip_upstream(self):
+        return self._upstream
+
+    def _pp_flip_bump_consumed(self, chan):
+        self.pp_flip_counters.taken += 1
+
+
+def test_the_armed_drain_takes_exactly_what_the_upstream_published():
+    """THE SAFETY ARGUMENT: it blocks only on a message proved to exist."""
+    r = _ArmedRank(wire=[_msg(0, 1, 1), _msg(1, 2, 1), _msg(2, 3, 1)], posted=2)
+    assert r.pp_flip_drain_tensor_dicts() == 2
+    assert r.recv_calls == 2, "it took more than the counter accounted for"
+
+
+def test_the_armed_drain_makes_no_call_when_the_upstream_is_not_ahead():
+    """counter-lags-send is the only permitted skew, and it under-reports.
+
+    If the drain ever called on an equal count it would block for ever on a
+    message that does not exist -- the failure the publish-after-post
+    ordering exists to make impossible.
+    """
+    r = _ArmedRank(wire=[], posted=0)
+    assert r.pp_flip_drain_tensor_dicts() == 0
+    assert r.recv_calls == 0
+
+
+def test_the_armed_drain_is_bounded():
+    r = _ArmedRank(wire=[_msg(0, i, 1) for i in range(200)], posted=10_000)
+    assert r.pp_flip_drain_tensor_dicts() == 64
+    assert r.recv_calls == 64
+
+
+def test_the_armed_drain_discards_any_kind_without_demultiplexing():
+    """Rank 0's upstream wire carries the OUTPUT return, not proxies.
+
+    Routing a discard through the demultiplexer would make it hunt for an
+    expected kind and block; while armed both kinds are equally void.
+    """
+    out = {"next_token_ids": torch.zeros(2), "__msg_type__": "output"}
+    r = _ArmedRank(wire=[out], posted=1)
+    assert r.pp_flip_drain_tensor_dicts() == 1
+    assert r.recv_calls == 1
 
 
 # -- THE STAMP MUST NOT REACH MODEL COMPUTE ------------------------------------

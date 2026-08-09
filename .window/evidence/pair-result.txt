@@ -1,0 +1,9 @@
+=== #631 Route A PD pair -- rung 'pair', 2026-08-07 ===
+prefill TP=1 (3080)  ->  decode TP=2/DCP=2 (5090 + 3080), mooncake, page_size=1
+model Qwen3.5-4B (hybrid GDN)
+
+counting probe : one, two, three, four, five, six, seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, sixteen, seventeen, eighteen, nineteen, twenty
+needle probe   : 61  (elderberry=61, correct)
+
+[2026-08-07 17:00:59 TP0] PD decode DCP preconditions satisfied: dcp_size=2, uneven-TP replicated-KV layout installed, transport=mooncake, page_size=1.
+[2026-08-07 17:00:59 TP1] PD decode DCP preconditions satisfied: dcp_size=2, uneven-TP replicated-KV layout installed, transport=mooncake, page_size=1.
