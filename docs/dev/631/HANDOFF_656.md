@@ -1712,3 +1712,67 @@ before claiming the TP phase speculates after a carry.
   in one boot.
 - The cutover clock report -- `seq_lens`, `seqlen`, output tail and
   `input_id` per request, printed where the flip happens.
+
+## 8. ADDENDUM (same shift): the output-wire suspect is ELIMINATED
+
+The operator's steer was the output-return path -- the one wire still
+unstamped, plus `init_pp_loop_state` clearing output holders with no
+drain. **It is measured NOT the cause**, and this is the shift's most
+useful negative result because it was the leading hypothesis.
+
+What was done (`3b11027c6a`): the quiescence predicate gained the one
+in-flight output state it never named -- `pp_outputs`, the one-slot buffer
+holding an output already RECEIVED off the ring and awaiting the next
+pass's processing (every other clause names a wire or a queue) -- and the
+cutover now reports what `init_pp_loop_state` is about to destroy instead
+of assuming quiescence emptied it.
+
+**The report says the path is empty. 12 cutovers, 12 "output path empty at
+cutover", zero "CUTOVER DISCARDS IN-FLIGHT OUTPUT".** `pp_outputs`,
+`last_rank_comm_queue`, `send_output_work` and the tensor-dict inbox were
+all empty every time. The token is not lost in the PP output wire or its
+buffers. The gate stays as defence in depth, honestly labelled: it has
+never fired.
+
+The corruption is unchanged with it in (probe `--cycles 4`, 09:45Z):
+`pp_to_tp` drops a token (2 of 3, then 2 of 3), `tp_to_pp` shows the
+DUPLICATE face ('1118' where '118' was due, 3 of 3 in one cycle and 0 of 3
+in the next). Suite 496 passed.
+
+### What is now known, and it is a lot
+
+- The token is missing from the client's **`output_ids` array**, not only
+  the text -- detokenizer and tokenizer-manager are out.
+- **Rank 0 is the only emitter in both phases.** The detokenizer socket is
+  built once at boot (`scheduler.py:934-941`, called only from `:587`), so
+  the cutover's `ps` replacement cannot move it. In PP, rank 0 never
+  COMPUTES a token: the last stage samples and ids return around a ring
+  2->0->1->2, unstamped and paired positionally.
+- Every send cursor (`send_token_offset`, `send_decode_id_offset`,
+  `finished_len`, `finished_output`) lives on the **Req**, is carried, and
+  no phase-flip module touches any of them.
+- Both faces occur: a DROP is that cursor running ahead of what was sent,
+  a DUPLICATE is it lagging. `pp_to_tp` drops, `tp_to_pp` duplicates.
+
+### The next instrument, named precisely
+
+Everything above is consistent with exactly one remaining shape: **rank
+0's own `req.output_ids` disagreeing with the tokens the model actually
+generated**, by one, in either direction. Rank 0 emits from its own copy
+and its cursor is self-consistent with that copy, so a copy that is short
+produces a drop and a copy that double-appends produces a duplicate --
+with no wire, no cursor and no detokenizer at fault.
+
+So log, per resident request, at the FIRST pass after the cutover and on
+ALL THREE ranks: `len(req.output_ids)`, `req.send_token_offset`, and the
+last two ids. The existing cutover clock report
+(`bootstrap_clock_report`) already prints exactly these at the cutover and
+showed the ranks AGREEING there -- so the divergence, if it exists, opens
+in the pass right after. Compare the three ranks; the one that differs
+names the mechanism.
+
+Do not re-walk: the model (control clean 3/3), the scrub
+(`SGLANG_PHASE_FLIP_DRAFT_SCRUB=0` corrupts identically), the detokenizer
+(ids are short too), the emitter identity (frozen at boot), the send
+cursors (Req-owned, untouched), and now the output wire and its buffers
+(empty at all 12 cutovers).
