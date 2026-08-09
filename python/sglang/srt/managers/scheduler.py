@@ -6963,7 +6963,9 @@ class Scheduler(
             # boundary; re-arming it would only restart the park clock.
             return None
 
+        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
         from sglang.srt.managers.phase_policy import (
+            PhasePolicyDecision,
             PhasePolicyInputs,
             decide,
             note_flip_armed,
@@ -7005,6 +7007,32 @@ class Scheduler(
         state = self.phase_policy_state
         observe_idle(state, inp)
         decision = decide(cfg, state, inp)
+        # #631: DO NOT ARM a flip that cannot become ready. A carried
+        # request has no draft state, so with speculation armed for the TP
+        # phase the readiness predicate holds the flip until nothing is
+        # resident -- and under sustained decode something always is. The
+        # flip then parks for the full deadline and abandons, EVERY time,
+        # and the abandon path itself faulted on metal (05:21:16Z, a
+        # device-side illegal memory access right after "FLIP ABANDONED").
+        #
+        # Declining here rather than arming-and-waiting keeps the group out
+        # of that path entirely. It is safe to decide rank-locally because
+        # only the REQUEST-ORIGIN rank evaluates the policy and the arm is
+        # broadcast from it (see this method's docstring); a refusal inside
+        # PhaseFlipRuntime.arm would be a different thing and would risk
+        # diverging epochs, which is corpse H.
+        if (
+            decision.wants_flip
+            and decision.direction == PP_TO_TP
+            and not self.flip_spec_algorithm.is_none()
+            and inp.running_bs > 0
+        ):
+            decision = PhasePolicyDecision(
+                None,
+                f"speculating TP phase and {inp.running_bs} request(s) "
+                f"resident: they have no draft state, and arming would "
+                f"park until the deadline and abandon",
+            )
         if not decision.wants_flip:
             # #631 defect N: a policy that DECLINES used to be silent, so
             # "the layout is wrong under load" was indistinguishable from

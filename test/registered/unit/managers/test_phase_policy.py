@@ -436,6 +436,7 @@ def _sched(
     running=0,
     chunked=None,
     running_mbs=None,
+    spec_algo=None,
 ):
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -449,6 +450,13 @@ def _sched(
     s.waiting_queue = list(queue)
     s.running_batch = _StubBatch(running)
     s.chunked_req = chunked
+    # #631: the policy declines a pp_to_tp flip when the TP phase would
+    # speculate and requests are resident (they have no draft state).
+    # Default the harness to NO speculation so the existing pins keep
+    # testing the layout rule rather than that guard.
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    s.flip_spec_algorithm = SpeculativeAlgorithm.from_string(spec_algo)
     s.running_mbs = list(running_mbs) if running_mbs is not None else []
     # The REAL metric, not a stub of it: #631 defect N was precisely that
     # this quantity did not mean what its caller's comment said.
@@ -1793,3 +1801,45 @@ def test_a_rank_that_can_never_empty_its_channels_abandons_instead_of_wedging(
         "deadline without abandoning"
     )
     assert r.presence_timeouts == 1
+
+
+def test_the_policy_does_not_arm_a_flip_that_cannot_become_ready():
+    """#631: with speculation armed for the TP phase and requests
+    resident, arming is worse than useless.
+
+    A carried request has no draft state, so the readiness predicate holds
+    the flip until nothing is resident -- and under sustained decode
+    something always is. The flip then parks for the full deadline and
+    abandons, every time. Measured 2026-08-09 05:21Z, and the abandon path
+    itself faulted immediately afterwards with a device-side illegal
+    memory access, so staying out of that path is the point.
+
+    Safe to decide rank-locally: only the request-origin rank evaluates
+    the policy and the arm is broadcast from it. A refusal inside
+    PhaseFlipRuntime.arm would risk diverging epochs (corpse H).
+    """
+    s = _sched(
+        phase=PHASE_PP, queue=[], running=2, spec_algo="EAGLE",
+    )
+    assert s.maybe_arm_phase_policy() is None
+
+
+def test_without_speculation_the_same_state_does_arm():
+    """The decline is about the DRAFT STATE, not about decode work."""
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
+    s = _sched(phase=PHASE_PP, queue=[], running=2, spec_algo=None)
+    assert isinstance(s.maybe_arm_phase_policy(), PhaseFlipReqInput)
+
+
+def test_the_idle_return_leg_is_untouched_by_the_decline():
+    """tp_to_pp carries nothing into speculation, so it must still arm."""
+    from sglang.srt.managers.io_struct import PhaseFlipReqInput
+
+    s = _sched(
+        phase=PHASE_TP, queue=[_StubReq(N + 1000)], running=1,
+        spec_algo="EAGLE",
+    )
+    req = s.maybe_arm_phase_policy()
+    assert isinstance(req, PhaseFlipReqInput)
+    assert req.direction == TP_TO_PP
