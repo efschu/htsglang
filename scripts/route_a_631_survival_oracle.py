@@ -48,11 +48,21 @@ import urllib.request
 from typing import List, Optional, Tuple
 
 START = 10
+END = 400
+# CHAT, THINKING OFF, and both halves are load-bearing.
+#
+# The first probe here was a raw completion ("continue this sequence"),
+# and it produced a MEASURED FALSE NEGATIVE: the model kept the sequence
+# perfectly across the flip and then editorialised about how long to
+# count. The no-flip control drifted EARLIER (32 numbers) than the flip
+# run (43), which is what proved the drift was the model rather than the
+# cutover -- but a probe whose verdict depends on the model's appetite for
+# commentary cannot be a standing test. Chat framing with thinking
+# disabled holds the sequence for hundreds of tokens (measured: a clean
+# 11..120), so a break in it means something real.
 PROMPT = (
-    "Continue this sequence of integers, separated by single spaces, "
-    "counting upward by one. Write only the numbers.\n"
-    + " ".join(str(i) for i in range(1, START + 1))
-    + " "
+    f"Count from {START + 1} to {END}. Output ONLY the integers separated "
+    f"by single spaces, nothing else."
 )
 
 
@@ -91,12 +101,13 @@ class _Stream:
     def run(self) -> None:
         payload = {
             "model": "Qwen3.6-27B",
-            "prompt": PROMPT,
+            "messages": [{"role": "user", "content": PROMPT}],
             "max_tokens": self.limit,
             "temperature": 0.0,
             "stream": True,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
-        url = f"{self.base}/v1/completions"
+        url = f"{self.base}/v1/chat/completions"
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             url, data=data, headers={"Content-Type": "application/json"}
@@ -115,7 +126,10 @@ class _Stream:
                         obj = json.loads(body)
                     except json.JSONDecodeError:
                         continue
-                    piece = obj.get("choices", [{}])[0].get("text", "")
+                    choice = obj.get("choices", [{}])[0]
+                    piece = choice.get("delta", {}).get("content") or choice.get(
+                        "text", ""
+                    )
                     if piece:
                         self.text += piece
                         self.chunks += 1
@@ -126,26 +140,36 @@ class _Stream:
             self.done = True
 
 
-def check_sequence(text: str) -> Tuple[bool, str]:
-    """The determined answer: consecutive integers from START+1 upward."""
-    toks: List[int] = []
-    for piece in text.replace(",", " ").split():
-        try:
-            toks.append(int(piece))
-        except ValueError:
-            return False, f"non-integer token {piece!r} after {len(toks)} numbers"
-    if not toks:
-        return False, "no numbers produced at all"
+def correct_prefix(text: str) -> Tuple[int, str]:
+    """How many consecutive integers from START+1 the answer gets right.
+
+    A COUNT, not a boolean, and that is the correction the first metal run
+    forced. What this oracle must decide is whether the request kept a
+    COHERENT CONTEXT ACROSS THE CUTOVER -- not whether the model is
+    willing to count to 400. So the caller compares this prefix against
+    the point where the flip landed: numbers produced correctly AFTER the
+    flip are the evidence, and anything the model does later is its own
+    business.
+    """
     expect = START + 1
-    for i, got in enumerate(toks):
+    n = 0
+    pieces = text.replace(",", " ").split()
+    # A max_tokens cut lands MID-NUMBER ("...157 1"), and counting that
+    # stub as a break reads like corruption in the report. Drop a trailing
+    # piece only when the text does not end on whitespace, i.e. only when
+    # the generator was actually cut off mid-token.
+    if pieces and not text.endswith((" ", "\n")):
+        pieces = pieces[:-1]
+    for piece in pieces:
+        try:
+            got = int(piece)
+        except ValueError:
+            return n, f"non-integer token {piece!r} after {n} numbers"
         if got != expect:
-            return (
-                False,
-                f"sequence broke at position {i}: expected {expect}, got "
-                f"{got} (context corruption, not a slow answer)",
-            )
+            return n, f"expected {expect}, got {got} at position {n}"
         expect += 1
-    return True, f"{len(toks)} consecutive integers, {toks[0]}..{toks[-1]}"
+        n += 1
+    return n, "no break: every token was the next integer"
 
 
 def flip(base: str, direction: str, timeout: float) -> Tuple[int, str]:
@@ -166,11 +190,30 @@ def main() -> int:
                     help="stream chunks to observe before arming the flip")
     ap.add_argument("--limit", type=int, default=300)
     ap.add_argument("--stall-s", type=float, default=120.0)
+    ap.add_argument("--verify-log", default="/spinning/serving-30030.boot.log",
+                    help="serving log to read the COMMIT evidence from. An "
+                         "HTTP 200 from /phase_flip only means ARMED: a leg "
+                         "that parks and abandons also returns 200, and "
+                         "counting that as a pass is exactly how a refused "
+                         "leg once read as a green round trip.")
+    ap.add_argument("--margin", type=int, default=10,
+                    help="numbers that must still be CORRECT after each "
+                         "flip; the bar is post-cutover coherence, not the "
+                         "model's willingness to keep counting")
     ap.add_argument("--reference", action="store_true",
                     help="run WITHOUT flipping, to record the determined "
                          "answer this build produces when nothing moves")
     args = ap.parse_args()
     base = f"http://{args.host}:{args.port}"
+
+    # Watermark the log so only THIS run's lines are read back.
+    log_at_start = 0
+    try:
+        with open(args.verify_log, "rb") as fh:
+            fh.seek(0, 2)
+            log_at_start = fh.tell()
+    except OSError:
+        pass
 
     stream = _Stream(base, args.limit, args.stall_s)
     t = threading.Thread(target=stream.run, daemon=True)
@@ -178,6 +221,7 @@ def main() -> int:
     t.start()
 
     flips: List[Tuple[str, int, str, float]] = []
+    watermarks: List[Tuple[str, int]] = []
     if not args.reference:
         legs = [(args.direction, args.flip_after)]
         if args.round_trip:
@@ -194,11 +238,15 @@ def main() -> int:
                     f"be armed ({stream.chunks} chunks)"
                 )
                 break
-            at = stream.chunks
+            # The numbers already emitted when the flip is armed: the
+            # correctness bar is what comes AFTER this watermark.
+            at_numbers, _ = correct_prefix(stream.text)
+            watermarks.append((direction, at_numbers))
             code, body = flip(base, direction, timeout=args.stall_s)
-            flips.append((direction, code, body[:200], time.time() - t0))
+            flips.append((direction, code, body[:120], time.time() - t0))
             print(
-                f"[oracle] armed {direction} after {at} chunks -> HTTP {code}"
+                f"[oracle] armed {direction} at {stream.chunks} chunks / "
+                f"{at_numbers} numbers -> HTTP {code}"
             )
 
     # Stall watchdog: a dropped request goes silent rather than erroring.
@@ -215,18 +263,59 @@ def main() -> int:
     t.join(timeout=5.0)
     elapsed = time.time() - t0
 
-    ok_seq, why = check_sequence(stream.text)
+    # COMMIT EVIDENCE, from the log rather than from the arm response.
+    tail = ""
+    try:
+        with open(args.verify_log, "rb") as fh:
+            fh.seek(log_at_start)
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError as exc:
+        tail = f"<unreadable: {exc}>"
+    committed = {
+        direction: tail.count(f"PHASE-FLIP DONE {direction}")
+        for direction, _ in watermarks
+    }
+    carried_lines = tail.count("PHASE-FLIP-CARRY carried")
+    abandoned = tail.count("FLIP ABANDONED") + tail.count("abandon")
+
+    n_correct, why = correct_prefix(stream.text)
     survived = stream.error is None and stream.chunks > 0 and stream.done
+    # SURVIVED THE FLIP: the correct sequence has to extend past every
+    # watermark by a margin, i.e. the request went on producing the RIGHT
+    # continuation after the cutover moved its KV, its GDN state and its
+    # scheduler bookkeeping to another layout.
+    margin = args.margin
+    survived_each = [
+        (direction, mark, n_correct >= mark + margin)
+        for direction, mark in watermarks
+    ]
     print("=" * 68)
-    print(f"[oracle] elapsed        {elapsed:.1f}s")
-    print(f"[oracle] chunks         {stream.chunks}")
-    print(f"[oracle] flips          {flips if flips else 'none (reference)'}")
-    print(f"[oracle] stream error   {stream.error}")
-    print(f"[oracle] survived       {survived}")
-    print(f"[oracle] answer correct {ok_seq}: {why}")
-    print(f"[oracle] tail           ...{stream.text[-120:]!r}")
-    verdict = survived and ok_seq and (args.reference or len(flips) > 0)
-    print(f"[oracle] VERDICT        {'PASS' if verdict else 'FAIL'}")
+    print(f"[oracle] elapsed          {elapsed:.1f}s")
+    print(f"[oracle] chunks           {stream.chunks}")
+    print(f"[oracle] correct prefix   {n_correct} numbers ({why})")
+    print(f"[oracle] flips            {flips if flips else 'none (reference)'}")
+    print(f"[oracle] post-flip margin {survived_each or 'n/a (reference)'}")
+    print(f"[oracle] committed legs  {committed or 'n/a (reference)'}")
+    print(f"[oracle] carry log lines {carried_lines}")
+    print(f"[oracle] abandon mentions {abandoned}")
+    print(f"[oracle] stream error     {stream.error}")
+    print(f"[oracle] survived         {survived}")
+    print(f"[oracle] tail             ...{stream.text[-90:]!r}")
+    if args.reference:
+        verdict = survived and n_correct > 0
+    else:
+        verdict = (
+            survived
+            and len(flips) > 0
+            # Every armed leg must have COMMITTED on this rank's log, and
+            # the answer must stay right past each one. Either half alone
+            # is a false pass: a leg that never commits proves nothing,
+            # and a leg that commits while the answer breaks is the
+            # silent-corruption case this oracle exists for.
+            and all(committed.get(d, 0) > 0 for d, _ in watermarks)
+            and all(ok for _, _, ok in survived_each)
+        )
+    print(f"[oracle] VERDICT          {'PASS' if verdict else 'FAIL'}")
     print("=" * 68)
     return 0 if verdict else 1
 

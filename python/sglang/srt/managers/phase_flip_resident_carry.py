@@ -204,14 +204,22 @@ def resident_req_identity(scheduler) -> List[Tuple]:
     return sorted(ident)
 
 
-def assert_no_orphan_resident_reqs(scheduler) -> None:
-    """No request may be reachable ONLY through ``last_mbs``/``last_batch``.
+def orphan_resident_reqs(scheduler) -> List[str]:
+    """Requests reachable ONLY through ``last_mbs``/``last_batch``.
 
-    See the module header: at a quiescent boundary that cannot happen, so
-    if it does the quiescence predicate is wrong and the flip is running
-    at a boundary that is not one. Loud beats absorbed -- silently
-    widening the harvest would hide a broken predicate behind a carry that
-    appears to work.
+    THIS IS ALSO THE QUIESCENCE TERM (#631 defect L), which is why it is a
+    query and not only an assertion. ``last_batch`` names the batch that
+    ran in the previous iteration; in steady decode it holds exactly the
+    requests ``running_batch`` holds, and refusing to flip on "last_batch
+    is not empty" therefore refuses because requests EXIST -- the same
+    category error that made ``_pp_microbatches_drained`` block every
+    automatic flip. What actually matters is narrower and is this: is
+    every live request reachable through the handle the carry harvests?
+
+    Right after a prefill iteration the answer is briefly no -- the new
+    requests are still only in ``last_batch`` and get merged into the
+    running batch by the next ``get_next_batch_to_run``. That is a real
+    reason to wait, it clears itself in one iteration, and it is bounded.
     """
     carried: Set[int] = set()
     for batch in harvest_resident_batches(scheduler):
@@ -224,6 +232,18 @@ def assert_no_orphan_resident_reqs(scheduler) -> None:
         for req in _reqs_of(batch):
             if id(req) not in carried:
                 orphans.append(str(getattr(req, "rid", "?")))
+    return orphans
+
+
+def assert_no_orphan_resident_reqs(scheduler) -> None:
+    """The cutover's form of the check above: by then it must be empty.
+
+    The quiescence predicate gates on the same query, so reaching a
+    cutover with an orphan means the predicate did not hold -- a bug to
+    raise, not a carry to widen. Silently widening the harvest here would
+    hide a broken predicate behind a carry that appears to work.
+    """
+    orphans = orphan_resident_reqs(scheduler)
     if orphans:
         raise ResidentCarryError(
             f"{LOG_PREFIX} {len(orphans)} request(s) are reachable only "

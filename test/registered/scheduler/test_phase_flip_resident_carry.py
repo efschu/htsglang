@@ -174,6 +174,49 @@ class TestRealInitPreservesResidents(CustomTestCase):
         self.assertEqual(total, 2)
 
 
+class TestPpRingSurvivesTheTopologySwap(CustomTestCase):
+    """#631 DEFECT M: the PP chain's ring is not the live ps's.
+
+    The cutover rewrites ps per phase, and the TP phase gets pp_rank=0,
+    pp_size=1. Deriving the chain ring from ps therefore made UPSTREAM ==
+    SELF on every rank, and the flip-commit hygiene check then compared a
+    rank's own dict SEND counter against its own dict CONSUME counter --
+    two different wires. Rank 0 sends proxy dicts and consumes none, so
+    the imbalance was permanent: measured 8889 withheld rounds and
+    "tensor-dict wire has 24 unconsumed message(s) from rank 0" (itself),
+    with tp_to_pp abandoning for want of a quorum it could not form.
+    """
+
+    def _sched(self, pp_rank, pp_size, ring_rank=None, ring_n=None):
+        sched = SimpleNamespace(ps=SimpleNamespace(pp_rank=pp_rank, pp_size=pp_size))
+        if ring_rank is not None:
+            sched.pp_flip_counters = SimpleNamespace(rank=ring_rank, n_ranks=ring_n)
+        sched._pp_flip_ring = SchedulerPPMixin._pp_flip_ring.__get__(sched)
+        sched._pp_flip_upstream = SchedulerPPMixin._pp_flip_upstream.__get__(sched)
+        sched._pp_flip_downstream = SchedulerPPMixin._pp_flip_downstream.__get__(sched)
+        return sched
+
+    def test_ring_holds_after_the_ps_is_rewritten_to_the_tp_topology(self):
+        # ps says pp_rank=0/pp_size=1 (the TP phase); the counters carry
+        # the PP topology this rank was booted with.
+        for rank in (0, 1, 2):
+            sched = self._sched(0, 1, ring_rank=rank, ring_n=3)
+            self.assertEqual(sched._pp_flip_upstream(), (rank - 1) % 3)
+            self.assertEqual(sched._pp_flip_downstream(), (rank + 1) % 3)
+
+    def test_can_fail_the_old_ps_derived_ring_makes_upstream_self(self):
+        """The falsifier for the OLD path, so the defect stays dead."""
+        sched = self._sched(0, 1)  # no counters -> falls back to ps
+        self.assertEqual(sched._pp_flip_upstream(), 0)
+        self.assertEqual(sched._pp_flip_downstream(), 0)
+
+    def test_pp_phase_ring_is_unchanged(self):
+        """In the PP phase both sources agree, so nothing moves."""
+        for rank in (0, 1, 2):
+            sched = self._sched(rank, 3, ring_rank=rank, ring_n=3)
+            self.assertEqual(sched._pp_flip_upstream(), (rank - 1) % 3)
+
+
 class TestGdnSlotsFollowTheResidentSet(CustomTestCase):
     """#631 J.1's SECOND occurrence, found by audit and fixed here.
 
