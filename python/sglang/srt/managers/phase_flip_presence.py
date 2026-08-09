@@ -242,6 +242,45 @@ collective_min= argument), and that helper hardcodes its own module's
 label. The timing-out collective IS the flip's own reduction, wearing
 another feature's name. Do not go looking for a second bug.
 
+WHAT QUIESCENT-ANNOUNCE + SPIN THEN SHOWED (2026-08-09 00:06-00:09Z)
+--------------------------------------------------------------------
+The deadlock is GONE and the bounded-retry argument held exactly as
+written: rank 0 armed, drained first, announced, spun; ranks 1 and 2 never
+reached the entry; rank 0's per-round bound expired at 60.0 s; it
+abandoned LOUDLY with nothing entered, returned to the loop, and ranks 1
+and 2 then reached the entry and announced. Every step of case (b)
+behaved as designed. Two NEW defects were exposed underneath it, and
+neither is a variant of anything above.
+
+  G   SPINNING STARVES THE DOWNSTREAM. A spinning rank stops issuing the
+      per-pass chain forward -- and the downstream stages reach the hook
+      ONLY by returning from their blocking chain recv, which that forward
+      is what satisfies. So the first rank to become quiescent (rank 0,
+      the intake rank, always) prevents every rank behind it from ever
+      becoming ready. The retry is therefore bounded but NOT convergent:
+      the same starvation recurs every epoch, because the same rank
+      always drains first. The safety argument's case (b) is correct that
+      this is not a wedge; what it did not predict is that the condition
+      reproduces identically on each attempt. A quiescent spinner
+      evidently must keep EMITTING the keep-alive forward (an isend needs
+      no peer and never blocks) even though it must not CONSUME -- but
+      that is a design decision, not a tweak, and it owes an answer for
+      the sends that then accumulate unconsumed.
+
+  H   A PRE-ENTRY ABANDONMENT LEAVES A LIVE FLAG. _abandon_no_quorum is
+      rank-local BY DESIGN -- nothing was entered, so no peer is owed
+      anything -- and it disarms and mints a new epoch. But it does not,
+      and by the monotonicity rule cannot, retract the marker it already
+      wrote. So rank 0 abandoned epoch 0 and re-armed at epoch 1 while
+      ranks 1 and 2, arriving moments later, formed a full epoch-0 quorum
+      USING RANK 0'S STALE FLAG and entered epoch 0's reduction without
+      it. The epochs diverged and the group died on the collective
+      timeout. "Retraction mints a new epoch" protects the RETRACTING
+      rank; it does nothing for peers still reading the old one. A
+      withdrawal must be publishable -- evidence that a rank has LEFT is
+      as load-bearing as evidence that it arrived, and only one of the
+      two currently exists.
+
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
 Measured 2026-08-08 23:39Z, all three stacks
