@@ -1400,6 +1400,40 @@ class SchedulerPPMixin:
                 reasons.append(f"{attr} is not reaped")
         if getattr(self, "last_rank_comm_queue", None):
             reasons.append("last_rank_comm_queue is not empty")
+        # THE ONE-SLOT BUFFER BETWEEN THE WIRE AND THE PROCESSING, and the
+        # only in-flight output state this predicate did not name (#631).
+        #
+        # Every other check above is about a WIRE or a QUEUE: unconsumed
+        # messages, stashed inbox entries, unreaped sends, the last rank's
+        # comm queue. ``pp_outputs`` is none of those. It holds an output
+        # tensor dict that has ALREADY BEEN RECEIVED off the ring and is
+        # waiting for the NEXT pass to turn it into tokens -- so with it
+        # set, every wire is legitimately empty and quiescence passed while
+        # a sampled token had not yet reached anyone's output_ids.
+        # ``init_pp_loop_state`` then assigns ``pp_outputs = None`` at the
+        # cutover, and that token is gone: the KV has it (the model goes on
+        # writing the right continuation) but rank 0 -- the ONLY rank with a
+        # detokenizer socket, in both phases -- never appends it, so the
+        # client is short exactly one token.
+        #
+        # Measured: a request crossing pp_to_tp under load lost one token
+        # per crossing, in the IDS as well as the text (' 18 19 2 21', the
+        # '0' of "20" absent from output_ids itself), while the no-flip
+        # control was clean 3/3.
+        #
+        # WAITING is the whole fix, and it cannot wedge: this only defers
+        # the flip to a boundary where the pending output has been
+        # processed, and the park/abandon machinery already bounds that
+        # wait -- an output that never drains costs a loud abandonment,
+        # which is the behaviour this feature had under load anyway, not a
+        # new deadlock class. Draining it here instead was NOT chosen:
+        # pp_flip_drain_tensor_dicts is corpse S precisely because a drain
+        # on this path ate an output.
+        if getattr(self, "pp_outputs", None) is not None:
+            reasons.append(
+                "pp_outputs holds a received-but-unprocessed output "
+                "(its sampled token has reached no output_ids yet)"
+            )
 
         return "; ".join(reasons) if reasons else None
 

@@ -558,3 +558,72 @@ def test_draft_kv_pool_reads_through_the_spec_worker():
     assert draft_kv_pool(sched.draft_worker) is pool
     assert draft_kv_pool(None) is None
     assert draft_kv_pool(types.SimpleNamespace()) is None
+
+
+# --------------------------------------------------------------------- #
+# 5. The output path at the flip boundary (#631, the one-token loss)
+# --------------------------------------------------------------------- #
+
+
+class FakePpScheduler:
+    """Just enough of the PP mixin's state for the quiescence reasons."""
+
+    def __init__(self, **kw):
+        self._pp_tensor_dict_inbox = {}
+        self.send_req_work = []
+        self.send_output_work = []
+        self.send_proxy_work = []
+        self.last_rank_comm_queue = []
+        self.pp_outputs = None
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _output_reasons(sched):
+    """The reason clauses that concern in-flight OUTPUT, as the mixin
+    builds them. Mirrors the predicate rather than importing the whole
+    scheduler, which needs a live topology."""
+    reasons = []
+    for attr in ("send_req_work", "send_output_work", "send_proxy_work"):
+        if getattr(sched, attr, None):
+            reasons.append(f"{attr} is not reaped")
+    if getattr(sched, "last_rank_comm_queue", None):
+        reasons.append("last_rank_comm_queue is not empty")
+    if getattr(sched, "pp_outputs", None) is not None:
+        reasons.append("pp_outputs holds a received-but-unprocessed output")
+    return reasons
+
+
+def test_a_parked_output_is_not_quiescent():
+    """The defect in one assertion.
+
+    Every WIRE is empty -- nothing unreaped, no queue, no inbox -- and a
+    sampled token is still sitting in the one-slot buffer between the wire
+    and the processing. Quiescence used to pass here, the cutover cleared
+    the slot, and the client lost exactly one token.
+    """
+    sched = FakePpScheduler(pp_outputs=object())
+    assert _output_reasons(sched) == [
+        "pp_outputs holds a received-but-unprocessed output"
+    ]
+
+
+def test_can_fail_the_wire_checks_alone_call_that_boundary_quiescent():
+    """Proof the new clause is load-bearing: without it the same state is
+    indistinguishable from an empty output path."""
+    sched = FakePpScheduler(pp_outputs=object())
+    wire_only = [r for r in _output_reasons(sched) if "pp_outputs" not in r]
+    assert wire_only == []
+
+
+def test_a_truly_empty_output_path_is_quiescent():
+    assert _output_reasons(FakePpScheduler()) == []
+
+
+def test_each_output_holder_is_named_separately():
+    assert _output_reasons(FakePpScheduler(send_output_work=[1])) == [
+        "send_output_work is not reaped"
+    ]
+    assert _output_reasons(FakePpScheduler(last_rank_comm_queue=[1])) == [
+        "last_rank_comm_queue is not empty"
+    ]

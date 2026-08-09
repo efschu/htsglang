@@ -91,6 +91,13 @@ def count_request(idx, results):
         results[idx] = {
             "text": out.get("text", ""),
             "meta": out.get("meta_info", {}),
+            # THE IDS AS THE CLIENT RECEIVED THEM. The text is decoded
+            # through req.send_decode_id_offset and the ids are sent
+            # through req.send_token_offset -- two different offsets over
+            # two different lists. If a token is missing from the TEXT but
+            # present HERE, the loss is in the detokenize path and not in
+            # the id path, and that halves the search with no reboot.
+            "ids": out.get("output_ids", []),
             "s": round(time.time() - t0, 1),
         }
     except Exception as exc:  # noqa: BLE001
@@ -202,6 +209,7 @@ def main():
                             a = max(0, mm.start() - 40)
                             print(f"    raw: ...{r['text'][a:mm.end() + 40]!r}...")
                             break
+                print(f"    ids[40:80]: {r["ids"][40:80]}")
             ok_all = ok_all and ok
             spec = {k: v for k, v in r["meta"].items() if "accept" in k or "spec" in k}
             print(f"  req{i}: {'OK ' if ok else 'BAD'} {detail}  "

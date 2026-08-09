@@ -867,6 +867,32 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
 
         assert_no_orphan_resident_reqs(scheduler)
         resident_before = resident_req_identity(scheduler)
+        # WHAT init_pp_loop_state IS ABOUT TO DESTROY, on the record.
+        # It clears pp_outputs, last_rank_comm_queue, send_output_work and
+        # the tensor-dict inbox with no drain and no carry. The request
+        # side has a carry and a membership pin; the OUTPUT side has
+        # neither, and a discarded output is a token the client never sees
+        # (#631). Quiescence is supposed to make all of these empty -- this
+        # line is what says so out loud instead of assuming it.
+        _inflight = (
+            getattr(scheduler, "pp_outputs", None) is not None,
+            len(getattr(scheduler, "last_rank_comm_queue", None) or ()),
+            len(getattr(scheduler, "send_output_work", None) or ()),
+            sum(
+                len(q)
+                for q in getattr(scheduler, "_pp_tensor_dict_inbox", {}).values()
+            ),
+        )
+        if any(_inflight):
+            logger.warning(
+                "%s CUTOVER DISCARDS IN-FLIGHT OUTPUT: pp_outputs=%s "
+                "last_rank_comm_queue=%d send_output_work=%d inbox=%d -- "
+                "each is a sampled token that reaches no output_ids",
+                LOG_PREFIX,
+                *_inflight,
+            )
+        else:
+            logger.info("%s output path empty at cutover", LOG_PREFIX)
         scheduler.init_pp_loop_state()
         # 6b. The TP loops read ``running_batch``, not the slot array, so
         # the TP leg moves the re-seeded set over (and empties the slots,
