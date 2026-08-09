@@ -93,20 +93,41 @@ tail -20 "$OUT/corridor.log"
 say "COLLECT -- evidence slices from this run's log window only"
 sed -n "$((LOG_START+1)),\$p" "$SERVING_LOG" > "$OUT/serving_window.log"
 {
-  echo "--- phase transitions (policy-driven; no client posted /phase_flip)"
-  grep -aiE "phase flip (commit|committed)|flip .*(pp->tp|tp->pp)|phase_flip.*commit" \
-       "$OUT/serving_window.log" | tail -60
+  # The wording is the SERVER'S, not a guess. A first version of this
+  # collector grepped for "phase flip commit" and reported 0 commits for a
+  # run that had made 54 -- the log says "PHASE-FLIP DONE <phase>". A
+  # collector that under-reports is worse than none: it turns a passing run
+  # into an apparent failure.
+  echo "--- flip commits, BOTH directions (policy-driven; no client posted /phase_flip)"
+  printf 'PHASE-FLIP DONE pp (returned to PP) : %s\n' \
+    "$(grep -acE 'PHASE-FLIP DONE pp' "$OUT/serving_window.log")"
+  printf 'PHASE-FLIP DONE tp (entered TP)     : %s\n' \
+    "$(grep -acE 'PHASE-FLIP DONE tp' "$OUT/serving_window.log")"
+  printf 'flips armed by the policy           : %s\n' \
+    "$(grep -acE 'phase flip armed' "$OUT/serving_window.log")"
+  printf 'flips ABANDONED (any reason)        : %s\n' \
+    "$(grep -acE 'FLIP ABANDONED' "$OUT/serving_window.log")"
+  printf 'abandoned for STAGING room          : %s\n' \
+    "$(grep -acE 'staging [0-9]+ MiB needed' "$OUT/serving_window.log")"
   echo
-  echo "--- counts"
-  printf 'flip commits      : %s\n' "$(grep -acEi 'phase flip commit|flip commit' "$OUT/serving_window.log")"
-  printf 'accept-len lines  : %s\n' "$(grep -acEi 'accept.?len' "$OUT/serving_window.log")"
-  printf 'cuda graph lines  : %s\n' "$(grep -acEi 'cuda graph|graph capture|capture_bs|replay' "$OUT/serving_window.log")"
+  echo "--- speculation on the wire and CUDA graphs"
+  printf 'accept-len lines                    : %s\n' \
+    "$(grep -acE 'accept len:' "$OUT/serving_window.log")"
+  printf 'decode passes WITH a cuda graph     : %s\n' \
+    "$(grep -acE 'cuda graph: True' "$OUT/serving_window.log")"
+  grep -aoE 'accept len: [0-9.]+, accept rate: [0-9.]+' "$OUT/serving_window.log" \
+    | tail -5
   echo
-  echo "--- KV pool per phase"
-  grep -aoE "max_total_num_tokens[= ]+[0-9]+" "$OUT/serving_window.log" | sort | uniq -c | tail -20
+  echo "--- KV pool per phase (the flip's own census, at arm)"
+  grep -aoE 'POOL CENSUS at-arm [a-z_]+: size=[0-9]+ free=[0-9]+' \
+    "$OUT/serving_window.log" | sort | uniq -c | tail -10
   echo
-  echo "--- CUDA graph activity"
-  grep -aiE "cuda graph|graph capture" "$OUT/serving_window.log" | tail -20
+  echo "--- the long single session (bs=1, past the native ceiling)"
+  grep -aoE '#full token: [0-9]{6,}, full token usage: [0-9.]+' \
+    "$OUT/serving_window.log" | tail -5
+  echo
+  echo "--- staging refusals in full (the guard doing its job)"
+  grep -aE 'staging [0-9]+ MiB needed' "$OUT/serving_window.log" | tail -3
 } > "$OUT/evidence_slices.txt" 2>&1
 tail -40 "$OUT/evidence_slices.txt"
 
