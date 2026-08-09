@@ -1138,3 +1138,98 @@ fundamentally cheaper seam — pre-reserved, zero-allocation staging so the
 cutover never asks the driver for anything — not a bigger headroom
 allowance. The pool-ceiling formula from point 1 stands, but with a
 seam_peak term that is a function of the pool rather than a constant.
+
+## CORRECTION (successor 17, 2026-08-09): the "seam peak" is the TP-phase PLATEAU, not a cutover transient
+
+The headline of the previous shift -- "one pp_to_tp cutover costs 1.4-3.0
+GiB per card" -- is a MISATTRIBUTION, and every conclusion drawn from it
+(full-KV and auto-flip are in numeric tension; the seam must be made
+zero-allocation before capacity work can proceed) has to be withdrawn.
+
+### What was actually measured
+
+The original sampling window straddled a there-and-back flip PAIR. The
+previous holder note says so in its own words -- "both sampling windows
+straddle the same pair, epoch 3 pp_to_tp + epoch 4 tp_to_pp" -- and that
+is exactly the confound: what was read as a transient trough between two
+baselines is the TP-phase plateau BETWEEN the two flips.
+
+It reproduces on demand. Driving one `pp_to_tp` on the idle instance
+looks like a clean 1.6 s transient:
+
+    t=0.1s  5705 6248 4507     (PP)
+    t=0.9s  2745 4872 2699     <- "the seam peak"
+    t=1.7s  2745 4872 2699
+    t=2.5s  5705 6248 4507     (recovered)
+
+but the log shows the instance flipped BACK on its own 1.5 s later
+(`PHASE-FLIP DONE tp_to_pp (epoch 4)`, 22:44:30Z): POLICY=auto returns an
+idle instance to PP. The "recovery" is the second cutover, not the end of
+a transient.
+
+### The falsifier: hold the instance in TP with real work
+
+Same instrument, but a 1200-token generation keeps the instance in the TP
+layout for the whole decode (request wall time 7.93 s):
+
+    t=0.1s  5705 6248 4507     PP, before
+    t=1.1s  2743 4850 2695     TP  <-+
+    t=3.1s  2739 4848 2693     TP    | FLAT for ~7 s, with no cutover
+    t=8.1s  2739 4848 2693     TP  <-+  running anywhere in the window
+    t=9.1s  5699 6222 4501     back in PP
+    t=39s   5679 6222 4481     still PP, stable
+
+A cutover lasts 1.0-1.7 ms-scale seconds (`PHASE-FLIP DONE ... in 961.8 /
+1218.8 / 1711.9 ms`). A plateau that holds flat for 7 s and ends when the
+REQUEST ends is a steady state, not a transient.
+
+**So the number is real but it is a PHASE HOLD:** the TP layout keeps
+~2960 / 1400 / 1810 MiB more VRAM resident than the PP layout does, for
+as long as it is the active layout.
+
+### Why the pool-scaling result also dissolves
+
+Point 2 (pool 126000, "peak" 368/0/48 MiB) was produced by substituting
+`--max-total-tokens 500000 -> 126000`. That flag caps the TP pool. It did
+not shrink a transient super-linearly; it removed the TP/PP span
+difference, so the two plateaus became the same height and the apparent
+peak vanished. Nothing here is superlinear and nothing needs a
+zero-allocation seam to be reachable.
+
+### What actually binds capacity, with the numbers from this boot
+
+    PP pool (= the id space = serving capacity)   253528 tokens
+    TP pool (sizes itself to its own budget)      450290 tokens
+    --max-total-tokens cap                        500000  -> NOT BINDING
+
+Per section 6e the id space is the PP pool, so the TP pool's surplus of
+~196762 tokens is UNADDRESSABLE by construction -- no request can ever
+occupy it -- and it is exactly the hoarding that 6f capped with
+`--max-total-tokens`. At this boot the cap was set above the TP pool's own
+sizing, so it does nothing and the hoard is back.
+
+**The lever is therefore the one 6f already used, and full-KV does not
+need new machinery.** Capping the TP pool just above the id space
+(honouring the 6e invariant `TP capacity >= PP capacity`, whose violation
+is a device-side assert) releases the plateau difference during the TP
+phase, and that is the headroom the PP pool -- the number that actually
+sets serving capacity -- can grow into.
+
+### What survives from the previous shift
+
+* The measurement itself and its instrument: correct, reproducible, and
+  the raw samples are honest. Only the ATTRIBUTION was wrong.
+* Handle retention / a zero-allocation seam (shipped this shift, default
+  OFF behind `SGLANG_FLIP_SEAM_CHUNK_MIB`) is still worth having: it
+  removes the `cuMemCreate` OOM that can strike inside the cutover's
+  no-return region, which is a measured crash (2026-08-09 12:47:45,
+  rank 1). It is a CRASH fix, not a capacity fix, and must not be quoted
+  as one.
+
+### The general lesson, since this is the third number the chain inherited wrongly
+
+A memory reading taken across a flip PAIR cannot distinguish a transient
+from a phase hold. The separator is cheap and should be standard for any
+future seam measurement: hold the target layout under load for
+substantially longer than one cutover, and check whether the level tracks
+the WORK or the CUTOVER.
