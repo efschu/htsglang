@@ -749,3 +749,98 @@ real agentic load that refusal fired and took the instance down
 (04:55:43Z). The duplication is real; it is now resolved by filtering
 before the merge. The check was right to be loud and wrong to be fatal --
 and the assumption behind it was simply untrue.
+
+---
+
+# HANDOFF v4 — the SPEC=on + POLICY=auto attempt
+
+## 1. Wall 1 (OOM) is CLEARED, by derivation rather than iteration
+
+The failing allocation and the free memory at failure were read per rank
+from the crash log, and the new budget derived as
+
+    reduction = failed_alloc + corridor_target - free_at_failure
+
+| rank | card | free at OOM | reduction | 22200,14700,14700 -> |
+|---|---|---|---|---|
+| 0 | 5090 | 883.69 MiB | 1164 | **21000** |
+| 1 | 3080 | 650.38 MiB | 1398 | **13300** |
+| 2 | 3080 | 490.38 MiB | 1558 | **13100** |
+
+At that budget the OOM does not recur, and the corridor holds:
+
+    #631 VRAM CORRIDOR -- 2650 samples over 268.0s at 100 ms, floor 1024
+    gpu 0 (3080) MIN free 2642.4     breaches 0
+    gpu 1 (5090) MIN free 4897.7     breaches 0
+    gpu 2 (3080) MIN free 2714.4     breaches 0
+    CORRIDOR HELD: True
+
+**But the budget is now too LOOSE, and that is also a corridor violation
+in the operator's sense**: the rule is free NEAR 1024, not far above it.
+Headroom above the floor is +1618 / +3874 / +1690 MiB, i.e. ~7 GiB of
+this rig is being left unused. The derivation was deliberately
+conservative (it subtracted the whole failed allocation AND the whole
+corridor); the honest next step is to give most of that back once a run
+completes without faulting, and re-sample. **Do not raise it without the
+100 ms sampling** -- `scripts/route_a_631_corridor.py` is the harness,
+and it reports the per-card time-series minimum from the NVML FREE field
+(never total-used: a ~424-518 MiB carve-out is invisible to that
+subtraction).
+
+## 2. Wall 2 answered BY MEASUREMENT: waiting is NOT acceptable
+
+The coordinator asked whether the "speculating flips WAIT" mitigation is
+good enough or whether the draft-state carry must be built. Measured
+2026-08-09 05:21Z, SPEC=on POLICY=auto under agentic load:
+
+    05:21:01  armed (pp_to_tp) but NOT QUIESCENT: 1 resident request(s)
+              would enter a SPECULATING TP phase with no draft state
+    05:21:08  (same, all three ranks)
+    05:21:16  FLIP ABANDONED: pp_to_tp was armed for 30.0s without the
+              group reaching a quiescent boundary (deadline 30s)
+    05:21:16  Scheduler hit an exception
+              -> CUDA error: an illegal memory access was encountered
+
+**Two findings, and the second is the serious one.**
+
+**(a) The mitigation cannot work under sustained decode.** The guard's
+readiness condition is "nothing resident", and under a continuous agentic
+load something is always resident. So the flip never becomes ready, parks
+for the full deadline, and abandons -- every time. Flip cadence under
+sustained decode with speculation is therefore ZERO, and the feature
+delivers nothing in exactly the configuration production runs. **The
+draft-state carry is required, not optional.**
+
+**(b) ABANDONING A FLIP IS NOT SAFE UNDER LOAD, and the corpse table says
+it should be.** The design's standing claim for the pre-entry abandon
+path is "NOTHING was entered and nothing was moved". Here the abandonment
+is immediately followed by a device-side illegal memory access. The
+barlink BAR1 status poll in the traceback is where it SURFACES, not where
+it originates -- a sticky CUDA fault reports at the next synchronising
+call. This is a new defect, it is NOT the OOM, and it is NOT the draft
+state; it is the abandon path under load with speculation armed.
+
+Specimen: `/spinning/evidence-631/oom_and_abandon_20260809T0521Z/`
+(`serving.log` = the faulting boot, `oom_prior_boot.log` = the OOM boot
+the budget derivation came from).
+
+## 3. What the next session should do, in order
+
+1. **Diagnose (b) first.** It is a memory-safety fault on the abandon
+   path and it can corrupt rather than merely stop. Reproduce with
+   SPEC=on POLICY=auto plus sustained decode -- it reproduced within one
+   load run -- and capture with the wedge harness. Until it is understood,
+   POLICY=auto must not run with speculation.
+2. **Then build the draft-state carry** (v3 section 3 lists three options
+   and the shared hazard). Measurement now says the alternative -- waiting
+   -- is worth nothing under production load.
+3. Only then re-run the acceptance at SPEC=on POLICY=auto, tighten the
+   budget back toward the corridor, and run the A-vs-A gate vs
+   `9a929352c9` with a same-boot floor.
+
+## 4. Production
+
+Left on **`SPEC=on POLICY=manual`**, verified serving (`health` 200,
+`health_generate` 200, a real chat completion returned). That is the
+configuration that has served without incident throughout, and it is the
+only one currently proven with speculation.
