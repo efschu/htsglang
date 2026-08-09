@@ -24,7 +24,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.io_struct import PhaseFlipReqInput
-from sglang.srt.managers.phase_flip_counters import CHAN_DICT, CHAN_REQ
+from sglang.srt.managers.phase_flip_counters import CHAN_DICT, CHAN_PASS, CHAN_REQ
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -186,6 +186,7 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                self._pp_flip_pass_tick(mb_id)
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                 self._pp_forward_and_process_input_requests(recv_reqs)
@@ -851,6 +852,125 @@ class SchedulerPPMixin:
     #
     # Spin-at-the-hook is this same loop with the gate already open, which
     # is why there is one mechanism here and not two.
+
+    # -- #631 defect Q: THE ARMED WINDOW HAS NO PASS CLOCK ---------------
+    #
+    # THE INSTRUMENT, and the hypothesis it exists to KILL OR CONFIRM.
+    #
+    # What normally holds the PP stages in phase is not a shared counter --
+    # there is none. ``mb_id`` is the inner loop index of
+    # ``_event_loop_pp_body`` and is PURELY RANK-LOCAL. The synchroniser is
+    # the BLOCKING chain receive: a rank cannot begin its next slot
+    # iteration until its upstream has sent one message, so pass counts
+    # cannot drift. Every rank then runs the same deterministic
+    # ``get_next_batch_to_run`` over the same request stream and the stages
+    # build the same batches -- a property this tree RELIES ON and, as of
+    # the audit on 2026-08-09, states nowhere and asserts nowhere.
+    #
+    # THE ARMED INTAKE RULE REMOVES THAT CLOCK. While a flip is armed,
+    # ``request_receiver._pull_raw_reqs`` returns ``[]`` immediately on
+    # every rank -- rank 0 does not read zmq, and rank k>0 does not take
+    # the blocking ``chain_receiver.recv()``. Nothing blocks, so for the
+    # whole armed window (up to the 30 s park deadline) each rank
+    # free-runs its slot loop at its own rate. If the ranks run different
+    # numbers of passes in that window, their ``mb_id`` phase relationship
+    # is destroyed, and NOTHING re-establishes it when the flip ABANDONS
+    # and the ranks return to the ordinary loop.
+    #
+    # WHY A COMMIT IS SAFE AND AN ABANDON IS NOT -- the asymmetry the
+    # specimen shows and this hypothesis explains. A committed flip
+    # re-forms the topology and rebuilds the loop state
+    # (``init_pp_loop_state``), so the phase is reset by construction. An
+    # abandon returns to the SAME loop with drifted counters.
+    #
+    # WHAT IT COSTS WHEN IT GOES WRONG (specimen
+    # /spinning/evidence-631/oom_and_abandon_20260809T0521Z, 05:21:16Z):
+    # a microbatch's hidden states meet a DIFFERENT microbatch's batch. On
+    # that boot a 2048-row chunked-prefill chunk met a 1-request decode
+    # batch's cache indices, and one kernel BEFORE the guarded
+    # ``packed_decode`` that pair reaches ``causal_conv1d_update``, whose
+    # batch-vs-indices assert sits behind ``validate_data`` (default
+    # False). It launched 2048 programs against a 1-element index tensor:
+    # an out-of-bounds READ of the indices and an out-of-bounds WRITE into
+    # conv_state. That is the "illegal memory access" the abandon path was
+    # blamed for. It surfaced a second later in barlink's BAR1 status poll
+    # only because a sticky CUDA fault reports at the next synchronising
+    # call -- the poll is where it SHOWS, never where it happens.
+    #
+    # THE MEASUREMENT. Count slot iterations per rank across one armed
+    # window and publish the count where peers can read it. If the
+    # hypothesis is right the three counts differ, and the spread is the
+    # phase error. If they agree, the hypothesis is dead and the
+    # divergence is somewhere else -- which is exactly why this is an
+    # instrument and not yet a fix.
+    #
+    # A NOTE FOR WHOEVER FIXES IT, so the instrument is not mistaken for
+    # the remedy: restoring a per-pass chain message while armed is NOT
+    # obviously the answer -- presence is withheld while a rank owes a
+    # send, so a forward every pass could withhold presence every round.
+    # The likelier shape is that an armed rank must not ADVANCE its slot
+    # loop while it is doing no pipeline work.
+
+    def _pp_flip_pass_tick(self: Scheduler, mb_id: int) -> None:
+        """One slot iteration. Counts only while a flip is armed.
+
+        Zero cost on a boot without the flip: it returns on the server-args
+        test before touching anything. While armed it writes one small
+        /dev/shm file per pass, which is the same discipline and the same
+        directory the presence gate already uses.
+        """
+        if not getattr(self.server_args, "enable_phase_flip", False):
+            return
+        try:
+            armed = self.pp_phase_flip_armed()
+        except Exception:  # noqa: BLE001 - an instrument may never break the loop
+            return
+
+        passes = getattr(self, "_pp_flip_armed_passes", None)
+        counters = getattr(self, "pp_flip_counters", None)
+
+        if armed:
+            if passes is None:
+                self._pp_flip_armed_passes = 0
+                self._pp_flip_arm_mb_id = mb_id
+            else:
+                self._pp_flip_armed_passes = passes + 1
+            if counters is not None:
+                try:
+                    counters.publish_gauge(CHAN_PASS, self._pp_flip_armed_passes)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        # Falling edge: the flip committed or -- the interesting case --
+        # abandoned. Report the whole group's pass counts from ONE rank,
+        # because correlating three log streams by timestamp is how the
+        # last two diagnoses in this feature lost a boot each.
+        if passes is None:
+            return
+        self._pp_flip_armed_passes = None
+        arm_mb = getattr(self, "_pp_flip_arm_mb_id", None)
+        if counters is None:
+            return
+        try:
+            per_rank = [counters.sent(CHAN_PASS, r) for r in range(counters.n_ranks)]
+        except Exception:  # noqa: BLE001
+            return
+        spread = max(per_rank) - min(per_rank) if per_rank else 0
+        logger.warning(
+            "%s PASS-CLOCK across the armed window: rank %d ran %d slot "
+            "iteration(s) (armed at mb_id=%s, disarmed at mb_id=%d); group "
+            "%s, SPREAD %d. A non-zero spread means the ranks left the "
+            "armed window out of phase, so stage k's hidden states now "
+            "pair with a different microbatch on stage k+1 -- see defect Q.",
+            "PHASE-FLIP",
+            counters.rank,
+            passes,
+            arm_mb,
+            mb_id,
+            per_rank,
+            spread,
+        )
 
     def _pp_flip_bump_sent(self: Scheduler, chan: str) -> None:
         counters = getattr(self, "pp_flip_counters", None)

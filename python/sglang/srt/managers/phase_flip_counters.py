@@ -105,6 +105,17 @@ LOG_PREFIX = "PHASE-FLIP-COUNTERS"
 CHAN_REQ = "req"
 #: The tensor-dict wire (proxy AND output share it), rank k -> k+1 mod n.
 CHAN_DICT = "dict"
+#: NOT A WIRE. The number of pp_loop_size slot iterations a rank has run
+#: SINCE IT ARMED -- the instrument for #631 defect Q (the armed window has
+#: no pass clock). It rides the counter machinery because that machinery is
+#: already a cross-rank readable side channel with the right lifetime, so
+#: one rank can print all three ranks' pass counts on one line instead of
+#: three log streams having to be correlated by hand.
+#:
+#: Published ONLY while a flip is armed, and reset at each arm. A boot
+#: without the flip, and every unarmed pass of a boot with it, writes
+#: nothing at all.
+CHAN_PASS = "pass"
 
 _SENT = "s"
 _CONSUMED = "c"
@@ -185,6 +196,19 @@ class PhaseFlipCounters:
         self._publish(chan, _CONSUMED, n)
         return n
 
+    def publish_gauge(self, chan: str, value: int) -> None:
+        """Publish an ABSOLUTE value for a NON-WIRE channel (``CHAN_PASS``).
+
+        Deliberately not monotone, and that is safe ONLY because nothing
+        blocks on a gauge. The monotonicity of ``bump_sent`` exists so a
+        stale read can never send a receiver into an unbounded wait; a
+        gauge is read for DIAGNOSIS only, so a stale read costs a slightly
+        old number in a log line and nothing else. Do not route a wire
+        through here.
+        """
+        self._local[(chan, _SENT)] = int(value)
+        self._publish(chan, _SENT, int(value))
+
     # -- reading --------------------------------------------------------
 
     def _read(self, chan: str, kind: str, rank: int) -> int:
@@ -246,4 +270,10 @@ class PhaseFlipCounters:
         return removed
 
 
-__all__ = ["PhaseFlipCounters", "CHAN_REQ", "CHAN_DICT", "LOG_PREFIX"]
+__all__ = [
+    "PhaseFlipCounters",
+    "CHAN_REQ",
+    "CHAN_DICT",
+    "CHAN_PASS",
+    "LOG_PREFIX",
+]

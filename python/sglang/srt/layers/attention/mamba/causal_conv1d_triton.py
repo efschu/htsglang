@@ -1047,6 +1047,49 @@ def causal_conv1d_update(
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
 
+    # #631 MEMORY SAFETY, AND IT MAY NOT BE OPTIONAL.
+    #
+    # The kernel launches one program per row of ``x`` and each one reads
+    # ``conv_state_indices[row]`` to find its conv-state line. If the index
+    # tensor is SHORTER than the batch, those reads run off the end of it
+    # and the garbage they return is used as a cache-line number -- an
+    # out-of-bounds READ followed by an out-of-bounds WRITE into
+    # conv_state. Nothing raises; the corruption is silent and lands in
+    # another request's state.
+    #
+    # The equivalent assert already existed below, but behind
+    # ``validate_data``, which defaults to False -- so on every real call
+    # it was compiled out. MEASURED CONSEQUENCE, 2026-08-09 05:21:16Z
+    # (/spinning/evidence-631/oom_and_abandon_20260809T0521Z): a decode
+    # batch of one request was handed a 2048-row chunked-prefill hidden
+    # state. This kernel launched 2048 programs against a 1-element index
+    # tensor and the CUDA context was poisoned; the "illegal memory
+    # access" surfaced a full second later inside barlink's BAR1 status
+    # poll, which sent the investigation to the wrong subsystem. The
+    # Python guard that DID fire (fused_recurrent's `ssm_state_indices`
+    # shape check) is one kernel LATER -- it named the bug only after this
+    # one had already written.
+    #
+    # Checked unconditionally because a bounds check that is off in
+    # production is not a bounds check. It costs two host-side shape reads
+    # and no synchronisation, so it is invisible next to the launch.
+    #
+    # ONLY THE SHORT DIRECTION IS AN ERROR. A longer index tensor is
+    # harmless -- the surplus entries are never addressed -- and refusing
+    # it would break working callers for no safety gain. This guard
+    # therefore cannot change the behaviour of any call that is correct
+    # today, which is what makes it safe to add unconditionally.
+    if conv_state_indices is not None and conv_state_indices.shape[0] < batch:
+        raise ValueError(
+            f"causal_conv1d_update: conv_state_indices has "
+            f"{conv_state_indices.shape[0]} entr(ies) for a batch of {batch}. "
+            f"The kernel indexes it once per row, so this would read past "
+            f"its end and write to an unowned conv_state line. This means "
+            f"the batch and its cache indices came from different places -- "
+            f"under PP, the usual cause is a microbatch's hidden states "
+            f"paired with another microbatch's metadata."
+        )
+
     if validate_data:
         assert dim == weight.size(0)
         assert (

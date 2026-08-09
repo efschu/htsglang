@@ -1845,107 +1845,46 @@ def test_the_idle_return_leg_is_untouched_by_the_decline():
     assert req.direction == TP_TO_PP
 
 
-# -- #631 defect P: the armed rank dropped the request chain -------------------
+# -- #631 CORPSE P: "the armed rank drops requests off the chain" --------------
 #
-# SPECIMEN: /spinning/evidence-631/oom_and_abandon_20260809T0521Z/serving.log,
-# 2026-08-09 05:21:16Z. A pp_to_tp flip parked for its full 30 s deadline
-# under load and ABANDONED. In the same second PP2 died with
+# FALSIFIED THE SAME HOUR IT WAS PROPOSED, 2026-08-09. Recorded because it is
+# the obvious reading of the armed branch and the next reader will have it too.
+#
+# THE SPECIMEN it was invented to explain:
+# /spinning/evidence-631/oom_and_abandon_20260809T0521Z/serving.log. A pp_to_tp
+# flip parked its full 30 s under load and ABANDONED at 05:21:16Z. In the same
+# second PP2 died with
 #
 #     ValueError: `ssm_state_indices` must have shape [B]
 #                 (got (1,); expected (2048,))
 #
-# raised by fused_recurrent_gated_delta_rule_packed_decode -- a DECODE batch
-# of one request carrying 2048 rows of hidden state, and 2048 is exactly this
-# boot's chunked_prefill_size. A chunked-prefill chunk's hidden states had been
-# paired with a decode batch's cache indices, i.e. the ranks had built
-# DIFFERENT batches for the same pass.
+# from fused_recurrent_gated_delta_rule_packed_decode: a DECODE batch of one
+# request carrying 2048 rows of hidden state, and 2048 is exactly this boot's
+# chunked_prefill_size. A prefill CHUNK's hidden states had been paired with a
+# DECODE batch's cache indices -- the ranks had built different batches.
 #
-# WHY THAT IS A MEMORY-SAFETY BUG AND NOT A CRASH. One kernel earlier,
-# gdn_backend.forward_decode calls causal_conv1d_update(mixed_qkv, ...,
-# conv_state_indices=cache_indices) with the same mismatched pair, and that
-# kernel's batch-vs-indices guard
+# THE HYPOTHESIS. While armed, a non-last rank calls pp_flip_service() INSTEAD
+# of forwarding recv_reqs downstream (scheduler_pp_mixin, the armed branch).
+# So -- it seemed -- every request arriving during the armed window reached
+# rank 0's queue and never reached ranks 1 and 2, and the stages diverged.
 #
-#     assert (batch,) == conv_state_indices.shape
+# WHY IT IS WRONG, and it is wrong twice over:
 #
-# sits behind validate_data, which defaults to False. So it launched 2048
-# programs against a 1-element index tensor, read the index tensor
-# out of bounds, and used the garbage as a conv-state line number -- an
-# out-of-bounds WRITE into conv_state. That is the "illegal memory access"
-# the abandon was blamed for; it surfaced 1 s later in barlink's BAR1 status
-# poll only because a sticky CUDA fault reports at the next synchronising
-# call. The abandon path did not move KV. It corrupted the batch stream.
+#   1. While armed, recv_reqs is ALWAYS EMPTY. The armed intake rule in
+#      request_receiver._pull_raw_reqs returns [] on every rank before any
+#      of this: rank 0 deliberately LEAVES its requests in the zmq socket,
+#      which is what buffers them ("Not reading them is what buffers them --
+#      there is no queue to manage and nothing can be lost"). The dropped
+#      forward therefore drops an EMPTY message. Nothing is lost.
+#   2. Nor do the middle ranks strand anything. pp_flip_consume_inbound puts
+#      what it takes into PpChainReceiver.inbox, and the normal path reads
+#      through the SAME receiver -- recv() drains the inbox first, in arrival
+#      order, before touching the wire. The receiver is the single owner of
+#      that stream and is ON by default when the flip is enabled.
 #
-# THE CAUSE, and it is one line. While armed, a non-last rank calls
-# pp_flip_service() INSTEAD of the pair
-#
-#     _pp_commit_comm_work(self.send_req_work)          # blocking, unsafe
-#     self.send_req_work = self._pp_send_pyobj_to_next_stage(recv_reqs, ...)
-#
-# Only the first of those two is unsafe while armed. Dropping the second as
-# well was justified in the comment as "an armed rank issues no new forward --
-# it is admitting no new work, so it has nothing to forward", and THAT CLAIM IS
-# FALSE. recv_reqs is not the work this rank admits; it is the request stream
-# that keeps every PP stage's scheduler state identical, and rank 0 draws it
-# from ZMQ whether or not a flip is armed. Withholding ADMISSIONS is not the
-# same as not RECEIVING. There is no send-side backlog, so every request that
-# arrived during the 30 s armed window reached rank 0's waiting queue and
-# NEVER reached ranks 1 and 2 -- not delayed, lost. Rank 0 then scheduled a
-# prefill for a request its peers had never heard of.
-#
-# The middle ranks are not the same bug: pp_flip_consume_inbound() buffers
-# what it takes into PpChainReceiver.inbox and recv() hands it back in
-# arrival order, so nothing is lost there. Rank 0 has no such buffer.
+# THE LESSON, which is this feature's standing one: the armed branch LOOKS
+# like a message-loss bug and is not one. Do not re-derive it from the
+# symptom. What the armed intake rule actually removes is not the messages
+# -- it is the PASS CLOCK, and that is where the search went next.
 
 
-def test_an_armed_rank_still_forwards_the_request_chain():
-    """THE FALSIFIER FOR DEFECT P.
-
-    An armed rank may not block on the chain; it may not go SILENT on it.
-    Those are different requirements and the armed path conflated them.
-    """
-    s, fwd, sends, processed = _fwd_harness(armed=True)
-
-    fwd(["a request that arrived while the flip was armed"])
-
-    assert sends, (
-        "an armed rank issued NO chain forward. Every request that arrives "
-        "during the armed window is then invisible to every downstream "
-        "stage, permanently -- rank 0 draws recv_reqs from ZMQ and there is "
-        "no send-side backlog to replay them later. The stages then build "
-        "different batches and a chunked-prefill hidden-state tensor meets "
-        "a decode batch's cache indices in causal_conv1d_update, whose "
-        "shape guard is compiled out. See the specimen above."
-    )
-    assert "a request that arrived while the flip was armed" in sends[0][1]
-
-
-def test_the_armed_forward_stays_async():
-    """The forward is restored; the BLOCKING commit stays gone.
-
-    Corpse B' is the reason the armed branch exists at all: a synchronous
-    chain send pairs with a peer parked in the hidden-states exchange and
-    deadlocks. Only the blocking half was ever unsafe.
-    """
-    s, fwd, sends, processed, commits = _fwd_harness(armed=True, track_commits=True)
-
-    fwd(["req"])
-
-    assert sends[0][0] is True, "the armed forward must be async"
-    assert commits == [], (
-        "the armed path took a blocking commit; that is corpse B'. The "
-        "armed rank reaps its handle through pp_flip_flush_drained_sends, "
-        "gated on the downstream's published consumed-counter."
-    )
-
-
-def test_the_armed_path_still_services_its_channels():
-    """The service turn is not replaced by the restored forward."""
-    s, fwd, sends, processed = _fwd_harness(armed=True)
-
-    fwd(["req"])
-
-    assert s.services, (
-        "the armed rank stopped servicing its channels; that is defect G "
-        "back again (the downstream then reaches the hook only via a "
-        "forward that an armed upstream does not owe)"
-    )
