@@ -190,36 +190,70 @@ def committed_slots(scheduler, batch) -> List[torch.Tensor]:
     return out
 
 
-def scrub_draft_kv(pool, slot_rows: Sequence[torch.Tensor]) -> int:
-    """Zero the draft KV rows of the given token slots. Returns rows zeroed.
+def draft_kv_layer_ids(pool) -> List[int]:
+    """The layer ids whose KV buffers this pool actually holds.
 
-    Layer-generic and pool-generic: MLA-style pools return the same tensor
-    for key and value, so the value write is skipped when it aliases the
-    key (zeroing twice is harmless, but the guard keeps the row count
-    honest and halves the traffic).
+    NOT a range derived from a count, because on this model it is not one.
+    The draft pool here is a HYBRID pool: a Qwen3.6 layer stack mixes full
+    attention with linear/GDN layers, and only the full-attention ones have
+    KV rows at all. Such a pool carries no ``layer_num`` -- it carries
+    ``full_attention_layer_id_mapping``, a dict from the model's layer id
+    to the inner pool's -- and ``get_key_buffer`` REFUSES any id outside
+    it. A range-based scrub therefore either refuses outright (measured
+    08:56:39Z on all three ranks: "draft KV pool reports 0 layers") or, on
+    a pool that happens to expose a count, walks ids the pool would reject.
+
+    Order of authority: the explicit mapping first, a declared count
+    second, and a loud refusal third. The refusal is deliberate -- a scrub
+    that silently covers nothing leaves the stale rows this module exists
+    to remove, and the failure would then be a quiet acceptance collapse
+    rather than an error.
     """
     if pool is None:
-        return 0
-    rows = 0
-    start = int(getattr(pool, "start_layer", 0) or 0)
+        return []
+    mapping = getattr(pool, "full_attention_layer_id_mapping", None)
+    if mapping:
+        return sorted(int(k) for k in mapping.keys())
     n_layers = int(getattr(pool, "layer_num", 0) or 0)
-    if n_layers <= 0:
-        raise DraftBootstrapError(
-            f"{LOG_PREFIX} draft KV pool reports {n_layers} layers; refusing "
-            f"to scrub a pool whose geometry cannot be read"
-        )
+    if n_layers > 0:
+        start = int(getattr(pool, "start_layer", 0) or 0)
+        return list(range(start, start + n_layers))
+    raise DraftBootstrapError(
+        f"{LOG_PREFIX} draft KV pool {type(pool).__name__} declares neither "
+        f"full_attention_layer_id_mapping nor a non-zero layer_num; refusing "
+        f"to scrub a pool whose geometry cannot be read"
+    )
+
+
+def scrub_draft_kv(pool, slot_rows: Sequence[torch.Tensor]) -> tuple:
+    """Zero the draft KV rows of the given token slots.
+
+    Returns (rows zeroed, layer ids scrubbed) -- the layer ids are returned
+    rather than counted so the boot log records WHICH layers were covered.
+    On a hybrid draft stack that is the difference between a scrub that did
+    its job and one that covered a fraction of the layers, and the two are
+    indistinguishable from a row count alone.
+
+    Pool-generic: MLA-style pools return the same tensor for key and value,
+    so the value write is skipped when it aliases the key (zeroing twice is
+    harmless, but the guard keeps the traffic honest).
+    """
+    if pool is None:
+        return 0, []
+    layer_ids = draft_kv_layer_ids(pool)
+    rows = 0
     for slots in slot_rows:
         if slots.numel() == 0:
             continue
         idx = slots.to(torch.long)
-        for layer_id in range(start, start + n_layers):
+        for layer_id in layer_ids:
             k = pool.get_key_buffer(layer_id)
             k[idx] = 0
             v = pool.get_value_buffer(layer_id)
             if v is not None and v.data_ptr() != k.data_ptr():
                 v[idx] = 0
         rows += int(slots.numel())
-    return rows
+    return rows, layer_ids
 
 
 def build_bootstrap_draft_input(scheduler, batch, topk: int):
@@ -300,7 +334,7 @@ def arm_draft_bootstrap(scheduler, batch, draft_worker) -> dict:
         return {"reqs": len(reqs), "rows": 0, "armed": False}
 
     slot_rows = committed_slots(scheduler, batch)
-    rows = scrub_draft_kv(pool, slot_rows)
+    rows, layer_ids = scrub_draft_kv(pool, slot_rows)
 
     topk = int(getattr(draft_worker, "topk", 1) or 1)
     batch.spec_info = build_bootstrap_draft_input(scheduler, batch, topk)
@@ -309,14 +343,21 @@ def arm_draft_bootstrap(scheduler, batch, draft_worker) -> dict:
 
     logger.info(
         "%s bootstrapped %d carried request(s) into the speculating TP "
-        "phase: %d stale draft KV row(s) scrubbed, seed installed; the "
-        "first decode round runs a 1-node verify (no draft) and its "
-        "hidden states seed the real chain",
+        "phase: %d stale draft KV row(s) scrubbed across layer(s) %s of "
+        "%s, seed installed; the first decode round runs a 1-node verify "
+        "(no draft) and its hidden states seed the real chain",
         LOG_PREFIX,
         len(reqs),
         rows,
+        layer_ids,
+        type(pool).__name__,
     )
-    return {"reqs": len(reqs), "rows": rows, "armed": True}
+    return {
+        "reqs": len(reqs),
+        "rows": rows,
+        "layers": layer_ids,
+        "armed": True,
+    }
 
 
 def retune_carried_batches_for_phase(scheduler, spec_algorithm) -> int:

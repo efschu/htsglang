@@ -38,6 +38,7 @@ from sglang.srt.managers.phase_flip_draft_bootstrap import (
     build_bootstrap_draft_input,
     clear_bootstrap,
     committed_slots,
+    draft_kv_layer_ids,
     draft_kv_pool,
     retune_carried_batches_for_phase,
     scrub_draft_kv,
@@ -162,8 +163,9 @@ def test_can_fail_committed_slots_would_overrun_on_req_seqlen():
 def test_scrub_zeroes_only_the_carried_slots():
     sched, pool = make_scheduler()
     batch = make_batch()
-    rows = scrub_draft_kv(pool, committed_slots(sched, batch))
+    rows, layers = scrub_draft_kv(pool, committed_slots(sched, batch))
     assert rows == 7
+    assert layers == [0]
     k = pool.get_key_buffer(0)
     v = pool.get_value_buffer(0)
     for slot in [0, 1, 2, 10, 11, 12, 13]:
@@ -191,7 +193,7 @@ def test_scrub_skips_an_aliased_value_buffer():
     pool = FakeKVPool(alias_value=True)
     sched, _ = make_scheduler()
     batch = make_batch()
-    rows = scrub_draft_kv(pool, committed_slots(sched, batch))
+    rows, _ = scrub_draft_kv(pool, committed_slots(sched, batch))
     assert rows == 7
     assert torch.all(pool.get_key_buffer(0)[0] == 0)
 
@@ -205,10 +207,65 @@ def test_scrub_covers_every_layer_of_a_multilayer_draft():
         assert torch.all(pool.get_key_buffer(layer_id)[0] == 0), layer_id
 
 
+class FakeHybridPool:
+    """The pool shape that actually killed boot 08:56:39Z.
+
+    A Qwen3.6 layer stack mixes full attention with linear/GDN layers, so
+    the pool holds KV for SOME layer ids only, carries no ``layer_num``,
+    and its ``get_key_buffer`` raises for any id outside the mapping.
+    """
+
+    def __init__(self):
+        # Model layer 5 and 11 are the full-attention ones; the inner pool
+        # numbers them 0 and 1.
+        self.full_attention_layer_id_mapping = {5: 0, 11: 1}
+        self._k = [torch.full((N_SLOTS, 4), 7.0) for _ in range(2)]
+        self._v = [torch.full((N_SLOTS, 4), 9.0) for _ in range(2)]
+
+    def _inner(self, layer_id):
+        if layer_id not in self.full_attention_layer_id_mapping:
+            raise ValueError(f"{layer_id=} not in full attention layers")
+        return self.full_attention_layer_id_mapping[layer_id]
+
+    def get_key_buffer(self, layer_id):
+        return self._k[self._inner(layer_id)]
+
+    def get_value_buffer(self, layer_id):
+        return self._v[self._inner(layer_id)]
+
+
+def test_layer_ids_come_from_the_mapping_on_a_hybrid_draft_pool():
+    assert draft_kv_layer_ids(FakeHybridPool()) == [5, 11]
+
+
+def test_scrub_walks_a_hybrid_pool_s_real_layer_ids():
+    pool = FakeHybridPool()
+    sched, _ = make_scheduler()
+    batch = make_batch()
+    rows, layers = scrub_draft_kv(pool, committed_slots(sched, batch))
+    assert rows == 7
+    assert layers == [5, 11]
+    for layer_id in (5, 11):
+        assert torch.all(pool.get_key_buffer(layer_id)[0] == 0)
+        assert torch.all(pool.get_key_buffer(layer_id)[3] == 7.0)
+
+
+def test_can_fail_a_range_based_scrub_is_rejected_by_a_hybrid_pool():
+    """Proof the mapping lookup is load-bearing, not defensive padding.
+
+    This is exactly what the first metal boot did: derive a range from a
+    count, then hand the pool an id it does not hold.
+    """
+    pool = FakeHybridPool()
+    assert not hasattr(pool, "layer_num")
+    with pytest.raises(ValueError, match="not in full attention layers"):
+        pool.get_key_buffer(0)
+
+
 def test_scrub_refuses_a_pool_whose_geometry_is_unreadable():
     pool = FakeKVPool()
     pool.layer_num = 0
-    with pytest.raises(DraftBootstrapError, match="layers"):
+    with pytest.raises(DraftBootstrapError, match="declares neither"):
         scrub_draft_kv(pool, [torch.tensor([0])])
 
 
@@ -301,7 +358,7 @@ def test_arm_scrubs_seeds_and_marks_in_one_call():
     sched, pool = make_scheduler()
     batch = make_batch()
     report = arm_draft_bootstrap(sched, batch, sched.draft_worker)
-    assert report == {"reqs": 2, "rows": 7, "armed": True}
+    assert report == {"reqs": 2, "rows": 7, "layers": [0], "armed": True}
     assert torch.all(pool.get_key_buffer(0)[0] == 0)
     assert batch.spec_info is not None
     assert batch_needs_bootstrap(batch)
