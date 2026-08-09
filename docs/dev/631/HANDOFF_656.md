@@ -2135,3 +2135,120 @@ point in the pass; that is the lesson worth carrying.)
   plain-decode phase should resume from.
 - Do NOT re-walk: the pending-token convention (this section), the
   output wire, the send cursors, the detokenizer, cross-rank divergence.
+
+# HANDOFF v11 — written 2026-08-09 by successor #10
+
+**`tp_to_pp` with SPEC=on is CONTENT-CLEAN.** 36 of 36 determined answers
+byte-complete across 6 `tp_to_pp` and 6 `pp_to_tp` crossings under load,
+two independent runs, plus a third instrument that reads the id stream
+directly. HEAD `68817ac687`, suite **530 passed**. The last correctness
+defect on this strand is closed.
+
+## 1. THE DEFECT: a relay the source phase stopped maintaining
+
+A plain-decode round does not carry its input token on the batch. The
+last speculative round ends with `batch.input_ids = None` ("rebuilt next
+iter from draft_token", `scheduler.py`), and the next round's
+`resolve_forward_inputs` gathers the token out of
+`future_map.output_tokens_buf` — a pool-indexed relay whose contract is
+that a round which READS a row was preceded by a round that WROTE it.
+
+The TP speculative phase breaks that contract while it runs, and it is
+entitled to: the NON-OVERLAP V2 path (`scheduler.py`, `elif not
+batch.spec_algorithm.is_none()`) drives the worker synchronously and
+installs `next_draft_input` directly, so it never calls
+`_relay_forward_payload` and never stashes. Inside the phase this costs
+nothing — the next round rebuilds `input_ids` from the draft tokens
+instead of gathering.
+
+**At the cutover the READER changes.** The first PP decode gathers, and
+what it gathers is the token the PREVIOUS PP phase stashed — stale by the
+entire TP phase, hundreds of tokens. The model appends a foreign token to
+a correct prefix and answers from it.
+
+## 2. Why it looked intermittent, and why only one leg
+
+Measured on every `tp_to_pp` cutover of boot 11:57:26Z: **3 of 3 requests
+would have gathered a stale token, every time** (`relay=198 / 279 / 628 /
+17 / 15 / 220` against `last=16`). The MISMATCH rate is 100 %; the
+visible corruption rate was ~25 % (3 of 12 requests over 4 crossings).
+
+Both numbers are correct, and the gap between them is the reason six
+shifts read this as intermittent: on a hard-determined counting task the
+model usually recovers from one foreign token, so most crossings absorb
+the defect silently. **A defect's firing rate and its visible rate are
+different quantities, and instrumenting the mechanism gives the first
+one.** Rate-based reasoning over answers alone would have kept mis-sizing
+this forever.
+
+The direction dependence is equally mechanical: the PP phase stashes on
+EVERY pass (`scheduler_pp_mixin`), so a batch entering the TP phase finds
+the relay fresh. `pp_to_tp` was never exposed. That asymmetry is the
+whole of it — no state, no step, no width.
+
+## 3. THE FIX, and the rule it comes from
+
+`reseed_decode_input_relay` (`phase_flip_resident_carry.py`), called on
+the `tp_to_pp` leg only (`phase_flip_runtime.py`, the `else` of the
+draft-bootstrap arm). It re-derives each carried request's last token
+from `req.output_ids[-1]`, stashes it with the same primitive the
+batch-rebuild path already uses, and clears the leftover speculative
+`input_ids` so the gather is the only source.
+
+    A VALUE HANDED ACROSS THE CUTOVER MUST BE RE-DERIVED FROM THE TRUTH
+    AT THE HANDOVER, NEVER INHERITED FROM A BUFFER THE SOURCE PHASE
+    STOPPED MAINTAINING.
+
+This is the fifth law of the strand, and it is the general form of the
+width family's rule (take the width from the tensor that ran) applied to
+values instead of shapes: ask the thing that KNOWS, not the thing that
+usually knows.
+
+## 4. What was falsified on the way, so it is not re-walked
+
+- **The committed mamba STEP is innocent.** v10 section 5 named it as
+  the next instrument. It was not built, because the metal answered a
+  cheaper question first: at the cutover every request sat at
+  `tail=[220,16,16]` (" 11") and the FIRST PP round handed one request a
+  SPACE where the digit belonged, then the answer continued coherently.
+  One wrong token with a correct continuation is a wrong INPUT, not a
+  drifting recurrent state — a drifting state does not self-heal.
+- **Not a lost token either.** The new `route_a_631_tail_loss_probe`
+  renders the returned `output_ids` back into digits without a tokenizer
+  and compares that stream to the text. Pre-fix both streams broke at the
+  same place, which killed the send-cursor and detokenizer readings for
+  this face too.
+- The v10 section 5 falsification of the pending-token convention still
+  stands and is untouched by this.
+
+## 5. Method note
+
+The finding came from reading the pass trace AT the cutover instead of
+reasoning about the carry: `at-cutover` gave the tails, the next `round`
+line gave what each request was handed, and the two together located the
+defect in one reading. The delegated code trace then supplied the exact
+wire (`resolve_forward_inputs` ← `output_tokens_buf`) and the fact that
+the non-overlap spec path never writes it. Instrument, read, then sweep —
+the same order that found the width family.
+
+## 6. State
+
+- HEAD `68817ac687`, suite 530 passed, working tree clean.
+- SERVING on that tree, `POLICY=manual SPEC=on
+  RANK_MIB=21000,13300,13100`, health 200, boot 11:57:26Z.
+- Probes: `route_a_631_draft_carry_probe.py` (answers),
+  `route_a_631_tail_loss_probe.py` (ids vs text, NEW),
+  `route_a_631_roundtrip_probe.sh` (survival).
+
+## 7. NAMED RISK, not yet a defect
+
+The `tp_to_pp` leg leaves `batch.spec_info` in place. The comment at the
+retune site says "its spec_info is simply not read there", and that is
+false as written: `filter_batch` and `merge_batch` call into it
+unconditionally when it is truthy, and `capture_hidden_mode` is derived
+from it in `forward_batch_info`. Nothing observed has been traced to
+this, and the answers are clean, so it is recorded rather than fixed —
+but a PP phase capturing hidden states it has no drafter to consume is
+wasted work at best, and the first post-flip `merge_batch` calls
+`EagleDraftInput.merge_batch(None)`. Worth a can-fail before the
+acceptance soak is trusted for long dwells.
