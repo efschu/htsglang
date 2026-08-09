@@ -212,3 +212,178 @@ rotates the serving log instead.
   test results in the commit message.
 - GPU arbitration via `/spinning/gpu-arb/holder`: read it, update it on
   every boot.
+
+---
+---
+
+# HANDOFF v2 — written 2026-08-09 by successor #3
+
+**Everything above is still true as history. This section supersedes §3
+(defect G) and §4 (the acceptance program's readiness).** Read the corpse
+table in `python/sglang/srt/managers/phase_flip_presence.py` alongside it;
+entries G (resolved), I and J are the current state of the art.
+
+## 1. State
+
+- **HEAD**: `264f6142da` on `feat/route-a-631`.
+- **Tests**: `bash scripts/run_631_flip_family.sh` → **379 passed**. The
+  script is now the whole family: it also carries
+  `test_pp_chain_receiver.py` and the new `test_phase_flip_counters.py`,
+  so there is no longer a second suite to remember.
+- **Production**: serving on 30030, `POLICY=manual`, healthy
+  (`GET /health_generate` 200).
+- **`POLICY=auto` is UNATTENDED-FORBIDDEN.** It now *commits* the flip and
+  then dies ~1 pass later. See §4.
+
+## 2. What landed
+
+**Defect G is fixed and proven on metal.** The armed service loop with
+monotone `/dev/shm` send-counters (publish strictly after the isend post)
+went in exactly as specified. All three ranks now reach the flip entry
+with no traffic driving them there — "group present for epoch 0 after
+0.00s", all three ENTERING markers, rank 0's stack inside the reduction.
+Every predecessor boot had a rank blocked upstream of the gate.
+
+**The first policy-driven flip in this feature's history committed**, at
+2026-08-09 01:37:12Z, and has reproduced on every `POLICY=auto` boot
+since. Log: `/spinning/evidence-631/FIRST_AUTO_FLIP_COMMIT_20260809T0137Z.log`.
+
+**G was not the last thing in the way, and the real unblocker was
+elsewhere.** `build_flip_quiescence_fn` called
+`Scheduler._pp_microbatches_drained` — the *fully-idle* predicate, which
+also requires an empty `running_mbs`, the resident decode set. The policy
+arms `pp_to_tp` precisely *because* requests are decoding, so the arming
+condition and the quiescence condition could never hold together and every
+automatic flip abandoned at the park deadline, for ever. It also
+contradicted the function's own docstring and `build_flip_live_slots_fn`.
+Quiescence now reads `mbs` (pipeline in flight) only.
+
+**Permanent diagnostics** (keep them — they paid for themselves four
+times): the withhold reason, the quiescence reason, the flip extent probe,
+and the **pool census bracket**. Each of the diagnoses below was cheap
+only because of them.
+
+## 3. Defect J, in three parts
+
+**J.1 — SLOT SCOPE. Proven, fixed.** `scheduler.running_batch` and
+`last_batch` are rebound to `running_mbs[mb_id]` / `last_mbs[mb_id]` at the
+top of every slot iteration under `event_loop_pp`. They name ONE
+microbatch slot, not the rank's resident set, and the flip's hook fires at
+the end of an arbitrary slot. Evidence:
+
+    at-arm       cur_slot_reqs=1 resident_reqs=1 resident_slots=[1]
+    pre-cutover  cur_slot_reqs=0 resident_reqs=1 resident_slots=[1]
+
+Rows not enumerated are not MOVED, so this was silent context corruption,
+not an accounting bug. `_live_reqs` now enumerates every resident slot.
+
+**J.2 — ROW EXTENT. Measured, deliberately NOT cut.** With J.1 fixed the
+extent probe fires for the first time (page_size=1):
+
+    seqlen=82  kv_allocated_len=81  kv_committed_len=81
+    cache_protected_len=80  delta_vs_seqlen=-1
+
+`seqlen` **over**-counts, so the enumeration currently moves a row the
+allocator does not own. The right basis is `kv_allocated_len`
+(page-aligned) — it is the invariant checker's own charge basis, so
+enumeration and invariant would then share one source of truth and the
+seqlen arithmetic disappears entirely.
+
+**OWED BEFORE CUTTING IT** (operator instruction, not optional): take the
+measurement on a flip with the **spec path LIVE**. In the reading above
+`kv_committed_len == kv_allocated_len`, i.e. the #486 reserve was at rest.
+That reserve is `W + L` — `W = get_alloc_len_per_decode()` = max(topk *
+num_steps, num_draft_tokens) = 4 on this rig's NEXTN config, plus commit
+lag L — so the general form of the over-count is still unknown and one
+config's sign is not enough to re-cut an enumeration whose errors are
+silent.
+
+**J.3 — THE CUTOVER DOES NOT CARRY THE RESIDENT SET. Root cause, and the
+blocker.** Survival oracle, 2026-08-09 02:36:05-07Z:
+
+    POOL CENSUS at-arm        cur_slot_reqs=1 resident_reqs=1 slots=[0]
+    POOL CENSUS pre-cutover   cur_slot_reqs=1 resident_reqs=1 slots=[0]
+    POOL CENSUS post-cutover  cur_slot_reqs=0 resident_reqs=0 slots=[]
+    cutover complete x3, then
+    AssertionError: x_lru should not be locked when idle,
+        x_lru.full_lock_ref=1, x_lru.id=5
+    -> Mamba Radix tree sanity check failed -> SIGQUIT
+
+The request is present and enumerated right up to the cutover and gone
+immediately after. **The KV move is fine** (balanced cells, and J.1's
+enumeration now covers the request); the CUTOVER drops the requests when
+it swaps stacks and scheduler topology. The stranded KV page and the
+stranded mamba lock are TWIN SYMPTOMS OF ONE OMISSION — fixing either
+alone is treating a shadow.
+
+**Consequence, stated plainly: a flip under load is not merely unproven,
+it is currently IMPOSSIBLE.** Any request resident at the cutover is
+destroyed. Every flip observed so far committed only because nothing had
+to survive it.
+
+## 4. Method notes that will save the next reader a boot
+
+- **The falsifier of record for J** is the POOL CENSUS bracket (`at-arm` /
+  `pre-cutover` / `post-cutover`, reproducing the invariant checker's
+  `expected - free - cached` arithmetic) plus the survival oracle.
+- **The unmasking trick**: `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0`
+  demotes the idle leak check from raise to warn. Without it the
+  accounting crash fires first and hides everything downstream of it —
+  that demotion is what exposed the mamba lock and J.3.
+- **Two of my own hypotheses died here, both plausible, both wrong.**
+  First: "seqlen under-counts the spec reserve, so a row is missed" —
+  falsified by the census (the page was unaccounted *before* the flip
+  touched anything, and a no-flip control boot stayed clean). Second: "the
+  request finishes while armed and its overallocated row is never freed" —
+  falsified by reporting both slot scopes (it had not finished; the hook
+  was sampling an empty slot). **Do not re-derive either from the symptom;
+  they fit it perfectly and are still wrong.**
+- A wrong guess in KV-row accounting does not fail loudly. It moves the
+  wrong bytes or leaves the right ones behind, and the request's context
+  is then quietly corrupt. Measure first, every time.
+
+## 5. THE NEXT BUILD, named precisely
+
+**Carry the resident request set across the stack/topology swap** —
+`build_production_flip_cutover` plus the scheduler topology snapshot in
+`phase_flip_runtime`. What must cross is not just KV cells:
+
+1. the **request objects** themselves (the resident set across all
+   microbatch slots — see J.1 for why `running_batch` is the wrong
+   handle);
+2. the **scheduler bookkeeping** for them (`req_to_token` rows,
+   `kv_allocated_len` / `kv_committed_len` / `cache_protected_len`, the
+   radix locks and protected refs);
+3. the **mamba/GDN state AND ITS LOCKS** — the stranded `full_lock_ref=1`
+   is the direct evidence that these are not currently handled.
+
+**Standing architecture context to read BEFORE designing this** (do not
+skip; the resident-carry design has to compose with it):
+
+- **#635/#636**: KV handover between the PP layout (`dcp_size=1`) and the
+  TP layout (`dcp_size=3`) is **not a simple transfer**. It hangs on four
+  silent preconditions. The resident-carry must compose with that reshard,
+  not sit beside it.
+- **#212**: store routes **truncate GDN state**. Mamba/GDN state must be
+  moved **deliberately and explicitly**; anything that relies on a store
+  path to carry it will silently lose it. This is very likely why the
+  mamba lock strands today.
+
+Then, in this order: the **can-fail set written from what that build
+actually produces** (not from a mechanism guessed in advance — that is why
+the pins were not written yet), then the **acceptance program verbatim**
+from §4 of the original handoff, with the honesty bar unchanged: a
+completed PP→TP→PP cycle **under load** in one unmanned log, not a report.
+
+## 6. Standing warnings (unchanged, and one added)
+
+- `POLICY=auto` must not be left unattended: it commits the flip, then
+  dies. `POLICY=manual` is the safe configuration and is what serves.
+- Production stays serving; whoever stops it owns bringing it back.
+- Watchdog stays decommissioned. Port 30099 is never touched.
+- Commits: author `efschu` only, no trailers, English throughout, test
+  results in the message.
+- **New**: `scheduler.running_batch` under `event_loop_pp` is a per-slot
+  handle. Anything reading it from a per-slot hook and treating it as the
+  rank's resident set is making J.1's mistake. Flagged as an audit
+  candidate beyond #631; not chased here.
