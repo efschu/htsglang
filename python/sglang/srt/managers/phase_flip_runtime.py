@@ -211,20 +211,68 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
     require an empty waiting queue or an empty running batch -- the flip
     exists to run between a request's prefill and its decode."""
 
-    def _ready() -> bool:
+    def _why_not() -> Optional[str]:
+        """The reason this rank is not quiescent, or None if it is.
+
+        SEPARATED OUT so a rank can SAY why it is holding. Defect I was
+        diagnosed from three py-spy stacks because "ready=0" is all the
+        log ever carried, and the interesting question -- WHICH rank is
+        holding WHAT, and is it the same thing every epoch -- was
+        unanswerable from the log alone. It costs one string on a path
+        that only runs while a flip is armed.
+        """
         if getattr(scheduler, "chunked_req", None) is not None:
-            return False
+            return "a chunked prefill is half-written"
         last_batch = getattr(scheduler, "last_batch", None)
         if last_batch is not None and not last_batch.is_empty():
-            return False
+            # Length via getattr: the predicate's contract is is_empty(),
+            # and the diagnostic must not impose a wider one on callers.
+            n = len(getattr(last_batch, "reqs", ()) or ())
+            return f"last_batch is not empty ({n} req(s) visible)"
         result_queue = getattr(scheduler, "result_queue", None)
         if result_queue is not None and len(result_queue) > 0:
-            return False
-        drained = getattr(scheduler, "_pp_microbatches_drained", None)
-        if drained is not None and not drained():
-            return False
-        return True
+            return f"result_queue holds {len(result_queue)} result(s)"
+        # IN-FLIGHT MICROBATCHES ONLY -- deliberately NOT
+        # Scheduler._pp_microbatches_drained, which this used to call.
+        #
+        # That helper is the FULLY-IDLE predicate (is_fully_idle, on_idle)
+        # and it also requires every ``running_mbs`` slot to be empty.
+        # ``running_mbs`` is the RESIDENT DECODE SET, not work in flight:
+        # it holds the requests currently being decoded and empties only
+        # when they FINISH. Borrowing it made this function contradict its
+        # own contract two lines up ("does NOT require an empty running
+        # batch") and, worse, contradict the policy that drives it: the
+        # policy arms pp_to_tp precisely BECAUSE requests are decoding, so
+        # the arming condition and the quiescence condition could never
+        # hold at the same time and every automatic flip abandoned at the
+        # park deadline.
+        #
+        # MEASURED, 2026-08-09 01:29:50Z, POLICY=auto with one request
+        # decoding: "NOT QUIESCENT: PP microbatches not drained (live mb
+        # slots [], running_mbs slots [0])" on ranks 0 and 1 -- nothing in
+        # flight, the resident decode set alone holding the flip. The gate
+        # assembled, all three ranks entered the reduction and agreed to
+        # abandon on the park deadline, with ready=0 everywhere.
+        #
+        # Carrying a resident decode set across the flip is what the rest
+        # of the design already assumes: build_flip_live_slots_fn exists
+        # to move exactly those requests' KV rows ("the flip runs with
+        # requests parked, whose KV rows live in req_to_token"). What must
+        # be quiet is the PIPELINE -- no forward in flight, no half-written
+        # chunk -- which is what ``mbs`` answers.
+        mbs = getattr(scheduler, "mbs", None)
+        if mbs is not None:
+            live = [
+                i for i, mb in enumerate(mbs) if mb is not None and not mb.is_empty()
+            ]
+            if live:
+                return f"PP microbatches still in flight (mb slots {live})"
+        return None
 
+    def _ready() -> bool:
+        return _why_not() is None
+
+    _ready.why_not = _why_not
     return _ready
 
 
@@ -978,6 +1026,7 @@ class PhaseFlipRuntime:
         self.presence_withheld_channels = 0
         self.entry_channel_violations = 0
         self._last_withhold_log = None
+        self._last_not_ready_log = None
         self._presence_deadline_s = float(presence_deadline_s)
         self._presence_wait_started = None
         self._gate_open_epoch = None
@@ -1162,6 +1211,10 @@ class PhaseFlipRuntime:
         # reduction) for no gain. Caught by
         # TestConsensusDiscipline::test_readiness_skew_holds_uniformly.
         if armed and self._presence is not None and not ready and not expired:
+            # SAY WHAT IS HOLDING THIS RANK, periodically. Without it the
+            # only evidence is "ready=0" in an abandonment 30 s later, and
+            # defect I had to be read off three py-spy stacks instead.
+            self._log_not_ready()
             return None
         # #631 THE ENTRY GATE, evaluated AFTER park expiry now that
         # announcing requires quiescence. It SPINS: once this rank has
@@ -1271,6 +1324,37 @@ class PhaseFlipRuntime:
             return None
         self._last_hold_reason = None
         return self._execute()
+
+    def _log_not_ready(self) -> None:
+        """Report what is holding this rank out of quiescence.
+
+        Throttled to a quarter of the park deadline: a rank that drains in
+        a pass or two stays silent, and one that never drains is on the
+        record BEFORE the abandonment that names it.
+        """
+        why = None
+        probe = getattr(self._ready_fn, "why_not", None)
+        if probe is not None:
+            try:
+                why = probe()
+            except Exception as exc:  # noqa: BLE001
+                why = f"(quiescence probe failed: {exc})"
+        if not why:
+            return
+        now = self._clock()
+        if (
+            self._last_not_ready_log is not None
+            and (now - self._last_not_ready_log) < max(self._park_deadline_s / 4.0, 1.0)
+        ):
+            return
+        self._last_not_ready_log = now
+        logger.warning(
+            "%s armed (%s) but NOT QUIESCENT: %s. This rank is holding the "
+            "flip; it has not announced and is not at the entry.",
+            LOG_PREFIX,
+            self._pending,
+            why,
+        )
 
     def _spin_for_group_presence(self):
         """#631: announce, then SPIN here until the group assembles.
