@@ -688,3 +688,64 @@ chased. All are confirmed by reading, none by measurement.
 every consumer that wants "this rank's requests" must harvest the slot
 array instead. `phase_flip_resident_carry.harvest_resident_batches` is
 the one authority; use it.
+
+## 9. WHERE IT STANDS, and the two walls left
+
+### What works, measured
+
+| | |
+|---|---|
+| autoswitch, both directions, zero manual flips | YES -- 12 transitions in one acceptance run, 5 automatic PP->TP->PP cycles |
+| a request decoding ACROSS a cutover | YES -- 197 consecutive correct integers, both legs committed on all 3 ranks |
+| prefill in the PP layout | **4032-4553 tok/s** against **1525 tok/s** in TP (~3x) |
+| decode in the TP layout with MTP | **113 tok/s**, accept len 3.7-4.0, graphs on, against **43 tok/s** without MTP (~2.6x) |
+| agentic multi-turn (5 turns, growing context) | PASS -- real prefill in PP every turn, decode in TP every turn |
+| aborts | 0 of 27, 0 of 30 |
+
+Those are the two gains the phase flip exists to collect, and both are now
+collected on this rig.
+
+### Wall 1: SPEC=on + POLICY=auto runs out of memory under load
+
+Measured 2026-08-09 05:09:41Z, agentic multi-turn load:
+
+    torch.OutOfMemoryError: Tried to allocate 1024.00 MiB
+    GPU 0: 883.69 MiB free      GPU 1: 650.38 MiB free
+    -> SIGQUIT
+
+**This also breaches the operator's standing corridor rule** (exactly
+1024 MiB free per card, continuously). So the rank budget
+`RANK_MIB=22200,14700,14700` is too aggressive for THIS configuration:
+speculation's draft stack plus a flip that must carry a resident set
+needs headroom the budget does not leave. `SPEC=on POLICY=manual` at the
+same budget serves fine for hours, because nothing flips under load.
+
+The remedy is a budget, not a redesign: lower `RANK_MIB` for the
+auto+speculation configuration and re-measure the corridor at 100 ms
+sampling through boot, flip and decode. Do not raise it back without that
+sampling -- that is what the corridor rule is for.
+
+### Wall 2: the carried request still has no draft state
+
+Section 3 stands. It is currently mitigated rather than fixed: with
+speculation armed, a `pp_to_tp` flip WAITS until nothing is resident
+instead of crashing the draft graph runner. That mitigation is what makes
+`SPEC=on` safe at all; it also means the flip does not help a request
+that is already decoding, which is the case the draft-state build must
+close.
+
+### Therefore
+
+**Production rests on `SPEC=on POLICY=manual`**, which is the
+configuration that has served without incident throughout this work, and
+is what the instance was left on. `POLICY=auto` is proven and fast at
+`SPEC=off`; at `SPEC=on` it needs Wall 1 cleared first.
+
+### One assumption of mine that metal falsified, kept as a warning
+
+The carry originally REFUSED when one request was reachable through two
+batches ("a request belongs to exactly one microbatch slot"). Under a
+real agentic load that refusal fired and took the instance down
+(04:55:43Z). The duplication is real; it is now resolved by filtering
+before the merge. The check was right to be loud and wrong to be fatal --
+and the assumption behind it was simply untrue.
