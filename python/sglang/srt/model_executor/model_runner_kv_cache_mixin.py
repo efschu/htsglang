@@ -392,6 +392,59 @@ class ModelRunnerKVCacheMixin:
         total_gb = total_b / (1 << 30)
         return (total_gb, max(0.0, total_gb - device_free_gb - own_b / (1 << 30)))
 
+    def _nvml_process_reach_gb(self: ModelRunner) -> Optional[Tuple[float, float, float]]:
+        """``(held by THIS process, card free, card total)`` in GiB, or None.
+
+        Read through the registry identity map, never by assuming the CUDA
+        ordinal equals the NVML index -- they differ on this rig (#397).
+
+        Why this exists (#631). The delta arithmetic the budget ledger uses
+        measures memory consumed SINCE this stack's pre-load reading, and
+        for the physical-availability check that is the wrong quantity: with
+        one rank on the card it collapses algebraically to
+
+            used_by_me + device_free
+              = (pre_load_free - now_free) + now_free
+              = pre_load_free
+
+        so the check degenerates into "does the budget fit in whatever was
+        free when THIS STACK started loading". A phase-flip instance builds
+        three stacks in one process (PP weights, TP weights, MTP draft),
+        each re-entering init_torch_distributed and taking its own pre-load
+        reading with the previous stack's pool still resident. Measured on
+        the 5090, boot 2026-08-09 12:27: stack 1 began at 30.46 GiB free,
+        stack 2 at 23.40 GiB, stack 3 at 8.78 GiB. The check therefore got
+        STRICTER as the budget grew -- a larger budget makes stack 1
+        allocate more, which lowers stack 2's baseline, which refuses the
+        budget that caused it. That feedback loop was read as a hard wall
+        ("the 5090 cannot be filled").
+
+        NVML's per-process reading has neither property: it is per PROCESS,
+        not per stack, so an earlier stack's pool shows up as memory this
+        rank HOLDS instead of silently vanishing from what it could reach,
+        and it counts what torch cannot see (CUDA context, VMM arena
+        handles, raw cudaMalloc workspaces).
+
+        Returns None when NVML has nothing to say about this pid -- MPS
+        attributes device memory to the server process, and a pid namespace
+        can hide it -- so the caller keeps the old arithmetic as fallback
+        rather than trusting a zero.
+        """
+        try:
+            from sglang.srt.registry import nvml
+
+            if not nvml.is_available():
+                return None
+            uuid = nvml.current_device_uuid()
+            mem = nvml.memory_info_for_uuid(uuid)
+            held_b = nvml.process_bytes_on_uuid(uuid).get(os.getpid())
+        except Exception:  # pragma: no cover - diagnostics path
+            return None
+        if not held_b:
+            return None
+        gib = float(1 << 30)
+        return (held_b / gib, mem.free_bytes / gib, mem.total_bytes / gib)
+
     @staticmethod
     def budget_physical_shortfall_gb(
         budget_gb: float,
@@ -417,9 +470,36 @@ class ModelRunnerKVCacheMixin:
         device_free_gb: float,
     ) -> None:
         ranks_on_gpu = self._ranks_on_my_gpu()
+        # Prefer the NVML per-PROCESS reading: stack-invariant, and it sees
+        # the bytes torch does not (context, VMM arena, raw workspaces).
+        # The delta arithmetic stays as the fallback for the paths where
+        # NVML cannot attribute this pid (MPS, pid namespaces).
+        nvml_reach = self._nvml_process_reach_gb()
+        basis = "delta"
+        if nvml_reach is not None:
+            held_gb, nvml_free_gb, nvml_total_gb = nvml_reach
+            used_by_me_gb, device_free_gb = held_gb, nvml_free_gb
+            basis = "nvml"
         shortfall_gb = self.budget_physical_shortfall_gb(
             budget_gb, used_by_me_gb, device_free_gb, ranks_on_gpu
         )
+        if basis == "nvml":
+            # One line per rank per stack, on purpose: three of them with
+            # three different "holds" is the readable proof that the stacks
+            # are distinct and that the check is no longer per-stack.
+            logger.info(
+                "BUDGET-REACH[nvml] rank %d: budget %d MiB, this process holds "
+                "%.2f GiB, card free %.2f GiB of %.2f GiB total, %d rank(s) "
+                "co-located -> reachable %.2f GiB, shortfall %.2f GiB",
+                self.tp_rank,
+                budget_mib,
+                used_by_me_gb,
+                device_free_gb,
+                nvml_total_gb,
+                ranks_on_gpu,
+                used_by_me_gb + device_free_gb / max(1, ranks_on_gpu),
+                shortfall_gb,
+            )
         if shortfall_gb <= 0:
             return
         rank_gpu_id = getattr(self.server_args, "rank_gpu_id", None) or []
@@ -438,7 +518,11 @@ class ModelRunnerKVCacheMixin:
             f"rank(s), {total_gb:.2f} GiB total, {outside_gb:.2f} GiB held "
             f"outside this process -- co-resident processes, sibling ranks "
             f"and CUDA contexts), which is {shortfall_gb:.2f} GiB short of "
-            f"the budget. The budget is an ABSOLUTE allowance and is "
+            f"the budget. [basis={basis}: 'nvml' reads what this PROCESS "
+            f"holds on the card and NVML's free column, so a previously "
+            f"built stack counts as held rather than missing; 'delta' is "
+            f"the per-stack fallback and understates the hold of a "
+            f"multi-stack process.] The budget is an ABSOLUTE allowance and is "
             f"deliberately NOT reduced by that occupancy; size it for what "
             f"the co-resident process leaves free (raise "
             f"--rank-auto-reserve-mib on this GPU, or lower "

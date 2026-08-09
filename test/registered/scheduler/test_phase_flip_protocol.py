@@ -192,6 +192,21 @@ class _StubScheduler:
             ps: object
 
         @_dc.dataclass
+        class _OutputStreamerStub:
+            """Models the two fields the cutover has to refresh.
+
+            ``spec_algorithm`` is here because the real streamer keeps a
+            VALUE COPY of it and gates the whole spec-counter wire on that
+            copy: a phase-flip instance parks speculation at boot, so a
+            streamer that is only ps-refreshed reports no accept length for
+            the life of the process. A stub without the field cannot catch
+            that regression.
+            """
+
+            ps: object
+            spec_algorithm: object = None
+
+        @_dc.dataclass
         class _BatchResultProcessorStub:
             model_worker: object
             draft_worker: object
@@ -203,7 +218,9 @@ class _StubScheduler:
             model_worker=self.tp_worker, draft_worker=None
         )
         self.request_receiver = _ReceiverStub(ps=self.ps)
-        self.output_streamer = _PsHolderStub(ps=self.ps)
+        self.output_streamer = _OutputStreamerStub(
+            ps=self.ps, spec_algorithm=self.spec_algorithm
+        )
         self.load_inquirer = _PsHolderStub(ps=self.ps)
 
     def init_pp_loop_state(self):
@@ -440,6 +457,63 @@ class TestSpeculationIsTpDecodePhaseOnly(CustomTestCase):
             self.assertIsNone(sched.draft_worker)
             self.assertIs(sched.model_worker, sched.tp_worker)
             verify_flip_cutover(sched, tp_phase=False)
+
+    def test_cutover_refreshes_the_streamers_spec_algorithm_copy(self):
+        """The spec-counter WIRE, not just the spec worker.
+
+        The output streamer holds a value copy of spec_algorithm and gates
+        every per-request spec counter on it (spec_verify_ct and the accept
+        token counts). A phase-flip instance parks speculation at boot
+        because it rests in PP, so that copy starts as NONE; a cutover that
+        refreshes only ``ps`` leaves it NONE forever. Nothing about the
+        ANSWERS changes -- the TP phase verifies normally -- but
+        ``meta_info`` carries no spec_accept_length and the instance looks
+        unspeculated to every observer. Measured on metal 2026-08-09: the
+        acceptance probe read null accept length across a run whose TP
+        phase was speculating correctly.
+        """
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = self._armed_stub()
+            self.assertTrue(
+                sched.output_streamer.spec_algorithm.is_none(),
+                "boot parks speculation, so the copy starts NONE",
+            )
+            cutover = build_production_flip_cutover(sched)
+            cutover(PP_TO_TP)
+            self.assertIs(
+                sched.output_streamer.spec_algorithm,
+                sched.spec_algorithm,
+                "the streamer must ship the counters the TP phase produces",
+            )
+            self.assertFalse(sched.output_streamer.spec_algorithm.is_none())
+            cutover(TP_TO_PP)
+            self.assertTrue(
+                sched.output_streamer.spec_algorithm.is_none(),
+                "the PP phase produces no spec counters to ship",
+            )
+
+    def test_can_fail_a_ps_only_streamer_refresh_is_caught(self):
+        import dataclasses as _dc2
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        with _ParallelStatePatch(), _PublishedArgsPatch():
+            sched = self._armed_stub()
+            cutover = build_production_flip_cutover(sched)
+            cutover(PP_TO_TP)
+            verify_flip_cutover(sched, tp_phase=True)  # green baseline
+
+            # Exactly the old rebuild: ps refreshed, the spec copy left
+            # behind. Silent in every other observable, so the self-check
+            # is the only thing that can make it loud.
+            sched.output_streamer = _dc2.replace(
+                sched.output_streamer,
+                spec_algorithm=SpeculativeAlgorithm.from_string(None),
+            )
+            with self.assertRaisesRegex(
+                KvReshardError, "output_streamer.spec_algorithm"
+            ):
+                verify_flip_cutover(sched, tp_phase=True)
 
     def test_unspeculated_flip_is_bit_for_bit_the_old_behaviour(self):
         with _ParallelStatePatch(), _PublishedArgsPatch():

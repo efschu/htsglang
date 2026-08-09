@@ -36,6 +36,56 @@ def _check(result, label: str):
     return result[1] if isinstance(result, tuple) and len(result) > 1 else None
 
 
+def _mem_create_reclaiming(step: int, prop, label: str = "cuMemCreate"):
+    """``cuMemCreate``, and on OUT_OF_MEMORY reclaim torch's cache and retry.
+
+    THE COMPETITION THIS RESOLVES, measured on metal (#631, 2026-08-09
+    12:47:45, rank 1 on a 3080). The arena allocates RAW DRIVER memory:
+    ``cuMemCreate`` can only be served by physical pages the driver holds
+    free. torch's caching allocator, by design, does NOT return freed
+    blocks to the driver -- it keeps them reserved for its own reuse. A
+    long prefill grows that reserve and never gives it back, so the free
+    physical memory the arena can see SHRINKS over the life of the
+    process even though nothing is actually using the pages.
+
+    The phase flip is where that bites. ``_build_kv_backing_swap``
+    releases the source pool's pages and immediately commits the
+    destination's, and its comment asserted the restore "cannot fail for
+    want of memory" because boot sized the budget for max(PP, TP). That
+    reasoning holds only against a static allocator. Under the acceptance
+    load it was false: the flip died with
+
+        RuntimeError: cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY
+
+    inside restore_backing, taking the whole server down via SIGQUIT --
+    a crash whose root is that torch was SITTING on the pages, not that
+    the card lacked them.
+
+    ``empty_cache`` returns exactly those unused-but-reserved blocks to
+    the driver, which is the one reclaim that makes an arena commit
+    possible. It costs nothing on the happy path (only reached after a
+    real OOM) and costs a re-warm of torch's cache when it does fire --
+    which is strictly better than losing the instance. If the retry still
+    fails, the error is genuine and propagates unchanged.
+    """
+    drv = _driver()
+    result = drv.cuMemCreate(step, prop, 0)
+    err = result[0] if isinstance(result, tuple) else result
+    if err == drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY:
+        logger.warning(
+            "%s: %d bytes refused by the driver; releasing torch's cached "
+            "blocks and retrying once. torch reserved %.2f GiB / allocated "
+            "%.2f GiB before the reclaim.",
+            label,
+            int(step),
+            torch.cuda.memory_reserved() / (1 << 30),
+            torch.cuda.memory_allocated() / (1 << 30),
+        )
+        torch.cuda.empty_cache()
+        result = drv.cuMemCreate(step, prop, 0)
+    return _check(result, label)
+
+
 def align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -245,7 +295,7 @@ class KvVmmArena:
                 if self._chunk is not None:
                     step = min(step, self._chunk)
                 addr = self.base + offset + pos
-                handle = _check(drv.cuMemCreate(step, self._prop, 0), "cuMemCreate")
+                handle = _mem_create_reclaiming(step, self._prop)
                 try:
                     _check(drv.cuMemMap(addr, step, 0, handle, 0), "cuMemMap")
                     _check(

@@ -806,8 +806,22 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             attn_tp_group=scheduler.attn_tp_group,
             attn_tp_cpu_group=scheduler.attn_tp_cpu_group,
         )
+        # The streamer also holds a VALUE COPY of spec_algorithm, and that
+        # copy decides whether the per-request spec counters are shipped at
+        # all (_GenerationStreamAccumulator gates every spec_verify_ct /
+        # accept-token append on it). A phase-flip instance parks
+        # speculation at boot because it rests in the PP layout, so the copy
+        # taken by init_output_streamer is NONE -- and refreshing only ps
+        # left it NONE for the whole life of the process. The counters were
+        # accumulated on the Req and then dropped on the way out, so
+        # meta_info carried no spec_accept_length, /generate reported null,
+        # and the TP phase looked like it was running without speculation
+        # while it was in fact verifying normally. Refresh it from the phase
+        # being entered, exactly like the batch result processor below.
         scheduler.output_streamer = _dc2.replace(
-            scheduler.output_streamer, ps=scheduler.ps
+            scheduler.output_streamer,
+            ps=scheduler.ps,
+            spec_algorithm=want_spec_algo,
         )
         if getattr(scheduler, "load_inquirer", None) is not None:
             scheduler.load_inquirer = _dc2.replace(
@@ -1115,8 +1129,14 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
         if receiver.tp_cpu_group is not scheduler.tp_cpu_group:
             stale.append("request_receiver.tp_cpu_group")
     streamer = getattr(scheduler, "output_streamer", None)
-    if streamer is not None and streamer.ps is not scheduler.ps:
-        stale.append("output_streamer.ps")
+    if streamer is not None:
+        if streamer.ps is not scheduler.ps:
+            stale.append("output_streamer.ps")
+        # Pins the spec-counter wire: a stale copy here is silent (answers
+        # stay correct, only the acceptance evidence disappears), which is
+        # exactly the kind of defect this self-check exists to make loud.
+        if streamer.spec_algorithm is not scheduler.spec_algorithm:
+            stale.append("output_streamer.spec_algorithm")
     brp = getattr(scheduler, "batch_result_processor", None)
     if brp is not None:
         # On the decode hot path, and it calls into the SPEC worker.
@@ -1311,9 +1331,20 @@ def _build_kv_backing_swap(scheduler, stacks) -> Callable[[str], None]:
         # source pool again. The window where neither layout is backed is
         # bounded by these two calls and no kernel runs inside it.
         #
-        # The restore cannot fail for want of memory: boot sized the budget
-        # for max(PP, TP) and the source's pages were just handed back, so
-        # the destination's span is covered. If it raises anyway it raises
+        # The restore CAN fail for want of memory, and this comment used to
+        # claim it could not. The old reasoning -- boot sized the budget for
+        # max(PP, TP) and the source's pages were just handed back, so the
+        # destination's span is covered -- holds only if nothing ELSE on the
+        # card took physical pages in the meantime. torch's caching
+        # allocator does exactly that: a long prefill grows its reserve and
+        # it never returns the blocks to the driver, while the arena needs
+        # RAW driver pages. Measured 2026-08-09 12:47:45 under the mixed
+        # acceptance load, rank 1: cuMemCreate failed with
+        # CUDA_ERROR_OUT_OF_MEMORY inside restore_backing and SIGQUIT took
+        # the instance down. The reclaim-and-retry now lives at the
+        # allocation itself (_mem_create_reclaiming), so the flip gives
+        # torch's unused blocks back to the driver rather than dying.
+        # If it raises after that, the card is genuinely full and it raises
         # loudly here, inside the flip, rather than corrupting anything.
         src.release_backing()
         dst.restore_backing()
