@@ -372,9 +372,60 @@ proven yarn1.5/393216 config with the windows ON and see whether the seam
 OOM reappears. Evidence:
 `/spinning/evidence-631/serving_fallback_flipOOM.log`.
 
+## 4e. THE FAIRNESS WINDOWS ARE A REGRESSION — three boots, three deaths
+
+**Read this before re-enabling anything from this shift.**
+
+Three consecutive boots, all carrying my new `pp_window_s=15` /
+`tp_decode_floor_s=10`, all dead within minutes:
+
+| boot | config | died | signature |
+|---|---|---|---|
+| 21:43Z | purity=strict, ctx 262144 | 21:47Z | defect M: spin in `committed_slots` |
+| 21:51Z | purity=off, ctx 262144 | 21:55Z | defect N: `cuMemCreate` OOM at the seam |
+| 21:56Z | purity=off, **proven** yarn1.5 / ctx 393216 | 22:03Z | `torch.OutOfMemoryError`, 128 MiB on a 3080 with 106 MiB free, **after 12 flips** |
+
+The third one is decisive. It ran the exact configuration that survived
+40+ minutes with 0 exceptions earlier today. The ONLY difference was the
+windows. It died anyway, with 12 flips in ~4 minutes.
+
+**Mechanism**: the windows raise the FLIP RATE by design (a 15 s PP window
+plus a 10 s TP floor is a ~25 s cycle, where the pre-shift build flipped
+only when the load rules fired). Every cutover re-commits the KV backing
+(`restore_backing` -> `_back_spans` -> `commit_range`) and that seam has a
+memory PEAK. HANDOFF_657 §5c already measured the 3080s sitting only
+~530-610 MiB above the corridor floor at runtime. More flips per minute =
+more visits to that peak, and the rig has no headroom for it. Two of the
+three deaths are literally allocation failures at the seam.
+
+**So the honest verdict on this shift's policy change**: it correctly
+fixes the STARVATION (defect K) in the decision logic and is pinned by
+tests — and it is NOT SHIPPABLE on this rig at these values, because the
+flip rate it produces exceeds what the seam can afford. Fixing starvation
+by flipping more is the wrong axis while a single cutover costs 1.0-1.7 s
+per rank AND spikes memory.
+
+**What the next shift should do with it**, in order:
+1. Serving is restored with the windows DISABLED
+   (`PHASE_POLICY_PP_WINDOW_S=0`, `PHASE_POLICY_TP_DECODE_FLOOR_S=0`),
+   which is behaviourally the pre-shift build. The defaults in
+   `phase_policy.py` are still 15/10 — **change the DEFAULTS to 0 or fix
+   the seam before anyone boots without those env vars.** That is the
+   single most dangerous loose end I am leaving.
+2. Make the seam cheap or memory-flat before raising the flip rate again.
+   The seam's peak is the real constraint, not the policy.
+3. Only then re-tune the windows, with much larger values (minutes, not
+   seconds) as the starting point, and measure the corridor minimum
+   IN THE PP PHASE specifically.
+
+Evidence: `serving_defectM_wedge.log`, `serving_fallback_flipOOM.log`,
+`serving_windows_flipOOM.log`, all under `/spinning/evidence-631/`.
+
 ## 5. Exact next steps
 
-0. **Defect M above** — it gates the fairness rules; explain before fixing.
+0. **§4e FIRST**: the fairness-window defaults (15/10) are still live in
+   `phase_policy.py` and they killed three boots. Change them to 0 or fix
+   the cutover's memory peak. THEN defect M (§4b), which gates them.
 1. **The green-criterion run.** Serving must be up on `2ce40f86a2` with
    `POLICY=auto` (the boot script defaults to `manual` — the first boot
    this shift was discarded for exactly that; always pass `POLICY=auto`).

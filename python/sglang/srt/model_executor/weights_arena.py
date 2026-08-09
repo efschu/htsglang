@@ -55,16 +55,71 @@ _CHECKSUM_BYTES = 8
 # twice with a memory trace (2026-08-08).
 _CHECKSUM_CHUNK_BYTES = 16 * 1024 * 1024
 
+# DEFECT N (2026-08-09 22:00:12Z): the bound above is a CONSTANT, and at a
+# phase-flip seam the constant is the problem. 16 MiB x 8 = a 128 MiB
+# transient, and the flip happens with the card deliberately full: the KV
+# pool is sized to consume it. PP1 asked for exactly 128.00 MiB with
+# 106.38 MiB free and the instance died inside
+# gdn_flip_mover._pack_pp_side -> kv_reshard._checksum -> here.
+#
+# It was already primed to fail: the exclusive-KV-backing path had just
+# been refused 161480704 bytes by the driver and had called
+# empty_cache(), so torch's cache -- the reserve this allocation would
+# otherwise have come from -- had been handed back moments earlier.
+#
+# So the chunk is now chosen against what is ACTUALLY FREE on the
+# payload's device rather than against a number picked on a different rig
+# for a different failure. The floor keeps it from degenerating into
+# per-element launches on a card that is genuinely out of memory; at the
+# floor the transient is 8 MiB.
+#
+# This matters beyond the crash: the >600k-token pool this task is
+# working toward makes the seam TIGHTER, not looser, so a fixed transient
+# that barely fits today does not fit at all after the pool grows.
+_CHECKSUM_CHUNK_MIN_BYTES = 1024 * 1024
+
+# sum(dtype=int64) casts the input first, so the transient is 8x the
+# chunk. Spend at most this share of free device memory on it.
+_CHECKSUM_FREE_SHARE = 0.25
+_CHECKSUM_CAST_FACTOR = 8
+
+
+def _checksum_chunk_bytes(payload: torch.Tensor) -> int:
+    """Largest chunk whose 8x transient fits in free memory, bounded.
+
+    Returns the module constant unchanged for CPU payloads and whenever
+    the device cannot be queried -- the host case is what the 16 MiB bound
+    was measured for, and it is still right there.
+    """
+    if not payload.is_cuda:
+        return _CHECKSUM_CHUNK_BYTES
+    try:
+        free, _total = torch.cuda.mem_get_info(payload.device)
+    except Exception:
+        # Never let an accounting refinement be the thing that breaks a
+        # checksum: fall back to the measured constant.
+        return _CHECKSUM_CHUNK_BYTES
+    affordable = int(free * _CHECKSUM_FREE_SHARE) // _CHECKSUM_CAST_FACTOR
+    return max(_CHECKSUM_CHUNK_MIN_BYTES, min(_CHECKSUM_CHUNK_BYTES, affordable))
+
 
 def uint8_checksum(payload: torch.Tensor) -> int:
     """Exact int64 sum of a uint8 payload without materializing a
     converted copy of it (see _CHECKSUM_CHUNK_BYTES). Device-agnostic;
-    a single host sync at the end."""
+    a single host sync at the end.
+
+    The VALUE is independent of the chunk size -- an exact integer sum is
+    associative -- so sizing the chunk to the device's free memory changes
+    only the peak transient, never the checksum. That is what makes the
+    adaptive bound safe to apply to payloads whose checksums are compared
+    ACROSS ranks and across a flip: two ranks with different free memory
+    still agree.
+    """
     if payload.numel() == 0:
         return 0
     parts = [
         chunk.sum(dtype=torch.int64)
-        for chunk in payload.split(_CHECKSUM_CHUNK_BYTES)
+        for chunk in payload.split(_checksum_chunk_bytes(payload))
     ]
     return int(torch.stack(parts).sum().item())
 

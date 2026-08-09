@@ -7093,10 +7093,39 @@ class Scheduler(
             harvest_resident_batches,
         )
 
-        running_bs = sum(
-            len(getattr(b, "reqs", []) or [])
-            for b in harvest_resident_batches(self)
+        # DEFECT M containment. ``harvest_resident_batches`` now refuses a
+        # resident set it cannot identify (a ``reqs`` that is not a request
+        # list, or a length above max_running_requests) instead of
+        # returning a number the rest of this function would act on.
+        #
+        # It is caught HERE, and only here, because this call site is a
+        # POLICY OBSERVATION: its output decides whether to arm a flip, and
+        # declining to arm is always a safe answer. The instance keeps
+        # serving in its current layout. The same refusal raised on the
+        # CUTOVER path is deliberately not caught -- there, proceeding
+        # would allocate against the corrupted set, which is the thing
+        # that killed the 21:47Z run.
+        #
+        # Loud, once per occurrence, with the exception text carrying the
+        # offending object's type: defect M appeared once in one boot, so
+        # the log line is the only instrument that will catch it again.
+        from sglang.srt.managers.phase_flip_resident_carry import (
+            ResidentCarryError,
         )
+
+        try:
+            running_bs = sum(
+                len(getattr(b, "reqs", []) or [])
+                for b in harvest_resident_batches(self)
+            )
+        except ResidentCarryError as exc:
+            logger.error(
+                "PHASE-POLICY refusing to evaluate the flip policy this "
+                "round: the resident set is corrupted (%s). Not arming; "
+                "the instance keeps serving in its current phase.",
+                exc,
+            )
+            return
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the

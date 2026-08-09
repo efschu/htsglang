@@ -134,8 +134,17 @@ class DraftBootstrapError(RuntimeError):
     """
 
 
-def _reqs_of(batch) -> List:
-    return list(getattr(batch, "reqs", None) or [])
+# ONE definition of "what is resident", shared with the carry rather than
+# duplicated here. Defect M reached this module through a second, weaker
+# copy of this helper: the carry could have refused the object and this
+# one would still have iterated it, because they were separate two-line
+# functions that happened to agree. The guard belongs to the concept, not
+# to the file, so the consumer that ALLOCATES imports the same check as
+# the producer that harvests.
+from sglang.srt.managers.phase_flip_resident_carry import (  # noqa: E402
+    ResidentCarryError,
+    _reqs_of,
+)
 
 
 def draft_kv_pool(draft_worker) -> Optional[Any]:
@@ -407,6 +416,29 @@ def arm_draft_bootstrap(scheduler, batch, draft_worker) -> dict:
     pool = draft_kv_pool(draft_worker)
     if not reqs or pool is None:
         return {"reqs": len(reqs), "rows": 0, "armed": False}
+
+    # DEFECT M's LETHAL HALF. ``committed_slots`` below allocates one
+    # tensor per resident request. That is correct and cheap for the 0-4
+    # requests a real carry holds, and it is unsurvivable for a corrupted
+    # resident set: on 2026-08-09 a claimed 10485760 requests kept this
+    # rank inside that loop until the kernel OOM-killed it.
+    #
+    # The carry guards its own harvest, but this function is reachable
+    # with a batch from elsewhere, and the allocation happens HERE. A
+    # consumer that can be ruined by an implausible input checks that
+    # input itself rather than trusting every present and future caller.
+    ceiling = getattr(scheduler, "max_running_requests", None)
+    try:
+        ceiling = int(ceiling) if ceiling else None
+    except (TypeError, ValueError):
+        ceiling = None
+    if ceiling is not None and len(reqs) > ceiling:
+        raise ResidentCarryError(
+            f"{LOG_PREFIX} refusing to arm draft state for {len(reqs)} "
+            f"carried request(s), above max_running_requests={ceiling}. "
+            f"committed_slots would allocate one tensor per request. This "
+            f"is defect M: the resident set is corrupted, not large."
+        )
 
     slot_rows = committed_slots(scheduler, batch)
     # THE SCRUB IS SEPARABLE ON PURPOSE, and this switch is a measuring

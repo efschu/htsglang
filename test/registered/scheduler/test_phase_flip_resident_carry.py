@@ -24,6 +24,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.phase_flip_resident_carry import (
+    _reqs_of,
     duplicate_resident_reqs,
     ResidentCarryError,
     assert_no_orphan_resident_reqs,
@@ -390,6 +391,126 @@ class TestInstallDestinations(CustomTestCase):
         sched.running_mbs = [_FakeBatch()]
         install_resident_set(sched, [a, b], to_tp=True)
         self.assertEqual(a.merged_from, [b])
+
+
+class _NotARequestList:
+    """A buffer left reachable as a batch's ``reqs``.
+
+    Models defect M's object exactly in the one property that mattered:
+    it answers ``len()`` with a byte count and it is ITERABLE, so the old
+    ``list(...)`` body would happily materialise it. Iterating raises
+    here, which turns "the guard materialised it" from an invisible
+    performance cliff on metal into a test failure on CPU.
+    """
+
+    def __init__(self, nbytes):
+        self._n = nbytes
+        self.iterated = False
+
+    def __len__(self):
+        return self._n
+
+    def __iter__(self):
+        self.iterated = True
+        raise AssertionError(
+            "defect M regression: the guard iterated the buffer instead of "
+            "refusing it by type"
+        )
+
+
+class _BatchWithBuffer:
+    def __init__(self, buf):
+        self.reqs = buf
+
+
+class DefectMResidentSetGuard(unittest.TestCase):
+    """#631 defect M: a resident set that is not a request list.
+
+    Measured 2026-08-09: ``_reqs_of`` returned 10485760 entries once and
+    12582912 another time -- 10 MiB and 12 MiB in bytes, not request
+    counts. The policy armed a flip on an idle instance and the cutover
+    then allocated one tensor per claimed request until the kernel
+    OOM-killed rank 0 (cgroup oom_kill, host RAM 112 GiB of 120 GB).
+    """
+
+    def test_a_reqs_that_is_not_a_list_is_refused_by_type(self):
+        buf = _NotARequestList(10 * (1 << 20))
+        with self.assertRaises(ResidentCarryError) as ctx:
+            _reqs_of(_BatchWithBuffer(buf))
+        msg = str(ctx.exception)
+        self.assertIn("_NotARequestList", msg, "the offending TYPE must be named")
+        self.assertIn("10485760", msg)
+
+    def test_the_guard_refuses_without_materialising(self):
+        """THE FIX IS THE ORDER, so this is the pin that guards it.
+
+        The hang was inside ``list()``: ten million allocations are the
+        damage, not a slow path to it. A version that checked the length
+        after materialising would still take the instance down, and would
+        still pass every other test in this class.
+        """
+        buf = _NotARequestList(10 * (1 << 20))
+        with self.assertRaises(ResidentCarryError):
+            _reqs_of(_BatchWithBuffer(buf))
+        self.assertFalse(
+            buf.iterated,
+            "the guard must reject by type BEFORE iterating the object",
+        )
+
+    def test_a_byte_count_is_reported_as_one(self):
+        """The MiB reading is what identified the object class on metal.
+
+        A bare '10485760 requests' reads as a big number; '= 10 MiB in
+        bytes' says what kind of thing was mistaken for a request list,
+        and that is the sentence the next reader needs.
+        """
+        with self.assertRaises(ResidentCarryError) as ctx:
+            _reqs_of(_BatchWithBuffer(_NotARequestList(12 * (1 << 20))))
+        self.assertIn("12 MiB in bytes", str(ctx.exception))
+
+    def test_a_plain_list_still_passes_through(self):
+        a, b = _req("a", 1), _req("b", 2)
+        self.assertEqual(_reqs_of(_FakeBatch([a, b])), [a, b])
+        self.assertEqual(_reqs_of(_FakeBatch()), [])
+        self.assertEqual(_reqs_of(SimpleNamespace()), [])
+
+    def test_harvest_refuses_a_slot_above_max_running_requests(self):
+        """The scheduler-aware half: right type, impossible length.
+
+        A list of 5000 real Req objects is not something ``_reqs_of`` can
+        object to, and it reaches ``committed_slots`` just the same. The
+        ceiling is the only place that knows 4 is the limit.
+        """
+        sched = _PPStub(1)
+        sched.max_running_requests = 4
+        sched.running_mbs = [_FakeBatch([_req(str(i), i) for i in range(5000)])]
+        with self.assertRaises(ResidentCarryError) as ctx:
+            harvest_resident_batches(sched)
+        msg = str(ctx.exception)
+        self.assertIn("running_mbs[0]", msg, "the offending SLOT must be named")
+        self.assertIn("5000", msg)
+        self.assertIn("max_running_requests=4", msg)
+
+    def test_harvest_is_unchanged_for_a_legal_resident_set(self):
+        sched = _PPStub(1)
+        sched.max_running_requests = 4
+        held = _FakeBatch([_req("a", 1), _req("b", 2)])
+        sched.running_mbs = [held]
+        sched.running_batch = _FakeBatch()
+        self.assertEqual(harvest_resident_batches(sched), [held])
+
+    def test_no_ceiling_attribute_does_not_break_the_harvest(self):
+        """Every existing caller predates the ceiling.
+
+        A scheduler shell without ``max_running_requests`` must keep
+        harvesting rather than fail closed: the type guard still applies,
+        and that is the half that catches defect M's actual shape.
+        """
+        sched = _PPStub(1)
+        held = _FakeBatch([_req("a", 1)])
+        sched.running_mbs = [held]
+        sched.running_batch = _FakeBatch()
+        self.assertEqual(harvest_resident_batches(sched), [held])
 
 
 if __name__ == "__main__":

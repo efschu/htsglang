@@ -20,6 +20,7 @@ The load-bearing gates, mapped to DESIGN_631 section 3.3:
 """
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -27,6 +28,10 @@ from sglang.srt.model_executor.weights_arena import (
     image_from_tensors,
     ARENA_ALIGN,
     WeightsArenaError,
+    _CHECKSUM_CHUNK_BYTES,
+    _CHECKSUM_CHUNK_MIN_BYTES,
+    _checksum_chunk_bytes,
+    uint8_checksum,
     allocate_arena,
     arena_image,
     arena_refill,
@@ -278,6 +283,108 @@ class TestChecksumMemory(CustomTestCase):
             f"256 MiB payload -- the checksum is materializing an int64 "
             f"copy of the payload again (8x blowup, host-OOM on real boots)",
         )
+
+
+class _FakeCudaPayload:
+    """Just enough tensor surface for the chunk-size decision.
+
+    The decision reads ``is_cuda`` and ``device`` and nothing else, so the
+    sizing rule can be pinned on a CPU-only runner. The SUM itself is
+    exercised against real tensors in the value-invariance test below.
+    """
+
+    def __init__(self, device="cuda:0"):
+        self.is_cuda = True
+        self.device = device
+
+
+class DefectNChecksumTransientFitsFreeMemory(unittest.TestCase):
+    """#631 defect N: a fixed 128 MiB transient does not fit a full card.
+
+    Measured 2026-08-09 22:00:12Z. The phase flip runs with the card
+    deliberately full (the KV pool is sized to consume it), and the
+    checksum's bounded-but-CONSTANT transient asked for exactly 128.00 MiB
+    against 106.38 MiB free. The instance died at
+    gdn_flip_mover._pack_pp_side.
+    """
+
+    def test_cpu_payloads_keep_the_measured_constant(self):
+        """The 16 MiB bound was measured for the HOST-OOM failure.
+
+        Nothing about defect N invalidates it there, so the CPU path must
+        not drift as a side effect of fixing the device path.
+        """
+        self.assertEqual(
+            _checksum_chunk_bytes(torch.zeros(8, dtype=torch.uint8)),
+            _CHECKSUM_CHUNK_BYTES,
+        )
+
+    def test_a_nearly_full_card_shrinks_the_chunk(self):
+        """The exact conditions of the crash: 106.38 MiB free."""
+        free = int(106.38 * 1024 * 1024)
+        with mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(free, 20 * 1024**3)
+        ):
+            chunk = _checksum_chunk_bytes(_FakeCudaPayload())
+        transient = chunk * 8
+        self.assertLess(
+            transient,
+            free,
+            "the 8x cast transient must fit in what is actually free -- "
+            "this is the allocation that killed the instance",
+        )
+        self.assertLess(chunk, _CHECKSUM_CHUNK_BYTES)
+
+    def test_an_empty_card_keeps_the_full_chunk(self):
+        """Adaptive must not mean 'always small': a card with room keeps
+        the big chunk, or every flip pays thousands of extra launches."""
+        with mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(16 * 1024**3, 20 * 1024**3)
+        ):
+            self.assertEqual(
+                _checksum_chunk_bytes(_FakeCudaPayload()), _CHECKSUM_CHUNK_BYTES
+            )
+
+    def test_an_exhausted_card_still_returns_a_usable_floor(self):
+        """Zero free memory must not produce a zero or negative chunk.
+
+        ``split(0)`` raises, so an unguarded ratio would convert an OOM
+        into a confusing ValueError at the same seam.
+        """
+        with mock.patch.object(
+            torch.cuda, "mem_get_info", return_value=(0, 20 * 1024**3)
+        ):
+            chunk = _checksum_chunk_bytes(_FakeCudaPayload())
+        self.assertEqual(chunk, _CHECKSUM_CHUNK_MIN_BYTES)
+        self.assertGreater(chunk, 0)
+
+    def test_an_unqueryable_device_falls_back_to_the_constant(self):
+        """An accounting refinement may never be the thing that breaks a
+        checksum."""
+        with mock.patch.object(
+            torch.cuda, "mem_get_info", side_effect=RuntimeError("no driver")
+        ):
+            self.assertEqual(
+                _checksum_chunk_bytes(_FakeCudaPayload()), _CHECKSUM_CHUNK_BYTES
+            )
+
+    def test_the_checksum_value_does_not_depend_on_the_chunk_size(self):
+        """THE SAFETY PROPERTY OF THE WHOLE CHANGE.
+
+        These checksums are compared ACROSS RANKS and across a flip. Two
+        ranks with different free memory now pick different chunk sizes,
+        so if the value moved with the chunk, this fix would trade a crash
+        for a false mismatch -- a much worse failure, because it would
+        read as data corruption at the seam.
+        """
+        payload = torch.randint(0, 256, (1 << 20,), dtype=torch.uint8)
+        expected = int(payload.sum(dtype=torch.int64).item())
+        for chunk in (1, 7, 1024, 1 << 16, 1 << 20, 1 << 24):
+            with mock.patch(
+                "sglang.srt.model_executor.weights_arena._checksum_chunk_bytes",
+                return_value=chunk,
+            ):
+                self.assertEqual(uint8_checksum(payload), expected, f"chunk={chunk}")
 
 
 if __name__ == "__main__":
