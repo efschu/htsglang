@@ -208,6 +208,100 @@ boot-and-sample question, not a mechanism question.
 
 **Status: METAL-UNPROVEN.** No spill rung implemented this shift.
 
+### 5a. THE SPILL-DEPTH LADDER — design, ready to implement
+
+Implement in this order; each rung is independently shippable and
+independently measurable.
+
+**Flag surface.** `--phase-flip-spill-depth {0,1,2,3}` (default **0** =
+today's behaviour, so the default path is unchanged, per the backward-
+compatibility law). Depth is cumulative: 2 implies 1. Also accept
+`SGLANG_PHASE_FLIP_SPILL_DEPTH` for A/B without editing the boot script.
+
+| Depth | Spills at the tp→pp seam | Restores at pp→tp | Measured size/rank |
+|---|---|---|---|
+| 0 | nothing (today) | — | — |
+| 1 | draft (MTP) weights | before `arm_draft_bootstrap` | **1.86 – 2.01 GB** |
+| 2 | + draft CUDA graphs | before first TP decode | **~0.55 GB** |
+| 3 | + GDN/mamba state sets not owned by PP | at cutover | not yet measured |
+
+**The primitive already exists — do not write a new one.**
+`phase_flip_boot.snapshot_and_free(named, layout, pin=True)` builds a
+pinned host image and rebinds every `param.data` to a 0-sized placeholder;
+`bind_arena_views` + `arena_refill` put it back and verify a checksum. That
+is exactly a spill/restore pair, already used at boot for the two model
+layouts. Rung 1 is that pair applied to `draft_worker`'s model at the seam
+instead of at boot.
+
+**Why rung 1 is safe and why it is first.** The PP phase has *no draft
+worker at all* — `build_flip_draft_worker` returns None there, and the
+cutover already documents the PP phase as "bit-for-bit the state an
+instance without speculation has". The draft weights are therefore
+provably unreachable during PP, which is the strongest possible precondition
+for a spill: there is no correctness question, only a cost question.
+Note the boot comment that says the draft's weights "stay resident across
+both phases … there is no second layout for them to flip between" — that
+explains why they were never *arena*-backed; it is not an argument that
+they must stay resident.
+
+**Where the hooks go.** Both legs are already ordered and named in
+`phase_flip_runtime._cutover` step 7b, which this shift edited:
+- tp→pp branch (next to `clear_spec_info_for_unspeculated_phase`): spill.
+- pp→tp branch (immediately before `arm_draft_bootstrap_all_reachable`,
+  which needs the drafter live to scrub its pool): restore.
+
+**Restore latency is the whole cost, and it is on the pp→tp path**, i.e.
+in the flip the user feels before decode resumes. Budget it: ~2.0 GB over
+PCIe from pinned host memory is roughly 150-250 ms/rank at realistic
+speeds, against a current pp→tp cutover of 997-1720 ms/rank. Fill the
+table on metal:
+
+| Depth | flip pp→tp ms/rank | flip tp→pp ms/rank | pool tokens | corridor min free |
+|---|---|---|---|---|
+| 0 | (baseline, measure) | | 277468 @ ctx 393216 | |
+| 1 | | | | |
+| 2 | | | | |
+
+**Do not spill on a flip that will abandon.** Spill only after the cutover
+has actually committed, never while merely armed — an abandoned flip that
+had already freed the draft weights would return to TP with no drafter.
+
+### 5b. What budget the ranks can actually take, now that #652 is gone
+
+Measured this shift, both boots, at PP sizing time:
+
+| rank | card | budget | reachable | headroom |
+|---|---|---|---|---|
+| 0 | 5090 | 22700 MiB (22.17 GiB) | 31.27 GiB | **9.10 GiB** |
+| 1 | 3080a | 11920 MiB (11.64 GiB) | 19.55 GiB | **7.91 GiB** |
+| 2 | 3080b | 11970 MiB (11.69 GiB) | 19.53 GiB | **7.84 GiB** |
+
+`shortfall 0.00 GiB` everywhere: the physical check is not binding, and
+with #652 falsified there is no driver wall behind it either.
+
+That headroom is not all spendable — the TP stack's non-exclusive assets
+are built *after* PP sizing and must fit in it: draft weights ~2.0 GB +
+draft graphs ~0.55 GB ≈ **2.5 GiB/rank**. Spilling them during PP (rungs
+1+2) is precisely what releases that claim, so PP sizing can take it.
+
+**Projection, and it is a projection — label it METAL-UNPROVEN.** Rank 1
+holds 9.73 GiB of weights against an 11.64 GiB budget, so its KV portion is
+≈ **1.9 GiB** and that yields the current 277468. The 3080s are the
+min-reducing ranks. Adding 2.4 GiB of spilled drafter to the KV portion:
+
+    1.9 GiB -> 4.3 GiB  =  2.26x  ->  ~627k tokens
+
+which lands in the **>600k class the order asks for**, at ctx 393216. At
+ctx-262144-class settings it should be higher again. Two caveats that must
+be measured, not assumed: (a) the KV-portion figure is derived from a
+sizing-time reading, not read out directly — get it from the pool census;
+(b) the corridor floor of 1024 MiB free per card is evaluated at the
+runtime PEAK (flip + graphs + speculating decode), and this projection
+spends memory that is currently part of that headroom. Raise `RANK_MIB` in
+`scripts/route_a_631_prod_boot.sh` in one step, boot, read
+`/get_server_info`, and re-sample the corridor under the acceptance load
+before quoting any number.
+
 ---
 
 ## 6. CUDA GRAPHS (item 4)
