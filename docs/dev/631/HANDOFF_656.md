@@ -1404,3 +1404,122 @@ Everything else was interactive because it was metal work on a single
 shared instance, which does not parallelise: the three cards are one
 resource and every design question this shift asked was answered by a boot
 rather than by reading.
+
+---
+
+# HANDOFF v7 — written 2026-08-09 by successor #7
+
+**The predecessor's open question was the wrong question, and answering the
+right one closed defect Q twice.** Read v6 part 2 first for the corpses;
+this section replaces its framing.
+
+## 1. THE RE-DIAGNOSIS, and how it was reached
+
+v6 asked: *which proxies is an armed rank still owed?* It assumed a
+message was stranded on the wire. **Nothing is stranded.** A parked rank
+neither sends nor receives a proxy (the park makes
+`get_next_batch_to_run` return `batch_to_run=None`, so `cur_batch` is
+falsy and both the send and the receive are skipped), so the
+one-message-per-pass contract holds through an armed window and the
+counters stay balanced.
+
+The answer was already in the log, in an instrument my predecessor built
+and then read as a curiosity. The corpse-R boot, 07:19:23Z:
+
+    rank 0  44477 armed iterations, armed at mb_id=2, DISARMED AT 2
+    rank 1  33690 armed iterations, armed at mb_id=2, DISARMED AT 0
+    rank 2  38069 armed iterations, armed at mb_id=2, DISARMED AT 2
+
+**Every rank arms on the same slot and leaves on a different one.** From
+that instant stage k computes its slot-s batch while stage k+1 applies the
+result to its slot-s' batch -- permanently, not once. The stamp fires on
+the first such message, which reads exactly like one stale leftover. That
+misreading is what killed both disposals: corpse R dropped it and made a
+second blocking receive against a debt of one (wedge in 6 s), and corpse S
+drained a wire with no surplus on it and so could only eat something that
+WAS owed.
+
+**Why the index drifts.** In steady state the pass loop is paced by the
+request chain -- one blocking receive per slot iteration -- so rank k's
+i-th iteration is rank k-1's i-th and the indices cannot diverge. An armed
+rank admits nothing and launches nothing, so its iterations become
+free-running spin (~8 kHz, tens of thousands per window) and each rank
+abandons on its own park deadline wherever it happened to stop.
+
+## 2. FIX ONE: hold the slot (`_pp_flip_hold_slot`), commit `0600d8ae34`
+
+Once the armed window has run the pipeline dry (every `mbs` slot `None`,
+no half-written chunk), the loop HOLDS its slot instead of walking it.
+Same spin, same channel servicing, same gate polling, one index. The hold
+is reached on the same slot on every rank because the arm rides the 1:1
+ordered request chain and every rank then needs exactly `pp_loop_size`
+parked iterations to null every slot. No launch timing moves and no rank
+waits on a peer, so the refined design law is untouched. With the flip
+disabled the `while` loop is the previous `for` loop line for line.
+
+`CHAN_SLOT` makes the falling edge return a VERDICT rather than a number:
+the group's resume slots, AGREED or DIVERGED, on one line from one rank.
+
+**METAL, 12 arm/abandon cycles under sustained decode with SPEC on:** 36
+abandonments, 36 verdicts, **all `RESUME SLOTS [2, 2, 2] -- AGREED`**,
+with the spin spread as large as ever (8110-8694 iterations). 0 refusals,
+0 mispairs, 0 illegal accesses, 0 aborts, health 200. Control (same load,
+no arms): 0 drops, decode 13.89 tok/s against 14.06 on the previous build.
+Evidence `/spinning/evidence-631/slot_hold_Q_CLOSED_20260809T0807Z`.
+
+## 3. FIX TWO: the cadence counter — the SIBLING, and the old TP wedge
+
+The reproducer only ever abandons, so it never exercises what is past the
+cutover. A committed flip on an idle server then killed the box:
+
+    barlink collective 'phase_flip.consensus' made no progress for 120s
+
+PP0 in `event_loop_normal -> get_next_batch_to_run ->
+_phase_flip_on_round`, inside the reduction; peers never arrived, then
+SIGQUIT. `PhaseFlipRuntime._round` is a RANK-LOCAL counter and
+`_round % _interval` gates ENTRY TO A BLOCKING COLLECTIVE. The armed
+window called `on_round` 37371 / 28677 / 32344 times in ONE 5 s window, so
+the ranks emerged incongruent mod 8, their periodic entries never coincide
+again, and the first to enter waits for peers that are waiting on the
+broadcast it owes them.
+
+**This is pre-existing** -- the counter behaved this way before the slot
+hold -- and is very likely the old `attempt12-FLIP-OK-tp-serving-wedge`.
+
+**Fix:** count only the rounds the cadence actually gates, i.e. calls with
+`require_armed_and_parked=False` (the lockstep TP path). **The first cut
+was wrong** ("count unarmed rounds only") and the existing KV-move
+correctness pin caught it: an armed rank on the periodic path must still
+reach the reduction, or a flip armed in the TP phase can never commit.
+Keep that pin honest -- it is the only thing that separates the two rules.
+
+## 4. THE GENERAL FORM, now confirmed twice
+
+**A QUANTITY IS ONLY IN LOCKSTEP WHILE SOMETHING KEEPS IT THERE.** Neither
+`mb_id` nor `_round` was ever synchronised by design; both were
+synchronised by traffic, as a side effect. The armed window removes the
+traffic, the invariant evaporates silently, and every rank-local check
+still passes. Ask of any cross-rank index in this feature: what,
+mechanically, holds it equal, and is that thing still running in the state
+I am designing? Candidates not yet audited: anything else keyed off a
+per-iteration counter across ranks.
+
+## 5. What is still open, in the order the program asks for it
+
+1. **The round trip under load.** `scripts/route_a_631_roundtrip_probe.sh`
+   runs abandons -> commit -> serve in TP -> a soak longer than the 120 s
+   collective bound -> the return leg. Run it and believe only its
+   summary.
+2. **Draft-state carry** -- untouched. Still the wall for SPEC=on under
+   load: the quiescence predicate refuses to carry a resident request into
+   a speculating TP phase, so every armed window under load abandons by
+   design.
+3. **Full acceptance** (auto + graphs + spec + max KV, corridor near
+   1024 MiB). Budget still ~7 GiB loose.
+4. **A-vs-A vs `9a929352c9`**, then ship.
+5. **The OUTPUT wire is still unstamped.** With the slot fixed this is now
+   defence in depth rather than a live defect, but the guard shape is the
+   same one that produced the proxy strand.
+6. `pp_flip_drain_tensor_dicts` is still present and uncalled. It is
+   corpse S, and the re-diagnosis makes it doubly wrong: it disposes of
+   something that was never there. Delete it or keep it only as a specimen.

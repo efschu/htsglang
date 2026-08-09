@@ -1524,8 +1524,49 @@ class PhaseFlipRuntime:
         carrying ``expired``, and every participating rank abandons the
         flip on the reduced maximum. Abandoning the flip is the whole
         point -- the parked requests are never abandoned."""
-        self._round += 1
         armed = 1 if self._pending is not None else 0
+        # #631 DEFECT Q, SECOND INSTANCE -- and this one is fatal in the TP
+        # phase. ``_round`` is a RANK-LOCAL counter, and ``_round %
+        # _interval`` below gates ENTRY TO A BLOCKING COLLECTIVE. That is
+        # only safe while the ranks' counts stay congruent, and nothing
+        # makes them congruent except the loop being paced in lockstep.
+        #
+        # AN ARMED WINDOW IS EXACTLY WHERE THAT PACING STOPS. An armed rank
+        # admits nothing and launches nothing, so its pass loop free-runs at
+        # about 8 kHz and calls this hook every iteration: measured
+        # 2026-08-09, 37371 / 28677 / 32344 calls in ONE 5 s window. The
+        # ranks come out incongruent mod _interval, their periodic entries
+        # never coincide again, and the FIRST periodic consensus after the
+        # cutover deadlocks -- rank 0 inside the reduction, its peers inside
+        # the broadcast recv that rank 0 owes them. Measured 08:09:39Z:
+        # "barlink collective 'phase_flip.consensus' made no progress for
+        # 120s", PP0 in event_loop_normal -> get_next_batch_to_run ->
+        # _phase_flip_on_round, peers never arriving, then SIGQUIT.
+        #
+        # SO THE CADENCE COUNTS ONLY THE ROUNDS THE CADENCE GATES. The
+        # per-pass hook of event_loop_pp is exactly the caller that passes
+        # require_armed_and_parked=True, and its entry is decided by the
+        # parked predicate and the presence gate -- never by this counter.
+        # Its increments therefore buy nothing and cost the congruence of
+        # every periodic round after them. The periodic caller
+        # (event_loop_normal, require_armed_and_parked=False) is the one
+        # this counter exists for, and that loop IS paced: rank 0 broadcasts
+        # the request list every iteration, so those rounds stay in step.
+        #
+        # NOT "count unarmed rounds only", which was the first cut and is
+        # wrong: an ARMED rank on the periodic path must still reach the
+        # reduction, or a flip armed in the TP phase can never commit.
+        # Freezing the counter while armed left ranks whose residue was not
+        # already zero unable to enter at all, and
+        # TestMoveCorrectness caught it -- the move never ran and the
+        # destination pool kept its old bytes.
+        #
+        # This is the same warning the ``_entry_round`` comment below already
+        # makes ("incrementing anywhere else -- a local loop counter, a clock
+        # -- would reintroduce the absolute divergence between ranks"),
+        # applied to the variable it was actually true of.
+        if not require_armed_and_parked:
+            self._round += 1
         ready = 1 if (armed and self._ready_fn()) else 0
         expired = 1 if self._park_expired(armed, ready) else 0
         # #631 QUIESCENT-ANNOUNCE. An armed rank that is NOT yet quiescent
