@@ -1329,3 +1329,49 @@ before the corridor does.
 Note what did NOT have to happen for any of this: no zero-allocation
 staging, no new machinery, no change to the seam. The capacity was behind
 a cap that had been set above the pools' own sizing.
+
+### The ladder continued, and where it really stops
+
+| RANK_MIB | cap | serving capacity | corridor min (TP phase) |
+|---|---|---|---|
+| 29200,15920,15970 | 360000 | 360000 | 3803 / 4700 / 3499 |
+| 32200,17700,17750 | 520000 | **REFUSED AT BOOT** | -- |
+| 31800,17400,17450 | 460000 | **460000 (+81.5 %)** | 2655 / 3034 / 2609 |
+
+**Boot 4 found the honest ceiling exactly where 6f said it would**, and it
+refused cleanly instead of dying:
+
+    ValueError: The per-rank budget of 32200 MiB (31.45 GiB) for rank 0 on
+    GPU 0 is not physically available: the rank holds 15.64 GiB and
+    15.68 GiB of the device is free to it (31.34 GiB total)
+
+That is `_profile_available_bytes`. The 5090's usable ceiling is ~31.3 GiB,
+so rank 0's budget cannot exceed ~32000 MiB. Fail-fast worked: no crash, no
+corrupted state, and the message names the numbers needed to pick the next
+rung.
+
+**THE BINDER HAS CHANGED, and this is the finding to carry forward.** At
+`RANK_MIB=31800,17400,17450` the engine reports its own budget-derived
+capacity as **1096606 tokens** -- more than twice what is configured -- so
+`--max-total-tokens` is now the only thing holding the pool down, and the
+BUDGET is no longer the constraint. What binds instead is the corridor:
+
+    marginal cost, 360000 -> 460000:  1148 / 1666 / 890 MiB per 100k tokens
+    headroom above the 1024 floor at 460000: 1631 / 2010 / 1585 MiB
+
+Card 1 (the 5090) is now the binding card, and its 2010 MiB at 1666 MiB per
+100k tokens is worth about +120000 more, i.e. a corridor-limited ceiling
+around **580000** at this vector -- short of the >600k goal.
+
+**The lever for the last stretch is the TOKEN VECTOR, and the engine
+computes the recommendation itself:**
+
+    Uneven DCP: restart with SGLANG_UNEVEN_TOKEN_VECTOR=31,17,16 to raise
+    max_total_num_tokens from 1096606 to ~1396288 (per-rank profiled
+    capacity [709932, 385302, 349078]; active vector [28, 26, 20] leaves
+    ranks idle)
+
+The active 28,26,20 over-weights rank 0, which is precisely the card whose
+corridor now binds. Re-balancing toward 31,17,16 moves KV rows off the 5090
+and should convert directly into corridor headroom on the binding card.
+That is the next experiment, and it is a one-variable boot.
