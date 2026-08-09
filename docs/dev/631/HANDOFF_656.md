@@ -1776,3 +1776,192 @@ Do not re-walk: the model (control clean 3/3), the scrub
 (ids are short too), the emitter identity (frozen at boot), the send
 cursors (Req-owned, untouched), and now the output wire and its buffers
 (empty at all 12 cutovers).
+
+---
+
+# HANDOFF v9 — written 2026-08-09 by successor #9
+
+**The one-token loss had a cause, it is fixed, and the fix is on metal.**
+`c75300cc8c`. What remains is a DIFFERENT defect with a different
+signature, and this shift also proved the flip CONTENT-CORRECT in both
+directions under load with speculation off — the first such result on
+this strand.
+
+## 1. State right now
+
+- **HEAD** `c75300cc8c`, branch `feat/route-a-631`. Suite
+  `bash scripts/run_631_flip_family.sh` -> **518 passed** (was 496).
+- Box SERVING on it, `POLICY=manual`, **`SPEC=off`**,
+  `RANK_MIB=21000,13300,13100`, health 200. (The last boot of the shift
+  was the SPEC=off partition run; reboot with `SPEC=on` to resume the
+  hunt.)
+- Two new files: `managers/phase_flip_output_trace.py` (the instrument)
+  and two test files, 22 pins, 3 of them can-fail proofs.
+
+## 2. THE FIX: the verify's output stride is the width that RAN
+
+`verify` stamped its `GenerationBatchResult` with the INSTANCE's
+configured draft width. **Three** consumers divide that result's
+row-strided tensors by the field: `_resolve_spec_v2_tokens` (each
+request's accepted run at `[i*stride, i*stride+accept_len)`), the
+adaptive controller's rung attribution, and the `return_hidden_states`
+lane.
+
+The two widths are equal on every ordinary round. The phase-flip
+BOOTSTRAP round is the first caller for which they differ: a 1-node
+trivial verify on an instance configured for 4, so `predict` has `bs`
+rows while the consumer strode over 4. **Request 0 sliced its single
+token correctly and every later request sliced PAST THE END and got an
+EMPTY LIST** — `output_ids.extend([])` appends nothing. The KV had
+advanced, so the answer resumed exactly one token short.
+
+Fixed at the SOURCE (`verify_input.draft_token_num`), not per consumer,
+so all three agree by construction. **Byte-identical on the default
+path**: the normal draft path sets `draft_token_num` from the same
+configured value, so only a narrowed round sees any change. It is the
+same general form as the `_draft_extend_for_decode` width defect fixed
+in `4147972205`, one consumer further along — and that is now a family
+of two. **A third occurrence should be assumed, not hoped against:**
+anything that divides a verify result by a width is suspect.
+
+Metal, the same round before and after:
+
+    10:13:17Z  round kind=decode -- 3367da51 have=49 +[220]
+                                  | bcf3eb14 have=49 +[]
+                                  | 6772dc40 have=49 +[]
+    10:30:49Z  round kind=decode -- d19424a5 have=49 +[220]
+                                  | 58679a46 have=49 +[220]
+                                  | c396fa82 have=48 +[15]
+
+The first break moved from position 18 to position 28.
+
+## 3. THE INSTRUMENT, and the two hypotheses it killed
+
+`managers/phase_flip_output_trace.py`. Per-rank output clocks for a ring
+of passes before a cutover and a countdown of passes after it; the
+tokens each round PRODUCED next to what it APPENDED (with `accept_lens`
+and the stride the slicing used); and an emit-slice continuity check —
+a GAP is the drop face, an OVERLAP the duplicate face.
+
+Costs the default path nothing: every entry point is reached only from
+the phase-flip round hook or the cutover, and the ring is maintained
+only while a flip is PENDING. `SGLANG_PHASE_FLIP_OUTPUT_TRACE=0`
+silences it; `SGLANG_PHASE_FLIP_OUTPUT_TRACE_POST` widens the window
+(the first defect sat in the first post-cutover round, the second did
+not — widen before concluding "nothing happened").
+
+**It killed the two hypotheses v8 named, in one boot, both negative:**
+
+1. **The three ranks' `output_ids` agree EXACTLY** at and after every
+   cutover — same lengths, same offsets, same tails, every pass. v8's
+   "rank 0's own copy disagrees by one" is MEASURED FALSE.
+2. **The emitted slices are continuous** — no gap, no overlap, the
+   continuity check has never fired. The client's array IS this rank's
+   list.
+
+Both were reached from the code before the boot, too, and the second is
+worth keeping in mind: `_stream_output_generation` builds its
+accumulator, fills it and flushes it inside ONE call, so there is no
+cross-pass buffer for a cutover to throw away. The streamer-replacement
+theory dies by reading, without a boot.
+
+## 4. NEW MILESTONE: SPEC=off is CONTENT-CLEAN, both directions
+
+`SPEC=off`, `--cycles 2 --concurrency 3`, run 11:0xZ:
+
+    cycle 0  pp_to_tp under load   3/3 counts 2..120 unbroken
+    cycle 1  tp_to_pp under load   3/3 counts 2..120 unbroken
+    cutovers 21 | abandoned 0 | faults 0 | collective timeouts 0
+    health 200
+
+**Six determined answers, byte-complete, across flips in both
+directions under load.** This is the partition that matters: the carried
+KV rows AND the carried mamba/GDN linear state cross a cutover
+CORRECTLY. Everything still broken lives in the SPECULATION path after a
+carry, and nothing else.
+
+It is also a shippable configuration, and the acceptance program should
+record it as one rather than treating spec as all-or-nothing.
+
+## 5. THE REMAINING DEFECT, characterised but not fixed
+
+With `SPEC=on`, a request carried across `pp_to_tp` still corrupts, and
+it is NOT the width defect. Metal, 10:41:08Z, all three ranks identical
+(rid order is batch order):
+
+    [accept_lens=[4, 4, 4] stride=4] cc0e0bcd have=74 +[17, 24, 220, 18]
+                                   | 3d6a2083 have=74 +[17, 24, 220, 18]
+                                   | 5c978fd3 have=74 +[17, 24, 220, 18]
+    [accept_lens=[4, 1, 1] stride=4] cc0e0bcd have=78 +[15, 220, 18, 16]
+                                   | 3d6a2083 have=78 +[220]
+                                   | 5c978fd3 have=78 +[220]
+
+Read it carefully, because every word is a constraint:
+
+- The requests are **byte-identical in content and position** — same
+  prompt, same `have`, the same appended run every round since the
+  cutover — and the probe decodes at **temperature 0**. Under greedy
+  decoding three identical rows MUST sample the same token.
+- Request 0 samples `15` ('0', completing "30"). Requests 1 and 2 sample
+  `220` (' '). With `accept_len=1` that token is the target's own bonus
+  at the ROOT position, so this is the TARGET disagreeing with itself
+  across batch rows, not a draft being rejected.
+- They then continue self-consistently ("…29 3 30 31 32"), so the wrong
+  token went into their KV too. The corruption is an INSERTION, not a
+  loss — the opposite face from the defect this shift fixed.
+- **The batch's index-0 request is correct in BOTH defects.** The fixed
+  one was index-proportional by construction (`i * stride`). That this
+  one also spares index 0 is the strongest single clue available and
+  should drive the next attempt.
+- It appears at the FIRST round whose `accept_lens` split — round 9
+  after the cutover, ~28 tokens in — never before it. Seven identical
+  `[4,4,4]` rounds precede it.
+- The no-flip CONTROL is clean 3/3 with the same three concurrent
+  requests, so it is not the model and not batching.
+
+### What to do next, in order
+
+1. **Find the third member of the width family.** Grep every consumer
+   that strides a verify-shaped tensor by a width or by a batch index:
+   `eagle_prepare_for_verify`'s `out_cache_loc` / `req_to_token` writes,
+   `_draft_extend_for_decode`'s `select_index`, the accept-path
+   compaction (`_finalize_accept_tree_path`), and the draft KV slot
+   allocation. The bootstrap round runs ONE token wide where every other
+   round runs four; anything that recorded a per-request offset during
+   that round is wrong by `i * 3` for row `i` — and index 0 by zero.
+   That is exactly the observed shape, and it explains why the damage
+   surfaces LATER (the bad offset is only read once the sequence reaches
+   those rows).
+2. Instrument the root sample directly: log, for one post-cutover round,
+   each row's root token, its `seq_lens`, and its `out_cache_loc` /
+   `req_to_token` tail. The target disagreeing with itself across rows
+   is an indexing fact and will be visible there.
+3. Do NOT re-walk the carried KV or the mamba/GDN state: SPEC=off moved
+   both correctly, 6/6, section 4.
+
+## 6. DO-NOT-RE-WALK (updated; the v8 list still stands)
+
+Added by this shift, each measured:
+
+- The three ranks' `output_ids` do not diverge (section 3).
+- The emit slices are continuous, and the streamer cannot lose a
+  buffered slice at a cutover (section 3).
+- The carried KV and the carried mamba/GDN linear state are correct
+  across cutovers in both directions (section 4).
+- The verify output stride (section 2) — FIXED, with a can-fail pin that
+  reproduces the empty slice in unit form.
+
+Unchanged from v8: the model, the draft KV scrub, the detokenizer, the
+emitter identity, the Req-owned send cursors, the PP output wire and its
+four buffers.
+
+## 7. Tools this shift leaves behind
+
+- `managers/phase_flip_output_trace.py` and its two env switches.
+- `test/registered/unit/managers/test_spec_verify_width_631.py` — the
+  defect in unit form: three rows, stride 4, requests 1 and 2 slice
+  empty. Use it as the template for the third family member.
+- The method that worked, stated plainly: the round trace prints what a
+  round PRODUCED next to what it APPENDED. "Appended nothing" and
+  "produced nothing" are different defects, and no amount of reasoning
+  about `len(output_ids)` separates them.
