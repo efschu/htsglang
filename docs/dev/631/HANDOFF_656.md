@@ -620,3 +620,71 @@ owns rather than missing a live one, which is the safe direction of the
 two and is why shipping it while the measurement is owed is defensible.
 Do not "fix" it on the strength of the SPEC=off reading alone -- that is
 precisely the one-config re-cut v2 refused, and the errors are silent.
+
+## 8. THE J.1 AUDIT, carried out and still open
+
+v2 flagged "anything reading `running_batch`/`last_batch` from a per-slot
+hook" as an audit candidate and deliberately did not chase it. It has now
+been swept across `python/sglang/srt/` (delegated to the local Qwen
+worker; the sweep is mechanical, the judgements below are mine).
+
+**The class is real and it is not confined to #631: there are now THREE
+confirmed instances**, and the third was in this feature's own policy.
+
+### Fixed here
+
+- **`gdn_flip_mover`** (second instance, silent): moved the conv/ssm state
+  of one microbatch slot. Fixed as `resident_mamba_slots()`.
+- **`maybe_arm_phase_policy`'s `running_bs`** (THIRD instance, and
+  load-bearing): the policy hook runs inside `recv_requests()`, i.e. once
+  per microbatch slot right after that slot's rebind. The PP->TP rule is
+  `pending <= N AND running_bs > 0`, so a request decoding in slot 1
+  while the hook fired for an empty slot 0 read `running_bs = 0` and the
+  flip was **not armed** -- the decision depended on WHICH SLOT the hook
+  sampled rather than on the load. Now counted from
+  `harvest_resident_batches`. Note this is the arming side of exactly the
+  shape defects L and the `_pp_microbatches_drained` bug had on the
+  quiescence side.
+
+### NOT fixed, named here, in severity order
+
+None of these are #631's, and per scope they are named rather than
+chased. All are confirmed by reading, none by measurement.
+
+1. **`Scheduler.pause_generation` (scheduler.py ~7184-7251) is the worst
+   one.** It reads `self.running_batch`/`self.last_batch` with **no
+   `pp_size` branch at all** and, for a `"retract"` request, retracts
+   `self.running_batch.reqs` wholesale. Its immediate sibling
+   `_abort_request_now` shows the correct pattern right next to it
+   (`if self.ps.pp_size == 1: [running_batch, last_batch] else:
+   [*running_mbs, *self.mbs]`). Under PP a retract therefore appears to
+   succeed while silently leaving every request resident in the other
+   slots. Fix by copying the sibling's branch.
+2. **`pool_stats_observer.active_pool_idxs`** feeds the invariant
+   checker's `session_held_*` accounting and is reachable from the
+   watchdog dump at ANY moment, not only at a quiescent boundary. A
+   per-slot read there means a wrong `session_held`, i.e. a **false leak
+   report** -- which is exactly the signal this feature spent three boots
+   learning to trust.
+3. **`load_inquirer.get_loads`** reports `len(running_batch.reqs)` as the
+   instance's running-request count for `/v1/loads` and DP load
+   balancing: under PP it publishes one slot's count as the rank's.
+4. **`kv_pressure_runtime`'s `spill_fn`** offers only the current slot's
+   batch to `try_spill`, so requests resident in other slots are never
+   offered for spill under pressure.
+5. **`kv_session_offload.release_finished_spilled_req`** and
+   **`kv_session_spill_destination._release_parked_req`** clear
+   `batch_is_full` on whichever slot is bound, not on the slot whose
+   admission the freed KV actually unsticks.
+6. **`is_fully_idle`**'s `last_batch` conjunct: `_pp_microbatches_drained`
+   checks `running_mbs` and `mbs` across all slots but NOT `last_mbs`, so
+   that one conjunct still reads a single slot.
+7. **`build_gdn_flip_guard`** still carries the old pattern but **has no
+   call site anywhere** -- it is the 5.3 placeholder the real mover
+   superseded. Delete it rather than fix it.
+
+**The general form, for the fourth time in this file:** under
+`event_loop_pp`, `running_batch`/`last_batch` are per-slot ALIASES, and
+every consumer that wants "this rank's requests" must harvest the slot
+array instead. `phase_flip_resident_carry.harvest_resident_batches` is
+the one authority; use it.
