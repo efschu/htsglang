@@ -1987,3 +1987,100 @@ four buffers.
 Serving left on `SPEC=on POLICY=manual RANK_MIB=21000,13300,13100`,
 health 200, on this commit — the configuration the next shift wants for
 the hunt. `SPEC=off` is the configuration that is content-clean today.
+
+---
+
+# HANDOFF v10 — written 2026-08-09 by successor #9 (second shift)
+
+**`pp_to_tp` is CONTENT-CLEAN under load with speculation on.** 6 of 6
+determined answers byte-complete across two independent runs, where
+every run before this shift corrupted 2 of 3. HEAD `a970a8fed9`, suite
+**522 passed**.
+
+## 1. The fourth width defect, and why it was the answer-corrupting one
+
+`commit_mamba_states_after_verify` recovers each request's accepted TREE
+STEP as `accept_index[req, accept_lens-1] - arange(0, bs*W, W)[req]`.
+`accept_index` holds GLOBAL node ids minted in the width the verify RAN;
+handed the CONFIGURED width it becomes `i - 4i` on the 1-wide bootstrap
+round — negative step ids for every row but row 0.
+
+**The damage is a RECURRENT state written from the wrong step**, which is
+why six shifts could not find it by looking at token bookkeeping:
+nothing raises, and the KV and append clocks stay in exact agreement
+(`kv == seen - 1` on every row, every round — measured). The row decodes
+on from a subtly wrong linear-attention state and DRIFTS, surfacing as a
+wrong token ~28 tokens later. Every collected constraint falls out of
+that one mechanism: row 0 spared, SPEC=off clean, no-flip control clean,
+scrub innocent.
+
+Converted with it: `clear_unaccepted_c128`, `compute_spec_v2_logprobs`
+(step count now taken from `accept_index`'s own width, so the arange
+matches the tensor it indexes), and `_draft_extend_for_decode`'s
+`verify_width`, now passed UNCONDITIONALLY.
+
+**THE FAMILY IS NOW FOUR** (`4147972205`, `c75300cc8c`, and two here).
+Treat "a width or a stride taken from `self.speculative_num_*` rather
+than from the tensor or input at hand" as a defect until proven
+otherwise. The pattern that survives is `bonus_tokens`' kernel, which
+takes its stride from `accept_index.shape[1]` — the tensor's own width.
+Copy that.
+
+## 2. Method note: what actually found it
+
+Two instrument readings, in this order, and neither was a guess:
+
+1. **The flat row tensor.** `flat=[24,220,18,15, 220,0,0,0, 220,0,0,0]`
+   with `accept_lens=[4,1,1]`: the expected token sat at NO other index.
+   That killed "the slicing is misaligned" and pushed the defect
+   upstream of `predict` in one line.
+2. **`kv` against `seen` per row.** Exact agreement everywhere ruled out
+   a commit/append desync and left the STATE itself — which is what made
+   a recurrent-state defect the only candidate standing.
+
+Then a delegated sweep enumerated every verify-row-to-request mapping
+and found the one consumer that both fires on a hybrid GDN model and
+corrupts silently. Instrument, read, narrow, then sweep — not theory.
+
+## 3. WHAT IS LEFT: the tp_to_pp DUPLICATE face
+
+`pp_to_tp` no longer corrupts. `tp_to_pp` still does, and it is the
+DUPLICATE face — one token appended twice, 1-2 of 3 requests:
+
+    got 1118, expected 118      (an extra '1')
+    got 11117, expected 117     (an extra '1')
+
+At the cutover all three requests sit at `tail=[220, 16, 16]` (" 11")
+and the post-cutover passes show `+0` for several passes, so the extra
+token lands as the PP phase resumes.
+
+**The named hypothesis, and it is well-founded but METAL-UNPROVEN.** The
+two phases hold DIFFERENT pending-token conventions:
+
+- plain decode (PP): the last appended token is NOT yet in the KV; it is
+  the next round's input. Measured this shift: `kv == seen` exactly on
+  every PP round.
+- speculative decode (TP): every accepted token IS committed during
+  verify, and the next round re-roots at `bonus_tokens`.
+
+A carry that hands PP an `input_ids` whose token the KV already holds
+would have the PP round regenerate it — one token, appended twice,
+exactly the observed face. The cutover clock report checks
+`seq_lens == seqlen - 1`, but it only runs on the `tp_phase` leg, so
+this direction has never been checked at all.
+
+**Next step, precisely.** Print the same clock report on the tp_to_pp
+leg (it is `bootstrap_clock_report`, and it takes any batch), plus
+`kv_committed_len` per request, at the cutover and for the first three
+PP passes. If `kv == seen` at the cutover while the carry assumes
+`kv == seen - 1`, that is the defect and the fix is to reconcile the
+convention on the leg, not to touch either phase's own bookkeeping.
+
+## 4. State
+
+- HEAD `a970a8fed9`, suite 522 passed, working tree clean.
+- SERVING on that commit, `POLICY=manual SPEC=on
+  RANK_MIB=21000,13300,13100`, health 200.
+- `SPEC=off` remains content-clean in both directions (v9 section 4).
+- Acceptance program (v9 section 6 / the anchored capacity spec) is
+  untouched and still waits on the tp_to_pp leg.
