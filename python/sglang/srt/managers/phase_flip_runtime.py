@@ -58,6 +58,7 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.model_executor.weights_arena import uint8_checksum
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
     KvPoolView,
@@ -290,6 +291,16 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
         values = scheduler.tree_cache.all_values_flatten()
         if values is not None and values.numel():
             parts.append(values.detach().to("cpu", torch.int64))
+        # UNCHANGED, and that is a MEASURED decision rather than an
+        # oversight. Defect J looked exactly like a missed row here --
+        # ``seqlen`` is a property of the sequence while the allocator
+        # hands out ``kv_allocated_len``, and under #486 the spec reserve
+        # makes those structurally different. The census bracket
+        # (at-arm / pre-cutover / post-cutover, 2026-08-09 02:08Z) falsified
+        # it: the unaccounted page is already unaccounted BEFORE the flip
+        # touches anything, and a no-flip control boot stays clean. Widening
+        # this enumeration would have moved rows nobody asked for, on a
+        # guess, in the one place where a wrong guess corrupts silently.
         running = getattr(scheduler, "running_batch", None)
         reqs = list(getattr(running, "reqs", []) or []) if running else []
         req_to_token = scheduler.req_to_token_pool.req_to_token
@@ -299,11 +310,87 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
                 continue
             rows = req_to_token[req.req_pool_idx, :n]
             parts.append(rows.detach().to("cpu", torch.int64))
+        _probe_allocated_extent(scheduler, _live_reqs(scheduler))
         if not parts:
             return torch.empty(0, dtype=torch.int64)
         return torch.unique(torch.cat(parts))
 
     return _live
+
+
+def _live_reqs(scheduler) -> List:
+    """The requests the pool charges to this rank. DIAGNOSTICS ONLY.
+
+    ``running_batch`` AND ``last_batch``, deduplicated by identity,
+    because that is the pair the invariant checker walks -- so a census
+    built on it can be compared with the checker's arithmetic directly.
+
+    Deliberately NOT used to decide what the flip MOVES. That decision is
+    unchanged and stays with ``_live``; see the note there.
+    """
+    seen = set()
+    out: List = []
+    for name in ("running_batch", "last_batch"):
+        batch = getattr(scheduler, name, None)
+        for req in list(getattr(batch, "reqs", []) or []) if batch else []:
+            if id(req) in seen:
+                continue
+            seen.add(id(req))
+            out.append(req)
+    return out
+
+
+def _probe_allocated_extent(scheduler, reqs) -> None:
+    """#631 defect J: MEASURE the gap between what the allocator owns and
+    what this enumeration covers. Does not change what is moved.
+
+    VERIFY BEFORE FIXING. A wrong guess about which KV rows belong to a
+    request does not fail loudly -- it silently moves the wrong bytes, or
+    silently leaves the right ones behind, and the request's context is
+    then quietly corrupt. So the delta is measured on a real flip before
+    the enumeration is changed to close it.
+
+    ``req.kv_allocated_len`` is the AUTHORITATIVE extent: the number of KV
+    slots the allocator has handed this request, and precisely what the
+    invariant checker charges to the pool (invariant_checker._check reads
+    the same field, page-aligned). ``req.seqlen`` is
+    ``len(origin_input_ids) + len(output_ids)`` -- a property of the
+    SEQUENCE, not of the allocation, and under speculative decoding the
+    two are structurally different: task #486 reserves W + L slots ahead
+    of ``kv_committed_len`` every decode step, where W is the draft/verify
+    write footprint (topk * num_steps, or num_draft_tokens) and L is the
+    commit lag. On this rig's NEXTN config that reserve is several slots,
+    NOT one -- so any fix built on "seqlen + 1" would be wrong in general
+    even where it happens to balance the books on a quiet flip.
+    """
+    if not reqs:
+        return
+    try:
+        page_size = int(getattr(scheduler.token_to_kv_pool_allocator, "page_size", 1))
+        rows = []
+        for req in reqs:
+            alloc = int(getattr(req, "kv_allocated_len", -1))
+            aligned = (
+                ceil_align(alloc, page_size) if (page_size > 1 and alloc > 0) else alloc
+            )
+            rows.append(
+                f"rid={getattr(req, 'rid', '?')} seqlen={int(req.seqlen)} "
+                f"kv_allocated_len={alloc} aligned={aligned} "
+                f"kv_committed_len={int(getattr(req, 'kv_committed_len', -1))} "
+                f"cache_protected_len={int(getattr(req, 'cache_protected_len', -1))} "
+                f"delta_vs_seqlen={aligned - int(req.seqlen)}"
+            )
+        logger.warning(
+            "%s FLIP EXTENT PROBE (page_size=%d): %s. delta_vs_seqlen is the "
+            "number of allocator-owned rows this enumeration does NOT move; "
+            "nonzero means they are left owned by nobody in the destination "
+            "stack, which is defect J.",
+            LOG_PREFIX,
+            page_size,
+            " | ".join(rows),
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe must never break a flip
+        logger.warning("%s flip extent probe failed: %s", LOG_PREFIX, exc)
 
 
 def flip_blocking_guards(scheduler) -> List[str]:
@@ -771,7 +858,7 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         int(server_args.pp_size),
     )
 
-    return PhaseFlipRuntime(
+    runtime = PhaseFlipRuntime(
         n_ranks=world.world_size,
         rank=world.rank_in_group,
         layer_map=layer_map,
@@ -833,6 +920,9 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         pre_write_fns=(_build_kv_backing_swap(scheduler, stacks),),
         guards=flip_blocking_guards(scheduler),
     )
+    # #631 J: read-only handle for the pool census straddling the cutover.
+    runtime._census_scheduler = scheduler
+    return runtime
 
 
 def _build_kv_backing_swap(scheduler, stacks) -> Callable[[str], None]:
@@ -1027,6 +1117,9 @@ class PhaseFlipRuntime:
         self.entry_channel_violations = 0
         self._last_withhold_log = None
         self._last_not_ready_log = None
+        #: #631 J: read-only handle for the pool census. Set by the
+        #: builder; absent in unit stubs, where the census is a no-op.
+        self._census_scheduler = None
         self._presence_deadline_s = float(presence_deadline_s)
         self._presence_wait_started = None
         self._gate_open_epoch = None
@@ -1150,6 +1243,11 @@ class PhaseFlipRuntime:
         # the deadline bounds how long the requests are held, and they are
         # held from the moment this rank starts withholding work.
         self._armed_at = self._clock()
+        # #631 J: census AT ARM. The pre/post-cutover pair proved the move
+        # and the cutover innocent (identical unaccounted set on both
+        # sides), and a no-flip control boot stayed clean, so the page goes
+        # missing somewhere in the ARMED window. This bracket closes it.
+        self._pool_census("at-arm", direction)
         msg = (
             f"phase flip armed: {direction} (source {source}); commits at "
             f"the next consensus boundary where every rank is quiescent, or "
@@ -1324,6 +1422,47 @@ class PhaseFlipRuntime:
             return None
         self._last_hold_reason = None
         return self._execute()
+
+    def _pool_census(self, when: str, direction: str) -> None:
+        """#631 defect J: the allocator's own view, straddling the cutover.
+
+        Reproduces the invariant checker's leak arithmetic
+        (expected - free - cached) at a point where the flip can still be
+        reasoned about, because by the time on_idle raises it the stacks
+        have already been swapped and the evidence is one pass stale.
+
+        Read-only and best effort: a census must never be able to affect a
+        flip it is only watching.
+        """
+        try:
+            scheduler = self._census_scheduler
+            if scheduler is None:
+                return
+            alloc = getattr(scheduler, "token_to_kv_pool_allocator", None)
+            tree = getattr(scheduler, "tree_cache", None)
+            if alloc is None or tree is None:
+                return
+            free = set(alloc.free_pages.tolist()) | set(alloc.release_pages.tolist())
+            cached = set(tree.all_values_flatten().tolist())
+            size = int(alloc.size)
+            leaked = set(range(1, size + 1)) - free - cached
+            reqs = _live_reqs(scheduler)
+            logger.warning(
+                "%s POOL CENSUS %s %s: size=%d free=%d cached=%d "
+                "available=%s live_reqs=%d unaccounted=%d %s",
+                LOG_PREFIX,
+                when,
+                direction,
+                size,
+                len(free),
+                len(cached),
+                getattr(alloc, "available_size", lambda: "?")(),
+                len(reqs),
+                len(leaked),
+                sorted(leaked)[:12],
+            )
+        except Exception as exc:  # noqa: BLE001 - a census never breaks a flip
+            logger.warning("%s pool census (%s) failed: %s", LOG_PREFIX, when, exc)
 
     def _log_not_ready(self) -> None:
         """Report what is holding this rank out of quiescence.
@@ -2084,9 +2223,18 @@ class PhaseFlipRuntime:
         write_ms = (self._clock() - t_write0) * 1000.0
 
         # EXTRA MOVERS (weights arena, GDN state) then CUTOVER.
+        #
+        # #631 defect J: census the pool on BOTH sides of the cutover. The
+        # leak the checker raises one pass later cannot distinguish "the
+        # enumeration missed a row" from "the cutover mis-registers the
+        # destination allocator", and those have opposite fixes. Straddling
+        # the cutover answers it directly: if the unaccounted page is
+        # already there BEFORE, the enumeration is innocent.
+        self._pool_census("pre-cutover", direction)
         for fn in self._pre_cutover_fns:
             fn(direction)
         self._cutover_fn(direction)
+        self._pool_census("post-cutover", direction)
         self._phase = _PHASE_AFTER[direction]
         self._pending = None
         self._armed_at = None
