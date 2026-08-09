@@ -164,6 +164,19 @@ def causal_conv1d_update(
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
+    # #631: the same unconditional bounds check the triton path carries.
+    # This branch reaches the kernel through sgl_kernel instead, so a guard
+    # on only one of the two would leave the safety property dependent on
+    # which build is installed. See causal_conv1d_triton.causal_conv1d_update
+    # for the measured specimen and the reason it is not behind a flag.
+    if conv_state_indices is not None and conv_state_indices.shape[0] < x.shape[0]:
+        raise ValueError(
+            f"causal_conv1d_update: conv_state_indices has "
+            f"{conv_state_indices.shape[0]} entr(ies) for a batch of "
+            f"{x.shape[0]}. The kernel indexes it once per row, so this "
+            f"would read past its end and write to an unowned conv_state "
+            f"line."
+        )
     if conv_state_indices is not None and conv_state_indices.dtype != torch.int32:
         conv_state_indices = conv_state_indices.to(torch.int32)
     causal_conv1d_update_kernel(

@@ -35,6 +35,7 @@ import pytest
 
 from sglang.srt.managers.phase_flip_counters import (
     CHAN_DICT,
+    CHAN_PASS,
     CHAN_REQ,
     PhaseFlipCounters,
 )
@@ -545,3 +546,101 @@ class _FakeSizeZeroDist:
                 return True
 
         return _W()
+
+
+# -- #631 defect Q: the pass-clock instrument ---------------------------------
+#
+# The armed intake rule returns [] on every rank without blocking, which
+# removes the ONE thing that holds the PP stages in phase: the blocking chain
+# receive. mb_id is a purely rank-local loop index, so during an armed window
+# each rank free-runs. These pin the instrument that measures whether it does.
+#
+# An instrument has its own can-fail obligation: one that reports "no drift"
+# whatever happens would have quietly cleared the hypothesis. So the third
+# test DRIVES drift and requires the instrument to report it.
+
+
+def _tick_harness(counters, armed=True, enabled=True):
+    from types import SimpleNamespace
+
+    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+    class S:
+        pass
+
+    s = S()
+    s.server_args = SimpleNamespace(enable_phase_flip=enabled)
+    s.pp_flip_counters = counters
+    s._armed = armed
+    s.pp_phase_flip_armed = lambda: s._armed
+    return s, SchedulerPPMixin._pp_flip_pass_tick.__get__(s, S)
+
+
+def test_the_pass_clock_counts_slot_iterations_while_armed(tmp_path):
+    c = _counters(tmp_path, rank=0)
+    s, tick = _tick_harness(c)
+
+    for mb in (0, 1, 2, 0, 1):
+        tick(mb)
+
+    assert c.sent(CHAN_PASS, 0) == 4, (
+        "the first armed pass establishes the baseline and each later one "
+        "adds a pass; five ticks are four iterations of armed window"
+    )
+
+
+def test_the_pass_clock_is_silent_without_the_flip(tmp_path):
+    """Zero cost on every boot that does not use this feature."""
+    c = _counters(tmp_path, rank=0)
+    s, tick = _tick_harness(c, enabled=False)
+
+    for mb in range(50):
+        tick(mb)
+
+    assert c.sent(CHAN_PASS, 0) == 0
+
+
+def test_can_fail_the_instrument_actually_SEES_a_drifting_group(tmp_path):
+    """THE CAN-FAIL FOR THE INSTRUMENT ITSELF.
+
+    Three ranks share one /dev/shm directory and run DIFFERENT numbers of
+    slot iterations inside one armed window -- exactly what the hypothesis
+    says the armed intake rule permits. Any rank must be able to read the
+    whole group's counts and compute a non-zero spread.
+
+    If this ever reads 0, the instrument is blind and a green pass-clock
+    line on metal would mean nothing.
+    """
+    ranks = [_counters(tmp_path, rank=r) for r in range(3)]
+    harnesses = [_tick_harness(c) for c in ranks]
+
+    for passes, (s, tick) in zip((30, 12, 7), harnesses):
+        for i in range(passes):
+            tick(i % 3)
+
+    observed = [ranks[0].sent(CHAN_PASS, r) for r in range(3)]
+    assert observed == [29, 11, 6], observed
+    assert max(observed) - min(observed) == 23, (
+        "rank 0 could not see its peers' pass counts; the instrument cannot "
+        "detect the drift it exists to detect"
+    )
+
+
+def test_the_falling_edge_reports_and_rearms(tmp_path):
+    """Disarming reports once, then the next armed window starts clean."""
+    c = _counters(tmp_path, rank=0)
+    s, tick = _tick_harness(c)
+
+    for i in range(5):
+        tick(i % 3)
+    s._armed = False
+    tick(1)          # the falling edge: reports the group
+    tick(1)          # and does not report again
+    s._armed = True
+    tick(0)
+
+    assert c.sent(CHAN_PASS, 0) == 0, (
+        "a second armed window must restart the count; carrying the "
+        "previous window's total forward would make every later spread "
+        "unreadable"
+    )
