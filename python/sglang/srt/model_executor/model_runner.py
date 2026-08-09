@@ -3987,6 +3987,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
+        # #631: DOES THIS HIDDEN STATE BELONG TO THIS BATCH?
+        #
+        # Under PP the pairing of a received proxy tensor to a local batch is
+        # PURELY POSITIONAL -- "whatever came off the wire this slot iteration
+        # belongs to whatever batch I have this slot iteration". PPProxyTensors
+        # carries no mb_id, no sequence number and no length, the receive
+        # demultiplexes only on __msg_type__, and the model asserts the
+        # proxy's PRESENCE but never its SHAPE. So a single stranded message
+        # puts every later receive off by one, silently and permanently.
+        #
+        # It can strand: the recv is guarded by THIS rank's ``cur_batch`` while
+        # the upstream's send is guarded by the UPSTREAM's, and nothing
+        # enforces that the two agree -- only the unasserted "every rank builds
+        # the same batches" property. A commit hides any strand because the
+        # cutover re-enters event_loop_pp and init_pp_loop_state resets every
+        # buffer including _pp_tensor_dict_inbox; an ABANDON resets nothing.
+        #
+        # MEASURED COST (2026-08-09 05:21:16Z, specimen
+        # /spinning/evidence-631/oom_and_abandon_20260809T0521Z): a decode
+        # batch of one request was computed on a 2048-row chunked-prefill
+        # hidden state, and the mismatched pair reached causal_conv1d_update
+        # -- an out-of-bounds write into another request's conv state.
+        #
+        # Checked here because this is the one funnel every PP stage's forward
+        # passes through, so one check covers every model. Two host-side shape
+        # reads, no synchronisation. It names mb-level facts the old failure
+        # could not: the previous symptom appeared 30 layers deep in a GDN
+        # kernel and pointed at the wrong subsystem entirely.
+        if pp_proxy_tensors is not None:
+            _hs = pp_proxy_tensors.tensors.get("hidden_states")
+            _want = forward_batch.input_ids.shape[0]
+            if _hs is not None and _hs.shape[0] != _want:
+                raise ValueError(
+                    f"#631 PP proxy/batch mismatch: received hidden_states with "
+                    f"{_hs.shape[0]} row(s) for a {forward_batch.forward_mode} "
+                    f"batch of {_want} token(s) "
+                    f"(bs={forward_batch.batch_size}). The hidden states of one "
+                    f"microbatch have been paired with another microbatch's "
+                    f"metadata -- the PP stages are out of step. Computing on "
+                    f"this pair corrupts memory rather than merely failing: the "
+                    f"cache-index tensors are sized for THIS batch."
+                )
+
         self.forward_pass_id += 1
 
         # Try msprob debugger
