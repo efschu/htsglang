@@ -103,6 +103,18 @@ PHASE_POLICY_FLIP_TOKENS="${PHASE_POLICY_FLIP_TOKENS:-}"
 # 3s keeps a thrash bound while leaving the flip inside one chunk. The
 # structural thrash protection is the hysteresis band around N, not this.
 PHASE_POLICY_MIN_DWELL_S="${PHASE_POLICY_MIN_DWELL_S:-3}"
+# STRICT PHASE PURITY (user rule, 2026-08-09) and the two windows that make
+# it progress. min_dwell above is a THRASH bound and cannot schedule the
+# alternation: it gates how SOON a flip may arm, never how LONG a phase is
+# allowed to keep the other side waiting. Under purity that difference is
+# the whole game -- the PP window is what stops the instance parking in the
+# prefill layout with decode work it is forbidden to run (measured defect
+# K: 508 decode records in PP, 0 % CUDA graphs, 35 tok/s), and the TP floor
+# is what stops the always-present backlog dragging the instance back out
+# of the decode layout after one min_dwell.
+PHASE_POLICY_PP_WINDOW_S="${PHASE_POLICY_PP_WINDOW_S:-15}"
+PHASE_POLICY_TP_DECODE_FLOOR_S="${PHASE_POLICY_TP_DECODE_FLOOR_S:-10}"
+PHASE_FLIP_PURITY="${PHASE_FLIP_PURITY:-strict}"
 PHASE_POLICY_IDLE_DWELL_S="${PHASE_POLICY_IDLE_DWELL_S:-}"
 PHASE_IDLE_STATE="${PHASE_IDLE_STATE:-}"
 HICACHE="${HICACHE:-0}"
@@ -186,6 +198,8 @@ export SGLANG_PHASE_FLIP_INSTANCE="${SGLANG_PHASE_FLIP_INSTANCE:-$(date +%s)-$$}
 [ -n "$PHASE_POLICY_TP_TOK_S" ] && export SGLANG_PHASE_POLICY_TP_TOK_S="$PHASE_POLICY_TP_TOK_S"
 [ -n "$PHASE_POLICY_FLIP_TOKENS" ] && export SGLANG_PHASE_POLICY_FLIP_TOKENS="$PHASE_POLICY_FLIP_TOKENS"
 [ -n "$PHASE_POLICY_MIN_DWELL_S" ] && export SGLANG_PHASE_POLICY_MIN_DWELL_S="$PHASE_POLICY_MIN_DWELL_S"
+[ -n "$PHASE_POLICY_PP_WINDOW_S" ] && export SGLANG_PHASE_POLICY_PP_WINDOW_S="$PHASE_POLICY_PP_WINDOW_S"
+[ -n "$PHASE_POLICY_TP_DECODE_FLOOR_S" ] && export SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S="$PHASE_POLICY_TP_DECODE_FLOOR_S"
 [ -n "$PHASE_POLICY_IDLE_DWELL_S" ] && export SGLANG_PHASE_POLICY_IDLE_DWELL_S="$PHASE_POLICY_IDLE_DWELL_S"
 [ -n "$PHASE_IDLE_STATE" ] && export HTSGLANG_PHASE_IDLE_STATE="$PHASE_IDLE_STATE"
 
@@ -334,6 +348,7 @@ setsid "$PY" -m sglang.launch_server \
     --enable-phase-flip \
     --phase-flip-tp-vector 30,17,17 \
     --phase-flip-policy "$POLICY" \
+    --phase-flip-purity "$PHASE_FLIP_PURITY" \
     --disable-overlap-schedule \
     --kv-cache-dtype fp8_e4m3 --context-length "$CTX" \
     --max-running-requests "$MAX_RUNNING" \

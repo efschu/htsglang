@@ -17,6 +17,8 @@ CPU-only; the policy is a pure function and needs no GPU.
 
 from types import SimpleNamespace
 
+import time
+
 import pytest
 
 from sglang.srt.managers.phase_policy import (
@@ -437,7 +439,17 @@ def _sched(
     chunked=None,
     running_mbs=None,
     spec_algo=None,
+    aged_s=0.0,
 ):
+    """``aged_s`` = how long the instance has ALREADY been in ``phase``.
+
+    Default 0.0 means the phase was just entered, which is what every pin
+    written before the fairness windows assumed implicitly. The two window
+    rules (pp_window_s, tp_decode_floor_s) measure from phase entry, so a
+    test that wants to exercise the load rules of a phase the server has
+    been sitting in for a while must say so explicitly rather than inherit
+    a clock by accident.
+    """
     from sglang.srt.managers.scheduler import Scheduler
 
     class S:
@@ -458,6 +470,11 @@ def _sched(
 
     s.flip_spec_algorithm = SpeculativeAlgorithm.from_string(spec_algo)
     s.running_mbs = list(running_mbs) if running_mbs is not None else []
+    if aged_s:
+        # Pre-age the phase clock. last_phase must match, or observe_idle
+        # reads this as a phase CHANGE and resets the clock it just set.
+        s.phase_policy_state.last_phase = phase
+        s.phase_policy_state.phase_since = time.perf_counter() - aged_s
     # The REAL metric, not a stub of it: #631 defect N was precisely that
     # this quantity did not mean what its caller's comment said.
     s._pending_prefill_tokens = Scheduler._pending_prefill_tokens.__get__(s, S)
@@ -520,13 +537,37 @@ def test_a_chunked_prefill_is_visible_to_the_policy():
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
     # Queue empty, but a big prompt is admitted and mostly uncomputed.
-    s = _sched(queue=[], running=1, chunked=_StubChunked(N + 5000, 1000))
+    #
+    # Aged past the decode floor on purpose. What defect N was about is
+    # VISIBILITY -- the policy read 0 pending prefill and therefore could
+    # not fire -- and the floor does not affect visibility, it only delays
+    # acting on it. Both halves are pinned: the freshly-entered case below
+    # must be held by the FLOOR (proving the prompt was seen), and the aged
+    # case must arm.
+    s = _sched(
+        queue=[], running=1, chunked=_StubChunked(N + 5000, 1000), aged_s=60.0
+    )
     req = s.maybe_arm_phase_policy()
     assert isinstance(req, PhaseFlipReqInput), (
         "an admitted-but-uncomputed prompt larger than N must move the "
         "instance to the prefill layout"
     )
     assert req.direction == TP_TO_PP
+
+    # The same backlog one second into the TP phase: still SEEN -- the
+    # reason names the FLOOR, not an empty queue -- just not acted on yet.
+    # A reason mentioning 0 pending here would mean defect N had returned.
+    fresh = PhasePolicyState()
+    fresh_inp = PhasePolicyInputs(
+        phase=PHASE_TP,
+        pending_prefill_tokens=N + 4000,
+        running_bs=1,
+        now=1000.0,
+    )
+    observe_idle(fresh, fresh_inp)
+    held = decide(cfg(), fresh, fresh_inp)
+    assert held.direction is None
+    assert "decode floor" in held.reason
 
 
 def test_a_nearly_finished_chunked_prefill_does_not_move_the_layout():
@@ -541,7 +582,7 @@ def test_policy_emits_the_same_request_the_rpc_path_produces():
     originates the arm."""
     from sglang.srt.managers.io_struct import PhaseFlipReqInput
 
-    s = _sched(queue=[_StubReq(N + 1000)], running=1)
+    s = _sched(queue=[_StubReq(N + 1000)], running=1, aged_s=60.0)
     req = s.maybe_arm_phase_policy()
     assert isinstance(req, PhaseFlipReqInput)
     assert req.direction == TP_TO_PP
@@ -1838,7 +1879,7 @@ def test_the_idle_return_leg_is_untouched_by_the_decline():
 
     s = _sched(
         phase=PHASE_TP, queue=[_StubReq(N + 1000)], running=1,
-        spec_algo="EAGLE",
+        spec_algo="EAGLE", aged_s=60.0,
     )
     req = s.maybe_arm_phase_policy()
     assert isinstance(req, PhaseFlipReqInput)

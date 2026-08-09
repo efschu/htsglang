@@ -146,6 +146,52 @@ ENV_FLIP_TOKENS = "SGLANG_PHASE_POLICY_FLIP_TOKENS"
 ENV_MIN_DWELL = "SGLANG_PHASE_POLICY_MIN_DWELL_S"
 ENV_IDLE_DWELL = "SGLANG_PHASE_POLICY_IDLE_DWELL_S"
 ENV_REST_STATE = "HTSGLANG_PHASE_IDLE_STATE"
+ENV_PP_WINDOW = "SGLANG_PHASE_POLICY_PP_WINDOW_S"
+ENV_TP_FLOOR = "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S"
+
+# -- THE FAIRNESS BOUND (starvation fix, metal-observed 2026-08-09) ----------
+# Both thresholds above are LOAD-TRIGGERED, and that is not enough. Under
+# CONTINUOUS mixed arrivals -- which is exactly what a real agent backend
+# produces -- neither of them ever fires in the PP direction:
+#
+#   21:15:25Z .. 21:16:15Z  PHASE-POLICY holding in pp: prefilling in pp
+#                           (302757 tok pending, running bs 2)   x 6 samples
+#   same window: 87 Decode batches, 6 Prefill batches, cuda graph: False,
+#   gen throughput 35.4 tok/s
+#
+# The PP->TP rule is ``pending <= N``. With arrivals sustaining a backlog far
+# above N=7004 that predicate is never true, so the server pins itself in the
+# PREFILL layout and serves DECODE there -- no speculation, no decode CUDA
+# graphs, 35 tok/s. The docstring above anticipated the ``== 0`` form of this
+# trap and replaced it with ``<= N``; that fixed the batching case and left
+# the sustained-backlog case, which is the same trap one threshold further
+# out. Absolute prefill priority can never reach the decode layout under a
+# load that always has prefill pending.
+#
+# The bound is therefore a TIME-SLICE, and it must be symmetric or it just
+# moves the starvation to the other side:
+#
+#   pp_window_s      max continuous seconds in PP while decode work waits.
+#                    On expiry PP->TP arms REGARDLESS of pending prefill;
+#                    the residents carry across (phase_flip_draft_bootstrap)
+#                    and new prefill queues behind the existing admission
+#                    hold until the next PP window.
+#   tp_decode_floor_s minimum seconds in TP before a pending-prefill-driven
+#                    TP->PP may arm. Without it the TP phase would last one
+#                    min_dwell (3 s here) before the ever-present backlog
+#                    dragged it straight back, and decode would starve in
+#                    the mirror image of the defect.
+#
+# Both apply ONLY while the other side actually has work (``running_bs > 0``
+# for the PP window; the TP floor likewise). A phase with nothing to protect
+# is left free to flip on the load rule immediately, so an arriving long
+# prompt at a decode-idle server still gets PP-class prefill in its TTFT.
+#
+# Cost accounting, and it is deliberate: one 15 s + 10 s cycle carries two
+# round trips (~3.2 s measured), i.e. ~11 % of wall clock in cutovers. That
+# is the price of both sides making progress; it is a knob, not a constant.
+DEFAULT_PP_WINDOW_S = 15.0
+DEFAULT_TP_DECODE_FLOOR_S = 10.0
 
 # Defaults for the two timers. The minimum dwell is deliberately larger than
 # one round trip: a server that flips, and is allowed to flip straight back,
@@ -211,6 +257,11 @@ class PhasePolicyConfig:
     min_dwell_s: float = DEFAULT_MIN_DWELL_S
     idle_dwell_s: float = DEFAULT_IDLE_DWELL_S
     rest_state: str = REST_PREFILL
+    #: Fairness bound; 0 disables it and restores the pure load-triggered
+    #: behaviour that starves under a sustained backlog. See the block
+    #: comment at DEFAULT_PP_WINDOW_S.
+    pp_window_s: float = DEFAULT_PP_WINDOW_S
+    tp_decode_floor_s: float = DEFAULT_TP_DECODE_FLOOR_S
 
     def __post_init__(self) -> None:
         if self.rest_state not in REST_STATES:
@@ -238,6 +289,23 @@ class PhasePolicyState:
     idle_since: Optional[float] = None
     flips_armed: int = 0
     last_reason: str = ""
+    #: When the CURRENT phase was entered, on the caller's clock. Distinct
+    #: from ``last_flip_at`` on purpose: that one is an ARM stamp and is 0
+    #: until the first flip, while the fairness bound has to measure the
+    #: very first PP occupancy too. Maintained by ``observe_idle`` from the
+    #: OBSERVED phase, so a manual POST /phase_flip -- which the policy
+    #: never armed -- also restarts the clock.
+    #: None means NOT YET OBSERVED, and both window rules treat that as
+    #: "inapplicable" rather than as "infinitely long ago". Without that
+    #: reading, any caller reaching ``decide`` without having called
+    #: ``observe_idle`` first -- every pre-window unit test, and any future
+    #: caller that forgets -- would see a window that expired at t=0 and
+    #: flip immediately. Degrading to the pre-window behaviour is the safe
+    #: direction: an unobserved phase simply keeps the load-triggered rules.
+    #: A sentinel rather than 0.0 because 0.0 is a legitimate clock value
+    #: and the two readings must not be confusable.
+    phase_since: Optional[float] = None
+    last_phase: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -297,6 +365,31 @@ def decide(
         # layout. Below the threshold the prefill runs in TP as-is, which is
         # the correct answer for short prompts by construction of N.
         if inp.pending_prefill_tokens > cfg.flip_tokens:
+            # THE DECODE FLOOR. Under purity every token of prefill has to
+            # wait for a PP window, so the backlog is essentially always
+            # above N and this rule would otherwise fire the instant
+            # min_dwell expires -- giving decode a 3 s window per cycle and
+            # starving it in the mirror image of the defect the PP window
+            # fixes. Only applies while decode work actually exists: with
+            # nothing decoding there is nothing to protect, and an arriving
+            # long prompt should reach the PP layout inside its TTFT.
+            in_phase = (
+                None
+                if state.phase_since is None
+                else inp.now - state.phase_since
+            )
+            if (
+                cfg.tp_decode_floor_s > 0
+                and in_phase is not None
+                and inp.running_bs > 0
+                and in_phase < cfg.tp_decode_floor_s
+            ):
+                return _no(
+                    f"decode floor: {in_phase:.1f}s in tp < "
+                    f"{cfg.tp_decode_floor_s:g}s, {inp.running_bs} req "
+                    f"decoding ({inp.pending_prefill_tokens} tok prefill "
+                    f"waiting for the next pp window)"
+                )
             return PhasePolicyDecision(
                 TP_TO_PP,
                 f"pending prefill {inp.pending_prefill_tokens} tok > "
@@ -344,6 +437,28 @@ def decide(
                 f"prefill down to {inp.pending_prefill_tokens} tok "
                 f"(<= N={cfg.flip_tokens}), {inp.running_bs} req decoding",
             )
+        # THE PP WINDOW. The rule above needs prefill to DRAIN below N; a
+        # sustained backlog never does, and under strict purity the PP
+        # phase may not decode at all, so without this bound the instance
+        # parks in PP with decode work it is forbidden to run. On expiry
+        # PP->TP arms regardless of the backlog: the residents carry over
+        # and decode batched in the TP window, and the prefill that did not
+        # fit waits for the next PP window. This is also the deadlock
+        # breaker for a PP phase that cannot ADMIT its pending prefill (no
+        # free state slot) -- see phase_purity's deadlock section.
+        if (
+            cfg.pp_window_s > 0
+            and state.phase_since is not None
+            and inp.running_bs > 0
+            and (inp.now - state.phase_since) >= cfg.pp_window_s
+        ):
+            return PhasePolicyDecision(
+                PP_TO_TP,
+                f"pp window {inp.now - state.phase_since:.1f}s >= "
+                f"{cfg.pp_window_s:g}s with {inp.running_bs} req waiting to "
+                f"decode ({inp.pending_prefill_tokens} tok prefill deferred "
+                f"to the next pp window)",
+            )
         if idle and cfg.rest_phase == PHASE_TP:
             if state.idle_since is None:
                 return _no("idle, waiting for the idle dwell to start")
@@ -376,6 +491,13 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
             state.idle_since = inp.now
     else:
         state.idle_since = None
+    # Phase-entry clock for the fairness bound. Driven by the OBSERVED
+    # phase rather than by the policy's own verdict, so it is correct for
+    # the first phase (no flip has happened yet, last_flip_at == 0) and for
+    # a phase this policy did not choose (manual /phase_flip).
+    if state.last_phase != inp.phase:
+        state.last_phase = inp.phase
+        state.phase_since = inp.now
 
 
 def note_flip_armed(
@@ -452,16 +574,20 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
         min_dwell_s=min_dwell,
         idle_dwell_s=idle_dwell,
         rest_state=rest_state,
+        pp_window_s=_env_float(ENV_PP_WINDOW, DEFAULT_PP_WINDOW_S),
+        tp_decode_floor_s=_env_float(ENV_TP_FLOOR, DEFAULT_TP_DECODE_FLOOR_S),
     )
     if enabled:
         logger.warning(
             "%s armed: N=%d tok (%s), min dwell %gs, idle dwell %gs, "
-            "resting layout %s (%s)",
+            "pp window %gs, tp decode floor %gs, resting layout %s (%s)",
             LOG_PREFIX,
             cfg.flip_tokens,
             source,
             cfg.min_dwell_s,
             cfg.idle_dwell_s,
+            cfg.pp_window_s,
+            cfg.tp_decode_floor_s,
             cfg.rest_phase,
             cfg.rest_state,
         )

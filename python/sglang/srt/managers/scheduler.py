@@ -189,6 +189,12 @@ from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
+from sglang.srt.managers.phase_purity import (
+    decode_blocked_here as phase_decode_blocked_here,
+)
+from sglang.srt.managers.phase_purity import (
+    prefill_blocked_here as phase_prefill_blocked_here,
+)
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -462,6 +468,20 @@ class Scheduler(
             from sglang.srt.managers.phase_policy import PhasePolicyState
 
             self.phase_policy_state = PhasePolicyState()
+        # #631 STRICT PHASE PURITY. Resolved at boot, like the policy config
+        # and for the same reason: an unusable value must be found here, not
+        # on the first busy round. The pair check refuses the one
+        # combination that deadlocks (purity enforced with no bounded PP
+        # window to break a PP phase that may not decode and cannot admit).
+        self._phase_purity = None
+        if getattr(server_args, "enable_phase_flip", False):
+            from sglang.srt.managers.phase_purity import (
+                purity_from_server_args,
+                validate_purity_policy_pair,
+            )
+
+            self._phase_purity = purity_from_server_args(server_args)
+            validate_purity_policy_pair(self._phase_purity, self.phase_policy_cfg)
         # #261 live session handover runtime: None on every default path;
         # built lazily on the first /session_handover control request. The
         # admission hook in handle_generate_request is a no-op while this
@@ -4661,6 +4681,19 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif phase_prefill_blocked_here(self):
+            # #631 STRICT PHASE PURITY: not a single token is prefilled in
+            # the TP layout. The prefill batch is not BUILT (nothing is
+            # allocated and then dropped) -- the work stays queued and is
+            # executed, batched, in the next PP window. TP prefill measures
+            # 1681 tok/s against PP's 7245 on this rig, so this defers work
+            # rather than losing it.
+            #
+            # Same rank-uniformity argument as the congruent lane below:
+            # every input (static purity config, the replicated active
+            # layout) is identical on every rank, so the group never splits
+            # across branches with mismatched collectives.
+            new_batch = None
         elif (
             self.congruent_prefill_lane is not None
             and not self.congruent_prefill_lane.allow_prefill(
@@ -4757,8 +4790,25 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                running_batch = self.update_running_batch(running_batch)
-                ret = running_batch if not running_batch.is_empty() else None
+                if phase_decode_blocked_here(self, running_batch.batch_size()):
+                    # #631 STRICT PHASE PURITY: no decode step executes in
+                    # the PP layout. The requests stay RESIDENT and are
+                    # carried across the next cutover by the resident-carry
+                    # and draft-bootstrap machinery, then resume batched in
+                    # the TP window with graphs and speculation live.
+                    #
+                    # Returning None here leaves the round empty, which is
+                    # the intended signal: with prefill drained and decode
+                    # forbidden the PP phase has no work, and the policy's
+                    # ``pending <= N and running_bs > 0`` rule arms PP->TP
+                    # on the very next decision. When prefill is NOT
+                    # drained but cannot be admitted either, the policy's
+                    # bounded PP window is the exit -- see the deadlock
+                    # section of phase_purity.
+                    ret = None
+                else:
+                    running_batch = self.update_running_batch(running_batch)
+                    ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None
 

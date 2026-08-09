@@ -5277,6 +5277,32 @@ class ServerArgs:
             choices=["manual", "auto"],
         ),
     ] = "manual"
+    phase_flip_purity: A[
+        Optional[str],
+        Arg(
+            help="#631: how strictly each layout is confined to the work it "
+            "is for. 'strict' (DEFAULT) forbids BOTH mixed cases: no decode "
+            "step executes in the PP prefill layout, and not a single token "
+            "is prefilled in the TP decode layout. Work for the other layout "
+            "is DEFERRED and executed batched after the next flip, so the "
+            "server alternates: run all pending prefill in PP (decode work "
+            "queues) -> flip -> run the deferred decode in TP with CUDA "
+            "graphs and speculation (prefill queues) -> flip. Measured "
+            "reason: with the layouts mixed, 87 decode batches ran in the PP "
+            "layout at 35 tok/s with no graphs while prefill barely "
+            "advanced, each half starving the other (2026-08-09). "
+            "'threshold:<n>' is the ESCAPE HATCH: decode may still run in "
+            "the PP layout while at most <n> requests are decoding, trading "
+            "a little layout purity for tail latency; it does NOT relax the "
+            "prefill-in-TP prohibition, which has no latency argument on the "
+            "other side (TP prefills at 1681 tok/s against PP's 7245). "
+            "'off' lifts both and restores the pre-purity interleaving, kept "
+            "reachable for A/B only. The accepted cost of 'strict' is that a "
+            "request mid-decode when prefill pressure arrives is PAUSED, "
+            "resident, until the next TP window. Requires "
+            "--enable-phase-flip; env fallback SGLANG_PHASE_FLIP_PURITY.",
+        ),
+    ] = None
     phase_flip_tp_vector: A[
         Optional[str],
         Arg(
@@ -7211,7 +7237,22 @@ class ServerArgs:
                 f"--phase-flip-policy={self.phase_flip_policy!r} is not a "
                 f"known mode; use 'manual' or 'auto'."
             )
+        # Parse the purity mode HERE so an unusable value is an argument
+        # error, not a surprise on the first busy round. parse_purity is the
+        # single definition of what is valid; this call is what makes a typo
+        # loud instead of silently falling back to the default -- a
+        # mis-typed purity that read as 'strict' would look like it was
+        # enforcing a rule the operator never actually set.
+        from sglang.srt.managers.phase_purity import parse_purity
+
+        parse_purity(self.phase_flip_purity)
         if not self.enable_phase_flip:
+            if self.phase_flip_purity is not None:
+                raise ValueError(
+                    "--phase-flip-purity requires --enable-phase-flip: with "
+                    "one layout there is no other layout to keep work out "
+                    "of, so the setting would do nothing."
+                )
             if self.phase_flip_tp_vector is not None:
                 raise ValueError(
                     "--phase-flip-tp-vector requires --enable-phase-flip "
