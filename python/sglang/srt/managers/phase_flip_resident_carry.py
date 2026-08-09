@@ -167,23 +167,35 @@ def harvest_resident_batches(scheduler) -> List:
     # double free -- and the failure would be silent until the pool
     # arithmetic drifted. A request lives in exactly one microbatch slot;
     # if that stops being true, this must be the thing that says so.
-    owner: dict = {}
-    for batch in out:
-        for req in _reqs_of(batch):
-            prev = owner.get(id(req))
-            if prev is not None:
-                raise ResidentCarryError(
-                    f"{LOG_PREFIX} request {getattr(req, 'rid', '?')} is "
-                    f"resident in TWO distinct batches at once "
-                    f"(req_pool_idx={getattr(req, 'req_pool_idx', '?')}). "
-                    f"Merging them would carry the same request twice -- "
-                    f"duplicate KV rows and a double free. A request "
-                    f"belongs to exactly one microbatch slot; this means "
-                    f"the slot bookkeeping diverged, not that the carry "
-                    f"needs widening."
-                )
-            owner[id(req)] = batch
     return out
+
+
+def duplicate_resident_reqs(batches: Sequence) -> List[str]:
+    """Requests reachable through MORE THAN ONE of these batches.
+
+    MEASURED ON METAL, 2026-08-09 04:55:43Z, and it falsified the
+    assumption this used to assert. The first version of the carry RAISED
+    here, on the reasoning that "a request belongs to exactly one
+    microbatch slot". Under a real agentic multi-turn load that refusal
+    fired and took the instance down:
+
+        ResidentCarryError: request b0446d8c... is resident in TWO
+        distinct batches at once
+
+    So the assumption was wrong, and the loud refusal is what proved it --
+    which is the right outcome for the check and the wrong outcome for the
+    server. The duplication is real and must be RESOLVED rather than
+    refused: ``merge_batch`` extends ``reqs`` in place, so carrying the
+    same Req twice is duplicate rows and a double free.
+    """
+    seen: Set[int] = set()
+    dups: List[str] = []
+    for batch in batches:
+        for req in _reqs_of(batch):
+            if id(req) in seen:
+                dups.append(str(getattr(req, "rid", "?")))
+            seen.add(id(req))
+    return dups
 
 
 def resident_req_identity(scheduler) -> List[Tuple]:
@@ -266,7 +278,33 @@ def merge_resident_batches(batches: Sequence) -> Optional[object]:
     if not live:
         return None
     base = live[0]
+    carried: Set[int] = {id(r) for r in _reqs_of(base)}
     for other in live[1:]:
+        reqs = _reqs_of(other)
+        keep = [i for i, r in enumerate(reqs) if id(r) not in carried]
+        if not keep:
+            # Every request in this batch is already carried through
+            # another one: merging it would duplicate all of them.
+            logger.warning(
+                "%s a resident batch was entirely duplicate (%d req(s) "
+                "already carried); not merged",
+                LOG_PREFIX,
+                len(reqs),
+            )
+            continue
+        if len(keep) != len(reqs):
+            # PARTIAL overlap, resolved with the scheduler's own primitive
+            # so the batch's tensors stay consistent with its reqs. Raising
+            # here is what took the instance down at 04:55:43Z; the
+            # duplication is real, so it is resolved, not refused.
+            logger.warning(
+                "%s a resident batch shared %d req(s) with another; "
+                "filtering the duplicates before the merge",
+                LOG_PREFIX,
+                len(reqs) - len(keep),
+            )
+            other.filter_batch(keep_indices=keep)
+        carried.update(id(r) for r in _reqs_of(other))
         base.merge_batch(other)
     return base
 

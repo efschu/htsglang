@@ -24,6 +24,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.phase_flip_resident_carry import (
+    duplicate_resident_reqs,
     ResidentCarryError,
     assert_no_orphan_resident_reqs,
     harvest_resident_batches,
@@ -61,6 +62,11 @@ class _FakeBatch:
     def merge_batch(self, other):
         self.merged_from.append(other)
         self.reqs.extend(other.reqs)
+
+    def filter_batch(self, chunked_req_to_exclude=None, keep_indices=None):
+        """Same signature as the real one; the carry uses keep_indices."""
+        if keep_indices is not None:
+            self.reqs = [self.reqs[i] for i in keep_indices]
 
 
 class _PPStub:
@@ -103,13 +109,36 @@ class TestHarvest(CustomTestCase):
             resident_req_identity(sched), [("a", 1), ("b", 2)]
         )
 
-    def test_can_fail_one_request_in_two_batches_is_refused(self):
-        """Merging those would carry the same Req twice -- duplicate rows
-        and a double free. It must be loud, not absorbed."""
+    def test_one_request_in_two_batches_is_resolved_not_refused(self):
+        """MEASURED ON METAL 2026-08-09 04:55:43Z, and it falsified the
+        assumption this test used to encode.
+
+        The carry first RAISED here, on the reasoning that a request
+        belongs to exactly one microbatch slot. Under a real agentic
+        multi-turn load that refusal fired and took the instance down. The
+        assumption was wrong; the duplication is real and must be RESOLVED,
+        because merge_batch extends reqs in place and carrying the same Req
+        twice is duplicate rows and a double free.
+        """
         shared = _req("a", 1)
         sched = _PPStub(3, ([shared], [shared], []))
-        with self.assertRaisesRegex(ResidentCarryError, "TWO distinct batches"):
-            harvest_resident_batches(sched)
+        got = harvest_resident_batches(sched)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(duplicate_resident_reqs(got), ["a"])
+
+    def test_the_merge_carries_a_shared_request_exactly_once(self):
+        shared, only_b = _req("a", 1), _req("b", 2)
+        b0, b1 = _FakeBatch([shared]), _FakeBatch([shared, only_b])
+        merged = merge_resident_batches([b0, b1])
+        rids = [r.rid for r in merged.reqs]
+        self.assertEqual(sorted(rids), ["a", "b"])
+        self.assertEqual(len(rids), 2, "the shared request was duplicated")
+
+    def test_a_fully_duplicate_batch_is_skipped(self):
+        shared = _req("a", 1)
+        b0, b1 = _FakeBatch([shared]), _FakeBatch([shared])
+        merged = merge_resident_batches([b0, b1])
+        self.assertEqual([r.rid for r in merged.reqs], ["a"])
 
     def test_can_fail_a_request_only_in_last_mbs_is_refused(self):
         """At a quiescent boundary this cannot happen, so it means the
