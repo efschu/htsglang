@@ -226,8 +226,51 @@ arithmetic was built on. Anything deriving a threshold from "what it would
 cost to do X in the other layout" is suspect under purity. Grep for other
 consumers of `flip_tokens` before adding the next feature.
 
+## 4b. OPEN DEFECT M — running_bs read 10485760 once (NOT fixed)
+
+Live, purity build, 21:46:28Z, the very first `pp_to_tp` arming:
+
+```
+PHASE-POLICY arming pp_to_tp: prefill down to 0 tok (<= N=7004),
+10485760 req decoding
+```
+
+10485760 = 10 x 2^20. Every other sample in the same run is sane
+(`running bs 0/2/3`, `1 req decoding`, `2 req decoding`); this is 1
+occurrence so far. Not a display bug — the same value is the `running_bs`
+the decision was MADE on.
+
+**Why it matters more than a cosmetic log line**: `running_bs > 0` is the
+gate on BOTH new fairness rules (the PP window and the TP decode floor)
+and on the PP->TP load rule. A spurious large value fabricates decode work
+that does not exist, which:
+- fires `pp_to_tp` while the instance is actually IDLE (exactly what
+  happened here: prefill 0, so the correct verdict was the idle rule and
+  the PP resting layout, not a flip),
+- would make the PP window expire against phantom waiters,
+- would engage the decode floor and hold TP with nothing decoding.
+
+**Where to look** (not yet investigated):
+`Scheduler.maybe_arm_phase_policy` computes
+`running_bs = sum(len(getattr(b, "reqs", []) or []) for b in
+harvest_resident_batches(self))` (`scheduler.py` ~:7086).
+`harvest_resident_batches` (`phase_flip_resident_carry.py:141`) draws from
+the PP slot array `running_mbs` and from `running_batch`. The occurrence
+was in the PP phase on PP0, so the PP slot side is the first suspect: a
+slot whose `reqs` attribute is not a request list but something tensor-
+shaped would give `len()` a dimension instead of a count. 2^20 smells like
+a buffer dimension, and the `x10` like the 10 GDN resident state slots.
+
+**Do NOT "fix" it by clamping.** The value must be explained first: a clamp
+would convert a wrong input into a plausible one and hide whichever handle
+is leaking into the resident harvest. Add a cheap assertion at the sum
+site (running_bs may not exceed `max_running_requests`) and let it raise
+with the offending batch's type and attribute — the same
+loud-over-plausible discipline the merge_batch guard uses.
+
 ## 5. Exact next steps
 
+0. **Defect M above** — it gates the fairness rules; explain before fixing.
 1. **The green-criterion run.** Serving must be up on `2ce40f86a2` with
    `POLICY=auto` (the boot script defaults to `manual` — the first boot
    this shift was discarded for exactly that; always pass `POLICY=auto`).
