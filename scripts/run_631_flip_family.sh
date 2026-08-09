@@ -25,6 +25,7 @@ FAMILY=(
     test/registered/unit/managers/test_phase_flip_counters.py
     test/registered/unit/managers/test_pp_chain_receiver.py
     test/registered/unit/managers/test_pp_proxy_stamp_631.py
+    test/registered/unit/managers/test_pp_flip_slot_hold_631.py
     test/registered/unit/server_args/test_phase_flip_args.py
     test/registered/unit/distributed/test_phase_flip_groups.py
     test/registered/unit/distributed/test_census_wire_domain_631.py

@@ -24,7 +24,12 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.io_struct import PhaseFlipReqInput
-from sglang.srt.managers.phase_flip_counters import CHAN_DICT, CHAN_PASS, CHAN_REQ
+from sglang.srt.managers.phase_flip_counters import (
+    CHAN_DICT,
+    CHAN_PASS,
+    CHAN_REQ,
+    CHAN_SLOT,
+)
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -181,7 +186,14 @@ class SchedulerPPMixin:
     def _event_loop_pp_body(self):
         while True:
             server_is_idle = True
-            for mb_id in range(self.pp_loop_size):
+            # #631 DEFECT Q, CLOSED HERE. The slot index is a WHILE loop and
+            # not a ``for`` because an armed, fully parked rank must HOLD it
+            # -- see _pp_flip_hold_slot for the measurement and the argument.
+            # With the flip disabled the two are the same loop: the hold is
+            # never taken and mb_id increments once per iteration exactly as
+            # ``for mb_id in range(self.pp_loop_size)`` did.
+            mb_id = 0
+            while mb_id < self.pp_loop_size:
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -264,6 +276,12 @@ class SchedulerPPMixin:
                 # microbatches).
                 if self.server_args.enable_phase_flip:
                     self._phase_flip_on_round(require_armed_and_parked=True)
+                    # #631 DEFECT Q. Do NOT advance the slot while the armed
+                    # window is running dry: every rank must re-enter the
+                    # pipeline on the slot it left it on.
+                    if self._pp_flip_hold_slot():
+                        continue
+                mb_id += 1
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -941,6 +959,12 @@ class SchedulerPPMixin:
             if counters is not None:
                 try:
                     counters.publish_gauge(CHAN_PASS, self._pp_flip_armed_passes)
+                    # THE QUANTITY THE PIPELINE ACTUALLY PAIRS ON. The pass
+                    # count above measures the divergence; this one is the
+                    # thing that must NOT diverge, and publishing it is what
+                    # lets the falling edge below return a verdict instead of
+                    # a number nobody can act on.
+                    counters.publish_gauge(CHAN_SLOT, mb_id)
                 except Exception:  # noqa: BLE001
                     pass
             return
@@ -957,15 +981,27 @@ class SchedulerPPMixin:
             return
         try:
             per_rank = [counters.sent(CHAN_PASS, r) for r in range(counters.n_ranks)]
+            slots = [counters.sent(CHAN_SLOT, r) for r in range(counters.n_ranks)]
         except Exception:  # noqa: BLE001
             return
         spread = max(per_rank) - min(per_rank) if per_rank else 0
-        logger.warning(
+        # #631 DEFECT Q, AS A VERDICT. The spread is expected and harmless:
+        # ranks spin at their own rate and abandon on their own clock. The
+        # SLOT is what may not diverge, because it is what the proxy stamp,
+        # the mbs occupancy and the output pairing are all indexed by. A
+        # rank reads its peers' last published armed slot here; with the
+        # hold in place (_pp_flip_hold_slot) every rank is parked on the
+        # slot it armed on, so these agree.
+        agreed = len(set(slots)) <= 1
+        logger.log(
+            logging.WARNING if agreed else logging.ERROR,
             "%s PASS-CLOCK across the armed window: rank %d ran %d slot "
             "iteration(s) (armed at mb_id=%s, disarmed at mb_id=%d); group "
-            "%s, SPREAD %d. A non-zero spread means the ranks left the "
-            "armed window out of phase, so stage k's hidden states now "
-            "pair with a different microbatch on stage k+1 -- see defect Q.",
+            "passes %s, SPREAD %d; group RESUME SLOTS %s -- %s. The spread "
+            "is not the defect: ranks spin at their own rate and abandon on "
+            "their own clock. The RESUME SLOT is, because stage k's hidden "
+            "states pair with stage k+1's batch by that index and by "
+            "nothing else (#631 defect Q).",
             "PHASE-FLIP",
             counters.rank,
             passes,
@@ -973,7 +1009,110 @@ class SchedulerPPMixin:
             mb_id,
             per_rank,
             spread,
+            slots,
+            (
+                "AGREED"
+                if agreed
+                else "DIVERGED, so every later proxy on this instance is "
+                "mispaired and the slot hold did not do its job"
+            ),
         )
+
+    def _pp_flip_hold_slot(self: Scheduler) -> bool:
+        """Must this rank stay on the SAME microbatch slot for another turn?
+
+        #631 DEFECT Q, and this is its fix rather than another instrument
+        for it.
+
+        THE MEASUREMENT THAT NAMES THE DEFECT (2026-08-09 07:19:23Z, the
+        boot that produced corpse R):
+
+            rank 0 ran 44477 slot iteration(s) (armed at mb_id=2,
+                   disarmed at mb_id=2)
+            rank 1 ran 33690 slot iteration(s) (armed at mb_id=2,
+                   disarmed at mb_id=0)
+            rank 2 ran 38069 slot iteration(s) (armed at mb_id=2,
+                   disarmed at mb_id=2)   SPREAD 10787
+
+        ALL THREE RANKS ARM ON THE SAME SLOT AND LEAVE ON DIFFERENT ONES.
+        That is the whole defect, and it is not a message defect.
+
+        WHY THE ARMED WINDOW DRIFTS AT ALL. In steady state the pass loop
+        is PACED BY THE REQUEST CHAIN: every slot iteration makes exactly
+        one blocking chain receive, so rank k's i-th iteration is rank
+        k-1's i-th iteration and the slot indices cannot diverge. An armed
+        rank admits nothing (``_pull_raw_reqs`` returns [] before touching
+        the chain) and launches nothing (``get_next_batch_to_run`` returns
+        ``batch_to_run=None`` while a flip is pending), so its iterations
+        are pure spin -- roughly 8 kHz here -- and the pacing is gone. Each
+        rank then abandons on its OWN park deadline, having spun a
+        different number of times, and re-enters the pipeline on a
+        different slot.
+
+        WHAT THAT COSTS, and why it looked like a stranded message. Nothing
+        is left on the wire: a parked rank neither sends nor receives a
+        proxy, so the one-message-per-pass contract is never broken and the
+        counts stay balanced. What breaks is the LABEL. Stage k computes
+        the hidden states of its slot-s batch while stage k+1 applies them
+        to its slot-s' batch, for ever after, because both indices simply
+        advance from wherever their rank happened to stop. The proxy stamp
+        detects the first such message ("stamp mb_id=2 ... while this rank
+        is on mb_id=1") and both disposals died trying to treat a standing
+        phase offset as one stale message: corpse R took a second message
+        against a debt of one and wedged; corpse S drained a wire that had
+        nothing surplus on it and ate an output.
+
+        THE FIX IS TO STOP THE INDEX, NOT TO REPAIR ITS CONSEQUENCES. Hold
+        the slot once the armed window has run the pipeline dry; the rank
+        keeps spinning, keeps servicing its channels, keeps polling the
+        gate -- it simply does so on ONE slot. Every rank then resumes
+        where it armed, whatever its spin count was, and the spread becomes
+        irrelevant instead of fatal.
+
+        WHY THE HOLD IS REACHED ON THE SAME SLOT ON EVERY RANK, which is
+        the only property that makes this correct. A parked iteration sets
+        ``mbs[mb_id] = None``. The arm itself is slot-uniform because it
+        rides the request chain, which is 1:1 and ordered, so it lands on
+        the same ordinal iteration everywhere (measured above: "armed at
+        mb_id=2" on all three ranks). From that shared slot every rank
+        needs exactly ``pp_loop_size`` parked iterations to null every
+        slot, so ``all(mb is None)`` first holds at the same slot index on
+        every rank. ``is None`` and not ``is_empty()`` deliberately: the
+        stricter test is the one that is reached after a FIXED number of
+        iterations rather than whenever a slot happens to be empty.
+
+        A HALF-WRITTEN CHUNK IS NOT A HOLD. ``chunked_req`` is exempt from
+        the park (its continuation must complete or quiescence is
+        unreachable), so those iterations launch real work, are chain-paced
+        like any other, and are lockstep across ranks. Holding there would
+        stop a rank the pipeline is still driving.
+
+        ONE AUTHORITY FOR "ARMED", checked rather than assumed. The park in
+        ``get_next_batch_to_run`` keys on ``phase_flip_runtime.pending is
+        not None``; ``pp_phase_flip_armed`` -> ``is_armed()`` is a read of
+        that same ``_pending`` and nothing else. So "armed" here and
+        "parked" there cannot disagree, and this predicate can never hold a
+        rank that is still being handed batches.
+
+        NO LAUNCH TIMING MOVES -- the refined design law. Every iteration
+        this suppresses launches nothing, sends nothing and receives
+        nothing; it is a spin the loop was already doing, on a different
+        index. No rank waits on any peer to decide whether to hold, so no
+        synchronisation point is added at arm time either.
+        """
+        if not getattr(self.server_args, "enable_phase_flip", False):
+            return False
+        try:
+            if not self.pp_phase_flip_armed():
+                return False
+        except Exception:  # noqa: BLE001 - never let a probe break the loop
+            return False
+        if getattr(self, "chunked_req", None) is not None:
+            return False
+        mbs = getattr(self, "mbs", None)
+        if not mbs:
+            return False
+        return all(mb is None for mb in mbs)
 
     def _pp_flip_bump_sent(self: Scheduler, chan: str) -> None:
         counters = getattr(self, "pp_flip_counters", None)

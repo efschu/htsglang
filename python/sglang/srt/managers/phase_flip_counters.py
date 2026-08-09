@@ -116,6 +116,20 @@ CHAN_DICT = "dict"
 #: without the flip, and every unarmed pass of a boot with it, writes
 #: nothing at all.
 CHAN_PASS = "pass"
+#: NOT A WIRE. The MICROBATCH SLOT INDEX this rank is currently on, published
+#: while a flip is armed -- the answer to defect Q rather than another
+#: measurement of it.
+#:
+#: WHY THE SLOT INDEX IS THE QUANTITY THAT MATTERS. ``CHAN_PASS`` above
+#: counts armed iterations and MEASURED the divergence (spreads of ~10787
+#: iterations over a 5 s armed window, 2026-08-09 07:19:23Z). But the pass
+#: count is not what the pipeline pairs on: ``mb_id`` is. Two ranks may spin
+#: any number of parked iterations and stay correct so long as they RESUME
+#: the pass loop on the same slot, because the proxy stamp, the ``mbs``
+#: occupancy and the output pairing are all indexed by that slot and by
+#: nothing else. So this gauge is what the falling-edge check reads, and
+#: agreement on it is the invariant the armed window must preserve.
+CHAN_SLOT = "slot"
 
 _SENT = "s"
 _CONSUMED = "c"
@@ -275,5 +289,6 @@ __all__ = [
     "CHAN_REQ",
     "CHAN_DICT",
     "CHAN_PASS",
+    "CHAN_SLOT",
     "LOG_PREFIX",
 ]

@@ -124,6 +124,17 @@ def _log_counts(log, since_byte):
             "abandons": len(re.findall(r"FLIP ABANDONED", blob)),
             "cutovers": len(re.findall(r"cutover complete: active stack", blob)),
             "drops": len(re.findall(r"PROXY LEFTOVER DROPPED", blob)),
+            # The stamp REFUSES rather than drops since corpse R. With the
+            # slot hold in place this must be ZERO: a refusal now means the
+            # ranks came out of an armed window on different slots, which
+            # is the defect the hold exists to remove.
+            "refusals": len(re.findall(r"PROXY LEFTOVER REFUSED", blob)),
+            # #631 DEFECT Q, THE DIRECT VERDICT. Every armed window ends
+            # with one PASS-CLOCK line per rank reporting the group's
+            # resume slots. AGREED is the invariant; DIVERGED is the metal
+            # defect, and it is a FAIL rather than a note.
+            "slot_agreed": len(re.findall(r"RESUME SLOTS .* -- AGREED", blob)),
+            "slot_diverged": len(re.findall(r"RESUME SLOTS .* -- DIVERGED", blob)),
             "gaveup": len(re.findall(r"gave up draining proxy leftovers", blob)),
             "mispairs": len(re.findall(r"#631 PP proxy/batch mismatch", blob)),
             "ima": len(re.findall(r"illegal memory access", blob)),
@@ -230,6 +241,24 @@ def main():
     else:
         verdict.append(("the reproducer abandoned at least once", counts.get("abandons", 0) > 0))
     verdict.append(("no proxy/batch mispair reached compute", counts.get("mispairs", 0) == 0))
+    # #631 DEFECT Q. These two are the slot hold's own pass conditions and
+    # they are the reason this run means something the earlier ones did
+    # not. Before the hold, a run with abandons produced refusals and
+    # DIVERGED lines by construction; the old verdict could not see either,
+    # so it called a phase-offset instance a pass.
+    verdict.append(
+        ("the ranks resumed on the SAME slot", counts.get("slot_diverged", 0) == 0)
+    )
+    verdict.append(
+        ("no proxy was refused as a leftover", counts.get("refusals", 0) == 0)
+    )
+    if args.cycles > 0:
+        verdict.append(
+            (
+                "a slot verdict was actually reported",
+                counts.get("slot_agreed", 0) + counts.get("slot_diverged", 0) > 0,
+            )
+        )
     verdict.append(("no drain gave up", counts.get("gaveup", 0) == 0))
     verdict.append(("no illegal memory access", counts.get("ima", 0) == 0))
     verdict.append(("server still healthy", health == 200))

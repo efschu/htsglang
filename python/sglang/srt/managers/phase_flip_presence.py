@@ -676,6 +676,68 @@ alone holding the flip.
       something that does not move -- the counters, which are built once
       from the boot PP topology and are now the ring's one authority.
 
+  Q   THE ARMED WINDOW MOVED THE MICROBATCH SLOT INDEX -- the root of the
+      proxy mispairing, and the reason TWO disposals for it died. CLOSED
+      on metal 2026-08-09 08:05-08:07Z.
+
+      IT WAS NEVER A MESSAGE DEFECT, and that is the whole lesson. Corpse
+      R (drop the leftover, take the next) and corpse S (drain the wire
+      while armed) are both DISPOSALS OF A STRANDED MESSAGE. Nothing was
+      ever stranded: a parked rank neither sends nor receives a proxy, so
+      the one-message-per-pass contract holds throughout an armed window
+      and the counters stay balanced. The log said so all along, in the
+      instrument the pass clock already published (07:19:23Z, the corpse-R
+      boot):
+
+        rank 0  44477 armed iterations, armed at mb_id=2, DISARMED AT 2
+        rank 1  33690 armed iterations, armed at mb_id=2, DISARMED AT 0
+        rank 2  38069 armed iterations, armed at mb_id=2, DISARMED AT 2
+
+      Every rank ARMS on the same slot and LEAVES on a different one. From
+      that instant stage k computes its slot-s batch while stage k+1
+      applies the result to its slot-s' batch -- permanently, not once.
+      The stamp fires on the first such message, which reads exactly like
+      one stale leftover; dropping it and taking another is a second
+      blocking recv against a debt of one (corpse R's wedge), and draining
+      a wire with no surplus on it can only eat something that IS owed
+      (corpse S's output).
+
+      WHY THE INDEX DRIFTS. In steady state the pass loop is PACED BY THE
+      REQUEST CHAIN -- one blocking receive per slot iteration -- so rank
+      k's i-th iteration is rank k-1's i-th and the indices cannot
+      diverge. An armed rank admits nothing (``_pull_raw_reqs`` returns []
+      before touching the chain) and launches nothing
+      (``get_next_batch_to_run`` returns ``batch_to_run=None`` while a
+      flip is pending), so its iterations become free-running spin -- some
+      8 kHz here, tens of thousands per window -- and each rank abandons
+      on its own park deadline wherever it happened to stop.
+
+      THE FIX IS TO STOP THE INDEX, NOT TO REPAIR ITS CONSEQUENCES.
+      ``Scheduler._pp_flip_hold_slot``: once the armed window has run the
+      pipeline dry, the loop HOLDS its slot instead of walking it. Same
+      spin, same channel servicing, same gate polling, one index. The hold
+      is reached on the same slot on every rank because the arm rides the
+      1:1 ordered request chain and every rank then needs exactly
+      ``pp_loop_size`` parked iterations to null every slot. No launch
+      timing moves and no rank waits on a peer to decide, so the refined
+      design law is untouched.
+
+      MEASURED, 12 arm/abandon cycles under sustained decode with SPEC on
+      (scripts/route_a_631_proxy_strand_repro.py --cycles 12): 36
+      abandonments, 36 slot verdicts, ALL "RESUME SLOTS [2, 2, 2] --
+      AGREED", with the spin spread as large as ever (8110-8694 iterations
+      between the fastest and slowest rank). Zero refusals, zero mispairs,
+      zero illegal accesses, zero aborts, health 200. The same reproducer
+      wedged the instance in six seconds against corpse R.
+
+      THE GENERAL FORM, worth more than the fix: A QUANTITY IS ONLY IN
+      LOCKSTEP WHILE SOMETHING KEEPS IT THERE. The slot index was never
+      synchronised by design -- it was synchronised by the chain receive,
+      as a side effect. Remove the traffic, as the armed window does, and
+      the invariant evaporates silently while every local check still
+      passes. Ask of any cross-rank index: what, mechanically, holds it
+      equal, and is that thing still running in the state I am designing?
+
 THE REAL GAP: BETWEEN ANNOUNCE AND ENTRY, WITHIN ONE ROUND
 ----------------------------------------------------------
 Measured 2026-08-08 23:39Z, all three stacks
