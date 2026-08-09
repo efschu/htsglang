@@ -360,6 +360,110 @@ def install_resident_set(scheduler, batches: Sequence, to_tp: bool) -> Optional[
     return merged
 
 
+def reseed_decode_input_relay(scheduler) -> int:
+    """Hand the PP phase its OWN last token, not a buffer nobody maintained.
+
+    THE DEFECT THIS CLOSES, and why it is one-directional
+    -----------------------------------------------------
+    A plain-decode round does not carry its input token on the batch. The
+    last spec round ends with ``batch.input_ids = None``
+    (``scheduler.py``, "rebuilt next iter from draft_token"), and the next
+    round's ``resolve_forward_inputs`` gathers it out of
+    ``future_map.output_tokens_buf`` -- a pool-indexed relay whose
+    contract is that the round which READS a row was preceded by a round
+    that WROTE it.
+
+    The TP speculative phase breaks that contract while it runs, and it is
+    entitled to: the NON-OVERLAP V2 path drives the worker synchronously
+    and installs ``next_draft_input`` directly, so it never calls
+    ``_relay_forward_payload`` and never stashes. Inside that phase this
+    costs nothing, because the next round rebuilds ``input_ids`` from the
+    draft tokens instead of gathering. At the ``tp_to_pp`` cutover the
+    reader changes: the first PP decode gathers, and what it gathers is
+    the token the PREVIOUS PP phase stashed -- stale by the entire TP
+    phase, hundreds of tokens. The model then appends a foreign token to a
+    correct prefix and answers from it, which surfaces as ONE wrong token
+    at the cutover and a coherent continuation afterwards, per request,
+    only for the requests whose stale row happens to differ.
+
+    The other leg is clean by construction and always was: the PP phase
+    stashes on EVERY pass (``scheduler_pp_mixin``), so a batch entering the
+    TP phase finds the relay fresh. That asymmetry is the whole direction
+    dependence of the defect.
+
+    THE RULE, which is why the fix lives at the handover
+    ----------------------------------------------------
+        A VALUE HANDED ACROSS THE CUTOVER MUST BE RE-DERIVED FROM THE
+        TRUTH AT THE HANDOVER, NEVER INHERITED FROM A BUFFER THE SOURCE
+        PHASE STOPPED MAINTAINING.
+
+    ``req.output_ids[-1]`` is that truth: it is what the request has
+    admitted to having produced, and it is what the KV is one short of
+    (``kv == seen - 1``, measured on both legs). Re-stashing it is the same
+    primitive the batch-rebuild path already uses before handing a batch to
+    a gathering round, so this introduces no second convention.
+
+    Returns the number of requests re-seeded. Logs the stale value against
+    the truth for every request, which is the falsifier: if they agree and
+    the answers still break, the defect is not here.
+    """
+    import torch
+
+    from sglang.srt.managers.overlap_utils import RelayPayload
+
+    future_map = getattr(scheduler, "future_map", None)
+    if future_map is None:
+        return 0
+    batches = []
+    for slot in getattr(scheduler, "running_mbs", None) or []:
+        if _is_resident(slot):
+            batches.append(slot)
+    running = getattr(scheduler, "running_batch", None)
+    if _is_resident(running) and not any(b is running for b in batches):
+        batches.append(running)
+
+    total = 0
+    for batch in batches:
+        reqs = [r for r in _reqs_of(batch) if getattr(r, "output_ids", None)]
+        if not reqs:
+            continue
+        indices = torch.tensor(
+            [r.req_pool_idx for r in reqs],
+            dtype=torch.int64,
+            device=future_map.output_tokens_buf.device,
+        )
+        truth = torch.tensor(
+            [r.output_ids[-1] for r in reqs],
+            dtype=torch.int64,
+            device=future_map.output_tokens_buf.device,
+        )
+        # THE FALSIFIER, read BEFORE the write: what the first PP decode
+        # would have gathered, next to what the request actually last
+        # produced. One D2H per cutover, not per round.
+        stale = future_map.output_tokens_buf[indices].tolist()
+        want = truth.tolist()
+        mismatched = sum(1 for a, b in zip(stale, want) if a != b)
+        logger.warning(
+            "%s decode-input relay at cutover: %d/%d request(s) would have "
+            "gathered a STALE token -- %s",
+            LOG_PREFIX,
+            mismatched,
+            len(reqs),
+            " | ".join(
+                "%s relay=%s last=%s%s"
+                % (str(getattr(r, "rid", "?"))[:8], a, b, "" if a == b else " MISMATCH")
+                for r, a, b in zip(reqs, stale, want)
+            ),
+        )
+        future_map.stash(indices, RelayPayload(bonus_tokens=truth))
+        # And make the gather the ONLY source: a leftover ``input_ids``
+        # from the speculative phase names draft tokens that the PP phase
+        # has no drafter to interpret.
+        batch.input_ids = None
+        total += len(reqs)
+    return total
+
+
 def _empty_batch_like(scheduler):
     """A fresh empty slot batch, built the way the loop builds them."""
     from sglang.srt.managers.schedule_batch import ScheduleBatch

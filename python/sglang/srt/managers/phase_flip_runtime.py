@@ -972,6 +972,26 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             arm_draft_bootstrap(
                 scheduler, scheduler.running_batch, want_draft
             )
+        else:
+            # THE TP->PP LEG'S OWN HANDOVER. The PP phase's first decode
+            # gathers its input token out of the future-map relay, and the
+            # speculative phase it is leaving never wrote that relay (the
+            # non-overlap V2 path installs next_draft_input directly and
+            # skips _relay_forward_payload). Re-derive it from the requests
+            # themselves, here, where the truth is present -- see
+            # reseed_decode_input_relay for the rule and the falsifier.
+            from sglang.srt.managers.phase_flip_resident_carry import (
+                reseed_decode_input_relay,
+            )
+
+            reseeded = reseed_decode_input_relay(scheduler)
+            if reseeded:
+                logger.info(
+                    "%s re-seeded the decode-input relay for %d carried "
+                    "request(s)",
+                    LOG_PREFIX,
+                    reseeded,
+                )
 
         # 8. Deferred aborts drain in the first post-flip round.
         window = getattr(scheduler, "phase_flip_abort_window", None)
