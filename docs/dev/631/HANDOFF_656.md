@@ -2252,3 +2252,72 @@ but a PP phase capturing hidden states it has no drafter to consume is
 wasted work at best, and the first post-flip `merge_batch` calls
 `EagleDraftInput.merge_batch(None)`. Worth a can-fail before the
 acceptance soak is trusted for long dwells.
+
+## 8. ADDENDUM (same shift): where the acceptance program actually stands
+
+The correctness work is finished; this is the state the capacity work is
+handed over in, with the unproven parts labelled as such.
+
+**Proven this shift, on metal:**
+
+- The survival soak passes on the fix: `route_a_631_roundtrip_probe.sh`
+  reports health 200, 6 cutovers, slot AGREED 3 / DIVERGED 0, 0 proxy
+  refusals, 0 collective timeouts, 0 SIGQUIT.
+- CUDA graphs were ON for every correctness run above
+  (`disable_cuda_graph=False`, capture completed), so the 36/36 is a
+  full-perf result, not an eager one.
+- `POLICY=auto` boots and ARMS on its own: `PHASE-POLICY armed: N=7004
+  tok (break-even 3.2s / (1/1681 - 1/7245.5)), min dwell 3s, idle dwell
+  3s, resting layout pp` and repeated `PHASE-POLICY arming tp_to_pp:
+  idle 3.0s >= 3s, returning to the prefill resting layout`.
+- Two more clean `tp_to_pp` crossings under the corridor run, and two
+  more after the final reboot: **8 clean `tp_to_pp` crossings** total on
+  the fix, 0 corrupt.
+
+**THE 5090 CANNOT BE FILLED THROUGH `--rank-gpu-memory-mib`, and this is
+a wall, not a tuning miss.** `RANK_MIB=23790` for rank 0 is refused at
+boot:
+
+    ValueError: The per-rank budget of 23790 MiB for rank 0 on GPU 0 is
+    not physically available: the rank holds 7.90 GiB and 13.27 GiB of
+    the device is free to it (31.34 GiB total)
+
+21.17 GiB is all the check can see, because the two-stack weights arena
+is resident at the moment the check runs, while the corridor sampler
+later measures ~2.9 GiB free on that card at runtime. The headroom is
+real and the check cannot reach it. Filling it needs the arena's
+residency during the check to change, which is exactly the #297/#635
+machinery the capacity spec authorises. `21500` boots; `22070` (the
+value a corridor-target would ask for) would not.
+
+**A MEASUREMENT TRAP, recorded because it nearly became a wrong fix.**
+At `RANK_MIB=21500,14090,13840` the corridor BREACHED: min free
+570 / 2598 / 586 MiB, 84 breaches on each 3080. Backing the 3080s off to
+13780 / 13540 gave min free 1936 / 3974 / 2008 with ZERO breaches -- but
+so did the ORIGINAL 13300 / 13100 (1914 / 3912 / 1866). The budget delta
+did not move the minimum at all.
+
+The difference between those runs was the LOAD, not the budget: the
+breaching run had `route_a_631_acceptance.py full` on it (long prefills),
+the others had the counting probe (decode-dominated). A slope derived
+across two load shapes is not a slope. **The corridor minimum must be
+sized against the ACCEPTANCE load, and every corridor number in this
+strand must name the load it was taken under.** None of the pre-existing
+corridor figures do.
+
+**Still METAL-UNPROVEN, in the order the spec asks for them:**
+
+1. accept-len evidence in the unmanned log. `route_a_631_acceptance.py`
+   returned `spec_accept_length: null` / `spec_accept_rate: null` on this
+   boot; whether that is a missing `meta_info` field or a request that
+   never ran in the TP phase was not determined.
+2. the one unmanned log carrying flips + graphs + spec + max KV together,
+   with per-phase KV pool sizes.
+3. the bs=1 spill leg (#364 / #104 / kvso / #287) -- untouched.
+4. the bs=1 YaRN leg beyond 262144 -- untouched.
+5. the A-vs-A gate against `9a929352c9` -- untouched.
+
+**State at end of shift:** SERVING healthy on the fix tree,
+`POLICY=auto SPEC=on RANK_MIB=21500,13780,13540`,
+`PHASE_POLICY_TP_TOK_S=1681.0`, corridor HELD under the flip probe load
+and UNVERIFIED under the acceptance load.
