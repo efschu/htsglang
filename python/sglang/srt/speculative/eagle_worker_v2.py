@@ -1497,6 +1497,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
+            # #631: the phase-flip bootstrap round's verify was a 1-node
+            # trivial one, so this draft extend carries one token per
+            # request while the captured graph reads bs*num_tokens_per_bs.
+            # can_run_graph checks only the batch size and cannot see it.
+            and not getattr(batch, "phase_flip_draft_bootstrap_round", False)
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
@@ -2068,6 +2073,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # See managers/phase_flip_draft_bootstrap.py for why this and
             # not a carried hidden state.
             flip_bootstrap = batch_needs_draft_bootstrap(batch)
+            # Carried on the BATCH, because the draft-extend at the end of
+            # this round needs the same answer and reaches it through a
+            # different object. Its captured graph "always reads the FULL
+            # bs*num_tokens_per_bs token rows", and this round's verify
+            # produced ONE token per request instead of num_draft_tokens --
+            # measured 09:03:01Z, all three ranks: "The size of tensor a
+            # (3) must match the size of tensor b (12)", i.e. bs against
+            # bs*4. The flag is read in _draft_extend_for_decode rather
+            # than inferred from token counts there, because in ordinary
+            # operation that batch's width varies with the accept length
+            # and a count-based gate would refuse graphs across normal
+            # speculating decode.
+            batch.phase_flip_draft_bootstrap_round = flip_bootstrap
             if self.speculative_num_steps == 0 or flip_bootstrap:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
