@@ -992,3 +992,60 @@ touching the wire. Nothing is lost. Full record in `test_phase_policy.py`.
 - Evidence: `/spinning/evidence-631/abandon_q_20260809T0556Z/`
   (`control_specoff_commits.log` = 51 commits, all SPREAD 0;
   `abandon_specon_drift.log` = the two abandons with SPREAD 62292/62241).
+
+## 6. ROOT CAUSE FOUND (added same day, after v5 was written)
+
+v5 left "the origin of the 2048-vs-1 pairing is STILL OPEN". It is now
+closed, reproduced and evidenced. Specimen
+`/spinning/evidence-631/pp_proxy_mispair_20260809T0626Z`.
+
+**Reproducer**: park deadline 5 s (`SGLANG_PHASE_FLIP_PARK_DEADLINE_S=5`),
+a manual `pp_to_tp` arm every 7 s, and the mixed acceptance load. At
+SPEC=on a resident decode makes every `pp_to_tp` park and abandon, so this
+buys ~12 abandons a minute instead of 2.
+
+    06:26:34 PP0] FLIP ABANDONED
+    06:26:34 PP2] FLIP ABANDONED
+    06:26:34 PP1] FLIP ABANDONED          <- LAST
+    06:26:35 PP1] #631 PP proxy/batch mismatch: received hidden_states
+                  with 1 row(s) for a batch of 24 token(s) (bs=1)
+
+**The mechanism.** The abandon is RANK-LOCAL — every rank times out on its
+own clock, so the ranks disarm at different instants. A rank that has
+already disarmed resumes launching and sends its proxy hidden states. Its
+downstream is still armed and still withholding, so that rank's
+`cur_batch` is None — and the proxy recv is guarded by **this rank's**
+`cur_batch`, never by whether the upstream sent. The message is not taken.
+It strands in `_pp_tensor_dict_inbox`, and since the pairing is **purely
+positional** (`PPProxyTensors` has no mb_id, no sequence number, no
+length; the receive demultiplexes only on `__msg_type__`), every later
+proxy recv on that rank is off by one, silently, for the rest of the
+loop's life.
+
+**The rank that disarms LAST is the rank that strands.** PP1 above is both.
+
+**Why a commit never showed it**: the cutover re-enters `event_loop_pp`
+and `init_pp_loop_state` resets every buffer, `_pp_tensor_dict_inbox`
+included. The three abandon functions in `phase_flip_runtime` clear
+`_pending`, `_armed_at`, `_last_hold_reason` and touch no channel, no
+buffer and no loop state. That is the whole asymmetry — and it is
+mechanical, NOT defect Q's pass-count drift, which remains open on its own
+merits (an armed rank running 62k iterations behind a peer is unhealthy
+regardless).
+
+**It also corrects v5**: the fault needs no 2048-row chunk. Here the
+direction is the opposite — a 1-row decode hidden state meeting a 24-token
+extend batch. Any two microbatches of different width will do.
+
+**THE FIX, named but NOT built** (next step): a rank must not resume
+launching while a peer is still armed. It belongs at the RESUME, not at
+the abandon — the abandon cannot be made instantaneous across ranks, but
+the withhold can be held until the group has disarmed, reusing the
+presence markers that already exist in /dev/shm. **A blind reset of loop
+state on abandon is NOT the fix**: unlike a commit, an abandon has no
+quiescence guarantee, so it would discard in-flight microbatches.
+
+**Instrument shipped** (`36f9c8be90`): one shape check at
+`model_runner.forward`, the single funnel every PP stage's forward passes
+through. The model asserted the proxy's presence but never its shape.
+0 false positives across a full boot with cuda-graph capture; suite 425.
