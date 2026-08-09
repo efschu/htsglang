@@ -444,7 +444,12 @@ Measured, 21:05-21:21Z soak, `scripts/phase_evidence_extract.sh`:
            in TP:   5 records, mean 1147.3 tok/s
   DECODE   in PP: 412 records, cuda graph True 0.0%, accept len 0.00
            in TP:   1 record
-  flips: 6 tp_to_pp, 6 pp_to_tp  (12 total in 16 minutes)
+  flips: 6 tp_to_pp, 6 pp_to_tp  (12 records = 4 real flips)
+
+CONFIRMED HARDER AT T+24 min: the flip count is STILL 12. The last flip
+committed at ~21:07Z and NOTHING has flipped since -- 22+ minutes parked
+in PP while 29 requests completed and prefill passed 170k tokens. This is
+not "fewer flips", it is a permanent park.
 ```
 
 Decode is running **in the PP phase**, eagerly, with no CUDA graphs and no
