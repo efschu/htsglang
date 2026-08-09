@@ -465,12 +465,50 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
         # extent reports it every flip; change this only on that evidence.
         reqs = _live_reqs(scheduler)
         req_to_token = scheduler.req_to_token_pool.req_to_token
+        # A REQUEST WITHOUT A POOL SLOT OWNS NO ROWS, and indexing as if it
+        # did is not a no-op -- it silently changes the SHAPE. `req_pool_idx`
+        # is Optional and starts as None (schedule_batch.py: "self.
+        # req_pool_idx: Optional[int] = None"); a Req is visible in
+        # last_batch / running_mbs / chunked_req from the moment it is
+        # admitted, which is BEFORE its slot is allocated. Then
+        #
+        #     req_to_token[None, :n]
+        #
+        # is not "row None" -- None is numpy-style newaxis, so a (R, C)
+        # table returns a (1, n, C) tensor, and the concatenation below
+        # died on it:
+        #
+        #     RuntimeError: Tensors must have same number of dimensions:
+        #     got 1 and 3        (metal, 2026-08-09, all three ranks)
+        #
+        # Skipping is CORRECT and not merely convenient: req_to_token is
+        # indexed BY req_pool_idx, so a request without one cannot have a
+        # row there and therefore holds no KV that a flip could leave
+        # behind. Its slot is allocated later, in whatever layout is then
+        # current. This is the one case where omitting rows does not risk
+        # the silent-wrong-context class the docstring names -- but it is
+        # counted and logged rather than assumed, because "this cannot
+        # happen" is what made it a crash instead of a log line.
+        skipped_no_slot: List[str] = []
         for req in reqs:
             n = int(req.seqlen)
             if n <= 0:
                 continue
+            if getattr(req, "req_pool_idx", None) is None:
+                skipped_no_slot.append(str(getattr(req, "rid", "?")))
+                continue
             rows = req_to_token[req.req_pool_idx, :n]
             parts.append(rows.detach().to("cpu", torch.int64))
+        if skipped_no_slot:
+            logger.info(
+                "%s live-slot enumeration skipped %d admitted request(s) "
+                "with no req_pool_idx yet (%s): they hold no rows in "
+                "req_to_token, so there is nothing for the flip to move; "
+                "their slots are allocated in the post-flip layout.",
+                LOG_PREFIX,
+                len(skipped_no_slot),
+                ", ".join(skipped_no_slot[:8]),
+            )
         _probe_allocated_extent(scheduler, reqs)
         if not parts:
             return torch.empty(0, dtype=torch.int64)

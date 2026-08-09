@@ -39,6 +39,7 @@ FAMILY=(
     test/registered/unit/distributed/test_census_wire_domain_631.py
     test/registered/unit/layers/test_causal_conv1d_bounds_631.py
     test/registered/unit/managers/test_phase_flip_staging_reserve_631.py
+    test/registered/unit/managers/test_phase_flip_live_slots_no_pool_idx_631.py
     test/registered/unit/mem_cache/test_gdn_cap_flip_two_stacks_631.py
 )
 

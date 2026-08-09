@@ -85,6 +85,17 @@ say "PHASE 2 -- bs=1 long-context needle probe past 262144 (alone)"
 echo "needle probe rc=$?"
 tail -20 "$OUT/needle.log"
 
+# ORDER IS THE POINT: this runs AFTER the long session, because concurrent
+# /generate minutes after a >262k session is the exact recipe that killed
+# all three ranks in the live-slot enumeration. It is therefore both the
+# wire-accept-len measurement and that defect's standing reproduction.
+say "PHASE 3 -- wire accept-len in TP, and the post-long-session flip"
+"$PY" "$WT/scripts/route_a_631_wire_accept_probe.py" \
+      --port "$PORT" --out "$OUT/wire_accept.json" \
+      > "$OUT/wire_accept.log" 2>&1
+echo "wire probe rc=$?"
+tail -12 "$OUT/wire_accept.log"
+
 say "corridor sampler down (SIGINT prints the report)"
 kill -INT "$CORRIDOR_PID" 2>/dev/null
 wait "$CORRIDOR_PID" 2>/dev/null
@@ -128,6 +139,17 @@ sed -n "$((LOG_START+1)),\$p" "$SERVING_LOG" > "$OUT/serving_window.log"
   echo
   echo "--- staging refusals in full (the guard doing its job)"
   grep -aE 'staging [0-9]+ MiB needed' "$OUT/serving_window.log" | tail -3
+  echo
+  echo "--- accept-len ON THE WIRE (meta_info, native /generate)"
+  grep -aE 'VERDICT healthy_after|wire_accept' "$OUT/wire_accept.log" | tail -3
+  echo
+  echo "--- live-slot enumeration after the long session (the fixed defect)"
+  printf 'requests skipped for having no req_pool_idx yet : %s\n' \
+    "$(grep -acE 'live-slot enumeration skipped' "$OUT/serving_window.log")"
+  printf 'live-slot dimension errors (must be 0)          : %s\n' \
+    "$(grep -acE 'must have same number of dimensions' "$OUT/serving_window.log")"
+  printf 'server health at the end of the run             : %s\n' \
+    "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")"
 } > "$OUT/evidence_slices.txt" 2>&1
 tail -40 "$OUT/evidence_slices.txt"
 
