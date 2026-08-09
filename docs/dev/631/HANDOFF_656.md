@@ -2084,3 +2084,54 @@ convention on the leg, not to touch either phase's own bookkeeping.
 - `SPEC=off` remains content-clean in both directions (v9 section 4).
 - Acceptance program (v9 section 6 / the anchored capacity spec) is
   untouched and still waits on the tp_to_pp leg.
+
+## 5. ADDENDUM (same shift): the convention-mismatch hypothesis is METAL-FALSIFIED
+
+The carry clocks now print on BOTH legs (`[#631 OUTTRACE] carry clocks`),
+which is the check the `tp_to_pp` direction had never had. Measured
+11:37Z, same boot, both cutovers:
+
+    carry clocks dir=pp_to_tp -- 8338d8f4 seen=79  kv=78  tail=[220, 17]
+                              | 04455e63 seen=79  kv=78
+                              | 7fa6b9bb seen=79  kv=78
+    carry clocks dir=tp_to_pp -- 86823e3b seen=395 kv=394 tail=[220, 16]
+                              | 12a8af99 seen=393 kv=392
+                              | 68d1d9a1 seen=392 kv=391
+
+**`kv == seen - 1` on BOTH legs, every request.** The two phases do NOT
+disagree about the pending token at the cutover: the last appended token
+is out of the KV in both directions, exactly as PP expects. So the carry
+does NOT hand PP a token the KV already holds, and **normalizing the
+handed-over `(input_id, seqlen)` pair would be a fix for a defect that
+is not there.** v10 section 3's hypothesis is dead; do not spend a boot
+on it.
+
+(The `kv == seen` reading in v10 came from PP-phase ROUND lines, sampled
+at a different point in the pass than the cutover — after that round's
+commit and before its append. It described the sampling point, not a
+convention. A clock is only comparable to another clock read at the same
+point in the pass; that is the lesson worth carrying.)
+
+### What the same run adds about tp_to_pp
+
+- `pp_to_tp` clean again, 3/3 — **9/9 across three independent runs**
+  since `a970a8fed9`. The mamba-step fix holds; no regression.
+- `tp_to_pp` still corrupts, and one specimen is WORSE than a duplicate:
+  alongside the familiar `1119` for `119`, one request degenerated into
+  repetition — `ends [100, 100, 100, 100, 100, 1]`. A repeated n-gram is
+  a STATE signature, not an off-by-one in token bookkeeping.
+- That points back at the recurrent state on the OTHER leg. Leaving a
+  speculating TP phase, a request's mamba state was last committed at an
+  accepted STEP inside a verify tree; entering plain PP decode it must
+  correspond to exactly the committed prefix. The GDN mover moves the
+  state, but nothing has ever checked that the state it moves is at the
+  right step for a phase that no longer speculates.
+- **Named next instrument** (unproven, but this is where the evidence
+  points): log, on the tp_to_pp leg, each request's committed mamba step
+  against `accept_lens - 1` of the LAST verify before the cutover, and
+  compare the moved state's step on both sides of the mover. The
+  `commit_mamba_states_after_verify` call is now width-correct; the open
+  question is whether the last spec round's committed step is the one a
+  plain-decode phase should resume from.
+- Do NOT re-walk: the pending-token convention (this section), the
+  output wire, the send cursors, the detokenizer, cross-rank divergence.

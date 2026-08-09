@@ -298,13 +298,40 @@ def trace_cutover(scheduler, direction: str) -> None:
     epoch = getattr(runtime, "epoch", None) if runtime is not None else None
     for line in trace.cutover(direction, epoch):
         logger.info("%s", line)
-    rows = snapshot_rows(_resident_reqs(scheduler))
+    reqs = _resident_reqs(scheduler)
+    rows = snapshot_rows(reqs)
     logger.info(
         "%s at-cutover dir=%s ep=%s -- %s",
         LOG_PREFIX,
         direction,
         epoch,
         _fmt_delta(trace.prev, rows),
+    )
+    # THE CARRY CLOCKS, on BOTH legs. The cutover clock report
+    # (bootstrap_clock_report) only ever ran on the tp_phase leg, so the
+    # tp_to_pp direction has never had its pending-token convention
+    # checked at all. The two phases disagree about what the last
+    # appended token means: plain PP decode holds it OUT of the KV as the
+    # next round's input (kv == seen), while a speculating TP phase
+    # COMMITS every accepted token during verify. A carry that hands PP
+    # an input whose token the KV already holds makes PP regenerate it --
+    # one token, appended twice, which is the duplicate face.
+    logger.info(
+        "%s carry clocks dir=%s -- %s",
+        LOG_PREFIX,
+        direction,
+        " | ".join(
+            "%s seen=%d kv=%s tail=%s"
+            % (
+                str(getattr(r, "rid", "?"))[:8],
+                len(getattr(r, "origin_input_ids", None) or [])
+                + len(getattr(r, "output_ids", None) or []),
+                getattr(r, "kv_committed_len", "?"),
+                list((getattr(r, "output_ids", None) or [])[-2:]),
+            )
+            for r in reqs
+        )
+        or "(none)",
     )
     trace.prev = rows
 
