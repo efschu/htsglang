@@ -253,6 +253,51 @@ NOT YET MEASURED.
 
 ---
 
+## 5b. THE LOADED RUNS, AND THE HEADLINE THEY CORRECT
+
+Same boot, same B=16, differing only in how hard the pool was driven:
+
+| | occupancy | min free (0/1/2) | corridor | flips | abandons |
+|---|---|---|---|---|---|
+| run 1 | 39.8% | 1348 / 3484 / 1256 | HELD | 159 | 0 |
+| run 2 | **83.1%** | **1008 / 3062 / 972** | **BREACHED** | 234 | 0 |
+
+**Pool 500000 does not hold the corridor at real occupancy.** The
+inherited "pool 500000 RUNS, 0 breaches" was taken below the occupancy
+bar and does not survive 83%. Zero abandons across 234 flips with a
+broken corridor is the keeper: the affordability gate protects against
+OOM inside the seam, not the corridor floor.
+
+**And the breach is not the seam.** `min_at_s` against flip timestamps:
+gpu2, the binding card, spent 1473 of 7196 samples below the floor --
+20% of the run -- with its minimum BETWEEN flips. A seam is ~2 s of a
+~13 s cycle. Sustained pressure, not a transient. Row blocking is worth
+its measured 212 MiB per binding card (without it this run breaches by
+~264 MiB rather than 52) but it is not what breaks this pool.
+
+Deficit on the binding card: **52 MiB**. Largest resident non-KV item:
+the draft CUDA graphs at 0.12-0.30 GB per rank.
+
+## 5c. THE ONE BOOT THAT SHOULD RUN FIRST NEXT SHIFT
+
+`--disable-draft-cuda-graph` (added this shift, 7 tests, call site
+pinned) at 83% occupancy. It converges three open items:
+
+* **item 8** -- does NEXTN gain anything from draft graphs? The user's
+  rule says remove them if not.
+* **pool 500000** -- 0.3 GB/rank against a 52 MiB deficit; removing them
+  may recover the corridor outright.
+* **item 6** -- no draft graphs means no baked weight addresses, so
+  `resolve_spill_depth`'s refusal of rungs 2-3 dissolves and the spill
+  route to >=600000 opens.
+
+Run it BEFORE resizing the pool. Shrinking would also "fix" the corridor
+while spending capacity to buy back memory that may be free.
+
+I did not get this boot in: it collided with the live instance (see the
+`--from-capture` trap below) and I was out of room to supervise another.
+Serving is left HEALTHY on boot 3 at pool 500000, B=16, chunk 16 MiB.
+
 ## 6. STATE, AND WHAT I WOULD DO NEXT
 
 Commits, all pushed on `feat/route-a-631`:
@@ -301,5 +346,11 @@ Next, in order:
   A/B then measured a log nothing was writing to — reading as "the
   feature did nothing". Check the log is GROWING before believing a null
   result. `setsid ... < /dev/null` fixed it.
+* **`--from-capture` NEVER STOPS THE LIVE SERVER.** The stop step is
+  guarded by `if not args.from_capture`, so using it while an instance is
+  running starts a second one that collides on BAR1 and dies with
+  `Bar1WindowRefused: given 24 MiB ... but only 10 MiB of` -- which reads
+  exactly like a barlink defect and is not one. SIGTERM the serving pid
+  yourself first. Cost me the last boot of the shift.
 * **`pkill -f` self-matches** and killed my own shell (exit 144). It is
   forbidden by the brief anyway. Do not reach for it.
