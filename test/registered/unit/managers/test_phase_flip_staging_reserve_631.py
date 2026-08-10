@@ -33,7 +33,10 @@ Two quantities that must not be conflated, and both directions are wrong:
 
 import unittest
 
-from sglang.srt.layers.dcp.phase_flip_plan import seam_transient_peaks
+from sglang.srt.layers.dcp.phase_flip_plan import (
+    ordered_layer_waves,
+    seam_transient_peaks,
+)
 from sglang.srt.managers.phase_flip_runtime import (
     DEFAULT_STAGING_RESERVE_BYTES,
     PhaseFlipRuntime,
@@ -475,6 +478,55 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         self.assertTrue(
             all(len(w) == 1 for w in waves),
             "one layer per wave is the point of the lifted cap",
+        )
+
+    def test_the_rollback_switch_restores_the_WHOLE_old_design(self):
+        """Order, wave count and slack accounting are one switch.
+
+        The falsifier for splitting them. Rolling the order back while
+        leaving the count at ``n_layers`` gives a one-layer wave under
+        release-first -- a wave with no release of its own to pay for its
+        commit, which is the netting rule that set the old cap in the first
+        place. Priced on the rig geometry that combination lands at
+        354,868 tokens against ~435,000 for release-first W=4, so it is a
+        capacity REGRESSION wearing the word 'rollback'.
+        """
+        r = self._runtime_on_the_rig(swappable=True)
+        r._seam_restore_first = False
+        waves = r._flip_waves("pp_to_tp")
+        self.assertEqual(
+            len(waves), 16, "rollback must restore the smallest-stage cap"
+        )
+        for w in waves:
+            for stage in self.LAYER_MAP:
+                self.assertTrue(
+                    set(w) & set(stage),
+                    f"rollback must restore the proportional split; {w} "
+                    f"skips a stage",
+                )
+
+    def test_the_slack_accounting_follows_the_order(self):
+        """Restore-first must be charged MORE than release-first.
+
+        It holds the wave's commit against the previous wave's releases
+        rather than its own, so the same plan is strictly more expensive.
+        Equality here would mean the accounting ignored the order, which is
+        a false verdict in whichever direction it happens to err.
+        """
+        src, dst = self._sides()
+        waves = ordered_layer_waves(self.LAYER_MAP, (14, 10, 8), 64, "pp_to_tp")
+        charged = {}
+        for restore_first in (True, False):
+            r = self._runtime_on_the_rig(swappable=True)
+            r._seam_restore_first = restore_first
+            charged[restore_first] = r._backing_slack_bytes(
+                "pp_to_tp", src, dst, waves
+            )
+        self.assertGreater(
+            charged[True],
+            charged[False],
+            "restore-first holds a wave's commit against the PREVIOUS "
+            "wave's releases, so it cannot cost the same or less",
         )
 
     def test_the_wave_order_keeps_the_transient_off_the_binding_ranks(self):

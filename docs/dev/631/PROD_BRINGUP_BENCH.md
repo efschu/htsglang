@@ -3027,3 +3027,45 @@ Evidence: `/spinning/evidence-631/s25/acceptance/`.
 ### Reading it
 
 FILL_READING
+
+### Result — ACCEPTANCE: GREEN
+
+Extract: `/spinning/evidence-631/s25/acceptance/extract.txt`, reproduced verbatim:
+
+```
+===== #656 ACCEPTANCE EVIDENCE  pool=430000  /spinning/evidence-631/s25/acceptance
+
+-- corridor (28659 samples, floor 1024 MiB/card)
+   gpu0_free: MIN=2231  p1=2279  TYPICAL(p50)=2761  max=4675  breaches=0  margin=1207
+   gpu1_free: MIN=5098  p1=5118  TYPICAL(p50)=5760  max=8262  breaches=0  margin=4074
+   gpu2_free: MIN=2487  p1=2505  TYPICAL(p50)=2851  max=4387  breaches=0  margin=1463
+
+-- flips (lines since last boot: 50476)
+   pp_to_tp: 348
+   tp_to_pp: 348
+   BOTH LAYOUTS VISITED: True
+   FLIP ABANDONED: 0    tracebacks: 0
+   staging reserved MiB: min=0.5 max=1132.0 mean=584.4
+   live slots: max=163626  = 38.1% of pool
+
+-- phase purity and CUDA graphs
+   prefill batches: 11313  WITH a graph: 0
+   decode  batches: 1344  WITH a graph: 1341
+   STRICT PURITY (no prefill graph): True
+   decode graph share: 99.8%
+
+-- speculation (MTP)
+   accept length: mean=2.788 n=1344
+
+-- agent / client traffic (counted, not asserted)
+   /v1/completions: 240
+   /v1/messages/count_tokens: 26
+   /v1/messages: 26
+   /v1/chat/completions: 1
+
+-- host RAM
+   memory.peak: 112.1 GiB
+   memory.events: low 0 high 0 max 0 oom 0 oom_kill 9 oom_group_kill 0
+
+===== ACCEPTANCE: GREEN
+```
