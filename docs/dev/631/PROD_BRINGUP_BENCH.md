@@ -2725,3 +2725,116 @@ of cache is what SURVIVED an `empty_cache`, so it could not have served a
 **The binding term is now the 3156 MiB staging demand, not the pool and
 not the geometry.** Both previous capacity levers are off the critical
 path until staging bytes come down or the binding card gains ~500 MiB.
+
+---
+
+## 2e. THE SEAM IS WAVED — the 270k one-request livelock, removed (successor 24, 2026-08-10)
+
+Commits `427db8f279` (the wave) and `510fb632a0` (its two constants).
+
+### What was wrong
+
+The flip swapped BOTH layouts' physical KV backing exactly once, at the
+read/write seam. That forced every byte crossing the seam to be resident
+at that one instant, so the staging demand was `sum(row_nbytes * n_rows)`
+over the WHOLE plan — proportional to the resident live set and unbounded
+in request length. The affordability gate was honest; it priced exactly
+what the move allocated. **The defect was in the move.**
+
+Under strict purity that does not degrade, it WEDGES: decode may only run
+in TP, so a request that cannot be flipped never decodes, stays resident,
+keeps the live set large, and the identical refusal repeats at ~1/s
+forever. Health went 503 and only a reboot recovered.
+
+### The fix
+
+Split the seam into layer WAVES. Release the source layout's backing and
+restore the destination's one wave at a time, so only one wave's payload
+is ever staged. Each wave takes a proportional slice of every rank's own
+layer block, which is what makes a wave's releases pay for its commits —
+residency never rises above the resting layout while the staged bytes
+fall by the wave count. The count is a property of the LAYER MAP (the
+smallest stage's layer count), so what remains scales with pool geometry
+rather than with the prompt.
+
+`SGLANG_FLIP_SEAM_WAVES` overrides it; **1 reproduces the previous move
+byte for byte**, which is what keeps this a one-variable A/B.
+
+### Staging, before and after (rig fixture, map [28,20,16], 270k rows)
+
+| | unwaved (1 wave) | waved (16) | at a FULL POOL |
+|---|---|---|---|
+| first cut (`427db8f279`) | 3856 MiB | 574 | 728 |
+| constants priced (`510fb632a0`) | 3853 MiB | **418** | **550** |
+
+The full-pool column is the closure: the live set cannot exceed the pool,
+so **no request that fits this configuration can reach the refusal.**
+
+The second commit went after two constants that dominated once the legs
+were divided:
+
+| term | first cut | priced | why |
+|---|---|---|---|
+| backing slack | 778 MiB | **242** | a flat "one layer of the bigger pool" over-reserved 3x; now computed by walking the wave plan and taking the worst boundary |
+| gather window | 231 MiB | **~8** | `k[rows]` and the strided `.contiguous()` materialised the whole row list; now blocked (`SGLANG_FLIP_GATHER_ROWS`, default 16384) |
+
+Over-reserving is not the safe direction. The gate's only action is to
+refuse, and a refusal does not drain the resident set it refused on, so
+invented headroom moves the livelock to a smaller request rather than
+preventing one.
+
+### Metal: the reproducer that wedged
+
+`scripts/route_a_631_yarn_needle_probe.py --target-tokens 270000
+--max-tokens 64`, bs=1, purity strict, pool 380000, map [7,5,4] over 16
+full-attention layers → 4 waves.
+
+| axis | successor 23 (unwaved) | successor 24 (waved) |
+|---|---|---|
+| FLIP ABANDONED | ~1/s, forever | **0** |
+| flip committed | never | **yes**, at 270003 and 270012 live slots |
+| health | 503 | **200 throughout** |
+| staging reserved (per rank) | 3855 needed vs 3102 spendable | **2258 / 2192 / 1896 MiB** |
+| flip time | — | 2020 / 2503 / 1784 ms |
+| corridor min free | — | **2203 / 5154 / 2419**, 0 breaches of 1024 |
+| recovery | reboot only | not needed |
+
+Evidence: `/spinning/evidence-631/s24/{yarn_270k.json, yarn_270k.log,
+corridor_270k.csv}`.
+
+The metal figures are from `427db8f279`; `510fb632a0` cuts a further
+~760 MiB off the per-rank staging, which the fixture table above prices
+and the green run below measures.
+
+### >262144 YaRN leg (spec item 4): GREEN
+
+The same probe answers it, and it is the stronger reading. All three
+planted needles were verified — including the DEEP one at ~95% depth,
+i.e. past the 262144 native ceiling — at `prompt_tokens` 270031, and a
+deep-only re-ask was answered from the same session at 270002 tokens
+(268288 cached). The request **decoded**, which under strict purity can
+only have happened in the TP layout. Prefill-only would not have produced
+a token.
+
+### A falsifier that failed, and what it taught
+
+`TestSharedArenaReadsPrecedeWrites` models the two layouts ALIASING one
+arena. It broke under the waved seam, correctly: waving interleaves reads
+of one layout with writes of the other, so when the two overlay the same
+bytes a wave's writes can land on rows a later wave has not read — the
+#297 reads-before-writes hazard, reachable exactly here.
+
+**An aliased arena and a waved seam are alternative capacity designs, not
+a combination.** The runtime now detects overlap from the actual pointers
+(`KvPoolView.overlaps`) and collapses the seam to a single wave with a
+loud log. Anyone who later builds the aliased arena gets correct
+behaviour and an explicit message saying staging will scale with the live
+set again.
+
+### Also
+
+`flush_cache` now names WHICH clause of `is_fully_idle()` is false when
+it refuses. The wedged instance refused the very flush its own abandon
+message advertises, while every visible counter read zero, and the two
+counters it printed could not say why. `Scheduler.idle_blockers()` is
+diagnostic only — no caller branches on it.
