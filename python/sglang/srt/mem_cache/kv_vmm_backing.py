@@ -327,12 +327,28 @@ class KvVmmArena:
             )
         drv = _driver()
         extents = self._extents_by_offset.setdefault(offset, [])
-        pos = prev
-        with torch.cuda.device(self.device_id):
-            while pos < want:
-                step = want - pos
+        # #631: fill only the UNMAPPED parts of [prev, want).
+        #
+        # This used to walk straight from the watermark to `want`, which is
+        # correct only while coverage is contiguous from zero. decommit_span
+        # can leave an interior HOLE, and the watermark then reports the
+        # contiguous prefix BELOW that hole -- so a later whole-pool commit
+        # (finalize -> restore_backing, the streamed seam's completion step)
+        # would re-map extents that are still mapped, double-counting
+        # _range_backed and issuing cuMemMap over live mappings. With no
+        # holes there is exactly one gap, [prev, want), so the legacy path
+        # is byte-identical.
+        plan = []
+        for gap_lo, gap_hi in self._gaps_in(offset, prev, want):
+            p = gap_lo
+            while p < gap_hi:
+                step = gap_hi - p
                 if self._chunk is not None:
                     step = min(step, self._chunk)
+                plan.append((p, step))
+                p += step
+        with torch.cuda.device(self.device_id):
+            for pos, step in plan:
                 addr = self.base + offset + pos
                 handle = self._take_retained(step)
                 reused = handle is not None
@@ -367,11 +383,13 @@ class KvVmmArena:
                     else:
                         rel = drv.cuMemRelease(handle)
                         rel = rel[0] if isinstance(rel, tuple) else rel
+                    extents.sort()
+                    self._refresh_watermark(offset)
                     raise
                 extents.append((pos, step, handle))
-                pos += step
                 self._range_backed += step
-                self._committed_by_offset[offset] = pos
+        extents.sort()
+        self._refresh_watermark(offset)
 
     def decommit_range(self, offset: int, keep_bytes: int) -> int:
         """Release every whole extent of ``offset`` at or above ``keep_bytes``
@@ -448,6 +466,28 @@ class KvVmmArena:
             (rel, rel + size) for rel, size, _h in self._extents_by_offset.get(offset, [])
         )
 
+    def _gaps_in(self, offset: int, lo: int, hi: int):
+        """The UNMAPPED sub-ranges of ``[lo, hi)`` at ``offset``, ascending.
+
+        Shared by ``commit_range`` and ``commit_span`` so the two cannot
+        disagree about what is already backed. When coverage is contiguous
+        and reaches ``lo`` there is exactly one gap, ``[lo, hi)``, which is
+        what makes the legacy prefix path byte-identical through here.
+        """
+        gaps = []
+        cursor = lo
+        for start, stop in self._extent_intervals(offset):
+            if stop <= lo or start >= hi:
+                continue
+            if start > cursor:
+                gaps.append((cursor, min(start, hi)))
+            cursor = max(cursor, stop)
+            if cursor >= hi:
+                break
+        if cursor < hi:
+            gaps.append((cursor, hi))
+        return gaps
+
     def _refresh_watermark(self, offset: int) -> None:
         """``_committed_by_offset`` is the CONTIGUOUS-from-zero watermark.
 
@@ -492,18 +532,7 @@ class KvVmmArena:
         # than a watermark -- the boot page commit can leave a first
         # extent smaller than a chunk, so chunk-aligned arithmetic alone
         # would mis-detect coverage.
-        gaps = []
-        cursor = lo
-        for start, stop in self._extent_intervals(offset):
-            if stop <= lo or start >= hi:
-                continue
-            if start > cursor:
-                gaps.append((cursor, min(start, hi)))
-            cursor = max(cursor, stop)
-            if cursor >= hi:
-                break
-        if cursor < hi:
-            gaps.append((cursor, hi))
+        gaps = self._gaps_in(offset, lo, hi)
 
         drv = _driver()
         extents = self._extents_by_offset.setdefault(offset, [])

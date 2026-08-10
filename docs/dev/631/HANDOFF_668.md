@@ -246,6 +246,24 @@ Built, tested, committed:
 * `HostKvPool.release_backing_span` / `restore_backing_span` — the
   layer-subset entry point.
 
+A HAZARD FOUND BY AUDIT AND FIXED, worth knowing because it sat on the
+new design's own completion path:
+
+`commit_range` decided what to map from the contiguous watermark ALONE and
+never consulted the extent list. That is correct only while coverage is
+contiguous from zero. `decommit_span` can leave an interior HOLE, and the
+watermark then reports the prefix BELOW it — so the streamed seam's own
+last step (`restore_backing` -> `finalize` -> `commit_range`) would have
+re-mapped extents that were never released: `cuMemMap` over live
+mappings, with `backed_bytes` counting them twice. Both calls now share
+`_gaps_in`, so they cannot disagree about what is already backed, and with
+no holes there is exactly one gap so the legacy path is unchanged.
+Regression pinned by `TestLegacyPrefixPathAfterASpanRelease`.
+
+It was found by a qwen audit lane running as acceptance traffic. **I
+verified it against the code before acting on it** — agent reports are not
+evidence, and this one happened to be right.
+
 NOT built — this is the remaining work and it is the risky half:
 
 * the streamed `_execute` loop itself (section 2.1);

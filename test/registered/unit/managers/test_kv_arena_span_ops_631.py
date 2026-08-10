@@ -263,6 +263,52 @@ class TestChunkIsRequired(_SpanOpsBase):
             self.assertIn("chunk", str(ctx.exception).lower())
 
 
+class TestLegacyPrefixPathAfterASpanRelease(_SpanOpsBase):
+    """The hazard a coverage audit found, pinned.
+
+    ``commit_range`` decided what to map from the contiguous watermark
+    ALONE. That is right only while coverage is contiguous from zero.
+    ``decommit_span`` can leave an interior HOLE, and the watermark then
+    reports the prefix BELOW that hole -- so the streamed seam's own
+    completion step (``restore_backing`` -> ``finalize`` ->
+    ``commit_range``) would re-map extents that were never released:
+    cuMemMap over live mappings, and ``backed_bytes`` counting them twice.
+
+    Both calls now share ``_gaps_in``, so they cannot disagree about what
+    is already backed.
+    """
+
+    def test_commit_range_does_not_remap_a_span_that_is_still_mapped(self):
+        arena = _bare_arena(self.backing)
+        with self._patched():
+            arena.commit_span(OFF, 0, 8 * CHUNK)
+            arena.decommit_span(OFF, 2 * CHUNK, 5 * CHUNK)  # interior hole
+            self.assertEqual(arena.backed_bytes, 5 * CHUNK)
+            maps_before = len(self.drv.maps)
+            arena.commit_range(OFF, 8 * CHUNK)  # the completion step
+        self.assertEqual(
+            arena.backed_bytes,
+            8 * CHUNK,
+            "the pool must end FULLY backed and counted exactly once",
+        )
+        self.assertEqual(
+            len(self.drv.maps) - maps_before,
+            3,
+            "only the 3 chunks of the hole may be mapped; re-mapping the "
+            "5 that were never released is the bug this pins",
+        )
+        self.assertEqual(self._covered(arena), [i * CHUNK for i in range(8)])
+
+    def test_the_watermark_reports_the_prefix_below_a_hole(self):
+        """Why the bug was reachable at all. Pinned so a future change to
+        the watermark's meaning shows up here rather than as a double map."""
+        arena = _bare_arena(self.backing)
+        with self._patched():
+            arena.commit_span(OFF, 0, 8 * CHUNK)
+            arena.decommit_span(OFF, 2 * CHUNK, 5 * CHUNK)
+        self.assertEqual(arena.committed_bytes(OFF), 2 * CHUNK)
+
+
 class TestStreamingPeakIsBounded(_SpanOpsBase):
     """The property the whole design turns on, in miniature.
 
