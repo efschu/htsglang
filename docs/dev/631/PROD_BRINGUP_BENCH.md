@@ -2595,3 +2595,88 @@ corridor breach. Successor 21's pool 500000 livelocked at a rank that was
 **13 MiB** short of its staging reserve. The staging bound and the corridor
 bound have genuinely come apart: the corridor is now a budgeting question,
 where before it was an availability one.
+
+---
+
+# successor 23 — two corrections to the sections above, and a measurement protocol
+
+## 2a. CORRECTION to 1g ("the geometry is quantised"): there is no quantum
+
+Section 1g closed the 600000 target on the claim that stage layer counts
+quantise to multiples of 4, permitting only `[28,20,16]` and `[32,16,16]`.
+That is this chain's FIFTH capacity closure and, like the four before it,
+it is false.
+
+`derive_pp_layer_split` (`distributed/utils.py:1481`, loop `:1540-1560`)
+contains no literal 4 and no rounding to a multiple of anything. It rounds
+the FULL-ATTENTION COUNT and clamps the proportional layer target into the
+window between full-attention positions. "A whole number of full-attention
+layers per stage" does not imply "a layer count divisible by 4".
+
+Driving the real function on CPU over all 465 stage-ratio triples summing
+to 32 (sanity-checked against the live server: `14,10,8 -> [28,20,16]`):
+
+| quantity | value |
+|---|---|
+| distinct reachable `pp_layer_ratio` | **245** |
+| triples refused (≥1 full-attn/stage guard, `utils.py:1573-1585`) | 52 |
+| of the 245, NOT all-multiples-of-4 | **140** |
+| effective granularity | **2 layers**, not 4 |
+
+`15,10,7 -> [32,18,14]` and `16,9,7 -> [32,18,14]` — the ratio HANDOFF_664
+§6 originally asked for. Section 1e's remap rule saw a quantum because
+`target_full = round(cum/2)` with banker's rounding snaps only when
+`cum ≡ 3 (mod 4)`, and `15,9,8` is that residue class. The snap there is
+30 -> 32, TWO layers; the "four" is the gap between achieved geometries.
+
+`--pp-layer-ratio` (`server_args.py:14641-14680`) bypasses the planner
+entirely — any triple summing to 64 with ≥1 full-attention layer per stage
+boots today. No consumer requires the alignment: KV cell sizing
+(`pool_configurator.py:250-258`), the layer→row map (`memory_pool.py:3473`),
+weight load (`utils/common.py:1986-2000`), dispatch (`qwen3_5.py:1412`),
+`kv_reshard.py` and the graph runners all key off GLOBAL layer ids under a
+half-open `start_layer <= i < end_layer`.
+
+**Any capacity verdict resting on "only two geometries" must be recomputed.**
+
+## 2b. CORRECTION to the capacity method: unflushed NVML-free readings are contaminated
+
+HANDOFF_665 §13 concluded the pool lever is exhausted from a 26 MiB idle-free
+move after a genuine ~750 MiB KV reduction. Measured here on the live IDLE
+instance (0 running, 0 queued), `/flush_cache`
+(`scheduler.py:6425`, `current_platform.empty_cache`):
+
+| card | free before | free after | returned |
+|---|---|---|---|
+| rank1 (binding 3080) | 2079 | **3245** | +1166 |
+| rank0 (5090) | 4876 | 6302 | +1426 |
+| rank2 (3080) | 2327 | 3355 | +1028 |
+
+Over a gibibyte per card of allocator cache is held at ZERO requests. The
+freed KV bytes went there, invisible to the NVML free column.
+
+**PROTOCOL: flush immediately before any idle-free reading, and state in the
+row whether you did.** Every unflushed reading in this corpus is optimistic
+by up to ~1.4 GiB, including the 37% budget-lever return in 665 §14.
+
+`/flush_cache` also resets the radix cache, so it is a measurement
+instrument, not a mid-benchmark action. It is refused while any request is
+resident (`is_fully_idle()` gate), which is why it cannot be a runtime
+corridor remedy.
+
+## 2c. Why geometry alone does not close the corridor — the layer/token coupling
+
+Corridor minima at pool 470000, nvidia-smi index order (rank1, rank0, rank2):
+**381 / 3036 / 787**, total surplus above the 1024 floor **1132 MiB**.
+
+From 665 §1.1, measured: a 4-layer move gained rank1 **+1558** (~390
+MiB/layer) and cost rank0 **2792** (~698 MiB/layer). A layer is ~1.8x dearer
+on rank0 because `SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8` gives it 14/32 of the
+tokens. **So each layer moved onto the 5090 destroys ~308 MiB of total
+corridor**, and rank0's 2012 MiB of slack absorbs 2 layers while rank1+rank2
+need to shed 3. That, not a quantum, is why `15,9,8` overshot rank0 to 64 MiB.
+
+The layer split and the token vector are INDEPENDENT knobs currently pinned
+proportional to one another. Decoupling them — more layers AND fewer tokens
+on the 5090 — is the lever that escapes the tax, needs no new code, and has
+never been tried.
