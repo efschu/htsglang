@@ -402,3 +402,44 @@ to the budget lever. Read it with:
 `set_per_process_memory_fraction`) comes BEFORE spill rung 2. It is a flag
 change plus a small patch, against rung 2's VA-stable carrier work, and it
 addresses the term that is actually binding.
+
+## 14. THE BUDGET LEVER WORKS — measured, and it is the remedy
+
+Single-variable step through the replay tool, pool untouched at 470000:
+`--rank-gpu-memory-mib 31800,17400,17450 -> 31800,16200,16650`.
+
+| card | free before | free after | budget cut | gained |
+|---|---|---|---|---|
+| rank1 (binding) | 2303 | **2685** | -1200 | **+382** |
+| rank0 | 5160 | 5684 | 0 | +524 |
+| rank2 | 2551 | 2833 | -800 | +282 |
+
+**Compare the two levers on the same card, same session, same geometry:**
+
+| lever | change | rank1 free gained |
+|---|---|---|
+| pool | -80000 tokens (550000 -> 470000) | **+26 MiB** |
+| per-rank budget | -1200 MiB on rank1 | **+382 MiB** |
+
+The corridor responds to the budget and not to the pool. That is the
+finding this session ends on, and it redirects the remaining capacity work
+completely.
+
+Two things to understand before using it:
+
+* **It is not 1:1.** A 1200 MiB cut on rank1 returned 382. Some of the cut
+  is absorbed by the same allocator behaviour that ate the pool reduction,
+  which is precisely why the ENFORCED version (a per-rank
+  `set_per_process_memory_fraction` from `RANK_MIB`, 664 §6's top unbuilt
+  item) is worth more than the advisory flag: it would make the return 1:1
+  by construction.
+* **rank0 gained 524 MiB without any cut to its budget.** The per-rank KV
+  unit is min-reduced across ranks, so lowering the two 3080s' budgets
+  lowers the global unit and shrinks every rank's KV. A successor tuning
+  one card must expect the others to move.
+
+Where that leaves the corridor: rank1 at 2685 idle against the measured
+bs=4 + long-prefill transient of 1790 predicts a floor of ~895, still ~130
+MiB short of 1024. On the measured 1200:382 return ratio, roughly another
+400-450 MiB of budget cut on rank1 should close it. **That is the next
+single-variable step, and it is a flag change.**
