@@ -290,6 +290,21 @@ bear directly on it:
   identity and refuse loudly if one Req is reachable through two distinct
   batches."* That is precisely the failure now observed — one request
   entering `running_mbs[0]` once per round. **Start here.**
+
+  **And K names the mechanism outright:** *"`merge_batch` extends in place,
+  so it is not idempotent; a second merge enters the same Req twice."* A
+  non-idempotent merge re-executed once per scheduler round produces exactly
+  the observed law — **+1 per round, ~700/s, unbounded**. The question for
+  the successor is therefore not "what is appending?" but **"what is
+  re-merging the same batch every round, and why did the identity dedupe not
+  catch it?"** Note that s18's identity guard catches `X.merge_batch(X)` —
+  the *same object* — so a re-merge of a *distinct object holding the same
+  Req* passes straight through it. That is the gap between the two bugs, and
+  it is why fixing the doubling did not fix this.
+
+  This reading is not one agent's opinion: **two independently briefed
+  surveys of the 800-line docstring converged on it**, and both flag the same
+  entries as still open.
 * **J.1 — SLOT SCOPE**, and its unnamed **AUDIT CANDIDATE** successor
   (docstring lines 525-532), which is marked **OPEN**: the false assumption
   that `scheduler.running_batch` names the rank's resident set is available
