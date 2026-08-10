@@ -243,9 +243,104 @@ NOT built — this is the remaining work and it is the risky half:
 
 ---
 
-## 3. STATE
+## 2.3 THE TENSION THAT EXPLAINS WHY THE SEAM WORK IS NOT OPTIONAL
 
-* Serving rebooted to pool **410000** on the inherited commit, health 200,
-  geometry `pp_stage_ratio 14,10,8` unchanged, single variable moved.
-* Flip-family suite at base: **680 passed, 0 failed**.
+Stated in the user's own terms, because it is the clearest argument for
+doing section 2.1b and it is not obvious from any single measurement.
+
+The corridor law has two halves: never breach 1024 MiB free per card, AND
+be well filled (free NEAR 1024, not multiple GiB above). **With the
+current seam those two halves cannot both be satisfied.**
+
+* Size the pool so the corridor is well filled at TYPICAL occupancy and
+  the pool goes past ~438,000. A flip at FULL occupancy is then
+  unaffordable, and under strict purity an unaffordable flip does not
+  degrade, it WEDGES (HANDOFF_667 section 1.1).
+* Size the pool for anti-wedge safety at ~430,000 and the corridor sits
+  loose whenever occupancy is normal — the acceptance run below holds its
+  minimum around 2650 MiB on the binding card, some 1600 MiB above the
+  floor.
+
+The cause is that staging scales with the LIVE SET while the pool must be
+sized for the worst case, so the headroom reserved for a full-occupancy
+flip is idle at every other moment. Removing the occupancy-dependent term
+is exactly what sections 2.1 and 2.1b do, and it is what collapses the two
+halves back into one operating point.
+
+**So "the corridor is loose" is not slack left on the table by
+carelessness — it is the price of the current seam, and it is the same
+price as the ~600000 shortfall.** One fix buys both.
+
+## 3. WHAT THE CAPACITY LADDER SETTLED
+
+Full tables in PROD_BRINGUP_BENCH section 2g. The three results that
+matter:
+
+1. **The ~432,000 anti-wedge ceiling is CONFIRMED, by a third independent
+   method.** My own measurement — baseline free on the binding card
+   excluding staging, taken as `min_free + staging_reserved` at pool
+   500000 — gives **437,862**, against successor 24's 432,861 and the qwen
+   log regression's 437,235. Within 1.2%. The inferred-baseline term that
+   successor 24 flagged as his weak link has now been measured and did not
+   move the answer.
+2. **A 500000 boot holding the corridor is NOT a refutation of that
+   ceiling**, and reading it as one would have been this chain's sixth
+   false closure. I nearly made it. The ceiling is defined at FULL
+   occupancy; that run's live set peaked at 131,288 slots, **26% of the
+   pool**. The deciding term was never exercised. What the run did settle
+   is the staging model, in the ledger's favour: 1047.6 MiB measured at
+   131,288 live slots against 950 predicted.
+3. **The honest maximum for the current seam is ~435,000**, because one
+   long request is enough to reach the unsafe region on its own: at pool
+   500000 a 393,216-token request prices staging at 2132 MiB against 2752
+   MiB of baseline — a breach — while at 430000 the same request lands at
+   1304 MiB free.
+
+The user's **>= 600000 (spec item 6) is NOT met and is not reachable by
+stepping the pool.** It is blocked by the staging SLOPE, not by the
+intercept, which is why the remaining work is the seam and not a bigger
+number in the launch command.
+
+## 4. STATE AT HANDOFF
+
+* Branch `feat/route-a-631`, pushed to the fork.
+* Flip family: **700 passed, 1 failed** — the pre-existing
+  constant-dominated `_staging_bytes` red, newly VISIBLE because I fixed
+  the runner's collection gap. It is documented in the commit that
+  exposed it, not silenced. Baseline before my changes was 680/680 with
+  that file never collected.
+* Serving at pool **430000**, the acceptance configuration.
 * GPU arbitration holder is mine; heartbeat running.
+
+### 4.1 The arbitration collision, and the rule that came out of it
+
+At 15:23:22Z successor 24 — believing this strand had finished — rebooted
+serving from my live 500000 experiment down to 410000, killing the run
+mid-flight. It checked for load PROCESSES and for traffic in the serving
+log, and concluded the rig was quiet. It never listed
+`/spinning/gpu-arb/heartbeat.*`, where my heartbeat was 31 seconds old.
+
+**STANDING RULE, now in the holder: before ANY serving reboot, list
+`/spinning/gpu-arb/heartbeat.*` by mtime and treat anything fresher than
+120 s as a live peer.** Process checks and log greps do not cover it.
+Successor 24's own account is preserved at
+`/spinning/gpu-arb/holder.s24-collision-note`.
+
+## 5. WHAT I DID NOT GET TO, in the order I would take it
+
+1. **Section 2.1b, the restore-first + W=16 + ordered-waves change.** The
+   design is complete and quantified, including which tests must go red.
+   Try it BEFORE 2.1 — it avoids row-blocking the collective, which is
+   the one change that can deadlock the group.
+2. **Section 2.1, the fully streamed seam.** The arena and pool
+   substrate for it is built and tested; what remains is the `_execute`
+   loop, the global round count, and re-deriving `_staging_bytes`.
+3. **Decouple `SGLANG_FLIP_SEAM_CHUNK_MIB` from `retain_handles`.**
+   Chunked extents are required by both routes; handle retention parks
+   pages per-arena and defeats exclusive backing. Today they are one knob,
+   so the knob is a trap.
+4. **The graph A/Bs of spec item 8** — NEXTN draft graphs, DFLASH x
+   graphs, PP-prefill graphs, and the prefill chunk ladder. Untouched by
+   me. Decode graphs and strict purity ARE verified on metal (section 6).
+5. **The recoverable abandon** (HANDOFF_667 section 1.1c) and the
+   **wave-count floor guard** (1.2). Both still unbuilt.
