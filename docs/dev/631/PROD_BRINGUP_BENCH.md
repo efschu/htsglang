@@ -2290,3 +2290,132 @@ The third term is reclaimable and is now reclaimed (SUCCESSOR 21 / 2). The
 second is not reclaimable and scales at ~30 MiB per 1000 prompt tokens. The
 first is what the pool competes for. Any future capacity claim must state
 which of the three it is moving.
+
+# SUCCESSOR 22 / 1 — THE MOVER WAS THE TRANSIENT, AND FIXING IT REMOVED THE BREACH
+
+HANDOFF_664 section 13 traced the length-scaling VRAM transient to the
+phase-flip KV mover and named the fix without building it. Built and
+measured here. The one-line result: **at pool 400000 with the exact
+111405-token request that breached the corridor for successor 21, the
+corridor now holds with 1741 MiB to spare on the binding card, and the
+request completes 3x faster.**
+
+## 1a. Hermetic: what the mover held, before and after
+
+Three-rank threaded flip, production row geometry (`row_nbytes = 2048 B`),
+peak measured by a `TorchDispatchMode` probe over live tensor storage.
+The probe EXCLUDES the persistent KV pools — an in-place op returns the
+tensor it mutated, so `write_rows`' `k[idx] = ...` hands the probe the
+destination pool itself (32 buffers, 20.6 MiB); counting them was a fifth
+of the first reading and pure noise. `scripts/s22_mover_live_set.py`.
+
+| direction | peak BEFORE | peak AFTER | plan floor | ratio before | ratio after |
+|---|---|---|---|---|---|
+| pp_to_tp | 39.4 MiB | **19.2 MiB** | 19.2 MiB | 2.05x | **1.00x** |
+| tp_to_pp | 36.6 MiB | **20.2 MiB** | 19.2 MiB | 1.91x | **1.05x** |
+
+The floor is `incoming + max(outgoing, local)`, computed from the plan and
+never hardcoded. The mover now holds exactly what it owes.
+
+Three changes, and the third is the one nobody had itemised:
+
+1. `_pack_outgoing` fills one exact-size buffer per peer in place, instead
+   of one tensor per layer plus `torch.cat` plus a checksum-appended copy
+   (three copies of a peer's payload live at the peak);
+2. `read_rows_into` is the pool-view primitive that makes that possible;
+   `read_rows` is now built on it so the two cannot produce different
+   bytes for the same rows;
+3. **the outgoing buffers are released the moment `_exchange` returns.**
+   They used to stay referenced through the local read, the backing swap
+   and every write — the widest part of the move — making the peak
+   `outgoing + incoming + local` when it only ever had to be
+   `incoming + max(outgoing, local)`.
+
+## 1b. Metal: pool 400000, the same trigger, only the code moved
+
+Rebooted through `seam_scaling_reboot.py` (see 1d), same geometry
+`PP_STAGE_RATIO=14,10,8` / `SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8` /
+`MAMBA_SLOTS=12` / `RANK_MIB=31800,17400,17450` / CTX 393216 / purity
+strict / policy auto / spill depth cache. HEAD f6e7f9803e.
+
+| axis | s21, old mover (HANDOFF_664 §12) | s22, streamed mover |
+|---|---|---|
+| pool | 400000 | 400000 |
+| prompt tokens | 111405 | 111405 |
+| `#cached-token` | — | **0** (genuine full prefill, not a cache hit) |
+| corridor min, rank1 (3080, binding) | **719 MiB — 305 UNDER the floor** | **2765 MiB — 1741 ABOVE** |
+| corridor min, rank0 (5090) | 3106 | 5852 |
+| corridor min, rank2 (3080) | 1151 | 2915 |
+| request wall time | 68.5 s | **22.6 s** |
+| `FLIP ABANDONED` | 0 | 0 |
+| tracebacks / exits | 0 / 0 | 0 / 0 |
+| spill rung fires | 42 / 42 flips | 24 / 24 flips |
+
+Transient measured at 73008 prompt tokens: **1120 / 1346 / 982 MiB**, i.e.
+**15.3 / 18.4 / 13.4 MiB per 1000 prompt tokens** against successor 21's
+24 / 32 / 20. Going on from 73008 to 111405 prompt tokens added **zero**
+further drop, which is the qualitative change: the term that tracked total
+sequence length was the mover's, and it is bounded now.
+
+The 3x wall-time gain is not a separate win. The mover allocated and freed
+hundreds of MiB per flip and fired dozens of times inside one request;
+removing two thirds of that allocator traffic is the same fix.
+
+### READ THIS BEFORE COMPARING ANY PER-CARD TRIPLE IN THIS CORPUS
+
+Every per-card triple in successors 20-21 is in **nvidia-smi INDEX order**,
+which is `(rank1, rank0, rank2)` — NOT rank order. Confirmed two ways:
+`SGLANG_RANK_CARD_UUIDS` on the live schedulers resolves rank0 to the 5090
+(nvidia-smi index 1) and ranks 1/2 to the 3080s (indices 0 and 2), and
+HANDOFF_664 §12a labels its own slopes "24 (rank1) / 32 (rank0) / 20
+(rank2)" in that order. A successor who reads `719 / 3106 / 1151` as
+rank0/1/2 will conclude the 5090 was the binding card. It was not.
+
+## 1c. The accounting hole, and why the ORDER of the two fixes was load-bearing
+
+`_staging_bytes` was `2 x outgoing + incoming` **with the local retained
+leg missing entirely**. Every affordability refusal in this feature,
+including the one that livelocked pool 500000, was computed from it.
+
+It is now `incoming + max(outgoing, local) + one_layer_window`, where the
+last term is the bounded per-layer gather that streaming did not remove
+(it made it fixed at 1/L of a leg rather than proportional to the prompt).
+Measured against the hermetic peak: predicted 20.2 MiB vs measured
+19.2 / 20.2 — never short, never grossly over.
+
+HANDOFF_664 §13c warned that shipping the formula fix ALONE would make the
+livelock strictly more reachable, because the gate can only refuse and a
+refusal does not drain the resident set it refused on. That warning is
+now discharged rather than merely respected: streaming landed first, and
+the honest budget (20.2 MiB) is SMALLER than the dishonest one it replaced
+(30.2 MiB, over-reserving by 57%). On metal the same effect is visible per
+flip — a flip that reserves 457 MiB under the new formula would have
+reserved 650 MiB under the old one while actually needing less than either.
+
+`test_phase_flip_staging_reserve_631` pinned the superseded formula BY
+NAME (`test_outgoing_is_counted_twice_and_incoming_once`), which is how a
+missing term looked deliberate for five successors. Rewritten with a
+fixture in which the retained leg dominates — the geometry the old
+expression could not see.
+
+## 1d. A trap in the one tool that was mandated for capacity steps
+
+`scripts/seam_scaling_reboot.py` read `/tmp/boot_cmdline.txt` and
+`/tmp/boot_env.txt`. Against the running server those files were 10 hours
+stale and differed in load-bearing ways:
+
+| | capture file | live server |
+|---|---|---|
+| `pp-stage-ratio` | 2,1,1 | 14,10,8 |
+| `rank-gpu-memory-mib` | 22700,11920,11970 | 31800,17400,17450 |
+| `SGLANG_UNEVEN_TOKEN_VECTOR` | 28,26,20 | 14,10,8 |
+| `PHASE_FLIP_PURITY` | **off** | **strict** |
+
+So the tool prescribed for single-variable discipline would have booted a
+different geometry with strict purity DISABLED and reported it as a
+one-variable step — worse than a hand-built environment, because it looks
+disciplined. It now reads the live process, stops it by PID as part of the
+same invocation (capture and kill cannot be separated without losing the
+baseline), takes arbitrary explicit substitutions, and writes a
+baseline-vs-replay record per boot to
+`/spinning/evidence-631/boot-captures/`.

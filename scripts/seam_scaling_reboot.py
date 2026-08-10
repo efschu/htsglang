@@ -160,6 +160,12 @@ def main():
     ap.add_argument("--del-env", action="append", metavar="NAME")
     ap.add_argument("--from-capture", nargs=2, metavar=("CMDLINE", "ENV"))
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--no-stop",
+        action="store_true",
+        help="do not stop the live server first (it will fight for the port)",
+    )
+    ap.add_argument("--stop-timeout", type=float, default=60.0)
     args = ap.parse_args()
 
     if args.from_capture:
@@ -239,6 +245,58 @@ def main():
     if args.dry_run:
         print("--dry-run: nothing launched")
         return 0
+
+    # CAPTURE, THEN STOP, THEN LAUNCH -- in that order and inside one tool.
+    # The baseline is read from the live process, so a successor who kills
+    # the server first has nothing left to replay; doing it by hand in two
+    # steps is how the stale capture files came to exist in the first
+    # place. Stopped by PID (SIGTERM, then SIGKILL on the same pid after a
+    # bounded wait) -- never a pattern kill: this box runs the router on
+    # 30099 and other agents' processes, and a broad pkill has taken those
+    # out before.
+    if not args.from_capture and not args.no_stop:
+        import signal
+
+        print(f"stopping live pid {pid} (SIGTERM)")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.time() + args.stop_timeout
+        while time.time() < deadline:
+            if not os.path.exists(f"/proc/{pid}"):
+                break
+            time.sleep(0.5)
+        if os.path.exists(f"/proc/{pid}"):
+            print(f"pid {pid} still up after {args.stop_timeout}s; SIGKILL")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            time.sleep(3.0)
+        # The schedulers are children and normally follow the parent down.
+        # Verify rather than assume: a surviving scheduler still holds its
+        # card, and the replacement would then boot into a card that is
+        # already full and blame the pool for it.
+        stragglers = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                    cmd = fh.read()
+            except OSError:
+                continue
+            if b"sglang::scheduler_PP" in cmd or b"sglang::detokenizer" in cmd:
+                stragglers.append(int(entry))
+        for spid in stragglers:
+            print(f"straggler {spid} still holding a card; SIGKILL by pid")
+            try:
+                os.kill(spid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if stragglers:
+            time.sleep(3.0)
 
     if os.path.exists(LOG):
         os.rename(LOG, f"/spinning/serving-30030.boot.{stamp}.log")
