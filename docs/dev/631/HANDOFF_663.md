@@ -260,6 +260,42 @@ blocker is the corridor, not the pool sizer.** The gap is ~6.4 GiB on the
 needs a fourth card or a smaller per-token cell, and that is a decision for
 the user, not a defect for a successor to fix.
 
+## 5b. THE 807 MiB ODDITY IS RESOLVED: it is real and it does not bind
+
+662 flagged, and the bench repeated, that `RANK_MIB=31800` on a 32607 MiB
+card leaves 807 MiB — under the 1024 floor **by construction** — and warned
+that every passing config held only because the engine did not consume its
+whole budget. It has been carried as unresolved by every document since.
+
+Measured at 30 minutes of the T=190000 run:
+
+| card | total | RANK_MIB | used | NVML free | overshoot |
+|---|---|---|---|---|---|
+| gpu0 3080 (rank1) | 20480 | 17400 | 18267 | 1789 | **+867** |
+| gpu1 5090 (rank0) | 32607 | 31800 | 29279 | 2810 | -2521 |
+| gpu2 3080 (rank2) | 20480 | 17450 | 18739 | **1317** | **+1289** |
+
+**The oddity is real and it never binds.** Rank 0 sits 2521 MiB UNDER its
+budget, so the 5090 is the most comfortable card in the rig. What binds is
+the opposite failure on the other two: **the 3080s exceed their budgets by
+867 and 1289 MiB.** `RANK_MIB` is advisory in both directions, and only 662's
+half of that was known.
+
+Sharpest form: **rank2 is the tightest card while holding the SMALLEST token
+share (20 of 74)**, so its pressure is weights plus per-rank overhead, not
+KV. Tuning the token vector or the pool attacks the wrong term for the only
+card that actually decides the corridor.
+
+Two consequences a successor should not have to rediscover:
+
+* **The carve-out is exact.** `total-used` minus NVML `free` is **424** on
+  both 3080s. Sizing against `total-used` reads 1741 MiB of headroom where
+  1317 exists — one whole safety margin of error.
+* **The untried cell is LOW budget x LOW pool, on the 3080s.** 662 lowered
+  `RANK_MIB` against a 460000 pool, got a worse result, and concluded
+  "change the pool, not the budget". That conclusion is sound for the cell it
+  ran and is not evidence about this one, which nobody has run.
+
 ## 6. WHAT I DID NOT REACH
 
 * **Graph A/Bs (spec item 8)** — still untouched after five successors.
@@ -274,3 +310,29 @@ the user, not a defect for a successor to fix.
   does not end the window; that is the cheapest capacity work available.
 * **The alignment lever (662 §5)**, costed on weights AND KV per card. The
   KV-only arithmetic looks like a free 12.1 % and is not.
+
+## 7. HOUSEKEEPING A SUCCESSOR INHERITS
+
+**A retired claim is still live in the text.** 659 §1 costed the cutover at
+"1.4-3.0 GiB per card" and concluded ">600k and auto-flip are in direct
+tension". 660 §1 WITHDREW it — the seam peak was a PHASE HOLD, not a cutover
+cost. But 658 §4e still cites "a 1.4-3.0 GiB seam" to condemn the fairness
+windows, and 661 §3 then had to reverse that separately ("a policy knob was
+blamed for a sizing defect"). **The number outlived two of its own
+retractions.** When you retire a figure, grep the corpus for it.
+
+**The PD loops carry defect R's exact shape.** Confirmed by audit:
+the prefill-disaggregation loop reads `self.last_batch = self.last_mbs[mb_id]`
+(~:348) with the conditional assignment at ~:434-440, and the
+decode-disaggregation loop reads at ~:494 with the conditional at ~:616-623.
+**Whether either is HARMFUL is NOT established** — that needs (a) their
+batch-selection returning None while requests stay resident, and (b) a
+mutating consume of `last_batch`. Both were left unverified when my audit
+died. Do not read my silence as a clean bill.
+
+**Corpse-table entries H, J.2 and I remain open**, as does the unnamed J.1
+AUDIT CANDIDATE (docstring ~:525-532) — the false assumption that
+`scheduler.running_batch` names the rank's resident set under
+`event_loop_pp`. Defect R is arguably its third instance, since the whole
+bug is a slot-scoped handle being treated as durable. **That audit pass is
+now overdue by four handoffs.**
