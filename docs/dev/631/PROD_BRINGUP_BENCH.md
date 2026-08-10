@@ -1959,3 +1959,67 @@ HISTORY, not of the pool.**
 That is a sharper statement of the sticky-mark finding, and it means every
 capacity number in this document should carry the load history that produced
 it, not just the load in flight at the time of reading.
+
+## SUCCESSOR 20 / 2 — the corridor is bound by the 3080s OVERSHOOTING their budget
+
+Measured on the T=190000 green run at 05:35Z, 30 minutes in:
+
+| card | total | RANK_MIB | used | NVML free | total-used | overshoot |
+|---|---|---|---|---|---|---|
+| gpu0 3080 (rank1) | 20480 | 17400 | 18267 | 1789 | 2213 | **+867** |
+| gpu1 5090 (rank0) | 32607 | 31800 | 29279 | 2810 | 3328 | -2521 |
+| gpu2 3080 (rank2) | 20480 | 17450 | 18739 | **1317** | 1741 | **+1289** |
+
+### Three findings, and the third relocates a constraint
+
+**1. The carve-out is confirmed to the MiB.** `total-used` minus NVML `free`
+is **exactly 424** on both 3080s. The memory law's warning is not a rule of
+thumb: anyone sizing against `total-used` here reads 1741 MiB of headroom
+where 1317 exists, an error of one whole safety margin.
+
+**2. `RANK_MIB` is advisory in BOTH directions.** 662 established that a
+too-small budget does not stop a too-large pool from overshooting. This adds
+the other half: the 3080s exceed their assigned budget by 867 and 1289 MiB,
+while the 5090 sits 2521 MiB UNDER its own.
+
+**3. 662's "structural oddity" is real but is NOT the binding constraint.**
+662 flagged that `RANK_MIB=31800` on a 32607 MiB card leaves 807 MiB — below
+the 1024 floor by construction — and warned that every passing config held
+only because the engine did not consume its whole budget. That is true, and
+it does not bind: rank0 never approaches its budget, so the 5090 sits at
+2810 MiB free, the most comfortable card in the rig. **The corridor is bound
+by the two 3080s, which overshoot.**
+
+The sharpest form: **rank2 is the tightest card while holding the SMALLEST
+token share (20 of 74).** So the pressure on it is not KV — it is weights
+plus per-rank overhead, which the token vector does not control. Tuning
+`SGLANG_UNEVEN_TOKEN_VECTOR` or the pool therefore attacks the wrong term
+for the card that actually binds.
+
+### The lever that has never been tried
+
+662 lowered `RANK_MIB` to 30500/16550/16500 **while the pool was still
+460000** and the 5090 got WORSE (852 MiB free at idle), correctly concluding
+"change the pool, not the budget". But that experiment holds only for the
+combination it ran. **The untried cell is a LOW budget with a LOW pool**, and
+specifically a lower budget on the two 3080s, which are the cards that
+overshoot and the cards that bind. Nobody has run (low RANK_MIB x low pool).
+
+### The corridor decays in STEPS, not as a drift
+
+| bucket | gpu0 | gpu1 | gpu2 |
+|---|---|---|---|
+| t-35..30 min | 3093 | 3990 | 2603 |
+| t-30..25 min | 2431 | 2988 | 1901 |
+| t-25..20 min | 2089 | 2488 | 1579 |
+| t-20..15 min | 2049 | 2488 | 1579 |
+| t-15..10 min | 2049 | 2488 | 1577 |
+| t-10..05 min | 2049 | 2486 | 1577 |
+| t-05..00 min | 1809 | 2146 | **1317** |
+
+**Four consecutive flat buckets and then a 260 MiB step.** This is the
+mechanism behind the repeated "it plateaued and then it breached" reports:
+the mark is a high-water function of request SHAPE, so it is flat exactly
+until a bigger shape arrives. **A plateau of any length is not evidence of a
+settled corridor — it is evidence that no larger request has arrived yet.**
+Twenty minutes of flatness meant nothing.
