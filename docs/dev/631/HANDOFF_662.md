@@ -250,6 +250,27 @@ linear leak remains underneath it.**
   clear the condition it is detecting**, and the instance can never recover.
   1115 flips happened before the wedge; zero after.
 
+### REPRODUCED, twice, on independent boots — and the onset is load-dependent
+
+| boot | survived | wedged at | first claim | grew to |
+|---|---|---|---|---|
+| 01:54:41Z, T=260000, heavy green-run load | **8 min** | 02:01:10Z | 5 | 168854 |
+| 02:07:14Z, T=260000, light agent traffic only | **55 min**, 738 flips | 03:02:57Z | 5 | 868447 |
+
+**Both begin at exactly `claims 5` — one above `max_running_requests=4`.**
+That is the sharpest single clue in this handoff: the leak does not start
+small and drift, it starts the instant the count first crosses the ceiling,
+which is also the instant the guard starts refusing. Whatever repairs or
+drains the set is evidently gated behind the very evaluation the guard
+declines to perform.
+
+**Correction to an earlier phrasing of mine:** this is not "wedges within
+~4 minutes". Onset scales with load — minutes under a heavy soak, most of an
+hour under light agent traffic — but the outcome is the same and the
+instance never recovers. **An unmanned instance with no agent traffic can
+still look healthy for an hour**, which is exactly how it survived successor
+18's 65-minute run, so a clean long run is NOT evidence that this is absent.
+
 ### Why it fires now and not for successor 18
 
 The trigger is **queueing pressure** — `#queue-req: 6` against
@@ -380,7 +401,7 @@ pairwise).
 
 1. **Fix the wedge (§5b). Nothing else matters until this is done** — the
    green criterion requires agent traffic, and agent traffic wedges the
-   scheduler within ~4 minutes. This is the whole blocker now.
+   it (8 min heavy, 55 min light -- reproduced twice). The whole blocker.
 2. **Then re-run the green run.** No green run of mine completed: three were
    aborted by me for corridor breaches (460000, 380000, 340000) and the
    fourth, at T=260000, was killed by the wedge at 02:05Z after 8 minutes.
