@@ -440,3 +440,71 @@ exactly the gap between the measured 500000 and the 600000 acceptance target.
 
 **Do not treat this as a tuning nicety.** It is the most likely route to the
 acceptance number, and it is cheaper than spill rungs 2-3.
+
+## 11. CORRECTIONS TO SECTION 9, measured on the wedged instance
+
+I published section 9's candidate fixes without testing them. Two are wrong.
+The livelock also recurred on the RESTORED instance under ordinary agent
+traffic, which changes what section 8 is allowed to claim.
+
+### 11a. "Run rung 1 before the affordability test" is worth ZERO
+
+The full abandon line, which I had truncated when I wrote section 9:
+
+```
+This rank: staging 2246 MiB needed but only 2116 MiB is spendable
+(driver free 2460 MiB, allocator cache 680 MiB, reserve 1024 MiB kept free)
+```
+
+`2460 + 680 - 1024 = 2116`. **The affordability test already credits the
+allocator cache as reclaimable.** Reclaiming earlier moves no number. My
+"cheapest lead" was arithmetic I had not done, on a log line I had not read to
+the end — the same error successor 20 recorded as their 0b, in a new costume.
+
+### 11b. The log's OWN suggested remedy is refused in the state that needs it
+
+The abandon message says "flushing the cache or sizing the target pool up are
+both real answers". Tested against the wedged instance:
+
+```
+flush http=400          free before 2461,2056,487  ->  after 2461,2056,487
+```
+
+`/flush_cache` returns **HTTP 400** while a request is resident, and the
+abandon loop continued unbroken. So the escape hatch the message advertises is
+unavailable exactly when the condition it addresses holds.
+
+**That is the third instance of one shape in this feature**: the resident-carry
+guard (663 §2), the staging-affordability refusal (§9), and now the flush
+remedy. Each declines to act in precisely the state it exists for. A successor
+should stop treating these as separate bugs and look for the rule: **any guard
+in the flip path whose refusal does not change the condition it tested is a
+livelock waiting for a large enough resident set.** That is a design review of
+every early-return in `phase_flip_runtime`, not three patches.
+
+### 11c. Containment must be INSIDE the scheduler
+
+Because the HTTP path needs a scheduler round-trip, no external remedy is
+reachable once wedged — health, flush and the admin routes all fail together.
+Whatever fixes this has to act from inside the flip decision: retract or
+preempt the largest resident request, or drop the resident prefix cache from
+the scheduler side, and then retry. An operator cannot be the recovery path.
+
+### 11d. What section 8 may and may not claim
+
+The livelock recurred on the restored 500000 instance under ordinary qwen agent
+traffic, with a **111507-token** resident request and rank 1 short by 130 MiB.
+Agent file-reading traffic reaches those lengths by itself; no synthetic ladder
+was needed.
+
+**Section 8's corridor numbers stand as measured. The configuration does not.**
+500000 with this geometry is not shippable: it holds the corridor and then
+stops serving. Do not quote it as an achieved pool without this paragraph.
+
+### 11e. State left behind
+
+Restored at **pool 400000**, same geometry, on the reasoning that rank 1
+regains ~910 MiB (100000 tokens x 9.10 MiB/1000) against a 130 MiB shortfall.
+**That is a prediction, not a verification** — it is being watched by a health
++ abandon-signature monitor rather than declared healthy from one probe, which
+is how I got this wrong the first time.
