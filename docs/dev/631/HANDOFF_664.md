@@ -508,3 +508,67 @@ regains ~910 MiB (100000 tokens x 9.10 MiB/1000) against a 130 MiB shortfall.
 **That is a prediction, not a verification** — it is being watched by a health
 + abandon-signature monitor rather than declared healthy from one probe, which
 is how I got this wrong the first time.
+
+## 12. VERDICT AT POOL 400000: no livelock, but a corridor breach — and the two bounds are different
+
+Reproduction of the exact trigger that wedged 500000, driven deliberately
+rather than waited for.
+
+| | pool 500000 | pool 400000 |
+|---|---|---|
+| prompt tokens | 111507 | 111405 |
+| outcome | **LIVELOCK**, never recovered | **HTTP 200 in 68.5 s** |
+| `FLIP ABANDONED` | unbounded loop | **0** |
+| flips / spill fires | — | 42 / 42 |
+| corridor minimum | n/a (wedged) | **719 / 3106 / 1151 MiB** |
+| tracebacks / health failures | — | 0 / 0 |
+| free after completion | — | 1167 / 3752 / 1435 |
+
+**The prediction in §11e held**: rank 1's ~578 MiB of regained headroom cleared
+the 130 MiB staging shortfall, and the livelock did not occur.
+
+**And 400000 still fails the corridor**: rank 1 reached **719 MiB**, 305 below
+the floor. Transient for a 111405-token prefill measured at
+**2684 / 3584 / 2264 MiB** (~24 / 32 / 20 MiB per 1000 tokens, at the high end
+of §2's 19-26 range).
+
+### The relationship that actually governs the pool, stated plainly
+
+There are TWO distinct bounds and this chain has only ever discussed one:
+
+```
+  corridor bound : idle_free(pool) - transient(max_prefill) >= 1024 MiB
+  livelock bound : spendable(pool, resident_set) >= staging(resident_set)
+```
+
+Both tighten with prefill length; **the livelock bound is the harder one**,
+because breaching the corridor costs margin while breaching the staging bound
+costs the instance. 500000 crossed the second, 400000 only the first.
+
+Neither is a property of the pool alone. **A pool number without the maximum
+admitted prefill length beside it is meaningless**, which retrospectively
+condemns every bare pool figure in this corpus including my own §8.
+
+Solving the corridor bound at this geometry for a 111k prefill: rank 1 needs
+~305 MiB more, i.e. ~33500 fewer tokens, giving **pool ~366000 with unbounded
+111k prefills**. Bound the prefill lower and the pool rises steeply — at the
+43k prefill of §8's window the same cards carry 500000 comfortably. **The
+honest deliverable is that curve, not a single number.**
+
+### What this makes the next move
+
+`--max-prefill-tokens` is already 16384 and `chunked_prefill_size` 2048, yet
+the transient still scales with TOTAL sequence length, not chunk size. That is
+the anomaly worth chasing: a chunked prefill should not need memory
+proportional to the whole sequence. Find that term and both bounds move at
+once. It is a better lever than any further geometry search, and it was
+invisible until the transient was measured against length.
+
+### Boot method, corrected per operator direction
+
+All five of my boots used a hand-constructed environment.
+`scripts/seam_scaling_reboot.py` replays the CAPTURED cmdline+env with exactly
+one variable moved, and it existed the whole time. Given `15,10,7` silently
+became `16/9/7`, a second variable cannot be excluded in any of my boots.
+**Every capacity number in sections 4, 8 and 12 is provisional until
+reproduced through the replay tool.**
