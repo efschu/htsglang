@@ -345,3 +345,60 @@ constraint at the end of my session, and it is the right constraint.
    the discriminator is a chunk EXCEEDING `chunked_prefill_size` (a static
    run already shows ~19 distinct sizes), and enabling the flag grows
    `max_prefill_buffer_tokens` 2048 -> 16384, which lands on the corridor.
+
+## 13. THE POOL LEVER IS EXHAUSTED — found at the very end, and it redirects the remedy
+
+Rebooting 550000 -> 470000 as a clean single-variable step, the KV pool
+really did shrink: `max_total_num_tokens=470000` applied, and per-rank
+`K size` came back 3.14 / 2.24 / 1.79 GB in exactly the 14:10:8 ratio,
+about 750 MiB less on rank1 than at 550000.
+
+**Idle free on rank1 moved 2329 -> 2303. Twenty-six MiB.** The model
+predicted 824.
+
+So below some point, lowering `--max-total-tokens` does not buy corridor
+headroom at all: the freed KV bytes are re-absorbed inside the SAME
+per-rank static budget. This is HANDOFF_664 §6's audited finding arriving
+as a measurement — `--rank-gpu-memory-mib` is ADVISORY (it becomes
+`mem_fraction_static`, consumed once in `_profile_available_bytes`),
+`torch.cuda.set_per_process_memory_fraction` is called nowhere in the tree,
+and nothing stops the allocator expanding into the corridor.
+
+### What this changes
+
+* **§4's capacity curve is valid as a fit over 400000-600000 and must not
+  be extrapolated below it.** Three points sat on a line and the fourth,
+  outside the fitted range, is 850 MiB off. A two-point slope through a
+  regime boundary is not a model.
+* **The corridor lever is `--rank-gpu-memory-mib` on the binding rank, not
+  the pool.** To give rank1 ~850 MiB of corridor the step is
+  `--set-arg rank-gpu-memory-mib 31800,16550,17450` — a single-variable
+  step through the replay tool. The pool may then re-size itself downward,
+  and THAT is the honest trade between pool and corridor. This chain has
+  never made that trade explicitly; it has only ever moved the pool and
+  hoped.
+* It retro-explains why successor 21's four-boot geometry search moved the
+  bottleneck between cards without ever lifting the minimum much: the
+  budgets stayed put, so the floor did too.
+* It promotes 664 §6's "single highest-value unbuilt item" — a per-rank
+  `set_per_process_memory_fraction` derived from `RANK_MIB` — from a
+  tidiness argument to the actual mechanism. With it the corridor becomes
+  an enforced invariant and the allocator reclaims instead of expanding.
+
+### The falsifier, left running
+
+The green run at 470000 was left running deliberately as the test: if it
+breaches at about the same depth as 550000 did (rank1 ~539), the pool lever
+is confirmed dead over this range and the next successor should go straight
+to the budget lever. Read it with:
+
+```
+/spinning/htsglang-gpu/.venv/bin/python scripts/s22_green_verdict.py \
+    /spinning/evidence-631/s22/green2/corridor.csv
+```
+
+**Revised order for §12, in light of this:** the budget lever
+(`--rank-gpu-memory-mib` on rank1, then the enforced
+`set_per_process_memory_fraction`) comes BEFORE spill rung 2. It is a flag
+change plus a small patch, against rung 2's VA-stable carrier work, and it
+addresses the term that is actually binding.
