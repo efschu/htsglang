@@ -447,3 +447,43 @@ correction (`correction_gb`) to `rest_memory` immediately before
 freed later" credit belongs, additive, and off by default so the default
 path stays byte-identical. If a future asset genuinely frees worst-case
 bytes, that is where the credit goes; no re-architecting required.
+
+## 9. GREEN RUN VERDICT: PASSED, 61 minutes, T=190000
+
+Run 05:05:02Z -> 06:06Z, pool 190000, `RANK_MIB=31800,17400,17450`,
+CTX 393216, purity strict, POLICY auto. Load: bs=4 soak for the first 50 min
+then real qwen agent traffic only, all through router 30099.
+
+| axis | result |
+|---|---|
+| both layouts visited | 393 `pp_to_tp` / 390 `tp_to_pp`, **783 flips** |
+| prefill only in PP | **12453 prefill batches, 0 with a CUDA graph** |
+| decode only in TP | **852 decode batches, 852 carrying `accept len`** |
+| graph coverage (decode) | 846 / 852 = **99.3 %** |
+| purity gate firing | 130 refusals of prefill-in-TP |
+| accept length | 2.52 |
+| resident-set corruption | **0** |
+| repairs performed | **0** |
+| self-merge refusals | **0** |
+| carried resident, values seen | 1, 2, 3, 4 — ceiling is 4 |
+| tracebacks / crashes | **0 / 0** |
+| health | 200 throughout |
+| agent requests via router 30099 | **213** |
+| pool | **190000** |
+| corridor time-series MIN | **1369 / 1646 / 1037** over **27671** samples @100 ms, floor 1024 |
+
+**PASSED on every axis, corridor included** — 1037 MiB is above the 1024
+floor, though by only 13 MiB, and that minimum was set while the over-driven
+soak was draining rather than under the acceptance load.
+
+**Read the two instruments correctly.** `corrupt=0` alone would prove
+nothing: that alarm is silent below `max_running_requests`. The load-bearing
+figure is the carry count, which reports the resident set's ACTUAL size at
+every cutover and never left 1-4 across 783 flips. Under the pre-fix build
+the same instrument walked to 868447.
+
+**`selfmerge=0` is a second-order confirmation.** Successor 19's build fired
+`SELF-MERGE REFUSED` 132708 times in a single wedge window; this run fired it
+zero times. The stale-`last_mbs` entry was also what kept re-creating the
+aliased state that guard existed to catch, so removing the leak removed its
+cause too.
