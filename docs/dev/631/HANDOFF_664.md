@@ -618,3 +618,79 @@ whole curve rather than one point on it.
 
 Caveat, and it is the same one as everywhere: the livelock bound is separate
 and harder, and this table addresses only the corridor bound.
+
+## 13. SECTION 12 IS WRONG ABOUT THE CAUSE. The transient is the FLIP MOVER, not prefill.
+
+Traced in source after §12 was written. **§12's numbers stand; §12a's model and
+its "two independent bounds" framing do not.**
+
+**No allocation on the prefill forward path scales with total sequence length.**
+Every candidate was checked and ruled out with code:
+
+| candidate | verdict |
+|---|---|
+| flashinfer float workspace | fixed 384 MiB env constant; Qwen3_5 excluded from the 512 MiB bump |
+| flashinfer `kv_indices` | scales, `flashinfer_backend.py:7325` — **0.43 MiB** at 111405 tokens |
+| `req_to_token` / index pools | boot-time, `max_running_requests=4` |
+| chunked prefix cache | unreachable: `model_runner.py:805-813` forces it off for non-MLA; Qwen3_5 is MHA |
+| fp8 KV dequantisation | does not exist on this path — `get_kv_buffer` is a zero-copy `.view()` |
+| Mamba/GDN scratch | chunk-scaled, freed per layer; caches boot-time |
+| PP proxy buffers | `[chunk, hidden]` = 20 MiB, constant |
+| logits / lm_head | `[bs, hidden]`, never `[seq_len, vocab]` |
+
+**The dominant term is the phase-flip KV mover.** `build_flip_live_slots_fn`
+(`phase_flip_runtime.py:471-534`) defines the live set as radix values UNION
+every resident request's `req_to_token[req.req_pool_idx, :req.seqlen]` — so it
+grows chunk-by-chunk through a chunked prefill and peaks at the **whole**
+prompt. Three staging allocations are live at once, each `rows x 2048 B x
+layers`:
+
+1. **outgoing pack, resident 2-3x** — `phase_flip_runtime.py:2876-2883`: `parts`
+   is still referenced when `flat = torch.cat(parts)` exists, and `flat` is
+   still referenced while the checksum-appended copy is built;
+2. **receive buffers per peer** — `kv_reshard.py:634-637`;
+3. **local retained leg** — `phase_flip_runtime.py:2947-2950`, materialised in
+   full before the first write to preserve reads-before-writes.
+
+Modelled totals at 111405 tokens: **3250 / 2522 / 2202 MiB** against measured
+2684 / 3584 / 2264. Magnitude and the ~20-30 MiB/1000-token slope match; rank 2
+is exact. UNDETERMINED: the per-rank ordering is inverted (rank 1 measures 32
+against a predicted 22.6). Suspects: the boot script sets
+`SGLANG_UNEVEN_TOKEN_VECTOR` while `phase_flip_tp_vector` stays `30,17,17`, or
+allocator fragmentation differing between the 5090 and the 3080s.
+
+Geometry correction while here: the model has **64 layers**, `pp-stage-ratio
+14,10,8` becomes `pp-layer-ratio 28,20,16`, with full-attention layers
+**[7,5,4] of 16** and `row_nbytes = 2048 B` per token per full-attn layer. My
+§4 "727 MiB/layer over 32 layers" was an empirical fit to the wrong layer
+count; it still predicts arena sizes, but do not read its per-layer constant as
+physical.
+
+### 13a. A real accounting hole in the affordability gate
+
+`_staging_bytes` (`phase_flip_runtime.py:2686-2719`) counts **`2 x outgoing +
+1 x incoming` and omits the local retained leg entirely**. The gate at `:2723`
+therefore under-reserves by **231-714 MiB per rank**. That is a defect
+independent of the livelock and should be fixed first, because every
+affordability decision in this feature — including the refusals that produced
+the livelock — is computed from an incomplete formula.
+
+### 13b. What this changes about the plan
+
+* **§12a's table is void as a causal model.** It fits the data because the
+  live set tracks prompt length, but the knob it implies
+  (`--max-prefill-tokens`) cannot bound the term: the flip's live set is
+  `req.seqlen`, not the chunk. That is why 16384 did not already buy ~740000.
+* **The corridor and livelock bounds are ONE bound**, on the same buffers.
+* Highest leverage, in order:
+  1. include the local leg in `_staging_bytes` — correctness, small;
+  2. **stream the outgoing pack per-peer-per-layer instead of `cat`-ing every
+     layer** — removes the 2-3x and drops rank 0 by ~800 MiB at 111k tokens.
+     This is the single biggest VRAM win identified in this whole handoff and
+     it costs no capacity, no geometry change and no spill;
+  3. refuse to ARM a flip while a request with `seqlen > threshold` is
+     resident — bounds both curves with one knob and would have prevented the
+     livelock outright.
+* **The spill ladder, the geometry search and the surplus-VRAM item are all
+  downstream of this.** A successor should do (2) before spending another boot
+  on layer splits.
