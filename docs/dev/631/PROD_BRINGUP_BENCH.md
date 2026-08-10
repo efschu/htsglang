@@ -2023,3 +2023,55 @@ the mark is a high-water function of request SHAPE, so it is flat exactly
 until a bigger shape arrives. **A plateau of any length is not evidence of a
 settled corridor — it is evidence that no larger request has arrived yet.**
 Twenty minutes of flatness meant nothing.
+
+## SUCCESSOR 20 / 3 — the T=190000 green run, in two segments
+
+Boot 05:02Z, `MAX_TOTAL_TOKENS=190000`, `RANK_MIB=31800,17400,17450`
+unchanged, CTX 393216, purity strict, POLICY auto, HEAD 8764b96589+.
+
+### Segment A, 05:05:02Z -> 05:55:32Z (50.5 min): 4 soak streams + 4 agents
+
+| axis | value |
+|---|---|
+| flips | 648 |
+| carried resident, values seen | 1, 2, 3, 4 (ceiling 4) |
+| corruption reports / repairs | **0 / 0** |
+| tracebacks | 0 |
+| health | 200 throughout |
+| agent requests (`POST /v1/messages`) | 179 |
+| soak requests | 79, all HTTP 200 |
+| corridor time-series MIN | **1369 / 1646 / 1037** over 22167 samples |
+
+**No breach — but 13 MiB of margin on gpu2, and still stepping down.** The
+leak axis is spotless over 648 flips; the corridor is the whole story.
+
+**The load was over-driven and I should name that plainly.** The acceptance
+point is bs=4. Four soak streams PLUS four live agents is roughly twice
+that, and it is the same over-drive I had already identified and corrected
+once. Real agent traffic is the user's criterion; the synthetic soak is my
+addition on top of it. So segment A measures "190000 at ~2x design point",
+not the acceptance load.
+
+### Segment B, from 05:55:32Z: agents only, i.e. the ACCEPTANCE load
+
+Soak withdrawn, the four qwen agents left running, so the load is now the
+one the green criterion actually names. This segment answers the question
+that matters: **does the corridor hold at 190000 under real agent traffic?**
+
+### The pattern across three pools, which is the useful part
+
+| pool | load | time to trouble | corridor min |
+|---|---|---|---|
+| 260000 | 8 streams (2x) | ~12 min, no plateau | ended at 1629, falling |
+| 260000 | 4 streams + agents | **BREACH at ~18 min** | 1325/1382/**1007** |
+| 190000 | 4 streams + agents | 50 min, no breach | 1369/1646/**1037** |
+
+Lowering the pool bought time — 18 minutes to 50 — but did not change the
+SHAPE: the mark keeps stepping down as agent context grows, and each pool
+merely sets how many steps fit before the floor. **That is evidence the pool
+is the wrong knob for this failure.** The steps come from request shape, and
+what converts a shape into resident bytes is the per-rank budget, not the
+pool ceiling — which is exactly where SUCCESSOR 20 / 2 found the two 3080s
+overshooting `RANK_MIB` by 867 and 1289 MiB while the 5090 sits 2521 MiB
+under. **The untried low-`RANK_MIB` x low-pool cell is the indicated next
+experiment, and this table is the argument for it.**
