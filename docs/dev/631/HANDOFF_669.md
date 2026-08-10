@@ -241,6 +241,86 @@ number survived to be inherited.
 
 ---
 
+## 3b. METAL: THE 430000 STEP UNDER THE 2.1b SEAM
+
+Boot 16:47Z, pool 430000, restore-first W=16, 12-minute step.
+`s25_step_verdict.py`: **PASS**.
+
+| | |
+|---|---|
+| corridor | 0 breaches; min free 2763 / 5506 / 2829 MiB |
+| flips | 72, 0 abandoned, `seam waves=16` |
+| staging reserved | min 420.1, max 1601.0, mean 921.6 MiB |
+| occupancy | 131455 slots = **30.6%** |
+
+The verdict tool refuses this as capacity evidence on occupancy grounds
+and it is right to. But its own anti-wedge extrapolation, computed from
+the binding card's baseline excluding staging (2763 + 1601 = 4364 MiB),
+gives **502,863** as the largest pool whose full-occupancy flip still
+clears 1024 MiB.
+
+**So two independent methods now bracket the 2.1b ceiling:**
+
+| method | ceiling |
+|---|---|
+| calibrated staging model (section 3) | 473,157 |
+| verdict-tool extrapolation from the metal step | 502,863 |
+| confirmed old seam, four methods | ~435,000 |
+| user floor | 600,000 |
+
+They disagree by 6% and agree on the thing that matters: 2.1b is a real
+gain of roughly 40–70k tokens, and it does not reach 600,000.
+
+## 3c. THE OCCUPANCY BUG WAS IN THE LOAD, NOT THE POOL
+
+Worth its own section because it has cost this chain four capacity steps.
+Every one has been refused for the same reason — 26%, 38.1%, 30.6% — and
+each successor has treated it as a load-tuning problem to be nudged.
+
+It is not tunable, it is structural. `soak_631_mixed_load.py` drives
+occupancy from its PREFILL worker, whose requests retire almost as fast
+as they arrive, while its DECODE workers — the ones whose docstring says
+they are "what must be RESIDENT across a cutover" — carry a
+one-sentence prompt and `max_tokens=512`. A request that has retired
+cannot hold a slot, so no cadence on the prefill side can raise the
+resident set. The ceiling of that recipe is a few thousand resident slots
+plus whatever prefill happens to be in flight.
+
+`scripts/s26_fill_load.py` holds K concurrent streams of long UNIQUE
+context (unique high-entropy prefix, or `--enable-prefix-caching` serves
+the filler from cache and the prefill collapses — the same trap
+`soak_631_mixed_load` documents). Occupancy becomes `K * context_tokens`,
+chosen rather than hoped for. A first probe against the live 430000 boot
+took occupancy from 30.6% to 61% within two minutes at
+`--context-tokens 100000`; note the char-to-token estimate runs light,
+about 66k actual tokens per 100k requested, so scale the request up.
+
+**Any future capacity claim should use this driver.** With
+`max_running_requests=4` on this rig, four streams of ~110k tokens hold
+~440k slots.
+
+## 3d. SECTION 2.1 STEP A IS WRITTEN (ab3f3e6460), SHIPPED DARK
+
+Since the transient is what blocks 600,000, I wrote the change that
+attacks it rather than leaving it as a note. `_stream_wave` restores,
+writes and releases ONE ROW BLOCK at a time, so the commit unit stops
+being a layer and the term shrinks roughly as `1/blocks`.
+
+* Drives the span substrate that was already built and tested.
+* The enabling trick: a contiguous pool row RANGE selects scattered
+  writes cheaply, because the plan enumerates slots ascending, so the
+  rows inside a range are a contiguous SLICE and the payload slice comes
+  along at the same offsets. Asserted, not assumed — an unsorted row
+  tensor would pair the wrong payload with the wrong rows.
+* The EXCHANGE is deliberately not blocked: that needs the global round
+  count, and a rank-local one deadlocks the group while looking like a
+  hang. This change touches only local backing and local writes, so no
+  rank can diverge.
+* Byte identity is structural (one job list, one order) and pinned by
+  comparing the same flip at 1 and 4 blocks tensor by tensor.
+* `SGLANG_FLIP_SEAM_ROW_BLOCKS` **defaults to 1**. It is unmeasured on
+  metal; do not enable it in an acceptance run before an A/B.
+
 ## 4. OPEN RISKS AND TRAPS
 
 * **`_pools_alias()` is rank-local**, and so is `SGLANG_FLIP_SEAM_WAVES`.
