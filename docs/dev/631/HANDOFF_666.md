@@ -166,13 +166,39 @@ place into room for 2. That is why `15,9,8` overshot rank0 to 64 MiB
 free, and it is a property of the LAYER/TOKEN COUPLING, not of a quantum.
 
 **The unexploited knob is therefore the TOKEN VECTOR, not the layer
-split.** Layers and tokens are independent
-(`SGLANG_UNEVEN_TOKEN_VECTOR` vs `--pp-stage-ratio`/`--pp-layer-ratio`),
-and they are currently pinned proportional to each other (14,10,8 and
-28,20,16). Decoupling them — more layers AND fewer tokens on the 5090 —
-is the move that can level the corridor without the 308 MiB/layer tax.
-**Nobody in this chain has tried it.** That is the highest-value
-unexplored lever and it needs no new code.
+split.** Audited, and the result is stronger than "it is possible":
+**the two knobs are ALREADY fully decoupled, and the live configuration
+is BACKWARDS relative to the design intent.**
+
+* No code ties them. A grep for any cross-reference between
+  `pp_layer_ratio`/`pp_stage_ratio` and
+  `SGLANG_UNEVEN_TOKEN_VECTOR`/`cp_token_ratio` returns nothing. They are
+  validated independently — the layer ratio against `num_hidden_layers`
+  (`server_args.py:14679-14700`), the token vector as positive integers of
+  length `dcp_size` (`distributed/utils.py:540-551`).
+* Different axes: the layer ratio places WEIGHT LAYERS on PP stages; the
+  token vector sets each rank's KV TOKEN-SLOT share via the owner rule.
+* **`parse_flip_token_vector()` (`phase_flip_boot.py:84-113`) documents why
+  they SHOULD differ: weight shards follow COMPUTE (the 5090 takes the
+  biggest share), token slots follow REMAINING MEMORY (the 5090 takes the
+  SMALLEST token share precisely because its weight shard is largest).**
+  The code expects divergence and logs it (`phase_flip_boot.py:465-474`).
+* The live config sets the token vector EQUAL to the stage ratio
+  (`14,10,8`), giving the 5090 the largest share on BOTH axes. **That is
+  the direct cause of the ~698 vs ~390 MiB/layer asymmetry above.**
+* It drifted there by default: `SGLANG_UNEVEN_TOKEN_VECTOR` overrides the
+  flip vector when set and DEFAULTS to it when unset
+  (`phase_flip_boot.py:118-142`). It is GCD-reduced, so `14,10,8` is
+  effectively `[7,5,4]`.
+* Why the denominators differ (32 vs the flip vector's 64): the flip vector
+  doubles as the weight-shard plan (`rank_tp_ratio`), so its sum must divide
+  the sharded dimensions — `hidden_size 5120 % 64 == 0`
+  (`distributed/utils.py:869-878`). The token vector carries no such
+  constraint; only its reduced ratio matters.
+
+**So the move is a single ENV change, no code: give the 5090 MORE layers and
+FEWER tokens.** It attacks the 308 MiB/layer tax at its source, it is what
+the module was designed for, and nobody in this chain has tried it.
 
 ---
 
