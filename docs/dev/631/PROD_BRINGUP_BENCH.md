@@ -3069,3 +3069,93 @@ Extract: `/spinning/evidence-631/s25/acceptance/extract.txt`, reproduced verbati
 
 ===== ACCEPTANCE: GREEN
 ```
+
+## 2i. Section 2.1b on metal, and the ceiling priced honestly (successor 26, 2026-08-10)
+
+The 2.1b seam — `reclaim -> restore -> release`, wave cap lifted from the
+smallest PP stage (4) to one layer per wave (16), wave order chosen per
+direction so the transient lands on the largest-share rank — implemented
+in `0ee52e7dac` / `f01c17e03a` and measured here.
+
+### Step row: pool 430000, restore-first W=16, 12 min
+
+| | |
+|---|---|
+| boot | 16:47Z, `--set-env SGLANG_FLIP_SEAM_RESTORE_FIRST 1`, `SEAM_WAVES 16` |
+| corridor | **0 breaches**; min free 2763 / 5506 / 2829 MiB |
+| flips | 72, **0 abandoned**, log confirms `seam waves=16` |
+| staging reserved | 420.1 min / **1601.0 max** / 921.6 mean MiB |
+| occupancy | 131455 = 30.6% — NOT a capacity result, see below |
+| flip latency | 1214–1859 ms, against 1336–2074 ms at W=4 |
+| verdict | **PASS** |
+
+Flip latency is the row worth keeping: quadrupling the wave count
+quadruples the exchange round trips inside the no-return region and cost
+nothing measurable. The per-wave fixed cost is not what dominates a flip.
+
+### THE CEILING: 601,233 WAS WRONG, AND HERE IS THE MEASUREMENT
+
+HANDOFF_668 priced 2.1b at 601,233 and treated the >=600000 floor as
+reachable by this change. It is not.
+
+`staging reserved` on a flip DONE line IS `_staging_bytes()`, a pure
+function of the plan, so designs can be compared as exact arithmetic. A
+model of the rig geometry (map `[7,5,4]` over 16 full-attention ordinals,
+vector `(14,10,8)`) with ONE free parameter — the row width — calibrated
+against a measured point (1132.0 MiB at 163626 live slots) returns
+**2036.4 B/row**, against 2048 B/cell computed independently from the
+DONE lines' cell counts.
+
+It was then checked against a number it was not fitted to, in a different
+accounting regime and at the opposite end of the occupancy range:
+
+| | |
+|---|---|
+| model prediction, pool 430000, W=16, 90 live slots | **1305 MiB** |
+| measured on metal, 16:50Z boot | **1312.5 MiB** |
+| error | **0.6%** |
+
+That single measurement settles the disagreement without any modelling in
+between. **The seam's pool-proportional constant is ~1305 MiB, not the
+60 MiB the 601,233 estimate assumed** — and because it does not depend on
+the live set, it is measurable at idle by anyone who wants to re-check it.
+
+Two independent methods now bracket the 2.1b ceiling:
+
+| method | ceiling |
+|---|---|
+| confirmed old release-first seam (four methods, successor 25) | ~435,000 |
+| calibrated staging model | 473,157 |
+| `s25_step_verdict.py` extrapolation from the 430000 metal step | 502,863 |
+| **user floor (spec item 6)** | **600,000** |
+
+2.1b is worth roughly 40–70k tokens. It does not reach the floor.
+
+### WHY, AND WHAT DOES REACH IT
+
+At 600,000 the binding card's KV alone is 5826 MiB of a 6579 MiB budget,
+leaving 753 MiB for staging. 2.1b needs 2508 MiB:
+
+    payload leg          687 MiB
+    backing transient   1821 MiB
+
+The payload would nearly fit on its own. **The backing transient is what
+blocks 600,000**, and no wave tuning removes it — the order can only move
+that term between cards, never shrink it. It is one LAYER span because a
+layer is the commit unit, and it is the commit unit only because
+`restore_backing` takes a layer list. Commit in ROW BLOCKS and it becomes
+one block span: a knob, not a geometry constant. That is section 2.1,
+written as `_stream_wave` in `ab3f3e6460` and shipped dark behind
+`SGLANG_FLIP_SEAM_ROW_BLOCKS` (default 1) pending its own A/B.
+
+### A DEFECT IN THE MEASUREMENT RECIPE, NOT THE POOL
+
+Four capacity steps in this chain have been refused for occupancy — 26%,
+38.1%, 30.6% — and each successor treated it as load tuning.
+`soak_631_mixed_load.py` drives occupancy from its PREFILL worker, whose
+requests retire as fast as they arrive, while its DECODE workers — whose
+docstring calls them "what must be RESIDENT across a cutover" — carry a
+one-sentence prompt and `max_tokens=512`. A retired request cannot hold a
+slot, so no prefill cadence can raise the resident set.
+`scripts/s26_fill_load.py` holds K streams of long unique context, making
+occupancy `K * context_tokens`. Any future capacity claim should use it.
