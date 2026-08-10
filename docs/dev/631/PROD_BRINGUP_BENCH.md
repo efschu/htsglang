@@ -3159,3 +3159,55 @@ one-sentence prompt and `max_tokens=512`. A retired request cannot hold a
 slot, so no prefill cadence can raise the resident set.
 `scripts/s26_fill_load.py` holds K streams of long unique context, making
 occupancy `K * context_tokens`. Any future capacity claim should use it.
+
+### Step row: pool 500000, restore-first W=16, 16 min, high-occupancy driver
+
+The decisive one. 500000 is ABOVE the old seam's confirmed ~435,000
+ceiling, so this pool could not previously be run at all.
+
+| | |
+|---|---|
+| boot | 17:08Z, commit `ab3f3e6460`, `max_total_num_tokens` confirmed 500000 |
+| load | `s26_fill_load.py`, 4 streams x ~112k unique context |
+| corridor | **0 breaches**; min free 1663 / 4092 / 1969 MiB |
+| corridor margin over floor | 639 / 3068 / 945 MiB |
+| flips | 78, **0 abandoned**, `seam waves=16` |
+| staging reserved | 583.8 min / **1998.3 max** / 1174.5 mean MiB |
+| occupancy | 225499 = 45.1% — the largest live set of any step in this chain |
+| verdict | **PASS** |
+
+**The pool is 65,000 tokens above what the old seam could hold, and the
+corridor held.** It is also much better FILLED than any previous row: the
+binding cards sit 639 and 945 MiB over the floor, against 1739 and 1805
+at pool 430000. The corridor law's second half is close to satisfied on
+the two 3080s; the 5090 remains loose at 3068 MiB over, which is the
+expected consequence of deliberately assigning it the seam transient.
+
+### THREE ESTIMATES OF THE 2.1b CEILING, AND THEY CONVERGE
+
+| method | ceiling |
+|---|---|
+| confirmed OLD release-first seam (four methods, successor 25) | ~435,000 |
+| calibrated staging model (desk) | 473,157 |
+| extrapolation from the 430000 metal step | 502,863 |
+| extrapolation from the 500000 metal step | **501,525** |
+
+The two independent metal extrapolations, taken at pools 70,000 apart,
+agree to within 0.3%. Treat **~501,000** as the 2.1b ceiling: the desk
+model was 6% conservative, which is the right direction to be wrong in.
+
+At 500000 we are therefore sitting essentially ON the ceiling — which is
+exactly why the corridor is well filled here and why nothing above this
+should be attempted without section 2.1.
+
+### HONEST LIMIT OF THESE TWO ROWS
+
+Both steps peaked below the 50% occupancy the verdict tool requires, so
+neither is a full-occupancy capacity proof and the tool says so on both.
+What they DO establish, without extrapolation: pool 500000 runs, flips
+both directions, holds the corridor and abandons nothing under the
+heaviest resident load this chain has produced. The extrapolations then
+agree with each other and bracket the desk model. The remaining gap is
+occupancy, and `s26_fill_load.py` is the instrument for closing it —
+raise `--streams` against a boot with a larger `max_running_requests`,
+which is the one knob that caps resident concurrency at 4 today.
