@@ -160,7 +160,34 @@ minutes on the pre-fix build) plus real qwen agent traffic through router
 
 **The decisive instrument is the carry count, not the absence of an alarm.**
 
-<!-- FINAL NUMBERS: filled in at end of window -->
+Judged evidence at 06:00Z, 55 minutes into the T=190000 run:
+
+| axis | value |
+|---|---|
+| both layouts visited | **357 pp_to_tp and 357 tp_to_pp** re-dispatches, exactly balanced |
+| flips (cutovers complete) | 711 |
+| prefill only in PP | **11344 prefill batches, 0 with a CUDA graph** — the PP stack is eager by construction, so a graphed prefill would mean TP |
+| decode only in TP | **768 decode batches, 768 carrying `accept len`** — the PP phase has no drafter, so `accept len` can only be TP |
+| purity gate active | 119 refusals of `purity: prefill cannot run in tp` |
+| graph coverage (decode) | 762 / 768 = **99.2 %** |
+| accept length | 2.15 |
+| resident-set corruption | **0** |
+| repairs performed | **0** |
+| tracebacks / crashes | **0** |
+| health | 200 throughout |
+| agent requests via router 30099 | 197 and rising |
+| pool | 190000 |
+| corridor time-series MIN | 1369 / 1646 / **1037** over 24205 samples (floor 1024) |
+
+**The leak axis is clean across 711 flips under sustained queueing
+pressure.** That is the blocker, and it is closed.
+
+**The corridor is the open axis.** 1037 MiB leaves 13 MiB of margin, and it
+was reached while the over-driven soak was draining; since the load became
+agents-only it has been stable at ~1165. The number is therefore a floor on
+a load that was heavier than the acceptance point, not a verdict on the
+acceptance point itself.
+
 
 ## 4. PURITY, measured from the log's own layout discriminators
 
