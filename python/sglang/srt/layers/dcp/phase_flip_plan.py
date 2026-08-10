@@ -81,6 +81,62 @@ def validate_layer_map(
     return norm
 
 
+def default_wave_count(layer_map: Sequence[Sequence[int]]) -> int:
+    """The most waves the seam can be split into with every rank paying in.
+
+    A wave is the unit at which the flip releases the source layout's
+    backing and restores the destination's, so the two must NET OUT inside
+    each wave -- see :func:`layer_waves`. That holds only while every rank
+    contributes at least one of its OWN layers per wave, so the ceiling is
+    the SMALLEST stage's layer count (16 on this rig's [28, 20, 16] split).
+    """
+    sizes = [len(stage) for stage in layer_map if len(stage)]
+    return max(1, min(sizes)) if sizes else 1
+
+
+def layer_waves(
+    layer_map: Sequence[Sequence[int]], n_waves: int
+) -> Tuple[Tuple[int, ...], ...]:
+    """Split the global layer ordinals into ``n_waves`` balanced waves.
+
+    THE BALANCE IS THE WHOLE POINT, and it is a memory argument rather
+    than a load-balancing one. The flip's seam swaps physical backing
+    between the two layouts: the source layout's pages for a layer may be
+    released once that layer has been read, and the destination layout's
+    pages for a layer must be committed before it is written. Doing that
+    ONCE for the whole pool forces every byte that crosses the seam to be
+    staged at the same instant, which is the unbounded term behind the
+    one-request livelock (#631, HANDOFF_666): staging grew with the
+    resident live set until no request past a certain length could ever
+    flip, and under strict purity that wedges rather than degrades.
+
+    Splitting the seam into waves bounds the staged bytes to ONE wave's
+    share -- but only if a wave's releases pay for its commits. Rank ``r``
+    releases the wave's layers that IT owns in the PP layout (``L_r/W`` of
+    them, each spanning the full PP pool) and commits the wave's layers in
+    the TP layout (``64/W`` of them, each spanning its ``w_r`` share of the
+    rows). Those are equal exactly when each rank contributes a
+    PROPORTIONAL slice of its own block to every wave, which is what this
+    split produces: each stage's ascending ordinals are cut into ``n_waves``
+    contiguous groups and group ``j`` of every stage forms wave ``j``.
+
+    Integer floors leave at most one layer of drift between the two sides
+    at a wave boundary, so the peak carries ONE layer-span of slack. That
+    term is priced explicitly in ``_staging_bytes`` -- it is a constant of
+    the pool geometry and does not grow with the request.
+    """
+    n_waves = max(1, int(n_waves))
+    waves: list[list[int]] = [[] for _ in range(n_waves)]
+    for stage_layers in layer_map:
+        stage = list(stage_layers)
+        total = len(stage)
+        for j in range(n_waves):
+            lo = (j * total) // n_waves
+            hi = ((j + 1) * total) // n_waves
+            waves[j].extend(stage[lo:hi])
+    return tuple(tuple(sorted(w)) for w in waves)
+
+
 @dataclass
 class PhaseFlipTransition:
     """One rank's share of a PP<->TP layout flip.

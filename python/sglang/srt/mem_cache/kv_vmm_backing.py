@@ -5,7 +5,7 @@ import logging
 import os
 import tempfile
 from math import prod
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 import torch.utils.cpp_extension
@@ -652,46 +652,106 @@ class KvVmmBufferOwner:
                 self._arena.commit_range(spec.offset, want)
                 spec.backed_to = want
 
+    def _back_subset(self, pairs: Sequence[Tuple[int, int]]) -> None:
+        """``_back_spans`` for an explicit ``(buffer index, span)`` list."""
+        if self._arena is None:
+            raise RuntimeError("backing after close / before construction")
+        for idx, span in pairs:
+            self._check_span(self._specs[idx], span)
+        gran = self._arena.granularity
+        for idx, span in pairs:
+            spec = self._specs[idx]
+            want = align_up(int(span), gran)
+            if want > spec.backed_to:
+                self._arena.commit_range(spec.offset, want)
+                spec.backed_to = want
+
     def ensure_prefix(self, num_tokens: int) -> None:
         """Ensure the first ``num_tokens`` slots of every buffer are physically backed."""
         self._back_spans(
             [s.desc.prefix_span_bytes(num_tokens, self.page_size) for s in self._specs]
         )
 
-    def finalize(self, final_num_tokens: int) -> None:
-        """Back each buffer's final advertised span; set the final serving capacity."""
+    def _check_final(self, final_num_tokens: int) -> int:
         final = int(final_num_tokens)
         if not (self.page_size <= final <= self._reserved_num_tokens):
             raise ValueError(
                 f"final_num_tokens={final} must satisfy page_size="
                 f"{self.page_size} <= final <= reserved={self._reserved_num_tokens}"
             )
-        self._back_spans(
-            [s.desc.final_span_bytes(final, self.page_size) for s in self._specs]
-        )
-        self._final_num_tokens = final
+        return final
 
-    def shrink(self, final_num_tokens: int) -> int:
+    def _resolve_indices(self, buffer_indices: Optional[Sequence[int]]) -> List[int]:
+        """Validate a buffer subset, or return every index when None.
+
+        An out-of-range index is a caller bug and is raised BEFORE anything
+        commits or decommits: the #631 seam calls these per wave from
+        inside the flip's no-return region, where a half-applied subset
+        would leave one layout's layers backed and the other's not.
+        """
+        if buffer_indices is None:
+            return list(range(len(self._specs)))
+        out: List[int] = []
+        for i in buffer_indices:
+            idx = int(i)
+            if not (0 <= idx < len(self._specs)):
+                raise ValueError(
+                    f"buffer index {idx} outside [0, {len(self._specs)}) -- "
+                    f"the owner holds {len(self._specs)} buffers"
+                )
+            out.append(idx)
+        return out
+
+    def finalize(
+        self,
+        final_num_tokens: int,
+        buffer_indices: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Back each buffer's final advertised span; set the final serving capacity.
+
+        ``buffer_indices`` restricts the commit to a SUBSET of the buffers
+        (#631 waved seam): the phase flip commits the destination layout
+        one layer wave at a time so that only one wave's worth of pages is
+        ever held on top of the resting layout. None = every buffer, which
+        is the whole-pool behaviour this call has always had.
+        """
+        final = self._check_final(final_num_tokens)
+        indices = self._resolve_indices(buffer_indices)
+        self._back_subset(
+            [
+                (i, self._specs[i].desc.final_span_bytes(final, self.page_size))
+                for i in indices
+            ]
+        )
+        if buffer_indices is None:
+            self._final_num_tokens = final
+
+    def shrink(
+        self,
+        final_num_tokens: int,
+        buffer_indices: Optional[Sequence[int]] = None,
+    ) -> int:
         """#330 dial: decommit every buffer's backing above the span of
         ``final_num_tokens`` and return the bytes actually released to the
         driver. Release is extent-granular (see ``decommit_range``), so the
         remaining backing may exceed the exact span by < 1 commit chunk per
         buffer — ``backed_bytes`` stays the truthful number. Caller must hold
-        an idle boundary: rows above the new span must be dead."""
+        an idle boundary: rows above the new span must be dead.
+
+        ``buffer_indices`` restricts the release to a SUBSET (#631 waved
+        seam), which is what lets the flip hand back one layer wave at a
+        time instead of the whole source layout at once."""
         if self._arena is None:
             raise RuntimeError("shrink after close / before construction")
-        final = int(final_num_tokens)
-        if not (self.page_size <= final <= self._reserved_num_tokens):
-            raise ValueError(
-                f"shrink final_num_tokens={final} must satisfy page_size="
-                f"{self.page_size} <= final <= reserved={self._reserved_num_tokens}"
-            )
+        final = self._check_final(final_num_tokens)
         released = 0
-        for spec in self._specs:
+        for idx in self._resolve_indices(buffer_indices):
+            spec = self._specs[idx]
             keep = spec.desc.final_span_bytes(final, self.page_size)
             released += self._arena.decommit_range(spec.offset, keep)
             spec.backed_to = self._arena.committed_bytes(spec.offset)
-        self._final_num_tokens = final
+        if buffer_indices is None:
+            self._final_num_tokens = final
         return released
 
     # -- accessors / teardown -------------------------------------------------

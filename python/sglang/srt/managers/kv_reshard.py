@@ -159,6 +159,33 @@ class KvPoolView:
     def device(self) -> torch.device:
         return self._k[0].device
 
+    def storage_ranges(self) -> List[Tuple[object, int, int]]:
+        """``(device, first byte, last byte + 1)`` of every buffer.
+
+        Exists so a caller can ask whether two views OVERLAY THE SAME
+        BYTES. The #631 waved seam interleaves reads of one layout with
+        writes of the other, which is only sound while the two occupy
+        disjoint storage; if they alias, every source row must be read
+        before any destination row is written and the seam cannot be
+        waved at all. Answering that from the actual pointers beats
+        answering it from a comment.
+        """
+        out: List[Tuple[object, int, int]] = []
+        for buf in list(self._k) + list(self._v):
+            lo = int(buf.data_ptr())
+            out.append((buf.device, lo, lo + buf.numel() * buf.element_size()))
+        return out
+
+    def overlaps(self, other: "KvPoolView") -> bool:
+        """True when any of this view's bytes are also ``other``'s bytes."""
+        mine = self.storage_ranges()
+        theirs = other.storage_ranges()
+        for dev_a, lo_a, hi_a in mine:
+            for dev_b, lo_b, hi_b in theirs:
+                if dev_a == dev_b and lo_a < hi_b and lo_b < hi_a:
+                    return True
+        return False
+
     def read_rows_into(
         self, layer: int, rows: torch.Tensor, out: torch.Tensor
     ) -> None:

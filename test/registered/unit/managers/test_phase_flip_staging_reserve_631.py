@@ -309,8 +309,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestStagingScalesWithTheLiveSet(CustomTestCase):
-    """THE ONE-REQUEST LIVELOCK, pinned as a bounded regression.
+class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
+    """THE ONE-REQUEST LIVELOCK, and the wave split that removes it.
 
     Successor 23 wedged the live instance with a SINGLE 270032-token
     request at bs=1 (pool 380000, purity strict). The prompt prefilled
@@ -323,64 +323,203 @@ class TestStagingScalesWithTheLiveSet(CustomTestCase):
     identical refusal repeated at ~1/s forever. /health went 503 and only
     a reboot recovered it.
 
-    WHY IT HAPPENS, from the formula rather than from the log: the move is
-    streamed across LAYERS but never chunked across ROWS. ``outgoing``,
-    ``incoming`` and the retained ``local`` leg are each
-    ``sum(row_nbytes * n_rows)`` over the whole plan, so staging is
-    PROPORTIONAL TO THE RESIDENT LIVE SET and grows without bound as a
-    request gets longer. The affordability gate is therefore HONEST -- it
-    prices exactly what the move allocates. The defect is in the move.
+    WHY IT HAPPENED, from the formula rather than from the log: the move
+    was streamed across LAYERS but the seam swapped the two layouts'
+    physical backing exactly ONCE, so every byte crossing it had to be
+    resident at that instant. ``outgoing``, ``incoming`` and the retained
+    ``local`` leg were each ``sum(row_nbytes * n_rows)`` over the whole
+    plan, i.e. proportional to the resident live set and unbounded in the
+    request length. The affordability gate was therefore HONEST -- it
+    priced exactly what the move allocated. The defect was in the move.
 
-    This test is the cheap standing guard: it asserts the proportionality
-    that makes the wedge reachable. WHEN THE EXCHANGE IS CHUNKED OVER ROWS
-    the growth must become bounded, and this test SHOULD then fail and be
-    rewritten to pin the new ceiling -- that is its purpose, not an
-    accident. Do not "fix" it by loosening the assertion.
+    THE FIX is to wave the seam: release the source layout's backing and
+    restore the destination's ONE LAYER WAVE AT A TIME, so only one wave's
+    share is ever staged. The wave count is a property of the LAYER MAP,
+    so what remains is bounded by the pool geometry.
+
+    The fixture is the rig: layer map [28, 20, 16], token vector 14/10/8
+    of 32, this rank = 1 (the binding one, 20 of 64 layers). The row width
+    is calibrated so the UNWAVED formula reproduces the 3855 MiB that was
+    actually measured -- a 2-layer toy makes the demand small enough to be
+    affordable and hides the very condition under test.
     """
 
-    # The binding rank on this rig carries 20 of the 64 layers
-    # (pp_layer_ratio [28,20,16]), so the fixture uses 20 -- a 2-layer
-    # toy makes the demand small enough to be affordable and hides the
-    # very condition under test.
-    LAYERS = tuple(range(20))
+    #: [28, 20, 16] over 64 full-attention layers, ascending blocks.
+    LAYER_MAP = (
+        tuple(range(0, 28)),
+        tuple(range(28, 48)),
+        tuple(range(48, 64)),
+    )
+    RANK = 1
+    #: The wedging request, and the ownership split of its slots under the
+    #: 14/10/8 token vector.
+    LIVE_ROWS = 270000
+    MY_ROWS = LIVE_ROWS * 10 // 32
+    PEER0_ROWS = LIVE_ROWS * 14 // 32
+    PEER2_ROWS = LIVE_ROWS * 8 // 32
+    #: Calibrated so the unwaved peak is the 3855 MiB seen on metal.
+    ROW_NBYTES = 536
+    POOL_ROWS = 380000
+    #: What the gate reported as spendable in the wedged state.
+    SPENDABLE_MIB = 3102
 
-    def _plan_with_rows(self, rows):
-        layers = list(self.LAYERS)
+    class _Side:
+        def __init__(self, row_nbytes, num_layers, num_rows):
+            self._n = row_nbytes
+            self.num_layers = num_layers
+            self.num_rows = num_rows
+
+        def row_nbytes(self, _layer):
+            return self._n
+
+    def _plan(self, rows=None):
+        rows = self.LIVE_ROWS if rows is None else rows
+        scale = rows / self.LIVE_ROWS
+        mine = int(self.MY_ROWS * scale)
+        mp = self.LAYER_MAP
+        me = self.RANK
 
         class _P:
-            def __init__(self, n):
-                self.send_layers = {1: layers}
-                self.recv_layers = {1: layers}
-                self.send_rows = {1: _N(n)}
-                self.recv_rows = {1: _N(n)}
-                self.local_layers = tuple(layers)
-                self.local_pp_rows = _N(n)
-                self.local_tp_rows = _N(n)
-        return _P(rows)
+            direction = "pp_to_tp"
+            layer_map = mp
+            local_layers = mp[me]
+            local_pp_rows = _N(mine)
+            local_tp_rows = _N(mine)
+            send_layers = {0: mp[me], 2: mp[me]}
+            recv_layers = {0: mp[0], 2: mp[2]}
 
-    def _prepared(self):
-        r = _runtime(_Probe(0, 0))
-        r._src_layer_idx = lambda _d, f: f
-        r._dst_layer_idx = lambda _d, f: f
+        p = _P()
+        p.send_rows = {
+            0: _N(int(TestStagingIsBoundedByTheLayerMap.PEER0_ROWS * scale)),
+            2: _N(int(TestStagingIsBoundedByTheLayerMap.PEER2_ROWS * scale)),
+        }
+        p.recv_rows = {0: _N(mine), 2: _N(mine)}
+        return p
+
+    def _runtime_on_the_rig(self, driver_free_mib=0, swappable=False):
+        r = _runtime(_Probe(driver_free_mib, 0))
+        r._map = self.LAYER_MAP
+        r._rank = self.RANK
+        r._n_layers = 64
+        r._n_waves = None
+        r._pre_write_fns = (_FakeWavedSwap(),) if swappable else ()
+        # Pool-local index of a global ordinal, both sides: the PP pool
+        # holds this stage's block, the TP pool holds every ordinal. Only
+        # the widths matter here, so identity is enough.
+        r._src_layer_idx = lambda _d, f: 0
+        r._dst_layer_idx = lambda _d, f: 0
         return r
 
-    def test_staging_grows_without_bound_with_resident_rows(self):
-        r = self._prepared()
-        side = TestStagingBytesFromThePlan._Side(2048, num_layers=20)
-        small = r._staging_bytes(self._plan_with_rows(1000), "pp_to_tp", side, side)
-        big = r._staging_bytes(self._plan_with_rows(270000), "pp_to_tp", side, side)
-        # 270x the rows must NOT cost ~270x the staging once the exchange
-        # is chunked. Today it does, which is exactly the wedge.
-        self.assertGreater(big, 100 * small)
+    def _sides(self):
+        src = self._Side(self.ROW_NBYTES, 20, self.POOL_ROWS)
+        dst = self._Side(self.ROW_NBYTES, 64, self.POOL_ROWS * 10 // 32)
+        return src, dst
 
-    def test_a_long_enough_request_cannot_be_afforded_at_any_sane_reserve(self):
-        # The livelock condition itself: driver-free far above the corridor
-        # reserve, and the flip STILL unaffordable, because the demand
-        # tracks the live set rather than a fixed window.
-        r = self._prepared()
-        side = TestStagingBytesFromThePlan._Side(2048, num_layers=20)
-        need = r._staging_bytes(self._plan_with_rows(270000), "pp_to_tp", side, side)
-        gate = _runtime(_Probe(4098, 226))
+    def test_the_fixture_reproduces_the_measured_unwaved_demand(self):
+        """If this drifts, the rest of the class stops being about the wedge."""
+        r = self._runtime_on_the_rig()
+        src, dst = self._sides()
+        unwaved = r._staging_bytes(self._plan(), "pp_to_tp", src, dst)
+        self.assertAlmostEqual(unwaved / MIB, 3855, delta=12)
+
+    def test_the_unwaved_seam_cannot_afford_the_wedging_request(self):
+        """THE CAN-FAIL PROOF: one wave is the behaviour that livelocked.
+
+        Without this the class could pass by pricing something cheap and
+        never demonstrate that the wave split is what buys the flip.
+        """
+        r = self._runtime_on_the_rig()
+        src, dst = self._sides()
+        need = r._staging_bytes(self._plan(), "pp_to_tp", src, dst, waves=(None,))
+        gate = _runtime(_Probe(self.SPENDABLE_MIB + 1024, 0))
         ok, detail = gate._staging_affordable(need)
         self.assertFalse(ok)
         self.assertIn("spendable", detail)
+
+    def test_the_waved_seam_affords_it(self):
+        """The wedge, gone, at the spendable figure the rig actually had."""
+        r = self._runtime_on_the_rig()
+        src, dst = self._sides()
+        need = r._staging_bytes(self._plan(), "pp_to_tp", src, dst, r._flip_waves())
+        gate = _runtime(_Probe(self.SPENDABLE_MIB + 1024, 0))
+        ok, detail = gate._staging_affordable(need)
+        self.assertTrue(ok, detail)
+
+    def test_the_wave_count_is_the_smallest_stage(self):
+        # [28, 20, 16] -> 16 waves, every rank paying into each of them.
+        r = self._runtime_on_the_rig()
+        waves = r._flip_waves()
+        self.assertEqual(len(waves), 16)
+        # Every layer exactly once, and every wave carries all three ranks.
+        seen = [f for w in waves for f in w]
+        self.assertEqual(sorted(seen), list(range(64)))
+        for w in waves:
+            for stage in self.LAYER_MAP:
+                self.assertTrue(set(w) & set(stage), f"wave {w} skips a stage")
+
+    def test_waving_divides_the_peak_by_about_the_wave_count(self):
+        r = self._runtime_on_the_rig()
+        src, dst = self._sides()
+        plan = self._plan()
+        one = r._staging_bytes(plan, "pp_to_tp", src, dst, waves=(None,))
+        many = r._staging_bytes(plan, "pp_to_tp", src, dst, r._flip_waves())
+        # Not exactly 1/16: the one-layer gather window does not divide,
+        # and the wave shares are integers. An order of magnitude is the
+        # claim, and it is the claim that removes the wedge.
+        self.assertLess(many * 8, one)
+
+    def test_the_full_pool_live_set_is_still_affordable(self):
+        """THE ACTUAL CLOSURE, and it is stronger than a ratio.
+
+        The live set cannot exceed the pool, so pricing the seam at a FULL
+        pool bounds it for every request that can exist in this
+        configuration. If this holds, no request length can reach the
+        refusal that livelocked -- which is the property the 270k
+        reproducer exists to check on metal.
+        """
+        r = self._runtime_on_the_rig(swappable=True)
+        src, dst = self._sides()
+        full = self._plan(rows=self.POOL_ROWS)
+        need = r._staging_bytes(full, "pp_to_tp", src, dst, r._flip_waves())
+        gate = _runtime(_Probe(self.SPENDABLE_MIB + 1024, 0))
+        ok, detail = gate._staging_affordable(need)
+        self.assertTrue(ok, f"{need / MIB:.0f} MiB at a full pool: {detail}")
+
+    def test_the_swappable_seam_is_charged_its_wave_boundary_slack(self):
+        """The one-layer drift is real memory and the gate must own it.
+
+        Integer layer counts cannot always be split proportionally, so a
+        wave boundary can carry up to one layer-span of extra residency.
+        It is a constant of the pool geometry -- it must be charged, and
+        it must NOT grow with the request.
+        """
+        r_plain = self._runtime_on_the_rig(swappable=False)
+        r_swap = self._runtime_on_the_rig(swappable=True)
+        src, dst = self._sides()
+        waves = r_plain._flip_waves()
+        small = r_swap._staging_bytes(
+            self._plan(rows=1000), "pp_to_tp", src, dst, waves
+        ) - r_plain._staging_bytes(
+            self._plan(rows=1000), "pp_to_tp", src, dst, waves
+        )
+        big = r_swap._staging_bytes(
+            self._plan(), "pp_to_tp", src, dst, waves
+        ) - r_plain._staging_bytes(self._plan(), "pp_to_tp", src, dst, waves)
+        self.assertGreater(small, 0)
+        self.assertEqual(small, big, "the slack must not track the live set")
+
+
+class _FakeWavedSwap:
+    """Just enough of WavedBackingSwap for the pricing path to see a seam."""
+
+    is_swappable = True
+
+    def release_wave(self, direction, wave):
+        pass
+
+    def restore_wave(self, direction, wave):
+        pass
+
+
+if __name__ == "__main__":
+    unittest.main()

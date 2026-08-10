@@ -104,6 +104,28 @@ class TestFlipStatsParserAgainstRealFormat(CustomTestCase):
             data = json.load(open(out))
             self.assertEqual(data[0]["epoch"], 2)
             self.assertEqual(data[0]["write_ms"], 3.0)
+            # Pre-wave format: reported as absent, not as 1.
+            self.assertIsNone(data[0]["seam_waves"])
+
+    def test_the_waved_done_line_still_parses(self):
+        """The waved seam (#631) added a clause mid-line.
+
+        Both formats must parse: the archived pre-wave logs are the
+        baseline every flip-time row is compared against.
+        """
+        bench = _load("route_a_631_step6_bench.py")
+        line = (
+            "PHASE-FLIP DONE pp_to_tp (epoch 5) in 812.0 ms over 16 seam "
+            "wave(s): 270031 live slots, sent 120 cells / 3.00 MiB, "
+            "received 140 cells / 4.00 MiB, local 1.00 MiB, staging "
+            "reserved 574.00 MiB (read 10.0 ms, exchange 20.0 ms, write "
+            "30.0 ms)"
+        )
+        parsed = bench.parse_flip_stats([line])
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["seam_waves"], 16)
+        self.assertEqual(parsed[0]["live_slots"], 270031)
+        self.assertEqual(parsed[0]["write_ms"], 30.0)
 
 
 class TestBenchDriverSmoke(CustomTestCase):

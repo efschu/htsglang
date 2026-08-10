@@ -54,6 +54,8 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
     TP_TO_PP,
     PhaseFlipTransition,
     build_phase_flip_transition,
+    default_wave_count,
+    layer_waves,
     validate_layer_map,
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
@@ -1403,7 +1405,11 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
             (_build_gdn_leg(scheduler), "gdn_state"),
             (stacks.refill, "weights_refill"),
         ),
-        pre_write_fns=(_build_kv_backing_swap(scheduler, stacks),),
+        pre_write_fns=(
+            _build_kv_backing_swap(
+                scheduler, stacks, layer_map[world.rank_in_group]
+            ),
+        ),
         guards=flip_blocking_guards(scheduler),
     )
     # #631 J: read-only handle for the pool census straddling the cutover.
@@ -1431,97 +1437,170 @@ def _labelled_movers(*pairs) -> Tuple[Callable[[str], None], ...]:
     return tuple(movers)
 
 
-def _build_kv_backing_swap(scheduler, stacks) -> Callable[[str], None]:
-    """The runtime half of exclusive KV backing (#631).
+def _in_wave(layers: Sequence[int], wave_set) -> List[int]:
+    """``layers`` restricted to one seam wave; a None wave means all of them."""
+    if wave_set is None:
+        return list(layers)
+    return [f for f in layers if f in wave_set]
 
-    Runs at the read/write seam, the one instant where the source pool has
-    been fully drained and the destination not yet touched, so the physical
-    pages may move from one layout to the other. The VA reservations are
-    untouched, so every address the TP stack's decode graphs baked in stays
-    valid across any number of flips.
 
-    Inert unless both pools were built VA-backed (swappable_backing, set
-    under --enable-phase-flip): without it there is nothing to swap and the
-    old both-resident behaviour stands.
+class WavedBackingSwap:
+    """The runtime half of exclusive KV backing, driven ONE WAVE AT A TIME.
+
+    The seam is the single instant where the source layout has been fully
+    read and the destination not yet written, so it is the only place the
+    physical pages may move between layouts. Doing the whole pool there
+    forces every crossing byte to be staged at once -- the unbounded term
+    that wedged a 270k-token request (HANDOFF_666).
+
+    Per wave the accounting nets out by construction: rank ``r`` releases
+    the wave's layers it owns in the PP layout (each spanning the full PP
+    pool) and commits the wave's layers in the TP layout (each spanning
+    its token share), and ``layer_waves`` sizes those to be equal. So the
+    pool residency never rises above the resting layout while the staged
+    bytes fall by the wave count.
+
+    ``__call__`` keeps the whole-pool behaviour for a single-wave seam and
+    for callers that do not know about waves, so wave count 1 is
+    byte-identical to the pre-wave code.
     """
-    from sglang.srt.managers.phase_flip_spill import (
-        release_allocator_cache,
-        resolve_spill_depth,
-    )
 
-    pp_pool = scheduler.tp_worker.model_runner.token_to_kv_pool
-    tp_pool = stacks.tp_worker.model_runner.token_to_kv_pool
-    # Resolved ONCE, at wiring time, so a malformed depth is a boot-time
-    # refusal and not an exception thrown inside a cutover that has already
-    # released the source pool's pages.
-    spill_depth = resolve_spill_depth(getattr(scheduler, "server_args", None))
-    # The rank's OWN device. Every worker here has all three cards visible, so
-    # a bare current-device read can name a card this rank does not own.
-    spill_device = getattr(scheduler.tp_worker.model_runner, "gpu_id", None)
-
-    def _swap(direction: str) -> None:
-        src, dst = (
-            (pp_pool, tp_pool) if direction == PP_TO_TP else (tp_pool, pp_pool)
+    def __init__(self, scheduler, stacks, my_layers: Sequence[int]):
+        from sglang.srt.managers.phase_flip_spill import (
+            release_allocator_cache,
+            resolve_spill_depth,
         )
+
+        self._pp_pool = scheduler.tp_worker.model_runner.token_to_kv_pool
+        self._tp_pool = stacks.tp_worker.model_runner.token_to_kv_pool
+        self._my_layers = tuple(int(f) for f in my_layers)
+        self._release_allocator_cache = release_allocator_cache
+        # Resolved ONCE, at wiring time, so a malformed depth is a
+        # boot-time refusal and not an exception thrown inside a cutover
+        # that has already released the source pool's pages.
+        self._spill_depth = resolve_spill_depth(
+            getattr(scheduler, "server_args", None)
+        )
+        # The rank's OWN device. Every worker here has all three cards
+        # visible, so a bare current-device read can name a card this rank
+        # does not own.
+        self._spill_device = getattr(
+            scheduler.tp_worker.model_runner, "gpu_id", None
+        )
+
+    @property
+    def is_swappable(self) -> bool:
+        return hasattr(self._pp_pool, "release_backing") and hasattr(
+            self._tp_pool, "release_backing"
+        )
+
+    def _pools(self, direction: str):
+        return (
+            (self._pp_pool, self._tp_pool)
+            if direction == PP_TO_TP
+            else (self._tp_pool, self._pp_pool)
+        )
+
+    def _pool_local(self, pool_is_pp: bool, ordinals: Sequence[int]):
+        """Pool-local layer indices of global ordinals.
+
+        The TP pool holds every ordinal, so the index IS the ordinal. The
+        PP pool holds only this stage's block, so the index is the
+        position within it -- and ordinals outside the block simply are
+        not this pool's business.
+        """
+        if not pool_is_pp:
+            return [int(f) for f in ordinals]
+        return [
+            self._my_layers.index(int(f))
+            for f in ordinals
+            if int(f) in self._my_layers
+        ]
+
+    def release_wave(self, direction: str, wave: Sequence[int]) -> None:
+        """Hand back the source layout's pages for this wave's layers.
+
+        Safe because every row this wave owes has already been read into
+        the payloads; nothing reads those layers again.
+        """
+        src, _dst = self._pools(direction)
         if not hasattr(src, "release_backing"):
             return
-        # SOURCE FIRST, and the order is the whole point. Restoring the
-        # destination first would hold both layouts' pages for the width of
-        # the swap, which is precisely the residency being removed -- and
-        # the corridor floor is a CONTINUOUS minimum, so a peak that lasts
-        # only a few milliseconds still counts against it.
-        #
-        # Releasing first is safe because every row this transition owes has
-        # already been read into the payloads above; nothing reads the
-        # source pool again. The window where neither layout is backed is
-        # bounded by these two calls and no kernel runs inside it.
-        #
-        # The restore CAN fail for want of memory, and this comment used to
-        # claim it could not. The old reasoning -- boot sized the budget for
-        # max(PP, TP) and the source's pages were just handed back, so the
-        # destination's span is covered -- holds only if nothing ELSE on the
-        # card took physical pages in the meantime. torch's caching
-        # allocator does exactly that: a long prefill grows its reserve and
-        # it never returns the blocks to the driver, while the arena needs
-        # RAW driver pages. Measured 2026-08-09 12:47:45 under the mixed
-        # acceptance load, rank 1: cuMemCreate failed with
-        # CUDA_ERROR_OUT_OF_MEMORY inside restore_backing and SIGQUIT took
-        # the instance down. The reclaim-and-retry now lives at the
-        # allocation itself (_mem_create_reclaiming), so the flip gives
-        # torch's unused blocks back to the driver rather than dying.
-        # If it raises after that, the card is genuinely full and it raises
-        # loudly here, inside the flip, rather than corrupting anything.
-        # The two halves are censused SEPARATELY and that separation is the
-        # point: the release hands physical pages back to the driver and the
-        # restore asks for them again (2*L monolithic cuMemCreate calls for
-        # the destination span, since the flip pools carry no commit chunk).
-        # A single mark around the pair would net them out and report the
-        # difference of the spans -- which is exactly the reading that hides
-        # a re-commit that cannot be served.
-        src.release_backing()
+        layers = self._pool_local(direction == PP_TO_TP, wave)
+        if not layers:
+            return
+        src.release_backing(layers)
         seam_census.mark("backing_release")
-        # SPILL RUNG 1 (#656 spec item 6), and this is the only instant in the
-        # whole cycle where it is both safe and maximally productive:
-        #  * the outgoing layout's scratch is dead by construction -- the
-        #    phase that allocated it will not run again until the next flip;
-        #  * the source pool's physical pages have just gone back to the
-        #    driver, so what remains cached is genuinely torch's and nobody
-        #    else's;
-        #  * the restore below asks the driver for RAW pages, and the
-        #    documented failure of that call is precisely torch sitting on
-        #    blocks it is not using. Reclaiming BEFORE the ask turns a
-        #    retry-after-OOM into a first-attempt success.
-        # Censused between the two halves so the corridor credit is
-        # attributable to this rung and not netted out against the re-commit.
-        released = release_allocator_cache(
-            direction, depth=spill_depth, device_index=spill_device
+
+    def reclaim_between(self, direction: str) -> None:
+        """SPILL RUNG 1 (#656 spec item 6), once per flip.
+
+        This is the only instant in the whole cycle where it is both safe
+        and maximally productive: the outgoing layout's scratch is dead by
+        construction, the source pool's pages have just gone back to the
+        driver, and the restore below asks the driver for RAW pages whose
+        documented failure mode is precisely torch sitting on blocks it is
+        not using. Reclaiming BEFORE the ask turns a retry-after-OOM into a
+        first-attempt success. Censused on its own so the corridor credit
+        is attributable to this rung and not netted out against the
+        re-commit.
+        """
+        released = self._release_allocator_cache(
+            direction, depth=self._spill_depth, device_index=self._spill_device
         )
         if released:
             seam_census.mark("allocator_cache_release")
+
+    def restore_wave(self, direction: str, wave: Sequence[int]) -> None:
+        """Re-map the destination layout's pages for this wave's layers.
+
+        The restore CAN fail for want of memory. Boot sizes the budget for
+        max(PP, TP) and this wave's source pages were just handed back, so
+        the span is covered UNLESS something else on the card took physical
+        pages meanwhile -- torch's caching allocator does exactly that, and
+        the arena needs RAW driver pages. Measured 2026-08-09 under the
+        mixed acceptance load: cuMemCreate failed with OUT_OF_MEMORY inside
+        restore_backing and SIGQUIT took the instance down. The
+        reclaim-and-retry now lives at the allocation itself
+        (``_mem_create_reclaiming``); if it still raises, the card is
+        genuinely full and it raises loudly here rather than corrupting
+        anything.
+
+        The two halves are censused SEPARATELY on purpose: a single mark
+        around the pair would net the release against the re-commit and
+        report their difference, which is exactly the reading that hides a
+        re-commit that cannot be served.
+        """
+        _src, dst = self._pools(direction)
+        if not hasattr(dst, "restore_backing"):
+            return
+        layers = self._pool_local(direction == TP_TO_PP, wave)
+        if not layers:
+            return
+        dst.restore_backing(layers)
+        seam_census.mark("backing_restore")
+
+    def __call__(self, direction: str) -> None:
+        """Whole-pool swap: release the source, reclaim, restore the target.
+
+        SOURCE FIRST, and the order is the whole point. Restoring the
+        destination first would hold both layouts' pages for the width of
+        the swap, which is precisely the residency being removed -- and the
+        corridor floor is a CONTINUOUS minimum, so a peak that lasts only a
+        few milliseconds still counts against it.
+        """
+        src, dst = self._pools(direction)
+        if not hasattr(src, "release_backing"):
+            return
+        src.release_backing()
+        seam_census.mark("backing_release")
+        self.reclaim_between(direction)
         dst.restore_backing()
         seam_census.mark("backing_restore")
 
-    return _swap
+
+def _build_kv_backing_swap(scheduler, stacks, my_layers) -> "WavedBackingSwap":
+    return WavedBackingSwap(scheduler, stacks, my_layers)
 
 
 def _build_gdn_leg(scheduler) -> Callable[[str], None]:
@@ -1747,6 +1826,22 @@ class PhaseFlipRuntime:
         self.staging_aborts = 0
         self._staging_reserve_bytes = int(staging_reserve_bytes)
         self._mem_probe = mem_probe
+        #: #631 SEAM WAVES. How many layer waves the move is split into.
+        #: None = auto, the most the layer map supports with every rank
+        #: paying in (``default_wave_count``). 1 reproduces the pre-wave
+        #: move byte for byte, which is what makes this a one-variable A/B.
+        #: Env override so the A/B needs no reboot flag of its own.
+        _waves_env = os.environ.get("SGLANG_FLIP_SEAM_WAVES", "").strip()
+        self._n_waves: Optional[int] = None
+        if _waves_env:
+            try:
+                self._n_waves = max(1, int(_waves_env))
+            except ValueError:
+                raise KvReshardError(
+                    f"SGLANG_FLIP_SEAM_WAVES={_waves_env!r} is not an "
+                    f"integer; it is the number of layer waves the flip's "
+                    f"seam is split into (unset = auto)"
+                )
 
         logger.info(
             "%s armed at boot: rank %d/%d, phase %s, layer map %s, vector "
@@ -2682,9 +2777,96 @@ class PhaseFlipRuntime:
             return ordinal
         return self._map[self._rank].index(ordinal)
 
+    # -- seam waves -----------------------------------------------------------
+    def _flip_waves(self) -> Tuple[Tuple[int, ...], ...]:
+        """This flip's layer-wave split.
+
+        A PURE FUNCTION OF THE REPLICATED LAYER MAP, deliberately: both
+        ends of every pair must cut the wire payload the same way, and a
+        wave count that travelled in a consensus payload would be one more
+        thing that can disagree. The map is already replicated and already
+        equality-checked at boot, so deriving the split from it makes
+        agreement structural.
+        """
+        if self._pools_alias():
+            # ALIASED LAYOUTS CANNOT BE WAVED, and this is a correctness
+            # bound rather than a tuning one. Waving interleaves reads of
+            # the source layout with writes of the destination; when the
+            # two overlay the same bytes, a wave's writes can land on rows
+            # a later wave has not read yet -- the #297
+            # reads-before-writes hazard, reachable exactly here. One wave
+            # restores the invariant that every source read precedes every
+            # destination write.
+            return (tuple(range(self._n_layers)),)
+        n = self._n_waves
+        if n is None:
+            n = default_wave_count(self._map)
+        return layer_waves(self._map, n)
+
+    def _pools_alias(self) -> bool:
+        """Do the two layouts' pools overlay the same bytes? Cached.
+
+        Pointers do not move after boot -- the VA reservations are fixed
+        precisely so captured graphs keep replaying -- so this is asked
+        once and remembered.
+        """
+        cached = getattr(self, "_seam_aliased", None)
+        if cached is None:
+            try:
+                cached = bool(self._pp.overlaps(self._tp))
+            except Exception:  # pragma: no cover - stub views
+                cached = False
+            if cached:
+                logger.warning(
+                    "%s the PP and TP pools share storage, so the seam runs "
+                    "as a SINGLE wave: every source row must be read before "
+                    "any destination row is written. Staging then scales "
+                    "with the resident live set again, which is the "
+                    "condition that livelocked a 270k-token request "
+                    "(HANDOFF_666) -- an aliased arena and a waved seam are "
+                    "alternative capacity designs, not a combination.",
+                    LOG_PREFIX,
+                )
+            self._seam_aliased = cached
+        return cached
+
+    def _seam_swap(self):
+        """The waved backing-swap hook, or None when the seam is unwaved.
+
+        Unit stubs pass plain ``pre_write_fns`` callables; those run once
+        at the seam exactly as before.
+        """
+        for fn in getattr(self, "_pre_write_fns", ()):
+            if hasattr(fn, "release_wave"):
+                return fn
+        return None
+
+    def _seam_backing_is_swappable(self) -> bool:
+        swap = self._seam_swap()
+        return bool(swap is not None and swap.is_swappable)
+
     # -- staging affordability ------------------------------------------------
-    def _staging_bytes(self, tr, direction: str, src, dst) -> int:
+    def _staging_bytes(self, tr, direction: str, src, dst, waves=None) -> int:
         """Device bytes the move will hold at once, from the PLAN.
+
+        ``waves`` is the seam's layer-wave split (#631). The move stages ONE
+        WAVE at a time -- pack, exchange, read the retained leg, swap that
+        wave's backing, write -- so the peak is the WIDEST WAVE's legs, not
+        the whole plan's. With a single wave containing every layer this is
+        byte-identical to the unwaved formula, which is what makes the
+        wave count a one-variable A/B.
+
+        WHY THE WAVE SPLIT IS WHAT BOUNDS THIS. Before it, the seam swapped
+        the two layouts' physical backing exactly once, so every byte
+        crossing the seam had to be resident at that instant and the three
+        legs below were each summed over the WHOLE plan. That made staging
+        proportional to the resident live set, and past some request length
+        no flip could ever be afforded -- under strict purity the request
+        then never decodes, stays resident, and the refusal repeats
+        forever (the 270k one-request livelock, HANDOFF_666). Waving the
+        seam divides all three legs by the wave count, and the wave count
+        is a property of the LAYER MAP, so what remains scales with the
+        pool geometry instead of with the prompt.
 
         THREE legs, and the peak is not their sum. ``_execute`` spends
         them in two overlapping windows:
@@ -2724,32 +2906,50 @@ class PhaseFlipRuntime:
         replaces rather than larger. Do not reintroduce the doubling
         "for safety": it does not buy margin, it buys an earlier wedge.
         """
-        outgoing = 0
-        for peer in tr.send_layers:
-            n = int(tr.send_rows[peer].numel())
-            outgoing += (
-                sum(
-                    src.row_nbytes(self._src_layer_idx(direction, f)) * n
-                    for f in tr.send_layers[peer]
-                )
-                + _CHECKSUM_BYTES
-            )
-        incoming = 0
-        for peer in tr.recv_layers:
-            n = int(tr.recv_rows[peer].numel())
-            incoming += (
-                sum(
-                    dst.row_nbytes(self._dst_layer_idx(direction, f)) * n
-                    for f in tr.recv_layers[peer]
-                )
-                + _CHECKSUM_BYTES
-            )
+        # None = one wave over every layer, expressed as a null filter so
+        # the formula needs no layer count of its own.
+        if waves is None:
+            waves = (None,)
         local_rows = tr.local_pp_rows if direction == PP_TO_TP else tr.local_tp_rows
         n_local = int(local_rows.numel())
-        local = sum(
-            src.row_nbytes(self._src_layer_idx(direction, f)) * n_local
-            for f in tr.local_layers
-        )
+
+        outgoing = incoming = local = 0
+        for wave in waves:
+            wave_set = None if wave is None else set(int(f) for f in wave)
+            out_w = 0
+            for peer in tr.send_layers:
+                n = int(tr.send_rows[peer].numel())
+                layers_w = _in_wave(tr.send_layers[peer], wave_set)
+                if not layers_w or not n:
+                    continue
+                out_w += (
+                    sum(
+                        src.row_nbytes(self._src_layer_idx(direction, f)) * n
+                        for f in layers_w
+                    )
+                    + _CHECKSUM_BYTES
+                )
+            in_w = 0
+            for peer in tr.recv_layers:
+                n = int(tr.recv_rows[peer].numel())
+                layers_w = _in_wave(tr.recv_layers[peer], wave_set)
+                if not layers_w or not n:
+                    continue
+                in_w += (
+                    sum(
+                        dst.row_nbytes(self._dst_layer_idx(direction, f)) * n
+                        for f in layers_w
+                    )
+                    + _CHECKSUM_BYTES
+                )
+            local_w = sum(
+                src.row_nbytes(self._src_layer_idx(direction, f)) * n_local
+                for f in _in_wave(tr.local_layers, wave_set)
+            )
+            # The peak is per wave, and the widest wave is the one the gate
+            # has to be able to afford.
+            if in_w + max(out_w, local_w) > incoming + max(outgoing, local):
+                outgoing, incoming, local = out_w, in_w, local_w
         # THE ONE-LAYER WINDOW. Streaming did not make the copies vanish,
         # it made them BOUNDED: ``read_rows_into`` still gathers one
         # layer's K and V before placing them, and ``write_rows`` still
@@ -2764,13 +2964,33 @@ class PhaseFlipRuntime:
             + [int(r.numel()) for r in tr.send_rows.values()]
             + [int(r.numel()) for r in tr.recv_rows.values()]
         )
-        one_layer_window = 0
+        # Both sides are None when there is nothing to stage at all (an
+        # empty live set): the formula must not reach for a row width it
+        # has no use for.
+        widest_layer_nbytes = 0
         if widest_rows:
-            one_layer_window = widest_rows * max(
+            widest_layer_nbytes = max(
                 max((src.row_nbytes(i) for i in range(src.num_layers)), default=0),
                 max((dst.row_nbytes(i) for i in range(dst.num_layers)), default=0),
             )
-        return int(incoming + max(outgoing, local) + one_layer_window)
+        one_layer_window = widest_rows * widest_layer_nbytes
+        # THE WAVE-BOUNDARY SLACK, and it is a constant, not a scaling term.
+        # A wave's releases pay for its commits only when each rank
+        # contributes an exactly proportional slice of its own block, and
+        # integer layer counts cannot always be split that way (exact only
+        # when the wave count divides every stage's layer count -- 4 on
+        # this rig's [28, 20, 16]). The floors leave at most ONE layer of
+        # drift between released and committed span at a boundary, so the
+        # peak carries one layer's full POOL span -- not one layer of the
+        # live set. It does not grow with the request, which is the whole
+        # property being bought here; it is charged so the gate cannot be
+        # surprised by it.
+        backing_slack = 0
+        if widest_rows and len(waves) > 1 and self._seam_backing_is_swappable():
+            backing_slack = widest_layer_nbytes * max(src.num_rows, dst.num_rows)
+        return int(
+            incoming + max(outgoing, local) + one_layer_window + backing_slack
+        )
 
     def _reclaim_cached_blocks(self) -> None:
         """Hand the allocator's unused blocks back to the driver.
@@ -2880,9 +3100,17 @@ class PhaseFlipRuntime:
 
     # -- the move -------------------------------------------------------------
     def _pack_outgoing(
-        self, tr: PhaseFlipTransition, direction: str, src, peer: int
+        self,
+        tr: PhaseFlipTransition,
+        direction: str,
+        src,
+        peer: int,
+        layers: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """One peer's wire payload, streamed into a single exact-size buffer.
+
+        ``layers`` restricts the payload to one seam WAVE's ordinals (#631);
+        None is the whole pair, which is what a single-wave seam asks for.
 
         BYTE-FOR-BYTE what ``torch.cat([*per_layer_reads, checksum])``
         produced -- layers ascending, each layer's rows row-major, K bytes
@@ -2910,7 +3138,7 @@ class PhaseFlipRuntime:
         1/(2L) of the payload, dead before the next layer's -- so the
         staging window is bounded by the geometry instead of by the prompt.
         """
-        layers = tr.send_layers[peer]
+        layers = tr.send_layers[peer] if layers is None else tuple(layers)
         rows = tr.send_rows[peer]
         n = int(rows.numel())
         widths = [src.row_nbytes(self._src_layer_idx(direction, f)) for f in layers]
@@ -2928,9 +3156,16 @@ class PhaseFlipRuntime:
         return buf
 
     def _pack_local(
-        self, tr: PhaseFlipTransition, direction: str, src, local_src: torch.Tensor
+        self,
+        tr: PhaseFlipTransition,
+        direction: str,
+        src,
+        local_src: torch.Tensor,
+        layers: Optional[Sequence[int]] = None,
     ) -> List[torch.Tensor]:
         """The retained leg, streamed into one buffer, as per-layer views.
+
+        ``layers`` restricts it to one seam WAVE's ordinals (#631).
 
         The local rows must ALL be read before the first destination write
         -- the reads-before-writes invariant below, which the cross-phase
@@ -2940,15 +3175,16 @@ class PhaseFlipRuntime:
         concatenation of the K and V halves on top of the gather.
         """
         n = int(local_src.numel())
+        local_layers = tr.local_layers if layers is None else tuple(layers)
         widths = [
-            src.row_nbytes(self._src_layer_idx(direction, f)) for f in tr.local_layers
+            src.row_nbytes(self._src_layer_idx(direction, f)) for f in local_layers
         ]
         buf = torch.empty(
             sum(w * n for w in widths), dtype=torch.uint8, device=src.device
         )
         out: List[torch.Tensor] = []
         offset = 0
-        for f, width in zip(tr.local_layers, widths):
+        for f, width in zip(local_layers, widths):
             seg = buf[offset : offset + n * width].view(n, width)
             src.read_rows_into(self._src_layer_idx(direction, f), local_src, seg)
             out.append(seg)
@@ -3017,7 +3253,8 @@ class PhaseFlipRuntime:
         # are known from the plan before a single byte is allocated, and
         # the answer when they do not fit is the same unanimous abandon.
         # A rank-local abandon would half-flip the group.
-        staging_bytes = self._staging_bytes(tr, direction, src, dst)
+        waves = self._flip_waves()
+        staging_bytes = self._staging_bytes(tr, direction, src, dst, waves)
         affordable, staging_detail = self._staging_affordable(staging_bytes)
         if not affordable:
             too_small.append(staging_detail)
@@ -3052,119 +3289,157 @@ class PhaseFlipRuntime:
             seam_census.reset()
             return None
 
-        # PACK (reads only): per peer, layers ascending, one row list.
+        # THE MOVE, ONE LAYER WAVE AT A TIME (#631).
+        #
+        # Pack, exchange, read the retained leg, swap THIS WAVE's backing,
+        # write -- then the next wave. Every buffer allocated for a wave is
+        # dead before the next wave allocates its own, so the staged bytes
+        # are one wave's share of the crossing rather than all of it. That
+        # is the difference between a flip whose cost tracks the resident
+        # live set (and therefore becomes unaffordable at some request
+        # length, then wedges under strict purity) and one whose cost is a
+        # property of the layer map.
+        #
+        # A single wave containing every layer reproduces the previous
+        # code exactly, which is what keeps the wave count a one-variable
+        # A/B.
         seam_census.mark("plan")
-        t_read0 = self._clock()
-        outgoing_payloads: Dict[int, torch.Tensor] = {}
-        for peer in tr.send_layers:
-            outgoing_payloads[peer] = self._pack_outgoing(tr, direction, src, peer)
-        read_ms = (self._clock() - t_read0) * 1000.0
-        seam_census.mark("kv_pack")
+        local_src = tr.local_pp_rows if direction == PP_TO_TP else tr.local_tp_rows
+        local_dst = tr.local_tp_rows if direction == PP_TO_TP else tr.local_pp_rows
+        swap = self._seam_swap()
+        read_ms = xfer_ms = write_ms = 0.0
+        sent_bytes = 0
+        received_bytes = 0
+        local_bytes = 0
+        reclaimed = False
 
-        # Expected incoming sizes from MY OWN pool's row widths -- the
-        # runtime pin of row byte-compatibility across layouts.
-        incoming_nbytes: Dict[int, int] = {}
-        for peer in tr.recv_layers:
-            n = int(tr.recv_rows[peer].numel())
-            nbytes = sum(
-                dst.row_nbytes(self._dst_layer_idx(direction, f)) * n
-                for f in tr.recv_layers[peer]
+        for wave in waves:
+            wave_set = None if wave is None else set(int(f) for f in wave)
+
+            # PACK (reads only): per peer, layers ascending, one row list.
+            t_read0 = self._clock()
+            outgoing_payloads: Dict[int, torch.Tensor] = {}
+            for peer in tr.send_layers:
+                layers_w = _in_wave(tr.send_layers[peer], wave_set)
+                if not layers_w or not int(tr.send_rows[peer].numel()):
+                    continue
+                outgoing_payloads[peer] = self._pack_outgoing(
+                    tr, direction, src, peer, layers_w
+                )
+            read_ms += (self._clock() - t_read0) * 1000.0
+            seam_census.mark("kv_pack")
+
+            # Expected incoming sizes from MY OWN pool's row widths -- the
+            # runtime pin of row byte-compatibility across layouts.
+            incoming_nbytes: Dict[int, int] = {}
+            wave_recv_layers: Dict[int, List[int]] = {}
+            for peer in tr.recv_layers:
+                n = int(tr.recv_rows[peer].numel())
+                layers_w = _in_wave(tr.recv_layers[peer], wave_set)
+                if not layers_w or not n:
+                    continue
+                wave_recv_layers[peer] = layers_w
+                incoming_nbytes[peer] = (
+                    sum(
+                        dst.row_nbytes(self._dst_layer_idx(direction, f)) * n
+                        for f in layers_w
+                    )
+                    + _CHECKSUM_BYTES
+                )
+
+            # EXCHANGE (pools still untouched): failure up to and including
+            # checksum verification aborts with both pools byte-identical
+            # FOR THIS WAVE. Earlier waves have already been written, so a
+            # raise here is still inside the no-return region -- the same
+            # contract the single-wave move had once its first byte landed.
+            t_xfer0 = self._clock()
+            received = self._exchange(outgoing_payloads, incoming_nbytes)
+            xfer_ms += (self._clock() - t_xfer0) * 1000.0
+
+            # THE SEND BUFFERS ARE DEAD HERE, and holding them any longer is
+            # pure corridor. ``_exchange`` returns only after every work in
+            # the batch has been polled to completion (``bounded_collective``,
+            # then a device synchronize), so nothing reads these bytes again.
+            sent_bytes += sum(int(t.numel()) for t in outgoing_payloads.values())
+            outgoing_payloads.clear()
+
+            incoming_data: Dict[int, torch.Tensor] = {}
+            for peer, layers_w in wave_recv_layers.items():
+                payload = received.get(peer)
+                if payload is None or payload.numel() != incoming_nbytes[peer]:
+                    got = 0 if payload is None else payload.numel()
+                    raise KvReshardError(
+                        f"{LOG_PREFIX} exchange returned {got} bytes from peer "
+                        f"{peer}, expected {incoming_nbytes[peer]} -- size "
+                        f"mismatch means the layouts' row formats or the "
+                        f"payload convention diverged"
+                    )
+                data = payload[:-_CHECKSUM_BYTES]
+                want = int(payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item())
+                have = uint8_checksum(data)
+                if want != have:
+                    raise KvReshardError(
+                        f"{LOG_PREFIX} payload checksum mismatch from peer "
+                        f"{peer}: sender {want}, receiver {have} -- refusing to "
+                        f"scatter."
+                    )
+                incoming_data[peer] = data
+            received.clear()
+            received_bytes += sum(incoming_nbytes.values())
+
+            # THE RETAINED LEG of this wave, read BEFORE the backing swap.
+            #
+            # INVARIANT, load-bearing: every SOURCE READ of a wave completes
+            # before the first DESTINATION WRITE of that wave. The local leg
+            # used to read and write per layer in one loop, which is safe
+            # only while the two pools are disjoint allocations. That is the
+            # #297 reads-before-writes hazard, and it becomes reachable the
+            # moment the phases share backing (one arena / mutually
+            # exclusive VMM backing sized max(PP, TP) instead of their sum)
+            # -- then a destination write can land on a source row that has
+            # not been read yet.
+            t_write0 = self._clock()
+            local_layers_w = _in_wave(tr.local_layers, wave_set)
+            local_data = (
+                self._pack_local(tr, direction, src, local_src, local_layers_w)
+                if local_layers_w and int(local_src.numel())
+                else []
             )
-            incoming_nbytes[peer] = nbytes + _CHECKSUM_BYTES
+            local_bytes += sum(int(t.numel()) for t in local_data)
+            seam_census.mark("kv_local_read")
 
-        # EXCHANGE (pools still untouched): failure up to and including
-        # checksum verification aborts with both pools byte-identical.
-        t_xfer0 = self._clock()
-        received = self._exchange(outgoing_payloads, incoming_nbytes)
-        xfer_ms = (self._clock() - t_xfer0) * 1000.0
+            # #631 CROSS-PHASE BACKING SWAP, PER WAVE. Every byte this wave
+            # owes has now been read, so the source layers of this wave may
+            # hand their physical pages back -- and the destination layers of
+            # this wave need theirs before the writes below. Releasing first
+            # is what keeps the two sides netting out.
+            if swap is not None:
+                swap.release_wave(direction, wave)
+                if not reclaimed:
+                    swap.reclaim_between(direction)
+                    reclaimed = True
+                swap.restore_wave(direction, wave)
+            else:
+                for fn in self._pre_write_fns:
+                    fn(direction)
 
-        # THE SEND BUFFERS ARE DEAD HERE, and holding them any longer is
-        # pure corridor. ``_exchange`` returns only after every work in the
-        # batch has been polled to completion (``bounded_collective``, then
-        # a device synchronize), so nothing reads these bytes again -- yet
-        # they used to stay referenced through the local read, the backing
-        # swap and every write, which is the widest part of the move. That
-        # made the peak ``outgoing + incoming + local`` when it only ever
-        # had to be ``incoming + max(outgoing, local)``.
-        #
-        # Captured first: the stats line reports what was sent, and the
-        # dict it used to sum is about to be empty.
-        sent_bytes = sum(int(t.numel()) for t in outgoing_payloads.values())
-        outgoing_payloads.clear()
+            for f, data in zip(local_layers_w, local_data):
+                dst.write_rows(self._dst_layer_idx(direction, f), local_dst, data)
+            local_data = []
+            for peer, layers_w in wave_recv_layers.items():
+                n = int(tr.recv_rows[peer].numel())
+                rows = tr.recv_rows[peer]
+                offset = 0
+                for f in layers_w:
+                    li = self._dst_layer_idx(direction, f)
+                    width = dst.row_nbytes(li)
+                    chunk = incoming_data[peer][offset : offset + n * width]
+                    dst.write_rows(li, rows, chunk.view(n, width))
+                    offset += n * width
+            incoming_data.clear()
+            write_ms += (self._clock() - t_write0) * 1000.0
+            seam_census.mark("kv_write")
 
-        incoming_data: Dict[int, torch.Tensor] = {}
-        for peer, rows in tr.recv_rows.items():
-            payload = received.get(peer)
-            if payload is None or payload.numel() != incoming_nbytes[peer]:
-                got = 0 if payload is None else payload.numel()
-                raise KvReshardError(
-                    f"{LOG_PREFIX} exchange returned {got} bytes from peer "
-                    f"{peer}, expected {incoming_nbytes[peer]} -- size "
-                    f"mismatch means the layouts' row formats or the "
-                    f"payload convention diverged"
-                )
-            data = payload[:-_CHECKSUM_BYTES]
-            want = int(payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item())
-            have = uint8_checksum(data)
-            if want != have:
-                raise KvReshardError(
-                    f"{LOG_PREFIX} payload checksum mismatch from peer "
-                    f"{peer}: sender {want}, receiver {have} -- refusing to "
-                    f"scatter."
-                )
-            incoming_data[peer] = data
-
-        # WRITE (no-return region): local first, then incoming. Targets are
-        # disjoint (injective row map), so the write order is free -- kept
-        # deterministic anyway.
-        #
-        # INVARIANT, load-bearing: every SOURCE READ completes before the
-        # first DESTINATION WRITE. The local leg used to read and write per
-        # layer in one loop, which is safe only while the two pools are
-        # disjoint allocations. That is the #297 reads-before-writes hazard,
-        # and it becomes reachable the moment the phases share backing
-        # (one arena / mutually exclusive VMM backing sized max(PP, TP)
-        # instead of their sum) -- then a destination write can land on a
-        # source row that has not been read yet. Hoisting the reads costs
-        # one list of already-materialised payloads, which the peer legs
-        # above hold anyway.
-        seam_census.mark("kv_exchange")
-        t_write0 = self._clock()
-        local_src = (
-            tr.local_pp_rows if direction == PP_TO_TP else tr.local_tp_rows
-        )
-        local_dst = (
-            tr.local_tp_rows if direction == PP_TO_TP else tr.local_pp_rows
-        )
-        local_data = self._pack_local(tr, direction, src, local_src)
-
-        # #631 CROSS-PHASE BACKING SWAP. Every byte this transition owes has
-        # now been read: the peer legs are materialised above and the local
-        # leg immediately before this line. Nothing further reads the SOURCE
-        # pool, and the DESTINATION pool is written from here on -- so this
-        # instant, and only this instant, is where the physical pages may
-        # move from one layout to the other.
-        #
-        # Without it the two layouts' pools both hold pages for the whole
-        # process life, which is what forced each of them to be sized against
-        # half the per-rank budget. The VA reservations do not move, so
-        # addresses baked into captured decode graphs stay valid.
-        seam_census.mark("kv_local_read")
-        for fn in self._pre_write_fns:
-            fn(direction)
-
-        for f, data in zip(tr.local_layers, local_data):
-            dst.write_rows(self._dst_layer_idx(direction, f), local_dst, data)
-        for peer, rows in tr.recv_rows.items():
-            n = int(rows.numel())
-            offset = 0
-            for f in tr.recv_layers[peer]:
-                li = self._dst_layer_idx(direction, f)
-                width = dst.row_nbytes(li)
-                chunk = incoming_data[peer][offset : offset + n * width]
-                dst.write_rows(li, rows, chunk.view(n, width))
-                offset += n * width
-        write_ms = (self._clock() - t_write0) * 1000.0
 
         # EXTRA MOVERS (weights arena, GDN state) then CUTOVER.
         #
@@ -3174,7 +3449,6 @@ class PhaseFlipRuntime:
         # destination allocator", and those have opposite fixes. Straddling
         # the cutover answers it directly: if the unaccounted page is
         # already there BEFORE, the enumeration is innocent.
-        seam_census.mark("kv_write")
         self._pool_census("pre-cutover", direction)
         for fn in self._pre_cutover_fns:
             fn(direction)
@@ -3199,9 +3473,10 @@ class PhaseFlipRuntime:
             "outgoing_cells": tr.outgoing_cells,
             "incoming_cells": tr.incoming_cells,
             "sent_bytes": sent_bytes,
-            "received_bytes": sum(incoming_nbytes.values()),
-            "local_bytes": sum(int(t.numel()) for t in local_data),
+            "received_bytes": received_bytes,
+            "local_bytes": local_bytes,
             "staging_bytes": staging_bytes,
+            "seam_waves": len(waves),
             "read_ms": read_ms,
             "exchange_ms": xfer_ms,
             "write_ms": write_ms,
@@ -3209,14 +3484,15 @@ class PhaseFlipRuntime:
         }
         self.last_stats = stats
         logger.warning(
-            "%s DONE %s (epoch %d) in %.1f ms: %d live slots, sent %d "
-            "cells / %.2f MiB, received %d cells / %.2f MiB, local %.2f "
-            "MiB, staging reserved %.2f MiB (read %.1f ms, exchange %.1f ms, "
-            "write %.1f ms)",
+            "%s DONE %s (epoch %d) in %.1f ms over %d seam wave(s): %d live "
+            "slots, sent %d cells / %.2f MiB, received %d cells / %.2f MiB, "
+            "local %.2f MiB, staging reserved %.2f MiB (read %.1f ms, "
+            "exchange %.1f ms, write %.1f ms)",
             LOG_PREFIX,
             direction,
             self._epoch,
             total_ms,
+            len(waves),
             tr.total_slots,
             tr.outgoing_cells,
             stats["sent_bytes"] / 1048576.0,

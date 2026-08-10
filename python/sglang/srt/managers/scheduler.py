@@ -6431,13 +6431,55 @@ class Scheduler(
                 logger.info("Cache flushed successfully!")
             success = True
         else:
+            # NAME THE CLAUSE, not just the verdict (#631/#656). The wedged
+            # instance of 2026-08-10 refused this flush while the metrics
+            # reported 0 running and 0 queued, and the two counters printed
+            # here could not say why -- so the remedy the flip's own abandon
+            # message advertises looked broken for no visible reason, and
+            # only a reboot recovered. is_fully_idle() is a conjunction of
+            # nine clauses; which one is false is the whole diagnosis.
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                f"#running-req: {len(self.running_batch.reqs)}, "
+                f"not-idle because: {', '.join(self.idle_blockers()) or 'unknown'}"
             )
             success = False
         return success
+
+    def idle_blockers(self) -> List[str]:
+        """Which clauses of :meth:`is_fully_idle` are currently false.
+
+        Diagnostic only -- no caller changes behaviour on it. It exists
+        because "not idle" with every visible counter at zero is a state
+        this server can reach and could not previously explain.
+        """
+        blockers: List[str] = []
+
+        def _check(name: str, ok: bool) -> None:
+            if not ok:
+                blockers.append(name)
+
+        _check("running_batch", self.running_batch.is_empty())
+        _check("chunked_req", self.chunked_req is None)
+        _check("dllm_staging", not self.dllm_manager.any_staging_reqs())
+        _check(
+            "last_batch",
+            self.last_batch is None or self.last_batch.is_empty(),
+        )
+        _check(
+            "overlap_result_queue",
+            not self.enable_overlap or len(self.result_queue) == 0,
+        )
+        _check("pp_microbatches", self._pp_microbatches_drained())
+        _check(
+            "kv_session_offload_spilled",
+            self.kv_session_offload is None
+            or not self.kv_session_offload.has_spilled(),
+        )
+        _check("waiting_queue", len(self.waiting_queue) == 0)
+        _check("grammar_queue", len(self.grammar_manager.grammar_queue) == 0)
+        return blockers
 
     def handle_session_handover(
         self, recv_req: SessionHandoverReqInput

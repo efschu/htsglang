@@ -2120,6 +2120,9 @@ class MHATokenToKVPool(KVCache):
         # post-capture sizing (self.size is final at construction).
         self.swappable_backing = swappable_backing
         self._backing_released = False
+        #: #631 waved seam: layer ordinals whose backing is currently
+        #: unmapped. Empty = fully resident; a full set = fully released.
+        self._released_layers = set()
         self._post_capture_owner = None
         # #330 dial: chunked physical commits make the tail releasable at
         # runtime; None keeps one handle per extension (stock post-capture).
@@ -2465,41 +2468,96 @@ class MHATokenToKVPool(KVCache):
     # so the #592 resize-translation gap on finalize_backing does not apply
     # here: the span released and restored is always this pool's OWN row count.
 
-    def release_backing(self) -> int:
+    def _layer_buffer_indices(self, layers):
+        """Owner-buffer indices of a layer subset, or None for "all".
+
+        ``_build_kv_buffer_descs`` emits ``k0..k(L-1)`` then ``v0..v(L-1)``,
+        so layer ``i`` owns buffers ``i`` and ``layer_num + i``. Both halves
+        move together: a layer whose K pages are mapped and whose V pages
+        are not is a layout no reader can use.
+        """
+        if layers is None:
+            return None
+        indices = []
+        for layer in layers:
+            i = int(layer)
+            if not (0 <= i < self.layer_num):
+                raise ValueError(
+                    f"layer {i} outside [0, {self.layer_num}) for this pool"
+                )
+            indices.append(i)
+            indices.append(self.layer_num + i)
+        return indices
+
+    def release_backing(self, layers=None) -> int:
         """Unmap this pool's physical pages; return bytes handed back.
 
         Caller must hold an idle boundary for this pool: every row it owes
         the other layout must already have been READ (the flip's read region
         completes before its write region for exactly this reason), and no
         kernel may touch these rows until :meth:`restore_backing`.
+
+        ``layers`` releases only that subset (#631 waved seam). The flip
+        walks the seam one layer wave at a time so that the bytes staged
+        between a release and its matching restore are one wave's share
+        rather than the whole live set -- the term whose unboundedness
+        wedged a single 270k-token request (HANDOFF_666).
         """
         if self._post_capture_owner is None:
             raise RuntimeError(
                 "release_backing on a pool that was not allocated on a VA "
                 "reservation; construct it with swappable_backing=True"
             )
-        if self._backing_released:
+        indices = self._layer_buffer_indices(layers)
+        if indices is None:
+            if self._backing_released:
+                return 0
+            # page_size is the floor the owner accepts; the residue is one
+            # page plus at most one commit chunk per buffer, not the pool.
+            released = self._post_capture_owner.shrink(self.page_size)
+            self._released_layers = set(range(self.layer_num))
+            self._backing_released = True
+            return released
+        wanted = [i for i in layers if int(i) not in self._released_layers]
+        if not wanted:
             return 0
-        # page_size is the floor the owner accepts; the residue is one page
-        # plus at most one commit chunk per buffer, not the pool.
-        released = self._post_capture_owner.shrink(self.page_size)
-        self._backing_released = True
+        released = self._post_capture_owner.shrink(
+            self.page_size, self._layer_buffer_indices(wanted)
+        )
+        self._released_layers.update(int(i) for i in wanted)
+        self._backing_released = len(self._released_layers) >= self.layer_num
         return released
 
-    def restore_backing(self) -> None:
-        """Remap this pool's full span at its unchanged addresses."""
+    def restore_backing(self, layers=None) -> None:
+        """Remap this pool's span at its unchanged addresses.
+
+        ``layers`` restores only that subset; see :meth:`release_backing`.
+        """
         if self._post_capture_owner is None:
             raise RuntimeError(
                 "restore_backing on a pool that was not allocated on a VA "
                 "reservation; construct it with swappable_backing=True"
             )
-        self._post_capture_owner.finalize(int(self.size))
-        self._backing_released = False
+        self._post_capture_owner.finalize(
+            int(self.size), self._layer_buffer_indices(layers)
+        )
+        if layers is None:
+            self._released_layers = set()
+        else:
+            self._released_layers.difference_update(int(i) for i in layers)
+        self._backing_released = len(self._released_layers) >= self.layer_num
 
     @property
     def backing_is_resident(self) -> bool:
-        """False only between a release and its matching restore."""
-        return not self._backing_released
+        """False from the first layer released until the last is restored.
+
+        PARTIAL is not resident. The waved seam (#631) unmaps one layer
+        wave at a time, so between waves some layers are backed and some
+        are not; every caller of this property is asking "may a kernel
+        touch this pool", and the answer for a partially mapped pool is
+        no.
+        """
+        return not self._released_layers
 
     @property
     def post_capture_backed_bytes(self) -> int:
@@ -3488,11 +3546,11 @@ class HybridLinearKVPool(KVCache):
     # Only the full-attention KV rows are swapped here. The mamba/GDN state
     # pool lives on req_to_token_pool and is handled separately.
 
-    def release_backing(self) -> int:
-        return self.full_kv_pool.release_backing()
+    def release_backing(self, layers=None) -> int:
+        return self.full_kv_pool.release_backing(layers)
 
-    def restore_backing(self) -> None:
-        self.full_kv_pool.restore_backing()
+    def restore_backing(self, layers=None) -> None:
+        self.full_kv_pool.restore_backing(layers)
 
     @property
     def backing_is_resident(self) -> bool:

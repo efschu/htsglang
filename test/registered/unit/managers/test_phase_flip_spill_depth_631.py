@@ -181,7 +181,10 @@ class SeamOrderingTest(unittest.TestCase):
         rt.seam_census.mark = lambda *a, **k: log.append(f"mark:{a[0]}")
         spill.release_allocator_cache = fake_release
         try:
-            swap = rt._build_kv_backing_swap(sched, stacks)
+            # The stage's own layer ordinals: the waved seam needs them to
+            # map global ordinals onto the PP pool's local indices. The
+            # whole-pool __call__ path under test here does not use them.
+            swap = rt._build_kv_backing_swap(sched, stacks, (0, 1))
             swap(direction)
         finally:
             spill.release_allocator_cache = real_release
@@ -227,7 +230,7 @@ class SeamOrderingTest(unittest.TestCase):
 
         sched = _Scheduler(_Pool("pp", []), _Args("draft"))
         with self.assertRaises(spill.PhaseFlipSpillError):
-            rt._build_kv_backing_swap(sched, _Stacks(_Pool("tp", [])))
+            rt._build_kv_backing_swap(sched, _Stacks(_Pool("tp", [])), (0, 1))
 
 
 class _patched_torch:

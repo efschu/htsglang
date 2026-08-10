@@ -1416,6 +1416,68 @@ class TestSharedArenaReadsPrecedeWrites(CustomTestCase):
                 )
 
 
+class TestSeamWavesAreByteIdentical(CustomTestCase):
+    """#631: waving the seam changes memory economics, never a byte.
+
+    The move is split into layer WAVES so that only one wave's payload is
+    staged at a time -- the fix for the one-request livelock, where
+    staging tracked the resident live set and a long enough request could
+    never be afforded (HANDOFF_666). The wire format changes shape (one
+    checksummed payload per peer PER WAVE instead of one for the whole
+    plan), so the destination bytes are the thing that must not move.
+
+    Run the SAME flip at one wave and at the map's default, on
+    independently built but identically seeded pools, and compare every
+    destination row. A single wave is the pre-wave code path, so this is
+    also the A/B that keeps the wave count a one-variable change.
+    """
+
+    def _run_at(self, waves):
+        ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 300, seed=23
+        )
+        runtimes, _cutovers = _build_runtimes(pp_views, tp_views, live)
+        for rt in runtimes:
+            rt._n_waves = waves
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        self.assertEqual(
+            [rt.last_stats["seam_waves"] for rt in runtimes], [waves] * 3
+        )
+        return ref, live, tp_pools
+
+    def test_one_wave_and_the_default_split_agree_byte_for_byte(self):
+        _ref_a, live_a, tp_a = self._run_at(1)
+        _ref_b, live_b, tp_b = self._run_at(4)
+        self.assertTrue(torch.equal(live_a, live_b))
+        owner = owner_of(live_a, VEC)
+        for r in range(3):
+            rows = rows_of(live_a[owner == r], VEC, r)
+            for f in range(N_LAYERS):
+                self.assertTrue(
+                    torch.equal(tp_a[r][0][f][rows], tp_b[r][0][f][rows]),
+                    f"rank {r} ordinal {f} K differs between 1 and 4 waves",
+                )
+                self.assertTrue(
+                    torch.equal(tp_a[r][1][f][rows], tp_b[r][1][f][rows]),
+                    f"rank {r} ordinal {f} V differs between 1 and 4 waves",
+                )
+
+    def test_the_waved_run_really_did_land_the_reference_rows(self):
+        """Equality between two runs proves nothing if both are wrong."""
+        ref, live, tp_pools = self._run_at(4)
+        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
+        self.assertTrue(ok, f"waved flip corrupted rows: {msg}")
+
+    def test_the_default_wave_count_is_the_smallest_stage(self):
+        # MAP_625 is (8, 4, 4): four waves, every rank paying into each.
+        ref, live, _pp, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 300, seed=23
+        )
+        runtimes, _ = _build_runtimes(pp_views, tp_views, live)
+        self.assertEqual(len(runtimes[0]._flip_waves()), 4)
+
+
 class TestPreWriteSeamOrdering(CustomTestCase):
     """The read/write seam is where cross-phase KV backing may be swapped.
 

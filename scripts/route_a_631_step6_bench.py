@@ -103,9 +103,15 @@ def cmd_decode(args):
 
 
 # PHASE-FLIP DONE pp_to_tp (epoch 1) in 812.4 ms: 123 live slots, ...
+# The "over N seam wave(s)" clause arrived with the waved seam (#631) and
+# is OPTIONAL here on purpose: archived logs from before it are still the
+# comparison baseline for every flip-time row in the bench, and a parser
+# that silently skipped them would turn a format change into a missing
+# regression rather than a visible one.
 _FLIP_RE = re.compile(
     r"PHASE-FLIP DONE (?P<dir>\w+) \(epoch (?P<epoch>\d+)\) in "
-    r"(?P<total>[\d.]+) ms: (?P<slots>\d+) live slots.*?"
+    r"(?P<total>[\d.]+) ms(?: over (?P<waves>\d+) seam wave\(s\))?: "
+    r"(?P<slots>\d+) live slots.*?"
     r"read (?P<read>[\d.]+) ms, exchange (?P<xchg>[\d.]+) ms, "
     r"write (?P<write>[\d.]+) ms",
     re.S,
@@ -135,6 +141,11 @@ def parse_flip_stats(lines):
                     "exchange_ms": float(m.group("xchg")),
                     "write_ms": float(m.group("write")),
                     "live_slots": int(m.group("slots")),
+                    # None for pre-wave logs, which is a truthful "the run
+                    # predates the split" rather than a fabricated 1.
+                    "seam_waves": (
+                        int(m.group("waves")) if m.group("waves") else None
+                    ),
                     "line": line.strip()[:240],
                 }
             )
