@@ -469,6 +469,38 @@ class KvVmmArena:
     # -- is never unmapped. Reversing either one produces a fault or
     # silent KV corruption at a chunk boundary.
 
+    @staticmethod
+    def span_bounds(lo_bytes: int, hi_bytes: int, granularity: int, outward: bool):
+        """Normalise a byte span to the MAPPING unit, which is granularity.
+
+        THE CHUNK IS A HANDLE SIZE, NOT AN ALIGNMENT, and conflating the two
+        took all three ranks down on the first boot where the streamed seam
+        actually engaged (cuMemMap -> CUDA_ERROR_INVALID_VALUE).
+
+        ``commit_span`` used to round outward to the CHUNK while
+        ``commit_range`` rounds to the granularity. Buffer VA extents are
+        laid out granularity-aligned, so a chunk-rounded ``hi`` overshoots
+        the end of its own buffer -- by up to chunk-1 bytes -- and asks the
+        driver to map over the NEXT buffer's live mapping. cuMemMap answers
+        INVALID_VALUE, the exception climbs out of the seam inside the
+        no-return region, and the instance dies.
+
+        It hid because the legacy whole-pool path never produced a span
+        ending anywhere but at a buffer's own end, and because the span
+        unit tests do not run against a real arena with a neighbour to
+        collide with.
+
+        ``outward`` covers every byte asked for (commit); inward keeps a
+        chunk that still holds live rows out of the range (decommit), where
+        over-releasing is silent KV corruption rather than a fault.
+        """
+        g = int(granularity)
+        lo = max(int(lo_bytes), 0)
+        hi = max(int(hi_bytes), 0)
+        if outward:
+            return (lo // g) * g, align_up(hi, g)
+        return align_up(lo, g), (hi // g) * g
+
     def _require_chunk(self, op: str) -> int:
         if self._chunk is None:
             raise RuntimeError(
@@ -539,8 +571,10 @@ class KvVmmArena:
                 f"commit_span offset {offset} not granularity-aligned "
                 f"({self.granularity})"
             )
-        lo = max(int(lo_bytes), 0) // chunk * chunk
-        hi = align_up(max(int(hi_bytes), 0), chunk)
+        # Granularity, NOT chunk: the chunk caps the HANDLE size below, but
+        # the mapping unit -- and the alignment every buffer's VA extent was
+        # laid out on -- is the granularity. See span_bounds.
+        lo, hi = self.span_bounds(lo_bytes, hi_bytes, self.granularity, True)
         if hi <= lo:
             return 0
         if offset + hi > self.reserved:
@@ -601,9 +635,11 @@ class KvVmmArena:
         """
         if self._closed:
             raise RuntimeError("KvVmmArena.decommit_span after close")
-        chunk = self._require_chunk("decommit_span")
-        lo = align_up(max(int(lo_bytes), 0), chunk)
-        hi = max(int(hi_bytes), 0) // chunk * chunk
+        # Kept for its REFUSAL, not its value: on an unchunked arena the
+        # extents are per-buffer monoliths and a range release could only
+        # give back everything or nothing.
+        self._require_chunk("decommit_span")
+        lo, hi = self.span_bounds(lo_bytes, hi_bytes, self.granularity, False)
         extents = self._extents_by_offset.get(offset, [])
         if not extents or hi <= lo:
             return 0

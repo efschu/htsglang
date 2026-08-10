@@ -33,7 +33,10 @@ for b in $BLOCKS; do
   spans_after=$(grep -c "backing_restore_span" "$LOG")
   {
     echo "=== blocks=$b direction=$dir ==="
-    grep "PHASE-FLIP DONE" "$LOG" | tail -3 \
+    # Only lines newer than this arm's mark: tail -3 straddles two flips
+    # when a direction completes between arms, which silently attributes
+    # the previous arm's numbers to this one.
+    grep "PHASE-FLIP DONE" "$LOG" | tail -n +$((before + 1)) \
       | sed -E 's/.*(PP[0-9]).*DONE ([a-z_]+) \(epoch ([0-9]+)\) in ([0-9.]+) ms.*staging reserved ([0-9.]+) MiB.*/  \1 \2 epoch=\3 ms=\4 staging=\5/'
     echo "  span_marks_delta=$(( spans_after - spans_before ))"
     nvidia-smi --query-gpu=index,memory.free --format=csv,noheader | sed 's/^/  free /'
