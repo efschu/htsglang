@@ -2871,3 +2871,122 @@ only part of that is the smaller staging peak — this run had 8049 prefill
 batches against 2d's 10989, so the load was lighter. Do not book the whole
 1484 MiB as recovered headroom; measure it (section 2e, and HANDOFF_667
 section 4 for the ledger).
+
+---
+
+## 2g. Capacity ladder, successor 25 — measured, and one correction that
+## invalidates a method earlier rows relied on
+
+### 2g.0 Idle free memory is AGE-dependent and is NOT a capacity baseline
+
+Measured rather than argued, and it matters because several earlier
+capacity arguments in this file reason from a resting free reading.
+
+| pool | process age at reading | free idx0 / idx1 / idx2 (MiB) |
+|---|---|---|
+| 380000 | ~3.5 h | 3523 / 6712 / 3535 |
+| 410000 | fresh boot | **3749 / 7058 / 3741** |
+
+A strictly LARGER pool showed MORE free memory. The pool really was
+adopted (`get_server_info: max_total_num_tokens = 410000`,
+`pp_stage_ratio [14,10,8]` unchanged), so this is not a boot that ignored
+the flag: the older process was holding roughly **520 / 756 / 440 MiB** of
+torch allocator cache it never returned.
+
+**Consequence: only corridor MINIMA under a standardised load compare
+between two pools.** A fresh boot's idle free is optimistic by several
+hundred MiB per card.
+
+### 2g.1 The resident term, corroborated on metal
+
+Two boots at EQUAL process age, one variable moved:
+
+| pool | free idx0 / idx1 / idx2 (MiB) |
+|---|---|
+| 410000 | 3749 / 7058 / 3741 |
+| 500000 | 2829 / 5726 / 2977 |
+| **drop** | **920 / 1332 / 764** |
+| predicted from 2048 B/layer/token at layer counts 5 / 7 / 4 | 879 / 1230 / 703 |
+
+Within 5-9%, ordered correctly. The ledger's resident geometry
+(2048 bytes per KV cell, per-rank layer counts 5/7/4) is confirmed by a
+clean two-point boot rather than only by log regression.
+
+### 2g.2 The ladder
+
+Corridor floor is 1024 MiB free per card, sampled throughout.
+
+| pool | load | corridor min idx0/idx1/idx2 | breaches | verdict |
+|---|---|---|---|---|
+| 380000 (s24 green) | 64.5 min mixed | 2699 / 5732 / 2831 | 0 | pass |
+| 410000 | 14 min mixed, LOW occupancy | **2707 / 5752 / 2857** | 0 | pass for the load; **NOT evidence about the ceiling** |
+| 500000 | high-occupancy leg | see 2g.3 | | |
+
+**Why the 410000 row is not a capacity result.** The seam's staging term
+scales with the LIVE SET, so a load that never fills the pool cannot test
+the term that decides the ceiling. That row's occupancy stayed low, which
+is why `scripts/s25_capacity_step.sh` exists: it issues long prefills
+faster than they retire so the pool actually fills, and
+`scripts/s25_step_verdict.py` refuses to read a step as capacity evidence
+when peak occupancy is under 50%.
+
+### 2g.3 The inherited ceiling is CONFIRMED — and the obvious reading of
+### the 500000 run is wrong
+
+A 500000 boot held the corridor for a full high-occupancy leg:
+**min 1705 / 4336 / 2051 MiB, zero breaches, zero FLIP ABANDONED**, both
+flip directions visited (12 `pp_to_tp`, 9 `tp_to_pp`).
+
+**That is not a refutation of the ~432,000 ceiling, and reading it as one
+would be this chain's sixth false closure.** The ceiling is an ANTI-WEDGE
+condition: a flip must stay affordable when the live set FILLS the pool.
+This run's live set peaked at **131,288 slots — 26% of the pool.** The
+term that decides the ceiling was never exercised.
+
+What the run DID settle is the staging model, and it settles it in the
+ledger's favour:
+
+| quantity | measured here | ledger prediction |
+|---|---|---|
+| staging at 131,288 live slots | **1047.6 MiB** | 950 MiB |
+
+Within 10%, so `S(L) = 4.517 * L/1000 + 357` stands.
+
+Extrapolate with it and the 500000 boot fails the anti-wedge test rather
+than passing it. Free on the binding card excluding staging is
+`1705 + 1047 = 2752` MiB at P=500000; at FULL occupancy the same pool
+would want `S(500000) = 2616` MiB, leaving 136 MiB — far under the floor.
+Solving for the largest pool that keeps `base(P) - S(P) >= 1024`:
+
+    P <= 437,862
+
+against successor 24's **432,861** and the qwen log regression's
+**437,235**. **Three independent methods, agreeing to 1.2%.** The
+inferred-baseline term that successor 24 flagged as the weak link has now
+been measured, and it did not move the answer.
+
+**Consequence for the acceptance pool.** 500000 is not a safe operating
+point even though it holds this load, because a single long request is
+enough to reach the unsafe region: at pool 500000 a 393,216-token request
+prices staging at 2132 MiB against 2752 MiB of baseline, i.e. 620 MiB
+free — a breach. At pool 430000 the same request has 3436 MiB of baseline
+and lands at 1304 MiB free, which holds. The honest maximum for the
+CURRENT seam is therefore about **435,000**, and that is where the
+acceptance run belongs.
+
+This is also why the user's >=600000 (spec item 6) is not reachable by
+stepping the pool: it is blocked by the staging SLOPE, not by the
+intercept. See HANDOFF_668 sections 2.1 and 2.1b for the two routes that
+remove it.
+
+### 2g.4 Graph and purity axes at pool 500000
+
+Both acceptance axes hold simultaneously at the larger pool:
+
+| axis | count |
+|---|---|
+| decode batches with `cuda graph: True` | 27 / 27 |
+| prefill batches with `cuda graph: True` | **0 / 178** (strict purity) |
+
+Graphs are active where the spec wants them (TP decode) and absent where
+purity forbids them (PP prefill).

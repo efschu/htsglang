@@ -161,6 +161,56 @@ written still get backed on the way past, which is required anyway —
 the destination must end fully backed because it becomes the resting
 layout.
 
+### 2.1b A CHEAPER INTERMEDIATE that may clear the floor on its own
+
+Derived after 2.1 and worth trying FIRST, because it avoids the one
+genuinely dangerous change (row-blocking the collective) and is a
+contained edit to the wave loop.
+
+Three moves:
+
+1. **Restore-first per wave** — restore the destination wave's backing
+   before releasing the source wave's, instead of after.
+2. **Lift the wave count to `n_layers` (16).** `default_wave_count` is
+   capped at the SMALLEST stage (4 here) only because a wave's releases
+   must pay for its commits under release-first. Restore-first budgets the
+   overlap explicitly, so the cap goes away. The payload slope is
+   `~18 MiB/1000 live slots / W`, so W=4 -> 4.5 and W=16 -> **1.13**.
+3. **Choose the wave ORDER so the transient lands on the card with the
+   most headroom.** This is the part that is not obvious. Per wave, rank
+   `r` restores its destination layers (in `tp_to_pp` a PP layer spans the
+   FULL pool, 1.953 MiB/1000 pool tokens) and releases the wave's TP layer
+   (`share_r` of that). They balance over the whole flip but not wave by
+   wave, so the peak is
+
+       max_j [ 1.953 * M_r(j)  -  1.953 * share_r * j ]
+
+   where `M_r(j)` counts rank `r`'s destination layers among the first
+   `j+1`. Whoever owns the FIRST layer processed pays a full layer with
+   nothing yet released — that payment is unavoidable, but it is
+   ASSIGNABLE. Put rank 0's layer first (the 5090, the card with by far
+   the most headroom) and delay each 3080's first owned layer to
+   `j0 >= 1/share_r` — with `[7,5,4]` that is `j0 >= 4` for rank 1 and
+   `j0 >= 5` for rank 2 — and both BINDING cards pay approximately
+   ZERO transient, while the 5090 absorbs ~1.95 MiB/1000 pool tokens.
+
+Predicted ceiling on successor 24's inferred baseline: about **594,600**
+— just under the floor. On the corridor minima actually measured here it
+may clear 600000; that is a question for a boot, not for more arithmetic.
+
+**Why this is low-risk despite touching the seam.** Restore-first does
+not change WHICH bytes are read or written, nor in what order — only when
+physical pages are mapped. Byte identity is therefore preserved by
+construction, and the existing byte-identity tests
+(`TestByteIdentity`, `TestSeamWavesAreByteIdentical`,
+`TestSharedArenaReadsPrecedeWrites`) are the net that proves it. The
+tests that MUST go red and be rewritten to the new contract are the
+order pins: `SeamOrderingTest` (three methods asserting
+release-then-reclaim-then-restore) and
+`TestPreWriteSeamOrdering::test_hook_fires_between_last_read_and_first_write`.
+Aliased pools must keep the OLD order — `_pools_alias()` already gates
+that, and it must stay gated.
+
 ### 2.2 What is BUILT and what is NOT
 
 Built, tested, committed:
