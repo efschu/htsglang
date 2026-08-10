@@ -3407,3 +3407,117 @@ once:
 
 Run it before resizing the pool. Shrinking the pool would also "fix" the
 corridor and would spend capacity to buy back memory that may be free.
+
+---
+
+# SUCCESSOR 28 (2026-08-10, from 18:58Z)
+
+## 2n. SPEC ITEM 8, ANSWERED: DRAFT CUDA GRAPHS STAY ON
+
+The experiment above ran. It answered item 8 decisively and in the
+**opposite direction to the hypothesis that motivated it**, which
+retires the convergence plan the last three handoffs were built around.
+
+### 2n.1 First, the instrument was inert -- twice
+
+**Defect 1: the gate sat on a class this rig never executes.** The
+19:06Z boot carried `--disable-draft-cuda-graph` on the live process's
+own cmdline and captured the draft graphs anyway. Evidence, not
+suspicion: **zero** occurrences of the disable message in the log, and
+idle VRAM moving `-108 / -234 / +274` MiB across the three cards --
+mixed sign, i.e. boot noise, not a freed capture.
+
+`--speculative-algorithm NEXTN` runs `EAGLEWorkerV2`, a wrapper that
+delegates to `EagleDraftWorker`, and `EagleDraftWorker` **overrides**
+`init_cuda_graphs`. The gate was on `EagleDraftWorkerBase`. The flag
+parsed, propagated, reached the worker and did nothing. This is the
+third occurrence in this file of one shape: **a switch tested against an
+ancestor the production path does not execute** (HANDOFF_670 section 1b
+`hasattr`, section 1d the span-forwarding wrapper, now this).
+
+A second gate was needed in `_capture_cuda_graphs`, and it is not a
+duplicate: the flip re-arms a layout through that method **without
+passing `init_cuda_graphs`**, so an entry-point-only gate would have
+held at boot and let the graphs return at the first flip -- disabled for
+exactly as long as nobody looked.
+
+**Defect 2, found on metal: the eager runner is BUILT by the call that
+was being skipped.** With the gate wired, the boot got further and died
+at 19:18Z on all three ranks at the first draft extend:
+
+    AttributeError: 'ModelRunner' object has no attribute 'eager_runner'
+    ... _draft_extend_for_decode -> draft_runner.forward -> _forward_raw
+
+`ModelRunner.init_cuda_graphs` does not only capture graphs; it
+constructs the eager runner and aliases the prefill and decode runners
+onto it. **The eager path is not the absence of the graph path, it is an
+object somebody has to build.** The refusal now lives inside that
+method, sharing `_install_eager_only_runners` with the existing
+phase-flip PP carve. Note the failure mode: the log said "graphs
+disabled" and the instance looked healthy for three minutes.
+
+Commits `4f6c0c4de1`, `b0f63d860e`. 13 tests, red-first.
+
+### 2n.2 The measurement
+
+Boot-time flag, so no same-boot floor is available. Substitute control:
+token count pinned (every request runs to exactly 600 new tokens, 7200
+per arm) plus a **mandatory same-boot A-vs-A floor**. The originally
+planned control -- hashing the output text -- was discarded after
+measurement: **at temperature 0.0 this instance does not reproduce its
+own output within a single boot** (round 1 vs round 2, same prompt, 2565
+vs 2741 characters), because batch composition varies and speculative
+verification is not batch-invariant. A control nothing can pass is not a
+control.
+
+| metric | graphs ON | graphs OFF | delta | same-boot floor |
+|---|---|---|---|---|
+| accept length (aggregate) | 2.722 | 2.561 | **-5.9%** | +-1.2% |
+| wall decode tok/s | 84.51 | 49.75 | **-41.1%** | +-0.9% |
+| request seconds, mean | 18.84 | 39.81 | **+111.3%** | +-4.1% |
+| request seconds, median | 14.90 | 37.51 | **+151.7%** | +-1.1% |
+| request seconds, max | 29.20 | 49.09 | **+68.1%** | +-1.6% |
+
+All five move far beyond the floor. Accept length itself drops 5.9%,
+which is worth noting separately: an eager draft is not numerically
+identical to a captured one, so removing the graphs costs a little
+acceptance on top of the launch overhead.
+
+Memory freed by removing them, idle, three samples per card:
+
+| card | graphs ON free | graphs OFF free | freed |
+|---|---|---|---|
+| gpu0 (3080) | 2617 | 2965 | +348 MiB |
+| gpu1 (5090) | 5576 | 5782 | +206 MiB |
+| gpu2 (3080, binding) | 2447 | 3177 | **+730 MiB** |
+
+**VERDICT: draft CUDA graphs stay ON.** The user's rule (spec item 8) is
+to remove them if NEXTN gains nothing. NEXTN gains 41% throughput. The
+730 MiB on the binding card is real and it is fourteen times the 52 MiB
+corridor deficit -- and it is not purchasable, because the price is 41%
+of decode.
+
+### 2n.3 What this retires, and what it leaves
+
+**Retired: the convergence route to >=600000.** HANDOFF_670 sequenced
+item 8 before item 6 on the reasoning that removing draft graphs would
+also dissolve `resolve_spill_depth`'s refusal of spill rungs 2-3 (no
+graphs, no baked weight addresses). The graphs are staying, so that door
+does not open. Any spill route to >=600000 must now work **with draft
+CUDA graphs resident**.
+
+**Not available either: trimming the capture set.** The draft graphs
+capture `bs=[1, 2, 3, 4]`, which is exactly `max_running_requests=4`.
+There is no oversized batch ladder to cut; the set is already minimal.
+(Draft decode 0.17 GB, draft verify 0.26-0.30 GB per rank, plus draft
+extend -- consistent with the +730 MiB measured on gpu2.)
+
+**The open question this exposes, and it should have been asked before
+any spill was priced.** The 500000 breach is sustained pressure with its
+minimum BETWEEN flips, not a seam transient. A drafter spilled during
+the PP phase is worth its full size to the corridor floor **only if the
+binding minimum falls in the PP phase**. If gpu2's minimum falls in the
+TP phase -- where the drafter is active and cannot be spilled at all --
+then rung 2 buys exactly 0 MiB of floor, however large its payload.
+`s21_phase_corridor.py` exists to answer precisely this and was built by
+successor 21 for this reason. Measuring it now, before building.

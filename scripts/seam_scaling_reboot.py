@@ -122,6 +122,49 @@ def read_files(cmdline_path: str, env_path: str):
     return argv, env
 
 
+def read_replay_record(path: str):
+    """Recover (argv, env) from a replay record this tool wrote earlier.
+
+    Why this exists: when the previous boot DIED, there is no live process
+    to read and ``--from-capture`` needs two files nobody saves. The
+    documented workaround was to reconstruct them by hand from the
+    ``replay argv:`` / ``replay env:`` sections of the record -- which is
+    transcription, on the two inputs whose whole point is that they must
+    not drift. The record already holds exactly what is needed; parse it.
+
+    Reads the REPLAY sections, not the baseline ones: the replay argv is
+    what actually ran, so a chain of reboots composes instead of silently
+    reverting the substitution before last.
+    """
+    # Section headers are matched EXACTLY against the set this tool writes.
+    # A "line ending in a colon" heuristic looked equivalent and was not:
+    # PATH-like values end in ':' all the time, so the first such variable
+    # was read as a section header and every variable after it was dropped.
+    # Caught by a --dry-run that reported SGLANG_BOOT_COMMIT as "(absent)"
+    # on a record that plainly contains it.
+    sections = {"substitutions", "baseline argv", "replay argv",
+                "baseline env", "replay env"}
+    argv, env, section = [], {}, None
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line[:-1] in sections and line.endswith(":"):
+                section = line[:-1]
+                continue
+            if not line.strip():
+                continue
+            if section == "replay argv":
+                argv.append(line)
+            elif section == "replay env" and "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    if not argv:
+        raise SystemExit(f"{path}: no 'replay argv:' section found")
+    if not env:
+        raise SystemExit(f"{path}: no 'replay env:' section found")
+    return argv, env
+
+
 def _norm(name: str) -> str:
     """Accept ``pp-stage-ratio`` as well as ``--pp-stage-ratio``.
 
@@ -173,6 +216,12 @@ def main():
     ap.add_argument("--set-env", nargs=2, action="append", metavar=("NAME", "VALUE"))
     ap.add_argument("--del-env", action="append", metavar="NAME")
     ap.add_argument("--from-capture", nargs=2, metavar=("CMDLINE", "ENV"))
+    ap.add_argument(
+        "--from-replay", metavar="RECORD",
+        help="a replay-*.txt this tool wrote. Use when the previous boot "
+             "DIED and there is no live process to read. Like --from-capture "
+             "it does not stop anything, because there is nothing to stop.",
+    )
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
         "--no-stop",
@@ -182,7 +231,17 @@ def main():
     ap.add_argument("--stop-timeout", type=float, default=60.0)
     args = ap.parse_args()
 
-    if args.from_capture:
+    if args.from_capture and args.from_replay:
+        raise SystemExit("--from-capture and --from-replay are alternatives")
+
+    if args.from_replay:
+        argv, env = read_replay_record(args.from_replay)
+        source = f"replay record {args.from_replay}"
+        print(
+            "WARNING: baseline is a REPLAY RECORD of an earlier boot, not a "
+            "running server. Verify no instance is live before launching."
+        )
+    elif args.from_capture:
         argv, env = read_files(*args.from_capture)
         source = f"capture files {args.from_capture[0]} + {args.from_capture[1]}"
         print(
@@ -268,7 +327,7 @@ def main():
     # bounded wait) -- never a pattern kill: this box runs the router on
     # 30099 and other agents' processes, and a broad pkill has taken those
     # out before.
-    if not args.from_capture and not args.no_stop:
+    if not args.from_capture and not args.from_replay and not args.no_stop:
         import signal
 
         print(f"stopping live pid {pid} (SIGTERM)")
