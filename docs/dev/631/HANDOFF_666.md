@@ -518,3 +518,75 @@ single-rank filter there.
 **The decode decomposition is now unblocked** — the probe was the blocker,
 not the workload. Re-run it inside a load window and the in-phase number
 will exist for the first time in this chain.
+
+---
+
+## 11. THE LIVELOCK, REPRODUCED DETERMINISTICALLY BY ONE REQUEST — the headline
+
+I ran the YaRN acceptance leg empirically because a code audit is not a
+measurement. It wedged the instance, and the mechanism is now fully
+documented with a **one-request reproducer**, which this chain has never had.
+
+**Reproducer:** `scripts/route_a_631_yarn_needle_probe.py --target-tokens
+270000 --max-tokens 64` against pool 380000 /
+`RANK_MIB 31800,14000,15600` / geometry `[28,20,16]` / purity strict.
+Single request, bs=1, server otherwise idle.
+
+**What happens, in order:**
+
+1. The 270032-token prompt **prefills successfully in PP** —
+   `kv_committed_len=270031`. So YaRN above the 262144 base genuinely
+   works, and §7's audit verdict is confirmed for the PREFILL half.
+2. The `pp_to_tp` flip is then abandoned:
+
+```
+staging reclaim: driver free 4126 -> 4126 MiB (+0 returned), 226 MiB still
+                 cached, reserve 1024 MiB, staging needs 3855 MiB
+FLIP ABANDONED (pool too small for the live set): pp_to_tp.
+   staging 3855 MiB needed but only 3102 MiB is spendable
+```
+
+3. **Under strict purity decode may ONLY run in TP.** An abandoned
+   `pp_to_tp` means the request can never decode, so it stays resident, so
+   the live set stays large, so staging still needs 3855 MiB. Forever.
+4. `/health` goes 503; a trivial 8-token completion times out at 90 s.
+5. Killing the client drains the request — `num_running_reqs 0`,
+   `num_queue_reqs 0` — **and the livelock continues**, abandon lines
+   growing ~1/second (408 -> 432 in 25 s). The RESIDENT PREFIX CACHE still
+   holds the live set.
+6. `/flush_cache`, the remedy the abandon message itself advertises,
+   returns **HTTP 400**. `is_fully_idle()` is False while the metrics
+   report zero running and zero queued — a state/metrics divergence.
+7. No external remedy exists. Only a reboot recovered it (664 §11c, now
+   confirmed on a second, cleanly reproducible case).
+
+**MY COMMIT NEITHER CAUSED NOR PREVENTED THIS.** The reclaim returned
+**+0 MiB**; the superseded formula would have offered `226 + 3102 = 3328`,
+still short of 3855. It livelocks identically on the old code. This is a
+pre-existing defect that a single long request exposes on demand.
+
+### What it means for the program
+
+* **STAGING BYTES SCALE WITH THE RESIDENT LIVE SET** — 3156 MiB under the
+  68-min mixed load, **3855 MiB** for one 270k request. There is therefore a
+  request length beyond which the flip can NEVER afford to carry the live
+  set, and under strict purity that length is a **hard context ceiling that
+  wedges the instance rather than degrading**.
+* **This bounds user acceptance item 4 (bs=1 + YaRN above 262144).** The
+  model config permits 393216, the rope cache really covers it, and the
+  prefill completes — but decode is unreachable at 270k on this budget.
+  Prefill-only success is NOT the acceptance item.
+* **It is the top defect, ahead of every capacity item.** A wedge that any
+  long request can trigger outranks corridor tuning.
+* **Two candidate fixes, neither built.** (a) Make the abandon path
+  RECOVERABLE from inside the scheduler — retract or preempt the resident
+  request, or drop its prefix cache, then retry; 664 §11c argued this and
+  the reproducer now makes it testable in minutes. (b) Bound staging bytes
+  so they cannot scale without limit with the live set (chunk the move).
+* **Fix `is_fully_idle()`/metrics divergence** so `/flush_cache` is
+  available in the state that needs it — that alone would have converted
+  this wedge into a recoverable event.
+
+**A REGRESSION TEST EXISTS NOW.** Any future claim that the livelock family
+is closed must run the 270k reproducer above. The three previously "known"
+instances were all argued from logs; this one is a command.
