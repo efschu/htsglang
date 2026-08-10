@@ -37,6 +37,21 @@ reached it by luck, not by method. **A number computed downstream of a flag
 you set yourself can never tell you what the rig would do without that
 flag.** See §5.
 
+**0c. I had no liveness check on my own agent traffic, and agent traffic is
+a GREEN-RUN REQUIREMENT.** I rebooted at 05:01Z under two running agents and
+killed both (`502 router could not reach the local endpoint`) — the exact
+error I had quoted from successor 19 an hour earlier and then committed
+anyway. One announced its death; the other simply stopped. Worse, my check
+for "is agent traffic flowing" was reading the request COUNT, which cannot
+distinguish "running" from "died five minutes ago" — two samples taken close
+together look identical either way. **A count is not a liveness signal; only
+its DERIVATIVE is.** The green criterion requires real agent traffic, so an
+unnoticed agent death silently converts a green run into a soak-only run
+that still looks green. Fixed by monitoring the count's rate of change and
+alarming when it is flat for two consecutive intervals. **A successor should
+assume that anything requiring an external producer needs a stall alarm, not
+a presence check.**
+
 **1. I fixed the main PP loop and left two structurally identical loops
 alone.** `_event_loop_pp_body` was the loop my feature runs, so it is the
 loop I fixed. The prefill-disaggregation and decode-disaggregation loops in
