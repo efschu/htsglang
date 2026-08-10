@@ -46,19 +46,37 @@ MIB = 1024 * 1024
 
 
 class _Probe:
-    """A stand-in for the two memory readings, in MiB for readability."""
+    """A stand-in for the two memory readings, in MiB for readability.
 
-    def __init__(self, driver_free_mib, cached_free_mib):
+    ``returnable_mib`` is how much of the cache a reclaim would actually
+    hand back to the driver. It defaults to all of it -- the case the old
+    formula silently assumed everywhere -- and the interesting tests are
+    the ones that set it lower, because a 584 MiB buffer cannot be cut out
+    of cache that is scattered across blocks too small to serve it.
+    """
+
+    def __init__(self, driver_free_mib, cached_free_mib, returnable_mib=None):
         self.driver_free = int(driver_free_mib) * MIB
         self.cached_free = int(cached_free_mib) * MIB
+        self.returnable = (
+            self.cached_free if returnable_mib is None else int(returnable_mib) * MIB
+        )
+        self.reclaims = 0
 
     def __call__(self):
         return self.driver_free, self.cached_free
+
+    def reclaim(self):
+        self.reclaims += 1
+        self.driver_free += self.returnable
+        self.cached_free -= self.returnable
+        self.returnable = 0
 
 
 def _runtime(probe, reserve_mib=1024):
     r = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
     r._mem_probe = probe
+    r._mem_reclaim = probe.reclaim
     r._staging_reserve_bytes = int(reserve_mib) * MIB
     return r
 
@@ -85,13 +103,60 @@ class TestStagingAffordable(CustomTestCase):
         self.assertTrue(ok)
         self.assertEqual(detail, "")
 
-    def test_the_allocator_cache_counts_and_does_not_touch_the_corridor(self):
+    def test_the_allocator_cache_counts_once_it_has_been_handed_back(self):
         # Driver-free is AT the reserve (nothing spendable from the driver),
-        # but the allocator already holds 800 MiB it can hand back. Those
-        # bytes are invisible to NVML, so the corridor is untouched and the
-        # flip is affordable. Counting only driver-free would abandon here.
-        ok, _ = _runtime(_Probe(1024, 800))._staging_affordable(584 * MIB)
+        # but the allocator holds 800 MiB it CAN hand back. The verdict is
+        # unchanged from the old formula -- affordable -- but it is now
+        # reached by materialising the cache rather than by promising it,
+        # so the corridor reading is restored as a side effect.
+        probe = _Probe(1024, 800)
+        ok, _ = _runtime(probe)._staging_affordable(584 * MIB)
         self.assertTrue(ok)
+        self.assertEqual(probe.reclaims, 1)
+        self.assertEqual(probe.driver_free, (1024 + 800) * MIB)
+
+    def test_cache_that_cannot_be_handed_back_is_not_spendable(self):
+        # THE FALSIFIER for the superseded formula, and the reason this
+        # changed. Same 800 MiB of cache, but fragmented: a reclaim returns
+        # nothing usable. The old `usable = cached_free + max(0, driver_free
+        # - reserve)` blessed a 584 MiB staging here; the allocator would
+        # then have gone to the DRIVER for it and spent the user's corridor,
+        # or raised the OutOfMemoryError out of _exchange that took all
+        # three ranks down. Refused now.
+        probe = _Probe(1024, 800, returnable_mib=0)
+        ok, detail = _runtime(probe)._staging_affordable(584 * MIB)
+        self.assertFalse(ok)
+        self.assertEqual(probe.reclaims, 1)
+        self.assertIn("584", detail)
+
+    def test_a_partial_hand_back_is_credited_only_for_what_came_back(self):
+        # 800 MiB cached, only 300 returnable -> 300 spendable, 584 refused.
+        # The middle case: neither "trust the whole cache" nor "trust none".
+        probe = _Probe(1024, 800, returnable_mib=300)
+        ok, _ = _runtime(probe)._staging_affordable(584 * MIB)
+        self.assertFalse(ok)
+        ok2, _ = _runtime(_Probe(1024, 800, returnable_mib=600))._staging_affordable(
+            584 * MIB
+        )
+        self.assertTrue(ok2)
+
+    def test_no_reclaim_when_the_driver_alone_already_affords_it(self):
+        # Hysteresis: empty_cache is not free, and a flip that fits from
+        # driver-free with the corridor intact must not pay for one.
+        probe = _Probe(4096, 800)
+        ok, _ = _runtime(probe)._staging_affordable(584 * MIB)
+        self.assertTrue(ok)
+        self.assertEqual(probe.reclaims, 0)
+
+    def test_the_corridor_keeper_reclaims_even_when_staging_fits(self):
+        # driver_free 900 is already UNDER the 1024 reserve while the
+        # allocator sits on 800 MiB. Staging is tiny and would fit either
+        # way, but the user's corridor law is continuous, so the hoard goes
+        # back regardless.
+        probe = _Probe(900, 800)
+        ok, _ = _runtime(probe)._staging_affordable(1 * MIB)
+        self.assertTrue(ok)
+        self.assertEqual(probe.reclaims, 1)
 
     def test_the_cache_does_not_excuse_dipping_below_the_reserve(self):
         # 200 MiB cached, driver free BELOW the reserve: spendable is the

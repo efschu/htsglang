@@ -2772,6 +2772,20 @@ class PhaseFlipRuntime:
             )
         return int(incoming + max(outgoing, local) + one_layer_window)
 
+    def _reclaim_cached_blocks(self) -> None:
+        """Hand the allocator's unused blocks back to the driver.
+
+        Injectable so the unit tests can model a reclaim that succeeds, one
+        that partly succeeds, and one that returns nothing -- the three
+        cases whose verdicts must differ.
+        """
+        hook = getattr(self, "_mem_reclaim", None)
+        if hook is not None:
+            hook()
+            return
+        if torch.cuda.is_available():  # pragma: no cover - needs a device
+            torch.cuda.empty_cache()
+
     def _staging_affordable(self, staging_bytes: int) -> Tuple[bool, str]:
         """Can this rank stage ``staging_bytes`` without eating the reserve?
 
@@ -2780,14 +2794,37 @@ class PhaseFlipRuntime:
 
         * bytes the caching allocator already holds but has not handed out
           are reusable AND invisible to NVML, so spending them cannot move
-          the free-VRAM number the corridor is measured on. They are free
-          to this check.
+          the free-VRAM number the corridor is measured on.
         * bytes that must come from the driver DO move it, so only the
           amount above the reserve may be spent.
 
-        Hence ``usable = cached_free + max(0, driver_free - reserve)``.
-        Using ``driver_free`` alone would abandon flips that fit fine; using
-        the allocator's view alone would spend the corridor.
+        THE CACHE CREDIT IS ONLY REAL ONCE IT HAS BEEN MATERIALISED.  This
+        check used to read ``usable = cached_free + max(0, driver_free -
+        reserve)`` and stop there, which credits a fungibility the
+        allocator does not provide: ``cached_free`` is the SUM of every
+        free block, and a 457 MiB staging buffer cannot be cut out of 1166
+        MiB scattered across hundreds of small ones.  When the cache cannot
+        serve the request the allocator goes to the driver instead, and the
+        corridor -- the very number this reserve exists to protect -- pays
+        for a credit that was never collectable.  Measured on the live rig
+        (2026-08-10): ``/flush_cache`` on an IDLE instance handed 1166 MiB
+        back to the driver on the binding card, so hoard at that scale is
+        the normal resting state, not an edge case.
+
+        So when the decision has to lean on the cache, RETURN THE CACHE TO
+        THE DRIVER FIRST and then judge against ``driver_free`` alone.  If
+        the reclaim fully succeeds the verdict is arithmetically identical
+        to the old formula, and the corridor is restored as a side effect;
+        if it only partly succeeds the verdict is correctly smaller.  This
+        can never be more permissive than what it replaced, only more
+        honest, which is why it cannot introduce an OOM the old code
+        refused.
+
+        The same reclaim doubles as the corridor keeper: if driver-free has
+        already fallen under the reserve while the allocator sits on unused
+        blocks, hand them back whether or not this particular flip needs
+        them.  The flip boundary is the natural place for it -- the
+        outgoing layout's buffers have just been released.
 
         Off CUDA (unit stubs) there is nothing to measure and this term is
         not the one under test, so it abstains rather than inventing a
@@ -2805,8 +2842,28 @@ class PhaseFlipRuntime:
                 )
                 return int(free_dev), int(max(0, cached_free))
 
+        reserve = self._staging_reserve_bytes
         driver_free, cached_free = probe()
-        usable = cached_free + max(0, driver_free - self._staging_reserve_bytes)
+        from_driver = max(0, driver_free - reserve)
+        if cached_free > 0 and (staging_bytes > from_driver or driver_free < reserve):
+            before = driver_free
+            self._reclaim_cached_blocks()
+            driver_free, cached_free = probe()
+            from_driver = max(0, driver_free - reserve)
+            mib = 1024 * 1024
+            logger.info(
+                "%s staging reclaim: driver free %.0f -> %.0f MiB "
+                "(+%.0f returned), %.0f MiB still cached, reserve %.0f MiB, "
+                "staging needs %.0f MiB",
+                LOG_PREFIX,
+                before / mib,
+                driver_free / mib,
+                (driver_free - before) / mib,
+                cached_free / mib,
+                reserve / mib,
+                staging_bytes / mib,
+            )
+        usable = from_driver
         if staging_bytes <= usable:
             return True, ""
         mib = 1024 * 1024
