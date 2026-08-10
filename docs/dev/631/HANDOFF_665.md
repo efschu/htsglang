@@ -236,11 +236,10 @@ baseline-vs-replay record per boot to
     `[PP Dynamic Chunk] Failed to profile prefill latency` on any exception.
     That log line, or `Predictor ready (quadratic)`, is the engagement
     evidence — flag presence is not.
-  - `server_args.max_prefill_buffer_tokens` grows to
-    `max(chunked, max_prefill_tokens, ceil(chunked*1.25))` when dynamic
-    chunking is on with `pp_size > 1`: **2048 -> 16384, an 8x prefill buffer
-    ceiling**, which lands directly on the 1024 MiB corridor. Cost it before
-    crediting any speed win.
+  - I published a warning here that enabling the flag grows
+    `max_prefill_buffer_tokens` 2048 -> 16384 and that this "lands directly
+    on the 1024 MiB corridor". **THAT WARNING IS WRONG — see §16.** The
+    growth is real but costs nothing. Do not let it deter the arm.
   - the runtime `Predicted chunk size` line is `logger.debug` and will not
     appear at the default level; the observable that does is the spread of
     `#new-token:` across a request's prefill chunks.
@@ -341,10 +340,11 @@ constraint at the end of my session, and it is the right constraint.
    suspicion is already falsified (histogram `{1:15, 2:42, 3:90}`); the open
    question is in-phase tok/s versus plain TP3, which is what the probe
    separates.
-4. **Chunk A/B including the dynamic arm**, with the two traps in §8:
-   the discriminator is a chunk EXCEEDING `chunked_prefill_size` (a static
-   run already shows ~19 distinct sizes), and enabling the flag grows
-   `max_prefill_buffer_tokens` 2048 -> 16384, which lands on the corridor.
+4. **Chunk A/B including the dynamic arm.** The one real trap is the
+   discriminator: a chunk EXCEEDING `chunked_prefill_size`, not merely a
+   distinct one (a static run already shows ~19 distinct sizes). The VRAM
+   objection I raised against the arm is withdrawn in §16 — it costs
+   nothing, so the arm is cheaper to try than I said.
 
 ## 13. THE POOL LEVER IS EXHAUSTED — found at the very end, and it redirects the remedy
 
@@ -504,3 +504,51 @@ livelock family is in much better shape than 664 left it.
 I wrote that both audit agents were lost to the final reboot. Only the
 dynamic-chunking one was; this one completed. Its questions are answered
 here and should not be re-asked.
+
+
+## 16. A WARNING I PUBLISHED AND THEN FALSIFIED: the dynamic-chunking arm is free
+
+In §8 I warned that `--enable-dynamic-chunking` grows
+`server_args.max_prefill_buffer_tokens` from 2048 to 16384 — an 8x prefill
+buffer ceiling — and that this "lands directly on the 1024 MiB corridor",
+and I told a successor to cost it before crediting any speed win.
+
+**The growth is real and the cost is zero.** Verified by me, not taken from
+the audit that raised it: the sole caller in the tree is
+
+```
+python/sglang/srt/model_executor/runner/eager_runner.py:114
+    prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
+```
+
+At pool 470000 that is `max(470000, 16384)` with the flag and
+`max(470000, 2048)` without — the same number either way, dominated about
+29-fold. No other allocation path reads it. So the arm costs nothing in
+VRAM and my objection would have deterred the cheapest remaining
+experiment.
+
+**The error underneath is worth more than the correction.** I read a
+formula that grows a quantity 8x and inferred a cost without grepping for
+who consumes it. That is the same shape as HANDOFF_664 §11a, where
+successor 21 called a fix "the cheapest lead" from arithmetic they had not
+done on a log line they had not read to the end. *A quantity growing is not
+a cost; find the consumer first.*
+
+### What the audit says about engagement, and what is still unverified
+
+Marked **UNVERIFIED** except the caller list above, which I checked:
+
+* the `pp_size > 1` gate passes in this config, so adding the flag arms the
+  boot-time profiler;
+* the profiler runs during `__init__`, before the event loop, so it does
+  NOT pass through the strict-purity gate at `scheduler.py:4731` — the
+  purity objection to the arm also looks unfounded;
+* **the first chunk of every request always uses the static size**
+  (`scheduler.py:5072` applies the dynamic size only when
+  `self.chunked_req is not None`), so the arm can only ever affect the
+  second and later chunks. Any A/B must account for that or it will
+  under-measure the effect;
+* engagement evidence at boot is `Predictor ready (quadratic)` versus
+  `[PP Dynamic Chunk] Failed to profile prefill latency`; the runtime
+  `Predicted chunk size` line is `logger.debug` and will not appear at the
+  default level.
