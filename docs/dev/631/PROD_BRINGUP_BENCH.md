@@ -1695,3 +1695,39 @@ Two properties worth carrying:
   window read a rock-steady 1393/1352/1447 — that was the soak spinning up,
   not the corridor passing. A corridor sample taken before load arrives
   proves nothing, and its flatness is the tell.
+
+## 6. The capacity ladder under real agent traffic
+
+The corridor minimum falls as the **agent context size** grows, because the
+allocator's high-water mark follows the largest request shape it has seen.
+This makes the ladder load-dependent in a way the synthetic soak never
+exposed.
+
+| pool | load | gpu0 | gpu1 (5090) | gpu2 | verdict |
+|---|---|---|---|---|---|
+| 460000 | soak only (s18) | 1397 | 1354 | 1451 | 0 breaches |
+| 460000 | soak + agents | 591 | 270 | 621 | BREACH x3 |
+| 340000 | soak + light agents | 1191 | 1166 | 1089 | 0 breaches, margin 65 MiB |
+| 340000 | soak + heavy agents | 1029 | 886 | 869 | BREACH gpu1, gpu2 |
+| 260000 | soak + heavy agents | see green run | | | |
+
+**A plateau is only a plateau for the workload mix in flight.** At 340000
+the corridor read *identically* 1191/1166/1089 for two consecutive
+2-minute buckets — a textbook steady state — and then breached within two
+minutes of two large-context agents joining. The allocator had simply
+finished growing for the shapes it had been shown. **Stress the worst
+shapes early**: a breach discovered at minute 40 costs the entire window,
+and deliberately provoking it at minute 10 cost ten.
+
+**Change the pool, not the budget.** Lowering `RANK_MIB` from
+31800/17400/17450 to 30500/16550/16500 made the 5090 *worse* — 852 MiB free
+at **idle**, already under the floor — because the KV pool is a hard
+requirement while `RANK_MIB` is advisory: a too-small budget against a
+too-large pool simply overshoots. The budget stays at the proven values and
+`--max-total-tokens` is the lever.
+
+**A structural oddity worth a successor's attention:** `RANK_MIB=31800` on a
+32607 MiB card leaves 807 MiB, which is **below the 1024 MiB floor by
+construction**. Every configuration that held did so only because the engine
+did not consume its whole budget. The budget and the corridor law have never
+been reconciled with each other.

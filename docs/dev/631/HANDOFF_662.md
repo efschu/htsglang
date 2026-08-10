@@ -71,23 +71,42 @@ silently sends the work to Anthropic and produces exactly successor 18's
 symptom: agents that run correctly while the serving log stays empty.
 **For qwen/local-model agents, pass no `model` argument.**
 
-## 3. 460000 IS RETIRED. The ship number under agent traffic is 340000
+## 3. 460000 IS RETIRED. The best-supported pool is 260000
 
 Successor 18 established 460000 on a synthetic soak with **no agent
 traffic**, and the user's green criterion *requires* agent traffic. Adding
-it breaks the corridor on all three cards:
+it breaks the corridor on all three cards — and the corridor minimum keeps
+falling as the agent CONTEXT grows, because the allocator's high-water mark
+follows the largest request shape it has seen:
 
 | pool | load | gpu0 | gpu1 (5090) | gpu2 | verdict |
 |---|---|---|---|---|---|
 | 460000 | soak only (s18) | 1397 | 1354 | 1451 | 0 breaches |
-| 460000 | soak + agent traffic | **591** | **270** | **621** | all breach |
-| 340000 | soak + agent traffic | **1733** | **1886** | **1551** | 0 breaches |
+| 460000 | soak + agents | 591 | 270 | 621 | BREACH x3 |
+| 340000 | soak + light agents | 1191 | 1166 | 1089 | 0 breaches, margin 65 MiB |
+| 340000 | soak + heavy agents | 1029 | **886** | **869** | BREACH gpu1, gpu2 |
+| 260000 | soak + heavy agents | 2167 | 2612 | 1809 | 0 breaches / 3150 samples |
 
 Floor is 1024 MiB. **A capacity number is only real under the load the
 acceptance criterion names**, and this is the second time in this chain that
 a rung was climbed under a load lighter than the bar (s18 caught the same
-error going from bs=1 to bs=4; this is the bs=4→agent-traffic instance of
-it).
+error going from bs=1 to bs=4; this is the bs=4→agent-traffic instance).
+
+**A plateau is only a plateau for the workload mix in flight.** At 340000 the
+corridor read *identically* 1191/1166/1089 for two consecutive 2-minute
+buckets — a textbook steady state — then breached within two minutes of two
+large-context agents joining. Provoking the worst shapes at minute 10 cost
+ten minutes; discovering them at minute 40 would have cost the window.
+
+**Change the pool, not the budget.** Lowering `RANK_MIB` to
+30500/16550/16500 made the 5090 *worse* (852 MiB free at **idle**) because
+the KV pool is a hard requirement while `RANK_MIB` is advisory — a too-small
+budget against a too-large pool simply overshoots.
+
+**A structural oddity for a successor:** `RANK_MIB=31800` on a 32607 MiB card
+leaves 807 MiB, **below the 1024 floor by construction**. Every config that
+held did so only because the engine did not consume its whole budget. The
+budget and the corridor law have never been reconciled.
 
 Two properties worth carrying:
 
@@ -98,9 +117,9 @@ Two properties worth carrying:
   460000 window read a rock-steady 1393/1352/1447 — that was the soak
   spinning up, not the corridor passing. Flatness is the tell.
 
-340000 still leaves 527–862 MiB above the floor, so it is not the edge; the
-edge is nearer 400000 and was not chased because a proven number beat an
-optimal one with the clock where it was.
+260000 still leaves 785–1588 MiB above the floor, so it is not the edge —
+but no pool has yet carried a full 60-minute window, so the edge stays
+unmeasured until the wedge in §5b is fixed.
 
 ## 4. FULL KV >600k: the honest closure the spec asks for
 
@@ -143,7 +162,7 @@ become idle card slack.** This is the third handoff to arrive here.
 **The framing itself is the defect: "can we spill at runtime to grow the
 pool" is unanswerable, and the answerable question is "what pool can the rig
 BOOT with and still hold the corridor".** Under the load the acceptance
-criterion names, that answer is 340000 — so >600k is further away than
+criterion names, that answer is 260000 — so >600k is further away than
 successor 18's negative suggested, not closer.
 
 `phase_flip_spill.py` is written but **not wired**: `get_spill_ladder` has no
@@ -190,11 +209,81 @@ the only one still untried.
    together, per card** — the KV-only arithmetic looks like a free win and
    is not.
 
+## 5b. THE WEDGE: a self-reinforcing deadlock, and it is the real blocker
+
+**This is the most important thing in this handoff.** The green run died at
+02:05Z, and the mechanism is a defect that the strand's sibling task
+(#622/#649, "why serving keeps wedging") has been hunting.
+
+Log evidence, `/spinning/evidence-631/WEDGE_20260810T0201Z_residentcarry.log`
+(also `/spinning/serving-30030.boot.log.s19-260k-WEDGE-0205`):
+
+    02:01:10 PP0  Prefill batch ... #running-req: 1, #queue-req: 6,
+                  #pending-token: 177339
+    02:01:10 PP0  PHASE-POLICY refusing to evaluate the flip policy this
+                  round: the resident set is corrupted (PHASE-FLIP-CARRY
+                  running_mbs[0] claims 5 resident request(s), above
+                  max_running_requests=4 ... This is defect M
+
+The claimed count then walks **5 → 13338 → 26671 → 40005 → 53338 → …→
+168854**, in exactly uniform increments: **+1 per scheduler round**, ~700/s.
+
+### It is not successor 18's bug
+
+s18's self-merge doubled the batch (powers of two). This grows **linearly**,
+and the s18 guard is present and firing in this very build (`SELF-MERGE
+REFUSED` 132708 times in the same window). **The doubling was fixed; a
+linear leak remains underneath it.**
+
+### It is a miscount, and then a deadlock
+
+* **Miscount:** on the same round the scheduler reports `#running-req: 1`
+  while `running_mbs[0]` claims 5. 168854 concurrent requests is impossible
+  with `max_running_requests=4`. And the growth rate (~700/s) is orders of
+  magnitude above the arrival rate (6 requests in 7 minutes), so
+  **`running_mbs[0]` is accumulating a duplicate of the same request once
+  per scheduler round.**
+* **Deadlock:** the guard (`phase_flip_resident_carry.py:236-245`) refuses to
+  evaluate the flip policy while the set looks corrupt. But under **strict
+  purity decode is forbidden in the PP layout**, so *only a flip to TP can
+  drain the resident set*. **The guard blocks the one action that would
+  clear the condition it is detecting**, and the instance can never recover.
+  1115 flips happened before the wedge; zero after.
+
+### Why it fires now and not for successor 18
+
+The trigger is **queueing pressure** — `#queue-req: 6` against
+`max_running_requests=4`. Successor 18's synthetic soak never exceeded the
+design point. Real agent traffic does, easily, because agent turns arrive in
+bursts. **So closing the agent-traffic gate is what exposed this**: the
+blocker has moved from "traffic does not arrive" to "traffic wedges the
+scheduler", and the green criterion cannot be met until this is fixed.
+
+### For the successor, the shape of the fix
+
+Two separable defects, and they should not be conflated:
+
+1. **The leak** — find what appends to `running_mbs[0]` once per round
+   without removing the finished/duplicate entry. Start at
+   `harvest_resident_batches` (`phase_flip_resident_carry.py:209-260`) and
+   the `running_mbs`/`last_mbs` stores in `scheduler_pp_mixin.py:198/250`,
+   the same pair that hosted the s18 aliasing bug.
+2. **The deadlock** — a detector that only refuses is not containment; this
+   is the *second* time that exact lesson has been paid for in this chain
+   (HANDOFF_661 §2 records the first). Under strict purity the refusal must
+   not be able to outlive the condition: either repair the set, or permit the
+   flip that drains it, but never spin forever.
+
+**Do not "fix" this by raising `max_running_requests`.** The count reaches
+168854; any ceiling is crossed within seconds. And do not relax strict
+purity — that hides the deadlock without touching the leak, and purity is a
+hard user requirement (spec item 10).
+
 ## 6. State at handover
 
 * HEAD as committed this shift; suite status recorded in the commit message.
 * Serving UP on 30030, boot `06ed5afc25`, `RANK_MIB=31800,17400,17450`,
-  `MAX_TOTAL_TOKENS=340000`, CTX 393216, purity strict, both fairness
+  `MAX_TOTAL_TOKENS=260000`, CTX 393216, purity strict, both fairness
   windows on, POLICY=auto.
 * Boot replay: `/tmp/s18_boot.sh` (pass `RANK_MIB` and `MAX_TOTAL_TOKENS`).
   Note its defaults differ from `route_a_631_prod_boot.sh`, whose own
@@ -208,12 +297,18 @@ the only one still untried.
 
 ## 7. Next steps, in order
 
-1. **Judge the green run** (armed 01:40:33Z, 65 min, T=340000, with real
-   agent traffic). Evidence must show both layouts visited, prefill only in
-   PP, decode only in TP, graphs live, accept-len, the pool number, the
-   corridor time-series minimum, and agent tasks completed through 30099.
-2. **Re-establish the capacity edge under agent traffic.** 340000 holds with
-   527–862 MiB of margin; the edge is nearer 400000. One boot, same load.
+1. **Fix the wedge (§5b). Nothing else matters until this is done** — the
+   green criterion requires agent traffic, and agent traffic wedges the
+   scheduler within ~4 minutes. This is the whole blocker now.
+2. **Then re-run the green run.** No green run of mine completed: three were
+   aborted by me for corridor breaches (460000, 380000, 340000) and the
+   fourth, at T=260000, was killed by the wedge at 02:05Z after 8 minutes.
+   T=260000 held the corridor cleanly while it lived — min 2167/2612/1809,
+   **0 breaches in 3150 samples** with heavy agent traffic — so 260000 is
+   the best-supported pool, but it has NOT carried a 60-minute window.
+3. **Re-establish the capacity edge under agent traffic** once the instance
+   can survive one. 260000 left 785–1588 MiB of margin, so the edge is
+   higher; it was not chased because the wedge ended the window.
 3. **The alignment lever (§5)**, costed on weights *and* KV per card.
 4. **Graph A/Bs (spec item 8), still unmeasured** — I did not reach them.
    NEXTN draft graphs (`SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH`), DFLASH x
