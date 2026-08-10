@@ -572,3 +572,49 @@ one variable moved, and it existed the whole time. Given `15,10,7` silently
 became `16/9/7`, a second variable cannot be excluded in any of my boots.
 **Every capacity number in sections 4, 8 and 12 is provisional until
 reproduced through the replay tool.**
+
+### 12a. The curve, closed-form — use this instead of spending boots
+
+Both measured points fit one expression. Per card, at the aligned 14/10/8
+geometry:
+
+```
+  max_prefill_tokens_that_hold_1024 = (idle_free_MiB - 1024) / t
+      t = transient slope, MiB per 1000 prompt tokens
+        = 24 (rank1) / 32 (rank0) / 20 (rank2)
+  idle_free at pool P, from the measured 400000 / 500000 pair:
+        rank1  3403 - 5.78 x (P-400000)/1000
+        rank0  6690 - 9.70 x (P-400000)/1000
+        rank2  3415 - 4.40 x (P-400000)/1000
+```
+
+The KV slopes are the MEASURED 500000->400000 deltas (578 / 970 / 440 MiB per
+100000 tokens), not my earlier model, which over-predicted them by ~35 %.
+
+Checks against the two observations:
+* pool 400000 -> rank1 admits (3403-1024)/24 = **99100 tokens**. Measured: held
+  at 43k, breached at 111405. Consistent.
+* pool 500000 -> rank1 idle 2825, admits (2825-1024)/24 = **75000 tokens**.
+  Measured: held through the 42948 rung of the §8 window. Consistent.
+
+**Rank 1 is the binding card at every pool in this range.** Inverting for the
+acceptance target:
+
+| max prefill admitted | largest pool holding the 1024 corridor |
+|---|---|
+| 16384 (= `max_prefill_tokens`) | **~740000** |
+| 32768 | ~672000 |
+| 65536 | ~536000 |
+| 99000 | ~400000 |
+| 131072 | ~264000 |
+
+**So >=600000 IS reachable at this geometry provided prefills are bounded at
+about 43000 tokens** — and `--max-prefill-tokens` is already 16384, which by
+this table would allow ~740000. The fact that it does NOT is the anomaly in
+§12: the transient tracks total sequence length even though the chunk is 2048
+and the per-forward cap is 16384. **Fixing that term is worth more than every
+geometry and spill lever in this document combined**, because it moves the
+whole curve rather than one point on it.
+
+Caveat, and it is the same one as everywhere: the livelock bound is separate
+and harder, and this table addresses only the corridor bound.
