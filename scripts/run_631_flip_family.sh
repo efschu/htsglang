@@ -40,6 +40,12 @@ FAMILY=(
     test/registered/unit/managers/test_phase_flip_spill_depth_631.py
     test/registered/unit/managers/test_kv_arena_handle_retention_631.py
     test/registered/unit/managers/test_spec_counter_wire_631.py
+    # Third under-collection, caught 2026-08-10: six tests were added to
+    # this file and the family total did not move, because the list is
+    # explicit and nobody extended it. The file guards spec item 8's flag
+    # and the eager-runner regression that took all three ranks down, so
+    # it belongs in the sweep, not only in a hand-run.
+    test/registered/unit/managers/test_draft_cuda_graph_removal.py
     test/registered/unit/managers/test_spec_mamba_commit_width_631.py
     test/registered/unit/server_args/test_phase_flip_args.py
     test/registered/unit/distributed/test_phase_flip_groups.py
