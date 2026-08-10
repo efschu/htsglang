@@ -239,9 +239,20 @@ class KvVmmArena:
             # handles and nothing is ever reusable -- retention alone
             # would park memory and still allocate. Chunked commits make
             # every handle the same granule, and only then are the pages
-            # fungible between the two layouts. The two settings are one
-            # feature; enabling retention without a chunk is a no-op that
-            # costs memory, which is why _back_spans logs the pairing.
+            # fungible AT ALL. Enabling retention without a chunk is a
+            # no-op that costs memory, which is why _back_spans logs the
+            # pairing.
+            #
+            # BUT FUNGIBLE WITHIN ONE ARENA ONLY, and the phase flip's two
+            # layouts are two arenas -- one per KV pool, each with its own
+            # ``_retained``. The PP arena parks exactly the pages the TP
+            # arena is about to ask the driver for, and ``_take_retained``
+            # on the TP side can never see them, so both layouts stay
+            # resident and exclusive backing is defeated. Retention is
+            # therefore OFF by default even when a chunk is set; see
+            # ``memory_pool.seam_chunk_and_retention``. It stays reachable
+            # because a single-layout arena that grows and shrinks in place
+            # (the #330 dial) does recycle its own handles.
             self._retain_handles = bool(retain_handles)
             self._retained = {}
             self._retained_bytes = 0
@@ -262,6 +273,15 @@ class KvVmmArena:
             self.reserved / (1024**3),
             self.granularity // 1024,
         )
+
+    @property
+    def commit_chunk_bytes(self) -> int:
+        """The commit granule, or 0 when the arena maps monolithic extents.
+
+        Read by ``KvVmmBufferOwner.has_commit_chunk``, which the phase
+        flip's seam gate consults before choosing the span-granular path.
+        """
+        return int(self._chunk or 0)
 
     def _align(self, v: int) -> int:
         return align_up(v, self.granularity)
@@ -1001,6 +1021,11 @@ class KvVmmBufferOwner:
         return released
 
     # -- accessors / teardown -------------------------------------------------
+
+    @property
+    def has_commit_chunk(self) -> bool:
+        """Whether the span calls can run at all (see ``_require_chunk``)."""
+        return bool(self._arena is not None and self._arena.commit_chunk_bytes)
 
     @property
     def backed_bytes(self) -> int:

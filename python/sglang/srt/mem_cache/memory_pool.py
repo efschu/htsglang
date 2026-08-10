@@ -2076,6 +2076,39 @@ class KVCache(abc.ABC):
         return self.custom_mem_pool
 
 
+def seam_chunk_and_retention(chunk_mib: int, swappable: bool, retain_env: str):
+    """Resolve the #631 seam's commit chunk and handle retention SEPARATELY.
+
+    Returns ``(commit_chunk_bytes_or_None, retain_handles)``.
+
+    A COMMIT CHUNK IS NOW LOAD-BEARING ON ITS OWN, which is why the two
+    came apart. Section 2.1's row-blocked seam calls ``commit_span`` /
+    ``decommit_span``, and those RAISE on an unchunked arena
+    (``KvVmmArena._require_chunk``): a monolithic per-buffer extent can
+    only be released all-or-nothing, because ``cuMemUnmap`` takes whole
+    mappings. So the streamed seam needs the chunk whether or not anyone
+    wants retention.
+
+    RETENTION DEFAULTS OFF, and this is a fix rather than a preference.
+    Parked handles live in ``KvVmmArena._retained``, which is PER ARENA,
+    and the flip's two layouts are two pools with two arenas. The PP
+    arena parks precisely the pages the TP arena then asks the driver
+    for, and the TP arena's ``_take_retained`` cannot see another arena's
+    park. Both layouts stay resident, which defeats the exclusive backing
+    the VA-backed pool exists to provide -- the pool sizing then has to
+    fit both layouts at once. ``SGLANG_FLIP_SEAM_RETAIN_HANDLES=1``
+    restores it for a single-arena user (the #330 grow/shrink dial does
+    recycle its own handles).
+
+    Only swappable pools qualify for either: a pool that never releases
+    has nothing to park and nothing to stream.
+    """
+    if not swappable or int(chunk_mib) <= 0:
+        return None, False
+    retain = str(retain_env).strip().lower() in ("1", "true", "yes", "on")
+    return (int(chunk_mib) << 20), retain
+
+
 class MHATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -2398,23 +2431,11 @@ class MHATokenToKVPool(KVCache):
     def _alloc_post_capture_buffers(self):
         dev = torch.device(self.device)
         device_id = dev.index if dev.index is not None else torch.cuda.current_device()
-        # #631 ZERO-ALLOCATION SEAM (SGLANG_FLIP_SEAM_CHUNK_MIB, default 0 =
-        # off, so this is inert unless asked for and the A/B is ONE
-        # variable). The flip's cutover releases the source layout's
-        # physical pages and immediately re-commits the destination's,
-        # which today means 2*L monolithic cuMemCreate calls served only
-        # from driver-free pages -- the allocation that has to succeed
-        # inside the no-return region. Setting a chunk makes every handle
-        # the same size, and retention then re-maps the source's handles
-        # for the destination instead of asking the driver at all.
-        #
-        # Deliberately ONE knob for two settings: retention without a chunk
-        # is a no-op that costs memory (the sizes never match), so exposing
-        # them separately only creates a broken combination to choose.
-        # Only swappable pools qualify -- a pool that never releases has
-        # nothing to park and would just pin its own pages forever.
-        chunk_mib = int(os.environ.get("SGLANG_FLIP_SEAM_CHUNK_MIB", "0") or 0)
-        seam_chunk = (chunk_mib << 20) if (chunk_mib > 0 and self.swappable_backing) else None
+        seam_chunk, retain = seam_chunk_and_retention(
+            int(os.environ.get("SGLANG_FLIP_SEAM_CHUNK_MIB", "0") or 0),
+            swappable=bool(self.swappable_backing),
+            retain_env=os.environ.get("SGLANG_FLIP_SEAM_RETAIN_HANDLES", ""),
+        )
         self._post_capture_owner = KvVmmBufferOwner(
             device=self.device,
             device_id=device_id,
@@ -2423,7 +2444,7 @@ class MHATokenToKVPool(KVCache):
             reserved_num_tokens=self.size,
             buffer_descs=self._build_kv_buffer_descs(),
             commit_chunk_bytes=self._vmm_commit_chunk_bytes or seam_chunk,
-            retain_handles=seam_chunk is not None,
+            retain_handles=retain,
         )
         self._assign_post_capture_tensors(self._post_capture_owner.tensors)
 
@@ -2598,6 +2619,18 @@ class MHATokenToKVPool(KVCache):
         return self._post_capture_owner.back_token_span(
             int(lo_row), int(hi_row), indices
         )
+
+    @property
+    def supports_backing_spans(self) -> bool:
+        """Can the two span calls above actually run, or only be called?
+
+        They need a CHUNKED arena (``KvVmmArena._require_chunk``); on an
+        unchunked one they raise. The seam's gate asks THIS rather than
+        ``hasattr``, because the raise would happen inside the flip's
+        no-return region. See ``WavedBackingSwap.is_span_swappable``.
+        """
+        owner = self._post_capture_owner
+        return bool(owner is not None and owner.has_commit_chunk)
 
     @property
     def backing_is_resident(self) -> bool:

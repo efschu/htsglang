@@ -41,6 +41,7 @@ from sglang.srt.managers.phase_flip_runtime import (
     PHASE_PP,
     PHASE_TP,
     PhaseFlipRuntime,
+    WavedBackingSwap,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1878,3 +1879,264 @@ class TestWavedSeamOrdering(CustomTestCase):
         self.assertTrue(all(logs.values()))
         ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
         self.assertTrue(ok, f"the reordered seam corrupted rows: {msg}")
+
+
+# -- #631 section 2.1 PREREQUISITES (successor 27) ---------------------------
+#
+# The row-blocked seam shipped dark in ab3f3e6460 and could not have run on
+# any boot this rig has taken. Three linked reasons, one test each below,
+# plus the accounting that decides whether the shrink is ever CASHED.
+
+
+class TestStreamedSeamPrerequisites(CustomTestCase):
+    """The gate must answer for the ARENA, not for the method table.
+
+    ``commit_span``/``decommit_span`` raise unless the arena was built with
+    a commit chunk (``_require_chunk``), because ``cuMemUnmap`` only takes
+    whole mappings and a monolithic per-buffer extent can therefore only be
+    released all-or-nothing. ``SGLANG_FLIP_SEAM_CHUNK_MIB`` defaults to 0,
+    so on a default boot the span API is present and non-functional -- and
+    ``hasattr`` cannot tell those apart. The raise would land inside the
+    flip's no-return region.
+    """
+
+    @staticmethod
+    def _swap(supports):
+        from types import SimpleNamespace as NS
+
+        pool = NS(
+            release_backing_span=lambda *a: 0,
+            restore_backing_span=lambda *a: 0,
+            supports_backing_spans=supports,
+        )
+        swap = WavedBackingSwap.__new__(WavedBackingSwap)
+        swap._pp_pool = pool
+        swap._tp_pool = pool
+        return swap
+
+    def test_span_swappable_is_false_without_a_commit_chunk(self):
+        swap = self._swap(False)
+        self.assertFalse(
+            swap.is_span_swappable(PP_TO_TP),
+            "is_span_swappable answered from hasattr, so a pool whose arena "
+            "has no commit chunk green-lights a path that raises inside the "
+            "seam's no-return region",
+        )
+
+    def test_span_swappable_is_true_with_one(self):
+        self.assertTrue(self._swap(True).is_span_swappable(PP_TO_TP))
+
+
+class TestSeamChunkRetentionDecoupled(CustomTestCase):
+    """A commit chunk must be obtainable WITHOUT handle retention.
+
+    Retention parks released handles in ``KvVmmArena._retained`` for reuse.
+    That is per-ARENA, and the two layouts are two arenas: the PP arena
+    parks the pages the TP arena needs, and the TP arena's
+    ``_take_retained`` can never see them. Both layouts then stay resident
+    and exclusive backing -- the whole reason this pool is VA-backed -- is
+    defeated. Row-blocking NEEDS the chunk, so the two must come apart.
+    """
+
+    def test_chunk_alone_does_not_turn_retention_on(self):
+        from sglang.srt.mem_cache.memory_pool import seam_chunk_and_retention
+
+        chunk, retain = seam_chunk_and_retention(64, swappable=True, retain_env="")
+        self.assertEqual(chunk, 64 << 20)
+        self.assertFalse(
+            retain,
+            "retention is per-arena and the two layouts are two arenas, so "
+            "parking the source's pages hides them from the destination",
+        )
+
+    def test_retention_is_still_reachable_on_purpose(self):
+        from sglang.srt.mem_cache.memory_pool import seam_chunk_and_retention
+
+        chunk, retain = seam_chunk_and_retention(64, swappable=True, retain_env="1")
+        self.assertEqual(chunk, 64 << 20)
+        self.assertTrue(retain)
+
+    def test_no_chunk_means_no_chunk_and_no_retention(self):
+        from sglang.srt.mem_cache.memory_pool import seam_chunk_and_retention
+
+        self.assertEqual(
+            seam_chunk_and_retention(0, swappable=True, retain_env="1"), (None, False)
+        )
+        self.assertEqual(
+            seam_chunk_and_retention(64, swappable=False, retain_env=""), (None, False)
+        )
+
+
+class TestStreamedReleaseCoversBoundaryChunks(CustomTestCase):
+    """The residual that grows with B and cancels the 1/B gain.
+
+    ``decommit_span`` rounds INWARD (a chunk only partly inside the range
+    still holds live rows). So for an interior boundary, block ``b``'s
+    ``hi`` rounds below it and block ``b+1``'s ``lo`` rounds above it, and
+    the chunk straddling it is released by NEITHER -- ``(B-1)`` chunks per
+    buffer left mapped on the resting layout, growing with the block count.
+
+    The fix costs nothing: release ``[0, hi_b)`` cumulatively. Every source
+    read completes before the seam opens (``_execute`` reads the retained
+    leg and drains the exchange first), so no source row is live at any
+    point in this loop, and a wider release is always sound.
+    """
+
+    def test_release_spans_are_cumulative_from_row_zero(self):
+        from types import SimpleNamespace as NS
+
+        log = []
+        swap = _RecordingSeamSwap(log)
+        rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
+        rows = torch.arange(8, dtype=torch.int64)
+        data = torch.zeros(8, 4, dtype=torch.uint8)
+        written = []
+        dst = NS(
+            num_rows=16,
+            write_rows=lambda li, r, d: written.append((li, r.clone())),
+        )
+        rt._stream_wave(swap, PP_TO_TP, (0,), NS(num_rows=16), dst, [(0, rows, data)], 4)
+        rel = [span for kind, span in log if kind == "release_span"]
+        self.assertEqual(
+            rel,
+            [(0, 4), (0, 8), (0, 12), (0, 16)],
+            "each block must release everything released so far, so the "
+            "chunk straddling a block boundary -- which inward rounding "
+            "leaves out of both neighbours -- is covered by the next block",
+        )
+
+    def test_restore_spans_stay_disjoint(self):
+        """Only the RELEASE side widens.
+
+        Commit rounds outward and is idempotent, so a disjoint restore
+        already leaves no gap; widening it too would re-commit the whole
+        destination on every block and put the layer-span transient
+        straight back.
+        """
+        from types import SimpleNamespace as NS
+
+        log = []
+        rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
+        rows = torch.arange(8, dtype=torch.int64)
+        data = torch.zeros(8, 4, dtype=torch.uint8)
+        dst = NS(num_rows=16, write_rows=lambda li, r, d: None)
+        rt._stream_wave(
+            _RecordingSeamSwap(log), PP_TO_TP, (0,), NS(num_rows=16), dst,
+            [(0, rows, data)], 4,
+        )
+        res = [span for kind, span in log if kind == "restore_span"]
+        self.assertEqual(res, [(0, 4), (4, 8), (8, 12), (12, 16)])
+
+
+class TestBlockedSeamAccounting(CustomTestCase):
+    """The gate must PRICE the shrink, or the shrink is never cashed.
+
+    ``_staging_bytes`` is what refuses a flip. Row-blocking makes the real
+    peak smaller, but if ``_backing_slack_bytes`` keeps charging a whole
+    layer span the reservation is unchanged, the pool stays capped exactly
+    where it was, and the change measures as inert. The mirror error is
+    worse: pricing blocks that the loop is not running under-reserves and
+    the flip OOMs inside the no-return region.
+    """
+
+    @staticmethod
+    def _rt(blocks, restore_first=True, span_swappable=True, chunk=0):
+        from types import SimpleNamespace as NS
+
+        rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
+        rt._map = MAP_625
+        rt._rank = 0
+        rt._seam_row_blocks = blocks
+        rt._seam_restore_first = restore_first
+        rt._pools_alias = lambda: False
+        rt._seam_backing_is_swappable = lambda: True
+        rt._seam_swap = lambda: NS(
+            is_swappable=True,
+            is_span_swappable=lambda d: span_swappable,
+            commit_chunk_bytes=lambda d: chunk,
+        )
+        return rt
+
+    @staticmethod
+    def _pools():
+        from types import SimpleNamespace as NS
+
+        # THE TWO SPANS MUST DIFFER OR THE TEST PROVES NOTHING. A PP layer
+        # carries every head over the whole pool; a TP layer carries this
+        # rank's head share (3 of 7 by VEC) over the whole pool. With equal
+        # spans the wave's NET growth swamps the transient and every block
+        # count prices the same -- which is a property of the fixture, not
+        # of the accounting, and it is what the first version of this test
+        # accidentally asserted.
+        src = NS(num_layers=16, num_rows=1000, row_nbytes=lambda i: 7)
+        dst = NS(num_layers=16, num_rows=1000, row_nbytes=lambda i: 3)
+        return src, dst
+
+    def _slack(self, rt, waves=None):
+        src, dst = self._pools()
+        if waves is None:
+            waves = tuple((f,) for f in range(N_LAYERS))
+        return rt._backing_slack_bytes(PP_TO_TP, src, dst, waves)
+
+    def test_blocking_shrinks_the_reservation(self):
+        one = self._slack(self._rt(1))
+        four = self._slack(self._rt(4))
+        self.assertLess(
+            four,
+            one,
+            "the gate charged the whole layer span regardless of the block "
+            "count, so a streamed seam would shrink the real peak and still "
+            "be refused at exactly the old pool ceiling",
+        )
+
+    def test_one_block_is_byte_identical_to_the_unblocked_price(self):
+        """Keeps the block count a ONE-VARIABLE A/B."""
+        self.assertEqual(self._slack(self._rt(1)), self._slack(self._rt(0)))
+
+    def test_the_price_never_undercuts_what_the_loop_will_do(self):
+        """Blocks priced but not run is the dangerous direction.
+
+        Release-first, aliased pools and an unchunked arena all take the
+        whole-wave branch in ``_execute``. Charging the blocked price there
+        under-reserves, and the gate's verdict is the last check before the
+        no-return region.
+        """
+        unblocked = self._slack(self._rt(1))
+        self.assertEqual(
+            self._slack(self._rt(4, span_swappable=False)),
+            unblocked,
+            "an arena with no commit chunk cannot do span ops, so _execute "
+            "takes the whole-wave branch and the price must follow it",
+        )
+        # Release-first has its own, correct, price; the only requirement is
+        # that the block count cannot move it, because that branch never
+        # streams.
+        self.assertEqual(
+            self._slack(self._rt(4, restore_first=False)),
+            self._slack(self._rt(1, restore_first=False)),
+        )
+
+    def test_the_chunk_granularity_is_a_floor(self):
+        """More blocks cannot commit less than one chunk per buffer.
+
+        Without this the model claims a shrink the driver cannot deliver
+        (``commit_span`` rounds OUTWARD to the chunk), which is an
+        under-reservation.
+        """
+        fine = self._slack(self._rt(64, chunk=0))
+        floored = self._slack(self._rt(64, chunk=200))
+        self.assertGreater(
+            floored, fine, "the chunk floor did not bind at a fine block count"
+        )
+
+    def test_blocking_converges_to_the_net_not_to_zero(self):
+        """Honesty check on the limit.
+
+        The transient shrinks as 1/B, but the wave's NET growth
+        (commit minus release) does not -- it is layout arithmetic, not
+        ordering. A model that drove the whole term to zero would be
+        promising a free flip.
+        """
+        prices = [self._slack(self._rt(b)) for b in (1, 2, 4, 8, 16, 64)]
+        self.assertEqual(prices, sorted(prices, reverse=True))
+        self.assertGreater(prices[-1], 0)

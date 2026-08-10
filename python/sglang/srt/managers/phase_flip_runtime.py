@@ -42,6 +42,7 @@ no-return region.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -1557,12 +1558,42 @@ class WavedBackingSwap:
     # extents the stream had already mapped.
 
     def is_span_swappable(self, direction: str) -> bool:
-        """Can BOTH sides do span-granular backing on this direction?"""
+        """Can BOTH sides do span-granular backing on this direction?
+
+        THE METHOD BEING PRESENT IS NOT THE QUESTION, and answering from
+        ``hasattr`` alone is how the streamed seam shipped unrunnable.
+        ``commit_span``/``decommit_span`` RAISE unless the arena was built
+        with a commit chunk (``KvVmmArena._require_chunk``): without one the
+        arena maps a single monolithic extent per buffer, and ``cuMemUnmap``
+        only takes whole mappings, so a range op could release everything or
+        nothing. ``SGLANG_FLIP_SEAM_CHUNK_MIB`` defaults to 0, so on a
+        default boot both methods exist and both throw -- and the throw
+        would land inside the flip's no-return region, where the exception
+        climbs out into the event loop and takes all three ranks with it.
+
+        So ask the pool what its ARENA can do. Pools that predate the
+        property are treated as incapable rather than assumed capable: the
+        cost of a false no is a slower seam, the cost of a false yes is the
+        instance.
+        """
         src, dst = self._pools(direction)
         return bool(
-            hasattr(src, "release_backing_span")
-            and hasattr(dst, "restore_backing_span")
+            getattr(src, "supports_backing_spans", False)
+            and getattr(dst, "supports_backing_spans", False)
         )
+
+    def commit_chunk_bytes(self, direction: str) -> int:
+        """The destination arena's commit granule, 0 if it has none.
+
+        The seam's staging reservation needs it as a FLOOR: backing moves
+        in whole chunks and ``commit_span`` rounds outward, so a row block
+        can never commit less than one chunk per buffer however fine the
+        blocking gets (``PhaseFlipRuntime._seam_chunk_floor``).
+        """
+        _src, dst = self._pools(direction)
+        owner = getattr(dst, "_post_capture_owner", None)
+        arena = getattr(owner, "_arena", None)
+        return int(getattr(arena, "commit_chunk_bytes", 0) or 0)
 
     def release_wave_span(
         self, direction: str, wave: Sequence[int], lo_row: int, hi_row: int
@@ -2882,6 +2913,58 @@ class PhaseFlipRuntime:
             return ordinal
         return self._map[self._rank].index(ordinal)
 
+    # -- seam tuning, re-read per flip ----------------------------------------
+    def _refresh_seam_tuning(self) -> None:
+        """Re-read the seam knobs from a tune FILE, if one was named.
+
+        WHY A FILE AND NOT JUST THE ENV. The env is fixed at exec, so
+        sweeping the row-block count costs one BOOT per point -- and a
+        curve measured across boots cannot separate the knob from
+        boot-to-boot variance, which is exactly the comparison the
+        same-boot-floor rule exists to protect. A file the flip re-reads
+        turns the whole curve into one boot with a floor arm in it.
+
+        RANK-LOCAL DIVERGENCE IS SAFE HERE, and that is not true of every
+        knob in this file. Row blocking touches only local backing and
+        local writes -- the exchange is deliberately not blocked
+        (``_stream_wave``) -- so two ranks at different block counts still
+        call the collective the same number of times. The affordability
+        verdict is a ``_collective_min``, so a differing reservation
+        changes the number, never the unanimity. ``SGLANG_FLIP_SEAM_WAVES``
+        would NOT be safe to put here for exactly the reason ``_flip_waves``
+        documents, which is why this reads one key and not a settings dict.
+
+        Inert unless ``SGLANG_FLIP_SEAM_TUNE_FILE`` names a path. A missing
+        or malformed file leaves the boot-time value in place rather than
+        failing a flip: this is measurement scaffolding, and it must not be
+        able to abort a production seam.
+        """
+        path = os.environ.get("SGLANG_FLIP_SEAM_TUNE_FILE", "").strip()
+        if not path:
+            return
+        try:
+            with open(path) as fh:
+                blocks = int(json.load(fh)["row_blocks"])
+        except Exception as exc:  # pragma: no cover - defensive by design
+            logger.warning(
+                "%s seam tune file %s unreadable (%s); keeping row_blocks=%d",
+                LOG_PREFIX,
+                path,
+                exc,
+                self._seam_row_blocks,
+            )
+            return
+        blocks = max(1, blocks)
+        if blocks != self._seam_row_blocks:
+            logger.info(
+                "%s seam tune: row_blocks %d -> %d (from %s)",
+                LOG_PREFIX,
+                self._seam_row_blocks,
+                blocks,
+                path,
+            )
+        self._seam_row_blocks = blocks
+
     # -- seam waves -----------------------------------------------------------
     def _flip_waves(self, direction: str) -> Tuple[Tuple[int, ...], ...]:
         """This flip's layer-wave split, ORDERED for the given direction.
@@ -3167,6 +3250,7 @@ class PhaseFlipRuntime:
         # Mirrors the gate in ``_execute``: aliased pools keep release-first
         # whatever the knob says, so they must be PRICED release-first too.
         restore_first = self._seam_restore_first and not self._pools_alias()
+        blocks = self._effective_row_blocks(direction) if restore_first else 1
         released = committed = worst = 0
         for wave in waves:
             layers = [] if wave is None else list(wave)
@@ -3176,6 +3260,7 @@ class PhaseFlipRuntime:
                 n_rel, n_com = len([f for f in layers if f in mine]), len(layers)
             else:
                 n_rel, n_com = len(layers), len([f for f in layers if f in mine])
+            com_w, rel_w = n_com * dst_span, n_rel * src_span
             committed += n_com * dst_span
             # THE ACCOUNTING FOLLOWS THE ORDER, and must: charging the
             # wrong one is a false verdict in whichever direction it errs.
@@ -3194,12 +3279,89 @@ class PhaseFlipRuntime:
             # moves the wedge to a smaller request rather than preventing
             # one (the reasoning in this method's docstring).
             if restore_first:
-                worst = max(worst, committed - released)
-                released += n_rel * src_span
+                # ROW BLOCKING (#631 section 2.1) SPLITS THIS WAVE'S COMMIT.
+                # ``_stream_wave`` commits block b of the destination, writes
+                # it, then releases through block b of the source, so the
+                # peak inside the wave is the largest partial prefix rather
+                # than the whole commit:
+                #
+                #   max over b in [0, B) of ((b+1)*com_w - b*rel_w) / B
+                #
+                # linear in b, so only the endpoints can be maximal. At B=1
+                # it collapses to ``com_w`` and this whole branch is
+                # byte-identical to the pre-2.1 accounting -- which is what
+                # keeps the block count a one-variable A/B.
+                #
+                # THE ACCOUNTING MUST TRAVEL WITH THE LOOP, exactly as the
+                # order and the wave count had to (HANDOFF_669 section 2.2).
+                # The gate's reservation is what refuses a flip; leaving it
+                # at the whole-layer term while the loop commits in blocks
+                # means the shrink is real and never CASHED -- the pool
+                # stays capped where it was and the change looks inert. The
+                # mirror error is worse: pricing blocks the loop is not
+                # running under-reserves and lets through a flip that ends
+                # in an OOM inside the no-return region. Hence
+                # ``_effective_row_blocks`` mirrors ``_execute``'s gate
+                # rather than reading the knob.
+                inner = com_w
+                if blocks > 1:
+                    num = max(com_w, blocks * com_w - (blocks - 1) * rel_w)
+                    # Round the reservation UP: a partial byte of headroom
+                    # is not headroom.
+                    inner = -(-num // blocks)
+                    # THE PHYSICAL FLOOR. Backing moves in arena chunks and
+                    # ``commit_span`` rounds OUTWARD, so a block can never
+                    # commit less than one chunk per buffer it touches. Past
+                    # that point more blocks buy nothing, and claiming they
+                    # do would under-reserve.
+                    inner = max(
+                        inner, min(com_w, self._seam_chunk_floor(direction, n_com))
+                    )
+                worst = max(worst, committed - com_w + inner - released)
+                released += rel_w
             else:
                 released += n_rel * src_span
                 worst = max(worst, committed - released)
         return max(0, worst)
+
+    def _effective_row_blocks(self, direction: str) -> int:
+        """Row blocks the seam will ACTUALLY stream in on this direction.
+
+        Mirrors the branch conditions in ``_execute`` rather than reading
+        ``SGLANG_FLIP_SEAM_ROW_BLOCKS`` directly, because the knob being set
+        is not the same as the loop running: release-first and aliased pools
+        take the whole-wave branch, and a pool whose arena has no commit
+        chunk cannot do span ops at all. Pricing a shrink that does not
+        happen is an under-reservation, which the gate cannot survive.
+        """
+        # getattr: the accounting is reachable from runtimes built with
+        # __new__ in tests that predate the knob, and defaulting to
+        # whole-wave there is both correct and the safe direction.
+        if int(getattr(self, "_seam_row_blocks", 1) or 1) <= 1:
+            return 1
+        if not self._seam_restore_first or self._pools_alias():
+            return 1
+        swap = self._seam_swap()
+        if swap is None or not getattr(swap, "is_span_swappable", None):
+            return 1
+        blocks = int(getattr(self, "_seam_row_blocks", 1) or 1)
+        return blocks if swap.is_span_swappable(direction) else 1
+
+    def _seam_chunk_floor(self, direction: str, n_layers: int) -> int:
+        """Smallest commit a block can make: one arena chunk per buffer.
+
+        Asks the real destination POOL, not the plan's view -- the chunk is
+        a property of the arena the pages come from. Zero when nothing can
+        report one, which makes the floor inert rather than inventing a
+        number.
+        """
+        swap = self._seam_swap()
+        getter = getattr(swap, "commit_chunk_bytes", None) if swap else None
+        chunk = int(getter(direction) or 0) if callable(getter) else 0
+        if chunk <= 0 or n_layers <= 0:
+            return 0
+        # Two buffers (K and V) per full-attention layer in this pool.
+        return chunk * 2 * int(n_layers)
 
     # -- #631 section 2.1: streamed (row-blocked) seam -------------------------
 
@@ -3263,9 +3425,25 @@ class PhaseFlipRuntime:
                 i0, i1 = torch.searchsorted(rows, bounds).tolist()
                 if i1 > i0:
                     dst.write_rows(li, rows[i0:i1], data[i0:i1])
-            slo = (b * src_rows) // blocks
+            # RELEASE CUMULATIVELY FROM ROW 0, and this is not sloppiness.
+            # ``decommit_span`` rounds INWARD -- a chunk only partly inside
+            # the range still holds live rows, so unmapping it would be
+            # silent KV corruption. For an interior boundary that means
+            # block b's ``hi`` rounds BELOW it and block b+1's ``lo`` rounds
+            # ABOVE it, so the chunk straddling the boundary is released by
+            # NEITHER: (blocks - 1) chunks per buffer left mapped on the
+            # resting layout, a residual that GROWS with the block count and
+            # eats the 1/blocks gain this loop exists to win.
+            #
+            # Restating [0, hi) each block covers those chunks on the next
+            # pass, and re-releasing already-unmapped rows is free (the
+            # extent is gone; ``decommit_span`` walks extents). It is sound
+            # at any width because NO source row is live here: ``_execute``
+            # reads the whole retained leg and drains the exchange before
+            # the seam opens, so the source pool is write-only-dead for the
+            # duration of this loop.
             shi = ((b + 1) * src_rows) // blocks
-            swap.release_wave_span(direction, wave, slo, shi)
+            swap.release_wave_span(direction, wave, 0, shi)
         # The span restores left the destination marked non-resident on
         # purpose; this is what closes the wave. Safe to call after a
         # streamed restore only because commit_range consults the extent
@@ -3534,6 +3712,10 @@ class PhaseFlipRuntime:
         # are known from the plan before a single byte is allocated, and
         # the answer when they do not fit is the same unanimous abandon.
         # A rank-local abandon would half-flip the group.
+        # BEFORE the price, not after: the reservation and the loop must be
+        # computed from the SAME block count or the gate is pricing a seam
+        # that is not the one about to run.
+        self._refresh_seam_tuning()
         waves = self._flip_waves(direction)
         staging_bytes = self._staging_bytes(tr, direction, src, dst, waves)
         affordable, staging_detail = self._staging_affordable(staging_bytes)
