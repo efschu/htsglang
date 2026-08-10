@@ -248,9 +248,29 @@ class CorridorGuard:
         delta_mib: int = DEFAULT_DELTA_MIB,
         probe: Optional[Callable[[], int]] = None,
         fleet_probe: Optional[Callable[[], Sequence[int]]] = None,
+        law_floor_mib: Optional[int] = None,
     ) -> None:
         self.device_index = int(device_index)
         self.floor_mib = int(floor_mib)
+        # THE ARMING WATERMARK AND THE LAW ARE NOT THE SAME NUMBER, and
+        # conflating them wedged this instance on 2026-08-10.
+        #
+        # ``floor_mib`` is a POLICY target: where the gate starts working and
+        # how far it frees. ``law_floor_mib`` is the user's corridor law, the
+        # only thing a REFUSAL may be justified by. When they are equal (the
+        # default) nothing changes. When the policy floor is raised -- for a
+        # proof run, or by a future per-card policy -- a shared threshold
+        # makes the gate refuse allocations that the law permits perfectly
+        # well, and on the pp->tp leg that is not a conservative choice: it
+        # is a DEADLOCK. Strict purity forbids decode in PP, so a permanently
+        # refused pp->tp flip means decode never runs again, and nothing in
+        # the PP phase can free the memory that would end the refusal.
+        # Measured: 411 abandons, 0 requests completed in 6 minutes, /health
+        # 503 while every rank was alive and logging normally.
+        self.law_floor_mib = int(
+            law_floor_mib if law_floor_mib is not None else floor_mib
+        )
+        self.law_floor_bytes = self.law_floor_mib * _MIB
         self.delta_mib = int(delta_mib)
         self.floor_bytes = int(floor_mib) * _MIB
         self.delta_bytes = int(delta_mib) * _MIB
@@ -412,7 +432,8 @@ class CorridorGuard:
             free_now = self.free_bytes()
 
         self.reclaimed_total += reclaimed
-        ok = (free_now - want) >= self.floor_bytes
+        # Judged against the LAW, not the arming watermark: see __init__.
+        ok = (free_now - want) >= self.law_floor_bytes
         if not ok:
             self.refuse_count += 1
         if host_blocked and not ok:
@@ -420,8 +441,9 @@ class CorridorGuard:
         detail = (
             f"want {want/_MIB:.0f} MiB, free {free_before/_MIB:.0f} -> "
             f"{free_now/_MIB:.0f} MiB, reclaimed {reclaimed/_MIB:.0f} MiB "
-            f"from [{', '.join(used) or 'nothing'}], floor "
-            f"{self.floor_bytes/_MIB:.0f} MiB"
+            f"from [{', '.join(used) or 'nothing'}], arming floor "
+            f"{self.floor_bytes/_MIB:.0f} MiB, corridor law "
+            f"{self.law_floor_mib} MiB"
             + (f" ({reason})" if reason else "")
         )
         if host_blocked:

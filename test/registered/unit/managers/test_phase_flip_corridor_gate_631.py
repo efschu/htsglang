@@ -81,6 +81,7 @@ def _runtime():
     r._census_scheduler = object()
     r.corridor_aborts = 0
     r.corridor_reclaims = 0
+    r._corridor_pp_refusals = 0
     return r
 
 
@@ -180,6 +181,123 @@ class TheGateIsActuallyConsultedTest(unittest.TestCase):
         # "simplifies" the try/except away, this catches it.
         src = inspect.getsource(PhaseFlipRuntime._corridor_gate)
         self.assertIn("except Exception", src)
+
+
+class TheProviderBindsLateTest(unittest.TestCase):
+    """The trap: the ladder binds its carrier AFTER the first cutover leg,
+    but the guard is built at the first gate, which is BEFORE it. A provider
+    that captured the carrier at registration would cache None into a list
+    that is never rebuilt -- an inert guard, indistinguishable in the logs
+    from one that never needed to arm."""
+
+    def test_a_scheduler_with_no_carrier_yet_yields_nothing_and_does_not_raise(self):
+        class _S:
+            pass
+
+        provider = phase_flip_spill._late_bound_draft_provider(_S())
+        self.assertEqual(provider(1 << 30), 0)
+
+    def test_a_carrier_that_appears_later_is_found_on_the_next_call(self):
+        class _Carrier:
+            spilled = False
+
+            def spill(self):
+                _Carrier.spilled = True
+                return 286.0
+
+        class _Ladder:
+            _weights = None
+
+        class _S:
+            phase_flip_spill_ladder = _Ladder()
+
+        s = _S()
+        provider = phase_flip_spill._late_bound_draft_provider(s)
+        self.assertEqual(provider(1 << 30), 0)
+        # ...the cutover leg runs and the ladder binds...
+        s.phase_flip_spill_ladder._weights = _Carrier()
+        self.assertEqual(provider(1 << 30), int(286.0 * MIB))
+
+    def test_an_already_spilled_carrier_yields_nothing_rather_than_double_counting(self):
+        class _Carrier:
+            spilled = True
+
+            def spill(self):  # pragma: no cover - must not be reached
+                raise AssertionError("spilled twice")
+
+        class _Ladder:
+            _weights = _Carrier()
+
+        class _S:
+            phase_flip_spill_ladder = _Ladder()
+
+        self.assertEqual(
+            phase_flip_spill._late_bound_draft_provider(_S())(1 << 30), 0
+        )
+
+
+class TheLawAndTheArmingFloorAreDifferentNumbersTest(unittest.TestCase):
+    """The 2026-08-10 wedge. A guard whose refusal is judged by its ARMING
+    watermark refuses allocations the corridor law permits. On the pp->tp leg
+    that is not conservative -- strict purity forbids decode in PP, so a
+    permanently refused pp->tp starves decode and nothing in PP can free the
+    memory that would end it. Measured: 411 abandons, 0 requests in 6 min."""
+
+    def test_a_raised_arming_floor_does_not_manufacture_refusals(self):
+        from sglang.srt.managers import corridor_guard as cg
+
+        free = [2306 * MIB]
+        g = cg.CorridorGuard(
+            0,
+            floor_mib=1600,
+            law_floor_mib=1024,
+            probe=lambda: free[0],
+            fleet_probe=lambda: list(free),
+        )
+        # free - want = 1580: below the 1600 arming floor, so the gate ARMS
+        # and tries. Well above the 1024 law, so it must NOT refuse.
+        r = g.ensure_headroom(726 * MIB)
+        self.assertEqual(g.arm_count, 1)
+        self.assertTrue(r.ok, r.detail)
+        self.assertEqual(g.refuse_count, 0)
+
+    def test_the_law_still_refuses_what_the_law_forbids(self):
+        from sglang.srt.managers import corridor_guard as cg
+
+        free = [1100 * MIB]
+        g = cg.CorridorGuard(
+            0,
+            floor_mib=1600,
+            law_floor_mib=1024,
+            probe=lambda: free[0],
+            fleet_probe=lambda: list(free),
+        )
+        self.assertFalse(g.ensure_headroom(900 * MIB).ok)
+
+    def test_by_default_the_two_floors_coincide(self):
+        from sglang.srt.managers import corridor_guard as cg
+
+        g = cg.CorridorGuard(0, probe=lambda: 0)
+        self.assertEqual(g.law_floor_mib, cg.DEFAULT_FLOOR_MIB)
+        self.assertEqual(g.law_floor_bytes, g.floor_bytes)
+
+
+class RepeatedPpToTpRefusalIsNamedTest(unittest.TestCase):
+    def test_consecutive_pp_to_tp_refusals_are_counted(self):
+        r = _runtime()
+        with _Patched(_Guard(_refused())):
+            for _ in range(3):
+                r._corridor_gate(500 * MIB, "pp_to_tp")
+        self.assertEqual(r._corridor_pp_refusals, 3)
+
+    def test_the_other_direction_resets_the_streak(self):
+        # tp->pp refusal is survivable: the instance stays in TP and decode
+        # keeps running. Only the pp->tp streak is a deadlock signal.
+        r = _runtime()
+        with _Patched(_Guard(_refused())):
+            r._corridor_gate(500 * MIB, "pp_to_tp")
+            r._corridor_gate(500 * MIB, "tp_to_pp")
+        self.assertEqual(r._corridor_pp_refusals, 0)
 
 
 if __name__ == "__main__":

@@ -1959,6 +1959,10 @@ class PhaseFlipRuntime:
         #: room", this one says "there is not enough room AND nothing left
         #: to spill", which is the end of the ladder and not a transient.
         self.corridor_aborts = 0
+        #: Consecutive pp->tp refusals. Reset by any other direction. See
+        #: _corridor_gate: this direction's refusal is a decode deadlock,
+        #: not a transient, and must be named as one.
+        self._corridor_pp_refusals = 0
         #: Seams the corridor gate FUNDED by spilling first. The number that
         #: proves the gate is doing work rather than merely passing: a run
         #: with zero reclaims has not exercised item 15a at all.
@@ -3723,6 +3727,38 @@ class PhaseFlipRuntime:
                 )
             return ""
         self.corridor_aborts += 1
+        # A REFUSED pp->tp IS NOT A TRANSIENT, and the two directions are not
+        # symmetric. Refusing tp->pp is safe: the instance stays in TP, decode
+        # keeps running, prefill defers. Refusing pp->tp under strict purity
+        # starves DECODE COMPLETELY -- decode is forbidden in PP, so requests
+        # prefill and then wait forever, and nothing the PP phase can do frees
+        # the memory that would end the refusal. Measured 2026-08-10 with a
+        # deliberately raised arming floor: 411 abandons, 0 requests completed
+        # in 6 minutes, /health 503 while every rank was alive and logging.
+        #
+        # The gate must never be the silent cause of that. It cannot fix it
+        # either -- the answer is a provider that can fund the seam (item 15c,
+        # kvso over the host tier) -- so it says exactly what is happening,
+        # once per escalation rather than once per flip.
+        if direction == "pp_to_tp":
+            self._corridor_pp_refusals += 1
+            n = self._corridor_pp_refusals
+            if n in (1, 10) or (n % 100 == 0):
+                logger.error(
+                    "%s corridor gate has refused pp->tp %d time(s) in a row. "
+                    "Under strict purity decode runs ONLY in TP, so a "
+                    "persistently refused pp->tp means DECODE IS STARVED and "
+                    "no amount of waiting will clear it: the PP phase holds "
+                    "nothing that would fund the TP seam. This needs a "
+                    "provider that can (spec item 15c, kvso over the host "
+                    "tier), a smaller pool, or a lower arming floor. Verdict: "
+                    "%s",
+                    LOG_PREFIX,
+                    n,
+                    verdict.detail,
+                )
+        else:
+            self._corridor_pp_refusals = 0
         return f"corridor gate refused the seam staging: {verdict.detail}"
 
     # -- the move -------------------------------------------------------------

@@ -918,6 +918,38 @@ _COST_DRAFT_WEIGHTS = 20
 
 CORRIDOR_GUARD_ATTR = "phase_flip_corridor_guard"
 
+#: Proof/soak override for the gate's arming floor. See get_corridor_guard.
+CORRIDOR_FLOOR_ENV = "SGLANG_CORRIDOR_FLOOR_MIB"
+
+
+def _late_bound_draft_provider(scheduler: Any):
+    """A draft-carrier provider that finds its carrier when it is called.
+
+    Two places hold the carrier and neither is reliable at guard-build time:
+    the ladder binds it on the first cutover leg, and the draft worker holds
+    it only while the instance is in TP -- under strict purity
+    ``scheduler.draft_worker`` is None for the whole PP phase, by
+    construction.
+
+    So look in both, at call time, and return 0 when neither has it. Zero is
+    the honest answer for "the drafter is not resident and cannot be spilled
+    again", which is also true right after a spill; the guard treats a
+    provider that yields nothing as spent and moves down the ladder.
+    """
+
+    def free_up_to(nbytes: int) -> int:
+        ladder = getattr(scheduler, "phase_flip_spill_ladder", None)
+        carrier = getattr(ladder, "_weights", None) if ladder is not None else None
+        if carrier is None:
+            carrier = carrier_of(getattr(scheduler, "draft_worker", None))
+        if carrier is None:
+            return 0
+        from sglang.srt.managers.corridor_guard import draft_carrier_provider
+
+        return draft_carrier_provider(carrier)(nbytes)
+
+    return free_up_to
+
 
 def get_corridor_guard(scheduler: Any):
     """The rank's spill-before-alloc gate (#656 items 15a/15b/16), built once.
@@ -949,13 +981,39 @@ def get_corridor_guard(scheduler: Any):
         return None
 
     server_args = getattr(scheduler, "server_args", None)
+    # THE FLOOR IS OVERRIDABLE, and the reason is a test obligation rather
+    # than a tuning knob. A gate that has never been observed to FIRE is not
+    # a gate that works -- it is indistinguishable from a gate that is never
+    # reached, and this chain has shipped seven such mechanisms. Raising the
+    # floor above the measured resting headroom is the only way to make the
+    # seam's own allocation cross it on demand, on the real rig, with the
+    # real payload. The corridor law itself is unchanged: the sampler still
+    # judges against 1024, so a proof run at a raised floor can demonstrate
+    # spill-before-alloc without being able to launder a breach.
     floor_mib = int(
-        getattr(server_args, "phase_flip_corridor_floor_mib", None)
+        os.environ.get(CORRIDOR_FLOOR_ENV)
+        or getattr(server_args, "phase_flip_corridor_floor_mib", None)
         or cg.DEFAULT_FLOOR_MIB
     )
+    if floor_mib != cg.DEFAULT_FLOOR_MIB:
+        logger.warning(
+            "%s corridor guard floor is %d MiB, NOT the %d MiB corridor law "
+            "(%s is set). This makes the gate arm earlier than the law "
+            "requires; it is a proof/soak setting, and the corridor verdict "
+            "must still be read against %d MiB.",
+            LOG_PREFIX,
+            floor_mib,
+            cg.DEFAULT_FLOOR_MIB,
+            CORRIDOR_FLOOR_ENV,
+            cg.DEFAULT_FLOOR_MIB,
+        )
     guard = cg.CorridorGuard(
         int(device_index),
         floor_mib=floor_mib,
+        # The LAW never moves with the proof setting: a raised arming floor
+        # must make the gate work EARLIER, never make it refuse allocations
+        # the corridor permits. See CorridorGuard.__init__.
+        law_floor_mib=cg.DEFAULT_FLOOR_MIB,
         fleet_probe=cg.nvml_fleet_probe(),
     )
 
@@ -963,15 +1021,20 @@ def get_corridor_guard(scheduler: Any):
     # lives in host RAM: it evacuates a non-layer-bound payload from the
     # binding card, which is the PP levelling move item 16 prescribes. See
     # the corridor_guard module docstring for the full argument.
-    ladder = get_spill_ladder(scheduler)
-    carrier = getattr(ladder, "_weights", None) if ladder is not None else None
-    if carrier is not None:
-        guard.register(
-            "draft-weights",
-            _COST_DRAFT_WEIGHTS,
-            cg.draft_carrier_provider(carrier),
-            tier=cg.RELIEF_REBALANCE,
-        )
+    #
+    # RESOLVED PER CALL, NOT AT REGISTRATION. The ladder binds its carrier
+    # lazily, on the first cutover leg, and the guard is built at the first
+    # gate -- which happens BEFORE that leg. Capturing the carrier here would
+    # cache None into a provider list that is never rebuilt, and the guard
+    # would spend the rest of the process with nothing to give: inert, and
+    # indistinguishable in the logs from a guard that simply never needed to
+    # arm. That failure mode has shipped in this chain before.
+    guard.register(
+        "draft-weights",
+        _COST_DRAFT_WEIGHTS,
+        _late_bound_draft_provider(scheduler),
+        tier=cg.RELIEF_REBALANCE,
+    )
 
     setattr(scheduler, CORRIDOR_GUARD_ATTR, guard)
     logger.info(

@@ -91,13 +91,25 @@ def main() -> int:
     series_fh = None
     if args.series:
         series_fh = open(args.series, "w")
-        series_fh.write("unix_ts," + ",".join(f"free{i}" for i in range(n)) + "\n")
+        # SPREAD is item 16's metric and it is a separate axis from the
+        # minimum: a run can hold the floor on every card and still be badly
+        # unlevel, which is exactly the state the user forbade (one card
+        # binding while another sits on GiBs). Booked per sample so the
+        # levelness is a time series like the corridor itself, not a
+        # post-hoc average that hides the unlevel moments.
+        series_fh.write(
+            "unix_ts," + ",".join(f"free{i}" for i in range(n)) + ",spread\n"
+        )
 
     mins: List[float] = [float("inf")] * n
     maxs: List[float] = [0.0] * n
     sums: List[float] = [0.0] * n
     breaches: List[int] = [0] * n
     min_at: List[float] = [0.0] * n
+    # Item 16 levelness accumulators.
+    spread_max = 0.0
+    spread_sum = 0.0
+    spread_max_at = 0.0
     samples = 0
     t0 = time.time()
     interval = args.interval_ms / 1000.0
@@ -117,12 +129,19 @@ def main() -> int:
             sums[i] += free
             if free < args.floor:
                 breaches[i] += 1
+        spread = max(row_free) - min(row_free)
+        if spread > spread_max:
+            spread_max = spread
+            spread_max_at = now - t0
+        spread_sum += spread
         if series_fh is not None:
             # Absolute unix time, not elapsed: the phase windows come from
             # the serving log's wall-clock timestamps and the two series have
             # to be joinable without knowing when the sampler started.
             series_fh.write(
-                f"{now:.3f}," + ",".join(f"{v:.3f}" for v in row_free) + "\n"
+                f"{now:.3f},"
+                + ",".join(f"{v:.3f}" for v in row_free)
+                + f",{spread:.3f}\n"
             )
         samples += 1
         # Sleep the remainder of the cadence, never a fixed sleep: the NVML
@@ -167,13 +186,25 @@ def main() -> int:
     print(f"headroom above the floor: "
           f"{', '.join(f'{o:+.0f}' for o in over)} MiB "
           f"(large positives mean the budget is leaving VRAM unused)")
+    # ITEM 16: the cards must fill EVENLY. Reported next to the corridor
+    # because the two are independent -- holding the floor everywhere says
+    # nothing about whether one card was carrying the pressure alone.
+    spread_mean = spread_sum / samples if samples else 0.0
+    print(
+        f"free-headroom SPREAD (max-min across cards): mean "
+        f"{spread_mean:.0f} MiB, WORST {spread_max:.0f} MiB at "
+        f"t+{spread_max_at:.1f}s"
+    )
     print(f"CORRIDOR HELD: {ok}")
     print("=" * 74)
     if args.out:
         with open(args.out, "w") as fh:
             json.dump(
                 {"samples": samples, "elapsed_s": elapsed,
-                 "floor_mib": args.floor, "held": ok, "cards": rows},
+                 "floor_mib": args.floor, "held": ok, "cards": rows,
+                 "spread_mean_mib": spread_mean,
+                 "spread_max_mib": spread_max,
+                 "spread_max_at_s": spread_max_at},
                 fh, indent=2,
             )
         print(f"written: {args.out}")
