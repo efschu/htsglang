@@ -54,8 +54,8 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
     TP_TO_PP,
     PhaseFlipTransition,
     build_phase_flip_transition,
-    default_wave_count,
-    layer_waves,
+    ordered_layer_waves,
+    restore_first_wave_count,
     validate_layer_map,
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
@@ -1827,10 +1827,27 @@ class PhaseFlipRuntime:
         self.staging_aborts = 0
         self._staging_reserve_bytes = int(staging_reserve_bytes)
         self._mem_probe = mem_probe
+        #: #631 2.1b SEAM ORDER. Restore the destination wave's backing
+        #: before releasing the source wave's (the default), or the other
+        #: way round (the pre-2.1b behaviour). Set
+        #: ``SGLANG_FLIP_SEAM_RESTORE_FIRST=0`` to get the old order back
+        #: WITHOUT also changing the wave count, which is what makes the
+        #: reorder a one-variable A/B and, if metal disagrees with the
+        #: desk arithmetic, a rollback that needs no code change.
+        #:
+        #: Aliased pools ignore this and always release first -- there the
+        #: order is a correctness bound, not a tuning knob (``_flip_waves``
+        #: and the seam block in ``_execute`` both say why).
+        self._seam_restore_first = (
+            os.environ.get("SGLANG_FLIP_SEAM_RESTORE_FIRST", "1").strip()
+            not in ("0", "false", "no")
+        )
         #: #631 SEAM WAVES. How many layer waves the move is split into.
-        #: None = auto, the most the layer map supports with every rank
-        #: paying in (``default_wave_count``). 1 reproduces the pre-wave
-        #: move byte for byte, which is what makes this a one-variable A/B.
+        #: None = auto: one layer per wave under restore-first
+        #: (``restore_first_wave_count``), else the most the layer map
+        #: supports with every rank paying in (``default_wave_count``).
+        #: 1 reproduces the pre-wave move byte for byte, which is what
+        #: makes the wave count a one-variable A/B.
         #: Env override so the A/B needs no reboot flag of its own.
         _waves_env = os.environ.get("SGLANG_FLIP_SEAM_WAVES", "").strip()
         self._n_waves: Optional[int] = None
@@ -2779,15 +2796,34 @@ class PhaseFlipRuntime:
         return self._map[self._rank].index(ordinal)
 
     # -- seam waves -----------------------------------------------------------
-    def _flip_waves(self) -> Tuple[Tuple[int, ...], ...]:
-        """This flip's layer-wave split.
+    def _flip_waves(self, direction: str) -> Tuple[Tuple[int, ...], ...]:
+        """This flip's layer-wave split, ORDERED for the given direction.
 
-        A PURE FUNCTION OF THE REPLICATED LAYER MAP, deliberately: both
+        A PURE FUNCTION OF THE REPLICATED LAYER MAP AND THE DIRECTION: both
         ends of every pair must cut the wire payload the same way, and a
         wave count that travelled in a consensus payload would be one more
         thing that can disagree. The map is already replicated and already
-        equality-checked at boot, so deriving the split from it makes
+        equality-checked at boot, and the direction is agreed by consensus
+        before the seam runs, so deriving the split from the two makes
         agreement structural.
+
+        THE DIRECTION IS AN INPUT because under restore-first the two
+        directions want OPPOSITE orders (see ``ordered_layer_waves``): the
+        destination of ``tp_to_pp`` is the PP layout, where a rank commits
+        only on its own layers, so those want to be late; ``pp_to_tp``
+        mirrors it exactly, so they want to be early. One static order
+        cannot serve both.
+
+        TWO KNOWN GAPS, neither introduced here, both worth a successor's
+        attention because they get sharper as the wave count rises:
+
+        * ``_pools_alias`` is a RANK-LOCAL pointer check, so a boot where
+          one rank's pools alias and its peers' do not gives that rank 1
+          wave and the others many. Ranks then call ``_exchange`` a
+          different number of times. It is bounded rather than silent (the
+          liveness poll aborts the flip) but it is not checked.
+        * ``SGLANG_FLIP_SEAM_WAVES`` is read per process and never compared
+          across ranks, with the same consequence.
         """
         if self._pools_alias():
             # ALIASED LAYOUTS CANNOT BE WAVED, and this is a correctness
@@ -2801,8 +2837,21 @@ class PhaseFlipRuntime:
             return (tuple(range(self._n_layers)),)
         n = self._n_waves
         if n is None:
-            n = default_wave_count(self._map)
-        return layer_waves(self._map, n)
+            # #631 2.1b: restore-first removes the per-wave netting rule
+            # that capped this at the smallest stage, so the cap becomes
+            # one layer per wave.
+            #
+            # MEASURED CAVEAT, recorded because the design note does not
+            # say it: the PAYLOAD leg (send + receive buffers) stops
+            # shrinking at about W=8 -- the widest wave still carries a
+            # layer of one's own plus a layer from each peer, and that
+            # floor is W-independent. Past W=8 the only thing still
+            # improving is the backing transient via the ORDER below, and
+            # each extra wave costs one more exchange round trip. If a
+            # measurement ever shows the round trips dominating, W=8 is
+            # the place to stand, not W=1.
+            n = restore_first_wave_count(self._map)
+        return ordered_layer_waves(self._map, self._vec, n, direction)
 
     def _pools_alias(self) -> bool:
         """Do the two layouts' pools overlay the same bytes? Cached.
@@ -3026,9 +3075,17 @@ class PhaseFlipRuntime:
                 n_rel, n_com = len([f for f in layers if f in mine]), len(layers)
             else:
                 n_rel, n_com = len(layers), len([f for f in layers if f in mine])
-            released += n_rel * src_span
             committed += n_com * dst_span
+            # RESTORE-FIRST (#631 2.1b): this wave's commit lands BEFORE its
+            # own release, so the worst instant of wave j weighs everything
+            # committed through j against everything released through j-1.
+            # Crediting the current wave's release here -- which is what the
+            # release-first version did, and it was right then -- now
+            # under-reserves by exactly one wave's release span at the worst
+            # boundary, and the gate's whole job is to refuse a flip that
+            # cannot be afforded.
             worst = max(worst, committed - released)
+            released += n_rel * src_span
         return max(0, worst)
 
     def _reclaim_cached_blocks(self) -> None:
@@ -3292,7 +3349,7 @@ class PhaseFlipRuntime:
         # are known from the plan before a single byte is allocated, and
         # the answer when they do not fit is the same unanimous abandon.
         # A rank-local abandon would half-flip the group.
-        waves = self._flip_waves()
+        waves = self._flip_waves(direction)
         staging_bytes = self._staging_bytes(tr, direction, src, dst, waves)
         affordable, staging_detail = self._staging_affordable(staging_bytes)
         if not affordable:
@@ -3351,6 +3408,10 @@ class PhaseFlipRuntime:
         received_bytes = 0
         local_bytes = 0
         reclaimed = False
+        # Asked ONCE per flip rather than per wave: ``_pools_alias`` is
+        # cached, but the gate it drives decides an ordering that must not
+        # be allowed to differ between two waves of the same seam.
+        seam_restore_first = self._seam_restore_first and not self._pools_alias()
 
         for wave in waves:
             wave_set = None if wave is None else set(int(f) for f in wave)
@@ -3450,14 +3511,54 @@ class PhaseFlipRuntime:
             # #631 CROSS-PHASE BACKING SWAP, PER WAVE. Every byte this wave
             # owes has now been read, so the source layers of this wave may
             # hand their physical pages back -- and the destination layers of
-            # this wave need theirs before the writes below. Releasing first
-            # is what keeps the two sides netting out.
+            # this wave need theirs before the writes below.
+            #
+            # THE ORDER IS reclaim -> restore -> release (#631 section 2.1b),
+            # and each of the three positions is load-bearing.
+            #
+            # RESTORE BEFORE RELEASE. Release-first makes a wave's releases
+            # pay for its own commits, which is why the wave count had to be
+            # capped at the SMALLEST stage -- a wave with no layer of mine to
+            # release cannot afford the layers it must commit. That coupling
+            # is the seam's staging SLOPE (~4.5 MiB per 1000 live slots at
+            # W=4) and it is what caps the KV pool near 438k tokens under the
+            # corridor law. Restore-first budgets the overlap explicitly
+            # instead: the peak becomes the worst PREFIX imbalance rather
+            # than a per-wave one, the wave cap disappears, and the slope
+            # falls with W.
+            #
+            # RECLAIM AHEAD OF THE RESTORE, not between it and the release.
+            # The restore is the allocation that can fail inside the
+            # no-return region -- it raised cuMemCreate OUT_OF_MEMORY on
+            # metal on 2026-08-09 and took the instance down. Under
+            # release-first that restore happened at the memory TROUGH, with
+            # the source already unmapped. Restore-first moves it to the
+            # PEAK, with the source still fully mapped, so it is strictly
+            # MORE exposed and the reclaim must lead it. Moving the reclaim
+            # after the restore re-opens that crash; TestWavedSeamOrdering
+            # fails if anyone does.
+            #
+            # ALIASED POOLS KEEP THE OLD ORDER, and this gate is a
+            # correctness bound rather than a tuning one. When the two
+            # layouts overlay the same bytes, the destination's pages ARE
+            # the source's pages: restoring first and releasing second would
+            # hand back the very mapping just committed and leave the
+            # destination unbacked. ``_flip_waves`` already collapses the
+            # aliased seam to a single wave; the order needs its own gate
+            # because a single wave still runs this branch.
             if swap is not None:
-                swap.release_wave(direction, wave)
-                if not reclaimed:
-                    swap.reclaim_between(direction)
-                    reclaimed = True
-                swap.restore_wave(direction, wave)
+                if seam_restore_first:
+                    if not reclaimed:
+                        swap.reclaim_between(direction)
+                        reclaimed = True
+                    swap.restore_wave(direction, wave)
+                    swap.release_wave(direction, wave)
+                else:
+                    swap.release_wave(direction, wave)
+                    if not reclaimed:
+                        swap.reclaim_between(direction)
+                        reclaimed = True
+                    swap.restore_wave(direction, wave)
             else:
                 for fn in self._pre_write_fns:
                     fn(direction)

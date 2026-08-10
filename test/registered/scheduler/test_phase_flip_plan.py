@@ -17,6 +17,7 @@ CPU-only, no torch.distributed, no GPU. The load-bearing gates:
   one receiver goes RED, proving the byte-identity gate can fail.
 """
 
+import itertools
 import unittest
 
 import torch
@@ -25,6 +26,11 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
     PP_TO_TP,
     TP_TO_PP,
     build_phase_flip_transition,
+    default_wave_count,
+    layer_waves,
+    ordered_layer_waves,
+    restore_first_wave_count,
+    seam_transient_peaks,
     validate_layer_map,
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError, owner_of, rows_of
@@ -343,6 +349,128 @@ class TestByteIdentity(CustomTestCase):
                         torch.equal(t[s], orig[r][f][s]),
                         f"roundtrip mismatch rank {r} layer {f} slot {s}",
                     )
+
+
+RIG_MAP = ((0, 1, 2, 3, 4, 5, 6), (7, 8, 9, 10, 11), (12, 13, 14, 15))
+RIG_VEC = (14, 10, 8)
+
+
+class TestOrderedLayerWaves(CustomTestCase):
+    """The restore-first wave planner (#631 section 2.1b, move 2 and 3)."""
+
+    def test_the_cap_rises_from_the_smallest_stage_to_the_layer_count(self):
+        self.assertEqual(default_wave_count(RIG_MAP), 4)
+        self.assertEqual(restore_first_wave_count(RIG_MAP), 16)
+
+    def test_every_layer_lands_exactly_once_in_both_directions(self):
+        for direction in (PP_TO_TP, TP_TO_PP):
+            for n_waves in (1, 3, 4, 16):
+                waves = ordered_layer_waves(RIG_MAP, RIG_VEC, n_waves, direction)
+                self.assertEqual(len(waves), n_waves)
+                flat = [f for w in waves for f in w]
+                self.assertEqual(
+                    sorted(flat),
+                    list(range(16)),
+                    f"{direction} W={n_waves} does not partition the layers",
+                )
+
+    def test_the_two_directions_want_opposite_orders(self):
+        """Not cosmetic: one order cannot serve both (see the peaks below)."""
+        fwd = ordered_layer_waves(RIG_MAP, RIG_VEC, 16, PP_TO_TP)
+        rev = ordered_layer_waves(RIG_MAP, RIG_VEC, 16, TP_TO_PP)
+        self.assertNotEqual(fwd, rev)
+
+    def test_using_one_direction_order_for_the_other_costs_real_memory(self):
+        """The falsifier for making the order direction-agnostic.
+
+        If someone 'simplifies' this by computing the order once, the
+        binding peak in the wrong direction must be visibly worse -- that
+        is the whole justification for threading ``direction`` through
+        ``_flip_waves``.
+        """
+        for direction, other in ((PP_TO_TP, TP_TO_PP), (TP_TO_PP, PP_TO_TP)):
+            right = [
+                f for w in ordered_layer_waves(RIG_MAP, RIG_VEC, 16, direction)
+                for f in w
+            ]
+            wrong = [
+                f for w in ordered_layer_waves(RIG_MAP, RIG_VEC, 16, other)
+                for f in w
+            ]
+            pk_right = seam_transient_peaks(right, RIG_MAP, RIG_VEC, direction)
+            pk_wrong = seam_transient_peaks(wrong, RIG_MAP, RIG_VEC, direction)
+            self.assertLess(
+                max(pk_right[1:]),
+                max(pk_wrong[1:]),
+                f"{direction}: the other direction's order is no worse "
+                f"({pk_right} vs {pk_wrong}), so the split is unjustified",
+            )
+
+    def test_the_order_beats_the_proportional_split_on_binding_ranks(self):
+        for direction in (PP_TO_TP, TP_TO_PP):
+            chosen = [
+                f for w in ordered_layer_waves(RIG_MAP, RIG_VEC, 16, direction)
+                for f in w
+            ]
+            baseline = [f for w in layer_waves(RIG_MAP, 4) for f in w]
+            pk = seam_transient_peaks(chosen, RIG_MAP, RIG_VEC, direction)
+            base = seam_transient_peaks(baseline, RIG_MAP, RIG_VEC, direction)
+            self.assertLessEqual(max(pk[1:]), max(base[1:]))
+
+    def test_the_chosen_order_is_exhaustively_optimal(self):
+        """Brute force on a map small enough to enumerate completely.
+
+        The planner is a dynamic program, and a DP that optimises the wrong
+        recurrence still returns a confident answer. ``[3, 2, 2]`` has 210
+        distinct rank sequences, so the true minimum is computable directly
+        and the DP has to match it -- not merely beat the baseline.
+        """
+        small_map = ((0, 1, 2), (3, 4), (5, 6))
+        small_vec = (3, 2, 2)
+        for direction in (PP_TO_TP, TP_TO_PP):
+            best = None
+            for perm in set(itertools.permutations([0, 0, 0, 1, 1, 2, 2])):
+                cursor = {0: 0, 1: 0, 2: 0}
+                order = []
+                for r in perm:
+                    order.append(small_map[r][cursor[r]])
+                    cursor[r] += 1
+                pk = seam_transient_peaks(order, small_map, small_vec, direction)
+                binding = max(pk[1:])
+                if best is None or binding < best:
+                    best = binding
+            got = seam_transient_peaks(
+                [
+                    f
+                    for w in ordered_layer_waves(small_map, small_vec, 7, direction)
+                    for f in w
+                ],
+                small_map,
+                small_vec,
+                direction,
+            )
+            self.assertAlmostEqual(
+                max(got[1:]),
+                best,
+                places=9,
+                msg=f"{direction}: DP returned {max(got[1:])}, optimum is {best}",
+            )
+
+    def test_the_planner_is_a_pure_function_of_its_inputs(self):
+        """Both ends of every pair derive the split independently."""
+        for direction in (PP_TO_TP, TP_TO_PP):
+            a = ordered_layer_waves(RIG_MAP, RIG_VEC, 16, direction)
+            b = ordered_layer_waves(
+                tuple(tuple(s) for s in RIG_MAP), tuple(RIG_VEC), 16, direction
+            )
+            self.assertEqual(a, b)
+
+    def test_an_empty_stage_does_not_break_the_planner(self):
+        """A degenerate split is legal per ``validate_layer_map``."""
+        degenerate = ((0, 1, 2, 3), (), (4, 5))
+        for direction in (PP_TO_TP, TP_TO_PP):
+            waves = ordered_layer_waves(degenerate, (4, 0, 2), 6, direction)
+            self.assertEqual(sorted(f for w in waves for f in w), list(range(6)))
 
 
 if __name__ == "__main__":

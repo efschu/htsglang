@@ -30,7 +30,11 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from sglang.srt.layers.dcp.phase_flip_plan import (
+    PP_TO_TP,
+    TP_TO_PP,
+    default_wave_count,
+)
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError, owner_of, rows_of
 from sglang.srt.managers.kv_reshard import KvPoolView
 from sglang.srt.managers.phase_flip_runtime import (
@@ -1469,13 +1473,26 @@ class TestSeamWavesAreByteIdentical(CustomTestCase):
         ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
         self.assertTrue(ok, f"waved flip corrupted rows: {msg}")
 
-    def test_the_default_wave_count_is_the_smallest_stage(self):
-        # MAP_625 is (8, 4, 4): four waves, every rank paying into each.
+    def test_the_default_wave_count_is_one_layer_per_wave(self):
+        """#631 2.1b: the smallest-stage cap (4 for MAP_625) is lifted.
+
+        Release-first needed every rank to own a layer in every wave, so
+        the count stopped at the smallest stage. Restore-first budgets the
+        overlap across the whole prefix instead, leaving one layer per wave
+        as the only bound. ``default_wave_count`` still returns the old cap
+        and is still the right answer for the aliased single-wave path --
+        what changed is which of the two ``_flip_waves`` asks for.
+        """
         ref, live, _pp, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 300, seed=23
         )
         runtimes, _ = _build_runtimes(pp_views, tp_views, live)
-        self.assertEqual(len(runtimes[0]._flip_waves()), 4)
+        waves = runtimes[0]._flip_waves(PP_TO_TP)
+        self.assertEqual(len(waves), N_LAYERS)
+        self.assertEqual(
+            sorted(f for w in waves for f in w), list(range(N_LAYERS))
+        )
+        self.assertEqual(default_wave_count(MAP_625), 4)
 
 
 class TestPreWriteSeamOrdering(CustomTestCase):
@@ -1544,3 +1561,195 @@ class TestPreWriteSeamOrdering(CustomTestCase):
 
         ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
         self.assertTrue(ok, msg)
+
+
+class _RecordingSeamSwap:
+    """A ``WavedBackingSwap`` stand-in that records the seam's ORDER.
+
+    ``_seam_swap`` picks the hook out of ``pre_write_fns`` by duck-typing on
+    ``release_wave``, so a recorder carrying that surface drives the REAL
+    wave loop. That is the whole reason this class exists:
+    ``TestPreWriteSeamOrdering`` passes a plain callable, which takes the
+    ``swap is None`` branch, so it can observe the seam's POSITION but never
+    the order of release/reclaim/restore INSIDE it.
+
+    Every call is logged unconditionally -- the real swap's "no layers of
+    mine in this wave" early return is internal to it, and modelling that
+    here would hide waves from the sequence assertions below.
+    """
+
+    is_swappable = True
+
+    def __init__(self, log):
+        self._log = log
+
+    def release_wave(self, direction, wave):
+        self._log.append(("release", tuple(int(f) for f in wave)))
+
+    def restore_wave(self, direction, wave):
+        self._log.append(("restore", tuple(int(f) for f in wave)))
+
+    def reclaim_between(self, direction):
+        self._log.append(("reclaim", None))
+
+
+class TestWavedSeamOrdering(CustomTestCase):
+    """The waved seam's per-wave order: reclaim -> restore -> release.
+
+    #631 section 2.1b. Two DIFFERENT hazards are pinned here and they pull
+    in opposite directions, which is why both assertions have to exist:
+
+    * RESTORE BEFORE RELEASE, per wave. Under release-first a wave's
+      destination pages are committed only after its source pages are gone,
+      so the staging peak carries a full wave of drift and the seam's slope
+      is ~4.5 MiB per 1000 live slots per wave. Restore-first budgets the
+      overlap explicitly, which is what lets the wave count rise to
+      ``n_layers`` and drops the slope to ~1.1.
+
+    * RECLAIM AHEAD OF THE FIRST RESTORE. The restore is the allocation that
+      can fail INSIDE the no-return region; it OOM'd on metal on 2026-08-09
+      and took the instance down. Under release-first the reclaim naturally
+      sat at the memory trough. Restore-first moves the destination commit
+      to the PEAK with the source still mapped, so the reclaim must move
+      AHEAD of it rather than following it. An implementation that reorders
+      the pair to restore -> reclaim -> release re-opens that crash and
+      must fail here, not on the rig.
+
+    The whole-pool ``WavedBackingSwap.__call__`` path is NOT covered by this
+    and must KEEP release-first: it holds BOTH layouts for the width of the
+    swap, which is the residency the waved seam exists to remove. Its pins
+    live in ``SeamOrderingTest``
+    (test/registered/unit/managers/test_phase_flip_spill_depth_631.py).
+    """
+
+    def _run_and_log(self):
+        ref, live, _pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 300
+        )
+        logs = {r: [] for r in range(len(VEC))}
+        runtimes, _ = _build_runtimes(
+            pp_views,
+            tp_views,
+            live,
+            pre_write_fns_for=lambda r: (_RecordingSeamSwap(logs[r]),),
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        return logs, tp_pools, ref, live
+
+    def test_the_seam_is_waved_at_all(self):
+        """Guard on the fixture: a single wave would make the rest vacuous."""
+        logs, _tp_pools, _ref, _live = self._run_and_log()
+        for r, log in logs.items():
+            waves = [w for kind, w in log if kind == "restore"]
+            self.assertGreater(
+                len(waves), 1, f"rank {r}: seam ran unwaved, sequence proves nothing"
+            )
+
+    def test_each_wave_restores_the_destination_before_releasing_the_source(self):
+        logs, _tp_pools, _ref, _live = self._run_and_log()
+        for r, log in logs.items():
+            seen = [e for e in log if e[0] in ("restore", "release")]
+            for i in range(0, len(seen), 2):
+                pair = seen[i : i + 2]
+                self.assertEqual(
+                    [k for k, _w in pair],
+                    ["restore", "release"],
+                    f"rank {r}: wave pair {i // 2} ran {[k for k, _w in pair]}, "
+                    f"expected restore then release -- release-first is the "
+                    f"4.5 MiB/1000-slot slope that caps the pool at ~438k "
+                    f"(#631 section 2.1b). Full sequence: {log}",
+                )
+                self.assertEqual(
+                    pair[0][1],
+                    pair[1][1],
+                    f"rank {r}: restore and release disagree about the wave; "
+                    f"the pair must be the SAME wave's layers: {log}",
+                )
+
+    def test_reclaim_runs_once_and_ahead_of_the_first_restore(self):
+        logs, _tp_pools, _ref, _live = self._run_and_log()
+        for r, log in logs.items():
+            kinds = [k for k, _w in log]
+            self.assertEqual(
+                kinds.count("reclaim"),
+                1,
+                f"rank {r}: reclaim is a once-per-flip rung, got "
+                f"{kinds.count('reclaim')}: {log}",
+            )
+            self.assertLess(
+                kinds.index("reclaim"),
+                kinds.index("restore"),
+                f"rank {r}: the reclaim must hand pages back BEFORE the first "
+                f"destination commit -- that commit is the allocation which "
+                f"OOM'd inside the no-return region on 2026-08-09. "
+                f"Sequence: {log}",
+            )
+
+    def test_waves_do_not_interleave(self):
+        """Wave j's release must precede wave j+1's restore.
+
+        Otherwise two waves' destination pages are committed at once and the
+        peak is two waves wide, which silently undoes the bound that the
+        wave split exists to provide.
+        """
+        logs, _tp_pools, _ref, _live = self._run_and_log()
+        for r, log in logs.items():
+            order = [(k, w) for k, w in log if k in ("restore", "release")]
+            for i in range(2, len(order), 2):
+                self.assertEqual(
+                    order[i - 1][0],
+                    "release",
+                    f"rank {r}: wave {i // 2} began before the previous wave "
+                    f"released: {log}",
+                )
+
+    def test_aliased_pools_keep_release_first(self):
+        """The alias gate, asserted on ORDER rather than on bytes.
+
+        ``TestSharedArenaReadsPrecedeWrites`` covers the aliased path but
+        checks byte identity only, so if this gate were wrong it would stay
+        green wherever the corruption happened to be invisible to that
+        fixture. It is asserted directly here because the failure is not a
+        slow path or a lost optimisation: when the layouts overlay the same
+        bytes, the destination's pages ARE the source's, so restoring and
+        then releasing hands back the mapping just committed and leaves the
+        destination unbacked.
+        """
+        _ref, live, _pp_pools, pp_views, _tp_pools, tp_views = (
+            _make_aliased_layout_pools(MAP_625, VEC, 300)
+        )
+        logs = {r: [] for r in range(len(VEC))}
+        runtimes, _ = _build_runtimes(
+            pp_views,
+            tp_views,
+            live,
+            pre_write_fns_for=lambda r: (_RecordingSeamSwap(logs[r]),),
+        )
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        for r, log in logs.items():
+            kinds = [k for k, _w in log]
+            self.assertEqual(
+                kinds.count("restore"),
+                1,
+                f"rank {r}: the aliased seam must run as ONE wave: {log}",
+            )
+            self.assertLess(
+                kinds.index("release"),
+                kinds.index("restore"),
+                f"rank {r}: aliased layouts must release the source BEFORE "
+                f"restoring the destination -- they are the same pages. "
+                f"Sequence: {log}",
+            )
+
+    def test_reordering_the_seam_changes_no_byte(self):
+        """Byte identity is the net under the whole reorder.
+
+        Restore-first changes WHEN physical pages are mapped, never which
+        bytes are read or written, so the flip's output must be unchanged.
+        """
+        logs, tp_pools, ref, live = self._run_and_log()
+        self.assertTrue(all(logs.values()))
+        ok, msg = _check_tp_layout(tp_pools, ref, live, VEC)
+        self.assertTrue(ok, f"the reordered seam corrupted rows: {msg}")

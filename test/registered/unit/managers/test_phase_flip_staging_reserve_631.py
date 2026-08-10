@@ -33,6 +33,7 @@ Two quantities that must not be conflated, and both directions are wrong:
 
 import unittest
 
+from sglang.srt.layers.dcp.phase_flip_plan import seam_transient_peaks
 from sglang.srt.managers.phase_flip_runtime import (
     DEFAULT_STAGING_RESERVE_BYTES,
     PhaseFlipRuntime,
@@ -402,6 +403,11 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         r._rank = self.RANK
         r._n_layers = 64
         r._n_waves = None
+        # The rig's KV token share vector. Needed since #631 2.1b, because
+        # the wave ORDER is chosen from it: rank 1's 10/32 is what ``_sides``
+        # already encodes in the destination row count below, so the two
+        # must not be allowed to drift apart.
+        r._vec = (14, 10, 8)
         r._pre_write_fns = (_FakeWavedSwap(),) if swappable else ()
         # Pool-local index of a global ordinal, both sides: the PP pool
         # holds this stage's block, the TP pool holds every ordinal. Only
@@ -440,29 +446,78 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         """The wedge, gone, at the spendable figure the rig actually had."""
         r = self._runtime_on_the_rig()
         src, dst = self._sides()
-        need = r._staging_bytes(self._plan(), "pp_to_tp", src, dst, r._flip_waves())
+        need = r._staging_bytes(self._plan(), "pp_to_tp", src, dst, r._flip_waves("pp_to_tp"))
         gate = _runtime(_Probe(self.SPENDABLE_MIB + 1024, 0))
         ok, detail = gate._staging_affordable(need)
         self.assertTrue(ok, detail)
 
-    def test_the_wave_count_is_the_smallest_stage(self):
-        # [28, 20, 16] -> 16 waves, every rank paying into each of them.
+    def test_the_wave_count_is_one_layer_per_wave(self):
+        """#631 2.1b replaced the smallest-stage cap with one layer per wave.
+
+        The OLD contract was 16 waves ([28, 20, 16] -> smallest stage) with
+        every wave carrying a layer of every stage, because release-first
+        made a wave's own releases pay for its own commits. Restore-first
+        removes that coupling, so the cap is the layer count and a wave
+        containing exactly one stage's layer is now normal and correct.
+
+        What replaces the "every wave touches every stage" invariant is the
+        transient-peak contract asserted below -- the property that
+        invariant was a proxy for.
+        """
         r = self._runtime_on_the_rig()
-        waves = r._flip_waves()
-        self.assertEqual(len(waves), 16)
-        # Every layer exactly once, and every wave carries all three ranks.
+        waves = r._flip_waves("pp_to_tp")
+        self.assertEqual(len(waves), 64)
         seen = [f for w in waves for f in w]
         self.assertEqual(sorted(seen), list(range(64)))
-        for w in waves:
-            for stage in self.LAYER_MAP:
-                self.assertTrue(set(w) & set(stage), f"wave {w} skips a stage")
+        self.assertTrue(
+            all(len(w) == 1 for w in waves),
+            "one layer per wave is the point of the lifted cap",
+        )
+
+    def test_the_wave_order_keeps_the_transient_off_the_binding_ranks(self):
+        """The ORDER is load-bearing, so it is asserted on its own.
+
+        A wave commits its destination before releasing its source, so
+        somebody holds both for an instant. The order decides who. The peak
+        is measured in full-pool layer spans; the rank with the largest
+        share is the card sized to absorb it, and every other rank is a
+        binding card whose peak is what the corridor law pays for.
+
+        Asserted against the naive ascending order rather than as a bare
+        number, so the test states a COMPARATIVE claim that cannot be
+        satisfied by accident.
+        """
+        r = self._runtime_on_the_rig()
+        for direction in ("pp_to_tp", "tp_to_pp"):
+            waves = r._flip_waves(direction)
+            order = [f for w in waves for f in w]
+            peaks = seam_transient_peaks(order, self.LAYER_MAP, r._vec, direction)
+            naive = seam_transient_peaks(
+                list(range(64)), self.LAYER_MAP, r._vec, direction
+            )
+            big = max(range(len(r._vec)), key=lambda i: r._vec[i])
+            bind = [p for i, p in enumerate(peaks) if i != big]
+            bind_naive = [p for i, p in enumerate(naive) if i != big]
+            self.assertLessEqual(
+                max(bind),
+                max(bind_naive),
+                f"{direction}: the chosen order is worse for the binding "
+                f"ranks than doing nothing: {peaks} vs {naive}",
+            )
+            self.assertLess(
+                max(bind),
+                1.0,
+                f"{direction}: a binding rank holds a full extra layer span "
+                f"at the seam ({peaks}); that is the term the order exists "
+                f"to move onto rank {big}",
+            )
 
     def test_waving_divides_the_peak_by_about_the_wave_count(self):
         r = self._runtime_on_the_rig()
         src, dst = self._sides()
         plan = self._plan()
         one = r._staging_bytes(plan, "pp_to_tp", src, dst, waves=(None,))
-        many = r._staging_bytes(plan, "pp_to_tp", src, dst, r._flip_waves())
+        many = r._staging_bytes(plan, "pp_to_tp", src, dst, r._flip_waves("pp_to_tp"))
         # Not exactly 1/16: the one-layer gather window does not divide,
         # and the wave shares are integers. An order of magnitude is the
         # claim, and it is the claim that removes the wedge.
@@ -480,7 +535,7 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         r = self._runtime_on_the_rig(swappable=True)
         src, dst = self._sides()
         full = self._plan(rows=self.POOL_ROWS)
-        need = r._staging_bytes(full, "pp_to_tp", src, dst, r._flip_waves())
+        need = r._staging_bytes(full, "pp_to_tp", src, dst, r._flip_waves("pp_to_tp"))
         gate = _runtime(_Probe(self.SPENDABLE_MIB + 1024, 0))
         ok, detail = gate._staging_affordable(need)
         self.assertTrue(ok, f"{need / MIB:.0f} MiB at a full pool: {detail}")
@@ -496,7 +551,7 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         r_plain = self._runtime_on_the_rig(swappable=False)
         r_swap = self._runtime_on_the_rig(swappable=True)
         src, dst = self._sides()
-        waves = r_plain._flip_waves()
+        waves = r_plain._flip_waves("pp_to_tp")
         small = r_swap._staging_bytes(
             self._plan(rows=1000), "pp_to_tp", src, dst, waves
         ) - r_plain._staging_bytes(
