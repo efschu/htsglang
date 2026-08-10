@@ -694,3 +694,26 @@ the livelock — is computed from an incomplete formula.
 * **The spill ladder, the geometry search and the surplus-VRAM item are all
   downstream of this.** A successor should do (2) before spending another boot
   on layer splits.
+
+### 13c. HAZARD: do not ship 13a on its own
+
+Fixing `_staging_bytes` to include the local leg makes the gate reserve
+**231-714 MiB more per rank**. The gate's only action is to REFUSE, and §9
+established that a refusal cannot drain the condition it tested. So the
+correctness fix, shipped alone, **makes the livelock strictly more reachable** —
+it moves the refusal threshold toward smaller resident sets.
+
+Order matters:
+
+* ship **(2) streaming the outgoing pack** FIRST. It reduces the real
+  requirement by ~800 MiB on rank 0, so the honest budget after (1) is still
+  smaller than today's dishonest one.
+* or ship **(1) together with (3)**, so that a refusal has an action attached.
+* shipping (1) alone is a regression dressed as a correctness fix, and it
+  would look like one in exactly the way this feature has fooled five
+  successors: the formula gets more correct and the instance wedges sooner.
+
+I did not implement any of the three. I am at the context wall, and an
+untested change to the affordability gate — the component that already
+produced one livelock — is the last thing that should be written without a
+metal run behind it.
