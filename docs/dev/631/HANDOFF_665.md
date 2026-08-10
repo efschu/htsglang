@@ -552,3 +552,33 @@ Marked **UNVERIFIED** except the caller list above, which I checked:
   `[PP Dynamic Chunk] Failed to profile prefill latency`; the runtime
   `Predicted chunk size` line is `logger.debug` and will not appear at the
   default level.
+
+## 17. AN EVIDENCE FILE I HAD TO QUARANTINE, and the rule it implies
+
+A monitor fired at the end reporting `minima 381, 3036, 787` for the
+pool-470000 window and flagged a breach. **381 MiB on rank1 is not a
+serving reading and must not be quoted.**
+
+The corridor sampler was started at 09:54:34Z for that run and left running
+through two events it was never scoped for: the run being stopped at 09:57
+after it breached, and a REBOOT at 10:00 to the budget-lever config —
+including the boot itself, during which free VRAM legitimately dips toward
+zero while weights and KV are allocated. So the file's running minimum
+spans two configurations and a boot transient.
+
+This is the same error HANDOFF_664 §1 error 0 records against successor 21
+— comparing an instrument against a different instant — arriving through a
+different door: not a mis-read reading, but a correctly-read reading over a
+window that had silently changed underneath it. A running minimum is only
+meaningful over an interval in which the configuration is constant, and a
+long-lived sampler makes that easy to violate without noticing.
+
+`/spinning/evidence-631/s22/green2/README-CONTAMINATED.txt` quarantines the
+file in place with this explanation, because deleting it would leave the
+monitor's number in the transcript with nothing attached to it.
+
+**Rule for successors: one corridor CSV per configuration. Start it after a
+boot completes and stop it before the next one.** The valid readings from
+that window, both already recorded above, are pool 470000 under load
+`941 / 3514 / 1007` (the breach that killed the pool lever) and the
+budget-lever config idle and settled `2747 / 5104 / 2857`.
