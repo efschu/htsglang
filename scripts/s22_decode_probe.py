@@ -50,18 +50,39 @@ def post(port, payload, timeout):
 
 def tp_seconds(log, t_start, t_end):
     """Seconds inside TP windows between two wall instants, from the log."""
+    # The prefix carries a RANK TAG between the time and the bracket:
+    #   [2026-08-10 10:47:30 PP2] PHASE-FLIP DONE pp_to_tp
+    # The original pattern required "]" immediately after the time, so it
+    # matched NOTHING, `events` stayed empty, `in_tp` stayed False, and this
+    # function returned 0.0 -- reported as "0% TP duty cycle" on a run whose
+    # log held 1026 of these lines. A duty cycle of exactly zero is
+    # impossible under strict purity, where decode may ONLY run in TP, so
+    # the instrument was contradicting a boot-enforced invariant.
     out = subprocess.run(
-        ["grep", "-oE", r"[0-9-]+ [0-9:]+\] PHASE-FLIP DONE (pp_to_tp|tp_to_pp)", log],
+        ["grep", "-oE",
+         r"[0-9-]+ [0-9:]+ [A-Za-z0-9_]+\] PHASE-FLIP DONE (pp_to_tp|tp_to_pp)",
+         log],
         capture_output=True, text=True, timeout=120,
     ).stdout.splitlines()
-    events = []
+    # ONE FLIP IS LOGGED ONCE PER RANK, so the raw lines over-count by the
+    # rank count and each duplicate would close and reopen the same window.
+    # Collapsing on (timestamp, direction) is NOT enough: the log has
+    # one-second resolution and the ranks straddle second boundaries, so on
+    # a real 1026-line log that yields 560 "distinct" events against ~342
+    # real flips. Filter to a SINGLE rank instead -- exact by construction.
+    parsed = []
     for line in out:
-        m = re.match(r"([0-9-]+ [0-9:]+)\] PHASE-FLIP DONE (\w+)", line)
+        m = re.match(
+            r"([0-9-]+ [0-9:]+) ([A-Za-z0-9_]+)\] PHASE-FLIP DONE (\w+)", line
+        )
         if not m:
             continue
         ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
-        events.append((ts, m.group(2)))
-    events.sort()
+        parsed.append((ts, m.group(2), m.group(3)))
+    if not parsed:
+        return 0.0
+    keep = sorted({rank for _, rank, _ in parsed})[0]
+    events = sorted((ts, d) for ts, rank, d in parsed if rank == keep)
     total, in_tp, cur = 0.0, False, t_start
     for ts, direction in events:
         if ts < t_start or ts > t_end:

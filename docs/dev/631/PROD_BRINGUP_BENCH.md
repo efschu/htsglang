@@ -2695,7 +2695,7 @@ decode probe + three qwen agent lanes through the router, concurrently.
 | minimum, idx order | **1215 / 3542 / 1349** |
 | 1024 floor | HELD, worst margin **+191** |
 | surplus above floor | 3034 MiB (too loose — the other half of the law) |
-| flips | 834 (417 / 417) |
+| flips | 834 LOG LINES = **278 flips** (139 each way) |
 | FLIP ABANDONED | **51 lines = 17 events x 3 ranks** |
 | tracebacks | 0 |
 | prefill batches / with graph | 10989 / **0** (PURE) |

@@ -316,7 +316,7 @@ three qwen agent lanes through the router with NO model override.
 | minimum, idx order | **1215 / 3542 / 1349** |
 | floor 1024 MiB | **HELD**, worst 1215, margin +191 |
 | surplus above floor | 3034 MiB — the OTHER half of the law, still too loose |
-| flips | **834** (417 pp_to_tp / 417 tp_to_pp) |
+| flips | 834 LOG LINES = **278 flips** (139 each way) — see §7c |
 | **FLIP ABANDONED** | **51 lines = 17 events x 3 ranks** |
 | tracebacks | 0 |
 | prefill batches | 10989, **0 with a CUDA graph** (PURE — PP only) |
@@ -352,7 +352,7 @@ availability cost and must not be reported as a clean pass. 665 §9 said
 deliberately.
 
 No livelock: the instance held `/health` 200 throughout, and flips
-continued at 417 each way after the abandons.
+continued in both directions after the abandons.
 
 **What is still needed for green.** The 3156 MiB staging demand against
 ~4100 MiB of driver-free is the binding term now — not the pool, not the
@@ -472,3 +472,49 @@ in my 68-min run) — the discriminator is a chunk EXCEEDING
   the live server carries it too — verify with
   `tr '\0' '\n' < /proc/<launcher pid>/environ | grep PYTHONPATH` on the
   LAUNCHER, never on a scheduler (§1.2).
+
+---
+
+## 7c. THE DECODE PROBE'S BROKEN INSTRUMENT — root-caused and FIXED, plus a counting error of mine
+
+`s22_decode_probe.py` reported **"0.0 s inside TP (0% TP duty cycle)"** on a
+run whose log holds 1026 `PHASE-FLIP DONE` lines. Zero is impossible under
+strict purity, where decode may ONLY run in TP — the instrument was
+contradicting a boot-enforced invariant, which is the cheapest kind of
+falsifier and should have been checked the moment it printed.
+
+**Root cause.** `tp_seconds()` grepped
+`[0-9-]+ [0-9:]+\] PHASE-FLIP DONE (pp_to_tp|tp_to_pp)`, requiring `]`
+immediately after the timestamp. The real line carries a RANK TAG:
+
+```
+[2026-08-10 10:47:30 PP2] PHASE-FLIP DONE pp_to_tp
+```
+
+So the grep matched NOTHING, `events` stayed empty, `in_tp` stayed False,
+and the function returned 0.0. Fixed to accept the rank tag.
+
+**A second bug behind the first, and it is the one that caught me too.**
+One flip is logged ONCE PER RANK. My first fix collapsed on
+`(timestamp, direction)` — and that is WRONG: the log has one-second
+resolution and the three ranks straddle second boundaries, so 1026 lines
+became 560 "distinct" events against ~342 real flips. The fix filters to a
+SINGLE rank, which is exact by construction. Verified: 1026 lines ->
+**342 events, 171 pp_to_tp / 171 tp_to_pp**. The perfect balance is the
+sanity check — flips must alternate.
+
+**CORRECTION TO MY OWN §7 NUMBERS.** I reported "834 flips (417/417)" from
+the verdict tool. That is 834 LOG LINES across three ranks =
+**278 flips (139 each way)**. `s22_green_verdict.py:62` counts lines, not
+events, and every flip count in this corpus quoted from it is 3x high. I
+de-duplicated the ABANDON count correctly (51 lines -> 17 events) in the
+same session and then failed to apply the identical correction one row
+above it. The abandon RATE is unchanged (17/278 = 6%), but the absolute
+flip figures were wrong.
+
+`s22_green_verdict.py` still line-counts; a successor should apply the same
+single-rank filter there.
+
+**The decode decomposition is now unblocked** — the probe was the blocker,
+not the workload. Re-run it inside a load window and the in-phase number
+will exist for the first time in this chain.
