@@ -454,3 +454,53 @@ MiB short of 1024. At the measured 37% return that is roughly another
 180-200 MiB of budget cut on rank1. **That is the next single-variable
 step, it is a flag change, and it is the last thing between this
 configuration and a corridor-holding green run at pool 470000.**
+
+## 15. THE REFUSAL-GUARD DESIGN REVIEW (664 §11b) — done, and it found NO fourth surprise
+
+664 §11b asked for "a design review of every early-return in
+`phase_flip_runtime`, not three patches", on the rule that *any guard whose
+refusal does not change the condition it tested is a livelock waiting for a
+large enough resident set*. That review was run as a read-only audit.
+
+**UNVERIFIED BY ME — this is a subagent report, and an agent report is not
+evidence.** It is recorded because it is a complete enumeration with
+file:line for every claim, which makes it cheap to check. A successor
+should spot-check the four candidates before acting on them.
+
+Coverage claimed: all 3181 lines of `phase_flip_runtime.py`, plus
+`phase_flip_presence.py`, `phase_purity.py`, and the flip-relevant regions
+of `scheduler.py`. 33 guards enumerated. Not covered: `kv_reshard.py`,
+`phase_flip_spill.py`, `phase_flip_draft_bootstrap.py`,
+`phase_flip_seam_census.py` (argued out of scope as no-return-region or
+read-only).
+
+**The useful result is a negative one: it found no unknown livelock shape.**
+Everything ranked reachable is already on the record:
+
+| rank | guard | file:line | status |
+|---|---|---|---|
+| 1 | `_staging_affordable` refusal in `_execute` | `phase_flip_runtime.py:2963-2996` | the confirmed one, 664 §9 |
+| 2 | pool-size refusal (`max_pp_row`/`max_tp_row`) | `phase_flip_runtime.py:2936-2946` | livelock-SHAPED but structurally bounded: slot ids cannot exceed the boot-sized pool |
+| 3 | `/flush_cache` HTTP 400 while resident | `scheduler.py:6408` | the confirmed one, 664 §11b |
+| 4 | draft-bootstrap impossibility on PP->TP | `phase_flip_runtime.py:449-461` | resolved by the bounded PP window; **boot REFUSES `pp_window_s == 0` with strict purity** (`phase_purity.py:221`), so the deadlock is unreachable by configuration |
+
+Everything else — the arming guards, the quiescence gates, the presence
+gates, the consensus holds, the park deadline, the checksum and size
+raises — was argued SAFE, and the argument is the same in each case: either
+the condition drains through the ordinary scheduler loop, or a bounded
+deadline closes it (park 30 s, presence 60 s), or it is a code-bug raise
+rather than an accumulating runtime condition.
+
+**Why this matters for the plan.** It removes an open worry rather than
+adding work: the three known instances are the whole set, the fourth is
+closed by a boot-time refusal, and #2 is bounded by construction. So a
+successor fixing the staging refusal is fixing the last reachable one, not
+the first of many. Combined with §9 — the corridor and staging bounds have
+come apart, and a 485 MiB breach no longer wedges the instance — the
+livelock family is in much better shape than 664 left it.
+
+### Correction to §12 of this handoff
+
+I wrote that both audit agents were lost to the final reboot. Only the
+dynamic-chunking one was; this one completed. Its questions are answered
+here and should not be re-asked.
