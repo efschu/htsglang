@@ -2075,3 +2075,218 @@ pool ceiling — which is exactly where SUCCESSOR 20 / 2 found the two 3080s
 overshooting `RANK_MIB` by 867 and 1289 MiB while the 5090 sits 2521 MiB
 under. **The untried low-`RANK_MIB` x low-pool cell is the indicated next
 experiment, and this table is the argument for it.**
+
+---
+
+# SUCCESSOR 21 / 1 — THE BYTE LEDGER, AND THE TERM EVERY EARLIER LEDGER OMITTED
+
+This section is the standing falsifier the user's override rule demands: no
+capacity verdict counts unless the full delta between two configurations is
+attributed by name, VRAM **and** host RAM. It is written because three
+successors in a row produced a closure from a component analysis, and a
+component analysis can silently omit a term while a closing balance cannot.
+
+**It closes on a term nobody had itemised, and the omitted term is larger than
+every term that had been argued about.**
+
+## 1a. The static column, read from the live boot (pool 190000, HEAD 803222a339)
+
+Instrument: `mem_ledger.flight_recorder`, which the boot script already arms
+via `SGLANG_VRAM_FLIGHT_DIR=/spinning/flight_605`. Earlier handoffs said this
+was unset; it is set — read `/proc/<pid>/environ`, not the log.
+
+| term | rank0 (5090) | rank1 (3080) | rank2 (3080) | source |
+|---|---|---|---|---|
+| card total (NVML) | 32607 | 20480 | 20480 MiB | flight mark |
+| weights arena `max(pp,tp)` | 14936 | 7924 | 9115 MiB | `PHASE-FLIP-BOOT TP stack built` |
+| — PP layout image | 14936 | 6690 | 9115 MiB | `snapshotted ... MiB image` |
+| — TP layout image | 13163 | 7924 | 7924 MiB | same |
+| draft (MTP) weights, resident BOTH phases | 2058 | 1925 | 1925 MiB | `Load weight end` |
+| mamba/GDN state pool | 1516 | 758 | 758 MiB | `Mamba Cache is allocated` |
+| KV VMM arena, VA reserved | 3482 | 3174 | 2662 MiB | `KvVmmArena[...] ready` |
+| — PP KV backing | 2944 | 1472 | 1472 MiB | `released the PP KV backing` |
+| — TP KV backing | 2270 | 2040 | 1583 MiB | `KV Cache is allocated` (TP pass) |
+| TP decode graph pool | 286 | 290 | 290 MiB | `capture_begin`→`capture_end` |
+| PP graph pool | **0** | 0 | 0 MiB | eager by construction (661 §7) |
+| NVML free at `boot_complete` | **7843** | **5764** | **5034** MiB | flight mark |
+
+**The two KV pools are never both backed.** Traced through a full
+pp→tp→pp cycle: `phase_flip_runtime.py:1489-1491` releases the source before
+restoring the destination, `phase_flip_boot.py:718-734` asserts it at the
+worst moment (TP allocated *and* graphs captured), and the two pools own
+disjoint physical page sets through their own `KvVmmArena`. HANDOFF_663 §12
+listed "two KV pools" and "duplicate graph pools" as unitemised leads; both
+are now closed at **0 MiB**, by code and by the boot assertion.
+
+**So the flip setup's static VRAM cost over plain TP3 is only the arena tail**
+— `arena - tp_bytes` = **1773 / 0 / 1191 MiB** — plus the KV misalignment
+(per-rank `max(layer_share, token_share)` sums to 1.1216 instead of 1.0).
+Nowhere near the 6.4 / 4.5 / 3.5 GiB the conservation identity demands.
+
+## 1b. The omitted term: post-boot allocator growth, and it is the whole gap
+
+| | rank0 | rank1 | rank2 |
+|---|---|---|---|
+| NVML free at boot_complete | 7843 | 5764 | 5034 MiB |
+| corridor minimum under load (HANDOFF_663 §9) | 1646 | 1369 | 1037 MiB |
+| **decay after boot sizing** | **6197** | **4395** | **3997 MiB** |
+| gap the conservation identity demands (663 §12) | 6554 | 4608 | 3584 MiB |
+
+**The rows agree to within half a GiB on every card.** The mass that "exists,
+is resident, and has a name" is not cold inactive-layout weights — those are
+already at zero VRAM, because the arena is `max(pp,tp)` and the inactive
+layout lives as a pinned host image. It is memory the process takes **after**
+every boot-time itemisation has finished, which is exactly why five successive
+boot-time analyses could not see it.
+
+## 1c. What the growth IS, measured — the coefficient nobody had
+
+`scripts/s21_scratch_ladder.py` sends one request per rung at a known prompt
+length and reads the NVML floor from the 100 ms corridor sampler. Run
+short-to-long on purpose: long-to-short allocates the worst case first and
+reports zero for every later rung, which is true for that ordering and
+useless.
+
+Live instance, pool 190000, one request at a time:
+
+| prompt tokens | marginal drop (MiB, card0/1/2) | cumulative floor |
+|---|---|---|
+| 2686 | 0 / 0 / 0 | 5017 / 6652 / 4347 |
+| 5370 | 0 / 0 / 0 | 5017 / 6652 / 4347 |
+| 10737 | 0 / 0 / 0 | 5017 / 6652 / 4347 |
+| 21476 | 200 / 300 / 180 | 4817 / 6352 / 4167 |
+| 42948 | 500 / 640 / 460 | 4317 / 5712 / 3707 |
+| 85894 | 902 / 1320 / 924 | **3415 / 4392 / 2783** |
+
+**~19-26 MiB of sticky allocator reserve per 1000 prompt tokens per card,
+above a free tier of roughly 15k tokens.** It is monotone: the allocator never
+returns the blocks on its own.
+
+**This is the mechanism behind successor 20's law.** 663 recorded that "the
+corridor decays in STEPS, not as a drift — a plateau of ANY length only means
+no larger request has arrived yet" and that the misread had cost three
+successors. That is precisely a high-water indexed by the longest prefill seen
+so far. The law was right; the cause was never named, so it read as something
+to be endured rather than something to be fixed.
+
+## 1d. The falsifier that separates residue from peak
+
+Asking the allocator to return its cached segments, on the same live instance,
+with no reboot and no config change:
+
+```
+free BEFORE flush   3911, 4392, 2911 MiB
+free AFTER  flush   6605, 7846, 5405 MiB     (+2694 / +3454 / +2494)
+```
+
+Full recovery to the boot-complete level, regardless of the accumulated
+history. So the decay is **returnable**, and nothing in the phase-flip path
+ever asks: `torch.cuda.empty_cache()` appears four times in
+`phase_flip_boot.py` (:482, :543, :595, :747) and **zero times** in
+`phase_flip_runtime.py`. The runtime flip has never reclaimed.
+
+Re-running the ladder with a release before each rung separates the two
+quantities, which must not be conflated:
+
+| prompt tokens | in-flight dip (concurrent PEAK) | residue left behind |
+|---|---|---|
+| 21476 | 1640 / 1042 / 1112 | 240 / 320 / 220 |
+| 42948 | 2118 / 1562 / 1572 | 480 / 640 / 462 |
+| 85894 | **3042 / 2624 / 2456** | 922 / 1322 / 882 |
+
+* the **peak** is live memory while the prefill runs (~30 MiB per 1000 tokens
+  per card). No allocator call can return it, and a release-at-cutover must
+  not be credited with it.
+* the **residue** is what survives the request and every shorter request after
+  it. That is what the rung reclaims, and it is why an hour-long run's
+  corridor bears no relation to its first minute's.
+
+## 1e. Why the KV pool was never the binding term, and the A/B that proves it
+
+663 recorded pool 190000 holding at 1037 MiB and pool 260000 breaching at
+1007 MiB. A 70000-token pool step costs ~1.1 GiB on rank 0 by the pool
+arithmetic; the observed difference is **30 MiB**. Two pool sizes 37 % apart
+produced the same corridor minimum to within noise, because in both cases the
+allocator expanded until roughly the same amount of free memory was left.
+
+Confirmed in code: **`--rank-gpu-memory-mib` is ADVISORY ONLY.** It becomes
+`mem_fraction_static` (`server_args.py:10492-10512`), which is consumed once
+in `_profile_available_bytes` to size the KV pool, and nothing enforces it
+afterwards. `torch.cuda.set_per_process_memory_fraction` is called nowhere in
+the tree. The VRAM dial (`managers/vram_dial.py`) is not a ceiling either — it
+resizes the VMM-backed KV tail against a floor measured once and never
+re-checked, i.e. it moves the one term the measurement shows is *not* growing.
+
+**Therefore "260000 breached the corridor" was never a statement about 260000.**
+
+## 1f. The host-RAM column, which the VRAM-only ledgers never had
+
+The previous run died at 73 minutes on `oom_kill 9`, not on the corridor.
+
+| | value |
+|---|---|
+| cgroup `memory.current` | 105.2 GiB |
+| anon | 14.8 GiB |
+| file | 89.7 GiB |
+| **shmem** | **74.1 GiB** |
+| swap | **0** |
+| `/dev/shm` in use | 1.3 GiB |
+
+The shmem is not `/dev/shm`; it is the schedulers themselves —
+`RssShmem` 34.2 / 17.5 / 25.8 GB on PP0/PP1/PP2 — i.e. the **pinned weight
+images**, `layout_pp.total_bytes + layout_tp.total_bytes` per rank, 58.3 GiB
+by the boot log's own `images pinned` line. With no swap configured, pinned
+shmem is unreclaimable, so ~89 GiB of a 117 GiB box is permanently spoken for
+and the OOM killer is one long agent session away.
+
+**Lever, recorded for whoever takes it:** the two images are READ-ONLY masters
+— a flip only ever reads them into the arena, never writes them — and the same
+bytes already exist on disk in the checkpoint. File-backing them converts
+58 GiB of unswappable shmem into reclaimable page cache, at the cost of a page
+fault on a cold flip. Not taken in this pass; the VRAM axis was the ordered
+work.
+
+## 1g. Which phase actually binds — and it is not what 663 assumed
+
+`scripts/s21_phase_corridor.py` cuts the corridor series at the log's own
+`event loop re-dispatch` instants and reports the minimum SEPARATELY per
+phase, with a settle margin so the cutover's own transient is neither phase.
+An aggregate minimum cannot answer this, and the answer decides whether any
+spill is worth anything: an asset cold in the **binding** phase is worth its
+full size, and one cold only in the other phase is worth exactly 0 MiB.
+
+bs=4, pool 190000, 1961 samples over 4.5 min:
+
+| card | pp min | tp min | seam min | binds |
+|---|---|---|---|---|
+| card0 (3080, rank1) | 5913 | 5017 | 5017 | **TP** |
+| card1 (5090, rank0) | 7034 | 7378 | **6674** | **SEAM** |
+| card2 (3080, rank2) | 5137 | 4349 | 4349 | **TP** |
+
+663 §8 credited the arena tail at 0 MiB on every rank, on the reasoning that
+the tail is idle only in each rank's non-binding phase. The tail is idle in
+**TP**, and TP binds on both 3080s — and rank0's 1773 MiB tail is idle in TP
+as well, where the seam (a TP-side event) sets the minimum. **That zero was
+derived from an assumed binding phase, not a measured one. Re-derive before
+reusing it.**
+
+Second consequence, and it is new: **on the 5090 the deepest point of the
+whole cycle is the cutover itself.** Any work on rank 0's corridor is work on
+the seam, not on either phase's steady state.
+
+## 1h. What this ledger licenses, and what it does not
+
+It does **not** say >600k is reachable, and it does not say it is not. It says
+the accounting that produced both previous verdicts was measuring the wrong
+term, and it replaces that term with a measured one:
+
+```
+corridor_min(card) = boot_free(card)
+                   - concurrent_peak_of_the_binding_regime(longest prefill)
+                   - accumulated_residue(every longer prefill ever served)
+```
+
+The third term is reclaimable and is now reclaimed (SUCCESSOR 21 / 2). The
+second is not reclaimable and scales at ~30 MiB per 1000 prompt tokens. The
+first is what the pool competes for. Any future capacity claim must state
+which of the three it is moving.

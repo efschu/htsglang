@@ -1444,8 +1444,20 @@ def _build_kv_backing_swap(scheduler, stacks) -> Callable[[str], None]:
     under --enable-phase-flip): without it there is nothing to swap and the
     old both-resident behaviour stands.
     """
+    from sglang.srt.managers.phase_flip_spill import (
+        release_allocator_cache,
+        resolve_spill_depth,
+    )
+
     pp_pool = scheduler.tp_worker.model_runner.token_to_kv_pool
     tp_pool = stacks.tp_worker.model_runner.token_to_kv_pool
+    # Resolved ONCE, at wiring time, so a malformed depth is a boot-time
+    # refusal and not an exception thrown inside a cutover that has already
+    # released the source pool's pages.
+    spill_depth = resolve_spill_depth(getattr(scheduler, "server_args", None))
+    # The rank's OWN device. Every worker here has all three cards visible, so
+    # a bare current-device read can name a card this rank does not own.
+    spill_device = getattr(scheduler.tp_worker.model_runner, "gpu_id", None)
 
     def _swap(direction: str) -> None:
         src, dst = (
@@ -1488,6 +1500,24 @@ def _build_kv_backing_swap(scheduler, stacks) -> Callable[[str], None]:
         # a re-commit that cannot be served.
         src.release_backing()
         seam_census.mark("backing_release")
+        # SPILL RUNG 1 (#656 spec item 6), and this is the only instant in the
+        # whole cycle where it is both safe and maximally productive:
+        #  * the outgoing layout's scratch is dead by construction -- the
+        #    phase that allocated it will not run again until the next flip;
+        #  * the source pool's physical pages have just gone back to the
+        #    driver, so what remains cached is genuinely torch's and nobody
+        #    else's;
+        #  * the restore below asks the driver for RAW pages, and the
+        #    documented failure of that call is precisely torch sitting on
+        #    blocks it is not using. Reclaiming BEFORE the ask turns a
+        #    retry-after-OOM into a first-attempt success.
+        # Censused between the two halves so the corridor credit is
+        # attributable to this rung and not netted out against the re-commit.
+        released = release_allocator_cache(
+            direction, depth=spill_depth, device_index=spill_device
+        )
+        if released:
+            seam_census.mark("allocator_cache_release")
         dst.restore_backing()
         seam_census.mark("backing_restore")
 

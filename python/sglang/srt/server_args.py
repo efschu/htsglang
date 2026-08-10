@@ -5314,6 +5314,32 @@ class ServerArgs:
             "sized at boot from it (DESIGN_631 section 3.4a).",
         ),
     ] = None
+    phase_flip_spill_depth: A[
+        Optional[str],
+        Arg(
+            help="#656 spec item 6: how much of the INACTIVE layout's cold "
+            "memory is given up at each phase change, as a selectable ladder "
+            "trading flip duration against reclaimed VRAM. Cumulative. "
+            "'none' keeps the pre-#656 behaviour. 'cache' (DEFAULT under "
+            "--enable-phase-flip) returns the outgoing phase's cached "
+            "allocator segments to the driver at the cutover seam. That rung "
+            "exists because the corridor is stated in NVML's FREE column, "
+            "which counts torch's cached-but-unused segments as USED: a "
+            "prefill grows the allocator's reserve by ~19-26 MiB per 1000 "
+            "prompt tokens per card on this rig and the allocator never "
+            "hands those blocks back, so the corridor decays one step per "
+            "longest-prefill-so-far and never recovers. Measured 2026-08-10 "
+            "on the live instance, the release returned 2.5-3.5 GiB per "
+            "card. It reclaims RESIDUE, not peak -- the transient a long "
+            "prefill needs while it runs is live and no allocator call can "
+            "return it. Deeper rungs ('draft', 'draft+graphs') are defined "
+            "and REFUSED rather than clamped, because the TP decode CUDA "
+            "graphs bake the draft weights' addresses and those rungs still "
+            "lack a VA-stable carrier. Integers 0..3 are accepted so a depth "
+            "sweep can be scripted. Requires --enable-phase-flip; env "
+            "fallback SGLANG_PHASE_FLIP_SPILL_DEPTH.",
+        ),
+    ] = None
     enable_vram_dial: A[
         bool,
         Arg(
@@ -7259,6 +7285,13 @@ class ServerArgs:
                     "(the vector configures the flip's TP layout; alone it "
                     "does nothing, which would silently mask a typo)."
                 )
+            if self.phase_flip_spill_depth is not None:
+                raise ValueError(
+                    "--phase-flip-spill-depth requires --enable-phase-flip: "
+                    "the ladder gives up the INACTIVE layout's cold memory "
+                    "at a phase change, and without a second layout there is "
+                    "neither an inactive side nor a phase change."
+                )
             if self.phase_flip_policy != "manual":
                 raise ValueError(
                     "--phase-flip-policy=auto requires --enable-phase-flip: "
@@ -7268,6 +7301,18 @@ class ServerArgs:
                     "'the policy is running'."
                 )
             return
+        # Default the spill ladder to its lowest MEASURED rung, and resolve it
+        # here so a bad value is an argument error rather than an exception
+        # raised inside a cutover that has already released the source pool's
+        # pages. 'cache' is the default rather than 'none' because leaving it
+        # off is not a neutral choice: without it the corridor decays one step
+        # per longest-prefill-so-far and never recovers, which is a slow leak
+        # of the very budget the acceptance is judged on.
+        if self.phase_flip_spill_depth is None:
+            self.phase_flip_spill_depth = "cache"
+        from sglang.srt.managers.phase_flip_spill import resolve_spill_depth
+
+        resolve_spill_depth(self)
         if self.phase_flip_tp_vector is None:
             raise ValueError(
                 "--enable-phase-flip requires --phase-flip-tp-vector (the "

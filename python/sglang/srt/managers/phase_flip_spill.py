@@ -25,18 +25,30 @@ empty device.
 
 THE LADDER IS USER-SELECTABLE, and cumulative
 ---------------------------------------------
-``--phase-flip-spill-depth {0,1,2}`` / ``SGLANG_PHASE_FLIP_SPILL_DEPTH``.
+``--phase-flip-spill-depth {none,cache,draft,draft+graphs}`` (integers 0..3
+also accepted) / ``SGLANG_PHASE_FLIP_SPILL_DEPTH``.
 
-    0  nothing spilled -- TODAY'S BEHAVIOUR, and the default, so the
-       default path is unchanged (backward-compatibility law).
-    1  draft (MTP) weights            ~1.86-2.01 GB/rank
-    2  + draft CUDA graphs            ~0.55 GB/rank
+    0  none          nothing given up -- the pre-#656 seam, byte-identical
+    1  cache         the outgoing phase's cached allocator segments go back
+                     to the driver at the cutover      measured 2.5-3.5 GiB/card
+    2  draft         + draft (MTP) weights             ~1.86-2.01 GB/rank
+    3  draft+graphs  + draft CUDA graphs               ~0.55 GB/rank
 
-Depth 2 implies depth 1. Each rung buys KV tokens and costs flip
-milliseconds; the measured trade is recorded in
-``docs/dev/631/PROD_BRINGUP_BENCH.md``. Higher flip time is an accepted
-price per the ordering user -- but it is a price, so it is measured and
-published per rung rather than assumed small.
+Cumulative: depth N performs every rung up to N. Each rung buys corridor and
+costs flip milliseconds; the measured trade is recorded per rung in
+``docs/dev/631/PROD_BRINGUP_BENCH.md``. Higher flip time is an accepted price
+per the ordering user -- but it IS a price, so it is measured and published
+per rung rather than assumed small.
+
+RUNG 1 IS THE DEFAULT under ``--enable-phase-flip``, and rung 1 only.
+``IMPLEMENTED_DEPTH`` gates the rest: rungs 2 and 3 parse and are then
+REFUSED, because the TP decode CUDA graphs bake the draft weights' addresses
+and the restore below allocates a FRESH arena, which moves them. That is a
+latent graph-corruption bug in this module as originally written, not a
+missing feature -- wiring it as-is would have been worse than leaving it
+dead. Those rungs need a VA-stable carrier (``KvVmmArena``, whose
+commit/decommit the KV pools already use with addresses held fixed) before
+they can be turned on.
 
 THE PRIMITIVE IS NOT NEW
 ------------------------
@@ -67,9 +79,20 @@ ORDERING LAW: SPILL ONLY AFTER THE CUTOVER HAS COMMITTED
 --------------------------------------------------------
 Never spill on a merely ARMED flip. An abandoned flip that had already
 freed the draft weights would return to the TP phase with no drafter and
-0-sized parameter placeholders -- a loud crash at best. Both call sites in
-``phase_flip_runtime._cutover`` step 7b sit after the active-stack swap,
-which is past the point of no return, and that is deliberate.
+0-sized parameter placeholders -- a loud crash at best.
+
+CORRECTION (#656 successor 21): the sentence that used to stand here claimed
+"both call sites in ``phase_flip_runtime._cutover`` step 7b sit after the
+active-stack swap". THAT WIRING DOES NOT EXIST AND NEVER DID -- a whole-tree
+grep for ``get_spill_ladder``/``on_enter_pp``/``on_enter_tp`` matched only
+this file. The draft rungs are unreferenced code with no tests. The statement
+is left visible rather than deleted because a docstring asserting a call site
+that is absent is exactly the kind of claim that let five successors believe
+spec item 6 was implemented.
+
+Rung 1 IS wired, at ``phase_flip_runtime._build_kv_backing_swap``, strictly
+between the source pool's release and the destination's restore, and it is
+covered by ``test_phase_flip_spill_depth_631.py``.
 
 The restore leg runs BEFORE ``arm_draft_bootstrap_all_reachable``, which
 needs a live drafter to scrub its pool.
@@ -96,10 +119,49 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-FLIP-SPILL"
 
+# The ladder is CUMULATIVE: depth N performs every rung up to and including
+# N. Rung 1 was added by #656 successor 21 and deliberately sits BELOW the
+# draft rungs, because it is the only rung whose worth was measured before it
+# was written and because it is the one that matches the asset the corridor
+# actually loses.
+#
+# WHY RUNG 1 IS FIRST, in the rig's own numbers. The corridor law is a
+# CONTINUOUS minimum of NVML free memory, and NVML counts torch's cached-but-
+# unused segments as USED. A prefill grows the caching allocator's reserve in
+# proportion to the sequence length -- measured on this rig at ~19-26 MiB per
+# 1000 prompt tokens per card -- and the allocator never returns those blocks
+# to the driver on its own. So the corridor decays in steps, one step per
+# longest-prefill-so-far, and never recovers. Measured 2026-08-10 on the live
+# instance: free had decayed to 3911/4392/2911 MiB, and asking the allocator
+# to return its cached segments restored 6605/7846/5405 MiB -- 2.5 to 3.5 GiB
+# per card that no phase was using and no boot-time itemisation could see.
+#
+# The seam is the correct instant to ask, and not merely a convenient one:
+# the outgoing layout's scratch is dead there by construction, the source
+# pool's physical pages have just been handed back, and the destination's
+# re-commit is about to ask the driver for RAW pages -- the exact allocation
+# that has failed here before for want of them.
 DEPTH_NONE = 0
-DEPTH_DRAFT_WEIGHTS = 1
-DEPTH_DRAFT_GRAPHS = 2
+DEPTH_ALLOCATOR_CACHE = 1
+DEPTH_DRAFT_WEIGHTS = 2
+DEPTH_DRAFT_GRAPHS = 3
 MAX_DEPTH = DEPTH_DRAFT_GRAPHS
+
+#: Spelling accepted by the CLI and the environment, in ladder order. The
+#: integer form stays valid so an A/B can sweep the ladder numerically.
+DEPTH_NAMES = {
+    "none": DEPTH_NONE,
+    "cache": DEPTH_ALLOCATOR_CACHE,
+    "draft": DEPTH_DRAFT_WEIGHTS,
+    "draft+graphs": DEPTH_DRAFT_GRAPHS,
+}
+
+#: The deepest rung that is WIRED AND EXERCISED. Anything above this parses
+#: but is refused at resolution time rather than silently behaving as this
+#: value -- a depth dial that quietly under-delivers is worse than one that
+#: says no, because the A/B that compares two rungs would then compare a rung
+#: against itself and report a real-looking zero.
+IMPLEMENTED_DEPTH = DEPTH_ALLOCATOR_CACHE
 
 DEPTH_ENV = "SGLANG_PHASE_FLIP_SPILL_DEPTH"
 VERIFY_ENV = "SGLANG_PHASE_FLIP_SPILL_VERIFY"
@@ -131,23 +193,109 @@ def resolve_spill_depth(server_args: Any = None) -> int:
             depth = raw
     if depth in (None, ""):
         return DEPTH_NONE
-    try:
-        value = int(depth)
-    except (TypeError, ValueError):
-        raise PhaseFlipSpillError(
-            f"{LOG_PREFIX} spill depth {depth!r} is not an integer; valid "
-            f"depths are 0..{MAX_DEPTH}"
-        )
+    if isinstance(depth, str) and depth.strip().lower() in DEPTH_NAMES:
+        value = DEPTH_NAMES[depth.strip().lower()]
+    else:
+        try:
+            value = int(depth)
+        except (TypeError, ValueError):
+            names = ", ".join(DEPTH_NAMES)
+            raise PhaseFlipSpillError(
+                f"{LOG_PREFIX} spill depth {depth!r} is neither an integer "
+                f"0..{MAX_DEPTH} nor one of: {names}"
+            )
     if not 0 <= value <= MAX_DEPTH:
         raise PhaseFlipSpillError(
             f"{LOG_PREFIX} spill depth {value} out of range; valid depths "
             f"are 0..{MAX_DEPTH} (cumulative: 2 implies 1)"
+        )
+    if value > IMPLEMENTED_DEPTH:
+        # Refuse rather than clamp. Clamping would make a depth sweep report
+        # that rung 3 is worth exactly what rung 1 is worth, which reads as a
+        # measurement and is an artefact of the clamp.
+        raise PhaseFlipSpillError(
+            f"{LOG_PREFIX} spill depth {value} is defined but not wired; the "
+            f"deepest implemented rung is {IMPLEMENTED_DEPTH} "
+            f"('cache': return the outgoing phase's cached allocator segments "
+            f"to the driver at the cutover). Rungs {IMPLEMENTED_DEPTH + 1}.."
+            f"{MAX_DEPTH} spill the DRAFT model, whose weights the TP decode "
+            f"CUDA graphs bake addresses into, so they need a VA-stable "
+            f"carrier that this module does not yet have -- restoring into a "
+            f"freshly allocated arena would move those addresses and corrupt "
+            f"the graphs."
         )
     return value
 
 
 def spill_verify_enabled() -> bool:
     return os.environ.get(VERIFY_ENV, "") not in ("", "0", "false", "False")
+
+
+def release_allocator_cache(
+    direction: str, *, depth: int, device_index: Any = None
+) -> int:
+    """Rung 1: hand the outgoing phase's cached segments back to the driver.
+
+    Returns the number of bytes NVML reports as newly free, or 0 when the rung
+    is not selected or CUDA is unavailable.
+
+    WHAT THIS DOES NOT DO, stated because the difference decides what the rung
+    is worth. It does not reduce the PEAK. The transient a long prefill needs
+    while it runs is live memory, measured on this rig at ~30 MiB per 1000
+    prompt tokens per card, and no allocator call can give that back while the
+    prefill is in flight. What this returns is the RESIDUE: the segments the
+    allocator kept after the request finished, which survive every subsequent
+    shorter request and turn a one-off long prefill into a permanent corridor
+    loss. Those two quantities were measured separately (a ladder run with and
+    without a release between rungs) precisely so that this rung is not
+    credited with the peak it cannot touch.
+
+    The free-byte delta is read from the driver rather than from torch's own
+    counters on purpose: the corridor law the user set is stated in the FREE
+    column, and torch's ``reserved`` figure does not mean the same thing --
+    under ``expandable_segments:True`` it counts a VIRTUAL extent and was
+    observed at 36910 MiB on a 32607 MiB card, so it cannot be compared to a
+    physical budget at all.
+
+    ``device_index`` MUST be the rank's own device. Every rank in this
+    deployment sees all three cards (``CUDA_VISIBLE_DEVICES`` lists three
+    UUIDs in every worker), so a bare ``mem_get_info()`` reports whichever
+    device the calling thread happens to be on, which is not necessarily this
+    rank's. That mistake was made here first and caught by cross-checking the
+    logged figure against ``nvidia-smi``: the rung reported 10371 MiB free on
+    a card the driver said had 3149. The delta happened to stay plausible,
+    which is precisely why the absolute value has to be pinned to a named
+    device rather than trusted because it "looks right".
+    """
+    if depth < DEPTH_ALLOCATOR_CACHE:
+        return 0
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0
+        dev = device_index if device_index is not None else torch.cuda.current_device()
+        free_before, _ = torch.cuda.mem_get_info(dev)
+        torch.cuda.empty_cache()
+        free_after, _ = torch.cuda.mem_get_info(dev)
+    except Exception as e:  # pragma: no cover - driver/platform differences
+        # A failed reclaim must never take the flip down: the flip is correct
+        # without it, only tighter.
+        logger.warning("%s allocator cache release failed: %s", LOG_PREFIX, e)
+        return 0
+    returned = int(free_after) - int(free_before)
+    logger.info(
+        "%s rung 1 (cache) at %s on device %s: returned %.1f MiB of cached "
+        "segments to the driver; free %.1f -> %.1f MiB. This is residue, not "
+        "peak.",
+        LOG_PREFIX,
+        direction,
+        dev,
+        returned / _MIB,
+        free_before / _MIB,
+        free_after / _MIB,
+    )
+    return returned
 
 
 def draft_model_of(draft_worker: Any) -> Optional[Any]:

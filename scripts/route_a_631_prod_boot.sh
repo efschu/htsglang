@@ -115,6 +115,11 @@ PHASE_POLICY_MIN_DWELL_S="${PHASE_POLICY_MIN_DWELL_S:-3}"
 PHASE_POLICY_PP_WINDOW_S="${PHASE_POLICY_PP_WINDOW_S:-15}"
 PHASE_POLICY_TP_DECODE_FLOOR_S="${PHASE_POLICY_TP_DECODE_FLOOR_S:-10}"
 PHASE_FLIP_PURITY="${PHASE_FLIP_PURITY:-strict}"
+# #656 spec item 6: the spill ladder. 'cache' is the server's own default and
+# is restated here so an A/B can set it to 'none' without editing the script.
+# Do NOT read the default off this line -- server_args owns it; this only
+# makes the knob reachable.
+PHASE_FLIP_SPILL_DEPTH="${PHASE_FLIP_SPILL_DEPTH:-cache}"
 PHASE_POLICY_IDLE_DWELL_S="${PHASE_POLICY_IDLE_DWELL_S:-}"
 PHASE_IDLE_STATE="${PHASE_IDLE_STATE:-}"
 HICACHE="${HICACHE:-0}"
@@ -349,6 +354,7 @@ setsid "$PY" -m sglang.launch_server \
     --phase-flip-tp-vector 30,17,17 \
     --phase-flip-policy "$POLICY" \
     --phase-flip-purity "$PHASE_FLIP_PURITY" \
+    --phase-flip-spill-depth "$PHASE_FLIP_SPILL_DEPTH" \
     --disable-overlap-schedule \
     --kv-cache-dtype fp8_e4m3 --context-length "$CTX" \
     --max-running-requests "$MAX_RUNNING" \
