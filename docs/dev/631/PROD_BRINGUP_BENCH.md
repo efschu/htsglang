@@ -3814,3 +3814,51 @@ items 11-14 rather than for this rung: KV itself is a spill class, and
 the idle-slot GDN/mamba states at bs<4 are a far larger payload than the
 drafter ever was. The carrier's allocation hook exists so those reuse
 this mechanism instead of duplicating it.
+
+### 2p.5 The loaded phase split at depth=draft: the corridor HOLDS, and the binding phase MOVED
+
+7196 samples at 100 ms over 12.0 min, 4 streams, ctx 150k, pool 500000,
+POLICY=auto, strict purity, MTP on, decode/verify AND draft graphs on.
+174 flips in window, **0 abandons**, occupancy 410142 live slots of
+500000 (82%). Same load and same sampler as section 2o's baseline, so
+the rows are directly comparable.
+
+| card | PP min: depth=cache -> depth=draft | delta | TP min | binding |
+|---|---|---|---|---|
+| 0 (3080) | 896 -> **1496** | **+600** | 1216 | PP -> **TP** |
+| 1 (5090) | 3345 -> **4149** | **+804** | 3029 | TP (unchanged) |
+| 2 (3080) | 1210 -> **1766** | **+556** | 1414 | PP -> **TP** |
+
+    per-card MINIMUM free: 1196 / 2942 / 1396 MiB   (worst 1196, floor 1024)
+    CORRIDOR HELD: True
+
+**The pool-500000 breach is closed.** Card 0's PP minimum was 896 MiB
+against the 1024 floor -- a 128 MiB breach -- and is now 1496.
+
+**TWO RESULTS THAT WERE NOT PREDICTED, and one that was.**
+
+*Predicted, and it happened exactly:* HANDOFF_671 said "A alone does NOT
+reach 600000: it moves the corridor breach into the TP phase". The
+binding phase has moved from PP to TP **on all three cards**. Every card
+now binds in TP, where the drafter is resident by design and this rung
+is worth nothing. Any further work must be priced against the **TP**
+row, not the PP row -- and section 2o's rule applies with full force:
+re-measure which phase binds before pricing the next spill.
+
+*Not predicted (1):* the PP gain is **+556 to +804 MiB against a payload
+of 285.5 to 439.1 MiB** -- roughly double. The carrier does not only
+release the payload; it also replaces ~2 GB of scattered per-tensor
+storages with a single arena block, so the allocator's fragmentation
+residue for the draft model goes away with it. The dead code's docstring
+predicted this defragmentation effect as an aside; it turns out to be
+comparable in size to the payload itself. **Do not credit the whole
+delta to the spill** -- part of it is a one-off layout change that a
+depth=cache boot with an arena-packed drafter would also get.
+
+*Not predicted (2):* the worst reading of the whole run is the **seam**,
+not either phase (1196 on card 0, +172 above the floor). With both
+phases now comfortable, the seam is the tightest instant in the cycle.
+
+**Occupancy caveat, stated because this chain has quoted capacity off
+idle samplers:** 82% is real load, and `full token usage: 0.73` was
+observed directly in the scheduler log during the run.

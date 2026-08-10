@@ -169,14 +169,34 @@ produces valid tokens after its pages were released and re-committed.
 N28's warning was heeded: a boot that reaches READY is not a boot that
 works, so this one was loaded before it was believed.
 
-## 4. WHAT THAT BUYS, AND WHAT IT DOES NOT
+## 4. WHAT IT BUYS — MEASURED UNDER LOAD
 
-* **It closes the pool-500000 corridor breach.** Card 0's PP minimum was
-  896 MiB against the 1024 floor, a 128 MiB deficit; +285 MiB clears it.
-* **It does NOT fund 600000.** That needed **+1140 MiB in PP** on the
-  binding rank. 285 MiB is a quarter of it. HANDOFF_671's "A+B clears by
-  39 MiB" rested on the 1925 figure and **does not survive** — and B (the
-  arena tail, 319/220/1191 MiB) pays the TP phase, not PP.
+7196 samples at 100 ms over 12.0 min, 4 streams, ctx 150k, pool 500000,
+174 flips, **0 abandons**, occupancy 410142/500000 (82%). Same load and
+sampler as HANDOFF_671 section 3, so the rows compare directly.
+
+| card | PP min: cache -> draft | delta | TP min | binding |
+|---|---|---|---|---|
+| 0 (3080) | 896 -> **1496** | **+600** | 1216 | PP -> **TP** |
+| 1 (5090) | 3345 -> **4149** | **+804** | 3029 | TP |
+| 2 (3080) | 1210 -> **1766** | **+556** | 1414 | PP -> **TP** |
+
+    per-card MINIMUM free 1196 / 2942 / 1396 MiB, floor 1024
+    CORRIDOR HELD: True
+
+* **The pool-500000 breach is closed.** Card 0 was 128 MiB below the
+  floor in PP; it is now 472 above it.
+* **671's warning came true exactly: the binding phase MOVED to TP, on
+  all three cards.** Every card now binds where the drafter is resident
+  by design and this rung is worth nothing. **Price the next spill
+  against the TP row.**
+* **The PP gain is roughly DOUBLE the payload** (+556..+804 MiB against
+  285.5..439.1 MiB). The carrier also replaces ~2 GB of scattered
+  per-tensor storages with one arena block, so the allocator's
+  fragmentation residue goes with it. Do not credit the whole delta to
+  the spill — part is a one-off layout change.
+* **The worst reading of the run is now the SEAM** (1196 on card 0,
+  +172), not either phase.
 
 ## 5. THE SPEC MOVED UNDER THIS WORK — items 11-14
 
@@ -205,15 +225,45 @@ ladder rather than parallel machinery. Item 13 is the same argument the
 carrier already makes: VA stability is what lets a graph survive a
 release.
 
+### 5b. ITEM 15 ARRIVED LATE AND IT RETIRES THE POOL LADDER
+
+I had only items 11-14 in my brief; **item 15 was added to the spec at
+20:48Z** and I read it only after the coordinator named it. It changes
+the program:
+
+> "AUFFUELLEN BIS ZUR GRENZE statt Layout-Kapazitaetstests ... KEINE
+> statischen Pool-Treppen-Messlaeufe mehr ... Residenz regelt ein
+> Laufzeit-Druckregler. Draft-Layer werden im PP-Prefill gar nicht erst
+> resident gehalten."
+
+* **No more static pool ladders.** Stepping the pool toward a fixed
+  600000 is explicitly rejected. Cards are kept filled NEAR the 1024
+  floor and a **runtime pressure controller** spills KV/cold as a card
+  approaches it.
+* Build requirements the user confirmed against operator objections:
+  **(a) SPILL-BEFORE-ALLOC** — the check happens AT the allocation
+  (`free - X >= 1024`, else spill synchronously first), NOT reactive
+  threshold observation; **(b) two watermarks** against thrashing (free
+  up to floor+delta); **(c)** when everything resident is hot, **kvso
+  keeps computing over the host tier — the price is tempo, never a
+  corridor breach**.
+* **"Draft layers are not kept resident in PP prefill at all"** is
+  precisely what rung 2 now does, so this shift is on item 15's path.
+
+**Existing machinery to reuse, not rebuild** (surveyed, not yet wired):
+`kv_pressure_ladder` (#287) + `managers/kv_pressure_runtime.py` (already
+a rank-uniform, consensus-driven pressure driver with an
+`on_pressure_boundary` planner hook), `kv_ladder_auto.py`,
+`gdn_slot_runtime.py` (#364 idle-slot vacate), and kvso for (c). The
+gap versus item 15 is that these are **boundary/threshold** driven,
+while 15a demands the check sit **at the allocation**.
+
 ## 6. NOT DONE
 
-* The loaded PP/TP corridor split at depth=draft was **in flight** when
-  this file was written; read `/spinning/evidence-631/s29/loaded_phase/`
-  and the bench section 2p.5 if it landed.
-* The pool raise. Given section 4, the next bytes are not in the
-  drafter — they are in items 11/12 (idle-slot GDN states at bs<4, and
-  KV itself). **Re-measure which phase binds before pricing any of it**;
-  671 section 3 is emphatic and it was right.
+* **The pressure controller (item 15).** This is the next build, and it
+  supersedes the pool ladder. Note the measured starting point: after
+  rung 2 every card binds in **TP**, so the controller's first real
+  payload is a TP-phase asset, not a PP one.
 * Remaining item-8 arms: DFLASH × graphs, PP-prefill-graphs, chunk A/B,
   5090 stage-imbalance A/B.
 * Threshold-purity arm (item 10) — note it is now REFUSED with depth>=2;
@@ -223,9 +273,34 @@ release.
 
 ## 7. IF YOU DO ONE THING
 
-Do **not** spend another shift on the drafter — it is done and it is
-small. Take the next payload class from spec item 11: at bs1 three of the
-four mamba/GDN slots are idle, and those states are far larger than 285
-MiB. Reuse `VmmDraftWeightCarrier`'s mechanics through
-`allocate_carrier_tensor`; the hard parts (VA stability, the
-affordability gate, the pin) are solved and tested.
+Build **item 15a, spill-before-alloc**, on top of
+`managers/kv_pressure_runtime.py` rather than starting a new controller.
+The measured facts that should shape it:
+
+* Every card now binds in **TP** (1216 / 3029 / 1414). A PP-phase payload
+  buys nothing more; the drafter is done.
+* The tightest instant in the whole cycle is the **seam** (1196), so the
+  allocation the controller most needs to guard is the seam's
+  `commit_range`, which is also the one that has killed this instance
+  before.
+* `VmmDraftWeightCarrier` already solves the hard parts for any payload
+  class — VA stability so graphs survive a release, the affordability
+  gate, and a post-capture pin. Reuse it via `allocate_carrier_tensor`;
+  do not write a second carrier.
+
+And do **not** run another static pool ladder. Item 15 rejects it in
+those words.
+
+## 8. A PROCESS NOTE THAT COST ME A ROUND TRIP
+
+I ended a turn to wait for a 12-minute sampler, on the theory that an
+armed monitor would resume me. It does not, reliably; the operator's
+re-poke does, and that is a full round trip of latency. **Never end a
+turn to wait.** Poll with bounded `until ...; do sleep 3; done` loops
+under 60 s inside the same turn, or do desk work meanwhile. This is
+occurrence 11+ of that trap in this chain.
+
+Related: my brief carried spec items 11-14 but the user had added **item
+15**. Re-read `flip-setup-kapazitaets-spec.md` at the START of a shift
+rather than trusting the briefing's copy — the spec is the law, the
+briefing is a snapshot of it.
