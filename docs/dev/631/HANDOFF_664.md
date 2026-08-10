@@ -401,3 +401,42 @@ corridor held for the whole window and the purity, graph, flip and accept-len
 axes were all green — but the run ENDED in this livelock rather than being
 stopped cleanly, and no >=60-minute green run was achieved. Do not read section
 8 as an acceptance pass.
+
+## 10. USER NOTE (2026-08-10, during the run): the surplus free VRAM is a DEFECT, not slack
+
+The user read section 8's minima (1181 / 3676 / 1527) and pointed out what they
+leave unused: roughly 181 + 2676 + 527 MB above a 1000 MB reading, 157 + 2652 +
+503 = **3312 MiB above the 1024 MiB floor**. Deferred by the user ("darum
+koennen wir uns spaeter kuemmern"), but explicitly logged as owed work.
+
+This is the OTHER half of the corridor law, which this chain has consistently
+treated as one-sided. `[[vram-korridor-regel]]` says both: never breach 1024
+**and** keep the cards as full as possible, free near 1024 and not more. Every
+handoff in this corpus has reported the corridor as a floor to survive. A card
+sitting 2.6 GiB above it is failing the rule just as a card at 900 MiB is.
+
+**The structure of the surplus is the whole point, and it is not evenly spread:**
+
+| card | margin above 1024 | share of surplus |
+|---|---|---|
+| rank0 (5090) | **2652 MiB** | 80 % |
+| rank2 (3080) | 503 MiB | 15 % |
+| rank1 (3080) | 157 MiB | 5 % |
+
+**Raising the pool cannot spend it.** The pool is global and draws from every
+card in proportion to that card's share, so the next token off the pool costs
+rank 1 — the card with 157 MiB — at 9.10 MiB per 1000 tokens. Rank 0's 2652 MiB
+is unreachable from the pool knob alone; it is reachable only by moving SHARE
+onto rank 0, i.e. the joint search over (pp layers, `--phase-flip-tp-vector`,
+`SGLANG_UNEVEN_TOKEN_VECTOR`) already listed as next move 3 in section 8.
+
+So the user's note and that item are the same work, and section 4's calibrated
+model (727 MiB/layer + fixed 3304/874/3299, accurate to ~200 MiB over four
+boots) makes it a desk exercise before it costs a boot. Rough size of the
+prize: if the surplus were levelled so all three cards sat near 1024, rank 1
+would gain ~1100 MiB of the 3312, which at 9.10 MiB per 1000 tokens is on the
+order of **+120000 tokens** — which is, to within the noise of this estimate,
+exactly the gap between the measured 500000 and the 600000 acceptance target.
+
+**Do not treat this as a tuning nicety.** It is the most likely route to the
+acceptance number, and it is cheaper than spill rungs 2-3.
