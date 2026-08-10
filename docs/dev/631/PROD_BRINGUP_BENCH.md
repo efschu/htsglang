@@ -1914,3 +1914,48 @@ The claim this window supports is consequently narrow and safe:
 -point episode has permanently raised the allocator's mark.** It does NOT
 establish the edge — 1467 MiB of headroom on the binding card says the edge
 is higher, and finding it is the cheapest capacity work left.
+
+### ...and then it breached. The plateau was not a plateau either
+
+At 04:58:55Z, after ~18 minutes of the bs=4 window, the corridor collapsed:
+
+| bucket | gpu0 (rank1) | gpu1 (rank0, 5090) | gpu2 (rank2) |
+|---|---|---|---|
+| t-10..08 min | 1825 | 2022 | 1467 |
+| t-06..04 min | 1805 | 2022 | 1467 |
+| t-04..02 min | 1725 | 1982 | 1387 |
+| t-02..00 min | **1325** | **1382** | **1007** |
+
+**gpu2 reached 1007 MiB — below the 1024 floor. This is a BREACH and the
+window failed its corridor axis.** Window minima over 8214 samples:
+1325 / 1382 / 1007.
+
+The collapse tracks the agent request count (120 -> 140 over the same
+minutes), which is 662's finding reproduced: the allocator's high-water mark
+follows the largest request SHAPE it has seen, and agent turns keep getting
+bigger. Three buckets of dead-flat readings preceded it. **This is the third
+time in this chain that a flat corridor was read as a settled one.** Two
+equal buckets are not a steady state; they are two equal buckets.
+
+### The correction I owe on my own argument
+
+I argued above that inheriting the heavy phase's sticky high-water mark made
+this window a WORST CASE and therefore strong evidence. **That argument is
+valid in one direction only, and I stated it as though it ran both ways.**
+
+* a PASS under a pessimistic allocator history *would* have been strong;
+* a **FAIL under one is weak**, because the pre-loaded mark is a live
+  candidate for the entire cause.
+
+So this breach does **NOT** falsify 260000 for a fresh boot. 662 measured
+2167/2612/1809 at this pool on a clean allocator with heavy agents and saw
+0 breaches in 3150 samples. What is established is narrower and still
+useful:
+
+**260000 does not survive a 2x-design-point episode followed by an hour of
+growing agent context. A pool number is a property of a boot's whole load
+HISTORY, not of the pool.**
+
+That is a sharper statement of the sticky-mark finding, and it means every
+capacity number in this document should carry the load history that produced
+it, not just the load in flight at the time of reading.
