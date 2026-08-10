@@ -307,6 +307,64 @@ class LadderBindsTheBootCarrierTest(unittest.TestCase):
         self.assertFalse(carrier.spilled)
 
 
+class SharedStorageIsNotSpillableTest(unittest.TestCase):
+    """Found on metal, 2026-08-10 21:02:04Z, on the first depth=draft boot.
+
+    The drafter's ``lm_head.weight`` is a partial view of a 13481 MiB storage
+    -- the TARGET model's weights arena. The drafter does not own it. Packing
+    it onto the carrier would re-point a slice of the target's arena, and
+    spilling it would release pages the target still reads during the phase
+    where the target is the only thing running.
+
+    The boot refused (``plan_arena_layout``'s V1-scope check) instead of
+    corrupting anything, which is the behaviour to preserve. These tests pin
+    the fix: shared bytes are excluded from the payload and stay resident.
+    """
+
+    def _model_with_a_shared_param(self):
+        model = _DraftModel(layers=4)
+        # A parameter that VIEWS a larger storage, exactly as the real
+        # lm_head views the target's arena.
+        backing = torch.randn(4096)
+        model.borrowed = nn.Parameter(backing[:512])
+        return model
+
+    def test_a_partial_view_is_excluded_not_refused(self):
+        model = self._model_with_a_shared_param()
+        carrier = spill.VmmDraftWeightCarrier(model, 0, arena=_FakeArena())
+        self.assertNotIn("borrowed", carrier.param_ptrs())
+        # And the exclusive parameters are still carried.
+        self.assertIn("embed", carrier.param_ptrs())
+
+    def test_the_shared_param_is_untouched_by_a_cycle(self):
+        model = self._model_with_a_shared_param()
+        carrier = spill.VmmDraftWeightCarrier(model, 0, arena=_FakeArena())
+        want = model.borrowed.detach().clone()
+        ptr = model.borrowed.data.data_ptr()
+        carrier.spill()
+        carrier.restore()
+        self.assertEqual(model.borrowed.data.data_ptr(), ptr)
+        self.assertTrue(torch.equal(model.borrowed.data, want))
+
+    def test_the_payload_excludes_the_shared_bytes(self):
+        plain = spill.VmmDraftWeightCarrier(_DraftModel(layers=4), 0, arena=_FakeArena())
+        shared = spill.VmmDraftWeightCarrier(
+            self._model_with_a_shared_param(), 0, arena=_FakeArena()
+        )
+        # Adding a borrowed parameter must not grow what the rung claims to
+        # release -- that is how a spill gets credited for memory it never
+        # freed.
+        self.assertEqual(shared.payload_bytes, plain.payload_bytes)
+
+    def test_a_drafter_that_owns_nothing_is_refused(self):
+        model = nn.Module()
+        backing = torch.randn(4096)
+        model.only = nn.Parameter(backing[:512])
+        with self.assertRaises(spill.PhaseFlipSpillError) as cm:
+            spill.VmmDraftWeightCarrier(model, 0, arena=_FakeArena())
+        self.assertIn("exclusive", str(cm.exception))
+
+
 class AffordabilityGatePricesTheRestoreTest(unittest.TestCase):
     """The gate is the difference between an abandon and a dead instance.
 

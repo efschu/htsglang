@@ -479,6 +479,68 @@ class VmmDraftWeightCarrier:
                 f"parameters; refusing to install a spill that would free "
                 f"nothing and hide a wrong model handle"
             )
+        # NOT EVERYTHING THE DRAFTER NAMES IS THE DRAFTER'S TO GIVE.
+        #
+        # Found on the first depth=draft boot, 2026-08-10 21:02:04Z: the boot
+        # refused with
+        #
+        #   'lm_head.weight' views 848035840 bytes of a 14137090816-byte
+        #   storage; a partial view would smuggle unowned bytes into the
+        #   arena (V1 scope)
+        #
+        # 14137090816 B is 13481 MiB -- the TARGET model's weights arena. The
+        # drafter does not own its lm_head, it VIEWS the target's. Moving that
+        # onto the carrier would have re-pointed a slice of the target's arena,
+        # and spilling it would have released pages the TARGET still reads,
+        # during the phase where the target is the only thing running. That is
+        # a corruption, not a capacity win, and plan_arena_layout's V1-scope
+        # check is what caught it.
+        #
+        # So the payload is the parameters the drafter EXCLUSIVELY owns: those
+        # whose storage is exactly their own bytes. A partial view means the
+        # storage belongs to someone else (or is shared), and shared bytes are
+        # by definition not phase-exclusive, which is the entire precondition
+        # for spilling anything.
+        #
+        # CONSEQUENCE FOR THE PRICE. HANDOFF_671 costed this rung at 1925
+        # MiB/rank from the boot's "Load weight end ... mem usage=" delta. That
+        # delta includes the shared bytes. The real spillable payload is
+        # smaller and is logged below per rank -- do not quote 1925 without
+        # re-reading the installed figure.
+        shared = {}
+        exclusive = {}
+        for name, p in self._named.items():
+            t = p.data
+            own = t.numel() * t.element_size()
+            try:
+                storage = t.untyped_storage().nbytes()
+            except Exception:  # pragma: no cover - exotic tensor types
+                storage = own
+            if storage > own:
+                shared[name] = (own, storage)
+            else:
+                exclusive[name] = p
+        if shared:
+            biggest = sorted(shared.items(), key=lambda kv: -kv[1][0])[:4]
+            logger.info(
+                "%s excluding %d draft parameter(s) that VIEW a larger "
+                "storage and are therefore not the drafter's to release "
+                "(%.1f MiB kept resident). Largest: %s",
+                LOG_PREFIX,
+                len(shared),
+                sum(v[0] for v in shared.values()) / _MIB,
+                ", ".join(
+                    f"{n} ({own/_MIB:.0f} MiB of a {st/_MIB:.0f} MiB storage)"
+                    for n, (own, st) in biggest
+                ),
+            )
+        if not exclusive:
+            raise PhaseFlipSpillError(
+                f"{LOG_PREFIX} every draft parameter views a larger storage; "
+                f"the drafter owns no exclusive bytes on this build, so there "
+                f"is nothing this rung can release"
+            )
+        self._named = exclusive
         self._layout = plan_arena_layout(self._named)
         self._device_index = int(device_index)
         self._nbytes = int(self._layout.total_bytes)

@@ -38,7 +38,35 @@ for hb in /spinning/gpu-arb/heartbeat.*; do
 done
 
 if [ -z "$OLD_PID" ]; then
-  OLD_PID=$(pgrep -f "sglang.launch_server.*--port $PORT" | head -1 || true)
+  # MATCH ON ARGV STRUCTURE, NEVER `pgrep -f <pattern>`.
+  #
+  # `pgrep -f "sglang.launch_server.*--port 30030"` matches ANY process whose
+  # command line CONTAINS that text -- including the shell that is running the
+  # pgrep, and including any monitoring loop that mentions it. On 2026-08-10
+  # this cost two incidents in one shift: the reboot captured a bash wrapper's
+  # 5-entry argv as if it were the server's 58-entry argv and relaunched a
+  # stub, and separately a health-wait loop could never exit because its own
+  # `! pgrep` clause matched itself. It is the same family as the `pkill -f`
+  # self-kill the brief forbids -- eleven occurrences in this chain.
+  #
+  # A real server is: argv[0] is a python interpreter, argv[2] is exactly
+  # "sglang.launch_server", and "--port <PORT>" appears as adjacent argv
+  # entries. A shell that merely quotes those strings satisfies none of it.
+  OLD_PID=$(
+    for d in /proc/[0-9]*; do
+      pid=${d#/proc/}
+      [ -r "$d/cmdline" ] || continue
+      mapfile -d '' -t a < "$d/cmdline" 2>/dev/null || continue
+      [ "${#a[@]}" -ge 4 ] || continue
+      case "${a[0]}" in *python*) ;; *) continue ;; esac
+      [ "${a[2]}" = "sglang.launch_server" ] || continue
+      for i in "${!a[@]}"; do
+        if [ "${a[$i]}" = "--port" ] && [ "${a[$((i+1))]}" = "$PORT" ]; then
+          echo "$pid"; break
+        fi
+      done
+    done | head -1
+  )
 fi
 
 if [ -n "$OLD_PID" ]; then
@@ -80,10 +108,18 @@ if kill -0 "$OLD_PID" 2>/dev/null; then
   sleep 5
 fi
 echo "[reboot] old instance gone; waiting for its workers to release VRAM"
-for _ in $(seq 1 60); do
-  remaining=$(pgrep -f "sglang.launch_server.*--port $PORT" | head -1 || true)
-  [ -z "$remaining" ] || { sleep 1; continue; }
-  break
+# WAIT ON THE CHILDREN, NOT THE PARENT. The VRAM is held by the
+# `sglang::scheduler_PP*` worker processes, which do NOT match the
+# launch_server pattern -- the first version of this loop polled only the
+# parent, saw it gone immediately, and printed free-memory figures
+# (1625/4154/1895) that were the OLD instance's, while the relaunch was
+# already starting into a card that had not been given back yet. Poll the
+# DRIVER instead: free memory is the thing the next boot actually needs.
+for _ in $(seq 1 90); do
+  busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+         | awk '$1 > 2000 {n++} END {print n+0}')
+  [ "$busy" -eq 0 ] && break
+  sleep 2
 done
 nvidia-smi --query-gpu=index,memory.free --format=csv,noheader
 
