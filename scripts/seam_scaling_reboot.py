@@ -1,68 +1,249 @@
 #!/usr/bin/env python3
-"""#631 seam-scaling probe: relaunch the LIVE boot with one variable moved.
+"""#631 boot replay: relaunch the LIVE serving instance with ONE thing moved.
 
-Why a replay of /proc rather than another run of the boot script: the
-question is whether the phase-flip cutover's memory peak scales with the
-KV POOL, and that only means something if nothing else moved. The boot
-script carries ~85 environment variables and 56 arguments; re-deriving
-them by hand is how a second variable sneaks in. So the launch is read
-back from the running process and replayed verbatim, with exactly one
-substitution.
+Why a replay of /proc rather than another run of the boot script: a
+capacity or seam measurement only means something if nothing else moved.
+The boot carries ~85 environment variables and 56 arguments; re-deriving
+them by hand is how a second variable sneaks in, and it did -- successor
+21's hand-built environment silently turned ``PP_STAGE_RATIO=15,10,7``
+into an achieved 16/9/7 split and cost two boots.
 
-The lever is --max-total-tokens, deliberately, and NOT --rank-gpu-memory-mib:
-the per-card budget stays at 22700,11920,11970 so the cards, the weights
-and the corridor are untouched. Lowering the budget instead would change
-free memory AND the pool at once, and the resulting peak difference would
-be unattributable.
+WHAT CHANGED HERE, AND WHY IT IS NOT A REFINEMENT (successor 22,
+2026-08-10). This script used to read ``/tmp/boot_cmdline.txt`` and
+``/tmp/boot_env.txt``, files written by whoever last ran the boot script.
+Those files were 10 hours stale against the running server and differed
+from it in load-bearing ways:
 
-Usage: seam_scaling_reboot.py <max_total_tokens>
+    pp-stage-ratio         2,1,1              live: 14,10,8
+    rank-gpu-memory-mib    22700,11920,11970  live: 31800,17400,17450
+    SGLANG_UNEVEN_TOKEN_VECTOR  28,26,20      live: 14,10,8
+    PHASE_FLIP_PURITY      off                live: strict
+
+So "replay the captured boot with one variable moved" would have booted a
+different geometry WITH STRICT PURITY DISABLED and reported the result as
+a one-variable step. A tool whose whole purpose is single-variable
+discipline cannot take its baseline from a file nobody re-captures. It
+now reads the LIVE process by default, and refuses a capture it cannot
+tie to a running server unless that is asked for explicitly.
+
+Usage:
+  seam_scaling_reboot.py 500000
+      Replay the live boot with --max-total-tokens 500000 (the historical
+      form; the positional argument is still the pool).
+  seam_scaling_reboot.py --set-arg --chunked-prefill-size 8192
+  seam_scaling_reboot.py --add-flag --enable-dynamic-chunking
+  seam_scaling_reboot.py --set-env PP_STAGE_RATIO 14,10,8 --set-arg ...
+      Any number of explicit substitutions. Every one is printed, and the
+      full effective diff against the live boot is written next to the log
+      so the row in the bench can name what moved.
+  seam_scaling_reboot.py --dry-run ...
+      Show the substitutions and the diff, launch nothing.
+
+The lever for a pure capacity step is --max-total-tokens, deliberately,
+and NOT --rank-gpu-memory-mib: the per-card budget must stay put so the
+cards, the weights and the corridor are untouched. Lowering the budget
+instead would change free memory AND the pool at once, and the resulting
+peak difference would be unattributable.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
-import sys
 import time
 
-CMDLINE = "/tmp/boot_cmdline.txt"
-ENVFILE = "/tmp/boot_env.txt"
 LOG = "/spinning/serving-30030.boot.log"
+CAPTURE_DIR = "/spinning/evidence-631/boot-captures"
 
 # Regenerated per boot by the runtime; replaying a stale one would make two
 # boots claim the same phase-flip instance id.
 DROP_ENV = {"SGLANG_PHASE_FLIP_INSTANCE"}
 
+# Set by whatever shell launched the previous boot; carrying it forward
+# pins a stale interpreter path into the replay.
+DROP_ENV_PREFIXES = ("_=",)
 
-def read_lines(path):
-    with open(path) as fh:
-        return [ln.rstrip("\n") for ln in fh if ln != ""]
+
+def find_live_server(port: str = "30030") -> int:
+    """PID of the running launch_server for ``port``, or raise.
+
+    Matched on the cmdline rather than on a pidfile: the pidfile is
+    written by the boot script and this tool exists precisely because
+    boot-script bookkeeping goes stale.
+    """
+    hits = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            continue
+        if not argv or b"sglang.launch_server" not in b" ".join(argv):
+            continue
+        if b"--port" in argv and argv[argv.index(b"--port") + 1] == port.encode():
+            hits.append(int(entry))
+    if not hits:
+        raise SystemExit(
+            f"no live sglang.launch_server on port {port}. Boot one with "
+            f"PROD_BRINGUP_BENCH.md section 7 first, or pass "
+            f"--from-capture <cmdline> <env> and accept that the baseline "
+            f"is whatever those files happen to hold."
+        )
+    if len(hits) > 1:
+        raise SystemExit(f"several servers on port {port}: {hits}")
+    return hits[0]
+
+
+def read_proc(pid: int):
+    with open(f"/proc/{pid}/cmdline", "rb") as fh:
+        argv = [a.decode() for a in fh.read().split(b"\0") if a]
+    env = {}
+    with open(f"/proc/{pid}/environ", "rb") as fh:
+        for item in fh.read().split(b"\0"):
+            if not item or b"=" not in item:
+                continue
+            k, v = item.decode("utf-8", "replace").split("=", 1)
+            env[k] = v
+    return argv, env
+
+
+def read_files(cmdline_path: str, env_path: str):
+    with open(cmdline_path) as fh:
+        argv = [ln.rstrip("\n") for ln in fh if ln.strip() != ""]
+    env = {}
+    with open(env_path) as fh:
+        for ln in fh:
+            ln = ln.rstrip("\n")
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                env[k] = v
+    return argv, env
+
+
+def set_arg(argv, name, value):
+    """``--name value``: replace in place, or append if absent."""
+    if name in argv:
+        idx = argv.index(name)
+        if idx + 1 >= len(argv) or argv[idx + 1].startswith("--"):
+            raise SystemExit(f"{name} is a bare flag in the live boot, not a value arg")
+        old = argv[idx + 1]
+        argv[idx + 1] = value
+        return f"arg {name}: {old} -> {value}"
+    argv.extend([name, value])
+    return f"arg {name}: (absent) -> {value}"
+
+
+def add_flag(argv, name):
+    if name in argv:
+        return f"flag {name}: already set (no change)"
+    argv.append(name)
+    return f"flag {name}: (absent) -> set"
+
+
+def del_flag(argv, name):
+    if name not in argv:
+        return f"flag {name}: already absent (no change)"
+    argv.remove(name)
+    return f"flag {name}: set -> removed"
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(__doc__)
-        return 2
-    cap = str(int(sys.argv[1]))
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("pool", nargs="?", help="--max-total-tokens (historical form)")
+    ap.add_argument("--port", default="30030")
+    ap.add_argument("--set-arg", nargs=2, action="append", metavar=("NAME", "VALUE"))
+    ap.add_argument("--add-flag", action="append", metavar="NAME")
+    ap.add_argument("--del-flag", action="append", metavar="NAME")
+    ap.add_argument("--set-env", nargs=2, action="append", metavar=("NAME", "VALUE"))
+    ap.add_argument("--del-env", action="append", metavar="NAME")
+    ap.add_argument("--from-capture", nargs=2, metavar=("CMDLINE", "ENV"))
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
 
-    argv = [a for a in read_lines(CMDLINE) if a != ""]
-    if "--max-total-tokens" not in argv:
-        raise SystemExit("captured cmdline has no --max-total-tokens")
-    argv[argv.index("--max-total-tokens") + 1] = cap
+    if args.from_capture:
+        argv, env = read_files(*args.from_capture)
+        source = f"capture files {args.from_capture[0]} + {args.from_capture[1]}"
+        print(
+            "WARNING: baseline is a CAPTURE FILE, not a running server. "
+            "Nothing verifies it matches anything currently serving."
+        )
+    else:
+        pid = find_live_server(args.port)
+        argv, env = read_proc(pid)
+        source = f"live pid {pid} on port {args.port}"
 
-    env = {}
-    for line in read_lines(ENVFILE):
-        if "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        if k not in DROP_ENV:
-            env[k] = v
+    base_argv = list(argv)
+    base_env = dict(env)
+
+    changes = []
+    if args.pool:
+        changes.append(set_arg(argv, "--max-total-tokens", str(int(args.pool))))
+    for name, value in args.set_arg or []:
+        changes.append(set_arg(argv, name, value))
+    for name in args.add_flag or []:
+        changes.append(add_flag(argv, name))
+    for name in args.del_flag or []:
+        changes.append(del_flag(argv, name))
+    for name, value in args.set_env or []:
+        old = env.get(name, "(absent)")
+        env[name] = value
+        changes.append(f"env {name}: {old} -> {value}")
+    for name in args.del_env or []:
+        old = env.pop(name, None)
+        changes.append(f"env {name}: {old} -> (removed)")
+
+    for key in DROP_ENV:
+        env.pop(key, None)
+    for prefix in DROP_ENV_PREFIXES:
+        for key in [k for k in env if f"{k}=".startswith(prefix)]:
+            env.pop(key, None)
+
+    if not changes:
+        raise SystemExit(
+            "no substitution requested -- this tool exists to move exactly "
+            "one thing; relaunching an identical boot is what the boot "
+            "script is for"
+        )
 
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    print(f"baseline: {source}")
+    print(f"substitutions ({len(changes)}):")
+    for line in changes:
+        print(f"  {line}")
+    if len(changes) > 1:
+        print(
+            "NOTE: more than one variable moved. The result is not a "
+            "single-variable step and must not be reported as one."
+        )
+
+    os.makedirs(CAPTURE_DIR, exist_ok=True)
+    record = os.path.join(CAPTURE_DIR, f"replay-{stamp}.txt")
+    with open(record, "w") as fh:
+        fh.write(f"baseline: {source}\nstamp: {stamp}\n\nsubstitutions:\n")
+        for line in changes:
+            fh.write(f"  {line}\n")
+        fh.write("\nbaseline argv:\n")
+        fh.write("\n".join(base_argv) + "\n")
+        fh.write("\nreplay argv:\n")
+        fh.write("\n".join(argv) + "\n")
+        fh.write("\nbaseline env:\n")
+        for k in sorted(base_env):
+            fh.write(f"{k}={base_env[k]}\n")
+        fh.write("\nreplay env:\n")
+        for k in sorted(env):
+            fh.write(f"{k}={env[k]}\n")
+    print(f"replay record: {record}")
+
+    if args.dry_run:
+        print("--dry-run: nothing launched")
+        return 0
+
     if os.path.exists(LOG):
         os.rename(LOG, f"/spinning/serving-30030.boot.{stamp}.log")
-
     with open(LOG, "wb") as out:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             argv,
             env=env,
             stdout=out,
@@ -70,7 +251,7 @@ def main():
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-    print(f"relaunched with --max-total-tokens {cap}; log {LOG}")
+    print(f"relaunched as pid {proc.pid}; log {LOG}")
     return 0
 
 
