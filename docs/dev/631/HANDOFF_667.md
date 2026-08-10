@@ -332,11 +332,8 @@ In the order I would take them:
 2. **Restore-first + intra-wave row chunking** (section 4). It is what
    turns the staging slope into a constant and the only route to 600000
    that the arithmetic supports.
-3. **Decode decomposition.** In-phase vs wall-clock decode tok/s is STILL
-   unanswered after seven successors. `s22_decode_probe.py`'s duty-cycle
-   instrument was fixed by successor 23 but the decomposition itself was
-   never produced. The phase intervals must come from the server log's own
-   flip markers, not from the probe's opinion.
+3. **Decode decomposition — ANSWERED, see section 7.** What remains is
+   the bs4/bs8 A/B against plain TP3, which I did not run.
 4. **Accept length 2.54 vs the ~2.9 measured under plain TP** — cause
    unknown.
 5. **Prefill chunk A/B.** Note HANDOFF_666's correction: the dynamic arm is
@@ -372,3 +369,59 @@ reproducer that used to wedge, by a 64.5-minute traffic run with zero
 abandons, and by the >262144 YaRN leg decoding rather than merely
 prefilling. What remains is capacity (the corridor is loose), the decode
 decomposition, and the recoverable-abandon safety net.
+
+
+---
+
+## 7. DECODE DECOMPOSITION — answered, with the part I had to reject
+
+Open since successor 17. The phase intervals come from the server log's own
+flip markers (`PHASE-FLIP DONE pp_to_tp` opens a TP interval, the next
+`tp_to_pp` closes it), taken on the **PP2 prefix only** so the three-rank
+triplet counts once. Window is the green run, 13:20:00–14:25:00.
+
+| quantity | value | source |
+|---|---|---|
+| TP intervals | 137 | flip markers |
+| TP time | 1174 s of 3900 s | flip markers |
+| **TP duty cycle** | **30.1 %** | flip markers |
+| mean TP interval | 8.6 s | flip markers |
+| decode tok/s **while a batch runs** | **93.7** | scheduler's own `gen throughput`, 2541 batches |
+| decode tok/s **in-phase** (TP window, incl. TP idle) | **>= 34.0** | 39936 soak tokens / 1174 s |
+| decode tok/s **wall-clock** | **>= 10.2** | 39936 / 3900 s |
+| **cost of the alternation** | **3.32x** | = 1 / duty cycle |
+
+Three levels, and the ordering is the result: 93.7 while decoding, ~34
+across the TP phase, ~10 across the wall clock. The gap from 93.7 to 34 is
+**idle time inside the TP phase** — the instance is in the decode layout
+with nothing to decode. The gap from 34 to 10 is the PP phase, where decode
+cannot run at all.
+
+**The in-phase and wall-clock figures are LOWER BOUNDS.** 39936 is the
+soak leg's client-side count; the decode probe and the agent lanes also
+decoded and are not in it. The duty cycle and the 93.7 are not bounds.
+
+Note the "ratio" carries no information beyond the duty cycle — same
+numerator over two denominators, so 3.32x IS 1/0.301. The honest headline
+is the duty cycle, and the lever on it is TP interval length (8.6 s mean)
+against PP interval length, not decode speed.
+
+### The part I rejected, and why it is recorded
+
+A qwen analysis lane produced this decomposition and reported **4.24 tok/s
+in-phase / 1.35 wall-clock**, from a count of 7040 accepted tokens summed
+out of `OUTTRACE round kind=decode ... accept_lens=[...]` lines.
+
+**I could not reproduce that count** — the pattern sums to zero against the
+same log (there are 23049 OUTTRACE lines, but in the form
+`[#631 OUTTRACE] pre[-2] site=pp_end ...`). Two independent sources
+contradict 7040: the soak alone reports 39936 decode tokens client-side,
+and the scheduler's own mean `gen throughput` is 93.7 tok/s, which cannot
+coexist with 4.24 tok/s in-phase. So the throughput half of that report is
+**not adopted**.
+
+Its duty-cycle half DID reproduce (31.9 % over a wider window that included
+post-run idle, against my 30.1 % restricted to the load window), and its
+accept length (2.73) matches my independent 2.734. Methodology sound,
+arithmetic input unverified — which is exactly why agent reports are not
+evidence.
