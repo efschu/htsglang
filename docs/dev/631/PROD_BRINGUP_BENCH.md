@@ -3521,3 +3521,108 @@ TP phase -- where the drafter is active and cannot be spilled at all --
 then rung 2 buys exactly 0 MiB of floor, however large its payload.
 `s21_phase_corridor.py` exists to answer precisely this and was built by
 successor 21 for this reason. Measuring it now, before building.
+
+## 2o. WHICH PHASE BINDS -- the number that decides whether a spill is worth anything
+
+Loaded run, pool 500000, B=16, graphs ON, 82.1% occupancy (410856 live
+slots), 195 flips, **0 abandons**, 7196 corridor samples at 100 ms over
+12 minutes. `scripts/s28_loaded_phase_run.sh` +
+`scripts/s21_phase_corridor.py`, series
+`/spinning/evidence-631/s28/loaded_phase/series.csv`.
+
+Aggregate corridor: min free **896 / 3048 / 1210** MiB, floor 1024.
+BREACHED on card 0 by 128 MiB.
+
+Split by the phase in force (seam samples held out with a 1.5 s margin):
+
+| card | pp min | tp min | seam min | binding phase | vs floor |
+|---|---|---|---|---|---|
+| 0 (3080) | **896** | 1292 | 956 | **PP** | -128 |
+| 1 (5090) | 3345 | 3047 | 3047 | TP | +2023 |
+| 2 (3080) | **1210** | 1384 | 1250 | **PP** | +186 |
+
+**Both binding cards are bound by the PP PREFILL phase.** Under strict
+purity the drafter is used only for MTP decode and decode runs only in
+TP, so **the drafter is idle for the entire binding phase**. A draft
+spill is therefore worth its full payload here, not zero -- which is the
+question section 2n closed on and the reason this run existed.
+
+Note also which card binds is NOT stable run to run: the previous run at
+the same settings put the minimum on card 2 (972) and this one puts it
+on card 0 (896). A fix aimed at one card is fragile; the mechanism has
+to be per-rank.
+
+### 2o.1 What it costs to reach 600000, per rank
+
+KV per token per rank, from the boot's own
+`released the PP KV backing` lines: 13.99 / 9.99 / 8.00 KiB. So
+500000 -> 600000 costs **+1366 / +976 / +781 MiB**. Against the phase
+minima above, the requirement on the binding rank (card 0) is
+**+1140 MiB in the PP phase** and **+181 MiB in the TP phase**.
+
+### 2o.2 The route, priced
+
+**Direction A -- draft weights, spilled during PP.** Measured at boot,
+NVML delta not a torch counter: `Load weight end ... mem usage=` **2.01 /
+1.88 / 1.88 GB** per rank. These are deliberately NOT arena-backed and
+stay resident in both phases (`phase_flip_boot.py:556-563`: "they are not
+arena-backed, because there is no second layout for them to flip
+between"). **1925 MiB on the binding card, in the binding phase.** This
+is the only lever large enough for the 1140 MiB PP gap.
+
+**Direction B -- the inactive layout's main-model weight shard: ALREADY
+DONE, do not build it.** One arena sized `max(pp, tp)` is refilled in
+place every flip and `snapshot_and_free` frees both device originals;
+the inactive layout exists only as a pinned host image. The only residue
+is the arena TAIL `pp_bytes - tp_bytes` = **319 / 220 / 1191 MiB**,
+reclaimable only in the TP phase. It is the cheapest memory in the
+system (past every TP slot offset so no graph can address it; its
+content is rewritten by the refill that already runs, so there is no
+host round trip) -- but it pays the TP phase, which is not the binding
+one at pool 500000.
+
+**Neither alone reaches 600000.** A alone: card 0 PP becomes 2785 (needs
+2000, clears) but TP steady falls to 843 -- a 181 MiB breach in the
+OTHER phase. A+B: TP steady 1063 against the 1024 floor, clearing by
+**39 MiB**. The two are complements, not alternatives: A pays the PP
+phase, B pays the TP phase. Anyone shipping A alone must re-measure the
+TP minimum before claiming the pool raise.
+
+### 2o.3 The carrier: KvVmmArena, not torch_memory_saver
+
+`torch_memory_saver` pause/resume is VA-stable and already wraps the
+draft weights, but on this rig it is **OFF** (`enable_memory_saver=False`
+in the live server_args; no `LD_PRELOAD` in `/proc/<pid>/environ`) and
+turning it on needs four moving parts: the launcher's LD_PRELOAD
+injection, `hook_mode=preload`, a NEW tag with its own `MemPool`
+(`GPU_MEMORY_TYPE_WEIGHTS` is shared by every ModelRunner, and the
+fork's own adapter warns that `region()` routes every tag into one pool
+whose segments pause together), and a boot-flag surface change. Its
+`enable_cpu_backup` also forces a D2H on every pause that this design
+does not need.
+
+`KvVmmArena` needs none of that: `cuMemAddressReserve` + commit/decommit
+behind a fixed VA, already exposed as a `torch.cuda.MemPool`, already
+what the KV pools use. `phase_flip_spill.py:49-51` names it as the fix.
+**Spill becomes a decommit with zero copy**; only the restore moves
+bytes.
+
+Cost, measured link widths from sysfs: the binding rank is on **Gen4 x4**
+(the other two x8). Restore leg 1925 MiB at ~6.2 GB/s = **310-340 ms**,
+against a current `pp_to_tp` of 3661 ms on that rank: **+8.5-9.3% on the
+slowest rank's leg**, ~1-2.6% of the duty cycle. Tenable. The group pays
+the full 340 ms though, because that rank is already the pace-setter.
+
+### 2o.4 The risk that must not be skipped
+
+`commit_range` for 1925 MiB of raw driver pages runs at the tightest
+instant in the cycle -- inside the no-return region, with the
+destination KV pool already committed. That is the same shape as the
+`cuMemCreate OUT_OF_MEMORY` that killed the instance on 2026-08-09
+(`phase_flip_runtime.py:1658-1668`). The restore's bytes **must** be
+added to the `_staging_affordable` verdict at
+`phase_flip_runtime.py:3735-3738`, so a rank that cannot afford the
+restore abandons the flip unanimously before line 3768 instead of dying
+at the restore. That is the difference between an abandoned flip and a
+dead instance, and the affordability gate has already proved it protects
+the seam: 0 abandons across 195 flips here, and across 234 before.

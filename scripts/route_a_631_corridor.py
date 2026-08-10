@@ -55,6 +55,15 @@ def main() -> int:
                     help="0 = run until SIGINT/SIGTERM")
     ap.add_argument("--floor", type=float, default=FLOOR_MIB)
     ap.add_argument("--out", default="")
+    ap.add_argument(
+        "--series", default="",
+        help="write the RAW per-sample series here (unix_ts,free0,free1,...). "
+             "The summary alone cannot attribute a minimum to a PP or a TP "
+             "window, and that attribution decides whether a phase-scoped "
+             "spill is worth its full payload or exactly zero: an asset that "
+             "is cold only in the NON-binding phase buys no floor at all. "
+             "s21_phase_corridor.py consumes this.",
+    )
     args = ap.parse_args()
 
     try:
@@ -79,6 +88,11 @@ def main() -> int:
         pynvml.nvmlDeviceGetMemoryInfo(h).total / MIB for h in handles
     ]
 
+    series_fh = None
+    if args.series:
+        series_fh = open(args.series, "w")
+        series_fh.write("unix_ts," + ",".join(f"free{i}" for i in range(n)) + "\n")
+
     mins: List[float] = [float("inf")] * n
     maxs: List[float] = [0.0] * n
     sums: List[float] = [0.0] * n
@@ -92,8 +106,10 @@ def main() -> int:
         if args.seconds and (time.time() - t0) >= args.seconds:
             break
         now = time.time()
+        row_free: List[float] = []
         for i, h in enumerate(handles):
             free = pynvml.nvmlDeviceGetMemoryInfo(h).free / MIB
+            row_free.append(free)
             if free < mins[i]:
                 mins[i] = free
                 min_at[i] = now - t0
@@ -101,12 +117,22 @@ def main() -> int:
             sums[i] += free
             if free < args.floor:
                 breaches[i] += 1
+        if series_fh is not None:
+            # Absolute unix time, not elapsed: the phase windows come from
+            # the serving log's wall-clock timestamps and the two series have
+            # to be joinable without knowing when the sampler started.
+            series_fh.write(
+                f"{now:.3f}," + ",".join(f"{v:.3f}" for v in row_free) + "\n"
+            )
         samples += 1
         # Sleep the remainder of the cadence, never a fixed sleep: the NVML
         # reads themselves cost time and would stretch the interval.
         slept = interval - (time.time() - now)
         if slept > 0:
             time.sleep(slept)
+
+    if series_fh is not None:
+        series_fh.close()
 
     elapsed = time.time() - t0
     print()
