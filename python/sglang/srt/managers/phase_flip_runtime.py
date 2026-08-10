@@ -1945,10 +1945,27 @@ class PhaseFlipRuntime:
         #: #631 2.1 STREAMED SEAM. Row blocks per wave: 1 = commit a whole
         #: layer at a time (the 2.1b behaviour), >1 = restore/write/release
         #: one row block at a time, which shrinks the backing transient
-        #: roughly as 1/blocks. DEFAULT 1 -- this ships dark until it is
-        #: measured on metal, because it moves the hot write path.
+        #: toward the arena's chunk floor.
+        #:
+        #: DEFAULT 16, MEASURED. Same boot, same direction, pool 500000
+        #: (bench 2j): the binding 3080s' staging reservation falls
+        #: 488.7 -> 305.6 -> 276.5 MiB at B = 1, 4, 16, and B=32 returns
+        #: EXACTLY the B=16 numbers because the 16 MiB commit chunk's floor
+        #: binds there -- while costing 8% more flip latency for it. So 16
+        #: is the last block count that buys anything and the largest that
+        #: costs nothing. Flip latency at 16 is +4% against the floor arm,
+        #: inside the spread between ranks.
+        #:
+        #: INERT WITHOUT A COMMIT CHUNK, which is still off by default:
+        #: ``_effective_row_blocks`` mirrors ``_execute``'s gate and returns
+        #: 1 when the arena cannot do span ops, so a default boot is
+        #: unchanged. Pair this with ``SGLANG_FLIP_SEAM_CHUNK_MIB=16``; that
+        #: default should not move until a LOADED corridor run exists at
+        #: this setting, because every number above was taken at 90 live
+        #: slots and prices the seam's constant, not its behaviour under a
+        #: full pool.
         _blocks_env = os.environ.get("SGLANG_FLIP_SEAM_ROW_BLOCKS", "").strip()
-        self._seam_row_blocks = 1
+        self._seam_row_blocks = 16
         if _blocks_env:
             try:
                 self._seam_row_blocks = max(1, int(_blocks_env))

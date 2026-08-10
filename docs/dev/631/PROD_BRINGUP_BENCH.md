@@ -3211,3 +3211,107 @@ agree with each other and bracket the desk model. The remaining gap is
 occupancy, and `s26_fill_load.py` is the instrument for closing it —
 raise `--streams` against a boot with a larger `max_running_requests`,
 which is the one knob that caps resident concurrency at 4 today.
+
+## 2j. Section 2.1 on metal, first execution ever (successor 27, 2026-08-10)
+
+The row-blocked seam shipped dark in `ab3f3e6460` and was priced by
+HANDOFF_669 as the route to the >=600000 floor. It had never executed an
+instruction on this rig. Four defects stood between the shipped code and
+one working flip; HANDOFF_670 section 1 lists them. Two are worth
+repeating here because they are measurement traps, not just bugs.
+
+**A capability probe answered from `hasattr`.** `is_span_swappable()`
+checked that the span METHODS existed. They always do. The object the
+flip actually holds is `HybridLinearKVPool`, a wrapper that forwarded
+`release_backing`/`restore_backing` and neither span variant, so the gate
+looked past a capability the underlying pool had and took the whole-wave
+branch on every flip in silence. Boot 2 read the tune file nine times,
+reached block count 32, and recorded **zero** `backing_*_span` census
+marks with an unchanged staging reservation at every arm. A null result
+that looks exactly like "the feature does nothing".
+
+**`commit_span` mapped over its neighbour.** The first boot on which the
+streamed path engaged killed all three ranks:
+
+    _stream_wave -> restore_wave_span -> commit_span
+    RuntimeError: cuMemMap failed: CUDA_ERROR_INVALID_VALUE
+
+`commit_span` rounded its range outward to the COMMIT CHUNK (16 MiB);
+`commit_range` has always rounded to the allocation GRANULARITY (2 MiB).
+Buffer VA extents are laid out granularity-aligned, so a chunk-rounded
+`hi` overshoots its own buffer by up to chunk-1 bytes and maps over the
+next buffer's live mapping. **The chunk is a handle size, not an
+alignment.** Fixed in `0de295bb29` behind one pure helper, `span_bounds`,
+testable without a device.
+
+### The measurement: staging reserved per rank, pool 500000, same boot
+
+`staging reserved` on a DONE line IS `_staging_bytes()`, so these are the
+gate's own numbers, not a proxy.
+
+Every arm below is `pp_to_tp` on the SAME boot, floor arm first, with the
+return-to-PP flip pinned at B=1 so the reset never varies with the knob.
+The first sweep alternated directions between arms and was not a
+like-for-like comparison; this one is.
+
+| B | rank 0 (5090, absorber) | rank 1 (3080) | rank 2 (3080) | slowest rank |
+|---|---|---|---|---|
+| 1 | 1526.49 | 488.65 | 488.67 | 1868.0 ms |
+| 4 | 1206.03 | 259.75 | 305.55 | 1869.1 ms |
+| **16** | **1131.21** | **215.45** | **276.51** | **1941.9 ms** |
+| 32 | 1131.21 | 215.45 | 276.51 | 2097.7 ms |
+
+**B=32 returns EXACTLY the B=16 numbers** -- the 16 MiB commit chunk's
+floor binds there, precisely where the model put it -- and charges 8%
+more flip latency for the privilege. So 16 is the last block count that
+buys anything and the largest that costs nothing, and it is now the
+default (`SGLANG_FLIP_SEAM_ROW_BLOCKS`, inert until a commit chunk is
+set). The binding cards improve **1.77x** (rank 2) and **2.27x**
+(rank 1) against the floor arm for **+4%** flip latency, which is inside
+the spread between ranks.
+
+CAVEAT THAT MUST TRAVEL WITH THESE NUMBERS: every arm ran at 90 live
+slots. That prices the seam's pool-proportional CONSTANT, which is what
+the block count moves, and says nothing about behaviour under a full
+pool. `SGLANG_FLIP_SEAM_CHUNK_MIB` stays 0 by default until a loaded
+corridor run exists at B=16.
+
+### The desk model, validated to 0.1% on numbers it was not fitted to
+
+`s27_seam_ceiling_sweep.py` drives the REAL accounting, so it cannot
+drift from the gate. Scaled from its 600000 table to this pool:
+
+| | predicted | measured | error |
+|---|---|---|---|
+| B=1, binding | 488.25 | 488.37 / 488.50 | **0.05%** |
+| B=4, rank 1 | 259.4 | 259.75 | **0.1%** |
+| B=4, rank 2 | 305.2 | 305.55 | **0.1%** |
+
+The same model reproduces HANDOFF_669's independent desk ceiling
+(473,157) at 473,085 — 0.02%.
+
+### A correction: the wave order is NOT leaving anything on the table
+
+A first pass here reported the transient as `max over all ranks` and
+concluded `ordered_layer_waves` was 36% off the optimum. That is the
+wrong statistic. The planner assigns the transient DELIBERATELY to the
+largest-share rank — the 5090, the only card with GiB of corridor slack —
+and minimises the binding ranks in pass 1. Reported per rank the planner
+is doing its job, and `s27_seam_ceiling_sweep.py` now refuses to collapse
+the three into one worst, with the reason in the code.
+
+### What >=600000 still needs
+
+With a 16 MiB chunk the floor binds around B=16 and further blocking buys
+nothing. At pool 600000 the binding card then needs
+
+    payload leg          687 MiB
+    backing transient    325 MiB   (was 586 at B=1)
+    ----------------------------
+    total               1012 MiB   against a 753 MiB budget
+
+Row blocking closes about half the gap. The remaining ~259 MiB is the
+PAYLOAD leg, which means either row-blocking the EXCHANGE (needs a global
+round count — a rank-local one deadlocks and looks like a hang) or spill
+rung 2, the mechanism spec item 6 actually names. Rung 2 is written and
+dark exactly like this seam was; price `payload_mib` before trusting it.

@@ -1649,6 +1649,15 @@ class TestWavedSeamOrdering(CustomTestCase):
             live,
             pre_write_fns_for=lambda r: (_RecordingSeamSwap(logs[r]),),
         )
+        # WHOLE-WAVE ARM, PINNED EXPLICITLY. This class asserts the order of
+        # release/reclaim/restore INSIDE a whole-layer commit; the streamed
+        # path (now the default block count) emits a different, equally
+        # correct sequence, which TestStreamedSeamOrdering owns. Leaving the
+        # arm implicit made these tests silently follow the default and fail
+        # the moment it moved -- the arm under test must be stated, not
+        # inherited.
+        for rt in runtimes:
+            rt._seam_row_blocks = 1
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
         self.assertEqual([e for e in exceptions if e], [])
         return logs, tp_pools, ref, live
