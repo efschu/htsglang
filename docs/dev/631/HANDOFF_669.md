@@ -211,6 +211,24 @@ with that being the design that clears the floor.
 
 So the route to spec item 6 is **2.1, not more of 2.1b**.
 
+### Why 2.1 removes the term, stated as a granularity argument
+
+Worth having in one line, because it says exactly what to build. The
+transient is one LAYER span because a whole layer is the unit that gets
+committed before anything is released. Nothing about the seam requires
+that: the unit is a layer only because `restore_backing(layers)` takes a
+layer list. Commit in ROW BLOCKS instead and the transient becomes one
+BLOCK span, which is a tuning knob rather than a geometry constant — and
+it goes to ~0 as the block shrinks.
+
+That is precisely what the built-but-unused substrate does:
+`KvVmmArena.commit_span`/`decommit_span`,
+`KvVmmBufferOwner.back_token_span`/`release_token_span`,
+`HostKvPool.release_backing_span`/`restore_backing_span`. They are
+tested. The missing piece is the loop that drives them, plus the global
+round count for the collective. So section 2.1 is not a new design to
+invent — it is wiring an existing, tested substrate into the seam.
+
 ### Where HANDOFF_668's 601,233 came from
 
 Two terms. It modelled the payload slope as `18 / W` MiB per 1000 live
