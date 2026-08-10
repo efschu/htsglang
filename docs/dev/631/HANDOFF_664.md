@@ -282,3 +282,67 @@ geometry is exhausted, and only against a re-measured binding phase.
   with a calibration cached for this rig
   (`~/.cache/sglang/vram_calibration-a191a0712717.json`). **Turn it on before
   hand-building any itemisation.**
+
+## 8. RESULT: 500000 HOLDS. That is +92 % on the shipped pool, measured.
+
+Boot: `PP_STAGE_RATIO=14,10,8`, `SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8`,
+`MAMBA_SLOTS=12`, `RANK_MIB=31800,17400,17450`, `MAX_TOTAL_TOKENS=500000`,
+CTX 393216, purity strict, POLICY auto, spill depth `cache`, HEAD 12d820fa8b.
+
+Load history, stated with the row because the corridor is a property of it:
+bs=4 soak (4 streams, mixed long prompts) for the whole window, plus real qwen
+agent traffic through router 30099, plus a deliberate prefill ladder driving
+21476 then 42948 then 85894 prompt tokens to force the sticky high-water
+rather than wait for it.
+
+| axis | result |
+|---|---|
+| pool | **500000** |
+| corridor minimum, per phase, MiB | pp **1181 / 3676 / 1527**, tp 1483 / 4006 / 1793 |
+| corridor floor | 1024 — **held on all three cards** (margin 157 / 2652 / 503) |
+| binding phase | **PP on all three cards** at this pool |
+| flips | 132, balanced 66 `pp_to_tp` / 66 `tp_to_pp` |
+| spill rung fired | **132 of 132 flips** |
+| prefill only in PP | 606 prefill batches, **0 with a CUDA graph** |
+| decode only in TP | 144 decode batches, **144 carrying `accept len`** |
+| purity gate active | 22 refusals of `prefill cannot run in tp` |
+| accept length | 2.55 |
+| tracebacks / exits | **0 / 0** |
+| host RAM | `oom_kill` unchanged at 9 (no new kill) |
+
+**Against the inherited state this is the headline: 663 shipped 190000 and
+recorded 260000 as breaching. 500000 holds with graphs, speculation, strict
+purity and agent traffic simultaneously.** 600000 boots and serves but breaches
+(§4), so the acceptance target is approached and not met.
+
+### The honest caveat, and it is the one that will bite a successor
+
+Rank 1's margin is **157 MiB**, and it was measured with an 85894-token prefill
+in flight. The ceiling is a function of the longest prefill admitted, not of
+elapsed time: by §2's coefficient each additional 1000 prompt tokens costs
+19-26 MiB per card. A deployment that admits materially longer prefills than
+this window did will breach at 500000, and the pool must come down by
+`breach_MiB / 9.10` thousand tokens on rank 1 to compensate. **Do not quote
+500000 without the prefill length it was measured at.**
+
+### What would buy the last 100000 tokens
+
+In descending confidence:
+
+1. **A hard runtime ceiling** (§6): `set_per_process_memory_fraction` per rank
+   from `RANK_MIB`. Converts the corridor from an outcome into an invariant and
+   makes the allocator reclaim instead of expand. Small change, unbuilt.
+2. **Rank 2's arena.** It is PP-bound at 9115 MiB because rank 2 carries the
+   lm_head (3299 MiB fixed) on top of 8 layers. Moving one layer off rank 2
+   costs 727 MiB of arena and 533 MiB of PP KV there — but the layer has to go
+   somewhere, and every destination was worse in the four boots tried. A
+   non-uniform search over (layers, tp weight vector, token vector) jointly is
+   the unexplored space; §4's calibrated model makes that a desk exercise
+   before it is a boot.
+3. **Spill rungs 2-3** on a VA-stable carrier — but read §5 first: at the
+   aligned geometry that gets closest to the target, the draft is the only
+   genuinely cold asset and PP now binds, so rung 2 is worth its full
+   2058/1925/1925 MiB *in the binding phase*. That is the one configuration in
+   which the ordered spill would pay, and it is this one. This reverses the
+   priority I gave in §5 for the aligned case and is the strongest remaining
+   lead.
