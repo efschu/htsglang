@@ -522,3 +522,73 @@ while requests stay resident", does not hold for them. They would resurrect
 defect R the moment strict purity reached a disaggregated PP path. Left
 unchanged deliberately: they are outside #631's scope and untested here, and
 a blind edit to a path I cannot exercise is how the next defect gets written.
+
+## 11. DIRECTIVE (1a) MEASURED: the 103 tok/s has TWO causes, and one is defect-shaped
+
+Measured from the 61-minute green run's own log, no extra boot needed.
+
+### Duty cycle — the flip schedule is 4:1 against decode
+
+Derived from the 285 `event loop re-dispatch` transitions:
+
+| phase | total | windows | mean window |
+|---|---|---|---|
+| TP (decode) | 853 s | 142 | **6.01 s** |
+| PP (prefill) | 3299 s | 142 | **23.23 s** |
+
+**TP duty cycle = 20.5 % of wall clock.** So a wall-clock figure must be
+divided by ~0.205 to compare against a plain-TP number, and 103 tok/s
+wall-clock corresponds to roughly 500 tok/s in-phase — the same order as the
+~500 aggregate the user recalls from plain TP3 at bs8. **Most of the apparent
+shortfall is duty cycle, exactly as the directive suspected.**
+
+Note the asymmetry for its own sake: PP windows run **3.9x longer** than TP
+windows, against a config of `PP_WINDOW_S=15` / `TP_DECODE_FLOOR_S=10`. The
+schedule is not delivering the floor-to-window ratio it is configured for,
+and that is worth a look independently of throughput.
+
+### Batch size — and this part is NOT duty cycle
+
+| `#running-req` in decode batches | count |
+|---|---|
+| 1 | **774** |
+| 2 | 159 |
+| 3 | 60 |
+
+Per-batch gen throughput: mean 44.5 tok/s, p50 51.4, p90 100.8, max 168.9.
+
+**With four agents live, decode runs at batch size 1 in 78 % of its
+batches.** The design point is bs=4. This is not explained by the duty cycle
+and it is not a property of speculation — it says requests are being
+SERIALISED rather than batched: each PP window admits and prefills, the short
+TP window drains what little is resident, and the cycle repeats. The carry
+counts agree — "carried 1 resident" dominates the later run.
+
+**Per the directive's own standard, this is a defect to hunt, not a trade to
+accept**, and it is the more promising of the two factors because duty cycle
+is a policy knob while bs=1 is lost work. The likely suspects, in the order I
+would test them: the PP window admitting one request per pass; the
+`pp_max_micro_batch_size` / admission limiter interaction under purity; and
+the TP floor being too short to accumulate a batch before the next flip.
+
+### What I could NOT do, and exactly what remains
+
+Directive (1b) needs a same-boot A/B against plain TP3 at bs4 and bs8 —
+**not run, no boot budget left.** With in-phase decode now separable, that
+A/B is the clean comparison it could not be before: compare
+**in-phase** tok/s, never wall-clock.
+
+Directive (1c), the accept-len regression (2.15-2.52 live vs 2.90 earlier):
+**not diagnosed.** One datum that narrows it — accept len moved within this
+single run (2.15 -> 2.38 -> 2.52) while the model and config were fixed, so
+traffic content is a live suspect and draft-state carry across flips cannot
+be the whole story. Also note bs=1 decode changes the acceptance regime, so
+(1c) may be downstream of the batching defect above and should be re-measured
+AFTER it, not before.
+
+Directives (2) prefill-chunk A/B and (3) the KV restore ladder: **not
+started.** Both need multiple boots. (2)'s disqualification rule — an arm
+that breaches 1024 MiB is out regardless of speed — matters especially here:
+this rig ran the whole green run at 1037 MiB, so larger activation
+transients have almost no room. Take the same-boot floor FIRST, and expect
+16384 to be disqualified on corridor rather than speed.
