@@ -97,10 +97,18 @@ class ResolveSpillDepthTest(unittest.TestCase):
             spill.resolve_spill_depth(_Args("cahce"))
         self.assertIn("cache", str(cm.exception))
 
+    def test_rung_2_is_accepted_now_that_the_carrier_exists(self):
+        # Rung 2 was refused for four shifts because the restore allocated a
+        # FRESH arena and moved the addresses the TP decode graphs had baked.
+        # #656 successor 29 put the weights on a VA-stable KvVmmArena span, so
+        # the refusal is lifted -- but only for rung 2.
+        self.assertEqual(spill.resolve_spill_depth(_Args("draft")), 2)
+        self.assertEqual(spill.resolve_spill_depth(_Args(2)), 2)
+
     def test_unimplemented_rung_is_refused_not_clamped(self):
-        # The refusal is the feature: a clamp would make a sweep of rungs 1
-        # and 2 report a difference of zero and look like a measurement.
-        for depth in ("draft", "draft+graphs", 2, 3):
+        # The refusal is the feature: a clamp would make a sweep of rungs 2
+        # and 3 report a difference of zero and look like a measurement.
+        for depth in ("draft+graphs", 3):
             with self.assertRaises(spill.PhaseFlipSpillError) as cm:
                 spill.resolve_spill_depth(_Args(depth))
             self.assertIn("not wired", str(cm.exception))
@@ -113,7 +121,7 @@ class ResolveSpillDepthTest(unittest.TestCase):
 
     def test_implemented_depth_does_not_silently_exceed_the_ladder(self):
         self.assertLessEqual(spill.IMPLEMENTED_DEPTH, spill.MAX_DEPTH)
-        self.assertEqual(spill.IMPLEMENTED_DEPTH, spill.DEPTH_ALLOCATOR_CACHE)
+        self.assertEqual(spill.IMPLEMENTED_DEPTH, spill.DEPTH_DRAFT_WEIGHTS)
 
 
 class ReleaseAllocatorCacheTest(unittest.TestCase):
@@ -228,7 +236,10 @@ class SeamOrderingTest(unittest.TestCase):
         # handed the source pool's pages back, leaving neither layout backed.
         from sglang.srt.managers import phase_flip_runtime as rt
 
-        sched = _Scheduler(_Pool("pp", []), _Args("draft"))
+        # "draft+graphs" rather than "draft": rung 2 became implemented in
+        # #656 successor 29, so the still-unwired rung is now 3. The property
+        # under test is WHEN the refusal happens, not which rung triggers it.
+        sched = _Scheduler(_Pool("pp", []), _Args("draft+graphs"))
         with self.assertRaises(spill.PhaseFlipSpillError):
             rt._build_kv_backing_swap(sched, _Stacks(_Pool("tp", [])), (0, 1))
 

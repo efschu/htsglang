@@ -565,6 +565,43 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                 scheduler, tp_worker, tp_args, world_rank
             )
 
+            # 4c. THE DRAFT-WEIGHT CARRIER (#656 spec item 6, spill rung 2).
+            #
+            # THIS PLACEMENT IS THE WHOLE CORRECTNESS ARGUMENT. It must be
+            # after the draft worker exists and BEFORE its CUDA graphs are
+            # captured at step 5, because capture bakes the drafter's
+            # parameter addresses into the graphs. Pack afterwards and the
+            # graphs address the pre-pack storages, which the pack has
+            # already freed -- and that corruption is SILENT: no exception,
+            # just wrong draft logits and a quietly collapsing accept rate.
+            # The assertion after step 5 exists to make a future reordering
+            # of these lines fail loudly instead.
+            #
+            # The comment above (4b) used to justify leaving these weights
+            # un-arena-backed with "there is no second layout for them to
+            # flip between". Rung 2 falsifies the premise rather than the
+            # reasoning: a spill needs no second layout, only a host image
+            # and an empty device.
+            # Imported locally: phase_flip_spill reaches back into this module
+            # for checkpoint_param_dict/snapshot_and_free, and a module-level
+            # import here would close that loop at import time.
+            from sglang.srt.managers.phase_flip_spill import (
+                DEPTH_DRAFT_WEIGHTS,
+                install_draft_weight_carrier,
+                resolve_spill_depth,
+            )
+
+            draft_spill_depth = resolve_spill_depth(
+                getattr(scheduler, "server_args", None)
+            )
+            draft_carrier = None
+            if draft_spill_depth >= DEPTH_DRAFT_WEIGHTS:
+                draft_carrier = install_draft_weight_carrier(
+                    draft_worker,
+                    tp_worker.model_runner.gpu_id,
+                    server_args=getattr(scheduler, "server_args", None),
+                )
+
             # 5. TP pools + backends + decode graphs, with the TP arena
             # bytes live (graphs bake the fixed arena addresses; pin 2:
             # ONLY this stack captures decode graphs).
@@ -704,6 +741,35 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             tp_worker.init_cuda_graphs()
             if draft_worker is not None:
                 draft_worker.init_cuda_graphs()
+
+            # 5b. THE CARRIER PIN (#656 rung 2), checked AFTER capture.
+            #
+            # Capture is the instant the drafter's parameter addresses stop
+            # being movable. Asserting here -- not at pack time -- is what
+            # catches the failure this ordering exists to prevent: something
+            # between the pack and the capture reallocating a draft
+            # parameter, so the graphs bake an address the carrier does not
+            # own and the spill later releases pages the graphs still read.
+            # There is no runtime symptom to catch that later; the drafter
+            # simply produces wrong tokens and the accept rate decays.
+            if draft_carrier is not None:
+                if not draft_carrier.contains_all_params():
+                    raise PhaseFlipBootError(
+                        "PHASE-FLIP-SPILL the draft CUDA graphs were captured "
+                        "against parameter addresses that do NOT all lie "
+                        "inside the spill carrier's reservation. Something "
+                        "between the carrier pack (4c) and the capture (5) "
+                        "reallocated a draft parameter. Spilling would then "
+                        "release pages the graphs still address, which is "
+                        "silent corruption -- refusing the boot instead."
+                    )
+                logger.info(
+                    "%s carrier pin OK: all %d draft parameters lie inside the "
+                    "VA-stable reservation after graph capture; rung 2 may "
+                    "release their pages without moving an address",
+                    LOG_PREFIX,
+                    len(draft_carrier.param_ptrs()),
+                )
 
             # 5c. EXCLUSIVE-BACKING PIN, measured rather than intended.
             # Between the release above and the restore below exactly one

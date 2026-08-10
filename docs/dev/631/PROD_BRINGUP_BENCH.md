@@ -3626,3 +3626,117 @@ restore abandons the flip unanimously before line 3768 instead of dying
 at the restore. That is the difference between an abandoned flip and a
 dead instance, and the affordability gate has already proved it protects
 the seam: 0 abandons across 195 flips here, and across 234 before.
+
+---
+
+## 2p. RUNG 2 BUILT: the drafter on a VA-stable carrier (#656 successor 29)
+
+HANDOFF_671 section 4 designed and priced this and deliberately did not
+build it. It is built now. Section 2p.1 is the mechanism proof on metal;
+2p.2 is what changed in the tree; 2p.3 is what is still unmeasured.
+
+### 2p.1 The mechanism, proven on hardware before any model boot
+
+`scripts/s29_carrier_metal_probe.py`, run against the real driver while
+the production instance was serving on the same cards. This exists as a
+separate script because the alternative -- discovering a driver-level
+mistake inside a three-rank model boot -- is how this chain has
+repeatedly attributed a fault to the wrong layer.
+
+It also answered an open question: this boot does **not** set
+`--enable-vram-dial`, so the carrier is the FIRST user of `KvVmmArena`
+in the serving process. The JIT stub build and the `cuMem*` path were
+unexercised on this configuration until now. They work:
+
+    torch cuda:0 = RTX 5090   arena base 0x502000000, granularity 2 MiB
+    span offset 0 (granularity-aligned, as the bump allocator guarantees)
+
+    committed 192 MiB   free 3524 -> 3332   (cost exactly 192)
+    cycle 0  SPILL released 192 MiB   free 3220 -> 3412  (regained 192)
+    cycle 1  SPILL released 192 MiB   free 3220 -> 3412  (regained 192)
+    cycle 2  SPILL released 192 MiB   free 3220 -> 3412  (regained 192)
+
+    [PASS] VA stable across spill     0x502000000 vs 0x502000000
+    [PASS] VA stable across restore   0x502000000 vs 0x502000000
+    [PASS] decommit reports the payload      192 of 192 MiB
+    [PASS] spill returns pages to the DRIVER 192 of 192 MiB
+    [PASS] memory usable after restore       4 sample points
+
+**The address does not move and the pages really go back.** Those are
+the two properties the whole rung rests on, and they are now measured
+rather than argued from the arena's docstring.
+
+**Two instrument defects found and fixed in this probe, both mine, both
+of the kind that manufactures a false negative:**
+
+* The first run reported "regained 80 MiB of 192" and looked like a
+  partial release. It was not. Free memory at the end of the run was 112
+  MiB BELOW free at the start *with the arena already closed* -- the
+  production instance took that memory mid-probe, and 192 - 112 = 80. A
+  single before/after pair on a shared card measures the carrier plus
+  everything else that moved and cannot separate them. Fixed by cycling
+  three times and taking the BEST regain: other processes can only make
+  the observed regain look smaller, so one clean cycle proves the
+  mechanism while no cycle can invent a regain that did not happen.
+* The pass/fail line then compared a MiB delta against a BYTE payload,
+  so it printed `FAIL ... regained 192 MiB of 192`. A check that cannot
+  pass is not a check.
+
+A third, unrelated: the probe's first checksum did
+`span.to(torch.int64).sum()`, inflating a 192 MiB span into a 2 GiB
+allocation and OOMing on a card that is also serving. Replaced by sparse
+boundary sampling. **Note for anyone verifying memory work: your
+verification must not itself be the largest allocation in the test.**
+
+Also re-confirmed here, because it has cost this chain time before:
+**torch device indices are not NVML indices.** `nvidia-smi` index 1 is
+the 5090; `torch.cuda` index 1 is a 3080. The probe now prints the
+mapping and selects by free memory.
+
+### 2p.2 What changed
+
+* `VmmDraftWeightCarrier` (`phase_flip_spill.py`): draft weights on a
+  `KvVmmArena` reservation. Spill is `decommit_range(offset, 0)`;
+  restore is `commit_range` + `arena_refill`. Parameters are bound onto
+  the carrier exactly ONCE, at boot, and never rebound -- that is why
+  the TP decode graphs stay valid, and therefore why spec item 8's
+  "draft graphs stay ON" verdict and this spill are compatible at all.
+* Boot (`phase_flip_boot.py`) packs the carrier strictly between
+  `build_flip_draft_worker` and `draft_worker.init_cuda_graphs()`, and a
+  **carrier pin AFTER capture** refuses the boot if any draft parameter
+  landed outside the reservation. That corruption has no runtime
+  symptom -- the drafter simply produces wrong tokens and the accept
+  rate decays -- so it has to be an assertion or it is nothing.
+* Hooks in `_cutover`, not at the pre-wave site section 2o proposed. On
+  the PP leg `scheduler.draft_worker` is already None there, so the
+  drafter is unreachable by construction. The corridor gain is
+  unaffected: the binding minimum is a PP-PHASE minimum, not a seam one,
+  so the safety is bought for nothing.
+* Affordability: `_staging_bytes` now returns
+  `max(wave_peak, draft_restore_bytes)` on pp->tp. **max(), not sum():**
+  the wave buffers are dead before the cutover runs, so summing models a
+  peak that does not occur and would abandon flips that fit -- against a
+  record of 0 abandons in 402.
+* `IMPLEMENTED_DEPTH` 1 -> 2. Rung 3 stays refused, now with the honest
+  reason: a captured graph cannot be refilled from a host image, it must
+  be re-CAPTURED per flip, and item 8 priced those graphs at 41% of
+  decode.
+* `depth>=2` refuses non-strict purity **at boot**. Between spill and
+  restore the parameters address unbacked virtual memory; that is sound
+  only because strict purity forbids decode in PP. Under threshold
+  purity (spec item 10) a PP-phase decode would fault, so the
+  combination is refused where a flag can still fix it.
+
+Tests: 22 new in `test_phase_flip_draft_carrier_631.py`, CPU-hermetic
+with a fake arena that **scribbles the span on decommit** so a restore
+that forgets to refill cannot pass, a 20-layer fixture, and a CONTROL
+test that performs the old fresh-arena restore and asserts it DOES move
+the addresses -- without it the stability test could pass vacuously.
+Registered in `run_631_flip_family.sh` (under-collection has bitten this
+chain three times).
+
+### 2p.3 NOT yet measured
+
+The corridor gain, the flip-duration cost, and the pool raise. Those
+need the depth=draft boot. Nothing in 2p.1 or 2p.2 is a capacity claim.
+

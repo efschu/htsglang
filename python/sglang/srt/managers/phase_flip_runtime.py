@@ -1077,9 +1077,44 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
                 want_spec_algo,
             )
 
+        # 7b-i. SPILL RUNG 2 (#656 spec item 6): the draft weights.
+        #
+        # WHY HERE AND NOT AT THE PRE-WAVE SITE. The design note proposed
+        # spilling before the wave loop, so the seam's own staging could use
+        # the freed bytes. This site is later and gives up that bonus on
+        # purpose: by the time control reaches it the active-stack swap has
+        # already run, so on the PP leg ``scheduler.draft_worker`` IS None
+        # and the drafter is unreachable through the scheduler by
+        # construction. The corridor gain is unaffected -- the corridor
+        # minimum that binds is measured in the PP PHASE, not at the seam --
+        # so the safety is bought for nothing. Move it earlier only with a
+        # measurement showing seam staging, not the PP steady state, is what
+        # binds.
+        #
+        # ORDERING LAW: both legs are past the abandon decision (which is
+        # taken in _execute before any byte moves), so neither can strand a
+        # flip that then returns to its origin phase with no drafter.
+        from sglang.srt.managers.phase_flip_spill import get_spill_ladder
+
+        _ladder = get_spill_ladder(scheduler)
+
         if tp_phase:
+            # RESTORE BEFORE THE BOOTSTRAP. arm_draft_bootstrap_all_reachable
+            # scrubs the drafter's pool and therefore needs a drafter whose
+            # weights are physically present. The bytes this commits were
+            # priced into the pp->tp affordability verdict before the flip
+            # committed, so reaching here means a rank already agreed it can
+            # afford them.
+            if _ladder is not None:
+                _ladder.on_enter_tp(stacks.draft_worker)
             arm_draft_bootstrap_all_reachable(scheduler, want_draft)
         else:
+            # ``stacks.draft_worker``, not ``want_draft``: want_draft is None
+            # on this leg by design (that is the point of the leg), while the
+            # carrier is parked on the worker object the stacks still hold.
+            if _ladder is not None:
+                _ladder.on_enter_pp(stacks.draft_worker)
+
             # THE SEAM MUST LEAVE NO TP DRAFT STATE REACHABLE. Runs before
             # the relay re-seed, so that nothing between the stack swap and
             # the next event-loop iteration can observe a half-scrubbed
@@ -3225,9 +3260,60 @@ class PhaseFlipRuntime:
         one_layer_window = min(widest_rows, _gather_block_rows()) * widest_layer_nbytes
         # THE WAVE-BOUNDARY SLACK, computed from the actual wave plan.
         backing_slack = self._backing_slack_bytes(direction, src, dst, waves)
-        return int(
-            incoming + max(outgoing, local) + one_layer_window + backing_slack
-        )
+        wave_peak = incoming + max(outgoing, local) + one_layer_window + backing_slack
+        # THE SPILLED DRAFTER'S RESTORE (#656 rung 2), priced HERE and not at
+        # the site that performs it. See _draft_restore_bytes.
+        return int(max(wave_peak, self._draft_restore_bytes(direction)))
+
+    def _draft_restore_bytes(self, direction: str) -> int:
+        """Device bytes the pp->tp leg must be able to commit for the drafter.
+
+        WHY THE GATE OWNS THIS. Rung 2 releases the draft weights' physical
+        pages for the PP phase and re-commits them inside ``_cutover`` -- which
+        is past the point of no return. A ``cuMemCreate`` failure there is not
+        recoverable: the flip cannot go back, and the instance dies. That exact
+        shape (``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` inside a seam
+        restore) took all three ranks down on 2026-08-09. Pricing the commit
+        into the affordability verdict converts that death into a unanimous,
+        free abandon before a single byte moves.
+
+        WHY max() AND NOT A SUM. The wave staging and the draft restore never
+        coexist: the waves' buffers are dead before the cutover runs, and the
+        restore happens after the source pool's pages have gone back. Summing
+        them would model a peak that does not occur and would abandon flips
+        that fit -- and an abandoned flip is a visible functional regression
+        against a record of 0 abandons in 402. What both asks DO share is the
+        same free-minus-reserve budget, so the binding constraint is whichever
+        is larger.
+
+        Zero on the tp->pp leg (nothing is being restored) and zero whenever no
+        carrier is installed or it is already resident, so instances without
+        speculation and boots below depth 2 are untouched.
+        """
+        if direction != PP_TO_TP:
+            return 0
+        # getattr, not attribute access: _staging_bytes is exercised directly
+        # by unit stubs built with object.__new__, which carry none of the
+        # runtime's fields. An AttributeError here would surface as a staging
+        # regression in tests that have nothing to do with the drafter.
+        scheduler = getattr(self, "_census_scheduler", None)
+        if scheduler is None:  # unit stubs
+            return 0
+        try:
+            from sglang.srt.managers.phase_flip_spill import pending_restore_bytes
+
+            stacks = getattr(scheduler, "phase_flip_stacks", None)
+            return int(pending_restore_bytes(getattr(stacks, "draft_worker", None)))
+        except Exception as e:  # pragma: no cover - never block a flip on this
+            # A gate that cannot price the restore must not also refuse it;
+            # the pre-rung-2 behaviour is the safe fallback.
+            logger.warning(
+                "%s could not price the draft restore, gating on the wave "
+                "peak alone: %s",
+                LOG_PREFIX,
+                e,
+            )
+            return 0
 
     def _backing_slack_bytes(self, direction: str, src, dst, waves) -> int:
         """Residency the WAVE BOUNDARIES carry on top of the resting layout.

@@ -40,15 +40,23 @@ costs flip milliseconds; the measured trade is recorded per rung in
 per the ordering user -- but it IS a price, so it is measured and published
 per rung rather than assumed small.
 
-RUNG 1 IS THE DEFAULT under ``--enable-phase-flip``, and rung 1 only.
-``IMPLEMENTED_DEPTH`` gates the rest: rungs 2 and 3 parse and are then
-REFUSED, because the TP decode CUDA graphs bake the draft weights' addresses
-and the restore below allocates a FRESH arena, which moves them. That is a
-latent graph-corruption bug in this module as originally written, not a
-missing feature -- wiring it as-is would have been worse than leaving it
-dead. Those rungs need a VA-stable carrier (``KvVmmArena``, whose
-commit/decommit the KV pools already use with addresses held fixed) before
-they can be turned on.
+RUNG 1 IS THE DEFAULT under ``--enable-phase-flip``. RUNG 2 IS IMPLEMENTED
+(#656 successor 29) and must be asked for explicitly; rung 3 still parses and
+is then REFUSED.
+
+Rung 2 was refused for four shifts because the TP decode CUDA graphs bake the
+draft weights' addresses and the restore allocated a FRESH arena, which moves
+them -- a latent graph-corruption bug, not a missing feature. The fix is not
+to stop capturing graphs (spec item 8 measured that at 41% of decode
+throughput) but to make the ADDRESS survive the release:
+``VmmDraftWeightCarrier`` puts the weights on a ``KvVmmArena`` reservation, so
+a spill unmaps physical pages while the virtual addresses stand still. The
+graphs stay valid because nothing they point at ever moved.
+
+Rung 3 (the draft CUDA graphs themselves) is a genuinely different trade: a
+captured graph cannot be refilled from a host image, it must be re-CAPTURED,
+so rung 3 pays a capture per flip for graphs item 8 proved are worth 41% of
+decode. It needs its own measurement before it is offered.
 
 THE PRIMITIVE IS NOT NEW
 ------------------------
@@ -81,21 +89,30 @@ Never spill on a merely ARMED flip. An abandoned flip that had already
 freed the draft weights would return to the TP phase with no drafter and
 0-sized parameter placeholders -- a loud crash at best.
 
-CORRECTION (#656 successor 21): the sentence that used to stand here claimed
+HISTORY, kept because it is the reason to distrust docstrings here.
+Successor 21 found that the sentence which used to stand in this place --
 "both call sites in ``phase_flip_runtime._cutover`` step 7b sit after the
-active-stack swap". THAT WIRING DOES NOT EXIST AND NEVER DID -- a whole-tree
-grep for ``get_spill_ladder``/``on_enter_pp``/``on_enter_tp`` matched only
-this file. The draft rungs are unreferenced code with no tests. The statement
-is left visible rather than deleted because a docstring asserting a call site
-that is absent is exactly the kind of claim that let five successors believe
-spec item 6 was implemented.
+active-stack swap" -- described wiring that DID NOT EXIST AND NEVER HAD. A
+whole-tree grep for ``get_spill_ladder``/``on_enter_pp``/``on_enter_tp``
+matched only this file. That false claim let five successors believe spec
+item 6 was implemented.
 
-Rung 1 IS wired, at ``phase_flip_runtime._build_kv_backing_swap``, strictly
-between the source pool's release and the destination's restore, and it is
-covered by ``test_phase_flip_spill_depth_631.py``.
+IT IS WIRED NOW (#656 successor 29), and here is where, so the claim is
+checkable:
 
-The restore leg runs BEFORE ``arm_draft_bootstrap_all_reachable``, which
-needs a live drafter to scrub its pool.
+    rung 1  ``WavedBackingSwap.reclaim_between``, called once per flip from
+            ``PhaseFlipRuntime._execute``.
+    rung 2  SPILL  ``_cutover``'s PP branch, after the active-stack swap has
+                   installed ``scheduler.draft_worker = None``.
+            RESTORE ``_cutover``'s TP branch, immediately before
+                   ``arm_draft_bootstrap_all_reachable``, which needs a live
+                   drafter to scrub its pool.
+    gate    ``PhaseFlipRuntime._staging_bytes`` adds the pending restore to
+            the pp->tp affordability verdict, so the commit that could fail
+            inside the no-return region is priced before the flip commits.
+
+Both rung-2 legs sit AFTER the abandon decision, which is what the ordering
+law below requires.
 """
 
 from __future__ import annotations
@@ -107,10 +124,8 @@ from typing import Any, Dict, Optional
 import torch
 
 from sglang.srt.model_executor.weights_arena import (
-    allocate_arena,
     arena_refill,
     bind_arena_views,
-    image_from_tensors,
     plan_arena_layout,
     uint8_checksum,
 )
@@ -161,7 +176,41 @@ DEPTH_NAMES = {
 #: value -- a depth dial that quietly under-delivers is worse than one that
 #: says no, because the A/B that compares two rungs would then compare a rung
 #: against itself and report a real-looking zero.
-IMPLEMENTED_DEPTH = DEPTH_ALLOCATOR_CACHE
+#
+# RAISED TO 2 BY #656 successor 29, and the reason the refusal could be
+# lifted is the carrier, not a decision to tolerate the hazard. The refusal
+# text below used to say the draft weights need "a VA-stable carrier that
+# this module does not yet have". ``VmmDraftWeightCarrier`` is that carrier:
+# the weights live on a ``KvVmmArena`` reservation whose virtual address is
+# taken once at boot and freed only at close, so a spill releases PHYSICAL
+# pages (``cuMemUnmap`` + ``cuMemRelease``) while every ``data_ptr()`` the
+# TP decode graphs baked stays exactly where it was. Rung 3 (the draft
+# CUDA graphs themselves) is still unwired -- and note that spec item 8 is
+# now answered AGAINST removing those graphs, so rung 3 buys a phase-local
+# spill of something the next TP phase must re-capture, which is a
+# different and much worse trade than rung 2.
+IMPLEMENTED_DEPTH = DEPTH_DRAFT_WEIGHTS
+
+#: Where the boot parks the carrier on the draft worker. An attribute on the
+#: worker rather than an entry on the scheduler because BOTH flip hooks
+#: already hold the draft worker and neither holds a spill-aware scheduler
+#: field; adding one would have meant touching the stacks dataclass, the
+#: factory and two call sites to carry a pointer that the object at hand
+#: already knows.
+CARRIER_ATTR = "_phase_flip_weight_carrier"
+
+#: Physical handle size for the carrier's commits. The arena maps ONE
+#: monolithic handle per extension when this is unset, and a single ~2 GiB
+#: cuMemCreate is the allocation most likely to fail on a card that is by
+#: construction nearly full at this instant. Chunking makes the restore a
+#: sequence of independently-satisfiable asks.
+CARRIER_COMMIT_CHUNK = 64 * 1024 * 1024
+
+#: Slack added to the reservation on top of the aligned payload. The pool's
+#: bump allocator is granularity-aligned and torch rounds large-pool segments
+#: up per tensor; one tensor is allocated here, so this is one rounding plus
+#: a granule. VA costs nothing until committed.
+CARRIER_VA_SLACK = 64 * 1024 * 1024
 
 DEPTH_ENV = "SGLANG_PHASE_FLIP_SPILL_DEPTH"
 VERIFY_ENV = "SGLANG_PHASE_FLIP_SPILL_VERIFY"
@@ -216,13 +265,15 @@ def resolve_spill_depth(server_args: Any = None) -> int:
         raise PhaseFlipSpillError(
             f"{LOG_PREFIX} spill depth {value} is defined but not wired; the "
             f"deepest implemented rung is {IMPLEMENTED_DEPTH} "
-            f"('cache': return the outgoing phase's cached allocator segments "
-            f"to the driver at the cutover). Rungs {IMPLEMENTED_DEPTH + 1}.."
-            f"{MAX_DEPTH} spill the DRAFT model, whose weights the TP decode "
-            f"CUDA graphs bake addresses into, so they need a VA-stable "
-            f"carrier that this module does not yet have -- restoring into a "
-            f"freshly allocated arena would move those addresses and corrupt "
-            f"the graphs."
+            f"('draft': the cached allocator segments AND the draft model's "
+            f"weights, the latter on a VA-stable KvVmmArena carrier). Rung "
+            f"{MAX_DEPTH} ('draft+graphs') additionally spills the draft CUDA "
+            f"GRAPHS, which is not wired: a captured graph cannot be released "
+            f"and re-materialised from a host image the way a weight tensor "
+            f"can -- it would have to be re-CAPTURED on every pp->tp flip, and "
+            f"#656 spec item 8 measured those graphs as worth 41% of decode "
+            f"throughput, so paying a re-capture per flip is a different trade "
+            f"from rung 2 and needs its own measurement before it is offered."
         )
     return value
 
@@ -329,27 +380,96 @@ def draft_model_of(draft_worker: Any) -> Optional[Any]:
     return getattr(runner, "model", None)
 
 
-class DraftWeightSpill:
-    """RUNG 1: the draft model's checkpoint parameters, out of VRAM for the
-    duration of the PP phase.
+def allocate_carrier_tensor(arena: Any, nbytes: int, device_index: int):
+    """A flat uint8 tensor occupying ``nbytes`` of ``arena``'s reservation.
 
-    Lifecycle, and note that the FIRST spill is the only one that pays a
-    device-to-host copy:
+    THE SPAN IS THE EXTENSION POINT. #656 spec items 11-14 make residency a
+    function of (phase, load) rather than a boot constant, and the payload
+    classes queued behind the drafter -- idle-slot GDN/mamba states, the cold
+    layout's bytes, session KV -- are further rungs of THIS ladder, not new
+    machinery. They differ only in which bytes they carry; the VA-stable
+    mechanics (reserve once, commit/decommit underneath, refill from a host
+    image) are identical. So the arena is injectable and the allocation is a
+    function rather than an inlined ``use_mem_pool`` block: a payload class
+    that already owns a span hands it in, and a test hands in a host-memory
+    stand-in.
 
-        spill()   #1  build pinned host image from the live originals,
-                      rebind every param to a 0-sized placeholder, drop the
-                      original storages.
-        restore()     allocate ONE contiguous device arena, bind views,
-                      one H2D refill, checksum verified on the device.
-        spill()   #2+ drop the arena; the host image is already correct.
+    An arena exposing ``allocate_carrier`` owns the allocation itself.
+    Otherwise this takes the ``KvVmmArena`` path: allocate from its MemPool,
+    whose pluggable allocator is a granularity-aligned bump pointer over the
+    reservation and returns an ADDRESS ONLY -- no pages are mapped until
+    ``commit_range``.
+    """
+    hook = getattr(arena, "allocate_carrier", None)
+    if hook is not None:
+        return hook(nbytes)
+    with torch.cuda.use_mem_pool(arena.pool):
+        return torch.empty(
+            int(nbytes), dtype=torch.uint8, device=f"cuda:{int(device_index)}"
+        )
 
-    After the first restore the parameters live in this module's arena and
-    the boot-time storages are gone for good, which is incidentally a
-    defragmentation win: ~2 GB of scattered per-tensor storages become one
-    block that is allocated and released whole.
+
+class VmmDraftWeightCarrier:
+    """RUNG 2: the draft model's checkpoint parameters, physically absent for
+    the duration of the PP phase, at a virtual address that never moves.
+
+    WHY A VMM ARENA AND NOT A torch ALLOCATION
+    ------------------------------------------
+    The version of this class that shipped dead in the tree freed the
+    parameters by rebinding them to 0-sized placeholders and restored them
+    into a FRESHLY allocated arena. That is correct for the bytes and fatal
+    for the graphs: the TP decode CUDA graphs bake the drafter's parameter
+    addresses at capture, and a fresh allocation lands wherever the caching
+    allocator pleases. The refusal in ``resolve_spill_depth`` existed to keep
+    that bug unreachable.
+
+    ``KvVmmArena`` splits the two things a normal allocation fuses. The
+    VIRTUAL range is reserved once (``cuMemAddressReserve``) at boot and
+    released only at ``close()``; the PHYSICAL pages behind it are mapped and
+    unmapped freely underneath (``cuMemMap`` / ``cuMemUnmap`` +
+    ``cuMemRelease``). So:
+
+        spill    = decommit_range(offset, 0)   pages go back to the DRIVER,
+                                               NVML free rises, data_ptr()s
+                                               are byte-for-byte unchanged
+        restore  = commit_range(offset, n)     fresh pages behind the SAME
+                   + arena_refill              addresses, then one H2D copy
+                                               with a device-side checksum
+
+    Nothing is ever rebound. ``bind_arena_views`` runs exactly once, at boot,
+    before graph capture, and the parameter views it installs stay valid for
+    the life of the process. That is what makes "draft graphs stay ON" (spec
+    item 8's measured verdict) and "the drafter spills" compatible at all.
+
+    WHAT IS UNSAFE, SAID PLAINLY
+    ----------------------------
+    Between ``spill()`` and ``restore()`` the parameter tensors point at
+    virtual addresses with NO physical backing. A read is not a wrong answer,
+    it is a fault. This is sound only because the drafter is provably idle
+    for the whole PP phase under strict purity -- decode, and therefore MTP,
+    runs only in TP. It is NOT sound under threshold purity (spec item 10),
+    where decode may continue in the PP layout, and ``install_draft_weight_
+    carrier`` refuses that combination at boot rather than leaving a fault to
+    be discovered at the first threshold decode.
+
+    THE IMMUTABILITY ASSUMPTION, and its falsifier
+    ----------------------------------------------
+    The pinned host image is built ONCE, at boot, and every restore refills
+    from it. Correct only if nothing writes the draft weights during a TP
+    phase -- true for inference, and the same assumption the boot's own
+    ``image_pp``/``image_tp`` already make. ``SGLANG_PHASE_FLIP_SPILL_VERIFY=1``
+    re-checksums the live device bytes before each spill and raises on
+    mismatch. It costs a device reduction over ~2 GB per flip; run it once to
+    prove the assumption, then leave it off.
     """
 
-    def __init__(self, model: Any) -> None:
+    def __init__(
+        self,
+        model: Any,
+        device_index: int,
+        *,
+        arena: Any = None,
+    ) -> None:
         from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
 
         self._named = checkpoint_param_dict(model)
@@ -360,10 +480,95 @@ class DraftWeightSpill:
                 f"nothing and hide a wrong model handle"
             )
         self._layout = plan_arena_layout(self._named)
-        self._image: Optional[torch.Tensor] = None
-        self._arena: Optional[torch.Tensor] = None
-        self._device = next(iter(self._named.values())).device
+        self._device_index = int(device_index)
+        self._nbytes = int(self._layout.total_bytes)
+        # The arena is created on device_index and the parameters are rebound
+        # onto it. If they do not already live there, the rebind silently
+        # MIGRATES the drafter to another card -- which on this rig means a
+        # rank computing against another rank's GPU. Refuse instead: a wrong
+        # device here is a configuration bug, not something to paper over.
+        param_devices = {
+            p.device.index for p in self._named.values() if p.device.type == "cuda"
+        }
+        if param_devices and param_devices != {self._device_index}:
+            raise PhaseFlipSpillError(
+                f"{LOG_PREFIX} the draft parameters live on cuda device(s) "
+                f"{sorted(d for d in param_devices if d is not None)} but the "
+                f"carrier was asked for device {self._device_index}; binding "
+                f"them onto an arena on the wrong card would migrate the "
+                f"drafter across GPUs"
+            )
         self._spilled = False
+        self._baseline_sum: Optional[int] = None
+
+        if arena is None:
+            from sglang.srt.mem_cache.kv_vmm_backing import KvVmmArena, align_up
+
+            # Reserve only what this payload needs. A 256 GiB default
+            # reservation is free in principle, but three of these across
+            # three ranks in one process tree is a lot of address space to
+            # take for no reason, and a tight reservation makes an
+            # out-of-bounds commit fail loudly instead of scribbling into
+            # unrelated slack.
+            probe_gran = _probe_granularity(self._device_index)
+            reserve = align_up(self._nbytes, probe_gran) + CARRIER_VA_SLACK
+            arena = KvVmmArena(
+                self._device_index,
+                reserve_bytes=reserve,
+                commit_chunk_bytes=CARRIER_COMMIT_CHUNK,
+                # Retention would PARK the physical handles instead of
+                # returning them to the driver -- it makes the restore
+                # allocation-free and the spill worth exactly 0 MiB of
+                # corridor, which is the entire point of this rung.
+                retain_handles=False,
+            )
+        self._arena = arena
+
+        # VA first, pages second. The pool's allocator is a bump allocator
+        # over the reservation: this hands back an address, it does not back
+        # it. Touching the tensor before commit_range is a fault, so the
+        # order here is load-bearing.
+        self._carrier = allocate_carrier_tensor(
+            self._arena, self._nbytes, self._device_index
+        )
+        self._offset = int(self._carrier.data_ptr()) - int(self._arena.base)
+        if self._offset < 0 or self._offset % self._arena.granularity != 0:
+            raise PhaseFlipSpillError(
+                f"{LOG_PREFIX} carrier landed at offset {self._offset}, which "
+                f"is negative or not aligned to the arena granularity "
+                f"{self._arena.granularity}; commit_range would refuse it"
+            )
+        self._arena.commit_range(self._offset, self._nbytes)
+
+        # Snapshot the live weights to a pinned host image and free the
+        # device originals BEFORE binding onto the carrier, so the peak is
+        # max(originals, carrier) and not their sum -- the same reordering
+        # the boot already applies to the model layouts.
+        from sglang.srt.managers.phase_flip_boot import snapshot_and_free
+
+        # Pinning is what makes the restore's H2D copy a DMA rather than a
+        # staged copy, and on the Gen4 x4 rank that difference is most of the
+        # restore's cost. It is also only meaningful with a GPU present:
+        # pin_memory() raises without CUDA, which would make every CPU unit
+        # test of this class fail for a reason unrelated to what it tests.
+        pin = bool(param_devices)
+        self._image = snapshot_and_free(self._named, self._layout, pin=pin)
+        bind_arena_views(
+            self._layout, self._carrier, rebind=list(self._named.items())
+        )
+        arena_refill(self._carrier, self._layout, self._image)
+        logger.info(
+            "%s carrier installed on device %d: %d params, %.1f MiB on a "
+            "VA-stable reservation at 0x%x+0x%x (chunk %d MiB). Draft "
+            "parameter addresses are now FIXED for the life of the process.",
+            LOG_PREFIX,
+            self._device_index,
+            len(self._named),
+            self.payload_mib,
+            int(self._arena.base),
+            self._offset,
+            CARRIER_COMMIT_CHUNK // (1024 * 1024),
+        )
 
     @property
     def spilled(self) -> bool:
@@ -371,14 +576,38 @@ class DraftWeightSpill:
 
     @property
     def payload_mib(self) -> float:
-        return self._layout.total_bytes / _MIB
+        return self._nbytes / _MIB
+
+    @property
+    def payload_bytes(self) -> int:
+        return self._nbytes
+
+    def param_ptrs(self) -> Dict[str, int]:
+        """Current device address of every carried parameter.
+
+        The boot assertion compares this before and after graph capture; a
+        difference means something reallocated the drafter behind our back
+        and the captured graphs are addressing freed memory.
+        """
+        return {name: int(p.data.data_ptr()) for name, p in self._named.items()}
+
+    def contains_all_params(self) -> bool:
+        """Every carried parameter lies inside the carrier's reservation."""
+        lo = int(self._arena.base) + self._offset
+        hi = lo + self._nbytes
+        for p in self._named.values():
+            ptr = int(p.data.data_ptr())
+            if p.data.numel() == 0:
+                return False
+            if not (lo <= ptr < hi):
+                return False
+        return True
 
     def _checksum_live(self) -> int:
         """Checksum of the live device bytes in layout order.
 
-        Only reachable under SGLANG_PHASE_FLIP_SPILL_VERIFY -- it is the
-        falsifier for this module's immutability assumption, not a
-        steady-state cost.
+        Only reachable under SGLANG_PHASE_FLIP_SPILL_VERIFY -- the falsifier
+        for the immutability assumption, not a steady-state cost.
         """
         total = 0
         for slot in self._layout.slots:
@@ -388,61 +617,143 @@ class DraftWeightSpill:
         return total
 
     def spill(self) -> float:
-        """Free the draft weights from the device. Returns MiB released."""
+        """Release the draft weights' physical pages. Returns MiB released.
+
+        The virtual addresses survive; only the pages go back to the driver,
+        which is what NVML's free column -- and therefore the corridor law --
+        actually measures.
+        """
         if self._spilled:
             return 0.0
-        verify = spill_verify_enabled()
-        live_sum = self._checksum_live() if verify else None
-        if self._image is None:
-            # First spill: the originals are the only copy of the bytes.
-            self._image = image_from_tensors(
-                self._named, self._layout, pin=True
-            )
-            self._baseline_sum = live_sum
-        elif verify and live_sum != getattr(self, "_baseline_sum", None):
-            raise PhaseFlipSpillError(
-                f"{LOG_PREFIX} the draft weights CHANGED between restore "
-                f"and spill (checksum {live_sum} vs {self._baseline_sum}); "
-                f"the re-used host image would silently revert them. This "
-                f"module's immutability assumption is falsified -- rebuild "
-                f"the image on every spill before shipping depth>=1."
-            )
-        for name, param in self._named.items():
-            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
-        self._arena = None
+        if spill_verify_enabled():
+            live_sum = self._checksum_live()
+            if self._baseline_sum is None:
+                self._baseline_sum = live_sum
+            elif live_sum != self._baseline_sum:
+                raise PhaseFlipSpillError(
+                    f"{LOG_PREFIX} the draft weights CHANGED between restore "
+                    f"and spill (checksum {live_sum} vs {self._baseline_sum}); "
+                    f"the re-used host image would silently revert them. The "
+                    f"immutability assumption is falsified -- rebuild the "
+                    f"image on every spill before trusting depth>=2."
+                )
+        released = int(self._arena.decommit_range(self._offset, 0))
         self._spilled = True
-        released = self.payload_mib
         logger.info(
-            "%s rung 1 SPILLED the draft weights: %d params, %.1f MiB "
-            "released to the allocator (PP phase has no drafter)",
+            "%s rung 2 SPILLED the draft weights on device %d: %.1f MiB of "
+            "physical pages returned to the driver; %d parameter addresses "
+            "UNCHANGED (PP phase has no drafter)",
             LOG_PREFIX,
+            self._device_index,
+            released / _MIB,
             len(self._named),
-            released,
         )
-        return released
+        return released / _MIB
 
     def restore(self) -> float:
-        """Bring the draft weights back. Returns MiB re-materialized."""
+        """Re-back and refill the draft weights. Returns MiB re-materialized.
+
+        This is the allocation that runs inside the flip's no-return region.
+        Its bytes are priced into the staging affordability verdict before
+        the flip commits (``phase_flip_runtime._staging_bytes``), so a rank
+        that cannot afford them abandons unanimously and cheaply instead of
+        raising ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` here, where
+        there is nothing left to do but die.
+        """
         if not self._spilled:
             return 0.0
-        if self._image is None:  # pragma: no cover - defensive
-            raise PhaseFlipSpillError(
-                f"{LOG_PREFIX} spilled with no host image; the draft "
-                f"weights are unrecoverable"
-            )
-        self._arena = allocate_arena(self._layout.total_bytes, self._device)
-        bind_arena_views(
-            self._layout, self._arena, rebind=list(self._named.items())
-        )
-        arena_refill(self._arena, self._layout, self._image)
+        self._arena.commit_range(self._offset, self._nbytes)
+        arena_refill(self._carrier, self._layout, self._image)
         self._spilled = False
         logger.info(
-            "%s rung 1 RESTORED the draft weights: %.1f MiB refilled from "
-            "the pinned host image, checksum verified on device",
+            "%s rung 2 RESTORED the draft weights on device %d: %.1f MiB "
+            "re-committed behind the SAME addresses and refilled from the "
+            "pinned host image, checksum verified on device",
             LOG_PREFIX,
+            self._device_index,
             self.payload_mib,
         )
         return self.payload_mib
+
+
+def _probe_granularity(device_index: int) -> int:
+    """Allocation granularity of a device, with a 2 MiB fallback.
+
+    Split out so the size arithmetic is testable without a driver.
+    """
+    try:
+        from sglang.srt.mem_cache.kv_vmm_backing import query_granularity
+
+        return int(query_granularity(device_index))
+    except Exception:  # pragma: no cover - no driver in unit tests
+        return 2 * 1024 * 1024
+
+
+def carrier_of(draft_worker: Any) -> Optional[VmmDraftWeightCarrier]:
+    """The carrier the boot parked on this draft worker, or None."""
+    if draft_worker is None:
+        return None
+    return getattr(draft_worker, CARRIER_ATTR, None)
+
+
+def pending_restore_bytes(draft_worker: Any) -> int:
+    """Device bytes a pp->tp flip must be able to commit for the drafter.
+
+    Zero unless a carrier is installed AND currently spilled. Read by the
+    affordability gate; deliberately total-payload rather than a fraction,
+    because ``commit_range`` asks for the whole span in one call and a
+    partially satisfied commit is not a state this design has.
+    """
+    carrier = carrier_of(draft_worker)
+    if carrier is None or not carrier.spilled:
+        return 0
+    return int(carrier.payload_bytes)
+
+
+def install_draft_weight_carrier(
+    draft_worker: Any,
+    device_index: int,
+    *,
+    server_args: Any = None,
+    arena: Any = None,
+) -> Optional[VmmDraftWeightCarrier]:
+    """Move the drafter's weights onto a VA-stable carrier, at BOOT.
+
+    MUST run after the draft worker is built and BEFORE its CUDA graphs are
+    captured. Between those two points the parameter addresses are still
+    free to move; after graph capture they are baked into the graphs and
+    moving them is silent corruption rather than a crash.
+
+    Returns None when there is nothing to carry (no speculation on this
+    instance). Raises rather than degrading: a depth>=2 boot that silently
+    came up without a carrier would spill nothing, measure as a flat zero,
+    and read as "the rung is not worth anything".
+    """
+    if draft_worker is None:
+        return None
+    model = draft_model_of(draft_worker)
+    if model is None:
+        logger.info(
+            "%s depth>=%d configured but this instance has no draft model; "
+            "no carrier installed",
+            LOG_PREFIX,
+            DEPTH_DRAFT_WEIGHTS,
+        )
+        return None
+    purity = getattr(server_args, "phase_flip_purity", "strict")
+    if purity is not None and str(purity).strip().lower() != "strict":
+        raise PhaseFlipSpillError(
+            f"{LOG_PREFIX} spill depth >= {DEPTH_DRAFT_WEIGHTS} requires "
+            f"--phase-flip-purity strict, got {purity!r}. The draft weights "
+            f"are released for the whole PP phase, which is only sound "
+            f"because strict purity forbids decode there. Under threshold "
+            f"purity a PP-phase decode would touch unbacked virtual memory "
+            f"and fault, so this combination is refused at boot rather than "
+            f"at the first threshold decode."
+        )
+    carrier = VmmDraftWeightCarrier(model, device_index, arena=arena)
+    setattr(draft_worker, CARRIER_ATTR, carrier)
+    return carrier
 
 
 class PhaseFlipSpillLadder:
@@ -455,29 +766,37 @@ class PhaseFlipSpillLadder:
 
     def __init__(self, depth: int) -> None:
         self.depth = int(depth)
-        self._weights: Optional[DraftWeightSpill] = None
+        self._weights: Optional[VmmDraftWeightCarrier] = None
         self._installed = False
         self._install_failed = False
 
     def _install(self, draft_worker: Any) -> None:
+        """Bind to the carrier the BOOT installed. Never builds one.
+
+        Constructing a carrier here would mean reserving virtual address
+        space, allocating pages and copying ~2 GB to the host from inside
+        the cutover's no-return region -- and, worse, it would move the
+        parameter addresses that the TP decode graphs baked at capture. The
+        carrier exists before graph capture or it does not exist at all.
+        """
         if self._installed or self._install_failed:
             return
-        model = draft_model_of(draft_worker)
-        if model is None:
-            # No speculation on this instance: every rung is a no-op. Say
-            # it once, then stay quiet.
+        carrier = carrier_of(draft_worker)
+        if carrier is None:
+            # No speculation on this instance, or no carrier was installed:
+            # every draft rung is a no-op. Say it once, then stay quiet.
             logger.info(
-                "%s depth=%d configured but this instance has no draft "
-                "model; the ladder is a no-op",
+                "%s depth=%d configured but no draft-weight carrier is "
+                "installed on this worker; the draft rungs are a no-op",
                 LOG_PREFIX,
                 self.depth,
             )
             self._install_failed = True
             return
-        self._weights = DraftWeightSpill(model)
+        self._weights = carrier
         self._installed = True
         logger.info(
-            "%s installed depth=%d, rung 1 payload %.1f MiB/rank",
+            "%s bound depth=%d to the boot carrier, payload %.1f MiB/rank",
             LOG_PREFIX,
             self.depth,
             self._weights.payload_mib,
