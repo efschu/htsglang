@@ -182,14 +182,34 @@ the second is the one the user's spec actually names:
    a GLOBAL round count — derive it from the replicated plan, never
    rank-local, because a rank-local count deadlocks the group and looks
    exactly like a hang.
-2. **Spill rung 2 (draft weights) at the seam.** Spec item 6 names spill
-   depth as the mechanism for full KV and explicitly accepts a longer
-   flip. `phase_flip_spill.py` has `DEPTH_DRAFT_WEIGHTS = 2` with a
-   written `DraftWeightSpill` class (spill/restore/payload_mib) but
+2. **Spill rung 2 (draft weights) at the seam — START HERE NEXT SHIFT.**
+   Spec item 6 names spill depth as the mechanism for full KV and
+   explicitly accepts a longer flip. `phase_flip_spill.py` has
+   `DEPTH_DRAFT_WEIGHTS = 2` with a written `DraftWeightSpill` class
+   (spill / restore / `payload_mib`), but
    `IMPLEMENTED_DEPTH = DEPTH_ALLOCATOR_CACHE = 1`, so rungs 2 and 3
-   parse and are refused. This is the same shape of inheritance as the
-   dark seam — written, unreferenced, untested — so **price the payload
-   before trusting it**, and read section 1 of this file first.
+   parse and are then refused.
+
+   **Its own docstring prices the payload at ~2 GB per rank** ("~2 GB of
+   scattered per-tensor storages become one block"). The shortfall at
+   600000 is 259 MiB. If that number survives contact with
+   `payload_mib`, rung 2 does not merely close the gap, it closes it
+   roughly eight times over — and it is the mechanism the user asked
+   for rather than a substitute for it.
+
+   The fit is better than arithmetic. Under STRICT PURITY the drafter is
+   used only for MTP decode, and decode happens only in the TP layout,
+   so the drafter is genuinely IDLE for the whole PP phase. The spill
+   window and the unused window are the same window; this is not a
+   trade of latency for memory, it is an asset that was resident for no
+   reason.
+
+   Two cautions. This is the same shape of inheritance as the dark seam
+   — written, unreferenced, untested — so **measure `payload_mib` before
+   building on it**, and read section 1 of this file first. And its
+   docstring calls itself "RUNG 1" while the ladder has it at 2; the
+   numbering drifted when the allocator-cache rung was inserted below
+   it, so trust `DEPTH_DRAFT_WEIGHTS`, not the prose.
 
 The seam's staging need is a SEAM-INSTANT need, not a resident one,
 which is exactly what a seam-time spill is for. That makes route 2 the
