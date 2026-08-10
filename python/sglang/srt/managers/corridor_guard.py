@@ -60,13 +60,64 @@ the flip -- which the affordability verdict already knows how to do
 unanimously and for free -- rather than dying inside the no-return region.
 A gate that shrugs and lets the allocation proceed would be worse than no
 gate, because it would launder a corridor breach as a check that passed.
+
+ITEM 16: THE CARDS FILL EVENLY, AND HOST RAM IS LAST
+----------------------------------------------------
+    "CARDS MUST FILL EVENLY BEFORE ANY HOST SPILL. Host spill happens ONLY
+     when ALL three cards are at the floor -- never while one card binds and
+     the others have headroom."
+
+"Even" is defined on FREE HEADROOM, not on bytes held: this rig's cards are
+32/20/20 GiB, so equal bytes would mean permanently unequal pressure and the
+20 GiB cards would bind forever. The objective is therefore a water-filling
+one over the per-card FREE column, and the metric that says whether it has
+been achieved is the SPREAD of that column (:func:`free_spread_mib`), which
+belongs in every corridor CSV so that "evenly filled" is provable rather
+than asserted.
+
+This splits the provider order into a TIER above the cost:
+
+    RELIEF_REBALANCE  make the free column more level. In TP this is the
+                      uneven-DCP token vector (``distributed.corridor_vector``
+                      already solves it against per-card corridor capacity):
+                      steer tokens to the freest card, physical backing
+                      follows the vector, VA stays geometric. In PP the KV is
+                      layer-bound and cannot be token-steered, so levelling
+                      means evacuating everything NOT layer-bound from the
+                      heavy card -- the drafter (done), idle mamba slots,
+                      arena slack, graph pools.
+    RELIEF_PARK       park a cold payload in ANOTHER card's surplus free
+                      space. Still VRAM, still fast, and it levels.
+    RELIEF_HOST       system RAM. Gated: see below.
+
+**Tier outranks cost, and that is the point.** Cost still orders providers
+WITHIN a tier -- item 15's cheapest-first law is untouched -- but it may not
+promote a host spill ahead of a rebalance merely because the host spill is
+cheaper to execute. Those are answers to different questions.
+
+**The host gate is a FLEET predicate.** A guard that sees only its own card
+cannot distinguish "everything is full" from "I am the only one that is
+full", and those two states have opposite correct answers. So the guard reads
+the whole free column and admits the host tier only when
+:func:`fleet_is_level` holds. Without a fleet probe the host tier stays shut:
+item 16 is a permission that must be proven, not assumed.
+
+**Why the drafter is a REBALANCE and not a host spill, even though its bytes
+land in host RAM.** The tier names what the action does to the free column,
+not where the bytes go. Evacuating a non-layer-bound payload from the binding
+card is precisely the PP levelling move the user prescribes ("drafter done;
+mamba slots, arena slack, graph pools next"), and it is not the KV/cold spill
+class item 16 gates. If a successor finds the user meant the destination
+rather than the effect, the change is one ``tier=`` argument at the
+registration site -- deliberately, so that it is a one-line decision and not
+a refactor.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +133,66 @@ DEFAULT_FLOOR_MIB = 1024
 #: measured seam trough (1196 MiB free at the tightest instant, floor 1024).
 DEFAULT_DELTA_MIB = 256
 
+#: Relief tiers (item 16). Lower is tried first, unconditionally: the tier
+#: outranks the cost, so a cheap host spill can never overtake an expensive
+#: rebalance. Cost still orders providers within one tier.
+RELIEF_REBALANCE = 0  # level the free column: token vector, evacuate the heavy card
+RELIEF_PARK = 1  # park a cold payload in another card's surplus VRAM
+RELIEF_HOST = 2  # system RAM -- only once every card is at the floor
+
+_TIER_NAMES = {
+    RELIEF_REBALANCE: "rebalance",
+    RELIEF_PARK: "park",
+    RELIEF_HOST: "host",
+}
+
+
+def free_spread_mib(free_column) -> int:
+    """max - min over the per-card free column, in MiB. The levelness metric.
+
+    This is the number that goes in the corridor CSV. A run whose spread
+    stays small was evenly filled; a run whose spread is thousands of MiB was
+    not, whatever its minimum says. The corridor law's minimum and item 16's
+    spread are independent axes and a CSV needs both.
+    """
+    col = [int(f) for f in free_column]
+    if not col:
+        return 0
+    return int((max(col) - min(col)) // _MIB)
+
+
+def water_fill_targets(free_column):
+    """The equal-free-headroom targets for a fleet, in bytes.
+
+    The objective is EQUAL FREE, so every card's target is the mean of the
+    column regardless of its total size. Returned as a vector (rather than a
+    scalar) because the caller subtracts each card's current free to get the
+    signed transfer it should aim for: negative means "this card should give
+    bytes up", positive means "this card can take them".
+    """
+    col = [int(f) for f in free_column]
+    if not col:
+        return []
+    mean = sum(col) // len(col)
+    return [mean] * len(col)
+
+
+def fleet_is_level(free_column, floor_mib: int, delta_mib: int) -> bool:
+    """True when EVERY card sits at the floor, i.e. host RAM is permitted.
+
+    "At the floor" is a band and not a point -- a card is never exactly at
+    1024 MiB, so a point predicate would be unreachable and the host tier
+    would be dead code. The band is the same ``floor + delta`` upper
+    watermark the gate frees to, which keeps one number in charge of both.
+
+    An EMPTY column is not level. No evidence is not evidence.
+    """
+    col = [int(f) for f in free_column]
+    if not col:
+        return False
+    ceiling = (int(floor_mib) + int(delta_mib)) * _MIB
+    return all(f <= ceiling for f in col)
+
 
 class CorridorBreachRefused(RuntimeError):
     """The allocation cannot be made without breaking the corridor law.
@@ -94,7 +205,10 @@ class CorridorBreachRefused(RuntimeError):
 
 @dataclass(order=True)
 class _Provider:
-    # Ordered by cost first: the cheapest thing to give back goes first.
+    # Ordered by TIER first (item 16), then by cost (item 15). The two-key
+    # sort is the whole enforcement: a cheap host spill sorts after every
+    # rebalance no matter how expensive the rebalance is.
+    tier: int
     cost: int
     name: str = field(compare=False)
     free_up_to: Callable[[int], int] = field(compare=False)
@@ -133,20 +247,34 @@ class CorridorGuard:
         floor_mib: int = DEFAULT_FLOOR_MIB,
         delta_mib: int = DEFAULT_DELTA_MIB,
         probe: Optional[Callable[[], int]] = None,
+        fleet_probe: Optional[Callable[[], Sequence[int]]] = None,
     ) -> None:
         self.device_index = int(device_index)
+        self.floor_mib = int(floor_mib)
+        self.delta_mib = int(delta_mib)
         self.floor_bytes = int(floor_mib) * _MIB
         self.delta_bytes = int(delta_mib) * _MIB
         self._probe = probe
+        # Item 16's fleet predicate. Deliberately a per-card NVML read rather
+        # than a collective: this gate runs inside the flip's no-return
+        # region, and a collective there is a deadlock waiting for the one
+        # rank that took a different branch. NVML sees every card regardless
+        # of CUDA_VISIBLE_DEVICES, so no rank has to be asked.
+        self._fleet_probe = fleet_probe
         self._providers: List[_Provider] = []
         self.arm_count = 0
         self.refuse_count = 0
+        self.host_blocked_count = 0
         self.reclaimed_total = 0
 
     # -- registration ----------------------------------------------------
 
     def register(
-        self, name: str, cost: int, free_up_to: Callable[[int], int]
+        self,
+        name: str,
+        cost: int,
+        free_up_to: Callable[[int], int],
+        tier: int = RELIEF_REBALANCE,
     ) -> None:
         """Add a payload class the gate may spend.
 
@@ -158,19 +286,32 @@ class CorridorGuard:
 
         ``cost`` orders the spend: lower is cheaper to give up and to get
         back. Ties are resolved by registration order.
+
+        ``tier`` (item 16) outranks ``cost`` entirely -- see the module
+        docstring. It defaults to ``RELIEF_REBALANCE`` so that a provider
+        written before tiers existed keeps working: defaulting to
+        ``RELIEF_HOST`` would silently switch off relief that already works,
+        while this direction forces the gated class to be declared on
+        purpose, which is the way an omission should fall.
         """
         if not callable(free_up_to):
             raise TypeError(f"{LOG_PREFIX} provider {name!r} is not callable")
-        self._providers.append(_Provider(int(cost), str(name), free_up_to))
-        self._providers.sort(key=lambda p: p.cost)
+        if tier not in _TIER_NAMES:
+            raise ValueError(
+                f"{LOG_PREFIX} provider {name!r}: unknown relief tier {tier!r}, "
+                f"expected one of {sorted(_TIER_NAMES)}"
+            )
+        self._providers.append(_Provider(int(tier), int(cost), str(name), free_up_to))
+        self._providers.sort(key=lambda p: (p.tier, p.cost))
         logger.info(
-            "%s registered provider %r at cost %d (device %d); spend order "
-            "is now: %s",
+            "%s registered provider %r in tier %s at cost %d (device %d); "
+            "spend order is now: %s",
             LOG_PREFIX,
             name,
+            _TIER_NAMES[tier],
             cost,
             self.device_index,
-            ", ".join(p.name for p in self._providers),
+            ", ".join(f"{p.name}[{_TIER_NAMES[p.tier]}]" for p in self._providers),
         )
 
     @property
@@ -185,6 +326,22 @@ class CorridorGuard:
         import torch
 
         return int(torch.cuda.mem_get_info(self.device_index)[0])
+
+    def fleet_free(self) -> List[int]:
+        """The per-card free column, in bytes. Empty when unknown."""
+        if self._fleet_probe is None:
+            return []
+        try:
+            return [int(f) for f in self._fleet_probe()]
+        except Exception as e:
+            # An unreadable fleet is an UNPROVEN fleet, and item 16's host
+            # permission must be proven. Degrading to "empty" therefore
+            # closes the host tier rather than opening it.
+            logger.warning("%s fleet probe failed: %s", LOG_PREFIX, e)
+            return []
+
+    def _host_tier_permitted(self, column: Sequence[int]) -> bool:
+        return fleet_is_level(column, self.floor_mib, self.delta_mib)
 
     def ensure_headroom(
         self,
@@ -216,9 +373,21 @@ class CorridorGuard:
         used: List[str] = []
         reclaimed = 0
         free_now = free_before
+        # Item 16: read the fleet ONCE, before spending. Re-reading it after
+        # each provider would let a rebalance that just filled a peer card
+        # close the host gate mid-ladder on the strength of its own effect,
+        # which is a feedback loop, not a policy.
+        column = self.fleet_free()
+        host_ok = self._host_tier_permitted(column)
+        host_blocked = False
         for provider in self._providers:
             if free_now >= target:
                 break
+            if provider.tier == RELIEF_HOST and not host_ok:
+                # Never while a peer still has headroom: the bytes belong on
+                # that card, not in RAM.
+                host_blocked = True
+                continue
             deficit = target - free_now
             try:
                 got = int(provider.free_up_to(deficit))
@@ -246,6 +415,8 @@ class CorridorGuard:
         ok = (free_now - want) >= self.floor_bytes
         if not ok:
             self.refuse_count += 1
+        if host_blocked and not ok:
+            self.host_blocked_count += 1
         detail = (
             f"want {want/_MIB:.0f} MiB, free {free_before/_MIB:.0f} -> "
             f"{free_now/_MIB:.0f} MiB, reclaimed {reclaimed/_MIB:.0f} MiB "
@@ -253,6 +424,13 @@ class CorridorGuard:
             f"{self.floor_bytes/_MIB:.0f} MiB"
             + (f" ({reason})" if reason else "")
         )
+        if host_blocked:
+            detail += (
+                "; host tier withheld -- fleet is not level"
+                f" (free column {[int(f // _MIB) for f in column]} MiB, spread "
+                f"{free_spread_mib(column)} MiB): item 16 spends host RAM only "
+                "once every card is at the floor"
+            )
         if ok:
             logger.info("%s cleared on device %d: %s", LOG_PREFIX, self.device_index, detail)
         else:
@@ -270,6 +448,40 @@ class CorridorGuard:
         return GuardResult(
             ok, free_before, free_now, want, reclaimed, tuple(used), detail
         )
+
+
+def nvml_fleet_probe() -> Callable[[], List[int]]:
+    """A fleet free-column probe over NVML, for item 16's host gate.
+
+    NVML, deliberately, and not a collective. This gate runs inside the
+    flip's no-return region; a collective there deadlocks the moment one rank
+    takes a different branch, and the whole reason the seam is guarded is
+    that ranks can disagree about affordability. NVML sidesteps the question:
+    it sees every physical card regardless of ``CUDA_VISIBLE_DEVICES``, so a
+    rank pinned to one card can still read the other two without asking
+    anyone.
+
+    The column is in NVML index order and includes cards this instance does
+    not use. That is correct for the predicate being asked -- "is there
+    headroom anywhere else" -- and it is conservative in the safe direction:
+    a foreign card with free memory keeps the host tier SHUT, which costs
+    tempo and never costs the corridor.
+
+    Only called when the gate arms, which is rare, so no cache: a cached free
+    column can only be wrong in the direction that opens the host gate.
+    """
+
+    def probe() -> List[int]:
+        from sglang.srt.registry import nvml as registry_nvml
+
+        with registry_nvml.nvml_session() as pynvml:
+            out: List[int] = []
+            for index in range(pynvml.nvmlDeviceGetCount()):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+                out.append(int(pynvml.nvmlDeviceGetMemoryInfo(handle).free))
+            return out
+
+    return probe
 
 
 def draft_carrier_provider(carrier) -> Callable[[int], int]:

@@ -909,3 +909,76 @@ def get_spill_ladder(scheduler: Any) -> Optional[PhaseFlipSpillLadder]:
     ladder = PhaseFlipSpillLadder(depth)
     scheduler.phase_flip_spill_ladder = ladder
     return ladder
+
+
+#: Cost ranks inside the REBALANCE tier. Spread out so a later rung can be
+#: slotted between two of these without renumbering the others.
+_COST_ARENA_TAIL = 10
+_COST_DRAFT_WEIGHTS = 20
+
+CORRIDOR_GUARD_ATTR = "phase_flip_corridor_guard"
+
+
+def get_corridor_guard(scheduler: Any):
+    """The rank's spill-before-alloc gate (#656 items 15a/15b/16), built once.
+
+    Cached on the scheduler for the same reason the ladder is: the providers
+    it holds wrap payloads whose host images must survive every flip, and a
+    per-flip guard would re-register them on each seam.
+
+    The device is taken from ``model_runner.gpu_id`` rather than
+    ``torch.cuda.current_device()``. Under ``--rank-gpu-id`` a worker's
+    current device is ``cuda:0`` inside its own visible set, which is not the
+    physical card the corridor law is stated about, and this chain has
+    already shipped one defect from that conflation.
+
+    Returns None only when there is no scheduler device to guard, which is a
+    unit-test shape rather than a serving one.
+    """
+    guard = getattr(scheduler, CORRIDOR_GUARD_ATTR, None)
+    if guard is not None:
+        return guard
+
+    from sglang.srt.managers import corridor_guard as cg
+
+    model_runner = getattr(
+        getattr(scheduler, "tp_worker", None), "model_runner", None
+    )
+    device_index = getattr(model_runner, "gpu_id", None)
+    if device_index is None:
+        return None
+
+    server_args = getattr(scheduler, "server_args", None)
+    floor_mib = int(
+        getattr(server_args, "phase_flip_corridor_floor_mib", None)
+        or cg.DEFAULT_FLOOR_MIB
+    )
+    guard = cg.CorridorGuard(
+        int(device_index),
+        floor_mib=floor_mib,
+        fleet_probe=cg.nvml_fleet_probe(),
+    )
+
+    # The drafter is a REBALANCE and not a HOST spill even though its image
+    # lives in host RAM: it evacuates a non-layer-bound payload from the
+    # binding card, which is the PP levelling move item 16 prescribes. See
+    # the corridor_guard module docstring for the full argument.
+    ladder = get_spill_ladder(scheduler)
+    carrier = getattr(ladder, "_weights", None) if ladder is not None else None
+    if carrier is not None:
+        guard.register(
+            "draft-weights",
+            _COST_DRAFT_WEIGHTS,
+            cg.draft_carrier_provider(carrier),
+            tier=cg.RELIEF_REBALANCE,
+        )
+
+    setattr(scheduler, CORRIDOR_GUARD_ATTR, guard)
+    logger.info(
+        "%s corridor guard armed on device %d, floor %d MiB, providers %s",
+        LOG_PREFIX,
+        int(device_index),
+        floor_mib,
+        list(guard.providers) or "[] (nothing to spend yet)",
+    )
+    return guard

@@ -40,6 +40,8 @@ FAMILY=(
     test/registered/unit/managers/test_phase_flip_spill_depth_631.py
     test/registered/unit/managers/test_phase_flip_draft_carrier_631.py
     test/registered/unit/managers/test_corridor_guard_631.py
+    test/registered/unit/managers/test_corridor_even_fill_631.py
+    test/registered/unit/managers/test_phase_flip_corridor_gate_631.py
     test/registered/unit/managers/test_kv_arena_handle_retention_631.py
     test/registered/unit/managers/test_spec_counter_wire_631.py
     # Third under-collection, caught 2026-08-10: six tests were added to

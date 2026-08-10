@@ -1953,6 +1953,16 @@ class PhaseFlipRuntime:
         #: Flips abandoned because the live set did not fit the target
         #: pool. Same reason for counting it.
         self.fit_aborts = 0
+        #: Flips abandoned by the corridor gate (#656 item 15a) because no
+        #: provider could fund the staging without breaking the floor.
+        #: Distinct from staging_aborts: that one says "there is not enough
+        #: room", this one says "there is not enough room AND nothing left
+        #: to spill", which is the end of the ladder and not a transient.
+        self.corridor_aborts = 0
+        #: Seams the corridor gate FUNDED by spilling first. The number that
+        #: proves the gate is doing work rather than merely passing: a run
+        #: with zero reclaims has not exercised item 15a at all.
+        self.corridor_reclaims = 0
         #: Flips abandoned because the STAGING buffers would not fit in
         #: free VRAM above the reserve. Counted separately from fit_aborts:
         #: "the target pool has no row for this slot" and "there is no room
@@ -3658,6 +3668,63 @@ class PhaseFlipRuntime:
             f"retried when occupancy drops"
         )
 
+    def _corridor_gate(self, staging_bytes: int, direction: str) -> str:
+        """#656 item 15a: spill BEFORE the seam allocates. Returns "" if clear.
+
+        WHY HERE AND NOT AT ``commit_range``. The seam's commits happen
+        inside the no-return region, and there is no try/except on that path
+        by design -- ``_abandon_parked_flip`` states the law: a raise from
+        inside a cutover climbs into the event loop and takes the instance
+        down. So the gate is consulted at the last point where refusing is
+        still free, and its refusal joins ``too_small``, which already rides
+        the ``_collective_min`` that makes the abandon unanimous. A
+        rank-local refusal would half-flip the group.
+
+        The gate runs BEFORE ``_staging_affordable`` on purpose: the
+        providers return pages to the DRIVER, so whatever the gate reclaims
+        is money the affordability check then sees. Reversing the two would
+        have the cheaper check refuse a flip the gate could have funded.
+
+        A refusal here is not an error. It is the flip declining to start,
+        with every request intact, which is exactly the outcome the 2026-08-09
+        ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` death should have had.
+        """
+        scheduler = self._census_scheduler
+        if scheduler is None:
+            return ""
+        try:
+            from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+            guard = get_corridor_guard(scheduler)
+            if guard is None:
+                return ""
+            verdict = guard.ensure_headroom(
+                int(staging_bytes), reason=f"seam staging {direction}"
+            )
+        except Exception as e:
+            # The gate is a safety net, not a dependency. A net that tears
+            # must not take down the thing it was protecting, so a broken
+            # gate degrades to the pre-gate behaviour -- which is the
+            # affordability check on the next line -- and says so loudly.
+            logger.error(
+                "%s corridor gate failed to evaluate (%s); the flip proceeds "
+                "on the staging affordability check alone",
+                LOG_PREFIX,
+                e,
+            )
+            return ""
+        if verdict.ok:
+            if verdict.reclaimed > 0:
+                self.corridor_reclaims += 1
+                logger.info(
+                    "%s corridor gate funded the seam: %s",
+                    LOG_PREFIX,
+                    verdict.detail,
+                )
+            return ""
+        self.corridor_aborts += 1
+        return f"corridor gate refused the seam staging: {verdict.detail}"
+
     # -- the move -------------------------------------------------------------
     def _pack_outgoing(
         self,
@@ -3819,6 +3886,12 @@ class PhaseFlipRuntime:
         self._refresh_seam_tuning()
         waves = self._flip_waves(direction)
         staging_bytes = self._staging_bytes(tr, direction, src, dst, waves)
+        # #656 item 15a/16: spill before the allocation, and level the cards
+        # before touching host RAM. Runs first so its reclaim is money the
+        # affordability check below can see.
+        corridor_detail = self._corridor_gate(staging_bytes, direction)
+        if corridor_detail:
+            too_small.append(corridor_detail)
         affordable, staging_detail = self._staging_affordable(staging_bytes)
         if not affordable:
             too_small.append(staging_detail)
@@ -3831,7 +3904,13 @@ class PhaseFlipRuntime:
             self._last_hold_reason = None
             # Which of the two conditions THIS rank hit, so a boot that is
             # short of staging room is not read as a pool-sizing problem.
-            if staging_detail:
+            if corridor_detail:
+                # Already counted by the gate itself, and counted there
+                # rather than here so that a PEER's corridor refusal (which
+                # reaches this rank only as a reduced verdict) is not
+                # miscounted as this rank's pool being too small.
+                pass
+            elif staging_detail:
                 self.staging_aborts += 1
             else:
                 self.fit_aborts += 1
