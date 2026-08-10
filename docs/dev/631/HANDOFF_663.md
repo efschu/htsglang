@@ -592,3 +592,86 @@ that breaches 1024 MiB is out regardless of speed — matters especially here:
 this rig ran the whole green run at 1037 MiB, so larger activation
 transients have almost no room. Take the same-boot floor FIRST, and expect
 16384 to be disqualified on corridor rather than speed.
+
+## 12. MY >600k CLOSURE IS FALSIFIED. Read this before section 5 or 8.
+
+**Sections 5 and 8 above are WRONG as verdicts. Do not act on them.** They
+are left in place unedited because the SHAPE of the error is the useful part.
+
+### The falsifier, and why it beats everything I wrote
+
+Plain TP3 on this exact rig holds **669440 tokens**. The flip setup breaches
+the corridor at **260000**. Therefore:
+
+    CONSERVATION IDENTITY
+    flip capacity = plain-TP capacity - (whatever the flip setup holds
+                                          resident that plain TP does not)
+
+The gap is ~409k tokens, about **+6.4 / +4.5 / +3.5 GiB per card**. That mass
+exists, it is resident, and it has a name. No amount of component reasoning
+can argue it away.
+
+### The exact shape of my error, stated so it is not repeated
+
+**I analysed ONE component and delivered a verdict about the WHOLE system.**
+I established, correctly and with citations, that the weights arena is
+`max(pp,tp)` per rank and that the inactive layout's parameters live in a
+pinned host image. Then I concluded ">600k is unreachable and the spill is
+worth 0 MiB". That conclusion does not follow from that premise.
+
+**My own numbers should have stopped me.** The arena's idle tail is
+1773 / 0 / 1191 MiB — about 3 GiB across all three cards. The gap is
+6.4 / 4.5 / 3.5 GiB **per card**. My accounting was short by roughly a factor
+of five, and I never checked it against a total. **A component analysis can
+silently omit a term; a conservation identity cannot.** I had the weaker
+instrument and treated it as the stronger one.
+
+This is the second false closure in this chain (662's was the first, on a
+different premise). Both were produced the same way: a true local fact
+promoted to a global verdict without a closing balance.
+
+### THE RULE THIS BUYS, and it is the durable part
+
+**No capacity verdict without a closed byte ledger.** Every future claim of
+the form "X cannot be reached" must first attribute the full delta between
+the two configurations, GiB by GiB, by name. If the itemisation does not sum
+to the measured difference, the analysis is incomplete and the verdict is
+not earned — regardless of how well-cited its individual terms are.
+
+### WHAT THE SUCCESSOR MUST DO, in this order
+
+**(A) THE BYTE LEDGER, BEFORE ANY CODE.** Per-card itemised VRAM, plain-TP3
+boot vs flip boot, same model and ctx. Rows at minimum: weights per layout,
+CUDA graph pools per layout, attention/flashinfer workspaces, draft assets,
+KV pool(s), and corridor. **Every GiB of the delta attributed by name**, and
+the rows must SUM to the measured difference. Put it in PROD_BRINGUP_BENCH as
+the standing falsifier for all future capacity verdicts.
+
+Candidate terms I never itemised, and which my analysis therefore could not
+have seen — offered as leads, not findings:
+  * **two KV pools.** `phase_flip_boot` builds a PP pool and a TP pool and
+    swaps their physical backing per flip; whether the swap is truly
+    exclusive at all times, or whether both hold backing simultaneously in
+    some window, is UNVERIFIED by me.
+  * **duplicate graph pools.** Each layout captures its own CUDA graphs. I
+    never measured either pool, and graph pools are not small.
+  * **duplicate workspaces** (attention backend, comm buffers) per layout.
+  * the arena tail (1773 / 0 / 1191 MiB) — the only term I did measure, and
+    the smallest of them.
+
+**(B) THEN BUILD THE REAL SPILL** per the standing VMM directive: release the
+inactive layout's physical pages — weights AND graph pools/workspaces where
+releasable — keeping the VA stable so baked graph addresses survive, remap
+and H2D-restore before next use. The machinery exists and is proven in-tree
+for the KV pool (`kv_vmm_backing.py:208/350/358`;
+`phase_flip_runtime.py:1434-1491`). Spill depth selectable, default full on
+this rig. Red-first: a hermetic falsifier proving VA stability and
+byte-identical graph replay across a release/restore cycle, then metal.
+Note `phase_flip_spill.py` today only ever touches the DRAFT model — that is
+a misimplementation of spec item 6, not a completed one.
+
+**(C) ACCEPTANCE:** pool >= 600000 in the FLIP setup with the 1024 MiB
+corridor held — 100 ms time series, bs=4, on a load-marked allocator — and
+both purity directions proven. Report added flip time honestly at the
+measured H2D bandwidths (6.4 / 13 / 13 GB/s). **No closure verdict without
+the (A) ledger showing where every byte went.**
