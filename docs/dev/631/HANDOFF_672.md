@@ -258,12 +258,43 @@ a rank-uniform, consensus-driven pressure driver with an
 gap versus item 15 is that these are **boundary/threshold** driven,
 while 15a demands the check sit **at the allocation**.
 
+### 5c. ITEM 15a/15b: `CorridorGuard` IS BUILT (not yet wired)
+
+`managers/corridor_guard.py`, 14 hermetic tests. A gate at the CALL SITE
+rather than a round-boundary observer:
+
+* arms on `free - want < floor` — against the allocation about to happen,
+  not the current reading. A guard that only reads current free passes
+  immediately before a breach, and that case is a test.
+* frees to `floor + delta` (15b). Freeing exactly to the floor guarantees
+  the next allocation spills again; the no-respill consequence is pinned.
+* spends providers **cheapest first** (the reclaim-ordering law).
+* **re-probes the driver after every provider** instead of trusting its
+  return value — a provider that hands bytes to torch's cache has freed
+  nothing NVML can see, and this chain has credited such a release before.
+* **refuses** when providers are exhausted. Allocating anyway would
+  launder a breach as a passed check.
+* 15c (kvso host-tier continuation) is expressed as the most EXPENSIVE
+  provider, not a special case, so it is reached last and still never
+  breaches.
+
+`draft_carrier_provider` adapts rung 2's carrier as the first provider.
+
+**Not wired into a production allocation site.** That wiring wants its
+own commit and its own metal supervision, and the obvious first target is
+named below.
+
 ## 6. NOT DONE
 
-* **The pressure controller (item 15).** This is the next build, and it
-  supersedes the pool ladder. Note the measured starting point: after
-  rung 2 every card binds in **TP**, so the controller's first real
-  payload is a TP-phase asset, not a PP one.
+* **Wiring `CorridorGuard` into the seam.** The measurement says where:
+  the tightest instant of the whole cycle is now the **seam** (1196 MiB,
+  +172 above the floor), and the seam's `commit_range` is the allocation
+  that has already killed this instance once. Register the draft carrier
+  and the GDN idle slots as providers, call `ensure_headroom` before the
+  commit, and route a refusal into the existing unanimous abandon.
+* **The rest of the pressure controller (item 15).** It supersedes the
+  pool ladder. Measured starting point: after rung 2 every card binds in
+  **TP**, so the first real payload is a TP-phase asset, not a PP one.
 * Remaining item-8 arms: DFLASH × graphs, PP-prefill-graphs, chunk A/B,
   5090 stage-imbalance A/B.
 * Threshold-purity arm (item 10) — note it is now REFUSED with depth>=2;
