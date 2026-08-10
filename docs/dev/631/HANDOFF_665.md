@@ -286,3 +286,62 @@ Ladder of what was measured, so nobody re-runs it:
 Against the 190000 successor 21 shipped, 470000 is **+147%**, and unlike
 their 500000 row it is measured under the concurrency the deployment
 actually runs at.
+
+## 11. THE GREEN RUN, NOT DONE — and the exact recipe, because it is now cheap
+
+I did not complete a >=60 minute green run. The one I started was at pool
+550000 and disqualified itself in eight minutes for the reason in §1.2; I
+converted it into the transient measurement rather than let it burn an hour
+proving a number I already knew was wrong.
+
+Everything needed is built. Run it exactly like this:
+
+```bash
+cd /spinning/wt-631-routea
+# 1. Boot. ONLY through the replay tool -- it reads the live process, so a
+#    server must be up first. Verify the achieved split from its output.
+/spinning/htsglang-gpu/.venv/bin/python scripts/seam_scaling_reboot.py 470000
+#    then confirm: pp_layer_ratio=[28,20,16], pp_stage_ratio=[14,10,8]
+
+# 2. Corridor time series at 100 ms, for the whole window plus slack.
+setsid bash scripts/corridor_sample.sh 4500 /spinning/evidence-631/s22/green2/corridor.csv &
+
+# 3. Load, all three kinds at once -- the acceptance claim is about the
+#    COMBINATION, and each alone hides something:
+setsid bash scripts/s20_soak.sh 3900 /spinning/evidence-631/s22/green2/soak 4 &
+setsid bash /spinning/evidence-631/s22/green/longprefill.sh &   # 4 x 111405 tokens
+#    plus REAL agent traffic: spawn qwen subagents on genuine read-only
+#    repo work. They must NOT carry a model override, or they bypass the
+#    instance under test.
+
+# 4. Verdict, one command, every axis:
+/spinning/htsglang-gpu/.venv/bin/python scripts/s22_green_verdict.py \
+    /spinning/evidence-631/s22/green2/corridor.csv
+
+# 5. Decode decomposition -- run it INSIDE the window, not after:
+/spinning/htsglang-gpu/.venv/bin/python scripts/s22_decode_probe.py \
+    --concurrency 4 --max-new 600 --rounds 3
+```
+
+Predicted at 470000: rank1 floor ~1363 (margin +339), rank0 and rank2 far
+above. If rank1 lands materially below that, the transient deepened past
+1790 and the pool must come down by `shortfall / 10.30` thousand tokens.
+
+**Do not reboot while agent traffic is live** — I lost time to exactly that
+constraint at the end of my session, and it is the right constraint.
+
+## 12. WHAT I WOULD DO NEXT, in order
+
+1. **The green run above.** Everything is built; it is an hour of waiting.
+2. **Spill rung 2 (draft weights)** on the VA-stable `KvVmmArena` carrier.
+   1925 MiB on the binding card against a 335 MiB shortfall at pool 600000,
+   and §6 shows it is the only lever that can reach the user's target now
+   that the layer knob is proven quantised. Highest value by a distance.
+3. **Decode decomposition** with `scripts/s22_decode_probe.py`. The bs=1
+   suspicion is already falsified (histogram `{1:15, 2:42, 3:90}`); the open
+   question is in-phase tok/s versus plain TP3, which is what the probe
+   separates.
+4. **Chunk A/B including the dynamic arm**, with the two traps in §8:
+   the discriminator is a chunk EXCEEDING `chunked_prefill_size` (a static
+   run already shows ~19 distinct sizes), and enabling the flag grows
+   `max_prefill_buffer_tokens` 2048 -> 16384, which lands on the corridor.
