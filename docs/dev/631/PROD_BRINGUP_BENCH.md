@@ -3315,3 +3315,95 @@ PAYLOAD leg, which means either row-blocking the EXCHANGE (needs a global
 round count — a rank-local one deadlocks and looks like a hang) or spill
 rung 2, the mechanism spec item 6 actually names. Rung 2 is written and
 dark exactly like this seam was; price `payload_mib` before trusting it.
+
+### 2j-b. THE LOADED RUNS: pool 500000 is a FUNCTION pass and a CAPACITY FAIL
+
+Two runs, same boot, same B=16, differing only in how hard the pool was
+driven. The second one is the answer to a question this chain has been
+unable to ask for four successors.
+
+| | occupancy | min free (0/1/2) | corridor | flips | abandons |
+|---|---|---|---|---|---|
+| run 1 | 198,828 = 39.8% | 1348 / 3484 / 1256 | **HELD** | 159 | 0 |
+| run 2 | **415,519 = 83.1%** | **1008 / 3062 / 972** | **BREACHED** | 234 | 0 |
+
+Floor is 1024 MiB. Run 2 broke it on BOTH 3080s, by 16 and 52 MiB.
+
+**So pool 500000 does not hold the corridor at real occupancy.** The
+inherited headline -- "pool 500000 RUNS, 0 corridor breaches" -- was
+taken at an occupancy the tool itself refuses for capacity claims, and
+it does not survive being driven to 83%. That is not a regression from
+the seam work; it is the first time this pool has been loaded properly.
+The occupancy driver only reached 83% after the SECOND occupancy trap
+was fixed (decode length, not just context length -- see the harness).
+
+**Zero abandons across 234 flips, and that is the point worth keeping.**
+The affordability gate never refused, yet the corridor still broke. The
+gate protects against OOM inside the seam; it does not protect the
+corridor floor. Those are different guarantees and this run separates
+them cleanly for the first time.
+
+**What row blocking was worth here, measured under load.** Staging at the
+last flip was 1953.85 / 1030.56 / 1087.91 MiB (the payload leg scales
+with the live set, so these dwarf the idle-flip numbers). The backing
+slack is pool-proportional, so B=16 versus B=1 is the same ~212 MiB per
+binding card as at idle. Without row blocking this run would have
+breached by roughly 264 MiB instead of 52. **The seam work did not save
+pool 500000, but it came within 52 MiB of doing so.**
+
+### HYPOTHESIS FOR THE BREACH, flagged as a hypothesis
+
+Probably NOT the staging. The corridor law notes NVML counts torch's
+cached-but-unused segments as USED, and that a prefill grows the caching
+allocator's reserve by ~19-26 MiB per 1000 prompt tokens per card. These
+streams prefill ~99k tokens each, which is ~2 GB of allocator growth per
+prefill per card. Spill rung 1 returns it, but only AT THE SEAM, so
+between seams it accumulates unbounded.
+
+If that is the mechanism, the answer is a more frequent reclaim rather
+than a smaller pool, and the fix is cheap. It is testable without a boot
+theory: sample the corridor against flip timestamps and see whether the
+minima sit just BEFORE seams (allocator growth) or AT them (staging).
+Do that before resizing anything.
+
+### 2j-c. THE HYPOTHESIS TESTED: the breach is NOT the seam
+
+`min_at_s` against the flip DONE timestamps settles it without another
+boot.
+
+| card | min free | breaches | minimum at | nearest flips |
+|---|---|---|---|---|
+| gpu0 | 1008 | 154 | 18:44:48 | 18:44:46, 18:44:47 (AT a seam) |
+| gpu1 | 3062 | 0 | 18:46:14 | between |
+| **gpu2** | **972** | **1473** | 18:48:12 | 18:48:00, 18:48:19 (**between**) |
+
+gpu2 is the binding card and it is not spiking at seams: **1473 of 7196
+samples = 20% of the run below the floor**, with its minimum sitting
+between flips. A seam is ~2 s of a ~13 s cycle, so a transient cannot
+produce 20%. This is SUSTAINED pressure, not the flip.
+
+Two consequences, and the first is the uncomfortable one:
+
+1. **Row blocking cannot fix this, and neither can any further seam
+   work.** The seam transient is real and worth its 212 MiB, but it is
+   not what breaks pool 500000 at 83% occupancy.
+2. The deficit on the binding card is **52 MiB**. Resident non-KV memory
+   is now the lever, and the largest identified item is the **draft CUDA
+   graphs at 0.12-0.30 GB per rank** -- between two and six times the
+   deficit.
+
+### THE NEXT EXPERIMENT, and it is one boot
+
+`--disable-draft-cuda-graph` (added this shift) + the 83% occupancy
+corridor run. That single boot potentially answers three open things at
+once:
+
+* **spec item 8** -- does NEXTN gain anything from draft graphs? If not,
+  the user's rule says remove them.
+* **pool 500000** -- does removing them recover the corridor outright?
+* **spec item 6** -- with no draft graphs there are no baked weight
+  addresses, so `resolve_spill_depth`'s refusal of rungs 2-3 dissolves
+  and the spill route to >=600000 opens.
+
+Run it before resizing the pool. Shrinking the pool would also "fix" the
+corridor and would spend capacity to buy back memory that may be free.
