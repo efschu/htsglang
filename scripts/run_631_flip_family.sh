@@ -48,6 +48,14 @@ FAMILY=(
     test/registered/unit/managers/test_phase_flip_staging_reserve_631.py
     test/registered/unit/managers/test_phase_flip_live_slots_no_pool_idx_631.py
     test/registered/unit/mem_cache/test_gdn_cap_flip_two_stacks_631.py
+    # Added by successor 25. The streaming file was NEVER collected by this
+    # runner despite holding the strongest peak-residency pins in the tree
+    # (TestMoverLiveSetIsBounded, TestStagingFormulaMatchesReality) -- the
+    # suite reported green while those assertions never executed. That is
+    # the third under-collection this header warns about, so it is fixed
+    # here rather than noted.
+    test/registered/unit/managers/test_phase_flip_mover_streaming_631.py
+    test/registered/unit/managers/test_kv_arena_span_ops_631.py
 )
 
 cd "$WT/test/registered/scheduler"

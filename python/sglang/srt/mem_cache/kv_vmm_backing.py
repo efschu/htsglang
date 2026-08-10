@@ -411,6 +411,175 @@ class KvVmmArena:
         )
         return released
 
+    # -- #631 arbitrary-extent backing, for the STREAMED seam ----------------
+    #
+    # commit_range/decommit_range are both PREFIX operations: one grows a
+    # contiguous watermark up from zero, the other drops the tail above a
+    # keep point. The flip's seam cannot be streamed with only those,
+    # because reading consumes from one end while writing fills the other:
+    # walking rows ascending lets the destination grow as a prefix but
+    # leaves the source owing a suffix it cannot release, and walking them
+    # descending does the mirror. Either way the two layouts peak at twice
+    # one layout. The source and destination row lists are index-aligned
+    # and both ascending, so the two directions are LOCKED and no
+    # scheduling choice escapes it -- the arena has to be able to back a
+    # range that does not start at zero.
+    #
+    # ROUNDING IS ASYMMETRIC ON PURPOSE. commit rounds OUTWARD so every
+    # byte asked for is covered; decommit rounds INWARD so a chunk that is
+    # only partly inside the range -- and therefore still holds live rows
+    # -- is never unmapped. Reversing either one produces a fault or
+    # silent KV corruption at a chunk boundary.
+
+    def _require_chunk(self, op: str) -> int:
+        if self._chunk is None:
+            raise RuntimeError(
+                f"KvVmmArena.{op} requires a commit chunk. Without "
+                f"commit_chunk_bytes the arena maps ONE monolithic extent "
+                f"per buffer, and cuMemUnmap only takes whole mappings, so "
+                f"an extent-range op could only release everything or "
+                f"nothing. Construct the pool with a commit chunk."
+            )
+        return self._chunk
+
+    def _extent_intervals(self, offset: int):
+        """Mapped [start, end) intervals at ``offset``, ascending."""
+        return sorted(
+            (rel, rel + size) for rel, size, _h in self._extents_by_offset.get(offset, [])
+        )
+
+    def _refresh_watermark(self, offset: int) -> None:
+        """``_committed_by_offset`` is the CONTIGUOUS-from-zero watermark.
+
+        Keeping it contiguous rather than "highest mapped byte" is what
+        lets the legacy prefix path stay correct while a span op has left
+        a hole: a watermark that counted a suffix would make
+        ``commit_range`` skip the gap below it and hand back a pool with
+        unbacked rows in the middle.
+        """
+        end = 0
+        for start, stop in self._extent_intervals(offset):
+            if start > end:
+                break
+            end = max(end, stop)
+        self._committed_by_offset[offset] = end
+
+    def commit_span(self, offset: int, lo_bytes: int, hi_bytes: int) -> int:
+        """Back ``[offset+lo, offset+hi)``, skipping chunks already mapped.
+
+        Returns the bytes newly committed. Idempotent: re-committing a
+        covered span allocates nothing, which is what keeps a streamed
+        seam from allocating once per row block.
+        """
+        if self._closed:
+            raise RuntimeError("KvVmmArena.commit_span after close")
+        chunk = self._require_chunk("commit_span")
+        if offset % self.granularity != 0:
+            raise ValueError(
+                f"commit_span offset {offset} not granularity-aligned "
+                f"({self.granularity})"
+            )
+        lo = max(int(lo_bytes), 0) // chunk * chunk
+        hi = align_up(max(int(hi_bytes), 0), chunk)
+        if hi <= lo:
+            return 0
+        if offset + hi > self.reserved:
+            raise RuntimeError(
+                f"commit_span [{offset + lo}, {offset + hi}) exceeds "
+                f"reservation {self.reserved}"
+            )
+        # Fill only the GAPS, computed from the real extent list rather
+        # than a watermark -- the boot page commit can leave a first
+        # extent smaller than a chunk, so chunk-aligned arithmetic alone
+        # would mis-detect coverage.
+        gaps = []
+        cursor = lo
+        for start, stop in self._extent_intervals(offset):
+            if stop <= lo or start >= hi:
+                continue
+            if start > cursor:
+                gaps.append((cursor, min(start, hi)))
+            cursor = max(cursor, stop)
+            if cursor >= hi:
+                break
+        if cursor < hi:
+            gaps.append((cursor, hi))
+
+        drv = _driver()
+        extents = self._extents_by_offset.setdefault(offset, [])
+        committed = 0
+        with torch.cuda.device(self.device_id):
+            for gap_lo, gap_hi in gaps:
+                pos = gap_lo
+                while pos < gap_hi:
+                    step = min(chunk, gap_hi - pos)
+                    addr = self.base + offset + pos
+                    handle = self._take_retained(step)
+                    reused = handle is not None
+                    if handle is None:
+                        handle = _mem_create_reclaiming(
+                            step, self._prop, reclaim=self.drop_retained
+                        )
+                    try:
+                        _check(drv.cuMemMap(addr, step, 0, handle, 0), "cuMemMap")
+                        _check(
+                            drv.cuMemSetAccess(addr, step, [self._access], 1),
+                            "cuMemSetAccess",
+                        )
+                    except Exception:
+                        unmap = drv.cuMemUnmap(addr, step)
+                        unmap = unmap[0] if isinstance(unmap, tuple) else unmap
+                        if reused:
+                            self._park_retained(step, handle)
+                        else:
+                            rel = drv.cuMemRelease(handle)
+                            rel = rel[0] if isinstance(rel, tuple) else rel
+                        self._refresh_watermark(offset)
+                        raise
+                    extents.append((pos, step, handle))
+                    self._range_backed += step
+                    committed += step
+                    pos += step
+        extents.sort()
+        self._refresh_watermark(offset)
+        return committed
+
+    def decommit_span(self, offset: int, lo_bytes: int, hi_bytes: int) -> int:
+        """Release every extent lying WHOLLY inside ``[lo, hi)``.
+
+        Returns the bytes released. Caller must hold an idle boundary for
+        the released rows; a defensive synchronize precedes the unmap.
+        """
+        if self._closed:
+            raise RuntimeError("KvVmmArena.decommit_span after close")
+        chunk = self._require_chunk("decommit_span")
+        lo = align_up(max(int(lo_bytes), 0), chunk)
+        hi = max(int(hi_bytes), 0) // chunk * chunk
+        extents = self._extents_by_offset.get(offset, [])
+        if not extents or hi <= lo:
+            return 0
+        drv = _driver()
+        kept = []
+        released = 0
+        with torch.cuda.device(self.device_id):
+            torch.cuda.synchronize()
+            for rel, size, handle in extents:
+                if rel >= lo and rel + size <= hi:
+                    _check(
+                        drv.cuMemUnmap(self.base + offset + rel, size), "cuMemUnmap"
+                    )
+                    if self._retain_handles:
+                        self._park_retained(size, handle)
+                    else:
+                        _check(drv.cuMemRelease(handle), "cuMemRelease")
+                    released += size
+                    self._range_backed -= size
+                else:
+                    kept.append((rel, size, handle))
+        self._extents_by_offset[offset] = kept
+        self._refresh_watermark(offset)
+        return released
+
     def _park_retained(self, size: int, handle) -> None:
         self._retained.setdefault(int(size), []).append(handle)
         self._retained_bytes += int(size)
