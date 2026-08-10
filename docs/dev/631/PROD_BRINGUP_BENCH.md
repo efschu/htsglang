@@ -1523,3 +1523,175 @@ remaining gate between this run and green.
 **Do not report this configuration as green.** Report it as: every
 measurable serving axis passed for 65 minutes, and the agent-backend axis
 is untested because no agent traffic arrived.
+
+---
+
+# SUCCESSOR 19
+
+## 1. The agent-traffic lane: the router was never the defect
+
+HANDOFF_661 §9 left the green criterion blocked on "real Qwen agent tasks
+through the router", with the symptom that dispatched agents ran correctly
+while the serving log gained zero request lines. The router was suspected.
+
+**The router is fine, and so is the server.** A direct probe through
+127.0.0.1:30099 with `model=Qwen3.6-27B` returned 200 and appeared in the
+serving log within the same second:
+
+    router  POST /v1/messages -> local (model=Qwen3.6-27B)
+    serving [01:08:13] "POST /v1/messages HTTP/1.1" 200 OK
+
+**The defect is in how the agent is dispatched.** The `qwen`,
+`local-model` and `local-model-think` agent definitions carry
+`model: Qwen3.6-27B` in their frontmatter, and the router routes on an
+exact match of that string (`router.py:380`, `model in app[LOCAL_MODELS]`).
+Passing an explicit `model:` argument to the Agent tool **overrides the
+frontmatter**, so the request goes out as `claude-*` and the router sends
+it upstream to Anthropic. Proven by a control pair, same task, same agent
+type, one minute apart:
+
+| dispatch | router verdict |
+|---|---|
+| `subagent_type: qwen`, no model argument | `-> local (model=Qwen3.6-27B)` x2 |
+| `subagent_type: qwen`, `model: haiku` | `-> upstream (model=claude-haiku-4-5-…)` x2 |
+
+The router's own counter confirms the lane had simply gone unused rather
+than broken: 14492 local routes lifetime, last one at 21:59Z — two hours
+*before* successor 18's run, i.e. no `Qwen3.6-27B` request was ever issued
+during that window.
+
+**The trap is that a standing instruction causes it.** The memory law
+`agent-modellwahl` says "model IMMER explizit, sonst Fable-Erbe" — always
+name the model explicitly. Applied to a `qwen` agent that rule silently
+defeats the agent's entire purpose. **For local-model agents, pass no
+`model` argument at all.**
+
+## 2. The KV byte model, validated at two pool sizes
+
+Per-rank KV bytes are governed by a single expression:
+
+    per-rank KV bytes = T x 32 KiB x max(layer_share_i, token_share_i)
+
+where `T` is the global `--max-total-tokens`, `layer_share_i` is that rank's
+share of the 64 layers in the **PP** layout, and `token_share_i` is its
+uneven-DCP token share in the **TP** layout. The `max` is there because both
+layouts' KV is backed by one arena sized `max(PP, TP)`, not `PP + TP`.
+
+32 KiB/token whole-model = 16 full-attention layers (`full_attention_interval
+4`) x 4 KV heads x 256 head_dim x 2 (K and V) at fp8_e4m3.
+
+Validated against two independent boots, exactly:
+
+| | predicted | measured |
+|---|---|---|
+| T=540000 PP rank0 K | 4.12 GiB | 4.12 GiB |
+| T=540000 PP rank1/2 K | 2.06 GiB | 2.06 GiB |
+| T=540000 TP rank0 | 204324 tok / 3.12 GiB | 204344 tok / 3.12 GiB |
+| T=460000 PP rank0 K | 3.51 GiB | 3.51 GiB |
+| T=380000 PP rank0 K | 2.90 GiB | 2.90 GiB |
+
+## 3. A 12.1 % capacity tax nobody had costed: layer share != token share
+
+The ship config runs `pp_layer_ratio [32,16,16]` (shares 0.500 / 0.250 /
+0.250) against token vector `28,26,20` (shares 0.378 / 0.351 / 0.270). The
+per-rank cost is the **max** of the two, so the rig pays
+
+    max = (0.500, 0.351, 0.270),  sum = 1.121
+
+i.e. **112.1 % of one whole KV cache** to store one KV cache. Cross-checked
+against the allocation: 460000 x 32 KiB x 1.121 = 15.74 GiB, and the three
+measured arenas sum to 7.02 + 4.93 + 3.79 = 15.74 GiB exactly.
+
+Aligning the two vectors drives the sum to 1.000 and returns that 12.1 %
+**for free, at boot, with no new machinery** — it is a flag change, not a
+feature. This is the one capacity lever in this chain that costs nothing to
+try.
+
+**But it is in direct tension with the PP compute balance.** `pp_layer_ratio`
+sets both the PP stage's compute share and its KV share. HANDOFF_661 §8
+records the 5090 drawing only ~250 of 400 W during PP prefill, which argues
+for giving it *more* layers; capacity argues for giving it *fewer*, because
+its layer share (0.500) exceeds its token share (0.378) and is therefore the
+term that binds. **The 5090 cannot simultaneously be the compute-heavy PP
+stage and the capacity-efficient one.** Naming that trade-off is the result;
+picking a point on it is a measurement that has not been made.
+
+## 4. >600k: the honest closure, with the full asset table
+
+Successor 18 closed this negative on the draft assets alone. The user's spec
+item 6 orders a different mechanic — spill everything cold of the *inactive
+layout* at the phase change, including the PP weight shards. That mechanic
+is **already implemented and already banked**:
+
+`weights_arena.py:2-8` and `phase_flip_boot.py:477-547` — both layouts'
+parameters live one at a time in ONE arena per rank sized
+`max(pp_bytes, tp_bytes)`, and a flip rewrites its contents from the other
+layout's **pinned host image** (`snapshot_and_free(..., pin=True)`). The
+inactive layout's weights are already in system RAM, at a cost of 59.75 GiB
+of pinned host memory already being paid.
+
+Measured arena sizes (`TP stack built` log line):
+
+| rank | PP layout | TP layout | arena = max | idle tail | tail freeable in |
+|---|---|---|---|---|---|
+| 0 (5090) | 14936 MiB | 13163 MiB | 14936 MiB | 1773 MiB | TP phase (binding) |
+| 1 (3080) | 6690 MiB | 7924 MiB | 7924 MiB | 1234 MiB | PP phase (wrong side) |
+| 2 (3080) | 9115 MiB | 7924 MiB | 9115 MiB | 1191 MiB | TP phase (binding) |
+
+So the residue the spec's mechanic could still reclaim is the arena's **idle
+tail**, not the shards themselves — and two of three ranks free it in the
+binding phase, which is better polarity than the draft-asset rung.
+
+**It still cannot fund >600k, for a reason that is structural rather than
+arithmetic: the KV pool is sized ONCE, at boot, from a one-shot free-memory
+reading, and every runtime grow path is closed.**
+
+* `_profile_available_bytes` (`model_runner_kv_cache_mixin.py:608-700`) takes
+  a single `mem_get_info` snapshot at pool-construction time; nothing
+  re-measures on the serving path.
+* `--max-total-tokens` is a `min()` cap only (`:4406-4427`) — it can lower
+  the profiled capacity, never raise it.
+* `post_capture_resize_kv_pool` is off by default, is shrink-only via
+  `cap_tokens`, and is excluded for the TP stack anyway.
+* `runtime_set_backing_tokens` is hard-bounded by the boot VA reservation.
+* `phase_flip_boot.py:636-650` refuses boot unless `tp_capacity >=
+  pp_capacity`, because one allocator serves both layouts for process life.
+
+**Therefore no runtime spill of any asset can add KV capacity.** Freed bytes
+become idle card slack. Chasing runtime spill for capacity is the wrong
+question, and this is the third handoff to arrive there; the right question
+is what pool the rig can BOOT with and still hold the corridor.
+
+`phase_flip_spill.py` is written but **not wired** — `grep` for
+`get_spill_ladder` finds only the module itself, and `phase_flip_spill_depth`
+is not a `ServerArgs` field. Its docstring describes call sites in
+`_cutover` step 7b that do not exist.
+
+## 5. 460000 is not corridor-legal under real agent traffic
+
+The number that matters, and it retires the inherited ship number.
+
+Successor 18 established 460000 on a synthetic soak with **no agent
+traffic** — and the user's green criterion *requires* agent traffic. Adding
+it breaks the corridor:
+
+    window 01:16:24Z, pool 460000, soak (2 decode streams + 12000-tok
+    prefill / 25 s) PLUS real qwen agent traffic through router 30099
+    1982 samples @ 100 ms
+      gpu0 (rank1, 3080) min  591 MiB
+      gpu1 (rank0, 5090) min  270 MiB
+      gpu2 (rank2, 3080) min  621 MiB
+    floor 1024 -> ALL THREE BREACH
+
+Not contamination: `nvidia-smi` showed only the three scheduler PIDs on the
+cards throughout.
+
+Two properties worth carrying:
+
+* **Free memory swings by GiB across a flip** (the KV backing
+  release/restore leg), so a corridor minimum is phase-dependent and a
+  reading is only meaningful with the phase it was taken in.
+* **A flat corridor reading can mean an idle server.** The first 90 s of this
+  window read a rock-steady 1393/1352/1447 — that was the soak spinning up,
+  not the corridor passing. A corridor sample taken before load arrives
+  proves nothing, and its flatness is the tell.
