@@ -2680,3 +2680,48 @@ The layer split and the token vector are INDEPENDENT knobs currently pinned
 proportional to one another. Decoupling them — more layers AND fewer tokens
 on the 5090 — is the lever that escapes the tax, needs no new code, and has
 never been tried.
+
+## 2d. Green-run row — 68 min, corridor HELD, 17 flips abandoned
+
+Pool 380000, `RANK_MIB 31800,14000,15600`, geometry `[28,20,16]`, purity
+strict, spill depth cache, NEXTN 3/1/4, `max_running_requests 4`.
+Flushed idle baseline 4209/7618/4101 (idx order rank1, rank0, rank2).
+Load history: 68 min of bs=4 soak + 4x111405-token prefill ladder +
+decode probe + three qwen agent lanes through the router, concurrently.
+
+| axis | value |
+|---|---|
+| corridor samples | 29740 over 68.1 min, 100 ms |
+| minimum, idx order | **1215 / 3542 / 1349** |
+| 1024 floor | HELD, worst margin **+191** |
+| surplus above floor | 3034 MiB (too loose — the other half of the law) |
+| flips | 834 (417 / 417) |
+| FLIP ABANDONED | **51 lines = 17 events x 3 ranks** |
+| tracebacks | 0 |
+| prefill batches / with graph | 10989 / **0** (PURE) |
+| purity refusals | 138 |
+| decode batches | 1011, accept len **2.54** |
+| decode `#running-req` | `{1:453, 2:270, 3:234, 4:54}` |
+| largest prefill chunk | 2048, chunks > 2048: **0** (STATIC) |
+| host `memory.peak` / `oom_kill` | 112.1 GiB / 9 (unchanged) |
+
+Comparison against 665's configuration under comparable load makes the
+trade explicit, and it is the finding of this row:
+
+| | pool 470000, RANK_MIB ...,16200,16650 | pool 380000, RANK_MIB ...,14000,15600 |
+|---|---|---|
+| corridor min (binding) | **381 — breached by 643** | **1215 — held, +191** |
+| FLIP ABANDONED | 0 | **17 events** |
+
+**The corridor breach and the flip abandon are the same event.** Commit
+`f4d8c1094e` chooses which one you get: it refuses a flip whose cache
+credit is not collectable instead of letting the allocator take the
+shortfall out of the user's reserve. The observed refusal —
+`staging 3156 MiB needed but only 3074 spendable (driver free 4098,
+allocator cache 246, reserve 1024)` — is short by 82 MiB, and the 246 MiB
+of cache is what SURVIVED an `empty_cache`, so it could not have served a
+3156 MiB contiguous buffer anyway.
+
+**The binding term is now the 3156 MiB staging demand, not the pool and
+not the geometry.** Both previous capacity levers are off the critical
+path until staging bytes come down or the binding card gains ~500 MiB.

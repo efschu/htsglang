@@ -269,11 +269,86 @@ load window.
 
 ---
 
-## 7. THE GREEN RUN
+## 7. THE GREEN RUN — 68 minutes, corridor HELD, but NOT green
 
-Status recorded in §7a below at the end of my session. The recipe in 665
-§11 is sound EXCEPT that its pool/budget numbers do not hold the
-corridor; use the configuration named in §7a.
+Configuration (two variables moved from 665's, recorded as such):
+`--max-total-tokens 380000`, `--rank-gpu-memory-mib 31800,14000,15600`,
+geometry UNCHANGED at `pp_stage_ratio [14,10,8] -> pp_layer_ratio
+[28,20,16]`, purity strict, policy auto, spill depth cache, CTX 393216,
+NEXTN 3/1/4, `max_running_requests 4`. Pool held at 380000, not clamped.
+
+Flushed idle baseline (new protocol), idx order (rank1, rank0, rank2):
+**4209 / 7618 / 4101** — against 3245/6302/3355 at 665's configuration.
+
+Load, all at once for 68 min: 100-ms corridor sampler, `s20_soak` at
+bs=4, the 4x111405-token long-prefill ladder, `s22_decode_probe`, and
+three qwen agent lanes through the router with NO model override.
+
+| axis | result |
+|---|---|
+| corridor samples | 29740 over **68.1 min** |
+| minimum, idx order | **1215 / 3542 / 1349** |
+| floor 1024 MiB | **HELD**, worst 1215, margin +191 |
+| surplus above floor | 3034 MiB — the OTHER half of the law, still too loose |
+| flips | **834** (417 pp_to_tp / 417 tp_to_pp) |
+| **FLIP ABANDONED** | **51 lines = 17 events x 3 ranks** |
+| tracebacks | 0 |
+| prefill batches | 10989, **0 with a CUDA graph** (PURE — PP only) |
+| purity refusals | 138 (`prefill cannot run in tp`, the gate acting) |
+| decode batches | 1011, all carrying accept len |
+| accept len | **2.54** mean over 1011 |
+| decode `#running-req` | `{1:453, 2:270, 3:234, 4:54}` — reaches bs=4 |
+| host RAM `memory.peak` | 112.1 GiB, `oom_kill` **9** (precedent unchanged) |
+
+**IT IS NOT GREEN, AND THE REASON IS MY OWN COMMIT.** The abandon count
+was **0** at the 34-minute midpoint and 51 at the end. The refusal reads:
+
+```
+staging 3156 MiB needed but only 3074 MiB is spendable
+(driver free 4098 MiB, allocator cache 246 MiB, reserve 1024 MiB kept free)
+```
+
+`4098 - 1024 = 3074` is exactly my new formula. The superseded formula
+would have added the 246 MiB cache credit, got 3320, and blessed it.
+
+**But the refusal is correct, and this is the important part.** That 246
+MiB is what SURVIVED an actual `empty_cache` — my code reclaims, re-probes,
+then logs — so it is genuinely stranded and could never have served a 3156
+MiB contiguous buffer. The old code would have gone to the driver for the
+82 MiB shortfall, straight into the user's reserve.
+
+**So the corridor breach and the flip abandon are THE SAME EVENT, and this
+commit chooses which one you get.** 665's run: corridor breached to 381,
+0 abandons. This run: corridor held at 1215, 17 abandons. Under the user's
+hard "never breach" law the trade is the right way round, but it is a real
+availability cost and must not be reported as a clean pass. 665 §9 said
+"the corridor and the staging bound have come apart"; this re-couples them
+deliberately.
+
+No livelock: the instance held `/health` 200 throughout, and flips
+continued at 417 each way after the abandons.
+
+**What is still needed for green.** The 3156 MiB staging demand against
+~4100 MiB of driver-free is the binding term now — not the pool, not the
+geometry. Either reduce staging bytes or buy the binding card ~500 MiB
+more headroom, then re-run this exact recipe.
+
+### 7b. Decode decomposition — INSTRUMENT FAILED, do not quote its duty cycle
+
+`s22_decode_probe.py --concurrency 4 --max-new 600 --rounds 3`, run
+INSIDE the window, completed: 12 requests ok / 0 failed, 7200 output
+tokens, 329.5 s wall, **21.9 aggregate tok/s**, per-request median 5.7
+(min 4.8, max 8.3).
+
+It also printed **"0.0 s inside TP (0% TP duty cycle)"** and therefore
+produced NO in-phase number. **That reading is false on its face** — 1011
+decode batches ran under strict purity, which forbids decode outside TP.
+The probe's TP-window detection is broken; fix it before trusting any
+in-phase figure. The open question (in-phase decode tok/s versus plain
+TP3) is therefore STILL unanswered after six successors.
+
+The one decode question that IS settled: **decode is not bs=1.** The
+histogram over 1011 batches is `{1:453, 2:270, 3:234, 4:54}`.
 
 ---
 
@@ -293,11 +368,68 @@ corridor; use the configuration named in §7a.
    --max-new 600 --rounds 3`, INSIDE a load window. Note decode logging is
    gated on `decode_log_interval` (default 40), so short generations
    produce zero decode evidence.
-5. **Prefill chunk A/B including the dynamic arm.** Still unmeasured. The
-   arm is free (665 §16, verified). Two traps: the discriminator is a
-   chunk EXCEEDING `chunked_prefill_size` (a static run already shows ~43
-   distinct sizes), and the FIRST chunk of every request always uses the
-   static size (`scheduler.py:5072`).
+5. **Prefill chunk A/B including the dynamic arm.** Still unmeasured, and
+   **665 §16's "the arm is free" is WRONG — see §10.**
+
+---
+
+## 10. CORRECTION to 665 §16: the dynamic-chunking arm is NOT free
+
+665 §16 withdrew its own VRAM objection to `--enable-dynamic-chunking`
+after verifying that `max_prefill_buffer_tokens()` has exactly one
+consumer (`eager_runner.py:114`) where the 16384 is dominated ~29x by
+`max_total_num_tokens`. That verification is correct and I reproduce it.
+
+**It checked the wrong quantity.** The number that varies at runtime is
+`chunked_prefill_size`, and that has TEN memory-sizing consumers, of
+which only `eager_runner.py:114` goes through the inflating accessor:
+
+| file:line | what it sizes |
+|---|---|
+| `flashinfer.py:122-123` | FlashInfer MoE workspace |
+| `gdn_backend.py:76` | GDN attention chunk |
+| `n_gram_embedding.py:85` | n-gram embedding buffer |
+| `indexer_topk.py:34` | indexer topk buffer |
+| `routed_experts.py:67` | routed-experts buffer |
+| `expert_distribution.py:391` | expert distribution (`x8`) |
+| `triton_symm_mem_ag.py:438` | Triton symmetric all-gather |
+| `mhc.py:580` | MHC prewarm buckets |
+| `kt_ep_wrapper.py:91` | KT EP config |
+
+`max_prefill_buffer_tokens()` (`server_args.py:14213-14226`) inflates to
+`ceil(chunked * 1.25)` under dynamic chunking; those nine read
+`server_args.chunked_prefill_size` RAW. And the runtime dynamic size CAN
+exceed the base — the quadratic solver at
+`scheduler_pp_mixin.py:2684-2702` produces values above `base_chunk_size`
+at low `history_len`, smoothed toward it with coefficient 0.75
+(`environ.py:586`). The boot profiler is more concrete still: it runs
+**128 real prefills** at up to `chunked_prefill_size * 1.25`
+(`scheduler_pp_mixin.py:1578-1584`) — 2560 tokens against buffers sized
+for 2048.
+
+**The error shape is 665's own, one level down.** 665 §16's lesson was
+"a quantity growing is not a cost; find the consumer first." They found
+the consumer of the quantity they were TOLD grew, and never grepped the
+quantity that actually varies. Before booting the arm, size those nine
+buffers at 1.25x or pin `chunked_prefill_size` so the inflation cannot
+exceed them.
+
+Engagement evidence, verified (`scheduler.py:1531` `pp_size > 1` gate,
+`:1542` self-disable):
+* success: `[PP Dynamic Chunk] [PP{rank}] Predictor ready (quadratic)`
+  (`scheduler_pp_mixin.py:1738`), `[ChunkSizePredictor] Fitted
+  coefficients:` (`:2627`)
+* failure: `[PP Dynamic Chunk] Failed to profile prefill latency:`
+  (`scheduler.py:1538`)
+* the per-chunk `Predicted chunk size:` line (`:1770`) is `logger.debug`
+  and will not appear at the default level.
+
+Confirmed: the FIRST chunk of every request always uses the static size
+(`scheduler.py:5072`, dynamic applied only when `chunked_req is not
+None`), so an A/B must use prompts long enough for later chunks to
+dominate. And a static run shows many distinct `#new-token:` values (117
+in my 68-min run) — the discriminator is a chunk EXCEEDING
+`chunked_prefill_size`, which my run confirms at **0**.
 
 ---
 
