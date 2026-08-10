@@ -465,6 +465,29 @@ can-fail arm does NOT move: `gemm_format` / `gemm_lanes` come off `resolved` at
 while the arithmetic ran on the wrong one -- that is what kept the defect alive.
 
 ## 3. Memory tiers / offload / spill
+- **Phase-flip spill ladder** (`--phase-flip-spill-depth`, #656 spec item 6,
+  `managers/phase_flip_spill.py`): what the INACTIVE phase's assets give back
+  at a PP<->TP cutover, as a selectable dial. Rung 1 `cache` returns the
+  outgoing phase's cached allocator segments to the driver (2.5-3.5 GiB/card
+  measured — NVML counts torch's cached-but-unused segments as USED, so the
+  corridor decays one step per longest-prefill-so-far without it). Rung 2
+  `draft` releases the draft model's weights for the whole PP phase, where
+  strict purity makes the drafter provably idle. **Rung 2's mechanism is the
+  reusable part**: the weights sit on a `KvVmmArena` reservation, so a spill
+  is `cuMemUnmap`+`cuMemRelease` behind a FIXED virtual address — pages go
+  back to the driver while every address a CUDA graph baked stands still.
+  That is why spilling and keeping draft graphs ON are compatible (#656 item
+  8 priced those graphs at 41% of decode). A boot-time pin AFTER graph
+  capture refuses the boot if any carried parameter escaped the reservation,
+  because that corruption has no runtime symptom. Rung 3 (`draft+graphs`) is
+  defined and REFUSED: a captured graph cannot be refilled from a host image,
+  only re-captured. **Measured caveat, do not re-derive it the hard way:** the
+  drafter's `embed_tokens`/`lm_head` are VIEWS into the target's weights
+  arena, so the spillable payload is what the drafter EXCLUSIVELY owns —
+  439 MiB (5090) / 285 MiB (3080) here, not the 1925 MiB its load delta
+  suggests. `allocate_carrier_tensor` is the injection point for further
+  payload classes (idle-slot GDN states, cold layout bytes, session KV) under
+  spec items 11-14; they are rungs of this ladder, not new machinery.
 - **KV-pool token-slot ledger** (`DESIGN_330_vram_dial.md` §3b, #486): every
   standing holder of `C_target` slots is a NAMED posten — committed KV, the
   per-decode reserve (`bs x get_alloc_reserve_per_decode()`, held under spec
