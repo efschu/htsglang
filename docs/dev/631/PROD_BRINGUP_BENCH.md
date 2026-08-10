@@ -3740,3 +3740,77 @@ chain three times).
 The corridor gain, the flip-duration cost, and the pool raise. Those
 need the depth=draft boot. Nothing in 2p.1 or 2p.2 is a capacity claim.
 
+
+### 2p.4 RUNG 2 RUNS ON METAL -- and it is worth about a sixth of its estimate
+
+Boot 21:06-21:08Z, `--phase-flip-spill-depth draft`, POLICY=auto, strict
+purity, MTP on, decode/verify AND draft graphs on, pool 500000, the same
+`--rank-gpu-memory-mib 31800,14000,15600` the measured instance used, so
+the depth is the only variable against section 2o's numbers.
+
+The whole chain executes:
+
+    carrier installed on device 0: 12 params, 439.1 MiB (PP0/5090)
+    carrier installed on device 0: 12 params, 285.5 MiB (PP1/3080)
+    carrier installed on device 0: 12 params, 285.5 MiB (PP2/3080)
+    carrier pin OK: all 12 draft parameters lie inside the VA-stable
+      reservation AFTER graph capture                     (all 3 ranks)
+    The server is fired up and ready to roll!
+    rung 2 SPILLED: 440.0 / 286.0 / 286.0 MiB of physical pages returned
+      to the driver; parameter addresses UNCHANGED
+    rung 2 RESTORED: re-committed behind the SAME addresses and refilled
+      from the pinned host image, checksum verified on device
+
+24 flips, 6 spills, 3 restores, **0 abandons**. A real request returned
+HTTP 200 in 4.17 s with coherent on-topic output -- i.e. the drafter
+produces valid tokens after its pages were released and re-committed,
+which is the functional evidence that the graphs address correct memory.
+N28's warning applies and was watched for: a boot that reaches READY is
+not a boot that works; this one was loaded before it was believed.
+
+**THE CORRECTION, and it is large.** Section 2o priced Direction A at
+**1925 MiB/rank**, taken from the boot's `Load weight end ... mem usage=`
+delta. That delta counts bytes the drafter does not own:
+
+    excluding 2 draft parameter(s) that VIEW a larger storage and are
+    therefore not the drafter's to release (1617.5 MiB kept resident).
+    Largest: model.embed_tokens.weight (809 MiB of a 13482 MiB storage),
+             lm_head.weight            (809 MiB of a 13482 MiB storage)
+
+Both are views into the TARGET model's weights arena. The drafter shares
+the embedding and the output head; releasing them would have freed pages
+the target still reads, during the phase where the target is the only
+thing running. The real exclusively-owned payload is:
+
+| rank | card | payload | vs the 1925 MiB estimate |
+|---|---|---|---|
+| PP0 | 5090 | **439.1 MiB** | -77% |
+| PP1 | 3080 | **285.5 MiB** | -85% |
+| PP2 | 3080 | **285.5 MiB** | -85% |
+
+**The binding cards are the two 3080s (section 2o: PP minima 896 and
+1210), so this rung is worth 285 MiB where it matters, not 1925.**
+
+What that does and does not buy, against section 2o's own arithmetic:
+
+* **It does close the pool-500000 corridor breach.** Card 0's PP minimum
+  was 896 MiB against the 1024 floor, a 128 MiB deficit. +285 MiB clears
+  it with room.
+* **It does NOT fund 600000.** That needed +1140 MiB in PP on the binding
+  rank. 285 MiB is a quarter of it. Section 2o's conclusion that "A+B
+  clears by 39 MiB" rested on the 1925 MiB figure and does not survive:
+  A is 285 MiB on the binding card, and B (the arena tail, 319/220/1191
+  MiB) pays the TP phase, not PP.
+
+This is the seventh capacity headline in this chain that did not
+survive contact -- and the first one that died BEFORE it was claimed,
+because the arena's V1-scope check refused the boot rather than letting
+a shared view be packed and spilled. **Do not price a spill from a
+memory-usage delta. Price it from the bytes the payload EXCLUSIVELY
+owns, and let the boot tell you which those are.**
+
+Where the remaining bytes have to come from is now a question for spec
+items 11-14 rather than for this rung: KV itself is a spill class, and
+the idle-slot GDN/mamba states at bs<4 are a far larger payload than the
+drafter ever was. The carrier's allocation hook exists so those reuse
+this mechanism instead of duplicating it.

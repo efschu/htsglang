@@ -71,7 +71,7 @@ the model layouts at boot. No new memory primitive is introduced.
 
 THE IMMUTABILITY ASSUMPTION, named out loud
 -------------------------------------------
-The host image is built ONCE, on the first spill, and re-used by every
+The host image is built ONCE, on the first spill, and reused by every
 later restore. That is only correct if nothing writes to the draft weights
 between a restore and the next spill -- true for inference, and exactly the
 assumption the boot images ``image_pp`` / ``image_tp`` already make (they
@@ -695,7 +695,7 @@ class VmmDraftWeightCarrier:
                 raise PhaseFlipSpillError(
                     f"{LOG_PREFIX} the draft weights CHANGED between restore "
                     f"and spill (checksum {live_sum} vs {self._baseline_sum}); "
-                    f"the re-used host image would silently revert them. The "
+                    f"the reused host image would silently revert them. The "
                     f"immutability assumption is falsified -- rebuild the "
                     f"image on every spill before trusting depth>=2."
                 )
