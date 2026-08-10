@@ -307,3 +307,53 @@ So the cheapest honest first step is `SGLANG_PP_BOUNDARY_STATS=N` for the
 wait side, and a paired `compute_ms` bracket around the forward call in the
 same loop is the small addition that would make the 5090's ~250/400 W
 observation decidable.
+
+---
+
+## 9. THE 65-MINUTE RUN: passed on every measurable axis, one gate unmet
+
+Window `23:54:16Z - 00:59:29Z` on the self-merge fix. Full table in
+PROD_BRINGUP_BENCH ("The 65-minute green run at 460000").
+
+    corridor 28069 samples   min free 1397 / 1354 / 1451 MiB   0 breaches
+    flips    1845 unmanned   924 pp_to_tp / 921 tp_to_pp
+    prefill  1096 records in PP, 0 in TP
+    decode   1377 records in TP, 0 in PP, 99.4 % on CUDA graphs
+    spec     mean accept len 2.90
+    requests 760 ok, 0 err     scheduler exceptions 0
+
+Auto flip + graphs + MTP speculation + the largest corridor-legal KV held
+**simultaneously** for 65 minutes, which is what spec item 2 asks for.
+
+### The gate that is still open, and it is not a serving defect
+
+Spec item 7 makes green conditional on the instance serving **real Qwen
+agent tasks through the router (30099)**. All 760 requests in this window
+were my synthetic soak on `127.0.0.1 /v1/completions`. I tried to supply
+real agent traffic from the operator session by dispatching local `qwen`
+agents; they ran and returned correct work, but **the serving log gained
+zero request lines while they ran**, and the entire boot log carries one
+`/v1/chat/completions`. `ANTHROPIC_BASE_URL` is set to
+`http://127.0.0.1:30099` and the router unit is up
+(`--local-model Qwen3.6-27B`), so the wiring looks right and the traffic
+still does not arrive.
+
+**So the local-agent lane does not currently reach this instance.** Until
+that is resolved the agent-backend axis cannot be tested from inside a
+strand session, no matter how healthy serving is. Next successor: settle
+this FIRST, because it gates the user's acceptance and nothing about the
+serving configuration will move it. Check whether the router forwards the
+`Qwen3.6-27B` alias to 30030 or to a different backend, and confirm with
+one request while watching the serving log.
+
+**Do not report the configuration as green.** Report it as: every
+measurable serving axis passed for 65 minutes unmanned, and the
+agent-backend axis is untested because no agent traffic arrived.
+
+### One number worth carrying
+
+The self-merge guard fired **494106 times** in 65 minutes. Every one of
+those calls would have doubled a batch on the previous commit. The
+configuration was not "occasionally unlucky" — it was standing on the
+defect continuously, which is why several shifts of this chain kept
+finding serving wedged.

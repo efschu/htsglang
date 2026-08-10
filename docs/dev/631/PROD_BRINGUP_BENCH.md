@@ -1475,3 +1475,51 @@ the configuration before judging the component.
 
 (If a seam OOM does return, `SGLANG_FLIP_SEAM_CHUNK_MIB` — successor 17's
 zero-allocation seam — is the targeted mitigation and is still default 0.)
+
+### The 65-minute green run at 460000 (successor 18, 2026-08-10)
+
+Boot `23:54:03Z` on commit `1ba907f1b5` (the self-merge fix), window
+`23:54:16Z - 00:59:29Z`, harness `scripts/green_criterion_631.sh`.
+
+    RANK_MIB 31800,17400,17450   MAX_TOTAL_TOKENS 460000   CTX 393216
+    POLICY=auto  PHASE_FLIP_PURITY=strict
+    PHASE_POLICY_PP_WINDOW_S=15   PHASE_POLICY_TP_DECODE_FLOOR_S=10
+
+| axis | result |
+|---|---|
+| corridor, 28069 samples @100 ms | min free **1397 / 1354 / 1451** MiB, **0 breaches** |
+| flips, unmanned | **1845** — 924 `pp_to_tp`, 921 `tp_to_pp` |
+| prefill records | **1096 in PP, 0 in TP** |
+| decode records | **1377 in TP, 0 in PP** |
+| CUDA graphs | **99.4 %** of decode records `cuda graph: True` |
+| speculation | mean accept len **2.90** |
+| requests | **760 ok, 0 err** |
+| scheduler exceptions | **0** |
+| purity verdict | exit 0 — PURITY HELD, both layouts used |
+
+All four axes the spec asks to hold SIMULTANEOUSLY — auto flip, CUDA
+graphs, MTP speculation, and the largest corridor-legal KV — held together
+for 65 minutes unmanned.
+
+**The self-merge guard fired 494106 times in the window.** That is not
+noise: it is the measure of how close this configuration was to the
+crash, since every one of those calls would have doubled a batch before
+`1ba907f1b5`.
+
+#### What this run does NOT establish
+
+The user's green criterion (spec item 7) requires the instance to serve
+**real Qwen agent tasks through the router on 30099**. Every one of the
+760 requests in this window was the synthetic soak driver on
+`127.0.0.1 /v1/completions`; the window log records **no** agent traffic.
+An attempt to supply it from the operator session by dispatching local
+`qwen` agents failed to reach this server at all — the agents completed
+their work correctly, but the serving log gained **zero** request lines,
+and the whole log carries exactly one `/v1/chat/completions` since boot.
+So the local-agent lane is not currently routed to this instance. That is
+a router/harness question, not a serving defect, and it is the single
+remaining gate between this run and green.
+
+**Do not report this configuration as green.** Report it as: every
+measurable serving axis passed for 65 minutes, and the agent-backend axis
+is untested because no agent traffic arrived.
