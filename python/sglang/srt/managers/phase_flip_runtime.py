@@ -67,6 +67,7 @@ from sglang.srt.managers.kv_reshard import (
     KvPoolView,
     _checksum,
     _encode,
+    _gather_block_rows,
 )
 
 logger = logging.getLogger(__name__)
@@ -2973,24 +2974,62 @@ class PhaseFlipRuntime:
                 max((src.row_nbytes(i) for i in range(src.num_layers)), default=0),
                 max((dst.row_nbytes(i) for i in range(dst.num_layers)), default=0),
             )
-        one_layer_window = widest_rows * widest_layer_nbytes
-        # THE WAVE-BOUNDARY SLACK, and it is a constant, not a scaling term.
-        # A wave's releases pay for its commits only when each rank
-        # contributes an exactly proportional slice of its own block, and
-        # integer layer counts cannot always be split that way (exact only
-        # when the wave count divides every stage's layer count -- 4 on
-        # this rig's [28, 20, 16]). The floors leave at most ONE layer of
-        # drift between released and committed span at a boundary, so the
-        # peak carries one layer's full POOL span -- not one layer of the
-        # live set. It does not grow with the request, which is the whole
-        # property being bought here; it is charged so the gate cannot be
-        # surprised by it.
-        backing_slack = 0
-        if widest_rows and len(waves) > 1 and self._seam_backing_is_swappable():
-            backing_slack = widest_layer_nbytes * max(src.num_rows, dst.num_rows)
+        # Bounded by the gather block: KvPoolView reads and writes rows in
+        # blocks, so the per-layer transient is a fixed window rather than
+        # one layer of the whole live set.
+        one_layer_window = min(widest_rows, _gather_block_rows()) * widest_layer_nbytes
+        # THE WAVE-BOUNDARY SLACK, computed from the actual wave plan.
+        backing_slack = self._backing_slack_bytes(direction, src, dst, waves)
         return int(
             incoming + max(outgoing, local) + one_layer_window + backing_slack
         )
+
+    def _backing_slack_bytes(self, direction: str, src, dst, waves) -> int:
+        """Residency the WAVE BOUNDARIES carry on top of the resting layout.
+
+        A wave releases the source layout's pages for its own layers and
+        then commits the destination's, and ``layer_waves`` sizes those to
+        cancel. They cancel EXACTLY only when the wave count divides every
+        stage's layer count; integer floors otherwise leave a drift, and
+        while that drift is bounded by roughly one layer it is real device
+        memory at the peak and the gate owns it.
+
+        Charging a flat "one layer of the bigger pool" was the first
+        version and it over-reserved by 3x on the rig ([7, 5, 4] over 16
+        full-attention layers: 778 MiB charged against a true worst
+        boundary of 242 MiB). Over-reserving is not the safe direction
+        here -- the gate's only action is to refuse, and a refusal does
+        not drain the resident set it refused on, so invented headroom
+        moves the livelock to a smaller request rather than preventing
+        one. So walk the plan and take the worst boundary, which is both
+        exact and cheap.
+        """
+        if len(waves) <= 1 or not self._seam_backing_is_swappable():
+            return 0
+        if src is None or dst is None:
+            return 0
+        src_span = (
+            max((src.row_nbytes(i) for i in range(src.num_layers)), default=0)
+            * src.num_rows
+        )
+        dst_span = (
+            max((dst.row_nbytes(i) for i in range(dst.num_layers)), default=0)
+            * dst.num_rows
+        )
+        mine = set(self._map[self._rank])
+        released = committed = worst = 0
+        for wave in waves:
+            layers = [] if wave is None else list(wave)
+            if direction == PP_TO_TP:
+                # I release the wave's layers I own in PP; I commit all of
+                # them in TP, where every ordinal lives on every rank.
+                n_rel, n_com = len([f for f in layers if f in mine]), len(layers)
+            else:
+                n_rel, n_com = len(layers), len([f for f in layers if f in mine])
+            released += n_rel * src_span
+            committed += n_com * dst_span
+            worst = max(worst, committed - released)
+        return max(0, worst)
 
     def _reclaim_cached_blocks(self) -> None:
         """Hand the allocator's unused blocks back to the driver.

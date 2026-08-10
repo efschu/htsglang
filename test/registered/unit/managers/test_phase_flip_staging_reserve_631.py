@@ -358,7 +358,7 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
     PEER0_ROWS = LIVE_ROWS * 14 // 32
     PEER2_ROWS = LIVE_ROWS * 8 // 32
     #: Calibrated so the unwaved peak is the 3855 MiB seen on metal.
-    ROW_NBYTES = 536
+    ROW_NBYTES = 543
     POOL_ROWS = 380000
     #: What the gate reported as spendable in the wedged state.
     SPENDABLE_MIB = 3102

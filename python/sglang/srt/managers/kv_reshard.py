@@ -52,6 +52,7 @@ metadata is rebuilt host-side per replay from the refreshed backend bounds).
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -72,6 +73,24 @@ _MIN_FIELDS = ("armed", "ready")
 _EQ_FIELDS = ("epoch",)
 
 _CHECKSUM_BYTES = 8
+
+#: Rows gathered/scattered per step inside :class:`KvPoolView` (#631). The
+#: indexed read ``k[rows]`` and the strided ``.contiguous()`` on the write
+#: side both materialise their result before it is placed, so an unblocked
+#: call holds a transient proportional to the resident sequence. Blocking
+#: bounds it; the bytes produced are identical either way. Large enough
+#: that the per-block launch overhead is noise against a 2 KiB row.
+DEFAULT_GATHER_BLOCK_ROWS = 16384
+
+
+def _gather_block_rows() -> int:
+    raw = os.environ.get("SGLANG_FLIP_GATHER_ROWS", "").strip()
+    if not raw:
+        return DEFAULT_GATHER_BLOCK_ROWS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_GATHER_BLOCK_ROWS
 
 
 def _encode(values: Sequence[int]) -> List[int]:
@@ -221,8 +240,20 @@ class KvPoolView:
         if n == 0:
             return
         idx = rows.to(k.device)
-        out[:, :k_bytes] = self._as_bytes(k[idx], k_bytes)
-        out[:, k_bytes:] = self._as_bytes(v[idx], expect - k_bytes)
+        # THE GATHER IS BLOCKED OVER ROWS. ``k[idx]`` materialises a fresh
+        # tensor of the indexed rows before it is copied into ``out``, so
+        # an unblocked gather holds one layer's K (then V) for the WHOLE
+        # row list -- a transient proportional to the resident sequence,
+        # which is the same shape of term the waved seam exists to remove
+        # (#631). Blocking bounds it to ``FLIP_GATHER_ROWS`` rows without
+        # changing a single output byte: the destination slices are
+        # disjoint and written in ascending order either way.
+        block = _gather_block_rows()
+        for lo in range(0, n, block):
+            hi = min(lo + block, n)
+            sub = idx[lo:hi]
+            out[lo:hi, :k_bytes] = self._as_bytes(k[sub], k_bytes)
+            out[lo:hi, k_bytes:] = self._as_bytes(v[sub], expect - k_bytes)
 
     def read_rows(self, layer: int, rows: torch.Tensor) -> torch.Tensor:
         """``[n, row_nbytes]`` uint8 tensor of layer ``layer``'s rows, on the
@@ -256,10 +287,19 @@ class KvPoolView:
                 f"layer {layer}"
             )
         idx = rows.to(k.device)
-        k_part = data[:, :k_bytes].contiguous().to(k.device)
-        v_part = data[:, k_bytes:].contiguous().to(v.device)
-        k[idx] = k_part.view(k.dtype).view((n,) + tuple(k.shape[1:]))
-        v[idx] = v_part.view(v.dtype).view((n,) + tuple(v.shape[1:]))
+        # Blocked for the same reason as the gather: ``.contiguous()`` on a
+        # strided half of the payload materialises that half in full, so an
+        # unblocked scatter holds a live-set-sized transient at the widest
+        # point of the move.
+        block = _gather_block_rows()
+        for lo in range(0, n, block):
+            hi = min(lo + block, n)
+            m = hi - lo
+            sub = idx[lo:hi]
+            k_part = data[lo:hi, :k_bytes].contiguous().to(k.device)
+            v_part = data[lo:hi, k_bytes:].contiguous().to(v.device)
+            k[sub] = k_part.view(k.dtype).view((m,) + tuple(k.shape[1:]))
+            v[sub] = v_part.view(v.dtype).view((m,) + tuple(v.shape[1:]))
 
 
 def _checksum(payload: torch.Tensor) -> torch.Tensor:
