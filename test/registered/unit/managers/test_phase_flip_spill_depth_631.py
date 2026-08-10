@@ -108,7 +108,10 @@ class ResolveSpillDepthTest(unittest.TestCase):
     def test_unimplemented_rung_is_refused_not_clamped(self):
         # The refusal is the feature: a clamp would make a sweep of rungs 2
         # and 3 report a difference of zero and look like a measurement.
-        for depth in ("draft+graphs", 3):
+        # Rung 3 is the ARENA TAIL now and it IS wired (#656 successor 30);
+        # the refused rung is 4, the draft CUDA graphs, which cannot be
+        # refilled from a host image and must be re-captured.
+        for depth in ("draft+graphs", 4):
             with self.assertRaises(spill.PhaseFlipSpillError) as cm:
                 spill.resolve_spill_depth(_Args(depth))
             self.assertIn("not wired", str(cm.exception))
@@ -121,7 +124,9 @@ class ResolveSpillDepthTest(unittest.TestCase):
 
     def test_implemented_depth_does_not_silently_exceed_the_ladder(self):
         self.assertLessEqual(spill.IMPLEMENTED_DEPTH, spill.MAX_DEPTH)
-        self.assertEqual(spill.IMPLEMENTED_DEPTH, spill.DEPTH_DRAFT_WEIGHTS)
+        self.assertEqual(spill.IMPLEMENTED_DEPTH, spill.DEPTH_ARENA_TAIL)
+        # "draft" must keep meaning 2: recorded evidence uses the integers.
+        self.assertEqual(spill.DEPTH_DRAFT_WEIGHTS, 2)
 
 
 class ReleaseAllocatorCacheTest(unittest.TestCase):

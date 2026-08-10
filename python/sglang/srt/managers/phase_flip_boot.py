@@ -328,6 +328,10 @@ class PhaseFlipStacks:
     #: swapped into the scheduler at cutover (#631); it never participates
     #: in the PP phase.
     draft_worker: object = None
+    #: RUNG 3 carrier when --phase-flip-spill-depth >= arena, else None. Holds
+    #: the weights arena on a VA-stable reservation so the tail can be handed
+    #: back to the driver in the phase whose layout does not reach it.
+    arena_carrier: object = None
 
     def refill(self, direction: str) -> None:
         """The weights leg of a flip: one contiguous H2D refill of the
@@ -348,7 +352,31 @@ class PhaseFlipStacks:
                 self.image_tp,
                 restore=(self.layout_pp, self.image_pp),
             )
+            # RUNG 3, AFTER the refill and not before: the restore= arm above
+            # rewrites the PP layout on a checksum mismatch, and the PP layout
+            # reaches into the tail. Releasing first would fault that recovery
+            # path on unbacked memory.
+            if self.arena_carrier is not None:
+                released = self.arena_carrier.set_active_prefix(
+                    self.layout_tp.total_bytes
+                )
+                if released:
+                    logger.info(
+                        "%s rung 3 released %.1f MiB of weights-arena tail to "
+                        "the driver (TP layout needs %.1f of %.1f MiB); "
+                        "arena address unchanged",
+                        LOG_PREFIX,
+                        released,
+                        self.layout_tp.total_bytes / 1048576.0,
+                        self.arena.numel() / 1048576.0,
+                    )
         elif direction == TP_TO_PP:
+            # BEFORE the refill: the refill writes the PP layout, which reaches
+            # into the tail. This commit is an allocation inside the no-return
+            # region -- it is priced into the affordability verdict by
+            # PhaseFlipRuntime._arena_tail_bytes before the flip commits.
+            if self.arena_carrier is not None:
+                self.arena_carrier.set_active_prefix(self.layout_pp.total_bytes)
             arena_refill(
                 self.arena,
                 self.layout_pp,
@@ -541,10 +569,30 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             image_tp = snapshot_and_free(tp_named, layout_tp, pin=True)
             if device == "cuda":
                 torch.cuda.empty_cache()
-            arena = allocate_arena(
-                max(layout_pp.total_bytes, layout_tp.total_bytes),
-                tp_worker.model_runner.device,
+            arena_total = max(layout_pp.total_bytes, layout_tp.total_bytes)
+            # RUNG 3: put the arena on a VA-stable reservation so its tail can
+            # be released in the phase that does not reach it. Opt-in, so the
+            # default path allocates exactly as it always did.
+            from sglang.srt.managers.phase_flip_spill import (
+                DEPTH_ARENA_TAIL,
+                VmmWeightsArenaCarrier,
+                resolve_spill_depth,
             )
+
+            arena_carrier = None
+            if (
+                resolve_spill_depth(getattr(scheduler, "server_args", None))
+                >= DEPTH_ARENA_TAIL
+                and device == "cuda"
+            ):
+                arena_carrier = VmmWeightsArenaCarrier(
+                    int(tp_worker.model_runner.gpu_id), arena_total
+                )
+                arena = arena_carrier.tensor
+            else:
+                arena = allocate_arena(
+                    arena_total, tp_worker.model_runner.device
+                )
             # Pure rebind, then one contiguous refill from the host image;
             # arena_refill verifies the checksum on the arena's device
             # after the copy.
@@ -856,4 +904,5 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         vector=tuple(vec),
         token_vector=tuple(tok_vec),
         draft_worker=draft_worker,
+        arena_carrier=arena_carrier,
     )

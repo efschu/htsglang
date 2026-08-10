@@ -3277,7 +3277,47 @@ class PhaseFlipRuntime:
         wave_peak = incoming + max(outgoing, local) + one_layer_window + backing_slack
         # THE SPILLED DRAFTER'S RESTORE (#656 rung 2), priced HERE and not at
         # the site that performs it. See _draft_restore_bytes.
-        return int(max(wave_peak, self._draft_restore_bytes(direction)))
+        return int(
+            max(
+                wave_peak,
+                self._draft_restore_bytes(direction),
+                self._arena_tail_bytes(direction),
+            )
+        )
+
+    def _arena_tail_bytes(self, direction: str) -> int:
+        """Device bytes the tp->pp leg must commit for the weights-arena tail.
+
+        RUNG 3's mirror of ``_draft_restore_bytes``, and it is here for the
+        same reason: the commit happens inside ``PhaseFlipStacks.refill``,
+        which runs at the pre-cutover seam -- past the point of no return. A
+        failure there cannot be unwound.
+
+        Note the DIRECTION IS THE OPPOSITE ONE. The drafter is re-committed on
+        pp->tp; the arena tail is re-committed on tp->pp, because PP is the
+        larger layout on every rank of this rig. A gate that priced both on the
+        same leg would leave one of them unpriced, which is the whole failure
+        mode being guarded against.
+
+        max(), not sum(), at the call site: the two peaks belong to different
+        legs and cannot coexist.
+        """
+        from sglang.srt.layers.dcp.phase_flip_plan import TP_TO_PP
+
+        if direction != TP_TO_PP:
+            return 0
+        scheduler = self._census_scheduler
+        stacks = getattr(scheduler, "phase_flip_stacks", None) if scheduler else None
+        carrier = getattr(stacks, "arena_carrier", None) if stacks else None
+        if carrier is None:
+            return 0
+        try:
+            return int(carrier.pending_tail_bytes(stacks.layout_pp.total_bytes))
+        except Exception:
+            # An unreadable carrier must not take the flip down here; the
+            # commit itself will still be attempted and the gate simply had
+            # nothing to add.
+            return 0
 
     def _draft_restore_bytes(self, direction: str) -> int:
         """Device bytes the pp->tp leg must be able to commit for the drafter.

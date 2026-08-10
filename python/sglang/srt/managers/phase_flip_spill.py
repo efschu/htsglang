@@ -159,7 +159,13 @@ LOG_PREFIX = "PHASE-FLIP-SPILL"
 DEPTH_NONE = 0
 DEPTH_ALLOCATOR_CACHE = 1
 DEPTH_DRAFT_WEIGHTS = 2
-DEPTH_DRAFT_GRAPHS = 3
+# RUNG 3 (#656 successor 30): the weights arena's tail, idle in whichever
+# phase has the smaller layout -- TP on all three ranks of this rig, which is
+# also the phase that binds after rung 2. Inserted BELOW draft+graphs rather
+# than renumbering "draft", so the integer form keeps its meaning in every
+# piece of evidence recorded so far.
+DEPTH_ARENA_TAIL = 3
+DEPTH_DRAFT_GRAPHS = 4
 MAX_DEPTH = DEPTH_DRAFT_GRAPHS
 
 #: Spelling accepted by the CLI and the environment, in ladder order. The
@@ -168,6 +174,7 @@ DEPTH_NAMES = {
     "none": DEPTH_NONE,
     "cache": DEPTH_ALLOCATOR_CACHE,
     "draft": DEPTH_DRAFT_WEIGHTS,
+    "arena": DEPTH_ARENA_TAIL,
     "draft+graphs": DEPTH_DRAFT_GRAPHS,
 }
 
@@ -189,7 +196,7 @@ DEPTH_NAMES = {
 # now answered AGAINST removing those graphs, so rung 3 buys a phase-local
 # spill of something the next TP phase must re-capture, which is a
 # different and much worse trade than rung 2.
-IMPLEMENTED_DEPTH = DEPTH_DRAFT_WEIGHTS
+IMPLEMENTED_DEPTH = DEPTH_ARENA_TAIL
 
 #: Where the boot parks the carrier on the draft worker. An attribute on the
 #: worker rather than an entry on the scheduler because BOTH flip hooks
@@ -816,6 +823,137 @@ def install_draft_weight_carrier(
     carrier = VmmDraftWeightCarrier(model, device_index, arena=arena)
     setattr(draft_worker, CARRIER_ATTR, carrier)
     return carrier
+
+
+class VmmWeightsArenaCarrier:
+    """RUNG 3: the WEIGHTS arena's tail, physically absent in the phase whose
+    layout does not need it.
+
+    THE BYTES. The weights arena is one flat allocation sized
+    ``max(layout_pp.total_bytes, layout_tp.total_bytes)`` because both layouts
+    bind views into it and only one is live at a time. Each layout occupies a
+    PREFIX ``[0, layout.total_bytes)``, so in the phase with the smaller
+    layout the span above it is committed and addressable by nothing.
+    Measured on the 2026-08-10 boot:
+
+        rank  arena/pp     tp          tail
+        PP0   13482.18     13163.45     318.7 MiB
+        PP1    8144.00      7923.95     220.1 MiB
+        PP2    9114.95      7923.95    1191.0 MiB
+
+    ``pp`` is the max on every rank, so the tail is idle in **TP** -- which is
+    the phase that binds on all three cards after rung 2 moved the binding
+    phase there. That is what makes this rung well-aimed where the drafter no
+    longer is.
+
+    WHY IT IS THE CHEAPEST PROVIDER IN THE SYSTEM. There is no host round
+    trip. The tail holds no live bytes in the phase it is released in, and the
+    content of the whole arena is rewritten by ``arena_refill`` on the way
+    back regardless -- a refill that already runs on every flip. So the spill
+    is a ``decommit_range`` and the restore is a ``commit_range``, with no
+    copy on either side. Compare the drafter, which must stage a pinned host
+    image both ways.
+
+    ORDERING IS LOAD-BEARING IN BOTH DIRECTIONS, and getting it backwards is
+    silent corruption rather than a crash:
+
+    * ``PP_TO_TP``: refill FIRST, release after. ``arena_refill``'s
+      ``restore=`` arm rewrites the PP layout on a checksum mismatch, and the
+      PP layout extends into the tail. Releasing first would make that
+      recovery path fault on unbacked memory.
+    * ``TP_TO_PP``: commit FIRST, refill after. The refill writes the PP
+      layout, which reaches into the tail.
+
+    AND THE COMMIT MUST BE PRICED. The ``TP_TO_PP`` commit is an allocation
+    inside the flip's no-return region -- precisely the kind that killed this
+    instance on 2026-08-09. ``pending_tail_bytes`` exists so the affordability
+    verdict can fold it in before the flip commits, exactly as
+    ``pending_restore_bytes`` does for the drafter.
+    """
+
+    def __init__(self, device_index: int, total_bytes: int, arena: Any = None):
+        self._device_index = int(device_index)
+        self._nbytes = int(total_bytes)
+        self._committed = self._nbytes
+        self._released_mib = 0.0
+
+        if arena is None:
+            from sglang.srt.mem_cache.kv_vmm_backing import KvVmmArena, align_up
+
+            probe_gran = _probe_granularity(self._device_index)
+            reserve = align_up(self._nbytes, probe_gran) + CARRIER_VA_SLACK
+            arena = KvVmmArena(
+                self._device_index,
+                reserve_bytes=reserve,
+                commit_chunk_bytes=CARRIER_COMMIT_CHUNK,
+                # Same reason as the drafter's: retention parks the handles
+                # instead of returning them, which makes the release worth
+                # exactly 0 MiB of corridor.
+                retain_handles=False,
+            )
+        self._arena = arena
+
+        self._tensor = allocate_carrier_tensor(
+            self._arena, self._nbytes, self._device_index
+        )
+        self._offset = int(self._tensor.data_ptr()) - int(self._arena.base)
+        if self._offset < 0 or self._offset % self._arena.granularity != 0:
+            raise PhaseFlipSpillError(
+                f"{LOG_PREFIX} weights arena landed at offset {self._offset}, "
+                f"which is negative or not aligned to the arena granularity "
+                f"{self._arena.granularity}; commit_range would refuse it"
+            )
+        # Fully backed at construction: the boot packs the PP layout, which is
+        # the larger one, and every caller downstream expects a normal arena.
+        self._arena.commit_range(self._offset, self._nbytes)
+        logger.info(
+            "%s weights arena on a VA-stable reservation at 0x%x+0x%x: "
+            "%.1f MiB, fully committed for the boot layout",
+            LOG_PREFIX,
+            int(self._arena.base),
+            self._offset,
+            self._nbytes / _MIB,
+        )
+
+    @property
+    def tensor(self):
+        """The flat uint8 arena. Its address never moves."""
+        return self._tensor
+
+    @property
+    def committed_bytes(self) -> int:
+        return self._committed
+
+    def pending_tail_bytes(self, active_bytes: int) -> int:
+        """Bytes a commit to ``active_bytes`` would have to ask the driver for.
+
+        Zero when the tail is already backed. Read by the affordability gate
+        BEFORE the flip commits, because this allocation happens where a
+        failure cannot be unwound.
+        """
+        want = int(active_bytes)
+        return max(0, min(want, self._nbytes) - self._committed)
+
+    def set_active_prefix(self, active_bytes: int) -> float:
+        """Back exactly ``[0, active_bytes)`` and release the rest.
+
+        Returns MiB RELEASED (0.0 when this call committed instead). The
+        release is extent-granular, so the driver may keep less than one
+        commit chunk more than asked -- ``committed_bytes`` stays truthful.
+        """
+        want = max(0, min(int(active_bytes), self._nbytes))
+        if want > self._committed:
+            self._arena.commit_range(self._offset, want)
+            self._committed = want
+            return 0.0
+        if want < self._committed:
+            released = int(self._arena.decommit_range(self._offset, want))
+            self._committed = int(
+                self._arena.committed_bytes(self._offset)
+            )
+            self._released_mib = released / _MIB
+            return released / _MIB
+        return 0.0
 
 
 class PhaseFlipSpillLadder:

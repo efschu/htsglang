@@ -3925,3 +3925,37 @@ trip. This is the next rung.
   layers, not four. Economics unchanged: ~308 MiB of corridor destroyed per
   layer moved onto the 5090. The untried lever is decoupling the layer split
   from the token vector, which needs no code.
+
+### s30 rung 3 — the weights-arena tail (depth=arena), metal
+
+Boot logs the release on every rank, addresses unchanged:
+
+    rung 3 released 1180.0 MiB of weights-arena tail (TP needs 7923.9 of 9115.0)
+    rung 3 released  300.0 MiB                        (TP needs 13163.5 of 13482.2)
+    rung 3 released  210.0 MiB                        (TP needs 7923.9 of 8144.0)
+
+Slightly under the theoretical 1191 / 318.7 / 220.1 because release is
+extent-granular; `committed_bytes` stays truthful.
+
+Loaded run, 12 min, 4 streams, ctx 150k, pool 500000, floor 1024, POLICY=auto,
+strict purity, MTP + graphs on. **57 release/restore cycles**, 0 abandons,
+health 200.
+
+| depth | min free 0/1/2 | breaches | spread mean | peak live slots |
+|---|---|---|---|---|
+| draft (baseline) | 1720 / 3768 / 1960 | 0 | 2901 | 199453 |
+| **arena** | **2036 / 3856 / 2312** | 0 | 2895 | 199455 |
+| delta | **+316 / +88 / +352** | — | −6 | matched |
+
+Occupancy is matched to within 2 slots, so the rows compare directly. Both are
+40% occupancy and neither is capacity evidence.
+
+The gain is smaller than the bytes released because the tail is idle only in
+TP, so once it is handed back the time-series minimum starts being set by the
+PP phase instead — the same "the binding phase moves" dynamic HANDOFF_672
+recorded for rung 2. The next payload should be priced against whichever phase
+binds AFTER this rung, not before it.
+
+Item 16 is untouched by this rung: spread 2895 vs 2901 MiB. Releasing bytes on
+every card in the same phase does not level anything. Levelling needs the
+rebalance tier, not another payload.
