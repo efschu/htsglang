@@ -6,6 +6,21 @@ claims and prices the route honestly.
 
 ---
 
+## 0a. THE RESULT, IN ONE LINE
+
+**Pool 500,000 now runs with the corridor held and nothing abandoned** —
+65,000 tokens above the old seam's confirmed ~435,000 ceiling — and the
+2.1b ceiling is measured at **~501,000** by two independent metal
+extrapolations that agree to 0.3%. The user's 600,000 floor is NOT
+reached and is not reachable by this design; section 2.1 is written
+(shipped dark) and is the route to it.
+
+| | pool | corridor min (binding) | flips | abandons | verdict |
+|---|---|---|---|---|---|
+| old seam ceiling | ~435,000 | — | — | — | confirmed by 4 methods |
+| 2.1b step | 430,000 | 2763 MiB | 72 | 0 | PASS |
+| **2.1b step** | **500,000** | **1663 MiB** | **78** | **0** | **PASS** |
+
 ## 0. THE ONE-PARAGRAPH VERSION
 
 Section 2.1b is IMPLEMENTED, tested and pushed. It works, and it raises
@@ -346,10 +361,16 @@ being a layer and the term shrinks roughly as `1/blocks`.
 
 ## 5. WHAT I WOULD DO NEXT, IN ORDER
 
-1. **Do not spend boots chasing 600,000 with 2.1b.** The arithmetic in
-   section 3 is calibrated to a measured point and cross-checked; the
-   ceiling is ~473,000. Confirm it with ONE high-occupancy step near
-   465,000 and then stop.
+1. **Do not spend boots chasing 600,000 with 2.1b.** Settled: the ceiling
+   is ~501,000 by two metal extrapolations 70k apart agreeing to 0.3%,
+   and 500,000 has been run. Anything above ~501,000 needs section 2.1
+   first.
+1b. **Close the occupancy gap.** Both my steps peaked at 30.6% and 45.1%,
+   under the tool's 50% bar, so neither is a full-occupancy proof.
+   `s26_fill_load.py` is the instrument; the binding constraint is
+   `max_running_requests=4`, which caps resident concurrency. Raise it
+   for a capacity boot and four to six streams of ~110k will fill the
+   pool. This is the single cheapest piece of evidence still missing.
 2. **Section 2.1, the streamed seam** — it is the only route to the user
    floor. Its substrate (`commit_span`/`decommit_span`,
    `back_token_span`/`release_token_span`, `release_backing_span`/
