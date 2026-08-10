@@ -122,8 +122,20 @@ def read_files(cmdline_path: str, env_path: str):
     return argv, env
 
 
+def _norm(name: str) -> str:
+    """Accept ``pp-stage-ratio`` as well as ``--pp-stage-ratio``.
+
+    argparse swallows a value that begins with ``--`` as an option, so
+    ``--set-arg --pp-stage-ratio 15,9,8`` fails with "expected 2
+    arguments". Rather than make the caller escape it, normalise here:
+    the flag name is unambiguous either way.
+    """
+    return name if name.startswith("-") else f"--{name}"
+
+
 def set_arg(argv, name, value):
     """``--name value``: replace in place, or append if absent."""
+    name = _norm(name)
     if name in argv:
         idx = argv.index(name)
         if idx + 1 >= len(argv) or argv[idx + 1].startswith("--"):
@@ -136,6 +148,7 @@ def set_arg(argv, name, value):
 
 
 def add_flag(argv, name):
+    name = _norm(name)
     if name in argv:
         return f"flag {name}: already set (no change)"
     argv.append(name)
@@ -143,6 +156,7 @@ def add_flag(argv, name):
 
 
 def del_flag(argv, name):
+    name = _norm(name)
     if name not in argv:
         return f"flag {name}: already absent (no change)"
     argv.remove(name)
