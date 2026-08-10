@@ -2633,6 +2633,18 @@ class MHATokenToKVPool(KVCache):
         return bool(owner is not None and owner.has_commit_chunk)
 
     @property
+    def backing_commit_chunk_bytes(self) -> int:
+        """The arena's commit granule, 0 if it has none.
+
+        The seam's staging reservation needs it as a FLOOR: a row block can
+        never commit less than one chunk per buffer, however fine the
+        blocking gets.
+        """
+        owner = self._post_capture_owner
+        arena = getattr(owner, "_arena", None) if owner is not None else None
+        return int(getattr(arena, "commit_chunk_bytes", 0) or 0)
+
+    @property
     def backing_is_resident(self) -> bool:
         """False from the first layer released until the last is restored.
 
@@ -3636,6 +3648,27 @@ class HybridLinearKVPool(KVCache):
 
     def restore_backing(self, layers=None) -> None:
         self.full_kv_pool.restore_backing(layers)
+
+    # THE SPAN SURFACE MUST BE FORWARDED TOO, and its absence is why the
+    # streamed seam (#631 section 2.1) was dead code on every boot this rig
+    # has taken: the object the flip actually holds is this wrapper, not the
+    # full-attention pool, so ``is_span_swappable`` looked straight past the
+    # capability and silently took the whole-wave branch. A capability probe
+    # that a wrapper can drop is a capability that turns itself off.
+
+    def release_backing_span(self, layers, lo_row: int, hi_row: int) -> int:
+        return self.full_kv_pool.release_backing_span(layers, lo_row, hi_row)
+
+    def restore_backing_span(self, layers, lo_row: int, hi_row: int) -> int:
+        return self.full_kv_pool.restore_backing_span(layers, lo_row, hi_row)
+
+    @property
+    def supports_backing_spans(self) -> bool:
+        return bool(getattr(self.full_kv_pool, "supports_backing_spans", False))
+
+    @property
+    def backing_commit_chunk_bytes(self) -> int:
+        return int(getattr(self.full_kv_pool, "backing_commit_chunk_bytes", 0))
 
     @property
     def backing_is_resident(self) -> bool:

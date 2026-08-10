@@ -2140,3 +2140,75 @@ class TestBlockedSeamAccounting(CustomTestCase):
         prices = [self._slack(self._rt(b)) for b in (1, 2, 4, 8, 16, 64)]
         self.assertEqual(prices, sorted(prices, reverse=True))
         self.assertGreater(prices[-1], 0)
+
+
+class TestTheWrapperCannotDropTheSpanSurface(CustomTestCase):
+    """The gap that made section 2.1 dead code on every boot.
+
+    The object the flip holds is ``HybridLinearKVPool``, a wrapper that
+    forwards the backing calls to its full-attention sub-pool. It forwarded
+    ``release_backing``/``restore_backing`` and NOT their span variants, so
+    the seam's capability probe looked straight past a capability the
+    underlying pool had, and took the whole-wave branch on every flip
+    without saying so. A capability probe a wrapper can drop is a
+    capability that turns itself off, which is the worst kind: nothing
+    fails, the feature is simply never exercised.
+
+    Pinned as a SURFACE test rather than through a flip, because the flip
+    is exactly what could not observe it.
+    """
+
+    SPAN_SURFACE = (
+        "release_backing_span",
+        "restore_backing_span",
+        "supports_backing_spans",
+        "backing_commit_chunk_bytes",
+    )
+
+    def test_the_hybrid_wrapper_forwards_every_span_member(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPool,
+        )
+
+        for name in self.SPAN_SURFACE:
+            self.assertTrue(
+                hasattr(MHATokenToKVPool, name),
+                f"{name} missing on the pool that owns the arena",
+            )
+            self.assertTrue(
+                hasattr(HybridLinearKVPool, name),
+                f"HybridLinearKVPool does not forward {name}; the seam holds "
+                f"the wrapper, so an unforwarded member silently disables "
+                f"the streamed path",
+            )
+
+    def test_forwarding_reaches_the_sub_pool(self):
+        from types import SimpleNamespace as NS
+
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        calls = []
+        w = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        w.full_kv_pool = NS(
+            release_backing_span=lambda l, lo, hi: calls.append(("rel", lo, hi)) or 7,
+            restore_backing_span=lambda l, lo, hi: calls.append(("res", lo, hi)) or 9,
+            supports_backing_spans=True,
+            backing_commit_chunk_bytes=16 << 20,
+        )
+        self.assertEqual(w.release_backing_span([0], 1, 2), 7)
+        self.assertEqual(w.restore_backing_span([0], 3, 4), 9)
+        self.assertEqual(calls, [("rel", 1, 2), ("res", 3, 4)])
+        self.assertTrue(w.supports_backing_spans)
+        self.assertEqual(w.backing_commit_chunk_bytes, 16 << 20)
+
+    def test_a_sub_pool_without_the_capability_answers_no(self):
+        """Can-fail proof: the forward must not manufacture a yes."""
+        from types import SimpleNamespace as NS
+
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        w = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        w.full_kv_pool = NS()
+        self.assertFalse(w.supports_backing_spans)
+        self.assertEqual(w.backing_commit_chunk_bytes, 0)

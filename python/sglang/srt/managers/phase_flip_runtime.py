@@ -1591,9 +1591,7 @@ class WavedBackingSwap:
         blocking gets (``PhaseFlipRuntime._seam_chunk_floor``).
         """
         _src, dst = self._pools(direction)
-        owner = getattr(dst, "_post_capture_owner", None)
-        arena = getattr(owner, "_arena", None)
-        return int(getattr(arena, "commit_chunk_bytes", 0) or 0)
+        return int(getattr(dst, "backing_commit_chunk_bytes", 0) or 0)
 
     def release_wave_span(
         self, direction: str, wave: Sequence[int], lo_row: int, hi_row: int
