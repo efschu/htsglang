@@ -120,40 +120,113 @@ class TestStagingAffordable(CustomTestCase):
 
 
 class TestStagingBytesFromThePlan(CustomTestCase):
-    """The byte count must match what the exchange actually allocates."""
+    """The byte count must match what the move actually allocates.
+
+    REWRITTEN 2026-08-10 (successor 22). The superseded contract -- which
+    the previous version of this class pinned by name,
+    ``test_outgoing_is_counted_twice_and_incoming_once`` -- was wrong in
+    two independent ways, and the test froze both:
+
+    * outgoing was doubled to model a packer that concatenated per-layer
+      reads. That packer is gone: ``_pack_outgoing`` fills one exact-size
+      buffer in place, measured at the plan's floor on the hermetic
+      three-rank flip (39.4 -> 19.2 MiB peak);
+    * THE LOCAL RETAINED LEG WAS NOT COUNTED AT ALL, and on the rig it is
+      the biggest of the three whenever a rank keeps more than it sends.
+      That is the accounting hole behind every affordability refusal in
+      this feature, including the pool-500000 livelock.
+
+    A test pinning a formula is only as good as the formula, and this one
+    made the hole look deliberate for five successors. The contract now is
+    ``incoming + max(outgoing, local) + one_layer_window`` -- a MAX and
+    not a sum, because the send buffers are released the moment the
+    exchange returns and the local leg is not read until after that.
+    """
 
     class _Plan:
-        # One send peer (2 layers x 4 rows) and one recv peer (3 layers x
-        # 2 rows), shaped like PhaseFlipTransition's fields.
+        # One send peer (2 layers x 4 rows), one recv peer (3 layers x 2
+        # rows), and a retained leg of 2 layers x 20 rows -- shaped like
+        # PhaseFlipTransition's fields. The local leg is deliberately the
+        # LARGEST, which is the case the superseded formula could not see.
         def __init__(self):
             self.send_layers = {1: [0, 1]}
             self.recv_layers = {1: [0, 1, 2]}
             self.send_rows = {1: _N(4)}
             self.recv_rows = {1: _N(2)}
+            self.local_layers = (0, 1)
+            self.local_pp_rows = _N(20)
+            self.local_tp_rows = _N(20)
 
     class _Side:
-        def __init__(self, row_nbytes):
+        def __init__(self, row_nbytes, num_layers=3):
             self._n = row_nbytes
+            self.num_layers = num_layers
 
         def row_nbytes(self, _layer):
             return self._n
 
-    def test_outgoing_is_counted_twice_and_incoming_once(self):
+    def _prepared(self):
         r = _runtime(_Probe(0, 0))
         r._src_layer_idx = lambda _d, f: f
         r._dst_layer_idx = lambda _d, f: f
+        return r
+
+    def test_the_peak_is_incoming_plus_the_larger_of_outgoing_and_local(self):
+        r = self._prepared()
         src = self._Side(1000)
         dst = self._Side(100)
         got = r._staging_bytes(self._Plan(), "pp_to_tp", src, dst)
-        # out: (2 layers * 4 rows * 1000 + 8) * 2 = 16016
-        # in : 3 layers * 2 rows * 100 + 8       =   608
-        self.assertEqual(got, 16016 + 608)
+        # out   : 2 layers *  4 rows * 1000 + 8    =   8008
+        # in    : 3 layers *  2 rows *  100 + 8    =    608
+        # local : 2 layers * 20 rows * 1000        =  40000  <- dominates
+        # window: widest 20 rows * widest row 1000 =  20000
+        self.assertEqual(got, 608 + 40000 + 20000)
+
+    def test_the_superseded_formula_would_have_under_reserved_here(self):
+        """The hole, stated as arithmetic so it cannot come back quietly."""
+        r = self._prepared()
+        src = self._Side(1000)
+        dst = self._Side(100)
+        got = r._staging_bytes(self._Plan(), "pp_to_tp", src, dst)
+        superseded = 2 * 8008 + 608  # 2 x outgoing + incoming
+        self.assertLess(
+            superseded,
+            got,
+            "the retained leg dominates in this plan, so the old formula "
+            "must be short of the new one -- if it is not, the fixture no "
+            "longer exercises the defect it exists for",
+        )
+
+    def test_outgoing_dominating_does_not_add_the_local_leg_on_top(self):
+        """A MAX, not a sum: over-reserving is not the safe direction.
+
+        The gate's only action is to refuse, and a refusal does not drain
+        the resident set it refused on, so every MiB of invented headroom
+        moves the livelock to a smaller request.
+        """
+        r = self._prepared()
+        plan = self._Plan()
+        plan.send_rows = {1: _N(400)}  # outgoing now far exceeds local
+        src = self._Side(1000)
+        dst = self._Side(100)
+        got = r._staging_bytes(plan, "pp_to_tp", src, dst)
+        outgoing = 2 * 400 * 1000 + 8
+        local = 2 * 20 * 1000
+        self.assertEqual(got, 608 + outgoing + 400 * 1000)
+        self.assertLess(got, 608 + outgoing + local + 400 * 1000)
 
     def test_an_empty_plan_stages_nothing(self):
         r = _runtime(_Probe(0, 0))
         plan = self._Plan()
         plan.send_layers = {}
         plan.recv_layers = {}
+        plan.send_rows = {}
+        plan.recv_rows = {}
+        plan.local_layers = ()
+        plan.local_pp_rows = _N(0)
+        plan.local_tp_rows = _N(0)
+        # Sides are None on purpose: with nothing to stage the formula must
+        # not reach for a row width at all.
         self.assertEqual(r._staging_bytes(plan, "pp_to_tp", None, None), 0)
 
 

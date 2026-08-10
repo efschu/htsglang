@@ -159,19 +159,63 @@ class KvPoolView:
     def device(self) -> torch.device:
         return self._k[0].device
 
+    def read_rows_into(
+        self, layer: int, rows: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """``read_rows`` without materialising the concatenation.
+
+        Writes exactly what ``read_rows`` returns into a caller-owned
+        ``[n, row_nbytes]`` uint8 destination, which is what lets a packer
+        fill ONE exact-size staging buffer instead of building a tensor
+        per layer and concatenating them. That distinction is the whole
+        point: the concatenating form held a peer's payload two to three
+        times at its peak, and that transient is the term that breaches
+        the VRAM corridor and starves the flip's own affordability gate
+        (#631, HANDOFF_664 section 13).
+
+        The per-layer gather is still materialised. It is one layer's rows
+        -- 1/(2L) of a payload -- and it dies before the next layer's, so
+        it is a bounded staging window rather than a term that grows with
+        the sequence.
+        """
+        k, v = self._k[layer], self._v[layer]
+        n = int(rows.numel())
+        k_bytes = self._row_nbytes(k)
+        expect = k_bytes + self._row_nbytes(v)
+        if tuple(out.shape) != (n, expect):
+            raise KvReshardError(
+                f"read_rows_into destination shape {tuple(out.shape)} != "
+                f"({n}, {expect}) for layer {layer}"
+            )
+        if out.dtype != torch.uint8:
+            raise KvReshardError(
+                f"read_rows_into destination must be uint8, got {out.dtype}"
+            )
+        if n == 0:
+            return
+        idx = rows.to(k.device)
+        out[:, :k_bytes] = self._as_bytes(k[idx], k_bytes)
+        out[:, k_bytes:] = self._as_bytes(v[idx], expect - k_bytes)
+
     def read_rows(self, layer: int, rows: torch.Tensor) -> torch.Tensor:
         """``[n, row_nbytes]`` uint8 tensor of layer ``layer``'s rows, on the
         pool's device (the exchange stays device-native; only the injected
-        test channels ever see host tensors)."""
-        k, v = self._k[layer], self._v[layer]
-        idx = rows.to(k.device)
-        return torch.cat(
-            [
-                self._as_bytes(k[idx], self._row_nbytes(k)),
-                self._as_bytes(v[idx], self._row_nbytes(v)),
-            ],
-            dim=1,
+        test channels ever see host tensors).
+
+        Implemented ON TOP of ``read_rows_into`` rather than beside it, so
+        the streamed packing path and this one cannot drift into producing
+        different bytes for the same rows -- a divergence the payload
+        checksum could not catch, because sender and receiver would both
+        compute it over the same wrong order.
+        """
+        n = int(rows.numel())
+        out = torch.empty(
+            (n, self.row_nbytes(layer)),
+            dtype=torch.uint8,
+            device=self._k[layer].device,
         )
+        self.read_rows_into(layer, rows, out)
+        return out
 
     def write_rows(self, layer: int, rows: torch.Tensor, data: torch.Tensor) -> None:
         """Inverse of ``read_rows``: scatter packed bytes into layer rows."""

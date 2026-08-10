@@ -2684,41 +2684,93 @@ class PhaseFlipRuntime:
 
     # -- staging affordability ------------------------------------------------
     def _staging_bytes(self, tr, direction: str, src, dst) -> int:
-        """Device bytes the exchange will hold at once, from the PLAN.
+        """Device bytes the move will hold at once, from the PLAN.
 
-        Counted the way the exchange actually spends them:
+        THREE legs, and the peak is not their sum. ``_execute`` spends
+        them in two overlapping windows:
 
-        * OUTGOING is counted TWICE. ``_execute`` reads one tensor per
-          layer, then concatenates them, and the per-layer reads are still
-          referenced while the concatenation exists -- so the packed
-          payload is resident twice at the peak, not once.
-        * INCOMING once per peer: ``_exchange`` pre-allocates the full
-          receive buffer before posting the irecv.
+        * PACK + EXCHANGE holds ``outgoing + incoming``: this rank's
+          packed send buffers (one exact-size buffer per peer, filled in
+          place by ``_pack_outgoing``) and the receive buffers, which
+          ``_exchange`` pre-allocates in full before posting the irecvs.
+        * WRITE holds ``incoming + local``: the send buffers are released
+          the moment the exchange returns, and only then is the retained
+          local leg read -- in full, because every source read must
+          complete before the first destination write (the cross-phase
+          backing swap makes that invariant physical, not stylistic).
 
-        Both use each side's own ``row_nbytes``, the same quantities the
-        exchange itself uses, so this cannot drift from what is allocated.
+        So the high-water is ``incoming + max(outgoing, local)``. Both
+        legs use their own side's ``row_nbytes`` -- the same quantities
+        the move itself uses -- so this cannot drift from what is
+        allocated.
+
+        WHAT THIS REPLACED, and why the shape of the error mattered more
+        than its size (HANDOFF_664 section 13a). The old formula was
+        ``2 x outgoing + incoming``: the doubling modelled a packing that
+        concatenated per-layer reads and so held each payload twice, and
+        the LOCAL LEG WAS MISSING ENTIRELY. On the rig that under-reserved
+        by 231-714 MiB per rank whenever the retained leg exceeded twice
+        the outgoing one -- and every affordability refusal in this
+        feature, including the one that livelocked pool 500000, was
+        decided from it.
+
+        ORDER OF THE TWO FIXES IS LOAD-BEARING. Correcting this formula
+        alone would have made things WORSE: the gate's only action is to
+        refuse, a refusal does not drain the resident set it refused on,
+        so a larger reservation simply reaches the livelock at a smaller
+        request. The packing was streamed FIRST -- measured 39.4 -> 19.2
+        MiB peak on the hermetic three-rank flip, exactly the plan's floor
+        -- so this honest budget is smaller than the dishonest one it
+        replaces rather than larger. Do not reintroduce the doubling
+        "for safety": it does not buy margin, it buys an earlier wedge.
         """
-        total = 0
+        outgoing = 0
         for peer in tr.send_layers:
             n = int(tr.send_rows[peer].numel())
-            payload = (
+            outgoing += (
                 sum(
                     src.row_nbytes(self._src_layer_idx(direction, f)) * n
                     for f in tr.send_layers[peer]
                 )
                 + _CHECKSUM_BYTES
             )
-            total += 2 * payload
+        incoming = 0
         for peer in tr.recv_layers:
             n = int(tr.recv_rows[peer].numel())
-            total += (
+            incoming += (
                 sum(
                     dst.row_nbytes(self._dst_layer_idx(direction, f)) * n
                     for f in tr.recv_layers[peer]
                 )
                 + _CHECKSUM_BYTES
             )
-        return int(total)
+        local_rows = tr.local_pp_rows if direction == PP_TO_TP else tr.local_tp_rows
+        n_local = int(local_rows.numel())
+        local = sum(
+            src.row_nbytes(self._src_layer_idx(direction, f)) * n_local
+            for f in tr.local_layers
+        )
+        # THE ONE-LAYER WINDOW. Streaming did not make the copies vanish,
+        # it made them BOUNDED: ``read_rows_into`` still gathers one
+        # layer's K and V before placing them, and ``write_rows`` still
+        # materialises one layer's two halves before scattering them.
+        # That is a fixed 1/L of a leg which dies before the next layer's,
+        # so it does not scale with the sequence -- but it is real device
+        # memory at the peak and the gate owns it. Measured: without this
+        # term the prediction was 1.7 MiB short of a 29.4 MiB live set on
+        # a local-leg-dominant geometry.
+        widest_rows = max(
+            [n_local]
+            + [int(r.numel()) for r in tr.send_rows.values()]
+            + [int(r.numel()) for r in tr.recv_rows.values()]
+        )
+        one_layer_window = 0
+        if widest_rows:
+            one_layer_window = widest_rows * max(
+                max((src.row_nbytes(i) for i in range(src.num_layers)), default=0),
+                max((dst.row_nbytes(i) for i in range(dst.num_layers)), default=0),
+            )
+        return int(incoming + max(outgoing, local) + one_layer_window)
 
     def _staging_affordable(self, staging_bytes: int) -> Tuple[bool, str]:
         """Can this rank stage ``staging_bytes`` without eating the reserve?
@@ -2770,6 +2822,82 @@ class PhaseFlipRuntime:
         )
 
     # -- the move -------------------------------------------------------------
+    def _pack_outgoing(
+        self, tr: PhaseFlipTransition, direction: str, src, peer: int
+    ) -> torch.Tensor:
+        """One peer's wire payload, streamed into a single exact-size buffer.
+
+        BYTE-FOR-BYTE what ``torch.cat([*per_layer_reads, checksum])``
+        produced -- layers ascending, each layer's rows row-major, K bytes
+        then V, the int64 checksum in the last 8 bytes. The receiver walks
+        it back with ``offset += n * width`` in the same layer order, so
+        the wire format is a contract between this function and that loop
+        and it has not moved. ``test_streamed_pack_equals_the_
+        concatenation_reference`` pins it against the old expression.
+
+        What changed is the LIVE SET, and that is the entire reason this
+        function exists. The concatenating form held, at its peak, three
+        copies of one peer's payload: the per-layer ``parts`` are still
+        referenced when ``flat = torch.cat(parts)`` exists, and ``flat`` is
+        still referenced while the checksum-appended copy is built. That
+        transient scales with the resident sequence -- the live set is
+        every resident request's ``req_to_token[:seqlen]`` -- which is what
+        made a chunked prefill cost memory proportional to the WHOLE
+        prompt, breach the 1024 MiB corridor, and then starve this flip's
+        own affordability gate into a livelock (HANDOFF_664 sections 12-13:
+        the corridor bound and the livelock bound are the same allocation,
+        which is why ``--max-prefill-tokens`` could never bound either).
+
+        Here the payload is written once, in place. The only transient is
+        one layer's gather inside ``read_rows_into`` -- a fixed fraction
+        1/(2L) of the payload, dead before the next layer's -- so the
+        staging window is bounded by the geometry instead of by the prompt.
+        """
+        layers = tr.send_layers[peer]
+        rows = tr.send_rows[peer]
+        n = int(rows.numel())
+        widths = [src.row_nbytes(self._src_layer_idx(direction, f)) for f in layers]
+        payload_nbytes = sum(w * n for w in widths)
+        buf = torch.empty(
+            payload_nbytes + _CHECKSUM_BYTES, dtype=torch.uint8, device=src.device
+        )
+        offset = 0
+        for f, width in zip(layers, widths):
+            seg = buf[offset : offset + n * width].view(n, width)
+            src.read_rows_into(self._src_layer_idx(direction, f), rows, seg)
+            offset += n * width
+        payload = buf[:payload_nbytes]
+        buf[payload_nbytes:].copy_(_checksum(payload))
+        return buf
+
+    def _pack_local(
+        self, tr: PhaseFlipTransition, direction: str, src, local_src: torch.Tensor
+    ) -> List[torch.Tensor]:
+        """The retained leg, streamed into one buffer, as per-layer views.
+
+        The local rows must ALL be read before the first destination write
+        -- the reads-before-writes invariant below, which the cross-phase
+        backing swap makes load-bearing rather than theoretical -- so this
+        leg is genuinely irreducible at one copy. It is still worth
+        streaming: one allocation instead of L, and no per-layer
+        concatenation of the K and V halves on top of the gather.
+        """
+        n = int(local_src.numel())
+        widths = [
+            src.row_nbytes(self._src_layer_idx(direction, f)) for f in tr.local_layers
+        ]
+        buf = torch.empty(
+            sum(w * n for w in widths), dtype=torch.uint8, device=src.device
+        )
+        out: List[torch.Tensor] = []
+        offset = 0
+        for f, width in zip(tr.local_layers, widths):
+            seg = buf[offset : offset + n * width].view(n, width)
+            src.read_rows_into(self._src_layer_idx(direction, f), local_src, seg)
+            out.append(seg)
+            offset += n * width
+        return out
+
     def _execute(self) -> Optional[dict]:
         direction = self._pending
         assert direction is not None
@@ -2872,15 +3000,7 @@ class PhaseFlipRuntime:
         t_read0 = self._clock()
         outgoing_payloads: Dict[int, torch.Tensor] = {}
         for peer in tr.send_layers:
-            # read_rows returns [n, row_nbytes] uint8, K bytes then V.
-            parts = [
-                src.read_rows(
-                    self._src_layer_idx(direction, f), tr.send_rows[peer]
-                ).reshape(-1)
-                for f in tr.send_layers[peer]
-            ]
-            flat = torch.cat(parts)
-            outgoing_payloads[peer] = torch.cat([flat, _checksum(flat)])
+            outgoing_payloads[peer] = self._pack_outgoing(tr, direction, src, peer)
         read_ms = (self._clock() - t_read0) * 1000.0
         seam_census.mark("kv_pack")
 
@@ -2900,6 +3020,21 @@ class PhaseFlipRuntime:
         t_xfer0 = self._clock()
         received = self._exchange(outgoing_payloads, incoming_nbytes)
         xfer_ms = (self._clock() - t_xfer0) * 1000.0
+
+        # THE SEND BUFFERS ARE DEAD HERE, and holding them any longer is
+        # pure corridor. ``_exchange`` returns only after every work in the
+        # batch has been polled to completion (``bounded_collective``, then
+        # a device synchronize), so nothing reads these bytes again -- yet
+        # they used to stay referenced through the local read, the backing
+        # swap and every write, which is the widest part of the move. That
+        # made the peak ``outgoing + incoming + local`` when it only ever
+        # had to be ``incoming + max(outgoing, local)``.
+        #
+        # Captured first: the stats line reports what was sent, and the
+        # dict it used to sum is about to be empty.
+        sent_bytes = sum(int(t.numel()) for t in outgoing_payloads.values())
+        outgoing_payloads.clear()
+
         incoming_data: Dict[int, torch.Tensor] = {}
         for peer, rows in tr.recv_rows.items():
             payload = received.get(peer)
@@ -2944,10 +3079,7 @@ class PhaseFlipRuntime:
         local_dst = (
             tr.local_tp_rows if direction == PP_TO_TP else tr.local_pp_rows
         )
-        local_data = [
-            src.read_rows(self._src_layer_idx(direction, f), local_src)
-            for f in tr.local_layers
-        ]
+        local_data = self._pack_local(tr, direction, src, local_src)
 
         # #631 CROSS-PHASE BACKING SWAP. Every byte this transition owes has
         # now been read: the peer legs are materialised above and the local
@@ -3009,8 +3141,10 @@ class PhaseFlipRuntime:
             "live_slots": tr.total_slots,
             "outgoing_cells": tr.outgoing_cells,
             "incoming_cells": tr.incoming_cells,
-            "sent_bytes": sum(int(t.numel()) for t in outgoing_payloads.values()),
+            "sent_bytes": sent_bytes,
             "received_bytes": sum(incoming_nbytes.values()),
+            "local_bytes": sum(int(t.numel()) for t in local_data),
+            "staging_bytes": staging_bytes,
             "read_ms": read_ms,
             "exchange_ms": xfer_ms,
             "write_ms": write_ms,
@@ -3019,8 +3153,9 @@ class PhaseFlipRuntime:
         self.last_stats = stats
         logger.warning(
             "%s DONE %s (epoch %d) in %.1f ms: %d live slots, sent %d "
-            "cells / %.2f MiB, received %d cells / %.2f MiB (read %.1f ms, "
-            "exchange %.1f ms, write %.1f ms)",
+            "cells / %.2f MiB, received %d cells / %.2f MiB, local %.2f "
+            "MiB, staging reserved %.2f MiB (read %.1f ms, exchange %.1f ms, "
+            "write %.1f ms)",
             LOG_PREFIX,
             direction,
             self._epoch,
@@ -3030,6 +3165,8 @@ class PhaseFlipRuntime:
             stats["sent_bytes"] / 1048576.0,
             tr.incoming_cells,
             stats["received_bytes"] / 1048576.0,
+            stats["local_bytes"] / 1048576.0,
+            stats["staging_bytes"] / 1048576.0,
             read_ms,
             xfer_ms,
             write_ms,
