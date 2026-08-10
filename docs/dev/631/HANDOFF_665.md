@@ -408,11 +408,18 @@ addresses the term that is actually binding.
 Single-variable step through the replay tool, pool untouched at 470000:
 `--rank-gpu-memory-mib 31800,17400,17450 -> 31800,16200,16650`.
 
-| card | free before | free after | budget cut | gained |
-|---|---|---|---|---|
-| rank1 (binding) | 2303 | **2685** | -1200 | **+382** |
-| rank0 | 5160 | 5684 | 0 | +524 |
-| rank2 | 2551 | 2833 | -800 | +282 |
+| card | free before | free after | budget cut | gained | return |
+|---|---|---|---|---|---|
+| rank1 (binding) | 2303 | **2747** | -1200 | **+444** | 37% |
+| rank0 | 5160 | 5104 | 0 | -56 | — |
+| rank2 | 2551 | 2857 | -800 | +306 | 38% |
+
+(Read at a SETTLED instant, 30 s after health. A reading taken 20 s earlier
+gave 2685/5684/2833 and would have supported a different and wrong story --
+that rank0 gained 524 MiB from a min-reduced global KV unit. It did not; it
+is flat, as a card whose budget did not change should be. Successor 21's
+error 0 was comparing an instrument against a different instant, and it
+nearly happened again here in the last measurement of the session.)
 
 **Compare the two levers on the same card, same session, same geometry:**
 
@@ -427,19 +434,23 @@ completely.
 
 Two things to understand before using it:
 
-* **It is not 1:1.** A 1200 MiB cut on rank1 returned 382. Some of the cut
+* **It is not 1:1, and the return rate is consistent.** 1200 -> 444 on
+  rank1 and 800 -> 306 on rank2, both ~37%. Some of the cut
   is absorbed by the same allocator behaviour that ate the pool reduction,
   which is precisely why the ENFORCED version (a per-rank
   `set_per_process_memory_fraction` from `RANK_MIB`, 664 §6's top unbuilt
   item) is worth more than the advisory flag: it would make the return 1:1
   by construction.
-* **rank0 gained 524 MiB without any cut to its budget.** The per-rank KV
-  unit is min-reduced across ranks, so lowering the two 3080s' budgets
-  lowers the global unit and shrinks every rank's KV. A successor tuning
-  one card must expect the others to move.
+* **The effect is PER-RANK.** rank0, whose budget was untouched, is flat
+  (-56 MiB, noise). So a successor can tune the binding card without
+  disturbing the others, which the pool knob could never do -- the pool is
+  global and draws from every card by share. That property is what makes
+  this the right lever for the user's section 10 surplus problem: it is the
+  first knob in this chain that can move ONE card.
 
-Where that leaves the corridor: rank1 at 2685 idle against the measured
-bs=4 + long-prefill transient of 1790 predicts a floor of ~895, still ~130
-MiB short of 1024. On the measured 1200:382 return ratio, roughly another
-400-450 MiB of budget cut on rank1 should close it. **That is the next
-single-variable step, and it is a flag change.**
+Where that leaves the corridor: rank1 at 2747 idle against the measured
+bs=4 + long-prefill transient of 1790 predicts a floor of ~957, about 67
+MiB short of 1024. At the measured 37% return that is roughly another
+180-200 MiB of budget cut on rank1. **That is the next single-variable
+step, it is a flag change, and it is the last thing between this
+configuration and a corridor-holding green run at pool 470000.**
