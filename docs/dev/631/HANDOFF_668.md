@@ -232,6 +232,53 @@ release-then-reclaim-then-restore) and
 Aliased pools must keep the OLD order — `_pools_alias()` already gates
 that, and it must stay gated.
 
+### 2.1c Test-impact map for 2.1b, and ONE correction to the recipe above
+
+From a qwen audit lane. **UNVERIFIED — I ran out of context before
+checking it against the code, unlike the `commit_range` hazard which I did
+verify. Treat the file:line list as a starting point, not as fact.** It is
+recorded because it is a map of where to look, and that is worth having.
+
+The order pins it names (rewrite these; expect them red):
+
+* `test_phase_flip_spill_depth_631.py` `SeamOrderingTest`, three methods
+  around lines 194 / 203 / 216, asserting the exact sequence
+  `release -> reclaim -> restore` in both directions;
+* `test_phase_flip_runtime.py`
+  `TestPreWriteSeamOrdering::test_hook_fires_between_last_read_and_first_write`
+  (~1496).
+
+**The two it flags as DANGEROUS are the useful part**, because both keep
+passing while ceasing to test what their names claim:
+
+* `test_hook_fires_between_last_read_and_first_write` checks only the
+  seam's POSITION (after the last read, before the first write). Both
+  orders satisfy that, so it stays green while verifying nothing about
+  release-vs-restore. Give it an assertion on the order INSIDE the seam.
+* `TestSharedArenaReadsPrecedeWrites` exercises the aliased path, which
+  MUST keep release-first. It checks byte identity, not order — so if the
+  `_pools_alias()` gating is wrong it stays green and the corruption ships.
+  Gate it explicitly and add an order assertion there.
+
+**THE CORRECTION, and it matters for 2.1b's safety.** I wrote above that
+reclaim moves to sit between restore and release. Think about what that
+does. Today `reclaim_between` runs at the memory TROUGH — the source is
+already unmapped, so the reclaim hands pages back right before the restore
+asks the driver for raw pages. That ordering exists because the restore is
+the allocation that can fail INSIDE the no-return region; it OOM'd on
+metal on 2026-08-09 and took the instance down.
+
+Under restore-first the destination commit happens at the PEAK instead,
+with the source still fully mapped — so restore-first makes that same
+allocation strictly MORE likely to fail, and moving reclaim after it
+removes the protection that was put there for it.
+
+So the order for 2.1b is **reclaim -> restore -> release**, not
+restore -> reclaim -> release: reclaim first so the driver has pages, then
+commit the destination, then hand back the source. Anyone implementing
+2.1b who reorders the pair without also moving reclaim AHEAD of the
+restore is re-opening a known crash.
+
 ### 2.2 What is BUILT and what is NOT
 
 Built, tested, committed:
