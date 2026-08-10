@@ -2419,3 +2419,101 @@ same invocation (capture and kill cannot be separated without losing the
 baseline), takes arbitrary explicit substitutions, and writes a
 baseline-vs-replay record per boot to
 `/spinning/evidence-631/boot-captures/`.
+
+## 1e. The `pp-stage-ratio` remap rule, which HANDOFF_664 §6 left unexplained
+
+Successor 21 spent two boots optimising a split that the actuator did not
+apply: `PP_STAGE_RATIO=15,10,7` came back as an achieved 16/9/7, `14,10,8`
+mapped exactly, and the rule was left as an open question with the standing
+instruction to verify the achieved split before spending a measurement.
+
+The rule is quantisation to the full-attention block period. The model has
+64 layers with one full-attention layer per 4, so a stage boundary can only
+fall on a multiple of 4. `pp-stage-ratio` is in 32nds; the raw request is
+`ratio / 32 * 64` layers, then rounded to a multiple of 4:
+
+| stage ratio | raw layers | achieved `pp_layer_ratio` | full-attn per stage |
+|---|---|---|---|
+| 14,10,8 | 28, 20, 16 | **28, 20, 16** (exact) | 7, 5, 4 |
+| 15,9,8 | 30, 18, 16 | **32, 16, 16** | 8, 4, 4 |
+
+`14,10,8` maps exactly because 28/20/16 are already multiples of 4. Nothing
+about `15,10,7` or `15,9,8` is; they land on the nearest legal boundary and
+the sum is held at 64.
+
+**Consequence for anyone planning a geometry step: the reachable splits are
+not the 32nds, they are the multiples of 4 layers.** Asking for one layer
+of relief on a stage gets you four or none. Read
+`pp_layer_ratio=[...], pp_stage_ratio=[...]` out of the boot log — it prints
+both, adjacent — rather than inferring the split from an arena size.
+
+## 1f. The capacity curve, re-derived on the fixed mover — and it is now SEPARABLE
+
+All triples below are in nvidia-smi index order = (rank1, rank0, rank2).
+
+The single most useful consequence of the mover fix is that the two terms
+finally separate. The transient is a property of the REQUEST and the
+geometry; the idle floor is a property of the POOL. Measured at two pools
+200000 apart, with the same 111405-token trigger:
+
+| | rank1 | rank0 | rank2 |
+|---|---|---|---|
+| transient at pool 400000 | 1120 | 1346 | 982 |
+| transient at pool 600000 | 1120 | 1366 | 926 |
+
+Identical to within noise. With the old mover the two were entangled — the
+staging peak scaled with the resident live set, which scaled with the pool
+— which is why HANDOFF_664 §12a's model needed a separate fit per pool and
+why §12 had to call the corridor and livelock bounds "two distinct bounds".
+They are one bound and it is now additive:
+
+```
+  holds  iff  idle_free(pool) - transient(longest prefill) >= 1024 MiB
+```
+
+| card | idle-free slope, MiB per 1000 pool tokens | max pool holding the corridor |
+|---|---|---|
+| rank1 (3080) | 10.30 | **567,000**  <- binding |
+| rank0 (5090) | 14.58 | 729,800 |
+| rank2 (3080) | 8.36 | 617,100 |
+
+## 1g. The geometry is quantised, and that is what blocks the 600000 target
+
+`pp-stage-ratio 15,9,8` was the levelling step: give rank0's surplus a job
+and relieve the binding card. Per 1e it lands on layers 32,16,16 — a
+FOUR-layer move, not the one that was wanted — and the result is a clean
+falsification of "just level it":
+
+| pool 600000 | rank1 | rank0 | rank2 |
+|---|---|---|---|
+| idle free, 14,10,8 | 1809 | 4282 | 2149 |
+| idle free, 15,9,8 | 3367 | 1490 | 2149 |
+| floor under load, 14,10,8 | **689** (335 under) | 2916 | 1223 |
+| floor under load, 15,9,8 | 2131 | **64** (960 under) | 1167 |
+
+rank1 gains 1558 MiB and rank0 loses 2792 — and rank0's transient grows
+too, because it went from 7 full-attention layers to 8. The card that had
+1892 MiB of margin ends at **64 MiB free**, which is a near-OOM, not a
+tuning miss.
+
+**So the user's §10 surplus item is not a tuning nicety that nobody got
+round to: at this layer count the surplus is UNREACHABLE with the layer
+knob.** The reachable splits are the multiples of 4 layers, the two
+candidates either side of balance are 7,5,4 and 8,4,4, and both leave one
+card far from 1024 while another is at or below it. The token vector cannot
+substitute, because after alignment each rank's KV is `max(KV_pp, KV_tp)`
+with both equal — lowering a rank's TP share leaves it PP-bound and buys it
+nothing while costing whoever receives the share.
+
+Two named routes remain to >= 600000, and both are real work rather than
+another boot:
+
+1. **Spill rung 2 (draft weights).** 1925 MiB on rank1, resident in both
+   phases, and the PP phase has no drafter at all. At this aligned geometry
+   PP binds, so it pays its full size on the binding card — against a
+   shortfall of 335 MiB. Needs the VA-stable carrier (`KvVmmArena`) because
+   the dead module's `restore()` moves the draft addresses that the TP
+   decode graphs bake. This is now by far the highest-value unbuilt item.
+2. **Rebuilding the PP prefill KV layout**, which user spec item 2
+   explicitly permits. It is the only lever that can break the
+   `max(KV_pp, KV_tp)` symmetry that makes the token vector inert.
