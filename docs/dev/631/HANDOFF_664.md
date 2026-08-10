@@ -346,3 +346,58 @@ In descending confidence:
    which the ordered spill would pay, and it is this one. This reverses the
    priority I gave in §5 for the aligned case and is the strongest remaining
    lead.
+
+## 9. DEFECT FOUND AT THE END, AND IT IS A LIVELOCK — read this first
+
+At 07:48Z, pool 500000, with an **85894-token request resident**, the instance
+stopped answering `/health` and never recovered. Not a crash: all three
+schedulers stayed in state R, the log kept advancing, no traceback, no exit.
+
+The log says exactly what happened, once per flip attempt, forever:
+
+```
+PHASE-FLIP FLIP ABANDONED (pool too small for the live set): pp_to_tp.
+This rank: staging 2149 MiB needed but only 2136 MiB is spendable (driver ...)
+```
+
+**The three facts compose into a deadlock:**
+
+1. strict purity forbids decode in the PP layout — the resident request can
+   only make progress after a flip to TP;
+2. `_staging_affordable` (`phase_flip_runtime.py:2693-2740`,
+   `DEFAULT_STAGING_RESERVE_BYTES` = 1024 MiB) declines the flip because rank 1
+   is 13 MiB short of the staging reserve;
+3. the thing that would free that memory **is the flip**, because the resident
+   request's KV is what makes staging unaffordable.
+
+So the guard's refusal is itself the condition it is refusing on. **This is the
+third time this chain has met that exact shape** — 663 §2 records the same
+structure in the resident-carry guard and says "a detector that only declines
+to act is not containment; it is now written into the code rather than into a
+handoff". It was written into *that* catch site. This is a different one, and
+it was not.
+
+Margin: **13 MiB**. It is not a sizing accident that a smaller pool avoids; any
+pool has a resident set that reaches it, and the larger the pool the longer the
+admissible request that gets there.
+
+**This is the single most important thing in this handoff.** It is a
+correctness/availability bug, it is reachable at the shipped configuration, and
+by the standing "bugs before features" rule it outranks the remaining capacity
+work. Candidate fixes, in the order I would try them:
+
+* make the abandon path **actionable**: if a flip is declined for staging and
+  the live set can only drain in the other layout, the scheduler must do
+  something that changes the condition — retract/preempt the largest resident
+  request, or spill its KV — rather than re-deciding the same way forever;
+* let rung 1 run **before** the affordability test, not only inside the swap.
+  It returned 120-444 MiB per flip in this very run, and the shortfall was
+  13 MiB. The reclaim currently sits *after* the decision that needed it;
+* admission control: refuse to admit a request whose resident KV would make the
+  next flip unaffordable, which is a boot-time computable bound.
+
+**Consequence for section 8's result:** the 500000 row stands as measured — the
+corridor held for the whole window and the purity, graph, flip and accept-len
+axes were all green — but the run ENDED in this livelock rather than being
+stopped cleanly, and no >=60-minute green run was achieved. Do not read section
+8 as an acceptance pass.
