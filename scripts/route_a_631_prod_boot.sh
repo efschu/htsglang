@@ -120,6 +120,13 @@ PHASE_FLIP_PURITY="${PHASE_FLIP_PURITY:-strict}"
 # Do NOT read the default off this line -- server_args owns it; this only
 # makes the knob reachable.
 PHASE_FLIP_SPILL_DEPTH="${PHASE_FLIP_SPILL_DEPTH:-cache}"
+# PP stage ratio = the PP layout's LAYER split, and therefore also its weight
+# shard split and its per-rank KV layer count. 2,1,1 (=16/8/8 of 32) is the
+# shipped recipe. It is reachable here because rank 0's PP KV pool is what
+# binds the 5090 at large pools: at 600000 tokens the PP pool is 8.53 GiB on
+# rank 0 against 6.45 GiB for the TP pool, so the 5090's ceiling is set by a
+# split the TP vector cannot touch.
+PP_STAGE_RATIO="${PP_STAGE_RATIO:-2,1,1}"
 PHASE_POLICY_IDLE_DWELL_S="${PHASE_POLICY_IDLE_DWELL_S:-}"
 PHASE_IDLE_STATE="${PHASE_IDLE_STATE:-}"
 HICACHE="${HICACHE:-0}"
@@ -347,7 +354,7 @@ setsid "$PY" -m sglang.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --served-model-name Qwen3.6-27B \
     --tp-size 1 --pp-size 3 \
-    --pp-stage-ratio 2,1,1 \
+    --pp-stage-ratio "$PP_STAGE_RATIO" \
     --rank-gpu-id 0,1,2 \
     --rank-gpu-memory-mib "$RANK_MIB" \
     --enable-phase-flip \

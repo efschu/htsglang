@@ -257,15 +257,27 @@ def release_allocator_cache(
     observed at 36910 MiB on a 32607 MiB card, so it cannot be compared to a
     physical budget at all.
 
-    ``device_index`` MUST be the rank's own device. Every rank in this
-    deployment sees all three cards (``CUDA_VISIBLE_DEVICES`` lists three
-    UUIDs in every worker), so a bare ``mem_get_info()`` reports whichever
-    device the calling thread happens to be on, which is not necessarily this
-    rank's. That mistake was made here first and caught by cross-checking the
-    logged figure against ``nvidia-smi``: the rung reported 10371 MiB free on
-    a card the driver said had 3149. The delta happened to stay plausible,
-    which is precisely why the absolute value has to be pinned to a named
-    device rather than trusted because it "looks right".
+    ``device_index`` names the rank's own device explicitly. This is belt and
+    braces rather than a bug fix, and the story of why it was written is worth
+    keeping, because the reasoning that produced it was wrong.
+
+    The figures this rung logs looked impossible next to ``nvidia-smi``: it
+    reported 10371 MiB free on a card the driver showed with 3149. The
+    conclusion drawn was "it is reading the wrong device", on the theory that
+    every worker sees all three cards. **That theory was false in both
+    halves.** ``--rank-gpu-id`` gives each worker process a
+    ``CUDA_VISIBLE_DEVICES`` holding exactly ONE physical GPU, so device 0 is
+    unambiguously this rank's card in every worker. And the two numbers were
+    never comparable: this rung runs at the SEAM, immediately after the source
+    pool handed its physical pages back, so free memory is legitimately some
+    gigabytes higher there than in either phase's steady state. At pool 600000
+    the source pool is ~8 GiB on rank 0, and the seam census independently
+    records a seam maximum of 10974 MiB on that card.
+
+    **Comparing an instrument's reading against a different instant is not a
+    cross-check.** The device is still named explicitly because an absolute
+    memory figure should say which card it is about, but do not read the
+    argument as evidence that a bare call was reading the wrong one.
     """
     if depth < DEPTH_ALLOCATOR_CACHE:
         return 0
