@@ -378,3 +378,72 @@ AUDIT CANDIDATE (docstring ~:525-532) — the false assumption that
 `event_loop_pp`. Defect R is arguably its third instance, since the whole
 bug is a slot-scoped handle being treated as durable. **That audit pass is
 now overdue by four handoffs.**
+
+## 8. THE VMM SPILL ROUTE (user directive, 06:00Z) — the premise is already satisfied
+
+The user overrode the >600k closure and ordered a VA-stable physical-release
+route: spill the INACTIVE layout's weight shards to host RAM each phase,
+restore at the flip, keep the virtual address stable so captured decode
+graphs stay valid, and re-size the pool against the freed bytes. Estimated
+in the order as ~9 GiB per card.
+
+**My objection (a) is withdrawn.** I had argued the arena cannot shrink
+because the TP decode graphs bake its addresses. A VA-stable release
+dissolves that, and this tree PROVES it dissolves it, because the mechanism
+is already here and already load-bearing for a different asset:
+
+* `kv_vmm_backing.py:208/350/358` — `cuMemAddressReserve`, `cuMemMap` /
+  `cuMemSetAccess`, `cuMemUnmap` / `cuMemRelease`.
+* `phase_flip_runtime.py:1434-1491` — the per-flip KV backing swap, whose
+  own comment is the refutation of my objection: *"The VA reservations are
+  untouched, so every address the TP stack's decode graphs baked in stays
+  valid across any number of flips."*
+
+So VMM works on this driver and VA-stable release is proven in production
+here. The route is technically open.
+
+**It has nothing left to reclaim, and that is a code fact, not an argument.**
+The inactive layout does not occupy device memory at all:
+
+* the arena is ONE per rank, sized `max(layout_pp.total_bytes,
+  layout_tp.total_bytes)` — `phase_flip_boot.py:544-547`,
+  `weights_arena.py:233-235`;
+* `snapshot_and_free` (`phase_flip_boot.py:247-270`) frees every device
+  original and rebinds it to a 0-element placeholder, leaving the layout
+  only as a **pinned host image**. Its docstring gives the reason in the
+  rig's own numbers: three copies resident would be
+  *"14.7 + 12.4 + 14.7 GB > 31.8"* and would not fit the 5090;
+* a flip is therefore a host->device `copy_` into the fixed arena VA
+  (`weights_arena.py:378-381`), checksum-verified on device.
+
+**The ordered spill is already implemented and already fully banked.** What
+remains is only the arena's idle tail, `arena - current_phase_bytes`:
+
+| rank | releasable in PP phase | releasable in TP phase | **worst case over time** |
+|---|---|---|---|
+| 0 (5090) | 0 | 1773 MiB | **0** |
+| 1 (3080) | 1234 MiB | 0 | **0** |
+| 2 (3080) | 0 | 1191 MiB | **0** |
+
+The tail exists on each rank only in that rank's NON-binding phase. A
+corridor floor is a continuous law governed by the worst instant, so the
+worst-case-over-time credit is **0 MiB on every rank**. Building a VMM path
+under the weights arena — which would mean moving it off the caching
+allocator (`weights_arena.py:235` is a bare `torch.empty`; the call site is
+in no `MemPool` context) — buys zero corridor.
+
+**What this does NOT say.** It does not say >600k is impossible; it says
+this particular funding source is empty because it was already spent at
+boot. The real gap and the real lever are unchanged and are in §5b: the two
+3080s exceed `RANK_MIB` by 867 and 1289 MiB while the 5090 sits 2521 MiB
+UNDER its own, so the binding term is per-rank budget overshoot, not
+inactive-layout residency. **The untried experiment is low `RANK_MIB` x low
+pool on the 3080s.**
+
+**One hook worth recording for whoever funds the pool differently.**
+`model_runner_kv_cache_mixin.py:755-783` already adds a signed byte
+correction (`correction_gb`) to `rest_memory` immediately before
+`_profile_available_bytes` returns — the exact place a "N bytes will be
+freed later" credit belongs, additive, and off by default so the default
+path stays byte-identical. If a future asset genuinely frees worst-case
+bytes, that is where the credit goes; no re-architecting required.
