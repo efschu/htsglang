@@ -2838,3 +2838,36 @@ it refuses. The wedged instance refused the very flush its own abandon
 message advertises, while every visible counter read zero, and the two
 counters it printed could not say why. `Scheduler.idle_blockers()` is
 diagnostic only — no caller branches on it.
+
+## 2f. Green-run row — 64.5 min on the waved seam, ZERO abandons
+
+Commit `510fb632a0`. Same recipe as 2d so the rows compare directly.
+
+| axis | 2d (unwaved) | 2f (waved) |
+|---|---|---|
+| duration / samples | 68.1 min / 29740 | 64.5 min / 28114 |
+| **FLIP ABANDONED** | **51 lines = 17 events** | **0** |
+| flip DONE lines | 834 (278 flips) | 813 (271 flips) |
+| tracebacks | 0 | 0 |
+| corridor min, idx order | 1215 / 3542 / 1349 | **2699 / 5732 / 2831** |
+| breaches of 1024 | 0 | 0 |
+| worst margin | +191 | **+1675** |
+| prefill batches / with graph | 10989 / 0 | 8049 / **0** (PURE) |
+| purity refusals | 138 | 136 |
+| decode batches / accept len | 1011 / 2.54 | 1647 / **2.734** |
+| decode `#running-req` | {1:453,2:270,3:234,4:54} | {1:624,2:516,3:489,4:18} |
+| host `memory.peak` / `oom_kill` | 112.1 GiB / 9 | 112.1 GiB / 9 (unchanged) |
+| largest prefill chunk | 2048, none above | 2048, none above |
+
+Agent traffic is in the log, not merely intended: 142 `/v1/messages` with
+their 142 `/v1/messages/count` companions (the agent-SDK shape through the
+router) and 124 `/v1/chat/completions`, on top of 119 `/v1/completions`
+from the soak and ladder. Two qwen lanes ran real analysis work for the
+whole window with no model override.
+
+**The 17 abandons became 0 at a comparable flip count.** That is the
+finding of this row. The corridor margin also went from +191 to +1675, but
+only part of that is the smaller staging peak — this run had 8049 prefill
+batches against 2d's 10989, so the load was lighter. Do not book the whole
+1484 MiB as recovered headroom; measure it (section 2e, and HANDOFF_667
+section 4 for the ledger).
