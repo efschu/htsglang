@@ -57,3 +57,27 @@ there. Stage explicit paths (`git add <file>`), and make the commit
 conditional on the edit actually having succeeded (`set -e`, or check the
 assertion's exit status) instead of letting a failed edit fall through into
 a blind commit.
+
+## 2026-08-10 16:45Z -- successor 26, second instance of the same shape
+
+`06ef108394 "[#631] acceptance run at pool 430000: ACCEPTANCE: GREEN"`
+also carries 54 lines of `test_phase_flip_staging_reserve_631.py` that
+have nothing to do with the acceptance run: the two #631 2.1b tests
+`test_the_rollback_switch_restores_the_WHOLE_old_design` and
+`test_the_slack_accounting_follows_the_order`, plus the
+`ordered_layer_waves` import they need.
+
+CAUSE, and it is structural rather than careless. The finisher
+(`scripts/s25_finish_acceptance.sh`) is detached and stages the worktree
+when the soak ends. A session working in the same worktree while a
+finisher is armed will have whatever it has not yet committed swept into
+the finisher's commit. I committed twice specifically to stay ahead of it
+and still lost the last edit by about forty seconds.
+
+FIX FOR THE NEXT ONE: a detached finisher must stage only the paths it
+owns -- its own evidence file and `PROD_BRINGUP_BENCH.md` -- never
+`git add -A`. Until that is changed, treat "a finisher is armed" as
+"commit before every tool call that edits a tracked file".
+
+The code in that commit is reviewed and tested; only the attribution is
+wrong.
