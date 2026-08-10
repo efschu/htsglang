@@ -1731,3 +1731,106 @@ too-large pool simply overshoots. The budget stays at the proven values and
 construction**. Every configuration that held did so only because the engine
 did not consume its whole budget. The budget and the corridor law have never
 been reconciled with each other.
+
+---
+
+## SUCCESSOR 20 / 1 — DEFECT R: the resident-carry leak, and it was one indentation
+
+The blocker that ended successors 18's and 19's windows is closed. It was
+not in the phase-flip machinery at all; it was in the PP event loop's slot
+bookkeeping, and the phase-flip feature merely created the conditions that
+made it reachable.
+
+### The defect
+
+`last_mbs[slot]` must name *the batch that slot ran in its previous
+iteration*. Its assignment in `_event_loop_pp_body` sat INSIDE
+`if self.mbs[next_mb_id] is not None:`, sharing a block with the D2H sync
+and `_pp_process_batch_result`. That quietly redefined the name as *the
+last non-empty batch this slot EVER ran*.
+
+The two readings differ only when a slot runs nothing while requests are
+still resident in it — and **strict purity creates exactly that state on
+purpose**: `get_next_batch_to_run` returns `batch_to_run = None` for a
+resident decode batch in the PP layout (`phase_decode_blocked_here` ->
+`ret = None`), and that None is the intended signal that the PP phase has
+no work.
+
+The stale entry is an EXTEND batch, so every later visit to the slot takes
+the `is_extend()` branch and reaches `running_batch.merge_batch(last_batch)`,
+which extends `reqs` **in place**. Once per cycle, forever.
+
+### Why both existing defences were blind, and neither was wrong
+
+* the self-merge guard compares `last_batch is running_batch` — the stale
+  entry is a **distinct object**;
+* `harvest_resident_batches` dedupes by `id(batch)` — the duplication is
+  **inside one batch's `reqs`**.
+
+A distinct object holding already-resident Reqs is the one shape that
+defeats both at once. Entry K of `phase_flip_presence` predicted precisely
+this for a non-idempotent merge.
+
+### The correction that mattered most
+
+**`claims 5` was never the onset.** 5 is merely the first value above
+`max_running_requests=4` that the guard is *able to report*; the leak runs
+silently through 1, 2, 3, 4 first. HANDOFF_662 read the coincidence of
+"starts at 5" and "the guard starts refusing at 5" as evidence that the
+drain was gated behind the refused evaluation, and pointed the successor at
+the guard. It was a detection threshold wearing the costume of an onset.
+The guard is causal for the **deadlock only**, not for the leak.
+
+Successor 19's asymmetric-alias lead (`install_resident_set` TP->PP) is
+**not** the cause — correctly flagged there as unproven. The aliasing is
+real and harmless, because the harvest dedupes by `id(batch)`.
+
+### The fix, and why it is the correct rule rather than merely a working one
+
+Unconditional assignment, which is what the non-PP loops have always done
+(`self.last_batch = batch`, `batch` possibly None). Both loop families now
+answer "what did the previous iteration run" the same way, and **"nothing"
+is a real answer instead of a hole that preserves the old one**.
+
+Containment is separate and was also owed: the guard's refusal was itself
+the deadlock, because under strict purity only a flip to TP drains the
+resident set. The catch site now repairs duplicated Reqs with the
+scheduler's own `filter_batch` and re-asks, and logs the whole slot row
+instead of a bare count — two boots were spent attributing that count.
+
+### Evidence, desk
+
+`test_pp_slot_last_batch_631.py` drives the **real** `_event_loop_pp_body`
+taken unbound off the mixin; a model of the statement order would have been
+circular, because the order IS the defect. `_LeakyRank` overrides one
+method back to the pre-fix rule and nothing else:
+
+| 25 cycles, 1 distinct request | resident entries | distinct | `last_mbs[0]` |
+|---|---|---|---|
+| PRE-FIX rule | **26** | 1 | STALE |
+| shipped rule | 2 | 1 | None |
+
+26 = 1 + 25 cycles, i.e. the metal law (+1 per round) reproduced exactly.
+Full #631 family: **649 passed, 0 failed** (was 643; +6 new).
+
+### Evidence, metal — and the instrument that matters
+
+Boot 04:23Z, `RANK_MIB=31800,17400,17450`, `MAX_TOTAL_TOKENS=260000`,
+CTX 393216, purity strict, POLICY auto. Load: 8 concurrent soak streams
+against `max_running_requests=4` (`#queue-req: 5` — the trigger condition)
+plus real qwen agent traffic through router 30099.
+
+**The direct instrument is the carry count, not the absence of an alarm.**
+`PHASE-FLIP-CARRY carried N resident request(s)` reports the actual size of
+the resident set at every cutover. Under the old code it walked without
+bound (5 -> ... -> 868447). In this window the only values that ever
+appear are:
+
+| carried | occurrences |
+|---|---|
+| 1 | 6 |
+| 3 | 66 |
+
+Bounded by `max_running_requests=4` across every flip. "No corruption
+report" would only have proved the count stayed under the alarm threshold;
+this proves the set is *stable*.
