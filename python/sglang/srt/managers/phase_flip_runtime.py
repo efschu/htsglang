@@ -1535,6 +1535,75 @@ class WavedBackingSwap:
         src.release_backing(layers)
         seam_census.mark("backing_release")
 
+    # -- #631 section 2.1: ROW-BLOCK granularity -----------------------------
+    #
+    # The transient the wave order can only MOVE, blocking can SHRINK. Under
+    # restore-first the seam holds, at its worst instant, everything
+    # committed through step j against everything released through j-1 --
+    # one commit unit. With a whole layer as that unit the term is one
+    # layer span (1821 MiB at pool 600000 on this rig, against a 753 MiB
+    # budget: HANDOFF_669 section 3). Nothing requires the unit to be a
+    # layer; it is a layer only because ``restore_backing`` takes a layer
+    # list. Split each layer's rows into B blocks and the term becomes one
+    # BLOCK span, which is a knob rather than a geometry constant.
+    #
+    # These two are the span-granular twins of release_wave/restore_wave.
+    # They deliberately do NOT mark residency: a span restore is one step
+    # of a stream, and ``restore_backing(layers)`` is what completes it
+    # (memory_pool.restore_backing_span says so). ``_execute`` calls that
+    # finaliser once per wave after the last block, which is safe only
+    # because ``commit_range`` now consults the extent list rather than the
+    # contiguous watermark -- without that fix the finaliser would re-map
+    # extents the stream had already mapped.
+
+    def is_span_swappable(self, direction: str) -> bool:
+        """Can BOTH sides do span-granular backing on this direction?"""
+        src, dst = self._pools(direction)
+        return bool(
+            hasattr(src, "release_backing_span")
+            and hasattr(dst, "restore_backing_span")
+        )
+
+    def release_wave_span(
+        self, direction: str, wave: Sequence[int], lo_row: int, hi_row: int
+    ) -> None:
+        src, _dst = self._pools(direction)
+        if not hasattr(src, "release_backing_span"):
+            return
+        layers = self._pool_local(direction == PP_TO_TP, wave)
+        if not layers or hi_row <= lo_row:
+            return
+        src.release_backing_span(layers, int(lo_row), int(hi_row))
+        seam_census.mark("backing_release_span")
+
+    def restore_wave_span(
+        self, direction: str, wave: Sequence[int], lo_row: int, hi_row: int
+    ) -> None:
+        _src, dst = self._pools(direction)
+        if not hasattr(dst, "restore_backing_span"):
+            return
+        layers = self._pool_local(direction == TP_TO_PP, wave)
+        if not layers or hi_row <= lo_row:
+            return
+        dst.restore_backing_span(layers, int(lo_row), int(hi_row))
+        seam_census.mark("backing_restore_span")
+
+    def finalize_wave(self, direction: str, wave: Sequence[int]) -> None:
+        """Mark the wave's destination layers resident after a streamed restore.
+
+        The span restores above leave the pool "not fully backed" on
+        purpose, because a partially backed pool must answer no to
+        ``backing_is_resident``. This is the call that closes the wave.
+        """
+        _src, dst = self._pools(direction)
+        if not hasattr(dst, "restore_backing"):
+            return
+        layers = self._pool_local(direction == TP_TO_PP, wave)
+        if not layers:
+            return
+        dst.restore_backing(layers)
+        seam_census.mark("backing_restore")
+
     def reclaim_between(self, direction: str) -> None:
         """SPILL RUNG 1 (#656 spec item 6), once per flip.
 
@@ -1844,6 +1913,22 @@ class PhaseFlipRuntime:
             os.environ.get("SGLANG_FLIP_SEAM_RESTORE_FIRST", "1").strip()
             not in ("0", "false", "no")
         )
+        #: #631 2.1 STREAMED SEAM. Row blocks per wave: 1 = commit a whole
+        #: layer at a time (the 2.1b behaviour), >1 = restore/write/release
+        #: one row block at a time, which shrinks the backing transient
+        #: roughly as 1/blocks. DEFAULT 1 -- this ships dark until it is
+        #: measured on metal, because it moves the hot write path.
+        _blocks_env = os.environ.get("SGLANG_FLIP_SEAM_ROW_BLOCKS", "").strip()
+        self._seam_row_blocks = 1
+        if _blocks_env:
+            try:
+                self._seam_row_blocks = max(1, int(_blocks_env))
+            except ValueError:
+                raise KvReshardError(
+                    f"SGLANG_FLIP_SEAM_ROW_BLOCKS={_blocks_env!r} is not an "
+                    f"integer; it is the number of row blocks each seam wave "
+                    f"is streamed in (unset or 1 = whole-layer commits)"
+                )
         #: #631 SEAM WAVES. How many layer waves the move is split into.
         #: None = auto: one layer per wave under restore-first
         #: (``restore_first_wave_count``), else the most the layer map
@@ -3116,6 +3201,78 @@ class PhaseFlipRuntime:
                 worst = max(worst, committed - released)
         return max(0, worst)
 
+    # -- #631 section 2.1: streamed (row-blocked) seam -------------------------
+
+    @staticmethod
+    def _write_jobs(dst, jobs) -> None:
+        for li, rows, data in jobs:
+            dst.write_rows(li, rows, data)
+
+    def _stream_wave(self, swap, direction, wave, src, dst, jobs, blocks) -> None:
+        """Restore, write and release ONE ROW BLOCK at a time.
+
+        The peak this bounds is the seam's backing transient. Whole-wave
+        restore-first commits an entire layer span before releasing
+        anything; here the commit unit is a block, so the term shrinks
+        roughly as ``1 / blocks``. Section 2.1 of the #631 notes, and the
+        only remaining route to the >=600000 floor -- the wave ORDER can
+        move that term between cards but not shrink it (HANDOFF_669).
+
+        WHY A CONTIGUOUS ROW RANGE CAN SELECT SCATTERED WRITES CHEAPLY, and
+        this is the load-bearing trick. The backing span API takes a
+        contiguous pool row range, while the rows this wave writes are the
+        LIVE slots, scattered through the pool. The two reconcile because
+        the plan enumerates slots ASCENDING on both ends, so the rows
+        falling inside a contiguous range are a contiguous SLICE of the row
+        tensor -- one searchsorted per job per block, no gather, and the
+        payload slice comes along at the same offsets.
+
+        That ascending invariant is asserted rather than assumed: if a
+        future plan change ever emits unsorted rows, the slice would
+        silently write the wrong payload to the wrong rows, and a silent
+        KV corruption is the worst failure this file can produce.
+
+        The exchange is deliberately NOT blocked here. Row-blocking the
+        exchange needs a GLOBAL round count so every rank calls the
+        collective the same number of times -- derived from the replicated
+        plan, never from a rank-local row count, because a rank-local count
+        deadlocks the group and looks exactly like a hang. That is a
+        separate, riskier change; this one touches only local backing and
+        local writes, so no rank can diverge from its peers.
+        """
+        for _li, rows, _data in jobs:
+            if int(rows.numel()) > 1 and not bool(
+                torch.all(rows[1:] >= rows[:-1])
+            ):
+                raise KvReshardError(
+                    f"{LOG_PREFIX} streamed seam requires ascending row "
+                    f"enumeration; got an unsorted row tensor. Blocking a "
+                    f"scattered write by row RANGE relies on rows inside a "
+                    f"range being a contiguous slice, so an unsorted tensor "
+                    f"would write the wrong payload to the wrong rows."
+                )
+        dst_rows, src_rows = int(dst.num_rows), int(src.num_rows)
+        for b in range(blocks):
+            dlo = (b * dst_rows) // blocks
+            dhi = ((b + 1) * dst_rows) // blocks
+            swap.restore_wave_span(direction, wave, dlo, dhi)
+            for li, rows, data in jobs:
+                if not int(rows.numel()):
+                    continue
+                bounds = torch.tensor([dlo, dhi], dtype=rows.dtype)
+                i0, i1 = torch.searchsorted(rows, bounds).tolist()
+                if i1 > i0:
+                    dst.write_rows(li, rows[i0:i1], data[i0:i1])
+            slo = (b * src_rows) // blocks
+            shi = ((b + 1) * src_rows) // blocks
+            swap.release_wave_span(direction, wave, slo, shi)
+        # The span restores left the destination marked non-resident on
+        # purpose; this is what closes the wave. Safe to call after a
+        # streamed restore only because commit_range consults the extent
+        # list rather than the contiguous watermark (3bbf2f50bb) -- on the
+        # old code it would have re-mapped live extents.
+        swap.finalize_wave(direction, wave)
+
     def _reclaim_cached_blocks(self) -> None:
         """Hand the allocator's unused blocks back to the driver.
 
@@ -3574,26 +3731,16 @@ class PhaseFlipRuntime:
             # destination unbacked. ``_flip_waves`` already collapses the
             # aliased seam to a single wave; the order needs its own gate
             # because a single wave still runs this branch.
-            if swap is not None:
-                if seam_restore_first:
-                    if not reclaimed:
-                        swap.reclaim_between(direction)
-                        reclaimed = True
-                    swap.restore_wave(direction, wave)
-                    swap.release_wave(direction, wave)
-                else:
-                    swap.release_wave(direction, wave)
-                    if not reclaimed:
-                        swap.reclaim_between(direction)
-                        reclaimed = True
-                    swap.restore_wave(direction, wave)
-            else:
-                for fn in self._pre_write_fns:
-                    fn(direction)
-
+            # THE WAVE'S DESTINATION WRITES, built ONCE as a job list.
+            #
+            # Both the whole-wave path and the row-blocked path below
+            # consume this same list in this same order, so they write
+            # identical bytes by construction rather than by two code paths
+            # agreeing. The row-blocked path only chooses WHEN each row is
+            # written relative to the backing calls around it.
+            jobs: List[Tuple[int, torch.Tensor, torch.Tensor]] = []
             for f, data in zip(local_layers_w, local_data):
-                dst.write_rows(self._dst_layer_idx(direction, f), local_dst, data)
-            local_data = []
+                jobs.append((self._dst_layer_idx(direction, f), local_dst, data))
             for peer, layers_w in wave_recv_layers.items():
                 n = int(tr.recv_rows[peer].numel())
                 rows = tr.recv_rows[peer]
@@ -3602,8 +3749,34 @@ class PhaseFlipRuntime:
                     li = self._dst_layer_idx(direction, f)
                     width = dst.row_nbytes(li)
                     chunk = incoming_data[peer][offset : offset + n * width]
-                    dst.write_rows(li, rows, chunk.view(n, width))
+                    jobs.append((li, rows, chunk.view(n, width)))
                     offset += n * width
+
+            if swap is None:
+                for fn in self._pre_write_fns:
+                    fn(direction)
+                self._write_jobs(dst, jobs)
+            elif not seam_restore_first:
+                swap.release_wave(direction, wave)
+                if not reclaimed:
+                    swap.reclaim_between(direction)
+                    reclaimed = True
+                swap.restore_wave(direction, wave)
+                self._write_jobs(dst, jobs)
+            else:
+                if not reclaimed:
+                    swap.reclaim_between(direction)
+                    reclaimed = True
+                if self._seam_row_blocks > 1 and swap.is_span_swappable(direction):
+                    self._stream_wave(
+                        swap, direction, wave, src, dst, jobs,
+                        self._seam_row_blocks,
+                    )
+                else:
+                    swap.restore_wave(direction, wave)
+                    self._write_jobs(dst, jobs)
+                    swap.release_wave(direction, wave)
+            local_data = []
             incoming_data.clear()
             write_ms += (self._clock() - t_write0) * 1000.0
             seam_census.mark("kv_write")

@@ -1592,6 +1592,21 @@ class _RecordingSeamSwap:
     def reclaim_between(self, direction):
         self._log.append(("reclaim", None))
 
+    # -- #631 2.1 span surface. Present so the streamed path engages; the
+    # recorder still swaps no real backing, which is deliberate -- it lets
+    # the byte-identity assertion isolate the WRITE ORDER from the backing.
+    def is_span_swappable(self, direction):
+        return True
+
+    def restore_wave_span(self, direction, wave, lo, hi):
+        self._log.append(("restore_span", (int(lo), int(hi))))
+
+    def release_wave_span(self, direction, wave, lo, hi):
+        self._log.append(("release_span", (int(lo), int(hi))))
+
+    def finalize_wave(self, direction, wave):
+        self._log.append(("finalize", tuple(int(f) for f in wave)))
+
 
 class TestWavedSeamOrdering(CustomTestCase):
     """The waved seam's per-wave order: reclaim -> restore -> release.
@@ -1741,6 +1756,116 @@ class TestWavedSeamOrdering(CustomTestCase):
                 f"rank {r}: aliased layouts must release the source BEFORE "
                 f"restoring the destination -- they are the same pages. "
                 f"Sequence: {log}",
+            )
+
+    def _run_blocked(self, blocks, seed=31):
+        ref, live, _pp, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, 300, seed=seed
+        )
+        logs = {r: [] for r in range(len(VEC))}
+        runtimes, _ = _build_runtimes(
+            pp_views,
+            tp_views,
+            live,
+            pre_write_fns_for=lambda r: (_RecordingSeamSwap(logs[r]),),
+        )
+        for rt in runtimes:
+            rt._seam_row_blocks = blocks
+        exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
+        self.assertEqual([e for e in exceptions if e], [])
+        return logs, tp_pools, ref, live
+
+    def test_the_streamed_seam_writes_the_same_bytes_as_the_whole_wave_one(self):
+        """#631 2.1: blocking changes WHEN pages are mapped, never a byte.
+
+        The strongest available falsifier: the same flip, same seed, run at
+        two block counts, compared tensor by tensor. A row-blocking bug
+        that mis-slices the payload -- writing a peer's rows at the wrong
+        offset -- lands here and essentially nowhere else, because every
+        row still gets written exactly once and the counts still agree.
+        """
+        _l1, tp1, ref1, live1 = self._run_blocked(1)
+        _l4, tp4, ref4, live4 = self._run_blocked(4)
+        self.assertTrue(torch.equal(live1, live4))
+        ok, msg = _check_tp_layout(tp4, ref4, live4, VEC)
+        self.assertTrue(ok, f"streamed seam corrupted rows: {msg}")
+        for r, ((k1, v1), (k4, v4)) in enumerate(zip(tp1, tp4)):
+            for f in range(len(k1)):
+                self.assertTrue(
+                    torch.equal(k1[f], k4[f]),
+                    f"rank {r} layer {f}: streamed K differs from whole-wave K",
+                )
+                self.assertTrue(
+                    torch.equal(v1[f], v4[f]),
+                    f"rank {r} layer {f}: streamed V differs from whole-wave V",
+                )
+
+    def test_each_block_restores_then_releases_and_the_wave_is_finalised(self):
+        logs, _tp, _ref, _live = self._run_blocked(4)
+        for r, log in logs.items():
+            # One segment per wave, cut at its finalize.
+            segments, cur = [], []
+            for kind, payload in log:
+                if kind == "reclaim":
+                    continue
+                cur.append(kind)
+                if kind == "finalize":
+                    segments.append(cur)
+                    cur = []
+            self.assertTrue(segments, f"rank {r}: streamed path never engaged")
+            self.assertEqual(
+                cur, [], f"rank {r}: a wave never reached finalize: {cur}"
+            )
+            for w, seg in enumerate(segments):
+                self.assertEqual(
+                    seg,
+                    ["restore_span", "release_span"] * 4 + ["finalize"],
+                    f"rank {r} wave {w}: each block must restore then "
+                    f"release, and finalize must close the wave AFTER the "
+                    f"last block -- finalising early marks the pool "
+                    f"resident while it is still partly unbacked. Got: {seg}",
+                )
+
+    def test_blocking_shrinks_the_commit_unit(self):
+        """The point of the change, asserted as a count.
+
+        Four blocks must produce four commit units per wave, not one. If
+        the knob silently fell back to whole-wave commits the transient
+        would be unchanged and every other test here would still pass.
+        """
+        for blocks in (2, 4):
+            logs, _tp, _ref, _live = self._run_blocked(blocks)
+            for r, log in logs.items():
+                restores = [k for k, _w in log if k == "restore_span"]
+                waves = [k for k, _w in log if k == "finalize"]
+                self.assertEqual(
+                    len(restores),
+                    blocks * len(waves),
+                    f"rank {r}: expected {blocks} commit units per wave",
+                )
+
+    def test_unsorted_rows_are_refused_rather_than_mis_sliced(self):
+        """The can-fail proof for the ascending-rows assumption.
+
+        Selecting scattered writes by contiguous row RANGE is only valid
+        because the plan enumerates slots ascending. If that ever changes,
+        the slice would pair the wrong payload with the wrong rows -- a
+        silent KV corruption. It must raise instead.
+        """
+        rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
+        rows = torch.tensor([5, 1, 9], dtype=torch.int64)
+        data = torch.zeros(3, 4, dtype=torch.uint8)
+        with self.assertRaises(KvReshardError):
+            from types import SimpleNamespace as _NS
+
+            rt._stream_wave(
+                _RecordingSeamSwap([]),
+                PP_TO_TP,
+                (0,),
+                _NS(num_rows=16),
+                _NS(num_rows=16),
+                [(0, rows, data)],
+                4,
             )
 
     def test_reordering_the_seam_changes_no_byte(self):
