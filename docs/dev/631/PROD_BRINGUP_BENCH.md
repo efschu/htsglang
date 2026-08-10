@@ -2532,8 +2532,21 @@ Measured directly at pool 550000, geometry 14,10,8, idle free
 
 | load | rank1 transient | rank1 corridor min |
 |---|---|---|
-| one 111405-token request (ladder) | 1120 | — |
-| bs=4 soak, mixed prompts, no long prefill yet | **1370** | **959 — BREACH** |
+| one 111405-token request (ladder, alone) | 1120 | — |
+| bs=4 soak, mixed prompts, no long prefill yet | 1370 | 959 — BREACH |
+| bs=4 soak + one 111405-token prefill on top | **1790** | **539** |
+
+Per-card at the deepest point (idle free was 2329 / 5014 / 2573):
+
+| | rank1 | rank0 | rank2 |
+|---|---|---|---|
+| corridor floor | **539** | 3262 | 1101 |
+| transient | **1790** | 1752 | 1472 |
+| single-request transient, same trigger | 1120 | 1346 | 982 |
+
+**Concurrency adds 60% on the binding card** (1120 -> 1790), and the figure
+was still deepening when the load was stopped, so treat 1790 as a floor on
+the floor.
 
 The breach arrived at +8 minutes, before the first scheduled 111405-token
 prefill had fired. The pool had been sized from the single-request number
@@ -2559,3 +2572,26 @@ A/B (same ladder, same single request, same trigger, only the code moved),
 so the 2.05x -> 1.00x and the 719 -> 2765 MiB corridor recovery stand
 exactly as measured. What it invalidates is my extrapolation from that
 measurement to a pool number for a bs=4 deployment.
+
+### The corrected pool, and one thing the breach proves in the mover's favour
+
+Re-solving the bound with the bs=4 transient (`slope 10.30 MiB per 1000
+pool tokens on rank1`, `idle_free(550000) = 2329`):
+
+| pool | rank1 idle | predicted floor | margin |
+|---|---|---|---|
+| 550000 | 2329 | 539 | **-485 (measured breach)** |
+| 500000 | 2844 | 1054 | +30 |
+| 480000 | 3050 | 1260 | +236 |
+| **470000** | **3153** | **1363** | **+339** |
+
+470000 is the green-run target: the transient was still deepening when the
+load was stopped, so the margin has to absorb further high-water growth
+rather than sit on the predicted value.
+
+**And note what did NOT happen at 539 MiB free.** The instance stayed at
+`/health` 200 with 0 `FLIP ABANDONED` and 0 tracebacks through a 485 MiB
+corridor breach. Successor 21's pool 500000 livelocked at a rank that was
+**13 MiB** short of its staging reserve. The staging bound and the corridor
+bound have genuinely come apart: the corridor is now a budgeting question,
+where before it was an availability one.
