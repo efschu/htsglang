@@ -1834,3 +1834,83 @@ appear are:
 Bounded by `max_running_requests=4` across every flip. "No corruption
 report" would only have proved the count stayed under the alarm threshold;
 this proves the set is *stable*.
+
+### The heavy phase, and why it was ended deliberately
+
+The first 12 minutes ran **8** concurrent streams against
+`max_running_requests=4` — over the design point on purpose, because
+queueing pressure is what the leak needs. Result at 04:38:42Z:
+
+| axis | value |
+|---|---|
+| flips | 228 |
+| carried resident, all values seen | 1, 2, 3, 4 (ceiling is 4) |
+| resident-set corruption reports | 0 |
+| repairs performed | 0 |
+| requests | 100, all HTTP 200 |
+| agent requests (`POST /v1/messages`) | 44 |
+| tracebacks | 0 |
+| prefill batches with a CUDA graph | 0 of 335 (all PP, eager) |
+| decode batches with graphs + `accept len` | 240 of 240 (all TP) |
+
+**The leak verdict is complete at this point and does not depend on
+anything that follows.** The pre-fix build wedged in 8 minutes under this
+same load.
+
+**The corridor, however, never plateaued**, and that is worth a successor's
+attention because 662 reported a plateau at this pool:
+
+| bucket | gpu0 | gpu1 (5090) | gpu2 |
+|---|---|---|---|
+| t-14..12 min | 4291 | 5610 | 3813 |
+| t-10..08 min | 3927 | 5022 | 3451 |
+| t-06..04 min | 3147 | 3902 | 2731 |
+| t-02..00 min | 1945 | 2262 | 1629 |
+
+Monotonic, roughly -260 MiB/min on gpu2 at the end, with no flattening over
+5240 samples. Projected to cross the 1024 floor within ~2 minutes, so the
+phase was ended before it did.
+
+**Two things this establishes.** First, the allocator's high-water mark is
+**sticky**: after the load stopped, idle free recovered only to
+2745/2262/1789 against 5777/6372/4577 at boot. A window cannot be "given
+back" its corridor by going quiet. Second, and this is the correction to
+662: **at 260000 the corridor plateaus only for the workload it has been
+shown.** 662 saw it flatten under soak-plus-agents; it does not flatten at
+2x the design point. A plateau is a property of the load, not of the pool.
+
+The corridor number therefore belongs to a window at the ACCEPTANCE load
+(bs=4), held fixed, which is what the next section measures. Mixing the two
+would have repeated successor 19's error 0.
+
+### The acceptance-load window (bs=4), and why its allocator history is a FEATURE
+
+Started 04:40:22Z on the same boot, 4 concurrent streams (the design point)
+plus real agent traffic. The corridor flattens and stays flat:
+
+| bucket | gpu0 | gpu1 (5090) | gpu2 |
+|---|---|---|---|
+| t-12..10 min | 1945 | 2262 | 1629 |
+| t-08..06 min | 1945 | 2262 | 1627 |
+| t-06..04 min | 1845 | 2162 | 1507 |
+| t-04..02 min | 1825 | 2022 | **1467** |
+| t-02..00 min | 1825 | 2022 | **1467** |
+
+Two consecutive identical buckets, 443 MiB above the 1024 floor on the
+binding card. Contrast the heavy phase, which never produced two equal
+buckets in six.
+
+**This window inherits the heavy phase's high-water mark, and that makes it
+a WORST CASE rather than a contaminated one.** The mark is sticky, so free
+memory here is strictly lower than a fresh boot at the same pool and load
+would show. A pass under a pessimistic allocator history is therefore
+stronger evidence than a pass from a clean boot, not weaker — which is the
+opposite of the instinct, and is why the window was NOT restarted. The
+restart would also have killed in-flight agent traffic for no gain
+(successor 19's error 1).
+
+The claim this window supports is consequently narrow and safe:
+**260000 holds the corridor at the acceptance load even after a 2x-design
+-point episode has permanently raised the allocator's mark.** It does NOT
+establish the edge — 1467 MiB of headroom on the binding card says the edge
+is higher, and finding it is the cheapest capacity work left.
