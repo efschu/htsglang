@@ -3260,6 +3260,16 @@ class ServerArgs:
         bool,
         "Disable the decode-phase CUDA graph. Convenience for --cuda-graph-backend-decode=disabled.",
     ] = False
+    disable_draft_cuda_graph: A[
+        bool,
+        "Disable CUDA graph capture for the SPECULATIVE DRAFT model (decode, "
+        "extend and verify). Target-model graphs are unaffected. #656 spec "
+        "item 8 requires draft graphs to be MEASURED rather than assumed "
+        "worthwhile, and an A/B that can only be run in one direction is not "
+        "an A/B. It also unblocks spill rungs 2-3: those are refused today "
+        "because the draft weights have their addresses baked into these "
+        "graphs, so with no draft graphs there is nothing to corrupt.",
+    ] = False
     disable_cuda_graph: A[bool, Arg(no_cli=True)] = False
     disable_cuda_graph_padding: A[
         bool,

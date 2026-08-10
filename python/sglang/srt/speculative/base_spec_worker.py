@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from sglang.srt.utils import is_cpu
+
+logger = logging.getLogger(__name__)
 
 _is_cpu = is_cpu()
 
@@ -72,6 +75,51 @@ def duplicate_prefix_tail_to_draft_branches(
     if src_slots.numel() > 0:
         token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
 
+
+
+def should_capture_draft_graphs(server_args) -> bool:
+    """Whether to capture CUDA graphs for the speculative DRAFT model.
+
+    #656 spec item 8: the user's rule is to MEASURE draft graphs and leave
+    them out if NEXTN gains nothing. They were captured unconditionally,
+    so the rule could not be applied and the item stayed open through
+    eleven successors. On this rig draft decode, extend and verify all
+    capture at 0.12-0.30 GB per rank per kind.
+
+    THIS ALSO GATES SPEC ITEM 6. ``resolve_spill_depth`` refuses spill
+    rungs 2-3 on the grounds that the TP decode CUDA graphs bake the draft
+    weights' addresses in, so restoring them into a fresh arena would
+    corrupt the graphs. With no draft graphs there are no baked addresses
+    and no blocker, which makes this removal experiment a PREREQUISITE for
+    the spill route to >=600000 rather than an independent errand.
+
+    Defaults to capturing, including when the attribute or the whole args
+    object is absent: a boot that did not ask must be byte-identical, and
+    a missing attribute silently disabling graphs is the wrong failure.
+    """
+    if server_args is None:
+        # FALL BACK TO THE GLOBAL, do not default to "capture" here. Several
+        # draft variants (StandaloneDraftWorker, FrozenKVMTPDraftWorker,
+        # MultiLayerEagleDraftWorker) bypass EagleDraftWorker.__init__ --
+        # the class comment on EagleDraftWorkerBase says so explicitly --
+        # so a gate that reads only the instance attribute would be
+        # SILENTLY INERT on exactly the workers this rig runs. Inert in the
+        # safe direction is still inert, and a knob that cannot refuse
+        # measures nothing.
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+        except Exception:
+            return True
+    if server_args is None:
+        return True
+    if getattr(server_args, "disable_cuda_graph", False):
+        # A boot that asked for no graphs must not still pay the draft
+        # capture and its per-rank memory -- that is exactly the corridor
+        # the phase flip is fighting for.
+        return False
+    return not getattr(server_args, "disable_draft_cuda_graph", False)
 
 class EagleDraftWorkerBase(ABC):
     # Draft-solo placement (--speculative-draft-placement solo) flags.
@@ -161,7 +209,18 @@ class EagleDraftWorkerBase(ABC):
         self.init_attention_backend()
 
     def init_cuda_graphs(self):
-        """Capture draft graphs (decode disabled on the draft TpModelWorker)."""
+        """Capture draft graphs (decode disabled on the draft TpModelWorker).
+
+        Skippable via ``--disable-draft-cuda-graph``; see
+        :func:`should_capture_draft_graphs` for why that switch exists and
+        what else depends on it.
+        """
+        if not should_capture_draft_graphs(getattr(self, "server_args", None)):
+            logger.info(
+                "Draft CUDA graphs DISABLED by --disable-draft-cuda-graph; "
+                "the draft model runs eager. Target-model graphs unaffected."
+            )
+            return
         self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         self._capture_cuda_graphs()
 
