@@ -279,6 +279,40 @@ Two separable defects, and they should not be conflated:
 purity — that hides the deadlock without touching the leak, and purity is a
 hard user requirement (spec item 10).
 
+### The corpse table already predicted this leak — read entry K first
+
+A survey of the 800-line corpse table in `phase_flip_presence.py` (lines
+14-812) puts this defect squarely in its most populated theme. Three entries
+bear directly on it:
+
+* **K — THE RESIDENT CARRY.** Its stated design law is that *"the hazard is
+  DUPLICATION, not loss: `merge_batch` extends in place, so dedupe by batch
+  identity and refuse loudly if one Req is reachable through two distinct
+  batches."* That is precisely the failure now observed — one request
+  entering `running_mbs[0]` once per round. **Start here.**
+* **J.1 — SLOT SCOPE**, and its unnamed **AUDIT CANDIDATE** successor
+  (docstring lines 525-532), which is marked **OPEN**: the false assumption
+  that `scheduler.running_batch` names the rank's resident set is available
+  to any code running under `event_loop_pp`, two instances were already
+  confirmed and fixed (J.1 and the GDN mover), and the docstring says the
+  general case is *"worth an audit pass of its own; not part of #631"*.
+  **That audit pass is now overdue and this wedge is plausibly its third
+  instance.**
+* **L** — the matching lesson that a non-empty `last_batch` means "requests
+  are resident", not "work is in flight".
+
+**Naming caution:** the runtime error text calls this "defect M"
+(`phase_flip_resident_carry.py:242`), but the docstring's own entry **M** is
+a different defect entirely (the PP chain ring read off the live `ps`). The
+label in the log does not index the corpse table — do not follow it to the
+wrong entry.
+
+Other entries the survey found still **OPEN**, for a successor's awareness:
+**H** (a pre-entry abandonment leaves a live flag; a withdrawal is not
+publishable), **J.2** (the row extent over-counts by one; deliberately not
+yet cut), and **I** (quiescence is rank-local while the obligation is
+pairwise).
+
 ## 6. State at handover
 
 * HEAD as committed this shift; suite status recorded in the commit message.
