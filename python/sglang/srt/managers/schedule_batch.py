@@ -3331,6 +3331,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        # #631/#656 SELF-MERGE, guarded HERE because this is where it would
+        # allocate. Every field below is a torch.cat or an extend, so if
+        # ``other is self`` the batch DOUBLES -- req_pool_indices, seq_lens
+        # and reqs all concatenate with themselves. Measured 2026-08-09
+        # 23:42:45Z: a scheduler slot rebound running_batch and last_batch to
+        # one object, the resident count walked 2^23 -> 2^24 -> 2^25 in three
+        # seconds, and all three ranks died in sampling_info.merge_batch's
+        # torch.cat asking 256 MiB with 138 MiB free.
+        #
+        # The caller that produced that death is fixed at its own site, so
+        # this is deliberately a SECOND line rather than the only one: the
+        # audit that followed found merge_batch reachable from seven call
+        # sites, one of which (the non-PP overlap-resume path) has the same
+        # shape and no identity guard of its own. A guard at one of several
+        # call sites is a guard that does not run on the others -- the same
+        # lesson the seam census learned when its probe was guarded at one
+        # of two entry points.
+        #
+        # Returning is correct rather than lenient: merging a batch with
+        # itself can only double-count requests that are already present.
+        # It is logged so the condition stays attributable instead of
+        # becoming a silent no-op that hides a caller's state bug.
+        if other is self:
+            logger.warning(
+                "merge_batch called with other is self (bs=%d); refusing. "
+                "Its requests are already in this batch and every field "
+                "would concatenate with itself. See #631/#656.",
+                self.batch_size(),
+            )
+            return
+
         # #622: admissions are the other half of batch membership (see the
         # drop notes in filter_batch); a rank admitting a request its peers
         # did not diverges just as hard as one dropping early.

@@ -239,3 +239,71 @@ guard.
    against a number that describes a different topology.
 4. Only then, if the user still wants the last stretch: the flip-aware
    `solo` placement (§4).
+
+---
+
+## 7. The graph A/B knobs, surveyed (spec item 8) — one item is ANSWERED
+
+Surveyed on the live tree this shift. Execute the A/Bs against these, and
+do not go looking for knobs that are not there.
+
+**PP-prefill graphs: there is nothing to A/B — the PP stack is eager BY
+CONSTRUCTION.** `ModelRunner.is_phase_flip_pp_stack`
+(`model_runner.py:1441-1450`) is true whenever `--enable-phase-flip` is set
+and the runner is neither the draft nor the flip's TP stack; `init_cuda_graphs`
+(`:1453`) checks it at `:1469` and routes BOTH the prefill and decode graph
+runners to `EagerRunner`, returning at `:1470-1482` before any
+`cuda_graph_config` logic runs. `init_prefill_cuda_graph` additionally
+*raises* if ever reached for this stack (`:3646-3652`). This is a hard
+structural invariant, not a setting. **So spec item 8's "if graphs help in
+PP prefill, enable them there too" cannot be measured without first
+changing that invariant** — which is a design decision for the user, not a
+flag. Report it as answered rather than leaving it open.
+
+**NEXTN draft graphs: the available knob is partial.**
+`SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH` (`environ.py:1537`, default False)
+suppresses ONLY `EAGLEDraftExtendCudaGraphRunner` (gated at
+`eagle_worker_v2.py:965`) — the draft EXTEND graph. It does **not** touch
+the draft DECODE/tree graph (`EAGLEDraftCudaGraphRunner`,
+`eagle_worker_v2.py:895-914`), which is gated only by
+`speculative_num_steps > 1` and has no dedicated off switch. A third
+capture, `draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)`
+(`:513`), follows the global `--cuda-graph-backend-prefill`.
+So "measure the draft graphs and drop them if they bring nothing" is
+answerable for the extend graph alone; dropping ALL draft capture needs
+`SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH=1` plus
+`--cuda-graph-backend-prefill=disabled`, and the tree graph still stands.
+Note the capacity angle: draft graphs are ~0.55 GiB/rank in the **TP**
+phase, which is the phase whose corridor binds, so this A/B is a capacity
+question as much as a latency one.
+
+**DFLASH** has its own capture path (`dflash_worker_v2.py:769-801`) driven
+by the global decode graph config; the draft-extend env var is never read
+there and does not apply.
+
+## 8. The 5090 stage-imbalance lead: the instrument does not exist yet
+
+`--pp-stage-ratio 2,1,1` compiles to explicit per-stage layer counts via
+`derive_pp_layer_split` (`distributed/utils.py:1481-1583`) and exports
+`SGLANG_PP_LAYER_PARTITION`; for 64 layers it yields **32 / 16 / 16**.
+`--pp-layer-ratio` is the explicit counterpart and the two are mutually
+exclusive (`server_args.py:14557-14562`). `--chunked-prefill-size` defaults
+to 2048 on every card in this rig's tiers, and the PP loop tapers it per
+microbatch slot (`scheduler_pp_mixin.py:1507-1508`).
+
+**There is NO per-stage compute-vs-wait millisecond split for the PP
+prefill loop**, which is exactly the measurement the ms/round law asks for:
+* `PASS-CLOCK` (`scheduler_pp_mixin.py:935-1019`) is not a timer at all — it
+  counts slot iterations across a flip window for defect Q.
+* `PPBoundaryStats` (`:59-124`, env `SGLANG_PP_BOUNDARY_STATS`, default 0)
+  times send and recv at the boundary; recv is a genuine wait/bubble proxy,
+  but there is **no paired compute counter**.
+* `RankPrefillLog` (`metrics_reporter.py:91-260`) DOES log
+  `gpu-ms (compute, wait)` — and is explicitly disabled whenever
+  `pp_size != 1` (`:379-383`), because PP processes prefill results on the
+  last stage only and that breaks its FIFO pairing.
+
+So the cheapest honest first step is `SGLANG_PP_BOUNDARY_STATS=N` for the
+wait side, and a paired `compute_ms` bracket around the forward call in the
+same loop is the small addition that would make the 5090's ~250/400 W
+observation decidable.
