@@ -2517,3 +2517,45 @@ another boot:
 2. **Rebuilding the PP prefill KV layout**, which user spec item 2
    explicitly permits. It is the only lever that can break the
    `max(KV_pp, KV_tp)` symmetry that makes the token vector inert.
+
+## 1h. EVERY TRANSIENT IN THIS CORPUS IS A LOWER BOUND, INCLUDING MINE
+
+The mover's live set is `radix values UNION every resident request's
+req_to_token[:seqlen]`. The union is over ALL resident requests. Every
+transient measurement in this chain — successor 21's 2684/3584/2264, my
+1120/1346/982 in 1b — was taken with the scratch ladder, which issues **one
+request at a time**. So all of them measure a live set of one request, and
+the deployment runs at bs=4.
+
+Measured directly at pool 550000, geometry 14,10,8, idle free
+2329/5014/2573:
+
+| load | rank1 transient | rank1 corridor min |
+|---|---|---|
+| one 111405-token request (ladder) | 1120 | — |
+| bs=4 soak, mixed prompts, no long prefill yet | **1370** | **959 — BREACH** |
+
+The breach arrived at +8 minutes, before the first scheduled 111405-token
+prefill had fired. The pool had been sized from the single-request number
+and the single-request number is 250 MiB short on this card.
+
+**This is the sizing rule that was missing, and it is not a refinement of
+§1f, it replaces its input:**
+
+```
+  holds  iff  idle_free(pool) - transient(TOTAL RESIDENT LIVE SET) >= 1024
+```
+
+where the total resident live set is bounded by
+`max_running_requests x longest admitted prefill`, not by one request. A
+capacity row quoting a pool without BOTH the concurrency and the longest
+prefill it was measured at is not reproducible — which condemns the load
+line on every capacity row in this document, mine included, that says only
+"bs=4 soak" without the prefill length or only a prefill length without the
+concurrency.
+
+Note what this does NOT touch: the mover fix's result in 1b is a same-load
+A/B (same ladder, same single request, same trigger, only the code moved),
+so the 2.05x -> 1.00x and the 719 -> 2765 MiB corridor recovery stand
+exactly as measured. What it invalidates is my extrapolation from that
+measurement to a pool number for a bs=4 deployment.
