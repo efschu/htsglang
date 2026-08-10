@@ -27,6 +27,7 @@ FAMILY=(
     test/registered/unit/managers/test_pp_chain_receiver.py
     test/registered/unit/managers/test_pp_proxy_stamp_631.py
     test/registered/unit/managers/test_pp_flip_slot_hold_631.py
+    test/registered/unit/managers/test_pp_slot_last_batch_631.py
     test/registered/unit/managers/test_phase_flip_draft_bootstrap_631.py
     test/registered/unit/managers/test_phase_flip_spec_seam_631.py
     test/registered/unit/managers/test_phase_purity_631.py

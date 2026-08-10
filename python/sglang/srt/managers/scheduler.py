@@ -7148,21 +7148,54 @@ class Scheduler(
         # the log line is the only instrument that will catch it again.
         from sglang.srt.managers.phase_flip_resident_carry import (
             ResidentCarryError,
+            describe_resident_slots,
+            repair_duplicate_resident_reqs,
         )
 
-        try:
-            running_bs = sum(
+        def _running_bs() -> int:
+            return sum(
                 len(getattr(b, "reqs", []) or [])
                 for b in harvest_resident_batches(self)
             )
+
+        try:
+            running_bs = _running_bs()
         except ResidentCarryError as exc:
+            # #631 DEFECT R. Refusing was NOT containment, it was the
+            # deadlock: under strict purity only a flip to TP drains the
+            # resident set, so declining to evaluate the flip policy
+            # blocked the one action that clears the condition being
+            # detected -- 1115 flips before, zero after, forever.
+            #
+            # So repair once, then re-ask. The repair only removes Req
+            # entries that are duplicated INSIDE one batch, which is
+            # unambiguously wrong at any count; if the set is corrupt some
+            # other way the retry raises again and we still decline, but
+            # now with the full slot row in the log instead of a bare
+            # count, because two boots were spent attributing that count.
             logger.error(
-                "PHASE-POLICY refusing to evaluate the flip policy this "
-                "round: the resident set is corrupted (%s). Not arming; "
-                "the instance keeps serving in its current phase.",
+                "PHASE-POLICY resident set is corrupted (%s). Slots: %s",
                 exc,
+                describe_resident_slots(self),
             )
-            return
+            try:
+                repaired = repair_duplicate_resident_reqs(self)
+                running_bs = _running_bs()
+            except ResidentCarryError as exc2:
+                logger.error(
+                    "PHASE-POLICY refusing to evaluate the flip policy this "
+                    "round: the resident set is still corrupted after repair "
+                    "(%s). Not arming; the instance keeps serving in its "
+                    "current phase.",
+                    exc2,
+                )
+                return
+            logger.error(
+                "PHASE-POLICY resident set repaired (%d duplicate entrie(s) "
+                "removed); evaluating the flip policy with running_bs=%d.",
+                repaired,
+                running_bs,
+            )
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the

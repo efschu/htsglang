@@ -288,6 +288,138 @@ def duplicate_resident_reqs(batches: Sequence) -> List[str]:
     return dups
 
 
+def describe_resident_slots(scheduler) -> str:
+    """One forensic line naming every slot's three handles. Read-only.
+
+    #631 DEFECT R cost two boots to attribute because the refusal named a
+    COUNT and nothing else: "running_mbs[0] claims 5". A count cannot
+    distinguish the three ways the number can be wrong -- duplicated Reqs
+    inside one batch, one batch reachable twice, or a genuinely oversized
+    admission -- and those have different fixes. This prints the whole
+    slot row instead, so the next occurrence is attributable from the log
+    without a second boot:
+
+      * ``reqs``/``uniq`` differing is duplication INSIDE the batch
+        (defect R's signature);
+      * ``mbs=None`` next to a resident ``run`` is the purity-idle slot
+        that makes a stale ``last`` reachable; and
+      * ``last`` naming a distinct EXTEND batch is the object that gets
+        re-merged.
+
+    Never raises: it runs on an error path, where a second exception would
+    destroy the evidence it exists to capture. ``_reqs_of`` refuses a
+    defect-M ``reqs``, so that call is guarded too.
+    """
+
+    def _shape(batch) -> str:
+        if batch is None:
+            return "None"
+        try:
+            reqs = _reqs_of(batch)
+        except ResidentCarryError as exc:
+            return f"<unreadable: {exc.__class__.__name__}>"
+        mode = getattr(batch, "forward_mode", None)
+        try:
+            mode_s = "extend" if mode is not None and mode.is_extend() else str(mode)
+        except Exception:  # noqa: BLE001 - forensic path, never mask evidence
+            mode_s = "?"
+        return (
+            f"id={id(batch) & 0xFFFFFF:06x} reqs={len(reqs)} "
+            f"uniq={len({id(r) for r in reqs})} mode={mode_s}"
+        )
+
+    slots = list(getattr(scheduler, "running_mbs", []) or [])
+    last = list(getattr(scheduler, "last_mbs", []) or [])
+    mbs = list(getattr(scheduler, "mbs", []) or [])
+    rows = []
+    for i in range(len(slots)):
+        rows.append(
+            f"[{i}] run({_shape(slots[i])}) "
+            f"last({_shape(last[i] if i < len(last) else None)}) "
+            f"mbs({_shape(mbs[i] if i < len(mbs) else None)})"
+        )
+    rows.append(f"running_batch({_shape(getattr(scheduler, 'running_batch', None))})")
+    return " | ".join(rows)
+
+
+def repair_duplicate_resident_reqs(scheduler) -> int:
+    """Drop Reqs that appear MORE THAN ONCE inside a single resident batch.
+
+    #631 DEFECT R, the containment half. The leak itself is fixed at its
+    source (``_pp_record_slot_last_batch``); this exists because the
+    guard's refusal was, on its own, a DEADLOCK:
+
+        under strict purity no decode runs in the PP layout, so only a
+        flip to TP can drain the resident set -- and the guard refused to
+        evaluate the flip policy precisely while the set looked corrupt.
+        The refusal therefore blocked the one action that clears the
+        condition it detects. 1115 flips before, zero after, and the
+        instance never recovered.
+
+    This is the SECOND time in this chain that "a detector that only
+    declines to act is not containment" was paid for, so the rule is now
+    stated rather than rediscovered: a refusal must not be able to outlive
+    the condition it names. Either repair the set or permit the drain --
+    never spin.
+
+    Repair, not clamp. A Req reachable twice through ONE batch's ``reqs``
+    is unambiguously wrong at any count: the batch's per-request tensor
+    rows and its ``reqs`` list are one basis, so a duplicate row is a
+    double free waiting to happen. Removing the later occurrences restores
+    the batch to a state the allocator can describe, which is more than
+    "small enough to pass the ceiling" -- a clamp would leave a set nobody
+    can name and move the next symptom further from its cause (the defect-M
+    lesson, ``_reqs_of``).
+
+    ``filter_batch(keep_indices=...)`` is the scheduler's own primitive and
+    the same one ``merge_resident_batches`` uses to resolve partial
+    overlap, so the batch's tensors stay consistent with its ``reqs``
+    rather than acquiring a second convention.
+
+    Returns the number of duplicate entries removed, and logs loudly per
+    batch: a repair that runs is a bug report, not a routine event. With
+    defect R fixed this should never fire; if it does, the log line names
+    the slot to start from.
+    """
+    removed = 0
+    slots = list(enumerate(getattr(scheduler, "running_mbs", []) or []))
+    candidates: List[Tuple[str, object]] = [
+        (f"running_mbs[{i}]", b) for i, b in slots
+    ]
+    running = getattr(scheduler, "running_batch", None)
+    if not any(b is running for _, b in candidates):
+        candidates.append(("running_batch", running))
+
+    for origin, batch in candidates:
+        if batch is None:
+            continue
+        reqs = _reqs_of(batch)
+        seen: Set[int] = set()
+        keep = []
+        for idx, req in enumerate(reqs):
+            if id(req) in seen:
+                continue
+            seen.add(id(req))
+            keep.append(idx)
+        if len(keep) == len(reqs):
+            continue
+        dropped = len(reqs) - len(keep)
+        logger.error(
+            "%s REPAIR: %s held %d entries for %d distinct request(s); "
+            "dropping %d duplicate entrie(s). This is #631 defect R -- a "
+            "stale last_batch was re-merged into a resident batch. The "
+            "flip policy may evaluate again after this repair.",
+            LOG_PREFIX,
+            origin,
+            len(reqs),
+            len(keep),
+            dropped,
+        )
+        batch.filter_batch(keep_indices=keep)
+        removed += dropped
+    return removed
+
+
 def resident_req_identity(scheduler) -> List[Tuple]:
     """The carried set as comparable identity, for the before/after pin.
 

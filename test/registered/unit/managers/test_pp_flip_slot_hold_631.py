@@ -94,6 +94,9 @@ class _Rank:
 
     _event_loop_pp_body = SchedulerPPMixin._event_loop_pp_body
     _pp_flip_hold_slot = SchedulerPPMixin._pp_flip_hold_slot
+    # #631 defect R: the slot's last-batch bookkeeping is shipping code too,
+    # so it is taken off the mixin like the rest rather than restubbed here.
+    _pp_record_slot_last_batch = SchedulerPPMixin._pp_record_slot_last_batch
 
     def __init__(
         self,

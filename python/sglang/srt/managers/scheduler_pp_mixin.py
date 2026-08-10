@@ -247,7 +247,10 @@ class SchedulerPPMixin:
                             self.mbs[next_mb_id],
                             next_batch_result,
                         )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                # #631 defect R: OUTSIDE the block above, deliberately. See
+                # _pp_record_slot_last_batch -- nesting this under "did the
+                # slot run something" is the resident-carry leak.
+                self._pp_record_slot_last_batch(next_mb_id)
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
@@ -1436,6 +1439,76 @@ class SchedulerPPMixin:
             )
 
         return "; ".join(reasons) if reasons else None
+
+    def _pp_record_slot_last_batch(self: Scheduler, slot: int) -> None:
+        """``last_mbs[slot]`` names the batch that slot ran LAST ITERATION.
+
+        #631 DEFECT R -- THE RESIDENT-CARRY LEAK, and it is one indentation
+        --------------------------------------------------------------------
+        This assignment used to live INSIDE ``if self.mbs[slot] is not
+        None:``, one level deeper, sharing a block with the D2H sync and
+        ``_pp_process_batch_result``. Sharing that block silently changed
+        what the name MEANS, from
+
+            "the batch this slot ran in its previous iteration"   (correct)
+
+        to
+
+            "the last non-empty batch this slot EVER ran"          (a leak)
+
+        and the two only differ when a slot legitimately runs nothing while
+        requests are still resident in it. Before strict phase purity that
+        combination barely existed: a slot holding a non-empty
+        ``running_batch`` produced a decode batch, so ``mbs[slot]`` was
+        non-None and the entry was refreshed every cycle. STRICT PURITY
+        CREATED IT ON PURPOSE -- ``get_next_batch_to_run`` returns
+        ``batch_to_run = None`` for a resident decode batch in the PP layout
+        (``scheduler.py``, ``phase_decode_blocked_here`` -> ``ret = None``),
+        and that None is the intended signal that the PP phase has no work.
+
+        WHAT THE STALE ENTRY THEN DOES, once per visit to the slot, forever
+        --------------------------------------------------------------------
+        The stale entry is an EXTEND batch, so on every later visit to this
+        slot ``get_next_batch_to_run`` takes its
+        ``last_batch.forward_mode.is_extend()`` branch and reaches
+        ``running_batch.merge_batch(last_batch)``. ``merge_batch`` extends
+        ``reqs`` IN PLACE, so the same requests are appended again, and
+        again, once per cycle:
+
+            claims 5 -> 13338 -> 26671 -> ... -> 868447   (+1 per round)
+
+        Neither existing defence can see it, and that is not an oversight in
+        either of them:
+
+          * the self-merge guard (``scheduler.py``, "SELF-MERGE REFUSED")
+            compares ``last_batch is running_batch`` -- but the stale entry
+            is a DISTINCT object; and
+          * ``harvest_resident_batches`` dedupes by ``id(batch)`` -- but the
+            duplication is INSIDE one batch's ``reqs``, not across batches.
+
+        A distinct object holding already-resident Reqs is the one shape
+        that defeats both at once, which is exactly the hazard entry K of
+        ``phase_flip_presence`` predicted for a non-idempotent merge.
+
+        WHY UNCONDITIONAL IS THE CORRECT RULE, not merely the fixed one
+        --------------------------------------------------------------------
+        The non-PP loops have always written ``self.last_batch = batch``
+        unconditionally, with ``batch`` possibly None. This restores that
+        same semantics per slot, so both loop families now answer "what did
+        the previous iteration run" the same way, and "nothing" is a real
+        answer rather than a hole that preserves the previous answer.
+
+        The ordering makes the consumption exactly-once: iteration
+        ``slot - 1`` publishes ``last_mbs[slot]`` from the cycle's earlier
+        ``mbs[slot]``, iteration ``slot`` consumes it, and the next cycle
+        overwrites it with whatever that consumption produced -- None
+        included.
+
+        The default path is unchanged: with purity off, a resident slot
+        always produces a batch, so ``mbs[slot]`` is non-None on exactly the
+        iterations that previously reached this line.
+        """
+        self.last_mbs[slot] = self.mbs[slot]
 
     def init_pp_loop_state(self: Scheduler):
         # #631 J.3: THIS REBIND IS WHERE THE RESIDENT DECODE SET DIED.
