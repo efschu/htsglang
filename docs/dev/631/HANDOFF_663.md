@@ -24,6 +24,19 @@ real size at every cutover. I found it by accident while grepping for
 something else. **Before trusting a null result, establish that the
 instrument can produce a non-null one.**
 
+**0b. I reported a log number as a finding without checking whether it was
+an echo of my own configuration.** I read `max_total_num_tokens 687090` out
+of the boot log, saw it was above the 669440 target, and announced that
+HANDOFF_662's >600k closure was contradicted. 687090 is
+`--max-total-tokens 260000` floored to a rank-unit boundary and multiplied
+back up by the split factor; the same log sentence prints
+`local capacity 260000`. The refutation was inside the evidence I quoted,
+and I did not read to the end of the line. The conclusion happened to
+survive — a genuine pre-cap profile one line earlier says ~953786 — but I
+reached it by luck, not by method. **A number computed downstream of a flag
+you set yourself can never tell you what the rig would do without that
+flag.** See §5.
+
 **1. I fixed the main PP loop and left two structurally identical loops
 alone.** `_event_loop_pp_body` was the loop my feature runs, so it is the
 loop I fixed. The prefill-disaggregation and decode-disaggregation loops in
@@ -146,29 +159,106 @@ unambiguously:
 
 Which gives a direct purity read without new instrumentation.
 
-## 5. >600k: 662's CLOSURE DOES NOT HOLD, and the reason is in the boot log
+## 5. >600k: 662's closure does not hold — but my first evidence for that was garbage
 
 HANDOFF_662 §4 closed >600k on the premise that the pool is sized once at
-boot and every grow path is closed, therefore no spill can add capacity.
-The premise about grow paths is true. **The conclusion does not follow,
-because it never asked what the boot-time size could have been.**
+boot and every runtime grow path is closed, therefore no spill can add
+capacity. The claim about grow paths is true. **The conclusion does not
+follow, because it never asked what the boot-time size could have been.**
 
-This boot's own log answers that:
+### First, the number I got wrong, because the shape of the mistake matters
+
+I read this line out of the boot log and reported it as a profiled capacity
+above the 669440 target:
 
     max_total_num_tokens 687090 (vector [28, 26, 20], hybrid mamba cap 2359344)
 
-At the shipping budget the engine **profiles 687090 tokens** — above the
-669440 target. The instance runs at 260000 only because
-`--max-total-tokens 260000` is passed, and that flag is a `min()` cap that
-can only lower the profiled figure.
+**It is not a profile. It is my own `--max-total-tokens 260000` rounded and
+re-expanded.** `_apply_token_constraints`
+(`model_runner_kv_cache_mixin.py:4422-4428`) applies the user cap FIRST,
+then divides by each rank's ratio and multiplies back by the split factor:
+`260000//28 = 9285`, `//26 = 10000`, `//20 = 13000`; `min = 9285`;
+`9285 x 74 = 687090`, and line 4541 clamps it straight back to 260000. The
+same log sentence prints `local capacity 260000` — the refutation was
+inside the evidence I quoted.
 
-So the binding constraint on >600k is **not the pool arithmetic. It is the
-corridor** — the 1024 MiB free-per-card law — because a larger pool spends
-exactly the free memory the corridor is measuring. That reframes the
-question a successor should ask, from "can the pool be grown" (answered: it
-does not need to be) to "what would make a 600k pool corridor-legal".
+**The lesson is not "check your arithmetic".** It is that a number computed
+downstream of a flag I set myself can never be evidence about what the rig
+could do without that flag, and 687090 was numerically close enough to the
+target to feel like a discovery. **Before a log number becomes a finding,
+establish that it is not an echo of your own configuration.**
 
-<!-- SUBAGENT COSTING: filled in below -->
+### The real ceiling, and it is higher than the number I wrongly cited
+
+One line earlier is a genuine PRE-cap profile, taken from a raw configurator
+call that never sees the user limit:
+
+    Uneven DCP: ... raise max_total_num_tokens from 953786 to ~1198144
+    (per-rank profiled capacity [609580, 335126, 299542];
+     active vector [28, 26, 20] leaves ranks idle)
+
+`min(609580//28, 335126//26, 299542//20) x 74 = 953786`, verified. So at the
+shipping budget the pool arithmetic would hand out **~953,786 tokens**, and
+662's premise is wrong with a wider margin than I claimed. Caveat, stated
+because it is load-bearing: this is a pre-graph-capture profile and
+post-capture resizing is inactive in this boot, so it is *what the sizer
+would have handed out*, not a number anyone has booted.
+
+### So the binding constraint is the corridor, and it is quantified
+
+The per-token cost is confirmed exactly against this boot:
+`260000 x 32 layers x 256 B = 1.983 GiB` matches PP0's reported K size, and
+the 2:1:1 split confirms the layer shares. 662 §5's expression holds:
+
+    per-rank KV bytes = T x 32 KiB x max(layer_share_r, token_share_r)
+
+with shares (0.500, 0.351, 0.270), sum 1.1216. Cost of going from 260000 to
+669440, against this window's measured corridor minima:
+
+| rank | share | delta KV | measured min @260k | projected min @669440 |
+|---|---|---|---|---|
+| 0 (5090) | 0.500 | +6397 MiB | 2167 | **-4231** |
+| 1 | 0.351 | +4496 MiB | 2612 | **-1884** |
+| 2 | 0.270 | +3458 MiB | 1809 | **-1649** |
+
+**669440 is short by 5-7 GiB per card.** Anchored on the measured minima,
+the largest corridor-legal pool is **T ~ 333,000, rank-0-bound** — which
+also says 260000 is *not* the edge, and is the cheapest capacity work
+available to a successor.
+
+### The spec's own spill mechanic cannot close it, and the reason is sharper than "no grow path"
+
+The arena is `max(pp_bytes, tp_bytes)` **fixed for process life**
+(`phase_flip_boot.py:544`), and it cannot be shrunk even in principle
+because **the TP decode CUDA graphs bake its absolute addresses**
+(`phase_flip_boot.py:569`). But suppose it could be. It still gains nothing,
+for a reason that applies to both quantities at once:
+
+* the **pool ceiling** is a worst-PHASE quantity, and each rank's idle tail
+  exists only in that rank's non-binding phase, so `min over phases` of the
+  bytes freed is **0** on every rank;
+* the **corridor minimum** is a worst-TIME quantity, and the tail is idle in
+  precisely the phase that does not set the minimum, so `min over time` is
+  **0** as well.
+
+**I had conceded that the tail was at least real for the FREE column. That
+concession was wrong** — it is real instantaneously and worthless to a
+continuous-minimum law. To make the tail spendable you would have to change
+what the `max()` is taken over, not when it is released: equalize the two
+layouts' per-rank weight footprints so `pp_bytes_r ~ tp_bytes_r`. Even then
+it is ~1.2-1.8 GiB per card against a ~6.4 GiB shortfall on rank 0.
+
+And `phase_flip_spill.py` is not a partial implementation of spec item 6 at
+all: `get_spill_ladder` has no caller, `phase_flip_spill_depth` is not a
+`ServerArgs` field, and the ladder is built over the **draft** model's
+parameters — which `phase_flip_boot.py:562` says are not arena-backed and
+stay resident across both phases. It targets a different asset entirely.
+
+**Honest closure: >600k is unreachable on this rig at this budget, and the
+blocker is the corridor, not the pool sizer.** The gap is ~6.4 GiB on the
+5090 alone; the spec's spill mechanic is worth 0 against it. Closing it
+needs a fourth card or a smaller per-token cell, and that is a decision for
+the user, not a defect for a successor to fix.
 
 ## 6. WHAT I DID NOT REACH
 
