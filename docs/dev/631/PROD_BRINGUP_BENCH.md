@@ -3862,3 +3862,66 @@ phases now comfortable, the seam is the tightest instant in the cycle.
 **Occupancy caveat, stated because this chain has quoted capacity off
 idle samplers:** 82% is real load, and `full token usage: 0.73` was
 observed directly in the scheduler log during the run.
+
+## s30 — CorridorGuard wired at the seam, item 16 folded in (2026-08-10)
+
+Boot: depth=draft, POLICY=auto, strict purity, MTP on, decode/verify/draft
+graphs on, pool 500000, `--rank-gpu-memory-mib 31800,14000,15600`.
+Peak occupancy 199453/500000 = 40% — **none of these rows is capacity
+evidence**, they are corridor and mechanism rows.
+
+### Corridor + item-16 levelness
+
+| run | arming floor | min free 0/1/2 | breaches | spread mean | spread worst | abandons | health |
+|---|---|---|---|---|---|---|---|
+| baseline | 1024 (=law) | 1720 / 3768 / 1960 | 0 | 2901 | 3551 | 0 | 200 |
+| can-fail A (pre-fix) | 1600 | 2300 / 4582 / 2444 | 0 | 2938 | 3155 | 330 | **503** |
+| can-fail B (post-fix) | 1600, law 1024 | 2024 / 3984 / 2244 | 0 | 2901 | 4013 | 0 | 200 |
+
+Can-fail A is the bug, not the gate: the guard judged refusals by its arming
+watermark, so it refused seams the law permitted, and under strict purity a
+persistently refused pp->tp starves decode outright (411 abandons, 0 requests
+in 6 min, /health 503, all ranks alive). Fixed by separating `law_floor_mib`
+from `floor_mib`. See HANDOFF_673 §1a.
+
+**Item 16 headline: the cards are NOT evenly filled.** The 5090 never drops
+below ~3.8 GiB free while both 3080s bind near 1.7-2.2 GiB, stable across
+runs. ~2.9 GiB of 5090 headroom is what a levelling rebalance is playing for.
+
+### Spill-before-alloc, proven on metal
+
+    CORRIDOR-GUARD cleared: want 820 MiB, free 2394 -> 2680 MiB,
+                            reclaimed 286 MiB from [draft-weights]  (tp_to_pp)
+
+NVML's free column rose by the payload BEFORE the allocation proceeded
+(re-probed, not trusted from the provider). 26 arms / 0 refusals in run B;
+197 refusals / 330 clean unanimous abandons / corridor HELD / no breach in
+run A. Both directions of the can-fail proof are on record.
+
+Known gap: on `pp->tp` every arm reads `reclaimed 0 MiB from [nothing]` — the
+drafter is already spilled in PP, so the gate has no provider for that
+direction at all (HANDOFF_673 §1d).
+
+### Arena tail re-measured, from this boot's `TP stack built` line
+
+| rank | arena / pp | tp | tail (idle in TP) |
+|---|---|---|---|
+| PP0 (5090) | 13482.18 | 13163.45 | **318.7 MiB** |
+| PP1 | 8144.00 | 7923.95 | **220.1 MiB** |
+| PP2 | 9114.95 | 7923.95 | **1191.0 MiB** |
+
+Confirms the 319/220/1191 record; **refutes 1773/0/1191**. Idle in TP, which
+is the phase that now binds on all three cards, and it needs no host round
+trip. This is the next rung.
+
+### Two rungs closed without building them
+
+* **Idle mamba/GDN slots are worth 0 bytes-to-driver.** `MambaPool` uses plain
+  `torch.zeros` (memory_pool.py:580-609), torch_memory_saver is off, and
+  `MambaSlotAllocator.free` frees an INDEX. An index is not a payload.
+* **The 4-layer PP stage-cut grid does not exist.** Effective granularity is
+  2 layers; `--pp-layer-ratio` bypasses the planner; mid-group cuts boot today
+  (`29,19,16` -> full map [7,5,4], validate passes). The `15,9,8` snap was two
+  layers, not four. Economics unchanged: ~308 MiB of corridor destroyed per
+  layer moved onto the 5090. The untried lever is decoupling the layer split
+  from the token vector, which needs no code.
