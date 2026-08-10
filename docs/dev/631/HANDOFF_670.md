@@ -97,6 +97,19 @@ mapped, working directly against the 1/B the loop exists to win.
 because `_execute` drains the retained leg and the exchange before the
 seam opens, so no source row is live anywhere in that loop.
 
+### 1g. A cost the cumulative release carries, measured small but not free
+
+Releasing `[0, hi)` per block makes each call walk that buffer's whole
+extent list, so the seam is `O(B x extents)` rather than `O(extents)`.
+On this rig at B=16, chunk 16 MiB, pool 500000 that is roughly 2.6M list
+steps per flip and shows up as the +4% flip latency -- acceptable, and
+measured rather than assumed. It scales with `B x pool / chunk` though,
+so a much larger pool or a much smaller chunk could make it matter. The
+O(1) form is available if it ever does: release only
+`[prev_hi - granularity, hi)`, which covers the one straddling granule
+and nothing already gone. Not done here because it would be an
+unmeasured optimisation of a measured-acceptable cost.
+
 ---
 
 ## 2. THE ACCOUNTING HAD TO MOVE WITH THE LOOP
