@@ -353,6 +353,47 @@ stepping the pool.** It is blocked by the staging SLOPE, not by the
 intercept, which is why the remaining work is the seam and not a bigger
 number in the launch command.
 
+## 3.5 THE ACCEPTANCE RUN (spec item 2)
+
+Launched at pool **430000** — the largest pool that satisfies the
+anti-wedge condition, verified by the run's own numbers (435,442). 65
+minutes unmanned, POLICY=auto, real agent traffic through router 30099
+from two qwen lanes started with NO model override.
+
+At the 4-minute extract every axis the spec names was green AT THE SAME
+TIME, which is the thing that had never been shown before:
+
+| axis | reading |
+|---|---|
+| corridor breaches of 1024 | **0** (min 2657 / 5698 / 2771) |
+| both layouts visited | **yes** — 30 `pp_to_tp`, 30 `tp_to_pp` |
+| FLIP ABANDONED / tracebacks | **0 / 0** |
+| strict purity | **0 of 553** prefill batches carried a CUDA graph |
+| graphs in decode | **63 of 63** — 100% |
+| accept length (MTP) | **2.768** |
+| agent-SDK traffic | `/v1/messages` + `/v1/messages/count_tokens` present |
+| host `memory.peak` / `oom_kill` | 112.1 GiB / 9 — unchanged |
+
+**The final verdict is written by
+`scripts/s25_finish_acceptance.sh`**, which was launched detached
+precisely so the evidence lands without a session watching: it writes the
+GREEN-RUN STAGE line into the holder at +30 minutes, then at the end
+extracts the judged evidence to
+`/spinning/evidence-631/s25/acceptance/extract.txt`, folds it into
+PROD_BRINGUP_BENCH section 2h, commits and pushes. It commits whatever the
+verdict is — a failed run that lands its evidence honestly is worth more
+than a green one nobody recorded.
+
+**Read that extract before believing this table.** The numbers above are
+from four minutes in; the run has to hold for sixty.
+
+### The one caveat on this run
+
+Peak occupancy is around 20-35% of the pool. That is fine for what
+acceptance asks — every axis holding together, unmanned, under real
+traffic — but it means the run does NOT double as a capacity proof, for
+the same reason section 3 gives. Do not cite it as one.
+
 ## 4. STATE AT HANDOFF
 
 * Branch `feat/route-a-631`, pushed to the fork.
