@@ -487,3 +487,38 @@ the same instrument walked to 868447.
 zero times. The stale-`last_mbs` entry was also what kept re-creating the
 aliased state that guard existed to catch, so removing the leak removed its
 cause too.
+
+## 10. INDEPENDENT ADVERSARIAL REVIEW OF THE FIX
+
+Briefed to break the fix, not confirm it. Result:
+
+| item | verdict |
+|---|---|
+| lost-work path (could clearing `last_mbs[S]` drop an unmerged batch?) | **CONFIRMED SAFE** |
+| consumers of `last_mbs` / `last_batch` | main loop SAFE; **risk found in the two disagg loops** |
+| default path with phase-flip OFF | **CONFIRMED SAFE**, bit-for-bit |
+| `repair_duplicate_resident_reqs` | **CONFIRMED SAFE** |
+
+The index argument, which is the one I most wanted checked: `mbs[S]` is
+written only at iteration `S`, and `last_mbs[S]` is published only at
+iteration `(S-1) % N`. Nothing else writes either index, so the value
+survives the full cycle between write and publish. The `_pp_flip_hold_slot`
+path repeats the CURRENT slot without advancing `mb_id`, so it cannot touch
+another slot's pair either.
+
+On premature flip commits: clearing the entry makes `orphan_resident_reqs`
+return FEWER orphans, so a flip can commit sooner. That is safe, and for a
+precise reason — the orphan scan compares requests in `last_mbs` against
+`running_mbs`, so a real unmerged prefill batch sitting in `last_mbs[S]`
+still reports its rids and still BLOCKS the flip. Only the "nothing ran"
+case is removed from the scan, which is exactly what it should be.
+
+**The disagg finding upgrades my error 1 from "not established" to a
+bounded statement.** `event_loop_pp_disagg_prefill` (:440) and
+`event_loop_pp_disagg_decode` (:623) still carry the old conditional form.
+They are **harmless today because neither consults
+`phase_decode_blocked_here`** — condition (A), "batch selection returns None
+while requests stay resident", does not hold for them. They would resurrect
+defect R the moment strict purity reached a disaggregated PP path. Left
+unchanged deliberately: they are outside #631's scope and untested here, and
+a blind edit to a path I cannot exercise is how the next defect gets written.
