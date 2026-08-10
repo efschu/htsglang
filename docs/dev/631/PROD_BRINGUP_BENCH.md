@@ -2990,3 +2990,40 @@ Both acceptance axes hold simultaneously at the larger pool:
 
 Graphs are active where the spec wants them (TP decode) and absent where
 purity forbids them (PP prefill).
+
+---
+
+## 2h. FINAL ACCEPTANCE RUN (user spec item 2) — pool 430000
+
+All axes on ONE unmanned log, POLICY=auto, strict purity, MTP on,
+CUDA graphs on in decode, real agent traffic through router 30099.
+
+Recipe: `scripts/s25_acceptance_run.sh 65 /spinning/evidence-631/s25/acceptance`
+plus two qwen analysis lanes launched with NO model override, doing real
+work (a coverage audit of the new span ops, and a map of which tests must
+change under restore-first).
+
+Extract: `scripts/s25_acceptance_evidence.py <outdir>`.
+Evidence: `/spinning/evidence-631/s25/acceptance/`.
+
+| axis | result |
+|---|---|
+| pool | 430000 |
+| corridor min idx0 / idx1 / idx2 | FILL |
+| corridor typical (p50) | FILL |
+| breaches of 1024 | FILL |
+| flips pp_to_tp / tp_to_pp | FILL |
+| BOTH layouts visited | FILL |
+| FLIP ABANDONED | FILL |
+| tracebacks | FILL |
+| prefill batches / WITH a CUDA graph | FILL (strict purity) |
+| decode batches / WITH a CUDA graph | FILL |
+| accept length (MTP) | FILL |
+| staging reserved min / max / mean | FILL |
+| peak live slots | FILL |
+| agent-SDK traffic (`/v1/messages` + companions) | FILL |
+| host `memory.peak` / `oom_kill` | FILL |
+
+### Reading it
+
+FILL_READING

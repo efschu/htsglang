@@ -194,9 +194,30 @@ Three moves:
    `j0 >= 5` for rank 2 — and both BINDING cards pay approximately
    ZERO transient, while the 5090 absorbs ~1.95 MiB/1000 pool tokens.
 
-Predicted ceiling on successor 24's inferred baseline: about **594,600**
-— just under the floor. On the corridor minima actually measured here it
-may clear 600000; that is a question for a boot, not for more arithmetic.
+**Predicted ceiling on the baseline I MEASURED (not the inferred one):
+601,233 — it clears the 600,000 floor.** On successor 24's inferred
+baseline the same design prices at about 594,600, just under; the
+difference is entirely the intercept, and mine is the measured one
+(binding-card free excluding staging = `min_free + staging_reserved` =
+`1705 + 1047` = 2752 MiB at P=500000).
+
+Side by side, all three from that same measured baseline:
+
+| design | staging slope (MiB/1000 slots) | const | ceiling |
+|---|---|---|---|
+| current seam, W=4 | 4.517 | 357 | **437,862** |
+| **2.1b restore-first, W=16, ordered waves** | 1.130 | 60 | **601,233** |
+| 2.1 fully streamed seam | ~0 | 60 | **670,803** |
+
+So **2.1b is the recommended next move**: it is the contained change, it
+avoids row-blocking the collective, and it is the one that first crosses
+the user's floor. 2.1 is the headroom beyond it, not the prerequisite.
+
+Treat 601,233 as a prediction with about 5% of slop in it — it sits close
+enough to 600,000 that the first boot must be measured at FULL occupancy,
+not at the 20-26% the current load recipes reach. Use
+`scripts/s25_capacity_step.sh`, and believe `scripts/s25_step_verdict.py`
+when it warns that occupancy was too low to conclude anything.
 
 **Why this is low-risk despite touching the seam.** Restore-first does
 not change WHICH bytes are read or written, nor in what order — only when
@@ -276,13 +297,26 @@ price as the ~600000 shortfall.** One fix buys both.
 Full tables in PROD_BRINGUP_BENCH section 2g. The three results that
 matter:
 
-1. **The ~432,000 anti-wedge ceiling is CONFIRMED, by a third independent
-   method.** My own measurement — baseline free on the binding card
-   excluding staging, taken as `min_free + staging_reserved` at pool
-   500000 — gives **437,862**, against successor 24's 432,861 and the qwen
-   log regression's 437,235. Within 1.2%. The inferred-baseline term that
-   successor 24 flagged as his weak link has now been measured and did not
-   move the answer.
+1. **The ~432,000 anti-wedge ceiling is CONFIRMED, now by FOUR independent
+   methods agreeing within 1%:**
+
+   | method | ceiling |
+   |---|---|
+   | successor 24, pricing the plan through `_staging_bytes` | 432,861 |
+   | qwen lane, regression over 393 logged flips | 437,235 |
+   | successor 25, measured baseline at pool **500000** | **437,862** |
+   | successor 25, measured baseline at pool **430000** (acceptance run) | **435,442** |
+
+   The last two are the same arithmetic applied at two DIFFERENT pools, so
+   they are not one measurement counted twice: the binding-card baseline
+   excluding staging is `min_free + staging_reserved`, which came out at
+   `1705 + 1047 = 2752` MiB at P=500000 and `2331 + 1070 = 3401` MiB at
+   P=430000 — consistent with each other under the resident slope. The
+   inferred-baseline term that successor 24 flagged as his weak link has
+   now been measured twice and did not move the answer.
+
+   `scripts/s25_step_verdict.py` now prints this extrapolation from any
+   step's own numbers, so it does not have to be re-derived by hand.
 2. **A 500000 boot holding the corridor is NOT a refutation of that
    ceiling**, and reading it as one would have been this chain's sixth
    false closure. I nearly made it. The ceiling is defined at FULL

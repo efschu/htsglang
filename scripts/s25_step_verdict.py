@@ -128,6 +128,45 @@ def main() -> int:
                 )
     print(f"batches with a CUDA graph: {graph_true} / without: {graph_false}")
 
+    # -- the anti-wedge extrapolation ---------------------------------------
+    #
+    # A step that holds the corridor at LOW occupancy says nothing about the
+    # ceiling, because the ceiling is the ANTI-WEDGE condition: a flip must
+    # stay affordable when the live set FILLS the pool. Rather than leave
+    # that arithmetic to be re-derived (and mis-derived) every time, do it
+    # here from THIS step's own numbers.
+    if dones and rows and pool:
+        gpu0 = sorted(int(r["gpu0_free"]) for r in rows if r.get("gpu0_free"))
+        if gpu0:
+            peak_stag = max(d["staging"] for d in dones)
+            # Free on the binding card excluding staging, at THIS pool.
+            base = gpu0[0] + peak_stag
+            resident = 5 * 2048 / 1048576 * 1000  # MiB/1000 tok, rank1 = 5 layers
+            slope, const = 4.517, 357             # corroborated staging model
+            lo, hi = 50_000, 1_500_000
+            for _ in range(80):
+                mid = (lo + hi) / 2
+                b = base + (pool - mid) * resident / 1000
+                s = slope * mid / 1000 + const
+                if b - s >= FLOOR_MIB:
+                    lo = mid
+                else:
+                    hi = mid
+            print(
+                f"\nanti-wedge extrapolation from THIS step:\n"
+                f"  binding-card baseline excluding staging = "
+                f"{gpu0[0]} + {peak_stag:.0f} = {base:.0f} MiB at pool {pool}\n"
+                f"  largest pool whose FULL-occupancy flip still clears "
+                f"{FLOOR_MIB} MiB: {lo:,.0f}"
+            )
+            if pool > lo:
+                print(
+                    f"  WARNING: the running pool {pool:,} EXCEEDS that. It "
+                    f"holds this load only because occupancy stayed low; a "
+                    f"single long request can reach the unsafe region, and "
+                    f"under strict purity an unaffordable flip WEDGES."
+                )
+
     ok = breaches == 0 and abandons == 0
     print(f"VERDICT: {'PASS' if ok else 'FAIL'} "
           f"(breaches={breaches}, abandons={abandons})")
