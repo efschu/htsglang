@@ -305,6 +305,38 @@ bear directly on it:
   This reading is not one agent's opinion: **two independently briefed
   surveys of the 800-line docstring converged on it**, and both flag the same
   entries as still open.
+
+### The strongest lead I have, stated as a lead and not a cause
+
+**READ, verified in source.** `install_resident_set`
+(`phase_flip_resident_carry.py:424-471`) is **asymmetric between the two
+legs**, and only one leg is defensive:
+
+* **PP→TP** (`to_tp=True`, `:443-448`) explicitly empties the slot arrays
+  *first* — `running_mbs = [_empty_batch_like(...)]`, `last_mbs = [None]*n`,
+  `last_batch = None` — with the stated reason *"so nothing references the
+  merged batch twice even transiently"*, because *"a stale slot batch still
+  referencing the carried requests would be a second, ageing view of the
+  resident set, and the NEXT flip's harvest would resurrect requests that had
+  since finished."*
+* **TP→PP** (`to_tp=False`, `:458-460`) does the opposite: it assigns
+  `slots[0] = merged` **and** `scheduler.running_batch = merged` — **the same
+  object reachable through both handles.**
+
+So the alias that s18's crash needed is *deliberately re-created on every
+`tp_to_pp` cutover*, in **slot 0** — which is exactly the slot my leak grows
+in (`running_mbs[0]`), in exactly the phase it grows in (PP).
+
+**INFERRED, and NOT established — do not treat this as the diagnosis.** I did
+not get to prove that this aliasing is the leak's cause, and there is a real
+argument against it: `harvest_resident_batches` dedupes by `id(batch)`
+(`:246-248`), so a pure alias is handled, and s18's guard catches
+`X.merge_batch(X)` directly. For this to be the cause, something must produce
+a **distinct object holding the same Reqs** — which is the one shape that
+defeats both defences at once. **Verify before building on it.** The cheapest
+falsifier: log `id(running_batch)` and `id(running_mbs[0])` alongside the
+claimed count at the guard site and watch whether they diverge as the count
+climbs.
 * **J.1 — SLOT SCOPE**, and its unnamed **AUDIT CANDIDATE** successor
   (docstring lines 525-532), which is marked **OPEN**: the false assumption
   that `scheduler.running_batch` names the rank's resident set is available
