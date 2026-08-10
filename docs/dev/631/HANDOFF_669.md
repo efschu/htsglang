@@ -153,6 +153,24 @@ Calibration returned **2036.4 B/row**. Independent check: the DONE lines
 give 545.38 MiB per 279237 cells = **2048 B/cell**. The model reproduces
 a number it was not fitted to, within 0.6%.
 
+**SECOND VALIDATION, on metal, against the NEW code.** The 16:47Z boot at
+pool 430000 running restore-first W=16 reported `staging reserved
+1312.50 MiB` at 90 live slots. The model — calibrated only against the
+OLD accounting at 163626 slots — predicts **1305 MiB** for that point.
+0.6% error on a prediction it was not fitted to, in a different accounting
+regime and at the opposite end of the occupancy range.
+
+That single number also settles the disagreement with HANDOFF_668
+directly, with no modelling in between: **the seam's pool-proportional
+constant is ~1305 MiB, not the 60 MiB the 601,233 estimate assumed.** It
+is measurable at idle, because it does not depend on the live set.
+
+**Metal also cleared the one risk W=16 introduced.** Four times the waves
+means four times the exchange round trips, and the flip sits inside the
+no-return region. Measured: **1214–1859 ms over 16 waves**, against
+1336–2074 ms over 4 waves on the previous boot. No penalty; the per-wave
+fixed cost is not what dominates a flip.
+
 ### Staging demand, worst rank, by design
 
 | pool (full occupancy) | old W=4 | 2.1b W=16 |
