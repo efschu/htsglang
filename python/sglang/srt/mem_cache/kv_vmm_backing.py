@@ -923,6 +923,54 @@ class KvVmmBufferOwner:
             self._final_num_tokens = final
         return released
 
+    # -- #631 row-range backing, the streamed seam's unit ---------------------
+    #
+    # ROUNDING IS ASYMMETRIC AND DELIBERATE. A commit must cover every row
+    # that will be WRITTEN, so its span runs from the row's own byte offset
+    # up to the PADDED end of the top row. A release must never drop a row
+    # that will still be READ, so its span starts past the padded end of
+    # the bottom row and stops at the plain offset of the top one. Folding
+    # these two into one helper -- they look like the same arithmetic --
+    # makes the seam unmap live rows at a chunk boundary, which surfaces as
+    # data-dependent KV corruption rather than a fault.
+
+    def back_token_span(
+        self,
+        lo_tokens: int,
+        hi_tokens: int,
+        buffer_indices: Optional[Sequence[int]] = None,
+    ) -> int:
+        """Back tokens ``[lo, hi)`` of a buffer subset. Rounds OUTWARD."""
+        if self._arena is None:
+            raise RuntimeError("back_token_span after close / before construction")
+        committed = 0
+        for idx in self._resolve_indices(buffer_indices):
+            spec = self._specs[idx]
+            lo_b = spec.desc.prefix_span_bytes(lo_tokens, self.page_size)
+            hi_b = spec.desc.final_span_bytes(hi_tokens, self.page_size)
+            hi_b = min(hi_b, spec.reserved_span)
+            committed += self._arena.commit_span(spec.offset, lo_b, hi_b)
+            spec.backed_to = self._arena.committed_bytes(spec.offset)
+        return committed
+
+    def release_token_span(
+        self,
+        lo_tokens: int,
+        hi_tokens: int,
+        buffer_indices: Optional[Sequence[int]] = None,
+    ) -> int:
+        """Release tokens ``[lo, hi)`` of a buffer subset. Rounds INWARD."""
+        if self._arena is None:
+            raise RuntimeError("release_token_span after close / before construction")
+        released = 0
+        for idx in self._resolve_indices(buffer_indices):
+            spec = self._specs[idx]
+            lo_b = spec.desc.final_span_bytes(lo_tokens, self.page_size)
+            hi_b = spec.desc.prefix_span_bytes(hi_tokens, self.page_size)
+            released += self._arena.decommit_span(spec.offset, lo_b, hi_b)
+            spec.backed_to = self._arena.committed_bytes(spec.offset)
+        return released
+
     # -- accessors / teardown -------------------------------------------------
 
     @property

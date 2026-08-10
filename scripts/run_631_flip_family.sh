@@ -56,6 +56,7 @@ FAMILY=(
     # here rather than noted.
     test/registered/unit/managers/test_phase_flip_mover_streaming_631.py
     test/registered/unit/managers/test_kv_arena_span_ops_631.py
+    test/registered/unit/mem_cache/test_kv_pool_row_span_631.py
 )
 
 cd "$WT/test/registered/scheduler"

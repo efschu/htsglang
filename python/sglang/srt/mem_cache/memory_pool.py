@@ -2547,6 +2547,58 @@ class MHATokenToKVPool(KVCache):
             self._released_layers.difference_update(int(i) for i in layers)
         self._backing_released = len(self._released_layers) >= self.layer_num
 
+    # -- #631 row-range backing, for the STREAMED seam ------------------------
+    #
+    # The waved seam releases a whole layer at a time, which bounds staging
+    # by the wave count but leaves an irreducible transient of ONE
+    # destination layer. In the tp_to_pp direction that layer spans the
+    # FULL pool (a PP stage holds all tokens of its layers), i.e. 1.953 MiB
+    # per 1000 pool tokens, and no ordering removes it: a peer cannot
+    # release a source layer until its owner has written it, and the owner
+    # cannot write until its destination layer is backed. These two calls
+    # cut the unit from a layer to a ROW RANGE so the transient becomes a
+    # block instead of a layer.
+    #
+    # A layer touched by either call is marked NOT fully backed until a
+    # restore covers the whole pool, because ``backing_is_resident`` is
+    # read as "may a kernel touch this pool" and a partially backed pool
+    # must answer no.
+
+    def release_backing_span(self, layers, lo_row: int, hi_row: int) -> int:
+        """Hand back rows ``[lo_row, hi_row)`` of ``layers``. Rounds INWARD."""
+        if self._post_capture_owner is None:
+            raise RuntimeError(
+                "release_backing_span on a pool that was not allocated on a "
+                "VA reservation; construct it with swappable_backing=True"
+            )
+        indices = self._layer_buffer_indices(layers)
+        released = self._post_capture_owner.release_token_span(
+            int(lo_row), int(hi_row), indices
+        )
+        # Any partial release makes these layers non-resident; only a full
+        # restore clears them again.
+        self._released_layers.update(int(i) for i in layers)
+        self._backing_released = len(self._released_layers) >= self.layer_num
+        return released
+
+    def restore_backing_span(self, layers, lo_row: int, hi_row: int) -> int:
+        """Re-map rows ``[lo_row, hi_row)`` of ``layers``. Rounds OUTWARD.
+
+        Deliberately does NOT clear ``_released_layers``: a span restore is
+        one step of a stream, and the pool is only resident again once the
+        whole span is back. ``restore_backing(layers)`` is what completes
+        it.
+        """
+        if self._post_capture_owner is None:
+            raise RuntimeError(
+                "restore_backing_span on a pool that was not allocated on a "
+                "VA reservation; construct it with swappable_backing=True"
+            )
+        indices = self._layer_buffer_indices(layers)
+        return self._post_capture_owner.back_token_span(
+            int(lo_row), int(hi_row), indices
+        )
+
     @property
     def backing_is_resident(self) -> bool:
         """False from the first layer released until the last is restored.

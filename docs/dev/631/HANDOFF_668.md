@@ -119,6 +119,78 @@ then falls out of resident growth alone.
 numbers that decide it are the corridor minima from the 410000 run and
 from each ladder step, not this arithmetic.
 
+### 2.1 The streaming schedule, and why it balances EXACTLY
+
+This is the part worth reading carefully; it is short, and every previous
+attempt to reason about the seam informally got the direction wrong.
+
+Stream over the DESTINATION pool's row space, DESCENDING, in blocks. Let
+`p` be the fraction of that row space already processed, counting from
+the top.
+
+* the destination's backing is a SUFFIX that grows downward as `p` rises:
+  `p * S_dst` bytes are backed;
+* the source's backing is a PREFIX that shrinks as `p` rises: `(1-p) *
+  S_src` bytes are still kept.
+
+The two cancel because **a rank's PP residency and its TP residency are
+EQUAL** — `S_dst == S_src == S`. That identity is not an assumption; it
+is forced by the geometry and was already established in HANDOFF_667
+section 4: rank `r` holds `|stage_r|` layers over the full pool in PP, and
+all 16 layers over its `share_r` token slice in TP, and
+`16 * share_r == |stage_r|`. So
+
+    total backed  =  p*S + (1-p)*S  =  S,  for every p.
+
+**Constant, not a slope, and not merely bounded — exactly the resting
+layout.** The transient left over is one block of destination backing plus
+one block of payload, both chosen by the block size and neither scaling
+with the pool or the live set.
+
+Why DESCENDING and not ascending: the source can only give back a prefix
+cheaply once the rows above it are read, and reading descends; the
+destination can only be written where it is already backed, and its
+backing grows downward to meet the writes. Ascending inverts both and
+peaks at `2S` (section 1.3).
+
+Why the row spaces line up: the destination row of a slot is monotone in
+the slot id in BOTH directions (`pp` row of slot `L` is `L` itself; `tp`
+compact rows of an ascending slot list are ascending), so one descending
+walk over slots drives both sides monotonically. Rows that are never
+written still get backed on the way past, which is required anyway —
+the destination must end fully backed because it becomes the resting
+layout.
+
+### 2.2 What is BUILT and what is NOT
+
+Built, tested, committed:
+
+* `KvVmmArena.commit_span` / `decommit_span` — arbitrary chunk-aligned
+  extent ranges, asymmetric rounding (commit outward, decommit inward),
+  contiguous-from-zero watermark refresh so the legacy prefix path stays
+  correct while a span op has left a hole. 10 tests, red first.
+* `KvVmmBufferOwner.back_token_span` / `release_token_span` — the
+  row-to-byte map, with the asymmetry pinned so it cannot be "tidied"
+  into one helper. 5 tests.
+* `HostKvPool.release_backing_span` / `restore_backing_span` — the
+  layer-subset entry point.
+
+NOT built — this is the remaining work and it is the risky half:
+
+* the streamed `_execute` loop itself (section 2.1);
+* row-blocking the EXCHANGE, which needs a GLOBAL round count so all
+  three ranks call the collective the same number of times. Derive it
+  from the replicated plan (`ceil(max_r |slots owned by r| / block)`),
+  never from a rank-local row count — a rank-local count deadlocks the
+  group, and that failure mode looks exactly like a hang;
+* `_staging_bytes` re-derived for the streamed peak;
+* the chunked-extent requirement. `SGLANG_FLIP_SEAM_CHUNK_MIB` currently
+  also switches on `retain_handles`, which PARKS unmapped pages per-arena
+  (owned, not driver-free). Parking defeats exclusive backing outright —
+  both layouts would hold their pages continuously — so the two MUST be
+  decoupled before the streamed seam can use chunked extents. This knob
+  is a trap in its present form.
+
 ---
 
 ## 3. STATE
