@@ -212,6 +212,20 @@ branch above can return early and make the assertion vacuous. Refusals
 kept and tested (feature off; predictor not ready) — "always dynamic"
 would have passed the positive tests and broken every boot.
 
+**The graph baseline for item 8, read off this boot so nobody spends a
+boot finding it.** Captured today: draft DECODE, draft EXTEND, draft
+VERIFY. Disabled: PREFILL (`cuda_graph_config` resolves
+`prefill.backend='disabled'`). Capture cost 0.12-0.30 GB per rank per
+kind.
+
+That inverts the obvious reading of spec item 8. The user's instruction
+is to MEASURE draft graphs and leave them out if NEXTN gains nothing --
+and they are currently ON, so the item-8 A/B is a REMOVAL experiment,
+not an addition one, and the null hypothesis is that ~0.3 GB per rank of
+corridor is being spent for nothing. That memory is the same corridor
+the seam is fighting for, so a negative result there is worth as much to
+item 6 as it is to item 8.
+
 **Threshold-decode arm (spec item 10)** is specified and the flag is
 confirmed present and parsed (`phase_purity.parse_purity`,
 `threshold:<n>`); it is a boot-time server arg so it needs its own boot.
