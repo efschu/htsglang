@@ -675,3 +675,43 @@ corridor held — 100 ms time series, bs=4, on a load-marked allocator — and
 both purity directions proven. Report added flip time honestly at the
 measured H2D bandwidths (6.4 / 13 / 13 GB/s). **No closure verdict without
 the (A) ledger showing where every byte went.**
+
+## 13. THE RUN ENDED AT 06:18:50Z ON A HOST-RAM OOM, not a corridor breach
+
+The green run passed its 61-minute verdict (section 9) and I let it carry on.
+At **06:18:50Z, ~73 minutes in**, it died. Forensics captured BEFORE the
+restart, per the rule:
+
+**The witness is `/sys/fs/cgroup/memory.events`: `oom_kill 9`.** That is the
+host-RAM signature — the cgroup OOM killer SIGKILLs a rank, which leaves
+**exit -9 and no traceback** on the victim. Host RAM at capture: 120 GiB
+total, 30 used, 89 available (i.e. already reclaimed by the time I looked).
+
+**Both visible tracebacks are downstream victims, not the cause**, and the
+shape says so plainly:
+
+* `PP1 06:18:50` — dies in `_pp_recv_dict_from_prev_stage` ->
+  `recv_tensor_dict`, i.e. **waiting on a peer**;
+* `PP2 06:18:52` — dies in `_pp_recv_proxy_tensors` -> `recv_object` ->
+  `work.wait()` with `RuntimeError: Connection closed by peer`, then
+  `TCPStore sendBytes failed ... Broken pipe`.
+
+Two ranks blocked in a receive from a third. The third left no traceback,
+which is exactly what a SIGKILL looks like. **This is NOT the corridor and
+NOT VRAM** — the corridor was holding at 1037 MiB and never breached.
+
+**Why this is a plausible consequence of the design, and a lead worth
+following.** The phase-flip carries **59.75 GiB of PINNED host memory** for
+the two layouts' images (662 §4). Pinned pages are unswappable. Add four
+qwen agents and a soak driver on the same box and the host-RAM budget is the
+resource nobody in this chain has been costing. **Every capacity discussion
+in these handoffs has been about VRAM; this run died of host RAM.**
+
+That also gives the byte ledger of section 12 a second column it must have:
+**HOST** RAM, plain-TP3 vs flip, itemised the same way. The flip setup's
+whole spill design is "keep the inactive layout in host RAM", so host RAM is
+a first-class budget for it, not a background assumption.
+
+**State at handover:** serving was restarted unsupervised at 06:19:41Z at
+T=190000; verify health before using it. Crash log preserved at
+`/spinning/evidence-631/CRASH_20260810T0618Z_hostoom.log`.
