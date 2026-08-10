@@ -252,10 +252,74 @@ Geometry, established rather than assumed:
 **The binding card is nvidia-smi index 0 (rank 1)** — smallest measured
 free at 2203 MiB during the 270k probe.
 
-Do not carry the arithmetic below into a boot without re-measuring: it
-assumes the worst case that the live set equals the pool, and it was
-computed against the FIRST commit's staging, before the constants were
-cut. It is a starting point for a measured step, not a verdict.
+### The staging curve, and why it is trustworthy
+
+Pricing the live geometry through the real code path
+(`build_phase_flip_transition` + `_staging_bytes`, rank 1, 4 waves) gives
+
+    S(L) = 4.517 MiB per 1000 live slots * L  +  357 MiB constant
+
+and at L = 176873 it predicts **1156 MiB against the 1153 MiB the green
+run actually logged**. The model is therefore not an assumption; it
+reproduces the measurement to 0.3%.
+
+### The ceiling, and the bad news
+
+The binding condition is no longer the corridor as such — it is the
+ANTI-WEDGE condition, which is stricter and is the same inequality: a flip
+must stay affordable when the live set fills the pool, because an
+unaffordable flip at high occupancy under strict purity is the livelock
+again.
+
+With baseline free on the binding card inferred at 3852 MiB
+(2699 measured minimum + the 1153 MiB staging peak added back):
+
+    3852 - (P - 380000)*9.766/1000 - S(P) >= 1024      ->  **P <= 432,861**
+
+**So the ledgered ceiling is about 432000 tokens, +14% over today — and
+the >= 600000 target in my brief is NOT reachable by stepping the pool.**
+Reaching 600000 needs the staging SLOPE to fall from 4.517 to about 0.537
+MiB per 1000 slots, an 8.4x reduction. No pool arithmetic gets there.
+
+This corrects the natural reading of the loose corridor. The +1675 MiB of
+apparent margin is not spendable on pool, because roughly two thirds of
+every pool token's cost now comes back as staging at full occupancy:
+resident 9.766 MiB/1000 tokens, staging 4.517 on top of it.
+
+### What WOULD get there, quantified
+
+The slope exists because a wave's payload is held across that wave's
+backing swap. Invert the intra-wave order and it stops being a slope:
+
+* today: **release** the source wave, then **restore** the destination
+  wave, holding the wave's LIVE payload across the swap -> cost scales
+  with the live set;
+* instead: **restore** the destination wave FIRST, then row-chunk the
+  exchange inside the wave (read a row block, exchange it, write it
+  straight into the already-backed destination), then **release** the
+  source wave last. The peak becomes one wave's DESTINATION POOL SPAN plus
+  one row block -> a constant in the live set.
+
+That span is `(n_layers/W) * share * row_bytes` per pool token, i.e.
+2.441 MiB/1000 at W=4, 0.610 at W=16. And it lifts the wave-count cap as a
+side effect: `default_wave_count` is limited by the smallest stage only
+because a wave's releases must pay for its commits, and restore-first
+budgets that overlap explicitly instead.
+
+    W = 16, restore-first:  P <= ~630,000     (clears the 600000 target)
+
+**This is derived, not measured.** It assumes the corridor baseline holds
+and that the row-chunked exchange costs what the arithmetic says. It is
+the single highest-value unbuilt item and it is a contained change to
+`_execute` plus `WavedBackingSwap`.
+
+### Do not carry any of this into a boot without measuring
+
+The 432000 ceiling was NOT tested — I did not step the pool. The baseline
+free term is INFERRED (measured minimum plus the staging peak added back),
+so it is the one number in the chain that a real boot could contradict. A
+first trial at 410000 with a >= 12 min mixed load would validate or break
+the whole ledger cheaply, and that is the right next action.
 
 ---
 
@@ -263,20 +327,22 @@ cut. It is a starting point for a measured step, not a verdict.
 
 In the order I would take them:
 
-1. **The capacity step.** One reboot at a larger `--max-total-tokens`, a
-   >=10 min mixed load, corridor read, repeat. The ledger in section 4
-   gives the first trial value; measure, do not trust it.
-2. **Decode decomposition.** In-phase vs wall-clock decode tok/s is STILL
+1. **Validate the capacity ledger** with one reboot at 410000 and a >= 12
+   min mixed load. It either confirms section 4 or breaks it, cheaply.
+2. **Restore-first + intra-wave row chunking** (section 4). It is what
+   turns the staging slope into a constant and the only route to 600000
+   that the arithmetic supports.
+3. **Decode decomposition.** In-phase vs wall-clock decode tok/s is STILL
    unanswered after seven successors. `s22_decode_probe.py`'s duty-cycle
    instrument was fixed by successor 23 but the decomposition itself was
    never produced. The phase intervals must come from the server log's own
    flip markers, not from the probe's opinion.
-3. **Accept length 2.54 vs the ~2.9 measured under plain TP** — cause
+4. **Accept length 2.54 vs the ~2.9 measured under plain TP** — cause
    unknown.
-4. **Prefill chunk A/B.** Note HANDOFF_666's correction: the dynamic arm is
+5. **Prefill chunk A/B.** Note HANDOFF_666's correction: the dynamic arm is
    NOT free — `chunked_prefill_size` has ten memory-sizing consumers and
    nine read it RAW without the 1.25x inflation.
-5. **The wave-count floor guard** (1.2) and the **recoverable abandon**
+6. **The wave-count floor guard** (1.2) and the **recoverable abandon**
    (1.1c).
 
 ---
