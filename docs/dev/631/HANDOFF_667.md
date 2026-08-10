@@ -180,9 +180,55 @@ that can only have happened in TP, so this is not a prefill-only pass.
 
 ---
 
-## 3. THE GREEN RUN
+## 3. THE GREEN RUN — 64.5 min, ZERO ABANDONS, corridor held
 
-(Filled in at the end of this successor's window — see section 6.)
+Commit `510fb632a0`, pool 380000, `RANK_MIB 31800,14000,15600`, purity
+strict, spill depth cache, 4 seam waves. Recipe deliberately identical to
+the 68-min row (bench 2d) so the two compare: bs=4 soak + a repeating
+111405-token prefill ladder + a repeating decode probe + live agent
+lanes, all concurrently.
+
+| axis | 68-min run (unwaved) | this run (waved) |
+|---|---|---|
+| duration / corridor samples | 68.1 min / 29740 | **64.5 min / 28114** |
+| **FLIP ABANDONED** | **51 lines = 17 events** | **0** |
+| flip DONE lines | 834 (= 278 flips) | **813 (= 271 flips)** |
+| tracebacks | 0 | **0** |
+| corridor min (idx 0/1/2) | 1215 / 3542 / 1349 | **2699 / 5732 / 2831** |
+| breaches of 1024 | 0 | **0** |
+| worst margin | +191 | **+1675** |
+| prefill batches / with a CUDA graph | 10989 / **0** | 8049 / **0** |
+| purity refusals | 138 | 136 |
+| decode batches / accept len | 1011 / **2.54** | 1647 / **2.734** |
+| decode `#running-req` | {1:453, 2:270, 3:234, 4:54} | **{1:624, 2:516, 3:489, 4:18}** |
+| host `memory.peak` / `oom_kill` | 112.1 GiB / 9 | **112.1 GiB / 9 (unchanged)** |
+
+**Agent traffic is evidenced, not asserted.** The serving log carries 142
+`/v1/messages` and their 142 `/v1/messages/count` companions — the
+agent-SDK request shape arriving through the router — plus 124
+`/v1/chat/completions`, on top of 119 `/v1/completions` from the soak and
+ladder legs. Two qwen analysis lanes were live for the whole window doing
+real work, launched with no model override.
+
+Evidence: `/spinning/evidence-631/s24/green/` (corridor.csv, soak.log,
+ladder.log, decode_probe.log).
+
+### Reading it
+
+* **The abandons are gone.** 17 events under the old code, 0 here, at a
+  comparable flip count. That is the whole point of the waved seam and it
+  is the number to re-check after any change to the seam.
+* **Strict purity held**: 8049 prefill batches, not one with a CUDA graph.
+* **Accept length recovered to 2.734** from 2.54, against a plain-TP
+  reference of about 2.9. Not explained — see 5.3 — but moving the right
+  way, and this run has 1647 decode batches behind it rather than 1011.
+* **Decode reaches bs=4**, so the bs=1 suspicion inherited from earlier
+  successors is settled for a second time.
+* **The corridor is now VERY loose**: worst margin +1675 MiB where the old
+  run had +191. Part of that is the smaller staging peak and part is a
+  lighter prefill count (8049 vs 10989), so do not read the whole 1484 MiB
+  as recovered headroom. It is, however, unambiguous that the pool lever is
+  open again.
 
 ---
 
@@ -237,4 +283,26 @@ In the order I would take them:
 
 ## 6. STATE AT HANDOFF
 
-(Completed at the end of the window.)
+* Branch `feat/route-a-631`, pushed to the fork. Tree clean.
+* **Serving is UP and healthy** on `510fb632a0`, port 30030, pool 380000,
+  geometry `pp_stage_ratio 14,10,8`, flip layer map [7,5,4] over 16
+  full-attention layers, purity strict, policy auto, 4 seam waves.
+* Two qwen analysis lanes may still be running (capacity byte ledger;
+  decode decomposition). **Stop them before rebooting serving.** Their
+  findings were not folded into this document — re-ask if needed.
+* GPU arbitration holder is mine; heartbeat stopped before release.
+* Harness nit worth one minute of someone's time:
+  `scripts/s24_green_run.sh` passes `--out '$OUT/ladder_$i.json'` inside a
+  nested quote where `$i` does not expand, so every ladder pass overwrites
+  one file. The per-rung numbers still land in `ladder.log`; only the JSON
+  is affected.
+
+### The one-line summary
+
+The 270k one-request livelock is fixed at its root — the seam is waved,
+staging no longer tracks the live set, and a full pool now prices at 550
+MiB where a 270k request used to price at 3855. It is proven by the
+reproducer that used to wedge, by a 64.5-minute traffic run with zero
+abandons, and by the >262144 YaRN leg decoding rather than merely
+prefilling. What remains is capacity (the corridor is loose), the decode
+decomposition, and the recoverable-abandon safety net.
