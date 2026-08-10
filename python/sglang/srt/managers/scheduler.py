@@ -4888,6 +4888,43 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def dynamic_chunked_prefill_size(self) -> int:
+        """This batch's chunked-prefill budget, dynamic when available.
+
+        #656: THE FIRST CHUNK IS SIZED TOO, and it did not used to be. The
+        gate here was ``self.chunked_req is not None``, so only an already
+        in-flight partial prefill got a predicted size and every prefill's
+        opening chunk took the static one.
+
+        That skipped the feature exactly where it pays. A prompt short
+        enough to finish in one chunk never becomes a ``chunked_req``, so
+        it was never sized dynamically at all -- the whole class of
+        requests the predictor could serve end to end was excluded. And
+        for long prompts the first chunk is the one that sets the
+        pipeline's opening bubble, so it is the worst one to take blind.
+
+        Nothing in the predictor needed the in-flight request: it takes a
+        ``history_len``, and for a prefill that has not started that value
+        is 0 -- known, not assumed. So the only real change is which
+        history is passed.
+
+        Still refusable, and that matters: the predictor returns None
+        until it has profiled (and ``enable_dynamic_chunking`` self-clears
+        when profiling raises at init), so a None must fall back to the
+        static size rather than be handed on as a chunk width.
+        """
+        if not self.enable_dynamic_chunking:
+            return self.chunked_prefill_size
+        history_len = (
+            len(self.chunked_req.prefix_indices)
+            if self.chunked_req is not None
+            else 0
+        )
+        dynamic_size = self.predict_next_chunk_size(history_len)
+        if dynamic_size is None:
+            return self.chunked_prefill_size
+        return dynamic_size
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -5068,12 +5105,7 @@ class Scheduler(
             return None, running_batch
 
         # Determine chunked_prefill_size for this batch
-        chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
-            history_len = len(self.chunked_req.prefix_indices)
-            dynamic_size = self.predict_next_chunk_size(history_len)
-            if dynamic_size is not None:
-                chunked_prefill_size = dynamic_size
+        chunked_prefill_size = self.dynamic_chunked_prefill_size()
 
         # RANK-UNIFORM prefill admission budget (uneven DCP): the deficit was
         # min-reduced once this iteration in update_dcp_admission_state (single

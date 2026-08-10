@@ -177,6 +177,13 @@ class _FakeScheduler:
         self.min_free_slots_delayer = None
         self.policy = types.SimpleNamespace(calc_priority=lambda q, b: None)
         self.chunked_prefill_size = 8192
+        # Bound off the real class, not stubbed: the sizing decision moved
+        # into its own method (#656 first-chunk dynamic chunking), and a
+        # fake that reimplemented it could keep passing while the real one
+        # changed underneath.
+        self.dynamic_chunked_prefill_size = (
+            scheduler_mod.Scheduler.dynamic_chunked_prefill_size.__get__(self)
+        )
         self.enable_dynamic_chunking = False
         self.kv_session_offload = None
         self.prefill_delayer = None
