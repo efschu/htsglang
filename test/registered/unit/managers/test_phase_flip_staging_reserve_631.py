@@ -307,3 +307,80 @@ class _N:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStagingScalesWithTheLiveSet(CustomTestCase):
+    """THE ONE-REQUEST LIVELOCK, pinned as a bounded regression.
+
+    Successor 23 wedged the live instance with a SINGLE 270032-token
+    request at bs=1 (pool 380000, purity strict). The prompt prefilled
+    fine in PP; the pp_to_tp flip was then refused --
+
+        staging 3855 MiB needed but only 3102 MiB is spendable
+
+    -- and under strict purity decode may ONLY run in TP, so the request
+    could never decode, stayed resident, kept the live set large, and the
+    identical refusal repeated at ~1/s forever. /health went 503 and only
+    a reboot recovered it.
+
+    WHY IT HAPPENS, from the formula rather than from the log: the move is
+    streamed across LAYERS but never chunked across ROWS. ``outgoing``,
+    ``incoming`` and the retained ``local`` leg are each
+    ``sum(row_nbytes * n_rows)`` over the whole plan, so staging is
+    PROPORTIONAL TO THE RESIDENT LIVE SET and grows without bound as a
+    request gets longer. The affordability gate is therefore HONEST -- it
+    prices exactly what the move allocates. The defect is in the move.
+
+    This test is the cheap standing guard: it asserts the proportionality
+    that makes the wedge reachable. WHEN THE EXCHANGE IS CHUNKED OVER ROWS
+    the growth must become bounded, and this test SHOULD then fail and be
+    rewritten to pin the new ceiling -- that is its purpose, not an
+    accident. Do not "fix" it by loosening the assertion.
+    """
+
+    # The binding rank on this rig carries 20 of the 64 layers
+    # (pp_layer_ratio [28,20,16]), so the fixture uses 20 -- a 2-layer
+    # toy makes the demand small enough to be affordable and hides the
+    # very condition under test.
+    LAYERS = tuple(range(20))
+
+    def _plan_with_rows(self, rows):
+        layers = list(self.LAYERS)
+
+        class _P:
+            def __init__(self, n):
+                self.send_layers = {1: layers}
+                self.recv_layers = {1: layers}
+                self.send_rows = {1: _N(n)}
+                self.recv_rows = {1: _N(n)}
+                self.local_layers = tuple(layers)
+                self.local_pp_rows = _N(n)
+                self.local_tp_rows = _N(n)
+        return _P(rows)
+
+    def _prepared(self):
+        r = _runtime(_Probe(0, 0))
+        r._src_layer_idx = lambda _d, f: f
+        r._dst_layer_idx = lambda _d, f: f
+        return r
+
+    def test_staging_grows_without_bound_with_resident_rows(self):
+        r = self._prepared()
+        side = TestStagingBytesFromThePlan._Side(2048, num_layers=20)
+        small = r._staging_bytes(self._plan_with_rows(1000), "pp_to_tp", side, side)
+        big = r._staging_bytes(self._plan_with_rows(270000), "pp_to_tp", side, side)
+        # 270x the rows must NOT cost ~270x the staging once the exchange
+        # is chunked. Today it does, which is exactly the wedge.
+        self.assertGreater(big, 100 * small)
+
+    def test_a_long_enough_request_cannot_be_afforded_at_any_sane_reserve(self):
+        # The livelock condition itself: driver-free far above the corridor
+        # reserve, and the flip STILL unaffordable, because the demand
+        # tracks the live set rather than a fixed window.
+        r = self._prepared()
+        side = TestStagingBytesFromThePlan._Side(2048, num_layers=20)
+        need = r._staging_bytes(self._plan_with_rows(270000), "pp_to_tp", side, side)
+        gate = _runtime(_Probe(4098, 226))
+        ok, detail = gate._staging_affordable(need)
+        self.assertFalse(ok)
+        self.assertIn("spendable", detail)

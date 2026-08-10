@@ -590,3 +590,69 @@ pre-existing defect that a single long request exposes on demand.
 **A REGRESSION TEST EXISTS NOW.** Any future claim that the livelock family
 is closed must run the 270k reproducer above. The three previously "known"
 instances were all argued from logs; this one is a command.
+
+### 11a. (a) vs (b) SETTLED FROM CODE: the gate is honest, the MOVE is unbounded
+
+The obvious hypothesis is that the affordability gate still prices the OLD
+un-streamed move (total live set) while successor 22's streamed mover
+actually needs only a fixed window — in which case repricing the gate would
+make the flip affordable at any length. **That is not what the code says.**
+
+`_staging_bytes` computes `incoming + max(outgoing, local) + one_layer_window`
+with
+
+```
+outgoing = SUM over peers, SUM over that peer's layers of  row_nbytes(layer) * n_rows
+incoming = the same on the destination side
+local    = the retained leg, read IN FULL (the docstring says so explicitly)
+```
+
+Every term is `Σ(row_nbytes × n_rows)` over the WHOLE plan. So:
+
+* **(a) is FALSE.** The gate is not stale; it prices exactly what the move
+  allocates. Repricing it would only hide the wedge behind an OOM.
+* **(b) is TRUE, and the unstreamed component is the ROW DIMENSION ITSELF**,
+  not an overlooked side table. 22's streaming removed the per-layer
+  temporaries and the 2x packing doubling — real gains, 39.4 -> 19.2 MiB
+  hermetic — but the per-peer wire buffer still carries that peer's ENTIRE
+  payload. The move is streamed across LAYERS and never chunked across ROWS.
+
+**So the fix is to chunk the exchange over rows**: move R rows at a time and
+staging becomes `O(R × row_nbytes × layers)`, independent of request length.
+That is a real change to `_pack_outgoing` / `_exchange` / `read_rows_into`,
+and it is the highest-value unbuilt item in this feature — it removes a
+wedge, not a tuning limit.
+
+**I am NOT declaring a hard context ceiling.** The byte-ledger law requires a
+per-component staging table measured on an instrumented flip, and I did not
+get one. What is established is the SCALING LAW from code plus one metal
+data point (3855 MiB at 270k rows on a 20-layer rank). A ceiling verdict
+needs the measured table attached; treat the above as the mechanism, not the
+number.
+
+**Escape valves if a residual truly scales after chunking**, cheapest first:
+1. spill the oversized staging component to host RAM (host is the ordered
+   spill target anyway, and the flip already tolerates seam latency);
+2. the SELECTABLE purity threshold — spec item 10 explicitly permits
+   decode-in-PP up to a threshold as a NON-default option. That is an honest
+   documented fallback for the >262k YaRN leg; **the default stays strict.**
+
+### 11b. Pinned as a standing regression (bounded, CPU, in the family)
+
+`TestStagingScalesWithTheLiveSet` in
+`test/registered/unit/managers/test_phase_flip_staging_reserve_631.py`:
+
+* `test_staging_grows_without_bound_with_resident_rows` — 270x the rows must
+  not cost ~270x the staging once chunking lands;
+* `test_a_long_enough_request_cannot_be_afforded_at_any_sane_reserve` —
+  reproduces the wedge CONDITION at the real memory picture (driver free
+  4098 MiB, cache 226, reserve 1024) on a 20-layer rank.
+
+The fixture uses **20 layers** because the binding rank carries 20 of 64
+(`[28,20,16]`). A 2-layer toy makes the demand affordable and hides the
+condition under test — my first version did exactly that and passed
+vacuously. **When the exchange is chunked these tests SHOULD fail and be
+rewritten to pin the new bound. That is their purpose. Do not loosen the
+assertions to keep them green.**
+
+Family suite with them: **671 passed, 0 failed.**
