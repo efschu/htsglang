@@ -313,6 +313,44 @@ and that the row-chunked exchange costs what the arithmetic says. It is
 the single highest-value unbuilt item and it is a contained change to
 `_execute` plus `WavedBackingSwap`.
 
+### Independently corroborated, by a second method
+
+A qwen lane audited this ledger from the logs alone, without my model, and
+landed on the same place by a different route:
+
+| quantity | my model (code path) | the lane (log regression) |
+|---|---|---|
+| bytes per KV cell | 2048, from one DONE line | **2048.00**, mean of 13 lines, max deviation 0.08 B |
+| resident bytes/token, ranks 0/1/2 | 14336 / 10240 / 8192 | **identical**, and PP == TP per rank |
+| binding card | nvidia-smi idx 0 (rank 1) | **idx 0 (rank 1)** |
+| staging slope, rank 1 | 4.517 MiB/1000 slots | **4.559** |
+| pool ceiling | 432,861 | 437,235 |
+
+**The slope is the load-bearing term and it corroborates to 1%** — one
+figure from pricing the plan through `_staging_bytes`, the other from
+regressing 393 logged flips. The lane also found the slope ordering across
+ranks (4.817 / 4.559 / 3.491 for 7 / 5 / 4 layers), which is the mechanism
+showing through: staging scales with a rank's layer count.
+
+The lane additionally measured the non-scaling overhead (weights +
+runtime) per card: **13716 / 22159 / 14306 MiB** for idx 0 / 1 / 2.
+
+### Two cautions on that agreement, and one on its recommendation
+
+**The ceilings agree less than they look.** My numerator/coefficient pair
+is 6182 / 0.014283; the lane's is 5103.6 / 0.011673. Different
+decompositions whose quotients happen to coincide — that is compensating
+difference, not independent confirmation. Specifically the lane's
+`staging_coeff` of 0.001906 MiB/token contradicts its OWN measured
+6.10 MiB/1000 slots by 3.2x; had it used its measured figure it would have
+computed a ceiling of ~322,000, i.e. BELOW today's pool. So treat the
+ceiling as **~432,000 (my figure, the more conservative)** and treat the
+slope as the corroborated part.
+
+**Its "conservative 60% trial: 262,341" is not usable.** It took 60% of
+the ceiling rather than 60% of the step, producing a number below the
+current 380,000. A first trial should be **410,000**.
+
 ### Do not carry any of this into a boot without measuring
 
 The 432000 ceiling was NOT tested — I did not step the pool. The baseline
