@@ -1449,6 +1449,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and not self.is_phase_flip_tp_stack
         )
 
+    def _install_eager_only_runners(self, reason: str) -> None:
+        """The complete no-capture terminal state for this runner.
+
+        Shared by every branch that declines to capture, because the state
+        is four coupled assignments and a divergence between two copies of
+        them is invisible until a forward pass reaches the one that was
+        missed. ``eager_runner`` in particular is what the prefill and
+        decode runners are aliased to; leaving it unset does not fall back
+        to an eager path, it raises AttributeError at the first forward.
+        """
+        self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
+        self.eager_runner = EagerRunner(self)
+        self.prefill_cuda_graph_runner = self.eager_runner
+        self.decode_cuda_graph_runner = self.eager_runner
+        self.graph_mem_usage = 0
+        logger.info(reason)
+
     @time_startup_latency(name="cuda_graph_capture")
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
@@ -1467,17 +1484,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # this stack, making a PP decode-graph set unreachable by
         # construction, not merely configured off.
         if self.is_phase_flip_pp_stack:
-            self.graph_shared_output = GraphSharedOutput.create_for_model_runner(
-                self
-            )
-            self.eager_runner = EagerRunner(self)
-            self.prefill_cuda_graph_runner = self.eager_runner
-            self.decode_cuda_graph_runner = self.eager_runner
-            self.graph_mem_usage = 0
-            logger.info(
+            self._install_eager_only_runners(
                 "PHASE-FLIP PP stack: no CUDA graphs captured by "
                 "construction (eager prefill per the #625 recipe; decode "
                 "graphs belong exclusively to the TP stack)."
+            )
+            return
+
+        # #656 spec item 8: --disable-draft-cuda-graph. THE REFUSAL BELONGS
+        # HERE, not around this call. The first attempt skipped
+        # init_cuda_graphs wholesale from the draft worker and all three
+        # ranks died at the first draft extend with
+        #   AttributeError: 'ModelRunner' object has no attribute 'eager_runner'
+        # because this method builds the EAGER runner as well as the graph
+        # runners -- the eager path is not the absence of the graph path, it
+        # is a thing that has to be constructed. Refusing inside, where that
+        # construction lives, gives the caller the eager draft runner it
+        # needs and no captures.
+        # Imported locally: base_spec_worker reaches back into this module's
+        # neighbourhood, and a module-level import here closes the cycle.
+        from sglang.srt.speculative.base_spec_worker import (
+            should_capture_draft_graphs,
+        )
+
+        if self.is_draft_worker and not should_capture_draft_graphs(
+            self.server_args
+        ):
+            self._install_eager_only_runners(
+                "Draft CUDA graphs DISABLED by --disable-draft-cuda-graph; "
+                "this draft runner is eager. Target-model graphs unaffected."
             )
             return
 

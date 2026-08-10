@@ -28,6 +28,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.speculative import eagle_worker_v2
 from sglang.srt.speculative.base_spec_worker import should_capture_draft_graphs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -144,8 +145,6 @@ class TheWorkerThisRigActuallyRuns(unittest.TestCase):
     """
 
     def _fake(self, server_args):
-        from sglang.srt.speculative import eagle_worker_v2
-
         calls = []
         w = eagle_worker_v2.EagleDraftWorker.__new__(
             eagle_worker_v2.EagleDraftWorker
@@ -166,28 +165,43 @@ class TheWorkerThisRigActuallyRuns(unittest.TestCase):
         return w, calls
 
     def test_the_flag_skips_the_override_the_rig_runs(self):
-        """No draft capture and no draft-prefill capture. _capture_cuda_graphs
-        is still ENTERED on purpose -- it is how both runner attributes get
-        nulled, exactly as the shadow-rank branch does it -- and it refuses in
-        turn, which ``TheFlipCannotBringTheGraphsBack`` proves against the
-        real method rather than against this stub.
+        """The prefill capture is skipped; the other two calls still happen.
+
+        Both survivors are deliberate and each refuses internally:
+
+        * ``draft_worker.init_cuda_graphs`` also BUILDS THE EAGER RUNNER.
+          Skipping it is what killed the 19:15 boot -- see
+          ``TheEagerRunnerMustStillExist``.
+        * ``_capture_cuda_graphs`` is how both runner attributes get nulled,
+          exactly as the shadow-rank branch does it, and it refuses in turn
+          per ``TheFlipCannotBringTheGraphsBack``.
+
+        So the assertion here is narrow on purpose: what this gate owns is
+        the prefill capture. The other refusals are owned, and proved,
+        where they live.
         """
         w, calls = self._fake(_args(disable_draft_cuda_graph=True))
-        w.init_cuda_graphs()
-        self.assertNotIn(
-            "draft", [c[0] for c in calls],
-            "the draft worker captured graphs despite the flag",
-        )
+        with mock.patch.object(
+            eagle_worker_v2, "speculative_moe_backend_context",
+            lambda: contextlib.nullcontext(),
+        ), mock.patch.object(
+            eagle_worker_v2, "speculative_moe_a2a_backend_context",
+            lambda: contextlib.nullcontext(),
+        ), mock.patch.object(
+            eagle_worker_v2, "check_cuda_graph_backend", lambda *a, **k: True
+        ):
+            w.init_cuda_graphs()
         self.assertNotIn(
             "prefill", [c[0] for c in calls],
-            "the draft prefill graph was captured despite the flag",
+            "the draft prefill graph was captured despite the flag "
+            "(check_cuda_graph_backend is forced True here so that this "
+            "assertion can actually fail)",
         )
-        self.assertEqual([c[0] for c in calls], ["capture"])
+        # `draft` IS expected: see the eager-runner note below.
+        self.assertEqual([c[0] for c in calls], ["draft", "capture"])
 
     def test_without_the_flag_the_override_still_captures(self):
         """Can-fail proof in the other direction: the default is untouched."""
-        from sglang.srt.speculative import eagle_worker_v2
-
         w, calls = self._fake(_args())
         with mock.patch.object(
             eagle_worker_v2, "speculative_moe_backend_context",
@@ -226,8 +240,6 @@ class TheFlipCannotBringTheGraphsBack(unittest.TestCase):
             return "mindspore"
 
     def _fake(self, server_args):
-        from sglang.srt.speculative import eagle_worker_v2
-
         w = eagle_worker_v2.EagleDraftWorker.__new__(
             eagle_worker_v2.EagleDraftWorker
         )
@@ -239,8 +251,6 @@ class TheFlipCannotBringTheGraphsBack(unittest.TestCase):
         return w
 
     def test_recapture_refuses_when_the_flag_is_set(self):
-        from sglang.srt.speculative import eagle_worker_v2
-
         args = self._RecordingArgs(True)
         w = self._fake(args)
         with mock.patch.object(
@@ -257,8 +267,6 @@ class TheFlipCannotBringTheGraphsBack(unittest.TestCase):
         self.assertIsNone(w.cuda_graph_runner_for_draft_extend)
 
     def test_recapture_proceeds_without_the_flag(self):
-        from sglang.srt.speculative import eagle_worker_v2
-
         args = self._RecordingArgs(False)
         w = self._fake(args)
         with mock.patch.object(
@@ -266,3 +274,75 @@ class TheFlipCannotBringTheGraphsBack(unittest.TestCase):
         ):
             w._capture_cuda_graphs()
         self.assertEqual(args.reads, ["model_impl"])
+
+
+class TheEagerRunnerMustStillExist(unittest.TestCase):
+    """The regression that took all three ranks down at 19:18 on 2026-08-10.
+
+        AttributeError: 'ModelRunner' object has no attribute 'eager_runner'
+        ... in _draft_extend_for_decode -> draft_runner.forward
+
+    The first version of this flag skipped ``init_cuda_graphs`` on the draft
+    worker entirely. But ``ModelRunner.init_cuda_graphs`` does not only
+    capture graphs -- it CONSTRUCTS the eager runner and aliases the prefill
+    and decode runners onto it. The eager path is not the absence of the
+    graph path; it is an object somebody has to build. Refusing around the
+    call skipped the construction, and the failure did not surface at boot:
+    it surfaced at the first draft extend, three minutes later, on every
+    rank at once.
+
+    Hence the refusal lives INSIDE ``init_cuda_graphs``, and hence this test
+    asserts on the surviving state rather than on a skipped call.
+    """
+
+    def _runner(self, disable_draft):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        r = ModelRunner.__new__(ModelRunner)
+        r.is_draft_worker = True
+        # is_phase_flip_pp_stack is a computed property and is False for any
+        # draft runner by construction, so the PP carve above cannot mask
+        # what this test is asserting about the draft carve.
+        r.server_args = _args(
+            disable_draft_cuda_graph=disable_draft, enable_phase_flip=True
+        )
+        assert r.is_phase_flip_pp_stack is False
+        return r
+
+    def test_a_refused_draft_capture_still_leaves_a_usable_runner(self):
+        from sglang.srt.model_executor import model_runner as mr
+
+        r = self._runner(True)
+        sentinel = object()
+        with mock.patch.object(
+            mr, "EagerRunner", lambda _self: sentinel
+        ), mock.patch.object(
+            mr.GraphSharedOutput, "create_for_model_runner",
+            staticmethod(lambda _self: "shared"),
+        ):
+            r.init_cuda_graphs()
+
+        # The four coupled assignments. `eager_runner` alone is not enough:
+        # the forward path reaches the aliases, and an alias left unset is
+        # the same crash one call deeper.
+        self.assertIs(r.eager_runner, sentinel)
+        self.assertIs(r.prefill_cuda_graph_runner, sentinel)
+        self.assertIs(r.decode_cuda_graph_runner, sentinel)
+        self.assertEqual(r.graph_mem_usage, 0)
+
+    def test_the_carve_can_fail_when_the_flag_is_absent(self):
+        """Can-fail proof: without the flag this must NOT take the eager exit.
+
+        Detected by letting the real method run on past the carve, where it
+        immediately reaches _harmonize_cuda_graph_plan -- a collective this
+        test has no group for. Raising there is the proof it did not return
+        early; returning cleanly would mean the carve swallowed a boot that
+        never asked for it.
+        """
+        r = self._runner(False)
+        with mock.patch.object(
+            type(r), "_harmonize_cuda_graph_plan",
+            lambda _self: (_ for _ in ()).throw(RuntimeError("went past")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "went past"):
+                r.init_cuda_graphs()

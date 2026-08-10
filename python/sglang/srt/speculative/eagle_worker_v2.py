@@ -507,31 +507,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # weight-TP=1, so its forward has no collectives to desync).
             self._capture_cuda_graphs()
             return
-        if not should_capture_draft_graphs(getattr(self, "server_args", None)):
-            # --disable-draft-cuda-graph. The gate lives HERE and not only on
-            # EagleDraftWorkerBase.init_cuda_graphs because this override is
-            # what NEXTN actually executes: the base method is never reached
-            # on this path, so a gate placed only there parses, propagates,
-            # and does nothing. Measured on the 19:06 boot of 2026-08-10 --
-            # flag on the live cmdline, graphs captured anyway.
-            #
-            # Delegating to _capture_cuda_graphs (which refuses in turn)
-            # rather than returning bare is deliberate: it is the shadow-rank
-            # branch's exit above, and it leaves both runner attributes set
-            # to None, which every later `is None` check depends on.
+        # --disable-draft-cuda-graph (#656 spec item 8). This override is what
+        # NEXTN actually executes -- EAGLEWorkerV2 delegates straight here --
+        # so a gate placed only on EagleDraftWorkerBase.init_cuda_graphs
+        # parses, propagates and does nothing. Measured on the 19:06 boot of
+        # 2026-08-10: flag on the live cmdline, graphs captured anyway.
+        capture = should_capture_draft_graphs(getattr(self, "server_args", None))
+        if not capture:
             logger.info(
                 "Draft CUDA graphs DISABLED by --disable-draft-cuda-graph; "
                 "the draft model runs eager. Target-model graphs unaffected."
             )
-            self._capture_cuda_graphs()
-            return
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
+            # ENTERED EVEN WHEN DISABLED, and that is the fix for the 19:15
+            # boot rather than an oversight: ModelRunner.init_cuda_graphs
+            # builds the draft runner's EAGER runner in the same call, so
+            # skipping it left `eager_runner` unset and all three ranks died
+            # at the first draft extend. It refuses internally now; the two
+            # captures below are what actually get skipped.
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
-            if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+            if capture and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
             self._capture_cuda_graphs()
 
