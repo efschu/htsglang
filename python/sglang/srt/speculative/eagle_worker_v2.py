@@ -59,7 +59,11 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.base_spec_worker import (
+    BaseSpecWorker,
+    EagleDraftWorkerBase,
+    should_capture_draft_graphs,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -503,6 +507,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # weight-TP=1, so its forward has no collectives to desync).
             self._capture_cuda_graphs()
             return
+        if not should_capture_draft_graphs(getattr(self, "server_args", None)):
+            # --disable-draft-cuda-graph. The gate lives HERE and not only on
+            # EagleDraftWorkerBase.init_cuda_graphs because this override is
+            # what NEXTN actually executes: the base method is never reached
+            # on this path, so a gate placed only there parses, propagates,
+            # and does nothing. Measured on the 19:06 boot of 2026-08-10 --
+            # flag on the live cmdline, graphs captured anyway.
+            #
+            # Delegating to _capture_cuda_graphs (which refuses in turn)
+            # rather than returning bare is deliberate: it is the shadow-rank
+            # branch's exit above, and it leaves both runner attributes set
+            # to None, which every later `is None` check depends on.
+            logger.info(
+                "Draft CUDA graphs DISABLED by --disable-draft-cuda-graph; "
+                "the draft model runs eager. Target-model graphs unaffected."
+            )
+            self._capture_cuda_graphs()
+            return
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -875,6 +897,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Shadow rank: no draft graphs at all (incl. every adaptive
             # ladder rung — build_adaptive_runtime_state routes through
             # here). The solo rank captures its rungs rank-locally.
+            return
+
+        if not should_capture_draft_graphs(getattr(self, "server_args", None)):
+            # The SECOND gate, and not a duplicate of the one in
+            # init_cuda_graphs. The phase flip re-arms a layout by calling
+            # this method directly (EAGLEWorkerV2 does so when it rebuilds
+            # the draft runtime state), bypassing init_cuda_graphs entirely.
+            # Gating only the entry point would hold at boot and let the
+            # graphs come back at the first flip -- disabled for exactly as
+            # long as nobody looked.
             return
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):

@@ -23,8 +23,10 @@ Default stays ON so a boot that does not ask is byte-identical.
 
 from __future__ import annotations
 
+import contextlib
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.speculative.base_spec_worker import should_capture_draft_graphs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -113,3 +115,154 @@ class TheGateIsReachedFromTheCallSite(unittest.TestCase):
         w, calls = self._worker(_args())
         w.init_cuda_graphs()
         self.assertEqual([c[0] for c in calls], ["draft", "target"])
+
+
+class TheWorkerThisRigActuallyRuns(unittest.TestCase):
+    """The base-class gate above was INERT on this rig. Measured, not feared.
+
+    The boot of 2026-08-10 19:06 carried ``--disable-draft-cuda-graph`` on
+    the command line of the live process and captured the draft graphs
+    anyway: the log held ZERO occurrences of the disable message and idle
+    VRAM moved by -108 / -234 / +274 MiB across the three cards -- mixed
+    sign, i.e. boot noise, not a freed capture.
+
+    ``--speculative-algorithm NEXTN`` runs ``EAGLEWorkerV2``, a thin wrapper
+    that delegates straight to ``EagleDraftWorker`` -- and
+    ``EagleDraftWorker`` OVERRIDES ``init_cuda_graphs`` and never called
+    the gate. So the flag
+    parsed, propagated, reached the worker, and did nothing. This is the
+    same shape as the span-forwarding defect of HANDOFF_670 section 1d: a
+    switch tested against a base class that the production path does not
+    execute. Test the override, not the ancestor.
+
+    ``_capture_cuda_graphs`` is tested separately and that is not
+    thoroughness for its own sake: the phase flip RE-CAPTURES draft graphs
+    when it re-arms a layout, entering through ``_capture_cuda_graphs``
+    without passing ``init_cuda_graphs``. A gate on the entry point alone
+    would hold at boot and let the graphs come back at the first flip --
+    disabled for exactly as long as nobody looked.
+    """
+
+    def _fake(self, server_args):
+        from sglang.srt.speculative import eagle_worker_v2
+
+        calls = []
+        w = eagle_worker_v2.EagleDraftWorker.__new__(
+            eagle_worker_v2.EagleDraftWorker
+        )
+        w.server_args = server_args
+        w._spec_solo_active = False
+        w._spec_solo_is_host = True
+        w.draft_worker = SimpleNamespace(
+            init_cuda_graphs=lambda **kw: calls.append(("draft", kw))
+        )
+        w.draft_runner = SimpleNamespace(
+            tp_group=None,
+            canary_manager=None,
+            init_prefill_cuda_graph=lambda **kw: calls.append(("prefill", kw)),
+        )
+        w._capture_cuda_graphs = lambda: calls.append(("capture", {}))
+        w.draft_tp_context = lambda _g: contextlib.nullcontext()
+        return w, calls
+
+    def test_the_flag_skips_the_override_the_rig_runs(self):
+        """No draft capture and no draft-prefill capture. _capture_cuda_graphs
+        is still ENTERED on purpose -- it is how both runner attributes get
+        nulled, exactly as the shadow-rank branch does it -- and it refuses in
+        turn, which ``TheFlipCannotBringTheGraphsBack`` proves against the
+        real method rather than against this stub.
+        """
+        w, calls = self._fake(_args(disable_draft_cuda_graph=True))
+        w.init_cuda_graphs()
+        self.assertNotIn(
+            "draft", [c[0] for c in calls],
+            "the draft worker captured graphs despite the flag",
+        )
+        self.assertNotIn(
+            "prefill", [c[0] for c in calls],
+            "the draft prefill graph was captured despite the flag",
+        )
+        self.assertEqual([c[0] for c in calls], ["capture"])
+
+    def test_without_the_flag_the_override_still_captures(self):
+        """Can-fail proof in the other direction: the default is untouched."""
+        from sglang.srt.speculative import eagle_worker_v2
+
+        w, calls = self._fake(_args())
+        with mock.patch.object(
+            eagle_worker_v2, "speculative_moe_backend_context",
+            lambda: contextlib.nullcontext(),
+        ), mock.patch.object(
+            eagle_worker_v2, "speculative_moe_a2a_backend_context",
+            lambda: contextlib.nullcontext(),
+        ), mock.patch.object(
+            eagle_worker_v2, "check_cuda_graph_backend", lambda *a, **k: False
+        ):
+            w.init_cuda_graphs()
+        self.assertIn("draft", [c[0] for c in calls])
+        self.assertIn("capture", [c[0] for c in calls])
+
+
+class TheFlipCannotBringTheGraphsBack(unittest.TestCase):
+    """``_capture_cuda_graphs`` is the flip's re-arm entry. Gate it there too.
+
+    The assertion is on HOW FAR EXECUTION GOT, not on a captured graph:
+    reading ``server_args.model_impl`` is the first thing past the gate, so
+    a recording property makes "returned at the gate" and "fell through it"
+    two distinguishable, dependency-free outcomes on a CPU box.
+    """
+
+    class _RecordingArgs:
+        def __init__(self, disable_draft_cuda_graph):
+            self.disable_draft_cuda_graph = disable_draft_cuda_graph
+            self.disable_cuda_graph = False
+            self.reads = []
+
+        @property
+        def model_impl(self):
+            self.reads.append("model_impl")
+            # Returns the one value that makes the real method stop right
+            # here, so no CUDA is needed to prove the gate was passed.
+            return "mindspore"
+
+    def _fake(self, server_args):
+        from sglang.srt.speculative import eagle_worker_v2
+
+        w = eagle_worker_v2.EagleDraftWorker.__new__(
+            eagle_worker_v2.EagleDraftWorker
+        )
+        w.server_args = server_args
+        w._spec_solo_active = False
+        w._spec_solo_is_host = True
+        w.cuda_graph_runner = "stale"
+        w.cuda_graph_runner_for_draft_extend = "stale"
+        return w
+
+    def test_recapture_refuses_when_the_flag_is_set(self):
+        from sglang.srt.speculative import eagle_worker_v2
+
+        args = self._RecordingArgs(True)
+        w = self._fake(args)
+        with mock.patch.object(
+            eagle_worker_v2, "check_cuda_graph_backend", lambda *a, **k: False
+        ):
+            w._capture_cuda_graphs()
+        self.assertEqual(
+            args.reads, [], "re-capture fell through the gate; a flip would "
+            "restore the draft graphs the boot asked to remove"
+        )
+        # The terminal state must match the shadow-rank path's: both
+        # runners nulled, so every later `is None` check reads correctly.
+        self.assertIsNone(w.cuda_graph_runner)
+        self.assertIsNone(w.cuda_graph_runner_for_draft_extend)
+
+    def test_recapture_proceeds_without_the_flag(self):
+        from sglang.srt.speculative import eagle_worker_v2
+
+        args = self._RecordingArgs(False)
+        w = self._fake(args)
+        with mock.patch.object(
+            eagle_worker_v2, "check_cuda_graph_backend", lambda *a, **k: False
+        ):
+            w._capture_cuda_graphs()
+        self.assertEqual(args.reads, ["model_impl"])
