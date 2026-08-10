@@ -408,6 +408,9 @@ class TestStagingIsBoundedByTheLayerMap(CustomTestCase):
         # already encodes in the destination row count below, so the two
         # must not be allowed to drift apart.
         r._vec = (14, 10, 8)
+        # #631 2.1b: order, wave-count default and slack accounting are one
+        # switch, so the fixture has to state which design it is pricing.
+        r._seam_restore_first = True
         r._pre_write_fns = (_FakeWavedSwap(),) if swappable else ()
         # Pool-local index of a global ordinal, both sides: the PP pool
         # holds this stage's block, the TP pool holds every ordinal. Only

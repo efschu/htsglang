@@ -54,6 +54,8 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
     TP_TO_PP,
     PhaseFlipTransition,
     build_phase_flip_transition,
+    default_wave_count,
+    layer_waves,
     ordered_layer_waves,
     restore_first_wave_count,
     validate_layer_map,
@@ -2835,6 +2837,17 @@ class PhaseFlipRuntime:
             # restores the invariant that every source read precedes every
             # destination write.
             return (tuple(range(self._n_layers)),)
+        if not self._seam_restore_first:
+            # THE ROLLBACK IS THE WHOLE OLD DESIGN, not just its order.
+            # Restore-first and the lifted wave count are one change: a
+            # one-layer wave under RELEASE-first has no release of its own
+            # to pay for its commit, which is precisely the netting rule
+            # that set the old cap. Rolling back the order while keeping
+            # W = n_layers would be the worst of both -- measured on the
+            # rig geometry at 354,868 tokens against the release-first
+            # W=4 ceiling of ~435,000.
+            n = self._n_waves or default_wave_count(self._map)
+            return layer_waves(self._map, n)
         n = self._n_waves
         if n is None:
             # #631 2.1b: restore-first removes the per-wave netting rule
@@ -3066,6 +3079,9 @@ class PhaseFlipRuntime:
             * dst.num_rows
         )
         mine = set(self._map[self._rank])
+        # Mirrors the gate in ``_execute``: aliased pools keep release-first
+        # whatever the knob says, so they must be PRICED release-first too.
+        restore_first = self._seam_restore_first and not self._pools_alias()
         released = committed = worst = 0
         for wave in waves:
             layers = [] if wave is None else list(wave)
@@ -3076,16 +3092,28 @@ class PhaseFlipRuntime:
             else:
                 n_rel, n_com = len(layers), len([f for f in layers if f in mine])
             committed += n_com * dst_span
-            # RESTORE-FIRST (#631 2.1b): this wave's commit lands BEFORE its
+            # THE ACCOUNTING FOLLOWS THE ORDER, and must: charging the
+            # wrong one is a false verdict in whichever direction it errs.
+            #
+            # Restore-first (#631 2.1b) lands this wave's commit BEFORE its
             # own release, so the worst instant of wave j weighs everything
             # committed through j against everything released through j-1.
-            # Crediting the current wave's release here -- which is what the
-            # release-first version did, and it was right then -- now
-            # under-reserves by exactly one wave's release span at the worst
-            # boundary, and the gate's whole job is to refuse a flip that
-            # cannot be afforded.
-            worst = max(worst, committed - released)
-            released += n_rel * src_span
+            # Crediting the current wave's release -- right under
+            # release-first -- would under-reserve by one wave's release
+            # span and let through a flip that cannot be afforded.
+            #
+            # Charging the restore-first term while actually running
+            # release-first is the mirror error and is NOT the safe side:
+            # the gate's only action is to refuse, and a refusal does not
+            # drain the resident set it refused on, so invented headroom
+            # moves the wedge to a smaller request rather than preventing
+            # one (the reasoning in this method's docstring).
+            if restore_first:
+                worst = max(worst, committed - released)
+                released += n_rel * src_span
+            else:
+                released += n_rel * src_span
+                worst = max(worst, committed - released)
         return max(0, worst)
 
     def _reclaim_cached_blocks(self) -> None:
