@@ -32,7 +32,19 @@ against a move that does not exist. The real move gave +1558 and cost rank0
 2792. The estimate being wrong did not cost a boot only because I checked
 the split before reading the result.
 
-**2. My first green-run watchdog cried wolf in its second minute.** A 5 s
+**2. I sized a pool from a single-request transient and it breached in
+eight minutes.** The mover's live set is the union of ALL resident
+requests' slots; the scratch ladder issues one request at a time; the
+deployment runs bs=4. Measured on the binding card: 1120 MiB alone, 1370
+under a bs=4 soak, **1790** with a 111405-token prefill on top — and still
+deepening when I stopped the load. I had sized pool 550000 against 1120.
+**Every transient figure in this corpus, successor 21's and mine, is a
+single-request measurement and therefore a LOWER bound**, and every
+capacity row that names a pool without naming both the concurrency and the
+longest prefill is not reproducible. What this does NOT touch is the mover
+A/B in §2: same ladder, same request, same trigger, only the code moved.
+
+**3. My first green-run watchdog cried wolf in its second minute.** A 5 s
 `curl` timeout against a scheduler doing a bs=4 round with a long prefill
 in flight is not a health signal. Three probes at 15 s all returned 200.
 **A liveness check has to be slower than the slowest legitimate round**, and
@@ -237,13 +249,40 @@ baseline-vs-replay record per boot to
   images, unswappable on a 117 GiB box, still the mechanism of the
   `oom_kill 9` precedent. Untouched.
 
-## 9. STATE LEFT BEHIND
+## 9. THE CORRIDOR AND THE STAGING BOUND HAVE COME APART
 
-Serving is UP at **pool 550000**, geometry `14,10,8` verified as
-`pp_layer_ratio=[28,20,16]`, `SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8`,
-`MAMBA_SLOTS=12`, `RANK_MIB=31800,17400,17450`, CTX 393216, purity strict,
-policy auto, spill depth cache.
+At pool 550000 the corridor broke by 485 MiB — rank1 to 539 MiB free — and
+the instance stayed at `/health` 200 with **0 `FLIP ABANDONED` and 0
+tracebacks** throughout. Successor 21's pool 500000 livelocked at a rank
+that was **13 MiB** short of its staging reserve.
 
-550000 is measured, not chosen: 600000 breaches at both reachable
-geometries, and the binding-card curve gives 567,000 as the ceiling.
-Against the 190000 successor 21 inherited, this is **+189%**.
+That is the practical payoff of §2 and §3 together: the corridor is now a
+BUDGETING question, where for the whole of this chain it was an
+AVAILABILITY one. A successor who overshoots the pool now gets a card
+sitting under 1024 MiB, not an instance that stops answering.
+
+## 10. STATE LEFT BEHIND
+
+Serving geometry `14,10,8`, verified as `pp_layer_ratio=[28,20,16]`,
+`SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8`, `MAMBA_SLOTS=12`,
+`RANK_MIB=31800,17400,17450`, CTX 393216, purity strict, policy auto,
+spill depth cache.
+
+**Pool: use 470000.** Derived, not guessed — `idle_free(P) - 1790 >= 1024`
+on rank1 with a measured slope of 10.30 MiB per 1000 pool tokens gives a
+ceiling of ~503000, and 470000 leaves 339 MiB for further high-water growth
+because the transient had not finished deepening when the load stopped.
+
+Ladder of what was measured, so nobody re-runs it:
+
+| pool | geometry | outcome |
+|---|---|---|
+| 400000 | 14,10,8 | holds, 1741 MiB margin, single-request load |
+| 470000 | 14,10,8 | **the green-run target** |
+| 550000 | 14,10,8 | breaks by 485 MiB under bs=4 + long prefill |
+| 600000 | 14,10,8 | breaks by 335 MiB, single-request load |
+| 600000 | 15,9,8 | breaks by 960 MiB (rank0 to 64 MiB free) |
+
+Against the 190000 successor 21 shipped, 470000 is **+147%**, and unlike
+their 500000 row it is measured under the concurrency the deployment
+actually runs at.
