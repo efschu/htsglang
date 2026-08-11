@@ -48,8 +48,18 @@ WHAT THIS FILE PINS
   the worst case of this feature is the behaviour it replaces.
 
 * **A seam below the LAW is refused however exhausted the budget is.** This
-  is the falsifier the whole item exists for: there is no path through this
-  gate that proceeds into a corridor breach.
+  is the falsifier the whole item exists for. Stated exactly: no path
+  proceeds when the pre-allocation law check fails. The YIELD path does
+  enter at the law, which is the state C20 measured a 456 MiB in-cutover
+  draw from -- it is bounded to be no worse than the run it replaces, not
+  bounded to be safe.
+
+* **The budget's currency is consecutive GROUP abandons, not this rank's own
+  shortages.** The group abandons if ANY rank objects, so a per-rank budget
+  reset by that rank's own clearance bounds nothing: three ranks taking
+  turns being short refund each other forever and pp->tp is delayed
+  indefinitely, which is the decode wedge reached through the mechanism that
+  exists to prevent it.
 
 * **The decision rides ``too_small`` into the existing ``_collective_min``**,
   so it is rank-EVALUATED and group-UNIFORM. A rank-local arming condition
@@ -72,26 +82,41 @@ MIB = 1024 * 1024
 STAGING = 300 * MIB
 
 
-class _Guard:
-    """A guard that answers by SIZE, the way the real one does.
+LAW = 1024 * MIB
 
-    ``capacity`` is the largest ``want`` this card can satisfy and still be
-    at or above the corridor law. Asking for more is refused. That is the
-    real ``ensure_headroom`` contract compressed to one number:
-    ``ok = (free_after_reclaim - want) >= law_floor``.
+
+class _Guard:
+    """A guard that answers the way the real one does: by ARITHMETIC.
+
+    ``free_after`` is the free memory the ladder reaches. The verdict is the
+    guard's own contract, ``ok = (free_after - want) >= law_floor``
+    (corridor_guard.py), and ``capacity_bytes`` is just a readable way to say
+    "the largest want this card can clear": ``free_after = capacity + law``.
+
+    Modelling ``free_after`` rather than a bare boolean is load-bearing here.
+    The gate decides delay-versus-refuse from the verdict's OWN numbers
+    instead of asking a second time, and a stub that returned zeros for them
+    would let a gate that re-asks pass this file.
     """
 
-    def __init__(self, capacity_bytes):
+    def __init__(self, capacity_bytes, law_floor_bytes=LAW):
         self.capacity = capacity_bytes
+        self.law_floor_bytes = law_floor_bytes
+        self.free_after = capacity_bytes + law_floor_bytes
         self.asks = []
 
     def ensure_headroom(self, want, *, reason="", refusal_is_fatal=False):
         want = int(want)
         self.asks.append((want, reason, refusal_is_fatal))
-        if want <= self.capacity:
-            return GuardResult(True, 0, 0, want, 0, ("allocator-cache",), "cleared")
+        ok = (self.free_after - want) >= self.law_floor_bytes
         return GuardResult(
-            False, 0, 0, want, 0, (), f"short by {(want - self.capacity) // MIB} MiB"
+            ok,
+            self.free_after,
+            self.free_after,
+            want,
+            0,
+            ("allocator-cache",) if ok else (),
+            "cleared" if ok else f"short by {(want - self.capacity) // MIB} MiB",
         )
 
 
@@ -105,6 +130,22 @@ def _runtime(collective_min=None):
     r.corridor_kv_relief_bytes = 0
     r._collective_min = collective_min or (lambda vals, **kw: list(vals))
     return r
+
+
+def _abandon(runtime, direction, times=1):
+    """Book ``times`` consecutive GROUP abandons of ``direction``.
+
+    In production this is done in ``_execute`` from the reduced fit verdict,
+    which is the whole point: the budget's currency is a number every rank
+    reads the same. The tests spend it the same way rather than reaching into
+    a rank-local counter that no longer exists.
+    """
+    book = getattr(runtime, "_seam_abandons_in_a_row", None)
+    if book is None:
+        book = {}
+        runtime._seam_abandons_in_a_row = book
+    for _ in range(times):
+        book[direction] = book.get(direction, 0) + 1
 
 
 class _Patched:
@@ -245,8 +286,13 @@ class TestTheBudgetPreventsAWedge(unittest.TestCase):
         with _Margin(margin_mib=512, budget=2):
             g = _Guard(capacity_bytes=STAGING + 100 * MIB)
             r = _runtime()
+            verdicts = []
             with _Patched(g):
-                verdicts = [r._corridor_gate(STAGING, "pp_to_tp") for _ in range(4)]
+                for _ in range(4):
+                    v = r._corridor_gate(STAGING, "pp_to_tp")
+                    verdicts.append(v)
+                    if v:
+                        _abandon(r, "pp_to_tp")
         self.assertNotEqual(verdicts[0], "")
         self.assertNotEqual(verdicts[1], "")
         self.assertEqual(verdicts[2], "", "budget spent -> the law governs")
@@ -254,20 +300,62 @@ class TestTheBudgetPreventsAWedge(unittest.TestCase):
         self.assertEqual(r.seam_margin_delays, 2)
         self.assertEqual(r.seam_margin_yields, 2)
 
-    def test_a_met_margin_restores_the_budget(self):
-        """Otherwise one bad patch of a long run disarms the gate forever."""
-        with _Margin(margin_mib=512, budget=2):
+    def test_three_ranks_taking_turns_being_short_still_reach_the_yield(self):
+        """THE WEDGE REGRESSION, and the reason the counter moved.
+
+        The first version spent the budget per RANK and reset it whenever
+        that rank's own ask cleared. But the group abandons if ANY rank
+        objects, so three ranks taking turns being short refund each other's
+        budgets forever: measured on stubs, 30 attempts produced 10 delays
+        per rank and ZERO yields, i.e. pp->tp delayed indefinitely -- the
+        decode wedge, entered through the mechanism that exists to prevent
+        it. The currency is now consecutive GROUP abandons, which every rank
+        reads identically.
+        """
+        budget = 2
+        with _Margin(margin_mib=512, budget=budget):
+            ranks = [_runtime() for _ in range(3)]
             tight = _Guard(capacity_bytes=STAGING + 100 * MIB)
             roomy = _Guard(capacity_bytes=4096 * MIB)
+            flipped = False
+            for attempt in range(budget + 4):
+                verdicts = []
+                for i, r in enumerate(ranks):
+                    # A different rank is the short one on every attempt.
+                    with _Patched(tight if i == attempt % 3 else roomy):
+                        verdicts.append(r._corridor_gate(STAGING, "pp_to_tp"))
+                if any(verdicts):
+                    for r in ranks:
+                        _abandon(r, "pp_to_tp")
+                else:
+                    flipped = True
+                    break
+        self.assertTrue(
+            flipped, "the group must reach a flip; rotating shortage must not wedge"
+        )
+        self.assertLessEqual(
+            attempt, budget, "bounded by the budget, not by rank count"
+        )
+        self.assertTrue(any(r.seam_margin_yields for r in ranks))
+
+    def test_a_cleared_gate_does_not_refund_the_budget_by_itself(self):
+        """A rank that cleared while a peer did not has learnt nothing about
+        the group, so it must not restore a group-wide budget. The reset
+        belongs to the reduced verdict in ``_execute``."""
+        import inspect
+
+        with _Margin(margin_mib=512, budget=2):
             r = _runtime()
-            with _Patched(tight):
-                r._corridor_gate(STAGING, "pp_to_tp")
-            with _Patched(roomy):
+            _abandon(r, "pp_to_tp", times=2)
+            with _Patched(_Guard(capacity_bytes=4096 * MIB)):
                 self.assertEqual(r._corridor_gate(STAGING, "pp_to_tp"), "")
-            with _Patched(tight):
-                self.assertNotEqual(r._corridor_gate(STAGING, "pp_to_tp"), "")
-        self.assertEqual(r.seam_margin_delays, 2)
-        self.assertEqual(r.seam_margin_yields, 0)
+            self.assertEqual(r._seam_abandons_in_a_row["pp_to_tp"], 2)
+        src = inspect.getsource(PhaseFlipRuntime._execute)
+        self.assertIn(
+            "self._seam_abandons_in_a_row[direction] = 0",
+            src,
+            "the group's own verdict is what restores the budget",
+        )
 
     def test_the_two_directions_keep_separate_budgets(self):
         """tp->pp delays are safe; pp->tp delays starve decode. One counter
@@ -277,6 +365,7 @@ class TestTheBudgetPreventsAWedge(unittest.TestCase):
             r = _runtime()
             with _Patched(g):
                 self.assertNotEqual(r._corridor_gate(STAGING, "tp_to_pp"), "")
+                _abandon(r, "tp_to_pp")
                 self.assertEqual(r._corridor_gate(STAGING, "tp_to_pp"), "")
                 # pp->tp has not spent anything yet.
                 self.assertNotEqual(r._corridor_gate(STAGING, "pp_to_tp"), "")
@@ -290,12 +379,54 @@ class TestNoPathProceedsIntoABreach(unittest.TestCase):
             # Cannot even fund the staging: the LAW would be broken.
             g = _Guard(capacity_bytes=STAGING - 1)
             r = _runtime()
+            verdicts = []
             with _Patched(g):
-                verdicts = [r._corridor_gate(STAGING, "pp_to_tp") for _ in range(5)]
+                for _ in range(5):
+                    verdicts.append(r._corridor_gate(STAGING, "pp_to_tp"))
+                    _abandon(r, "pp_to_tp")
         self.assertTrue(all(v != "" for v in verdicts), "the law is not budgeted")
         self.assertTrue(all("refused" in v for v in verdicts))
         self.assertEqual(r.seam_margin_yields, 0, "a yield here would be a breach")
         self.assertEqual(r.corridor_aborts, 5)
+
+    def test_the_gate_asks_the_guard_exactly_ONCE(self):
+        """The delay-or-refuse question is answered by ARITHMETIC.
+
+        The first version asked the guard a second time, for the law alone,
+        and it was wrong twice over. On the refusal path the second call
+        re-armed the whole ladder -- a second empty_cache, a second forced
+        host spill, every counter double-booked. And its ``except`` returned
+        "" on a raise, discarding a verdict that had ALREADY said the law
+        would break: the one path in this gate that could walk a seam into a
+        corridor breach. A value already in hand cannot raise and cannot
+        spend.
+        """
+        with _Margin(margin_mib=512, budget=2):
+            delayed = _Guard(capacity_bytes=STAGING + 100 * MIB)
+            with _Patched(delayed):
+                self.assertNotEqual(_runtime()._corridor_gate(STAGING, "pp_to_tp"), "")
+            refused = _Guard(capacity_bytes=STAGING - 1)
+            with _Patched(refused):
+                self.assertNotEqual(_runtime()._corridor_gate(STAGING, "pp_to_tp"), "")
+        self.assertEqual(len(delayed.asks), 1, "the delay path re-asked the guard")
+        self.assertEqual(len(refused.asks), 1, "the refusal path re-ran the ladder")
+
+    def test_a_guard_without_a_law_floor_attribute_refuses_rather_than_delays(self):
+        """Degrade toward the conservative answer, never toward proceeding."""
+
+        class _NoLaw:
+            asks = ()
+
+            def ensure_headroom(self, want, *, reason="", refusal_is_fatal=False):
+                # free_after 0: nothing is knowable, so nothing is assumed.
+                return GuardResult(False, 0, 0, int(want), 0, (), "unknown")
+
+        with _Margin(margin_mib=512, budget=2):
+            r = _runtime()
+            with _Patched(_NoLaw()):
+                detail = r._corridor_gate(STAGING, "pp_to_tp")
+        self.assertIn("refused", detail)
+        self.assertEqual(r.seam_margin_delays, 0)
 
     def test_a_law_refusal_is_reported_as_a_refusal_not_as_a_delay(self):
         """The two are different events and the extract must not merge them."""
@@ -339,9 +470,35 @@ class TestTheDecisionIsGroupUniform(unittest.TestCase):
         )
         exec_src = inspect.getsource(PhaseFlipRuntime._execute)
         gate_at = exec_src.index("_corridor_gate")
-        reduce_at = exec_src.index("_collective_min([fits, -fits])")
+        reduce_at = exec_src.index("_collective_min([fits, -fits")
         self.assertLess(
             gate_at, reduce_at, "the gate's verdict must reach the reduction"
+        )
+        self.assertEqual(
+            exec_src.count("_collective_min("),
+            1,
+            "the margin must ride the existing reduction, not add one",
+        )
+
+    def test_a_pure_margin_abandon_is_logged_as_a_DELAY_not_an_ABANDON(self):
+        """Every acceptance harness in this corpus greps FLIP ABANDONED.
+
+        A healthy by-design wait counted there is indistinguishable from the
+        411-abandon decode wedge, so the group log has to be able to tell
+        them apart -- and it can only do that from a REDUCED value, because a
+        rank that cleared does not know why its peers did not.
+        """
+        import inspect
+
+        src = inspect.getsource(PhaseFlipRuntime._execute)
+        self.assertIn("margin_only", src)
+        self.assertIn("FLIP DELAYED (seam entry margin", src)
+        # The vote: object for any reason other than the margin -> 0.
+        self.assertIn("SEAM_MARGIN_DELAY_TAG not in d", src)
+        delayed_at = src.index("FLIP DELAYED (seam entry margin")
+        abandoned_at = src.index("FLIP ABANDONED (pool too small")
+        self.assertLess(
+            delayed_at, abandoned_at, "the delay branch must precede the abandon"
         )
 
     def test_every_rank_evaluates_the_same_term(self):

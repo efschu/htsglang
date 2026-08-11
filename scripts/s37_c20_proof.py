@@ -140,26 +140,36 @@ def main() -> int:
         )
         return len(res.stdout.splitlines())
 
+    # LIVENESS AND COST ARE DIFFERENT QUESTIONS AND THEY HAVE DIFFERENT
+    # SOURCES. The margin's reason string only reaches the log when the guard
+    # ARMS, so counting reasons measures how EXPENSIVE the term was; a run
+    # that funded the margin out of cache every time would score zero on it
+    # and be reported inert. Liveness comes from the announcement, which the
+    # gate emits once on a path that always runs.
+    armed = count("[#656 SEAM-ENTRY] ARMED")
     delays = count("seam entry DELAYED")
     yields_ = count("seam entry margin YIELDED")
     refused = count("corridor gate refused the seam staging")
     asks = count("C20 entry margin")
+    kv_shrinks = count("KV-BACKING released")
     print()
     print("-- the seam-entry gate's own account (a gate that cannot say it did")
     print("   nothing is indistinguishable from one that was never wired)")
-    print(f"   asks carrying the C20 margin:            {asks}")
-    print(f"   seams DELAYED for the margin:            {delays}")
-    print(f"   seams entered on the law (budget spent): {yields_}")
-    print(f"   seams REFUSED (below the law):           {refused}")
-    if asks == 0:
-        print("   *** THE MARGIN NEVER REACHED THE GUARD -- the term is inert ***")
+    print(f"   ARMED announcements (one per rank per boot):  {armed}")
+    print(f"   armings that had to spend for the margin:     {asks}")
+    print(f"   seams DELAYED for the margin:                 {delays}")
+    print(f"   seams entered on the law (budget spent):      {yields_}")
+    print(f"   seams REFUSED (below the law):                {refused}")
+    print(f"   KV rung shrinks, THE MARGIN'S PRICE:          {kv_shrinks}   (s34: 21)")
+    if armed == 0:
+        print("   *** THE TERM NEVER ANNOUNCED ITSELF -- it is not wired ***")
         verdict_ok = False
     if delays == 0 and yields_ == 0:
         print(
-            "   NOTE: no seam was ever short of the margin. That is a PASS only\n"
-            "   together with the in-cutover minima above -- it means the ask\n"
-            "   was funded every time, not that the gate was asleep (the ask\n"
-            "   count above proves it ran)."
+            "   NOTE: no seam was ever short of the margin. Read that WITH the\n"
+            "   KV-rung line above: 'the margin was free' and 'the margin was\n"
+            "   paid for in KV rows and the free-memory metric hid it' produce\n"
+            "   the same corridor numbers, and only the price tells them apart."
         )
     print()
     print(f"   C20 VERDICT: {'HELD' if verdict_ok else 'FAILED'}")

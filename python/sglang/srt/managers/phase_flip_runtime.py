@@ -214,6 +214,12 @@ ENV_SEAM_ENTRY_MARGIN = "SGLANG_SEAM_ENTRY_MARGIN_MIB"
 DEFAULT_SEAM_ENTRY_DELAY_BUDGET = 2
 ENV_SEAM_ENTRY_DELAY_BUDGET = "SGLANG_SEAM_ENTRY_DELAY_BUDGET"
 
+#: The marker a margin delay carries into ``too_small``. It exists so the
+#: group's abandon log can name a DELAY as a delay: every acceptance harness
+#: in this corpus greps "FLIP ABANDONED", and a healthy by-design wait
+#: counted there is indistinguishable from the 411-abandon decode wedge.
+SEAM_MARGIN_DELAY_TAG = "seam entry margin short"
+
 
 def seam_entry_margin_bytes() -> int:
     """The designed headroom a seam must have ON TOP OF its staging ask.
@@ -2059,11 +2065,26 @@ class PhaseFlipRuntime:
         #: quietly widen the margin.
         self.seam_margin_delays = 0
         self.seam_margin_yields = 0
-        #: Consecutive margin delays PER DIRECTION. Separate because the two
-        #: legs are not symmetric: delaying tp->pp defers prefill and is safe,
-        #: delaying pp->tp defers decode and is the wedge above. One shared
-        #: counter would let the safe leg spend the dangerous leg's budget.
-        self._seam_margin_short = {PP_TO_TP: 0, TP_TO_PP: 0}
+        #: Consecutive ABANDONED ATTEMPTS per direction -- the currency the
+        #: C20 delay budget is spent in. Booked by ``note_seam_verdict`` from
+        #: the REDUCED fit verdict, which is identical on every rank, so the
+        #: budget means the same thing group-wide without a collective of its
+        #: own.
+        #:
+        #: It is not "this rank was short N times". That version could not
+        #: bound anything: the group abandons if ANY rank objects, so three
+        #: ranks taking turns being short refund each other's budgets and the
+        #: flip is delayed forever -- the decode wedge, entered through the
+        #: mechanism meant to prevent it.
+        #:
+        #: Per direction, because the legs are not symmetric: delaying tp->pp
+        #: defers prefill and is safe, delaying pp->tp defers decode and is
+        #: the wedge. One shared counter would let the safe leg spend the
+        #: dangerous leg's budget.
+        self._seam_abandons_in_a_row = {PP_TO_TP: 0, TP_TO_PP: 0}
+        #: Set once the seam-entry margin has announced itself, so the
+        #: liveness line is one per process rather than one per flip.
+        self._seam_margin_announced = False
         #: Flips abandoned because the STAGING buffers would not fit in
         #: free VRAM above the reserve. Counted separately from fit_aborts:
         #: "the target pool has no row for this slot" and "there is no room
@@ -3848,19 +3869,46 @@ class PhaseFlipRuntime:
                                    case of the margin is the behaviour it
                                    replaces, never a wedge.
           law short             -> refused, as before, however exhausted the
-                                   budget is. THERE IS NO PATH THROUGH THIS
-                                   GATE THAT PROCEEDS INTO A BREACH.
+                                   budget is. The law is never budgeted.
+
+        SAY THE GUARANTEE EXACTLY. No path proceeds when the pre-allocation
+        law check fails. That is not the same as "no breach is possible": the
+        YIELD path deliberately enters at the law, which is precisely the
+        state register C20 measured a 456 MiB in-cutover draw from. The yield
+        is bounded to be no worse than the run it replaces, not to be safe --
+        a run whose yields dominate its delays has a margin this
+        configuration cannot fund, and that is a finding, not a pass.
         """
         scheduler = self._census_scheduler
         # Stub runtimes built with __new__ (the hermetic gate tests) do not
         # run __init__, so the C20 state is established defensively here
         # rather than assumed.
-        if not hasattr(self, "_seam_margin_short"):
-            self._seam_margin_short = {PP_TO_TP: 0, TP_TO_PP: 0}
+        if not hasattr(self, "_seam_abandons_in_a_row"):
+            self._seam_abandons_in_a_row = {PP_TO_TP: 0, TP_TO_PP: 0}
+        if not hasattr(self, "seam_margin_delays"):
             self.seam_margin_delays = 0
             self.seam_margin_yields = 0
         margin_bytes = seam_entry_margin_bytes()
         ask_bytes = int(staging_bytes) + margin_bytes
+        # ANNOUNCE ONCE, FROM THE PATH THAT ALWAYS RUNS. The margin appears in
+        # the guard's reason string, but the guard only logs when it ARMS, so
+        # counting reasons in the log measures how expensive the term was and
+        # not whether it is wired. Those are different questions and a run
+        # that funds the margin from cache every time would answer the second
+        # one "inert" -- the exact false negative this corpus has shipped
+        # seven times, inverted.
+        if not getattr(self, "_seam_margin_announced", False):
+            self._seam_margin_announced = True
+            logger.info(
+                "%s [#656 SEAM-ENTRY] ARMED: C20 entry margin %d MiB on top of "
+                "the seam staging, delay budget %d consecutive abandoned "
+                "attempts per direction. The corridor LAW is unchanged; this "
+                "term decides how much headroom a cutover must ENTER with, "
+                "because the law alone let s34 enter with 19 MiB.",
+                LOG_PREFIX,
+                margin_bytes // (1024 * 1024),
+                seam_entry_delay_budget(),
+            )
         guard = None
         try:
             from sglang.srt.managers.phase_flip_spill import get_corridor_guard
@@ -3973,72 +4021,78 @@ class PhaseFlipRuntime:
                     LOG_PREFIX,
                     verdict.detail,
                 )
-            # The margin was reachable, so this direction's delay budget is
-            # whole again. Without the reset one bad patch of a long run
-            # would disarm the gate for the rest of the boot.
-            self._seam_margin_short[direction] = 0
             return ""
 
-        # #656 C20: the ask that failed included the margin. Ask again for
-        # the LAW alone, and let the answer decide which of the two events
-        # this is. The second ask is cheap -- the ladder has just run, so its
-        # providers return what they have left, which is usually nothing.
-        if margin_bytes > 0:
-            try:
-                law_verdict = guard.ensure_headroom(
-                    int(staging_bytes),
-                    reason=f"seam staging {direction} (law only, margin short)",
-                    refusal_is_fatal=(direction == "pp_to_tp"),
-                )
-            except Exception as e:
-                logger.error(
-                    "%s corridor gate failed to re-evaluate without the C20 "
-                    "margin (%s); the flip proceeds on the staging "
-                    "affordability check alone",
-                    LOG_PREFIX,
-                    e,
-                )
-                return ""
-            if law_verdict.ok:
-                spent = self._seam_margin_short[direction] + 1
-                self._seam_margin_short[direction] = spent
-                budget = seam_entry_delay_budget()
-                if spent <= budget:
-                    self.seam_margin_delays += 1
-                    logger.info(
-                        "%s seam entry DELAYED (%s): the corridor law is met "
-                        "but the %d MiB C20 entry margin is not (%s). The "
-                        "deepest troughs of this corpus are made INSIDE a "
-                        "cutover and the memory comes back -- delay %d of a "
-                        "budget of %d, then the law governs.",
-                        LOG_PREFIX,
-                        direction,
-                        margin_bytes // (1024 * 1024),
-                        verdict.detail,
-                        spent,
-                        budget,
-                    )
-                    return (
-                        f"seam entry margin short: {verdict.detail} "
-                        f"(delay {spent}/{budget}, {direction})"
-                    )
-                self.seam_margin_yields += 1
+        # #656 C20. THE REFUSED ASK INCLUDED THE MARGIN, so it does not yet
+        # say WHICH of the two events this is. Answer that from the verdict's
+        # OWN numbers instead of asking the guard a second time. The guard's
+        # contract is
+        #
+        #     ok = (free_after_the_ladder - want) >= law_floor_bytes
+        #
+        # (corridor_guard.py), so subtracting the STAGING from the free the
+        # ladder actually reached asks exactly the question a second call
+        # would answer.
+        #
+        # THE SECOND CALL WAS THE FIRST VERSION OF THIS AND IT WAS WRONG
+        # TWICE. On the refusal path it re-armed the entire ladder -- a
+        # second empty_cache, a second forced host spill, every counter
+        # double-booked -- and an exception inside it discarded a verdict
+        # that had ALREADY said the law would break, returning "" and walking
+        # the seam into the breach this gate exists to prevent. Arithmetic on
+        # a value already in hand cannot raise and cannot spend.
+        law_floor = int(getattr(guard, "law_floor_bytes", 0))
+        law_ok = margin_bytes > 0 and (
+            int(verdict.free_after) - int(staging_bytes) >= law_floor
+        )
+        if law_ok:
+            budget = seam_entry_delay_budget()
+            # GROUP-UNIFORM CURRENCY. The budget is spent in consecutive
+            # ABANDONED ATTEMPTS, booked by ``note_seam_verdict`` from the
+            # already-reduced fit verdict, so all three ranks read the same
+            # number. A per-rank counter reset by each rank's own clearance
+            # was the first version and it could not bound anything: the
+            # group abandons if ANY rank objects, so three ranks taking turns
+            # being short never spend a budget between them and pp->tp delays
+            # forever -- the 411-abandon decode wedge, reached through the
+            # mechanism that exists to prevent it.
+            spent = self._seam_abandons_in_a_row.get(direction, 0)
+            if spent < budget:
+                self.seam_margin_delays += 1
                 logger.warning(
-                    "%s seam entry margin YIELDED (%s) after %d consecutive "
-                    "delays: entering on the corridor law alone, which is the "
-                    "pre-C20 behaviour. %s. A run whose yields dominate its "
-                    "delays has a margin this configuration cannot fund -- "
-                    "read that as evidence, not as a reason to widen it.",
+                    "%s seam entry DELAYED (%s): the corridor law is met but "
+                    "the %d MiB C20 entry margin is not (%s). The deepest "
+                    "troughs of this corpus are made INSIDE a cutover and the "
+                    "level recovers between them -- consecutive abandoned "
+                    "attempts %d of a budget of %d, after which the law "
+                    "governs.",
                     LOG_PREFIX,
                     direction,
-                    budget,
+                    margin_bytes // (1024 * 1024),
                     verdict.detail,
+                    spent,
+                    budget,
                 )
-                return ""
-            # Below the LAW. Fall through to the refusal, with the law's own
-            # verdict as the thing reported: the margin is budgeted, the law
-            # is not.
-            verdict = law_verdict
+                return (
+                    f"{SEAM_MARGIN_DELAY_TAG}: {verdict.detail} "
+                    f"(attempt {spent + 1}, budget {budget}, {direction})"
+                )
+            self.seam_margin_yields += 1
+            logger.warning(
+                "%s seam entry margin YIELDED (%s) after %d consecutive "
+                "abandoned attempts: entering on the corridor law alone, "
+                "which is the pre-C20 behaviour, so this is never worse than "
+                "the run it replaces -- but it enters at the law and is "
+                "therefore exposed to the in-cutover draw register C20 "
+                "measures. %s. A run whose yields dominate its delays has a "
+                "margin this configuration cannot fund: read that as "
+                "evidence, not as a reason to widen it.",
+                LOG_PREFIX,
+                direction,
+                spent,
+                verdict.detail,
+            )
+            return ""
 
         self.corridor_aborts += 1
         # A REFUSED pp->tp IS NOT A TRANSIENT, and the two directions are not
@@ -4247,8 +4301,25 @@ class PhaseFlipRuntime:
             too_small.append(staging_detail)
 
         fits = 0 if too_small else 1
-        reduced_fit = self._collective_min([fits, -fits])
+        # #656 C20: is the group's objection NOTHING BUT the seam-entry
+        # margin? It rides the SAME reduction rather than adding one. A rank
+        # that does not object votes 1, a rank whose only objection is the
+        # margin votes 1, any other objection votes 0; the MIN therefore
+        # answers "this is a margin DELAY and nothing else". Without it the
+        # group log calls a healthy by-design wait a FLIP ABANDONED, which is
+        # the string every acceptance harness in this corpus counts and the
+        # one the 411-abandon decode wedge was measured with.
+        margin_only = 0 if any(SEAM_MARGIN_DELAY_TAG not in d for d in too_small) else 1
+        reduced_fit = self._collective_min([fits, -fits, margin_only])
         if reduced_fit[0] == 0:
+            # THE BUDGET'S CURRENCY, BOOKED WHERE EVERY RANK AGREES. This is
+            # the reduced verdict, so all three ranks increment together and
+            # a delay budget means the same thing on each of them.
+            book = getattr(self, "_seam_abandons_in_a_row", None)
+            if book is None:
+                book = self._seam_abandons_in_a_row = {}
+            book[direction] = book.get(direction, 0) + 1
+            delayed_for_margin = len(reduced_fit) > 2 and bool(reduced_fit[2])
             self._pending = None
             self._armed_at = None
             self._last_hold_reason = None
@@ -4264,23 +4335,47 @@ class PhaseFlipRuntime:
                 self.staging_aborts += 1
             else:
                 self.fit_aborts += 1
-            logger.error(
-                "%s FLIP ABANDONED (pool too small for the live set): %s. "
-                "This rank: %s. No bytes were moved -- the bound is checked "
-                "before the plan is executed -- and serving continues on the "
-                "%s stack with every request intact. The live set grows with "
-                "the resident prefix cache, so flushing the cache or sizing "
-                "the target pool up are both real answers; a smaller TP pool "
-                "is also what a draft-KV allocation inside the same budget "
-                "produces.",
-                LOG_PREFIX,
-                direction,
-                "; ".join(too_small) if too_small else "fits (a peer did not)",
-                self._phase,
-            )
+            if delayed_for_margin:
+                logger.warning(
+                    "%s FLIP DELAYED (seam entry margin, %s): every rank's "
+                    "only objection is the C20 entry margin, so no rank is "
+                    "short of the corridor LAW and nothing is wrong with the "
+                    "pool. This rank: %s. Consecutive delayed attempts in "
+                    "this direction: %d; when they reach the budget the law "
+                    "governs and the seam enters. Serving continues on the "
+                    "%s stack with every request intact.",
+                    LOG_PREFIX,
+                    direction,
+                    "; ".join(too_small) if too_small else "clear (a peer was not)",
+                    self._seam_abandons_in_a_row.get(direction, 0),
+                    self._phase,
+                )
+            else:
+                logger.error(
+                    "%s FLIP ABANDONED (pool too small for the live set): %s. "
+                    "This rank: %s. No bytes were moved -- the bound is checked "
+                    "before the plan is executed -- and serving continues on the "
+                    "%s stack with every request intact. The live set grows with "
+                    "the resident prefix cache, so flushing the cache or sizing "
+                    "the target pool up are both real answers; a smaller TP pool "
+                    "is also what a draft-KV allocation inside the same budget "
+                    "produces.",
+                    LOG_PREFIX,
+                    direction,
+                    "; ".join(too_small) if too_small else "fits (a peer did not)",
+                    self._phase,
+                )
             # Abandoned before any byte moved: there is no seam to attribute.
             seam_census.reset()
             return None
+
+        # The group is going through, so this direction's delay budget is
+        # whole again. Reset here rather than in the gate: the gate is
+        # rank-local and a rank that cleared while a peer did not has learnt
+        # nothing about the group.
+        if not hasattr(self, "_seam_abandons_in_a_row"):
+            self._seam_abandons_in_a_row = {}
+        self._seam_abandons_in_a_row[direction] = 0
 
         # THE MOVE, ONE LAYER WAVE AT A TIME (#631).
         #
