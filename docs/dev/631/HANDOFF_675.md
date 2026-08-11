@@ -9,9 +9,48 @@ more than the code.
 
 ---
 
+## 0. THE ONE-LINE STATE
+
+The KV rung's DEVICE HALF IS PROVEN ON METAL and is currently OFF by default.
+It works (`free 4 -> 1844 MiB, reclaimed 1840 MiB from [kv-backing]`) and it
+wedged the group, for a reason that is a design fact rather than a bug in the
+bytes: **a rank-local cap cannot drive a collective admission decision.** Fix
+that (§1a) and the rung ships.
+
+The `allocator-cache` rung is ON, unconditional, and proven paying.
+
+---
+
 ## 1. ERRORS FIRST
 
-### 1a. THE RELIEF PROVIDER CONSUMED 2.5 GiB INSTEAD OF FREEING IT
+### 1a. THE CAP DESYNCED THE PP GROUP — read this before touching the rung
+
+With an 8 MiB chunk the device half worked, three flips completed with it
+live, and then the scheduler stopped heartbeating; `/health` reported
+"couldn't get a response from detokenizer" while every rank was alive and
+logging normally.
+
+The ranks had capped to **449039 / 451037 / 175225 / 145734 rows**. The cap
+changes `available_size()`, which feeds ADMISSION, and each rank sized its own
+shrink from its own free memory and its own live set. So the group no longer
+agreed on how much work it could take, and a PP group that disagrees about
+admission desyncs.
+
+**This is the same law the corridor guard already states for its fleet probe**
+— a rank-local decision inside a collective waits forever on the rank that
+branched differently. The guard is RIGHT to read NVML per-rank for a REFUSAL,
+which is unanimous by construction. It is WRONG for a CAPACITY, which every
+rank must agree on.
+
+    A refusal may be decided locally. A capacity may not.
+
+THE FIX, and it is not a retreat: the shrink target must be a **collective
+minimum**, the way the seam's abandon already rides `_collective_min`, so
+every rank caps to the same row count. The gate runs at the same point in the
+flip protocol on every rank, which is exactly where that collective is safe.
+Until then the rung is behind `SGLANG_KV_BACKING_RELIEF=1`.
+
+### 1b. THE RELIEF PROVIDER CONSUMED 2.5 GiB INSTEAD OF FREEING IT
 
 Booted at a raised arming floor (`SGLANG_CORRIDOR_FLOOR_MIB=4000`) as the
 can-fail instrument. It fired inside one boot, and the gate's own detail line
@@ -50,7 +89,7 @@ actively consumed memory**. The generalisation is worth carrying:
     tries to undo its own attempt is not — undo is allocation, and it runs at
     the exact moment memory is scarcest.
 
-### 1b. THE ALLOCATOR CAP READ AS A POOL LEAK AND KILLED ALL THREE RANKS
+### 1c. THE ALLOCATOR CAP READ AS A POOL LEAK AND KILLED ALL THREE RANKS
 
 With `SGLANG_FLIP_SEAM_CHUNK_MIB=256` set, the rung shrank the pool and the
 cap withheld 80165 slots — i.e. **it worked**. The first idle check then
@@ -73,7 +112,7 @@ to every ledger that sums the pool, and the #486 named-posten law already said
 so. The next rung that removes slots — cached-evict, host-spill — inherits
 this obligation.
 
-### 1c. THE SHRINK STILL FREED NOTHING, BECAUSE RELEASE IS PER-BUFFER
+### 1d. THE SHRINK STILL FREED NOTHING, BECAUSE RELEASE IS PER-BUFFER
 
 With the chunk set and the invariant fixed, the rung ran clean and still
 returned zero on every attempt:
@@ -101,7 +140,7 @@ release no matter how much slack the pool had. At 8 MiB it is ~15285 rows
 (~230 MiB/rank), which is the right size against a gate asking ~500 MiB.
 **Pick the chunk from this formula, not from intuition about page sizes.**
 
-### 1d. A LATENT FAULT THIS RUNG MADE REACHABLE (fixed before it fired)
+### 1e. A LATENT FAULT THIS RUNG MADE REACHABLE (fixed before it fired)
 
 `zero_kv_data_buffers` zeroed the WHOLE VA-sized tensor. A KV buffer spans the
 reservation; its backing does not. So `/flush_cache` against a pool whose
@@ -165,10 +204,14 @@ any number across boots with and without it.
 
 ## 4. NEXT, IN ORDER
 
-1. **Finish the metal proof of the KV rung**: the shrink must be observed
-   PAYING (a non-zero measured driver delta), surviving idle checks, and
-   RECOVERING on the `tp->pp` leg. Watch `KV-BACKING released` and the
-   recovery counter, and confirm the pool returns to its boot rows.
+1. **Make the shrink target a COLLECTIVE MINIMUM and turn the rung back on**
+   (§1a). Everything else about it is proven: it registers, it caps safely, it
+   returns real driver bytes, it survives the idle invariant, and it rescued a
+   card that was at 4 MiB free. The only missing property is agreement across
+   ranks. Re-enable with `SGLANG_KV_BACKING_RELIEF=1` and
+   `SGLANG_FLIP_SEAM_CHUNK_MIB=8`, and confirm RECOVERY on the `tp->pp` leg
+   (the pool must return to its boot rows) — recovery is the property that
+   keeps this from being "a smaller pool as the fix".
 2. **`kv_reshard` as the `RELIEF_REBALANCE` provider** (item 16 levelling).
    Still the tier the ladder reaches BEFORE host, still already built
    (`KvReshardRuntime.arm(target)` -> `on_round` -> `_execute`), and still the
