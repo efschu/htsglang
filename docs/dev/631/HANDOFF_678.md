@@ -158,3 +158,81 @@ which item 16 scores as levelling failures.
 
 ---
 
+## 3. SPEC ITEM 12, PROVEN ON METAL, WITH THE RESTORE
+
+This is the mechanism the chain had never seen fire. It fired inside the
+acceptance window, on the pressure the occupancy leg created, and the
+evidence is a collective rather than three rank-local decisions:
+
+    13:03:50 PP0  KV-BACKING released 112 MiB by backing 504360 rows
+                  instead of 512552 (highest live row 465410, ...)
+    13:03:50 PP2  KV-BACKING released  64 MiB by backing 504360 rows ...
+    13:03:50 PP1  KV-BACKING released  78 MiB by backing 504360 rows ...
+
+**All three ranks land on the identical row count, 504360**, which is the
+point: a capacity may not be decided locally (HANDOFF_675 §1a), and the
+min-reduce is what makes the three agree. 8192 rows given up, ~254 MiB
+returned to the driver node-wide, and the per-rank figures differ because
+`bytes_per_row` differs with each stage's layer count — not because the ranks
+disagreed.
+
+The proposal that crossed zero, quoted whole because it is the first one in
+this chain's history that did:
+
+    PP1  rows current=512552 floor=465411 (max_live=465410, slack=47141)
+         need = floor 1536 + delta 256 + want 1351 = 3143 MiB
+         against free 2184 MiB and cheap relief 908 MiB
+         -> deficit +51 MiB -> SHRINK to 504360
+
+Fifty-one megabytes. That is how close the previous runs were, and it is why
+the missing instrument mattered more than any missing mechanism.
+
+**AND THE ROWS CAME BACK.** 0 corridor-bounded partial recoveries, 0 deferred
+recoveries, 0 pools that could not pay, and the next proposal reports
+`rows current=512552` — the boot reservation. A shrink whose rows do not
+return is a capacity loss wearing a spill's clothes; this one is residency.
+
+Worth knowing: **a successful recovery logs nothing.** Only the failures log,
+so "0 failed recoveries" is a weaker claim than "the pool is whole". The
+extract now reads the backed row count off the following proposal and
+compares it to the boot pool, which is the direct evidence.
+
+---
+
+## 4. WHAT TO DO NEXT, IN ORDER
+
+0. **Move the KV-rung trace above `propose`'s four ABSTAIN returns** (§1b).
+   An abstain is still silent, and abstain is the failure mode that takes the
+   whole group with it.
+1. **Improve the prefill gate's `want`** (§1a-bis). The activation slope is a
+   movement proxy; a peak-residency figure would let the gate preempt instead
+   of recover. `mem_ledger/activation.py`'s `measured_capture_mib_per_token`
+   is the shape to copy — it returns None rather than substituting a literal.
+2. **C18: give `vram_dial` the corridor guard's floor** instead of its own
+   NVML model, before anyone enables the dial.
+3. **The host half at a context where it fits** — HANDOFF_677 §2a's
+   arithmetic is unchanged and MemAvailable is now ~27 GiB, i.e. tighter, not
+   looser. Reduced `--context-length` or cached-prefix eviction.
+4. **The dynamic-chunking A/B**, engagement line ready since s33.
+5. **Item 16's continuous tier** still needs a seam-compatible partial
+   `kv_reshard` or a levelling primitive that does not migrate ownership.
+
+---
+
+## 5. PROCESS NOTES THAT EARNED THEIR PLACE
+
+* **The missing thing was an instrument, not a mechanism.** Item 12's rung
+  was correct for five shifts and declined by 51 MiB in silence. The fix that
+  finally moved it was a log line plus the arithmetic to know which term to
+  push on. Before building a mechanism's replacement, make it say why it
+  declined.
+* **Dry-run the reporting script mid-window.** Two extract bugs (§1c) would
+  otherwise have surfaced with the run over and nothing left to re-measure.
+  The report is part of the deliverable and deserves the same rehearsal.
+* **A wrong grep pattern is indistinguishable from a dead mechanism.** The
+  first mid-run check reported "kv proposals=0" because the pattern carried a
+  bracket the log prefix does not have. The trace had been firing since the
+  first seam. Check the instrument before concluding about the subject.
+* **Let a test state the limit instead of hiding it.** The gate cannot
+  preempt an underpriced chunk, and the test that says so names the number
+  that would make it (§1a-bis) rather than asserting the comfortable case.
