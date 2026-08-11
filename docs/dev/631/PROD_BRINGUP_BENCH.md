@@ -4261,3 +4261,58 @@ standing warning about the per-token slope.
 `--max-total-tokens 620000` produced a pool of **512552**: the server clamps
 at `_profile_available_bytes`. The binding budget is
 `--rank-gpu-memory-mib 31800,14000,15600`. Register C15.
+
+## Successor 33: the levelling levers, measured
+
+### The PP stage-ratio lever is quantized at 4 layers
+
+`derive_pp_layer_split` balances FULL-ATTENTION count, and this checkpoint has
+16 full-attention layers among 64 (`full_attention_interval` 4). So the
+reachable splits step in whole full-attention blocks and there is nothing
+between them:
+
+| `--pp-stage-ratio` | derived layers | full-attn per stage | at-rest free (NVML order) | pool |
+|---|---|---|---|---|
+| `14,10,8` | 28 / 20 / 16 | 7 / 5 / 4 | 2775 / 5598 / 3021 MiB | 512552 |
+| `15,9,8`  | 32 / 16 / 16 | 8 / 4 / 4 | 2939 / 1754 / 1517 MiB | **620000** |
+
+One step moves **~1.7 GiB** of weights. The imbalance to correct at the
+binding instant is ~1.3 GiB, so the lever OVERSHOOTS its target — there is no
+setting that levels this rig from the PP side.
+
+The `15,9,8` row is the better-balanced AND better-filled one (the profile
+ceiling rose to the full requested 620000, +21% KV, because the binding rank
+gave up two layers of weights) and it is **unrunnable**: the 5090 draws
+~3.2 GiB of TRANSIENT memory under load (at-rest 5598 -> minimum 2404 in s32's
+acceptance), which 1754 MiB at rest cannot absorb. It also uncovered the
+weights-arena high-water bug (HANDOFF_677 §1a) — with that fixed the ratio
+boots, but the corridor still says no.
+
+### The TP vector, at rest
+
+`--phase-flip-tp-vector 32,16,16` (12/6/6 of 24 attention heads exactly, where
+30,17,17 is not) measured at-rest **2785 / 5472 / 2949 MiB**, pool 512552 —
+within ~130 MiB of 30,17,17's at-rest column on every card. **The vector is
+close to a no-op on the at-rest distribution**; it moves token OWNERSHIP, and
+ownership shows up under load, not at boot. Do not expect a boot snapshot to
+tell you whether a vector change worked.
+
+### KV bytes per token, from the config rather than from a slope
+
+16 full-attention layers x 4 KV heads x 256 head-dim x 2 (K+V) x 1 byte
+(fp8_e4m3) = **32 KiB per token**, node-wide across the three ranks. This is
+the number to size host pools against, and it is exact — unlike the per-row
+release slopes above, which are chunk-quantisation artefacts (C10).
+
+Consequence for kv-session-offload: one FULL-CONTEXT region at
+`--context-length 393216` is **12.9 GB** node-wide, ~4.3 GB per rank, PINNED.
+`host_pool_effective_max_spills` fails fast rather than shrinking the depth,
+so it is that much or nothing.
+
+### Tokenizer ratio for synthetic long-context prompts
+
+The `alphaNNN/betaNNN/...` vocabulary used by `s33_yarn_bs1_leg.py` measures
+**3.935 tokens per word** on this tokenizer, not the ~1 a word-count estimate
+assumes. A long-context leg that sizes its prompt in words is off by a factor
+of four and will be rejected for exceeding the context window. Calibrate
+against `/v1/messages/count_tokens`.

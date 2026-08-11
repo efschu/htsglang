@@ -73,7 +73,14 @@ PYEOF
   echo "-- kvso <-> phase-flip contract (#656: a state, not a feature)"
   st=$(tr -d '\000' < "$LOG" | grep -c "kv-session-offload busy")
   echo "   flip arming refused for kvso state: $st time(s)"
-  echo "   kvso enabled on this instance: $(grep -c -- '--enable-kv-session-offload' /tmp/s33_argv.txt 2>/dev/null || echo 0)"
+  if grep -q -- '--enable-kv-session-offload' /tmp/s33_argv.txt 2>/dev/null; then
+    echo "   kvso enabled on this instance: yes"
+  else
+    echo "   kvso enabled on this instance: NO -- the contract unblocks it, but"
+    echo "   the pinned host pool at --context-length 393216 needs ~12.9 GB"
+    echo "   node-wide (one FULL-CONTEXT region per rank) against ~36 GiB"
+    echo "   MemAvailable and a prior 112.1/120 GiB peak. See HANDOFF_677 §2a."
+  fi
 
   echo
   echo "-- dynamic-chunking engagement (INFO line, edge-triggered)"

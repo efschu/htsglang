@@ -46,21 +46,65 @@ import urllib.request
 BOUNDARY = 262144
 
 
-def build_prompt(target_tokens: int, seed: int = 656) -> str:
-    """A non-repeating word stream of roughly ``target_tokens`` tokens.
-
-    ~0.75 words per token is the conservative direction for this tokenizer:
-    it overshoots, and the leg re-measures against the server's own count
-    rather than trusting this estimate.
-    """
+def _words(n: int, seed: int = 656):
     rng = random.Random(seed)
     vocabulary = [
-        f"{a}{n}"
+        f"{a}{n_}"
         for a in ("alpha", "beta", "gamma", "delta", "kappa", "sigma", "omega")
-        for n in range(1000)
+        for n_ in range(1000)
     ]
-    words = [rng.choice(vocabulary) for _ in range(int(target_tokens * 1.05))]
-    return " ".join(words)
+    return [rng.choice(vocabulary) for _ in range(n)]
+
+
+def build_prompt(target_tokens: int, base: str, timeout: float, seed: int = 656) -> str:
+    """A non-repeating word stream of CALIBRATED length.
+
+    THE ESTIMATE THAT DOES NOT SURVIVE CONTACT: a synthetic token like
+    "alpha123" is not one token. On this tokenizer it is two or three, so a
+    words-per-token guess in either direction is wrong by a factor, and wrong
+    UPWARD means a prompt past --context-length that the server rejects
+    outright -- the leg would report a failure of the feature when it was a
+    failure of the arithmetic.
+
+    So the ratio is MEASURED once against the server's own tokenizer, and the
+    prompt is then built to the token target. The client never gets to have an
+    opinion about how long its prompt is.
+    """
+    probe_words = _words(4000, seed)
+    probe = " ".join(probe_words)
+    counted = count_tokens(base, probe, timeout)
+    if counted <= 0:
+        # No tokenizer endpoint: fall back to a deliberately CONSERVATIVE
+        # 3 tokens per word, which undershoots the target rather than
+        # overrunning the context window.
+        tokens_per_word = 3.0
+        print("[yarn-bs1] token count unavailable; assuming 3 tokens/word", flush=True)
+    else:
+        tokens_per_word = counted / len(probe_words)
+        print(
+            f"[yarn-bs1] calibrated {tokens_per_word:.3f} tokens/word "
+            f"({counted} tokens for {len(probe_words)} words)",
+            flush=True,
+        )
+    need_words = int(target_tokens / max(0.1, tokens_per_word))
+    return " ".join(_words(need_words, seed + 1))
+
+
+def count_tokens(base: str, text: str, timeout: float) -> int:
+    """Token count from the SERVER's tokenizer, or 0 if it will not say."""
+    try:
+        res = post(
+            f"{base}/v1/messages/count_tokens",
+            {
+                "model": "Qwen3.6-27B",
+                "messages": [{"role": "user", "content": text}],
+            },
+            timeout,
+        )
+        return int(res.get("input_tokens", 0))
+    except Exception as e:  # noqa: BLE001
+        print(f"[yarn-bs1] count_tokens unavailable: {e}", flush=True)
+        return 0
 
 
 def post(url: str, payload: dict, timeout: float):
@@ -82,7 +126,7 @@ def main() -> int:
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    prompt = build_prompt(args.tokens)
+    prompt = build_prompt(args.tokens, args.base, 120.0)
     results = []
     for attempt in range(args.repeat):
         t0 = time.time()
