@@ -138,10 +138,18 @@ class TheVerdictTravelsAsAStringTest(unittest.TestCase):
         self.assertEqual(r.corridor_aborts, 1)
 
     def test_the_gate_is_asked_about_the_staging_bytes_it_was_given(self):
+        # #656 register C20: the ask is the staging PLUS the designed
+        # seam-entry margin, because clearing on the corridor LAW alone is
+        # what let s34 enter a cutover with 19 MiB to spare and s36 enter
+        # the same one 23 MiB short. The margin's own semantics are pinned
+        # in test_seam_entry_margin_631; what this asserts is that the
+        # staging the gate was GIVEN still reaches the guard intact.
+        from sglang.srt.managers.phase_flip_runtime import seam_entry_margin_bytes
+
         r = _runtime()
         with _Patched(_Guard(_cleared())) as g:
             r._corridor_gate(1234 * MIB, "pp->tp")
-        self.assertEqual(g.asks[0][0], 1234 * MIB)
+        self.assertEqual(g.asks[0][0], 1234 * MIB + seam_entry_margin_bytes())
         self.assertIn("pp->tp", g.asks[0][1])
 
     def test_no_scheduler_is_not_an_error(self):
@@ -318,7 +326,13 @@ class TheFatalLegIsMarkedTest(unittest.TestCase):
 
         class _G:
             def ensure_headroom(self, want, *, reason="", refusal_is_fatal=False):
-                seen[reason.split()[-1]] = refusal_is_fatal
+                # Keyed by the direction NAMED in the reason rather than by
+                # its last word: since C20 the reason also carries the
+                # seam-entry margin, and a positional read of it would pin
+                # the log wording instead of the fatal-leg contract.
+                for d in ("pp_to_tp", "tp_to_pp"):
+                    if d in reason:
+                        seen[d] = refusal_is_fatal
                 return _cleared()
 
         with _Patched(_G()):

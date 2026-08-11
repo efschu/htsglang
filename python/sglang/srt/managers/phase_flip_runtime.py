@@ -104,8 +104,7 @@ def chunk_blocks_quiescence(chunked_req) -> bool:
     has no pool row yet, so its KV has no home the carry could move.
     """
     return (
-        chunked_req is not None
-        and getattr(chunked_req, "req_pool_idx", None) is None
+        chunked_req is not None and getattr(chunked_req, "req_pool_idx", None) is None
     )
 
 
@@ -177,6 +176,67 @@ DEFAULT_PRESENCE_POLL_INTERVAL_S = 0.005
 #: restores the old unbounded wait -- available deliberately for debugging a
 #: slow drain, and named so a reader sees that "no deadline" is a choice.
 ENV_PARK_DEADLINE = "SGLANG_PHASE_FLIP_PARK_DEADLINE_S"
+
+# #656 REGISTER C20: THE SEAM MUST ENTER WITH HEADROOM, NOT MERELY BE LEGAL.
+#
+# The corridor's deepest troughs are made INSIDE the cutover. Measured on
+# successor 34's own GREEN window (evidence-631/s37/C20_SIZING.txt, 450
+# cutovers against a 100 ms sampler):
+#
+#   * from a LOW entry the cutover draws at most 456 MiB on the binding card
+#     -- the draw is self-limiting, because this gate frees to
+#     floor + delta + want before the seam stages, so a big draw only ever
+#     follows a HIGH entry (up to 1026 MiB there),
+#   * the deep entries are INHERITED: the deepest minima come in pairs of
+#     cutovers ~2 s apart, the second entering at the first one's trough,
+#   * s34 therefore held the 1024 MiB law by +19 MiB and successor 36's
+#     identical trough missed it by -23 MiB. That margin was never designed.
+#
+# 512 MiB covers the measured 456 MiB draw-from-a-low-entry with room over,
+# and it is deliberately NOT the 1026 MiB worst case: requiring that at every
+# seam would arm on 77% of cutovers on the binding card, which is successor
+# 36's falsified continuous cache-dumper wearing a different hat.
+DEFAULT_SEAM_ENTRY_MARGIN_MIB = 512
+ENV_SEAM_ENTRY_MARGIN = "SGLANG_SEAM_ENTRY_MARGIN_MIB"
+
+# How many CONSECUTIVE flips in one direction may be delayed for the margin
+# before the gate stands down to the corridor LAW.
+#
+# WHY THIS IS BOUNDED AT ALL. An unbounded margin refusal of pp->tp starves
+# decode outright: under strict purity decode runs only in TP, so requests
+# prefill and then wait forever, and nothing the PP phase holds can fund the
+# seam. Measured 2026-08-10 with a raised arming floor: 411 abandons, 0
+# requests completed in 6 minutes, /health 503 with every rank alive. So the
+# budget is spent and then the LAW governs -- which is exactly s34's shipped
+# behaviour, making the worst case of this term the behaviour it replaces.
+# Two rounds is enough for the paired trough to return (the pairs sit ~2 s
+# apart and the resting level recovers to a 1807 MiB median).
+DEFAULT_SEAM_ENTRY_DELAY_BUDGET = 2
+ENV_SEAM_ENTRY_DELAY_BUDGET = "SGLANG_SEAM_ENTRY_DELAY_BUDGET"
+
+
+def seam_entry_margin_bytes() -> int:
+    """The designed headroom a seam must have ON TOP OF its staging ask.
+
+    Zero disables the term and restores the single pre-C20 ask exactly. It is
+    a VALUE of the same term rather than a second code path, so the off
+    switch cannot drift from the on switch.
+    """
+    try:
+        mib = int(os.environ.get(ENV_SEAM_ENTRY_MARGIN, DEFAULT_SEAM_ENTRY_MARGIN_MIB))
+    except ValueError:
+        mib = DEFAULT_SEAM_ENTRY_MARGIN_MIB
+    return max(0, mib) * 1024 * 1024
+
+
+def seam_entry_delay_budget() -> int:
+    try:
+        n = int(
+            os.environ.get(ENV_SEAM_ENTRY_DELAY_BUDGET, DEFAULT_SEAM_ENTRY_DELAY_BUDGET)
+        )
+    except ValueError:
+        n = DEFAULT_SEAM_ENTRY_DELAY_BUDGET
+    return max(0, n)
 
 
 def park_deadline_s() -> float:
@@ -454,8 +514,7 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         pending = getattr(runtime, "pending", None) if runtime is not None else None
         if pending == PP_TO_TP and not _flip_spec_algo(scheduler).is_none():
             n_resident = sum(
-                len(getattr(b, "reqs", []) or [])
-                for b in _harvest(scheduler)
+                len(getattr(b, "reqs", []) or []) for b in _harvest(scheduler)
             )
             if n_resident and not _flip_can_bootstrap_draft(scheduler):
                 return (
@@ -685,9 +744,7 @@ def flip_blocking_guards(scheduler) -> List[str]:
     except ImportError:
         pass
     if getattr(server_args, "enable_hierarchical_cache", False):
-        guards.append(
-            "hierarchical cache (#630: PP x disk HiCache wedges at warmup)"
-        )
+        guards.append("hierarchical cache (#630: PP x disk HiCache wedges at warmup)")
     # kv-session-offload is a STATE, not a feature (#656, kvso_flip_contract).
     # This used to refuse arming whenever kvso was merely CONFIGURED, which
     # made the host half of spec items 6/12/15c and the phase flip mutually
@@ -775,9 +832,7 @@ def derive_pp_full_attn_layer_map(
         )
     layer_map = []
     for start, end in bounds:
-        layer_map.append(
-            tuple(i for i, gid in enumerate(ids) if start <= gid < end)
-        )
+        layer_map.append(tuple(i for i, gid in enumerate(ids) if start <= gid < end))
     covered = sorted(o for stage in layer_map for o in stage)
     if covered != list(range(len(ids))):
         raise KvReshardError(
@@ -1003,8 +1058,7 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             len(getattr(scheduler, "last_rank_comm_queue", None) or ()),
             len(getattr(scheduler, "send_output_work", None) or ()),
             sum(
-                len(q)
-                for q in getattr(scheduler, "_pp_tensor_dict_inbox", {}).values()
+                len(q) for q in getattr(scheduler, "_pp_tensor_dict_inbox", {}).values()
             ),
         )
         if any(_inflight):
@@ -1148,9 +1202,7 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             # the relay re-seed, so that nothing between the stack swap and
             # the next event-loop iteration can observe a half-scrubbed
             # set of batches.
-            spec_cleared, spec_rids = clear_spec_info_for_unspeculated_phase(
-                scheduler
-            )
+            spec_cleared, spec_rids = clear_spec_info_for_unspeculated_phase(scheduler)
             if spec_cleared:
                 logger.info(
                     "%s cleared TP spec_info from %d reachable batch(es) "
@@ -1176,8 +1228,7 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             reseeded = reseed_decode_input_relay(scheduler)
             if reseeded:
                 logger.info(
-                    "%s re-seeded the decode-input relay for %d carried "
-                    "request(s)",
+                    "%s re-seeded the decode-input relay for %d carried request(s)",
                     LOG_PREFIX,
                     reseeded,
                 )
@@ -1283,9 +1334,7 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
         )
     if tp_phase:
         want_worker = (
-            stacks.draft_worker
-            if stacks.draft_worker is not None
-            else stacks.tp_worker
+            stacks.draft_worker if stacks.draft_worker is not None else stacks.tp_worker
         )
     else:
         want_worker = scheduler.tp_worker
@@ -1333,7 +1382,9 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
     # so those requests never decode again, and it is a second ageing view
     # that the next flip's harvest would resurrect.
     slots = list(getattr(scheduler, "running_mbs", []) or [])
-    slot_resident = [i for i, mb in enumerate(slots) if len(getattr(mb, "reqs", []) or [])]
+    slot_resident = [
+        i for i, mb in enumerate(slots) if len(getattr(mb, "reqs", []) or [])
+    ]
     running = getattr(scheduler, "running_batch", None)
     running_n = len(getattr(running, "reqs", []) or [])
     if tp_phase and slot_resident:
@@ -1474,9 +1525,7 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
             (stacks.refill, "weights_refill"),
         ),
         pre_write_fns=(
-            _build_kv_backing_swap(
-                scheduler, stacks, layer_map[world.rank_in_group]
-            ),
+            _build_kv_backing_swap(scheduler, stacks, layer_map[world.rank_in_group]),
         ),
         guards=flip_blocking_guards(scheduler),
     )
@@ -1546,15 +1595,11 @@ class WavedBackingSwap:
         # Resolved ONCE, at wiring time, so a malformed depth is a
         # boot-time refusal and not an exception thrown inside a cutover
         # that has already released the source pool's pages.
-        self._spill_depth = resolve_spill_depth(
-            getattr(scheduler, "server_args", None)
-        )
+        self._spill_depth = resolve_spill_depth(getattr(scheduler, "server_args", None))
         # The rank's OWN device. Every worker here has all three cards
         # visible, so a bare current-device read can name a card this rank
         # does not own.
-        self._spill_device = getattr(
-            scheduler.tp_worker.model_runner, "gpu_id", None
-        )
+        self._spill_device = getattr(scheduler.tp_worker.model_runner, "gpu_id", None)
 
     @property
     def is_swappable(self) -> bool:
@@ -1580,9 +1625,7 @@ class WavedBackingSwap:
         if not pool_is_pp:
             return [int(f) for f in ordinals]
         return [
-            self._my_layers.index(int(f))
-            for f in ordinals
-            if int(f) in self._my_layers
+            self._my_layers.index(int(f)) for f in ordinals if int(f) in self._my_layers
         ]
 
     def release_wave(self, direction: str, wave: Sequence[int]) -> None:
@@ -2004,6 +2047,23 @@ class PhaseFlipRuntime:
         #: relief, and reading one number for the other would hide that.
         self.corridor_kv_relief_count = 0
         self.corridor_kv_relief_bytes = 0
+        #: #656 register C20. Seams DELAYED because the rank could satisfy the
+        #: corridor law but not the designed seam-entry margin, and seams
+        #: entered on the law alone after the delay budget was spent. Both are
+        #: booked apart from ``corridor_aborts``: a margin delay is the flip
+        #: WAITING for headroom that the paired-trough measurement says comes
+        #: back, while an abort is the ladder having nothing left. Reading one
+        #: for the other would make a healthy wait look like the 411-abandon
+        #: decode wedge. A run whose yields dominate its delays is a run whose
+        #: margin is not fundable on this configuration -- say so, do not
+        #: quietly widen the margin.
+        self.seam_margin_delays = 0
+        self.seam_margin_yields = 0
+        #: Consecutive margin delays PER DIRECTION. Separate because the two
+        #: legs are not symmetric: delaying tp->pp defers prefill and is safe,
+        #: delaying pp->tp defers decode and is the wedge above. One shared
+        #: counter would let the safe leg spend the dangerous leg's budget.
+        self._seam_margin_short = {PP_TO_TP: 0, TP_TO_PP: 0}
         #: Flips abandoned because the STAGING buffers would not fit in
         #: free VRAM above the reserve. Counted separately from fit_aborts:
         #: "the target pool has no row for this slot" and "there is no room
@@ -2024,10 +2084,9 @@ class PhaseFlipRuntime:
         #: Aliased pools ignore this and always release first -- there the
         #: order is a correctness bound, not a tuning knob (``_flip_waves``
         #: and the seam block in ``_execute`` both say why).
-        self._seam_restore_first = (
-            os.environ.get("SGLANG_FLIP_SEAM_RESTORE_FIRST", "1").strip()
-            not in ("0", "false", "no")
-        )
+        self._seam_restore_first = os.environ.get(
+            "SGLANG_FLIP_SEAM_RESTORE_FIRST", "1"
+        ).strip() not in ("0", "false", "no")
         #: #631 2.1 STREAMED SEAM. Row blocks per wave: 1 = commit a whole
         #: layer at a time (the 2.1b behaviour), >1 = restore/write/release
         #: one row block at a time, which shrinks the backing transient
@@ -2115,10 +2174,7 @@ class PhaseFlipRuntime:
         """Arm a flip. Replicated call; the consensus round commits it once
         every rank is armed AND ready. Returns (ok, msg)."""
         if self.blocking_guards:
-            msg = (
-                f"phase flip refused (guards): "
-                f"{', '.join(self.blocking_guards)}"
-            )
+            msg = f"phase flip refused (guards): {', '.join(self.blocking_guards)}"
             logger.warning("%s %s", LOG_PREFIX, msg)
             return False, msg
         if direction not in _DIR_ID:
@@ -2330,9 +2386,7 @@ class PhaseFlipRuntime:
 
         # Equality family: epoch + config fingerprint + vector ALWAYS
         # (boot config); direction once every rank is armed.
-        eq_checked = ["epoch", "config_fp"] + [
-            f"vector[{i}]" for i in range(self._n)
-        ]
+        eq_checked = ["epoch", "config_fp"] + [f"vector[{i}]" for i in range(self._n)]
         if lo["armed"] == 1:
             eq_checked.append("direction")
         mismatches = [
@@ -2445,10 +2499,9 @@ class PhaseFlipRuntime:
         if not why:
             return
         now = self._clock()
-        if (
-            self._last_not_ready_log is not None
-            and (now - self._last_not_ready_log) < max(self._park_deadline_s / 4.0, 1.0)
-        ):
+        if self._last_not_ready_log is not None and (
+            now - self._last_not_ready_log
+        ) < max(self._park_deadline_s / 4.0, 1.0):
             return
         self._last_not_ready_log = now
         logger.warning(
@@ -2726,7 +2779,11 @@ class PhaseFlipRuntime:
         # #631 H: the predicate is now "everyone present AND nobody
         # withdrawn". A stale presence flag from a rank that has since
         # abandoned must not form a quorum -- that is corpse H.
-        if not owes and not unclean and self._presence.quorum(epoch, round_=entry_round):
+        if (
+            not owes
+            and not unclean
+            and self._presence.quorum(epoch, round_=entry_round)
+        ):
             # #631 G, THE ASSERT. Re-checked HERE, at the instant of entry,
             # because the withholding check above proves nothing about the
             # moment a quorum forms: a peer's message can land in between.
@@ -2930,8 +2987,7 @@ class PhaseFlipRuntime:
             # catching only PeerLostError let it escape as a bare
             # "Fatal Python error: Aborted" (measured 2026-08-08).
             raise PhaseFlipJoinTimeout(
-                f"no group-wide join within {self._join_deadline_s:g}s "
-                f"({exc})"
+                f"no group-wide join within {self._join_deadline_s:g}s ({exc})"
             ) from exc
 
     def _abandon_unjoined_flip(self, why: str) -> None:
@@ -2970,7 +3026,9 @@ class PhaseFlipRuntime:
         the parked requests would die with it.
         """
         waited = (
-            self._clock() - self._armed_at if self._armed_at is not None else float("nan")
+            self._clock() - self._armed_at
+            if self._armed_at is not None
+            else float("nan")
         )
         direction = self._pending
         self._pending = None
@@ -3601,9 +3659,7 @@ class PhaseFlipRuntime:
         local writes, so no rank can diverge from its peers.
         """
         for _li, rows, _data in jobs:
-            if int(rows.numel()) > 1 and not bool(
-                torch.all(rows[1:] >= rows[:-1])
-            ):
+            if int(rows.numel()) > 1 and not bool(torch.all(rows[1:] >= rows[:-1])):
                 raise KvReshardError(
                     f"{LOG_PREFIX} streamed seam requires ascending row "
                     f"enumeration; got an unsorted row tensor. Blocking a "
@@ -3775,8 +3831,36 @@ class PhaseFlipRuntime:
         A refusal here is not an error. It is the flip declining to start,
         with every request intact, which is exactly the outcome the 2026-08-09
         ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` death should have had.
+
+        #656 REGISTER C20, THE SEAM-ENTRY MARGIN. The gate asks for the
+        staging PLUS ``seam_entry_margin_bytes()``, because clearing on the
+        LAW alone is what let s34 enter a cutover with 19 MiB of margin and
+        s36 enter the same one 23 MiB short. The margin is a TERM in the
+        existing ask -- one ladder, one refusal path, no second mechanism --
+        and it is graded, not absolute:
+
+          margin met            -> the seam enters (the common case)
+          margin short, law met -> the seam is DELAYED, up to a per-direction
+                                   budget, because the paired-trough
+                                   measurement says the memory comes back
+          budget spent, law met -> the seam enters on the law, loudly. This
+                                   is s34's shipped behaviour, so the worst
+                                   case of the margin is the behaviour it
+                                   replaces, never a wedge.
+          law short             -> refused, as before, however exhausted the
+                                   budget is. THERE IS NO PATH THROUGH THIS
+                                   GATE THAT PROCEEDS INTO A BREACH.
         """
         scheduler = self._census_scheduler
+        # Stub runtimes built with __new__ (the hermetic gate tests) do not
+        # run __init__, so the C20 state is established defensively here
+        # rather than assumed.
+        if not hasattr(self, "_seam_margin_short"):
+            self._seam_margin_short = {PP_TO_TP: 0, TP_TO_PP: 0}
+            self.seam_margin_delays = 0
+            self.seam_margin_yields = 0
+        margin_bytes = seam_entry_margin_bytes()
+        ask_bytes = int(staging_bytes) + margin_bytes
         guard = None
         try:
             from sglang.srt.managers.phase_flip_spill import get_corridor_guard
@@ -3816,10 +3900,16 @@ class PhaseFlipRuntime:
                 collective_kv_backing_relief,
             )
 
+            # The rung is asked to fund the MARGIN as well as the staging.
+            # Its deficit is floor + delta + want - free - cheap_relief, so a
+            # ``want`` that excluded the margin would have the funder of last
+            # resort decline exactly the gap the gate is about to delay for.
+            # The margin is a constant, so every rank still enters the
+            # reduction with the same additional term.
             kv_freed = collective_kv_backing_relief(
                 scheduler,
                 self._collective_min,
-                want_bytes=int(staging_bytes),
+                want_bytes=int(ask_bytes),
                 guard=guard,
                 direction=direction,
             )
@@ -3844,8 +3934,15 @@ class PhaseFlipRuntime:
             return ""
         try:
             verdict = guard.ensure_headroom(
-                int(staging_bytes),
-                reason=f"seam staging {direction}",
+                int(ask_bytes),
+                reason=(
+                    f"seam staging {direction}"
+                    + (
+                        f" +{margin_bytes // (1024 * 1024)} MiB C20 entry margin"
+                        if margin_bytes
+                        else ""
+                    )
+                ),
                 # THE TWO LEGS ARE NOT SYMMETRIC. Refusing tp->pp is
                 # survivable: the instance stays in TP, decode keeps running,
                 # prefill defers. Refusing pp->tp is not -- strict purity
@@ -3876,7 +3973,73 @@ class PhaseFlipRuntime:
                     LOG_PREFIX,
                     verdict.detail,
                 )
+            # The margin was reachable, so this direction's delay budget is
+            # whole again. Without the reset one bad patch of a long run
+            # would disarm the gate for the rest of the boot.
+            self._seam_margin_short[direction] = 0
             return ""
+
+        # #656 C20: the ask that failed included the margin. Ask again for
+        # the LAW alone, and let the answer decide which of the two events
+        # this is. The second ask is cheap -- the ladder has just run, so its
+        # providers return what they have left, which is usually nothing.
+        if margin_bytes > 0:
+            try:
+                law_verdict = guard.ensure_headroom(
+                    int(staging_bytes),
+                    reason=f"seam staging {direction} (law only, margin short)",
+                    refusal_is_fatal=(direction == "pp_to_tp"),
+                )
+            except Exception as e:
+                logger.error(
+                    "%s corridor gate failed to re-evaluate without the C20 "
+                    "margin (%s); the flip proceeds on the staging "
+                    "affordability check alone",
+                    LOG_PREFIX,
+                    e,
+                )
+                return ""
+            if law_verdict.ok:
+                spent = self._seam_margin_short[direction] + 1
+                self._seam_margin_short[direction] = spent
+                budget = seam_entry_delay_budget()
+                if spent <= budget:
+                    self.seam_margin_delays += 1
+                    logger.info(
+                        "%s seam entry DELAYED (%s): the corridor law is met "
+                        "but the %d MiB C20 entry margin is not (%s). The "
+                        "deepest troughs of this corpus are made INSIDE a "
+                        "cutover and the memory comes back -- delay %d of a "
+                        "budget of %d, then the law governs.",
+                        LOG_PREFIX,
+                        direction,
+                        margin_bytes // (1024 * 1024),
+                        verdict.detail,
+                        spent,
+                        budget,
+                    )
+                    return (
+                        f"seam entry margin short: {verdict.detail} "
+                        f"(delay {spent}/{budget}, {direction})"
+                    )
+                self.seam_margin_yields += 1
+                logger.warning(
+                    "%s seam entry margin YIELDED (%s) after %d consecutive "
+                    "delays: entering on the corridor law alone, which is the "
+                    "pre-C20 behaviour. %s. A run whose yields dominate its "
+                    "delays has a margin this configuration cannot fund -- "
+                    "read that as evidence, not as a reason to widen it.",
+                    LOG_PREFIX,
+                    direction,
+                    budget,
+                    verdict.detail,
+                )
+                return ""
+            # Below the LAW. Fall through to the refusal, with the law's own
+            # verdict as the thing reported: the margin is budgeted, the law
+            # is not.
+            verdict = law_verdict
+
         self.corridor_aborts += 1
         # A REFUSED pp->tp IS NOT A TRANSIENT, and the two directions are not
         # symmetric. Refusing tp->pp is safe: the instance stays in TP, decode
@@ -4318,7 +4481,12 @@ class PhaseFlipRuntime:
                     reclaimed = True
                 if self._seam_row_blocks > 1 and swap.is_span_swappable(direction):
                     self._stream_wave(
-                        swap, direction, wave, src, dst, jobs,
+                        swap,
+                        direction,
+                        wave,
+                        src,
+                        dst,
+                        jobs,
                         self._seam_row_blocks,
                     )
                 else:
@@ -4329,7 +4497,6 @@ class PhaseFlipRuntime:
             incoming_data.clear()
             write_ms += (self._clock() - t_write0) * 1000.0
             seam_census.mark("kv_write")
-
 
         # EXTRA MOVERS (weights arena, GDN state) then CUTOVER.
         #
