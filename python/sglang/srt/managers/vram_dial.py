@@ -59,6 +59,27 @@ LOG_PREFIX = "VRAM-DIAL"
 MIB = 1024 * 1024
 
 
+def corridor_law_floor_bytes() -> int:
+    """The user's corridor law in bytes, read from ``CorridorGuard``.
+
+    #658, register C18: THE DIAL AND THE GUARD MUST NOT CARRY TWO FLOORS.
+    Before this, ``_measure_local_floor_bytes`` derived a card-level floor of
+    its own (NVML used minus our VMM-backed KV) and every capacity
+    computation spent against ``budget_bytes - floor_bytes``, so a dial could
+    plan a KV ceiling that consumed the last free byte on the card. The guard
+    would then have to claw those bytes back at an allocation, which is the
+    C17 shape: two mechanisms, one resource, different floors.
+
+    IMPORTED FROM THE GUARD RATHER THAN RESTATED. A second literal ``1024``
+    in this module would be a second source of truth, and the one thing this
+    chain has repeatedly proved is that two constants that must agree
+    eventually do not.
+    """
+    from sglang.srt.managers.corridor_guard import DEFAULT_FLOOR_MIB
+
+    return int(DEFAULT_FLOOR_MIB) * MIB
+
+
 class KvCapacityError(RuntimeError):
     """Loud, rank-uniform failure of a capacity operation."""
 
@@ -230,6 +251,7 @@ class KvCapacityRuntime:
         pending_reshard_fn: Callable[[], Optional[Tuple[int, ...]]] = lambda: None,
         commit_fn: Optional[Callable[[int, int, str], int]] = None,
         ledger_report_fn: Optional[Callable[[int], None]] = None,
+        relief_fn: Optional[Callable[..., int]] = None,
         clock: Callable[[], float] = time.perf_counter,
     ):
         if n_ranks < 1:
@@ -270,6 +292,12 @@ class KvCapacityRuntime:
         self._pending_reshard_fn = pending_reshard_fn
         self._commit = commit_fn
         self._ledger_report = ledger_report_fn
+        # #658: the CorridorGuard's relief ladder, injected rather than
+        # imported, so this class stays a pure-math object with testable
+        # seams (the same shape as ``commit_fn`` and ``ledger_report_fn``).
+        # ``None`` is a supported state: a rank whose guard failed to build
+        # loses an optimisation, never a dial.
+        self._relief = relief_fn
         self._clock = clock
 
         for st in ranks:
@@ -535,9 +563,12 @@ class KvCapacityRuntime:
                 nb = ceil
             new_budgets[r] = nb
 
+        my_reduction = 0
         for r, nb in new_budgets.items():
             old = self._ranks[r].budget_bytes
             self._ranks[r].budget_bytes = nb
+            if r == self._rank:
+                my_reduction = max(0, old - nb)
             logger.warning(
                 "%s budget rank %d: %d MiB -> %d MiB (floor %d MiB)",
                 LOG_PREFIX,
@@ -546,6 +577,13 @@ class KvCapacityRuntime:
                 nb // MIB,
                 self._ranks[r].floor_bytes // MIB,
             )
+        # #658: A BUDGET REDUCTION IS CORRIDOR PRESSURE, AND THE LADDER
+        # DECIDES WHAT YIELDS.
+        #
+        # Committed only after the whole request has validated, so a rejected
+        # dial never pays a restore cost for a change that did not happen.
+        if my_reduction > 0:
+            self._relieve_for_reduction(my_reduction)
         self._op_seq += 1
         self._ledger_dirty = True
         c_target = self.compute_target_c()
@@ -567,6 +605,84 @@ class KvCapacityRuntime:
             )
         )
         return True, msg
+
+    def _relieve_for_reduction(self, nbytes: int) -> int:
+        """Spend the corridor relief ladder for an external budget cut.
+
+        WHY THE LADDER AND NOT THIS RUNTIME'S OWN SHRINK. The dial already
+        has an actuator for a lowered budget -- ``compute_target_c`` falls,
+        ``_shrink_authorized`` arms, and the next group-idle boundary cuts KV
+        capacity. That path is correct and it stays; what it is NOT is
+        relief, for two measured reasons:
+
+        * it commits only at a FULLY IDLE group boundary, so under load an
+          external tenant waits an unbounded time for its bytes, and
+        * a shrink flushes the radix cache (``_commit_on_scheduler``), i.e.
+          the default answer to "give back memory" was to throw away the
+          prefix cache and shrink the pool -- "a smaller pool as the fix",
+          which the standing rule forbids as a FIRST resort.
+
+        The ladder answers the same ask with the cheapest thing that can
+        yield instead: torch's unowned cached blocks (RELIEF_LOCAL), then a
+        cold payload parked in a peer card's surplus (RELIEF_PARK), then host
+        RAM (RELIEF_HOST) once the fleet is level. The REBALANCE tier is
+        empty by standing verdict -- three candidate mechanisms falsified
+        with receipts -- so in practice the ladder runs local -> park ->
+        host. Whatever the ladder cannot fund is left to the dial's capacity
+        arithmetic as the residual, which is the honest division of labour:
+        the ladder is fast and reversible, the capacity cut is slow and
+        flushes, so the slow one funds only what the fast one could not.
+
+        RANK-LOCAL SPEND, REPLICATED DECISION -- AND WHY THAT IS NOT N39's
+        TRAP. Register law 11/12's lesson from the steer was that a
+        group-uniform DECISION applied on a rank-local CLOCK desynchronises
+        replicated state. Nothing here is on a clock: the decision arrives
+        already replicated (the dial request is broadcast to every scheduler
+        and every rank computes identical budgets), and what the ladder
+        spends is rank-local PAYLOAD -- the allocator's cache, a carrier's
+        pages -- never replicated scheduler state. The KV pool, which IS
+        replicated because it moves ``available_size()`` and therefore
+        admission, is untouched here and continues to change only through the
+        existing MIN-reduced consensus boundary. That split is the same one
+        ``CorridorGuard`` already draws between its rank-local providers and
+        ``collective_kv_backing_relief``.
+
+        NEVER FATAL. A relief ladder that raised would turn a budget request
+        -- an external tenant politely asking for its own memory -- into a
+        failed dial. It is an optimisation; it is logged and swallowed.
+        """
+        if self._relief is None:
+            return 0
+        reason = (
+            f"#330 external budget reduction of {nbytes // MIB} MiB on rank "
+            f"{self._rank} (device "
+            f"{self._ranks[self._rank].card_uuid or self._ranks[self._rank].device_index})"
+        )
+        try:
+            got = int(self._relief(nbytes, reason=reason))
+        except Exception as e:
+            logger.warning(
+                "%s relief ladder raised while funding a %d MiB budget "
+                "reduction (%s); the reduction still stands and the capacity "
+                "arithmetic funds the residual at the next boundary",
+                LOG_PREFIX,
+                nbytes // MIB,
+                e,
+            )
+            return 0
+        logger.info(
+            "%s budget reduction of %d MiB on rank %d: the corridor relief "
+            "ladder returned %d MiB now; the residual is funded by the "
+            "capacity arithmetic at the next group-idle boundary. The guard "
+            "decides WHAT yields (local cache -> park -> host); this runtime "
+            "no longer answers a budget cut by flushing the radix cache "
+            "first.",
+            LOG_PREFIX,
+            nbytes // MIB,
+            self._rank,
+            got // MIB,
+        )
+        return got
 
     def _resolve_targets(self, device: str) -> List[int]:
         spec = str(device).strip()
@@ -889,12 +1005,30 @@ def _measure_local_floor_bytes(participants: List[DialParticipant]) -> tuple:
         ) from e
     used = int(info.total_bytes - info.free_bytes)
     backed = sum(int(p.pool.vmm_backed_bytes) for p in participants)
-    floor = used - backed
+    # #658, register C18: THE CORRIDOR LAW IS A TERM IN THIS FLOOR.
+    #
+    # Everything downstream spends ``budget_bytes - floor_bytes`` on KV, so a
+    # floor that stopped at "what is pinned on this card" let an absolute
+    # budget plan a ceiling that consumed the card's last free byte -- and the
+    # guard would then have to claw it back at an allocation. Adding the law
+    # here reserves the user's 1024 MiB free in ONE place, and every consumer
+    # (the unit cap, the budget rows, the minimum viable budget, the effective
+    # ceiling, the below-floor refusal) inherits it without knowing it exists.
+    #
+    # THE BOOT STATE IS BIT-IDENTICAL. ``build_kv_capacity_runtime`` derives
+    # the natural budget as ``floor + backed``, so raising the floor raises
+    # the natural budget by exactly the same amount and the spendable
+    # ``budget - floor`` does not move. The term bites only when a caller
+    # names an ABSOLUTE budget, which is precisely the moment an external
+    # tenant is taking bytes off this card and the law is what protects
+    # serving.
+    law = corridor_law_floor_bytes()
+    floor = used - backed + law
     if floor <= 0:
         raise KvCapacityError(
             f"floor measurement came out non-positive ({floor} bytes = "
-            f"{used} used - {backed} KV-backed) on card {uuid}; refusing to "
-            f"build a capacity model on nonsense numbers."
+            f"{used} used - {backed} KV-backed + {law} corridor law) on card "
+            f"{uuid}; refusing to build a capacity model on nonsense numbers."
         )
     return floor, uuid, device_index
 
@@ -925,6 +1059,54 @@ def _ledger_reporter(server_args, card_uuid: str, rank: int):
 
     _report.heartbeat = _heartbeat
     return _report
+
+
+def _corridor_relief(scheduler):
+    """Adapt ``CorridorGuard`` to the dial's relief hook, or ``None``.
+
+    #658: this is the join that makes the guard the ONE authority for
+    co-residency on a card (the #584 line). An external tenant lowering this
+    instance's budget now spends the SAME relief ladder a flip seam or a
+    prefill admission spends, in the same tier order, with the same refusal
+    semantics -- instead of the dial's private answer of "flush the radix
+    cache and shrink the pool at the next idle boundary".
+
+    ``ensure_headroom`` IS THE RIGHT CALL, and the equivalence is exact: an
+    external budget reduction of D bytes means someone else is about to take
+    D bytes of THIS card, which is precisely the question the gate answers --
+    "make D bytes allocatable without breaching the floor". It is not
+    ``lend_to_level``: that one is bounded by the water-fill objective and
+    capped below the host tier, which is right for levelling and wrong for a
+    tenant that has already been promised the bytes.
+
+    ``refusal_is_fatal`` is FALSE here, deliberately. Unlike the pp->tp leg,
+    a budget reduction has a survivable refusal path: the capacity
+    arithmetic funds the residual at the next boundary. So this caller does
+    not get to force host RAM onto an unlevel fleet, and item 16's
+    preference stands.
+
+    Returns ``None`` when no guard can be built, which the runtime treats as
+    "no ladder" rather than as an error.
+    """
+    try:
+        from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+        guard = get_corridor_guard(scheduler)
+    except Exception as e:
+        logger.warning(
+            "%s corridor guard unavailable (%s); a budget reduction will be "
+            "funded by the capacity arithmetic alone",
+            LOG_PREFIX,
+            e,
+        )
+        return None
+    if guard is None:
+        return None
+
+    def _relief(want_bytes: int, reason: str = "") -> int:
+        return int(guard.ensure_headroom(int(want_bytes), reason=reason).reclaimed)
+
+    return _relief
 
 
 def _refresh_capacity_snapshots(scheduler, c_new: int) -> None:
@@ -1230,6 +1412,7 @@ def build_kv_capacity_runtime(scheduler) -> KvCapacityRuntime:
             scheduler, c, rows, mode
         ),
         ledger_report_fn=_ledger_reporter(server_args, uuid, my_rank),
+        relief_fn=_corridor_relief(scheduler),
     )
     # An initial --vram-budget-mib below the natural boot budget authorizes
     # the first-boundary reconcile shrink (the cache is empty seconds after
