@@ -230,6 +230,48 @@ any number across boots with and without it.
 
 ---
 
+## 4b. THE SHIP-CONFIG RUN, AND EXACTLY WHAT ITS "GREEN" DOES NOT COVER
+
+Extract: `/spinning/evidence-631/s31/accept/EXTRACT.txt` (4829 corridor
+samples, real qwen agent traffic through the router, rung OFF).
+
+| axis | result |
+|---|---|
+| corridor breaches | **0** on all three cards (MIN 2214 / 4345 / 2470 MiB) |
+| flips | 81 `pp_to_tp` + 81 `tp_to_pp`, both layouts, **0 abandons, 0 tracebacks** |
+| strict purity | **True** — 1851 prefill batches, ZERO carrying a graph |
+| decode graphs | 95.5% of decode batches |
+| MTP | accept length **2.347** (n=66) |
+| occupancy | live slots max 159626 = **31.9%** of pool |
+| real traffic | `/v1/messages` 28, counted not asserted |
+| item 16 spread | mean **2915 MiB**, worst 3397 |
+| host RAM | peak **112.1 GiB**, cgroup `oom_kill` **9** (cumulative) |
+
+**THE SCRIPT PRINTS "GREEN". DO NOT QUOTE THAT AS ACCEPTANCE.** It is green on
+the axes it checks, and three things the user's spec requires are not among
+them:
+
+1. **Item 12 is not exercised** — the KV rung was off, and the gate never
+   armed at all this run (free stayed comfortable), so no provider was spent.
+   A run in which the ladder is never reached proves the ladder does not
+   break, not that it works.
+2. **Item 16 is NOT satisfied.** Spread mean 2915 MiB. The cards are not
+   evenly filled and nothing in this shift touched that.
+3. **The corridor's second half is unmet.** Margins of +1190 / +3321 / +1446
+   MiB above the floor mean the cards are far from "as full as possible" —
+   the 5090 leaves 3.3 GiB unused. Holding the floor is the easy half.
+
+Duration was ~11 minutes, not the >=60 the order asks for.
+
+### HOST RAM IS THE NEXT CONSTRAINT, AND IT IS ALREADY TIGHT
+
+Peak 112.1 GiB of 120, 17 GiB free / 30 GiB available at the reading, and the
+cgroup has recorded **9 oom_kills** (cumulative — I did not baseline it, so
+attribute nothing to this run). The HOST half of item 12 moves KV INTO that
+space. **Size it against ~30 GiB available, not against a nominal 120**, and
+book host RAM in the same ledger as VRAM from the first rung rather than
+after the first oom.
+
 ## 5. PROCESS NOTES THAT EARNED THEIR PLACE
 
 * **The can-fail instrument paid for itself twice in one shift.** Raising the
