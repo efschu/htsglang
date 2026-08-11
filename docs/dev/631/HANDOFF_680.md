@@ -269,7 +269,40 @@ and it should not be attempted by widening the lender.
 
 ---
 
-## 5. PROCESS NOTES
+## 5. RISKS BOOKED, NOT CLOSED
+
+An Opus review of the diff raised seven items. Three were defects and are
+fixed (commit `c7dbe33767`: the drafter's phase precondition, a double count
+in waiting, a docstring that under-stated the common path's cost). The other
+three are real and open, and a successor should know them before widening
+anything:
+
+* **S1 — `empty_cache`'s implicit device sync sits inside the PP round hook.**
+  `cudaFree` blocks until preceding device work completes, and the PP hook is
+  one line above a bounded consensus. That is the wedge SHAPE
+  `PhaseFlipRuntime.on_round` documents. Against it: 0 occurrences in 46
+  minutes across 98 lends and 100+ cutovers, and the PP call site sits after
+  every send of the iteration is flushed (`scheduler_pp_mixin.py:270-281`),
+  which is the same quiescence the consensus itself relies on. **The evidence
+  is empirical and the argument is not a proof.** If a wedge ever appears at
+  this hook, this is the first thing to remove.
+* **S5 — the water-fill mean is taken over every NVML card**, including any
+  this instance does not own (`nvml_fleet_probe` says so in its docstring,
+  where it is *conservative* for the host gate and *anti-conservative* here).
+  On this 3-card rig all three participate, so it is latent. It goes live the
+  moment TP < card count, a rank dies, or another tenant shares the box: one
+  idle 25 GiB card drags the mean up and every participating card becomes a
+  permanent shedder.
+* **S7 — the back-off damps the wrong case.** A lend that yields LITTLE grows
+  the interval; a lend that yields a lot resets it. But the bad case is a
+  payload that yields a lot and immediately comes back — torch's hoard does
+  exactly that — so the rule treats the worst case as the best. The fix is to
+  damp on a repeating provider set rather than on yield size, and §4.0's A/B
+  is what should size the problem first.
+
+---
+
+## 6. PROCESS NOTES
 
 * **Check the baseline's arithmetic before booting a mechanism against it.**
   "232 clears and a 1043 MiB minimum" is a contradiction on its face, and it
