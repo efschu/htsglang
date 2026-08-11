@@ -480,24 +480,16 @@ class PrefillAdmissionGate:
         Failures are swallowed on purpose. A levelling optimisation that can
         take prefill down is a worse bargain than an unlevel column.
         """
-        if self._lender is False:
-            return
-        if self._lender is None:
+        if self._lender is not None:
+            # An injected lender (tests) keeps the direct path.
             try:
-                from sglang.srt.managers.corridor_rebalance import (
-                    build_rebalance_lender,
-                )
-
-                self._lender = build_rebalance_lender(guard) or False
+                self._lender.maybe_lend(f"prefill admission, {int(tokens)} tokens")
             except Exception as e:  # noqa: BLE001
-                logger.warning("%s rebalance lender unavailable: %s", LOG_PREFIX, e)
-                self._lender = False
-            if self._lender is False:
-                return
-        try:
-            self._lender.maybe_lend(f"prefill admission, {int(tokens)} tokens")
-        except Exception as e:  # noqa: BLE001
-            logger.warning("%s rebalance lender raised: %s", LOG_PREFIX, e)
+                logger.warning("%s rebalance lender raised: %s", LOG_PREFIX, e)
+            return
+        from sglang.srt.managers.corridor_rebalance import lend_for_guard
+
+        lend_for_guard(guard, f"prefill admission, {int(tokens)} tokens")
 
     def _guard(self):
         try:

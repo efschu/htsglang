@@ -192,6 +192,7 @@ class RebalanceLender:
         """
         self.consulted += 1
         now = self._clock()
+        self._maybe_report_inert(now)
         if now - self._last_at < self._interval_s:
             return self._skip("rate-limited")
 
@@ -253,6 +254,33 @@ class RebalanceLender:
 
     # -- reporting ---------------------------------------------------------
 
+    def _maybe_report_inert(self, now: float) -> None:
+        """Say so, periodically, when the lender has never spent anything.
+
+        WHY THIS IS NOT OPTIONAL NOISE, and it cost this shift a window to
+        relearn: every other line the lender can emit is conditional on a LEND.
+        A lender wired to the wrong hot path is then byte-identical in the log
+        to a lender that was never needed -- which is exactly the confusion
+        that has shipped seven mechanisms in this chain. The skip histogram
+        names WHICH precondition is refusing, so "wrong hook" and "fleet was
+        level all window" can be told apart from the log alone.
+        """
+        if self.lends or self.consulted < 2:
+            return
+        if now - self._summary_at < 300.0:
+            return
+        self._summary_at = now
+        logger.warning(
+            "%s device %d has NOT lent once in %d consultations. Skips %s. "
+            "This is the lender reporting itself INERT: either the fleet never "
+            "went unlevel under pressure, or this hot path does not overlap "
+            "the pressure window. The histogram says which.",
+            LOG_PREFIX,
+            self.guard.device_index,
+            self.consulted,
+            {k: v for k, v in self.skips.items() if v},
+        )
+
     def _maybe_summarise(self, now: float, result: cg.GuardResult) -> None:
         if now - self._summary_at < 60.0:
             return
@@ -277,6 +305,74 @@ class RebalanceLender:
             f"{self.consulted} consultations, skips "
             f"{ {k: v for k, v in self.skips.items() if v} }"
         )
+
+
+#: Where the lender is cached. ON THE GUARD, not on the scheduler, because the
+#: guard is the object both call sites already resolve -- the prefill gate has
+#: its own two-step lookup and the scheduler round has another. Keying the
+#: cache on the guard is what stops those two paths building two lenders with
+#: two rate limiters that each think they are the only one.
+LENDER_ATTR = "_item16_rebalance_lender"
+
+
+def lender_for_guard(guard) -> Optional[RebalanceLender]:
+    """This card's lender, built once per guard and cached on it.
+
+    ``False`` is cached for "this rank must not lend" so the build (an NVML
+    UUID walk) is not retried on every scheduler round.
+    """
+    if guard is None:
+        return None
+    cached = getattr(guard, LENDER_ATTR, None)
+    if cached is not None:
+        return cached or None
+    lender = build_rebalance_lender(guard) or False
+    setattr(guard, LENDER_ATTR, lender)
+    return lender or None
+
+
+def lend_for_guard(guard, reason: str = "") -> None:
+    """Consult the lender for ``guard``'s card. Never raises.
+
+    A levelling optimisation that can take the scheduler down is a worse
+    bargain than an unlevel column, so every failure here is a warning and a
+    return.
+    """
+    try:
+        lender = lender_for_guard(guard)
+        if lender is not None:
+            lender.maybe_lend(reason)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("%s lend failed: %s", LOG_PREFIX, e)
+
+
+def lend_on_round(scheduler, reason: str = "scheduler round") -> None:
+    """The PER-ROUND consultation, and the reason it exists.
+
+    WIRING THE LENDER ONLY TO PREFILL ADMISSION WAS TOO NARROW, and the first
+    live window measured it: 0 lends in the first minutes while the tightest
+    card spent 7.8% of its samples below the watermark. The two windows do not
+    overlap. The corridor's trough is not made by the allocations the gates
+    cover -- s34's gate cleared 232 times and never let free fall below
+    ``floor + delta`` at a guarded site, yet the sampler still caught 1043 MiB
+    -- so the depth comes from allocations no gate prices (activations, KV
+    rows, mamba states, replay workspaces) and from the flip seam, where the
+    scheduler is not admitting prefill at all.
+
+    The scheduler round is the one clock that ticks inside both. It is
+    rank-local and performs no collective, which is the hard requirement here
+    (``phase_flip_runtime.on_round``'s docstring records the wedges that a
+    collective on a rank-local cadence caused). The rate limiter makes the
+    common path a monotonic clock read even at the ~8 kHz an armed rank spins.
+    """
+    try:
+        from sglang.srt.managers.phase_flip_spill import get_corridor_guard
+
+        guard = get_corridor_guard(scheduler)
+    except Exception:  # noqa: BLE001
+        return
+    if guard is not None:
+        lend_for_guard(guard, reason)
 
 
 def lender_enabled(default: bool = True) -> bool:

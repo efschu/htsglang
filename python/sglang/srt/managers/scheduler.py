@@ -4297,6 +4297,14 @@ class Scheduler(
         from sglang.srt.managers.phase_flip_output_trace import trace_tick
 
         trace_tick(self, "pp_end" if require_armed_and_parked else "tp_top")
+        # SPEC ITEM 16: consult the rebalance lender on the one clock that
+        # ticks in every phase, including the seam and the rounds no gate
+        # prices. Rank-local, no collective (that is a hard requirement at
+        # this cadence -- see PhaseFlipRuntime.on_round), rate-limited to a
+        # monotonic clock read on the common path, and it never raises.
+        from sglang.srt.managers.corridor_rebalance import lend_on_round
+
+        lend_on_round(self)
         flip_stats = self.phase_flip_runtime.on_round(
             require_armed_and_parked=require_armed_and_parked
         )

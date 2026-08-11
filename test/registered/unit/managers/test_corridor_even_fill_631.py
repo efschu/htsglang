@@ -612,3 +612,67 @@ class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheLenderIsCachedAndReportsItsOwnInertnessTest(unittest.TestCase):
+    """Successor 36, after the first live window: the wiring lessons."""
+
+    def test_one_lender_per_guard_no_matter_how_many_call_sites_ask(self):
+        # Two hot paths resolve this guard (prefill admission and the
+        # scheduler round). Two lenders would mean two rate limiters, each
+        # believing it is the only one, and a thrash rate twice what the
+        # policy says.
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        builds = []
+        original = crb.build_rebalance_lender
+
+        def counting_build(guard, **kw):
+            builds.append(guard)
+            return crb.RebalanceLender(guard, nvml_index=0, clock=_Clock())
+
+        crb.build_rebalance_lender = counting_build
+        try:
+            a = crb.lender_for_guard(g)
+            b = crb.lender_for_guard(g)
+        finally:
+            crb.build_rebalance_lender = original
+        self.assertIsNotNone(a)
+        self.assertIs(a, b)
+        self.assertEqual(len(builds), 1)
+
+    def test_a_rank_that_must_not_lend_is_not_rebuilt_every_round(self):
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        setattr(g, crb.LENDER_ATTR, False)
+        self.assertIsNone(crb.lender_for_guard(g))
+        crb.lend_for_guard(g, "round")  # must not raise
+
+    def test_a_lender_that_never_lends_says_so_in_the_log(self):
+        # THE WINDOW THIS COST. A lender on the wrong hot path logs exactly
+        # nothing, which reads identically to a lender that was never needed.
+        fleet = _Fleet([4000, 9000, 4000])  # no pressure, ever
+        g = _guard(fleet, 0)
+        clock = _Clock()
+        lender = _lender(g, 0, clock)
+        with self.assertLogs(crb.logger, level="WARNING") as caught:
+            lender.maybe_lend("one")
+            clock.advance(400.0)
+            lender.maybe_lend("two")
+        joined = "\n".join(caught.output)
+        self.assertIn("INERT", joined)
+        self.assertIn("no-pressure", joined)
+
+    def test_the_inert_report_stops_once_the_lender_actually_lends(self):
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        clock = _Clock()
+        lender = _lender(g, 0, clock)
+        lender.maybe_lend("lends")
+        self.assertEqual(lender.lends, 1)
+        clock.advance(400.0)
+        fleet.free[0] = 1100 * MIB
+        with self.assertLogs(crb.logger, level="INFO") as caught:
+            lender.maybe_lend("again")
+        self.assertNotIn("INERT", "\n".join(caught.output))
