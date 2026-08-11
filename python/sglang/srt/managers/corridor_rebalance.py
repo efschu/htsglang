@@ -117,6 +117,14 @@ DEFAULT_MIN_YIELD_MIB = 64
 DEFAULT_INTERVAL_S = 2.0
 DEFAULT_MAX_INTERVAL_S = 30.0
 
+#: How often the LOCAL pressure check may take a ``cudaMemGetInfo``. Much
+#: shorter than the lend interval on purpose: the dips this lender exists for
+#: last about a second, so a check on the lend clock would sample past them,
+#: while an unlimited check runs at whatever rate the scheduler round does
+#: (~8 kHz on an armed rank). 100 ms is the sampler's own resolution, which
+#: keeps the instrument and the actuator looking at the same timescale.
+DEFAULT_PROBE_INTERVAL_S = 0.1
+
 
 class RebalanceLender:
     """Item 16's first relief stage, driven by the water-fill objective.
@@ -138,6 +146,7 @@ class RebalanceLender:
         min_yield_mib: int = DEFAULT_MIN_YIELD_MIB,
         interval_s: float = DEFAULT_INTERVAL_S,
         max_interval_s: float = DEFAULT_MAX_INTERVAL_S,
+        probe_interval_s: float = DEFAULT_PROBE_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.guard = guard
@@ -147,8 +156,10 @@ class RebalanceLender:
         self.base_interval_s = float(interval_s)
         self.max_interval_s = float(max_interval_s)
         self._clock = clock
+        self.probe_interval_s = float(probe_interval_s)
         self._interval_s = float(interval_s)
         self._last_at = float("-inf")
+        self._last_probe_at = float("-inf")
         # Counters, all reported in the periodic summary so a window can be
         # judged on them without parsing every line.
         self.consulted = 0
@@ -156,6 +167,7 @@ class RebalanceLender:
         self.lent_bytes = 0
         self.skips = {
             "rate-limited": 0,
+            "probe-limited": 0,
             "no-pressure": 0,
             "fleet-unknown": 0,
             "level-enough": 0,
@@ -185,16 +197,30 @@ class RebalanceLender:
     def maybe_lend(self, reason: str = "") -> Optional[cg.GuardResult]:
         """Lend if the water-fill says this card should, else return None.
 
-        Cheap on the common path: a monotonic clock read and an integer
-        compare. The NVML fleet probe is only taken once the rate limiter and
-        the LOCAL pressure check have both passed, so a healthy card costs
-        nothing per scheduler round.
+        WHAT THE COMMON PATH ACTUALLY COSTS, corrected after review: a
+        monotonic clock read AND, at most every ``probe_interval_s``, one
+        ``cudaMemGetInfo``. The earlier claim that a healthy card costs only
+        the clock read was wrong -- the pressure check deliberately does NOT
+        arm the lend rate limiter, because a card that is fine must be
+        re-examined promptly (the dips this lender exists for last about a
+        second, so a 2 s pressure check would sample straight past them). The
+        probe therefore has its own, much shorter limiter: responsive enough
+        for a 1 s dip, bounded well below the ~8 kHz an armed rank can spin
+        this hook at. Measured on this rig: 13081 consultations per rank over
+        a 46-minute window.
+
+        The NVML FLEET probe is still only taken once both the lend limiter
+        and the local pressure check have passed, which on a healthy rig is
+        never.
         """
         self.consulted += 1
         now = self._clock()
         self._maybe_report_inert(now)
         if now - self._last_at < self._interval_s:
             return self._skip("rate-limited")
+        if now - self._last_probe_at < self.probe_interval_s:
+            return self._skip("probe-limited")
+        self._last_probe_at = now
 
         free_local = self.guard.free_bytes()
         headroom = self.watermark_bytes - free_local

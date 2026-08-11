@@ -723,7 +723,16 @@ class CorridorGuard:
         measured = max(0, free_now - free_before)
         self.lend_count += 1
         self.lent_total += measured
-        self.reclaimed_total += measured
+        # DELIBERATELY NOT added to ``reclaimed_total``. That counter answers
+        # "what did the GATE spend", and ``reclaimed_total / arm_count`` is a
+        # figure a successor will compute; folding lends into it pollutes both
+        # and sets up a double count for anyone who later sums the two.
+        # ``lent_total`` carries the lender's own bytes.
+        #
+        # One caveat this figure carries, named because the negative case is
+        # already named and the positive one was not: the delta credits the
+        # lend with any memory ANOTHER process released between the two
+        # probes. It over-reports in the permissive direction.
         detail = (
             f"lent {measured/_MIB:.0f} MiB of a {bound/_MIB:.0f} MiB "
             f"water-fill bound, free {free_before/_MIB:.0f} -> "

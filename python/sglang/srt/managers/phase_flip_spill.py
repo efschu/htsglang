@@ -1259,6 +1259,33 @@ def _late_bound_draft_provider(scheduler: Any):
     """
 
     def free_up_to(nbytes: int) -> int:
+        # THE PHASE IS A PRECONDITION, NOT AN ASSUMPTION (#656 successor 36).
+        #
+        # This provider's whole safety argument is that the drafter is
+        # UNREACHABLE while the instance is in PP: no draft worker exists
+        # there under strict purity, so decommitting its pages cannot be
+        # observed. In TP the opposite holds -- the drafter is live and its
+        # captured graphs point at those exact virtual addresses -- and the
+        # only ``restore()`` in the tree is on the pp->tp cutover leg
+        # (``PhaseFlipSpillLadder.on_enter_tp``). There is no lazy restore, so
+        # a spill taken during TP would leave graphs replaying against
+        # unbacked VA with nothing scheduled to fix it.
+        #
+        # That was survivable while the only caller was the seam gate, which
+        # in practice only reaches this rung with PP current. It stopped being
+        # survivable when the rebalance lender began spending the same ladder
+        # on a 2 s clock in BOTH phases. The precondition the registration
+        # comment already asserts is therefore enforced here rather than
+        # trusted -- and enforced for every caller, because a TP spill is a
+        # fault whoever asks for it.
+        #
+        # An UNKNOWN phase refuses. The carrier is not worth a guess.
+        # Imported in the body, not at module scope: the runtime imports this
+        # module, and the constant is not worth a cycle.
+        from sglang.srt.managers.phase_flip_runtime import PHASE_PP
+
+        if getattr(scheduler, "phase_flip_active_stack", None) != PHASE_PP:
+            return 0
         ladder = getattr(scheduler, "phase_flip_spill_ladder", None)
         carrier = getattr(ladder, "_weights", None) if ladder is not None else None
         if carrier is None:

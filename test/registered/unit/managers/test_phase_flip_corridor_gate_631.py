@@ -215,6 +215,12 @@ class TheProviderBindsLateTest(unittest.TestCase):
 
         class _S:
             phase_flip_spill_ladder = _Ladder()
+            # PP is the phase in which the drafter is spendable at all
+            # (#656 successor 36): under strict purity it is unreachable
+            # there, while in TP it is live and its captured graphs point at
+            # the addresses a spill would unmap. The provider now enforces
+            # that precondition, so this test must state the phase it means.
+            phase_flip_active_stack = "pp"
 
         s = _S()
         provider = phase_flip_spill._late_bound_draft_provider(s)

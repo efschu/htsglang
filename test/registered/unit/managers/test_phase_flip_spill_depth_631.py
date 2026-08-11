@@ -348,3 +348,65 @@ class TheDocstringMatchesTheLadderTest(unittest.TestCase):
         implemented = spill.DEPTH_NAMES_BY_VALUE[spill.IMPLEMENTED_DEPTH]
         self.assertIn(f"{implemented!r}", msg)
 
+
+
+# ---------------------------------------------------------------------------
+# #656 successor 36: the drafter provider's PHASE precondition.
+# ---------------------------------------------------------------------------
+
+
+class _Carrier:
+    def __init__(self):
+        self.spilled = False
+        self.spills = 0
+
+    def spill(self):
+        self.spilled = True
+        self.spills += 1
+        return 285.0  # MiB, the measured payload on this rig
+
+
+class _Ladder:
+    def __init__(self, carrier):
+        self._weights = carrier
+
+
+class _Sched:
+    def __init__(self, phase, carrier):
+        self.phase_flip_active_stack = phase
+        self.phase_flip_spill_ladder = _Ladder(carrier)
+        self.draft_worker = None
+
+
+def test_the_drafter_is_never_spilled_while_the_instance_is_in_TP():
+    """The fault this closes: in TP the drafter is LIVE and its captured
+    graphs point at the exact virtual addresses a spill unmaps, and the only
+    restore() in the tree is the pp->tp cutover leg. Nothing would put the
+    pages back. Survivable while the seam gate was the only caller; not
+    survivable once the rebalance lender spends the same ladder on a 2 s
+    clock in both phases."""
+    from sglang.srt.managers.phase_flip_spill import _late_bound_draft_provider
+
+    carrier = _Carrier()
+    provider = _late_bound_draft_provider(_Sched("tp", carrier))
+    assert provider(1 << 30) == 0
+    assert carrier.spills == 0
+    assert carrier.spilled is False
+
+
+def test_the_drafter_IS_spilled_in_PP_where_it_is_unreachable():
+    from sglang.srt.managers.phase_flip_spill import _late_bound_draft_provider
+
+    carrier = _Carrier()
+    provider = _late_bound_draft_provider(_Sched("pp", carrier))
+    assert provider(1 << 30) > 0
+    assert carrier.spills == 1
+
+
+def test_an_unknown_phase_refuses_rather_than_guesses():
+    from sglang.srt.managers.phase_flip_spill import _late_bound_draft_provider
+
+    carrier = _Carrier()
+    provider = _late_bound_draft_provider(_Sched(None, carrier))
+    assert provider(1 << 30) == 0
+    assert carrier.spills == 0

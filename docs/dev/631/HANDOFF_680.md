@@ -180,7 +180,10 @@ why, because the metric is not measuring only what it is named for:
   as a card getting emptier.
 
 **The axis that isolates the lender is the binding card's own level**, and
-the honest attribution is in §3c.
+the honest attribution is in §3c. Note there that the median free FELL
+(2407 -> 2247 MiB): whatever the spread number says, the cards in this window
+were typically fuller, not emptier, so nothing was given away on the
+corridor's second half to buy the floor on its first.
 
 ### 3c. WHAT THIS WINDOW PROVES AND WHAT IT DOES NOT
 
@@ -189,13 +192,34 @@ the lender fires exactly on the card the water-fill nominates, at pressure,
 bounded, from the cheapest tier, and lifts that card by ~460 MiB per lend at
 moments no allocation would have armed the gate.
 
-NOT PROVEN: that the improvement in the corridor MINIMUM is caused by it.
-The trough is seam-internal (§1d) and a single window cannot separate a
-shallower seam from a lighter load. The causal story is plausible — the seam
-begins from a level the lender has kept higher, so it dips less far — and it
-is exactly the kind of story this corpus has been burned by. Booked as
-plausible-and-unproven; the falsifier is an A/B at
-`SGLANG_CORRIDOR_REBALANCE=0` on the same load script, which is one boot.
+ATTRIBUTABLE, by a fingerprint rather than by a coincidence of two windows.
+Restricting BOTH windows to samples more than 2 s from any cutover — the only
+regime a per-round lender can act in — gives
+(`evidence-631/s36/NONSEAM_COMPARE.txt`, script beside it):
+
+                     non-seam gpu0 free       ALL gpu0 free
+                     min   p0.1  p1    p5     min   p50
+    s34 gate only    1249  1249  1707  1807   1043  2407
+    s36 lender on    1845  1845  1845  1847   1219  2247
+
+Two things in that table are not explainable by "s36 had a lighter load":
+
+* **The non-seam low tail COLLAPSES onto one value, 1845 MiB**, and that
+  value is the lender's configured watermark (`floor 1536 + delta 256 =
+  1792`) plus one lend's overshoot. p0.1, p1 and p5 are within 2 MiB of each
+  other. A floor appearing exactly at a number that exists only in the
+  lender's configuration is the mechanism's signature; a lighter load moves a
+  distribution, it does not clamp it at a configured constant.
+* **The MEDIAN free went DOWN, 2407 -> 2247 MiB.** The cards are typically
+  FULLER, not emptier, so the corridor's second half improved at the same
+  time as its first. That kills the obvious rival explanation — "s36 simply
+  had less resident" — which predicts the opposite sign.
+
+STILL NOT PROVEN: that the improvement in the ALL-samples minimum
+(1043 -> 1219) is caused by the lender. That minimum is the seam trough
+(§1d), the lender cannot reach inside a cutover, and two windows cannot
+separate a shallower seam from a lighter load. The controlled test is one
+boot at `SGLANG_CORRIDOR_REBALANCE=0` on the same load script (§4.0).
 
 ### 3d. WHERE THE REMAINING MARGIN IS
 
