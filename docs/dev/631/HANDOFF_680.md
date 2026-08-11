@@ -151,83 +151,75 @@ pool as the fix". Pool was 512552 on both boots, identical to s34.
 
 ---
 
-## 3. THE CONFIRMATION WINDOW
+## 3. THE CONFIRMATION WINDOW: IT FALSIFIED THE FEATURE
 
-Boot `a84568d7bd`, argv byte-identical to s34's green run (diff over the
-captured argv: no differences), env identical plus `SGLANG_CORRIDOR_REBALANCE=1`.
-Pool 512552 — the same as s34, so no capacity was traded for margin.
-Evidence: `/spinning/evidence-631/s36/confirm/EXTRACT36.txt`.
+Boot `a84568d7bd`, argv byte-identical to s34's green run, env identical plus
+`SGLANG_CORRIDOR_REBALANCE=1`, pool 512552 (same as s34 -- no capacity was
+traded). 46 minutes, real agent load, both occupancy legs and a YaRN leg.
+Evidence: `/spinning/evidence-631/s36/confirm/`.
 
-### 3a. THE LENDER SPENDS, AND ONLY WHERE IT SHOULD
+### 3a. THE SCORE AGAINST THE BRIEF'S OWN CRITERIA
 
-_(numbers in §5 / EXTRACT36; the shape, which did not change through the
-window: PP1 — the rank on s34's binding card — lends repeatedly, lifting free
-from ~1626 to ~2088 MiB each time; PP0 and PP2 skip essentially every
-consultation as `no-pressure`, and the 100 ms sampler agrees that their cards
-never crossed the watermark.)_
+| criterion | s34 baseline | s36 lender on | verdict |
+|---|---|---|---|
+| (a) 0 corridor breaches | 0 | **12** | **FAILED** |
+| (b) binding margin above +19 MiB | +19 | **-23** | **FAILED** |
+| (c) spread improved | 2409 mean | 2398 mean | NOT MET (unmoved) |
+| (d) flips both directions | 321/321 | 390/384 | held |
+| (d) gate refusals / tracebacks | 0 / 0 | 0 / 0 | held |
+| (d) KV rung able to fire | 21 shrinks | 114 shrinks | fires, 5x more |
 
-**The fuel was `allocator-cache` every time, never the drafter.** That is the
-best possible outcome for cost: the bytes are nobody's, the restore is free,
-and the ~15 s draft-weights cadence HANDOFF_679 §3 booked as the thrash
-tripwire is untouched by the levelling.
+The 12 breaches are ONE 1.5-second event at 16:07:14, on gpu0, inside a
+`pp_to_tp` cutover -- the same seam-internal trough §1d localised. The gate
+had done its job two seconds earlier (`want 1548, free 2402 -> 3050`); the
+cutover then consumed about 500 MiB more than the gate had priced.
 
-### 3b. THE AXIS THAT DID NOT MOVE, AND WHY IT IS CONFOUNDED
+**s34's identical trough landed at +19 MiB and this one at -23.** The margin
+at that instant was always approximately zero, and the green run passed on
+luck rather than on headroom. That finding outlives this feature.
 
-The free-headroom **spread** did not improve. It is worth being precise about
-why, because the metric is not measuring only what it is named for:
+### 3b. WHY IT HURT, WHICH IS THE PART THAT GENERALISES
 
-* Spread is `max - min` over the free column. The lender can only raise the
-  **min** (it frees the tightest card). It did.
-* But `max` is the 5090, and how full the 5090 sits is a property of the
-  LOAD, not of the lender. A window whose 5090 carries less KV has a larger
-  spread no matter what the tight card does.
-* Worse, spread and the corridor's second half ("fill the cards, free near
-  1024, not more") pull in opposite directions for the class of bytes this
-  lender spends. Releasing torch's hoard raises NVML free without losing an
-  ounce of capacity — the pool is identical — yet the spread metric scores it
-  as a card getting emptier.
+The only provider the lender ever spent was `allocator-cache`: 98 lends,
+every one of them, never the drafter.
 
-**The axis that isolates the lender is the binding card's own level**, and
-the honest attribution is in §3c. Note there that the median free FELL
-(2407 -> 2247 MiB): whatever the spread number says, the cards in this window
-were typically fuller, not emptier, so nothing was given away on the
-corridor's second half to buy the floor on its first.
+**Torch's allocator cache is the reason most allocations are invisible to the
+corridor law.** An allocation served from cache does not move NVML's free
+column at all. Dumping the hoard converts those into driver allocations, so
+the very column the law is written on begins to move for work that used to
+be free. The same dump shrinks `cheap_relief` at the seam, and the KV rung's
+deficit discounts against exactly that term -- which is why the rung fired
+five times as often for a pool that did not change size.
 
-### 3c. WHAT THIS WINDOW PROVES AND WHAT IT DOES NOT
+So the lender was not spending slack. It was destroying the buffer that made
+the corridor look calm, and then reporting the resulting driver-side free as
+an improvement.
 
-PROVEN, from the mechanism's own log with before/after driver readings:
-the lender fires exactly on the card the water-fill nominates, at pressure,
-bounded, from the cheapest tier, and lifts that card by ~460 MiB per lend at
-moments no allocation would have armed the gate.
+### 3c. THE GAIN WAS AN ARTEFACT, AND I REPORTED IT AS A FINGERPRINT
 
-ATTRIBUTABLE, by a fingerprint rather than by a coincidence of two windows.
-Restricting BOTH windows to samples more than 2 s from any cutover — the only
-regime a per-round lender can act in — gives
-(`evidence-631/s36/NONSEAM_COMPARE.txt`, script beside it):
+Mid-shift I found the non-seam floor collapsing onto 1845 MiB where s34 sat
+at 1249, argued that a floor appearing at exactly the lender's configured
+watermark could not be load variance, and called it attribution.
 
-                     non-seam gpu0 free       ALL gpu0 free
-                     min   p0.1  p1    p5     min   p50
-    s34 gate only    1249  1249  1707  1807   1043  2407
-    s36 lender on    1845  1845  1845  1847   1219  2247
+The reasoning was right and the conclusion was wrong. It IS the lender's
+fingerprint -- of the instrument clamping a number, not of the rig gaining
+usable memory. A metric that improves because a mechanism holds it up is the
+oldest trap in this corpus, and I walked into it with the argument for why I
+had not. The median free falling at the same time (2407 -> 2247) genuinely
+did rule out "lighter load"; it did not rule out "the number is being held".
 
-Two things in that table are not explainable by "s36 had a lighter load":
+**The lesson is narrower than "be careful": a free-memory metric cannot
+validate a mechanism whose action is to free memory.** The axes that could
+falsify it were the ones with independent meaning -- breaches, completions,
+decode batches -- and two of the three were already in the extract.
 
-* **The non-seam low tail COLLAPSES onto one value, 1845 MiB**, and that
-  value is the lender's configured watermark (`floor 1536 + delta 256 =
-  1792`) plus one lend's overshoot. p0.1, p1 and p5 are within 2 MiB of each
-  other. A floor appearing exactly at a number that exists only in the
-  lender's configuration is the mechanism's signature; a lighter load moves a
-  distribution, it does not clamp it at a configured constant.
-* **The MEDIAN free went DOWN, 2407 -> 2247 MiB.** The cards are typically
-  FULLER, not emptier, so the corridor's second half improved at the same
-  time as its first. That kills the obvious rival explanation — "s36 simply
-  had less resident" — which predicts the opposite sign.
+### 3d-i. THE CONTROLLED ARM
 
-STILL NOT PROVEN: that the improvement in the ALL-samples minimum
-(1043 -> 1219) is caused by the lender. That minimum is the seam trough
-(§1d), the lender cannot reach inside a cutover, and two windows cannot
-separate a shallower seam from a lighter load. The controlled test is one
-boot at `SGLANG_CORRIDOR_REBALANCE=0` on the same load script (§4.0).
+`scripts/s36_ab_lender_off.sh` boots the same commit with the switch off and
+refuses to run if an arm line appears. Results in
+`/spinning/evidence-631/s36/ab/`, judged by `scripts/s36_ab_judge.sh` at
+matched elapsed time (s34's own counters accelerate through its window, so
+totals across unequal runs say nothing).
 
 ### 3d. WHERE THE REMAINING MARGIN IS
 
@@ -327,6 +319,19 @@ anything:
 ---
 
 ## 6. PROCESS NOTES
+
+* **A free-memory metric cannot validate a mechanism whose action is to free
+  memory.** §3c. The corollary is cheap and I should have applied it before
+  the window, not after: pick the falsifying axis from the set the mechanism
+  does NOT touch. Here that was breaches, completions and decode batches --
+  all three already produced by the existing extract.
+* **The control arm cost 30 minutes and changed the answer.** Two windows on
+  two loads had me attributing a gain with a clever argument; one boot with
+  the switch off settled it. When a feature has an off switch, running it is
+  never the expensive option. Build the switch first, for that reason.
+* **Report the mechanism's own log, not only the outcome metric.** "98 lends,
+  all from allocator-cache, never the drafter" is what identified the harm.
+  The outcome metrics said the feature worked.
 
 * **Check the baseline's arithmetic before booting a mechanism against it.**
   "232 clears and a 1043 MiB minimum" is a contradiction on its face, and it

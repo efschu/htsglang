@@ -4448,37 +4448,42 @@ rate as s34's 244 clears over 65 min, so steady state rather than regression,
 and s34's MTP accept length of 2.850 says speculation survives it. Booked as
 the place a future thrash regression would first appear.
 
-## Item 16's rebalance lender: the levelling delta (successor 36)
+## Item 16's rebalance lender: MEASURED, FALSIFIED, SHIPPED OFF (successor 36)
 
-The tier existed and had one provider that was only ever spent when an
-allocation had already reached the trough. The lender spends the same ladder
-on the water-fill's schedule instead. Measured on the confirmation window
-(`/spinning/evidence-631/s36/confirm`, boot `a84568d7bd`, argv byte-identical
-to s34's green run, pool 512552 on both):
+The tier existed with one provider spent only at the last instant. The lender
+spends the same ladder on the water-fill's schedule. It works exactly as
+designed and the design is wrong for this rig.
 
-    PP1 (the card that bound in s34, NVML column 0), verbatim from the log:
+    46 min, boot a84568d7bd, argv byte-identical to s34, pool 512552 both
 
-      15:47:01  1 lend   428 MiB   free 1748 -> 2176   column [1748, 3327, 3100]
-      15:48:08  2 lends  892 MiB   free 1626 -> 2090   column [1626, 3197, 3012]
-      15:50:03  5 lends 1998 MiB   free 1626 -> 2088   column [1626, 3177, 2992]
+                              s34 gate only    s36 lender ON
+    corridor breaches <1024        0                12
+    binding-instant margin       +19 MiB          -23 MiB
+    free-headroom spread mean    2409 MiB         2398 MiB   (unmoved)
+    KV rung shrinks                21              114
+    median PP / TP dwell        17s / 7s         26s / 4s
+    soak completions @t+24         59               21
 
-    PP0 / PP2: 0 lends, 7374 of 7375 consultations skipped `no-pressure`.
-    Their cards never crossed the watermark, and the sampler agrees
-    (0 samples below 1792 MiB on either).
+**The mechanism of the harm.** All 98 lends spent `allocator-cache` and
+nothing else. Torch's cache is why most allocations never touch NVML's free
+column; dumping it converts them into driver allocations, so the column the
+corridor law is written on starts moving for work that was previously free.
+It also shrinks `cheap_relief`, the term the KV rung's deficit discounts
+against -- hence 114 shrinks for a pool that never changed size.
 
-**The fuel is the allocator hoard, not the drafter.** Every lend so far came
-from `allocator-cache` — bytes no payload owns, whose restore cost is zero.
-The drafter was not evacuated once by the lender, so the levelling is bought
-without adding to the ~15 s draft-weights cadence HANDOFF_679 §3 booked as
-the place a thrash regression would first show.
+**The gain was the instrument, not the rig.** The non-seam floor collapsed
+onto 1845 MiB (s34: 1249), which is this lender's own watermark plus one
+overshoot. A free-memory metric cannot validate a mechanism whose action is
+to free memory. The axes with independent meaning -- breaches, completions,
+decode batches -- all moved the other way, and two of them were already in
+the extract before the window ran.
 
-**Over-delivery is real and is reported, not clipped.** "lent 462 MiB of a
-166 MiB water-fill bound" is `empty_cache` being all-or-nothing: the provider
-cannot free a bounded amount, the guard re-probes the driver anyway, and the
-figure quoted is the measured delta. A successor reading a lend larger than
-its bound is looking at that, not at a policy breach.
+**What survives:** the tier and its ordering, the water-fill bound, the
+ceiling that cannot reach host RAM, the drafter's phase precondition, and the
+finding that 20/20 of the deepest troughs are INSIDE a cutover, where no
+per-round mechanism can act. Fund the tier with a payload that MOVES before
+trying this again.
 
-**Cost side, honestly:** ~25 consultations/second/rank at the per-round hook,
-of which all but a handful terminate on one monotonic clock read and one
-`mem_get_info`. No collective, no thread, no NVML read unless the local
-pressure check has already passed.
+Cost side: ~25 consultations/second/rank, all but a handful terminating on a
+clock read and a `mem_get_info` (100 ms limited). That part was cheap; the
+`empty_cache` was not.
