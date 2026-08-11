@@ -4215,3 +4215,49 @@ memory multiplies) and with the flip cadence, and neither axis is in this
 sample. The 16384 OOM is the warning that the interaction is real: at
 concurrency the memory term arrives sooner, so the safe direction from 512 is
 DOWN, never up.
+
+---
+
+## KV BACKING RELIEF (spec item 12, device half) — successor 32, 2026-08-11
+
+Two boots at a raised arming floor (`SGLANG_CORRIDOR_FLOOR_MIB=4000`) as the
+can-fail instrument, pool 500000, `SGLANG_FLIP_SEAM_CHUNK_MIB=8`, depth
+`arena`, everything else replayed verbatim from the live process.
+
+| | rank-local target (HANDOFF_675) | collective target (this shift) |
+|---|---|---|
+| target across ranks | 449039 / 451037 / 175225 / 145734 | **347161 on all three** |
+| driver bytes returned | 1840 MiB on one card | **2016 / 1440 / 1152 MiB** |
+| corridor refusals | 3 | **0** |
+| `cuMemCreate` failures | 1, from inside relief | **0** |
+| group | wedged (`/health`: detokenizer) | **200, 18 flip commits, both legs** |
+
+**The number to quote is not the megabytes, it is the uniformity.** The bytes
+were already proven before this shift; what was missing was three ranks
+agreeing, and a PP group that disagrees about admission desyncs.
+
+### The release granularity decides whether the rung can pay at all
+
+    min_release_rows = commit_chunk_bytes * n_buffers / bytes_per_row
+
+Release is extent-granular PER BUFFER and the arena holds `2*layer_num` of
+them, so the smallest release that returns anything is one commit chunk in
+EVERY buffer. At 256 MiB that is ~489132 rows on this geometry — more than
+the whole 500000-row pool, i.e. structurally unable to pay a partial release.
+At 8 MiB it is ~15285 rows (~230 MiB/rank). **Pick the chunk from the
+formula.**
+
+### Per-row backing cost, measured, and why one shrink cannot give it to you
+
+From the 152839-row shrink: 13.5 / 9.65 / 7.7 KiB per row on PP0 / PP1 / PP2.
+From the 405983-row shrink in the same boot: 9.66 / 5.52 / 5.52. The two
+disagree because release is chunk-quantised, so a single release divided by
+its row count is not a slope. **Anything sized against one of these is sized
+against a quantisation artefact** — measure two endpoints, per register C10's
+standing warning about the per-token slope.
+
+### The fill lever, stated because the obvious one is a no-op
+
+`--max-total-tokens 620000` produced a pool of **512552**: the server clamps
+at `_profile_available_bytes`. The binding budget is
+`--rank-gpu-memory-mib 31800,14000,15600`. Register C15.
