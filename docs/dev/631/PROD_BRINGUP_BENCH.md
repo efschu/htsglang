@@ -4386,21 +4386,21 @@ arm B the **draft checkpoint is present and correct** on this box
 gate lifted, `dflash_worker_v2.py:807-808` (TP>1) and `:824-830` (quantized
 `lm_head`) keep the DFLASH graph folds eager on this rig anyway.
 
-### Item 16, measured: the missing rebalance tier is worth ~864 MiB
+### Item 16, measured: the missing rebalance tier is worth ~948 MiB
 
-2246 samples at 100 ms, idle plus a real two-lane agent load, on the s34
+4990 samples at 100 ms, idle plus two real two-lane agent loads, on the s34
 binary (`evidence-631/s35/spread_ts.csv`):
 
-    spread of the free column   min 167   p50 2347   p90 2763   max 2803 MiB
+    spread of the free column   min 109   p50 2723   p90 2763   max 2839 MiB
     payload the water-fill wants moved off the fullest card
-                                min  98   p50  995   p90 1016   max 1344 MiB
+                                min  64   p50 1010   p90 1018   max 1347 MiB
 
-    at the binding instant: free column [1619, 3776, 2055] MiB
-      binding card 595 MiB above the 1024 law while a peer held 3776 free
-      water-fill [+864, -1293, +428] MiB -> card 0 sheds 864 MiB onto card 1
+    at the binding instant: free column [1519, 3926, 1955] MiB
+      binding card 495 MiB above the 1024 law while a peer held 3926 free
+      water-fill [+948, -1459, +512] MiB -> card 0 sheds 948 MiB onto card 1
 
 **Read this as the price of the missing tier, not as a corridor result.** A
-continuous levelling tier would roughly double the binding card's margin with
+continuous levelling tier would nearly triple the binding card's margin with
 no host RAM spent and no pool shrunk. `water_fill_targets` had computed this
 objective all along and had exactly one caller in the tree — a test.
 

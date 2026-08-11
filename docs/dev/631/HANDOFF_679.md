@@ -14,7 +14,7 @@ spec item 8's last two open arms are both **structurally blocked**, each at a
 longer silent, the prefill gate can now be priced from a measured peak instead
 of an absent geometry proxy, and item 16's water-filling objective — which had
 exactly one caller in the tree, a test — now reports the levelling it cannot
-perform, quantified on this rig at **~864 MiB of margin stranded on the wrong
+perform, quantified on this rig at **~948 MiB of margin stranded on the wrong
 card at the binding instant**.
 
 Serving on 30030 was left running throughout, healthy, on the s34 binary.
@@ -178,7 +178,7 @@ wanting a preempting gate sets that env var on the next acceptance boot; it
 costs two counter reads per forward and no synchronisation. 9 tests.
 
 ### 1e. ITEM 16'S OBJECTIVE HAD NO CALLER, AND THE MISSING TIER IS WORTH
-### ~864 MiB ON THE BINDING CARD (§4.5, INSTRUMENTED — ACTUATOR STILL ABSENT)
+### ~948 MiB ON THE BINDING CARD (§4.5, INSTRUMENTED — ACTUATOR STILL ABSENT)
 
 `water_fill_targets` (`corridor_guard.py:174`) had **exactly one caller in the
 entire tree and it was a test**. Item 16's first relief stage — redistribute
@@ -201,26 +201,26 @@ stated in PAYLOAD terms because that is what a reader acts on;
 `water_fill_targets`' own docstring states it in FREE terms, which reads
 backwards to anyone thinking about where the payload goes.
 
-**Measured on this rig, 2246 samples at 100 ms across an idle window and a
-real two-lane agent load** (`evidence-631/s35/spread_ts.csv`,
+**Measured on this rig, 4990 samples at 100 ms across an idle window and two
+real two-lane agent loads** (`evidence-631/s35/spread_ts.csv`,
 `WATER_FILL.txt`):
 
-    spread of the free column   min 167   p50 2347   p90 2763   max 2803 MiB
+    spread of the free column   min 109   p50 2723   p90 2763   max 2839 MiB
     payload the objective wants moved off the fullest card
-                                min  98   p50  995   p90 1016   max 1344 MiB
+                                min  64   p50 1010   p90 1018   max 1347 MiB
 
     AT THE BINDING INSTANT
-      free column   [1619, 3776, 2055] MiB
-      min free      1619 MiB  -> 595 MiB of margin over the 1024 law
-      spread        2157 MiB
-      water-fill    [+864, -1293, +428] MiB
-      verdict       card 0 should shed 864 MiB onto card 1
+      free column   [1519, 3926, 1955] MiB
+      min free      1519 MiB  -> 495 MiB of margin over the 1024 law
+      spread        2407 MiB
+      water-fill    [+948, -1459, +512] MiB
+      verdict       card 0 should shed 948 MiB onto card 1
 
 **This is the number that decides whether the rebalance tier is worth
-building, and no previous shift had it.** The binding card carried 595 MiB of
-margin while a peer held 3776 MiB free. A continuous levelling tier would have
-handed the binding card ~864 MiB — more than doubling its margin — with no
-host RAM spent and no pool shrunk. "Spread 879 MiB" never said that; a spread
+building, and no previous shift had it.** The binding card carried 495 MiB of
+margin while a peer held 3926 MiB free. A continuous levelling tier would have
+handed the binding card ~948 MiB — nearly tripling its margin — with no host
+RAM spent and no pool shrunk. "Spread 879 MiB" never said that; a spread
 figure names the unevenness without naming the card or the size of the fix.
 
 **What this does NOT claim.** The clause is an instrument in the code and was
