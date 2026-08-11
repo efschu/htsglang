@@ -125,6 +125,28 @@ UUID at construction; the boot log proves the divergence:
 An unresolvable mapping returns None and the lender is **not built** — a
 lender shedding on the wrong card is worse than no lender.
 
+### 1f. THE CONTROL ARM CRASHED, AND IT WAS NOT THIS FEATURE
+
+14.5 minutes into the lender-OFF arm, every rank aborted inside the cutover:
+
+    phase_flip_resident_carry.py:674  <- _cutover:1176 <- _execute:4349
+    TypeError: 'NoneType' object cannot be interpreted as an integer
+
+`reseed_decode_input_relay` selects carried requests on `output_ids` alone,
+then builds an int64 index tensor from `req_pool_idx`. A request whose pool
+slot was released still has output, so `None` reaches the tensor build --
+inside the no-return region, so all three ranks go down together. Health 000,
+179 soak errors.
+
+**Fixed** (`bd34ac2b0c`): those requests are skipped, because the relay is
+slot-indexed and a request with no slot has nothing to reseed, and they are
+logged rather than dropped quietly. The regression test is mutation-checked
+against the exact production TypeError.
+
+It fired with the lender OFF and never fired in the 46-minute lender-ON
+window, so it is a latent defect of the flip path that this A/B exposed, not
+a cost of the feature. Serving was rebooted on the fix and is up.
+
 ---
 
 ## 2. WHAT THE MECHANISM IS
@@ -213,13 +235,28 @@ validate a mechanism whose action is to free memory.** The axes that could
 falsify it were the ones with independent meaning -- breaches, completions,
 decode batches -- and two of the three were already in the extract.
 
-### 3d-i. THE CONTROLLED ARM
+### 3d-i. THE CONTROLLED ARM SETTLED IT: THE LENDER CAUSED THE STARVATION
 
-`scripts/s36_ab_lender_off.sh` boots the same commit with the switch off and
-refuses to run if an arm line appears. Results in
-`/spinning/evidence-631/s36/ab/`, judged by `scripts/s36_ab_judge.sh` at
-matched elapsed time (s34's own counters accelerate through its window, so
-totals across unequal runs say nothing).
+`scripts/s36_ab_lender_off.sh` booted the same commit with the switch off and
+refused to proceed unless the arm line was absent. Judged at matched elapsed
+time by `scripts/s36_ab_judge.sh` (s34's own counters accelerate through its
+window, so totals across unequal runs say nothing):
+
+                          s34 gate only   s36 lender ON   s36ab lender OFF
+    decode batches/min         15.5             7.0             14.1
+    median PP dwell            17.0s           26.0s            17.0s
+    median TP dwell             7.0s            4.0s             4.5s
+    soak ok at t+14              30              15               21
+    corridor breaches             0              12                0
+
+**PP dwell returns to exactly s34's 17.0 s and the decode rate to within 10%
+of it.** The instance was not sitting in prefill because of its load; it was
+sitting in prefill because the lender was dumping the allocator cache under
+it. Everything §3b predicted from the mechanism, the control arm measured.
+
+The control arm ran 14.5 of its 25 minutes before crashing (§1f) -- past the
+t+14 comparison, so the verdict stands on complete data, and its 25-minute
+column is a shorter sample than the others by construction.
 
 ### 3d. WHERE THE REMAINING MARGIN IS
 
@@ -238,10 +275,9 @@ and it should not be attempted by widening the lender.
 
 ## 4. WHAT TO DO NEXT, IN ORDER
 
-0. **The lender's own A/B, and it is one boot.** Everything in §3c that is
-   marked plausible-and-unproven becomes decided by re-running the same load
-   script with `SGLANG_CORRIDOR_REBALANCE=0` in `EXTRA_ENV` and nothing else
-   changed:
+0. **DONE THIS SHIFT -- the A/B ran and decided it (§3d-i).** Kept here only
+   as the recipe, because it is the cheapest instrument in this corpus and
+   the next feature with an off switch should use it on day one:
 
        LOG=/spinning/evidence-631/s37/serving.log SELF=656-successorNN \
        ARGV_SRC=/tmp/s33_argv.txt ENV_SRC=/tmp/s30_env.txt \
@@ -254,6 +290,19 @@ and it should not be attempted by widening the lender.
    then `bash scripts/s34_acceptance_run.sh 46 <dir>` and
    `bash scripts/s36_extract.sh <dir> <log>`. The switch exists precisely so
    this comparison costs a boot and not a revert.
+0b. **Re-run the acceptance on the shipped config to restore a GREEN stamp.**
+   The last full acceptance is s34's. This shift's two windows were a feature
+   trial and its control, and neither is an acceptance: one breached, the
+   other crashed at 14.5 min on a defect now fixed. Serving is up on
+   `bd34ac2b0c` with the lender off, which IS s34's behaviour plus that fix,
+   so the stamp should be cheap -- but it is not yet taken, and nobody should
+   report #656 as green until it is.
+0c. **Consider loosening the drafter's phase precondition (§1f-adjacent).**
+   It refuses outside PP, which also blocks the `tp_to_pp` seam where s34
+   spent `draft-weights` 212 times and where the spill is safe (the drafter
+   goes idle immediately after). The control arm ran 14.5 min with 0 gate
+   refusals and 0 drafter spends, so the relief was not missed there -- but
+   that is 14 minutes of evidence, not a proof.
 1. **The seam's staging demand on the binding card** (§3d). This is where the
    remaining margin is, it is a different mechanism, and widening the lender
    will not reach it — a cutover does not yield to the scheduler loop.
