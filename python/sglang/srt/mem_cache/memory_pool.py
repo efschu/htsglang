@@ -1961,6 +1961,17 @@ def zero_kv_data_buffers(kvcache) -> int:
             pools.append(sub)
     zeroed = 0
     for pool in pools:
+        # A KV BUFFER IS VA-SIZED; ITS BACKING IS NOT.
+        #
+        # On a swappable pool the tensor spans the whole reservation while
+        # only the rows below the watermark are mapped, so ``t.zero_()``
+        # writes into unmapped address space -- cudaErrorIllegalAddress,
+        # which kills every rank. That was unreachable while the only shrink
+        # path (the #330 dial) destroyed the live set and never ran under
+        # load; the #656 residency controller shrinks backing during normal
+        # serving, and the corridor procedure itself calls /flush_cache
+        # before every idle reading, so the two would have met.
+        limit = getattr(pool, "safe_zero_rows", None)
         for name in ("k_buffer", "v_buffer", "kv_buffer"):
             bufs = getattr(pool, name, None)
             if bufs is None:
@@ -1968,7 +1979,10 @@ def zero_kv_data_buffers(kvcache) -> int:
             if isinstance(bufs, torch.Tensor):
                 bufs = [bufs]
             for t in bufs:
-                t.zero_()
+                if limit is None:
+                    t.zero_()
+                else:
+                    t[: int(limit)].zero_()
                 zeroed += 1
     return zeroed
 
@@ -2655,6 +2669,34 @@ class MHATokenToKVPool(KVCache):
         no.
         """
         return not self._released_layers
+
+    @property
+    def safe_zero_rows(self):
+        """Rows of each K/V buffer a kernel may legally write, or None.
+
+        None means "the whole tensor is backed" -- the ordinary,
+        non-swappable case, where a caller should not pay for a slice.
+
+        On a swappable pool the tensor spans the VA reservation and only the
+        rows below the current watermark are mapped, so anything that writes
+        the buffer wholesale (``zero_kv_data_buffers``) must stop here or
+        fault. The minimum across buffers is deliberate: layouts differ in
+        tokens-per-row, and zeroing FEWER rows than a given buffer allows
+        leaves stale bytes in a region no sequence reads, while zeroing more
+        touches unmapped memory and kills the process. Those two errors are
+        not comparable, so the conservative one is chosen on purpose.
+        """
+        owner = self._post_capture_owner
+        specs = getattr(owner, "_specs", None) if owner is not None else None
+        if not specs:
+            return None
+        rows = []
+        for spec in specs:
+            desc = getattr(spec, "desc", None)
+            if desc is None:
+                return None
+            rows.append(desc._rows(int(self.size) + int(self.page_size)))
+        return min(rows) if rows else None
 
     @property
     def post_capture_backed_bytes(self) -> int:

@@ -1065,10 +1065,36 @@ def get_spill_ladder(scheduler: Any) -> Optional[PhaseFlipSpillLadder]:
 #: Cost ranks inside a tier. Spread out so a later rung can be slotted
 #: between two of these without renumbering the others.
 _COST_ALLOCATOR_CACHE = 10  # tier LOCAL
+_COST_KV_BACKING = 20  # tier LOCAL
 _COST_ARENA_TAIL = 10  # tier REBALANCE
 _COST_DRAFT_WEIGHTS = 20  # tier REBALANCE
 
 CORRIDOR_GUARD_ATTR = "phase_flip_corridor_guard"
+KV_BACKING_RELIEF_ATTR = "phase_flip_kv_backing_relief"
+
+
+def recover_kv_backing(scheduler: Any) -> int:
+    """Re-back the scheduler's KV pool and lift the allocator cap.
+
+    Called on the tp->pp leg, where the scheduler's pool becomes the ACTIVE
+    layout again. Recovery is not optional bookkeeping: a cap that is never
+    lifted turns dynamic residency into a permanently smaller pool, which is
+    the one fix the standing rule forbids.
+    """
+    relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
+    if relief is None:
+        return 0
+    try:
+        return int(relief.recover())
+    except Exception as e:
+        logger.error(
+            "%s KV backing recovery failed: %s. The pool is still capped, so "
+            "admission capacity stays reduced until the next successful "
+            "recovery -- this is a capacity loss, not a corridor risk",
+            LOG_PREFIX,
+            e,
+        )
+        return 0
 
 #: Proof/soak override for the gate's arming floor. See get_corridor_guard.
 CORRIDOR_FLOOR_ENV = "SGLANG_CORRIDOR_FLOOR_MIB"
@@ -1202,6 +1228,43 @@ def get_corridor_guard(scheduler: Any):
         _late_bound_draft_provider(scheduler),
         tier=cg.RELIEF_REBALANCE,
     )
+
+    # SPEC ITEM 12, THE DEVICE HALF: the KV pool's own unoccupied backing.
+    #
+    # This is the provider that funds the pp->tp leg, which was the deadlock
+    # class: under strict purity the drafter is already spilled for the whole
+    # PP phase, so the only REBALANCE provider returns 0 exactly when the
+    # fatal leg needs it. The scheduler's pool IS the PP layout's pool, so
+    # this is relief the binding leg can actually spend.
+    #
+    # It sits in tier LOCAL because the rows it unmaps hold nothing: the
+    # watermark never goes below the highest LIVE row, so no request loses a
+    # byte it owns and nothing is copied anywhere. It costs more than the
+    # allocator cache -- admission capacity is withheld until recovery -- so
+    # it is spent second.
+    #
+    # THIS IS NOT "A SMALLER POOL AS THE FIX", which the standing rule
+    # forbids. The VA reservation does not move, the addresses a captured
+    # graph baked in do not move, and the cap is lifted again on entry to PP.
+    # What changes is PHYSICAL RESIDENCY, which is precisely what item 12
+    # asks for: in VRAM lies exactly what has to lie there.
+    try:
+        from sglang.srt.managers.kv_backing_relief import kv_backing_provider
+
+        relief = kv_backing_provider(
+            scheduler, device_index=int(device_index), probe=guard.free_bytes
+        )
+    except Exception as e:
+        logger.warning("%s KV backing relief unavailable: %s", LOG_PREFIX, e)
+        relief = None
+    if relief is not None:
+        setattr(scheduler, KV_BACKING_RELIEF_ATTR, relief)
+        guard.register(
+            "kv-backing",
+            _COST_KV_BACKING,
+            relief.free_up_to,
+            tier=cg.RELIEF_LOCAL,
+        )
 
     setattr(scheduler, CORRIDOR_GUARD_ATTR, guard)
     logger.info(

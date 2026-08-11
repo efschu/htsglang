@@ -1115,6 +1115,15 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             if _ladder is not None:
                 _ladder.on_enter_pp(stacks.draft_worker)
 
+            # The scheduler's KV pool is the PP layout's, so entering PP makes
+            # it the ACTIVE pool again and any residency relief taken against
+            # it during the TP phase must be handed back. A cap that is never
+            # lifted is a permanently smaller pool, which the standing rule
+            # forbids; recovering here bounds the reduction to one phase.
+            from sglang.srt.managers.phase_flip_spill import recover_kv_backing
+
+            recover_kv_backing(scheduler)
+
             # THE SEAM MUST LEAVE NO TP DRAFT STATE REACHABLE. Runs before
             # the relay re-seed, so that nothing between the stack swap and
             # the next event-loop iteration can observe a half-scrubbed
