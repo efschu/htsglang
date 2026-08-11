@@ -120,6 +120,77 @@ class TestForwardPeakTracker(_EnvMixin, CustomTestCase):
         with peak_scope(None):
             pass
 
+    def test_the_transient_is_the_peak_MINUS_the_baseline(self):
+        """HANDOFF_678 §4.1: the peak alone cannot price a chunk.
+
+        ``reset_peak_memory_stats`` does not zero the counter, it RE-BASES it
+        to what is currently allocated, so ``max_memory_allocated`` after a
+        forward is weights + KV + transient. Charging a prefill admission that
+        number would price a 512-token chunk at tens of gigabytes.
+
+        The transient -- the only part a chunk actually adds -- is the peak
+        minus what was already allocated when the bracket opened, and that
+        subtraction needs a baseline the tracker did not record.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            t = ForwardPeakTracker(os.path.join(d, "peak"), "tp0")
+            fake = mock.MagicMock()
+            fake.cuda.memory_allocated.return_value = 10 * GIB
+            fake.cuda.max_memory_allocated.return_value = 10 * GIB + 300 * (1 << 20)
+            with mock.patch.dict("sys.modules", {"torch": fake}):
+                t.begin("extend", 512)
+                t.end()
+            row = t.rows["extend/512"]
+            self.assertEqual(row["peak_bytes_max"], 10 * GIB + 300 * (1 << 20))
+            self.assertEqual(row["transient_bytes_max"], 300 * (1 << 20))
+
+    def test_an_unreadable_baseline_yields_no_transient_rather_than_the_peak(self):
+        """Falling back to the peak here would be the tens-of-GiB error."""
+        with tempfile.TemporaryDirectory() as d:
+            t = ForwardPeakTracker(os.path.join(d, "peak"), "tp0")
+            fake = mock.MagicMock()
+            fake.cuda.memory_allocated.side_effect = RuntimeError("no cuda")
+            fake.cuda.max_memory_allocated.return_value = 8 * GIB
+            with mock.patch.dict("sys.modules", {"torch": fake}):
+                t.begin("extend", 512)
+                t.end()
+            row = t.rows["extend/512"]
+            self.assertEqual(row["peak_bytes_max"], 8 * GIB)
+            self.assertIsNone(row["transient_bytes_max"])
+
+    def test_the_per_token_transient_is_None_until_it_is_measured(self):
+        """The shape copied from ``measured_capture_mib_per_token``.
+
+        An uncalibrated bucket returns None so the caller treats it as NOT
+        PRICED, rather than substituting a literal -- which is the whole
+        argument of that function and the reason this one exists at all.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            t = ForwardPeakTracker(os.path.join(d, "peak"), "tp0")
+            self.assertIsNone(t.transient_bytes_per_token("extend", 512))
+            fake = mock.MagicMock()
+            fake.cuda.memory_allocated.return_value = 1 * GIB
+            fake.cuda.max_memory_allocated.return_value = 1 * GIB + 512 * 4096
+            with mock.patch.dict("sys.modules", {"torch": fake}):
+                t.begin("extend", 512)
+                t.end()
+            self.assertEqual(t.transient_bytes_per_token("extend", 512), 4096.0)
+            # A bucket nobody has run is still None: no extrapolation.
+            self.assertIsNone(t.transient_bytes_per_token("extend", 4096))
+            # And a phase nobody has run is None, not the other phase's number.
+            self.assertIsNone(t.transient_bytes_per_token("decode", 512))
+
+    def test_a_row_whose_baseline_never_read_does_not_price(self):
+        with tempfile.TemporaryDirectory() as d:
+            t = ForwardPeakTracker(os.path.join(d, "peak"), "tp0")
+            fake = mock.MagicMock()
+            fake.cuda.memory_allocated.side_effect = RuntimeError("no cuda")
+            fake.cuda.max_memory_allocated.return_value = 8 * GIB
+            with mock.patch.dict("sys.modules", {"torch": fake}):
+                t.begin("extend", 512)
+                t.end()
+            self.assertIsNone(t.transient_bytes_per_token("extend", 512))
+
     def test_can_fail(self):
         """Falsifier: a tracker that never reset would report a running max,
         not a per-forward peak, and this comparison would stop discriminating."""

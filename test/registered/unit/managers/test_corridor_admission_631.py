@@ -30,6 +30,7 @@ that its cooldown suppresses the SPEND and never the CHECK, and that it
 NEVER converts a verdict into a refusal.
 """
 
+import logging
 import types
 
 import pytest
@@ -263,6 +264,123 @@ def test_a_None_chunk_size_does_not_take_the_instance_down():
     scheduler = FakeScheduler(FakeReporter(qkv=100, ffn=40))
     gate = PrefillAdmissionGate(scheduler)
     assert gate.want_bytes(None) == 0
+
+
+# --------------------------------------------------------------------------
+# 1b. HANDOFF_678 §4.1: A MEASURED WANT, WHICH IS THE ONE THAT CAN PREEMPT.
+# --------------------------------------------------------------------------
+
+
+class FakeTracker:
+    """The forward-peak probe's in-process query, and nothing else."""
+
+    def __init__(self, per_token=None):
+        self._per_token = per_token
+        self.asked = []
+
+    def transient_bytes_per_token(self, phase, tokens):
+        self.asked.append((phase, tokens))
+        return self._per_token
+
+
+def sched_with_tracker(tracker, *, qkv=0, ffn=0, layers=1, cache_bytes=0):
+    """A scheduler whose model runner carries a forward-peak tracker."""
+    scheduler = FakeScheduler(FakeReporter(qkv=qkv, ffn=ffn), layers=layers)
+    scheduler.tp_worker = types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(_forward_peak=tracker)
+    )
+    scheduler._fake_cache_bytes = cache_bytes
+    return scheduler
+
+
+def gate_with_tracker(tracker, **kw):
+    cache = kw.pop("cache_bytes", 0)
+    gate = PrefillAdmissionGate(sched_with_tracker(tracker, **kw))
+    gate._allocator_cache_bytes = lambda: cache  # noqa: SLF001
+    return gate
+
+
+def test_a_measured_transient_beats_the_geometry_slope():
+    """Both readable: the measurement wins, because it is one.
+
+    The geometry slope is a movement proxy assembled from the metrics
+    reporter's per-token terms. The tracker's figure is the peak this rank
+    actually reached on this bucket. When both exist there is no contest.
+    """
+    gate = gate_with_tracker(FakeTracker(per_token=2048), qkv=100, ffn=40)
+    assert gate.want_bytes(512) == 512 * 2048
+
+
+def test_the_measured_want_is_charged_NET_of_the_allocator_cache():
+    """The tier law, at the second call site.
+
+    NVML free does not move when torch serves a forward out of its own cache
+    -- those bytes are already RESERVED and already missing from the free
+    column. Charging them again arms the gate for an allocation that will
+    never touch the driver. This is the same subtraction the KV rung makes
+    with ``cheap_relief_bytes``, for the same reason, and it is what keeps the
+    gate from arming on every admission once a slope becomes readable.
+    """
+    # 100 MiB of transient against a 200 MiB cache: nothing reaches the driver.
+    absorbed = gate_with_tracker(FakeTracker(per_token=MIB), cache_bytes=200 * MIB)
+    assert absorbed.want_bytes(100) == 0
+    # 300 MiB against the same cache: only the excess is the driver's problem.
+    spills = gate_with_tracker(FakeTracker(per_token=MIB), cache_bytes=200 * MIB)
+    assert spills.want_bytes(300) == 100 * MIB
+
+
+def test_a_measured_want_is_still_hard_capped():
+    """The cap is a safety property of the LADDER, not of the estimator.
+
+    An unreachable target spends every provider on every call, up to and
+    including the one that evacuates the drafter. That is true no matter how
+    the number was obtained, so a measured slope does not buy an exemption.
+    """
+    gate = gate_with_tracker(FakeTracker(per_token=10 * MIB))
+    assert gate.want_bytes(4096) == WANT_CAP_MIB * MIB
+
+
+def test_an_uncalibrated_bucket_falls_back_to_the_geometry_slope():
+    """None means NOT MEASURED, and the fallback is the old behaviour."""
+    gate = gate_with_tracker(FakeTracker(per_token=None), qkv=1024, ffn=0)
+    assert gate.want_bytes(512) == 512 * 1024
+
+
+def test_no_tracker_at_all_is_exactly_the_shipped_behaviour():
+    """The probe is off by default; this path must not change with it off."""
+    card = FakeCard(free_mib=4000)
+    gate, _ = build_gate(card, slope_bytes=1024)
+    assert gate.want_bytes(512) == 512 * 1024
+
+
+def test_the_tracker_is_asked_about_the_PREFILL_phase_not_decode():
+    """The tracker keys rows by phase, and prefill is 'extend' in that vocab."""
+    tracker = FakeTracker(per_token=8)
+    gate = gate_with_tracker(tracker)
+    gate.want_bytes(512)
+    assert tracker.asked == [("extend", 512)]
+
+
+def test_a_tracker_that_raises_does_not_take_prefill_down():
+    class Exploding:
+        def transient_bytes_per_token(self, phase, tokens):
+            raise RuntimeError("probe is broken")
+
+    gate = gate_with_tracker(Exploding(), qkv=1024, ffn=0)
+    assert gate.want_bytes(512) == 512 * 1024
+
+
+def test_the_announcement_names_WHICH_source_priced_the_gate(caplog):
+    """s34's lesson: a number in a log that does not say where it came from
+    cannot be checked. Measured and geometry differ by orders of magnitude."""
+    card = FakeCard(free_mib=8000)
+    tracker = FakeTracker(per_token=4096)
+    gate = gate_with_tracker(tracker)
+    guard = build_guard(card)
+    gate._guard = lambda: guard  # noqa: SLF001
+    with caplog.at_level(logging.INFO):
+        gate.before_admission(512)
+    assert "measured" in caplog.text.lower()
 
 
 def test_the_gate_is_off_unless_the_phase_flip_is_on():

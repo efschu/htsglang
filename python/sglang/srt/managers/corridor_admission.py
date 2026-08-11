@@ -178,6 +178,48 @@ def _activation_bytes_per_token(scheduler: Any) -> int:
     return max(0, int(total // layers))
 
 
+#: The forward-peak probe's name for a prefill forward. Its rows are keyed by
+#: phase, and "extend" is what the model runner passes for every non-decode
+#: batch (``model_runner.py``, the ``peak_probe.begin`` call).
+PREFILL_PHASE = "extend"
+
+
+def _measured_bytes_per_token(scheduler: Any, tokens: int) -> Optional[float]:
+    """The MEASURED per-token transient for a chunk this size, or None.
+
+    Read from ``ForwardPeakTracker``, which brackets every forward with
+    ``reset_peak_memory_stats`` / ``max_memory_allocated`` and now records the
+    peak MINUS the baseline -- i.e. what the forward ADDED, which is the only
+    part an admission may be charged for.
+
+    WHY THIS IS BETTER THAN THE GEOMETRY SLOPE and not merely different: the
+    geometry slope is assembled from the metrics reporter's per-token terms,
+    exists only under ``--enable-mfu-metrics``, and is a movement proxy that
+    was wrong by the layer count until a review caught it. The tracker's figure
+    is what this rank's allocator actually reached on this bucket, on this
+    model, at this chunk size. HANDOFF_678 §4.1 asks for a peak-residency
+    figure so the gate can PREEMPT a crossing rather than recover from it; this
+    is that figure.
+
+    None when the probe is off (it is off unless ``SGLANG_FORWARD_PEAK_PATH``
+    is set), when the bucket has not been measured, or when anything at all
+    goes wrong. None means NOT PRICED and the caller falls back -- never a
+    substituted literal, which is the rule ``measured_capture_mib_per_token``
+    exists to enforce and which this path inherits.
+    """
+    try:
+        runner = getattr(getattr(scheduler, "tp_worker", None), "model_runner", None)
+        tracker = getattr(runner, "_forward_peak", None)
+        if tracker is None:
+            return None
+        value = tracker.transient_bytes_per_token(PREFILL_PHASE, int(tokens))
+    except Exception:  # noqa: BLE001 -- a probe must never break admission
+        return None
+    if value is None or value <= 0:
+        return None
+    return float(value)
+
+
 class PrefillAdmissionGate:
     """Item 15a's spill-before-alloc, at the prefill admission site.
 
@@ -198,6 +240,7 @@ class PrefillAdmissionGate:
         self._clock = clock
         self._last_arm = float("-inf")
         self._slope_logged = False
+        self._measured_logged = False
         self._announced = False
         # Counters are the evidence this gate ever did anything. A mechanism
         # that cannot be shown to have fired is indistinguishable from one
@@ -222,7 +265,41 @@ class PrefillAdmissionGate:
         drafter and killing speculative decoding. With the cap, the worst a
         wrong slope can do is free a little more than necessary.
         """
-        tokens = int(tokens or 0)
+        tokens = max(0, int(tokens or 0))
+        cap = WANT_CAP_MIB * (1024 * 1024)
+        measured = _measured_bytes_per_token(self._scheduler, tokens) if tokens else None
+        if measured is not None:
+            raw = int(tokens * measured)
+            # NET OF THE ALLOCATOR CACHE, and only on this branch.
+            #
+            # The measured figure is ALLOCATOR-SIDE: it is torch's peak
+            # allocated bytes. The corridor is DRIVER-SIDE: NVML's free column.
+            # Those two move together only when the allocator has to grow its
+            # reservation -- bytes served out of its own cache are already
+            # reserved and already absent from the free column, so charging
+            # them again arms the gate for an allocation the driver never sees.
+            # This is the same subtraction the KV rung makes with
+            # ``cheap_relief_bytes``, for the same tier-law reason.
+            #
+            # The geometry branch below does NOT subtract it, and that is not
+            # an oversight: that slope is a movement proxy for driver-side
+            # growth, already biased small, and netting it against the cache
+            # would zero it on every admission -- removing what little an
+            # underpriced gate can still do (§1a-bis).
+            want = max(0, raw - self._allocator_cache_bytes())
+            if not self._measured_logged:
+                self._measured_logged = True
+                logger.info(
+                    "%s pricing prefill admission from a MEASURED transient: "
+                    "%.0f bytes/token on the %s/%d bucket, net of the "
+                    "allocator cache. This figure is the forward-peak probe's "
+                    "peak-minus-baseline, not the metrics-reporter geometry.",
+                    LOG_PREFIX,
+                    measured,
+                    PREFILL_PHASE,
+                    tokens,
+                )
+            return min(want, cap)
         slope = _activation_bytes_per_token(self._scheduler)
         if slope > 0 and not self._slope_logged:
             self._slope_logged = True
@@ -233,7 +310,45 @@ class PrefillAdmissionGate:
                 LOG_PREFIX,
                 slope,
             )
-        return min(max(0, tokens) * slope, WANT_CAP_MIB * (1024 * 1024))
+        return min(tokens * slope, cap)
+
+    def _price_source(self) -> str:
+        """Which estimator is pricing this gate, for the announcement.
+
+        The two differ by orders of magnitude and by kind -- one is a measured
+        peak, the other a geometry proxy -- so a bytes/token figure in a log
+        that does not say which one it is cannot be checked by the next reader.
+        This chain lost an acceptance run to exactly that ambiguity.
+        """
+        measured = _measured_bytes_per_token(self._scheduler, 512)
+        if measured is not None:
+            return f"MEASURED forward-peak transient (~{measured:.0f} B/token at 512)"
+        if _activation_bytes_per_token(self._scheduler) > 0:
+            return "metrics-reporter geometry (a movement proxy)"
+        return (
+            "NONE -- want is 0 and the gate enforces the floor without "
+            "preempting (set SGLANG_FORWARD_PEAK_PATH for a measured price)"
+        )
+
+    def _allocator_cache_bytes(self) -> int:
+        """Bytes torch holds reserved but not allocated: the cheap tier.
+
+        Deliberately the same quantity the KV rung calls ``cheap_relief`` --
+        ``reserved - allocated``. It overstates what ``empty_cache`` could
+        return, because it counts intra-segment fragmentation, and that is the
+        safe direction here: overstating the cache understates ``want``, and an
+        understated want costs a late arm, while an overstated one spends the
+        ladder for memory the driver was never going to be asked for.
+        """
+        try:
+            import torch
+
+            return max(
+                0,
+                int(torch.cuda.memory_reserved()) - int(torch.cuda.memory_allocated()),
+            )
+        except Exception:  # noqa: BLE001
+            return 0
 
     def before_admission(self, tokens: int) -> Optional[Any]:
         """Make room for a ``tokens``-wide prefill chunk BEFORE it is built.
@@ -327,7 +442,8 @@ class PrefillAdmissionGate:
             return
         logger.info(
             "%s ARMED on device %s: arming floor %d MiB, law floor %d MiB, "
-            "delta %d MiB, activation slope %d bytes/token, providers %s",
+            "delta %d MiB, activation slope %d bytes/token, providers %s, "
+            "pricing source %s",
             LOG_PREFIX,
             getattr(guard, "device_index", "?"),
             getattr(guard, "floor_mib", -1),
@@ -335,6 +451,7 @@ class PrefillAdmissionGate:
             getattr(guard, "delta_mib", -1),
             _activation_bytes_per_token(self._scheduler),
             list(getattr(guard, "providers", ())) or "[] (nothing to spend yet)",
+            self._price_source(),
         )
 
     # -- internals --------------------------------------------------------

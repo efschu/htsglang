@@ -64,6 +64,20 @@ class ForwardPeakTracker:
 
         self._phase = phase
         self._tokens = int(tokens)
+        # THE BASELINE, and why the peak is useless without it.
+        # ``reset_peak_memory_stats`` does not zero the counter -- it RE-BASES
+        # it to what is allocated right now (see mem_ledger/activation_probe).
+        # So the figure read at ``end`` is weights + KV + transient, tens of
+        # GiB on this model, and anything that prices a 512-token chunk from it
+        # is wrong by three orders of magnitude. The transient -- the only part
+        # a chunk adds, and the only part an admission gate may charge -- is
+        # the difference between the two.
+        try:
+            self._baseline = int(torch.cuda.memory_allocated(self.device))
+        except Exception:
+            # None, never 0: a missing baseline must yield NO transient rather
+            # than a transient equal to the whole peak.
+            self._baseline = None
         try:
             torch.cuda.reset_peak_memory_stats(self.device)
             self._armed = True
@@ -99,6 +113,10 @@ class ForwardPeakTracker:
                 "calls": 0,
                 "peak_bytes_max": 0,
                 "peak_bytes_last": 0,
+                #: Peak MINUS the baseline: what this forward ADDED. None
+                #: until a call manages to read both ends of the bracket.
+                "transient_bytes_max": None,
+                "transient_tokens": 0,
                 "tokens_max": 0,
                 "nvml_free_bytes_min": None,
                 "nvml_used_bytes_max": 0,
@@ -110,6 +128,16 @@ class ForwardPeakTracker:
         row["peak_bytes_last"] = peak
         row["peak_bytes_max"] = max(row["peak_bytes_max"], peak)
         row["tokens_max"] = max(row["tokens_max"], self._tokens)
+        baseline = getattr(self, "_baseline", None)
+        if baseline is not None and self._tokens > 0:
+            transient = max(0, peak - int(baseline))
+            prev = row["transient_bytes_max"]
+            # The MAX, not the mean: a gate sized on the average transient is
+            # under water exactly when the peak arrives, which is the only
+            # moment it exists for.
+            if prev is None or transient > prev:
+                row["transient_bytes_max"] = transient
+                row["transient_tokens"] = self._tokens
         if total_b:
             used = total_b - free_b
             prev_free = row["nvml_free_bytes_min"]
@@ -123,6 +151,37 @@ class ForwardPeakTracker:
             row["non_torch_bytes_max"] = max(
                 row["non_torch_bytes_max"], max(used - peak, 0)
             )
+
+    def transient_bytes_per_token(self, phase: str, tokens: int) -> Optional[float]:
+        """MEASURED transient bytes per token for this phase and size, or None.
+
+        The shape is copied deliberately from
+        ``mem_ledger.activation.measured_capture_mib_per_token``: when nothing
+        has been measured for the bucket asked about, this returns **None** and
+        the caller must treat that as NOT PRICED rather than substituting a
+        literal. Substituting is the failure that function exists to prevent,
+        and the corridor's admission gate has the same exposure -- a made-up
+        slope there does not merely mis-report, it makes the relief ladder's
+        target unreachable and spends every provider on every admission.
+
+        NO EXTRAPOLATION ACROSS BUCKETS. A bucket nobody has run is None even
+        when a neighbouring one has been measured a thousand times. The peak is
+        not linear in the chunk size (attention's own working set is not), and
+        the one thing worse than an unpriced gate is a confidently wrong one.
+        Buckets are coarse (:func:`_bucket`) precisely so that a fixed
+        ``--chunked-prefill-size`` lands in the same one every time.
+
+        Reading it costs a dict lookup: it is the rows this tracker is already
+        keeping, not a second measurement of the same quantity.
+        """
+        row = self.rows.get(f"{phase}/{_bucket(int(tokens))}")
+        if row is None:
+            return None
+        transient = row.get("transient_bytes_max")
+        measured_tokens = int(row.get("transient_tokens", 0) or 0)
+        if transient is None or measured_tokens <= 0:
+            return None
+        return float(transient) / float(measured_tokens)
 
     def dump(self) -> None:
         if not self.rows:
