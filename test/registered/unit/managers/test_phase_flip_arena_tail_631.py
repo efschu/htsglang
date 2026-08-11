@@ -142,27 +142,62 @@ class ThePendingCommitIsPricedTest(unittest.TestCase):
         c.set_active_prefix(13163 * MIB)
         self.assertEqual(c.pending_tail_bytes(13482 * MIB), 319 * MIB)
 
-    def test_the_runtime_prices_it_on_tp_to_pp_and_not_on_pp_to_tp(self):
+    def test_the_runtime_prices_the_leg_that_has_to_grow(self):
+        # WAS test_the_runtime_prices_it_on_tp_to_pp_and_not_on_pp_to_tp, and
+        # the rename is the correction: pricing a FIXED leg is what left the
+        # growing commit unpriced on a rank whose TP layout is the larger one.
+        # The concern the old name carried -- that the tail must not be double
+        # counted onto the drafter's leg -- is a max() at the call site and is
+        # still pinned by test_staging_bytes_folds_the_tail_in_with_max_not_sum.
         from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 
         c = _carrier(13482)
         c.set_active_prefix(13163 * MIB)
 
-        class _Layout:
+        class _LayoutPP:
             total_bytes = 13482 * MIB
+
+        class _LayoutTP:
+            total_bytes = 13163 * MIB
 
         class _Stacks:
             arena_carrier = c
-            layout_pp = _Layout()
+            layout_pp = _LayoutPP()
+            layout_tp = _LayoutTP()
+
+            @staticmethod
+            def refill_high_water_bytes():
+                return 13482 * MIB
 
         class _Sched:
             phase_flip_stacks = _Stacks()
 
         r = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
         r._census_scheduler = _Sched()
+        # PP is the larger layout here, so the 319 MiB is needed on either
+        # leg -- the refill's restore= arm reaches into the tail on both.
         self.assertEqual(r._arena_tail_bytes(TP_TO_PP), 319 * MIB)
-        # The drafter is the pp->tp payload; this one must not be double
-        # counted onto that leg.
+        self.assertEqual(r._arena_tail_bytes(PP_TO_TP), 319 * MIB)
+
+    def test_nothing_is_priced_once_the_high_water_is_backed(self):
+        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+
+        c = _carrier(13482)
+        c.set_active_prefix(13482 * MIB)
+
+        class _Stacks:
+            arena_carrier = c
+
+            @staticmethod
+            def refill_high_water_bytes():
+                return 13482 * MIB
+
+        class _Sched:
+            phase_flip_stacks = _Stacks()
+
+        r = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
+        r._census_scheduler = _Sched()
+        self.assertEqual(r._arena_tail_bytes(TP_TO_PP), 0)
         self.assertEqual(r._arena_tail_bytes(PP_TO_TP), 0)
 
     def test_no_carrier_prices_zero_rather_than_raising(self):
@@ -182,17 +217,51 @@ class ThePendingCommitIsPricedTest(unittest.TestCase):
 class OrderingAroundTheRefillTest(unittest.TestCase):
     """Backwards in either direction is a fault on unbacked memory."""
 
+    # COMMIT BEFORE, RELEASE AFTER -- ON BOTH LEGS.
+    #
+    # These used to assert release-after on pp->tp and commit-before on
+    # tp->pp, which was correct only while "PP is the larger layout on every
+    # rank" held. --pp-stage-ratio 15,9,8 (32,16,16 layers over 64) falsifies
+    # it on the middle rank, and then the pp->tp refill is the one that has to
+    # GROW the arena: it copied the larger TP image into the tail an earlier
+    # tp->pp had released, and took all three ranks down with
+    # cudaErrorInvalidValue inside the no-return region (metal, 2026-08-11).
+    #
+    # The invariant is therefore symmetric, and the leg that grows is a
+    # property of the layout sizes rather than of the direction.
+
+    def test_pp_to_tp_commits_the_high_water_before_it_refills(self):
+        src = inspect.getsource(PhaseFlipStacks.refill)
+        leg = src[src.index("PP_TO_TP:") : src.index("TP_TO_PP:")]
+        self.assertLess(
+            leg.index("_commit_refill_high_water"), leg.index("arena_refill")
+        )
+
     def test_release_happens_after_the_pp_to_tp_refill(self):
         src = inspect.getsource(PhaseFlipStacks.refill)
-        head = src.index("PP_TO_TP:")
-        tail = src.index("TP_TO_PP:")
-        leg = src[head:tail]
+        leg = src[src.index("PP_TO_TP:") : src.index("TP_TO_PP:")]
         self.assertLess(leg.index("arena_refill"), leg.index("set_active_prefix"))
 
-    def test_commit_happens_before_the_tp_to_pp_refill(self):
+    def test_tp_to_pp_commits_the_high_water_before_it_refills(self):
         src = inspect.getsource(PhaseFlipStacks.refill)
         leg = src[src.index("TP_TO_PP:") :]
-        self.assertLess(leg.index("set_active_prefix"), leg.index("arena_refill"))
+        self.assertLess(
+            leg.index("_commit_refill_high_water"), leg.index("arena_refill")
+        )
+
+    def test_release_happens_after_the_tp_to_pp_refill_too(self):
+        # Missing entirely before: the tail stayed committed for the whole PP
+        # phase on a rank whose TP layout is the larger one, which is rung 3's
+        # purpose given away.
+        src = inspect.getsource(PhaseFlipStacks.refill)
+        leg = src[src.index("TP_TO_PP:") :]
+        self.assertLess(leg.index("arena_refill"), leg.index("set_active_prefix"))
+
+    def test_the_high_water_is_the_maximum_of_both_layouts(self):
+        src = inspect.getsource(PhaseFlipStacks.refill_high_water_bytes)
+        self.assertIn("max(", src)
+        self.assertIn("layout_pp", src)
+        self.assertIn("layout_tp", src)
 
     def test_a_stack_without_a_carrier_refills_exactly_as_before(self):
         self.assertIsNone(PhaseFlipStacks.arena_carrier)

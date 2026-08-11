@@ -346,6 +346,12 @@ class PhaseFlipStacks:
         # verify-before-copy host sum was the dominant flip leg, 22-33 s
         # measured 2026-08-08).
         if direction == PP_TO_TP:
+            # COMMIT THE HIGH-WATER FIRST. See _refill_high_water_bytes: the
+            # refill writes the TP layout and its restore= arm may rewrite the
+            # PP layout, so BOTH must be backed before a byte moves. On a rank
+            # where TP is the larger layout this is the difference between a
+            # flip and a cudaErrorInvalidValue into the released tail.
+            self._commit_refill_high_water()
             arena_refill(
                 self.arena,
                 self.layout_tp,
@@ -354,8 +360,9 @@ class PhaseFlipStacks:
             )
             # RUNG 3, AFTER the refill and not before: the restore= arm above
             # rewrites the PP layout on a checksum mismatch, and the PP layout
-            # reaches into the tail. Releasing first would fault that recovery
-            # path on unbacked memory.
+            # reaches into the tail wherever PP is the larger layout.
+            # Releasing first would fault that recovery path on unbacked
+            # memory.
             if self.arena_carrier is not None:
                 released = self.arena_carrier.set_active_prefix(
                     self.layout_tp.total_bytes
@@ -371,20 +378,71 @@ class PhaseFlipStacks:
                         self.arena.numel() / 1048576.0,
                     )
         elif direction == TP_TO_PP:
-            # BEFORE the refill: the refill writes the PP layout, which reaches
-            # into the tail. This commit is an allocation inside the no-return
-            # region -- it is priced into the affordability verdict by
+            # BEFORE the refill, and to the HIGH-WATER rather than to the PP
+            # layout: the refill writes the PP layout and its restore= arm may
+            # rewrite the TP layout, so the larger of the two is what has to be
+            # backed. This commit is an allocation inside the no-return region
+            # -- it is priced into the affordability verdict by
             # PhaseFlipRuntime._arena_tail_bytes before the flip commits.
-            if self.arena_carrier is not None:
-                self.arena_carrier.set_active_prefix(self.layout_pp.total_bytes)
+            self._commit_refill_high_water()
             arena_refill(
                 self.arena,
                 self.layout_pp,
                 self.image_pp,
                 restore=(self.layout_tp, self.image_tp),
             )
+            # AND RELEASE AFTER, symmetrically with the pp->tp leg. Without
+            # this the tail stays committed for the whole PP phase on a rank
+            # whose TP layout is the larger one, which is rung 3's entire
+            # purpose given away.
+            if self.arena_carrier is not None:
+                released = self.arena_carrier.set_active_prefix(
+                    self.layout_pp.total_bytes
+                )
+                if released:
+                    logger.info(
+                        "%s rung 3 released %.1f MiB of weights-arena tail to "
+                        "the driver (PP layout needs %.1f of %.1f MiB); "
+                        "arena address unchanged",
+                        LOG_PREFIX,
+                        released,
+                        self.layout_pp.total_bytes / 1048576.0,
+                        self.arena.numel() / 1048576.0,
+                    )
         else:
             raise PhaseFlipBootError(f"unknown flip direction {direction!r}")
+
+    def refill_high_water_bytes(self) -> int:
+        """Bytes of arena that must be BACKED for any refill to be safe.
+
+        THE ASSUMPTION THIS REPLACES, stated so it cannot come back: rung 3
+        was written when "PP is the larger layout on every rank of this rig"
+        was true, so the tail was committed on tp->pp and released on pp->tp,
+        and the pp->tp refill was allowed to run against whatever happened to
+        be committed. Change the PP stage ratio -- ``--pp-stage-ratio 15,9,8``
+        derives 32,16,16 layers over 64 -- and a middle rank's PP layout drops
+        BELOW its TP layout. The tp->pp leg then decommits down to the smaller
+        PP layout, and the next pp->tp refill copies the larger TP image
+        straight into the released tail: ``CUDA error: invalid argument``,
+        inside the no-return region, killing all three ranks at the first
+        flip. Measured on this rig, 2026-08-11.
+
+        A refill also has its restore= arm, which rewrites the OTHER layout on
+        a checksum mismatch. So the safe span is the MAXIMUM of the two
+        layouts on either leg, not the layout being written -- which is what
+        makes this a property of the arena rather than of the direction.
+        """
+        return max(
+            int(self.layout_pp.total_bytes), int(self.layout_tp.total_bytes)
+        )
+
+    def _commit_refill_high_water(self) -> None:
+        if self.arena_carrier is None:
+            return
+        # set_active_prefix GROWS to the high-water here and can never shrink
+        # to it, because the high-water is the maximum of both layouts and the
+        # arena is never committed above that.
+        self.arena_carrier.set_active_prefix(self.refill_high_water_bytes())
 
 
 def build_flip_draft_worker(scheduler, tp_worker, tp_args, world_rank):

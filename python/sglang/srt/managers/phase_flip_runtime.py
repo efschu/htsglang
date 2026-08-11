@@ -3330,26 +3330,32 @@ class PhaseFlipRuntime:
         which runs at the pre-cutover seam -- past the point of no return. A
         failure there cannot be unwound.
 
-        Note the DIRECTION IS THE OPPOSITE ONE. The drafter is re-committed on
-        pp->tp; the arena tail is re-committed on tp->pp, because PP is the
-        larger layout on every rank of this rig. A gate that priced both on the
-        same leg would leave one of them unpriced, which is the whole failure
-        mode being guarded against.
+        PRICED ON BOTH LEGS, and the reason it used to be priced on only one
+        is a corrected assumption rather than an oversight. This said "the
+        arena tail is re-committed on tp->pp, because PP is the larger layout
+        on every rank of this rig" -- true for --pp-stage-ratio 14,10,8, false
+        for 15,9,8, where a middle rank's PP layout falls below its TP layout
+        and the pp->tp refill is the one that has to grow the arena. That
+        unpriced commit faulted inside the no-return region and took all three
+        ranks down at the first flip (measured 2026-08-11). The leg that must
+        grow is a property of the LAYOUT SIZES, so both legs are priced and
+        the carrier's own high-water answers how much.
 
         max(), not sum(), at the call site: the two peaks belong to different
         legs and cannot coexist.
         """
-        from sglang.srt.layers.dcp.phase_flip_plan import TP_TO_PP
-
-        if direction != TP_TO_PP:
-            return 0
-        scheduler = self._census_scheduler
+        # getattr, because this is now reached on BOTH legs. The old version
+        # returned 0 for pp->tp before touching anything, so a runtime built
+        # without a census scheduler never got here; pricing both legs means
+        # the attribute is read on every staging estimate, including the ones
+        # in tests that construct a bare runtime.
+        scheduler = getattr(self, "_census_scheduler", None)
         stacks = getattr(scheduler, "phase_flip_stacks", None) if scheduler else None
         carrier = getattr(stacks, "arena_carrier", None) if stacks else None
         if carrier is None:
             return 0
         try:
-            return int(carrier.pending_tail_bytes(stacks.layout_pp.total_bytes))
+            return int(carrier.pending_tail_bytes(stacks.refill_high_water_bytes()))
         except Exception:
             # An unreadable carrier must not take the flip down here; the
             # commit itself will still be attempted and the gate simply had

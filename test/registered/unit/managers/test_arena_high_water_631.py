@@ -1,0 +1,214 @@
+"""#656: the weights arena must be backed for the layout it is ABOUT to hold.
+
+THE BUG THIS PINS, measured on metal 2026-08-11. Rung 3 was written when "PP
+is the larger layout on every rank of this rig" held, so the tail was
+committed on tp->pp and released on pp->tp. ``--pp-stage-ratio 15,9,8``
+derives 32,16,16 layers over 64, which puts the middle rank's PP layout
+(6690 MiB) BELOW its TP layout (7924 MiB). The tp->pp leg then decommitted to
+the smaller PP layout, and the next pp->tp refill copied the larger TP image
+into the released tail:
+
+    torch.AcceleratorError: CUDA error: invalid argument
+      weights_arena.py:386 in arena_refill -> dst.copy_(payload)
+
+inside the flip's no-return region, killing all three ranks at the first
+flip after a tp->pp.
+
+RED-FIRST: :func:`test_pp_to_tp_commits_before_it_copies` and
+:func:`test_the_metal_sequence_that_faulted` both fail on the pre-fix tree --
+the first because nothing committed before the copy, the second because the
+recorded call order shows the copy hitting a 6690 MiB commitment with a 7924
+MiB payload. :func:`test_the_gate_prices_the_growing_leg` fails because
+``_arena_tail_bytes`` returned 0 for pp->tp by construction.
+"""
+
+import types
+import unittest
+
+from sglang.srt.managers.phase_flip_boot import PhaseFlipStacks
+from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+
+MIB = 1024 * 1024
+
+
+class _Layout:
+    def __init__(self, mib):
+        self.total_bytes = int(mib * MIB)
+
+
+class _Carrier:
+    """A carrier that FAULTS if written beyond its committed prefix."""
+
+    def __init__(self, nbytes, committed):
+        self._nbytes = int(nbytes)
+        self.committed = int(committed)
+        self.calls = []
+
+    def set_active_prefix(self, active_bytes):
+        want = max(0, min(int(active_bytes), self._nbytes))
+        self.calls.append(("prefix", want))
+        if want > self.committed:
+            self.committed = want
+            return 0.0
+        released = (self.committed - want) / MIB
+        self.committed = want
+        return released
+
+    def pending_tail_bytes(self, active_bytes):
+        return max(0, min(int(active_bytes), self._nbytes) - self.committed)
+
+
+def _stacks(pp_mib, tp_mib, committed_mib, recorder):
+    """A PhaseFlipStacks whose refill is real and whose copy is instrumented."""
+    hi = max(pp_mib, tp_mib)
+    carrier = _Carrier(hi * MIB, committed_mib * MIB)
+    st = PhaseFlipStacks.__new__(PhaseFlipStacks)
+    st.layout_pp = _Layout(pp_mib)
+    st.layout_tp = _Layout(tp_mib)
+    st.image_pp = object()
+    st.image_tp = object()
+    st.arena = types.SimpleNamespace(numel=lambda: hi * MIB)
+    st.arena_carrier = carrier
+    return st, carrier
+
+
+class _Recorder:
+    def __init__(self):
+        self.copies = []
+
+
+def _patched_refill(st, carrier, rec, monkey):
+    """Run PhaseFlipStacks.refill with arena_refill replaced by a recorder
+    that FAULTS exactly as the driver does: writing past the committed span."""
+
+    def fake_arena_refill(arena, layout, image, restore=None):
+        need = int(layout.total_bytes)
+        if restore is not None:
+            need = max(need, int(restore[0].total_bytes))
+        rec.copies.append((need, carrier.committed))
+        if need > carrier.committed:
+            raise RuntimeError(
+                f"CUDA error: invalid argument -- wrote {need} bytes into an "
+                f"arena committed to {carrier.committed}"
+            )
+
+    monkey(fake_arena_refill)
+
+
+class TestArenaHighWater(unittest.TestCase):
+    def setUp(self):
+        import sglang.srt.managers.phase_flip_boot as boot
+
+        self.boot = boot
+        self._orig = boot.arena_refill
+        self.rec = _Recorder()
+
+    def tearDown(self):
+        self.boot.arena_refill = self._orig
+
+    def _install(self, st, carrier):
+        _patched_refill(
+            st,
+            carrier,
+            self.rec,
+            lambda fn: setattr(self.boot, "arena_refill", fn),
+        )
+
+    # -- the rank where TP is the larger layout (the regression) ----------
+
+    def test_pp_to_tp_commits_before_it_copies(self):
+        # PP 6690, TP 7924, arena committed down to PP by an earlier tp->pp.
+        st, carrier = _stacks(6690, 7924, 6690, self.rec)
+        self._install(st, carrier)
+        st.refill(PP_TO_TP)
+        need, committed_at_copy = self.rec.copies[0]
+        self.assertEqual(need, 7924 * MIB)
+        self.assertGreaterEqual(committed_at_copy, need)
+
+    def test_the_metal_sequence_that_faulted(self):
+        # tp->pp then pp->tp, which is exactly the order the instance died in.
+        st, carrier = _stacks(6690, 7924, 7924, self.rec)
+        self._install(st, carrier)
+        st.refill(TP_TO_PP)
+        st.refill(PP_TO_TP)
+        for need, committed in self.rec.copies:
+            self.assertGreaterEqual(committed, need)
+
+    def test_the_tail_is_still_released_after_the_copy(self):
+        # The fix must not buy safety by keeping the arena fully committed --
+        # that would give away rung 3's entire purpose.
+        st, carrier = _stacks(6690, 7924, 7924, self.rec)
+        self._install(st, carrier)
+        st.refill(TP_TO_PP)
+        self.assertEqual(carrier.committed, 6690 * MIB)
+
+    # -- the rank where PP is the larger layout (must not regress) --------
+
+    def test_pp_larger_still_releases_on_pp_to_tp(self):
+        st, carrier = _stacks(9115, 7924, 9115, self.rec)
+        self._install(st, carrier)
+        st.refill(PP_TO_TP)
+        self.assertEqual(carrier.committed, 7924 * MIB)
+
+    def test_pp_larger_recommits_on_tp_to_pp(self):
+        st, carrier = _stacks(9115, 7924, 7924, self.rec)
+        self._install(st, carrier)
+        st.refill(TP_TO_PP)
+        need, committed_at_copy = self.rec.copies[0]
+        self.assertGreaterEqual(committed_at_copy, need)
+        self.assertEqual(carrier.committed, 9115 * MIB)
+
+    def test_high_water_is_the_max_of_both_layouts(self):
+        st, _ = _stacks(6690, 7924, 6690, self.rec)
+        self.assertEqual(st.refill_high_water_bytes(), 7924 * MIB)
+        st2, _ = _stacks(9115, 7924, 9115, self.rec)
+        self.assertEqual(st2.refill_high_water_bytes(), 9115 * MIB)
+
+    def test_a_carrierless_stack_does_not_raise(self):
+        st, _ = _stacks(6690, 7924, 6690, self.rec)
+        st.arena_carrier = None
+        self._install(st, _Carrier(7924 * MIB, 7924 * MIB))
+        st.refill(PP_TO_TP)  # rung 3 off: nothing to commit, nothing to release
+
+
+class TestGatePricesBothLegs(unittest.TestCase):
+    """The commit is an allocation in the no-return region; it must be priced
+    on whichever leg has to grow, not on a leg chosen at authoring time."""
+
+    def _runtime(self, pp_mib, tp_mib, committed_mib):
+        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+        hi = max(pp_mib, tp_mib)
+        carrier = _Carrier(hi * MIB, committed_mib * MIB)
+        stacks = types.SimpleNamespace(
+            arena_carrier=carrier,
+            layout_pp=_Layout(pp_mib),
+            layout_tp=_Layout(tp_mib),
+            refill_high_water_bytes=lambda: hi * MIB,
+        )
+        rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
+        rt._census_scheduler = types.SimpleNamespace(phase_flip_stacks=stacks)
+        return rt
+
+    def test_prices_the_pp_to_tp_leg_when_tp_is_larger(self):
+        rt = self._runtime(6690, 7924, 6690)
+        self.assertEqual(rt._arena_tail_bytes(PP_TO_TP), (7924 - 6690) * MIB)
+
+    def test_prices_the_tp_to_pp_leg_when_pp_is_larger(self):
+        rt = self._runtime(9115, 7924, 7924)
+        self.assertEqual(rt._arena_tail_bytes(TP_TO_PP), (9115 - 7924) * MIB)
+
+    def test_zero_when_already_backed(self):
+        rt = self._runtime(6690, 7924, 7924)
+        self.assertEqual(rt._arena_tail_bytes(PP_TO_TP), 0)
+
+    def test_no_carrier_is_zero_not_a_raise(self):
+        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+        rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
+        rt._census_scheduler = types.SimpleNamespace(phase_flip_stacks=None)
+        self.assertEqual(rt._arena_tail_bytes(PP_TO_TP), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
