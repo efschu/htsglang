@@ -4165,3 +4165,53 @@ Serving healthy on 30030 under real qwen agent traffic via the router: 84
 flips, corridor held, per-card free 2439/5394/2617 MiB. **Spread ~2955 MiB**
 — the item-16 unevenness is unchanged and no payload rung touches it, which
 is the standing argument for wiring `kv_reshard` as the REBALANCE tier.
+
+## CHUNK A/B, measured 2026-08-11 (successor 31) -- the 2048 default is dead
+
+Item 8's first arm, finally measured. Provoked by an operator question about
+slow agents; the ship config was running `chunked_prefill_size=2048`, the bare
+default, absent from argv and never chosen by anyone.
+
+Harness `scripts/s31_chunk_ab.py`. Prompts UNIQUE by construction (a repeated
+prompt measures the prefix cache, not the chunk), `max_tokens=8` so decode
+cannot smuggle its content-dependent variance in, TTFT as the number and
+prefill tok/s derived from the SERVER's own prompt-token count. One warmup
+discarded, n=6 per pass, A-vs-A floor per arm, one boot per arm.
+
+| chunk | prefill tok/s | vs default | noise floor |
+|---|---|---|---|
+| 256 | 2579 | +1.8% | 2.6% |
+| **512** | **2666** | **+5.3%** | 1.8% |
+| 1024 | 2597 | +2.5% | 1.8% |
+| 2048 (default) | 2533 | — | 1.3% |
+| 4096 | 2377 | -6.2% | 0.2% |
+| 8192 | 2156 | -14.9% | 1.4% |
+| 16384 | **OOM** | instance died | -- |
+
+**512 is an interior optimum**, beating both its neighbours by more than the
+floor. SHIP VALUE SET TO 512.
+
+**Bigger is worse, monotonically, and eventually fatal.** 16384 did not merely
+regress: `OutOfMemoryError: CUDA out of memory. Tried to allocate 192.00 MiB`
+on a 20 GB 3080, then `gloo: Connection closed by peer` and health 000. Larger
+chunks buy activation memory with corridor headroom, which on this rig is the
+wrong trade in both directions at once -- slower AND tighter.
+
+### WHAT THIS DOES **NOT** EXPLAIN, and the framing to avoid
+
+It does not explain slow agents, and it would be easy to claim it does. A
+179k-token agent prompt at ~2600 tok/s is **~69 s of prefill, irreducible**;
+moving 2048 -> 512 returns about 3.5 s of that. The chunk count per request
+(~87 at 2048) is a striking number and a red herring -- throughput is nearly
+flat across 256-2048, so shredding a prompt into more chunks costs almost
+nothing. An agent holding 179k tokens is slow because it holds 179k tokens.
+
+### SCOPE, stated because the sample is narrower than the question
+
+Measured at ~22.8k prompt tokens, ONE request at a time, no concurrency, with
+the flip controller live. The ship config serves up to 4 concurrent requests
+at up to 393216 context. Chunk size interacts with concurrency (activation
+memory multiplies) and with the flip cadence, and neither axis is in this
+sample. The 16384 OOM is the warning that the interaction is real: at
+concurrency the memory term arrives sooner, so the safe direction from 512 is
+DOWN, never up.
