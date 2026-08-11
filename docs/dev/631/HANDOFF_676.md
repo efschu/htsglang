@@ -136,11 +136,30 @@ not reach the arming guard.
 
 Three ways out, in the order a successor should consider them:
 
-1. **The pinned pool without kvso's controller.** The guard tests
-   `scheduler.kv_session_offload`, not the pool class. Instantiating the host
-   pool directly as a destination — which is all the order asks for, since
-   kvso is already disproven as a byte-returning vehicle — never trips it.
-   This is the cheapest route and the one that matches the brief.
+1. **The pinned pool without kvso's controller — CONFIRMED VIABLE, with the
+   entry points.** The guard tests `scheduler.kv_session_offload`, not the
+   pool class, and an audit this shift established that the pool is a pure
+   data structure:
+
+   * `MHATokenToKVPoolHost` (`mem_cache/pool_host/mha.py:88`, base
+     `pool_host/base.py:105`), constructor `mha.py:91-103`, takes
+     `(device_pool, host_to_device_ratio, host_size, page_size, layout,
+     pin_memory=True, ...)`. **It takes no scheduler reference** — only the
+     device-side `MHATokenToKVPool` (for dtype, dims, layer_num, head_num,
+     head_dim) plus sizing.
+   * D2H: `backup_from_device_all_layer(device_pool, host_indices,
+     device_indices, io_backend)` — `mha.py:352`.
+   * H2D, per layer: `load_to_device_per_layer(device_pool, host_indices,
+     device_indices, layer_id, io_backend)` — `mha.py:235`.
+   * Precedent for building it outside the manager already exists:
+     `_kv_sess_attach_host_pool()`
+     (`model_runner_kv_cache_mixin.py:2655-2808`) constructs it and hangs it
+     on `model_runner.kv_sess_host_pool`; the kvso manager merely READS it
+     later via the backend's `_sess_host_pool`. **The pool and the manager
+     are independent.**
+
+   So this route is open, it matches the brief exactly (kvso as destination
+   only), and it needs no change to the flip guard. It is the one to take.
 2. **Cached-prefix eviction first, which needs no host RAM at all.**
    HANDOFF_675 §4.3 lists it as the cheaper of the two host-half rungs: evict
    cached prefix entries (data discarded, recomputable) to lower `max_live`,
@@ -357,9 +376,33 @@ its own gaps:
    Until the cards sit near the floor the corridor's second half stays unmet,
    the spread stays around 2600 MiB, and the relief ladder is rarely reached
    past its cheapest tier, whatever the deeper rungs are capable of.
-4. **The DYNAMIC chunking arm**, still unmeasured. 512 is an interior optimum
-   and large chunks are lethal on this rig, so the value hypothesis is
-   downward adaptivity under mixed load, not throughput.
+4. **The DYNAMIC chunking arm**, still unmeasured — audited this shift, so
+   the next attempt can start from facts instead of `server_args.py:14243`.
+
+   * **It would activate here.** The gate is
+     `enable_dynamic_chunking and pp_size > 1 and chunked`
+     (`server_args.py:14243`), re-asserted at `scheduler.py:1531-1532`. This
+     instance is `pp_size=3`, so the feature is live the moment the flag is.
+   * **It moves in BOTH directions.** Down to `base_chunk_size // 4` — 128
+     from the shipped 512 (`scheduler_pp_mixin.py:2717`) — and up to
+     `ceil(chunked * 1.25)` via the raised prefill ceiling
+     (`server_args.py:14244-14246`). Since 512 is an interior optimum and
+     16384 was a fatal OOM, the DOWNWARD half is the value hypothesis and the
+     upward half is the risk.
+   * **Recomputed once per scheduling iteration**: `scheduler.py:5108` calls
+     `dynamic_chunked_prefill_size()` (`:4891`), which delegates to
+     `predict_next_chunk_size` (`scheduler_pp_mixin.py:1743` -> `:2656`),
+     quadratic solver at `:2688-2739`, smoothed at `:2713`.
+
+   **THE TRAP, and it decides whether the A/B is falsifiable at all:** the
+   ONLY line that reports a predicted chunk size is **DEBUG-level**
+   (`scheduler_pp_mixin.py:1770-1773`). Nothing at INFO or above fires when
+   the chunk deviates from `--chunked-prefill-size`. So the order's
+   "engagement proof — chunk size provably moved at runtime from chunk 1" is
+   **unobtainable at the default log level**. Raise the logger for that
+   module before the run, or add an INFO line; otherwise the arm produces a
+   throughput number with no evidence the mechanism ever engaged, which is
+   the shape of finding this chain has retracted seven times.
 5. Then the **GDN-cut A/B**, with the mandatory per-arm arena-tail re-measure
    (C1: the tail is a function of the split).
 
