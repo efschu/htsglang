@@ -61,6 +61,20 @@ if [ "$busy" -ne 0 ]; then
 fi
 nvidia-smi --query-gpu=index,memory.free --format=csv,noheader
 
+# THE SOURCE MAY NOT BE THE SINK. This script WRITES the prepared argv to
+# /tmp/s33_argv.txt, so pointing ARGV_SRC at that same file makes every run
+# inherit the previous run's edits. #658 lost a boot to exactly that: a failed
+# attempt left --enable-vram-dial in the file, and the next boot -- which had
+# deliberately dropped the flag -- picked it up again and died with the same
+# error, which reads as "my edit did nothing" rather than "my source is
+# poisoned". Refuse instead of accumulating.
+if [ "$(readlink -f "$ARGV_SRC")" = "$(readlink -f /tmp/s33_argv.txt)" ]; then
+  echo "REFUSE: ARGV_SRC is /tmp/s33_argv.txt, which is also this script's" >&2
+  echo "        OUTPUT. Copy it to a pristine path and point ARGV_SRC there," >&2
+  echo "        or each boot will inherit the last one's ARGV_SET edits." >&2
+  exit 5
+fi
+
 ARGV_SET="${ARGV_SET:-}" ARGV_SRC="$ARGV_SRC" $PY - <<'PYEOF'
 import os
 
@@ -68,6 +82,15 @@ argv = [a for a in open(os.environ["ARGV_SRC"]).read().split("\n") if a != ""]
 
 
 def put(flag, value):
+    # A BARE FLAG IS A FLAG, NOT A FLAG WITH AN EMPTY ARGUMENT. store_true
+    # options (--enable-vram-dial, --enable-dynamic-chunking) carry no value,
+    # and appending ["--flag", ""] hands argparse an empty POSITIONAL, which
+    # fails the boot in a way that reads like a config error rather than a
+    # quoting one. #658 hit exactly that.
+    if value == "":
+        if flag not in argv:
+            argv.append(flag)
+        return
     try:
         i = argv.index(flag)
         argv[i + 1] = value
