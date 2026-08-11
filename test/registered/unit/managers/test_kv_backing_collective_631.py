@@ -473,6 +473,54 @@ class RecoveryMayNotBreachTheCorridorItWasRelievingTest(unittest.TestCase):
         self.assertTrue(relief._cap.engaged)
 
 
+class ExhaustionIsOnlyEvidenceWhenTheAskCouldHavePaidTest(unittest.TestCase):
+    """A group target shallower than this rank's granularity proves nothing.
+
+    Release is one commit chunk in EVERY buffer, and the three PP stages here
+    hold 28 / 20 / 16 of them, so the ranks do not share a granularity. Once
+    the target became collective a rank could be handed a shrink smaller than
+    its own smallest possible release. It returns zero — correctly — and the
+    old rule read that as "this arena cannot pay" and stopped it asking for
+    the rest of the phase. That is a voice with real bytes silenced by a
+    number it did not choose, and nothing in the logs would look wrong.
+    """
+
+    def _coarse_rank(self):
+        """Granularity 1000 rows: one 4 MiB chunk in each of 1000 buffers."""
+        card = _Card(1100)
+        pool = _FakePool(500000, 4096, card=card)
+        pool.backing_commit_chunk_bytes = 4096
+        relief = kbr.KvBackingRelief(
+            pool,
+            _FakeAllocator(500000),
+            live_slots_fn=lambda: torch.tensor([80], dtype=torch.int64),
+            bytes_per_row=4096,
+            probe=card.probe,
+            buffers=1000,
+        )
+        return relief, pool, card
+
+    def test_a_sub_granularity_target_does_not_exhaust_the_rank(self):
+        relief, pool, card = self._coarse_rank()
+        self.assertEqual(relief._min_release_rows(), 1000)
+        # A shallower ask than one release quantum, and the card does not move.
+        pool._card = None  # the fake stops crediting the card: zero measured
+        relief.apply_target(500000 - 10)
+        self.assertFalse(
+            relief._exhausted,
+            "a target smaller than this rank's quantum is not evidence",
+        )
+
+    def test_a_full_size_ask_that_pays_nothing_still_exhausts(self):
+        relief, pool, card = self._coarse_rank()
+        pool._card = None
+        relief.apply_target(500000 - 5000)
+        self.assertTrue(
+            relief._exhausted,
+            "an ask well above the quantum that returns nothing IS evidence",
+        )
+
+
 class _Sched:
     pass
 

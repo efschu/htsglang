@@ -540,7 +540,21 @@ class KvBackingRelief:
             # nothing is handed out above the watermark), do not re-commit,
             # and stop trying. Recovery happens on the tp->pp leg, at an
             # idle boundary, where an allocation is affordable and survivable.
-            self._exhausted = True
+            #
+            # EXHAUSTION IS ONLY EVIDENCE WHEN THE ASK WAS BIG ENOUGH TO PAY.
+            # Since the target became collective, a rank can be handed a
+            # target shallower than ITS OWN release granularity -- one commit
+            # chunk in every one of its buffers, and the three PP stages here
+            # hold 28 / 20 / 16 of them. Releasing nothing under such a target
+            # says nothing about the arena; it says the group agreed on a
+            # number smaller than this rank can act on. Marking it exhausted
+            # would silence a voice that has real bytes to offer at a deeper
+            # target -- a slow leak of the group's ambition, and invisible,
+            # because every log line would still look correct.
+            asked = int(current) - int(target)
+            granularity = self._min_release_rows()
+            if granularity <= 0 or asked >= granularity:
+                self._exhausted = True
             logger.warning(
                 "%s shrink to %d rows reported %.0f MiB but the driver's free "
                 "column did not move, so this pool cannot pay: the arena has "
