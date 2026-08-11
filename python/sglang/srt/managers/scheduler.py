@@ -102,6 +102,7 @@ from sglang.srt.managers.admission_limiter import (
     set_admission_limiter,
     throttle_before_retract,
 )
+from sglang.srt.managers.corridor_admission import guard_prefill_admission
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -5158,6 +5159,25 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.dynamic_chunked_prefill_size()
+
+        # #656 item 15a, AT THE PREFILL ALLOCATION SITE (register C17).
+        #
+        # The corridor law used to be enforced at exactly one allocation site,
+        # the flip seam, and successor 33's acceptance breached at this one
+        # instead: a 272k-token bs1 prefill walked the binding card down to
+        # 1001 MiB and held it there for 1.6 s, until the next seam armed the
+        # very same gate and reclaimed 964 MiB in one call. The gate worked.
+        # It was not called from here.
+        #
+        # IT SPILLS; IT NEVER REFUSES, and that is a correctness requirement
+        # rather than caution. This gate reads THIS RANK'S free column, while
+        # prefill admission has to stay rank-uniform -- exactly the property
+        # the DCP note below is about. A rank-local refusal here would let one
+        # rank admit work its peers declined, which is the capacity desync
+        # that previously left a scheduler not heartbeating with every rank
+        # alive. So the verdict is logged, counted and ignored for the
+        # admission decision. See managers/corridor_admission.py.
+        guard_prefill_admission(self, chunked_prefill_size)
 
         # RANK-UNIFORM prefill admission budget (uneven DCP): the deficit was
         # min-reduced once this iteration in update_dcp_admission_state (single

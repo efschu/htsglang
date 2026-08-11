@@ -43,6 +43,7 @@ FAMILY=(
     test/registered/unit/managers/test_kv_backing_relief_631.py
     test/registered/unit/managers/test_kv_backing_collective_631.py
     test/registered/unit/managers/test_corridor_even_fill_631.py
+    test/registered/unit/managers/test_corridor_admission_631.py
     test/registered/unit/managers/test_kvso_flip_contract_631.py
     test/registered/unit/managers/test_dynamic_chunk_engagement_631.py
     test/registered/unit/managers/test_arena_high_water_631.py

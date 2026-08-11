@@ -95,6 +95,11 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "KV-BACKING"
 
+_MIB = 1024 * 1024
+
+#: Report EVERY proposal, not only the ones that change the deficit's sign.
+KV_RELIEF_TRACE_ENV = "SGLANG_KV_RELIEF_TRACE"
+
 #: A desire no reduction can lower: the neutral element of an element-wise MIN.
 _UNBOUNDED_ROWS = 1 << 40
 
@@ -314,6 +319,10 @@ class KvBackingRelief:
         self.shrink_count = 0
         self.recover_count = 0
         self.released_total = 0
+        #: -1 means "nothing reported yet", so the FIRST proposal always logs
+        #: and a run can never be silent about this rung again.
+        self._last_deficit_sign = -1
+        self._trace_all = os.environ.get(KV_RELIEF_TRACE_ENV, "") == "1"
 
     # -- plumbing --------------------------------------------------------
 
@@ -426,6 +435,10 @@ class KvBackingRelief:
             return ABSTAIN
         floor_rows = self._floor_rows(max_live)
         desire = current
+        # Hoisted so the diagnostic below can report the terms on the path
+        # where the rung declines, which is the ONLY path it has ever taken.
+        free_now = -1
+        deficit = 0
         if floor_rows < current and not self._exhausted:
             free_now = self._free_bytes()
             need = int(floor_bytes) + int(delta_bytes) + max(0, int(want_bytes))
@@ -438,7 +451,83 @@ class KvBackingRelief:
                 page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
                 desire = max(floor_rows, current - rows)
                 desire = int(math.ceil(desire / page) * page)
+        self._trace_proposal(
+            current=current,
+            floor_rows=floor_rows,
+            max_live=max_live,
+            want_bytes=int(want_bytes),
+            floor_bytes=int(floor_bytes),
+            delta_bytes=int(delta_bytes),
+            free_now=free_now,
+            cheap_relief_bytes=int(cheap_relief_bytes),
+            deficit=deficit,
+            desire=desire,
+        )
         return (int(desire), -int(floor_rows), int(current), -int(current))
+
+    def _trace_proposal(self, **t) -> None:
+        """Say why this rung did or did not propose a shrink.
+
+        WHY THIS EXISTS. Spec item 12's rung declined on every one of ~324
+        seam legs across two acceptance runs and emitted NOT ONE LINE while
+        doing it, because the only logging on this path was inside the
+        ``deficit > 0`` branch -- i.e. only on the path that already works.
+        A mechanism whose decline is silent is indistinguishable from a
+        mechanism that is never reached, and this chain has now shipped
+        several of those.
+
+        The decisive term was invisible for the same reason. Reconstructed
+        afterwards from 93 gate lines, the deficit was NEGATIVE on 100% of
+        arms, and dropping ``cheap_relief_bytes`` alone flipped every one of
+        them positive (+260..+832 MiB): the cheap tier's estimate
+        (``reserved - allocated``, which deliberately overstates because it
+        counts intra-segment fragmentation ``empty_cache`` cannot return) is
+        larger than the gap it is subtracted from. That is the tier law
+        working as written -- free money before KV capacity -- but nothing
+        said so out loud.
+
+        EDGE-TRIGGERED at INFO on a change in the sign of the deficit, so an
+        acceptance run keeps the signal without an env var, and it cannot
+        flood: ``propose`` runs on the pp_to_tp leg only, measured at 1.4-3
+        calls per minute per rank. ``SGLANG_KV_RELIEF_TRACE=1`` makes every
+        call report.
+        """
+        deficit_mib = t["deficit"] / _MIB
+        sign = 1 if t["deficit"] > 0 else 0
+        edge = sign != self._last_deficit_sign
+        self._last_deficit_sign = sign
+        if not (edge or self._trace_all):
+            return
+        logger.info(
+            "%s proposal on device %s: rows current=%d floor=%d (max_live=%d, "
+            "slack=%d) | need = floor %.0f + delta %.0f + want %.0f = %.0f MiB "
+            "against free %.0f MiB and cheap relief %.0f MiB -> deficit "
+            "%+.0f MiB -> %s. %s",
+            LOG_PREFIX,
+            self._device_index,
+            t["current"],
+            t["floor_rows"],
+            t["max_live"],
+            max(0, t["current"] - t["floor_rows"]),
+            t["floor_bytes"] / _MIB,
+            t["delta_bytes"] / _MIB,
+            t["want_bytes"] / _MIB,
+            (t["floor_bytes"] + t["delta_bytes"] + t["want_bytes"]) / _MIB,
+            t["free_now"] / _MIB,
+            t["cheap_relief_bytes"] / _MIB,
+            deficit_mib,
+            (
+                f"SHRINK to {t['desire']}"
+                if t["desire"] < t["current"]
+                else "no change"
+            ),
+            (
+                "the cheaper tier covers the whole gap, so KV capacity is not "
+                "spent -- this is the tier law, not a broken rung"
+                if t["deficit"] <= 0
+                else "the cheap tier cannot cover it; KV capacity is the funder"
+            ),
+        )
 
     def apply_target(self, target_rows: Optional[int]) -> int:
         """Cap and shrink to EXACTLY the row count the group agreed on.

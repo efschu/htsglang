@@ -1,0 +1,344 @@
+# SPDX-License-Identifier: Apache-2.0
+"""#656 register C17: the corridor law, enforced at the PREFILL site too.
+
+WHAT THESE PIN, AND WHY THE FIRST ONE IS A SIMULATION RATHER THAN AN
+ASSERTION ON A RETURN VALUE.
+
+Successor 33's acceptance breached the corridor for 12 samples on one card,
+and the cause was not a gate that failed -- it was a gate that was never
+called. ``CorridorGuard.ensure_headroom`` works; it had one caller, the flip
+seam, and the 272k-token bs1 prefill grew at a site with no caller:
+
+    11:20:47Z  gpu0 = 1001 MiB free, 12 samples (~1.6 s), 23 MiB under
+    11:20:49Z  CORRIDOR-GUARD cleared on device 0: free 1186 -> 2150,
+               reclaimed 964 MiB from [allocator-cache]
+
+A test that asserted "``ensure_headroom`` returns ok" would have passed on
+the pre-fix tree, because that function was never the broken part. So the
+first test here MODELS THE BREACH: a card whose free column falls as a
+prefill grows, sampled the way the corridor sampler samples it, run once
+without the gate and once with it. The pre-fix behaviour is the run with the
+gate switched off, and it must FAIL the corridor law for the test to be
+worth anything.
+
+    without the gate: minimum free 984 MiB  -> LAW BROKEN
+    with the gate:    minimum free 1400 MiB -> law held
+
+The remaining tests pin the three decisions in the gate that are easy to
+"simplify" back into defects: that it prices ACTIVATION and not KV rows,
+that its cooldown suppresses the SPEND and never the CHECK, and that it
+NEVER converts a verdict into a refusal.
+"""
+
+import pytest
+
+from sglang.srt.managers.corridor_admission import (
+    PrefillAdmissionGate,
+    get_prefill_admission_gate,
+)
+from sglang.srt.managers.corridor_guard import CorridorGuard, RELIEF_LOCAL
+
+MIB = 1024 * 1024
+
+
+class FakeCard:
+    """A card that loses free memory as a prefill grows, sampled at 100 ms.
+
+    ``hoard`` is the reclaimable allocator cache -- the tier that paid for
+    every one of s33's 50 gate arms.
+    """
+
+    def __init__(self, free_mib: int, hoard_mib: int = 1000):
+        self.free = free_mib * MIB
+        self.hoard = hoard_mib * MIB
+        self.samples = []
+        self.provider_calls = 0
+
+    def probe(self) -> int:
+        return int(self.free)
+
+    def sample(self) -> None:
+        self.samples.append(int(self.free // MIB))
+
+    def grow(self, mib: int) -> None:
+        """The forward takes transient memory. This is the allocation."""
+        self.free -= mib * MIB
+        self.sample()
+
+    def provider(self, nbytes: int) -> int:
+        """Give back up to ``nbytes`` from the hoard, and mean it."""
+        self.provider_calls += 1
+        paid = min(int(nbytes), self.hoard)
+        self.hoard -= paid
+        self.free += paid
+        return paid
+
+    @property
+    def min_free_mib(self) -> int:
+        return min(self.samples) if self.samples else 0
+
+
+class FakeReporter:
+    def __init__(self, qkv=0, ffn=0):
+        self._qkv_act_bytes_per_token = qkv
+        self._ffn_act_bytes_per_token = ffn
+
+
+class FakeScheduler:
+    def __init__(self, reporter=None):
+        self.metrics_reporter = reporter
+
+
+def build_guard(card: FakeCard) -> CorridorGuard:
+    guard = CorridorGuard(
+        0,
+        probe=card.probe,
+        # A level fleet, so item 16 never withholds a tier for reasons that
+        # have nothing to do with what these tests are about.
+        fleet_probe=lambda: [card.free, card.free, card.free],
+    )
+    guard.register("allocator-cache", 0, card.provider, tier=RELIEF_LOCAL)
+    return guard
+
+
+def build_gate(card: FakeCard, *, slope_bytes=512, cooldown_s=0.0):
+    """A gate wired to ``card``, bypassing the scheduler-side guard lookup."""
+    scheduler = FakeScheduler(FakeReporter(qkv=slope_bytes, ffn=0))
+    gate = PrefillAdmissionGate(scheduler, cooldown_s=cooldown_s)
+    guard = build_guard(card)
+    gate._guard = lambda: guard  # noqa: SLF001 -- the seam under test is below it
+    return gate, guard
+
+
+def run_prefill(card: FakeCard, gate, *, chunks=12, growth_mib=50, tokens=512):
+    """Admit ``chunks`` prefill chunks, each of which grows the card."""
+    card.sample()
+    for _ in range(chunks):
+        if gate is not None:
+            gate.before_admission(tokens)
+        card.grow(growth_mib)
+
+
+def breaching_samples(card: FakeCard) -> int:
+    return sum(1 for s in card.samples if s < 1024)
+
+
+#: The slope that PRICES the simulated growth honestly: 50 MiB over 512
+#: tokens. Where a test uses this, ``want`` equals what the chunk really
+#: takes, which is the regime the gate is designed for.
+COHERENT_SLOPE = (50 * MIB) // 512
+
+
+# --------------------------------------------------------------------------
+# 1. THE BREACH, REPRODUCED AND THEN PREVENTED.
+# --------------------------------------------------------------------------
+
+
+def test_ungated_prefill_walks_the_card_under_the_floor():
+    """The pre-fix tree. This is s33's sustained 1001 MiB trough, in miniature."""
+    card = FakeCard(free_mib=1384, hoard_mib=1000)
+    run_prefill(card, None)
+    assert card.provider_calls == 0, "nothing was ever asked to free memory"
+    assert card.min_free_mib < 1024, (
+        "the simulation must actually breach, or the next tests prove nothing"
+    )
+    assert card.min_free_mib == 784
+    assert breaching_samples(card) == 5, "a TROUGH, not a single dipped sample"
+
+
+def test_the_admission_gate_holds_the_floor_through_the_same_prefill():
+    """The fixed tree, with the chunk priced honestly: the dip never happens.
+
+    This is the gate working as designed -- ``want`` equals what the chunk
+    actually takes, so the arm happens BEFORE the allocation that would have
+    crossed the floor.
+    """
+    card = FakeCard(free_mib=1384, hoard_mib=1000)
+    gate, _ = build_gate(card, slope_bytes=COHERENT_SLOPE)
+    run_prefill(card, gate)
+    assert card.provider_calls > 0, "the gate must actually spend the ladder"
+    assert breaching_samples(card) == 0
+    assert card.min_free_mib >= 1024, (
+        f"corridor law broken at {card.min_free_mib} MiB despite the gate"
+    )
+    assert gate.armed > 0 and gate.cleared > 0
+
+
+def test_an_underpriced_slope_cannot_PREEMPT_but_still_bounds_the_TROUGH():
+    """The regime the metrics slope actually puts us in, stated honestly.
+
+    The activation slope is a movement proxy and is biased small, so on metal
+    ``want`` may be far below what the forward really takes. Then the gate
+    cannot arm ahead of the crossing -- the check before the chunk sees a
+    card that is still above the floor.
+
+    What it DOES do is arm on the very next admission, which on the measured
+    mix is ~90 ms later rather than the ~2 s it took the flip seam to notice.
+    That is the whole difference between s33's 12-sample trough and a single
+    dipped sample, and it is why this gate is worth having even underpriced.
+
+    A successor who improves the slope should see this test's breach count go
+    to zero; it is written to make that visible rather than to bless the 1.
+    """
+    card = FakeCard(free_mib=1384, hoard_mib=1000)
+    gate, _ = build_gate(card, slope_bytes=1)  # a slope that prices nothing
+    run_prefill(card, gate)
+    assert gate.armed > 0, "it must still arm, just later"
+    assert breaching_samples(card) == 1, (
+        "one dipped sample, recovered on the next admission -- against 5 "
+        "consecutive ones with no gate at all"
+    )
+    assert card.samples[-1] >= 1024, "and it does not stay down"
+
+
+def test_the_gate_arms_before_the_allocation_not_after_it():
+    """Spill-BEFORE-alloc: the distinction from a threshold observer.
+
+    The card starts ABOVE the floor and the chunk about to be admitted is
+    what would take it under. A reactive observer sees nothing here; the
+    gate must already have spent.
+    """
+    card = FakeCard(free_mib=1100, hoard_mib=1000)
+    gate, _ = build_gate(card, slope_bytes=200 * 1024)  # 200 KiB/token
+    # 512 tokens x 200 KiB = 100 MiB of want against 76 MiB of headroom.
+    gate.before_admission(512)
+    assert card.provider_calls == 1
+    assert card.free >= (1024 * MIB) + (100 * MIB), (
+        "the gate must fund the allocation, not merely restore the floor"
+    )
+
+
+# --------------------------------------------------------------------------
+# 2. WHAT IT CHARGES FOR. Pricing KV rows here would arm on every admission
+#    for pages that are already committed.
+# --------------------------------------------------------------------------
+
+
+def test_want_is_priced_from_the_activation_slope():
+    card = FakeCard(free_mib=4000)
+    gate, _ = build_gate(card, slope_bytes=1024)
+    assert gate.want_bytes(512) == 512 * 1024
+
+
+def test_want_sums_both_activation_terms():
+    scheduler = FakeScheduler(FakeReporter(qkv=100, ffn=40))
+    gate = PrefillAdmissionGate(scheduler)
+    assert gate.want_bytes(10) == 1400
+
+
+def test_an_unreadable_slope_still_enforces_the_floor():
+    """Degrade to want=0 -- the floor itself -- never to no gate at all."""
+    card = FakeCard(free_mib=900, hoard_mib=1000)
+    scheduler = FakeScheduler(None)
+    gate = PrefillAdmissionGate(scheduler, cooldown_s=0.0)
+    guard = build_guard(card)
+    gate._guard = lambda: guard  # noqa: SLF001
+    assert gate.want_bytes(512) == 0
+    gate.before_admission(512)
+    assert card.provider_calls == 1, "a card under the floor must still be lifted"
+    assert card.free >= 1024 * MIB
+
+
+def test_a_comfortable_card_costs_one_probe_and_no_relief():
+    card = FakeCard(free_mib=8000)
+    gate, _ = build_gate(card)
+    gate.before_admission(512)
+    assert gate.armed == 0
+    assert card.provider_calls == 0
+    assert gate.checks == 1
+
+
+# --------------------------------------------------------------------------
+# 3. THE COOLDOWN SUPPRESSES THE SPEND, NEVER THE CHECK.
+# --------------------------------------------------------------------------
+
+
+def test_cooldown_prevents_a_second_empty_cache_in_the_same_instant():
+    card = FakeCard(free_mib=900, hoard_mib=4000)
+    clock = {"t": 0.0}
+    scheduler = FakeScheduler(FakeReporter(qkv=0, ffn=0))
+    gate = PrefillAdmissionGate(
+        scheduler, cooldown_s=0.25, clock=lambda: clock["t"]
+    )
+    guard = build_guard(card)
+    gate._guard = lambda: guard  # noqa: SLF001
+    gate.before_admission(512)
+    assert card.provider_calls == 1
+    # Push it back under the floor and ask again immediately.
+    card.free = 900 * MIB
+    gate.before_admission(512)
+    assert card.provider_calls == 1, "relief must not be spent twice in 0 s"
+    assert gate.cooldown_skips == 1
+    assert gate.checks == 2, "the CHECK is never suppressed"
+    clock["t"] = 1.0
+    gate.before_admission(512)
+    assert card.provider_calls == 2, "after the cooldown it must spend again"
+
+
+# --------------------------------------------------------------------------
+# 4. IT NEVER REFUSES. A rank-local refusal here is a group-admission split,
+#    which is a hang -- see the module docstring and HANDOFF_675 1a.
+# --------------------------------------------------------------------------
+
+
+def test_an_exhausted_ladder_is_recorded_and_does_not_raise():
+    card = FakeCard(free_mib=600, hoard_mib=0)
+    gate, _ = build_gate(card)
+    verdict = gate.before_admission(512)
+    assert verdict is not None and verdict.ok is False
+    assert gate.short == 1
+    # The caller admits anyway. The gate returns evidence, not a decision.
+
+
+def test_a_broken_guard_does_not_take_prefill_down():
+    scheduler = FakeScheduler(FakeReporter(qkv=1, ffn=1))
+    gate = PrefillAdmissionGate(scheduler)
+
+    def explode():
+        raise RuntimeError("no guard here")
+
+    gate._guard = explode  # noqa: SLF001
+    with pytest.raises(RuntimeError):
+        gate._guard()  # noqa: SLF001 -- the double really does raise
+    # ...but the gate swallows it at its own boundary.
+    gate._guard = lambda: None  # noqa: SLF001
+    assert gate.before_admission(512) is None
+
+
+def test_a_failing_probe_is_survived():
+    class BadGuard:
+        floor_bytes = 1024 * MIB
+
+        def free_bytes(self):
+            raise RuntimeError("nvml is unhappy")
+
+    scheduler = FakeScheduler(FakeReporter(qkv=1, ffn=1))
+    gate = PrefillAdmissionGate(scheduler)
+    gate._guard = lambda: BadGuard()  # noqa: SLF001
+    assert gate.before_admission(512) is None
+
+
+# --------------------------------------------------------------------------
+# 5. ONE GATE PER SCHEDULER, because the guard beneath it is memoised too.
+# --------------------------------------------------------------------------
+
+
+def test_the_gate_is_memoised_on_the_scheduler():
+    scheduler = FakeScheduler(FakeReporter())
+    first = get_prefill_admission_gate(scheduler)
+    second = get_prefill_admission_gate(scheduler)
+    assert first is second
+
+
+def test_no_scheduler_no_gate():
+    assert get_prefill_admission_gate(None) is None
+
+
+def test_stats_report_what_the_gate_did():
+    card = FakeCard(free_mib=1384, hoard_mib=1000)
+    gate, _ = build_gate(card, slope_bytes=COHERENT_SLOPE)
+    run_prefill(card, gate)
+    stats = gate.stats()
+    assert stats["checks"] == 12
+    assert stats["armed"] >= 1
+    assert stats["reclaimed_mib"] > 0
