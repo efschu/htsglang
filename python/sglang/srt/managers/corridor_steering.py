@@ -421,7 +421,32 @@ def build_allocation_steering(scheduler) -> Optional[AllocationSteering]:
     device_index = getattr(model_runner, "gpu_id", None)
     nvml_index = None if device_index is None else resolve_nvml_index(int(device_index))
 
-    rank = int(getattr(getattr(scheduler, "ps", None), "tp_rank", 0) or 0)
+    # THE WORLD RANK, NOT ``ps.tp_rank``, and the first boot is why. The
+    # scheduler's topology snapshot describes the CURRENT phase, and this
+    # instance boots in PP3 -- where ``tp_size == 1`` and every rank's
+    # ``tp_rank`` is 0. All three ranks then wrote their NVML column into
+    # slot 0 of the reduction, the permutation came back as
+    # ``(0, 1048576, 1048576)``, and the steer disarmed itself rather than
+    # guess (which is the guard working, but it is not a steer).
+    #
+    # The token vector is indexed by the same identity the cutover uses to
+    # rebuild the topology (``get_world_group().rank_in_group``), so that is
+    # the one identity that means the same thing in both phases.
+    from sglang.srt.distributed import parallel_state as _ps
+
+    try:
+        rank = int(_ps.get_world_group().rank_in_group)
+    except Exception as e:
+        logger.info("%s not applicable: no world group yet (%s)", LOG_PREFIX, e)
+        return None
+    if rank >= len(ratios):
+        logger.info(
+            "%s not applicable: world rank %d is outside the token vector %s",
+            LOG_PREFIX,
+            rank,
+            ratios,
+        )
+        return None
     steer = AllocationSteering(
         scheduler, ratios=ratios, rank=rank, nvml_index=nvml_index
     )

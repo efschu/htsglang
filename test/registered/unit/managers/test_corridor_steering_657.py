@@ -218,6 +218,24 @@ class TestSteeringDecision(unittest.TestCase):
             self.assertIn("NOT replicated", s.state.disarmed_reason)
             self.assertIsNone(s.scheduler.token_to_kv_pool_allocator._owner_bias)
 
+    def test_an_unresolved_permutation_DISARMS_rather_than_guesses(self):
+        """The FIRST BOOT's actual failure, pinned as a regression.
+
+        Every rank reported ``rank 0`` because the scheduler's topology
+        snapshot describes the current phase and this instance boots in PP3,
+        where ``tp_size == 1`` and every rank's ``tp_rank`` is 0. All three
+        wrote their NVML column into slot 0, the permutation came back
+        ``(0, 1048576, 1048576)``, and the steer refused to run. Fixed by
+        indexing on the world rank; kept as a test because a steer that
+        guessed a column would push bytes ONTO the binding card.
+        """
+        steers = [self._steer(0, 1), self._steer(0, 0), self._steer(0, 2)]
+        column = [2369 * _MIB, 5030 * _MIB, 2715 * _MIB]
+        self._round(steers, column)
+        for s in steers:
+            self.assertFalse(s.state.armed)
+            self.assertIn("permutation did not resolve", s.state.disarmed_reason)
+
     def test_a_level_column_steers_nothing(self):
         steers = [self._steer(0, 1), self._steer(1, 0), self._steer(2, 2)]
         level = [2400 * _MIB, 2450 * _MIB, 2500 * _MIB]
