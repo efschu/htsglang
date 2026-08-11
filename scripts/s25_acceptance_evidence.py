@@ -167,7 +167,31 @@ def main() -> int:
         else:
             print("   series present but carries no spread column")
     else:
-        print("   no corridor.series.csv -- run the sampler with --series")
+        # THERE IS NO --series FLAG. corridor_sample.sh takes exactly two
+        # positional arguments (duration, output path) and always writes
+        # ts_ms,gpu0_free,gpu1_free,gpu2_free at 100 ms -- audited
+        # 2026-08-11. The instruction that stood here was unfollowable, so
+        # every run that read it left item 16 blank and the axis went
+        # unjudged for want of a flag that does not exist.
+        #
+        # The spread is max-min over the per-card free column, which those
+        # three columns already carry. Compute it.
+        rows_ = list(csv.reader(open(os.path.join(a.outdir, "corridor.csv"))))[1:]
+        sp = []
+        for r in rows_:
+            if len(r) >= 4:
+                try:
+                    cols = [int(r[1]), int(r[2]), int(r[3])]
+                except ValueError:
+                    continue
+                sp.append(max(cols) - min(cols))
+        if sp:
+            sp_sorted = sorted(sp)
+            print(f"   spread mean {sum(sp)/len(sp):.0f} MiB, median "
+                  f"{sp_sorted[len(sp)//2]:.0f}, best {min(sp)}, WORST "
+                  f"{max(sp)} MiB ({len(sp)} samples, from corridor.csv)")
+        else:
+            print("   corridor.csv carries no usable free column")
 
     # -- the relief ladder: which rung paid, and how often ------------------
     #
