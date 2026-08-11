@@ -291,6 +291,33 @@ be worse.
 
 ---
 
+## 6b. THE LEDGER OBLIGATION, NOW WITH THE EXACT LIST
+
+HANDOFF_675 §1c added a `withheld` term to the pool invariant after a cap
+read as a leak and killed all three ranks, and said the next rung that
+removes slots inherits the obligation. An audit this shift produced the
+precise inheritance, in `mem_cache/invariant_checker.py`:
+
+    available + evictable + protected + session_held + uncached + withheld
+        == total                                   (:112, shared function)
+
+| pool | terms it actually passes |
+|---|---|
+| full attention (`:173`) | all six — the ONLY one carrying `withheld` (`:184`, from `allocator.residency_withheld_slots`) |
+| SWA (`:199`) | five — no `withheld` |
+| mamba (`:213`) | four — neither `uncached` nor `withheld` |
+| mamba-int8 (`:262`, `:270`) | four/five, with different terms zeroed |
+| `req_to_token_pool` (`:467`) | a separate two-term invariant that does not call the shared function at all |
+
+**Today's cap is safe because it touches only the full-attention allocator.**
+A rung that withholds slots on the SWA or mamba lanes — and spec item 11
+names idle mamba states explicitly as spill class — will read as a leak and
+kill every rank at the first idle check, exactly as the first one did. Add
+the term to that pool's call site FIRST, and add the test that the same
+shortfall with no cap engaged is still a leak.
+
+---
+
 ## 7. PROCESS NOTES THAT EARNED THEIR PLACE
 
 * **The can-fail instrument paid for itself a third time.** Two boots at a
