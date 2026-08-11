@@ -322,6 +322,10 @@ class KvBackingRelief:
         #: -1 means "nothing reported yet", so the FIRST proposal always logs
         #: and a run can never be silent about this rung again.
         self._last_deficit_sign = -1
+        #: The cause of the last ABSTAIN, or None when this rank is taking
+        #: part. Edge-triggers the abstain warning and gates the recovery line.
+        self._last_abstain_reason: Optional[str] = None
+        self._abstain_count = 0
         self._trace_all = os.environ.get(KV_RELIEF_TRACE_ENV, "") == "1"
 
     # -- plumbing --------------------------------------------------------
@@ -422,17 +426,33 @@ class KvBackingRelief:
         recoverable (the guard refuses, the flip is retried next round) while
         over-shrinking costs admission capacity that bought nothing.
         """
-        if not self._supported() or self._bytes_per_row <= 0:
-            return ABSTAIN
+        if not self._supported():
+            return self._abstain(
+                "the pool has no runtime_set_backing_rows entry point, so this "
+                "rank cannot change its backing at all"
+            )
+        if self._bytes_per_row <= 0:
+            return self._abstain(
+                f"bytes_per_row is {self._bytes_per_row}, so no row count can "
+                "be computed from a byte deficit"
+            )
         current = self._current_rows()
         if current <= 0:
-            return ABSTAIN
+            return self._abstain(
+                f"the pool reports {current} backed rows, so there is no "
+                "backing to give up"
+            )
         max_live = self._max_live_row()
         if max_live < 0:
             # An unknown live set is not an empty one, and this is the number
             # that decides where memory gets unmapped. Abstain, and take the
             # group with us -- see ABSTAIN.
-            return ABSTAIN
+            return self._abstain(
+                "the live set could not be read, and an unknown live set is "
+                "not an empty one -- it is the row below which unmapping is a "
+                "FAULT"
+            )
+        self._clear_abstain()
         floor_rows = self._floor_rows(max_live)
         desire = current
         # Hoisted so the diagnostic below can report the terms on the path
@@ -482,6 +502,69 @@ class KvBackingRelief:
             skipped=skipped,
         )
         return (int(desire), -int(floor_rows), int(current), -int(current))
+
+    def _abstain(self, reason: str):
+        """Return ABSTAIN and say so. Never silently.
+
+        WHY THIS IS LOUDER THAN A DECLINE. A decline is this rank's arithmetic
+        saying the cheap tier already covers the gap -- the tier law working.
+        An ABSTAIN is this rank saying it cannot take part, and
+        :func:`collective_kv_target` then cancels the decision for EVERY rank,
+        because the danger was never "nobody capped", it is "some capped and
+        some did not" (HANDOFF_675 §1a). So one rank's local defect turns spec
+        item 12 off node-wide, and from the outside that is indistinguishable
+        from a rung whose deficit never crossed zero -- the exact confusion
+        that cost five shifts on this mechanism.
+
+        EDGE-TRIGGERED ON THE REASON, not on every call: the first line dates
+        the failure and a per-call repeat would bury it. A different
+        precondition failing re-arms the edge, because that is new information.
+        The count rides along so "still abstaining" stays legible without a
+        line per proposal.
+        """
+        self._abstain_count += 1
+        if reason != self._last_abstain_reason:
+            self._last_abstain_reason = reason
+            logger.warning(
+                "%s ABSTAIN on device %s (#%d): %s. This CANCELS THE SHRINK "
+                "FOR THE WHOLE GROUP -- the min-reduce declines whenever any "
+                "rank's current row count is not positive, so no rank will "
+                "cap this round, and spec item 12 is inert node-wide until "
+                "this rank recovers.",
+                LOG_PREFIX,
+                self._device_index,
+                self._abstain_count,
+                reason,
+            )
+        elif self._trace_all:
+            logger.warning(
+                "%s ABSTAIN on device %s (#%d, unchanged): %s",
+                LOG_PREFIX,
+                self._device_index,
+                self._abstain_count,
+                reason,
+            )
+        # A proposal was NOT made, so the deficit's sign carries no meaning
+        # this round. Reset it, or the first real proposal after an abstain
+        # can match a stale sign and be swallowed by the edge trigger -- which
+        # would restore the very silence this method exists to end.
+        self._last_deficit_sign = -1
+        return ABSTAIN
+
+    def _clear_abstain(self) -> None:
+        """Announce the return, so a WARNING is not this rung's last word."""
+        if self._last_abstain_reason is None:
+            return
+        logger.info(
+            "%s device %s is no longer abstaining after %d abstained "
+            "proposal(s) (last cause: %s); the group's shrink decision can be "
+            "reached again.",
+            LOG_PREFIX,
+            self._device_index,
+            self._abstain_count,
+            self._last_abstain_reason,
+        )
+        self._last_abstain_reason = None
 
     def _trace_proposal(self, **t) -> None:
         """Say why this rung did or did not propose a shrink.

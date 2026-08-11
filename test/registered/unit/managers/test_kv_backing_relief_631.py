@@ -574,3 +574,125 @@ class ProposalTraceReasonTest(unittest.TestCase):
         r = _relief(pool, _FakeAllocator(100000), live=(5,), card=_Card(64000))
         out = self._propose_and_capture(r)
         self.assertIn("the cheaper tier covers the whole gap", out)
+
+
+class AbstainIsNeverSilentTest(unittest.TestCase):
+    """HANDOFF_678 §4.0: an ABSTAIN was still silent, and it is the worst case.
+
+    ``propose`` has four early ``ABSTAIN`` returns above the trace, so a rank
+    that cannot take part at all logged NOTHING while doing it. That is not a
+    decline -- :func:`collective_kv_target` cancels the WHOLE group's decision
+    when any single ``current`` is not positive, so ONE silent abstention turns
+    spec item 12 off node-wide and looks exactly like a rung that declined on
+    the arithmetic.
+
+    D5 fixed the two skip paths BELOW the early returns. These are the returns
+    themselves, and each one must name which precondition it failed, loudly
+    enough that a reader hunting a dead rung finds it instead of the four terms
+    of a deficit that was never computed.
+    """
+
+    ASK = dict(
+        want_bytes=100 * MIB,
+        floor_bytes=1024 * MIB,
+        delta_bytes=256 * MIB,
+        cheap_relief_bytes=0,
+    )
+
+    def _capture(self, relief, level="WARNING"):
+        with self.assertLogs(kbr.__name__, level=level) as cm:
+            out = relief.propose(**self.ASK)
+        return out, "\n".join(cm.output)
+
+    def test_an_unsupported_pool_names_the_missing_entry_point(self):
+        pool = _FakePool(rows=1000)
+        pool.runtime_set_backing_rows = None  # a pool without the entry point
+        r = _relief(pool, _FakeAllocator(1000), live=(5,), card=_Card(2000))
+        proposal, out = self._capture(r)
+        self.assertEqual(proposal, kbr.ABSTAIN)
+        self.assertIn("ABSTAIN", out)
+        self.assertIn("runtime_set_backing_rows", out)
+
+    def test_a_zero_bytes_per_row_says_so_rather_than_dividing_by_it(self):
+        pool = _FakePool(rows=1000, bytes_per_row=0)
+        r = _relief(pool, _FakeAllocator(1000), live=(5,), card=_Card(2000))
+        proposal, out = self._capture(r)
+        self.assertEqual(proposal, kbr.ABSTAIN)
+        self.assertIn("ABSTAIN", out)
+        self.assertIn("bytes_per_row", out)
+
+    def test_an_empty_pool_names_the_row_count_it_read(self):
+        pool = _FakePool(rows=0)
+        r = _relief(pool, _FakeAllocator(1), live=(), card=_Card(2000))
+        proposal, out = self._capture(r)
+        self.assertEqual(proposal, kbr.ABSTAIN)
+        self.assertIn("ABSTAIN", out)
+        self.assertIn("backed rows", out)
+
+    def test_an_unreadable_live_set_is_reported_as_the_abstain_cause(self):
+        """The probe already warns; the ABSTAIN it CAUSES must be its own line.
+
+        The probe's warning says "live-set probe failed". It does not say that
+        the group's decision was cancelled as a result, and those are different
+        facts for the reader.
+        """
+
+        def _boom():
+            raise RuntimeError("no live set here")
+
+        pool = _FakePool(rows=1000)
+        r = kbr.KvBackingRelief(
+            pool,
+            _FakeAllocator(1000),
+            live_slots_fn=_boom,
+            bytes_per_row=pool._bytes_per_row,
+            probe=_Card(2000).probe,
+        )
+        proposal, out = self._capture(r)
+        self.assertEqual(proposal, kbr.ABSTAIN)
+        self.assertIn("ABSTAIN", out)
+        self.assertIn("live set", out)
+
+    def test_the_abstain_line_says_the_group_decision_is_cancelled(self):
+        """A reader must not have to know the reduction to read the damage."""
+        pool = _FakePool(rows=0)
+        r = _relief(pool, _FakeAllocator(1), live=(), card=_Card(2000))
+        _, out = self._capture(r)
+        self.assertIn("whole group", out.lower())
+
+    def test_a_persistent_abstain_does_not_flood_but_keeps_a_count(self):
+        """Edge-triggered like the deficit trace, and it says how many.
+
+        ``propose`` runs a few times a minute, so the cost of repeating is low
+        -- but a per-call line would bury the FIRST one, which is the one that
+        dates the failure. The count is what keeps "still abstaining" legible.
+        """
+        pool = _FakePool(rows=0)
+        r = _relief(pool, _FakeAllocator(1), live=(), card=_Card(2000))
+        with self.assertLogs(kbr.__name__, level="WARNING") as cm:
+            for _ in range(5):
+                r.propose(**self.ASK)
+        self.assertEqual(len(cm.output), 1, cm.output)
+        # ... and a changed cause re-arms the edge, because a DIFFERENT
+        # precondition failing is new information.
+        pool.size = 1000
+        pool._bytes_per_row = 0
+        r._bytes_per_row = 0
+        with self.assertLogs(kbr.__name__, level="WARNING") as cm2:
+            r.propose(**self.ASK)
+        self.assertIn("bytes_per_row", "\n".join(cm2.output))
+
+    def test_recovering_from_an_abstain_is_announced_too(self):
+        """The rank came back. A reader watching for the rung needs that fact.
+
+        Without it, an abstain that healed leaves a WARNING as the last word on
+        this rung for the rest of the run.
+        """
+        pool = _FakePool(rows=0)
+        r = _relief(pool, _FakeAllocator(1000), live=(5,), card=_Card(64000))
+        with self.assertLogs(kbr.__name__, level="WARNING"):
+            r.propose(**self.ASK)
+        pool.size = 100000
+        with self.assertLogs(kbr.__name__, level="INFO") as cm:
+            r.propose(**self.ASK)
+        self.assertIn("no longer abstaining", "\n".join(cm.output).lower())
