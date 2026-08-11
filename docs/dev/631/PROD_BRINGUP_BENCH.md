@@ -4546,3 +4546,65 @@ On the SHIPPED margin (512 MiB) both terms are near-inert by construction:
 the reserve is 512 rows against 512552 backed, and the margin is fundable on
 every seam. That is the point -- the floor is a bound on the pathological
 case, not a tax on the ordinary one.
+
+---
+
+## s39 (#657) — allocation steering: the actuator exists, and it costs
+
+The REBALANCE tier's actuator was built this shift and **ships OFF**. What it
+does is real: every allocation path takes the head of the KV allocator's free
+list, so a stable residue-class partition steers all of them at once, placing
+bytes without moving or freeing any. What it buys on this architecture is
+nothing, and what it costs is measurable.
+
+**The mechanism works, on the axis it should be judged on (placement):**
+
+| | s39 window (steer ON) |
+|---|---|
+| ranks armed / "not applicable" / DISARMS before the fatal seam | 3 / 0 / 0 |
+| rank -> NVML permutation (resolved by UUID, agreed over the group) | **[1, 0, 2]** |
+| decisions by absorbing rank | rank 0: 18, rank 2: 15, **binding card: 0** |
+| decisions naming the actually-fullest card | 24/30 (80%) |
+| promoted-slot counts appearing in TRIPLES | **11/11 — the three ranks' free lists are identical slot-for-slot** |
+
+That last row is worth more than the mechanism it came from: the whole flip
+design rests on "the free list is replicated scheduler state", asserted in a
+docstring and never verified on metal until this window.
+
+**And the price, at matched load** (both windows drive the same
+`s33_occupancy_leg.py --sessions 3 --tokens 130000`):
+
+| max_live at the KV rung's proposals | s38 (no steer) | s39 (steer ON) |
+|---|---|---|
+| p50 over all proposals | 132507 | **512543** |
+| at usage >= 0.20 | 343949 | **512543** |
+| share of the 512552-row id space | 67% | **99%** |
+
+The rung's floor is `max_live + 1 + margin + admission reserve`, so scattering
+allocations across a residue class drives the floor to the top of the pool and
+the rung -- the funder of the fatal pp->tp leg -- can return almost nothing.
+A hermetic test (`test_a_class_bias_raises_the_maximum_live_id`) predicted the
+direction before the boot; the window supplied the magnitude.
+
+**And the window did not survive it.** At t+18, inside a pp->tp cutover, all
+three ranks went down on `KvReshardError: PHASE-FLIP payload checksum mismatch
+from peer 1 -- refusing to scatter`, and in the SAME SECOND the steer's own
+replication check disarmed it on all three ranks: `the free list is NOT
+replicated across ranks (checksums 455859173976 vs 455936170468)`.
+
+The decision was group-uniform; the APPLICATION was not. The bias is
+re-applied on a rank-local 1 s clock (frees return pages to the head of the
+list and wash the order out), so three ranks re-sort at three different
+instants and hold the same members in different orders in between. The
+reshard plan is built from that state. A pure function applied on a private
+clock is not a group-uniform mutation of replicated state.
+
+| | s38 (30 min, no steer) | s39 (18 min, steer ON) |
+|---|---|---|
+| corridor breaches | 0 | 0 |
+| free-headroom spread p50 | 2741 MiB | 2625 MiB |
+| per-card MIN | 1083 / 1580 / 1581 | 1121 / 1558 / 1415 |
+| survived its window | **yes** | **NO** |
+
+Serving was restored on the ship config at 22:59:08Z (health 200, steering
+unset, 0 steer lines) and left running.

@@ -125,6 +125,60 @@ def steer_stats(log: Path):
     return out
 
 
+def decisions_vs_column(win: Path, perm):
+    """Did each steer name the card that actually had the most free memory?
+
+    The decision is taken from a rank-local NVML read and then reduced with
+    MIN, so it is not required to equal any single rank's view -- but if it
+    routinely named a card that was NOT the fullest, the steer would be
+    chasing noise, and that is worth knowing separately from whether it was
+    UNIFORM. Joined on the log's own second-resolution timestamp against the
+    corridor sampler, which is the only clock both instruments share.
+    """
+    if not perm:
+        return None
+    col = {}
+    with open(win / "corridor.csv") as f:
+        r = csv.reader(f)
+        next(r, None)
+        for x in r:
+            try:
+                col[int(x[0]) // 1000] = [int(v) for v in x[1:4]]
+            except (ValueError, IndexError):
+                continue
+    if not col:
+        return None
+    import datetime as dt
+
+    hits = miss = unknown = 0
+    for line in open(win / "serving.log", errors="replace"):
+        if "CORRIDOR-STEER steering NEW KV" not in line:
+            continue
+        m = _TOWARD.search(line)
+        ts = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        if not (m and ts):
+            continue
+        epoch = int(
+            dt.datetime.strptime(ts.group(1), "%Y-%m-%d %H:%M:%S")
+            .replace(tzinfo=dt.timezone.utc)
+            .timestamp()
+        )
+        sample = None
+        for d in range(0, 3):
+            sample = col.get(epoch - d) or col.get(epoch + d)
+            if sample:
+                break
+        if not sample:
+            unknown += 1
+            continue
+        want_card = perm[int(m.group(1))]
+        if want_card == max(range(3), key=lambda i: sample[i]):
+            hits += 1
+        else:
+            miss += 1
+    return hits, miss, unknown
+
+
 def main():
     win = Path(sys.argv[1])
     base = Path(sys.argv[2]) if len(sys.argv) > 2 else None
@@ -154,6 +208,13 @@ def main():
         if triples != len(counts):
             odd = {v: c for v, c in counts.items() if c % 3}
             print(f"     ! not a multiple of three: {odd}")
+    dv = decisions_vs_column(win, s["perm"])
+    if dv:
+        hits, miss, unknown = dv
+        tot = hits + miss
+        print(f"   decisions naming the ACTUALLY fullest card: {hits}/{tot}"
+              + (f" ({100*hits//tot}%)" if tot else "")
+              + (f", {unknown} unjoinable" if unknown else ""))
     print(f"   DISARMS                    : {len(s['disarmed'])}")
     for d in s["disarmed"][:3]:
         print(f"     ! {d}")
@@ -174,14 +235,26 @@ def main():
     else:
         print("   no proposal carried the split clause")
     if s["max_live"]:
-        ml = s["max_live"]
-        gaps = [
-            m - int(u * 512552) for m, u in zip(ml, s["usage_at_proposal"])
-        ]
-        gaps = sorted(g for g in gaps if g > 0)
-        if gaps:
-            print(f"   max_live vs live tokens: gap p50 {gaps[len(gaps)//2]} rows, "
-                  f"max {gaps[-1]} rows")
+        # THE CEILING ITSELF, which is what the rung's floor is made of. A
+        # mechanism that raises it makes the rung able to return LESS, so
+        # this is the axis on which a steer can do harm, and comparing it
+        # between windows only means something at matched load -- the
+        # occupancy leg is identical in both, so the usage column is what
+        # makes the rows comparable.
+        ml = sorted(m for m in s["max_live"] if m > 1000)
+        if ml:
+            print(f"   max_live at proposals  : p50 {ml[len(ml)//2]}, "
+                  f"max {ml[-1]} of a 512552-row pool "
+                  f"({100*ml[-1]//512552}% of the id space)")
+            pairs = [
+                (u, m)
+                for u, m in zip(s["usage_at_proposal"], s["max_live"])
+                if m > 1000
+            ]
+            hi = [m for u, m in pairs if u >= 0.20]
+            if hi:
+                print(f"   ... of those, at usage >= 0.20: p50 "
+                      f"{sorted(hi)[len(hi)//2]}, max {max(hi)}")
 
     print("\n-- THE FREE COLUMN (a consequence, not the proof)")
     cur = spread_stats(win / "corridor.csv")

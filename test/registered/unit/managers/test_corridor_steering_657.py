@@ -352,6 +352,23 @@ class TestTheRealAllocatorMethods(unittest.TestCase):
             with self.assertRaises(ValueError):
                 real.set_owner_bias(bad)
 
+    def test_the_default_path_is_unchanged_when_nothing_is_steered(self):
+        """PROTECT THE SHIP CONFIG. The bias lives on the shared base, so its
+        code runs on every boot; with no bias set, `merge_and_sort_free` must
+        produce exactly the sorted list it always did. Also covers the
+        allocators that do NOT call `super().__init__` (SWA, hisparse) and so
+        never get the attribute at all -- every read of it is a `getattr`
+        with a default, and this fails if one stops being.
+        """
+        real = self._real()
+        del real._owner_bias  # the SWA/hisparse shape: attribute never set
+        real.free_pages = torch.tensor([9, 3, 7], dtype=torch.int64)
+        real.release_pages = torch.tensor([5, 1], dtype=torch.int64)
+        real.merge_and_sort_free()
+        self.assertEqual(real.free_pages.tolist(), [1, 3, 5, 7, 9])
+        self.assertEqual(real.release_pages.numel(), 0)
+        self.assertEqual(real._apply_owner_bias(), 0)
+
     def test_real_partition_holds_through_a_merge(self):
         # merge_and_sort_free re-sorts, which undoes the partition; the
         # override must put it back or the steer lives only until the first
