@@ -12,6 +12,13 @@ The corridor law is no longer enforced at one allocation site, and spec item
 12's rung is no longer a mechanism nobody has ever seen decline — it now says
 which term declined it, in the log, every time the sign changes.
 
+**Read §1e before anything else if you are short of time.** The first
+acceptance boot of the new gate was ABORTED and re-run, because the gate
+emitted no line in 6066 admissions and "working but never needed" was
+indistinguishable from "inert". A review pass then found four defects in it,
+two of which were masking each other and one of which would have killed
+speculative decoding. None of them reached a shipped run.
+
 ---
 
 ## 1. ERRORS FIRST
@@ -34,7 +41,9 @@ pool's pages are committed once at `KvVmmBufferOwner.finalize()` and
 `alloc_extend` hands out slots that are ALREADY COMMITTED. Charging KV bytes
 would arm the gate on every admission for memory that is never allocated.
 What actually grows is the forward's transient working set, so that is what
-is charged, from the metrics reporter's own per-token figure.
+is charged: the metrics reporter's per-token figure DIVIDED BY THE LAYER
+COUNT (the reporter sums over layers; residency does not -- see §1e D3) and
+hard-capped at 256 MiB.
 
 **It SPILLS and never REFUSES.** `ensure_headroom` returns a verdict, and at
 the seam a false verdict means abandon the flip — a decision every rank
@@ -51,8 +60,9 @@ first.** The gate is not the missing piece; the collective is.
 
 ### 1a-bis. THE HONEST LIMIT OF THIS GATE, PINNED BY A TEST THAT SAYS SO
 
-The activation slope is a movement proxy and biased small. When it
-underprices the chunk, the gate CANNOT preempt the crossing — the check
+The activation slope is a movement proxy, and on this rig it is absent
+outright (§1e D2), so `want` is 0 and the gate prices nothing. When the chunk
+is underpriced, the gate CANNOT preempt the crossing — the check
 before the chunk sees a card still above the floor. What it does instead is
 arm on the very next admission, ~90 ms later on the measured mix rather than
 the ~2 s it took the seam to notice.
@@ -128,6 +138,74 @@ allocators were swept rather than assumed:
 C18 is the same shape as C17: a physically-growing allocator that answers to
 a different floor than the law. It will diverge the moment the dial is
 enabled.
+
+### 1e. FOUR DEFECTS IN THIS SHIFT'S OWN GATE, AND THE ONE THAT FOUND THEM
+
+**The gate logged nothing across 6066 prefill admissions on its first boot.**
+Every line it can emit is conditional on ARMING, so an installed-but-inert
+gate and a healthy gate on a card that never approaches the floor produce
+byte-identical logs. That is precisely the accusation this module's own
+docstring levels at the KV rung, committed within the hour.
+
+So the gate now ANNOUNCES itself once per process -- INFO with both floors,
+the resolved slope and the provider list when armed, WARNING when inert. The
+run was aborted at t+26 min and archived (`evidence-631/s34/accept-run1`)
+rather than shipped, because the axis this shift exists to close could not be
+observed in it. It was otherwise the strongest run of the chain, which is
+exactly the temptation the abort exists to resist.
+
+A review of the diff then found four more, ranked as they were reported:
+
+**D1, a crash.** `dynamic_chunked_prefill_size()` is annotated `-> int` and
+returns **None** whenever chunked prefill is off (explicit `-1`, multimodal
+without chunked support, `prefix_lm`, `--enable-mis`). `int(None)` sat
+OUTSIDE the gate's `try`, on the scheduler event loop. Not reachable on this
+boot's `--chunked-prefill-size 512`; a landmine on any other.
+
+**D2, why the log was silent, and it was not inertness.**
+`_qkv_act_bytes_per_token` and its FFN partner are created only inside
+`_init_estimated_perf_constants`, behind `enable_metrics` AND
+`enable_mfu_metrics`. This rig sets the first and not the second, so the
+attributes do not exist, the slope is 0, `want` is 0 and no pricing line is
+possible. **The silence was expected behaviour, and the inference "therefore
+the gate is a no-op" was wrong** -- the announcement is what settles it, not
+the reasoning.
+
+**D3, the one that would have hurt.** When the slope IS readable it is summed
+over every layer: each term in the reporter carries a `* num_layers`. For
+this model that is ~9.4 MiB/token, so a 512-token chunk prices at **~4.7
+GiB** -- larger than any card's free column. The guard frees towards
+`floor + delta + want`, so that target is unreachable, and an unreachable
+target spends EVERY provider on EVERY admission: `empty_cache()` at 4 Hz, and
+the rebalance provider that evacuates the drafter and takes speculative
+decoding with it. Transient activation is reused down the stack, so the
+resident figure is one layer's share.
+
+**D2 and D3 were masking each other.** Enabling the metrics to "fix" the
+missing slope would have switched on a slope that was wrong by a factor of
+64. Fixing either alone makes things worse than fixing neither.
+
+The fix is three-part: divide by the layer count, REFUSE to price when the
+layer count is unknown, and hard-cap `want` at 256 MiB. **The cap is the
+safety property, not a tuning knob**: no error in a proxy may be allowed to
+make the ladder's target unreachable.
+
+**D4, the default path.** `get_corridor_guard` had one caller and it lived on
+the flip seam, so the guard, its ladder, its NVML fleet probe and its
+`KvBackingRelief` were built only on phase-flip boots. Calling it from the
+unconditional prefill path built all of that on EVERY boot of this fork. The
+gate is now off unless `--enable-phase-flip` is set -- the corridor law is a
+property of this feature's regime and does not get to change everyone else's
+allocator behaviour as a side effect.
+
+**D5, booked and NOT fixed.** On the two paths where `propose` skips the
+deficit computation (`floor_rows >= current`, or `_exhausted`), the new KV
+trace still prints "the cheaper tier covers the whole gap", which is the
+wrong reason -- the real ones are "no slack above the floor" and "release
+granularity exhausted". A diagnostic that states a false cause is worse than
+one that states none. It needs a `skipped` reason threaded from `propose`.
+
+---
 
 ---
 
