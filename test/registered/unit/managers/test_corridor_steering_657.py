@@ -250,6 +250,51 @@ class TestTheRealAllocatorMethods(unittest.TestCase):
     touch -- they are pure tensor code and need nothing else.
     """
 
+    def test_the_allocator_this_rig_actually_uses_carries_the_bias(self):
+        """THE TRAP THAT COST A BOOT, pinned so it cannot come back.
+
+        The scheduler keeps ONE allocator for process life -- the PP stack's
+        -- and the PP layout has ``dcp_size == 1``, so at ``page_size == 1``
+        the chooser builds a plain ``TokenToKVPoolAllocator``, NOT the paged
+        one (``model_runner_kv_cache_mixin.py:4083``). The first boot of this
+        mechanism armed and steered nothing, reporting "the active allocator
+        has no owner bias" nine times, because the methods lived on the paged
+        subclass. They belong on the shared base, and this test fails if they
+        ever move back down.
+        """
+        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+        for cls in (
+            BaseTokenToKVPoolAllocator,
+            TokenToKVPoolAllocator,
+            PagedTokenToKVPoolAllocator,
+        ):
+            self.assertTrue(hasattr(cls, "set_owner_bias"), cls.__name__)
+            self.assertTrue(hasattr(cls, "_apply_owner_bias"), cls.__name__)
+
+    def test_the_unpaged_allocator_partitions_identically(self):
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+        a = TokenToKVPoolAllocator.__new__(TokenToKVPoolAllocator)
+        a.page_size = 1
+        a.free_pages = torch.arange(1, 321, dtype=torch.int64)
+        a.release_pages = torch.empty((0,), dtype=torch.int64)
+        a.is_not_in_free_group = True
+        a._owner_bias = None
+        a.device = "cpu"
+        a.need_sort = False
+        fake = _FakeAllocator(320)
+        self.assertEqual(
+            a.set_owner_bias((32, 14, 24)), fake.set_owner_bias((32, 14, 24))
+        )
+        self.assertEqual(a.free_pages.tolist(), fake.free_pages.tolist())
+        # And its own alloc path takes the head, which is the whole premise.
+        got = a.alloc(40)
+        res = got % 32
+        self.assertTrue(bool(((res >= 14) & (res < 24)).all()))
+
     def _real(self, size=320):
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 

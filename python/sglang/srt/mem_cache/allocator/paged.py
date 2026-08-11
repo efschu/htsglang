@@ -124,9 +124,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        #: #656 item 16: the DCP owner class new allocations should prefer,
-        #: or None. Set through :meth:`set_owner_bias` only.
-        self._owner_bias = None
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -292,101 +289,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             picks.append(pages[idxs].to(torch.int64))
         self.free_pages = pages[~take_mask]
         return picks
-
-    # -- #656 item 16, the REBALANCE tier: steering, not moving ------------
-
-    def set_owner_bias(self, bias) -> int:
-        """Prefer free slots of one DCP owner class at the head of the list.
-
-        ``bias`` is ``(mod, lo, hi)`` -- the weighted owner rule's
-        ``(cp_S, cp_lo, cp_hi)`` for the rank that should ABSORB new KV --
-        or ``None`` to steer nothing. Returns how many free slots of that
-        class were promoted, so a caller can log a number instead of a
-        claim.
-
-        THIS PLACES BYTES; IT DOES NOT MOVE OR FREE ANY. Every slot in the
-        free list is already a legal placement on its own rank, and this
-        only reorders which legal one the next allocation takes. Nothing is
-        copied, nothing is decommitted, and ``available_size()`` is
-        unchanged -- which is why the measurement law that falsified the
-        cache-dump lender (a free-memory metric cannot validate a mechanism
-        whose action is freeing memory) does not apply to it: the quantity
-        to measure here is PLACEMENT.
-
-        WHY REORDERING IS THE WHOLE MECHANISM. ``alloc``, ``alloc_extend``
-        and ``alloc_decode`` all consume the HEAD of ``free_pages``
-        (``:162``, ``:219``, ``:258``, and the two Triton kernels index it
-        from 0), so the head is the only choice point any of them has. A
-        stable partition therefore steers all three paths at once without
-        touching a kernel, and it degrades to a no-op the moment the
-        preferred class runs out -- the tail is still the whole rest of the
-        free list, so no allocation can fail because of a bias.
-
-        DETERMINISM IS A CORRECTNESS REQUIREMENT, NOT A NICETY. The free
-        list is replicated scheduler state: every rank hands out the same
-        global slot ids for the same tokens, and the owner rule turns an id
-        into a row on exactly one rank. Two ranks that ordered their free
-        lists differently would write one token's KV to two different
-        slots. The partition is therefore a pure function of
-        ``free_pages`` and ``bias`` (stable, so ties keep the sorted order),
-        and the CHOICE of bias must be group-uniform -- see
-        ``managers/corridor_steering.py``, which reduces it and then checks
-        the resulting order agrees across ranks.
-        """
-        if bias is not None:
-            mod, lo, hi = (int(v) for v in bias)
-            if mod <= 0 or not (0 <= lo < hi <= mod):
-                raise ValueError(
-                    f"owner bias {bias!r} is not a class of a {mod}-slot block"
-                )
-            if self.page_size != 1:
-                # Same precondition as alloc_owner_matched_classes: with
-                # page_size > 1 a page spans several residues, so a page id
-                # does not name an owner at all.
-                raise ValueError(
-                    "owner bias requires page_size == 1 (uneven-DCP keeps the "
-                    f"natural page size); this allocator has {self.page_size}"
-                )
-            bias = (mod, lo, hi)
-        self._owner_bias = bias
-        return self._apply_owner_bias()
-
-    def _apply_owner_bias(self) -> int:
-        """Stable-partition ``free_pages`` so the biased class leads. """
-        bias = getattr(self, "_owner_bias", None)
-        if bias is None:
-            return 0
-        if not self.is_not_in_free_group:
-            # A free group is mid-flight; its pages are not in the list yet
-            # and reordering now would be an incomplete answer taken as a
-            # complete one. The round clock will come back.
-            return 0
-        if len(self.release_pages) > 0:
-            # The BASE merge, not this class's override: the override calls
-            # back into here, and a partition that re-enters itself would
-            # pay for the same pass twice on every refill.
-            super().merge_and_sort_free()
-        pages = self.free_pages
-        if pages.numel() == 0:
-            return 0
-        mod, lo, hi = bias
-        res = pages % mod
-        m = (res >= lo) & (res < hi)
-        n = int(m.sum())
-        if n == 0 or n == pages.numel():
-            # Nothing to promote, or nothing to promote it over. Leaving the
-            # list untouched keeps the sorted order a later merge assumes.
-            return n
-        self.free_pages = torch.cat((pages[m], pages[~m]))
-        return n
-
-    def merge_and_sort_free(self):
-        super().merge_and_sort_free()
-        # The sort undoes the partition, and it runs from inside the alloc
-        # paths, so re-applying it here is what keeps the steer alive across
-        # a refill instead of only until the first one.
-        if getattr(self, "_owner_bias", None) is not None:
-            self._apply_owner_bias()
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
