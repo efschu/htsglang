@@ -191,8 +191,28 @@ reports both layouts:
 | PP1 | 8144.00 | 7923.95 | **220.1 MiB** |
 | PP2 | 9114.95 | 7923.95 | **1191.0 MiB** |
 
-This **confirms the 319/220/1191 record and refutes the 1773/0/1191 one** —
-the two disagreed and the disagreement is now closed by measurement.
+This **confirms the 319/220/1191 record**. It does NOT refute the
+1773/0/1191 one, and the first version of this paragraph said it did --
+CORRECTED after a contradictions audit (successor 30, same shift).
+
+The tail is GEOMETRY-DEPENDENT. Compare HANDOFF_662 §4 against this boot:
+
+    rank   662 pp / tp        this boot pp / tp
+    0      14936 / 13163      13482 / 13163      <- TP identical, PP differs
+    1       7924 /  6690       8144 /  7924
+    2       9115 /  7924       9115 /  7924      <- identical
+
+Rank 2 matches exactly and rank 0's TP matches, while the PP figures move.
+That is a different PP LAYER SPLIT, not bad arithmetic: both boots measured
+their own geometry correctly. `tail = max(pp,tp) - min(pp,tp)` is a function
+of the split, so it is not a constant of this rig.
+
+CONSEQUENCE, and it couples two things this handoff filed as independent:
+**changing the PP layer split changes what rung 3 harvests.** The GDN-only
+cut A/B (§5 item 3) moves layers between stages, so it moves the arena tail
+too -- possibly by more than the rung is worth. Re-measure the tail from the
+`TP stack built` line on EVERY boot whose split differs, and never carry a
+tail figure across a geometry change.
 
 Why it is the right next rung: the arena is sized `max(pp, tp)` and `pp` is
 the max on all three ranks, so the tail is committed-but-unused **in TP** —
