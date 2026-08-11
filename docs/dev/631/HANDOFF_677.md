@@ -206,6 +206,29 @@ not.
 
 ---
 
+### 3a. ONE PROVIDER DOES NOT MEASURE WHAT IT RETURNS (audit finding, not yet a bug)
+
+The ledger law is that a corridor-guard provider returns what the DRIVER gave
+back. Audited this shift:
+
+* `allocator-cache` (`corridor_guard.py:602`) probes free memory before and
+  after `empty_cache()` and returns the difference. Compliant.
+* `kv-backing` (`kv_backing_relief.py:507`) does the same around its shrink.
+  Compliant, and not a guard provider anyway.
+* **`draft-weights` (`corridor_guard.py:635`) returns
+  `carrier.spill() * _MIB`**, which is the arena's own `decommit_range` count
+  — not a measured NVML delta.
+
+It is not currently wrong, because `ensure_headroom` re-probes the driver
+after every provider (`corridor_guard.py:482`) and spends against that. But
+the number the provider RETURNS is not the number the corridor law is written
+in, and under `SGLANG_FLIP_SEAM_RETAIN_HANDLES` the arena parks the handle
+instead of releasing it — so the two diverge by the whole payload. Any future
+caller that trusts the return value directly, outside the guard, sees bytes
+the driver never gave back. Make it probe before/after like its two
+neighbours; it is a four-line change and it removes a latent member of the
+"freed nothing the driver could see" family this chain has shipped three times.
+
 ## 4. THE DYNAMIC-CHUNKING ENGAGEMENT LINE
 
 HANDOFF_676 §6.4 found the trap: the only line reporting a predicted chunk
