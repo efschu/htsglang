@@ -9,6 +9,14 @@ which the shift caught on metal, in a live window, and fixed.
 
 ## 0. THE ONE-LINE STATE
 
+**THE CONFIRMATION WINDOW DID NOT CONFIRM. It measured the lender as a net
+negative on this rig, and the switch therefore ships OFF.** The actuator is
+built, tested, reviewed and proven to do exactly what it says; what the
+window showed is that what it says is the wrong thing to do here. Read §3
+before §2 — the mechanism is only interesting once the verdict is known.
+
+### THE OLD ONE-LINE STATE, kept because the reasoning is the deliverable
+
 Spec item 16's first relief stage is an actuator instead of a report:
 `RebalanceLender` spends the corridor guard's existing ladder on the
 **water-fill's** schedule rather than the allocator's, bounded by the
@@ -263,7 +271,23 @@ and it should not be attempted by widening the lender.
 3. **C18**: give `vram_dial` the corridor guard's floor before the dial is on.
 4. The host half at a context where it fits; the dynamic-chunking A/B, unrun
    for a fourth acceptance now.
-5. `draft-weights` returns the arena's own count, not a measured NVML delta
+5. **The corridor counters are write-only, and it is systematic.** An
+   observability audit this shift found `CorridorGuard` maintains seven
+   counter attributes and logs none of them: `arm_count`, `refuse_count`,
+   `host_blocked_count`, `reclaimed_total` and both of the lender's
+   duplicates are incremented and never surfaced (`host_forced_count` alone
+   escapes, inside a warning). `kv_backing_relief` repeats it with
+   `shrink_count`, `recover_count`, `released_total`, and
+   `phase_flip_runtime` with `desync_checks`, `corridor_aborts`,
+   `entry_channel_violations`, `corridor_reclaims` and both
+   `corridor_kv_relief_*`. Every acceptance extract in this chain therefore
+   reconstructs those numbers by grepping log TEXT, which is why the flip
+   counters in `s36_extract.sh` had to be repaired against the log's actual
+   wording mid-shift. One periodic stats line per module would delete a
+   whole class of extract bugs. The lender's own counters ARE reported
+   (`corridor_rebalance` summary + inert lines), so it is not a new
+   offender, only a new instance of an old pattern.
+6. `draft-weights` returns the arena's own count, not a measured NVML delta
    (HANDOFF_677 §3a). Still latent. Note the lender never spent it in this
    window, so the defect stayed out of the item-16 numbers.
 

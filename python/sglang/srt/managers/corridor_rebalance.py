@@ -13,6 +13,24 @@
 # ==============================================================================
 """#656 spec item 16, THE ACTUATOR: the rebalance tier lends continuously.
 
+VERDICT FIRST: THIS SHIPS OFF (``SGLANG_CORRIDOR_REBALANCE=1`` to arm it).
+=========================================================================
+It was built, reviewed, tested and measured on metal, and the measurement
+says it hurts this rig: 12 corridor breaches against s34's 0, the binding
+margin 42 MiB WORSE, the levelness metric unmoved, and the KV rung firing
+five times as often. See :data:`ENABLE_ENV` for the table and for the
+mechanism -- which is the durable lesson here and is NOT specific to this
+module: **spending torch's allocator cache to satisfy a driver-side memory
+law converts allocations that were invisible to that law into allocations
+that are not.**
+
+Everything below describes what the mechanism does and why it was built.
+It is kept in full because the design is sound and the objective is the
+user's standing order; what the window falsified is the choice of PROVIDER,
+not the tier, the ordering, or the water-fill bound. A successor picking
+this up again should fund the tier with a payload that MOVES rather than one
+that merely returns cached pages -- see HANDOFF_680 §3.
+
 WHAT WAS MISSING, IN ONE MEASUREMENT
 ------------------------------------
 Successor 35 priced item 16 over successor 34's own green acceptance window
@@ -101,9 +119,35 @@ LOG_PREFIX = "CORRIDOR-REBALANCE"
 
 _MIB = 1024 * 1024
 
-#: Off switch. The lender is ON under ``--enable-phase-flip`` because item 16
-#: asks for it; ``=0`` restores the s34 shipped behaviour exactly (the gate
-#: alone), which is what an A/B against the green window needs.
+#: ON SWITCH, AND IT IS OFF BY DEFAULT. Set ``SGLANG_CORRIDOR_REBALANCE=1``
+#: to arm the lender.
+#:
+#: IT SHIPS OFF BECAUSE THE CONFIRMATION WINDOW MEASURED IT AS A NET NEGATIVE
+#: ON THIS RIG, not because it is unfinished. Over a 46-minute window against
+#: s34's green baseline (both at floor 1536, same argv, same load script):
+#:
+#:     corridor breaches below the 1024 MiB law   12   (s34: 0)
+#:     binding-instant margin                    -23   (s34: +19 MiB)
+#:     free-headroom spread, mean               2398   (s34: 2409 -- unmoved)
+#:     KV rung shrinks                           114   (s34: 21)
+#:     median PP dwell                            26s  (s34: 17s)
+#:     median TP dwell                             4s  (s34: 7s)
+#:
+#: THE MECHANISM OF THE HARM, which is the part worth carrying forward: the
+#: only provider the lender ever actually spent was ``allocator-cache``, and
+#: torch's cache is the reason most allocations are INVISIBLE to the corridor.
+#: An allocation served from cache does not move NVML's free column at all.
+#: Dumping the hoard converts those into driver allocations, so the very
+#: column the law is written on now moves for work that used to be free --
+#: and it makes ``cheap_relief`` smaller at the seam, which is why the KV
+#: rung, whose deficit discounts against it, fired five times as often.
+#:
+#: The gain it did produce was real and is the trap: a non-seam floor at
+#: exactly this module's watermark (1845 MiB where s34 sat at 1249). That is
+#: the lender clamping a number, not the rig having more usable memory.
+#:
+#: What it did NOT do is reach the trough. 20/20 of the deepest samples sit
+#: inside a flip cutover, which does not yield to the scheduler loop.
 ENABLE_ENV = "SGLANG_CORRIDOR_REBALANCE"
 
 #: Below this the fleet is level ENOUGH: the guard's own delta band is 256 MiB
@@ -401,7 +445,13 @@ def lend_on_round(scheduler, reason: str = "scheduler round") -> None:
         lend_for_guard(guard, reason)
 
 
-def lender_enabled(default: bool = True) -> bool:
+def lender_enabled(default: bool = False) -> bool:
+    """Whether this rank arms the lender. OFF unless asked for -- see ENABLE_ENV.
+
+    The default is the SHIP DECISION, and it is expressed here rather than in
+    a launch script so that nobody has to remember it. An unset environment
+    reproduces s34's green behaviour exactly: the corridor gate alone.
+    """
     raw = os.environ.get(ENABLE_ENV)
     if raw is None:
         return bool(default)
