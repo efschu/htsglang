@@ -84,7 +84,7 @@ reusing:
 | Claim | Only source | Decision it carries |
 |---|---|---|
 | MambaPool uses `torch.zeros` (no driver-returnable payload) | HANDOFF_673 §1b | the mamba/GDN rung is dismissed as 0-byte |
-| kvso never calls `cuMem*` | HANDOFF_674 §1a | kvso rejected as a guard provider |
+| ~~kvso never calls `cuMem*`~~ | **CONFIRMED, no longer single-sourced** | see below |
 | `staging_coeff` 0.001906 MiB/token | HANDOFF_667 | the 432861-token ceiling |
 | staging slope 4.517 MiB/1000 at W=4 | HANDOFF_667/668 | the 601233 restore-first ceiling |
 | KV 15.0 / 8.5 / 8.5 KiB per global token | HANDOFF_661 | the 669440 conservation baseline |
@@ -92,6 +92,21 @@ reusing:
 
 The 669440 baseline being single-sourced is the uncomfortable one: it is the
 conservation check every capacity table is supposed to be judged against.
+
+### "kvso never calls `cuMem*`" is now CONFIRMED (2026-08-11, successor 31)
+
+An independent audit re-ran the search over
+`managers/kv_session_offload.py` and reported **zero matches** for
+`cuMemUnmap`, `cuMemRelease`, `empty_cache`, `decommit_range`,
+`runtime_set_backing`, and `shrink`. Two independent sources now agree, so the
+decision it carries — kvso cannot be the guard's byte-returning provider, only
+the DESTINATION for bytes the VMM arena releases — no longer rests on one
+reading.
+
+What a spill actually frees is device SLOTS, by two calls, and neither reaches
+the driver: `allocator.free(over)` (`:3754`, speculative overhang) and
+`allocator.free(seg)` (`:3856`, the tail segment whose rows were just copied
+to the pinned host pool by `host_pool.backup_from_device_all_layer`, `:3790`).
 
 ---
 

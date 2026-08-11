@@ -301,6 +301,55 @@ space. **Size it against ~30 GiB available, not against a nominal 120**, and
 book host RAM in the same ledger as VRAM from the first rung rather than
 after the first oom.
 
+## 4c. THE HOST HALF: kvso INTEGRATION MAP (audited 2026-08-11)
+
+The device half releases bytes; kvso is where the DATA goes. An audit of
+`managers/kv_session_offload.py` produced the map, and the headline is that
+**the two halves already compose correctly** — the cap is the bridge.
+
+**Confirmed, and no longer single-sourced** (register updated): zero matches
+for `cuMemUnmap` / `cuMemRelease` / `empty_cache` / `decommit_range` /
+`runtime_set_backing` / `shrink`. A spill frees device SLOTS by
+`allocator.free(over)` (`:3754`, speculative overhang) and
+`allocator.free(seg)` (`:3856`, the tail whose rows were just copied to the
+pinned host pool by `host_pool.backup_from_device_all_layer`, `:3790`).
+
+### Why the cap and kvso already fit
+
+* `KvRowCap` removes high ids from `free_pages`, and kvso reads exactly that
+  list — `_restore_memory_ok` inspects `allocator.free_pages` (`:5173`) and
+  `allocator.available_size()` (`:5164`, `:4618`, `:2833`). So a capped pool
+  makes `_restore` DECLINE rather than allocate into unmapped rows. The
+  failure mode is a session staying on host longer, not a fault, and the
+  hysteresis controller retries so it recovers when the cap lifts.
+* `host_base` is computed ONCE at init from `allocator.size`
+  (`flashinfer_backend.py:2943` via `sentinel_base`) and never recomputed.
+  That is **safe under shrink**: it sits above the ORIGINAL maximum, so the
+  sentinel encoding (`row < host_base` distinguishes sentinel from real slot)
+  stays valid when the pool gets smaller. Worth knowing before someone
+  "fixes" it to track the live size — that would break it.
+* `region_tokens` derives from `host_pool.size` (pinned, fixed at boot), so
+  device-side residency changes do not touch region bookkeeping. Invariant:
+  `region_tokens * max_spills <= host_pool.size` (`:2441`).
+
+### The one real hazard to design against
+
+kvso's D2H reads from `self.full_pool` — the same pool the device half
+shrinks. **If backing is unmapped under rows kvso has not yet spilled, the
+copy faults.** The cap prevents the reachable version of this (nothing is
+handed out above the watermark, so live rows are always below it), but the
+ordering obligation is now explicit: **never lower the watermark below a row
+that a pending spill is about to read.** Spill first, then shrink.
+
+### Entry points for the rung
+
+`try_spill(batch, fast_pressure=None, need=None) -> bool` (`:3372`) with nine
+hard preconditions, any of which returns `False` cleanly.
+`_restore(slot, running_batch, L)` (`:5182`). Victim choice is
+`select_spill_victim` (`:1034`) → `spill_victim_candidates` (`:950`),
+youngest-first, and it protects the oldest normal session and anything marked
+`SPILL_CLASS_NEVER` or fast-lane. Concurrency is `max_spills` regions.
+
 ## 5. PROCESS NOTES THAT EARNED THEIR PLACE
 
 * **The can-fail instrument paid for itself twice in one shift.** Raising the
