@@ -239,6 +239,9 @@ class PrefillAdmissionGate:
         self._cooldown_s = float(cooldown_s)
         self._clock = clock
         self._last_arm = float("-inf")
+        #: Item 16's lender: None = not resolved yet, False = this rank has
+        #: none (disabled, or its NVML column could not be proven).
+        self._lender = None
         self._slope_logged = False
         self._measured_logged = False
         self._announced = False
@@ -361,6 +364,16 @@ class PrefillAdmissionGate:
         self._announce_once(guard)
         if guard is None:
             return None
+        # SPEC ITEM 16, FIRST RELIEF STAGE, BEFORE THE GATE IS EVEN PRICED.
+        #
+        # The lender is consulted on EVERY admission, not only the ones that
+        # arm: its whole purpose is to act before the trough, and the trough
+        # by definition happens between arms. It has its own (wider) pressure
+        # band and its own rate limiter, so the common path costs one
+        # monotonic clock read. Running it FIRST also means the gate below
+        # prices its want against a card the lender has already levelled --
+        # the two must not compete for the same bytes in the same round.
+        self._maybe_lend(guard, tokens)
         self.checks += 1
         want = self.want_bytes(tokens)
         try:
@@ -455,6 +468,36 @@ class PrefillAdmissionGate:
         )
 
     # -- internals --------------------------------------------------------
+
+    def _maybe_lend(self, guard, tokens: int) -> None:
+        """Consult item 16's rebalance lender, if this rank has one.
+
+        Resolved lazily and cached, for the same reason the guard is: this
+        object is built before the flip runtime has finished wiring, and a
+        None captured at construction would be a lender that never runs while
+        looking exactly like a lender that never needed to.
+
+        Failures are swallowed on purpose. A levelling optimisation that can
+        take prefill down is a worse bargain than an unlevel column.
+        """
+        if self._lender is False:
+            return
+        if self._lender is None:
+            try:
+                from sglang.srt.managers.corridor_rebalance import (
+                    build_rebalance_lender,
+                )
+
+                self._lender = build_rebalance_lender(guard) or False
+            except Exception as e:  # noqa: BLE001
+                logger.warning("%s rebalance lender unavailable: %s", LOG_PREFIX, e)
+                self._lender = False
+            if self._lender is False:
+                return
+        try:
+            self._lender.maybe_lend(f"prefill admission, {int(tokens)} tokens")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("%s rebalance lender raised: %s", LOG_PREFIX, e)
 
     def _guard(self):
         try:

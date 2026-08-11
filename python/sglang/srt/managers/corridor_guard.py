@@ -358,6 +358,12 @@ class CorridorGuard:
         #: the honest measure of how much the missing rebalance tier costs.
         self.host_forced_count = 0
         self.reclaimed_total = 0
+        #: Item 16's REBALANCE lender (see :meth:`lend_to_level`). Counted
+        #: apart from ``arm_count`` on purpose: an arm is an allocation that
+        #: would have breached, a lend is relief taken BEFORE any allocation
+        #: asked, and averaging the two would hide which one moved the trough.
+        self.lend_count = 0
+        self.lent_total = 0
 
     # -- registration ----------------------------------------------------
 
@@ -478,10 +484,6 @@ class CorridorGuard:
         # Free to the UPPER watermark, not merely to the floor, so the next
         # few allocations do not each pay a spill.
         target = self.floor_bytes + self.delta_bytes + want
-        used: List[str] = []
-        used_host = False
-        reclaimed = 0
-        free_now = free_before
         # Item 16: read the fleet ONCE, before spending. Re-reading it after
         # each provider would let a rebalance that just filled a peer card
         # close the host gate mid-ladder on the strength of its own effect,
@@ -490,53 +492,15 @@ class CorridorGuard:
         fleet_level = self._host_tier_permitted(column)
         host_ok = fleet_level or bool(refusal_is_fatal)
         host_forced = bool(refusal_is_fatal) and not fleet_level
-        host_blocked = False
-        for provider in self._providers:
-            if free_now >= target:
-                break
-            if provider.tier == RELIEF_HOST and host_forced and not used_host:
-                used_host = True
-                self.host_forced_count += 1
-                logger.warning(
-                    "%s spending HOST RAM on device %d while the fleet is NOT "
-                    "level (free column %s MiB, spread %d MiB), because "
-                    "refusing here would deadlock the caller. Item 16 wanted "
-                    "these bytes rebalanced onto a peer card instead -- this "
-                    "counter is the cost of the missing rebalance tier, not a "
-                    "licence. (%s)",
-                    LOG_PREFIX,
-                    self.device_index,
-                    [int(f // _MIB) for f in column],
-                    free_spread_mib(column),
-                    reason or "no reason given",
-                )
-            if provider.tier == RELIEF_HOST and not host_ok:
-                # Never while a peer still has headroom: the bytes belong on
-                # that card, not in RAM.
-                host_blocked = True
-                continue
-            deficit = target - free_now
-            try:
-                got = int(provider.free_up_to(deficit))
-            except Exception as e:
-                # A provider that fails must not take the allocation down;
-                # the gate simply has less to spend and may still refuse.
-                logger.warning(
-                    "%s provider %r raised while freeing: %s",
-                    LOG_PREFIX,
-                    provider.name,
-                    e,
-                )
-                continue
-            if got <= 0:
-                continue
-            reclaimed += got
-            used.append(provider.name)
-            # Re-probe rather than trusting the provider's arithmetic: the
-            # law is what the DRIVER reports, and a provider that returns
-            # its payload size while the pages went to torch's cache has
-            # freed nothing the corridor can see.
-            free_now = self.free_bytes()
+        reclaimed, free_now, used, used_host, host_blocked = self._spend_ladder(
+            target=target,
+            free_now=free_before,
+            column=column,
+            host_ok=host_ok,
+            host_forced=host_forced,
+            max_tier=RELIEF_HOST,
+            reason=reason,
+        )
 
         self.reclaimed_total += reclaimed
         # Judged against the LAW, not the arming watermark: see __init__.
@@ -593,6 +557,175 @@ class CorridorGuard:
         return GuardResult(
             ok, free_before, free_now, want, reclaimed, tuple(used), detail
         )
+
+    # -- the ladder, shared by the gate and the lender ---------------------
+
+    def _spend_ladder(
+        self,
+        *,
+        target: int,
+        free_now: int,
+        column: Sequence[int],
+        host_ok: bool,
+        host_forced: bool,
+        max_tier: int,
+        reason: str,
+    ):
+        """Spend providers, cheapest tier first, until ``target`` free or dry.
+
+        ONE ladder, two callers. :meth:`ensure_headroom` runs it with
+        ``max_tier=RELIEF_HOST`` (spend anything the fleet permits);
+        :meth:`lend_to_level` runs it with ``max_tier=RELIEF_REBALANCE``, so
+        item 16's first relief stage physically cannot reach a park or a host
+        spill. Extracting it was the alternative to a second spend loop, which
+        in this module is how two policies drift apart while both look right.
+
+        ``max_tier`` may terminate the loop rather than skip, because
+        ``_providers`` is kept sorted by ``(tier, cost)``.
+        """
+        used: List[str] = []
+        used_host = False
+        host_blocked = False
+        reclaimed = 0
+        for provider in self._providers:
+            if free_now >= target:
+                break
+            if provider.tier > max_tier:
+                break
+            if provider.tier == RELIEF_HOST and host_forced and not used_host:
+                used_host = True
+                self.host_forced_count += 1
+                logger.warning(
+                    "%s spending HOST RAM on device %d while the fleet is NOT "
+                    "level (free column %s MiB, spread %d MiB), because "
+                    "refusing here would deadlock the caller. Item 16 wanted "
+                    "these bytes rebalanced onto a peer card instead -- this "
+                    "counter is the cost of the missing rebalance tier, not a "
+                    "licence. (%s)",
+                    LOG_PREFIX,
+                    self.device_index,
+                    [int(f // _MIB) for f in column],
+                    free_spread_mib(column),
+                    reason or "no reason given",
+                )
+            if provider.tier == RELIEF_HOST and not host_ok:
+                # Never while a peer still has headroom: the bytes belong on
+                # that card, not in RAM.
+                host_blocked = True
+                continue
+            deficit = target - free_now
+            try:
+                got = int(provider.free_up_to(deficit))
+            except Exception as e:
+                # A provider that fails must not take the allocation down;
+                # the gate simply has less to spend and may still refuse.
+                logger.warning(
+                    "%s provider %r raised while freeing: %s",
+                    LOG_PREFIX,
+                    provider.name,
+                    e,
+                )
+                continue
+            if got <= 0:
+                continue
+            reclaimed += got
+            used.append(provider.name)
+            # Re-probe rather than trusting the provider's arithmetic: the
+            # law is what the DRIVER reports, and a provider that returns
+            # its payload size while the pages went to torch's cache has
+            # freed nothing the corridor can see.
+            free_now = self.free_bytes()
+
+        return reclaimed, free_now, used, used_host, host_blocked
+
+    # -- item 16's first relief stage --------------------------------------
+
+    def lend_to_level(
+        self,
+        bound_bytes: int,
+        *,
+        column: Sequence[int],
+        max_tier: int = RELIEF_REBALANCE,
+        reason: str = "",
+    ) -> GuardResult:
+        """Give up to ``bound_bytes`` back on THIS card because the fleet is
+        unlevel -- before any allocation has asked for them.
+
+        WHAT MAKES THIS THE REBALANCE TIER AND NOT A SECOND GATE. The gate is
+        reactive by construction: it arms on an allocation that would breach,
+        which means the trough has already been reached by the time relief is
+        spent. s34's green window measured that trough at 19 MiB of margin on
+        the binding card while a peer held 3280 MiB free -- a PLACEMENT
+        problem, not a capacity one. The lender is the same ladder, spent on
+        the schedule the water-fill dictates instead of the schedule the
+        allocator dictates.
+
+        THE BOUND IS THE OBJECTIVE, NOT A DEFICIT. ``bound_bytes`` comes from
+        :func:`water_fill_transfers` -- the payload this card must shed to sit
+        level with its peers. Freeing more than that would evacuate a card
+        that is no longer the tightest, which is the same unevenness with the
+        sign flipped, and it would pay restore costs for nothing.
+
+        IT PHYSICALLY CANNOT REACH HOST RAM. ``max_tier`` defaults to
+        ``RELIEF_REBALANCE`` and the ladder terminates there, so the lender
+        can never do what item 16 forbids -- spill to RAM while a peer has
+        headroom -- no matter what a caller passes as a bound. Host RAM stays
+        exactly where item 15c put it: the last stage, reached only through
+        :meth:`ensure_headroom`, only once every card is at the floor.
+
+        It never touches the KV rung either: that one is collective (it moves
+        ``available_size()`` and therefore admission), and a rank-local lender
+        that shrank the pool would be "a smaller pool as the fix", which the
+        standing rule forbids and which this method is the alternative to.
+        """
+        bound = max(0, int(bound_bytes))
+        free_before = self.free_bytes()
+        if bound == 0:
+            return GuardResult(
+                True, free_before, free_before, 0, 0, (), "nothing to lend"
+            )
+        target = free_before + bound
+        # HARD CEILING, not a default a caller can lift. Park is legitimate
+        # here -- parking a cold payload in a peer card's surplus IS the
+        # redistribution item 16 asks for -- but host RAM is the last stage by
+        # user order, and the lender runs precisely when the fleet is UNLEVEL,
+        # which is the one state in which host RAM is forbidden.
+        ceiling = min(int(max_tier), RELIEF_PARK)
+        claimed, free_now, used, _used_host, _blocked = self._spend_ladder(
+            target=target,
+            free_now=free_before,
+            column=list(column),
+            # The fleet is unlevel by construction -- that is why the lender
+            # was called -- so the host tier is shut and cannot be forced.
+            host_ok=False,
+            host_forced=False,
+            max_tier=ceiling,
+            reason=reason,
+        )
+        # THE MEASURED DELTA, NOT THE SUM OF THE PROVIDERS' CLAIMS. The gate
+        # can afford to credit claims because its verdict is re-probed anyway;
+        # the lender's whole output IS the number, and this chain has three
+        # times credited bytes that went to an allocator free-list instead of
+        # to the driver. A fall in free between the probes (another process
+        # taking memory) reads as 0 rather than as a negative.
+        measured = max(0, free_now - free_before)
+        self.lend_count += 1
+        self.lent_total += measured
+        self.reclaimed_total += measured
+        detail = (
+            f"lent {measured/_MIB:.0f} MiB of a {bound/_MIB:.0f} MiB "
+            f"water-fill bound, free {free_before/_MIB:.0f} -> "
+            f"{free_now/_MIB:.0f} MiB, from [{', '.join(used) or 'nothing'}], "
+            f"column {[int(f // _MIB) for f in column]} MiB, spread "
+            f"{free_spread_mib(column)} MiB"
+            + (
+                f" (providers claimed {claimed/_MIB:.0f} MiB)"
+                if claimed != measured
+                else ""
+            )
+            + (f" ({reason})" if reason else "")
+        )
+        return GuardResult(True, free_before, free_now, 0, measured, tuple(used), detail)
 
 
 def nvml_fleet_probe() -> Callable[[], List[int]]:

@@ -53,6 +53,7 @@ from __future__ import annotations
 import unittest
 
 from sglang.srt.managers import corridor_guard as cg
+from sglang.srt.managers import corridor_rebalance as crb
 
 MIB = 1024 * 1024
 
@@ -396,6 +397,217 @@ class WhenRefusingIsFatalTest(unittest.TestCase):
         r = g.ensure_headroom(900 * MIB, refusal_is_fatal=True)
         self.assertTrue(r.ok)
         self.assertEqual(g.host_forced_count, 0)
+
+
+class _Clock:
+    """A hand-cranked monotonic clock, so rate limiting is tested and not slept."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float):
+        self.t += seconds
+
+
+def _lender(guard, index, clock, **kw):
+    return crb.RebalanceLender(guard, nvml_index=index, clock=clock, **kw)
+
+
+class TheRebalanceTierLendsContinuouslyTest(unittest.TestCase):
+    """Item 16's ACTUATOR (successor 36).
+
+    The gate arms on an allocation, which means the trough has already
+    happened by the time it spends anything. s34's green window measured that
+    trough at 19 MiB of margin on card 0 while card 1 held 3280 MiB free.
+    These pin the lender that spends the same ladder on the water-fill's
+    schedule instead of the allocator's.
+    """
+
+    def test_the_card_the_water_fill_says_must_shed_lends_without_an_allocation(self):
+        # Card 0 is under the 1280 MiB watermark and 700 MiB below the fleet
+        # mean. Nothing is allocating; the s34 gate would therefore have done
+        # NOTHING here, and that inaction is what the 19 MiB margin was.
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        lender = _lender(g, 0, _Clock())
+
+        result = lender.maybe_lend("test")
+
+        self.assertIsNotNone(result)
+        self.assertGreater(result.reclaimed, 0)
+        self.assertEqual(lender.lends, 1)
+        self.assertGreater(fleet.free[0], 1100 * MIB)
+
+    def test_the_spend_is_bounded_by_the_objective_not_by_the_provider_pool(self):
+        # The provider could give 4 GiB. The water-fill wants 700 MiB shed and
+        # the watermark is 180 MiB away, so the correct spend is 180 MiB: the
+        # SMALLER of objective and pressure. Freeing the pool would evacuate a
+        # card that is no longer the tightest -- the same unevenness, mirrored.
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        lender = _lender(g, 0, _Clock())
+
+        result = lender.maybe_lend("test")
+
+        self.assertEqual(result.reclaimed, 180 * MIB)
+
+    def test_the_lender_can_never_reach_host_ram(self):
+        # THE STANDING ORDER: host RAM is the last stage and is forbidden
+        # while any peer has headroom -- which is exactly the state the lender
+        # runs in. Even asked for the host tier explicitly, it must not spend
+        # it. Not by convention: the ladder terminates below it.
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        order = []
+
+        def spy(name, fn):
+            def wrapped(n):
+                order.append(name)
+                return fn(n)
+
+            return wrapped
+
+        g.register("cache", 10, spy("cache", fleet.provider(0, 40)), tier=cg.RELIEF_LOCAL)
+        g.register("kvso", 1, spy("kvso", fleet.provider(0, 4000)), tier=cg.RELIEF_HOST)
+        # PARK is reachable and must stay so: parking a cold payload in a peer
+        # card's surplus VRAM IS the redistribution item 16 asks for. This
+        # half of the assertion is what stops the ceiling being clamped so low
+        # that the tier below host becomes dead code.
+        g.register("park", 5, spy("park", fleet.provider(0, 40)), tier=cg.RELIEF_PARK)
+        lender = _lender(g, 0, _Clock())
+
+        lender.maybe_lend("test")
+        # Asked directly for the host tier, the ceiling still holds. Host is
+        # blocked TWICE here -- by the ceiling and by ``host_ok=False`` -- and
+        # either alone suffices; the test pins the composite behaviour.
+        g.lend_to_level(900 * MIB, column=fleet.column(), max_tier=cg.RELIEF_HOST)
+
+        self.assertNotIn("kvso", order)
+        self.assertIn("park", order)
+        self.assertEqual(set(order), {"cache", "park"})
+
+    def test_the_absorber_never_lends(self):
+        # Card 1 is under pressure (1200 < 1280) but holds MORE free than the
+        # mean. Evacuating it would make the column less level, not more.
+        fleet = _Fleet([800, 1200, 800])
+        g = _guard(fleet, 1)
+        g.register("draft-weights", 20, fleet.provider(1, 4000), tier=cg.RELIEF_REBALANCE)
+        lender = _lender(g, 1, _Clock())
+
+        self.assertIsNone(lender.maybe_lend("test"))
+        self.assertEqual(lender.skips["absorber"], 1)
+        self.assertEqual(fleet.free[1], 1200 * MIB)
+
+    def test_a_level_fleet_is_left_alone(self):
+        # 26 MiB of unevenness is inside the guard's own 256 MiB delta band
+        # and indistinguishable from sampling noise on a live rig. Paying a
+        # drafter restore for it would be thrash with a levelling excuse.
+        fleet = _Fleet([1200, 1250, 1230])
+        g = _guard(fleet, 0)
+        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        lender = _lender(g, 0, _Clock())
+
+        self.assertIsNone(lender.maybe_lend("test"))
+        self.assertEqual(lender.skips["level-enough"], 1)
+
+    def test_a_card_above_the_watermark_is_not_the_lenders_business(self):
+        # Unevenness alone is not a reason to act: this card is not under
+        # pressure, and the corridor's second half says a full card is the
+        # GOAL, not a defect. The trigger is the gate's own signal.
+        fleet = _Fleet([4000, 9000, 4000])
+        g = _guard(fleet, 0)
+        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        lender = _lender(g, 0, _Clock())
+
+        self.assertIsNone(lender.maybe_lend("test"))
+        self.assertEqual(lender.skips["no-pressure"], 1)
+
+    def test_an_unreadable_fleet_stops_the_lender(self):
+        # No evidence is not evidence. The guard degrades this way for the
+        # host gate; the lender must not act on a column it could not read.
+        fleet = _Fleet([1100, 3000, 1600])
+        g = cg.CorridorGuard(
+            0, floor_mib=1024, delta_mib=256, probe=fleet.probe(0), fleet_probe=list
+        )
+        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        lender = _lender(g, 0, _Clock())
+
+        self.assertIsNone(lender.maybe_lend("test"))
+        self.assertEqual(lender.skips["fleet-unknown"], 1)
+        self.assertEqual(fleet.free[0], 1100 * MIB)
+
+    def test_the_rate_limiter_holds_the_hot_path(self):
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        g.register("draft-weights", 20, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        clock = _Clock()
+        lender = _lender(g, 0, clock)
+
+        self.assertIsNotNone(lender.maybe_lend("first"))
+        fleet.free[0] = 1100 * MIB  # pressure returns immediately
+        self.assertIsNone(lender.maybe_lend("too soon"))
+        self.assertEqual(lender.skips["rate-limited"], 1)
+        clock.advance(3.0)
+        self.assertIsNotNone(lender.maybe_lend("later"))
+
+    def test_a_lend_that_yields_nothing_backs_off_and_a_good_one_recovers(self):
+        # A card whose non-layer-bound payload is already gone stays the
+        # water-fill's shedder forever: the unevenness is then structural and
+        # asking again every 2 s is a throughput regression, not a policy.
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        g.register("dry", 20, lambda n: 0, tier=cg.RELIEF_REBALANCE)
+        clock = _Clock()
+        lender = _lender(g, 0, clock)
+
+        lender.maybe_lend("miss 1")
+        self.assertEqual(lender._interval_s, 4.0)
+        clock.advance(5.0)
+        lender.maybe_lend("miss 2")
+        self.assertEqual(lender._interval_s, 8.0)
+
+        g.register("real", 21, fleet.provider(0, 4000), tier=cg.RELIEF_REBALANCE)
+        clock.advance(9.0)
+        lender.maybe_lend("hit")
+        self.assertEqual(lender._interval_s, lender.base_interval_s)
+
+    def test_lent_bytes_are_the_measured_delta_not_the_providers_claim(self):
+        # The three-times-repeated defect in this corpus: crediting bytes that
+        # went to an allocator free-list. The lender's whole output is this
+        # number, so it is measured against the driver, never claimed.
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        g.register("liar", 20, lambda n: 512 * MIB, tier=cg.RELIEF_REBALANCE)
+        lender = _lender(g, 0, _Clock())
+
+        result = lender.maybe_lend("test")
+
+        self.assertEqual(result.reclaimed, 0)
+        self.assertEqual(lender.lent_bytes, 0)
+        self.assertIn("providers claimed 512 MiB", result.detail)
+
+    def test_the_lender_is_off_when_the_env_switch_says_so(self):
+        # The A/B against s34's green window needs the shipped behaviour to be
+        # reachable exactly, not approximately.
+        fleet = _Fleet([1100, 3000, 1600])
+        g = _guard(fleet, 0)
+        self.assertIsNone(crb.build_rebalance_lender(g, nvml_index=0, enabled=False))
+        self.assertIsNotNone(crb.build_rebalance_lender(g, nvml_index=0, enabled=True))
+
+    def test_the_gate_still_reaches_host_ram_when_the_fleet_is_level(self):
+        # The lender must not have narrowed the gate's own ladder: item 15c's
+        # host tier is still there, still last, still opened by a level fleet.
+        fleet = _Fleet([1100, 1200, 1150])
+        g = _guard(fleet, 0)
+        g.register("kvso", 90, fleet.provider(0, 4000), tier=cg.RELIEF_HOST)
+        r = g.ensure_headroom(900 * MIB)
+        self.assertTrue(r.ok)
+        self.assertIn("kvso", r.used_providers)
 
 
 if __name__ == "__main__":

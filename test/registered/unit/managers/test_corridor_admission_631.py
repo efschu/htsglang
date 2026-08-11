@@ -545,3 +545,51 @@ def test_stats_report_what_the_gate_did():
     assert stats["checks"] == 12
     assert stats["armed"] >= 1
     assert stats["reclaimed_mib"] > 0
+
+
+# ---------------------------------------------------------------------------
+# SPEC ITEM 16 (successor 36): the rebalance lender rides this hot path.
+# ---------------------------------------------------------------------------
+
+
+def _unlevel_gate(card, peer_free_mib=3000):
+    """A gate whose fleet is UNLEVEL, with this card as the water-fill loser."""
+    from sglang.srt.managers.corridor_rebalance import RebalanceLender
+
+    scheduler = FakeScheduler(FakeReporter(qkv=COHERENT_SLOPE, ffn=0))
+    gate = PrefillAdmissionGate(scheduler, cooldown_s=0.0)
+    guard = CorridorGuard(
+        0,
+        probe=card.probe,
+        fleet_probe=lambda: [card.free, peer_free_mib * MIB, peer_free_mib * MIB],
+    )
+    guard.register("allocator-cache", 0, card.provider, tier=RELIEF_LOCAL)
+    gate._guard = lambda: guard  # noqa: SLF001
+    gate._lender = RebalanceLender(guard, nvml_index=0, clock=lambda: 0.0)
+    return gate, guard
+
+
+def test_the_lender_is_consulted_on_admissions_the_gate_would_not_arm():
+    # THE POINT OF THE WHOLE TIER. This card is above the gate's arm line but
+    # below the watermark, and a peer holds 3 GiB. s34's gate did nothing here
+    # -- 42276 prefill admissions, relief only on the 232 that armed -- and
+    # the trough that followed was 19 MiB from the law.
+    card = FakeCard(free_mib=1270, hoard_mib=1000)
+    gate, guard = _unlevel_gate(card)
+
+    verdict = gate.before_admission(512)
+
+    assert verdict is None, "the gate itself must NOT have armed here"
+    assert guard.lend_count == 1
+    assert guard.lent_total > 0
+    assert card.free > 1270 * MIB
+
+
+def test_a_level_fleet_leaves_the_admission_path_exactly_as_it_was():
+    # The regression that matters: with the fleet level the lender must be a
+    # no-op, so every pre-item-16 admission number is reproduced byte for byte.
+    card = FakeCard(free_mib=1384, hoard_mib=1000)
+    gate, guard = _unlevel_gate(card, peer_free_mib=1384)
+    run_prefill(card, gate)
+    assert guard.lend_count == 0
+    assert gate.stats()["checks"] == 12
