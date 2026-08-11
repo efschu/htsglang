@@ -240,15 +240,64 @@ class HonestAccountingTest(unittest.TestCase):
         r = _relief(pool, a, live=[5], card=card)
         self.assertEqual(r.free_up_to(500 * MIB), 0)
 
-    def test_a_cap_that_bought_nothing_is_released_again(self):
-        # Holding a cap that yielded no driver bytes would cost capacity for
-        # nothing -- the worst of both directions.
+    def test_a_shrink_that_freed_nothing_is_never_undone_in_the_gate(self):
+        # THE 2.5 GiB METAL BUG, 2026-08-11.
+        #
+        # Undoing a failed shrink means GROWING, and growing calls finalize ->
+        # cuMemCreate. So the "cleanup" ALLOCATES, inside a gate that armed
+        # because memory was short. Measured: free 3040 -> 460 MiB across one
+        # refusal that reported "reclaimed 428 MiB", ending in
+        # cuMemCreate CUDA_ERROR_OUT_OF_MEMORY. The relief provider was the
+        # biggest consumer on the card.
         card = _Card(1100)
         pool = _FakePool(100000, bytes_per_row=MIB // 10, card=None)
         a = _FakeAllocator(100000)
         r = _relief(pool, a, live=[5], card=card)
         r.free_up_to(500 * MIB)
-        self.assertEqual(a.available_size(), 100000)
+        self.assertEqual(len(pool.calls), 1, "the gate must not grow the pool")
+        self.assertLess(pool.calls[0], 100000)
+
+    def test_the_cap_stays_on_after_a_zero_byte_shrink(self):
+        # The cap is the invariant "nothing above the watermark is handed
+        # out". Lifting it while the pool is still shrunk is the fault the
+        # cap exists to prevent -- and lifting it costs nothing to keep.
+        card = _Card(1100)
+        pool = _FakePool(100000, bytes_per_row=MIB // 10, card=None)
+        a = _FakeAllocator(100000)
+        r = _relief(pool, a, live=[5], card=card)
+        r.free_up_to(500 * MIB)
+        self.assertLess(a.available_size(), 100000)
+
+    def test_a_pool_that_paid_nothing_is_not_asked_twice(self):
+        # One failed shrink is evidence about the ARENA, not about this
+        # moment. Retrying can only cost time and risk; on metal it cost
+        # 2.5 GiB per gate arm because every arm repeated the attempt.
+        card = _Card(1100)
+        pool = _FakePool(100000, bytes_per_row=MIB // 10, card=None)
+        a = _FakeAllocator(100000)
+        r = _relief(pool, a, live=[5], card=card)
+        r.free_up_to(500 * MIB)
+        r.free_up_to(500 * MIB)
+        r.free_up_to(500 * MIB)
+        self.assertEqual(len(pool.calls), 1)
+
+    def test_a_failed_recovery_keeps_the_cap_engaged(self):
+        # Growing can fail for want of memory. When it does, the watermark
+        # has not moved, so the cap must not move either: a capacity loss is
+        # survivable, handing out unbacked ids is not.
+        class _StuckPool(_FakePool):
+            def runtime_set_backing_rows(self, rows):
+                if rows > self.size:
+                    raise RuntimeError("cuMemCreate failed: OUT_OF_MEMORY")
+                return super().runtime_set_backing_rows(rows)
+
+        card = _Card(1100)
+        pool = _StuckPool(100000, bytes_per_row=MIB // 10, card=card)
+        a = _FakeAllocator(100000)
+        r = _relief(pool, a, live=[5], card=card)
+        r.free_up_to(500 * MIB)
+        self.assertEqual(r.recover(), 0)
+        self.assertLess(a.available_size(), 100000)
 
     def test_recover_restores_both_the_backing_and_the_cap(self):
         card = _Card(1100)
@@ -278,6 +327,30 @@ class HonestAccountingTest(unittest.TestCase):
         card = _Card(1100)
         r = _relief(_Plain(), _FakeAllocator(1000), live=[5], card=card)
         self.assertEqual(r.free_up_to(500 * MIB), 0)
+
+
+class ChunklessArenaIsDisqualifiedTest(unittest.TestCase):
+    """The root cause of the metal incident, pinned at the registration site.
+
+    Without a commit chunk the arena holds ONE extent per buffer, and
+    ``decommit_range`` releases only extents lying wholly above the keep
+    point -- so a shrink to any watermark inside that extent releases exactly
+    zero while still lowering ``pool.size``. Registering against such a pool
+    produced a provider that consumed memory instead of freeing it.
+    """
+
+    class _Sched:
+        def __init__(self, supports):
+            pool = _FakePool(1000)
+            pool.supports_backing_spans = supports
+            self._pool = pool
+            self.token_to_kv_pool_allocator = _FakeAllocator(1000)
+            self.token_to_kv_pool_allocator.get_kvcache = lambda: pool
+
+    def test_a_chunkless_pool_does_not_register_a_provider(self):
+        self.assertIsNone(
+            kbr.kv_backing_provider(self._Sched(False), device_index=0)
+        )
 
 
 class FlushMustNotTouchUnbackedRowsTest(unittest.TestCase):

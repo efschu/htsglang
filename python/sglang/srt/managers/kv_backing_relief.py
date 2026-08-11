@@ -216,6 +216,10 @@ class KvBackingRelief:
         #: overwritten by a second one, so a two-step relief still recovers to
         #: the boot reservation rather than to the intermediate step.
         self._rows_at_boot: Optional[int] = None
+        #: Set when a shrink returned no driver bytes. One such attempt is
+        #: evidence about the ARENA, not about this moment, so repeating it
+        #: can only cost time and risk -- and on metal it cost 2.5 GiB.
+        self._exhausted = False
         self.shrink_count = 0
         self.recover_count = 0
         self.released_total = 0
@@ -248,7 +252,7 @@ class KvBackingRelief:
     # -- the provider ----------------------------------------------------
 
     def free_up_to(self, nbytes: int) -> int:
-        if not self._supported() or self._bytes_per_row <= 0:
+        if not self._supported() or self._bytes_per_row <= 0 or self._exhausted:
             return 0
         max_live = self._max_live_row()
         if max_live < 0:
@@ -286,19 +290,36 @@ class KvBackingRelief:
             return 0
         measured = max(0, self._free_bytes() - before)
         if measured <= 0:
-            # The pool may report bytes it merely UNMAPPED (retained handles),
-            # and a cap that bought no driver bytes costs capacity for
-            # nothing. Undo it rather than carry it.
+            # A SHRINK THAT FREED NOTHING MUST NOT BE UNDONE HERE, and getting
+            # this wrong cost 2.5 GiB per gate arm on metal (2026-08-11).
+            #
+            # ``recover()`` GROWS the pool, and growing calls ``finalize``,
+            # which calls ``cuMemCreate``. Undoing a failed shrink therefore
+            # ALLOCATES -- inside a gate that armed precisely because memory
+            # was short. Measured: free 3040 -> 460 MiB across one refusal
+            # whose own detail line claimed it had "reclaimed 428 MiB", and
+            # eventually ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` on
+            # the way back. The relief provider was the biggest consumer on
+            # the card.
+            #
+            # So: KEEP THE CAP (it is free, and it is the invariant that
+            # nothing is handed out above the watermark), do not re-commit,
+            # and stop trying. Recovery happens on the tp->pp leg, at an
+            # idle boundary, where an allocation is affordable and survivable.
+            self._exhausted = True
             logger.warning(
                 "%s shrink to %d rows reported %.0f MiB but the driver's free "
-                "column did not move; releasing the cap again. Retained "
-                "handles (SGLANG_FLIP_SEAM_RETAIN_HANDLES) unmap without "
-                "releasing, and those bytes are address space, not memory.",
+                "column did not move, so this pool cannot pay: the arena has "
+                "no commit chunk, or its handles are retained "
+                "(SGLANG_FLIP_SEAM_RETAIN_HANDLES), and unmapping without "
+                "releasing yields address space rather than memory. The cap "
+                "STAYS ON -- undoing it here would re-commit pages inside a "
+                "gate that armed because memory was short. No further attempt "
+                "will be made until the next recovery.",
                 LOG_PREFIX,
                 target,
                 claimed / (1024 * 1024),
             )
-            self.recover()
             return 0
         self.shrink_count += 1
         self.released_total += measured
@@ -326,14 +347,29 @@ class KvBackingRelief:
         if self._rows_at_boot is None:
             return 0
         rows = int(self._rows_at_boot)
-        restored = 0
-        if self._supported() and int(getattr(self._pool, "size", 0)) < rows:
-            self._pool.runtime_set_backing_rows(rows)
-            restored = rows - int(getattr(self._pool, "size", rows))
+        was = int(getattr(self._pool, "size", 0))
+        if self._supported() and was < rows:
+            try:
+                self._pool.runtime_set_backing_rows(rows)
+            except Exception as e:
+                # Growing commits pages, so it can fail for want of memory.
+                # THE CAP STAYS ON when it does: the invariant is "nothing is
+                # handed out above what is backed", and a failed grow leaves
+                # the watermark exactly where it was.
+                logger.error(
+                    "%s recovery to %d rows failed: %s. The cap stays engaged, "
+                    "so admission capacity remains reduced -- a capacity loss, "
+                    "never a fault.",
+                    LOG_PREFIX,
+                    rows,
+                    e,
+                )
+                return 0
         self._cap.release()
         self._rows_at_boot = None
+        self._exhausted = False
         self.recover_count += 1
-        return max(0, restored) or rows
+        return max(0, int(getattr(self._pool, "size", rows)) - was)
 
 
 def bytes_per_row(pool: Any) -> int:
@@ -386,13 +422,27 @@ def kv_backing_provider(
     if pool is None or not callable(getattr(pool, "runtime_set_backing_rows", None)):
         return None
     if not bool(getattr(pool, "supports_backing_spans", False)):
-        # Not fatal, but say so: without a commit chunk the arena releases in
-        # whole extents and a small ask may return nothing at all.
-        logger.info(
-            "%s pool reports no commit chunk; backing relief will release in "
-            "whole extents only",
+        # A CHUNKLESS ARENA CANNOT PAY, AND TRYING COSTS REAL MEMORY.
+        #
+        # Without a commit chunk the arena holds one extent per buffer, and
+        # ``decommit_range`` releases only extents lying WHOLLY above the keep
+        # point -- so a shrink to any watermark inside that extent releases
+        # exactly zero while still lowering ``pool.size``. The pool then looks
+        # smaller than its backing, and the way back re-commits.
+        #
+        # Measured on metal 2026-08-11: registered against a chunkless pool,
+        # this provider drove device 0 from 3040 MiB free to 460 and ended in
+        # ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY``. An inert provider
+        # would have been merely useless; this one was the biggest consumer on
+        # the card. So the missing chunk is a DISQUALIFIER, not a warning.
+        logger.warning(
+            "%s the KV pool's arena has NO COMMIT CHUNK, so a partial release "
+            "cannot return anything to the driver. Backing relief is NOT "
+            "registered. Boot with SGLANG_FLIP_SEAM_CHUNK_MIB set to enable "
+            "chunked commits and this rung with it.",
             LOG_PREFIX,
         )
+        return None
     row_bytes = bytes_per_row(pool)
     if row_bytes <= 0:
         logger.warning(

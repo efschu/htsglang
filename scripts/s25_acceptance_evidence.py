@@ -147,6 +147,63 @@ def main() -> int:
     if not endpoints:
         print("   none seen")
 
+    # -- item 16: levelness is a SEPARATE axis from the corridor minimum ----
+    #
+    # A run can hold the floor on every card and still be badly unlevel, and
+    # unlevel is exactly the state the user forbade: one card binding while
+    # another sits on gibibytes. The sampler books spread per sample, so this
+    # reports it as a time series statistic rather than an average that hides
+    # the unlevel moments.
+    series = os.path.join(a.outdir, "corridor.series.csv")
+    print("\n-- item 16: free-headroom spread (levelness)")
+    if os.path.exists(series):
+        sp = [float(r["spread"]) for r in csv.DictReader(open(series))
+              if r.get("spread")]
+        if sp:
+            sp_sorted = sorted(sp)
+            print(f"   spread mean {sum(sp)/len(sp):.0f} MiB, median "
+                  f"{sp_sorted[len(sp)//2]:.0f}, WORST {max(sp):.0f} MiB "
+                  f"({len(sp)} samples)")
+        else:
+            print("   series present but carries no spread column")
+    else:
+        print("   no corridor.series.csv -- run the sampler with --series")
+
+    # -- the relief ladder: which rung paid, and how often ------------------
+    #
+    # Counted per PROVIDER, because the ladder's whole design is that tier
+    # outranks cost and the cheap tiers are meant to absorb the pressure. A
+    # run in which the host tier paid is a run in which levelling failed, and
+    # that has to be visible next to the corridor verdict rather than buried.
+    txt = open(a.log, errors="ignore").read()
+    print("\n-- relief ladder (spill/restore per rung)")
+    cleared = len(re.findall(r"CORRIDOR-GUARD cleared on device", txt))
+    refused = len(re.findall(r"CORRIDOR-GUARD REFUSED on device", txt))
+    forced = len(re.findall(r"spending HOST RAM on device", txt))
+    print(f"   gate: {cleared} cleared, {refused} refused, "
+          f"{forced} host-forced (each forced one is a levelling failure)")
+    spent = re.findall(r"reclaimed \d+ MiB from \[([^\]]*)\]", txt)
+    names = {}
+    for group in spent:
+        for n in (x.strip() for x in group.split(",")):
+            if n and n != "nothing":
+                names[n] = names.get(n, 0) + 1
+    for n, c in sorted(names.items(), key=lambda kv: -kv[1]):
+        print(f"   provider {n}: paid {c} time(s)")
+    if not names:
+        print("   no provider was spent (the gate never needed to arm)")
+    kvb = re.findall(
+        r"KV-BACKING released (\d+) MiB by backing (\d+) rows instead of (\d+)",
+        txt,
+    )
+    if kvb:
+        mib = [int(m[0]) for m in kvb]
+        print(f"   kv-backing: {len(kvb)} shrink(s), {sum(mib)} MiB total, "
+              f"max {max(mib)} MiB, deepest cut to "
+              f"{min(int(m[1]) for m in kvb)} rows")
+    rec = len(re.findall(r"KV-BACKING .*recover|recover_kv_backing", txt))
+    print(f"   kv-backing recoveries seen in log: {rec}")
+
     print("\n-- host RAM")
     for f in ("/sys/fs/cgroup/memory.peak", "/sys/fs/cgroup/memory.events"):
         if os.path.exists(f):
