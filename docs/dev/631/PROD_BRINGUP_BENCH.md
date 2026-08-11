@@ -3959,3 +3959,59 @@ binds AFTER this rung, not before it.
 Item 16 is untouched by this rung: spread 2895 vs 2901 MiB. Releasing bytes on
 every card in the same phase does not level anything. Levelling needs the
 rebalance tier, not another payload.
+
+### s30 — kvso CANNOT fund the corridor guard (third "frees nothing" catch)
+
+Spec item 12 names kvso as the KV-to-host spill class, and the natural reading
+is that it can serve as the guard's RELIEF_HOST provider. It cannot.
+
+`managers/kv_session_offload.py` frees device slots into the ALLOCATOR FREE
+LIST and never touches physical backing:
+
+    kv_session_offload.py:3754   self.allocator.free(over.to(torch.int64))
+    kv_session_offload.py:3856   self.allocator.free(seg.to(torch.int64))
+
+    grep -n "empty_cache|release_backing|decommit|cuMem" kv_session_offload.py
+    -> no matches
+
+NVML free does not move, so `ensure_headroom` re-probes and counts it as 0. A
+kvso provider would be inert and would LOOK like a working one. This is the
+third time in this chain a "payload" turned out to free nothing the driver can
+see (1925 MiB drafter estimate; idle mamba slots; now kvso). The pattern is
+always the same: an internal bookkeeping free mistaken for a physical release.
+The existing pin is `test_corridor_guard_631.py:183
+test_a_provider_that_frees_to_torchs_cache_does_not_count`.
+
+Its host pool (`kv_sess_host_pool`) is pinned host RAM allocated once at boot
+and never released either.
+
+**What CAN fund it.** The production KV pool IS a `KvVmmArena` under #631 —
+`model_runner_kv_cache_mixin.py:3925` passes `swappable_backing=True` when
+`enable_phase_flip`, reaching `memory_pool.py:2439 KvVmmBufferOwner`, whose
+`decommit_range` is `cuMemUnmap` + `cuMemRelease`. The driver-returning
+primitives are:
+
+    memory_pool.py:2588  release_backing_span(layers, lo_row, hi_row) -> bytes
+    memory_pool.py:3705  runtime_set_backing_rows(rows) -> bytes released
+
+**The blocker is the watermark, not the release.** `shrink()` requires "rows
+above the new span must be dead", and NOTHING in the tree computes a safe
+shrink point from the live set. The #330 vram dial does not compute one — it
+destroys the live set instead (`vram_dial.py:957`: `tree_cache.reset()`,
+`req_to_token_pool.clear()`, then `allocator.resize`). And
+`vram_dial.py:1053` REFUSES `--enable-vram-dial` outright when kvso is on.
+
+So a KV provider must (a) pick a watermark above the highest LIVE row
+(`kv_reshard.py:879 _live_slots()` via `tree_cache.all_values_flatten()`, and
+the flip already has `build_flip_live_slots_fn`), (b) evict only the CACHED
+entries above it, (c) cap the allocator so nothing is handed out above the
+watermark, (d) then release. Skipping (c) means the next allocation touches
+unbacked memory — a fault, not an error.
+
+**And the REBALANCE actuator already exists.** `managers/kv_reshard.py` (#297)
+moves KV rows between DCP ranks at runtime — `KvReshardRuntime.arm(target)` ->
+`on_round` -> `_execute`, NCCL batch_isend_irecv, reads-before-writes,
+checksum-verified, proven on `7,3,3 -> 2,11,10`. `distributed/corridor_vector.py`
+only SOLVES a vector; this is the mover. Wiring reshard as the guard's
+RELIEF_REBALANCE provider is the item-16 levelling path, and it needs no new
+transport.
