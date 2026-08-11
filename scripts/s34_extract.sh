@@ -156,7 +156,10 @@ for r in d["results"]:
 PYEOF
   done
   echo " 5 run until it RUNS, spec carried in every briefing"
-  echo "     PROCESS ITEM. Carried; this is successor 34 of the chain."
+  # SELF is the shift that RAN the window, not the shift that wrote this
+  # script: an extract that misnames its own author is the first line a
+  # successor stops trusting.
+  echo "     PROCESS ITEM. Carried; this is ${SELF:-successor 34} of the chain."
   echo " 6 FULL KV: everything cold of the inactive layout spills to host at"
   echo "   the phase change; spill depth SELECTABLE"
   echo "     --phase-flip-spill-depth arena on this boot (selectable: none |"
