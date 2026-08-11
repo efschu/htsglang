@@ -65,6 +65,17 @@ c() { grep -c "$1" "$SCAN" 2>/dev/null | head -1; }
   echo "   The last three MUST be 0 for this to be residency rather than 'a"
   echo "   smaller pool as the fix': a shrink that never gives its rows back"
   echo "   is a capacity loss wearing a spill's clothes."
+  echo
+  # A SUCCESSFUL recovery logs NOTHING, so the proof that the rows came back
+  # has to be read off the next proposal's own view of the pool. Quoted here
+  # because "0 failed recoveries" is not the same claim as "the pool is whole".
+  LASTROWS=$(grep "KV-BACKING proposal on device" "$SCAN" 2>/dev/null \
+    | tail -1 | grep -oE "rows current=[0-9]+" | grep -oE "[0-9]+")
+  echo "   backed rows at the LAST proposal: ${LASTROWS:-unknown} (boot pool $(cat "$OUT/pool" 2>/dev/null))"
+  if [ -n "${LASTROWS:-}" ] && [ "${LASTROWS:-0}" = "$(cat "$OUT/pool" 2>/dev/null)" ]; then
+    echo "   -> the pool RETURNED to its boot reservation after shrinking."
+    echo "      This is the line that separates a spill from a capacity loss."
+  fi
   echo "   Sample proposals and shrinks:"
   grep -m 3 "KV-BACKING released" "$SCAN" 2>/dev/null | sed 's/^/     /'
   grep -m 2 "KV-BACKING proposal on device" "$SCAN" 2>/dev/null | sed 's/^/     /'
