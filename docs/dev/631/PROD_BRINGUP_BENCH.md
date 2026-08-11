@@ -4048,3 +4048,33 @@ checking shell's OWN command line. Structural /proc argv matching showed no
 fill load at all. Occurrence 14 of the `pgrep -f` / `pkill -f` self-match
 family in this chain, and it was in a shell written one screen after quoting
 the rule. Select processes by argv STRUCTURE, never by regex over cmdline.
+
+### s30 — real-load window, depth=arena (load mix labelled)
+
+25 min, 04:56-05:21Z. LOAD MIX (see realload.loadmix.txt):
+  PRIMARY real qwen agent traffic via router 30099 -- 2 agents doing genuine
+  read-only audits. Reached the rig on /v1/messages?beta=true and
+  /v1/completions (NOT /v1/chat/completions -- counting the wrong endpoint is
+  how I briefly mis-read this window as having no traffic at all).
+  TOP-UP s26_fill_load 04:58-05:08Z only, then STOPPED: it takes 4 streams
+  against max_running_requests=4 and was starving the real workers.
+
+| card | MIN free | mean | breaches |
+|---|---|---|---|
+| 0 (3080) | 1974 | 2285 | 0 |
+| 1 (5090) | 4278 | 5201 | 0 |
+| 2 (3080) | 2262 | 2661 | 0 |
+
+    per-card MINIMUM free 1974 / 4278 / 2262, floor 1024, CORRIDOR HELD: True
+    free-headroom SPREAD mean 2920 MiB, WORST 3997 MiB
+
+Real traffic alone: 37938 live slots = **7.6% occupancy**. Not capacity
+evidence, and it will not become capacity evidence by running longer --
+max_running_requests=4 caps concurrency, so >=80% on real traffic needs ~4
+CONCURRENT LONG-CONTEXT agents, not more short ones.
+
+Item 16 across every run this shift (5 windows, 3 boots, both depths, both
+floors): spread mean 2895-2938, worst 3155-4013 MiB. The 5090 never once
+dropped below 3.8 GiB free while both 3080s bound at 1.7-2.3 GiB. **The
+unlevelness is structural, not a transient**, and no payload rung touches it --
+only the rebalance tier can.
