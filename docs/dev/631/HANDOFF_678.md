@@ -8,6 +8,13 @@ geometry, pool and residency state it belongs to.
 
 ## 0. THE ONE-LINE STATE
 
+**ACCEPTANCE: GREEN.** 65 unmanned minutes, 28302 corridor samples at 100 ms,
+zero breaches on any card, 642 flips in both directions with zero abandons and
+zero tracebacks, strict purity over 42276 prefill batches, and spec item 12's
+KV rung FIRED 21 times with the pool returning to its boot reservation every
+time. Both YaRN legs cleared 262144. Every failure signature this corpus knows
+was grepped by name and came back zero.
+
 The corridor law is no longer enforced at one allocation site, and spec item
 12's rung is no longer a mechanism nobody has ever seen decline — it now says
 which term declined it, in the log, every time the sign changes.
@@ -369,17 +376,17 @@ except its own abort.
 
 | axis | result |
 |---|---|
-| **corridor** | **0 breaching samples**, per-card MIN free `MIN0 / MIN1 / MIN2` MiB against the 1024 MiB law. The law HELD on every card for the whole window |
-| item 16, at the minimum | spread `SPREAD` MiB at the binding instant (s33: 717). The levelling actuators were NOT touched this shift, so this axis moved only with run-to-run variance |
-| flips | `FLIPS` both directions, **0 abandons, 0 tracebacks** |
-| strict purity | **True** -- `PREFILLB` prefill batches, **ZERO** carrying a graph |
-| decode graphs | `DGRAPH` |
-| MTP | accept length `ACCEPT` (s33: 2.649) |
-| occupancy | live slots max `OCC` (s33: 64.8%) |
+| **corridor** | **0 breaching samples**, per-card MIN free **1043 / 1922 / 1541** MiB against the 1024 MiB law. The law HELD on every card for the whole window |
+| item 16, at the minimum | spread **879** MiB at the binding instant (s33: 717). The levelling actuators were NOT touched this shift, so this axis moved only with run-to-run variance |
+| flips | **321 pp_to_tp + 321 tp_to_pp** both directions, **0 abandons, 0 tracebacks** |
+| strict purity | **True** -- **42276** prefill batches, **ZERO** carrying a graph |
+| decode graphs | **99.2%** |
+| MTP | accept length **2.850** (s33: 2.649) |
+| occupancy | live slots max **342616 = 66.8% of pool** (s33: 64.8%) |
 | **spec item 4** | **PROVEN TWICE**: 271237 prompt tokens per leg, above the 262144 boundary, 48 tokens decoded each |
-| **spec item 12** | **FIRED** -- `SHRINKS` rank-shrinks, every one on a row target all three ranks agreed to, and the pool returned to 512552 each time (§3) |
-| prefill gate (C17) | **ARMED and quoted** on all three ranks; `PGATE` arms, `PSHORT` shortfalls. The 0 is read in §1a-ter, not as a pass |
-| relief ladder | seam gate `GATECLR` cleared, **0 refused, 0 host-forced** |
+| **spec item 12** | **FIRED** -- **21** rank-shrinks, every one on a row target all three ranks agreed to, and the pool returned to 512552 each time (§3) |
+| prefill gate (C17) | **ARMED and quoted** on all three ranks; **0** arms, **0** shortfalls. The 0 is read in §1a-ter, not as a pass |
+| relief ladder | seam gate **232** cleared, **0 refused, 0 host-forced** |
 | every failure signature | **0**, each grepped by name (block below) |
 
 ### EVERY FAILURE SIGNATURE THIS CORPUS KNOWS, COUNTED AND ZERO
