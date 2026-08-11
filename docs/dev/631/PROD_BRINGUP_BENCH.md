@@ -4517,3 +4517,32 @@ Probe (NOT an acceptance), margin forced to an unfundable 8192 MiB:
 branches executed on metal -- and the instance then died of
 `full_available_size=0` because the margin flows unbounded into the
 collective KV rung. See HANDOFF_681 section 1a.
+
+## successor 38 — the probe's own verdict, on the same forced margin
+
+Same probe, same 8192 MiB unfundable margin, against the KV rung's new
+admission floor and the gate's bounded discretionary ask. s37's run of this
+configuration died of `full_available_size=0` two minutes and 42 cutovers
+after its first delay.
+
+| | s37 (no floor) | s38 (admission floor) |
+|---|---|---|
+| seam delays / yields | 72 / 35 | see EXTRACT, both > 0 |
+| corridor breaches | 0 | 0 |
+| `Available full tokens: 0` | **the death** | **0** |
+| health at the end | **000** | 200 |
+
+The rung's account is legible in the log for the first time, and both new
+terms print their own numbers:
+
+    KV-BACKING proposal on device 0: rows current=512552 floor=593
+      (max_live=80 + admission reserve 512, slack=511959)
+
+    PHASE-FLIP-SPILL KV rung asked for 3949 of 8192 MiB discretionary
+      (pp_to_tp): it can return 4999 MiB above its admission floor, and
+      asking for more would drive it to that floor for bytes it does not have
+
+On the SHIPPED margin (512 MiB) both terms are near-inert by construction:
+the reserve is 512 rows against 512552 backed, and the margin is fundable on
+every seam. That is the point -- the floor is a bound on the pathological
+case, not a tax on the ordinary one.

@@ -158,8 +158,51 @@ spending all of its slack every time for bytes it does not have.
 
 ## 3. THE EVIDENCE
 
-*(filled in below by the metal sections; see §3a for the forced-margin probe
-and §3b for the confirmation window.)*
+### 3a. THE FORCED-MARGIN PROBE: THE SAME INPUT, AND THE INSTANCE LIVES
+
+`scripts/s38_admission_floor_probe.sh 9`, `SGLANG_SEAM_ENTRY_MARGIN_MIB=8192`
+— the configuration that killed the instance for s37 — on the tree that
+carries the floor. Evidence: `/spinning/evidence-631/s38/floor-probe3/` and
+`floor-probe3.out`.
+
+| | s37 (no admission floor) | **s38** |
+|---|---|---|
+| margin armings | 452 | **939** |
+| seam entry DELAYED | 72 | **156** |
+| seam entry margin YIELDED | 35 | **78** |
+| bounded rung asks (`KV rung asked for`) | — (no bound existed) | **117** |
+| pp->tp cutovers | 42 before the death | **78** |
+| `Available full tokens: 0` | **the death, at 19:25:15** | **0** |
+| tracebacks | 3 ranks | **0** |
+| gate refusals | 0 | **0** |
+| corridor breaches | 0 | **0** (3926 samples) |
+| corridor MIN per card | — | **1687 / 2482 / 2087 MiB** |
+| soak | — | **30 ok / 0 err** |
+| health at the end | **000** | **200** |
+
+**The branches still execute — 156 delays and 78 yields, more than double
+s37's counts — so this is not the survival of a mechanism that failed to
+arm.** The instance served the whole 9-minute window under an ask no ladder
+on this rig can fund.
+
+Both new terms print their own account, which is how a successor can tell
+they are wired without inferring it:
+
+    KV-BACKING proposal on device 0: rows current=512552 floor=593
+      (max_live=80 + admission reserve 512, slack=511959)
+
+    PHASE-FLIP-SPILL KV rung asked for 3949 of 8192 MiB discretionary
+      (pp_to_tp): it can return 4999 MiB above its admission floor, and
+      asking for more would drive it to that floor for bytes it does not have
+
+### 3b. THE CONFIRMATION WINDOW ON THE SHIP CONFIG
+
+*(see `/spinning/evidence-631/s38/ship-window/EXTRACT.txt`; this is a
+REGRESSION check against s37's standing green, not a new stamp.)*
+
+On the shipped margin both terms are near-inert by construction — a 512-row
+reserve against 512552 backed rows, and a margin that funds on every seam —
+so the window's job is to show that the ordinary path did not move.
 
 ---
 
