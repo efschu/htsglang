@@ -29,7 +29,11 @@ CSV="$OUT/corridor.csv"
 SCAN="$OUT/.scan.txt"
 tr -d '\000' < "$LOG" > "$SCAN" 2>/dev/null
 
-c() { grep -c "$1" "$SCAN" 2>/dev/null || echo 0; }
+# grep -c ALREADY prints 0 when there is no match, and exits 1 while doing it.
+# An `|| echo 0` here appends a SECOND zero, and every arithmetic test
+# downstream then dies on "0\n0". Caught by dry-running this script against a
+# partial log rather than at the end of the window.
+c() { grep -c "$1" "$SCAN" 2>/dev/null | head -1; }
 
 {
   bash "$WT/scripts/s33_extract.sh" "$OUT" "$LOG" > /dev/null 2>&1
@@ -51,8 +55,8 @@ c() { grep -c "$1" "$SCAN" 2>/dev/null || echo 0; }
 
   echo
   echo "-- SPEC ITEM 12: the KV rung, and whether it FIRED"
-  echo "   proposals traced (edge-triggered on the deficit's sign): $(c 'KV-BACKING] proposal on device')"
-  echo "   SHRINKS (rows actually unbacked, driver-measured):       $(c 'KV-BACKING] released')"
+  echo "   proposals traced (edge-triggered on the deficit's sign): $(c 'KV-BACKING proposal on device')"
+  echo "   SHRINKS (rows actually unbacked, driver-measured):       $(c 'KV-BACKING released')"
   echo "   seam legs the rung funded:                               $(c 'KV backing relief returned')"
   echo "   recoveries that came up short (corridor-bounded):        $(c 'recovered to')"
   echo "   recoveries deferred entirely:                            $(c 'recovery deferred')"
@@ -62,8 +66,8 @@ c() { grep -c "$1" "$SCAN" 2>/dev/null || echo 0; }
   echo "   smaller pool as the fix': a shrink that never gives its rows back"
   echo "   is a capacity loss wearing a spill's clothes."
   echo "   Sample proposals and shrinks:"
-  grep -m 3 "KV-BACKING] released" "$SCAN" 2>/dev/null | sed 's/^/     /'
-  grep -m 2 "KV-BACKING] proposal on device" "$SCAN" 2>/dev/null | sed 's/^/     /'
+  grep -m 3 "KV-BACKING released" "$SCAN" 2>/dev/null | sed 's/^/     /'
+  grep -m 2 "KV-BACKING proposal on device" "$SCAN" 2>/dev/null | sed 's/^/     /'
 
   echo
   echo "-- THE ARMING FLOOR THIS BOOT RAN AT (read this before the corridor verdict)"
@@ -88,7 +92,7 @@ c() { grep -c "$1" "$SCAN" 2>/dev/null || echo 0; }
   FLIPS_PT=$(c 'PHASE-FLIP DONE pp_to_tp')
   FLIPS_TP=$(c 'PHASE-FLIP DONE tp_to_pp')
   ABANDON=$(c 'FLIP ABANDONED')
-  SHRINKS=$(c 'KV-BACKING] released')
+  SHRINKS=$(c 'KV-BACKING released')
   GATE_OK=$(c 'CORRIDOR-GUARD cleared')
   PREF_ARM=$(c 'CORRIDOR-ADMISSION] cleared before prefill')
 
@@ -182,8 +186,8 @@ PYEOF
   else
     echo "   VERDICT: corridor BROKEN -- $BREACH samples. NOT GREEN."
   fi
-} > "$EX.tmp" 2>&1
-mv "$EX.tmp" "$EX"
+} > "$OUT/EXTRACT.s34.tmp" 2>&1
+mv "$OUT/EXTRACT.s34.tmp" "$EX"
 rm -f "$SCAN"
 
 echo "extract -> $EX"
