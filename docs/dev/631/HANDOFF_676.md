@@ -269,10 +269,22 @@ be worse.
    ladder on paper and pay nothing — the exact failure mode this chain has
    shipped seven times and now asserts against.
 
-   So the rebalance tier wants ONE of: an `arm()` at the gate whose effect the
-   NEXT gate sees (honest, delayed, and must be booked as such), or a
-   synchronous levelling primitive that does not go through the reshard
-   runtime. Decide which before writing code.
+   **And the seam is not idle**, which a second audit settled rather than
+   assumed. `is_fully_idle()` (`scheduler.py:6211`) requires an empty running
+   batch, an empty waiting queue and drained PP microbatches; the flip's
+   quiescence predicate deliberately requires none of those — the source says
+   so in as many words at `phase_flip_runtime.py:303` ("NOT #297 fully-idle")
+   and `:307` ("deliberately does NOT require an empty waiting queue or an
+   empty running batch"), and `:392` rejects `_pp_microbatches_drained`
+   precisely because it would demand the resident decode set be empty.
+
+   So `_execute` cannot run at the seam, and under continuous load a fully
+   idle round may not arrive at all. The rebalance tier wants ONE of: an
+   `arm()` at the gate whose effect the NEXT gate sees (honest, delayed, and
+   booked as such), or a synchronous levelling primitive that does not go
+   through the reshard runtime. Decide which before writing code — and note
+   that the delayed option cannot report bytes to the guard, so it must not
+   be registered as a provider either.
 
    Other requirements it carries: `tree_cache.all_values_flatten()`,
    `tp_cpu_group`, `tp_group.device_group`, a `HybridLinearKVPool` from
