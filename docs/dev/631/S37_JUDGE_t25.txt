@@ -1,0 +1,36 @@
+ALL FIGURES OVER EACH ARM'S FIRST 25 MINUTES
+
+s34   gate only   (start 13:24)
+   prefill batches  14830   decode batches   387   pp->tp cutovers  252
+   median dwell    TP   7.0s   PP  17.0s   (n=42)
+   lend summaries  0   seam delays 0   seam yields 0
+   soak t+14  13:37:45Z ok=30 err=0 decode_tok=10240 prefill_tok=709801
+   soak t+24  13:47:45Z ok=59 err=0 decode_tok=20480 prefill_tok=1348432
+
+s36   lender ON   (start 15:47)
+   prefill batches  16629   decode batches   174   pp->tp cutovers  189
+   median dwell    TP   4.0s   PP  26.0s   (n=31)
+   lend summaries  27   seam delays 0   seam yields 0
+   soak t+14  16:00:25Z ok=15 err=0 decode_tok=5120 prefill_tok=354462
+   soak t+24  16:10:25Z ok=21 err=0 decode_tok=7168 prefill_tok=496225
+
+s36ab lender OFF  (start 16:35)
+   prefill batches   9012   decode batches   204   pp->tp cutovers  156
+   median dwell    TP   4.5s   PP  17.0s   (n=26)
+   lend summaries  0   seam delays 0   seam yields 0
+   soak t+14  16:48:24Z ok=18 err=0 decode_tok=6144 prefill_tok=425486
+   soak t+24  16:58:24Z ok=25 err=459 decode_tok=8704 prefill_tok=567556
+
+s37   C20 margin   (start 18:12)
+   prefill batches  14764   decode batches   345   pp->tp cutovers  270
+   median dwell    TP   5.0s   PP  17.0s   (n=45)
+   lend summaries  0   seam delays 0   seam yields 0
+   soak t+14  18:25:18Z ok=27 err=0 decode_tok=9216 prefill_tok=638131
+   soak t+24  18:35:18Z ok=41 err=0 decode_tok=14336 prefill_tok=922054
+
+READ IT THIS WAY: s37 must look like s34 on decode batches, dwell and
+soak completions. s36's column is what a mechanism that buys corridor
+margin with throughput looks like: decode 15.5 -> 7.0 per minute, PP
+dwell 17 -> 26 s, soak t+14 30 -> 15. If s37 sits there, the margin is
+the lender's mistake repeated at a different call site, and the trough
+numbers do not redeem it.

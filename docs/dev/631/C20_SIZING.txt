@@ -1,0 +1,50 @@
+C20 SIZING, measured on s34's own GREEN window (accept2), successor 37
+=======================================================================
+scripts: seam_drawdown.py, seam_trigger_rate.py, deep_seam_events.py
+data:    /spinning/evidence-631/s34/accept2/corridor.csv + serving-run2.log
+         450 cutovers matched to 100 ms samples, 28881 samples
+
+1. THE DRAW (free at seam entry minus minimum inside the cutover), tight
+   windows entry [T-1.5s,T-0.2s] / seam [T-0.2s,T+1.5s]:
+
+     gpu0  p50=0   p90=726   p99=904   MAX=1026
+     gpu1  p50=-156 p90=1184 p99=2026  MAX=2326
+     gpu2  p50=104 p90=654   p99=798   MAX=1068
+
+2. THE DRAW IS SELF-LIMITING. Conditioned on the entry level:
+
+     gpu0 entry<1524 (n=19):  draw p50=0  MAX=456   worst in-seam min 1043
+     gpu0 entry<1824 (n=252): draw p50=0  MAX=456   worst in-seam min 1043
+     gpu2 entry<1824 (n=10):  draw p50=0  MAX=168   worst in-seam min 1541
+
+   The big draws (up to 1026 MiB) only ever happen from a HIGH entry, because
+   the seam's own gate frees to floor+delta+want before it stages: from a
+   high entry it consumes what it had, from a low entry it consumes almost
+   nothing. So the trough is NOT made by an unbounded seam appetite.
+
+3. THE DEPTH IS INHERITED, NOT DRAWN. The 15 deepest gpu0 minima come in
+   PAIRS of cutovers ~2 s apart:
+
+       13:59:11  entry 1499  draw 456  -> min 1043
+       13:59:13  entry 1043  draw   0  -> min 1043
+       13:42:04  entry 1367  draw 304  -> min 1063
+       13:42:05  entry 1063  draw   0  -> min 1063
+
+   The second cutover of each pair ENTERS at the first one's trough: the seam
+   does not get its memory back before the next seam begins. That is why
+   s34's binding margin was +19 MiB and s36's identical trough was -23: the
+   level at seam ENTRY is the whole story, and nothing was checking it.
+
+4. WHAT A REQUIREMENT MUST BE. Because the draw from a low entry is bounded
+   by ~456 MiB measured:
+
+       required_at_entry = law(1024) + margin(256) + seam_reserve(512)
+                         = 1792 MiB on the rank's own card
+
+   A worst-case requirement (law + p90 draw of a HIGH-entry cutover) would
+   arm on 77% of cutovers on gpu0 -- that is successor 36's continuous
+   cache-dumper wearing a different hat, and it is rejected on his evidence.
+
+5. RISK SET TO CLOSE: on s34's green window only 4/450 cutovers left gpu0
+   below 1124 MiB and 8/450 below 1324. The mechanism has to catch a rare
+   tail cheaply, not hold a high level continuously.
