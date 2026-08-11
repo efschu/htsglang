@@ -213,6 +213,28 @@ no funder at all.
 
 ## 6. NEXT, IN ORDER
 
+0. **Decide whether the KV rung should ever outrank the allocator cache.**
+   Measured in the acceptance run at the real 1024 MiB floor: the gate armed
+   repeatedly and `allocator-cache` covered the deficit EVERY time, returning
+   604-824 MiB per arm. So the KV rung proposed nothing and item 12 went
+   unexercised — correct tier behaviour (free money before KV capacity), and
+   also the reason the rung may almost never fire in production.
+
+   The mechanism is the `cheap_relief_bytes` discount in
+   `KvBackingRelief.propose`: the rung subtracts what the cheaper tier could
+   return before sizing its own ask. That estimate is
+   `memory_reserved - memory_allocated`, which OVERSTATES what `empty_cache`
+   actually hands back, and the overstatement is deliberate (under-shrinking
+   is retried, over-shrinking costs capacity for nothing).
+
+   The failure mode to watch: the gate can refuse AFTER the rung declined on
+   the strength of a cache that then under-delivers. The rung runs before the
+   gate, so there is no second chance inside one gate call. It is
+   self-correcting across ROUNDS — the abandon is free, the cache is spent by
+   then, and the next proposal sees a smaller discount — but nobody has
+   watched that sequence happen. Watch for a refusal immediately following an
+   `allocator-cache` reclaim that fell short of its hoard.
+
 1. **The host half by route 1 or 2 of §2** — and read §2 before planning it,
    because the obvious route is closed by a line no previous handoff names.
 2. **`kv_reshard` as the `RELIEF_REBALANCE` provider** (item 16 levelling) —
