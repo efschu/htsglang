@@ -204,3 +204,20 @@ to the pinned host pool by `host_pool.backup_from_device_all_layer`, `:3790`).
    reads like relief because it does return bytes. A mechanism that gives
    memory back EVENTUALLY cannot fund an allocation that is happening NOW,
    and the two must not be registered in the same ladder.
+14. **A rank-local `except` around a collective is a deadlock waiting for the
+   one rank that took a different branch** (#661, HANDOFF_684 §4b). Measured,
+   not theorised: `init_chunked_prefill` wrapped `profile_and_init_predictor`
+   in a per-rank `try/except`, and that function ends in a
+   `pp_group.broadcast_object_list` every rank enters unconditionally. PP0's
+   profile raised, PP0 disabled the feature FOR ITSELF and walked into the
+   event loop, and PP1/PP2 blocked in the broadcast until the boot was
+   killed. The corridor lane already respects this shape -- it is why
+   `KvBackingRelief` is built but deliberately NOT registered as a guard
+   provider (`phase_flip_spill.py:1468-1477`). The fix is always the same:
+   publish the FAILURE as data through the collective every rank already
+   enters, and let every rank decide on it together. **Sibling of law 12:**
+   law 12 is an identity bug presenting as inertness; this one is a branch
+   bug presenting as a hang, and both are cured by making the mechanism
+   report a resolved, group-visible verdict rather than acting on a private
+   one.
+
