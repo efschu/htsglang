@@ -203,16 +203,25 @@ def water_fill_transfers(free_column):
     thinking about where the payload goes, because the card that should give
     FREE bytes up is the card that should TAKE payload.
 
-    IT IS AN INSTRUMENT, NOT AN ACTUATOR, AND THAT IS THE POINT. Item 16's
-    first relief stage is "redistribute onto the card with the most headroom",
-    and the actuator for that is genuinely missing -- moving KV between cards
-    needs a seam-compatible partial reshard (HANDOFF_678 §4.5), and the DCP
-    token vector decides ownership mid-stream. Until that exists, the least a
-    guard can do is SAY what the levelling would have been. Before this,
-    ``water_fill_targets`` had exactly one caller in the tree and it was a
-    test: the objective was computed by nothing, which is this chain's
-    familiar failure one step earlier than usual -- not a mechanism that never
-    fires, a mechanism nothing ever asks.
+    IT IS NOW BOTH AN INSTRUMENT AND AN OBJECTIVE, AND THE SPLIT MATTERS.
+    Item 16's first relief stage is "redistribute onto the card with the most
+    headroom", and that has two halves with different fates:
+
+    * the SHED half -- get the bytes off the card that binds -- is actuated,
+      by :meth:`CorridorGuard.lend_to_level` driven from
+      ``corridor_rebalance.RebalanceLender``. This function supplies its
+      bound: the lender frees up to the transfer named here and no further.
+    * the ABSORB half -- put those same bytes on the peer card -- is still
+      missing, and structurally so for KV: the DCP owner rule makes a token's
+      row a pure function of the token vector (``layers/dcp/owner.py:348``),
+      the vector is boot-constant (``phase_flip_runtime.py:866``), and the
+      one actuator that may change it needs a fully idle instance
+      (``kv_reshard.py:781``). In the PP phase KV is layer-bound anyway.
+
+    So a positive transfer here is a move that WILL be attempted from the
+    tight card, and a negative one is capacity that stays unusable to its
+    peers. Before HANDOFF_679 ``water_fill_targets`` had exactly one caller
+    in the tree and it was a test: the objective was computed by nothing.
 
     A spread figure alone does not tell a successor whether the actuator is
     worth building; a per-card "shed 900 MiB / absorb 900 MiB" does.
@@ -237,10 +246,13 @@ def describe_water_fill(free_column) -> str:
     if transfers[shed] <= 0:
         return ""
     return (
-        f"item 16 water-fill would have card {shed} SHED "
+        f"item 16 water-fill wants card {shed} to SHED "
         f"{transfers[shed] / _MIB:.0f} MiB onto card {absorb} "
-        f"(which can absorb {-transfers[absorb] / _MIB:.0f} MiB); no actuator "
-        "exists for that move, so this is the levelling NOT performed"
+        f"(which can absorb {-transfers[absorb] / _MIB:.0f} MiB). The SHED "
+        "half is actuated by the rebalance lender, bounded by this figure; "
+        "the ABSORB half has no actuator (the DCP owner rule fixes KV "
+        "ownership to a boot-constant token vector), so any residue is "
+        "levelling NOT performed"
     )
 
 
