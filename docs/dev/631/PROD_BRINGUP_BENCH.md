@@ -4487,3 +4487,33 @@ trying this again.
 Cost side: ~25 consultations/second/rank, all but a handful terminating on a
 clock read and a `mem_get_info` (100 ms limited). That part was cheap; the
 `empty_cache` was not.
+
+## 2026-08-11 successor 37 -- C20 seam-entry margin, ACCEPTANCE GREEN (bde9d01c51)
+
+| axis | s34 (prev green) | s37 (C20) |
+|---|---|---|
+| corridor breaches (100 ms sampler, law 1024) | 0 | 0 |
+| per-card minima MiB | 1043 / 1922 / 1541 | 1123 / 2118 / 1641 |
+| IN-CUTOVER minimum, binding card | 1043 (+19) | 1123 (+99) |
+| seam draw from a LOW entry, binding card | 456 MiB | 184 MiB |
+| flips pp->tp / tp->pp | 321 / 321 | 348 / 348 |
+| FLIP ABANDONED / tracebacks | 0 / 0 | 0 / 0 |
+| strict purity / decode graph share | True / 99.2% | True / 99.7% |
+| MTP accept length | 2.850 | 2.797 |
+| YaRN prompt tokens (>262144) | 271237 | 271237 |
+| pool / pool at last KV proposal | 512552 / 512552 | 512552 / 512552 |
+| KV rung shrinks (the margin's price) | 21 | 348 |
+| gate cleared / refused | 232 / 0 | 454 / 0 |
+| decode batches, first 25 min | 387 | 345 |
+| median PP dwell, first 25 min | 17.0 s | 17.0 s |
+| soak ok at t+24 | 59 | 41 |
+| soak, full window | 218 ok / 0 err | 196 ok / 0 err |
+
+Config delta vs s34: `SGLANG_SEAM_ENTRY_MARGIN_MIB=512`,
+`SGLANG_SEAM_ENTRY_DELAY_BUDGET=2`. argv byte-identical.
+
+Probe (NOT an acceptance), margin forced to an unfundable 8192 MiB:
+72 seam delays, 35 yields, 0 refusals, 0 corridor breaches -- both safety
+branches executed on metal -- and the instance then died of
+`full_available_size=0` because the margin flows unbounded into the
+collective KV rung. See HANDOFF_681 section 1a.
