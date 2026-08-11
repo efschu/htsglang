@@ -4362,3 +4362,73 @@ figure (~0.147 MiB/token here), and cap any gate that consumes it.
 The two attributes also exist ONLY under `--enable-metrics` **and**
 `--enable-mfu-metrics`. This rig's boot sets the first and not the second, so
 the honest default is that the slope is unavailable.
+
+---
+
+## Successor 35: spec item 8 closed, and item 16 finally priced
+
+### Spec item 8 has no open arms left. Both closed as STRUCTURAL verdicts
+
+Neither residual arm was measurable, and each is refused by a specific
+`raise` rather than by a policy:
+
+| arm | verdict | the line that refuses |
+|---|---|---|
+| PP-prefill graphs | structurally blocked | `prefill_cuda_graph_runner.py:1226` — `PPProxyTensors is not supported in PrefillCudaGraphRunner yet`. Non-last PP ranks return exactly that type, so PP0/PP1 hit it on the first replay |
+| DFLASH × graphs | not deployable on this config | `arg_groups/speculative_hook.py:202-205` — `pp_size != 1` refuses, and unlike the generic PP-vs-spec assert at `server_args.py:16555` it carries NO `--enable-phase-flip` waiver, which is why NEXTN boots here and DFLASH cannot |
+
+Two facts worth not rediscovering. The `#631` carve at `model_runner.py:1486`
+is **not** the deepest blocker for arm A — `HANDOFF_661` stopped there and
+concluded the invariant was a reversible design decision; it is not. And for
+arm B the **draft checkpoint is present and correct** on this box
+(`models-cache/qwen3.6-27b-dflash/`, `block_size 16`, target layers
+`[1,16,31,46,61]`, 64 target layers): only `pp_size` refuses. Even with the
+gate lifted, `dflash_worker_v2.py:807-808` (TP>1) and `:824-830` (quantized
+`lm_head`) keep the DFLASH graph folds eager on this rig anyway.
+
+### Item 16, measured: the missing rebalance tier is worth ~864 MiB
+
+2246 samples at 100 ms, idle plus a real two-lane agent load, on the s34
+binary (`evidence-631/s35/spread_ts.csv`):
+
+    spread of the free column   min 167   p50 2347   p90 2763   max 2803 MiB
+    payload the water-fill wants moved off the fullest card
+                                min  98   p50  995   p90 1016   max 1344 MiB
+
+    at the binding instant: free column [1619, 3776, 2055] MiB
+      binding card 595 MiB above the 1024 law while a peer held 3776 free
+      water-fill [+864, -1293, +428] MiB -> card 0 sheds 864 MiB onto card 1
+
+**Read this as the price of the missing tier, not as a corridor result.** A
+continuous levelling tier would roughly double the binding card's margin with
+no host RAM spent and no pool shrunk. `water_fill_targets` had computed this
+objective all along and had exactly one caller in the tree — a test.
+
+### The prefill gate's `want`: the tracker's peak was the WRONG peak
+
+`ForwardPeakTracker` has bracketed every forward since #417, but
+`reset_peak_memory_stats` **re-bases** rather than zeroes, so the figure it
+stored was weights + KV + transient — tens of GiB on this model. Pricing a
+512-token chunk from it is wrong by three orders of magnitude. It now records
+a baseline at `begin()` and stores peak-minus-baseline, per phase and token
+bucket, returning `None` for any bucket it has not measured.
+
+The gate charges that figure **net of the allocator cache** (`reserved -
+allocated`): the measurement is allocator-side, the corridor is driver-side,
+and bytes served from torch's own cache never move the NVML free column. The
+geometry branch deliberately does not net — that slope is already biased small
+and netting would zero it on every admission.
+
+Off unless `SGLANG_FORWARD_PEAK_PATH` is set. Setting it on the next
+acceptance boot costs two counter reads per forward and no synchronisation,
+and is what turns the gate from floor-enforcing into preempting.
+
+### Guard cadence under a two-lane agent load (observation, not a defect)
+
+    14:48:36  want  464  free 1806 -> 2388  got 582  [allocator-cache, draft-weights]
+    14:48:40  want 1158  free 2444 -> 2848  got 404  [allocator-cache]
+
+`draft-weights` — the drafter evacuation — is spent roughly every 15 s. Same
+rate as s34's 244 clears over 65 min, so steady state rather than regression,
+and s34's MTP accept length of 2.850 says speculation survives it. Booked as
+the place a future thrash regression would first appear.
