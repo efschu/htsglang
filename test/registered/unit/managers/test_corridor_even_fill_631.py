@@ -260,5 +260,78 @@ class WaterFillingTest(unittest.TestCase):
         self.assertFalse(cg.fleet_is_level([], 1024, 256))
 
 
+class WhenRefusingIsFatalTest(unittest.TestCase):
+    """Item 16 is a preference, not a suicide pact.
+
+    The gate normally withholds host RAM while any card still has headroom,
+    because the bytes belong on that card. But on the pp->tp leg a refusal is
+    not survivable: strict purity forbids decode in PP, so a refused pp->tp
+    means decode never runs again, and nothing the PP phase holds can free the
+    memory that would end the refusal. Measured on 2026-08-10: 411 abandons,
+    0 requests in 6 minutes, /health 503, every rank alive.
+
+    Spec item 15c already answers this in the user's own words -- when
+    everything resident is hot, kvso keeps computing over the host tier, and
+    "the price is tempo, NEVER a corridor breach". Refusing forever does not
+    protect the corridor; the corridor is fine in that state. It kills
+    serving instead. So the host tier is admitted when the alternative is a
+    deadlock, and the event is counted and logged with the free column so the
+    missing levelling is loud rather than silent.
+    """
+
+    def test_an_unlevel_fleet_still_gets_host_when_refusal_is_fatal(self):
+        fleet = _Fleet([1100, 6000, 3000])
+        g = _guard(fleet, 0)
+        g.register("kvso", 90, fleet.provider(0, 4000), tier=cg.RELIEF_HOST)
+        r = g.ensure_headroom(900 * MIB, refusal_is_fatal=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.used_providers, ("kvso",))
+        self.assertEqual(g.host_forced_count, 1)
+        self.assertIn("refusal would deadlock", r.detail)
+
+    def test_the_default_still_withholds_host_on_an_unlevel_fleet(self):
+        # The escape must be opt-in per call. A default-on escape would make
+        # item 16 unenforceable everywhere.
+        fleet = _Fleet([1100, 6000, 3000])
+        g = _guard(fleet, 0)
+        g.register("kvso", 90, fleet.provider(0, 4000), tier=cg.RELIEF_HOST)
+        self.assertFalse(g.ensure_headroom(900 * MIB).ok)
+        self.assertEqual(g.host_forced_count, 0)
+
+    def test_rebalance_is_still_spent_first_even_when_refusal_is_fatal(self):
+        # The escape opens the host tier; it does not reorder the ladder.
+        fleet = _Fleet([1100, 6000, 3000])
+        g = _guard(fleet, 0)
+        order = []
+
+        def spy(name, inner):
+            def f(n):
+                order.append(name)
+                return inner(n)
+
+            return f
+
+        g.register("kvso", 1, spy("kvso", fleet.provider(0, 4000)), tier=cg.RELIEF_HOST)
+        g.register(
+            "rebalance", 99, spy("rebalance", fleet.provider(0, 4000)),
+            tier=cg.RELIEF_REBALANCE,
+        )
+        r = g.ensure_headroom(900 * MIB, refusal_is_fatal=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(order[0], "rebalance")
+        # Rebalance covered it, so the escape was never needed.
+        self.assertEqual(g.host_forced_count, 0)
+
+    def test_a_level_fleet_does_not_count_as_a_forced_host_spill(self):
+        # When the fleet IS level the host tier was permitted anyway, so
+        # nothing was forced and the counter must not inflate.
+        fleet = _Fleet([1100, 1200, 1150])
+        g = _guard(fleet, 0)
+        g.register("kvso", 90, fleet.provider(0, 4000), tier=cg.RELIEF_HOST)
+        r = g.ensure_headroom(900 * MIB, refusal_is_fatal=True)
+        self.assertTrue(r.ok)
+        self.assertEqual(g.host_forced_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3743,7 +3743,17 @@ class PhaseFlipRuntime:
             if guard is None:
                 return ""
             verdict = guard.ensure_headroom(
-                int(staging_bytes), reason=f"seam staging {direction}"
+                int(staging_bytes),
+                reason=f"seam staging {direction}",
+                # THE TWO LEGS ARE NOT SYMMETRIC. Refusing tp->pp is
+                # survivable: the instance stays in TP, decode keeps running,
+                # prefill defers. Refusing pp->tp is not -- strict purity
+                # forbids decode in PP, so it starves decode outright and
+                # nothing in PP can free the memory that would end it. So the
+                # pp->tp leg is allowed to spend host RAM ahead of levelling
+                # (spec item 15c: the price is tempo, never a corridor
+                # breach), and the guard counts every time it has to.
+                refusal_is_fatal=(direction == "pp_to_tp"),
             )
         except Exception as e:
             # The gate is a safety net, not a dependency. A net that tears

@@ -285,6 +285,11 @@ class CorridorGuard:
         self.arm_count = 0
         self.refuse_count = 0
         self.host_blocked_count = 0
+        #: Times the host tier was admitted onto an UNLEVEL fleet because
+        #: refusing would have deadlocked the caller. Every one of these is a
+        #: levelling failure that item 16 wanted avoided, so the counter is
+        #: the honest measure of how much the missing rebalance tier costs.
+        self.host_forced_count = 0
         self.reclaimed_total = 0
 
     # -- registration ----------------------------------------------------
@@ -369,11 +374,27 @@ class CorridorGuard:
         *,
         reason: str = "",
         raise_on_refusal: bool = False,
+        refusal_is_fatal: bool = False,
     ) -> GuardResult:
         """Make ``want_bytes`` allocatable without breaching the floor.
 
         Returns a verdict. ``ok=False`` means DO NOT ALLOCATE -- the caller
         must take its own refusal path (at the seam: abandon the flip).
+
+        ``refusal_is_fatal`` tells the gate that the caller has NO survivable
+        refusal path, and it opens the host tier even on an unlevel fleet.
+        Item 16 is a preference, not a suicide pact: withholding host RAM
+        while a peer has headroom is right when the caller can wait, and
+        catastrophic when it cannot. On the pp->tp leg it cannot -- strict
+        purity forbids decode in PP, so a refused pp->tp starves decode and
+        nothing in PP can free the memory that would end the refusal.
+        Item 15c already authorises this in the user's terms: the price of the
+        host tier is tempo, never a corridor breach. Refusing forever does not
+        protect the corridor, which is fine in that state; it kills serving.
+
+        It opens the tier; it does NOT reorder the ladder. Rebalance and park
+        are still spent first, so the escape is only reached when nothing
+        cheaper exists.
         """
         want = max(0, int(want_bytes))
         free_before = self.free_bytes()
@@ -391,6 +412,7 @@ class CorridorGuard:
         # few allocations do not each pay a spill.
         target = self.floor_bytes + self.delta_bytes + want
         used: List[str] = []
+        used_host = False
         reclaimed = 0
         free_now = free_before
         # Item 16: read the fleet ONCE, before spending. Re-reading it after
@@ -398,11 +420,29 @@ class CorridorGuard:
         # close the host gate mid-ladder on the strength of its own effect,
         # which is a feedback loop, not a policy.
         column = self.fleet_free()
-        host_ok = self._host_tier_permitted(column)
+        fleet_level = self._host_tier_permitted(column)
+        host_ok = fleet_level or bool(refusal_is_fatal)
+        host_forced = bool(refusal_is_fatal) and not fleet_level
         host_blocked = False
         for provider in self._providers:
             if free_now >= target:
                 break
+            if provider.tier == RELIEF_HOST and host_forced and not used_host:
+                used_host = True
+                self.host_forced_count += 1
+                logger.warning(
+                    "%s spending HOST RAM on device %d while the fleet is NOT "
+                    "level (free column %s MiB, spread %d MiB), because "
+                    "refusing here would deadlock the caller. Item 16 wanted "
+                    "these bytes rebalanced onto a peer card instead -- this "
+                    "counter is the cost of the missing rebalance tier, not a "
+                    "licence. (%s)",
+                    LOG_PREFIX,
+                    self.device_index,
+                    [int(f // _MIB) for f in column],
+                    free_spread_mib(column),
+                    reason or "no reason given",
+                )
             if provider.tier == RELIEF_HOST and not host_ok:
                 # Never while a peer still has headroom: the bytes belong on
                 # that card, not in RAM.
@@ -446,6 +486,12 @@ class CorridorGuard:
             f"{self.law_floor_mib} MiB"
             + (f" ({reason})" if reason else "")
         )
+        if host_forced and used_host:
+            detail += (
+                "; host tier admitted on an UNLEVEL fleet because refusal "
+                f"would deadlock (free column {[int(f // _MIB) for f in column]} "
+                f"MiB, spread {free_spread_mib(column)} MiB)"
+            )
         if host_blocked:
             detail += (
                 "; host tier withheld -- fleet is not level"

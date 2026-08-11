@@ -61,8 +61,8 @@ class _Guard:
         self.result = result
         self.asks = []
 
-    def ensure_headroom(self, want, *, reason=""):
-        self.asks.append((int(want), reason))
+    def ensure_headroom(self, want, *, reason="", refusal_is_fatal=False):
+        self.asks.append((int(want), reason, refusal_is_fatal))
         return self.result
 
 
@@ -298,6 +298,23 @@ class RepeatedPpToTpRefusalIsNamedTest(unittest.TestCase):
             r._corridor_gate(500 * MIB, "pp_to_tp")
             r._corridor_gate(500 * MIB, "tp_to_pp")
         self.assertEqual(r._corridor_pp_refusals, 0)
+
+
+class TheFatalLegIsMarkedTest(unittest.TestCase):
+    def test_pp_to_tp_is_declared_fatal_and_tp_to_pp_is_not(self):
+        r = _runtime()
+        seen = {}
+
+        class _G:
+            def ensure_headroom(self, want, *, reason="", refusal_is_fatal=False):
+                seen[reason.split()[-1]] = refusal_is_fatal
+                return _cleared()
+
+        with _Patched(_G()):
+            r._corridor_gate(100 * MIB, "pp_to_tp")
+            r._corridor_gate(100 * MIB, "tp_to_pp")
+        self.assertTrue(seen["pp_to_tp"])
+        self.assertFalse(seen["tp_to_pp"])
 
 
 if __name__ == "__main__":
