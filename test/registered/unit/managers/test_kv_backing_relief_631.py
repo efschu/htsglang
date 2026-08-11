@@ -39,7 +39,9 @@ Hermetic: tensor-backed fakes for the allocator and the pool, no CUDA.
 
 from __future__ import annotations
 
+import os
 import unittest
+import unittest.mock
 
 import torch
 
@@ -450,9 +452,25 @@ class ChunklessArenaIsDisqualifiedTest(unittest.TestCase):
             self.token_to_kv_pool_allocator.get_kvcache = lambda: pool
 
     def test_a_chunkless_pool_does_not_register_a_provider(self):
-        self.assertIsNone(
-            kbr.kv_backing_provider(self._Sched(False), device_index=0)
-        )
+        # ENABLED explicitly: the rung is opt-in until its shrink target is a
+        # collective minimum, and without this the assertion would pass on the
+        # opt-in gate rather than on the chunk check it names.
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_KV_BACKING_RELIEF": "1"}
+        ):
+            self.assertIsNone(
+                kbr.kv_backing_provider(self._Sched(False), device_index=0)
+            )
+
+    def test_the_rung_is_off_unless_explicitly_enabled(self):
+        # A rank-local cap changes admission, and ranks that disagree about
+        # admission desync the PP group -- measured as a scheduler that stopped
+        # heartbeating while every rank was alive.
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_KV_BACKING_RELIEF", None)
+            self.assertIsNone(
+                kbr.kv_backing_provider(self._Sched(True), device_index=0)
+            )
 
 
 class FlushMustNotTouchUnbackedRowsTest(unittest.TestCase):

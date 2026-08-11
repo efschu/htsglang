@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -490,6 +491,30 @@ def kv_backing_provider(
     guard's spend order read as if a tier were funded when it is not, and this
     chain has shipped three of those.
     """
+    # OFF BY DEFAULT, AND THE REASON IS A WEDGE, NOT CAUTION.
+    #
+    # The cap changes ``available_size()``, which feeds ADMISSION. Each rank
+    # sizes its own shrink from its own free memory and its own live set, so
+    # the three ranks capped to 449039 / 451037 / 175225 / 145734 rows in one
+    # boot -- i.e. they no longer agreed on how much work the group could
+    # take. A PP group whose ranks disagree about admission desyncs, and this
+    # one did: the scheduler stopped heartbeating and /health reported
+    # "couldn't get a response from detokenizer" while every rank was alive.
+    #
+    # The bytes half is PROVEN on metal (want 208 MiB, free 4 -> 1844 MiB,
+    # reclaimed 1840 MiB from [kv-backing]). What is missing is agreement: the
+    # target must be a COLLECTIVE MINIMUM across ranks, the way the seam's
+    # abandon already rides ``_collective_min``, so every rank caps to the
+    # same row count. Until that lands, the rung is opt-in and the ship config
+    # runs without it rather than with a group-desync hazard.
+    if os.environ.get("SGLANG_KV_BACKING_RELIEF", "") not in ("1", "true", "yes", "on"):
+        logger.info(
+            "%s relief is OFF (set SGLANG_KV_BACKING_RELIEF=1 to enable). The "
+            "device half is proven, but the shrink target is still rank-local "
+            "and ranks that disagree about admission desync the group.",
+            LOG_PREFIX,
+        )
+        return None
     allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
     if allocator is None:
         return None

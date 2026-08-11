@@ -73,7 +73,35 @@ to every ledger that sums the pool, and the #486 named-posten law already said
 so. The next rung that removes slots — cached-evict, host-spill — inherits
 this obligation.
 
-### 1c. A LATENT FAULT THIS RUNG MADE REACHABLE (fixed before it fired)
+### 1c. THE SHRINK STILL FREED NOTHING, BECAUSE RELEASE IS PER-BUFFER
+
+With the chunk set and the invariant fixed, the rung ran clean and still
+returned zero on every attempt:
+
+    KV-BACKING shrink to 421738 rows reported 0 MiB but the driver's free
+    column did not move
+
+Release is extent-granular **per buffer**. The arena holds each of the
+`2*layer_num` buffers at its own offset and `decommit_range` frees only
+extents lying WHOLLY above the keep point, so an ask for N bytes moves only
+`N/n_buffers` in each one. A 78262-row shrink asked about 40 MiB of each of
+~28 buffers, cleared no extent in any of them, and returned nothing.
+
+The provider now computes its own granularity — one commit chunk in EVERY
+buffer, expressed in rows — and rounds the ask UP to it rather than attempting
+a guaranteed no-op.
+
+**THE NUMBER THAT DECIDES WHETHER THIS RUNG EXISTS AT ALL:**
+
+    min_release_rows = commit_chunk_bytes * n_buffers / bytes_per_row
+
+At the 256 MiB chunk that is `256 MiB * 28 / 15 KiB = 489132 rows` — **more
+than the entire 500000-row pool**, so the rung could never pay a partial
+release no matter how much slack the pool had. At 8 MiB it is ~15285 rows
+(~230 MiB/rank), which is the right size against a gate asking ~500 MiB.
+**Pick the chunk from this formula, not from intuition about page sizes.**
+
+### 1d. A LATENT FAULT THIS RUNG MADE REACHABLE (fixed before it fired)
 
 `zero_kv_data_buffers` zeroed the WHOLE VA-sized tensor. A KV buffer spans the
 reservation; its backing does not. So `/flush_cache` against a pool whose
@@ -121,6 +149,9 @@ Zeroing now stops at `safe_zero_rows`.
 **The KV rung requires `SGLANG_FLIP_SEAM_CHUNK_MIB` to be set.** The ship
 config does not set it, so its arena is chunkless and the rung refuses to
 register (correctly — see §1a). Boots in this shift used `256`.
+
+And the chunk must be SMALL — see §1c for the formula. 256 MiB makes the rung
+structurally unable to pay; boots in this shift settled on 8 MiB.
 
 This is not a tuning knob, it is a precondition: a chunkless arena cannot
 release anything partially, which makes every row-range primitive in
