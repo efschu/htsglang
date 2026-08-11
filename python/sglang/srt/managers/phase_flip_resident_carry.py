@@ -669,6 +669,33 @@ def reseed_decode_input_relay(scheduler) -> int:
     total = 0
     for batch in batches:
         reqs = [r for r in _reqs_of(batch) if getattr(r, "output_ids", None)]
+        # A REQUEST CAN HAVE OUTPUT AND NO SLOT, and the cutover must survive
+        # it (#656 successor 36). ``req_pool_idx`` is None for a request whose
+        # pool slot has been released or was never assigned, and the tensor
+        # build below turns that into
+        #     TypeError: 'NoneType' object cannot be interpreted as an integer
+        # inside ``_cutover``, i.e. inside the no-return region -- so all three
+        # ranks abort together and serving dies. Measured 2026-08-11 16:51:50,
+        # every rank, 14.5 minutes into a run; the trace is
+        # phase_flip_resident_carry.py:674 <- _cutover:1176 <- _execute:4349.
+        #
+        # Skipping them is CORRECT and not merely defensive: the relay reseeds
+        # a slot-indexed buffer, so a request with no slot has nothing to
+        # reseed. It is logged rather than dropped quietly, because a resident
+        # request losing its slot across a cutover is a fact worth seeing.
+        slotless = [r for r in reqs if getattr(r, "req_pool_idx", None) is None]
+        if slotless:
+            reqs = [r for r in reqs if getattr(r, "req_pool_idx", None) is not None]
+            logger.warning(
+                "%s decode-input relay: %d carried request(s) have output but "
+                "no pool slot (rids %s); they cannot be reseeded because the "
+                "relay is slot-indexed, so they are skipped. Before this was "
+                "handled, the tensor build raised inside the cutover and took "
+                "every rank down with it.",
+                LOG_PREFIX,
+                len(slotless),
+                ", ".join(str(getattr(r, "rid", "?"))[:8] for r in slotless[:8]),
+            )
         if not reqs:
             continue
         indices = torch.tensor(

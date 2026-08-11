@@ -515,3 +515,49 @@ class DefectMResidentSetGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# #656 successor 36: a carried request with output but NO POOL SLOT killed
+# every rank inside the cutover. Measured 2026-08-11 16:51:50.
+# ---------------------------------------------------------------------------
+
+
+def test_a_carried_request_without_a_pool_slot_does_not_kill_the_cutover():
+    """req_pool_idx=None used to reach torch.tensor(dtype=int64) inside
+    _cutover's no-return region:
+        TypeError: 'NoneType' object cannot be interpreted as an integer
+    All three ranks aborted together and serving died. The relay is
+    slot-indexed, so a request with no slot has nothing to reseed."""
+    import types
+
+    import torch
+
+    from sglang.srt.managers import phase_flip_resident_carry as prc
+
+    good = types.SimpleNamespace(rid="good", output_ids=[7], req_pool_idx=0)
+    slotless = types.SimpleNamespace(rid="slotless", output_ids=[9], req_pool_idx=None)
+
+    class _Batch:
+        reqs = [good, slotless]
+
+    class _FutureMap:
+        def __init__(self):
+            self.output_tokens_buf = torch.zeros(4, dtype=torch.int64)
+            self.stashed = []
+
+        def stash(self, indices, payload):
+            self.stashed.append((indices, payload))
+
+    fm = _FutureMap()
+    batch = _Batch()
+    scheduler = types.SimpleNamespace(
+        running_mbs=[batch], running_batch=None, future_map=fm
+    )
+
+    # Must not raise, and must relay exactly the one request that HAS a slot.
+    total = prc.reseed_decode_input_relay(scheduler)
+
+    assert total == 1
+    assert len(fm.stashed) == 1
+    assert fm.stashed[0][0].tolist() == [0]
