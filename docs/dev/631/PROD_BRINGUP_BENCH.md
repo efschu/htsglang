@@ -4078,3 +4078,49 @@ floors): spread mean 2895-2938, worst 3155-4013 MiB. The 5090 never once
 dropped below 3.8 GiB free while both 3080s bound at 1.7-2.3 GiB. **The
 unlevelness is structural, not a transient**, and no payload rung touches it --
 only the rebalance tier can.
+
+## ANCHOR: the 669440 conservation baseline, with provenance
+
+Booked here because it was single-sourced and load-bearing -- the same
+fragility class CONTRADICTIONS_REGISTER.md documents, and the conservation
+check every capacity table is judged against.
+
+**Value:** 669440 tokens. **Per-rank KV cost:** 15.0 / 8.5 / 8.5 KiB per
+GLOBAL token on ranks 0/1/2 under the TP token split (HANDOFF_661:180);
+"slightly conservative" per that measurement.
+
+**What it is NOT.** It is a MODELLED ceiling for a TP-ONLY topology, not a
+measured serving capacity, and this bench said so where the number was born
+(:422): *"treat 669440 as the ceiling, not more: the model omits activation
+reserve, graphs, NCCL buffers and the continuous corridor minimum."*
+HANDOFF_660 §2 and HANDOFF_661 §4 both flag it as a misread target -- 661's
+words: **"669440 was never a serving capacity."**
+
+**How to use it.** As a CONSERVATION check only: the sum of resident +
+spilled KV should account for it, and any shortfall must be attributed to
+NAMED resident bytes. It is not an acceptance target and a run that does not
+reach it has not failed anything. Quoting it as "the pool we should hit" has
+already sent two shifts after an unreachable number.
+
+**Provenance to re-derive it:** the 15.0/8.5/8.5 KiB figures come from the TP
+token split at the geometry recorded in HANDOFF_661; per CONTRADICTIONS_REGISTER
+C1/C7 a different split or residency state changes the inputs, so re-derive
+rather than carry it across a geometry change.
+
+## FLUSH DISCIPLINE, and which rows are suspect
+
+**Procedure, one line:** call `/flush_cache` before ANY idle NVML free
+reading, and record that you did.
+
+Reason (HANDOFF_666 §2a, measured): over a gibibyte per card of torch
+allocator cache is held at ZERO requests, and NVML counts it as USED. An
+un-flushed idle reading understates free by ~1028-1426 MiB per card.
+
+**SUSPECT ROWS.** Every idle-free reading in this document taken without a
+preceding flush is contaminated and must be treated as suspect rather than
+re-derived on the spot. That explicitly includes the readings behind the
+"pool lever is exhausted" conclusion (retracted, register C5) and the 37%
+budget-lever return in HANDOFF_665 §14. **Under-load time-series minima from
+`route_a_631_corridor.py` are NOT affected** -- they sample under load, where
+the cache is in use rather than hoarded, and they are the rows the corridor
+verdicts actually rest on.
