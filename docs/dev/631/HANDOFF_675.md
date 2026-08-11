@@ -46,9 +46,36 @@ rank must agree on.
 
 THE FIX, and it is not a retreat: the shrink target must be a **collective
 minimum**, the way the seam's abandon already rides `_collective_min`, so
-every rank caps to the same row count. The gate runs at the same point in the
-flip protocol on every rank, which is exactly where that collective is safe.
-Until then the rung is behind `SGLANG_KV_BACKING_RELIEF=1`.
+every rank caps to the same row count. Until then the rung is behind
+`SGLANG_KV_BACKING_RELIEF=1`.
+
+**DO NOT IMPLEMENT THE OBVIOUS VERSION — it hangs.** The channel is there and
+it is the right one: `phase_flip_runtime.py:1414` builds
+`default_collective_min(flip_tp.cpu_group, label="phase_flip.consensus")`, a
+bounded MIN all-reduce over the three ranks that must agree (note it is the
+FLIP's TP group, which spans all three cards here — the bare `tp_cpu_group`
+at `tp_size=1` would be a group of one and the reduction a no-op).
+
+The trap is WHERE it is called. Reducing inside `free_up_to` puts the
+collective behind the guard's ARM CONDITION, and arming is rank-local by
+construction: `free - want < floor` is evaluated against each rank's own NVML
+reading. One rank arms, calls the reduction, and waits forever for a peer
+that never armed. That converts a capacity desync into a hard hang — strictly
+worse than what we have.
+
+So the target must be decided at a point EVERY rank executes unconditionally.
+Two shapes, and the second is smaller:
+
+* reduce in `_corridor_gate` before consulting the guard — every rank runs it
+  on both legs — and hand the agreed target down to the provider; or
+* **stop making the cap per-arm at all.** Set it once per phase at the seam's
+  post-cutover hook (where `_ladder.on_enter_pp/on_enter_tp` already run on
+  every rank), from a group-min target. That is still "residency follows the
+  phase and the load", it is one synchronised decision instead of N racing
+  ones, and it needs no collective anywhere near the gate.
+
+The recovery side already sits in the right place — `recover_kv_backing` is
+called from the `tp->pp` leg, which every rank executes.
 
 ### 1b. THE RELIEF PROVIDER CONSUMED 2.5 GiB INSTEAD OF FREEING IT
 
