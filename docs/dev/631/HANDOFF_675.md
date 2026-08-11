@@ -250,9 +250,17 @@ any number across boots with and without it.
    and then reuse the exact code path in §2 — they are separate providers at
    higher cost, not changes to `kv-backing`. NOTE the §1b obligation: each one
    must declare its slots to the pool invariant.
-4. **CHUNK A/B** (user pushed it three times), then the **GDN-cut A/B** with
-   the mandatory per-arm arena-tail re-measure (`net = prefill gain + tail
-   delta`, register C1/C7).
+4. ~~CHUNK A/B~~ **DONE, 2026-08-11.** Ship value is now **512** (was the
+   unmeasured 2048 default), set in `route_a_631_prod_boot.sh` as
+   `CHUNKED_PREFILL_SIZE`. Ladder, floor 0.2-2.6%: 256 -> 2579, **512 ->
+   2666**, 1024 -> 2597, 2048 -> 2533, 4096 -> 2377, 8192 -> 2156 tok/s,
+   16384 -> **CUDA OOM + gloo death**. 512 beats both neighbours, so it is an
+   interior optimum. Full write-up and the scope limits in
+   PROD_BRINGUP_BENCH.md. **The dynamic arm (`--enable-dynamic-chunking`) is
+   still NOT measured** -- note `server_args.py:14243` gates it on
+   `pp_size > 1`, which this instance is, so read that branch first.
+   Then the **GDN-cut A/B** with the mandatory per-arm arena-tail re-measure
+   (`net = prefill gain + tail delta`, register C1/C7).
 5. **Final all-axes acceptance** under real router traffic.
 
 ---

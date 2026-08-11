@@ -65,6 +65,8 @@ HOST="${HOST:-0.0.0.0}"
 RANK_MIB="${RANK_MIB:-22700,11920,11970}"
 CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-4}"
+# Measured, not inherited -- see the ladder at the flag site below.
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-512}"
 MAMBA_SLOTS="${MAMBA_SLOTS:-20}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-500000}"
 # OFF by default and not a preference: --enable-phase-flip hard-refuses
@@ -364,6 +366,17 @@ setsid "$PY" -m sglang.launch_server \
     --phase-flip-spill-depth "$PHASE_FLIP_SPILL_DEPTH" \
     --disable-overlap-schedule \
     --kv-cache-dtype fp8_e4m3 --context-length "$CTX" \
+    `# CHUNK: MEASURED, not inherited (#656 item 8, 2026-08-11). The default` \
+    `# 2048 was never chosen by anyone and was not even present in argv.` \
+    `# Ladder at 22.8k prompts, one boot per arm, A-vs-A floor 0.2-2.6%:` \
+    `#   256 2579 | 512 2666 | 1024 2597 | 2048 2533 | 4096 2377 |` \
+    `#   8192 2156 tok/s | 16384 CUDA OOM + gloo death.` \
+    `# 512 beats BOTH neighbours by more than the floor, so it is an` \
+    `# interior optimum and not just the smallest value tried. Bigger buys` \
+    `# activation memory with corridor headroom -- slower AND tighter, and` \
+    `# fatal at 16384. At concurrency the memory term arrives sooner, so the` \
+    `# safe direction from here is DOWN, never up.` \
+    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \
     --max-running-requests "$MAX_RUNNING" \
     `# The GDN/mamba state pool pins CONCURRENCY, not token capacity: the` \
     `# auto-sized pool gave 5 slots and the admission ratio (radix cache` \
