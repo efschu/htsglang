@@ -351,3 +351,47 @@ compares it to the boot pool, which is the direct evidence.
 * **Let a test state the limit instead of hiding it.** The gate cannot
   preempt an underpriced chunk, and the test that says so names the number
   that would make it (§1a-bis) rather than asserting the comfortable case.
+
+---
+
+## 6. THE ACCEPTANCE RUN
+
+`evidence-631/s34/accept2/EXTRACT.txt` and `CONFIG.txt`, log
+`evidence-631/s34/serving-run2.log`, code commit 1c2b3be294, boot
+`s33_boot_from_capture.sh` replaying the captured argv with one env addition,
+`SGLANG_CORRIDOR_FLOOR_MIB=1536` (§2: the ARMING floor; the law stays 1024 and
+every number below is judged against 1024).
+
+THIS IS THE SECOND RUN OF THIS SHIFT. The first is archived beside it at
+`accept-run1` and was aborted deliberately at t+26 min — see §1e. Nothing is
+averaged across the two and the first is not quoted as evidence for anything
+except its own abort.
+
+| axis | result |
+|---|---|
+| PLACEHOLDER | filled from EXTRACT.txt at close |
+
+### WHAT THIS RUN PROVES THAT NO EARLIER ONE DID
+
+* **Spec item 12 fired, with its restore**, inside the acceptance window
+  rather than beside it, on a target every rank agreed to (§3).
+* **The corridor law is enforced at two allocation sites**, and the second
+  one can be SEEN to be installed rather than inferred (§1e).
+* **The KV rung's decline is legible.** Whatever the shrink count, the log
+  now carries the four terms that produced it.
+
+### WHAT IT DOES NOT PROVE, SAID AS PLAINLY
+
+1. **The prefill gate's ARM count is not its value.** If it is 0, that means
+   the corridor never approached the floor AT AN ADMISSION INSTANT — the deep
+   dips in this configuration land at flip seams, where strict purity has
+   already parked prefill and the seam's own gate is the one that acts. The
+   announcement proves the caller is live; only an arm would prove it spends.
+2. **`want` is 0 on this boot** (§1e D2), so the gate enforces the floor and
+   does not preempt. A successor who enables `--enable-mfu-metrics` gets a
+   priced gate — and must keep the per-layer division and the cap.
+3. **The host half is still unspent** (HANDOFF_677 §2a), and MemAvailable has
+   moved the wrong way since: ~27 GiB now against the ~36 GiB that argument
+   was written against.
+4. **Dynamic chunking did not run.** The arm was off, deliberately, for the
+   second acceptance in a row.
