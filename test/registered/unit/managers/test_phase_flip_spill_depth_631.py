@@ -34,6 +34,7 @@ WHAT THESE TESTS PIN, and why each pin exists rather than being obvious:
 
 from __future__ import annotations
 
+import re
 import unittest
 from typing import List
 
@@ -307,3 +308,43 @@ class _patched_torch:
 
 if __name__ == "__main__":
     unittest.main()
+
+class TheDocstringMatchesTheLadderTest(unittest.TestCase):
+    """The ladder is described in three places -- the module docstring's flag
+    list, its rung table, and the refusal message -- and all three drifted the
+    moment rung 3 changed meaning. The refusal message printed "the deepest
+    implemented rung is 3 ('draft')" while rung 3 was the arena tail and
+    'draft' was rung 2, which is an error message that actively misinforms.
+    These pin the texts to the constants so the next insertion cannot repeat
+    it."""
+
+    def test_every_rung_name_appears_in_the_flag_list(self):
+        doc = spill.__doc__
+        for name in spill.DEPTH_NAMES:
+            self.assertIn(name, doc, f"rung name {name!r} missing from docstring")
+
+    def test_the_documented_integer_range_matches_max_depth(self):
+        self.assertIn(f"0..{spill.MAX_DEPTH}", spill.__doc__)
+
+    def test_every_rung_integer_has_a_table_row(self):
+        doc = spill.__doc__
+        for value, name in spill.DEPTH_NAMES_BY_VALUE.items():
+            self.assertRegex(
+                doc,
+                rf"\n\s+{value}\s+{re.escape(name)}\b",
+                f"rung {value} ({name}) has no row in the docstring table",
+            )
+
+    def test_the_name_map_is_derived_not_hand_written(self):
+        self.assertEqual(
+            spill.DEPTH_NAMES_BY_VALUE,
+            {v: k for k, v in spill.DEPTH_NAMES.items()},
+        )
+
+    def test_the_refusal_names_the_implemented_rung_correctly(self):
+        with self.assertRaises(spill.PhaseFlipSpillError) as cm:
+            spill.resolve_spill_depth(_Args(spill.MAX_DEPTH))
+        msg = str(cm.exception)
+        implemented = spill.DEPTH_NAMES_BY_VALUE[spill.IMPLEMENTED_DEPTH]
+        self.assertIn(f"{implemented!r}", msg)
+

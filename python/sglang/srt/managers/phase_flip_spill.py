@@ -25,14 +25,19 @@ empty device.
 
 THE LADDER IS USER-SELECTABLE, and cumulative
 ---------------------------------------------
-``--phase-flip-spill-depth {none,cache,draft,draft+graphs}`` (integers 0..3
-also accepted) / ``SGLANG_PHASE_FLIP_SPILL_DEPTH``.
+``--phase-flip-spill-depth {none,cache,draft,arena,draft+graphs}`` (integers
+0..4 also accepted) / ``SGLANG_PHASE_FLIP_SPILL_DEPTH``.
 
     0  none          nothing given up -- the pre-#656 seam, byte-identical
     1  cache         the outgoing phase's cached allocator segments go back
                      to the driver at the cutover      measured 2.5-3.5 GiB/card
-    2  draft         + draft (MTP) weights             ~1.86-2.01 GB/rank
-    3  draft+graphs  + draft CUDA graphs               ~0.55 GB/rank
+    2  draft         + draft (MTP) weights             439/285/285 MiB/rank
+                     (EXCLUSIVELY-owned bytes; the 1.86-2.01 GB figure that
+                     stood here was a memory-usage delta, most of which was
+                     the TARGET's embed/lm_head aliased into the draft)
+    3  arena         + the weights arena's idle tail   319/220/1191 MiB/rank
+                     (measured; released in TP, the phase that binds)
+    4  draft+graphs  + draft CUDA graphs               NOT WIRED, see below
 
 Cumulative: depth N performs every rung up to N. Each rung buys corridor and
 costs flip milliseconds; the measured trade is recorded per rung in
@@ -219,6 +224,12 @@ CARRIER_COMMIT_CHUNK = 64 * 1024 * 1024
 #: a granule. VA costs nothing until committed.
 CARRIER_VA_SLACK = 64 * 1024 * 1024
 
+#: Reverse of DEPTH_NAMES. Derived, never hand-maintained: the refusal message
+#: names the implemented rung, and a hand-written name there is exactly how it
+#: came to print "the deepest implemented rung is 3 ('draft')" when rung 3 was
+#: the arena tail and 'draft' was rung 2.
+DEPTH_NAMES_BY_VALUE = {v: k for k, v in DEPTH_NAMES.items()}
+
 DEPTH_ENV = "SGLANG_PHASE_FLIP_SPILL_DEPTH"
 VERIFY_ENV = "SGLANG_PHASE_FLIP_SPILL_VERIFY"
 
@@ -267,13 +278,15 @@ def resolve_spill_depth(server_args: Any = None) -> int:
         )
     if value > IMPLEMENTED_DEPTH:
         # Refuse rather than clamp. Clamping would make a depth sweep report
-        # that rung 3 is worth exactly what rung 1 is worth, which reads as a
-        # measurement and is an artefact of the clamp.
+        # that the refused rung is worth exactly what a lower one is worth,
+        # which reads as a measurement and is an artefact of the clamp.
         raise PhaseFlipSpillError(
             f"{LOG_PREFIX} spill depth {value} is defined but not wired; the "
             f"deepest implemented rung is {IMPLEMENTED_DEPTH} "
-            f"('draft': the cached allocator segments AND the draft model's "
-            f"weights, the latter on a VA-stable KvVmmArena carrier). Rung "
+            f"({DEPTH_NAMES_BY_VALUE[IMPLEMENTED_DEPTH]!r}: the cached "
+            f"allocator segments, the draft model's weights, AND the weights "
+            f"arena's idle tail, the latter two on VA-stable KvVmmArena "
+            f"carriers). Rung "
             f"{MAX_DEPTH} ('draft+graphs') additionally spills the draft CUDA "
             f"GRAPHS, which is not wired: a captured graph cannot be released "
             f"and re-materialised from a host image the way a weight tensor "

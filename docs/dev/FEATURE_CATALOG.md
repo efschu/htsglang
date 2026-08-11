@@ -479,15 +479,67 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   That is why spilling and keeping draft graphs ON are compatible (#656 item
   8 priced those graphs at 41% of decode). A boot-time pin AFTER graph
   capture refuses the boot if any carried parameter escaped the reservation,
-  because that corruption has no runtime symptom. Rung 3 (`draft+graphs`) is
-  defined and REFUSED: a captured graph cannot be refilled from a host image,
-  only re-captured. **Measured caveat, do not re-derive it the hard way:** the
+  because that corruption has no runtime symptom. **Rung 3 `arena`** (#656
+  successor 30) releases the WEIGHTS ARENA's idle tail: the arena is sized
+  `max(pp_bytes, tp_bytes)` and each layout occupies a PREFIX, so in the
+  smaller-layout phase the span above it is committed and addressable by
+  nothing — measured 318.7 / 220.1 / 1191.0 MiB per rank, idle in TP, which is
+  the phase that binds after rung 2 moved the binding there. It is the
+  CHEAPEST rung: no host round trip either way, because the tail holds nothing
+  live and `arena_refill` rewrites the arena on the way back regardless.
+  Ordering is load-bearing and silent corruption if reversed — release AFTER
+  the PP->TP refill (its `restore=` arm rewrites the PP layout, which reaches
+  into the tail), commit BEFORE the TP->PP refill. The TP->PP commit is an
+  allocation inside the no-return region and is priced by
+  `PhaseFlipRuntime._arena_tail_bytes` on the OPPOSITE leg from the drafter's.
+  Rung 4 (`draft+graphs`) is defined and REFUSED: a captured graph cannot be
+  refilled from a host image, only re-captured. **Measured caveat, do not
+  re-derive it the hard way:** the
   drafter's `embed_tokens`/`lm_head` are VIEWS into the target's weights
   arena, so the spillable payload is what the drafter EXCLUSIVELY owns —
   439 MiB (5090) / 285 MiB (3080) here, not the 1925 MiB its load delta
   suggests. `allocate_carrier_tensor` is the injection point for further
-  payload classes (idle-slot GDN states, cold layout bytes, session KV) under
-  spec items 11-14; they are rungs of this ladder, not new machinery.
+  payload classes (cold layout bytes, session KV) under spec items 11-14;
+  they are rungs of this ladder, not new machinery. **Two candidate payloads
+  are DISPROVEN, do not rebuild them:** idle mamba/GDN slot states free an
+  INDEX, not memory (`MambaPool` is plain `torch.zeros`, memory-saver off,
+  `MambaSlotAllocator.free` pushes to a free list), and kvso frees allocator
+  free-list slots with no `cuMem*` call at all. Both return zero bytes NVML
+  can see. The KV bytes that CAN be returned go through
+  `memory_pool.py:2588 release_backing_span` / `:3705
+  runtime_set_backing_rows`, and the blocker there is computing a safe shrink
+  watermark from the live set, not the release.
+- **Corridor guard / spill-before-alloc** (`managers/corridor_guard.py`, #656
+  spec items 15a/15b/16): a synchronous gate at the ALLOCATION rather than a
+  threshold observer, because the corridor law is a continuous minimum and the
+  allocation that most needs guarding — the seam's `commit_range` — does not
+  happen on a round boundary. `CorridorGuard.ensure_headroom(want)` arms on
+  `free - want < floor` (against the allocation about to happen, not the
+  current reading), frees to `floor + delta` so the next ask does not respill,
+  spends registered providers cheapest-first, and RE-PROBES the driver after
+  each one — a provider that hands bytes to torch's cache has freed nothing
+  the law can see. Exhausting the providers yields a REFUSAL, never a silent
+  breach; at the seam that becomes the existing unanimous abandon.
+  **Relief is TIERED above cost** (item 16): `RELIEF_REBALANCE` (level the
+  free column) < `RELIEF_PARK` (a peer card's surplus VRAM) < `RELIEF_HOST`
+  (system RAM). Cost orders within a tier and may not cross one. The host tier
+  is gated on a FLEET predicate read over NVML — every card at the floor, or
+  it stays shut — and NVML deliberately rather than a collective, because the
+  gate runs where ranks can disagree and a collective there deadlocks.
+  **Two floors, not one**: `floor_mib` is the arming watermark (raisable via
+  `SGLANG_CORRIDOR_FLOOR_MIB` to make the gate fire on demand for a can-fail
+  proof), `law_floor_mib` is the corridor law and the only thing a refusal may
+  cite. Conflating them wedged the rig — a raised floor refused legal seams,
+  and under strict purity a persistently refused `pp->tp` starves decode
+  outright (411 abandons, 0 requests in 6 min, /health 503). Hence
+  `refusal_is_fatal`, passed by the `pp->tp` leg only, which opens the host
+  tier even on an unlevel fleet because item 16 is a preference, not a suicide
+  pact; `host_forced_count` prices the missing rebalance tier. ENTRY:
+  `CorridorGuard` / `ensure_headroom`; built per rank by
+  `phase_flip_spill.get_corridor_guard`, whose providers resolve LATE (the
+  ladder binds its carrier only on the first cutover leg, after the first
+  gate). MEASURED: metal proof `want 820 MiB, free 2394 -> 2680 MiB, reclaimed
+  286 MiB from [draft-weights]`.
 - **KV-pool token-slot ledger** (`DESIGN_330_vram_dial.md` §3b, #486): every
   standing holder of `C_target` slots is a NAMED posten — committed KV, the
   per-decode reserve (`bs x get_alloc_reserve_per_decode()`, held under spec
@@ -749,11 +801,12 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   round: a spill landing in the same round as a drafter-in-tick step. Both
   facts are now IN the refusal text, and `KVSO_ALLOW_SPEC` is named in
   `--enable-kv-session-offload`'s CLI help (it appeared in no help text
-  before). Also mutually exclusive with
-  `--enable-hierarchical-cache` (:6620), PD disagg, `--weightless-kv-fastlane`,
+  before). Also mutually exclusive with PD disagg, `--weightless-kv-fastlane`,
   `--enable-unified-memory`, `--enable-hisparse`, `--enable-mixed-chunk`,
   `page_size > 1`, non-flashinfer backends, `pp_size > 1`, `dp_size > 1`
-  (:6596-6641).
+  (:6596-6641). `--enable-hierarchical-cache` is NO LONGER mutually exclusive:
+  #550 converted that refusal into an opt-in behind `KVSO_ALLOW_HICACHE=1`
+  once the shared `pinned_host_budget` existed (see §12).
 - **Hibernate to disk** (weights + module buffers survive process exit — NO KV
   is parked: `payload = {... "params", "static_state", "gguf_attrs" ...}`,
   `model_loader/hibernate.py:448-456`; uneven-TP3 reload 50s→8-14s, the uneven
