@@ -30,11 +30,15 @@ that its cooldown suppresses the SPEND and never the CHECK, and that it
 NEVER converts a verdict into a refusal.
 """
 
+import types
+
 import pytest
 
 from sglang.srt.managers.corridor_admission import (
+    WANT_CAP_MIB,
     PrefillAdmissionGate,
     get_prefill_admission_gate,
+    guard_prefill_admission,
 )
 from sglang.srt.managers.corridor_guard import CorridorGuard, RELIEF_LOCAL
 
@@ -85,8 +89,14 @@ class FakeReporter:
 
 
 class FakeScheduler:
-    def __init__(self, reporter=None):
+    """``layers=1`` by default so ``slope_bytes`` in a test IS the per-token
+    figure the gate uses; the per-layer division has its own tests."""
+
+    def __init__(self, reporter=None, layers=1):
         self.metrics_reporter = reporter
+        self.server_args = types.SimpleNamespace(enable_phase_flip=True)
+        if layers:
+            self.model_config = types.SimpleNamespace(num_hidden_layers=layers)
 
 
 def build_guard(card: FakeCard) -> CorridorGuard:
@@ -220,10 +230,49 @@ def test_want_is_priced_from_the_activation_slope():
     assert gate.want_bytes(512) == 512 * 1024
 
 
-def test_want_sums_both_activation_terms():
+def test_want_sums_both_activation_terms_and_takes_ONE_layer_of_them():
+    """The reporter sums over every layer; residency is one layer's worth.
+
+    Taking the sum priced a 512-token chunk at ~4.7 GiB on this model --
+    larger than any card's free column, so the guard's target would be
+    unreachable and it would spend the entire ladder on every admission,
+    including the provider that evacuates the drafter.
+    """
+    scheduler = FakeScheduler(FakeReporter(qkv=100, ffn=40), layers=10)
+    gate = PrefillAdmissionGate(scheduler)
+    assert gate.want_bytes(10) == 140  # (100+40)/10 layers * 10 tokens
+
+
+def test_an_unknown_layer_count_refuses_to_price_rather_than_price_wrongly():
+    scheduler = FakeScheduler(FakeReporter(qkv=100, ffn=40), layers=0)
+    gate = PrefillAdmissionGate(scheduler)
+    assert gate.want_bytes(10) == 0
+
+
+def test_want_is_hard_capped_so_a_bad_slope_cannot_unreach_the_target():
+    scheduler = FakeScheduler(FakeReporter(qkv=10 * MIB, ffn=0))
+    gate = PrefillAdmissionGate(scheduler)
+    assert gate.want_bytes(4096) == WANT_CAP_MIB * MIB
+
+
+def test_a_None_chunk_size_does_not_take_the_instance_down():
+    """`dynamic_chunked_prefill_size()` returns None when chunking is off.
+
+    `int(None)` raised OUTSIDE the gate's try, in the scheduler event loop.
+    """
     scheduler = FakeScheduler(FakeReporter(qkv=100, ffn=40))
     gate = PrefillAdmissionGate(scheduler)
-    assert gate.want_bytes(10) == 1400
+    assert gate.want_bytes(None) == 0
+
+
+def test_the_gate_is_off_unless_the_phase_flip_is_on():
+    """The default path must not grow a corridor guard as a side effect."""
+    card = FakeCard(free_mib=100)
+    scheduler = FakeScheduler(FakeReporter(qkv=1, ffn=1))
+    scheduler.server_args = types.SimpleNamespace(enable_phase_flip=False)
+    assert guard_prefill_admission(scheduler, 512) is None
+    assert getattr(scheduler, "phase_flip_corridor_admission", None) is None
+    assert card.provider_calls == 0
 
 
 def test_an_unreadable_slope_still_enforces_the_floor():
@@ -332,6 +381,42 @@ def test_the_gate_is_memoised_on_the_scheduler():
 
 def test_no_scheduler_no_gate():
     assert get_prefill_admission_gate(None) is None
+
+
+# --------------------------------------------------------------------------
+# 6. THE GATE SAYS IT IS THERE, ONCE, WHICHEVER WAY IT RESOLVED.
+#
+# Learned on metal this shift: the first boot logged NOTHING from this module
+# across 6066 prefill admissions, and "installed but never needed to arm" and
+# "inert because the guard lookup returned None" are opposite in value and
+# were identical in the log. Every other line here is conditional on arming,
+# so the announcement is the only thing that distinguishes them.
+# --------------------------------------------------------------------------
+
+
+def test_an_armed_gate_announces_itself_once(caplog):
+    card = FakeCard(free_mib=8000)
+    gate, _ = build_gate(card)
+    with caplog.at_level("INFO"):
+        gate.before_admission(512)
+        gate.before_admission(512)
+    armed = [r for r in caplog.records if "ARMED on device" in r.getMessage()]
+    assert len(armed) == 1, "exactly one announcement per process"
+
+
+def test_an_INERT_gate_says_so_at_WARNING(caplog):
+    """The state that cost this shift a whole acceptance run."""
+    scheduler = FakeScheduler(FakeReporter(qkv=1, ffn=1))
+    gate = PrefillAdmissionGate(scheduler)
+    gate._guard = lambda: None  # noqa: SLF001
+    with caplog.at_level("INFO"):
+        gate.before_admission(512)
+        gate.before_admission(512)
+    inert = [r for r in caplog.records if "INERT" in r.getMessage()]
+    assert len(inert) == 1
+    assert inert[0].levelname == "WARNING", (
+        "an inert corridor gate is not an INFO-level fact"
+    )
 
 
 def test_stats_report_what_the_gate_did():
