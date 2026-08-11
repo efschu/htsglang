@@ -227,7 +227,55 @@ Quoting the second log for item 12 would be the "green on the axes it checks"
 error HANDOFF_675 §4b warned about; quoting the first for the corridor would
 be worse.
 
-<!-- NUMBERS FILLED IN AT THE END OF THE SHIFT -->
+### The numbers
+
+**66 minutes unmanned**, 08:54:35Z to 10:00:06Z, one instance, one log,
+28692 corridor samples at 100 ms.
+
+| axis | result |
+|---|---|
+| corridor | **0 breaches on all three cards.** MIN free 1139 / 2404 / 1623 MiB, p50 2111 / 4852 / 2531 |
+| corridor, second half | headroom above the law **+115 / +1380 / +599 MiB** (s31: +948 / +2992 / +1160) |
+| flips | **279 `pp_to_tp` + 276 `tp_to_pp`**, both layouts, **0 abandons, 0 tracebacks** |
+| strict purity | **True** — 43995 prefill batches, **ZERO** carrying a graph |
+| decode graphs | **99.0%** (909 of 918) |
+| MTP | accept length **2.695** (n=918) |
+| occupancy | live slots max **238607 = 46.6%** of a 512552-row pool |
+| real traffic | 101 `/v1/completions`, 58 `/v1/messages`, 58 `count_tokens`, 1 `/v1/chat/completions` |
+| relief ladder | gate **armed 89 times, 0 refused, 0 host-forced**; `allocator-cache` paid **178 times** |
+| KV rung | **0 shrinks** — see below |
+| item 16 spread | mean **2640 MiB**, median 2759, best 247, worst 3237 |
+| host RAM | peak 112.1 GiB, `oom_kill` 9 **cumulative and unchanged from s31's reading, so zero new kills this run** |
+| script verdict | `ACCEPTANCE: GREEN` |
+
+### WHAT THE GREEN DOES AND DOES NOT COVER
+
+It covers more than s31's did, and the difference is worth naming precisely.
+
+**The gate now ARMS at the real law floor.** s31's run never armed once, so
+its ladder was unreached — a state that proves the ladder does not break, not
+that it works. Here it armed 89 times under real load and cleared every one:
+**0 refusals in 555 flips**, with 178 provider spends. Item 15a is exercised
+at the law, not only at a proof floor.
+
+**gpu0 held within 115 MiB of the corridor law for 66 minutes.** That is the
+"filled to the limit" regime spec item 15 asks for, and it never breached.
+
+Three things it still does not cover, stated as plainly as HANDOFF_675 stated
+its own gaps:
+
+1. **Item 12's KV rung did not fire in this run.** Zero shrinks. Every arm
+   was satisfied by the tier below it — `allocator-cache` returning 604-824
+   MiB — which is the tier law working correctly and is also why the rung was
+   never needed. Item 12 is proven in `serving-kvrung2.log`, at a raised
+   arming floor, and **must be quoted from there**. See §6 next-step 0.
+2. **Item 16 is still NOT satisfied.** Spread mean 2640 MiB, essentially
+   unchanged from s31's 2917. Nothing this shift touched levelling, and §6
+   item 2 now explains why the obvious actuator cannot be used at the seam.
+3. **YaRN long-context (spec item 4) is not in this run at all.** The
+   checkpoint is the `yarn1.5` build, but no leg drove context past 262144,
+   so the "bs=1 above the standard context" acceptance component remains
+   unmeasured. No successor should read this GREEN as covering it.
 
 ---
 
