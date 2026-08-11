@@ -259,20 +259,22 @@ any number across boots with and without it.
 
 ## 4b. THE SHIP-CONFIG RUN, AND EXACTLY WHAT ITS "GREEN" DOES NOT COVER
 
-Extract: `/spinning/evidence-631/s31/accept/EXTRACT.txt` (4829 corridor
-samples, real qwen agent traffic through the router, rung OFF).
+Extract: `/spinning/evidence-631/s31/accept/EXTRACT.txt` (10558 corridor
+samples over 1056 s, real qwen agent traffic through the router, rung OFF).
 
 | axis | result |
 |---|---|
-| corridor breaches | **0** on all three cards (MIN 2214 / 4345 / 2470 MiB) |
-| flips | 81 `pp_to_tp` + 81 `tp_to_pp`, both layouts, **0 abandons, 0 tracebacks** |
-| strict purity | **True** — 1851 prefill batches, ZERO carrying a graph |
-| decode graphs | 95.5% of decode batches |
-| MTP | accept length **2.347** (n=66) |
-| occupancy | live slots max 159626 = **31.9%** of pool |
-| real traffic | `/v1/messages` 28, counted not asserted |
-| item 16 spread | mean **2915 MiB**, worst 3397 |
+| corridor | **HELD, 0 breaches** on all three cards; MIN free 1972 / 4015 / 2184 MiB |
+| flips | **108 `pp_to_tp` + 108 `tp_to_pp`**, both layouts, **0 abandons, 0 tracebacks** |
+| strict purity | **True** — 3168 prefill batches, ZERO carrying a graph |
+| decode graphs | **97.1%** of decode batches |
+| MTP | accept length **2.407** (n=105) |
+| occupancy | live slots max **217741 = 43.5%** of pool |
+| real traffic | `/v1/messages` 38, counted not asserted |
+| item 16 spread | mean **2917 MiB**, median 2941, worst 3419 |
+| headroom above floor | **+948 / +2992 / +1160 MiB** |
 | host RAM | peak **112.1 GiB**, cgroup `oom_kill` **9** (cumulative) |
+| relief ladder | gate never armed; **no provider spent this run** |
 
 **THE SCRIPT PRINTS "GREEN". DO NOT QUOTE THAT AS ACCEPTANCE.** It is green on
 the axes it checks, and three things the user's spec requires are not among
