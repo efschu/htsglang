@@ -227,11 +227,15 @@ class KvBackingRelief:
         probe: Optional[Callable[[], int]] = None,
         device_index: int = 0,
         margin_rows: int = 0,
+        buffers: int = 0,
     ) -> None:
         self._pool = pool
         self._alloc = allocator
         self._live_slots_fn = live_slots_fn
         self._bytes_per_row = int(bytes_per_row)
+        #: Number of arena buffers (2 x layer_num). The release granularity is
+        #: one commit chunk in EACH of them, not one chunk overall.
+        self._buffers = int(buffers)
         self._probe = probe
         self._device_index = int(device_index)
         self._margin_rows = int(margin_rows)
@@ -259,6 +263,18 @@ class KvBackingRelief:
 
     def _supported(self) -> bool:
         return callable(getattr(self._pool, "runtime_set_backing_rows", None))
+
+    def _min_release_rows(self) -> int:
+        """Rows that must be given up before ANY extent can clear.
+
+        One commit chunk in EVERY buffer, expressed in rows. Below this the
+        release is arithmetically guaranteed to be zero, so attempting it can
+        only waste a cap and exhaust the provider.
+        """
+        chunk = int(getattr(self._pool, "backing_commit_chunk_bytes", 0) or 0)
+        if chunk <= 0 or self._buffers <= 0:
+            return 0
+        return int(math.ceil(chunk * self._buffers / self._bytes_per_row))
 
     def _max_live_row(self) -> int:
         try:
@@ -289,6 +305,23 @@ class KvBackingRelief:
         floor = max(page, max_live + 1 + self._margin_rows)
         floor = int(math.ceil(floor / page) * page)
         rows_wanted = int(math.ceil(max(0, int(nbytes)) / self._bytes_per_row))
+        # RELEASE IS EXTENT-GRANULAR, PER BUFFER, AND THAT IS COARSE.
+        #
+        # The arena holds each of the 2*layer_num buffers at its own offset and
+        # ``decommit_range`` frees only extents lying WHOLLY above the keep
+        # point. A shrink is therefore split across every buffer, so a request
+        # for N bytes moves only N/n_buffers in each one -- and if that is less
+        # than one commit chunk, NOTHING is released anywhere.
+        #
+        # Measured 2026-08-11 with a 256 MiB chunk: a 78262-row shrink asked
+        # about 40 MiB of each of ~28 buffers, cleared no extent in any of
+        # them, and returned 0 while the log looked like a working rung.
+        #
+        # So round the ask UP to the granularity instead of attempting a
+        # no-op. Over-delivering is not a failure -- the guard re-probes the
+        # driver and stops asking once the target is met -- whereas
+        # under-delivering is silent and costs a wasted cap.
+        rows_wanted = max(rows_wanted, self._min_release_rows())
         target = max(floor, current - rows_wanted)
         target = int(math.ceil(target / page) * page)
         if target >= current:
@@ -396,7 +429,26 @@ class KvBackingRelief:
         return max(0, int(getattr(self._pool, "size", rows)) - was)
 
 
-def bytes_per_row(pool: Any) -> int:
+def row_geometry(pool: Any):
+    """``(bytes_per_row, n_buffers)`` for the pool's arena, or ``(0, 0)``.
+
+    Both numbers come from the arena's own buffer descriptors, because that is
+    the geometry ``shrink`` actually prices against. The buffer COUNT matters
+    as much as the row size: release is extent-granular per buffer, so the
+    smallest release that can return anything is one commit chunk times the
+    number of buffers.
+    """
+    return _bytes_per_row(pool), _buffer_count(pool)
+
+
+def _buffer_count(pool: Any) -> int:
+    full = getattr(pool, "full_kv_pool", pool)
+    owner = getattr(full, "_post_capture_owner", None)
+    specs = getattr(owner, "_specs", None) if owner is not None else None
+    return len(specs) if specs else 0
+
+
+def _bytes_per_row(pool: Any) -> int:
     """Bytes of physical backing one KV row costs across every buffer.
 
     Derived from the arena's own buffer descriptors when they exist, because
@@ -467,7 +519,7 @@ def kv_backing_provider(
             LOG_PREFIX,
         )
         return None
-    row_bytes = bytes_per_row(pool)
+    row_bytes, n_buffers = row_geometry(pool)
     if row_bytes <= 0:
         logger.warning(
             "%s could not read the pool's row geometry; KV backing relief is "
@@ -485,4 +537,5 @@ def kv_backing_provider(
         bytes_per_row=row_bytes,
         probe=probe,
         device_index=device_index,
+        buffers=n_buffers,
     )

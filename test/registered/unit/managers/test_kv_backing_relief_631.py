@@ -329,6 +329,54 @@ class HonestAccountingTest(unittest.TestCase):
         self.assertEqual(r.free_up_to(500 * MIB), 0)
 
 
+class ReleaseGranularityTest(unittest.TestCase):
+    """Release is extent-granular PER BUFFER, and that is coarse.
+
+    The arena holds each of the 2*layer_num buffers at its own offset, and
+    ``decommit_range`` frees only extents lying wholly above the keep point.
+    A shrink is split across every buffer, so an ask for N bytes moves only
+    N/n_buffers in each -- and below one commit chunk, nothing is released
+    anywhere.
+
+    Measured 2026-08-11 with a 256 MiB chunk: a 78262-row shrink asked about
+    40 MiB of each of ~28 buffers, cleared no extent in any of them, and
+    returned 0 while the log read like a working rung.
+    """
+
+    def test_a_small_ask_is_rounded_up_to_one_chunk_per_buffer(self):
+        card = _Card(1100)
+        pool = _FakePool(500000, bytes_per_row=15 * 1024, card=card)
+        pool.backing_commit_chunk_bytes = 256 * MIB
+        a = _FakeAllocator(500000)
+        r = kbr.KvBackingRelief(
+            pool,
+            a,
+            live_slots_fn=lambda: torch.tensor([5], dtype=torch.int64),
+            bytes_per_row=15 * 1024,
+            probe=card.probe,
+            buffers=28,
+        )
+        r.free_up_to(489 * MIB)
+        # 256 MiB x 28 buffers / 15 KiB per row = 489132 rows, so the ask must
+        # grow far beyond the 33000 rows 489 MiB alone would suggest.
+        self.assertLess(pool.calls[0], 500000 - 400000)
+
+    def test_no_chunk_reported_means_no_rounding(self):
+        card = _Card(1100)
+        pool = _FakePool(500000, bytes_per_row=15 * 1024, card=card)
+        a = _FakeAllocator(500000)
+        r = kbr.KvBackingRelief(
+            pool,
+            a,
+            live_slots_fn=lambda: torch.tensor([5], dtype=torch.int64),
+            bytes_per_row=15 * 1024,
+            probe=card.probe,
+            buffers=28,
+        )
+        r.free_up_to(489 * MIB)
+        self.assertGreater(pool.calls[0], 400000)
+
+
 class WithheldCapacityIsANamedPostenTest(unittest.TestCase):
     """The second metal kill: the cap read as a pool leak.
 
