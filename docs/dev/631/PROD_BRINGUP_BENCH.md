@@ -4124,3 +4124,44 @@ budget-lever return in HANDOFF_665 §14. **Under-load time-series minima from
 `route_a_631_corridor.py` are NOT affected** -- they sample under load, where
 the cache is in use rather than hoarded, and they are the rows the corridor
 verdicts actually rest on.
+
+## RELIEF LADDER, measured 2026-08-11 (successor 31)
+
+Both rows are UNDER-LOAD gate events read from the serving log, not idle
+readings, so the flush caveat above does not apply to them.
+
+| rung | tier | event | measured |
+|---|---|---|---|
+| `allocator-cache` | LOCAL | seam staging `pp_to_tp` | free 2794 -> 2980 MiB, **+186 MiB** |
+| `allocator-cache` | LOCAL | seam staging `pp_to_tp` (peer rank) | free 2952 -> 3118 MiB, **+166 MiB** |
+| `kv-backing` | LOCAL | seam staging `tp_to_pp` | free **4 -> 1844 MiB**, **+1840 MiB**, pool backed 145734 rows instead of 500000 |
+| `kv-backing` | LOCAL | earlier arm, same boot | +362 MiB (claimed 384), +458 MiB (claimed 480), +1704 MiB (claimed 1704) |
+
+The `kv-backing` row is the one worth keeping: a card at **4 MiB free** —
+fully exhausted, far under the corridor law — was brought back over the floor
+by KV residency alone, and the 208 MiB allocation it was blocking went
+through. Three flips completed with the rung live.
+
+**Both numbers are MEASURED DRIVER DELTAS**, not the payload's own claim. The
+gap between claimed and measured (384 vs 362, 480 vs 458) is the accounting
+working: extent rounding and concurrent allocation are visible instead of
+being papered over.
+
+### Conditions these rows require, and they are not defaults
+
+* `SGLANG_FLIP_SEAM_CHUNK_MIB=8`. Without a commit chunk the arena releases
+  nothing partially; at 256 MiB the minimum useful release exceeds the whole
+  pool. See HANDOFF_675 §1d for the formula
+  (`chunk_bytes * n_buffers / bytes_per_row`).
+* `SGLANG_KV_BACKING_RELIEF=1`. The rung is OFF by default: its shrink target
+  is still rank-local, and ranks that disagree about admission desync the PP
+  group (HANDOFF_675 §1a).
+* `SGLANG_CORRIDOR_FLOOR_MIB` raised (3000/4000 in these boots) as the
+  can-fail instrument. The corridor VERDICT is still read against 1024.
+
+### Ship-config run, same day, rung OFF
+
+Serving healthy on 30030 under real qwen agent traffic via the router: 84
+flips, corridor held, per-card free 2439/5394/2617 MiB. **Spread ~2955 MiB**
+— the item-16 unevenness is unchanged and no payload rung touches it, which
+is the standing argument for wiring `kv_reshard` as the REBALANCE tier.
