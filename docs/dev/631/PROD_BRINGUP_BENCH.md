@@ -4447,3 +4447,38 @@ and is what turns the gate from floor-enforcing into preempting.
 rate as s34's 244 clears over 65 min, so steady state rather than regression,
 and s34's MTP accept length of 2.850 says speculation survives it. Booked as
 the place a future thrash regression would first appear.
+
+## Item 16's rebalance lender: the levelling delta (successor 36)
+
+The tier existed and had one provider that was only ever spent when an
+allocation had already reached the trough. The lender spends the same ladder
+on the water-fill's schedule instead. Measured on the confirmation window
+(`/spinning/evidence-631/s36/confirm`, boot `a84568d7bd`, argv byte-identical
+to s34's green run, pool 512552 on both):
+
+    PP1 (the card that bound in s34, NVML column 0), verbatim from the log:
+
+      15:47:01  1 lend   428 MiB   free 1748 -> 2176   column [1748, 3327, 3100]
+      15:48:08  2 lends  892 MiB   free 1626 -> 2090   column [1626, 3197, 3012]
+      15:50:03  5 lends 1998 MiB   free 1626 -> 2088   column [1626, 3177, 2992]
+
+    PP0 / PP2: 0 lends, 7374 of 7375 consultations skipped `no-pressure`.
+    Their cards never crossed the watermark, and the sampler agrees
+    (0 samples below 1792 MiB on either).
+
+**The fuel is the allocator hoard, not the drafter.** Every lend so far came
+from `allocator-cache` — bytes no payload owns, whose restore cost is zero.
+The drafter was not evacuated once by the lender, so the levelling is bought
+without adding to the ~15 s draft-weights cadence HANDOFF_679 §3 booked as
+the place a thrash regression would first show.
+
+**Over-delivery is real and is reported, not clipped.** "lent 462 MiB of a
+166 MiB water-fill bound" is `empty_cache` being all-or-nothing: the provider
+cannot free a bounded amount, the guard re-probes the driver anyway, and the
+figure quoted is the measured delta. A successor reading a lend larger than
+its bound is looking at that, not at a policy breach.
+
+**Cost side, honestly:** ~25 consultations/second/rank at the per-round hook,
+of which all but a handful terminate on one monotonic clock read and one
+`mem_get_info`. No collective, no thread, no NVML read unless the local
+pressure check has already passed.

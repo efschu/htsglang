@@ -126,8 +126,8 @@ PYEOF
 
   echo
   echo "-- axes that must NOT have moved (the green state)"
-  echo "   pp_to_tp flips:            $(c 'flip pp_to_tp committed')"
-  echo "   tp_to_pp flips:            $(c 'flip tp_to_pp committed')"
+  echo "   pp_to_tp cutovers:         $(c 'cutover pp_to_tp')"
+  echo "   tp_to_pp cutovers:         $(c 'cutover tp_to_pp')"
   echo "   corridor gate cleared:     $(c 'CORRIDOR-GUARD cleared')"
   echo "   corridor gate REFUSED:     $(c 'CORRIDOR-GUARD REFUSED')"
   echo "   host tier forced:          $(c 'spending HOST RAM')"
