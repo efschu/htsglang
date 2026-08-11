@@ -95,6 +95,62 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "KV-BACKING"
 
+#: A desire no reduction can lower: the neutral element of an element-wise MIN.
+_UNBOUNDED_ROWS = 1 << 40
+
+#: The proposal of a rank that cannot take part in a shrink at all -- no relief
+#: object, no VA reservation, or a live set it could not read. Its third field
+#: (``current``) is 0, and :func:`collective_kv_target` declines whenever the
+#: group's minimum ``current`` is not positive, so ONE abstention cancels the
+#: whole decision.
+#:
+#: That is the correct direction and the expensive lesson of HANDOFF_675 §1a:
+#: the danger is never "nobody capped", it is "some capped and some did not".
+#: An abstaining rank cannot cap, so its peers must not either.
+ABSTAIN = (_UNBOUNDED_ROWS, 0, 0, 0)
+
+
+def collective_kv_target(reduced):
+    """The group's shared row target, from an element-wise MIN of proposals.
+
+    ``reduced`` is what a MIN all-reduce returns over the four-field proposals
+    :meth:`KvBackingRelief.propose` produces::
+
+        [ desire, -floor, current, -current ]
+          |         |       |        |
+          |         |       |        `-- max current pool rows (diagnostic)
+          |         |       `-- MIN current pool rows: the shared reference
+          |         `-- negated, so MIN yields the MAX floor across the group
+          `-- MIN desire: the most-pressed rank sets the ambition
+
+    Two independent quantities, and getting their relationship backwards is a
+    fault rather than an inefficiency:
+
+    * the AMBITION is a minimum -- relief is driven by whichever rank is
+      closest to the corridor floor, because that is the rank the flip will
+      otherwise be refused on;
+    * the LIMIT is a maximum -- the target must clear the highest live row on
+      EVERY rank, because the target is an absolute row id and the shrink
+      unmaps physical pages under it. A target below a peer's live set is
+      ``cudaErrorIllegalAddress``, which kills every rank rather than raising.
+
+    **The limit wins.** Returns None when there is nothing every rank can give
+    up, which is a normal outcome and not an error.
+    """
+    if len(reduced) < 3:
+        return None
+    desire = int(reduced[0])
+    max_floor = -int(reduced[1])
+    min_current = int(reduced[2])
+    if min_current <= 0:
+        # An abstention, or a rank with no pool. Not a shrink the group can
+        # make uniformly, so it is not a shrink the group makes.
+        return None
+    target = max(desire, max_floor)
+    if target >= min_current:
+        return None
+    return int(target)
+
 
 class KvRowCap:
     """Withhold slot ids above ``cap`` from the allocator's free list.
@@ -290,9 +346,102 @@ class KvBackingRelief:
             return 0
         return int(live.max())
 
+    def _floor_rows(self, max_live: int) -> int:
+        """The lowest row count this rank may be capped to, in rows.
+
+        The shrink precondition stated as a number: every row at or below the
+        high-water mark must stay backed, plus one page of slack so the very
+        next allocation does not immediately re-arm.
+        """
+        page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
+        floor = max(page, int(max_live) + 1 + self._margin_rows)
+        return int(math.ceil(floor / page) * page)
+
+    # -- the collective decision -----------------------------------------
+
+    def propose(
+        self,
+        *,
+        want_bytes: int,
+        floor_bytes: int,
+        delta_bytes: int,
+        cheap_relief_bytes: int = 0,
+    ):
+        """This rank's four-field proposal for the group's shrink target.
+
+        PURE: it reads free memory and the live set and computes; it changes
+        no residency and touches no allocator. That is what lets every rank
+        call it unconditionally, which is the property the reduction needs --
+        a collective reached by only some ranks is a hang, and putting one
+        behind the guard's rank-local arm condition would turn the capacity
+        desync of HANDOFF_675 §1a into something strictly worse.
+
+        ``cheap_relief_bytes`` is what the tiers BELOW this one could still
+        return (on this rig: torch's allocator cache). Counting it here is how
+        the tier law survives the rung's move out of the guard's ladder --
+        free money is spent before KV capacity is. The estimate may overstate
+        what those tiers really return, and that is the safe direction:
+        overstating cheap relief understates this ask, and under-shrinking is
+        recoverable (the guard refuses, the flip is retried next round) while
+        over-shrinking costs admission capacity that bought nothing.
+        """
+        if not self._supported() or self._bytes_per_row <= 0:
+            return ABSTAIN
+        current = int(getattr(self._pool, "size", 0))
+        if current <= 0:
+            return ABSTAIN
+        max_live = self._max_live_row()
+        if max_live < 0:
+            # An unknown live set is not an empty one, and this is the number
+            # that decides where memory gets unmapped. Abstain, and take the
+            # group with us -- see ABSTAIN.
+            return ABSTAIN
+        floor_rows = self._floor_rows(max_live)
+        desire = current
+        if floor_rows < current and not self._exhausted:
+            free_now = self._free_bytes()
+            need = int(floor_bytes) + int(delta_bytes) + max(0, int(want_bytes))
+            deficit = need - free_now - max(0, int(cheap_relief_bytes))
+            if deficit > 0:
+                rows = int(math.ceil(deficit / self._bytes_per_row))
+                # Rounded UP to the arena's release granularity: below it the
+                # release is arithmetically guaranteed to be zero (§1d).
+                rows = max(rows, self._min_release_rows())
+                page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
+                desire = max(floor_rows, current - rows)
+                desire = int(math.ceil(desire / page) * page)
+        return (int(desire), -int(floor_rows), int(current), -int(current))
+
+    def apply_target(self, target_rows: Optional[int]) -> int:
+        """Cap and shrink to EXACTLY the row count the group agreed on.
+
+        Deliberately does NOT consult ``self._exhausted``. Exhaustion is
+        evidence about THIS rank's arena, and it is a reason to stop ASKING
+        (:meth:`propose` honours it) -- never a reason to stay uncapped while
+        peers cap, which is the admission disagreement that wedged the group.
+        A rank that pays nothing and caps anyway loses admission capacity for
+        no bytes; a rank that pays nothing and stays uncapped loses the group.
+        """
+        if target_rows is None:
+            return 0
+        target = int(target_rows)
+        if not self._supported() or self._bytes_per_row <= 0 or target <= 0:
+            return 0
+        current = int(getattr(self._pool, "size", 0))
+        if target >= current:
+            return 0
+        return self._shrink_to(target, current)
+
     # -- the provider ----------------------------------------------------
 
     def free_up_to(self, nbytes: int) -> int:
+        """Rank-local relief. NOT registered with the corridor guard.
+
+        Kept as the single-rank primitive the unit tests pin the watermark,
+        granularity and accounting laws against. In a distributed instance the
+        target comes from :func:`collective_kv_target` instead, because a
+        capacity may not be decided locally.
+        """
         if not self._supported() or self._bytes_per_row <= 0 or self._exhausted:
             return 0
         max_live = self._max_live_row()
@@ -300,11 +449,7 @@ class KvBackingRelief:
             return 0
         current = int(getattr(self._pool, "size", 0))
         page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
-        # The floor is the shrink precondition, stated in rows: every row at
-        # or below the high-water mark must stay backed, plus one page of
-        # slack so the very next allocation does not immediately re-arm.
-        floor = max(page, max_live + 1 + self._margin_rows)
-        floor = int(math.ceil(floor / page) * page)
+        floor = self._floor_rows(max_live)
         rows_wanted = int(math.ceil(max(0, int(nbytes)) / self._bytes_per_row))
         # RELEASE IS EXTENT-GRANULAR, PER BUFFER, AND THAT IS COARSE.
         #
@@ -327,7 +472,10 @@ class KvBackingRelief:
         target = int(math.ceil(target / page) * page)
         if target >= current:
             return 0
+        return self._shrink_to(target, current)
 
+    def _shrink_to(self, target: int, current: int) -> int:
+        """Cap to ``target`` rows, unmap above it, and report DRIVER bytes."""
         before = self._free_bytes()
         if self._rows_at_boot is None:
             self._rows_at_boot = current
@@ -389,7 +537,7 @@ class KvBackingRelief:
             measured / (1024 * 1024),
             target,
             current,
-            max_live,
+            self._max_live_row(),
             claimed / (1024 * 1024),
             self._cap.withheld,
         )

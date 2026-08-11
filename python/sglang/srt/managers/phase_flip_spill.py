@@ -1096,6 +1096,101 @@ def recover_kv_backing(scheduler: Any) -> int:
         )
         return 0
 
+def _cached_relief_estimate(device_index: int) -> int:
+    """Bytes the tiers BELOW the KV rung could still return, on this rank.
+
+    On this rig that is torch's caching allocator, which holds 1028-1426 MiB
+    per card at idle. It is an UPPER bound on what ``empty_cache`` really
+    hands back (the allocator keeps whole segments it is still carving from),
+    and the overestimate is deliberate: it understates the KV ask, and
+    under-shrinking is retried while over-shrinking costs admission capacity
+    that bought nothing.
+    """
+    try:
+        import torch
+
+        reserved = int(torch.cuda.memory_reserved(device_index))
+        allocated = int(torch.cuda.memory_allocated(device_index))
+        return max(0, reserved - allocated)
+    except Exception:
+        return 0
+
+
+def collective_kv_backing_relief(scheduler: Any, reduce_fn, *, want_bytes, guard) -> int:
+    """#656 item 12, the device half: ONE shrink target for the whole group.
+
+    A REFUSAL MAY BE DECIDED LOCALLY. A CAPACITY MAY NOT. The corridor guard
+    reads NVML per rank and refuses per rank, which is safe because a refusal
+    joins the seam's unanimous abandon. The KV cap is the opposite kind of
+    decision: it changes ``available_size()``, which feeds ADMISSION, so three
+    ranks that size their own shrink from their own free memory end up
+    disagreeing about how much work the group may take -- measured on metal as
+    449039 / 451037 / 175225 / 145734 rows, followed by a scheduler that
+    stopped heartbeating while every rank was alive (HANDOFF_675 §1a).
+
+    WHY HERE AND NOT INSIDE THE GUARD'S LADDER. A collective may only be
+    entered at a point EVERY rank reaches unconditionally. The guard's
+    providers run behind its ARM CONDITION, which is rank-local by
+    construction (``free - want < floor`` against this rank's own NVML
+    reading), so a reduction down there hangs the first time one rank arms and
+    a peer does not -- strictly worse than the desync it would be fixing. This
+    function is called from ``_corridor_gate``, on the same unconditional path
+    as the seam's existing fit reduction, and every rank calls it whether or
+    not it is under pressure.
+
+    It runs BEFORE the guard, so the bytes it frees are money the guard's own
+    probe then sees, and its ask already discounts the cheaper tiers.
+
+    Returns the bytes THIS rank gave back to the driver.
+    """
+    if reduce_fn is None:
+        # No consensus channel: single-rank shapes only. Uniform across the
+        # group by construction, since the channel is built for all or none.
+        return 0
+    from sglang.srt.managers import kv_backing_relief as kbr
+
+    relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None) if scheduler else None
+    if guard is None:
+        # No floor to propose against. Abstain -- but still reduce, because a
+        # rank that returns early here hangs the ones that did not.
+        relief = None
+    proposal = kbr.ABSTAIN
+    if relief is not None:
+        try:
+            proposal = relief.propose(
+                want_bytes=int(want_bytes),
+                floor_bytes=int(guard.floor_bytes),
+                delta_bytes=int(guard.delta_bytes),
+                cheap_relief_bytes=_cached_relief_estimate(guard.device_index),
+            )
+        except Exception as e:
+            # EVERY RANK STILL ENTERS THE REDUCTION. A rank that returned
+            # early here would leave its peers waiting on a collective that
+            # never completes, which is a hang rather than a degraded rung.
+            logger.warning(
+                "%s KV relief proposal failed (%s); abstaining, which makes "
+                "the whole group decline",
+                LOG_PREFIX,
+                e,
+            )
+            proposal = kbr.ABSTAIN
+    target = kbr.collective_kv_target(reduce_fn(list(proposal)))
+    if target is None or relief is None:
+        return 0
+    try:
+        return int(relief.apply_target(target))
+    except Exception as e:
+        logger.error(
+            "%s KV relief failed to apply the agreed target %d: %s. This rank "
+            "is now capped differently from its peers -- recovery on the "
+            "tp->pp leg lifts it.",
+            LOG_PREFIX,
+            target,
+            e,
+        )
+        return 0
+
+
 #: Proof/soak override for the gate's arming floor. See get_corridor_guard.
 CORRIDOR_FLOOR_ENV = "SGLANG_CORRIDOR_FLOOR_MIB"
 
@@ -1231,17 +1326,25 @@ def get_corridor_guard(scheduler: Any):
 
     # SPEC ITEM 12, THE DEVICE HALF: the KV pool's own unoccupied backing.
     #
-    # This is the provider that funds the pp->tp leg, which was the deadlock
+    # This is the relief that funds the pp->tp leg, which was the deadlock
     # class: under strict purity the drafter is already spilled for the whole
     # PP phase, so the only REBALANCE provider returns 0 exactly when the
     # fatal leg needs it. The scheduler's pool IS the PP layout's pool, so
     # this is relief the binding leg can actually spend.
     #
-    # It sits in tier LOCAL because the rows it unmaps hold nothing: the
-    # watermark never goes below the highest LIVE row, so no request loses a
-    # byte it owns and nothing is copied anywhere. It costs more than the
-    # allocator cache -- admission capacity is withheld until recovery -- so
-    # it is spent second.
+    # IT IS DELIBERATELY NOT REGISTERED AS A GUARD PROVIDER. Every other
+    # provider here answers a rank-local question -- "can I give bytes back" --
+    # and may therefore run behind the gate's rank-local arm condition. The KV
+    # cap answers a GROUP question, because it changes ``available_size()``
+    # and therefore admission, and three ranks that answered it independently
+    # wedged this instance (HANDOFF_675 §1a). So the target is agreed by one
+    # reduction in ``collective_kv_backing_relief``, which ``_corridor_gate``
+    # calls just BEFORE consulting this guard -- early enough that the bytes
+    # it returns are money the guard's own probe sees, and unconditional
+    # enough that a collective there is safe.
+    #
+    # The object is still built and cached here, because recovery on the
+    # tp->pp leg reaches it through the same attribute.
     #
     # THIS IS NOT "A SMALLER POOL AS THE FIX", which the standing rule
     # forbids. The VA reservation does not move, the addresses a captured
@@ -1259,11 +1362,11 @@ def get_corridor_guard(scheduler: Any):
         relief = None
     if relief is not None:
         setattr(scheduler, KV_BACKING_RELIEF_ATTR, relief)
-        guard.register(
-            "kv-backing",
-            _COST_KV_BACKING,
-            relief.free_up_to,
-            tier=cg.RELIEF_LOCAL,
+        logger.info(
+            "%s KV backing relief is available on device %d and will be driven "
+            "by the COLLECTIVE target, not by the guard's ladder",
+            LOG_PREFIX,
+            int(device_index),
         )
 
     setattr(scheduler, CORRIDOR_GUARD_ATTR, guard)

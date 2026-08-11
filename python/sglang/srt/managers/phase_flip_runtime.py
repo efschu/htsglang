@@ -1976,6 +1976,14 @@ class PhaseFlipRuntime:
         #: proves the gate is doing work rather than merely passing: a run
         #: with zero reclaims has not exercised item 15a at all.
         self.corridor_reclaims = 0
+        #: #656 item 12, device half: seams at which the group agreed a KV
+        #: backing target and this rank returned bytes for it, and the total
+        #: those returned. Booked separately from ``corridor_reclaims``
+        #: because this relief happens BEFORE the gate rather than inside its
+        #: ladder -- a run where the gate never armed can still show KV
+        #: relief, and reading one number for the other would hide that.
+        self.corridor_kv_relief_count = 0
+        self.corridor_kv_relief_bytes = 0
         #: Flips abandoned because the STAGING buffers would not fit in
         #: free VRAM above the reserve. Counted separately from fit_aborts:
         #: "the target pool has no row for this slot" and "there is no room
@@ -3743,14 +3751,71 @@ class PhaseFlipRuntime:
         ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` death should have had.
         """
         scheduler = self._census_scheduler
-        if scheduler is None:
-            return ""
+        guard = None
         try:
             from sglang.srt.managers.phase_flip_spill import get_corridor_guard
 
-            guard = get_corridor_guard(scheduler)
-            if guard is None:
-                return ""
+            if scheduler is not None:
+                guard = get_corridor_guard(scheduler)
+        except Exception as e:
+            logger.error(
+                "%s corridor guard could not be built (%s); the flip proceeds "
+                "on the staging affordability check alone",
+                LOG_PREFIX,
+                e,
+            )
+            guard = None
+
+        # SPEC ITEM 12, DEVICE HALF, AND THE ONE PLACE IT MAY HAPPEN.
+        #
+        # The KV cap changes admission, so it must be the SAME row count on
+        # every rank or the group desyncs (HANDOFF_675 §1a). That needs a
+        # reduction, and a reduction needs a call site every rank reaches
+        # UNCONDITIONALLY -- which the guard's providers are not, since they
+        # run behind its rank-local arm condition. This line is on the same
+        # unconditional path as the fit reduction that follows it.
+        #
+        # IT SITS OUTSIDE EVERY EARLY RETURN ABOVE, INCLUDING ``guard is
+        # None``, and that placement is the whole safety argument: a rank that
+        # skipped the reduction because its own guard failed to build would
+        # leave its peers inside a collective forever. A rank with no guard
+        # ABSTAINS instead, which makes the group decline -- a lost
+        # optimisation, never a hang.
+        #
+        # BEFORE the guard's own verdict, so what it frees is money the guard
+        # can see.
+        kv_freed = 0
+        try:
+            from sglang.srt.managers.phase_flip_spill import (
+                collective_kv_backing_relief,
+            )
+
+            kv_freed = collective_kv_backing_relief(
+                scheduler,
+                self._collective_min,
+                want_bytes=int(staging_bytes),
+                guard=guard,
+            )
+        except Exception as e:
+            logger.error(
+                "%s collective KV backing relief failed (%s); the gate "
+                "continues without it",
+                LOG_PREFIX,
+                e,
+            )
+        if kv_freed > 0:
+            self.corridor_kv_relief_bytes += int(kv_freed)
+            self.corridor_kv_relief_count += 1
+            logger.info(
+                "%s KV backing relief returned %.0f MiB before the gate (%s), "
+                "on a row target every rank agreed to",
+                LOG_PREFIX,
+                kv_freed / (1024 * 1024),
+                direction,
+            )
+        if guard is None:
+            return ""
+        try:
             verdict = guard.ensure_headroom(
                 int(staging_bytes),
                 reason=f"seam staging {direction}",

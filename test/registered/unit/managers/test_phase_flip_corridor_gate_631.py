@@ -76,12 +76,17 @@ def _refused():
     return GuardResult(False, 0, 0, 0, 0, (), "every provider is exhausted")
 
 
-def _runtime():
+def _runtime(collective_min=None):
     r = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
     r._census_scheduler = object()
     r.corridor_aborts = 0
     r.corridor_reclaims = 0
     r._corridor_pp_refusals = 0
+    r.corridor_kv_relief_count = 0
+    r.corridor_kv_relief_bytes = 0
+    #: The consensus channel item 12's KV target rides. Defaults to a
+    #: single-rank identity so the existing wiring tests keep their shape.
+    r._collective_min = collective_min or (lambda vals, **kw: list(vals))
     return r
 
 
@@ -315,6 +320,153 @@ class TheFatalLegIsMarkedTest(unittest.TestCase):
             r._corridor_gate(100 * MIB, "tp_to_pp")
         self.assertTrue(seen["pp_to_tp"])
         self.assertFalse(seen["tp_to_pp"])
+
+
+class EveryRankReachesTheKvReductionTest(unittest.TestCase):
+    """The deadlock class, pinned at the call site.
+
+    Item 12's KV target is agreed by a MIN all-reduce. A collective is only
+    safe where EVERY rank arrives, and the ways a rank can fail to arrive are
+    all rank-local: its guard failed to build, it has no scheduler yet, its
+    pool is not on a VA reservation. None of those are group-wide, so each of
+    them would strand the peers inside a reduction that never completes --
+    which is strictly worse than the admission desync this mechanism replaces
+    (HANDOFF_675 §1a: "DO NOT IMPLEMENT THE OBVIOUS VERSION -- it hangs").
+
+    So the reduction sits outside every early return in ``_corridor_gate``,
+    and these tests assert that by counting reductions, not by reading code.
+    """
+
+    def _counting_channel(self):
+        calls = []
+
+        def reduce(vals, **kw):
+            calls.append(list(vals))
+            return list(vals)
+
+        return calls, reduce
+
+    def test_a_guard_that_fails_to_build_still_joins_the_reduction(self):
+        calls, reduce = self._counting_channel()
+        r = _runtime(reduce)
+        with _Patched(RuntimeError("no device")):
+            self.assertEqual(r._corridor_gate(500 * MIB, "pp_to_tp"), "")
+        self.assertEqual(
+            len(calls), 1, "a rank with no guard must abstain, not walk away"
+        )
+
+    def test_a_rank_with_no_scheduler_still_joins_the_reduction(self):
+        calls, reduce = self._counting_channel()
+        r = _runtime(reduce)
+        r._census_scheduler = None
+        with _Patched(_Guard(_cleared())):
+            self.assertEqual(r._corridor_gate(500 * MIB, "pp_to_tp"), "")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_refused_gate_joined_the_reduction_before_refusing(self):
+        calls, reduce = self._counting_channel()
+        r = _runtime(reduce)
+        with _Patched(_Guard(_refused())):
+            r._corridor_gate(500 * MIB, "pp_to_tp")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(r.corridor_aborts, 1)
+
+    def test_exactly_one_reduction_per_gate_call(self):
+        # Two reductions on one rank and one on another is the same hang by a
+        # different route, so the count is asserted rather than "at least one".
+        calls, reduce = self._counting_channel()
+        r = _runtime(reduce)
+        with _Patched(_Guard(_cleared())):
+            r._corridor_gate(500 * MIB, "pp_to_tp")
+            r._corridor_gate(500 * MIB, "tp_to_pp")
+        self.assertEqual(len(calls), 2)
+
+
+class TheKvReliefRunsBeforeTheGateAndIsCountedTest(unittest.TestCase):
+    """Order and evidence, the two ways a rung becomes inert unnoticed."""
+
+    def test_the_relief_is_applied_before_the_guard_forms_its_verdict(self):
+        order = []
+
+        class _G:
+            floor_bytes = 1024 * MIB
+            delta_bytes = 256 * MIB
+            device_index = 0
+
+            def ensure_headroom(self, want, *, reason="", refusal_is_fatal=False):
+                order.append("gate")
+                return _cleared()
+
+        def relief(_scheduler, _reduce, *, want_bytes, guard):
+            order.append("kv-relief")
+            return 300 * MIB
+
+        r = _runtime()
+        old = phase_flip_spill.collective_kv_backing_relief
+        phase_flip_spill.collective_kv_backing_relief = relief
+        try:
+            with _Patched(_G()):
+                r._corridor_gate(500 * MIB, "pp_to_tp")
+        finally:
+            phase_flip_spill.collective_kv_backing_relief = old
+        self.assertEqual(
+            order,
+            ["kv-relief", "gate"],
+            "the gate must judge against a free column the relief has already "
+            "moved, or it refuses flips the relief could have funded",
+        )
+        self.assertEqual(r.corridor_kv_relief_count, 1)
+        self.assertEqual(r.corridor_kv_relief_bytes, 300 * MIB)
+
+    def test_a_relief_that_freed_nothing_is_not_counted(self):
+        def relief(_scheduler, _reduce, *, want_bytes, guard):
+            return 0
+
+        r = _runtime()
+        old = phase_flip_spill.collective_kv_backing_relief
+        phase_flip_spill.collective_kv_backing_relief = relief
+        try:
+            with _Patched(_Guard(_cleared())):
+                r._corridor_gate(500 * MIB, "pp_to_tp")
+        finally:
+            phase_flip_spill.collective_kv_backing_relief = old
+        self.assertEqual(r.corridor_kv_relief_count, 0)
+
+    def test_a_relief_that_raises_does_not_take_the_flip_down(self):
+        def relief(_scheduler, _reduce, *, want_bytes, guard):
+            raise RuntimeError("arena is gone")
+
+        r = _runtime()
+        old = phase_flip_spill.collective_kv_backing_relief
+        phase_flip_spill.collective_kv_backing_relief = relief
+        try:
+            with _Patched(_Guard(_cleared())):
+                self.assertEqual(r._corridor_gate(500 * MIB, "pp_to_tp"), "")
+        finally:
+            phase_flip_spill.collective_kv_backing_relief = old
+
+
+class TheGuardDoesNotCarryTheKvRungInItsLadderTest(unittest.TestCase):
+    """The registration that had to come OUT, pinned so it does not come back.
+
+    ``kv-backing`` was registered as a corridor-guard provider, and that is
+    precisely what made the shrink target rank-local: the guard's providers
+    run behind its arm condition, which each rank evaluates against its own
+    NVML reading. Re-registering it would restore the desync while every test
+    above still passed, so the absence is asserted.
+    """
+
+    def test_kv_backing_is_not_a_registered_provider(self):
+        import inspect as _inspect
+
+        src = _inspect.getsource(phase_flip_spill.get_corridor_guard)
+        self.assertNotIn(
+            '"kv-backing"',
+            src,
+            "the KV rung is driven by collective_kv_backing_relief, not by the "
+            "guard's ladder: a capacity may not be decided rank-locally",
+        )
+        self.assertIn("collective_kv_backing_relief", src)
 
 
 if __name__ == "__main__":
