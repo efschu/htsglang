@@ -181,13 +181,77 @@ for "crashed". Synthetic fill may top up only BELOW the cap.
 
 ---
 
+## 4b. USER PRIORITY CHANGE (2026-08-11) — THERE IS NO MAX KV
+
+The user asked why "max KV" capacity work still appears in the program. It
+should not. Spec item 12 says KV is a SPILL CLASS, not a number to discover.
+
+* **The per-(phase,load) capacity table is DEMOTED.** No standalone
+  measurement runs for it, ever. Capacity numbers fall out of corridor CSVs
+  and boot logs as free byproducts -- book them when they appear, never boot
+  for them. The 669440 anchor stays as the one-paragraph provenance note it
+  now is, and §0 already says it is a conservation check and never an
+  acceptance target.
+* **The KV-TO-HOST RUNG IS NOW THE PRIORITY** immediately after the pp->tp
+  seam provider. It is the piece that makes the user's sentence true: *when
+  VRAM for KV hits the limit, it spills.*
+* **The A/Bs (chunk, GDN-cut) queue BEHIND it**, unless a stable serving
+  window is already open and they fit without delaying it.
+
+### THE TARGET END STATE, and it is already the mechanism we have
+
+> boot the KV arena's VA at the session universe (max_running_requests x max
+> ctx class); physical residency follows the controller; a KV allocation that
+> would cross the floor triggers rebalance, then host spill, never a
+> refusal-starve and never a smaller pool as the fix.
+
+**That is precisely what `KvVmmArena` does** -- reserve the virtual range once
+at boot, map and unmap physical pages underneath it freely, addresses never
+move so CUDA graphs survive (spec item 13). The KV pool ALREADY sits on one
+under #631 (`model_runner_kv_cache_mixin.py:3925` passes
+`swappable_backing=True`). So the design is not new machinery; it is sizing
+the RESERVATION at the universe instead of at the pool, and putting the
+commit/decommit under the controller.
+
+### CORRECTION TO THE ORDER: NOT VIA kvso
+
+The order names "spec item 12 via kvso machinery". **kvso cannot do the device
+half** and building against it produces an inert rung that looks like it works
+(§1a): it frees slots into the ALLOCATOR FREE LIST, contains no
+`cuMem*`/`decommit`/`empty_cache` call anywhere, and NVML never moves. The
+guard re-probes the driver, so it would credit exactly 0 bytes.
+
+Split the rung by half:
+
+* **DEVICE half (the bytes): the VMM arena.** `memory_pool.py:2588
+  release_backing_span(layers, lo_row, hi_row)` / `:3705
+  runtime_set_backing_rows(rows)` return bytes actually released to the
+  driver. This is the only path that moves NVML.
+* **HOST half (where the bytes go): kvso's pinned host pool is reusable**, and
+  so is its per-session blob round trip. Use it as the destination, never as
+  the releaser.
+
+The blocker remains the WATERMARK, not the release: nothing computes a safe
+shrink point from the live set, and the vram dial sidesteps it by DESTROYING
+the live set (`vram_dial.py:957`). §3 steps 1-5 spell out the safe sequence;
+step 4 (cap the allocator so nothing is handed out above the watermark) is the
+one that makes this a real build -- skip it and the next allocation faults on
+unbacked memory.
+
+**"Never a smaller pool as the fix" is now a hard rule**, and it retires the
+last of the static-ladder thinking: if the controller cannot fund an
+allocation, the answer is rebalance, then host spill, then tempo -- never a
+pool that fits.
+
 ## 5. NEXT, IN ORDER
 
-1. **Wire `kv_reshard` as the `RELIEF_REBALANCE` provider** (§3). Item 16's
-   levelling path, already built, biggest measured gap.
-2. **The KV backing-release provider** (§3 steps 1-5), `RELIEF_HOST`, which is
-   what finally funds the `pp->tp` seam. The escape from §2 is already waiting
-   for it.
+1. **The pp->tp seam provider** -- still first, it is the deadlock class.
+2. **The KV-TO-HOST RUNG (§4b), now the user's priority.** Device half via
+   `release_backing_span`/`runtime_set_backing_rows`, host half via kvso's
+   pinned pool, VA reserved at the session universe, residency under the
+   controller. NOT via kvso's release path (§4b correction).
+   Wire `kv_reshard` as the `RELIEF_REBALANCE` provider alongside it (§3) --
+   already built, and it is the tier the ladder reaches BEFORE host.
 3. **PP-levelling A/B, GDN-only cut** — and note the correction: HANDOFF_673
    §1c said "do not build". That verdict was right about the *grid* and wrong
    about the *GDN-only* lever. The ~308 MiB/layer corridor cost applies to
@@ -210,8 +274,8 @@ for "crashed". Synthetic fill may top up only BELOW the cap.
    MiB of tail on a binding card is a LOSS, and pricing a change on the axis it
    was designed for while ignoring the axis it moves is exactly how this chain
    shipped rungs worth nothing (register C2, C7).
-4. Resident-working-set capacity table per (phase, load): bs1/bs4 x PP/TP, one
-   corridor CSV each at real occupancy, conservation check against 669440.
+4. ~~Resident-working-set capacity table~~ **DEMOTED, see §4b.** No standalone
+   runs. Book capacity only as a byproduct of corridor CSVs and boot logs.
 5. **CHUNK A/B -- the FIRST item-8 arm** (user pushed it ahead of DFLASH,
    PP-prefill-graphs and the 5090-imbalance arm; asked about dynamic prefill
    batching three times). VERIFIED PREMISE: the ship config runs
