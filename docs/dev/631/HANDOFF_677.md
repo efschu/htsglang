@@ -287,7 +287,52 @@ is not how to find out. The line is ready for whoever runs the A/B.
 
 See `/spinning/evidence-631/s33/accept/EXTRACT.txt` and `CONFIG.txt`.
 
-RESULTS_PLACEHOLDER
+**65 unmanned minutes, 10:47:00Z to 11:52:00Z, one instance, one log, 28421
+corridor samples at 100 ms. The verdict is NOT GREEN, on one axis, and the
+axis is the corridor.** Everything else is the strongest this chain has
+recorded. Both facts belong in the same paragraph.
+
+| axis | result |
+|---|---|
+| corridor | **12 breach samples on gpu0**, MIN free 1001 / 1718 / 1527 MiB -> margin **-23** / +694 / +503. gpu1 and gpu2 never breached |
+| item 16, at the minimum | spread **717 MiB** (s32: 1265). p50 spread 2498 is transient depth, not waste — see §3 |
+| flips | **324 `pp_to_tp` + 324 `tp_to_pp`**, both layouts, **0 abandons, 0 tracebacks** |
+| strict purity | **True** — 44226 prefill batches, **ZERO** carrying a graph |
+| decode graphs | **98.8%** (765 of 774) |
+| MTP | accept length **2.649** (n=774) |
+| occupancy | live slots max **332159 = 64.8%** of a 512552-row pool (s32: 46.6%) |
+| **spec item 4** | **PROVEN TWICE**: 271237 prompt tokens both legs, above the 262144 boundary, 48 tokens decoded each, 267 s and 262 s |
+| real traffic | 109 `/v1/completions`, 77 `count_tokens`, 74 `/v1/messages`, 1 chat — qwen agents on real repository-analysis tasks through router 30099 |
+| relief ladder | gate **50 cleared, 0 refused, 0 host-forced**; `allocator-cache` paid **100 times** |
+| KV rung | **0 shrinks** — the cheap tier covered all 50 arms again |
+| arena rung 3 | **324 tail releases, 0 invalid-argument faults** — §1a's fix held under 648 flips |
+| host RAM | peak 112.1 GiB, `oom_kill` 9 cumulative and unchanged, so zero new kills |
+
+### WHAT THIS RUN PROVES THAT NO EARLIER ONE DID
+
+* **Spec item 4, twice.** No run in this chain had exercised the YaRN long
+  context at all. Two bs1 sessions decoded above 262144, in different phase
+  contexts, from a prompt built to a measured token count.
+* **The cards are half again as full.** Occupancy 64.8% against s32's 46.6%,
+  at the same pool, because two 271k sessions were resident inside the window.
+* **Item 16 moved for the first time**, from 1265 to 717 MiB of spread at the
+  binding instant, on the TP-vector change alone.
+* **The arena fix survived 648 flips** with zero faults, on the leg that used
+  to be unpriced.
+
+### WHAT IT DOES NOT PROVE, SAID AS PLAINLY
+
+1. **The corridor law was broken**, 12 samples, one card, 23 MiB deep, 1.6 s.
+   Cause located in §1a-bis: an ungated prefill allocation, not the seam. Not
+   laundered as "shallow" — it is a breach, the run is NOT GREEN, and the fix
+   is named.
+2. **Item 12's rung still has not fired.** 0 shrinks in 50 arms. The
+   occupancy leg written to force it (`s33_occupancy_leg.py`) was CANCELLED
+   before it started, because it would have compounded a breach that had just
+   happened. It is committed and ready for a shift that runs it against a
+   corridor with a prefill gate in place.
+3. **The host half is unblocked but unspent** (§2a).
+4. **Dynamic chunking did not run** — the arm was off, deliberately.
 
 ---
 
