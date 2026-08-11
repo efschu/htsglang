@@ -260,6 +260,71 @@ class WaterFillingTest(unittest.TestCase):
         self.assertFalse(cg.fleet_is_level([], 1024, 256))
 
 
+class WaterFillIsAnInstrumentBeforeItIsAnActuatorTest(unittest.TestCase):
+    """Item 16, successor 35: the objective existed and nothing consumed it.
+
+    ``water_fill_targets`` had exactly ONE caller in the whole tree and it was
+    a test. So item 16's first relief stage -- redistribute onto the card with
+    the most headroom -- had a computed target and no reader, which is the
+    familiar failure of this chain one step earlier than usual: not a
+    mechanism that never fires, a mechanism nothing ever asks.
+
+    The ACTUATOR is genuinely missing and stays missing: moving KV between
+    cards needs a seam-compatible partial reshard (HANDOFF_678 §4.5). The
+    INSTRUMENT costs a log line, and it is what turns "spread 879 MiB" into
+    "this card should shed N MiB and that one can absorb M" -- which is the
+    number a successor needs before deciding whether the actuator is worth
+    building at all.
+    """
+
+    def test_transfers_are_signed_in_PAYLOAD_terms_not_free_terms(self):
+        """The sign convention a reader can act on without a decoder ring.
+
+        ``water_fill_targets``' own docstring describes the sign in terms of
+        FREE bytes ("negative means this card should give bytes up"), which
+        reads backwards to anyone thinking about where the payload goes. A
+        card with lots of FREE should ABSORB payload. This states it the way
+        the reader will act on it: positive = shed payload.
+        """
+        # Card 0 has the most free (6000) -> it should ABSORB.
+        # Cards 1 and 2 are fuller -> they should SHED.
+        transfers = cg.water_fill_transfers([6000 * MIB, 1200 * MIB, 1800 * MIB])
+        self.assertLess(transfers[0], 0, "the emptiest card absorbs")
+        self.assertGreater(transfers[1], 0, "the fullest card sheds")
+        self.assertGreater(transfers[2], 0)
+        # And they conserve: what is shed is what is absorbed.
+        self.assertEqual(sum(transfers), 0)
+
+    def test_the_fullest_card_sheds_the_most(self):
+        transfers = cg.water_fill_transfers([6000 * MIB, 1200 * MIB, 1800 * MIB])
+        self.assertGreater(transfers[1], transfers[2])
+
+    def test_a_level_fleet_asks_for_no_transfer_at_all(self):
+        self.assertEqual(cg.water_fill_transfers([1100 * MIB] * 3), [0, 0, 0])
+
+    def test_an_empty_column_yields_no_transfers_rather_than_raising(self):
+        self.assertEqual(cg.water_fill_transfers([]), [])
+
+    def test_it_agrees_with_the_targets_function_by_construction(self):
+        """One derivation, not two. A second one is a second thing to keep
+        in agreement, and this chain has shipped that defect twice."""
+        column = [6000 * MIB, 1200 * MIB, 1800 * MIB]
+        targets = cg.water_fill_targets(column)
+        self.assertEqual(
+            cg.water_fill_transfers(column),
+            [t - f for t, f in zip(targets, column)],
+        )
+
+    def test_the_guard_REPORTS_the_levelling_it_cannot_perform(self):
+        """The withheld-host line already names the spread; it must now name
+        the move, because the spread alone does not say which card to fix."""
+        fleet = _Fleet([1100, 6000, 3000])
+        g = _guard(fleet, 0)
+        g.register("host", 10, fleet.provider(0, 100), tier=cg.RELIEF_HOST)
+        r = g.ensure_headroom(900 * MIB)
+        self.assertIn("shed", r.detail.lower())
+
+
 class WhenRefusingIsFatalTest(unittest.TestCase):
     """Item 16 is a preference, not a suicide pact.
 

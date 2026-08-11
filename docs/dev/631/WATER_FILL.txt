@@ -1,0 +1,15 @@
+samples                2246 at 100 ms  (225 s of wall clock)
+corridor law           1024 MiB free per card
+
+SPREAD OF THE FREE COLUMN (item 16's levelness metric)
+  min 167  p50 2347  p90 2763  max 2803 MiB
+
+WATER-FILL: PAYLOAD THE OBJECTIVE WANTS MOVED OFF THE FULLEST CARD
+  min 98  p50 995  p90 1016  max 1344 MiB
+
+AT THE BINDING INSTANT (the lowest free any card reached)
+  free column   [1619, 3776, 2055] MiB
+  min free      1619 MiB   -> margin 595 MiB over the law
+  spread        2157 MiB
+  water-fill    [864, -1293, 428] MiB  (positive = SHED)
+  verdict       card 0 should shed 864 MiB onto card 1

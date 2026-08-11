@@ -187,6 +187,63 @@ def water_fill_targets(free_column):
     return [mean] * len(col)
 
 
+def water_fill_transfers(free_column):
+    """The signed PAYLOAD move each card needs to reach equal free, in bytes.
+
+    Positive means **this card should SHED that many bytes of payload**;
+    negative means it can ABSORB them. The vector sums to zero, because a
+    transfer is conserved.
+
+    WHY THIS EXISTS ALONGSIDE :func:`water_fill_targets` RATHER THAN INSTEAD
+    OF IT. The targets function is the objective and this is one subtraction
+    away from it -- computed FROM it here, so there is one derivation and not
+    two. What it adds is a sign convention a reader can act on without a
+    decoder ring: ``water_fill_targets`` states its sign in terms of FREE
+    bytes, and "this card should give bytes up" reads backwards to anyone
+    thinking about where the payload goes, because the card that should give
+    FREE bytes up is the card that should TAKE payload.
+
+    IT IS AN INSTRUMENT, NOT AN ACTUATOR, AND THAT IS THE POINT. Item 16's
+    first relief stage is "redistribute onto the card with the most headroom",
+    and the actuator for that is genuinely missing -- moving KV between cards
+    needs a seam-compatible partial reshard (HANDOFF_678 §4.5), and the DCP
+    token vector decides ownership mid-stream. Until that exists, the least a
+    guard can do is SAY what the levelling would have been. Before this,
+    ``water_fill_targets`` had exactly one caller in the tree and it was a
+    test: the objective was computed by nothing, which is this chain's
+    familiar failure one step earlier than usual -- not a mechanism that never
+    fires, a mechanism nothing ever asks.
+
+    A spread figure alone does not tell a successor whether the actuator is
+    worth building; a per-card "shed 900 MiB / absorb 900 MiB" does.
+    """
+    col = [int(f) for f in free_column]
+    if not col:
+        return []
+    return [t - f for t, f in zip(water_fill_targets(col), col)]
+
+
+def describe_water_fill(free_column) -> str:
+    """One human-readable clause naming the levelling move, or ''.
+
+    Empty when the fleet is unknown or already level, so a log line does not
+    grow a clause that says nothing.
+    """
+    transfers = water_fill_transfers(free_column)
+    if not transfers or all(t == 0 for t in transfers):
+        return ""
+    shed = max(range(len(transfers)), key=lambda i: transfers[i])
+    absorb = min(range(len(transfers)), key=lambda i: transfers[i])
+    if transfers[shed] <= 0:
+        return ""
+    return (
+        f"item 16 water-fill would have card {shed} SHED "
+        f"{transfers[shed] / _MIB:.0f} MiB onto card {absorb} "
+        f"(which can absorb {-transfers[absorb] / _MIB:.0f} MiB); no actuator "
+        "exists for that move, so this is the levelling NOT performed"
+    )
+
+
 def fleet_is_level(free_column, floor_mib: int, delta_mib: int) -> bool:
     """True when EVERY card sits at the floor, i.e. host RAM is permitted.
 
@@ -502,6 +559,9 @@ class CorridorGuard:
                 f"would deadlock (free column {[int(f // _MIB) for f in column]} "
                 f"MiB, spread {free_spread_mib(column)} MiB)"
             )
+            clause = describe_water_fill(column)
+            if clause:
+                detail += f". {clause}"
         if host_blocked:
             detail += (
                 "; host tier withheld -- fleet is not level"
@@ -509,6 +569,13 @@ class CorridorGuard:
                 f"{free_spread_mib(column)} MiB): item 16 spends host RAM only "
                 "once every card is at the floor"
             )
+            # NAME THE MOVE, not just the unevenness. "spread 879 MiB" does
+            # not say which card to fix or by how much, and the decision a
+            # successor faces -- is the missing rebalance tier worth building
+            # -- turns on exactly that number.
+            clause = describe_water_fill(column)
+            if clause:
+                detail += f". {clause}"
         if ok:
             logger.info("%s cleared on device %d: %s", LOG_PREFIX, self.device_index, detail)
         else:
