@@ -462,15 +462,35 @@ class ChunklessArenaIsDisqualifiedTest(unittest.TestCase):
                 kbr.kv_backing_provider(self._Sched(False), device_index=0)
             )
 
-    def test_the_rung_is_off_unless_explicitly_enabled(self):
-        # A rank-local cap changes admission, and ranks that disagree about
-        # admission desync the PP group -- measured as a scheduler that stopped
-        # heartbeating while every rank was alive.
+    def test_the_rung_is_on_by_default_now_that_the_target_is_collective(self):
+        # It was opt-in for exactly one shift, while the shrink target was
+        # still rank-local and ranks that disagreed about admission desynced
+        # the PP group. The target is agreed by a MIN all-reduce now, and the
+        # uniformity was measured on metal (347161 rows on all three ranks),
+        # so the default faces the other way.
+        # Asserted on the GATE, not on the returned object: these fakes have
+        # no arena geometry, so the builder declines further down for an
+        # unrelated and equally correct reason. The gate announces itself in
+        # the log when it declines, so its silence is the evidence.
         with unittest.mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SGLANG_KV_BACKING_RELIEF", None)
-            self.assertIsNone(
+            with self.assertLogs(kbr.logger, level="DEBUG") as caught:
+                kbr.logger.debug("marker")
                 kbr.kv_backing_provider(self._Sched(True), device_index=0)
-            )
+        self.assertFalse(
+            [line for line in caught.output if "DISABLED" in line],
+            "the env gate must not be what stops it any more",
+        )
+
+    def test_the_escape_hatch_still_turns_it_off(self):
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_KV_BACKING_RELIEF": "0"}, clear=False
+        ):
+            with self.assertLogs(kbr.logger, level="WARNING") as caught:
+                self.assertIsNone(
+                    kbr.kv_backing_provider(self._Sched(True), device_index=0)
+                )
+        self.assertTrue([line for line in caught.output if "DISABLED" in line])
 
 
 class FlushMustNotTouchUnbackedRowsTest(unittest.TestCase):

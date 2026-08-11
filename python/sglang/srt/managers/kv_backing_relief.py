@@ -719,27 +719,27 @@ def kv_backing_provider(
     guard's spend order read as if a tier were funded when it is not, and this
     chain has shipped three of those.
     """
-    # OFF BY DEFAULT, AND THE REASON IS A WEDGE, NOT CAUTION.
+    # ON BY DEFAULT SINCE THE TARGET BECAME COLLECTIVE (2026-08-11).
     #
-    # The cap changes ``available_size()``, which feeds ADMISSION. Each rank
-    # sizes its own shrink from its own free memory and its own live set, so
-    # the three ranks capped to 449039 / 451037 / 175225 / 145734 rows in one
-    # boot -- i.e. they no longer agreed on how much work the group could
-    # take. A PP group whose ranks disagree about admission desyncs, and this
-    # one did: the scheduler stopped heartbeating and /health reported
-    # "couldn't get a response from detokenizer" while every rank was alive.
+    # It was opt-in for one shift, and the reason was a wedge rather than
+    # caution: the cap changes ``available_size()``, which feeds ADMISSION,
+    # and each rank used to size its own shrink from its own free memory and
+    # its own live set. Three ranks capped to 449039 / 451037 / 175225 /
+    # 145734 rows in one boot, the group stopped agreeing about how much work
+    # it could take, and the scheduler stopped heartbeating while every rank
+    # was alive and logging.
     #
-    # The bytes half is PROVEN on metal (want 208 MiB, free 4 -> 1844 MiB,
-    # reclaimed 1840 MiB from [kv-backing]). What is missing is agreement: the
-    # target must be a COLLECTIVE MINIMUM across ranks, the way the seam's
-    # abandon already rides ``_collective_min``, so every rank caps to the
-    # same row count. Until that lands, the rung is opt-in and the ship config
-    # runs without it rather than with a group-desync hazard.
-    if os.environ.get("SGLANG_KV_BACKING_RELIEF", "") not in ("1", "true", "yes", "on"):
-        logger.info(
-            "%s relief is OFF (set SGLANG_KV_BACKING_RELIEF=1 to enable). The "
-            "device half is proven, but the shrink target is still rank-local "
-            "and ranks that disagree about admission desync the group.",
+    # The target is now agreed by one MIN all-reduce at a point every rank
+    # reaches unconditionally (``collective_kv_backing_relief``), and the same
+    # uniformity was then measured on metal: 347161 rows on all three ranks,
+    # then 94017 on all three, health 200 throughout, flips continuing in both
+    # directions. So the switch turns OFF a rung that works rather than ON one
+    # that might not, which is the direction an escape hatch should face.
+    if os.environ.get("SGLANG_KV_BACKING_RELIEF", "1") not in ("1", "true", "yes", "on"):
+        logger.warning(
+            "%s relief is DISABLED by SGLANG_KV_BACKING_RELIEF. Spec item 12's "
+            "device half is off: the KV pool keeps its full backing in both "
+            "phases and the pp->tp leg loses its only funder.",
             LOG_PREFIX,
         )
         return None

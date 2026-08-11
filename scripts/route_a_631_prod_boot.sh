@@ -198,6 +198,28 @@ export SGLANG_UNEVEN_DCP_WEIGHTED=1
 # Mixed 5090+3080 group is the CONFIGURATION, not a symptom.
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
+# #656 SPEC ITEM 12: THE KV ARENA'S COMMIT CHUNK. A PRECONDITION, NOT A KNOB.
+#
+# Without a commit chunk the arena holds ONE extent per buffer, and
+# decommit_range releases only extents lying WHOLLY above the keep point --
+# so a partial shrink returns exactly zero to the driver while still lowering
+# the pool's idea of its size. Every row-range primitive in kv_vmm_backing is
+# inert, the KV relief rung refuses to register (correctly), and the seam's
+# own waved span release is skipped too.
+#
+# THE VALUE COMES FROM A FORMULA, NOT FROM INTUITION ABOUT PAGE SIZES:
+#
+#     min_release_rows = commit_chunk_bytes * n_buffers / bytes_per_row
+#
+# Release is extent-granular PER BUFFER and the arena holds 2*layer_num of
+# them, so the smallest release that can return anything is one chunk in
+# EVERY buffer. At 256 MiB that is 256 MiB * 28 / 15 KiB = 489132 rows --
+# more than the whole 500000-row pool, i.e. structurally unable to pay. At
+# 8 MiB it is ~15285 rows (~230 MiB/rank), the right size against a gate
+# asking a few hundred MiB. Measured on metal 2026-08-11 at exactly that:
+# 2016 / 1440 / 1152 MiB released on the three ranks in one shrink.
+export SGLANG_FLIP_SEAM_CHUNK_MIB="${SGLANG_FLIP_SEAM_CHUNK_MIB:-8}"
+
 # #631: the phase-flip presence rendezvous tag. Set ONCE here so every
 # rank of this boot inherits the SAME value, and so a LATER boot gets a
 # different one. Both properties are load-bearing: identical across ranks

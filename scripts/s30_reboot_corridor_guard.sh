@@ -86,18 +86,41 @@ else
   exit 4
 fi
 
-# Substitute the depth token: the value on the line AFTER the flag.
-$PY - "$DEPTH" <<'PYEOF'
+# Substitute the depth token, plus any flags named in ARGV_SET.
+#
+# ARGV_SET is "--flag value" pairs, one per line. It exists so a run that
+# needs to move ONE server argument (the acceptance run raises
+# --max-total-tokens to fill the cards toward the corridor floor) still
+# replays everything else from the live process verbatim. Booting through
+# route_a_631_prod_boot.sh instead would change the checkpoint, the per-rank
+# MiB vector and the pool at once, and no number afterwards could be
+# attributed.
+ARGV_SET="${ARGV_SET:-}" $PY - "$DEPTH" <<'PYEOF'
+import os
 import sys
+
 depth = sys.argv[1]
 argv = open("/tmp/s30_argv.txt").read().split("\n")
 if argv and argv[-1] == "":
     argv.pop()
-try:
-    i = argv.index("--phase-flip-spill-depth")
-    argv[i + 1] = depth
-except ValueError:
-    argv += ["--phase-flip-spill-depth", depth]
+
+
+def put(flag, value):
+    try:
+        i = argv.index(flag)
+        argv[i + 1] = value
+    except ValueError:
+        argv.extend([flag, value])
+
+
+put("--phase-flip-spill-depth", depth)
+for line in os.environ.get("ARGV_SET", "").split("\n"):
+    line = line.strip()
+    if not line:
+        continue
+    flag, _, value = line.partition(" ")
+    put(flag, value.strip())
+    print(f"[reboot] argv set {flag}={value.strip()}", flush=True)
 open("/tmp/s30_argv_new.txt", "w").write("\n".join(argv))
 print(f"[reboot] argv rewritten, {len(argv)} entries, depth={depth}")
 PYEOF
