@@ -375,9 +375,9 @@ except its own abort.
 | strict purity | **True** -- `PREFILLB` prefill batches, **ZERO** carrying a graph |
 | decode graphs | `DGRAPH` |
 | MTP | accept length `ACCEPT` (s33: 2.649) |
-| occupancy | live slots max `OCC` of a 512552-row pool (s33: 46.6% -> 64.8%) |
+| occupancy | live slots max `OCC` (s33: 64.8%) |
 | **spec item 4** | **PROVEN TWICE**: 271237 prompt tokens per leg, above the 262144 boundary, 48 tokens decoded each |
-| **spec item 12** | **FIRED, `SHRINKS` rank-shrinks**, every one on a row target all three ranks agreed to, and the pool returned to 512552 each time (§3) |
+| **spec item 12** | **FIRED** -- `SHRINKS` rank-shrinks, every one on a row target all three ranks agreed to, and the pool returned to 512552 each time (§3) |
 | prefill gate (C17) | **ARMED and quoted** on all three ranks; `PGATE` arms, `PSHORT` shortfalls. The 0 is read in §1a-ter, not as a pass |
 | relief ladder | seam gate `GATECLR` cleared, **0 refused, 0 host-forced** |
 | every failure signature | **0**, each grepped by name (block below) |
