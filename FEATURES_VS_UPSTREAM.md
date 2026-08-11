@@ -53,6 +53,22 @@ lower bound for the features, not a projection of them. Stated once, not repeate
   actually give at the post-weight-load barrier, subtracts the operator reserve and the demand that
   has not materialized yet, and solves under the smaller of the two. The floor enters as a capacity,
   not as a term in the objective, so it can never be traded for tokens.
+- **Spill-before-alloc corridor gate** (#656): a synchronous gate at the allocation site, not a
+  threshold observer. The corridor law is a CONTINUOUS minimum of NVML free memory, so it is broken
+  by the trough and not by the average, and the allocation that most needs guarding — the phase
+  seam's `commit_range` — does not happen on a round boundary at all. The gate frees to a second
+  watermark above the floor (so the next few allocations do not each pay a spill) and, when every
+  provider is exhausted, REFUSES: the caller abandons the flip with every request intact rather than
+  dying inside a no-return region. Providers are ordered by TIER before cost, so a cheap host spill
+  can never overtake an expensive rebalance.
+- **KV physical residency follows the phase** (#656): the KV pool sits on a VA reservation, so its
+  addresses are fixed at boot and only the physical pages underneath move — which is what lets a
+  residency change survive a captured CUDA graph. Entering the decode layout, the prefill layout's
+  pool gives its unoccupied backing back to the driver and takes it again on the way back. This is
+  not a smaller pool: the reservation does not move, and the reduction is bounded to one phase.
+  The shrink target is agreed by a MIN all-reduce across ranks rather than computed per rank — a
+  refusal may be decided locally, a capacity may not, because the cap changes admission and a
+  group that disagrees about admission desyncs.
 
 ## Overview matrix
 
