@@ -72,6 +72,38 @@ asserts exactly that: one dipped sample instead of five consecutive ones. It
 is written to make an improved slope visible as the breach count going to
 zero, rather than to bless the 1.
 
+### 1a-ter. THE DEEP TROUGHS ARE INTRA-FORWARD, WHICH BOUNDS WHAT ANY
+### ADMISSION-TIME GATE CAN DO
+
+Measured in run 2, during the 272k YaRN prefill: gpu0 fell to **1063 MiB**,
+39 MiB above the law, held there for ~60 samples, and recovered. The prefill
+gate did not arm, and that is not a defect in it.
+
+An admission gate is consulted at ADMISSION INSTANTS -- the moment a prefill
+batch is formed. The 100 ms sampler measures continuously, including the
+middle of a forward pass, and that is where this trough lives: activation
+memory taken and returned INSIDE one chunk's execution, between two
+consecutive admission checks. No gate at a scheduling boundary can see it;
+catching it would need a hook inside the layer loop, which is not a thing
+this codebase should grow.
+
+**So the two troughs are different animals and only one of them is the
+prefill gate's business:**
+
+* s33's breach was a SUSTAINED STATE -- 1001 MiB held for 1.6 s across many
+  scheduling iterations, because nothing was looking. An admission gate fixes
+  exactly that: the next admission sees a card under the floor and spills
+  before proceeding.
+* run 2's 1063 MiB was a TRANSIENT SPIKE inside a forward. It recovered on
+  its own, and the corridor law survived it by 39 MiB.
+
+The honest claim for C17 is therefore narrower than "the corridor is now
+enforced everywhere": it is that the sustained-state hole is closed, and the
+intra-forward spike is bounded only by how much headroom the configuration
+leaves. On this rig that margin is 39 MiB at the worst instant, which is
+thin, and the lever for widening it is `--rank-gpu-memory-mib` on the binding
+card, not another gate.
+
 ### 1b. SPEC ITEM 12 DECLINED ~324 TIMES IN SILENCE, AND THE TERM THAT DID IT
 
 The rung's only logging sat inside the `deficit > 0` branch — i.e. only on
@@ -198,12 +230,16 @@ gate is now off unless `--enable-phase-flip` is set -- the corridor law is a
 property of this feature's regime and does not get to change everyone else's
 allocator behaviour as a side effect.
 
-**D5, booked and NOT fixed.** On the two paths where `propose` skips the
-deficit computation (`floor_rows >= current`, or `_exhausted`), the new KV
-trace still prints "the cheaper tier covers the whole gap", which is the
-wrong reason -- the real ones are "no slack above the floor" and "release
-granularity exhausted". A diagnostic that states a false cause is worse than
-one that states none. It needs a `skipped` reason threaded from `propose`.
+**D5, FIXED after the window opened** (the change is a log string and lands
+in a commit AFTER the acceptance run, so it is not in the shipped run's
+binary -- see CONFIG.txt). On the two paths where `propose` skips the deficit
+computation entirely (`floor_rows >= current`, or `_exhausted`), the new KV
+trace printed "the cheaper tier covers the whole gap" -- a cause it had not
+evaluated. **A diagnostic that states a FALSE cause is worse than one that
+states none**, because the next reader stops looking, and this shift has
+already lost one acceptance run to a log that could not distinguish two
+opposite states. A `skipped` reason is now threaded out of `propose` and
+names the real one. 3 tests.
 
 ---
 
@@ -280,8 +316,9 @@ compares it to the boot pool, which is the direct evidence.
 ## 4. WHAT TO DO NEXT, IN ORDER
 
 0. **Move the KV-rung trace above `propose`'s four ABSTAIN returns** (§1b).
-   An abstain is still silent, and abstain is the failure mode that takes the
-   whole group with it.
+   An abstain is STILL silent -- D5 fixed the two skip paths BELOW the early
+   returns, not the returns themselves -- and abstain is the failure mode that
+   takes the whole group with it.
 1. **Improve the prefill gate's `want`** (§1a-bis). The activation slope is a
    movement proxy; a peak-residency figure would let the gate preempt instead
    of recover. `mem_ledger/activation.py`'s `measured_capture_mib_per_token`

@@ -532,3 +532,45 @@ class FlushMustNotTouchUnbackedRowsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProposalTraceReasonTest(unittest.TestCase):
+    """#656 D5: the trace must not state a cause it did not evaluate.
+
+    The first version of this diagnostic printed "the cheaper tier covers the
+    whole gap" on EVERY non-shrinking path -- including the two where no gap
+    is ever computed. A diagnostic that states a FALSE cause is worse than one
+    that states none, because the next reader stops looking.
+    """
+
+    def _propose_and_capture(self, relief):
+        with self.assertLogs(kbr.__name__, level="INFO") as cm:
+            relief.propose(
+                want_bytes=100 * MIB,
+                floor_bytes=1024 * MIB,
+                delta_bytes=256 * MIB,
+                cheap_relief_bytes=0,
+            )
+        return "\n".join(cm.output)
+
+    def test_an_exhausted_arena_says_so_instead_of_blaming_the_cheap_tier(self):
+        pool = _FakePool(rows=1000)
+        r = _relief(pool, _FakeAllocator(1000), live=(5,), card=_Card(2000))
+        r._exhausted = True
+        out = self._propose_and_capture(r)
+        self.assertIn("EXHAUSTED", out)
+        self.assertNotIn("the cheaper tier covers the whole gap", out)
+
+    def test_no_slack_above_the_live_set_says_so(self):
+        """floor_rows >= current: there is nothing this rung MAY give up."""
+        pool = _FakePool(rows=10)
+        r = _relief(pool, _FakeAllocator(10), live=(9,), card=_Card(2000))
+        out = self._propose_and_capture(r)
+        self.assertIn("no slack above the live set", out)
+        self.assertNotIn("the cheaper tier covers the whole gap", out)
+
+    def test_a_real_decline_still_blames_the_cheap_tier_correctly(self):
+        pool = _FakePool(rows=100000)
+        r = _relief(pool, _FakeAllocator(100000), live=(5,), card=_Card(64000))
+        out = self._propose_and_capture(r)
+        self.assertIn("the cheaper tier covers the whole gap", out)

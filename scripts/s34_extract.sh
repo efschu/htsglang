@@ -45,6 +45,21 @@ c() { grep -c "$1" "$SCAN" 2>/dev/null | head -1; }
   echo
   echo "-- REGISTER C17 CLOSED: the corridor law is enforced at the PREFILL"
   echo "   site as well as at the flip seam"
+  # THE ANNOUNCEMENT IS THE LOAD-BEARING LINE WHEN THE ARM COUNT IS 0.
+  # Every other line this gate emits is conditional on arming, so without
+  # this one "installed and never needed" and "inert" are the same log --
+  # which is what cost this shift its first acceptance run.
+  if grep -q "CORRIDOR-ADMISSION] ARMED" "$SCAN" 2>/dev/null; then
+    echo "   gate liveness (quoted, one per rank per process):"
+    grep -m 3 "CORRIDOR-ADMISSION] ARMED" "$SCAN" | sed 's/^/     /'
+  elif grep -q "CORRIDOR-ADMISSION] INERT" "$SCAN" 2>/dev/null; then
+    echo "   gate liveness: INERT -- the guard was NOT reachable. C17 is NOT"
+    echo "   closed on this run, whatever the arm count says."
+    grep -m 3 "CORRIDOR-ADMISSION] INERT" "$SCAN" | sed 's/^/     /'
+  else
+    echo "   gate liveness: NO ANNOUNCEMENT AT ALL -- the gate was never"
+    echo "   reached (feature off, or the call site did not execute)."
+  fi
   echo "   prefill-gate arms (spill BEFORE the chunk):   $(c '#656 CORRIDOR-ADMISSION] cleared before prefill')"
   echo "   prefill-gate short (ladder exhausted):        $(c '#656 CORRIDOR-ADMISSION] SHORT before prefill')"
   grep -m 1 "CORRIDOR-ADMISSION] pricing prefill admission" "$SCAN" 2>/dev/null | sed 's/^/   /'

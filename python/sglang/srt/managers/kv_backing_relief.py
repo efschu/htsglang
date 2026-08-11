@@ -439,6 +439,23 @@ class KvBackingRelief:
         # where the rung declines, which is the ONLY path it has ever taken.
         free_now = -1
         deficit = 0
+        # WHY THE RUNG DECLINED, as a distinct fact from the deficit's sign.
+        # The first version of this trace printed "the cheaper tier covers the
+        # whole gap" on EVERY non-shrinking path, including the two where no
+        # gap is ever computed -- a diagnostic that states a false cause is
+        # worse than one that states none, because the next reader stops
+        # looking.
+        skipped = ""
+        if self._exhausted:
+            skipped = (
+                "this rank's arena is EXHAUSTED (a previous shrink returned no "
+                "driver bytes), so it stops asking; the deficit is not computed"
+            )
+        elif floor_rows >= current:
+            skipped = (
+                f"no slack above the live set: floor_rows {floor_rows} >= "
+                f"current {current}, so there is nothing this rung may give up"
+            )
         if floor_rows < current and not self._exhausted:
             free_now = self._free_bytes()
             need = int(floor_bytes) + int(delta_bytes) + max(0, int(want_bytes))
@@ -462,6 +479,7 @@ class KvBackingRelief:
             cheap_relief_bytes=int(cheap_relief_bytes),
             deficit=deficit,
             desire=desire,
+            skipped=skipped,
         )
         return (int(desire), -int(floor_rows), int(current), -int(current))
 
@@ -522,10 +540,15 @@ class KvBackingRelief:
                 else "no change"
             ),
             (
-                "the cheaper tier covers the whole gap, so KV capacity is not "
-                "spent -- this is the tier law, not a broken rung"
-                if t["deficit"] <= 0
-                else "the cheap tier cannot cover it; KV capacity is the funder"
+                t["skipped"]
+                if t["skipped"]
+                else (
+                    "the cheaper tier covers the whole gap, so KV capacity is "
+                    "not spent -- this is the tier law, not a broken rung"
+                    if t["deficit"] <= 0
+                    else "the cheap tier cannot cover it; KV capacity is the "
+                    "funder"
+                )
             ),
         )
 
