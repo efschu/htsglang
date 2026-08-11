@@ -4316,3 +4316,49 @@ The `alphaNNN/betaNNN/...` vocabulary used by `s33_yarn_bs1_leg.py` measures
 assumes. A long-context leg that sizes its prompt in words is off by a factor
 of four and will be rejected for exceeding the context window. Calibrate
 against `/v1/messages/count_tokens`.
+
+### The KV rung's deficit, and the term that decides it (successor 34)
+
+Spec item 12's rung shrinks when
+
+    deficit = arming_floor + delta(256 MiB) + staging_want
+              - free_now - cheap_relief   > 0
+
+`cheap_relief` is `torch.cuda.memory_reserved - memory_allocated`, and it is
+the term that decides the outcome. Measured over s33's 93 gate arms: the
+deficit was negative on **100%** of them (p50 -239 MiB), and removing that one
+term makes all 93 positive (p50 +513 MiB). Median hoard 766 MiB against a
+median gap of 239 MiB.
+
+Fires-per-arm against the ARMING floor (law stays 1024 throughout):
+
+| arming floor | arms that fire |
+|---|---|
+| 1024 | 0 / 93 |
+| 1280 | 57 / 93 |
+| **1536** | **91 / 93** |
+| 2048 | 93 / 93 |
+
+1536 is the working value: below ~1482 the target is shallower than the
+arena's release granularity (~16 400 rows, i.e. one 8 MiB commit chunk in each
+of the stage's buffers) and the shrink returns nothing in any buffer. 2048
+pushes the guard's own target past the allocator cache into the rebalance and
+host tiers, which item 16 scores as levelling failures.
+
+Measured firing, 2026-08-11 13:03:50Z, all three ranks on one agreed target:
+
+    504360 rows instead of 512552 (8192 rows), released 112 / 78 / 64 MiB
+    driver-measured, at 465410 live rows (90.8% occupancy).
+    Triggering deficit: +51 MiB.
+
+### Per-token activation slope: do NOT use the reporter's figure raw
+
+`metrics_reporter._qkv_act_bytes_per_token + _ffn_act_bytes_per_token` sums
+over **every layer** (each term carries `* num_layers`). For Qwen3.6-27B that
+is ~9.375 MiB/token, so a 512-token chunk "costs" ~4.7 GiB -- larger than any
+card's free column on this rig. Divide by the layer count for a residency
+figure (~0.147 MiB/token here), and cap any gate that consumes it.
+
+The two attributes also exist ONLY under `--enable-metrics` **and**
+`--enable-mfu-metrics`. This rig's boot sets the first and not the second, so
+the honest default is that the slope is unavailable.
