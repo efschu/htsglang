@@ -4015,3 +4015,36 @@ checksum-verified, proven on `7,3,3 -> 2,11,10`. `distributed/corridor_vector.py
 only SOLVES a vector; this is the mover. Wiring reshard as the guard's
 RELIEF_REBALANCE provider is the item-16 levelling path, and it needs no new
 transport.
+
+### s30 — prefix caching under the flip: it works; the fill load hid it
+
+User asked whether caching was running at all, having seen "pending tokens
+150000" over and over. Checked, because the question was well aimed:
+
+    cached tokens at boot        80
+    cached tokens after ~6 h     111956
+    prefill batches total        9732
+      with cached-token = 0      9708
+      with a real prefix hit       24  (values 2048, 4096, 14775, 26172)
+
+**Caching is on and retaining, and the agents do hit it** -- 14775 and 26172
+cached tokens are conversation history being reused rather than re-prefilled.
+
+The 150000 figure was `s26_fill_load --context-tokens 150000`, which builds a
+UNIQUE context per stream and is therefore uncacheable by construction. It
+generated most of the 9708 zero-hit batches.
+
+The rest of the zeros are structural, not a defect: at
+`chunked_prefill_size=2048` a 150k prompt is ~73 chunks and only the FIRST
+chunk of a request can report a prefix hit; the other ~72 are new content.
+
+**Independent motivation for the chunk A/B**: ~73 scheduler rounds per long
+prompt at the current unmeasured 2048 default. Whatever the A/B decides, this
+number is the reason it matters.
+
+Process note: the first check of "is the fill load still running" used
+`pgrep -u root -f s26_fill_load` and reported STILL RUNNING -- a match on the
+checking shell's OWN command line. Structural /proc argv matching showed no
+fill load at all. Occurrence 14 of the `pgrep -f` / `pkill -f` self-match
+family in this chain, and it was in a shell written one screen after quoting
+the rule. Select processes by argv STRUCTURE, never by regex over cmdline.
