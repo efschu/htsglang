@@ -613,6 +613,42 @@ def build_flip_live_slots_fn(scheduler) -> Callable[[], torch.Tensor]:
                 ", ".join(skipped_no_slot[:8]),
             )
         _probe_allocated_extent(scheduler, reqs)
+        # #657: SPLIT THE CEILING BY WHO PINS IT. The KV rung's floor is
+        # max(live id) + reserve, so the highest live id decides how much
+        # backing stays committed on every card -- and this union has two
+        # sources with completely different prices. A row held by a RESIDENT
+        # request cannot be given up at all. A row held only by the radix
+        # tree is EVICTABLE by the cache's own policy, and in the agent
+        # traffic this instance serves the cache returned `#cached-token: 0`
+        # on 41952 batches while pinning a five-figure row id.
+        #
+        # Recorded as a side channel rather than a second enumeration: the
+        # parts are already materialised here, and the enumeration itself is
+        # the expensive half. Whoever prices the rung reads it; nothing acts
+        # on it yet, which is exactly why it is worth measuring first.
+        try:
+            n_tree = 1 if (values is not None and values.numel()) else 0
+            tree_parts = parts[:n_tree]
+            req_parts = parts[n_tree:]
+            split = {
+                "tree_max": int(max(int(p.max()) for p in tree_parts))
+                if tree_parts
+                else -1,
+                "tree_rows": int(sum(int(p.numel()) for p in tree_parts)),
+                "req_max": int(max(int(p.max()) for p in req_parts))
+                if req_parts
+                else -1,
+                "req_rows": int(sum(int(p.numel()) for p in req_parts)),
+            }
+            # On the FUNCTION, so the rung that calls it can read the split
+            # without a second enumeration and without either module having
+            # to know the other's plumbing.
+            _live.last_split = split
+            scheduler.flip_live_split = split
+        except Exception as e:  # pragma: no cover - an instrument, never a gate
+            logger.warning("%s live-split instrument failed: %s", LOG_PREFIX, e)
+            _live.last_split = None
+            scheduler.flip_live_split = None
         if not parts:
             return torch.empty(0, dtype=torch.int64)
         return torch.unique(torch.cat(parts))
@@ -3976,6 +4012,20 @@ class PhaseFlipRuntime:
                 LOG_PREFIX,
                 e,
             )
+        # #657 item 16, the REBALANCE tier: agree on where the NEXT phase's
+        # new KV rows should be placed. It runs here and not on the round
+        # clock because the decision needs a REDUCTION -- its input is NVML,
+        # which is rank-local, and a free list ordered differently on two
+        # ranks would split one token's KV across two rows. This is the one
+        # point every rank reaches unconditionally with a bounded collective
+        # already in hand.
+        #
+        # It adds NO collective when steering is off, which is the shipped
+        # default: the builder returns None before any reduction is entered.
+        from sglang.srt.managers.corridor_steering import steer_at_seam
+
+        steer_at_seam(scheduler, self._collective_min)
+
         if kv_freed > 0:
             self.corridor_kv_relief_bytes += int(kv_freed)
             self.corridor_kv_relief_count += 1

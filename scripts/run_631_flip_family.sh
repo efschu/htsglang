@@ -53,6 +53,7 @@ FAMILY=(
     test/registered/unit/managers/test_phase_flip_arena_tail_631.py
     test/registered/unit/managers/test_kv_arena_handle_retention_631.py
     test/registered/unit/managers/test_spec_counter_wire_631.py
+    test/registered/unit/managers/test_corridor_steering_657.py
     # Third under-collection, caught 2026-08-10: six tests were added to
     # this file and the family total did not move, because the list is
     # explicit and nobody extended it. The file guards spec item 8's flag

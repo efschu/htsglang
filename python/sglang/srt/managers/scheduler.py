@@ -4305,6 +4305,14 @@ class Scheduler(
         from sglang.srt.managers.corridor_rebalance import lend_on_round
 
         lend_on_round(self)
+        # #657 item 16: re-apply the standing allocation steer. The DECISION
+        # was taken and reduced at the seam; this only keeps the free list's
+        # order matching it, because frees return pages to the head of the
+        # list and wash the partition out. Rate-limited, rank-local, and a
+        # pure reordering -- it places nothing new and frees nothing.
+        from sglang.srt.managers.corridor_steering import steer_on_round
+
+        steer_on_round(self)
         flip_stats = self.phase_flip_runtime.on_round(
             require_armed_and_parked=require_armed_and_parked
         )

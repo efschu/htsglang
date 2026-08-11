@@ -390,6 +390,41 @@ class KvBackingRelief:
             return 0
         return int(math.ceil(chunk * self._buffers / self._bytes_per_row))
 
+    def _describe_live_split(self, max_live: int) -> str:
+        """One clause naming WHAT pins the ceiling, or '' when unknown.
+
+        The clause exists because the two sources have different futures.
+        Rows held by resident requests are the floor's irreducible half. Rows
+        held only by the radix tree are evictable by the cache's own policy,
+        so a ceiling pinned by the TREE is a floor that could be lowered
+        without giving up a single live token -- at the price of prefix-cache
+        hits, which is a price this instance's own traffic can be measured
+        against rather than assumed.
+
+        NOTHING ACTS ON THIS YET, deliberately. Its whole purpose is to say
+        how much the unbuilt actuator would be worth before anyone builds it,
+        because five shifts of this chain have built relief for payloads that
+        turned out to be empty.
+        """
+        split = getattr(self, "_last_live_split", None)
+        if not split:
+            return ""
+        tree_max = int(split.get("tree_max", -1))
+        req_max = int(split.get("req_max", -1))
+        if tree_max < 0 and req_max < 0:
+            return ""
+        pinned_by = "the radix tree" if tree_max >= req_max else "resident requests"
+        # What the floor would be if the tree stopped pinning it: the
+        # resident half, which is what an eviction could not touch.
+        headroom_rows = max(0, tree_max - req_max)
+        return (
+            f" | ceiling pinned by {pinned_by} (tree_max={tree_max} over "
+            f"{int(split.get('tree_rows', 0))} rows, req_max={req_max} over "
+            f"{int(split.get('req_rows', 0))} rows); an id-targeted eviction "
+            f"could lower max_live={int(max_live)} by at most {headroom_rows} "
+            f"rows"
+        )
+
     def _max_live_row(self) -> int:
         try:
             live = self._live_slots_fn()
@@ -399,6 +434,13 @@ class KvBackingRelief:
             # point below which memory gets unmapped.
             logger.warning("%s live-set probe failed: %s", LOG_PREFIX, e)
             return -1
+        # #657: who PINS the ceiling. The floor this number produces is what
+        # keeps backing committed on every card, and its two sources are
+        # priced completely differently: a resident request's row cannot be
+        # given up, a radix-tree row is evictable by the cache's own policy.
+        # Read from the live-set function's own side channel -- enumerating
+        # is the expensive half and it has just been done.
+        self._last_live_split = getattr(self._live_slots_fn, "last_split", None)
         if live is None or int(getattr(live, "numel", lambda: 0)()) == 0:
             return 0
         return int(live.max())
@@ -686,7 +728,8 @@ class KvBackingRelief:
                 f"SHRINK to {t['desire']}"
                 if t["desire"] < t["current"]
                 else "no change"
-            ),
+            )
+            + self._describe_live_split(t["max_live"]),
             (
                 t["skipped"]
                 if t["skipped"]
