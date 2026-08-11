@@ -3952,14 +3952,22 @@ class PhaseFlipRuntime:
             # Its deficit is floor + delta + want - free - cheap_relief, so a
             # ``want`` that excluded the margin would have the funder of last
             # resort decline exactly the gap the gate is about to delay for.
-            # The margin is a constant, so every rank still enters the
-            # reduction with the same additional term.
+            #
+            # BUT THE MARGIN IS DECLARED DISCRETIONARY, and that distinction is
+            # register C20's residual 1. The rung spends ADMISSION CAPACITY to
+            # pay, and an unbounded ask made it spend all of it on every seam:
+            # at 8192 MiB the deficit could never be closed, the rung went to
+            # its floor 42 times, and the instance died in the scheduler loop
+            # with ``available_size() == 0``. The margin's shortfall has a
+            # graded answer (delay, then yield) and the staging's does not, so
+            # the margin is the half that may be bounded and the staging is not.
             kv_freed = collective_kv_backing_relief(
                 scheduler,
                 self._collective_min,
                 want_bytes=int(ask_bytes),
                 guard=guard,
                 direction=direction,
+                discretionary_bytes=int(margin_bytes),
             )
         except Exception as e:
             logger.error(

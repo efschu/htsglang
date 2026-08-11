@@ -226,17 +226,30 @@ class TestTheGateAsksForTheMargin(unittest.TestCase):
         Its deficit is ``floor + delta + want - free - cheap_relief``. If
         ``want`` excluded the margin the rung would decline a gap the gate is
         about to refuse for.
+
+        IT IS ALSO TOLD WHICH HALF IT MAY DROP (register C20, residual 1). The
+        rung pays in ADMISSION CAPACITY, and an ask it cannot fund makes it
+        spend all of that capacity on every seam for bytes it does not have --
+        at 8192 MiB, until the pool could admit nothing and the scheduler loop
+        raised. The margin has a graded answer (delay, then yield) and the
+        staging does not, so the margin is the half declared discretionary.
         """
         seen = {}
 
-        def spy(_sched, _reduce, *, want_bytes, guard, direction):
+        def spy(_sched, _reduce, *, want_bytes, guard, direction, discretionary_bytes=0):
             seen["want"] = int(want_bytes)
+            seen["discretionary"] = int(discretionary_bytes)
             return 0
 
         with _Margin(margin_mib=512):
             with _Patched(_Guard(4096 * MIB), kv_spy=spy):
                 _runtime()._corridor_gate(STAGING, "pp_to_tp")
         self.assertEqual(seen["want"], STAGING + 512 * MIB)
+        self.assertEqual(
+            seen["discretionary"],
+            512 * MIB,
+            "the rung must be told the margin's size or it cannot bound it",
+        )
 
 
 class TestShortOfTheMarginDelays(unittest.TestCase):

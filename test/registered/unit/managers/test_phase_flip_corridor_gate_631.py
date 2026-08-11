@@ -417,7 +417,9 @@ class TheKvReliefRunsBeforeTheGateAndIsCountedTest(unittest.TestCase):
                 order.append("gate")
                 return _cleared()
 
-        def relief(_scheduler, _reduce, *, want_bytes, guard, direction=""):
+        def relief(
+            _scheduler, _reduce, *, want_bytes, guard, direction="", discretionary_bytes=0
+        ):
             order.append("kv-relief")
             return 300 * MIB
 
@@ -439,7 +441,9 @@ class TheKvReliefRunsBeforeTheGateAndIsCountedTest(unittest.TestCase):
         self.assertEqual(r.corridor_kv_relief_bytes, 300 * MIB)
 
     def test_a_relief_that_freed_nothing_is_not_counted(self):
-        def relief(_scheduler, _reduce, *, want_bytes, guard, direction=""):
+        def relief(
+            _scheduler, _reduce, *, want_bytes, guard, direction="", discretionary_bytes=0
+        ):
             return 0
 
         r = _runtime()
@@ -453,7 +457,9 @@ class TheKvReliefRunsBeforeTheGateAndIsCountedTest(unittest.TestCase):
         self.assertEqual(r.corridor_kv_relief_count, 0)
 
     def test_a_relief_that_raises_does_not_take_the_flip_down(self):
-        def relief(_scheduler, _reduce, *, want_bytes, guard, direction=""):
+        def relief(
+            _scheduler, _reduce, *, want_bytes, guard, direction="", discretionary_bytes=0
+        ):
             raise RuntimeError("arena is gone")
 
         r = _runtime()

@@ -1141,7 +1141,13 @@ KV_RELIEF_DIRECTION = "pp_to_tp"
 
 
 def collective_kv_backing_relief(
-    scheduler: Any, reduce_fn, *, want_bytes, guard, direction: str = KV_RELIEF_DIRECTION
+    scheduler: Any,
+    reduce_fn,
+    *,
+    want_bytes,
+    guard,
+    direction: str = KV_RELIEF_DIRECTION,
+    discretionary_bytes: int = 0,
 ) -> int:
     """#656 item 12, the device half: ONE shrink target for the whole group.
 
@@ -1166,6 +1172,27 @@ def collective_kv_backing_relief(
 
     It runs BEFORE the guard, so the bytes it frees are money the guard's own
     probe then sees, and its ask already discounts the cheaper tiers.
+
+    ``discretionary_bytes`` is the part of ``want_bytes`` the caller can do
+    WITHOUT -- at the seam, the C20 entry margin, whose shortfall produces a
+    graded delay rather than a failure. It is bounded here by what this rank's
+    rung can return without crossing its admission floor, and the remainder is
+    passed through untouched.
+
+    WHY THE DISCRETIONARY HALF NEEDS A BOUND AT ALL, given that the floor
+    already stops the shrink. The rung's ask sets the SIZE of the shrink, not
+    only its limit: the deficit is ``floor + delta + want - free - cheap``, so
+    an ask nothing can fund produces a deficit nothing can satisfy and the rung
+    goes to its floor on EVERY seam -- spending all of its slack, every time,
+    to close a gap that was never closable. That is how a one-digit operator
+    typo became an instance death (HANDOFF_681 §1a) and it stays expensive even
+    once the death is fixed. Bounded, the rung shrinks for what it can actually
+    deliver and the gate takes its delay for the rest.
+
+    THE MANDATORY HALF IS NEVER BOUNDED. If the rung cannot fund the seam's
+    staging, the guard must see the full ask and refuse the seam -- a free,
+    unanimous abandon with every request intact. Laundering that into a smaller
+    ask would produce a seam that "fits" and an allocator that disagrees.
 
     Returns the bytes THIS rank gave back to the driver.
     """
@@ -1202,11 +1229,42 @@ def collective_kv_backing_relief(
         # No floor to propose against. Abstain -- but still reduce, because a
         # rank that returns early here hangs the ones that did not.
         relief = None
+    ask_bytes = int(want_bytes)
+    discretionary = max(0, int(discretionary_bytes))
+    if relief is not None and discretionary:
+        mandatory = max(0, ask_bytes - discretionary)
+        try:
+            fundable = int(relief.fundable_bytes())
+        except Exception as e:
+            # An unreadable bound is not an unbounded one. Granting nothing
+            # discretionary leaves the mandatory ask exactly as it was, which
+            # is the behaviour of a boot with no margin configured at all.
+            logger.warning(
+                "%s could not price what the KV rung can fund (%s); the "
+                "discretionary %d MiB is not asked for",
+                LOG_PREFIX,
+                e,
+                discretionary // (1024 * 1024),
+            )
+            fundable = 0
+        granted = max(0, min(discretionary, fundable - mandatory))
+        if granted < discretionary:
+            logger.info(
+                "%s KV rung asked for %d of %d MiB discretionary (%s): it can "
+                "return %d MiB above its admission floor, and asking for more "
+                "would drive it to that floor for bytes it does not have",
+                LOG_PREFIX,
+                granted // (1024 * 1024),
+                discretionary // (1024 * 1024),
+                direction,
+                max(0, fundable) // (1024 * 1024),
+            )
+        ask_bytes = mandatory + granted
     proposal = kbr.ABSTAIN
     if relief is not None:
         try:
             proposal = relief.propose(
-                want_bytes=int(want_bytes),
+                want_bytes=int(ask_bytes),
                 floor_bytes=int(guard.floor_bytes),
                 delta_bytes=int(guard.delta_bytes),
                 cheap_relief_bytes=_cached_relief_estimate(guard.device_index),

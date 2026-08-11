@@ -103,6 +103,16 @@ KV_RELIEF_TRACE_ENV = "SGLANG_KV_RELIEF_TRACE"
 #: A desire no reduction can lower: the neutral element of an element-wise MIN.
 _UNBOUNDED_ROWS = 1 << 40
 
+#: Rows this rung refuses to give up ON TOP of the live high-water mark, so a
+#: shrink leaves a pool that can still ADMIT. See :meth:`KvBackingRelief._floor_rows`.
+KV_ADMISSION_RESERVE_ENV = "SGLANG_KV_ADMISSION_RESERVE_ROWS"
+
+#: One chunked prefill on the shipped configuration (``chunked_prefill_size``
+#: 512), which is the exact allocation that raised when the floor reserved
+#: nothing: "Try to allocate 512 tokens. Available full tokens: 0". The factory
+#: derives the real default from the scheduler and falls back to this.
+DEFAULT_ADMISSION_RESERVE_ROWS = 512
+
 #: The proposal of a rank that cannot take part in a shrink at all -- no relief
 #: object, no VA reservation, or a live set it could not read. Its third field
 #: (``current``) is 0, and :func:`collective_kv_target` declines whenever the
@@ -291,6 +301,7 @@ class KvBackingRelief:
         margin_rows: int = 0,
         buffers: int = 0,
         law_floor_bytes: int = 1024 * 1024 * 1024,
+        admission_reserve_rows: int = DEFAULT_ADMISSION_RESERVE_ROWS,
     ) -> None:
         self._pool = pool
         self._alloc = allocator
@@ -307,6 +318,11 @@ class KvBackingRelief:
         #: arming floor must make the gate work earlier, never make the pool
         #: permanently smaller.
         self._law_floor_bytes = int(law_floor_bytes)
+        #: THE ADMISSION RESERVE (#656 register C20, residual 1). Rows kept
+        #: ABOVE the live high-water mark, so what survives a shrink is a pool
+        #: that can still take work rather than only hold it. Zero restores the
+        #: pre-2026-08-11 floor exactly, as a value of the same term.
+        self._admission_reserve_rows = max(0, int(admission_reserve_rows))
         self._cap = KvRowCap(allocator)
         #: The row count to restore to. Latched on the FIRST shrink and never
         #: overwritten by a second one, so a two-step relief still recovers to
@@ -393,10 +409,57 @@ class KvBackingRelief:
         The shrink precondition stated as a number: every row at or below the
         high-water mark must stay backed, plus one page of slack so the very
         next allocation does not immediately re-arm.
+
+        PLUS THE ADMISSION RESERVE, and that term is the whole of register
+        C20's residual 1. The precondition above protects the rows that EXIST.
+        It reserves nothing to admit new work with, so a caller that asks this
+        rung for more than the card can fund drives it here on every seam and
+        the pool arrives at a state where ``available_size()`` is 0 while every
+        live row is perfectly safe. Measured on metal 2026-08-11 under
+        ``SGLANG_SEAM_ENTRY_MARGIN_MIB=8192``: 42 cutovers after the first
+        delay, three ranks raised
+        ``Out of memory. Try to allocate 512 tokens. Available full tokens: 0``
+        inside ``_get_new_batch_prefill_raw`` -- in the scheduler loop, which
+        is fatal, and two minutes AFTER the branches that were suspected.
+
+        The reserve sits above ``max_live`` rather than being carved out of it
+        because that is the only range whose freeness is guaranteed: every id
+        above the high-water mark is unallocated by definition, while ids below
+        it may all be in use. So a cap of ``max_live + 1 + margin + reserve``
+        leaves at least ``reserve`` ALLOCATABLE ids, which is the quantity
+        admission actually spends.
+
+        GROUP-UNIFORM WITHOUT A NEW COLLECTIVE. The reduction already takes the
+        MAX floor across the group (``collective_kv_target``), so a target that
+        clears this rank's reserve clears every rank's.
         """
         page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
-        floor = max(page, int(max_live) + 1 + self._margin_rows)
+        floor = max(
+            page,
+            int(max_live) + 1 + self._margin_rows + self._admission_reserve_rows,
+        )
         return int(math.ceil(floor / page) * page)
+
+    def fundable_bytes(self) -> int:
+        """Bytes this rank could return WITHOUT crossing its admission floor.
+
+        The bound a caller needs to ask this rung for a DISCRETIONARY amount
+        honestly. A rank that cannot take part answers 0, which reads as "ask
+        me for nothing extra" -- the safe direction, since the mandatory part
+        of an ask is never bounded by this.
+
+        Pure: it reads the live set and the backing and computes. It is on the
+        gate's unconditional path, so it must not touch residency.
+        """
+        if not self._supported() or self._bytes_per_row <= 0 or self._exhausted:
+            return 0
+        max_live = self._max_live_row()
+        if max_live < 0:
+            return 0
+        current = self._current_rows()
+        if current <= 0:
+            return 0
+        return max(0, current - self._floor_rows(max_live)) * self._bytes_per_row
 
     # -- the collective decision -----------------------------------------
 
@@ -600,8 +663,9 @@ class KvBackingRelief:
         if not (edge or self._trace_all):
             return
         logger.info(
-            "%s proposal on device %s: rows current=%d floor=%d (max_live=%d, "
-            "slack=%d) | need = floor %.0f + delta %.0f + want %.0f = %.0f MiB "
+            "%s proposal on device %s: rows current=%d floor=%d (max_live=%d "
+            "+ admission reserve %d, slack=%d) | need = floor %.0f + delta "
+            "%.0f + want %.0f = %.0f MiB "
             "against free %.0f MiB and cheap relief %.0f MiB -> deficit "
             "%+.0f MiB -> %s. %s",
             LOG_PREFIX,
@@ -609,6 +673,7 @@ class KvBackingRelief:
             t["current"],
             t["floor_rows"],
             t["max_live"],
+            self._admission_reserve_rows,
             max(0, t["current"] - t["floor_rows"]),
             t["floor_bytes"] / _MIB,
             t["delta_bytes"] / _MIB,
@@ -1001,4 +1066,44 @@ def kv_backing_provider(
         device_index=device_index,
         buffers=n_buffers,
         law_floor_bytes=law_floor_bytes,
+        admission_reserve_rows=_admission_reserve_rows(scheduler),
     )
+
+
+def _admission_reserve_rows(scheduler: Any) -> int:
+    """Rows the rung keeps allocatable, from the scheduler's own admission size.
+
+    THE RESERVE IS NOT A SAFETY FACTOR, it is the largest single admission the
+    scheduler can attempt while this rung is the thing that shrank the pool. On
+    the shipped configuration that is ``chunked_prefill_size`` (512), which is
+    the number the failure quoted back: "Try to allocate 512 tokens".
+
+    Derived rather than constant because the two move together -- a boot with a
+    larger prefill chunk needs a larger reserve to make the same progress -- and
+    a constant sized once against one configuration is exactly the shape this
+    corpus keeps having to retract. ``SGLANG_KV_ADMISSION_RESERVE_ROWS``
+    overrides it, and 0 restores the pre-C20-residual floor.
+    """
+    raw = os.environ.get(KV_ADMISSION_RESERVE_ENV, "")
+    if raw.strip():
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning(
+                "%s %s=%r is not an integer; using the derived reserve",
+                LOG_PREFIX,
+                KV_ADMISSION_RESERVE_ENV,
+                raw,
+            )
+    args = getattr(scheduler, "server_args", None)
+    for holder, name in ((scheduler, "chunked_prefill_size"), (args, "chunked_prefill_size")):
+        size = getattr(holder, name, None) if holder is not None else None
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            continue
+        # A negative or zero chunk means "unchunked", which says nothing about
+        # the reserve; fall through to the default rather than reserve nothing.
+        if size > 0:
+            return size
+    return DEFAULT_ADMISSION_RESERVE_ROWS

@@ -456,18 +456,29 @@ class TestStagingFormulaMatchesReality(CustomTestCase):
         rt = runtimes[0]
         src, dst = pp_views[0], tp_views[0]
         tr, outgoing, incoming, local = _plan_legs(live, 0, PP_TO_TP, src, dst)
-        predicted = rt._staging_bytes(tr, PP_TO_TP, src, dst)
+        # PRICE THE SEAM THAT IS ABOUT TO RUN, NOT A DIFFERENT ONE. #656
+        # successor 38: this test compared an UNWAVED prediction with a WAVED
+        # measurement and had been red since the seam learned to wave. The
+        # production gate passes ``_flip_waves(direction)`` into the same call
+        # (``phase_flip_runtime._execute``), so a single-wave estimate is a
+        # quantity no caller ever spends -- on this fixture it is 20.2 MiB
+        # against a 3.8 MiB measured peak, and reading that gap as a 5.4x
+        # over-reservation in production is exactly the wrong conclusion.
+        single_wave = rt._staging_bytes(tr, PP_TO_TP, src, dst)
+        predicted = rt._staging_bytes(tr, PP_TO_TP, src, dst, rt._flip_waves(PP_TO_TP))
 
         probe = LiveStorageProbe(exclude=_pool_tensors(pp_pools, tp_pools))
         errs = _run_ranks_probing(runtimes, [PP_TO_TP] * 3, 0, probe)
         self.assertEqual([e for e in errs if e], [])
 
         # The gate must not UNDER-reserve: that is the accounting hole in
-        # HANDOFF_664 section 13a, which omitted the local leg entirely.
+        # HANDOFF_664 section 13a, which omitted the local leg entirely. Stated
+        # on the single-wave estimate, because the provable floor below is
+        # summed over the WHOLE plan and a waved seam never holds it at once.
         self.assertGreaterEqual(
-            predicted,
+            single_wave,
             peak_floor := max(outgoing + incoming, incoming + local),
-            f"_staging_bytes {predicted / MIB:.1f} MiB is below the bytes "
+            f"_staging_bytes {single_wave / MIB:.1f} MiB is below the bytes "
             f"the move provably holds ({peak_floor / MIB:.1f} MiB): "
             f"outgoing {outgoing / MIB:.1f}, incoming {incoming / MIB:.1f}, "
             f"local {local / MIB:.1f} -- the gate under-reserves",
@@ -483,6 +494,51 @@ class TestStagingFormulaMatchesReality(CustomTestCase):
             f"against the measured live set {probe.peak / MIB:.1f} MiB; "
             f"the gate refuses flips that would have fit, and a refusal "
             f"does not drain the resident set it refused on",
+        )
+
+    def test_the_waved_price_is_short_of_the_measured_live_set(self):
+        """REGISTER C21, as a RATCHET rather than an approval.
+
+        Measured by #656 successor 38 while reframing the test above: the
+        price the gate actually spends -- ``_staging_bytes`` with the run's own
+        wave plan -- is **2.398 MiB against a measured live set of 3.769 MiB**
+        on this three-rank fixture, a ratio of 0.64. The formula models the
+        seam's peak as ``incoming + max(outgoing, local)`` on the strength of
+        the send buffers being dead before the retained leg is read; on this
+        fixture the high-water holds an outgoing leg (0.689 + 0.684 MiB)
+        alongside a 1.025 MiB local read and its 1.025 MiB gather window.
+
+        NOT REPRODUCED ON METAL and not fixed here. The s37 acceptance window
+        priced the binding card's pp->tp seams at 1177 MiB p50 while the
+        deepest NVML drawdown across any of its 115 cutovers was 504 MiB, so
+        torch's allocator cache absorbs this transient rather than the driver
+        being asked for it -- which is why 65 minutes and 348 flips saw 0
+        corridor breaches. Widening the reservation on that evidence would buy
+        an earlier wedge (HANDOFF_664 section 13c), so the gap is BOOKED and
+        pinned instead of papered over.
+
+        The assertion is one-sided on purpose: closing the gap passes, and only
+        WIDENING it fails.
+        """
+        ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
+            MAP_625, VEC, NUM_SLOTS
+        )
+        runtimes = _build_runtimes(pp_views, tp_views, live)
+        rt = runtimes[0]
+        src, dst = pp_views[0], tp_views[0]
+        tr, _outgoing, _incoming, _local = _plan_legs(live, 0, PP_TO_TP, src, dst)
+        predicted = rt._staging_bytes(tr, PP_TO_TP, src, dst, rt._flip_waves(PP_TO_TP))
+        probe = LiveStorageProbe(exclude=_pool_tensors(pp_pools, tp_pools))
+        errs = _run_ranks_probing(runtimes, [PP_TO_TP] * 3, 0, probe)
+        self.assertEqual([e for e in errs if e], [])
+        self.assertGreaterEqual(
+            predicted,
+            0.60 * probe.peak,
+            f"the waved staging price is {predicted / probe.peak:.2f}x the "
+            f"measured live set ({predicted / MIB:.2f} vs {probe.peak / MIB:.2f} "
+            f"MiB). C21 recorded 0.64x; a SMALLER ratio means the gate's "
+            f"shortfall grew, and the corridor's only defence against it today "
+            f"is the allocator cache",
         )
 
     def test_the_local_leg_is_counted_when_it_dominates(self):
