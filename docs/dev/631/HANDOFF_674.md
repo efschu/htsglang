@@ -6,6 +6,46 @@ This file covers what happened after that and what the next shift should do.
 
 ---
 
+## 0. THE TWO LAWS THAT OUTLIVE THIS SHIFT
+
+Read these before quoting ANY number from this corpus.
+Full register: `docs/dev/631/CONTRADICTIONS_REGISTER.md`.
+
+### C7 — THE BINDING PHASE IS A STATE, NOT A FACT
+
+It was recorded as TP (pool 190000), then PP (pool 500000), then TP again
+(pool 500000, after the drafter spill). **None of those was wrong.** The
+binding phase is a function of the pool size AND the residency state, and
+**installing a spill moves the phase it was measured against**. That is a
+feedback loop, not a measurement error, and it is the single reason this chain
+keeps pricing rungs that turn out to be worth nothing.
+
+    Price no spill without re-measuring which phase binds AFTER the last one
+    landed.
+
+The same shape governs geometry: the weights-arena tail is a function of the
+PP layer split (register C1), so the GDN-cut A/B moves the tail rung 3
+harvests. A number is valid for its geometry, its pool, and its residency
+state -- say which, or it will be carried somewhere it is false.
+
+### TWO OPEN ITEMS — STOP QUOTING THESE AS SETTLED
+
+1. **The rank-1 per-token slope has four coexisting values**: 10.30 MiB/1000
+   (total idle), 9.10, and 9.766 resident + 4.517 staging -- a decomposition
+   summing to 14.283 against a measured total of 10.30. HANDOFF_667 §3 notices
+   its own `staging_coeff` contradicts its own slope and leaves it. **Anything
+   sized against a slope is sized against an unresolved number**; measure two
+   endpoints instead of extrapolating.
+2. **Flush contamination.** Over a GiB per card of torch allocator cache is
+   held at ZERO requests and NVML counts it as USED, so every un-flushed idle
+   free reading in the corpus understates free by ~1028-1426 MiB/card. Those
+   bench rows are marked SUSPECT rather than re-derived. Under-load corridor
+   minima are unaffected -- they sample where the cache is in use -- and they
+   are what the corridor verdicts actually rest on. Procedure: `/flush_cache`
+   before any idle reading, and record that you did.
+
+---
+
 ## 1. ERRORS FIRST
 
 ### 1a. kvso cannot fund the guard — the THIRD "frees nothing" catch
