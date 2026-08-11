@@ -197,12 +197,68 @@ they are wired without inferring it:
 
 ### 3b. THE CONFIRMATION WINDOW ON THE SHIP CONFIG
 
-*(see `/spinning/evidence-631/s38/ship-window/EXTRACT.txt`; this is a
-REGRESSION check against s37's standing green, not a new stamp.)*
+30 minutes on the ship config (margin 512, budget 2, lender off), booted
+20:51:22Z on `4aa1bf93a1`, with two agent lanes as the traffic carrier.
+Evidence: `/spinning/evidence-631/s38/ship-window/EXTRACT.txt`. **This is a
+REGRESSION check against s37's standing green, not a new stamp** — the window
+is half as long and its arms are not matched to s34's.
+
+| | s34 | s37 (65 min) | **s38 (30 min)** |
+|---|---|---|---|
+| corridor breaches | 0 | 0 | **0** (13118 samples) |
+| IN-CUTOVER min, binding card | 1043 (+19) | 1123 (+99) | **1083 (+59)** |
+| flips each way | 321 | 348 | **150** |
+| FLIP ABANDONED / tracebacks | 0 / 0 | 0 / 0 | **0 / 0** |
+| seams REFUSED below the law | 0 | 0 | **0** |
+| strict purity / decode graph | True / 99.2% | True / 99.7% | **True / 99.3%** |
+| MTP accept length | 2.850 | 2.797 | **2.869** |
+| YaRN leg | 271237 | 271237 | **271237** |
+| pool at the last KV proposal | 512552 | 512552 | **512552** |
+| live slots, max | — | 295620 (57.7%) | **327699 (63.9%)** |
+| prefill / decode batches, t+25 | 14830 / 387 | 14764 / 345 | **15475 / 363** |
+| median PP dwell | 17.0 s | 17.0 s | **17.0 s** |
+| soak t+24 | 59 | 41 | **48** |
+| soak, full window | 218 ok / 0 err | 196 ok / 0 err | **71 ok / 0 err** |
+
+**C20 VERDICT: HELD (exit 0).** The run sits in the s34/s37 family on every
+axis the margin does not touch, and is ahead of s37 on decode batches, MTP
+accept length and soak completions.
+
+**The one number that moved down, and why it is not a regression.** The
+binding card's in-cutover minimum is 1083 against s37's 1123. This window ran
+**hotter**: live slots peaked at 63.9% of the pool against s37's 57.7%, and
+the seam's own reservation rose with it (staging mean 1317.6 vs 1300.1 MiB).
+That is also why the margin's delay branch fired on the SHIPPED
+configuration for the first time — 2 delays, 1 yield, where s37 recorded
+none — which is the graded verdict doing exactly its job under load rather
+than a new failure. Neither of this shift's terms was active: the admission
+floor sat at 593 rows against a deepest cut of 448782, and the discretionary
+bound never triggered.
+
+**Read the gate's two refusal counters separately.** The extract reports
+`gate: 202 cleared, 3 refused`, and the C20 block reports `seams REFUSED
+(below the law): 0` with 0 abandoned flips. Both are right: the guard is
+shared, and those 3 refusals are the PREFILL-ADMISSION caller
+(`corridor_admission.py`), which spills and never refuses. A refusal counted
+there is not a refused seam, and a successor comparing 3 against s37's 0 would
+otherwise book a regression that did not happen.
 
 On the shipped margin both terms are near-inert by construction — a 512-row
 reserve against 512552 backed rows, and a margin that funds on every seam —
 so the window's job is to show that the ordinary path did not move.
+
+**Both inertness claims are visible in the window's own log rather than
+argued:**
+
+    KV-BACKING proposal on device 0: rows current=512552 floor=593
+      (max_live=80 + admission reserve 512, slack=511959)
+
+    "KV rung asked for" ............................ 0 occurrences
+
+Zero bounded asks means the discretionary path never triggered: the 512 MiB
+margin is fundable on every seam, so the rung receives the SAME
+`staging + margin` it received for s37. The floor is a bound on the
+pathological case, not a tax on the ordinary one.
 
 ---
 
@@ -224,6 +280,39 @@ so the window's job is to show that the ordinary path did not move.
    §2.1, HANDOFF_680 §4.2, HANDOFF_681 §4.5).
 6. **C18**: give `vram_dial` the corridor guard's floor before the dial is on.
 7. **The corridor counters are still write-only** (HANDOFF_680 §4.5).
+
+### 4b. THE CORRIDOR LAW IS NOT CONFIGURABLE, AND ABOUT FORTY PLACES ASSUME SO
+
+Audited during this window (the second agent-traffic lane).
+`SGLANG_CORRIDOR_FLOOR_MIB` moves the **arming** floor only; the LAW is
+`corridor_guard.DEFAULT_FLOOR_MIB = 1024`, wired explicitly at
+`phase_flip_spill.py:1422`, and roughly forty scripts plus every extract
+judge against a literal 1024. That is CONSISTENT today and the split is
+deliberate — a proof run must make the gate work earlier, never make the pool
+permanently smaller. It is only a trap if the user's corridor ever changes
+value: at that moment the arming floor would follow an env var and every
+verdict in the corpus would still score against 1024. If that day comes, make
+`DEFAULT_FLOOR_MIB` the single source the scripts read, rather than editing
+forty constants.
+
+### 4a. THREE ITEMS FELL OUT OF THE LIST WITHOUT BEING RESOLVED
+
+An audit of the numbered lists across HANDOFF_680/681/682 (run as one of this
+window's agent-traffic lanes) found that the 680 -> 681 transition dropped six
+items, and three of them were neither done nor superseded — they simply stopped
+being carried:
+
+* **`0c`, loosen the drafter's phase precondition.** The provider refuses
+  outside PP; 680 wanted the condition relaxed rather than asserted.
+* **`4`, the host half / dynamic-chunking A/B.**
+* **`6`, the draft-weights provider reports an ARENA COUNT, not an NVML
+  delta** — which is the ledger law (register law 2) applied to a rung this
+  corpus still prices from.
+
+The other three were legitimately closed (the lender A/B ran, the green stamp
+was restored, and 680's "seam staging demand" became C20). Re-entered here so
+the next list inherits them; a shift that decides one is not worth doing
+should say so in the Verworfenes register rather than let it fall out again.
 
 ---
 
