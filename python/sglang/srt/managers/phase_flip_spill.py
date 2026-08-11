@@ -854,10 +854,23 @@ class VmmWeightsArenaCarrier:
         PP1    8144.00      7923.95     220.1 MiB
         PP2    9114.95      7923.95    1191.0 MiB
 
-    ``pp`` is the max on every rank, so the tail is idle in **TP** -- which is
-    the phase that binds on all three cards after rung 2 moved the binding
-    phase there. That is what makes this rung well-aimed where the drafter no
-    longer is.
+    On THAT boot ``pp`` was the max on every rank, so the tail was idle in
+    **TP** -- the phase that binds on all three cards after rung 2 moved the
+    binding phase there. That is what makes this rung well-aimed where the
+    drafter no longer is.
+
+    **THAT IS A MEASUREMENT OF ONE STAGE RATIO, NOT A PROPERTY OF THE RUNG.**
+    ``--pp-stage-ratio 15,9,8`` derives 32,16,16 layers over 64 and puts the
+    MIDDLE rank's PP layout (6690 MiB) BELOW its TP layout (7924 MiB); the
+    tail is then idle in **PP** on that rank and the phases swap roles. A
+    previous version of this comment said "pp is the max on every rank" as
+    though it were structural, the refill path was written to match, and the
+    first flip after a tp->pp copied the larger TP image into the released
+    tail: ``cudaErrorInvalidValue`` inside the no-return region, all three
+    ranks down (metal, 2026-08-11). The carrier itself is symmetric and
+    always has been -- it is sized ``max(layout_pp, layout_tp)`` and driven by
+    ``PhaseFlipStacks.refill_high_water_bytes()`` -- so nothing here needs to
+    know which layout is larger. Do not re-derive that it does.
 
     WHY IT IS THE CHEAPEST PROVIDER IN THE SYSTEM. There is no host round
     trip. The tail holds no live bytes in the phase it is released in, and the
@@ -916,8 +929,15 @@ class VmmWeightsArenaCarrier:
                 f"which is negative or not aligned to the arena granularity "
                 f"{self._arena.granularity}; commit_range would refuse it"
             )
-        # Fully backed at construction: the boot packs the PP layout, which is
-        # the larger one, and every caller downstream expects a normal arena.
+        # Fully backed at construction, and note WHY that is safe regardless
+        # of which layout is larger: ``total_bytes`` is already
+        # max(layout_pp, layout_tp) at the call site (phase_flip_boot's
+        # arena_total), so committing all of it backs whichever layout the
+        # boot packs AND the one it will flip to. The earlier wording here --
+        # "the boot packs the PP layout, which is the larger one" -- was true
+        # of one stage ratio only; see the class docstring for the flip it
+        # killed.
+
         self._arena.commit_range(self._offset, self._nbytes)
         logger.info(
             "%s weights arena on a VA-stable reservation at 0x%x+0x%x: "
