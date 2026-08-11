@@ -290,11 +290,25 @@ be worse.
    `tp_cpu_group`, `tp_group.device_group`, a `HybridLinearKVPool` from
    `token_to_kv_pool_allocator.get_kvcache()`, and an empty
    `blocking_guards` — the same list that closes the kvso route in §2.
-3. **Fill the cards for real**: raise `--rank-gpu-memory-mib` and re-sample
-   the corridor under load. §1d explains why the pool figure is not the
-   lever. Until the cards sit near the floor, the corridor's second half
-   stays unmet and the relief ladder is rarely reached, whatever it is
-   capable of.
+3. **Fill the cards for real.** §1d explains why the pool figure is not the
+   lever; an audit of `_profile_available_bytes`
+   (`model_runner_kv_cache_mixin.py:608`, clamped at `:4406` via
+   `_apply_token_constraints`) names the ones that are:
+
+   * **`--mem-fraction-static`** — the fraction of free memory held back as
+     non-static slack. Lowering it raises the KV budget directly, and it is
+     the lever nobody in this chain has touched.
+   * **`--rank-gpu-memory-mib`** — the absolute per-rank budget, currently
+     `31800,14000,15600` against 32607/20480/20480 MiB cards.
+
+   And the confirmation of C15 in the source: **`--max-total-tokens` can only
+   LOWER.** Raising it above the profiled value has no effect and emits a
+   warning (`:4423-4427`) — which is exactly what happened when 620000 came
+   back as 512552, and it means a successor can stop looking there.
+
+   Until the cards sit near the floor the corridor's second half stays unmet,
+   the spread stays around 2600 MiB, and the relief ladder is rarely reached
+   past its cheapest tier, whatever the deeper rungs are capable of.
 4. **The DYNAMIC chunking arm**, still unmeasured. 512 is an interior optimum
    and large chunks are lethal on this rig, so the value hypothesis is
    downward adaptivity under mixed load, not throughput.
