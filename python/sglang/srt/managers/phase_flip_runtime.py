@@ -688,8 +688,28 @@ def flip_blocking_guards(scheduler) -> List[str]:
         guards.append(
             "hierarchical cache (#630: PP x disk HiCache wedges at warmup)"
         )
-    if getattr(scheduler, "kv_session_offload", None) is not None:
-        guards.append("kv-session-offload")
+    # kv-session-offload is a STATE, not a feature (#656, kvso_flip_contract).
+    # This used to refuse arming whenever kvso was merely CONFIGURED, which
+    # made the host half of spec items 6/12/15c and the phase flip mutually
+    # exclusive: enabling the spill destination turned the flip off. The guard
+    # now asks what kvso is DOING -- parked images stamped with the outgoing
+    # layout are safe to carry across, a copy in flight or an unplaceable
+    # image is not -- and refuses only the latter, for one round.
+    kvso = getattr(scheduler, "kv_session_offload", None)
+    if kvso is not None:
+        from sglang.srt.managers.kvso_flip_contract import (
+            FLIP_SAFE_STATES,
+            flip_safety_state,
+        )
+
+        live_phase = getattr(scheduler, "phase_flip_active_stack", None)
+        state, detail = flip_safety_state(
+            kvso,
+            current_phase=live_phase,
+            incoming_phase=_PHASE_AFTER.get(_DIR_OF_PHASE.get(live_phase)),
+        )
+        if state not in FLIP_SAFE_STATES:
+            guards.append(f"kv-session-offload {state}: {detail}")
     if getattr(scheduler, "is_dual_group_lane", False) or getattr(
         server_args, "dual_group_lane", None
     ):

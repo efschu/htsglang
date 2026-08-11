@@ -4448,6 +4448,21 @@ class Scheduler(
         # FIFO restore with hysteresis (merges the restored session back
         # into running_batch BEFORE batch selection / prepare_for_decode).
         if self.kv_session_offload is not None:
+            # #656 LAYOUT PIN, re-applied every round and BEFORE pre_schedule
+            # picks a tick. A host image belongs to the phase it was captured
+            # in; while the other phase is live, that session must not run.
+            # `suppress_tick` is a one-shot the picker clears, so this is a
+            # per-round re-assert and not a latch -- a latch would release
+            # itself on the first tick it suppressed, which is the tick that
+            # matters. No-op when the flip is off (no phase to pin against).
+            if getattr(self, "phase_flip_active_stack", None) is not None:
+                from sglang.srt.managers.kvso_flip_contract import (
+                    pin_spills_to_phase,
+                )
+
+                pin_spills_to_phase(
+                    self.kv_session_offload, self.phase_flip_active_stack
+                )
             running_batch = self.kv_session_offload.pre_schedule(
                 running_batch, last_batch
             )
@@ -4923,7 +4938,44 @@ class Scheduler(
         dynamic_size = self.predict_next_chunk_size(history_len)
         if dynamic_size is None:
             return self.chunked_prefill_size
+        self._log_dynamic_chunk_engagement(dynamic_size, history_len)
         return dynamic_size
+
+    def _log_dynamic_chunk_engagement(self, dynamic_size: int, history_len: int):
+        """ENGAGEMENT PROOF for the dynamic-chunking arm, at INFO.
+
+        #656: the only line that reported a predicted chunk size was
+        DEBUG-level (``scheduler_pp_mixin.predict_next_chunk_size``), and
+        nothing at INFO or above fired when the width actually deviated from
+        ``--chunked-prefill-size``. So an A/B of the arm produced a throughput
+        number with NO evidence that the mechanism ever engaged -- and a
+        throughput delta with no engagement proof is not a measurement of the
+        feature, it is a measurement of the run.
+
+        EDGE-TRIGGERED, not per-iteration. This is called once per scheduling
+        iteration (``scheduler.py`` in ``get_new_batch_prefill``'s budget
+        line), which is thousands of times a minute; an unconditional INFO
+        there would be a log flood and would itself perturb the thing being
+        measured. It therefore fires only when the width CHANGES to a value
+        not last reported, which is exactly the event the proof needs: the
+        first deviation from the static size is the engagement, and every
+        subsequent distinct width is the feature moving at runtime.
+        """
+        if dynamic_size == getattr(self, "_dyn_chunk_last_logged", None):
+            return
+        self._dyn_chunk_last_logged = int(dynamic_size)
+        static = int(self.chunked_prefill_size)
+        logger.info(
+            "[PP Dynamic Chunk] ENGAGED [PP%s]: chunk width %d (static "
+            "--chunked-prefill-size is %d, delta %+d, history_len=%d). This "
+            "line is edge-triggered on a change of width and is the runtime "
+            "engagement proof for the dynamic-chunking arm.",
+            getattr(getattr(self, "ps", None), "pp_rank", "?"),
+            int(dynamic_size),
+            static,
+            int(dynamic_size) - static,
+            int(history_len),
+        )
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None

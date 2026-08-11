@@ -1853,6 +1853,12 @@ class WaveBackController:
 # ---------------------------------------------------------------------------
 
 
+from sglang.srt.managers.kvso_flip_contract import (
+    restore_permitted,
+    stamp_spill,
+)
+
+
 class SpillSlot:
     """One CONCURRENTLY spilled session's scheduling state (S4).
 
@@ -1881,6 +1887,8 @@ class SpillSlot:
         "tick_hiddens",
         "tick_hidden_start",
         "suppress_tick",
+        # #656: the phase this image was captured in (kvso_flip_contract).
+        "flip_layout",
         # C2 (spec-in-spill-tick, Option b'): the spilled session's DRAFT KV
         # kept DEVICE-resident so draft() runs as a normal device decode while
         # the (large, DCP-sharded) TARGET KV lives on host. draft_dev_k/v are
@@ -1981,6 +1989,13 @@ class SpillSlot:
         self.budget_tick_release = False
         # #224: never set on the default path (destination chain unarmed).
         self.park_pending = False
+        # #656 kvso_flip_contract: the PHASE this host image was captured in.
+        # A host image is layout-specific (PP: this stage's layers, all
+        # tokens; TP: a token shard of every layer), so the stamp is what
+        # lets a flip decide whether carrying the image across is safe, and
+        # what stops a restore into a layout the bytes never lived in. None
+        # means "not provable", which the contract reads as refuse.
+        self.flip_layout = None
         # RESTORE-READINESS handshake (quiescence-trap fix): when a spilled
         # session is restore-ready but its last host-tick result is still
         # pending (last_batch is its own tick), one tick is suppressed so the
@@ -3891,6 +3906,7 @@ class KVSessionOffloadManager:
             slot.draft_spill_boundary = boundary
             slot.draft_spill_L = L
             slot.spec_in_tick = True
+        stamp_spill(slot, getattr(self.scheduler, "phase_flip_active_stack", None))
         self.spills[req.req_pool_idx] = slot
         if budget_armed:
             # Episode opened: decode phase, clock started, D2H volume charged.
@@ -4229,6 +4245,7 @@ class KVSessionOffloadManager:
         )
         slot.born_spilled = True
         slot.adopted = False
+        stamp_spill(slot, getattr(self.scheduler, "phase_flip_active_stack", None))
         self.spills[rpi] = slot
         if getattr(self, "_budget_armed", False):
             # #236: born-spilled episode -- write-once prefill phase; the
@@ -4561,6 +4578,23 @@ class KVSessionOffloadManager:
         return 0
 
     def _maybe_restore_flow(self, slot, running_batch, last_batch):
+        # #656 LAYOUT GATE, before every other consideration. A host image is
+        # specific to the phase it was captured in (PP: this stage's layers
+        # for all tokens; TP: a token shard of every layer), so reading it
+        # back in the other phase returns the wrong K/V -- silently, since
+        # the shapes still line up. This gate covers BOTH ways back: the
+        # incremental wave-back below and the committing restore, because
+        # both are H2D copies into a device layout.
+        #
+        # It is deliberately separate from the tick pin
+        # (kvso_flip_contract.pin_spills_to_phase), which stops the session
+        # from RUNNING in the wrong phase. Two independent gates on the same
+        # hazard means a bug in either one alone is still caught.
+        if not restore_permitted(
+            slot, getattr(self.scheduler, "phase_flip_active_stack", None)
+        ):
+            return running_batch
+
         # DEVICE-RESUME UNDER SPEC -- MILESTONE GUARD. A spilled session decodes
         # PLAIN on host: its EAGLE/MTP draft state (hidden_states / topk /
         # future_indices) is dropped at spill and never rebuilt while
