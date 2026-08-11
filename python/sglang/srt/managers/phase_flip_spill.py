@@ -1116,7 +1116,13 @@ def _cached_relief_estimate(device_index: int) -> int:
         return 0
 
 
-def collective_kv_backing_relief(scheduler: Any, reduce_fn, *, want_bytes, guard) -> int:
+#: The only leg on which the KV rung may shrink. See the driver's docstring.
+KV_RELIEF_DIRECTION = "pp_to_tp"
+
+
+def collective_kv_backing_relief(
+    scheduler: Any, reduce_fn, *, want_bytes, guard, direction: str = KV_RELIEF_DIRECTION
+) -> int:
     """#656 item 12, the device half: ONE shrink target for the whole group.
 
     A REFUSAL MAY BE DECIDED LOCALLY. A CAPACITY MAY NOT. The corridor guard
@@ -1150,6 +1156,28 @@ def collective_kv_backing_relief(scheduler: Any, reduce_fn, *, want_bytes, guard
     from sglang.srt.managers import kv_backing_relief as kbr
 
     relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None) if scheduler else None
+    if str(direction) != KV_RELIEF_DIRECTION:
+        # ONE LEG ONLY, and the asymmetry is structural rather than cautious.
+        #
+        # The scheduler's KV pool is the PP LAYOUT'S pool. Capping it on the
+        # pp->tp leg gives up backing that is about to hold nothing, because
+        # the PP layout goes inactive for the whole TP phase -- and pp->tp is
+        # also the leg whose refusal is fatal (strict purity forbids decode in
+        # PP, so a refused pp->tp starves decode outright).
+        #
+        # On the tp->pp leg the same pool is about to become ACTIVE again, and
+        # ``recover_kv_backing`` runs at that leg's post-cutover hook. A shrink
+        # here would therefore be undone within the same flip -- churn whose
+        # undo is a ``cuMemCreate``, which is the one operation this chain has
+        # already paid 2.5 GiB to learn not to do near a tight card.
+        #
+        # The rank still ABSTAINS INTO THE REDUCTION rather than returning
+        # early. The direction comes from the seam's reduced consensus payload
+        # and is therefore already agreed, so skipping would in fact be safe --
+        # but "safe because a value upstream is agreed" is precisely the
+        # reasoning that produces collective hangs when the upstream changes.
+        # One abstention per tp->pp leg is cheaper than that risk.
+        relief = None
     if guard is None:
         # No floor to propose against. Abstain -- but still reduce, because a
         # rank that returns early here hangs the ones that did not.
@@ -1355,7 +1383,13 @@ def get_corridor_guard(scheduler: Any):
         from sglang.srt.managers.kv_backing_relief import kv_backing_provider
 
         relief = kv_backing_provider(
-            scheduler, device_index=int(device_index), probe=guard.free_bytes
+            scheduler,
+            device_index=int(device_index),
+            probe=guard.free_bytes,
+            # THE LAW, never the arming floor. A proof run that raises the
+            # floor must make the gate work earlier; it must not bound
+            # recovery and leave the pool permanently smaller.
+            law_floor_bytes=guard.law_floor_bytes,
         )
     except Exception as e:
         logger.warning("%s KV backing relief unavailable: %s", LOG_PREFIX, e)

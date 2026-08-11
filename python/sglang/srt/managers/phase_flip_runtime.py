@@ -3795,6 +3795,7 @@ class PhaseFlipRuntime:
                 self._collective_min,
                 want_bytes=int(staging_bytes),
                 guard=guard,
+                direction=direction,
             )
         except Exception as e:
             logger.error(

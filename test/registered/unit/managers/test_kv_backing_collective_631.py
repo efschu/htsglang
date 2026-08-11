@@ -319,5 +319,226 @@ class RecoveryIsStillTheThingThatMakesThisNotASmallerPoolTest(unittest.TestCase)
             self.assertFalse(r._cap.engaged)
 
 
+class _LazyPool(_FakePool):
+    """A pool whose ``size`` is a RESERVATION and whose backing is separate.
+
+    This is the real shape and the one the first metal boot fell over. On the
+    hybrid VMM pool ``size`` keeps "stock rows semantics" and never moves --
+    ``initial_backing_rows`` says so in as many words -- while the physically
+    committed span lives in ``full_pool_backed_rows``. Reading ``size`` as the
+    current backing therefore over-reads it by everything already released,
+    and the next "shrink" asks for MORE rows than are committed, which is a
+    GROW: ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` on a card the rung
+    had just been asked to relieve.
+    """
+
+    def __init__(self, rows: int, bytes_per_row: int = 4096, *, card=None):
+        super().__init__(rows, bytes_per_row, card=card)
+        self._backed = rows
+        self.grew_to = []
+
+    @property
+    def full_pool_backed_rows(self) -> int:
+        return self._backed
+
+    def runtime_set_backing_rows(self, rows: int) -> int:
+        """Converges the backing in BOTH directions, like the real one.
+
+        That symmetry is the trap: an argument above the committed span is not
+        a smaller shrink, it is a commit, and it takes memory off the card. The
+        fake therefore charges the card for a grow and raises the driver's own
+        error when the card cannot pay -- so a caller that mistakes the
+        reservation for the backing fails here the way it failed on metal.
+        """
+        rows = int(rows)
+        self.calls.append(rows)
+        if rows > self._backed:
+            self.grew_to.append(rows)
+            need = (rows - self._backed) * self._bytes_per_row
+            if self._card is not None:
+                if need > self._card.free:
+                    raise RuntimeError("cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY")
+                self._card.free -= need
+            self._backed = rows
+            return 0
+        released = (self._backed - rows) * self._bytes_per_row
+        self._backed = rows
+        if self._card is not None:
+            self._card.free += released
+        return released
+
+
+class TheCurrentSpanIsWhatIsBackedNotWhatIsReservedTest(unittest.TestCase):
+    """Metal, 2026-08-11: the second shrink of a boot tried to GROW."""
+
+    def _lazy_rank(self, free_mib=1100, live=(80,)):
+        card = _Card(free_mib)
+        pool = _LazyPool(500000, card=card)
+        relief = kbr.KvBackingRelief(
+            pool,
+            _FakeAllocator(500000),
+            live_slots_fn=lambda: torch.tensor(list(live), dtype=torch.int64),
+            bytes_per_row=4096,
+            probe=card.probe,
+        )
+        return relief, pool, card
+
+    def test_a_second_shrink_never_asks_above_the_committed_span(self):
+        relief, pool, card = self._lazy_rank()
+        first, _ = _agree([relief], want_mib=500)
+        relief.apply_target(first)
+        self.assertLess(pool.full_pool_backed_rows, 500000)
+        # The card is tighter again; the group agrees a second target. It must
+        # be read against what is BACKED now, not against the reservation.
+        card.free = 1100 * MIB
+        second, proposals = _agree([relief], want_mib=500)
+        self.assertEqual(
+            proposals[0][2],
+            pool.full_pool_backed_rows,
+            "the proposal's 'current' must be the committed span",
+        )
+        if second is not None:
+            relief.apply_target(second)
+        self.assertEqual(pool.grew_to, [], "a shrink must never commit pages")
+
+    def test_a_target_above_the_committed_span_is_a_no_op_not_a_grow(self):
+        relief, pool, _card = self._lazy_rank()
+        relief.apply_target(300000)
+        self.assertEqual(pool.full_pool_backed_rows, 300000)
+        # A peer's ambition, agreed while this rank was already lower.
+        self.assertEqual(relief.apply_target(400000), 0)
+        self.assertEqual(pool.grew_to, [])
+
+
+class RecoveryMayNotBreachTheCorridorItWasRelievingTest(unittest.TestCase):
+    """Metal, 2026-08-11: recovery re-committed the pool and left 6 MiB free.
+
+    ``recover`` grew straight back to the boot reservation with no reference
+    to the corridor law, on a card whose relief had been the reason for the
+    shrink. Measured: ``free 6 -> 292 MiB`` on rank 1, and a ``cuMemCreate``
+    OOM on the way. Undo is allocation, and here it ran at an idle boundary
+    that was not as idle as the design assumed.
+
+    A partial recovery is a CAPACITY LOSS and a full one that breaches is a
+    FAULT, so the rung takes the loss: it recovers as far as the law permits,
+    keeps the cap at that level, and remembers the boot rows for later.
+    """
+
+    def _rank_at(self, free_mib, backed):
+        card = _Card(free_mib)
+        pool = _LazyPool(500000, card=card)
+        pool._backed = backed
+        pool.size = 500000
+        relief = kbr.KvBackingRelief(
+            pool,
+            _FakeAllocator(500000),
+            live_slots_fn=lambda: torch.tensor([80], dtype=torch.int64),
+            bytes_per_row=MIB,  # 1 MiB per row keeps the arithmetic readable
+            probe=card.probe,
+        )
+        relief._rows_at_boot = 500000
+        relief._cap.engage(backed)
+        return relief, pool, card
+
+    def test_recovery_stops_at_the_corridor_law(self):
+        # 3000 MiB free, law floor 1024 -> at most 1976 rows may be committed.
+        relief, pool, _card = self._rank_at(3000, 400000)
+        relief.recover()
+        self.assertLessEqual(pool.full_pool_backed_rows, 400000 + 1976)
+        self.assertGreater(pool.full_pool_backed_rows, 400000)
+        self.assertNotIn(
+            500000, pool.grew_to, "the full grow must never be attempted"
+        )
+
+    def test_a_partial_recovery_keeps_the_cap_at_the_level_it_reached(self):
+        relief, pool, _card = self._rank_at(3000, 400000)
+        relief.recover()
+        self.assertTrue(relief._cap.engaged, "uncapped rows above the backing")
+        self.assertEqual(relief._cap.cap, pool.full_pool_backed_rows)
+
+    def test_a_partial_recovery_remembers_the_boot_rows_for_later(self):
+        relief, pool, card = self._rank_at(3000, 400000)
+        relief.recover()
+        self.assertIsNotNone(relief._rows_at_boot)
+        card.free = 200_000 * MIB  # the pressure is gone
+        relief.recover()
+        self.assertEqual(pool.full_pool_backed_rows, 500000)
+        self.assertFalse(relief._cap.engaged)
+        self.assertIsNone(relief._rows_at_boot)
+
+    def test_a_card_with_no_headroom_recovers_nothing_and_stays_capped(self):
+        relief, pool, _card = self._rank_at(900, 400000)
+        self.assertEqual(relief.recover(), 0)
+        self.assertEqual(pool.full_pool_backed_rows, 400000)
+        self.assertTrue(relief._cap.engaged)
+
+
+class _Sched:
+    pass
+
+
+class _Guard:
+    floor_bytes = 1024 * MIB
+    delta_bytes = 256 * MIB
+    device_index = 0
+
+
+class TheRungShrinksOnOneLegOnlyTest(unittest.TestCase):
+    """pp->tp gives up backing that is about to hold nothing. tp->pp does not.
+
+    The scheduler's KV pool is the PP LAYOUT's pool. Capping it as the
+    instance leaves PP costs nothing real for the whole TP phase, and pp->tp
+    is also the leg whose refusal is fatal under strict purity. Capping it as
+    the instance RE-ENTERS PP is churn that ``recover_kv_backing`` undoes
+    within the same flip -- and the undo is a ``cuMemCreate``, the one
+    operation this chain has already paid 2.5 GiB to learn not to do near a
+    tight card.
+
+    The abstention must still ENTER the reduction, which is what the call
+    count asserts.
+    """
+
+    def _sched_with_relief(self):
+        from sglang.srt.managers import phase_flip_spill as pfs
+
+        relief, pool, _alloc, _card = _rank(free_mib=1100, live=(1000,))
+        sched = _Sched()
+        setattr(sched, pfs.KV_BACKING_RELIEF_ATTR, relief)
+        return sched, pool
+
+    def _run(self, direction):
+        from sglang.srt.managers import phase_flip_spill as pfs
+
+        sched, pool = self._sched_with_relief()
+        calls = []
+
+        def reduce(vals, **kw):
+            calls.append(list(vals))
+            return list(vals)
+
+        freed = pfs.collective_kv_backing_relief(
+            sched,
+            reduce,
+            want_bytes=500 * MIB,
+            guard=_Guard(),
+            direction=direction,
+        )
+        return freed, pool, calls
+
+    def test_pp_to_tp_shrinks(self):
+        freed, pool, calls = self._run("pp_to_tp")
+        self.assertGreater(freed, 0)
+        self.assertEqual(len(pool.calls), 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_tp_to_pp_abstains_but_still_joins_the_reduction(self):
+        freed, pool, calls = self._run("tp_to_pp")
+        self.assertEqual(freed, 0)
+        self.assertEqual(pool.calls, [], "the pool that is about to go live")
+        self.assertEqual(
+            len(calls), 1, "abstaining is not the same as walking away"
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

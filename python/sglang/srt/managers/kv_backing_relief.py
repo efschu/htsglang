@@ -285,6 +285,7 @@ class KvBackingRelief:
         device_index: int = 0,
         margin_rows: int = 0,
         buffers: int = 0,
+        law_floor_bytes: int = 1024 * 1024 * 1024,
     ) -> None:
         self._pool = pool
         self._alloc = allocator
@@ -296,6 +297,11 @@ class KvBackingRelief:
         self._probe = probe
         self._device_index = int(device_index)
         self._margin_rows = int(margin_rows)
+        #: The USER'S CORRIDOR LAW, and deliberately not the guard's arming
+        #: floor. Recovery is bounded by this; a proof run that raises the
+        #: arming floor must make the gate work earlier, never make the pool
+        #: permanently smaller.
+        self._law_floor_bytes = int(law_floor_bytes)
         self._cap = KvRowCap(allocator)
         #: The row count to restore to. Latched on the FIRST shrink and never
         #: overwritten by a second one, so a two-step relief still recovers to
@@ -320,6 +326,28 @@ class KvBackingRelief:
 
     def _supported(self) -> bool:
         return callable(getattr(self._pool, "runtime_set_backing_rows", None))
+
+    def _current_rows(self) -> int:
+        """Rows PHYSICALLY BACKED right now -- never the reservation.
+
+        ``pool.size`` is the logical row count and it does not move when the
+        backing does: ``initial_backing_rows`` states plainly that it "does
+        NOT touch self.size", because on this pool family ``size`` keeps the
+        stock semantics of the non-VMM constructor. The committed span lives
+        in ``full_pool_backed_rows``.
+
+        Reading ``size`` instead cost a boot on 2026-08-11. After the first
+        shrink to 347161 rows, ``size`` still said 500000, so the next ask was
+        computed against 500000 and produced a target of 379067 -- ABOVE the
+        committed span. ``runtime_set_backing_rows`` converges the backing to
+        its argument in BOTH directions, so that was a grow:
+        ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY``, from inside relief,
+        on the card that needed relieving.
+        """
+        rows = getattr(self._pool, "full_pool_backed_rows", None)
+        if rows is None:
+            return int(getattr(self._pool, "size", 0))
+        return int(rows)
 
     def _min_release_rows(self) -> int:
         """Rows that must be given up before ANY extent can clear.
@@ -387,7 +415,7 @@ class KvBackingRelief:
         """
         if not self._supported() or self._bytes_per_row <= 0:
             return ABSTAIN
-        current = int(getattr(self._pool, "size", 0))
+        current = self._current_rows()
         if current <= 0:
             return ABSTAIN
         max_live = self._max_live_row()
@@ -427,7 +455,7 @@ class KvBackingRelief:
         target = int(target_rows)
         if not self._supported() or self._bytes_per_row <= 0 or target <= 0:
             return 0
-        current = int(getattr(self._pool, "size", 0))
+        current = self._current_rows()
         if target >= current:
             return 0
         return self._shrink_to(target, current)
@@ -447,7 +475,7 @@ class KvBackingRelief:
         max_live = self._max_live_row()
         if max_live < 0:
             return 0
-        current = int(getattr(self._pool, "size", 0))
+        current = self._current_rows()
         page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
         floor = self._floor_rows(max_live)
         rows_wanted = int(math.ceil(max(0, int(nbytes)) / self._bytes_per_row))
@@ -544,7 +572,23 @@ class KvBackingRelief:
         return measured
 
     def recover(self) -> int:
-        """Re-back the pool to its boot reservation and lift the cap.
+        """Re-back the pool toward its boot reservation, as far as the
+        corridor law allows, and lift the cap to whatever it reached.
+
+        RECOVERY IS AN ALLOCATION, AND IT MUST OBEY THE SAME LAW THE SHRINK
+        WAS SERVING. The first metal boot of this rung recovered straight to
+        the boot rows with no reference to free memory, on the leg where the
+        PP pool becomes active again, and drove rank 1 to **6 MiB free** --
+        with a ``cuMemCreate`` OOM on the way. The design had called that leg
+        "an idle boundary, where an allocation is affordable"; measured, it is
+        not, because the pool being re-committed is exactly as large as the
+        relief that was taken.
+
+        So the grow is BOUNDED by this card's distance from the corridor law
+        (never by the gate's proof-time arming floor, which would cripple
+        recovery for an instrument). What it cannot re-commit stays capped:
+        that is an admission-capacity loss, which is recoverable on any later
+        leg, rather than a breach or a fault, which are not.
 
         Restore order is the mirror of the shrink: pages FIRST, cap SECOND.
         Lifting the cap before the memory exists would re-admit ids that are
@@ -552,9 +596,30 @@ class KvBackingRelief:
         """
         if self._rows_at_boot is None:
             return 0
-        rows = int(self._rows_at_boot)
-        was = int(getattr(self._pool, "size", 0))
-        if self._supported() and was < rows:
+        boot_rows = int(self._rows_at_boot)
+        was = self._current_rows()
+        rows = boot_rows
+        if self._supported() and was < boot_rows:
+            if self._bytes_per_row > 0:
+                headroom = self._free_bytes() - self._law_floor_bytes
+                affordable = int(headroom // self._bytes_per_row)
+                rows = min(boot_rows, was + max(0, affordable))
+                page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
+                rows = int(rows // page * page)
+            if rows <= was:
+                logger.warning(
+                    "%s recovery deferred: %d MiB free leaves nothing above "
+                    "the %d MiB corridor law to re-commit with, so the pool "
+                    "stays at %d of %d rows. Admission capacity is reduced "
+                    "until a later leg -- which is a capacity loss, never a "
+                    "breach.",
+                    LOG_PREFIX,
+                    self._free_bytes() // (1024 * 1024),
+                    self._law_floor_bytes // (1024 * 1024),
+                    was,
+                    boot_rows,
+                )
+                return 0
             try:
                 self._pool.runtime_set_backing_rows(rows)
             except Exception as e:
@@ -571,11 +636,25 @@ class KvBackingRelief:
                     e,
                 )
                 return 0
+        now = self._current_rows()
+        # Pages first, cap second -- and the cap comes back at the level the
+        # pages actually reached, not at the level they were aiming for.
         self._cap.release()
-        self._rows_at_boot = None
-        self._exhausted = False
+        if now < boot_rows:
+            self._cap.engage(now)
+            logger.info(
+                "%s recovered to %d of %d rows (corridor-bounded); the cap "
+                "stays at that level and the boot reservation is remembered "
+                "for a later leg",
+                LOG_PREFIX,
+                now,
+                boot_rows,
+            )
+        else:
+            self._rows_at_boot = None
+            self._exhausted = False
         self.recover_count += 1
-        return max(0, int(getattr(self._pool, "size", rows)) - was)
+        return max(0, now - was)
 
 
 def row_geometry(pool: Any):
@@ -631,6 +710,7 @@ def kv_backing_provider(
     *,
     device_index: int,
     probe: Optional[Callable[[], int]] = None,
+    law_floor_bytes: int = 1024 * 1024 * 1024,
 ) -> Optional[KvBackingRelief]:
     """Build the relief for a scheduler's KV pool, or None when unavailable.
 
@@ -711,4 +791,5 @@ def kv_backing_provider(
         probe=probe,
         device_index=device_index,
         buffers=n_buffers,
+        law_floor_bytes=law_floor_bytes,
     )
