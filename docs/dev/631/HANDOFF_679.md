@@ -223,12 +223,66 @@ handed the binding card ~948 MiB — nearly tripling its margin — with no host
 RAM spent and no pool shrunk. "Spread 879 MiB" never said that; a spread
 figure names the unevenness without naming the card or the size of the fix.
 
+**AND THE SAME ARITHMETIC OVER s34's GREEN ACCEPTANCE WINDOW SAYS IT LOUDER.**
+The report now parses the canonical `scripts/corridor_sample.sh` header too
+(§1f), so it runs over every acceptance `corridor.csv` already on disk. Over
+s34's full 65 minutes, 28881 samples (`evidence-631/s34/accept2/corridor.csv`,
+reproduced at `docs/dev/631/S34_WATER_FILL.txt`):
+
+    payload the objective wants moved   min 15   p50 1004   p90 1036   max 1335 MiB
+
+    AT THE BINDING INSTANT OF THE GREEN RUN
+      free column   [1043, 3280, 1541] MiB
+      min free      1043 MiB  -> 19 MiB of margin over the law
+      water-fill    [+912, -1325, +414] MiB
+
+**The tightest moment of the entire green acceptance was a PLACEMENT problem,
+not a capacity problem.** Card 0 came within **19 MiB** of the corridor law
+while card 1 sat on 3280 MiB of free memory, 912 MiB of which the water-fill
+objective would have moved onto it. The median opportunity, 1004 MiB, matches
+this shift's independently measured 1010 MiB across a different window and a
+different load — two windows agreeing to within 6 MiB on how much headroom is
+sitting on the wrong card.
+
+**This revises HANDOFF_678 §1a-ter.** That section concluded, correctly for
+what it had, that the 39 MiB intra-forward margin was thin and that "the lever
+for widening it is `--rank-gpu-memory-mib` on the binding card, not another
+gate". There is a second lever, it is larger by an order of magnitude, and it
+needs no boot-config change: the binding card was short of headroom by tens of
+MiB while a peer held hundreds it could not reach. A boot-vector change trades
+capacity for margin permanently; the rebalance tier would have lent it back
+continuously.
+
+No contradiction with s34's reported minima of 1043 / 1922 / 1541: those are
+each card's minimum over the whole window, while 3280 is card 1's value AT THE
+INSTANT card 0 reached its own minimum. Different quantities, both true — and
+the second is the one item 16 is about.
+
 **What this does NOT claim.** The clause is an instrument in the code and was
 NOT exercised on metal: the running server is the s34 binary and was
 deliberately not restarted, so the new log line has never appeared in a
 serving log. The numbers above are the same arithmetic applied offline to a
 measured free column, which is why the report script is committed beside the
 series rather than quoted from memory.
+
+### 1f. I COMMITTED A SECOND CORRIDOR SAMPLER BEFORE NOTICING THE FIRST
+
+`scripts/corridor_sample.sh` has been the canonical 100 ms sampler since
+2026-08-09 and is what every acceptance run calls. I wrote and committed an
+ad-hoc equivalent for the item-16 series without finding it first — same NVML
+`memory.free` field and same interval, plus two derived columns — which is the
+duplication this codebase's own comments warn about ("a second derivation of
+the same quantity is a second thing to keep in agreement").
+
+Removed from `docs/dev/631/`. The copy beside the series in
+`evidence-631/s35/` stays, because it is the provenance of that CSV and
+deleting it would leave the data unattributable.
+
+The consequential half was the reporting script: it parsed only my column
+names, so it would have failed against every acceptance `corridor.csv` on
+disk. It now accepts both headers, which is what made the s34 cross-check
+above possible at all — the defect and its fix are the reason that evidence
+exists.
 
 ---
 

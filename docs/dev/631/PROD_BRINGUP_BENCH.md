@@ -4399,6 +4399,21 @@ binary (`evidence-631/s35/spread_ts.csv`):
       binding card 495 MiB above the 1024 law while a peer held 3926 free
       water-fill [+948, -1459, +512] MiB -> card 0 sheds 948 MiB onto card 1
 
+Re-run over s34's own green acceptance window, 28881 samples
+(`evidence-631/s34/accept2/corridor.csv`):
+
+    payload the objective wants moved   min 15   p50 1004   p90 1036   max 1335 MiB
+    at the binding instant: free column [1043, 3280, 1541] MiB
+      card 0 was 19 MiB above the law while card 1 held 3280 MiB free
+      water-fill [+912, -1325, +414] MiB
+
+The tightest moment of the green run was a PLACEMENT problem, not a capacity
+one, and the two windows agree to within 6 MiB on the median opportunity
+(1004 vs 1010 MiB) across different loads. This revises the §1a-ter reading
+that `--rank-gpu-memory-mib` is the only lever for the binding card's margin:
+the rebalance tier is a second one, an order of magnitude larger, and it needs
+no boot-config change.
+
 **Read this as the price of the missing tier, not as a corridor result.** A
 continuous levelling tier would nearly triple the binding card's margin with
 no host RAM spent and no pool shrunk. `water_fill_targets` had computed this

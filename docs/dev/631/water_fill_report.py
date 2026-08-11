@@ -21,10 +21,28 @@ rows = list(csv.DictReader(open(sys.argv[1])))
 if not rows:
     sys.exit("empty series")
 
+# ACCEPT BOTH HEADERS. scripts/corridor_sample.sh is the CANONICAL sampler
+# this chain's acceptance runs use and it writes ts_ms,gpu0_free,gpu1_free,
+# gpu2_free; the s35 series was taken with an ad-hoc equivalent (same NVML
+# free field, same 100 ms) that also carries derived spread/min columns.
+# Parsing only one of them would make this report useless against every
+# acceptance corridor.csv already on disk, which is exactly the data a
+# successor will want to run it over.
+FIELDS = None
+for candidate in (
+    [f"free{i}_mib" for i in range(3)],
+    [f"gpu{i}_free" for i in range(3)],
+):
+    if all(c in rows[0] for c in candidate):
+        FIELDS = candidate
+        break
+if FIELDS is None:
+    sys.exit(f"unrecognised corridor CSV header: {sorted(rows[0])}")
+
 shed_mib, spreads = [], []
 binding = None
 for r in rows:
-    col = [int(r[f"free{i}_mib"]) * MIB for i in range(3)]
+    col = [int(r[f]) * MIB for f in FIELDS]
     t = water_fill_transfers(col)
     shed = max(t) / MIB
     shed_mib.append(shed)
