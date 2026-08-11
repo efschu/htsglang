@@ -156,6 +156,20 @@ for "crashed". Synthetic fill may top up only BELOW the cap.
    5090's idle prefill capacity with full-attn placement unchanged. A hand-set
    `--pp-layer-ratio` is acceptable for the A/B if the runtime is honest about
    the bypass. Book prefill tok/s, per-rank compute/wait ms, corridor.
+
+   **MANDATORY, and it is why this arm cannot be judged on prefill alone:**
+   the weights-arena tail is GEOMETRY-DEPENDENT (CONTRADICTIONS_REGISTER C1)
+   -- `tail = max(pp,tp) - min(pp,tp)` is a function of the PP layer split, so
+   moving layers between stages MOVES what rung 3 harvests. **Re-measure the
+   tail per arm** from that boot's `TP stack built` line; never quote the
+   319/220/1191 figures across a split change. The verdict is
+
+       net = prefill gain + tail delta (+ corridor delta)
+
+   not prefill gain alone. An arm that wins 8% of prefill while destroying 900
+   MiB of tail on a binding card is a LOSS, and pricing a change on the axis it
+   was designed for while ignoring the axis it moves is exactly how this chain
+   shipped rungs worth nothing (register C2, C7).
 4. Resident-working-set capacity table per (phase, load): bs1/bs4 x PP/TP, one
    corridor CSV each at real occupancy, conservation check against 669440.
 5. **CHUNK A/B -- the FIRST item-8 arm** (user pushed it ahead of DFLASH,
