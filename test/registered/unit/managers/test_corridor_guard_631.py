@@ -209,6 +209,119 @@ class HonestAccountingTest(unittest.TestCase):
             g.register("nope", 1, "not a function")
 
 
+class LocalReclaimTierTest(unittest.TestCase):
+    """The cheapest relief of all: memory nobody owns.
+
+    Torch's caching allocator holds blocks that no tensor uses; returning
+    them to the driver moves NVML's free column, moves no payload anywhere,
+    and costs only the re-``cudaMalloc`` of whatever asks next. It is
+    therefore neither a rebalance (it levels nothing) nor a park nor a host
+    spill, and it must be spent before all three -- including before a
+    rebalance that would move a real payload off the card.
+
+    This mattered on metal: the seam's gate ran BEFORE the staging path's
+    cache reclaim, so the gate could refuse a ``pp->tp`` flip -- the leg that
+    starves decode outright -- while over a gibibyte per card sat in torch's
+    cache (register: flush contamination, 1028-1426 MiB/card at idle).
+    """
+
+    def test_local_tier_sorts_ahead_of_every_other_tier(self):
+        self.assertLess(cg.RELIEF_LOCAL, cg.RELIEF_REBALANCE)
+        self.assertLess(cg.RELIEF_REBALANCE, cg.RELIEF_PARK)
+        self.assertLess(cg.RELIEF_PARK, cg.RELIEF_HOST)
+
+    def test_local_is_spent_before_a_cheaper_rebalance(self):
+        # Tier outranks cost, so an EXPENSIVE local reclaim still precedes a
+        # CHEAP rebalance. Anything else would evict a real payload while
+        # unowned cache sat on the card.
+        card = _Card(1100)
+        g = _guard(card)
+        order = []
+
+        def mk(name, pool_mib):
+            inner = card.provider(pool_mib)
+
+            def f(n):
+                order.append(name)
+                return inner(n)
+
+            return f
+
+        g.register("draft", 1, mk("draft", 4000), tier=cg.RELIEF_REBALANCE)
+        g.register("cache", 99, mk("cache", 4000), tier=cg.RELIEF_LOCAL)
+        g.ensure_headroom(500 * MIB)
+        self.assertEqual(order[0], "cache")
+
+    def test_local_relief_is_not_gated_by_the_fleet_predicate(self):
+        # Only RELIEF_HOST is gated by item 16. Returning unowned cache to
+        # the driver is not a spill and must never wait for the fleet to
+        # level -- doing so would reproduce the deadlock this tier fixes.
+        card = _Card(1100)
+        g = cg.CorridorGuard(
+            0,
+            floor_mib=1024,
+            delta_mib=256,
+            probe=card.probe,
+            fleet_probe=lambda: [9000 * MIB, 9000 * MIB, 9000 * MIB],
+        )
+        g.register("cache", 10, card.provider(4000), tier=cg.RELIEF_LOCAL)
+        r = g.ensure_headroom(900 * MIB)
+        self.assertTrue(r.ok)
+        self.assertIn("cache", r.used_providers)
+
+
+class AllocatorCacheProviderTest(unittest.TestCase):
+    """The provider reports what the DRIVER gave back, never what torch said.
+
+    ``memory_reserved() - memory_allocated()`` is the size of the hoard, not
+    the size of the release: the allocator may keep blocks it is still
+    carving from, and a provider that returned the hoard would credit the
+    guard bytes NVML never saw. That is the exact failure mode this chain has
+    now hit three times, so this provider is defined by its measured delta.
+    """
+
+    def test_reports_the_measured_driver_delta(self):
+        state = {"free": 900 * MIB}
+
+        def probe():
+            return state["free"]
+
+        def empty_cache():
+            state["free"] += 700 * MIB
+
+        f = cg.allocator_cache_provider(probe, empty_cache=empty_cache)
+        self.assertEqual(f(4000 * MIB), 700 * MIB)
+
+    def test_a_cache_flush_that_moves_nothing_returns_zero(self):
+        state = {"free": 900 * MIB}
+        f = cg.allocator_cache_provider(lambda: state["free"], empty_cache=lambda: None)
+        self.assertEqual(f(4000 * MIB), 0)
+
+    def test_a_driver_free_that_fell_is_reported_as_zero_not_negative(self):
+        # Another process can take memory between the two probes. A negative
+        # return would be subtracted from the guard's reclaim total and make
+        # the accounting lie in the dangerous direction.
+        state = {"free": 900 * MIB}
+
+        def probe():
+            v = state["free"]
+            state["free"] -= 100 * MIB
+            return v
+
+        f = cg.allocator_cache_provider(probe, empty_cache=lambda: None)
+        self.assertEqual(f(4000 * MIB), 0)
+
+    def test_a_raising_flush_is_reported_as_zero_rather_than_propagating(self):
+        # The guard catches provider exceptions, but this one runs at the
+        # seam's no-return edge often enough that it should not depend on
+        # that catch.
+        def boom():
+            raise RuntimeError("cuda is busy")
+
+        f = cg.allocator_cache_provider(lambda: 900 * MIB, empty_cache=boom)
+        self.assertEqual(f(4000 * MIB), 0)
+
+
 class DraftCarrierProviderTest(unittest.TestCase):
     class _Carrier:
         def __init__(self):

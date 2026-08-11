@@ -77,6 +77,14 @@ than asserted.
 
 This splits the provider order into a TIER above the cost:
 
+    RELIEF_LOCAL      give back memory NO payload owns. Torch's caching
+                      allocator holds blocks no tensor uses; returning them
+                      moves NVML's free column, moves no payload anywhere,
+                      and costs only the re-``cudaMalloc`` of whatever asks
+                      next. It levels nothing, so it is not a rebalance; it
+                      spills nothing, so it is not a host tier. It is simply
+                      free money and must be spent before anything that
+                      moves a real payload.
     RELIEF_REBALANCE  make the free column more level. In TP this is the
                       uneven-DCP token vector (``distributed.corridor_vector``
                       already solves it against per-card corridor capacity):
@@ -136,11 +144,13 @@ DEFAULT_DELTA_MIB = 256
 #: Relief tiers (item 16). Lower is tried first, unconditionally: the tier
 #: outranks the cost, so a cheap host spill can never overtake an expensive
 #: rebalance. Cost still orders providers within one tier.
+RELIEF_LOCAL = -1  # give back memory NO payload owns (torch's allocator cache)
 RELIEF_REBALANCE = 0  # level the free column: token vector, evacuate the heavy card
 RELIEF_PARK = 1  # park a cold payload in another card's surplus VRAM
 RELIEF_HOST = 2  # system RAM -- only once every card is at the floor
 
 _TIER_NAMES = {
+    RELIEF_LOCAL: "local",
     RELIEF_REBALANCE: "rebalance",
     RELIEF_PARK: "park",
     RELIEF_HOST: "host",
@@ -550,6 +560,61 @@ def nvml_fleet_probe() -> Callable[[], List[int]]:
             return out
 
     return probe
+
+
+def allocator_cache_provider(
+    probe: Callable[[], int],
+    *,
+    empty_cache: Optional[Callable[[], None]] = None,
+) -> Callable[[int], int]:
+    """Return torch's unused cached blocks to the driver. The cheapest relief.
+
+    WHY THIS IS A PROVIDER AND NOT AN IMPLEMENTATION DETAIL. The seam already
+    reclaims the allocator cache -- but inside ``_staging_affordable``, which
+    runs AFTER the corridor gate. So the gate formed its verdict against a
+    free column that understated the truth by the size of the hoard, and on
+    this rig the hoard is 1028-1426 MiB per card at idle (register: flush
+    contamination). The gate could therefore REFUSE a ``pp->tp`` flip -- the
+    leg that starves decode outright under strict purity -- or force the host
+    tier onto an unlevel fleet, while a gibibyte of nobody's memory sat on the
+    card. Registering it makes the gate spend it FIRST, before any payload
+    moves anywhere.
+
+    THE RETURN VALUE IS A MEASURED DELTA, NOT ``memory_reserved() -
+    memory_allocated()``. That difference is the size of the hoard, not the
+    size of the release: the allocator keeps whole segments it is still
+    carving from, so the two numbers routinely disagree. Crediting the hoard
+    would be the same class of error as crediting a free-list push -- bytes
+    the corridor law cannot see -- which this chain has now made three times.
+    So the provider probes, flushes, probes again, and reports the difference.
+
+    A fall in driver-free between the two probes (another process taking
+    memory) is reported as 0 rather than as a negative number: the guard sums
+    these into ``reclaimed_total`` and a negative would make the accounting
+    lie in the permissive direction.
+
+    ``nbytes`` is ignored, honestly rather than silently: ``empty_cache`` is
+    all-or-nothing and cannot free a bounded amount. Over-delivering is not a
+    failure -- the guard re-probes the driver and stops asking once the target
+    is met.
+    """
+
+    def free_up_to(_nbytes: int) -> int:
+        try:
+            before = int(probe())
+            if empty_cache is not None:
+                empty_cache()
+            else:
+                import torch
+
+                torch.cuda.empty_cache()
+            after = int(probe())
+        except Exception as e:
+            logger.warning("%s allocator cache reclaim failed: %s", LOG_PREFIX, e)
+            return 0
+        return max(0, after - before)
+
+    return free_up_to
 
 
 def draft_carrier_provider(carrier) -> Callable[[int], int]:

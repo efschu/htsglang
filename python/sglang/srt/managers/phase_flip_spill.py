@@ -1062,10 +1062,11 @@ def get_spill_ladder(scheduler: Any) -> Optional[PhaseFlipSpillLadder]:
     return ladder
 
 
-#: Cost ranks inside the REBALANCE tier. Spread out so a later rung can be
-#: slotted between two of these without renumbering the others.
-_COST_ARENA_TAIL = 10
-_COST_DRAFT_WEIGHTS = 20
+#: Cost ranks inside a tier. Spread out so a later rung can be slotted
+#: between two of these without renumbering the others.
+_COST_ALLOCATOR_CACHE = 10  # tier LOCAL
+_COST_ARENA_TAIL = 10  # tier REBALANCE
+_COST_DRAFT_WEIGHTS = 20  # tier REBALANCE
 
 CORRIDOR_GUARD_ATTR = "phase_flip_corridor_guard"
 
@@ -1166,6 +1167,21 @@ def get_corridor_guard(scheduler: Any):
         # the corridor permits. See CorridorGuard.__init__.
         law_floor_mib=cg.DEFAULT_FLOOR_MIB,
         fleet_probe=cg.nvml_fleet_probe(),
+    )
+
+    # FIRST, AND ON BOTH LEGS: hand torch's unused cached blocks back to the
+    # driver. The seam already did this, but inside _staging_affordable --
+    # i.e. AFTER this gate had already formed its verdict. So the gate judged
+    # against a free column that understated the truth by the size of the
+    # hoard (1028-1426 MiB/card at idle on this rig), and could refuse a
+    # pp->tp flip, the leg that starves decode outright, while a gibibyte of
+    # nobody's memory sat on the card. It is registered in tier LOCAL because
+    # it moves no payload anywhere and must precede everything that does.
+    guard.register(
+        "allocator-cache",
+        _COST_ALLOCATOR_CACHE,
+        cg.allocator_cache_provider(guard.free_bytes),
+        tier=cg.RELIEF_LOCAL,
     )
 
     # The drafter is a REBALANCE and not a HOST spill even though its image

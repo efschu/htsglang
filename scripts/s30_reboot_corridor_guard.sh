@@ -28,10 +28,15 @@ OLD_PID="${OLD_PID:-}"
 mkdir -p "$(dirname "$LOG")"
 
 # A live peer may be mid-boot on these cards. <120 s of heartbeat means wait.
+# SELF names THIS session's heartbeat so the check does not refuse on the
+# caller's own liveness proof. It was hardcoded to one session, which meant
+# the next shift's first reboot refused against its own heartbeat and looked
+# like a peer collision.
+SELF="${SELF:-successor30}"
 now=$(date -u +%s)
 for hb in /spinning/gpu-arb/heartbeat.*; do
   [ -e "$hb" ] || continue
-  case "$hb" in *successor30) continue ;; esac
+  case "$hb" in *"$SELF") continue ;; esac
   age=$(( now - $(stat -c %Y "$hb") ))
   if [ "$age" -lt 120 ]; then
     echo "REFUSE: $hb is ${age}s old -- a live peer may hold these cards." >&2
