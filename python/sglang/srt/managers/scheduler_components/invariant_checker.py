@@ -93,13 +93,29 @@ class SchedulerInvariantChecker:
         session_held: int,
         total: int,
         uncached: int = 0,
+        withheld: int = 0,
     ) -> Tuple[bool, str]:
-        """Check: available + evictable + protected + session_held + uncached == total."""
-        total_accounted = available + evictable + protected + session_held + uncached
+        """Check: available + evictable + protected + session_held + uncached
+        + withheld == total.
+
+        ``withheld`` is capacity the #656 residency controller has DELIBERATELY
+        taken out of circulation: slot ids above the KV pool's backed watermark,
+        held out of the free list so that nothing is handed out over unmapped
+        memory. It is not available, not cached and not held by a session, so
+        without a term of its own it reads as a leak -- and it killed the boot
+        that first exercised it ("total=500000, available=419745").
+
+        It is a NAMED POSTEN for the #486 reason: anything that durably occupies
+        or removes pool slots must be named in this ledger, or the next
+        unexplained delta gets attributed to the wrong holder.
+        """
+        total_accounted = (
+            available + evictable + protected + session_held + uncached + withheld
+        )
         leak = total_accounted != total
         msg = (
             f"[{pool_name}] {total=}, {available=}, {evictable=}, "
-            f"{protected=}, {session_held=}, {uncached=}"
+            f"{protected=}, {session_held=}, {uncached=}, {withheld=}"
         )
         return leak, msg
 
@@ -162,6 +178,10 @@ class SchedulerInvariantChecker:
             session_held,
             total,
             uncached,
+            # Slots the residency controller holds out of the free list because
+            # the pages under them are unmapped (#656 item 12). Published by
+            # KvRowCap in the same unit available_size() reports.
+            int(getattr(allocator, "residency_withheld_slots", 0) or 0),
         )
         if (
             leak

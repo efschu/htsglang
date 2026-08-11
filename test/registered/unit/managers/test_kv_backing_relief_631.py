@@ -329,6 +329,60 @@ class HonestAccountingTest(unittest.TestCase):
         self.assertEqual(r.free_up_to(500 * MIB), 0)
 
 
+class WithheldCapacityIsANamedPostenTest(unittest.TestCase):
+    """The second metal kill: the cap read as a pool leak.
+
+    The scheduler's idle invariant is ``available + evictable + protected +
+    session_held + uncached == total``. Withheld capacity is in none of those
+    buckets, so the first boot that exercised the cap died at its first idle
+    check with ``pool memory leak detected! [full] total=500000,
+    available=419745`` -- 80255 slots that were exactly the cap.
+
+    It is a NAMED term for the #486 reason: anything that durably removes pool
+    slots must be named in this ledger, or the next unexplained delta gets
+    attributed to the wrong holder.
+    """
+
+    def test_the_cap_publishes_its_size_to_the_allocator(self):
+        a = _FakeAllocator(1000)
+        cap = kbr.KvRowCap(a)
+        cap.engage(400)
+        self.assertEqual(a.residency_withheld_slots, 600)
+        cap.release()
+        self.assertEqual(a.residency_withheld_slots, 0)
+
+    def test_it_is_published_in_tokens_not_ids_on_a_paged_allocator(self):
+        # available_size() multiplies the free list by page_size, so a raw id
+        # count would be wrong by exactly that factor on every paged lane.
+        a = _FakeAllocator(1000)
+        a.page_size = 16
+        cap = kbr.KvRowCap(a)
+        cap.engage(400)
+        self.assertEqual(a.residency_withheld_slots, 600 * 16)
+
+    def test_the_invariant_accepts_withheld_capacity(self):
+        from sglang.srt.managers.scheduler_components.invariant_checker import (
+            SchedulerInvariantChecker,
+        )
+
+        leak, msg = SchedulerInvariantChecker._check_pool_invariant(
+            "full", 419745, 90, 0, 0, 500000, 0, 80165
+        )
+        self.assertFalse(leak, msg)
+
+    def test_the_invariant_still_catches_a_real_leak(self):
+        # The term must not become a licence: an unexplained shortfall with no
+        # cap engaged is still a leak.
+        from sglang.srt.managers.scheduler_components.invariant_checker import (
+            SchedulerInvariantChecker,
+        )
+
+        leak, _ = SchedulerInvariantChecker._check_pool_invariant(
+            "full", 419745, 90, 0, 0, 500000, 0, 0
+        )
+        self.assertTrue(leak)
+
+
 class ChunklessArenaIsDisqualifiedTest(unittest.TestCase):
     """The root cause of the metal incident, pinned at the registration site.
 

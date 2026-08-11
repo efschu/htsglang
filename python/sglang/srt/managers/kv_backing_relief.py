@@ -121,6 +121,27 @@ class KvRowCap:
     def withheld(self) -> int:
         return 0 if self._withheld is None else int(self._withheld.numel())
 
+    def _publish(self) -> None:
+        """Tell the allocator how much capacity is out of circulation.
+
+        The scheduler's idle invariant checks
+        ``available + evictable + protected + session_held + uncached ==
+        total``. Withheld capacity is in none of those buckets, so without a
+        term of its own it reads as a LEAK -- and it is a fatal one: the first
+        boot that exercised the cap died at the first idle check with
+        "pool memory leak detected! [full] total=500000, available=419745".
+
+        Published in the unit ``available_size()`` reports, which is TOKENS:
+        the paged allocator holds pages in its free list and multiplies by
+        ``page_size``, so a raw id count would be wrong by that factor on
+        every paged lane.
+        """
+        page = max(1, int(getattr(self._alloc, "page_size", 1) or 1))
+        try:
+            self._alloc.residency_withheld_slots = self.withheld * page
+        except Exception:  # pragma: no cover - exotic allocator objects
+            pass
+
     def engage(self, cap: int) -> int:
         """Hold back every free id above ``cap``. Returns the count withheld."""
         import torch
@@ -143,6 +164,7 @@ class KvRowCap:
         self._apply()
         if self._withheld is None:
             self._withheld = torch.empty((0,), dtype=torch.int64)
+        self._publish()
         return self.withheld
 
     def release(self) -> int:
@@ -163,6 +185,7 @@ class KvRowCap:
                     setattr(self._alloc, name, torch.sort(merged).values)
                     break
         self._withheld = None
+        self._publish()
         return n
 
     def _apply(self) -> None:
@@ -183,6 +206,7 @@ class KvRowCap:
             self._withheld = (
                 taken if self._withheld is None else torch.cat((self._withheld, taken))
             )
+            self._publish()
 
 
 class KvBackingRelief:

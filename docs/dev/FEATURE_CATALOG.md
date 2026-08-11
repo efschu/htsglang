@@ -540,6 +540,34 @@ while the arithmetic ran on the wrong one -- that is what kept the defect alive.
   ladder binds its carrier only on the first cutover leg, after the first
   gate). MEASURED: metal proof `want 820 MiB, free 2394 -> 2680 MiB, reclaimed
   286 MiB from [draft-weights]`.
+- **KV backing relief + the allocator cap** (`managers/kv_backing_relief.py`,
+  #656 spec item 12 device half): the rung that makes "there is no fixed max
+  KV" true. `runtime_set_backing_rows` could always unmap KV pages; what did
+  not exist is a SAFE shrink point. `shrink()`'s precondition is "rows above
+  the new span must be dead", and the only prior shrink path (#330 dial)
+  satisfies it by DESTROYING the live set (`tree_cache.reset()` +
+  `allocator.resize()`), which is impossible under load. `KvRowCap` withholds
+  high ids from the allocator's FREE LIST instead — live allocations are never
+  touched, `available_size()` falls out correct, and the scheduler simply
+  admits less work. Three leaks are pinned as tests: eviction does not compact
+  (a freed high id walks back onto the free list, so the cap subscribes to the
+  free listener), `clear()` rebuilds `arange(1, size+1)` and re-admits
+  everything, and a cap that bought no driver bytes is not carried. Bytes are
+  a MEASURED driver delta, never the pool's return value — under
+  `SGLANG_FLIP_SEAM_RETAIN_HANDLES` the arena parks handles and its number is
+  address space. Registered in `RELIEF_LOCAL`, and it is what funds the
+  `pp->tp` leg (under strict purity the drafter is already spilled, so the
+  REBALANCE tier returns 0 exactly when the fatal leg needs it).
+  **REQUIRES A COMMIT CHUNK** (`SGLANG_FLIP_SEAM_CHUNK_MIB`): a chunkless
+  arena holds one extent per buffer, so a partial shrink releases ZERO while
+  still lowering `pool.size` — measured on metal driving a card from 3040 to
+  460 MiB free and ending in `cuMemCreate OUT_OF_MEMORY`, because the failure
+  path re-committed. It is now a registration disqualifier.
+- **Local relief tier** (`corridor_guard.RELIEF_LOCAL`): torch's unused cached
+  blocks handed back to the driver. Sorts ahead of rebalance/park/host because
+  it moves no payload anywhere. The seam already did this, but inside
+  `_staging_affordable` — i.e. AFTER the gate had formed its verdict, so the
+  gate judged against a free column understated by 1028-1426 MiB/card.
 - **KV-pool token-slot ledger** (`DESIGN_330_vram_dial.md` §3b, #486): every
   standing holder of `C_target` slots is a NAMED posten — committed KV, the
   per-decode reserve (`bs x get_alloc_reserve_per_decode()`, held under spec
