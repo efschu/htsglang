@@ -207,7 +207,27 @@ no funder at all.
 
 ## 5. THE ACCEPTANCE RUN
 
-<!-- FILLED IN AT THE END OF THE SHIFT -->
+Extract: `/spinning/evidence-631/s32/accept/EXTRACT.txt`. Config, including
+the exact argv and env deltas and the code commit the instance was built
+from, is `CONFIG.txt` in the same directory. Log
+`/spinning/evidence-631/s32/serving-accept.log`.
+
+**WHICH LOG CARRIES WHICH AXIS, stated before the numbers**, because this
+shift has two and they are not interchangeable:
+
+* `serving-kvrung2.log` (boot 2, raised arming floor 4000 MiB) carries
+  **spec item 12** — the KV rung shrinking, uniformly, for real driver bytes.
+  It is the can-fail instrument and its corridor figures may NOT be read as
+  acceptance.
+* `serving-accept.log` (this run, the real 1024 MiB law) carries every other
+  axis, plus the fact that the relief ladder is REACHED at the law and that
+  its cheapest tier suffices at this fill level.
+
+Quoting the second log for item 12 would be the "green on the axes it checks"
+error HANDOFF_675 §4b warned about; quoting the first for the corridor would
+be worse.
+
+<!-- NUMBERS FILLED IN AT THE END OF THE SHIFT -->
 
 ---
 
