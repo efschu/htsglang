@@ -70,6 +70,41 @@ Red-first verified: reverting the two hunks turns 3 red.
 `test_phase_flip_arena_tail_631.py`'s ordering and pricing tests encoded the
 old assumption and are updated with the correction stated where they assert.
 
+### 1a-bis. THE CORRIDOR IS GATED AT THE SEAM, NOT AT PREFILL — AND THE bs1 LEG FOUND IT
+
+**The acceptance run breached, 12 samples, and the cause is a missing gate
+rather than a gate that failed.** Stated first because it is the most
+actionable thing here.
+
+    11:20:47Z   gpu0 = 1001 MiB, and stays there for 12 samples (~1.6 s)
+                23 MiB UNDER the 1024 law. Other cards: 3070 / 1527.
+    11:20:49Z   CORRIDOR-GUARD cleared on device 0: want 681 MiB,
+                free 1186 -> 2150, reclaimed 964 MiB from [allocator-cache]
+
+The gate armed **two seconds after the dip began**, and it worked — it pulled
+the card back to 2150 MiB. So the flip seam did not breach the corridor. What
+breached it was an allocation the gate does not see: the 272k-token bs1/YaRN
+prefill growing on rank 1's card.
+
+Spec item 15a asks for **SPILL-BEFORE-ALLOC** — "a check AT the allocation
+(free − X >= 1024, else spill synchronously first), not reactive threshold
+observation". `CorridorGuard.ensure_headroom` is exactly that check, and this
+tree calls it from ONE site: the flip seam. The prefill admission path has no
+such call, so a long prefill walks the binding card below the floor and only
+the next seam pulls it back. At bs=4 with 60k prefills that never showed; at
+bs=1 with a 272k prefill it shows immediately, which is why the leg the order
+demanded is what found it.
+
+**The fix is the same guard at the prefill admission site**, priced against
+the chunk about to be allocated. It is not a new mechanism — the mechanism
+exists, is tested, and has a working provider ladder. It is one more caller.
+
+Two things a successor should NOT conclude from this. It is not evidence that
+the ladder is weak: the gate reclaimed 964 MiB in the same second, and 4 more
+arms later in the run cleared 742-1104 MiB each with zero refusals. And it is
+not an argument for a smaller pool — the standing rule forbids that as a fix,
+and the pool is not what is unguarded.
+
 ### 1b. THE bs1 LEG NEARLY MEASURED ITS OWN ARITHMETIC
 
 The first version of `s33_yarn_bs1_leg.py` sized its prompt at 1.05 words per
@@ -258,6 +293,9 @@ RESULTS_PLACEHOLDER
 
 ## 6. NEXT, IN ORDER
 
+0. **CALL `ensure_headroom` AT PREFILL ADMISSION** (§1a-bis). The corridor law
+   is enforced at one allocation site and the run breached at another. This is
+   the first build of the next shift and it is one caller, not a mechanism.
 1. **The host half at a context where it fits** — §2a has the arithmetic and
    the two cheap routes. Do not size the pinned pool against total RAM.
 2. **Cached-prefix eviction as the rung below the host tier** — no host RAM,
