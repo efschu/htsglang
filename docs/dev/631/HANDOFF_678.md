@@ -371,6 +371,22 @@ except its own abort.
 |---|---|
 | PLACEHOLDER | filled from EXTRACT.txt at close |
 
+### EVERY FAILURE SIGNATURE THIS CORPUS KNOWS, COUNTED AND ZERO
+
+Not "no errors were noticed" -- each string below was grepped for by name,
+because a run is only as clean as the failures you went looking for:
+
+    Traceback 0 | CUDA error 0 | out of memory 0 | OutOfMemory 0
+    FLIP ABANDONED 0 | cuMemCreate 0 | illegal memory 0
+    CORRIDOR-GUARD REFUSED 0 | CORRIDOR-ADMISSION SHORT 0
+    "this pool cannot pay" 0 | "recovery deferred" 0
+    "host tier admitted on an UNLEVEL fleet" 0
+
+The last three matter most and are the ones a skim would miss: no shrink
+failed to return driver bytes, no recovery was deferred or corridor-bounded,
+and the guard never had to spend host RAM against item 16's levelling
+preference.
+
 ### WHAT THIS RUN PROVES THAT NO EARLIER ONE DID
 
 * **Spec item 12 fired, with its restore**, inside the acceptance window
