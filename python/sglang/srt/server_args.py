@@ -1472,6 +1472,29 @@ class ServerArgs:
             type_parser=_parse_int_list,
         ),
     ] = None
+    pp_attn_stage_ratio: A[
+        Optional[List[int]],
+        Arg(
+            help="Relative FULL-ATTENTION mass per pipeline stage, one entry "
+            "per stage in stage order. Only meaningful together with "
+            "--pp-stage-ratio, and only on a hybrid linear+full-attention "
+            "model, where it DECOUPLES the two layer families (#485): "
+            "--pp-stage-ratio keeps steering total layer mass (weights and "
+            "dense compute) while this flag independently steers the "
+            "full-attention layers, which are what carry the KV cache and "
+            "the attention core. Without it both targets are derived from "
+            "the one --pp-stage-ratio vector, which on a period-P hybrid "
+            "pins the layer boundary to a multiple of P and makes the two "
+            "families move together: on a 64-layer period-4 checkpoint the "
+            "smallest reachable step is FOUR layers, three of them linear. "
+            "With it, e.g. --pp-stage-ratio 31,17,16 --pp-attn-stage-ratio "
+            "7,5,4 moves three linear layers off stage 1 at ZERO KV cost. "
+            "Entries are relative, like --pp-stage-ratio. Unset (default): "
+            "the coupled single-vector derivation, byte-identical to not "
+            "passing the flag.",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
     dp_size: A[
         int,
         Arg(
@@ -14689,7 +14712,15 @@ class ServerArgs:
         over a silent even split throughout -- the #202 lesson.
         """
         scores = self.pp_stage_ratio
+        attn_scores = self.pp_attn_stage_ratio
         if scores is None:
+            if attn_scores is not None:
+                raise ValueError(
+                    "--pp-attn-stage-ratio steers the FULL-ATTENTION half of "
+                    "the split that --pp-stage-ratio derives, so it cannot be "
+                    "used on its own. Pass --pp-stage-ratio as well, or spell "
+                    "the whole split out with --pp-layer-ratio."
+                )
             return
 
         if self.pp_size <= 1:
@@ -14721,9 +14752,28 @@ class ServerArgs:
         if kinds is None:
             kinds = [True] * depth
 
+        if attn_scores is not None:
+            if len(attn_scores) != self.pp_size:
+                raise ValueError(
+                    f"--pp-attn-stage-ratio length ({len(attn_scores)}) must "
+                    f"equal --pp-size ({self.pp_size}): one score per stage."
+                )
+            n_full_declared = sum(kinds)
+            if not 0 < n_full_declared < depth:
+                raise ValueError(
+                    "--pp-attn-stage-ratio decouples the full-attention "
+                    f"family from the linear family, but {self.model_path} "
+                    f"declares {n_full_declared} full-attention layers out of "
+                    f"{depth} -- it is not a hybrid, so there are no two "
+                    "families to separate. Drop the flag and use "
+                    "--pp-stage-ratio alone."
+                )
+
         from sglang.srt.distributed.utils import derive_pp_layer_split
 
-        counts = derive_pp_layer_split(scores, is_full_attention=kinds)
+        counts = derive_pp_layer_split(
+            scores, is_full_attention=kinds, attn_scores=attn_scores
+        )
         n_full = sum(kinds)
         per_stage_full = []
         start = 0
@@ -14732,15 +14782,32 @@ class ServerArgs:
             start += count
         self.pp_layer_ratio = counts
         logger.info(
-            "--pp-stage-ratio %s: derived --pp-layer-ratio %s over %d layers "
+            "--pp-stage-ratio %s%s: derived --pp-layer-ratio %s over %d layers "
             "(full-attention per stage: %s of %d total -- a hybrid's KV mass "
             "follows the full-attention count, not the layer count).",
             ",".join(str(s) for s in scores),
+            (
+                " --pp-attn-stage-ratio " + ",".join(str(s) for s in attn_scores)
+                if attn_scores is not None
+                else ""
+            ),
             ",".join(str(c) for c in counts),
             depth,
             per_stage_full,
             n_full,
         )
+        if attn_scores is not None:
+            # #485: state the decoupling explicitly, because the useful
+            # property of this split is what it did NOT change.
+            coupled = derive_pp_layer_split(scores, is_full_attention=kinds)
+            if coupled != counts:
+                logger.info(
+                    "--pp-attn-stage-ratio decoupled the split: the coupled "
+                    "single-vector derivation would have given %s, this gives "
+                    "%s -- same layer budget, different family mix.",
+                    ",".join(str(c) for c in coupled),
+                    ",".join(str(c) for c in counts),
+                )
 
     def _handle_pp_layer_ratio(self):
         """--pp-layer-ratio: uneven layer split across pipeline stages.

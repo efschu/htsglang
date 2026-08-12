@@ -1,0 +1,666 @@
+"""Hermetic tests for the planner-solved per-family PP cut (#485).
+
+No GPU, no checkpoint, no probe run: the rig is the pinned card-probe
+artifact and the geometry is the reference checkpoint's config arithmetic,
+both inlined so a re-probe or a model-cache change cannot silently move a
+regression number.
+
+The falsifier is ``test_anti_proportional_cut_is_strictly_worse``: an
+attention split skewed AWAY from the fast card must score strictly worse
+than the solved cut. Without it, "the solver produced a skewed cut" is not
+evidence that the skew is the right one.
+"""
+
+import itertools
+import unittest
+
+from sglang.srt.distributed.utils import derive_pp_layer_split
+from sglang.srt.planner import pp_cut
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+# ---------------------------------------------------------------------------
+# Reference geometry: Qwen3.6-27B, from its config.json
+# ---------------------------------------------------------------------------
+
+N_LAYERS = 64
+FULL_ATTENTION_INTERVAL = 4
+HIDDEN = 5120
+Q_HEADS = 24
+KV_HEADS = 4
+HEAD_DIM = 256
+INTERMEDIATE = 17408
+GDN_K_HEADS, GDN_K_DIM = 16, 128
+GDN_V_HEADS, GDN_V_DIM = 48, 128
+CONV_KERNEL = 4
+
+#: fp8_e4m3 KV: 4 kv heads x 256 head_dim x 2 (K and V) x 1 byte = 2048 B.
+#: x 16 full-attention layers = the 32 KiB/token the 631 bench log validates
+#: against two independent boots (PROD_BRINGUP_BENCH.md sec. 2).
+KV_BYTES_PER_TOKEN_PER_ATTN_LAYER = KV_HEADS * HEAD_DIM * 2 * 1
+
+#: Weight params of one layer of each family, from the same formulas the
+#: cost model uses (uneven_perf.PerfCostModel._build_families:4011-4044).
+_ATTN_PROJ = HIDDEN * (Q_HEADS * HEAD_DIM + 2 * KV_HEADS * HEAD_DIM) + (
+    Q_HEADS * HEAD_DIM
+) * HIDDEN
+_MLP = 3 * HIDDEN * INTERMEDIATE
+_K_SZ = GDN_K_HEADS * GDN_K_DIM
+_V_SZ = GDN_V_HEADS * GDN_V_DIM
+_GDN = (
+    HIDDEN * (2 * _K_SZ + 2 * _V_SZ)
+    + HIDDEN * 2 * GDN_V_HEADS
+    + _V_SZ * HIDDEN
+    + (2 * _K_SZ + _V_SZ) * CONV_KERNEL
+)
+
+#: fp8 checkpoint -> 1 byte per param.
+BYTES_PER_PARAM = 1.0
+ATTN_LAYER_BYTES = (_ATTN_PROJ + _MLP) * BYTES_PER_PARAM
+LINEAR_LAYER_BYTES = (_GDN + _MLP) * BYTES_PER_PARAM
+
+#: 2 FLOPs per param per token for the dense projections and MLP.
+ATTN_LAYER_FLOPS_PER_TOKEN = 2.0 * (_ATTN_PROJ + _MLP)
+LINEAR_LAYER_FLOPS_PER_TOKEN = 2.0 * (_GDN + _MLP)
+#: QK^T and A@V, per query token per KV depth token, per attention layer.
+ATTN_CORE_FLOPS_PER_TOKEN_PAIR = 4.0 * Q_HEADS * HEAD_DIM
+
+
+# ---------------------------------------------------------------------------
+# Reference rig: the pinned card probe (test_key_solver._PROBE)
+# ---------------------------------------------------------------------------
+#
+# IdentityMap for this rig: PP rank 0 is the 5090; nvidia-smi index 0 is a
+# 3080. Stage order below is rank order, so stage 0 is the 5090.
+
+RANK0_5090 = dict(gemm_tflops=231.97, attn_bw_gbs=1533.8, total_mib=32607)
+RANK1_3080 = dict(gemm_tflops=65.57, attn_bw_gbs=717.4, total_mib=20480)
+RANK2_3080 = dict(gemm_tflops=65.59, attn_bw_gbs=717.8, total_mib=20480)
+
+#: Measured per-rank transients at the 111405-token trigger, in RANK order
+#: (PROD_BRINGUP_BENCH.md sec. 1f reports them in nvidia-smi order
+#: rank1/rank0/rank2 = 1120/1346/982).
+TRANSIENT_MIB = (1346.0, 1120.0, 982.0)
+
+#: The ship config's per-rank budgets.
+SHIP_BUDGET_MIB = (31800.0, 17400.0, 17450.0)
+
+
+def _families():
+    return pp_cut.layer_families_from_config(
+        {
+            "num_hidden_layers": N_LAYERS,
+            "full_attention_interval": FULL_ATTENTION_INTERVAL,
+        }
+    )
+
+
+def _inputs(
+    *,
+    depth=179000,
+    chunk=2048,
+    budgets=SHIP_BUDGET_MIB,
+    transients=TRANSIENT_MIB,
+    corridor=1024.0,
+    bw=None,
+    tflops=None,
+    pool=0,
+    tp_token_shares=None,
+    overheads=(0.0, 0.0, 0.0),
+):
+    cards = (RANK0_5090, RANK1_3080, RANK2_3080)
+    bw = bw or tuple(c["attn_bw_gbs"] for c in cards)
+    tflops = tflops or tuple(c["gemm_tflops"] for c in cards)
+    ranks = tuple(
+        pp_cut.RankResources(
+            label=label,
+            attn_bw_gbs=bw[i],
+            gemm_tflops=tflops[i],
+            budget_mib=budgets[i],
+            transient_mib=transients[i],
+            fixed_overhead_mib=overheads[i],
+        )
+        for i, label in enumerate(("rank0-5090", "rank1-3080", "rank2-3080"))
+    )
+    return pp_cut.PPCutInputs(
+        layer_families=_families(),
+        attn_layer_weight_bytes=ATTN_LAYER_BYTES,
+        linear_layer_weight_bytes=LINEAR_LAYER_BYTES,
+        attn_layer_flops_per_token=ATTN_LAYER_FLOPS_PER_TOKEN,
+        linear_layer_flops_per_token=LINEAR_LAYER_FLOPS_PER_TOKEN,
+        attn_core_flops_per_token_pair=ATTN_CORE_FLOPS_PER_TOKEN_PAIR,
+        kv_bytes_per_token_per_attn_layer=KV_BYTES_PER_TOKEN_PER_ATTN_LAYER,
+        kv_depth_tokens=depth,
+        prefill_chunk_tokens=chunk,
+        ranks=ranks,
+        kv_pool_tokens=pool,
+        tp_token_shares=tp_token_shares,
+        corridor_mib=corridor,
+    )
+
+
+def _brute_force_best(inputs, require_attention_per_stage=True):
+    """Every contiguous split, priced. The solver must match this exactly."""
+    n, k = inputs.n_layers, inputs.pp_size
+    hybrid = 0 < inputs.n_full_attention < n
+    best = None
+    for cuts in itertools.combinations(range(1, n), k - 1):
+        bounds = list(cuts) + [n]
+        counts = [bounds[0]] + [bounds[i] - bounds[i - 1] for i in range(1, k)]
+        sol, violations = pp_cut.validate_pp_cut(
+            counts, inputs, require_attention_per_stage=require_attention_per_stage
+        )
+        if violations:
+            continue
+        if require_attention_per_stage and hybrid and 0 in sol.attention_counts:
+            continue
+        if best is None or sol.makespan_seconds < best.makespan_seconds:
+            best = sol
+    return best
+
+
+class TestReferenceGeometry(CustomTestCase):
+    """Pin the geometry model against the numbers measured on metal."""
+
+    def test_family_map_matches_checkpoint_rule(self):
+        fams = _families()
+        self.assertEqual(len(fams), N_LAYERS)
+        attn_idx = [
+            i for i, f in enumerate(fams) if f == pp_cut.LAYER_FAMILY_ATTENTION
+        ]
+        self.assertEqual(len(attn_idx), 16)
+        self.assertEqual(attn_idx[:3], [3, 7, 11])
+        self.assertEqual(attn_idx[-1], 63)
+
+    def test_kv_per_token_matches_measured_32_kib(self):
+        node_wide = 16 * KV_BYTES_PER_TOKEN_PER_ATTN_LAYER
+        self.assertEqual(node_wide, 32 * 1024)
+
+    def test_ship_split_attention_census(self):
+        """[28,20,16] holds 7/5/4 full-attention layers, as the flip plan
+        records (layers/dcp/phase_flip_plan.py:93-97)."""
+        self.assertEqual(
+            pp_cut.attention_counts(_families(), [28, 20, 16]), (7, 5, 4)
+        )
+        self.assertEqual(
+            pp_cut.attention_counts(_families(), [32, 16, 16]), (8, 4, 4)
+        )
+
+    def test_explicit_layer_types_are_honoured(self):
+        types = ["linear_attention"] * 3 + ["full_attention"]
+        fams = pp_cut.layer_families_from_config(
+            {"num_hidden_layers": 4, "layer_types": types}
+        )
+        self.assertEqual(fams[3], pp_cut.LAYER_FAMILY_ATTENTION)
+        self.assertEqual(fams[0], pp_cut.LAYER_FAMILY_LINEAR)
+
+    def test_layer_types_length_mismatch_refuses(self):
+        with self.assertRaises(ValueError):
+            pp_cut.layer_families_from_config(
+                {"num_hidden_layers": 8, "layer_types": ["full_attention"] * 4}
+            )
+
+
+class TestAttentionRoofline(CustomTestCase):
+    """The attention core is compute-bound in prefill, not bandwidth-bound."""
+
+    def test_prefill_attention_is_compute_bound(self):
+        sol, violations = pp_cut.validate_pp_cut([28, 20, 16], _inputs())
+        self.assertEqual(violations, ())
+        for stage in sol.stages:
+            self.assertEqual(
+                stage.attn_bound_by,
+                "compute",
+                f"{stage.rank} attention core should be compute-bound at a "
+                f"2048-token prefill chunk",
+            )
+
+    def test_decode_shaped_chunk_flips_to_bandwidth(self):
+        """The roofline is real: a chunk of 1 lands on the other side."""
+        sol, _ = pp_cut.validate_pp_cut([28, 20, 16], _inputs(chunk=1))
+        for stage in sol.stages:
+            self.assertEqual(stage.attn_bound_by, "bandwidth")
+
+    def test_intensity_is_depth_independent(self):
+        """Depth scales both sides of the roofline equally, so the binding
+        side cannot change with depth -- only with chunk."""
+        for depth in (4096, 179000, 393216):
+            sol, _ = pp_cut.validate_pp_cut([28, 20, 16], _inputs(depth=depth))
+            self.assertEqual(
+                {s.attn_bound_by for s in sol.stages}, {"compute"}, f"depth={depth}"
+            )
+
+
+class TestSolver(CustomTestCase):
+    def test_matches_brute_force(self):
+        """Exactness, not a heuristic: with the headroom slack switched off
+        the DP equals exhaustive search."""
+        inputs = _inputs()
+        solved = pp_cut.solve_pp_cut(inputs, makespan_slack=1.0)
+        brute = _brute_force_best(inputs)
+        self.assertTrue(solved.feasible)
+        self.assertIsNotNone(brute)
+        self.assertAlmostEqual(
+            solved.makespan_seconds, brute.makespan_seconds, places=12
+        )
+
+    def test_default_slack_stays_within_its_budget(self):
+        """The default may trade a little speed for headroom, but never
+        more than it advertises, and never less headroom."""
+        inputs = _inputs()
+        exact = pp_cut.solve_pp_cut(inputs, makespan_slack=1.0)
+        default = pp_cut.solve_pp_cut(inputs)
+        self.assertLessEqual(
+            default.makespan_seconds,
+            exact.makespan_seconds * pp_cut._MAKESPAN_SLACK + 1e-12,
+        )
+        self.assertGreaterEqual(
+            default.min_headroom_mib, exact.min_headroom_mib - 1e-9
+        )
+
+    def test_slack_below_one_is_refused(self):
+        with self.assertRaises(ValueError):
+            pp_cut.solve_pp_cut(_inputs(), makespan_slack=0.9)
+
+    def test_matches_brute_force_under_tight_memory(self):
+        inputs = _inputs(budgets=(31800.0, 15000.0, 15000.0))
+        solved = pp_cut.solve_pp_cut(inputs)
+        brute = _brute_force_best(inputs)
+        if brute is None:
+            self.assertFalse(solved.feasible)
+            return
+        self.assertTrue(solved.feasible)
+        self.assertAlmostEqual(
+            solved.makespan_seconds, brute.makespan_seconds, places=12
+        )
+
+    def test_cut_is_skewed_toward_the_fast_card(self):
+        """The solved cut must give the 5090 strictly more than a uniform
+        share of BOTH families."""
+        sol = pp_cut.solve_pp_cut(_inputs())
+        self.assertTrue(sol.feasible, sol.refusals)
+        uniform_layers = N_LAYERS / 3.0
+        uniform_attn = 16 / 3.0
+        self.assertGreater(sol.counts[0], uniform_layers)
+        self.assertGreater(sol.attention_counts[0], uniform_attn)
+
+    def test_anti_proportional_cut_is_strictly_worse(self):
+        """FALSIFIER. Mirror the solved attention split onto the slow cards.
+        If that scored as well, the objective would not be measuring
+        anything."""
+        inputs = _inputs()
+        sol = pp_cut.solve_pp_cut(inputs)
+        self.assertTrue(sol.feasible, sol.refusals)
+
+        anti_counts = list(reversed(sol.counts))
+        anti, violations = pp_cut.validate_pp_cut(anti_counts, inputs)
+        # The mirrored cut may itself be infeasible on memory; that is a
+        # strictly worse outcome too, and the test accepts it as such.
+        if violations:
+            self.assertFalse(anti.feasible)
+            return
+        self.assertGreater(
+            anti.makespan_seconds,
+            sol.makespan_seconds,
+            "the anti-proportional cut must be strictly slower than the "
+            "solved cut",
+        )
+
+    def test_every_alternative_cut_is_at_least_as_slow(self):
+        """Optimality over the whole representable space, stated directly."""
+        inputs = _inputs()
+        sol = pp_cut.solve_pp_cut(inputs)
+        worse = 0
+        for cuts in itertools.combinations(range(1, N_LAYERS), 2):
+            bounds = list(cuts) + [N_LAYERS]
+            counts = [bounds[0], bounds[1] - bounds[0], bounds[2] - bounds[1]]
+            other, violations = pp_cut.validate_pp_cut(counts, inputs)
+            if violations:
+                continue
+            self.assertGreaterEqual(
+                other.makespan_seconds, sol.makespan_seconds - 1e-15
+            )
+            if other.makespan_seconds > sol.makespan_seconds:
+                worse += 1
+        self.assertGreater(worse, 0, "no strictly worse cut exists to compare against")
+
+    def test_determinism(self):
+        a = pp_cut.solve_pp_cut(_inputs())
+        b = pp_cut.solve_pp_cut(_inputs())
+        self.assertEqual(a.counts, b.counts)
+
+    def test_bottleneck_is_reported(self):
+        sol = pp_cut.solve_pp_cut(_inputs())
+        times = [s.total_seconds for s in sol.stages]
+        self.assertEqual(sol.bottleneck_stage, times.index(max(times)))
+        self.assertAlmostEqual(sol.makespan_seconds, max(times), places=12)
+
+    def test_depth_moves_the_cut_toward_the_fast_card(self):
+        """The attention term grows with depth and the 5090 is the faster
+        card on it, so more depth must not move attention AWAY from rank 0."""
+        shallow = pp_cut.solve_pp_cut(_inputs(depth=2048))
+        deep = pp_cut.solve_pp_cut(_inputs(depth=393216))
+        self.assertGreaterEqual(deep.attention_counts[0], shallow.attention_counts[0])
+
+
+class TestRefusals(CustomTestCase):
+    """Never a silent even split (the #202 lesson)."""
+
+    def test_impossible_budget_refuses_with_named_rank(self):
+        sol = pp_cut.solve_pp_cut(_inputs(budgets=(1200.0, 1200.0, 1200.0)))
+        self.assertFalse(sol.feasible)
+        self.assertTrue(sol.refusals)
+        self.assertEqual(sol.counts, ())
+        joined = " ".join(sol.refusals)
+        self.assertIn("rank0-5090", joined)
+        self.assertIn("corridor", joined)
+
+    def test_refusal_names_the_numbers(self):
+        sol = pp_cut.solve_pp_cut(
+            _inputs(budgets=(9000.0, 9000.0, 9000.0), depth=393216)
+        )
+        self.assertFalse(sol.feasible)
+        joined = " ".join(sol.refusals)
+        self.assertIn("MiB", joined)
+
+    def test_more_stages_than_attention_layers_refuses(self):
+        fams = tuple(
+            [pp_cut.LAYER_FAMILY_LINEAR] * 7 + [pp_cut.LAYER_FAMILY_ATTENTION]
+        )
+        ranks = tuple(
+            pp_cut.RankResources(
+                label=f"r{i}",
+                attn_bw_gbs=700.0,
+                gemm_tflops=60.0,
+                budget_mib=1e9,
+            )
+            for i in range(4)
+        )
+        inputs = pp_cut.PPCutInputs(
+            layer_families=fams,
+            attn_layer_weight_bytes=1.0,
+            linear_layer_weight_bytes=1.0,
+            attn_layer_flops_per_token=1.0,
+            linear_layer_flops_per_token=1.0,
+            attn_core_flops_per_token_pair=1.0,
+            kv_bytes_per_token_per_attn_layer=1.0,
+            kv_depth_tokens=16,
+            prefill_chunk_tokens=8,
+            ranks=ranks,
+            corridor_mib=0.0,
+        )
+        sol = pp_cut.solve_pp_cut(inputs)
+        self.assertFalse(sol.feasible)
+        self.assertTrue(any("full-attention" in r for r in sol.refusals))
+
+    def test_zero_rate_is_refused_not_defaulted(self):
+        with self.assertRaises(ValueError):
+            pp_cut.RankResources(
+                label="x", attn_bw_gbs=0.0, gemm_tflops=1.0, budget_mib=1.0
+            )
+        with self.assertRaises(ValueError):
+            pp_cut.RankResources(
+                label="x", attn_bw_gbs=1.0, gemm_tflops=0.0, budget_mib=1.0
+            )
+
+
+class TestMemoryModel(CustomTestCase):
+    """Arena sizing, and the honesty of the feasibility verdict.
+
+    NOTE: ``fixed_overhead_mib`` defaults to 0, which makes the verdict a
+    LOWER BOUND on real occupancy. These tests validate the MECHANISM; the
+    constant itself is uncalibrated on this rig (see HANDOFF_485_PPCUT.md --
+    the residual measured off the 631 at-rest boot is 10171/4982/7582 MiB,
+    which is not cut-invariant, so one scalar per rank may not suffice).
+    """
+
+    def test_pool_tokens_drive_memory_not_depth(self):
+        """A 600k-token arena must not be priced as a 179k request."""
+        small = pp_cut.validate_pp_cut([28, 20, 16], _inputs(depth=179000))[0]
+        big = pp_cut.validate_pp_cut(
+            [28, 20, 16], _inputs(depth=179000, pool=600000)
+        )[0]
+        self.assertGreater(big.stages[0].kv_mib, small.stages[0].kv_mib)
+        # ... while the timing term is untouched, because depth is the same.
+        self.assertAlmostEqual(
+            big.stages[0].attn_seconds, small.stages[0].attn_seconds, places=12
+        )
+
+    def test_kv_arena_matches_the_validated_formula(self):
+        """``T x 32 KiB x layer_share``, checked against the bench log's own
+        measured rows (PROD_BRINGUP_BENCH.md sec. 2). Those rows were taken
+        on the ship config ``[32,16,16]`` = attention ``8,4,4`` (sec. 3), and
+        they report the K arena alone, which is half of the K+V arena this
+        model prices."""
+        sol = pp_cut.validate_pp_cut(
+            [32, 16, 16], _inputs(depth=179000, pool=540000)
+        )[0]
+        self.assertEqual(sol.attention_counts, (8, 4, 4))
+        expected_rank0_gib = 540000 * 32 * 1024 * (8 / 16) / (1024**3)
+        self.assertAlmostEqual(
+            sol.stages[0].kv_mib / 1024.0, expected_rank0_gib, places=6
+        )
+        # measured: T=540000 PP rank0 K = 4.12 GiB, rank1/rank2 K = 2.06 GiB.
+        self.assertAlmostEqual(sol.stages[0].kv_mib / 1024.0 / 2.0, 4.12, places=2)
+        self.assertAlmostEqual(sol.stages[1].kv_mib / 1024.0 / 2.0, 2.06, places=2)
+        # measured: T=460000 and T=380000 rank0 K = 3.51 and 2.90 GiB.
+        for pool, k_gib in ((460000, 3.51), (380000, 2.90)):
+            row = pp_cut.validate_pp_cut([32, 16, 16], _inputs(pool=pool))[0]
+            self.assertAlmostEqual(row.stages[0].kv_mib / 1024.0 / 2.0, k_gib, places=2)
+
+    def test_shared_arena_takes_the_max_of_both_layouts(self):
+        """With a TP token vector the arena is max(PP share, TP share)."""
+        pp_only = pp_cut.validate_pp_cut([28, 20, 16], _inputs(pool=600000))[0]
+        shared = pp_cut.validate_pp_cut(
+            [28, 20, 16],
+            _inputs(pool=600000, tp_token_shares=(0.378, 0.351, 0.270)),
+        )[0]
+        # rank0's PP share (7/16 = 0.4375) already exceeds its TP share.
+        self.assertAlmostEqual(
+            shared.stages[0].kv_mib, pp_only.stages[0].kv_mib, places=9
+        )
+        # rank1's TP share (0.351) exceeds its PP share (5/16 = 0.3125).
+        self.assertGreater(shared.stages[1].kv_mib, pp_only.stages[1].kv_mib)
+
+    def test_fixed_overhead_binds_the_constraint(self):
+        """The gate is inert only because the constant is zero; supply one
+        and it bites."""
+        loose = pp_cut.validate_pp_cut([28, 20, 16], _inputs(pool=600000))
+        self.assertEqual(loose[1], ())
+        tight = pp_cut.validate_pp_cut(
+            [28, 20, 16], _inputs(pool=600000, overheads=(10171.0, 4982.0, 7582.0))
+        )
+        self.assertTrue(tight[1], "measured residuals must make rank1 infeasible")
+        self.assertFalse(tight[0].feasible)
+
+    def test_overhead_changes_the_solved_cut(self):
+        """A constraint that never changes the answer is not a constraint."""
+        free = pp_cut.solve_pp_cut(_inputs(pool=400000))
+        loaded = pp_cut.solve_pp_cut(
+            _inputs(pool=400000, overheads=(9000.0, 4500.0, 4500.0))
+        )
+        self.assertTrue(free.feasible, free.refusals)
+        if loaded.feasible:
+            self.assertNotEqual(free.counts, loaded.counts)
+        else:
+            self.assertTrue(loaded.refusals)
+
+    def test_tp_token_shares_are_validated(self):
+        with self.assertRaises(ValueError):
+            _inputs(tp_token_shares=(0.5, 0.5))
+        with self.assertRaises(ValueError):
+            _inputs(tp_token_shares=(0.5, -0.1, 0.6))
+
+
+class TestOverrideValidation(CustomTestCase):
+    """--pp-layer-ratio stops being a planner bypass."""
+
+    def test_ship_split_validates_clean(self):
+        sol, violations = pp_cut.validate_pp_cut([28, 20, 16], _inputs())
+        self.assertEqual(violations, ())
+        self.assertTrue(sol.feasible)
+        self.assertEqual(sol.attention_counts, (7, 5, 4))
+
+    def test_memory_overflow_is_named_with_the_overage(self):
+        # Force rank 1 far too small for the 20 layers the ship split gives it.
+        sol, violations = pp_cut.validate_pp_cut(
+            [28, 20, 16], _inputs(budgets=(31800.0, 6000.0, 17450.0))
+        )
+        self.assertTrue(violations)
+        self.assertFalse(sol.feasible)
+        joined = " ".join(violations)
+        self.assertIn("rank1-3080", joined)
+        self.assertIn("over by", joined)
+
+    def test_zero_attention_stage_is_refused(self):
+        # Layers 0..2 carry no full-attention layer (the first is index 3).
+        sol, violations = pp_cut.validate_pp_cut([3, 45, 16], _inputs())
+        self.assertTrue(any("zero" in v for v in violations))
+        self.assertEqual(sol.attention_counts[0], 0)
+
+    def test_wrong_length_and_bad_sum_raise(self):
+        with self.assertRaises(ValueError):
+            pp_cut.validate_pp_cut([32, 32], _inputs())
+        with self.assertRaises(ValueError):
+            pp_cut.validate_pp_cut([28, 20, 15], _inputs())
+        with self.assertRaises(ValueError):
+            pp_cut.validate_pp_cut([28, 0, 36], _inputs())
+
+
+class TestDecoupling(CustomTestCase):
+    """The point of the ticket: attention mass and linear mass move
+    independently."""
+
+    def test_linear_layers_move_at_zero_kv_cost(self):
+        """[28,20,16] -> [31,17,16] shifts three GDN layers off rank 1 while
+        the attention split stays exactly [7,5,4]. No single score vector can
+        express this, and the 631 bench log concluded from that that the rig
+        could not be levelled from the PP side at all
+        (PROD_BRINGUP_BENCH.md sec. 1g)."""
+        fams = _families()
+        base = pp_cut.attention_counts(fams, [28, 20, 16])
+        for counts in ([29, 19, 16], [30, 18, 16], [31, 17, 16]):
+            self.assertEqual(
+                pp_cut.attention_counts(fams, counts),
+                base,
+                f"{counts} must not disturb the attention split",
+            )
+
+        inputs = _inputs()
+        ship, _ = pp_cut.validate_pp_cut([28, 20, 16], inputs)
+        moved, _ = pp_cut.validate_pp_cut([31, 17, 16], inputs)
+        # KV bytes are untouched on every stage ...
+        self.assertEqual(
+            [s.kv_mib for s in ship.stages], [s.kv_mib for s in moved.stages]
+        )
+        # ... while the binding card sheds real weight bytes.
+        self.assertGreater(
+            ship.stages[1].weight_mib - moved.stages[1].weight_mib, 1000.0
+        )
+
+    def test_four_layer_quantisation_is_not_a_hardware_limit(self):
+        """Sixteen distinct layer splits hold the attention split at
+        [7,5,4]. The 4-layer step is an artifact of deriving both targets
+        from one score vector, not a property of the model."""
+        fams = _families()
+        holding = [
+            (b1, b2 - b1, N_LAYERS - b2)
+            for b1 in range(1, N_LAYERS)
+            for b2 in range(b1 + 1, N_LAYERS)
+            if pp_cut.attention_counts(fams, [b1, b2 - b1, N_LAYERS - b2])
+            == (7, 5, 4)
+        ]
+        self.assertEqual(len(holding), 16)
+        self.assertIn((28, 20, 16), holding)
+        self.assertIn((31, 17, 16), holding)
+
+
+class TestDerivePPLayerSplitDecoupling(CustomTestCase):
+    """``derive_pp_layer_split`` gains an independent attention vector."""
+
+    ISFA = [((idx + 1) % FULL_ATTENTION_INTERVAL == 0) for idx in range(N_LAYERS)]
+
+    def test_behaviour_neutral_without_attn_scores(self):
+        """PIN: every legacy call is byte-identical. These are the two rows
+        the 631 bench log recorded on metal
+        (PROD_BRINGUP_BENCH.md sec. 1e)."""
+        self.assertEqual(
+            derive_pp_layer_split([14, 10, 8], self.ISFA, N_LAYERS), [28, 20, 16]
+        )
+        self.assertEqual(
+            derive_pp_layer_split([15, 9, 8], self.ISFA, N_LAYERS), [32, 16, 16]
+        )
+        self.assertEqual(
+            derive_pp_layer_split([15, 10, 7], self.ISFA, N_LAYERS), [32, 18, 14]
+        )
+
+    def test_explicit_none_is_identical_to_omitting(self):
+        self.assertEqual(
+            derive_pp_layer_split([14, 10, 8], self.ISFA, N_LAYERS, None),
+            derive_pp_layer_split([14, 10, 8], self.ISFA, N_LAYERS),
+        )
+
+    def test_homogeneous_model_unaffected(self):
+        isfa = [True] * 12
+        self.assertEqual(derive_pp_layer_split([1, 1, 1], isfa, 12), [4, 4, 4])
+        self.assertEqual(
+            derive_pp_layer_split([1, 1, 1], isfa, 12, [3, 1, 1]),
+            [4, 4, 4],
+            "a non-hybrid stack has no attention axis to decouple",
+        )
+
+    def test_attn_vector_reaches_the_previously_unreachable_split(self):
+        """The whole ticket in one assertion: hold attention at [7,5,4]
+        while the layer vector asks for more mass on stage 0."""
+        counts = derive_pp_layer_split(
+            [31, 17, 16], self.ISFA, N_LAYERS, attn_scores=[7, 5, 4]
+        )
+        self.assertEqual(counts, [31, 17, 16])
+        self.assertEqual(pp_cut.attention_counts(_families(), counts), (7, 5, 4))
+
+    def test_attn_vector_controls_attention_independently(self):
+        """Same layer vector, two attention vectors, two different KV
+        splits."""
+        a = derive_pp_layer_split(
+            [30, 18, 16], self.ISFA, N_LAYERS, attn_scores=[7, 5, 4]
+        )
+        b = derive_pp_layer_split(
+            [30, 18, 16], self.ISFA, N_LAYERS, attn_scores=[8, 4, 4]
+        )
+        fams = _families()
+        self.assertEqual(pp_cut.attention_counts(fams, a), (7, 5, 4))
+        self.assertEqual(pp_cut.attention_counts(fams, b), (8, 4, 4))
+        self.assertNotEqual(a, b)
+
+    def test_attn_scores_are_validated(self):
+        with self.assertRaises(ValueError):
+            derive_pp_layer_split([14, 10, 8], self.ISFA, N_LAYERS, [7, 5])
+        with self.assertRaises(ValueError):
+            derive_pp_layer_split([14, 10, 8], self.ISFA, N_LAYERS, [7, 0, 9])
+
+    def test_zero_attention_stage_still_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            derive_pp_layer_split(
+                [1, 1, 62], self.ISFA, N_LAYERS, attn_scores=[1, 1, 400]
+            )
+        self.assertIn("full-attention", str(ctx.exception))
+
+    def test_solver_output_round_trips_through_the_resolver(self):
+        """The solved cut must be expressible as (layer, attention) score
+        vectors, which is how it reaches the existing boot path."""
+        sol = pp_cut.solve_pp_cut(_inputs())
+        self.assertTrue(sol.feasible, sol.refusals)
+        counts = derive_pp_layer_split(
+            list(sol.counts),
+            self.ISFA,
+            N_LAYERS,
+            attn_scores=list(sol.attention_counts),
+        )
+        self.assertEqual(counts, list(sol.counts))
+
+
+if __name__ == "__main__":
+    unittest.main()

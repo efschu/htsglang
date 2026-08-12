@@ -568,6 +568,64 @@ retroactively applies to numbers still quoted elsewhere.
 
 ---
 
+**C33 — "THE PP GEOMETRY IS QUANTISED AT FOUR LAYERS" AND "THE RIG CANNOT BE
+LEVELLED FROM THE PP SIDE" ARE BOTH FALSE (#485, 2026-08-12).** Desk-proven
+on `feat/pp-family-cut-485`; the METAL consequence is unmeasured (no window
+this shift), so what is overturned is the REASONING, not yet a boot.
+
+`PROD_BRINGUP_BENCH.md:2430-2448` states the rule as physical — "The model
+has 64 layers with one full-attention layer per 4, so a stage boundary can
+only fall on a multiple of 4" — and `:2499-2504` draws the conclusion that
+"at this layer count the surplus is UNREACHABLE with the layer knob… the
+reachable splits are the multiples of 4 layers." Both the ~1.7 GiB overshoot
+and the abandonment of the PP levelling lever rest on that.
+
+**The rule is not physical. It is an artifact of deriving two targets from
+one number.** `derive_pp_layer_split` (`distributed/utils.py:1481`) computes
+
+```
+target_full   = round(n_full   * cum/total)
+target_layers = round(n_layers * cum/total)
+```
+
+from the SAME fraction, then clamps `target_layers` into the window that
+yields `target_full` attention layers on the left. For a period-`P` hybrid
+that window starts at `P * target_full`, so whenever the fraction sits near
+a multiple of `1/n_full` the layer boundary lands on its bottom edge — a
+multiple of 4. **The shipped code already violates the stated rule** where
+the fraction does not: `derive_pp_layer_split([15,10,7], …)` returns
+`[32,18,14]`, a boundary at 50. That single counter-example was available in
+the code the whole time and is enough to falsify the "can only" claim without
+any new machinery.
+
+Give the attention target its own vector and the two families separate.
+**Sixteen distinct layer splits hold the attention split at `[7,5,4]`**
+(`[28,20,16]` through `[31,17,16]`) and sixteen more hold it at `[8,4,4]`
+(`[32,16,16]` through `[35,16,13]`). Moving three linear/GDN layers off the
+binding card is therefore reachable at **zero** KV cost — roughly 1.1 GiB of
+weights against the ~1.3 GiB imbalance sec. 1g called unreachable, and
+without the 8th attention layer that drove rank0 to 64 MiB free.
+
+**Second correction, same ticket: the deep-prefill attention term is
+COMPUTE-bound, not bandwidth-bound.** Its arithmetic intensity is
+`2 * C * q_heads / (kv_heads * dtype_bytes)` — **depth cancels** — which is
+24 576 FLOP/byte at a 2048-token chunk against ridge points of 151 (5090)
+and 91 (3080). It crosses to bandwidth-bound only below a ~13-token chunk,
+i.e. in decode. Any PP cut apportioning attention on the 2.14x
+memory-bandwidth spread rather than the 3.54x GEMM spread is under-skewed.
+
+**The law this produces (law 22).** *A lever that looks quantised may be
+quantised by the SOLVER, not by the hardware.* Both claims above were read
+off the reachable OUTPUTS of one function while treating its input space as
+given. The register recorded the output pattern faithfully and promoted it
+to a property of the model. Before declaring a knob's granularity physical,
+find the line that computes it and ask what it would take to ask for the
+value in between — and note the diagnostic tell: a "hardware" quantisation
+that exactly equals the model's own period, with no counter-example sought,
+is a solver artifact until proven otherwise.
+
+---
+
 ## SINGLE-SOURCED AND LOAD-BEARING — the next contradictions
 
 Each appears in exactly one place and a decision rests on it. Confirm before
@@ -1079,3 +1137,20 @@ the C23 two-actuator race (`KvBackingRelief` MAX-reduction at the flip seam vs
 `pool.runtime_set_backing_rows`) remains unobserved. Its precondition is a
 boot with **TP>=2 per PP stage** plus `--enable-phase-flip` plus
 `--enable-vram-dial`, which this rig's three cards can host only as PP=1.
+
+22. **A lever that looks quantised may be quantised by the SOLVER, not by
+   the hardware** (C33, #485). The PP layer knob was recorded as steppable
+   only in multiples of 4 because every split anyone tried came back that
+   way — and the cause was that `derive_pp_layer_split` derives its layer
+   target and its attention target from ONE fraction, so the layer boundary
+   lands on the bottom edge of the attention snap window. The shipped code
+   already produced a counter-example (`[15,10,7]` -> `[32,18,14]`, boundary
+   50) which nobody looked for. Two conclusions were built on the artifact:
+   a ~1.7 GiB "overshoot" and the abandonment of PP-side levelling. **Before
+   calling a granularity physical, find the line that computes it and ask
+   what it would take to request the value in between.** Diagnostic tell: a
+   "hardware" quantisation that exactly equals the model's own period, with
+   no counter-example sought, is a solver artifact until proven otherwise.
+   Sibling of law 12 (mechanisms that resolve nothing and report intent) —
+   here the mechanism reported its reachable outputs perfectly, and their
+   very regularity is what read as a physical law.

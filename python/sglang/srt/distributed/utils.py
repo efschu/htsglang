@@ -1482,6 +1482,7 @@ def derive_pp_layer_split(
     scores: List[int],
     is_full_attention: Optional[List[bool]] = None,
     num_hidden_layers: Optional[int] = None,
+    attn_scores: Optional[List[int]] = None,
 ) -> List[int]:
     """Derive per-stage layer counts from per-stage capability scores
     (#201 slice 3 item 2, the --pp-stage-ratio planner).
@@ -1500,6 +1501,20 @@ def derive_pp_layer_split(
     layers on each side (KV mass tracks the scores too). For homogeneous
     models the snap window is the whole axis and the split is the plain
     proportional rounding.
+
+    ``attn_scores`` (#485) decouples the two families. Without it BOTH
+    targets are derived from ``scores``, so on a period-P hybrid the layer
+    target lands at ``P * target_full`` -- the bottom of the snap window --
+    whenever the cumulative fraction sits near a multiple of ``1/n_full``.
+    That single-number coupling, not the hardware, is why the reachable
+    splits on the 64-layer period-4 reference checkpoint looked quantized to
+    four layers (PROD_BRINGUP_BENCH.md sec. 1e). Passing a separate
+    ``attn_scores`` targets the FULL-ATTENTION mass (KV bytes, attention
+    bandwidth) while ``scores`` continues to target total layer mass
+    (weights, dense compute), so linear/GDN layers can move across a stage
+    boundary at zero KV cost. The two vectors are independent; the snap
+    window still guarantees the attention split is exactly the one
+    ``attn_scores`` asks for.
 
     Refusals (never a silent even split -- the #202 lesson):
       * fewer layers than stages;
@@ -1531,7 +1546,19 @@ def derive_pp_layer_split(
             f"--pp-stage-ratio: {n_stages} stages cannot split "
             f"{n_layers} layers (every stage needs at least one)."
         )
+    if attn_scores is not None:
+        if len(attn_scores) != n_stages:
+            raise ValueError(
+                f"derive_pp_layer_split: attn_scores has {len(attn_scores)} "
+                f"entries but scores has {n_stages}."
+            )
+        if any((not isinstance(s, int)) or s < 1 for s in attn_scores):
+            raise ValueError(
+                f"--pp-attn-stage-ratio entries must be positive integers, "
+                f"got {attn_scores}."
+            )
     total_score = sum(scores)
+    total_attn_score = sum(attn_scores) if attn_scores is not None else total_score
     full_positions = [i for i, f in enumerate(is_full_attention) if f]
     n_full = len(full_positions)
     hybrid = 0 < n_full < n_layers
@@ -1539,11 +1566,15 @@ def derive_pp_layer_split(
     bounds: List[int] = []
     prev = 0
     cum_score = 0
+    cum_attn_score = 0
     for i in range(n_stages - 1):
         cum_score += scores[i]
+        cum_attn_score += attn_scores[i] if attn_scores is not None else scores[i]
         target_layers = round(n_layers * cum_score / total_score)
         if hybrid:
-            target_full = round(n_full * cum_score / total_score)
+            # #485: the attention target rides its OWN vector when one is
+            # given, so KV mass and layer mass are independent.
+            target_full = round(n_full * cum_attn_score / total_attn_score)
             target_full = min(max(target_full, 0), n_full)
             # All boundaries b with exactly target_full full-attention
             # layers in [0, b): the window between the target_full-th and
