@@ -1517,6 +1517,25 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                # #3287: spec_info=None + uneven_dcp is the branch that indexes
+                # over prefix_lens, so without a mirror it takes the unbounded
+                # blocking D2H. The mirror must describe THIS callsite's
+                # prefix_lens, which is seq_lens - block_size and NOT
+                # forward_batch.extend_prefix_lens -- forwarding the latter
+                # would size the index buffer from a different vector, a silent
+                # mis-size rather than a stall. Derived by the same subtraction
+                # on the host, immediately below the device expression, so the
+                # two cannot drift; this is also why the dLLM site needs no new
+                # field on the decode replay view. Taken over [:bs] because the
+                # builder consumes bs rows.
+                extend_prefix_lens_cpu=(
+                    None
+                    if seq_lens_cpu is None
+                    else [
+                        int(s) - self.dllm_config.block_size
+                        for s in seq_lens_cpu[:bs]
+                    ]
+                ),
             )
         elif forward_mode.is_draft_extend_v2():
             self.indices_updater_prefill.update(
@@ -1547,6 +1566,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                # #3287: same branch, same missing mirror. Here prefix_lens IS
+                # forward_batch.extend_prefix_lens, so its own mirror is the
+                # right one. It is NOT padded to the graph's slot count while
+                # the device vector is, and it does not need to be: both
+                # consumers take only a SUM, and replay_prepare has already
+                # zeroed the device tail, so the two sums are equal. Padding it
+                # would be harmless but would also imply a shape contract that
+                # does not exist on this arm.
+                extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             )
         else:
             raise ValueError("Invalid forward mode")
