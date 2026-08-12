@@ -1,0 +1,36 @@
+=== SUCCESSOR 49 CONFIRMATION WINDOW, ship config @ 2ef4c511c6 ===
+started 2026-08-12T10:10:11Z, extracted 2026-08-12T10:32:31Z
+
+--- CORRIDOR (NVML instrument, floor 1024) ---
+samples=9629
+  gpu0_free: MIN=1523  p1=1585  p50=1787  breaches=0
+  gpu1_free: MIN=2608  p1=3326  p50=3412  breaches=0
+  gpu2_free: MIN=1945  p1=1949  p50=3107  breaches=0
+
+--- SOAK ---
+  10:31:18Z ok=257 err=0 decode_tok=88064 prefill_tok=1207536
+soak end 10:32:24Z {'ok': 272, 'err': 0, 'decode_tokens': 93184, 'prefill_tokens': 1278939}
+
+--- FLIP / HEALTH ---
+phase flips (DONE lines / 3 ranks): 186
+FLIP ABANDONED                    : 0
+tracebacks / CUDA errors          : 0
+
+--- SEAM CENSUS (the second instrument) ---
+census CORRIDOR LAW BROKEN      : 0
+seam PREDICTS A SUB-LAW TROUGH  : 0
+seam entry YIELDED              : 2
+seam-census troughs             : 558
+deepest 5 seam-census troughs   : 1522 1528 1548 1562 1582 
+seam-census breaches (<1024)    : 0
+
+--- SUCCESSOR 49 INERTNESS (this shift's patches must not fire here) ---
+SEAM UNFUNDABLE verdicts        : 0   (must be 0)
+seam BACKING OFF lines          : 0   (must be 0)
+pool memory leak detected       : 0   (must be 0)
+
+--- VS THE PREVIOUS WINDOWS ---
+axis                        N46      N47      N48      N49
+gpu0_free MIN               1435     1397     1477     1523
+gpu1_free MIN               2388     2061     2416     2608
+gpu2_free MIN               1713     1727     1725     1945
