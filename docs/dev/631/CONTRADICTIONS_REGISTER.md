@@ -626,6 +626,107 @@ is a solver artifact until proven otherwise.
 
 ---
 
+**C34 — THE #485 CUT IS REAL, BIGGER THAN PREDICTED, AND LOCKED OUT BY THE
+FLIP SEAM (#485/#631, successor 48, 2026-08-12).** C33 overturned the
+REASONING on desk. This is the metal, and it splits into a win and a wall.
+
+**The win.** Four-arm same-boot-floor A/B, depth 179200, pool 280000, flip and
+spec removed identically from every arm (`server_args` requires that pairing
+on PP, so it is not a free choice). Control = the ship cut `[28,20,16]`
+attention `[7,5,4]`: **95.436 s**. Planner-optimal `[42,11,11]` attention
+`[10,3,3]`: **63.246 s** — **+50.9 %**. Anti-proportional falsifier
+`[16,24,24]` attention `[4,6,6]`: 119.271 s, **−20.0 %**, so the instrument
+separates in BOTH directions. Floor: A-vs-A spread 0.12-0.97 %, and 0.09 %
+across two SEPARATE boots at two different pools. The desk model predicted
++27.6 % and −50 %; it is a usable RANKER and a bad ESTIMATOR — direction right
+on both arms, magnitude wrong on both, in opposite directions. Do not quote
+its percentages.
+
+**The wall, and it is the finding that matters.** Neither the planner arm nor
+the falsifier can BOOT in the configuration this rig ships. With
+`--enable-phase-flip` on, every cut that moves the attention split off the
+ship's `[7,5,4]` starves the flip's seam staging and wedges the instance:
+`corridor gate refused the seam staging: want 5393 MiB, free 5338 -> 5338 MiB,
+reserve 1024 MiB, staging needs 4881 MiB` — **short by 55 MiB** — retried
+without backoff **528 times**. The instance prints *"The server is fired up
+and ready to roll!"* and then never answers `/health` again; the detokenizer
+heartbeat stops at that same second. py-spy on all three schedulers and the
+detokenizer shows every process IDLE in a normal wait, so this is NOT a
+deadlock and will not be found by looking for one — it is an unbounded retry
+loop that starves the heartbeat while every stack looks healthy. Arm A, the
+swap arm and the restored ship boot ran 0 abandons against 6-72 completed
+flips through the same code.
+
+Second, distinct failure at a pool where staging DOES fit: arm C serves, then
+dies on the first deep prefill inside `on_idle` with `pool memory leak
+detected! [full] total=280000, available=267217, withheld=25566` — available
+plus withheld over-counts the pool by 12783 tokens under the skewed token
+vector. **Not attributed:** both failures are reached through
+`SGLANG_UNEVEN_TOKEN_VECTOR`, set per arm to the arm's attention split. Cut
+versus token vector is one boot's work and was not run; recorded as open
+rather than guessed.
+
+**Consequence for the ticket: GATE, do not wire — and the reason is new.** The
+calibrated memory gate (C35) declared arm C FEASIBLE, predicting rank0 at
+~29990 MiB of 32607 with 2617 MiB free, well over the corridor floor. It was
+correct about RESIDENCY and useless in practice, because the flip needs
+4881 MiB of TRANSIENT staging on that same rank and `planner/pp_cut.py` has no
+term for it. A gate that certifies a cut which then wedges the instance is
+worse than no gate: it launders an unrunnable configuration through a
+calibrated-looking number. `RankResources` needs a `seam_staging_mib` term
+before `solve_pp_cut` may reach a boot path — and that work is worth doing,
+because it converts a measured +50.9 % from a locked prize into a reachable
+one.
+
+---
+
+**C35 — THE UNEXPLAINED RESIDUAL FOLLOWS THE STAGE ROLE, NOT THE CARD; AND
+THE RESIDUAL IS CUT-INVARIANT AFTER ALL (#485, successor 48, 2026-08-12).**
+Resolves the item HANDOFF_485_PPCUT §1e handed forward, and refutes both the
+hypothesis it named and the one the briefing named.
+
+§1e measured residuals of 10171 / 4982 / 7582 MiB, noted that two identical
+3080s differed by 2600 MiB, declined to pick a constant because the residual
+"is not cut-invariant", and named a co-resident TP weight shard as the leading
+suspect. Calibrated against a live at-rest ship boot, with every term named
+instead of lumped:
+
+```
+fixed_overhead_mib = [4061, 3273, 4275]        # rank0, rank1, rank2
+```
+
+**It is cut-invariant.** Every term inside it is sized by the flip's TP vector
+`32,16,16` = 0.5/0.25/0.25 — the mamba/GDN state pool (1229/614/614) and the
+draft KV (614/307/307) — or is flat (draft weights 2048/1884/1884). Not one
+of them is sized by the PP layer count; the mamba pool in particular does NOT
+follow the per-stage GDN layer census (21/15/12 would give 0.44/0.31/0.25 and
+does not fit the measurement). §1e's residual definition swept these
+TP-shaped terms in and then read their non-PP-proportionality as evidence that
+the CUT moved them. The suspect was wrong in kind, not just in size.
+
+**And the 3080s are interchangeable.** The briefing asked for per-card
+calibration as the default hypothesis and for an escalation if the gap
+reproduced. It reproduces in direction (rank2 above rank1) and the hypothesis
+is still wrong. Arm `swap` re-runs the arm A cut with `--rank-gpu-id 0,2,1`,
+exchanging the two 3080s and changing nothing else:
+
+| | rank1 | rank2 |
+|---|---:|---:|
+| baseline (rank1=smi0, rank2=smi2) | 1780 | 2592 |
+| swap (rank1=smi2, rank2=smi0) | **1780** | **2464** |
+
+The high residual moved from smi2 to smi0. It follows **rank2 — the last
+pipeline stage** — and rank1 reads 1780 MiB on either card, to the megabyte.
+The extra ~700-1300 MiB is the last stage's allocator high-water (graph pools,
+sampler and logits buffers), not a card defect. A per-card table would have
+encoded a hardware difference that does not exist, and would have been
+confirmed forever by a rig that never swaps the cards. **The cheap
+discriminator between "property of the card" and "property of the role" is
+one boot with the mapping permuted, and it should be run before any per-card
+constant is written down.**
+
+---
+
 ## SINGLE-SOURCED AND LOAD-BEARING — the next contradictions
 
 Each appears in exactly one place and a decision rests on it. Confirm before
@@ -1154,3 +1255,18 @@ boot with **TP>=2 per PP stage** plus `--enable-phase-flip` plus
    Sibling of law 12 (mechanisms that resolve nothing and report intent) —
    here the mechanism reported its reachable outputs perfectly, and their
    very regularity is what read as a physical law.
+
+23. **A residency gate cannot certify runnability: "fits at rest" and "can
+   run" are different predicates** (C34, #485). The calibrated memory gate
+   priced weights + KV + a measured fixed overhead, declared the planner cut
+   feasible with 2617 MiB to spare, and was correct — the configuration does
+   fit at rest. It wedged anyway, because the phase flip needs 4881 MiB of
+   TRANSIENT staging on that rank at cutover and the model had no term for
+   transient demand at all. The gate was not wrong about what it modelled; it
+   was wrong about what it was being ASKED. Before a feasibility check is
+   allowed to gate a boot, enumerate every mechanism that needs headroom the
+   check does not model — peak is not residency, and the mechanisms that need
+   peak (seam staging, graph capture, spill arenas) are exactly the ones whose
+   demand does not appear in any at-rest measurement. Sibling of law 13 (name
+   the LATENCY class of a relief mechanism): same error one axis over — there
+   the missing dimension was time, here it is transience.

@@ -69,7 +69,18 @@ number in the briefing derived from 48 is off.
    at `PROD_BRINGUP_BENCH.md:1595`. The arena model now reproduces four
    measured rows exactly (K = 4.12 / 2.06 / 3.51 / 2.90 GiB).
 
-### 1e. UNRESOLVED AND HANDED FORWARD: the memory gate is uncalibrated
+### 1e. CALIBRATED AND DIAGNOSED BY SUCCESSOR 48 — see HANDOFF_692 and C35
+
+> **Resolved 2026-08-12.** `fixed_overhead_mib = [4061, 3273, 4275]`. The
+> conclusion below that the residual "is not cut-invariant" is WRONG: every
+> term in it is sized by the flip's TP vector (0.5/0.25/0.25), not by the PP
+> cut, so a per-rank scalar is exactly the right shape. The named suspect (a
+> co-resident TP weight shard) is not the cause. The 4982-vs-7582 gap follows
+> the LAST-STAGE ROLE, not the card — proven by re-booting the same cut with
+> the two 3080s exchanged. Calibrating it did NOT make the gate safe to wire;
+> see C34 and law 23. The section is kept unedited below for the record.
+
+### 1e (original text). UNRESOLVED AND HANDED FORWARD: the memory gate is uncalibrated
 
 `RankResources.fixed_overhead_mib` defaults to **0**, which makes the
 feasibility verdict a **LOWER BOUND on real occupancy**. It will read
