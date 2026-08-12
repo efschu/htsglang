@@ -159,6 +159,24 @@ Two further eligibility rules that shape any forcing attempt
 * **under EAGLE/MTP a request may only leave the batch from the BACK**
   (`spec_back_only_victim`), so speculation narrows the victim set further.
 
+And a PARK needs strictly more than a spill. `park_decision`
+(`kv_session_spill_destination.py:360`) fires only on:
+
+```
+free_regions == 0  AND  a try_spill DECLINED for lack of a region within
+PARK_PRESSURE_WINDOW_ITERS  AND  no transfer in flight  AND  an eligible
+already-spilled slot to evict
+```
+
+so a park requires **two** spill events, not one: session A spills and fills
+the single host region, session B's spill is then declined for want of a
+region, and only that decline arms the park of A onto the file tier. With the
+oldest-session tabu on top, that means **at least three concurrent decoders**
+before a park is reachable at all. The unpark is the mirror
+(`unpark_decision`: a free region and NO fresh pressure), so letting the load
+subside is what closes the round trip — and a parked session cannot finish
+until it is unparked, which is what makes the round trip observable end-to-end.
+
 The forcing recipe that follows: a small `--max-total-tokens`, several
 CONCURRENT requests with LONG `max_new_tokens`, and modest prompts — decode
 pressure, not prefill pressure. Prepared as
