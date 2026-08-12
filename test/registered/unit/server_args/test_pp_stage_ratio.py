@@ -150,6 +150,56 @@ class TestPPStageRatioHandler(CustomTestCase):
         self.assertNotIn(PARTITION_ENV, os.environ)
 
 
+class TestPPLayerRatioFamilyGate(CustomTestCase):
+    """#485: an EXPLICIT --pp-layer-ratio now meets the same hybrid check the
+    derived path applies, instead of reaching get_pp_indices unexamined."""
+
+    def setUp(self):
+        os.environ.pop(PARTITION_ENV, None)
+
+    def tearDown(self):
+        os.environ.pop(PARTITION_ENV, None)
+
+    def _handle(self, ratio, kinds=None, depth=64):
+        args = make_args(pp_size=3, pp_layer_ratio=ratio)
+        with patch.object(
+            ServerArgs, "declared_num_hidden_layers", return_value=depth
+        ), patch.object(
+            ServerArgs,
+            "declared_layer_kinds",
+            return_value=qwen_kinds() if kinds is None else kinds,
+        ):
+            args._handle_pp_layer_ratio()
+        return args
+
+    def test_zero_full_attention_stage_is_refused(self):
+        # Layers 0..2 carry no full-attention layer (the first is index 3).
+        with self.assertRaisesRegex(ValueError, "zero of the model's 16"):
+            self._handle([3, 45, 16])
+
+    def test_valid_split_still_passes(self):
+        self._handle([28, 20, 16])
+        self.assertEqual(os.environ.get(PARTITION_ENV), "28,20,16")
+
+    def test_decoupled_split_passes(self):
+        self._handle([31, 17, 16])
+        self.assertEqual(os.environ.get(PARTITION_ENV), "31,17,16")
+
+    def test_non_hybrid_is_not_gated(self):
+        """An all-attention stack has no family split to get wrong."""
+        self._handle([3, 45, 16], kinds=[True] * 64)
+        self.assertEqual(os.environ.get(PARTITION_ENV), "3,45,16")
+
+    def test_gate_is_skipped_when_geometry_is_unknown(self):
+        """No declared kinds -> no census, and certainly no invented one."""
+        args = make_args(pp_size=3, pp_layer_ratio=[3, 45, 16])
+        with patch.object(
+            ServerArgs, "declared_num_hidden_layers", return_value=64
+        ), patch.object(ServerArgs, "declared_layer_kinds", return_value=None):
+            args._handle_pp_layer_ratio()
+        self.assertEqual(os.environ.get(PARTITION_ENV), "3,45,16")
+
+
 class TestPPAttnStageRatio(CustomTestCase):
     """--pp-attn-stage-ratio: the per-family decoupling on the CLI (#485)."""
 
