@@ -229,6 +229,75 @@ boot minus those two flags (`probe_boot_v9.sh`, diff = one line) served in
 * The two latent silent-drop siblings: **not fixed**, on purpose (§1c).
 * The `used:park:file` gauge reading 0 against 33 files on disk: **noticed,
   not investigated**.
-* `#559` merge-backlog triage: **not started by this shift** — the shift went
-  to the probe, and a listing that is already in HANDOFF_688 §7 is a worse use
-  of a GPU window than the leg that closed C28.
+* `#559` merge-backlog triage: **done at desk level in §8** — merge base and
+  conflicts computed per branch, order proposed on evidence. **No merges were
+  performed.** What is still missing is the content judgement on the two large
+  branches (which of their 82/155 commits are actually wanted).
+* The two large branches were NOT diffed commit-by-commit for intent.
+
+---
+
+## 8. #559 MERGE BACKLOG — TRIAGE ON EVIDENCE, DESK ONLY, NO MERGES DONE
+
+Measured against `feat/route-a-631` at `0c537d41eb`: real distance from the
+**actual merge base**, and conflicts from `git merge-tree --write-tree` (which
+computes the merge without touching the worktree).
+
+| order | branch | commits past merge base | files | python files | merge-tree |
+|---|---|---|---|---|---|
+| 1 | `chore/stash-rescue-432` | 1 | 8 | 0 | **CLEAN** |
+| 2 | `docs/433-int8-prefill-vector` | 1 | 1 | 0 | conflict: 1 file (add/add) |
+| 3 | `docs/pool-audit-2026-08-04` | 2 | 1 | 0 | conflict: `FEATURE_CATALOG.md` |
+| 4 | `audit/unwired-sweep-421` | 2 | 9 | 0 | conflict: 12 paths incl. a test |
+| 5 | `bugfix/pd-mamba-conv-state-transfer` | 82 | 117 | **69** | conflict: **171 paths** |
+| 6 | `docs/features-vs-upstream` | 155 | 137 | **69** | conflict: **174 paths** |
+
+**TWO OF HANDOFF_688 §7'S TWO OBSERVATIONS ARE WRONG, AND BOTH WOULD HAVE
+MISLED THE MERGER.** They were offered as reasoning, not measurement, and the
+measurement disagrees:
+
+* §7 said the 155 on `docs/features-vs-upstream` "is almost certainly mostly
+  SHARED history that simply predates this line's branch point... a
+  measurement artefact until someone computes the actual merge base". **It was
+  computed. It is not an artefact:** 155 commits past the true merge base,
+  137 files, **69 of them python**. A branch named `docs/` that carries 69
+  python files is not a docs branch, and the name is the trap here.
+* §7 said the four small ones "are docs/audit branches and are cheap; they are
+  the right first merges precisely because they exercise the merge process
+  without risking the integration line". **Three of the four conflict.** Only
+  `chore/stash-rescue-432` is clean. Cheap-because-small did not survive
+  contact.
+
+**Recommended order and why:**
+
+1. **`chore/stash-rescue-432` first** — the only genuinely free merge, and it
+   is the one that actually serves §7's stated purpose of exercising the
+   process at zero risk.
+2. **`docs/433-int8-prefill-vector`** — one add/add conflict on a single note
+   file. Resolution is a content decision on one document.
+3. **`docs/pool-audit-2026-08-04`** — conflicts in `FEATURE_CATALOG.md`, which
+   is under the catalogue-maintenance law. Resolve by UNION of feature entries,
+   never by taking one side wholesale.
+4. **`audit/unwired-sweep-421`** — 12 paths including
+   `test/registered/unit/test_unwired_features_421.py`. A conflicted test file
+   must be resolved so BOTH assertion sets survive; dropping one side here
+   silently reduces coverage, which is the failure mode this tree has hit
+   three times on the suite list.
+5. **`bugfix/pd-mamba-conv-state-transfer` — do NOT merge, cherry-pick.** It is
+   the genuine conflict candidate §7 correctly identified (it touches the mamba
+   conv-state path that #631 Route A also touches), but 82 commits and 171
+   conflicting paths spanning `docker/`, `README.md` and the whole
+   infrastructure surface is drift, not the fix. Extract the conv-state
+   transfer commits themselves.
+6. **`docs/features-vs-upstream` — a policy decision, not a merge.** 155
+   commits, 174 conflicting paths, 69 python files. Treat it as a long-lived
+   divergent line; the likely correct action is to extract
+   `FEATURES_VS_UPSTREAM.md` alone and let the rest die, but that is a call for
+   whoever owns the feature-doc policy, not something to resolve conflict-by-
+   conflict at 2 a.m.
+
+Both large branches conflict on the same infrastructure surface
+(`README.md`, `docker/htsglang.Dockerfile`, `docker/htsglang-entrypoint.sh`),
+which says they share an older base and both carry infra churn. Merging one
+will change the conflict set of the other — **sequence them, and re-run
+`merge-tree` after each.**
