@@ -1864,3 +1864,54 @@ costs the next allocations a fault-in and deserves its own measurement.
    looking for (17.71 → 3.34 GB at constant `nproc`). Memory leaving with its
    processes says nothing about whether memory was reclaimable. Constant
    `nproc` is part of the instrument, not a sanity print beside it.
+
+43. **A cap that never binds still does damage: it masks the imbalance that
+   would tell you where the capacity went.** `--max-total-tokens 620000` did
+   not lower the ship pool -- the min across ranks was 503950, well under it.
+   But it made the two non-binding ranks each report their capacity as exactly
+   `620000`, so the sizing log read as "three ranks near the cap" when the
+   truth was PP0 1252026 / PP1 503950 / PP2 727592 with **971718 token-slots
+   stranded**. Lifting a cap is a MEASUREMENT before it is an optimisation:
+   read the uncapped per-rank capacities before reasoning about the layout.
+
+44. **Removing the pool cap OOMs the boot, so "the cap is soft" and "the cap
+   can be deleted" are different claims.** The number lives in no source file
+   (`--max-total-tokens`, `server_args.py:1151`, pass-through to
+   `memory_pool.py:2481`) and `req_to_token` is `int32`, so nothing structural
+   bounds it -- and yet `--max-total-tokens 100000000` died with
+   `cuMemCreate ... CUDA_ERROR_OUT_OF_MEMORY` after the corridor guard counted
+   free from 116 to -4 MiB. The TP layout can only address ids the PP
+   allocator issues; uncapped, the TP pool allocates VRAM it can never address
+   and starves the PP pool. A cap is removable only once the TP pool is sized
+   to the PP id space.
+
+45. **torch's device 0 is not NVML's device 0, and a per-rank MiB budget is
+   read against the physical card.** torch orders FASTEST_FIRST, so gpu0 is
+   the 5090 while `nvidia-smi` index 1 is. `--pp-stage-ratio 18,7,7` was
+   costed as "give the big card more layers" and OOMed on it:
+   `GPU 0 has a total capacity of 31.34 GiB of which 421.75 MiB is free`.
+   rank0's budget was already 31800 of 32607 MiB -- 807 MiB, **below the 1024
+   corridor floor**. Resolve the mapping from the boot's own OOM/geometry
+   lines before attributing a per-rank number to a card.
+
+46. **The phase-flip weight arena is a max over layouts, not a sum, so a moved
+   layer can be free.** `phase_flip_boot.py`: `arena_total = max(
+   layout_pp.total_bytes, layout_tp.total_bytes)`. HANDOFF_662 §5 costed
+   `[24,23,17]` additively ("frees ~1.77 GiB on rank0 but adds ~1.31 GiB on
+   rank1") and rejected it. A rank whose TP weight share already exceeds its
+   new PP layer share pays nothing for received layers -- measured PP
+   13482.18/8144.00/9114.95 MiB against TP 13692.29/7659.52/7659.52. 662's
+   verdict survives for rank0 but on the ceiling argument of entry 45, not on
+   its own arithmetic.
+
+47. **A scaled RoPE cache that GROWS is not the cache it was built with.**
+   The YaRN family builds from `_compute_inv_freq(self.scaling_factor)` and
+   `* self.mscale`, but inherited a `_ensure_cos_sin_cache_length` that used
+   `_compute_inv_freq(self.base)` -- the RoPE theta passed where a scaling
+   factor belongs -- and no mscale. Appended rows carried different
+   frequencies and the wrong amplitude, silently. It already fires at every
+   boot (cache 393216 rows, reserve asks 393600) and is invisible only because
+   `context_len` caps positions below the appended region. **Raising the
+   context ceiling is precisely the change that makes the corrupt rows
+   reachable.** Fixed via an overridable hook pair; guarded by
+   `test/srt/test_yarn_rope_cache_growth.py`.
