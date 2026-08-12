@@ -1,3 +1,12 @@
+# PATHS HERE ARE RENDERED, NOT LITERAL. @@REPO@@, @@VENV@@,
+# @@LOG_DIR@@ and @@CONFIG@@ are substituted from [stack] by
+# scripts/turnkey_539_render_units.py when the installer writes this
+# unit. They were literal /spinning/htsglang-gpu paths until
+# 2026-08-12, when every unit died with 'No module named
+# sglang.srt.turnkey' because that checkout was not the one
+# [stack].repo named. Change stack.toml, or this template -- never
+# the rendered copy under /etc, which the next install overwrites.
+
 # The planner API (#584 names it the authority for VRAM/compute decisions).
 #
 # This unit exists because of a defect observed on this rig 2026-08-12: the
@@ -17,9 +26,9 @@ PartOf=htsglang.target
 
 [Service]
 Type=simple
-WorkingDirectory=/spinning/htsglang-gpu
-Environment=PYTHONPATH=/spinning/htsglang-gpu/python
-ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.planner --serve --port 8780
+WorkingDirectory=@@REPO@@
+Environment=PYTHONPATH=@@REPO@@/python
+ExecStart=@@VENV@@/bin/python -m sglang.planner --serve --port 8780
 
 # DELIBERATELY NOT CUDA_VISIBLE_DEVICES=-1, unlike the router's no-cuda
 # drop-in. That was the first draft here and it is wrong: the planner loads

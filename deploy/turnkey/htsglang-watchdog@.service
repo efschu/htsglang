@@ -1,3 +1,12 @@
+# PATHS HERE ARE RENDERED, NOT LITERAL. @@REPO@@, @@VENV@@,
+# @@LOG_DIR@@ and @@CONFIG@@ are substituted from [stack] by
+# scripts/turnkey_539_render_units.py when the installer writes this
+# unit. They were literal /spinning/htsglang-gpu paths until
+# 2026-08-12, when every unit died with 'No module named
+# sglang.srt.turnkey' because that checkout was not the one
+# [stack].repo named. Change stack.toml, or this template -- never
+# the rendered copy under /etc, which the next install overwrites.
+
 # #604: notice that lane %i died -- including the death systemd cannot see.
 #
 # systemd restarts a process that EXITS. It has no opinion about a process
@@ -23,8 +32,8 @@ PartOf=htsglang.target
 
 [Service]
 Type=simple
-Environment=PYTHONPATH=/spinning/htsglang-gpu/python
-ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.srt.turnkey --config /etc/htsglang/stack.toml watch %i --unit htsglang-serving@%i.service
+Environment=PYTHONPATH=@@REPO@@/python
+ExecStart=@@VENV@@/bin/python -m sglang.srt.turnkey --config @@CONFIG@@ watch %i --unit htsglang-serving@%i.service
 
 Restart=always
 RestartSec=10
