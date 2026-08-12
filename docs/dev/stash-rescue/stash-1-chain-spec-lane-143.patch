@@ -1,0 +1,1000 @@
+diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
+index 959d19a28e..bb1f4f1037 100644
+--- a/python/sglang/srt/arg_groups/speculative_hook.py
++++ b/python/sglang/srt/arg_groups/speculative_hook.py
+@@ -102,6 +102,22 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
+         kwargs=kwargs,
+     )
+ 
++    # #143: the weightless-KV fast lane validates the raw CLI algorithm
++    # (NEXTN/EAGLE/EAGLE3) in _handle_weightless_kv_fastlane, which runs
++    # BEFORE this alias resolution. The Gemma4-assistant promotion
++    # (NEXTN/EAGLE -> FROZEN_KV_MTP) would silently swap in a worker class
++    # without the lane's head-local-draft path -- reject it here, after the
++    # promotion is known.
++    if (
++        getattr(server_args, "weightless_kv_fastlane", False)
++        and server_args.speculative_algorithm == "FROZEN_KV_MTP"
++    ):
++        raise ValueError(
++            "--weightless-kv-fastlane does not support FROZEN_KV_MTP "
++            "(Gemma4 assistant draft): only the EAGLE/NEXTN chain worker "
++            "has the head-local draft path on this lane."
++        )
++
+     # Validate --speculative-draft-window-size once, regardless of algorithm.
+     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+     if server_args.speculative_draft_window_size is not None:
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index e468e9ceb5..d0edcd12f9 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -273,9 +273,20 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
+     from sglang.srt.distributed.utils import (
+         attn_q_partition_groups,
+         attn_q_partition_units,
++        weightless_kv_active,
+     )
+ 
+     mc = model_runner.model_config
++
++    # #143 weightless-KV fast lane: the spec DRAFT is HEAD-LOCAL and built
++    # weight-TP=1 (full projections, no sharding), so its q/k/v tensors carry
++    # ALL heads regardless of the process-global attn_tp geometry. Plan the
++    # draft's wrappers (and its full-context replicated KV pool) with the
++    # full counts. Only ever reached on the head rank (workers build no
++    # draft); no-op on every other configuration.
++    if weightless_kv_active() and getattr(model_runner, "is_draft_worker", False):
++        return mc.num_attention_heads, mc.get_total_num_kv_heads()
++
+     tp_size = get_parallel().attn_tp_size
+     tp_rank = get_parallel().attn_tp_rank
+     _total_kv = mc.get_total_num_kv_heads()
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index d05754946b..8e3bb24d43 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1131,7 +1131,12 @@ class Scheduler(
+             server_args=self.server_args,
+         )
+ 
+-        if self.spec_algorithm.carries_draft_hidden_states():
++        if (
++            self.spec_algorithm.carries_draft_hidden_states()
++            # #143 weightless-KV lane: a weightless worker rank has no draft
++            # (head-local draft) -> fall through to the minimal padding spec.
++            and getattr(self.draft_worker, "draft_worker", None) is not None
++        ):
+             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
+             # worker, so a single accessor covers both shapes.
+             draft_runner = self.draft_worker.draft_worker.draft_runner
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index bb6f19ca8e..7ffbbe79dc 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -184,6 +184,12 @@ class SchedulerBatchResultProcessor:
+         head rank computes and streams logprobs. Always False on the default
+         path (predicate requires --weightless-kv-fastlane)."""
+         model_runner = getattr(self.model_worker, "model_runner", None)
++        if model_runner is None:
++            # #143: with chain spec on the lane, model_worker is the spec
++            # worker (EAGLEWorkerV2), which exposes the target through
++            # .target_worker instead of .model_runner.
++            target_worker = getattr(self.model_worker, "target_worker", None)
++            model_runner = getattr(target_worker, "model_runner", None)
+         return model_runner is not None and getattr(
+             model_runner, "is_weightless_worker", False
+         )
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 9b52a1a1ba..eccf00a032 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -307,12 +307,23 @@ class TpModelWorker(BaseTpWorker):
+         self.world_group = get_world_group()
+ 
+         # Sync random seed across TP workers
+-        self.random_seed = broadcast_pyobj(
+-            [server_args.random_seed],
+-            self.tp_size * self.pp_rank + tp_rank,
+-            self.world_group.cpu_group,
+-            src=self.world_group.ranks[0],
+-        )[0]
++        if self.is_draft_worker and getattr(
++            server_args, "weightless_kv_fastlane", False
++        ):
++            # #143: the lane's DRAFT TpModelWorker exists on the head rank
++            # ONLY -- a cross-rank seed broadcast would hang (no worker-side
++            # counterpart). server_args.random_seed is resolved (randomized
++            # when unset) in ServerArgs before the schedulers fork, so every
++            # rank already holds the identical value the target's broadcast
++            # distributed.
++            self.random_seed = server_args.random_seed
++        else:
++            self.random_seed = broadcast_pyobj(
++                [server_args.random_seed],
++                self.tp_size * self.pp_rank + tp_rank,
++                self.world_group.cpu_group,
++                src=self.world_group.ranks[0],
++            )[0]
+         set_random_seed(self.random_seed)
+ 
+         self.enable_overlap = not server_args.disable_overlap_schedule
+@@ -555,6 +566,14 @@ class TpModelWorker(BaseTpWorker):
+             # batch on the existing lockstep CPU channel; the head's matching
+             # send is below. The per-layer NCCL collective count is untouched.
+             if getattr(self.model_runner, "is_weightless_worker", False):
++                # #143 (D3): spec target-VERIFY forwards must NOT touch the
++                # per-forward B1 token broadcast -- the head's is_verify path
++                # returns before its matching send, so a worker-side recv here
++                # would block forever. The verify accept payload (accept_lens
++                # + accepted ids) travels over its own broadcast in the spec
++                # worker (EAGLEWorkerV2 _wl_worker_verify), AFTER this forward.
++                if is_verify:
++                    return batch_result
+                 head_ids = broadcast_pyobj(
+                     [],
+                     self.tp_size * self.pp_rank + self.tp_rank,
+diff --git a/python/sglang/srt/mem_cache/kv_cache_builder.py b/python/sglang/srt/mem_cache/kv_cache_builder.py
+index 24bb327967..3463c9fd65 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_builder.py
++++ b/python/sglang/srt/mem_cache/kv_cache_builder.py
+@@ -55,6 +55,11 @@ def get_draft_kv_pool(
+     if draft_worker is None or spec_algorithm.is_ngram():
+         return None
+ 
++    # #143 weightless-KV fast lane: a weightless worker rank builds NO draft
++    # (the draft is head-local); it has no draft KV pool.
++    if getattr(draft_worker, "draft_worker", None) is None:
++        return None
++
+     # V2 workers nest the draft runner under `.draft_worker`.
+     if server_args.enable_multi_layer_eagle:
+         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 0fe1cca9e3..8f2108873c 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -141,7 +141,19 @@ def _set_kv_buffer_impl(
+     same_kv_dim: bool = True,
+ ) -> None:
+     row_bytes = row_dim * store_dtype.itemsize
+-    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
++    if (
++        (_is_cuda or _is_hip)
++        and same_kv_dim
++        and can_use_store_cache(row_bytes)
++        # store_cache requires viewable (row-contiguous) k/v. Multi-token
++        # writes can carry a STRIDED v (qkv.split slice from the fused-gate
++        # prepare, e.g. qwen3_5 draft-extend under #143's weight-TP=1 draft);
++        # `.view(-1, row_dim)` would raise there. Fall through to the naive
++        # scatter (stride-safe) instead. Single-token rows ([1, N] slices)
++        # count as contiguous, so the existing decode fast path is untouched.
++        and k.is_contiguous()
++        and v.is_contiguous()
++    ):
+         return store_cache(
+             k.view(-1, row_dim),
+             v.view(-1, row_dim),
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 3eb28effef..112d57fe30 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -375,8 +375,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         # they are no-ops on the default path (fast lane off).
+         _wl_fastlane = getattr(server_args, "weightless_kv_fastlane", False)
+         _wl_head = getattr(server_args, "weightless_kv_head_rank", 0)
+-        self.is_weightless_head = _wl_fastlane and self.tp_rank == _wl_head
+-        self.is_weightless_worker = _wl_fastlane and self.tp_rank != _wl_head
++        # #143: the SPEC DRAFT runner on the lane is neither the weightless
++        # head nor a weightless worker -- it is a HEAD-LOCAL model (built
++        # weight-TP=1 on the head rank only; the weightless workers build no
++        # draft at all). Without this guard the draft runner would inherit
++        # is_weightless_worker on the workers (meta model + stripped forward
++        # asserting a weightless attn backend the draft does not have) and
++        # is_weightless_head head-side behaviors (B1 token broadcast, guard
++        # resets) it must not take part in. _wl_draft_head_full keeps exactly
++        # the two build-time behaviors the head draft DOES need: the
++        # weight-TP=1 full build override and skipping the load-time tp-group
++        # barrier (which the workers would never join).
++        self.is_weightless_head = (
++            _wl_fastlane and self.tp_rank == _wl_head and not is_draft_worker
++        )
++        self.is_weightless_worker = (
++            _wl_fastlane and self.tp_rank != _wl_head and not is_draft_worker
++        )
++        self._wl_draft_head_full = _wl_fastlane and is_draft_worker
+         if self.is_weightless_worker:
+             logger.info(
+                 "Weightless-KV fast lane: rank %d is a WEIGHTLESS KV worker "
+@@ -1380,7 +1396,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         pre_model_load_memory = get_available_gpu_memory(
+             self.device,
+             self.gpu_id,
+-            distributed=get_world_group().world_size > 1 and not uneven_memory,
++            # #143: the lane's head-only draft runner must not join the
++            # cross-rank min-reduce (the workers build no draft to pair it).
++            distributed=get_world_group().world_size > 1
++            and not uneven_memory
++            and not self._wl_draft_head_full,
+             cpu_group=get_world_group().cpu_group,
+         )
+         self.tp_group = get_tp_group()
+@@ -1652,7 +1672,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                     attn_tp_size=1,
+                     attn_tp_rank=0,
+                 )
+-                if (self.is_weightless_head or self.is_weightless_worker)
++                if (
++                    self.is_weightless_head
++                    or self.is_weightless_worker
++                    # #143: the lane's head-local DRAFT builds full (TP=1)
++                    # exactly like the head's target model -- no weight
++                    # sharding, no FFN/residual all-reduce -> the draft
++                    # forwards issue ZERO collectives (kills desync axis D1).
++                    or self._wl_draft_head_full
++                )
+                 else contextlib.nullcontext()
+             )
+             with _wl_build_ctx:
+@@ -1802,7 +1830,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 logger,
+             )
+ 
+-        if self.server_args.elastic_ep_backend == "mooncake":
++        if self._wl_draft_head_full:
++            # #143: the lane's DRAFT loads on the head rank ONLY (the
++            # weightless workers construct no draft), so this tp-group barrier
++            # has no counterpart on the other ranks -- joining it would hang
++            # the boot. The draft load is head-local; nothing to synchronize.
++            pass
++        elif self.server_args.elastic_ep_backend == "mooncake":
+             # Mooncake does not support `monitored_barrier`
+             dist.barrier(group=get_tp_group().cpu_group)
+         else:
+@@ -3651,6 +3685,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         )
+         os.replace(tmp_path, path)
+ 
++    def determinism_dump_accepted_verify_rows(
++        self,
++        next_token_logits: torch.Tensor,
++        accept_len: int,
++    ) -> None:
++        """#124 dump surface for CHAIN speculative decode (#143).
++
++        For a single-sequence topk=1 chain verify, row i of the verify logits
++        is the target's next-token distribution after the committed prefix +
++        the first i accepted tokens -- contextually IDENTICAL to the i-th
++        plain decode forward of a no-spec run. Dumping rows 0..accept_len-1
++        (one per emitted token, in emission order, mode='decode') therefore
++        aligns the spec run's trajectory file-for-file with a no-spec
++        reference, so the existing DECODE_CLASS gate (argmax-identity + fp
++        band) applies unchanged. Debug-only (dump dir default off).
++        """
++        if next_token_logits is None:
++            return
++        dump_dir = self.server_args.determinism_logits_dump_dir
++        for i in range(accept_len):
++            step = getattr(self, "_determinism_dump_counter", 0)
++            self._determinism_dump_counter = step + 1
++            path = os.path.join(
++                dump_dir, f"rank{self.tp_rank}_step{step:07d}.pt"
++            )
++            tmp_path = path + ".tmp"
++            torch.save(
++                {
++                    "step": step,
++                    "mode": "decode",
++                    "logits": next_token_logits[i].detach().to("cpu", copy=True),
++                },
++                tmp_path,
++            )
++            os.replace(tmp_path, path)
++
+     def compute_logprobs_only(
+         self,
+         logits_output: LogitsProcessorOutput,
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index 75f09e3f0d..01aff9d4b3 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -1665,6 +1665,14 @@ class ModelRunnerKVCacheMixin:
+                     uneven_dcp_kv_replicated(self.dcp_size) or weightless_kv_active()
+                 ) and not _draft_non_dcp:
+                     _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
++                elif weightless_kv_active() and _draft_non_dcp:
++                    # #143: the lane's HEAD-LOCAL draft is built weight-TP=1
++                    # (full projections) and keeps its full-context replicated
++                    # pool -- so it stores ALL kv heads, not the ÷attn_tp_size
++                    # per-rank share (which fit the old uneven-TP head-sharded
++                    # draft, not this one). Head rank only; workers build no
++                    # draft pool.
++                    _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
+                 else:
+                     _hybrid_kv_head_num = self.model_config.get_num_kv_heads(
+                         get_parallel().attn_tp_size
+diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+index d5abeb9e29..7e489478e3 100644
+--- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+@@ -1151,7 +1151,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+         (``init_forward_metadata_out_graph(in_capture=True)`` installs the decode
+         cuda-graph wrappers onto ``forward_metadata``); the recorded body only
+         runs the capturable per-layer dispatch. No logits, no sampling, no
+-        capture-tail hooks, no autotune (the lane forbids speculative decode).
++        capture-tail hooks, no autotune.
++        #143 chain spec: with speculative decoding on the lane the capture
++        batches are TARGET_VERIFY-shaped (num_tokens_per_bs = draft tokens) on
++        EVERY rank, so the worker records the verify-extend mirror
++        (``forward_extend_weightless_worker``, has_prefix forced -> fused-KV +
++        Q + LSE-merge = 3 collectives/layer) to pair with the head's captured
++        verify forward; without spec it records the plain decode dispatch (4
++        collectives/layer) exactly as before.
+         The guard is already disabled for the whole capture (see ``capture``)."""
+         num_tokens = size * self.num_tokens_per_bs
+         bs = size
+@@ -1184,8 +1191,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+                     forward_batch.global_num_tokens_cpu,
+                 )
+                 set_is_extend_in_batch(False)
++                # #143: dispatch by capture mode -- TARGET_VERIFY (chain spec)
++                # records the verify-extend mirror, plain decode records the
++                # decode dispatch (see docstring).
++                if forward_batch.forward_mode.is_target_verify():
++                    wl_dispatch = wl_attn.forward_extend_weightless_worker
++                else:
++                    wl_dispatch = wl_attn.forward_decode_weightless_worker
+                 for layer in model_runner._weightless_attn_layers():
+-                    wl_attn.forward_decode_weightless_worker(layer, forward_batch)
++                    wl_dispatch(layer, forward_batch)
+                 # Sentinel output: the worker produces no logits. The backend
+                 # stores this (None) and returns it from replay; execute() maps
+                 # a None replay output to a logits-free ModelRunnerOutput.
+diff --git a/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py b/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py
+index 032c387747..ae4ff1546b 100644
+--- a/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py
++++ b/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py
+@@ -61,6 +61,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
+         self._pool = None
+         self._device_module = cuda_graph_runner.device_module
+         self._tp_group = cuda_graph_runner.model_runner.tp_group
++        # #143: rank-local captures (the lane's head-only draft graphs) skip
++        # the cross-rank warmup barrier in capture_one.
++        self._local_only_capture = bool(
++            getattr(cuda_graph_runner, "local_only_capture", False)
++        )
+         self._capture_stream: Optional[torch.cuda.Stream] = None
+         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
+             enable=enable_memory_saver
+@@ -97,7 +102,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
+         # post_warmup_hook lets the attention backend reset state that warmup mutated.
+         for _ in range(2):
+             self._device_module.synchronize()
+-            self._tp_group.barrier()
++            # #143 weightless-KV lane: the DRAFT graph capture runs on the
++            # head rank ONLY (the weightless workers build no draft), so the
++            # cross-rank warmup barrier has no counterpart and would hang the
++            # boot. Runners whose capture is rank-local set
++            # ``local_only_capture`` (default False -> unchanged pairing for
++            # every multi-rank capture, including the lane's symmetric
++            # target-verify capture).
++            if not self._local_only_capture:
++                self._tp_group.barrier()
+             forward_fn()
+             if post_warmup_hook is not None:
+                 post_warmup_hook()
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index fc49e5979c..7ac4ff8987 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -3588,17 +3588,50 @@ class ServerArgs:
+                 "Use --speculative-eagle-topk 1 (linear chain) if/when "
+                 "speculative decoding is supported on the lane."
+             )
+-        # Stage 1 scope: NO speculative decoding (the MTP/NEXTN draft adds its
+-        # own attention/DCP sites on the head rank that the weightless workers
+-        # do not mirror).
++        # #143: CHAIN (topk == 1) speculative decoding IS supported on the
++        # lane for the EAGLE/NEXTN family. The draft is HEAD-LOCAL (built
++        # weight-TP=1 on the head rank only; workers build no draft), so the
++        # num_steps-1 draft forwards contribute ZERO cross-rank collectives;
++        # the only spec collective surface is the target-verify extend, which
++        # the workers already mirror (forward_extend_weightless_worker forces
++        # has_prefix=True for is_target_verify). Accept lengths + accepted
++        # token ids are synced to the workers over the lockstep gloo CPU
++        # channel (one broadcast per verify), never via NCCL.
++        # Everything OUTSIDE that validated surface stays hard-rejected:
++        # tree/branching (topk>1, rejected above), non-chain algorithms, and
++        # modes that change the draft/verify collective or scheduler surface.
+         if self.speculative_algorithm is not None:
+-            raise ValueError(
+-                "--weightless-kv-fastlane (Stage 1) does not support "
+-                "speculative decoding "
+-                f"(--speculative-algorithm={self.speculative_algorithm}). Run "
+-                "with speculative decoding OFF; the MTP draft dispatch is a "
+-                "later stage."
+-            )
++            # NEXTN resolves to EAGLE later (arg_groups/speculative_hook runs
++            # AFTER this handler), so accept the raw CLI spellings here.
++            _chain_algos = ("NEXTN", "EAGLE", "EAGLE3")
++            if self.speculative_algorithm.upper() not in _chain_algos:
++                raise ValueError(
++                    "--weightless-kv-fastlane supports chain speculative "
++                    "decoding only for the EAGLE/NEXTN family "
++                    f"(one of {_chain_algos}); got --speculative-algorithm="
++                    f"{self.speculative_algorithm}. NGRAM/STANDALONE/DFLASH/"
++                    "DSPARK and custom algorithms have draft/verify surfaces "
++                    "the weightless workers do not mirror."
++                )
++            if self.enable_multi_layer_eagle:
++                raise ValueError(
++                    "--weightless-kv-fastlane does not support "
++                    "--enable-multi-layer-eagle (per-step draft model runners "
++                    "are not part of the validated head-local draft path)."
++                )
++            if self.speculative_use_rejection_sampling:
++                raise ValueError(
++                    "--weightless-kv-fastlane does not support "
++                    "--speculative-use-rejection-sampling: the draft-probs "
++                    "relay is not mirrored on the weightless workers. Use "
++                    "the default target-only verify."
++                )
++            if self.speculative_adaptive:
++                raise ValueError(
++                    "--weightless-kv-fastlane does not support "
++                    "--speculative-adaptive (runtime step switching touches "
++                    "draft graph state that exists on the head rank only)."
++                )
+         # Chunked prefill IS supported (#131): every chunk is a plain extend
+         # forward mirrored by forward_extend_weightless_worker, branching on the
+         # rank-uniform has_prefix (2 collectives for the first chunk, 4 for
+@@ -3789,7 +3822,18 @@ class ServerArgs:
+                     "1 (linear chain speculation), which is correct and "
+                     "bitwise-deterministic under uneven-DCP."
+                 )
+-            if self.speculative_algorithm is not None and not uneven_weighted_dcp:
++            # #143: the weightless-KV fast lane supports CHAIN (topk == 1)
++            # EAGLE/NEXTN speculation -- the head-local draft adds zero DCP
++            # collectives and the target-verify extend is mirrored by the
++            # weightless workers. Its fine-grained checks (chain family only,
++            # no rejection sampling / adaptive / multi-layer) live in
++            # _handle_weightless_kv_fastlane, which runs right after this
++            # handler; topk > 1 stays rejected by the #76/#139 guard above.
++            if (
++                self.speculative_algorithm is not None
++                and not uneven_weighted_dcp
++                and not self.weightless_kv_fastlane
++            ):
+                 raise ValueError(
+                     "Decode context parallel (--dcp-size / "
+                     "--decode-context-parallel-size > 1) on CUDA platform "
+@@ -3798,7 +3842,9 @@ class ServerArgs:
+                     "speculative decoding enabled. (The uneven-hybrid weighted "
+                     "DCP path -- SGLANG_UNEVEN_DCP=1 + "
+                     "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
+-                    "--rank-tp-ratio -- is the only supported spec+DCP config.)"
++                    "--rank-tp-ratio -- and chain topk=1 EAGLE/NEXTN on "
++                    "--weightless-kv-fastlane are the only supported spec+DCP "
++                    "configs.)"
+                 )
+         else:
+             raise ValueError(
+diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+index 4e193bb97c..fb2447b749 100644
+--- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+@@ -136,6 +136,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
+         self.enable_pdmux = False
+         self.record_nolora_graph = False
+         self.is_dllm = False
++        # Parent capture() reads this (#136a lane block-graph ladder);
++        # draft-side runners never take that path (#143: the lane's
++        # draft is head-local and not weightless-block-decoded).
++        self._wl_block_graph = False
+ 
+         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+ 
+@@ -260,6 +264,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
+         )
+         self.buffers.share_buffers()
+ 
++        # #143 weightless-KV lane: this draft runner exists on the head rank
++        # ONLY (workers build no draft) -- its capture must not join the
++        # cross-rank warmup barrier (full_cuda_graph_backend.capture_one).
++        from sglang.srt.distributed.utils import weightless_kv_active
++
++        self.local_only_capture = weightless_kv_active()
+         self.backend = resolve_decode_backend(self)
+ 
+         # Capture
+diff --git a/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
+index a8e79ea794..6df70c7cf2 100644
+--- a/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
+@@ -168,6 +168,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
+         self.enable_pdmux = False
+         self.record_nolora_graph = False
+         self.is_dllm = False
++        # Parent capture() reads this (#136a lane block-graph ladder);
++        # draft-side runners never take that path (#143: the lane's
++        # draft is head-local and not weightless-block-decoded).
++        self._wl_block_graph = False
+ 
+         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+ 
+@@ -310,6 +314,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
+         )
+         self.buffers.share_buffers()
+ 
++        # #143 weightless-KV lane: this draft runner exists on the head rank
++        # ONLY (workers build no draft) -- its capture must not join the
++        # cross-rank warmup barrier (full_cuda_graph_backend.capture_one).
++        from sglang.srt.distributed.utils import weightless_kv_active
++
++        self.local_only_capture = weightless_kv_active()
+         self.backend = resolve_decode_backend(self)
+ 
+         try:
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index ce2e2f5682..3ac1f90465 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -763,13 +763,23 @@ def eagle_sample(
+     # near-ties are common, and a single divergent accept desynchronizes
+     # KV/recurrent state across ranks for the rest of the sequence.
+     # Broadcast from rank 0 to ensure consistency.
+-    tp_group = (
+-        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+-    )
+-    if tp_group.world_size > 1:
+-        tp_group.broadcast(predict, src=0)
+-        tp_group.broadcast(accept_index, src=0)
+-        tp_group.broadcast(num_correct_drafts, src=0)
++    # #143 (D2): NOT on the weightless-KV fast lane -- eagle_sample runs on
++    # the HEAD rank only (the weightless workers bypass verify sampling), so
++    # this NCCL broadcast would hang against absent peers. There is exactly
++    # one sampling rank; the workers receive (accept_lens, accepted ids) over
++    # the lockstep gloo CPU channel in EAGLEWorkerV2 instead.
++    from sglang.srt.distributed.utils import weightless_kv_active
++
++    if not weightless_kv_active():
++        tp_group = (
++            get_parallel().attn_tp_group
++            if is_dp_attention_enabled()
++            else get_tp_group()
++        )
++        if tp_group.world_size > 1:
++            tp_group.broadcast(predict, src=0)
++            tp_group.broadcast(accept_index, src=0)
++            tp_group.broadcast(num_correct_drafts, src=0)
+ 
+     if SIMULATE_ACC_LEN > 0:
+         # Do simulation. The helper builds (and returns) a replacement
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 65f48bfcf5..d9f0d91992 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -134,8 +134,18 @@ def _broadcast_draft_picks(*tensors: Optional[torch.Tensor]) -> None:
+     eagle_utils.eagle_sample.
+     """
+     from sglang.srt.distributed import get_tp_group
++    from sglang.srt.distributed.utils import weightless_kv_active
+     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+ 
++    if weightless_kv_active():
++        # #143 (D2): on the weightless-KV fast lane the draft is HEAD-LOCAL
++        # (weight-TP=1 on the head rank; the weightless workers run no draft
++        # at all), so there is no second rank computing a divergent pick to
++        # sync -- and the workers never reach this call, so the head's NCCL
++        # broadcast would hang against absent peers. The verify accept result
++        # reaches the workers via the lockstep gloo CPU channel instead.
++        return
++
+     tp_group = (
+         get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+     )
+@@ -1185,17 +1195,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
+             context_length=target_worker.model_runner.model_config.context_len,
+         )
+ 
+-        self._draft_worker = EagleDraftWorker(
+-            server_args,
+-            gpu_id,
+-            tp_rank,
+-            dp_rank,
+-            moe_ep_rank,
+-            attn_cp_rank,
+-            moe_dp_rank,
+-            nccl_port,
+-            target_worker,
+-        )
++        # #143: weightless-KV fast lane chain-spec roles. The draft model is
++        # HEAD-LOCAL: the head rank builds it weight-TP=1 (full weights, zero
++        # draft-forward collectives); the weightless workers build NO draft at
++        # all and route every generation forward through the worker mirror
++        # (_wl_worker_verify / the extend stub) instead of draft()/verify().
++        _wl_lane = getattr(server_args, "weightless_kv_fastlane", False)
++        _wl_head_rank = getattr(server_args, "weightless_kv_head_rank", 0)
++        self._wl_is_head = _wl_lane and tp_rank == _wl_head_rank
++        self._wl_is_worker = _wl_lane and tp_rank != _wl_head_rank
++
++        if self._wl_is_worker:
++            self._draft_worker = None
++        else:
++            self._draft_worker = EagleDraftWorker(
++                server_args,
++                gpu_id,
++                tp_rank,
++                dp_rank,
++                moe_ep_rank,
++                attn_cp_rank,
++                moe_dp_rank,
++                nccl_port,
++                target_worker,
++            )
+ 
+         # Adaptive speculative
+         self.adaptive_controller: Optional[AdaptiveController] = None
+@@ -1218,12 +1241,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
+     def war_fastpath_runner(self):
+         # Per the base contract: the step's last shared-buffer-reading phase is
+         # draft_extend, which runs on the draft runner.
++        if self._draft_worker is None:
++            # #143 weightless worker: no draft; the last shared-buffer-reading
++            # phase is the target-verify mirror on the target runner.
++            return self._target_worker.model_runner
+         return self._draft_worker.draft_runner
+ 
+     @property
+     def spec_v2_attn_backends(self) -> tuple:
+         # Every attn backend a spec_v2 forward touches; consumed by
+         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
++        if self._draft_worker is None:
++            # #143 weightless worker: only the target's verify mirror runs here.
++            return (self._target_worker.model_runner.attn_backend,)
+         return (
+             self._target_worker.model_runner.attn_backend,
+             self._draft_worker.draft_attn_backend,
+@@ -1237,16 +1267,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
+         req_to_token_pool=None,
+         token_to_kv_pool_allocator=None,
+     ):
+-        self._draft_worker.alloc_memory_pool(
+-            memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
+-        )
++        if self._draft_worker is not None:
++            self._draft_worker.alloc_memory_pool(
++                memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
++            )
+         self.req_to_token_pool = req_to_token_pool
+         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+ 
+     def init_attention_backends(self):
+-        self._draft_worker.init_attention_backends()
++        if self._draft_worker is not None:
++            self._draft_worker.init_attention_backends()
+ 
+     def init_cuda_graphs(self):
++        if self._draft_worker is None:
++            # #143 weightless worker: no draft to capture.
++            return
+         self._draft_worker.init_cuda_graphs()
+         # Build adaptive runtime states after target and draft backends exist.
+         if self.adaptive_controller is not None:
+@@ -1307,6 +1342,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
+             if on_publish is not None:
+                 on_publish(batch_output.new_seq_lens)
+ 
++            if self._wl_is_worker:
++                # #143 weightless worker: the target extend mirror above
++                # already ran (and received the head's sampled tokens over the
++                # B1 broadcast). There is no draft on this rank -- skip
++                # draft-extend and hand the scheduler a shape-valid stub
++                # draft input (its topk/hidden relay values are never read on
++                # this rank; the worker verify path builds its own synthetic
++                # chain verify input each step).
++                batch_output.next_draft_input = self._wl_stub_draft_input(
++                    batch_output.next_token_ids
++                )
++                return batch_output
++
+             # Draft prefill
+             with (
+                 self.draft_worker.draft_tp_context(
+@@ -1326,6 +1374,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                 )
+                 return batch_output
+         else:
++            if self._wl_is_worker:
++                # #143 weightless worker: bypass draft entirely (0 collectives
++                # on the head's draft forwards -> nothing to mirror), run ONLY
++                # the target-verify mirror, then consume the head's
++                # (accept_lens, accepted ids) broadcast.
++                return self._wl_worker_verify(batch, on_publish)
++
+             self.activate_step_by_batch(batch.seq_lens.shape[0])
+ 
+             if batch.spec_info is None:
+@@ -1383,6 +1438,159 @@ class EAGLEWorkerV2(BaseSpecWorker):
+ 
+             return batch_output
+ 
++    # ------------------------------------------------------------------
++    # #143: weightless-KV fast lane, WORKER-side chain-spec mirror.
++    #
++    # The draft is head-local (0 collectives), so a weightless worker's whole
++    # spec step is: (1) mirror the target-verify extend (the ONLY cross-rank
++    # collective surface of the step -- identical per-layer sequence to the
++    # head via forward_extend_weightless_worker), then (2) consume the head's
++    # (accept_lens, accepted ids) gloo broadcast and advance scheduler state
++    # identically. Everything here must stay DETERMINISTIC and rank-uniform:
++    # the synthetic verify input below is a pure function of (bs, seq_lens,
++    # num_draft_tokens), so out_cache_loc / kv-owner writes match the head's
++    # slot-for-slot.
++    # ------------------------------------------------------------------
++
++    def _wl_stub_draft_input(self, next_token_ids: torch.Tensor) -> EagleDraftInput:
++        """Shape-valid EagleDraftInput stub for a weightless worker rank.
++
++        Only ``bonus_tokens`` carries real data (the head's sampled/accepted
++        tokens); topk_p / topk_index are zero placeholders sized for the
++        overlap FutureMap relay. No draft ever reads them on this rank -- the
++        worker verify path rebuilds its synthetic chain verify input from
++        scratch each step.
++        """
++        bs = int(next_token_ids.shape[0]) if next_token_ids is not None else 0
++        device = self.device
++        return EagleDraftInput(
++            bonus_tokens=next_token_ids.to(torch.int32),
++            topk_p=torch.zeros((bs, self.topk), dtype=torch.float32, device=device),
++            topk_index=torch.zeros((bs, self.topk), dtype=torch.int64, device=device),
++        )
++
++    def _wl_build_chain_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
++        """Synthetic topk=1 CHAIN EagleVerifyInput for the worker mirror.
++
++        The worker never embeds tokens, never samples, and its uneven-DCP
++        verify metadata path (call_begin_forward EAGLE_VERIFY branch) reads
++        only ``spec_input_type`` + ``draft_token_num`` -- token VALUES and the
++        retrieve_* topology are head-only concerns, so zeros / canonical chain
++        stubs are exact here. Positions mirror the head's chain layout
++        (seq_lens + [0..d)) for completeness (no RoPE runs on this rank).
++        """
++        d = self.speculative_num_draft_tokens
++        if batch.forward_mode.is_idle():
++            return EagleVerifyInput.create_idle_input(
++                self.topk, self.speculative_num_steps, d, self.device
++            )
++        bs = batch.seq_lens.shape[0]
++        device = self.device
++        positions = (
++            batch.seq_lens.to(torch.int64).unsqueeze(1)
++            + torch.arange(d, dtype=torch.int64, device=device)
++        ).flatten()
++        retrieve_index = torch.arange(
++            bs * d, dtype=torch.long, device=device
++        ).view(bs, d)
++        chain_next = torch.arange(1, d + 1, dtype=torch.long, device=device)
++        chain_next[-1] = -1
++        retrieve_next_token = chain_next.unsqueeze(0).expand(bs, d).contiguous()
++        return EagleVerifyInput(
++            draft_token=torch.zeros((bs * d,), dtype=torch.int64, device=device),
++            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
++            positions=positions,
++            retrieve_index=retrieve_index,
++            retrieve_next_token=retrieve_next_token,
++            retrieve_next_sibling=torch.full(
++                (bs, d), -1, dtype=torch.long, device=device
++            ),
++            retrieve_cum_len=None,
++            spec_steps=self.speculative_num_steps,
++            topk=self.topk,
++            draft_token_num=d,
++            capture_hidden_mode=CaptureHiddenMode.FULL,
++            seq_lens_sum=None,
++            seq_lens_cpu=None,
++        )
++
++    def _wl_worker_verify(self, batch: ScheduleBatch, on_publish=None):
++        """Weightless worker generation step under chain spec (see banner)."""
++        from sglang.srt.utils.common import broadcast_pyobj
++
++        verify_input = self._wl_build_chain_verify_input(batch)
++        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
++        batch.spec_info = verify_input
++
++        # Same allocator-free req_to_token reads + ForwardBatch build as the
++        # head (assign_extend_cache_locs is a pure function of shared state).
++        verify_forward_batch, _ = eagle_prepare_for_verify(
++            verify_input,
++            self.req_to_token_pool,
++            batch,
++            self.target_worker,
++        )
++
++        # The verify-extend mirror: per-layer fused-KV gather + Q gather +
++        # LSE-merge, in lockstep with the head's target-verify forward.
++        self.target_worker.forward_batch_generation(
++            batch=None,
++            forward_batch=verify_forward_batch,
++            is_verify=True,
++        )
++
++        # Consume the head's verify result (sent in verify() right after
++        # eagle_sample). One gloo broadcast per generation batch.
++        accept_lens_list, predict_list = broadcast_pyobj(
++            [],
++            self.tp_rank,
++            self.target_worker.world_group.cpu_group,
++            src=self.target_worker.world_group.ranks[
++                self.server_args.weightless_kv_head_rank
++            ],
++        )
++
++        device = self.device
++        bs = len(accept_lens_list)
++        stride = self.speculative_num_draft_tokens
++        accept_lens = torch.tensor(
++            accept_lens_list, dtype=torch.int32, device=device
++        )
++        predict = torch.tensor(predict_list, dtype=torch.int32, device=device)
++        new_seq_lens = batch.seq_lens + accept_lens
++        if on_publish is not None:
++            on_publish(new_seq_lens)
++
++        # Chain bonus token = last accepted token of each req's front chain
++        # (computed on CPU from the broadcast lists -- deterministic ints).
++        if bs > 0:
++            bonus_list = [
++                predict_list[i * stride + accept_lens_list[i] - 1]
++                for i in range(bs)
++            ]
++            bonus_tokens = torch.tensor(
++                bonus_list, dtype=torch.int32, device=device
++            )
++        else:
++            bonus_tokens = torch.empty((0,), dtype=torch.int32, device=device)
++
++        next_draft_input = EagleDraftInput(
++            bonus_tokens=bonus_tokens,
++            topk_p=torch.zeros((bs, self.topk), dtype=torch.float32, device=device),
++            topk_index=torch.zeros((bs, self.topk), dtype=torch.int64, device=device),
++        )
++
++        return GenerationBatchResult(
++            logits_output=None,
++            next_token_ids=predict,
++            can_run_cuda_graph=False,
++            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
++            next_draft_input=next_draft_input,
++            accept_lens=accept_lens,
++            new_seq_lens=new_seq_lens,
++            extra_keep_alive_refs=[verify_forward_batch],
++        )
++
+     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
+ 
+@@ -1764,6 +1972,42 @@ class EAGLEWorkerV2(BaseSpecWorker):
+             accept_index,
+         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+         new_seq_lens = batch.seq_lens + accept_lens
++
++        # #143 (weightless-KV fast lane, head rank): publish the verify result
++        # to the weightless workers over the lockstep gloo CPU channel -- ONE
++        # broadcast per generation batch, outside any NCCL collective. The
++        # workers block on this right after their target-verify mirror
++        # (_wl_worker_verify); without it a token-dependent finish (EOS/stop)
++        # or the per-req accept length would desync the lockstep schedulers
++        # into a permanent DCP hang. topk == 1 (chain) only: `predict` is
++        # already in its final front-chain layout here (the topk > 1
++        # compaction below never runs on the lane -- tree spec is rejected).
++        if self._wl_is_head:
++            from sglang.srt.utils.common import broadcast_pyobj
++
++            broadcast_pyobj(
++                [accept_lens.tolist(), predict.tolist()],
++                self.tp_rank,
++                self.target_worker.world_group.cpu_group,
++                src=self.target_worker.world_group.ranks[
++                    self.server_args.weightless_kv_head_rank
++                ],
++            )
++
++        # #124/#143 debug dump surface (default off): for a topk=1 chain,
++        # verify-logits row i is contextually identical to the i-th plain
++        # decode forward, so dumping the ACCEPTED rows aligns the spec run's
++        # trajectory file-for-file with a no-spec reference for the byte-gate.
++        if (
++            self.server_args.determinism_logits_dump_dir is not None
++            and self.topk == 1
++            and bs == 1
++            and not batch.forward_mode.is_idle()
++            and logits_output.next_token_logits is not None
++        ):
++            self.target_worker.model_runner.determinism_dump_accepted_verify_rows(
++                logits_output.next_token_logits, int(accept_lens[0].item())
++            )
+         clear_unaccepted_c128 = getattr(
+             self.token_to_kv_pool_allocator.get_kvcache(),
+             "clear_unaccepted_c128_draft_states",
+diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_cuda_graph_runner.py b/python/sglang/srt/speculative/frozen_kv_mtp_cuda_graph_runner.py
+index 4c7db0ffc0..7deb42e991 100644
+--- a/python/sglang/srt/speculative/frozen_kv_mtp_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/frozen_kv_mtp_cuda_graph_runner.py
+@@ -107,6 +107,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
+         self.enable_pdmux = False
+         self.record_nolora_graph = False
+         self.is_dllm = False
++        # Parent capture() reads this (#136a lane block-graph ladder);
++        # draft-side runners never take that path (#143: the lane's
++        # draft is head-local and not weightless-block-decoded).
++        self._wl_block_graph = False
+ 
+         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+ 
+diff --git a/tests/determinism/determinism_harness/matrix.py b/tests/determinism/determinism_harness/matrix.py
+index c562001c47..19545a7719 100644
+--- a/tests/determinism/determinism_harness/matrix.py
++++ b/tests/determinism/determinism_harness/matrix.py
+@@ -236,6 +236,60 @@ TEST_MATRIX: List[CaseSpec] = [
+             "~2x measured."
+         ),
+     ),
++    CaseSpec(
++        case_id="weightless_chain_spec",
++        description=(
++            "Weightless lane with CHAIN (topk=1) NEXTN speculative decode "
++            "(#143: head-local draft, worker verify-mirror, gloo accept sync) "
++            "vs. the SAME lane without spec, greedy: the accepted-token "
++            "trajectory must be argmax-identical (0 flips) -- speculation is "
++            "lossless under greedy accept. The spec arm dumps the ACCEPTED "
++            "verify-logits rows (contextually identical to plain decode "
++            "forwards), so the standard DECODE_CLASS gate applies file-for-"
++            "file. Reference = lane-no-spec isolates spec from the lane's own "
++            "fp band (lane-vs-solo is covered by weightless_decode)."
++        ),
++        model_role="dense_lane",
++        test_config={
++            **_LANE_BASE,
++            "speculative_algorithm": "NEXTN",
++            "speculative_eagle_topk": 1,
++            "speculative_num_steps": 3,
++            "speculative_num_draft_tokens": 4,
++            # Bring-up bounds (see notes): explicit KV cap works around the
++            # spec x uneven-budget x hybrid-pool sizing overshoot; eager both
++            # arms until spec-verify-under-graphs is validated (separate
++            # capture surface, #143 follow-on).
++            "max_total_tokens": 32768,
++            "disable_cuda_graph": True,
++        },
++        test_env={},
++        reference_config={
++            **_LANE_BASE,
++            "max_total_tokens": 32768,
++            "disable_cuda_graph": True,
++        },
++        reference_env={},
++        expected_class=ByteIdentityClass.DECODE_CLASS,
++        num_decode_tokens=96,
++        band=24.0,
++        near_tie_margin=1.0,
++        needs_rerun=True,
++        quality_gate=(
++            "accept-rate > 0 (draft actually running head-local; from the "
++            "server accept-len log) + self-det 5/5 same-boot reruns"
++        ),
++        notes=(
++            "#143 chain-spec byte-gate. Band/margin inherited from the "
++            "weightless_decode calibration (same lane fp envelope; the "
++            "verify extend runs the same 3-collective/layer mirror as "
++            "decode). needs_rerun captures a same-boot rerun arm for the "
++            "run==run evidence (evaluated manually; DECODE_CLASS verdict "
++            "itself is ref-vs-test). KV pool capped via max_total_tokens: "
++            "unbounded sizing OOMs under spec x --rank-gpu-memory-mib on "
++            "this vehicle (sizing overshoot, open item)."
++        ),
++    ),
+     CaseSpec(
+         case_id="fp8_offload",
+         description=(

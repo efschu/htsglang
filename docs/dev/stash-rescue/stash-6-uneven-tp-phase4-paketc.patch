@@ -1,0 +1,534 @@
+diff --git a/python/sglang/srt/distributed/utils.py b/python/sglang/srt/distributed/utils.py
+index 96a06a7144..8a6430778d 100644
+--- a/python/sglang/srt/distributed/utils.py
++++ b/python/sglang/srt/distributed/utils.py
+@@ -204,6 +204,57 @@ def tp_plan_active(tp_size: int) -> bool:
+     return bool(ratios) and len(ratios) == tp_size
+ 
+ 
++def tp_attention_head_counts(
++    total_num_heads: int,
++    total_num_kv_heads: int,
++    tp_size: int,
++    tp_rank: int,
++) -> Tuple[int, int]:
++    """Per-rank ``(num_heads, num_kv_heads)`` for the standard GQA
++    attention head computation in the model files.
++
++    Default path (no shard plan installed, or the plan does not match
++    ``tp_size``): bit-identical to the classic model-side computation --
++    ``assert total % tp == 0`` for q heads, partition-or-replicate for kv
++    heads (``max(1, total_kv // tp)``).
++
++    Uneven TP (--rank-tp-ratio): unit partition with kv heads as the
++    indivisible units, so every rank owns whole GQA groups and the q
++    heads follow the same unit distribution -- matching the split in
++    QKVParallelLinear. Models whose kv-head count is below tp_size would
++    need kv-head replication, which has no meaningful uneven shard
++    (every rank must own >= 1 kv head); they are rejected here with a
++    clear error at model build time instead of failing later with a
++    shape mismatch.
++    """
++    if tp_plan_active(tp_size):
++        if total_num_kv_heads < tp_size:
++            raise ValueError(
++                f"Uneven TP (--rank-tp-ratio) requires at least one kv head "
++                f"per rank, but the model has {total_num_kv_heads} kv heads "
++                f"for tp_size={tp_size} (kv-head replication is not "
++                f"supported with uneven shards). Use tp_size <= "
++                f"{total_num_kv_heads} or drop --rank-tp-ratio."
++            )
++        num_heads = tp_partition_size(
++            total_num_heads, tp_size, tp_rank, total_num_kv_heads
++        )
++        num_kv_heads = tp_partition_size(
++            total_num_kv_heads, tp_size, tp_rank, total_num_kv_heads
++        )
++        return num_heads, num_kv_heads
++    assert total_num_heads % tp_size == 0
++    if total_num_kv_heads >= tp_size:
++        # Number of KV heads is greater than TP size, so we partition
++        # the KV heads across multiple tensor parallel GPUs.
++        assert total_num_kv_heads % tp_size == 0
++    else:
++        # Number of KV heads is less than TP size, so we replicate
++        # the KV heads across multiple tensor parallel GPUs.
++        assert tp_size % total_num_kv_heads == 0
++    return total_num_heads // tp_size, max(1, total_num_kv_heads // tp_size)
++
++
+ def tp_loaded_shard_start(
+     loaded_full: int,
+     tp_size: Optional[int],
+diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
+index e11563564f..50237abe62 100644
+--- a/python/sglang/srt/model_loader/loader.py
++++ b/python/sglang/srt/model_loader/loader.py
+@@ -296,6 +296,37 @@ def _get_quantization_config(
+     return None
+ 
+ 
++def _check_uneven_tp_support(model_class) -> None:
++    """Fail fast when an uneven-TP shard plan (--rank-tp-ratio) is
++    installed but the model architecture has not been converted to the
++    rank-aware helpers (tp_attention_head_counts / tp_partition_*).
++
++    Unconverted models still compute heads as ``total // tp_size``; under
++    a plan their layer shapes would not match the plan-aware weight
++    loader offsets (a wall of shape mismatches at load, or in the worst
++    case silently inconsistent shards). Converted architectures carry a
++    ``supports_uneven_tp = True`` class attribute.
++    """
++    from sglang.srt.distributed.utils import get_tp_partition_ratios
++
++    if get_tp_partition_ratios() is None:
++        return
++    if getattr(model_class, "supports_uneven_tp", False):
++        return
++    raise ValueError(
++        f"Model architecture {model_class.__name__} does not support uneven "
++        "tensor parallelism (--rank-tp-ratio): its head/state computations "
++        "still assume an even total//tp_size split, which does not match the "
++        "shard plan's weight partitioning. Converted architectures include "
++        "the llama family, Qwen2/Qwen3 dense, Mixtral, Gemma3 (text) and "
++        "Qwen3-Next / Qwen3.5 / Qwen3.6 (GDN, incl. their MTP drafts). "
++        "Either drop --rank-tp-ratio (--rank-gpu-id placement with an even "
++        "split still works for every model) or convert the model following "
++        "the pattern in models/llama.py and mark it with "
++        "supports_uneven_tp = True."
++    )
++
++
+ def _initialize_model(
+     model_config: ModelConfig,
+     load_config: LoadConfig,
+@@ -303,6 +334,7 @@ def _initialize_model(
+ ) -> nn.Module:
+     """Initialize a model with the given configurations."""
+     model_class, _ = get_model_architecture(model_config)
++    _check_uneven_tp_support(model_class)
+     kwargs = {
+         "config": model_config.hf_config,
+         "quant_config": quant_config,
+diff --git a/python/sglang/srt/models/gemma3_causal.py b/python/sglang/srt/models/gemma3_causal.py
+index e956c28f4f..6b6993bc1f 100644
+--- a/python/sglang/srt/models/gemma3_causal.py
++++ b/python/sglang/srt/models/gemma3_causal.py
+@@ -26,6 +26,7 @@ from transformers import (
+     PreTrainedModel,
+ )
+ 
++from sglang.srt.distributed.utils import tp_attention_head_counts
+ from sglang.srt.layers.activation import GeluAndMul
+ from sglang.srt.layers.layernorm import Gemma3RMSNorm
+ from sglang.srt.layers.linear import (
+@@ -124,22 +125,16 @@ class Gemma3Attention(nn.Module):
+         self.layer_id = layer_id
+         self.config = config
+         tp_size = get_parallel().tp_size
++        tp_rank = get_parallel().tp_rank
+ 
+         self.total_num_heads = config.num_attention_heads
+-        assert self.total_num_heads % tp_size == 0
+-        self.num_heads = self.total_num_heads // tp_size
+         self.total_num_kv_heads = config.num_key_value_heads
+-
+-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+-
+-        if self.total_num_kv_heads >= tp_size:
+-            # Number of KV heads is greater than TP size, so we partition
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert self.total_num_kv_heads % tp_size == 0
+-        else:
+-            # Number of KV heads is less than TP size, so we replicate
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert tp_size % self.total_num_kv_heads == 0
++        # Default path: classic assert/divide/replicate. Uneven TP
++        # (--rank-tp-ratio): heads follow the shard plan with kv heads as
++        # indivisible units, matching the split in QKVParallelLinear.
++        self.num_heads, self.num_kv_heads = tp_attention_head_counts(
++            self.total_num_heads, self.total_num_kv_heads, tp_size, tp_rank
++        )
+ 
+         hidden_size = config.hidden_size
+ 
+@@ -169,6 +164,10 @@ class Gemma3Attention(nn.Module):
+             bias=config.attention_bias,
+             quant_config=quant_config,
+             prefix=add_prefix("o_proj", prefix),
++            # Uneven TP: the o_proj input dim is partitioned like the q
++            # heads in qkv_proj (kv-head units). Ignored on the default
++            # path (no shard plan installed).
++            tp_units=self.total_num_kv_heads,
+         )
+ 
+         self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
+@@ -667,6 +666,10 @@ class Gemma3TextModel(PreTrainedModel):
+ 
+ 
+ class Gemma3ForCausalLM(PreTrainedModel):
++    # This architecture's head/state computations are shard-plan aware
++    # (uneven TP via --rank-tp-ratio); checked at load time in
++    # model_loader/loader.py.
++    supports_uneven_tp = True
+     config_class = Gemma3TextConfig
+ 
+     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+diff --git a/python/sglang/srt/models/llama.py b/python/sglang/srt/models/llama.py
+index b6ce77f080..7bda5c2b42 100644
+--- a/python/sglang/srt/models/llama.py
++++ b/python/sglang/srt/models/llama.py
+@@ -29,7 +29,7 @@ from sglang.srt.distributed import (
+     get_pp_group,
+     get_pp_indices,
+ )
+-from sglang.srt.distributed.utils import tp_partition_size, tp_plan_active
++from sglang.srt.distributed.utils import tp_attention_head_counts
+ from sglang.srt.layers.activation import SiluAndMul
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import (
+@@ -144,29 +144,12 @@ class LlamaAttention(nn.Module):
+         tp_rank = get_parallel().tp_rank
+         self.total_num_heads = num_heads
+         self.total_num_kv_heads = num_kv_heads
+-        if tp_plan_active(tp_size):
+-            # Uneven TP (--rank-tp-ratio): heads follow the shard plan
+-            # with kv heads as indivisible units, matching the split in
+-            # QKVParallelLinear (whole GQA groups per rank; kv-head
+-            # replication is rejected there).
+-            self.num_heads = tp_partition_size(
+-                self.total_num_heads, tp_size, tp_rank, self.total_num_kv_heads
+-            )
+-            self.num_kv_heads = tp_partition_size(
+-                self.total_num_kv_heads, tp_size, tp_rank, self.total_num_kv_heads
+-            )
+-        else:
+-            assert self.total_num_heads % tp_size == 0
+-            self.num_heads = self.total_num_heads // tp_size
+-            if self.total_num_kv_heads >= tp_size:
+-                # Number of KV heads is greater than TP size, so we partition
+-                # the KV heads across multiple tensor parallel GPUs.
+-                assert self.total_num_kv_heads % tp_size == 0
+-            else:
+-                # Number of KV heads is less than TP size, so we replicate
+-                # the KV heads across multiple tensor parallel GPUs.
+-                assert tp_size % self.total_num_kv_heads == 0
+-            self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
++        # Default path: classic assert/divide/replicate. Uneven TP
++        # (--rank-tp-ratio): heads follow the shard plan with kv heads as
++        # indivisible units, matching the split in QKVParallelLinear.
++        self.num_heads, self.num_kv_heads = tp_attention_head_counts(
++            self.total_num_heads, self.total_num_kv_heads, tp_size, tp_rank
++        )
+         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
+         self.head_dim = getattr(
+             config, "head_dim", self.hidden_size // self.total_num_heads
+@@ -474,6 +457,10 @@ class LlamaModel(nn.Module):
+ 
+ 
+ class LlamaForCausalLM(nn.Module):
++    # This architecture's head/state computations are shard-plan aware
++    # (uneven TP via --rank-tp-ratio); checked at load time in
++    # model_loader/loader.py.
++    supports_uneven_tp = True
+     # BitandBytes specific attributes
+     default_bitsandbytes_target_modules = [
+         ".gate_proj.",
+diff --git a/python/sglang/srt/models/mixtral.py b/python/sglang/srt/models/mixtral.py
+index e797b7daf8..f4cd691409 100644
+--- a/python/sglang/srt/models/mixtral.py
++++ b/python/sglang/srt/models/mixtral.py
+@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
+     get_pp_group,
+     tensor_model_parallel_all_reduce,
+ )
++from sglang.srt.distributed.utils import tp_attention_head_counts
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import (
+     QKVParallelLinear,
+@@ -61,6 +62,15 @@ class MixtralMoE(nn.Module):
+     Each expert's weights are sharded across all ranks and a fused MoE
+     kernel is used for the forward pass, and finally we reduce the outputs
+     across ranks.
++
++    NOTE (uneven TP, --rank-tp-ratio): expert weights go through FusedMoE,
++    which has its own TP split logic (not layers/linear.py) and keeps the
++    classic EVEN intermediate-size split per rank. This is functionally
++    correct under an uneven shard plan -- every expert is internally
++    consistent and the final all_reduce is independent of shard sizes --
++    but the MoE share of memory/compute does NOT scale with the ratio;
++    only the attention part of this model does. intermediate_size must
++    stay divisible by tp_size as before.
+     """
+ 
+     def __init__(
+@@ -133,19 +143,15 @@ class MixtralAttention(nn.Module):
+         super().__init__()
+         self.hidden_size = hidden_size
+         tp_size = get_parallel().tp_size
++        tp_rank = get_parallel().tp_rank
+         self.total_num_heads = num_heads
+-        assert self.total_num_heads % tp_size == 0
+-        self.num_heads = self.total_num_heads // tp_size
+         self.total_num_kv_heads = num_kv_heads
+-        if self.total_num_kv_heads >= tp_size:
+-            # Number of KV heads is greater than TP size, so we partition
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert self.total_num_kv_heads % tp_size == 0
+-        else:
+-            # Number of KV heads is less than TP size, so we replicate
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert tp_size % self.total_num_kv_heads == 0
+-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
++        # Default path: classic assert/divide/replicate. Uneven TP
++        # (--rank-tp-ratio): heads follow the shard plan with kv heads as
++        # indivisible units, matching the split in QKVParallelLinear.
++        self.num_heads, self.num_kv_heads = tp_attention_head_counts(
++            self.total_num_heads, self.total_num_kv_heads, tp_size, tp_rank
++        )
+         self.head_dim = hidden_size // self.total_num_heads
+         self.q_size = self.num_heads * self.head_dim
+         self.kv_size = self.num_kv_heads * self.head_dim
+@@ -167,6 +173,10 @@ class MixtralAttention(nn.Module):
+             bias=False,
+             quant_config=quant_config,
+             prefix=add_prefix("o_proj", prefix),
++            # Uneven TP: the o_proj input dim is partitioned like the q
++            # heads in qkv_proj (kv-head units). Ignored on the default
++            # path (no shard plan installed).
++            tp_units=self.total_num_kv_heads,
+         )
+         self.rotary_emb = get_rope(
+             self.head_dim,
+@@ -336,6 +346,10 @@ class MixtralModel(nn.Module):
+ 
+ 
+ class MixtralForCausalLM(nn.Module):
++    # This architecture's head/state computations are shard-plan aware
++    # (uneven TP via --rank-tp-ratio); checked at load time in
++    # model_loader/loader.py.
++    supports_uneven_tp = True
+ 
+     def __init__(
+         self,
+diff --git a/python/sglang/srt/models/qwen2.py b/python/sglang/srt/models/qwen2.py
+index 98ae54aeb3..35aacda6cf 100644
+--- a/python/sglang/srt/models/qwen2.py
++++ b/python/sglang/srt/models/qwen2.py
+@@ -26,6 +26,7 @@ from sglang.srt.distributed import (
+     get_pp_group,
+     get_pp_indices,
+ )
++from sglang.srt.distributed.utils import tp_attention_head_counts
+ from sglang.srt.layers.activation import SiluAndMul
+ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+ from sglang.srt.layers.layernorm import RMSNorm
+@@ -123,19 +124,15 @@ class Qwen2Attention(nn.Module):
+         super().__init__()
+         self.hidden_size = hidden_size
+         tp_size = get_parallel().tp_size
++        tp_rank = get_parallel().tp_rank
+         self.total_num_heads = num_heads
+-        assert self.total_num_heads % tp_size == 0
+-        self.num_heads = self.total_num_heads // tp_size
+         self.total_num_kv_heads = num_kv_heads
+-        if self.total_num_kv_heads >= tp_size:
+-            # Number of KV heads is greater than TP size, so we partition
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert self.total_num_kv_heads % tp_size == 0
+-        else:
+-            # Number of KV heads is less than TP size, so we replicate
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert tp_size % self.total_num_kv_heads == 0
+-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
++        # Default path: classic assert/divide/replicate. Uneven TP
++        # (--rank-tp-ratio): heads follow the shard plan with kv heads as
++        # indivisible units, matching the split in QKVParallelLinear.
++        self.num_heads, self.num_kv_heads = tp_attention_head_counts(
++            self.total_num_heads, self.total_num_kv_heads, tp_size, tp_rank
++        )
+         if head_dim is not None:
+             self.head_dim = head_dim
+         else:
+@@ -161,6 +158,10 @@ class Qwen2Attention(nn.Module):
+             bias=False,
+             quant_config=quant_config,
+             prefix=add_prefix("o_proj", prefix),
++            # Uneven TP: the o_proj input dim is partitioned like the q
++            # heads in qkv_proj (kv-head units). Ignored on the default
++            # path (no shard plan installed).
++            tp_units=self.total_num_kv_heads,
+         )
+ 
+         self.rotary_emb = get_rope(
+@@ -425,6 +426,10 @@ class Qwen2Model(nn.Module):
+ 
+ 
+ class Qwen2ForCausalLM(nn.Module):
++    # This architecture's head/state computations are shard-plan aware
++    # (uneven TP via --rank-tp-ratio); checked at load time in
++    # model_loader/loader.py.
++    supports_uneven_tp = True
+     # BitandBytes specific attributes
+     default_bitsandbytes_target_modules = [
+         ".gate_proj.",
+diff --git a/python/sglang/srt/models/qwen3.py b/python/sglang/srt/models/qwen3.py
+index daaca22764..e5ed981814 100644
+--- a/python/sglang/srt/models/qwen3.py
++++ b/python/sglang/srt/models/qwen3.py
+@@ -8,6 +8,7 @@ from torch import nn
+ from sglang.srt.distributed import (
+     get_pp_group,
+ )
++from sglang.srt.distributed.utils import tp_attention_head_counts
+ from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+@@ -86,18 +87,15 @@ class Qwen3Attention(nn.Module):
+         attn_tp_rank = get_parallel().attn_tp_rank
+         attn_tp_size = get_parallel().attn_tp_size
+ 
+-        assert self.total_num_heads % attn_tp_size == 0
+-        self.num_heads = self.total_num_heads // attn_tp_size
+         self.total_num_kv_heads = num_kv_heads
+-        if self.total_num_kv_heads >= attn_tp_size:
+-            # Number of KV heads is greater than TP size, so we partition
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert self.total_num_kv_heads % attn_tp_size == 0
+-        else:
+-            # Number of KV heads is less than TP size, so we replicate
+-            # the KV heads across multiple tensor parallel GPUs.
+-            assert attn_tp_size % self.total_num_kv_heads == 0
+-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
++        # Default path: classic assert/divide/replicate. Uneven TP
++        # (--rank-tp-ratio): heads follow the shard plan with kv heads as
++        # indivisible units, matching the split in QKVParallelLinear.
++        # (Uneven TP is pure single-node TP, so attn_tp_size == tp_size
++        # whenever a plan is installed.)
++        self.num_heads, self.num_kv_heads = tp_attention_head_counts(
++            self.total_num_heads, self.total_num_kv_heads, attn_tp_size, attn_tp_rank
++        )
+         self.head_dim = head_dim or hidden_size // self.total_num_heads
+         self.q_size = self.num_heads * self.head_dim
+         self.kv_size = self.num_kv_heads * self.head_dim
+@@ -137,6 +135,10 @@ class Qwen3Attention(nn.Module):
+             tp_size=attn_tp_size,
+             reduce_results=False,
+             prefix=add_prefix("o_proj", prefix),
++            # Uneven TP: the o_proj input dim is partitioned like the q
++            # heads in qkv_proj (kv-head units). Ignored on the default
++            # path (no shard plan installed).
++            tp_units=self.total_num_kv_heads,
+         )
+ 
+         self.rotary_emb = get_rope(
+@@ -450,6 +452,10 @@ class Qwen3Model(Qwen2Model):
+ 
+ 
+ class Qwen3ForCausalLM(nn.Module):
++    # This architecture's head/state computations are shard-plan aware
++    # (uneven TP via --rank-tp-ratio); checked at load time in
++    # model_loader/loader.py.
++    supports_uneven_tp = True
+     # BitandBytes specific attributes
+     default_bitsandbytes_target_modules = [
+         ".gate_proj.",
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index a36c677c6e..051a50b77b 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1173,6 +1173,10 @@ ALL_DECODER_LAYER_TYPES = {
+ class Qwen3_5ForCausalLM(nn.Module):
+     """Qwen3.5 Model with support for dense variant."""
+ 
++    # This architecture's head/state computations are shard-plan aware
++    # (uneven TP via --rank-tp-ratio); checked at load time in
++    # model_loader/loader.py.
++    supports_uneven_tp = True
+     packed_modules_mapping = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+         "gate_up_proj": ["gate_proj", "up_proj"],
+@@ -1698,6 +1702,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+ 
+ 
+ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
++    # The language model is shard-plan aware (uneven TP via
++    # --rank-tp-ratio). The VISION tower is not: it must run
++    # replicated via --mm-enable-dp-encoder (enforced in
++    # Qwen3VLForConditionalGeneration when a plan is installed).
++    supports_uneven_tp = True
+     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+     hf_to_sglang_mapper = None
+ 
+@@ -1854,6 +1863,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+ 
+ 
+ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
++    # The language model is shard-plan aware (uneven TP via
++    # --rank-tp-ratio). The VISION tower is not: it must run
++    # replicated via --mm-enable-dp-encoder (enforced in
++    # Qwen3VLForConditionalGeneration when a plan is installed).
++    supports_uneven_tp = True
+     """Qwen3.5 MoE Vision-Language Model."""
+ 
+     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+diff --git a/python/sglang/srt/models/qwen3_5_mtp.py b/python/sglang/srt/models/qwen3_5_mtp.py
+index ebda7517fd..da5be24bdb 100644
+--- a/python/sglang/srt/models/qwen3_5_mtp.py
++++ b/python/sglang/srt/models/qwen3_5_mtp.py
+@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ class Qwen3_5ForCausalLMMTP(nn.Module):
++    # The draft wraps the shard-plan-aware Qwen3_5ForCausalLM (plus a
++    # replicated fc), so it is uneven-TP ready as well; checked at load
++    # time in model_loader/loader.py.
++    supports_uneven_tp = True
+ 
+     def __init__(
+         self,
+diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
+index 64ba393d2c..58a5a31647 100644
+--- a/python/sglang/srt/models/qwen3_next.py
++++ b/python/sglang/srt/models/qwen3_next.py
+@@ -1067,6 +1067,10 @@ class HybridLayerType(enum.Enum):
+ 
+ 
+ class Qwen3NextForCausalLM(nn.Module):
++    # This architecture's head/state computations are shard-plan aware
++    # (uneven TP via --rank-tp-ratio); checked at load time in
++    # model_loader/loader.py.
++    supports_uneven_tp = True
+     fall_back_to_pt_during_load = False
+ 
+     # Map fused module names to their checkpoint (unfused) counterparts.
+diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
+index aa7f7c9c19..730e5cf40d 100644
+--- a/python/sglang/srt/models/qwen3_vl.py
++++ b/python/sglang/srt/models/qwen3_vl.py
+@@ -28,6 +28,7 @@ from transformers.activations import ACT2FN
+ 
+ from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+ from sglang.srt.distributed.parallel_state import get_pp_group
++from sglang.srt.distributed.utils import tp_plan_active
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.vision import (
+     BATCH_BUCKETS,
+@@ -1233,6 +1234,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
+ 
+         self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+ 
++        # Uneven TP (--rank-tp-ratio): the vision tower's model-side head
++        # math is NOT shard-plan aware (only the language model is), so it
++        # must run replicated on every rank. Reject at build time instead
++        # of failing later with a weight-shape mismatch.
++        if tp_plan_active(get_parallel().tp_size) and not self.use_data_parallel:
++            raise ValueError(
++                "Uneven TP (--rank-tp-ratio) requires the vision encoder to "
++                "run replicated: pass --mm-enable-dp-encoder. The language "
++                "model follows the shard plan; the vision tower does not."
++            )
++
+         self.visual = Qwen3VLMoeVisionModel(
+             config.vision_config,
+             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.

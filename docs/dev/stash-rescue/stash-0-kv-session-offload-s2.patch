@@ -1,0 +1,51 @@
+diff --git a/python/sglang/srt/managers/kv_session_offload.py b/python/sglang/srt/managers/kv_session_offload.py
+index 838516ddb8..d8c7910489 100644
+--- a/python/sglang/srt/managers/kv_session_offload.py
++++ b/python/sglang/srt/managers/kv_session_offload.py
+@@ -80,15 +80,42 @@ def sentinel_base(alloc_max_slot: int, split_factor: int) -> int:
+ 
+ 
+ def make_sentinels(
+-    host_base: int, split_factor: int, residues: torch.Tensor
++    host_base: int, split_factor: int, residues: torch.Tensor, start: int = 0
+ ) -> torch.Tensor:
+-    """Sentinel slot ids for positions ``0..len(residues)-1`` with the given
+-    owner residues. int64; caller casts for the req_to_token write."""
++    """Sentinel slot ids for positions ``start..start+len(residues)-1`` with
++    the given owner residues. int64; caller casts for the req_to_token
++    write. ``start`` > 0 encodes a PARTIAL spill segment (S1b): only the
++    positions inside the tier segment [a, b) carry sentinels."""
+     n = residues.numel()
+-    p = torch.arange(n, dtype=torch.int64, device=residues.device)
++    p = torch.arange(start, start + n, dtype=torch.int64, device=residues.device)
+     return host_base + p * int(split_factor) + residues.to(torch.int64)
+ 
+ 
++def chunk_ceil(need: int, chunk: int) -> int:
++    """Round a token shortfall up to the spill-growth chunk (amortizes the
++    per-event D2H cost; the over-eviction margin is bounded by chunk-1)."""
++    c = max(1, int(chunk))
++    n = max(0, int(need))
++    return ((n + c - 1) // c) * c
++
++
++def bundle_spillable_sizes(req, seq_len: int) -> List[Tuple[str, int]]:
++    """Per-resource spillable sizes of one session's RESIDENCY BUNDLE.
++
++    Factoring seam for the future GDN-state host tier: a session's
++    residency unit is the BUNDLE of (target KV shard, GDN/Mamba states,
++    MTP-draft share). Victim ORDERING stays `session_priority_key` /
++    `select_spill_victim` (resource-agnostic); the MECHANICS consume this
++    list. In S2 the KV shard is the only element; a GDN tier adds
++    ("gdn_state", ...) / ("draft_kv", ...) entries here without touching
++    the ordering logic. NOTE: the S1 spec-decode rejection will later be
++    lifted through exactly this bundle -- the draft share spills WITH the
++    session instead of speculative decoding being forbidden.
++    """
++    kv = max(0, int(seq_len) - int(req.cache_protected_len or 0))
++    return [("kv", kv)]
++
++
+ def new_token_residue(position: int, split_factor: int) -> int:
+     """Owner residue assigned to a token generated WHILE spilled."""
+     return int(position) % max(1, int(split_factor))
