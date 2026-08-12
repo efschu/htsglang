@@ -150,6 +150,28 @@ built** — the spill path's design IS a runtime-adaptive decomposition. Making
 them compose means pinning the boundary and the split-k, at an unpriced
 performance cost. That is a product decision, not a bug fix.
 
+**BOOKED AS A REFUSAL PAIR, and the direction matters:**
+
+> **REFUSED (guarantee):** a session that went through a kvso spill is
+> **excluded from any determinism guarantee**. The **#412 determinism-
+> certificate mode must NAME this exclusion in the certificate** — written
+> onto the #412 row of `ROADMAP_456_matrix_execution.md` *before* the mode is
+> built, so it cannot ship a claim it cannot honour.
+>
+> **NOT REFUSED (boot):** the flag pair. The two flags boot and serve
+> correctly together at a sufficient chunk budget; most sessions never spill.
+
+Getting that split backwards is a documented failure on this line — C30 records
+a shift told to "wire a LOUD boot-time refusal naming both flags", which would
+have rejected a working config while leaving the real trap armed. **The object
+of refusal is the CLAIM, not the configuration.**
+
+Operational gap worth knowing today: **spilling is silent to the client.**
+There is no per-response marker distinguishing an answer that came back through
+the host tier from one that never left the device, so a caller cannot tell a
+guaranteed answer from an excluded one. #412 would need that signal; the
+`PARK/SPILL rid=` records already carry what it needs.
+
 ### 1c. THE #330 DIAL BRIEF CONTAINED TWO FALSE PREMISES
 
 Booked as **C32**. Item 3 passed (`PROOF_EXIT=0`) but two of its four

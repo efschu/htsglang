@@ -746,6 +746,35 @@ runtime-adaptive decomposition. Making them compose is not a flag fix; it
 requires pinning the boundary and the split-k, at a performance cost nobody
 has priced. Whether that is worth doing is a product decision, not a bug fix.
 
+**THE REFUSAL THIS PRODUCES, AND THE ONE IT MUST NOT PRODUCE.**
+
+> **REFUSED (guarantee):** a session that has been through a
+> kv-session-offload spill is **excluded from any determinism guarantee** this
+> engine issues. The **#412 determinism-certificate mode must NAME this
+> exclusion** in the certificate itself, not in a footnote — recorded on the
+> #412 row of `ROADMAP_456_matrix_execution.md` **before** the mode is built,
+> so it cannot ship a claim it cannot honour.
+>
+> **NOT REFUSED (boot):** the flag pair itself. `--enable-deterministic-
+> inference` + `--enable-kv-session-offload` boot and serve correctly together
+> at a sufficient chunk budget, and most sessions never spill.
+
+**That split is the entire point, and getting it backwards is a documented
+failure mode on this very line.** C30 records a shift that was told to "wire a
+LOUD boot-time refusal naming both flags" and would have rejected a working
+configuration while leaving the real trap armed. The correct object of refusal
+here is **the claim, not the configuration**: a certificate asserting
+"deterministic" over a boot where a session may silently spill is false, and
+falsity is what gets refused. A boot-time exclusion would destroy a useful
+config to protect a guarantee that nothing has yet issued.
+
+The operational consequence for anyone running determinism today: **spilling is
+silent from the client's side.** There is no per-response marker saying "this
+answer came back through the host tier", so a caller cannot currently tell a
+guaranteed answer from an excluded one. If #412 is built, the certificate needs
+that per-response signal, and the `PARK/SPILL rid=` records already carry
+exactly the information it would need.
+
 The FILE-tier park arm is separately
 unproven — the host tier is sized to hold **one** full-context region (proved
 by the refusal at `--kv-session-offload-host-ram-gib 0.12`: *"cannot hold even

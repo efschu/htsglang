@@ -82,7 +82,35 @@ left one cheaper successor window in its place (row 2).
 | #363 weight mover + full pre-capture | #363 | #286 (WAVE 1 item 5) landed | `DESIGN_363_regime_controller.md` §20.2/§20.3 built and card-gated per that document's own §11.7-style evidence discipline |
 | Remote integration into `expert_compute_placement` | #439 + #453 | WAVE 3's #302c and #453 both landed | the #439 compute-placement mechanism extended to route to the remote CPU lane, not only across local ranks |
 | #411 portable sessions | #411 | none named here beyond the never-silent-conversion contract already cited (`DESIGN_261_live_session_handover.md`) | — |
-| #412 determinism mode | #412 | — | — |
+| #412 determinism mode | #412 | **must name the C31 exclusion (below)** | a certificate that ENUMERATES what it does not cover |
+
+**#412 CARRIES A NAMED EXCLUSION BEFORE IT IS BUILT (C31, measured 2026-08-12).**
+Any determinism guarantee this mode issues **must exclude sessions that have
+been through a kv-session-offload spill**, and must say so in the certificate
+rather than in a footnote. This is not a caution, it is a measured fact: with
+`--enable-deterministic-inference` live and holding (17 never-spilled
+generations byte-identical across 5 runs), every session that spilled produced
+different output — 3 spills, 3 distinct outputs, differing from the reference
+and from each other.
+
+The cause is structural, not a bug to be fixed before #412 ships:
+`kv_session_offload.py` never consults the determinism config at all (0
+references to `enable_deterministic_inference` / `fixed_split_size` /
+`split_tile`), the spill path's `w.plan(...)` calls drop the
+`fixed_split_size` the resident path pins, and a spilled session's attention is
+a chain of partials folded by a **non-associative** `_safe_merge_state` whose
+shape is chosen by a **CUDA-event timing probe**
+(`kv_session_offload.py:4983`). A guarantee cannot cover a decomposition
+selected by wall-clock progress.
+
+So the pair is **refused as a GUARANTEE pair, not as a boot pair** — and that
+distinction is load-bearing. The two flags boot and serve correctly together
+(C30); refusing the combination at boot would repeat exactly the error C30
+records, rejecting a working and useful configuration. What must be refused is
+the *claim*: a certificate that says "deterministic" over a boot where a
+session may silently spill is false, and #412 must either name spilled
+sessions as out of scope or pin the wave-back boundary and the split-k first,
+at a performance cost nobody has priced.
 
 ---
 
