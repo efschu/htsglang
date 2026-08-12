@@ -38,7 +38,42 @@ Specifically unproven on metal:
   the wrong branch. The memory *is* locked; torch's bookkeeping just does not
   own it.
 
-### 1.2 A correctness risk I accepted deliberately, and you should re-check
+### 1.2 Two regressions this branch already caused, found and fixed here
+
+Both were found by running the suites, not by reading the code. Recording them
+because the second one falsified a claim I had written into the module's own
+docstring.
+
+**(a) `AttributeError: 'Scheduler' object has no attribute 'tp_rank'` — a
+read-only instrument took a boot down.** The census was wired as
+`log_host_shmem_census(rank=self.tp_rank)`. The Scheduler has no `tp_rank`
+(the residency census beside it reads `getattr(model_runner, "tp_rank", -1)`,
+off the model_runner, defensively — I did not copy that). The AttributeError
+propagated out of scheduler init, the launcher SIGKILLed the process group,
+and `test_customized_info_streaming.py` died at **exit 137** with no summary.
+
+`log_host_shmem_census` had a `try/except` and its docstring said it was
+"never able to break a boot". **That was false**, twice over: the argument was
+evaluated at the CALL SITE, outside the guard, and the guard covered only the
+collection, not the rendering after it. Now: rank via `getattr` off the
+model_runner, the whole call wrapped at the call site, and the whole body
+wrapped inside. Pinned by `test_the_census_can_never_raise`.
+
+The general lesson, worth carrying: **a `try/except` inside a function does not
+protect the expression that computes its arguments.**
+
+**(b) `torch.empty` silently became a zeroing allocation.** `arena_image` used
+`torch.empty`; routing it through `_alloc_host_image` made it zero-fill, which
+faults every page in up front. Resident pages, not virtual size, are what get a
+process killed. `_alloc_host_image` now takes `zero=`, and `arena_image` passes
+`zero=False` — every byte there is overwritten immediately anyway. Pinned by
+`test_an_overwritten_image_is_not_faulted_in_up_front`.
+
+(b) was found first and did NOT fix the exit-137; (a) was the actual cause. I
+am recording that ordering because it is the trap: the first plausible
+explanation for a memory-shaped symptom was memory-shaped, and wrong.
+
+### 1.3 A correctness risk I accepted deliberately, and you should re-check
 
 `image_from_tensors` promises "alignment-gap bytes are zeroed, so the checksum
 is deterministic". The old code got that from `torch.zeros`. The new code gets
@@ -51,7 +86,7 @@ checksum goes non-deterministic across boots.** `_alloc_host_image` pins the
 allocator explicitly (`allocator=None` → a fresh `HostTensorAllocator`) to stop
 that, but it is a comment-and-argument defence, not a mechanism.
 
-### 1.3 What I did NOT do
+### 1.4 What I did NOT do
 
 * **No madvise / PAGEOUT lever.** The task anticipated the `#408/#644`
   `ConsumedPageDropper` as the tool. It does not apply: that dropper reclaims
@@ -70,7 +105,7 @@ that, but it is a comment-and-argument defence, not a mechanism.
 * **`--pp-stage-ratio` was not touched.** See 6.2: it is the bigger lever and
   it is a one-flag change.
 
-### 1.4 Measurement caveat
+### 1.5 Measurement caveat
 
 The 75.07 GiB figure comes from cgroup `/.lxc`, the ranks' own cgroup. The
 namespace root `/sys/fs/cgroup` reported *nothing useful* — the kernel does not
@@ -80,6 +115,15 @@ be conservative-but-useless here. The new census module reads the process's own
 cgroup from `/proc/self/cgroup`. **`_read_cgroup_memory` still reads the root**
 — I left it alone rather than change the behaviour of a function six guards
 depend on, but that is an inconsistency someone should resolve.
+
+### 1.6 The test box kills long pytest runs at random
+
+Several full-directory runs ended mid-progress with no summary, on the
+UNMODIFIED parent commit as well as on this branch (the baseline 4-directory
+run truncated at 84% once and completed at another attempt). That is
+environmental and independent of this work, but it means a single truncated
+run proves nothing -- compare completed runs only, and re-run before believing
+a disappearance.
 
 ---
 
@@ -186,7 +230,7 @@ that adds host posts up.
 | `python/sglang/srt/mem_ledger/host_shmem.py` | **new.** Read-only per-rank host-shmem census from `/proc/<pid>/smaps`, classified by owner (`anon-shared`, `shm-nccl`, `shm-named`, `driver`, `file-shared`), in Pss. Reads the process's own cgroup. One grep-able line, **not env-gated**. |
 | `python/sglang/srt/managers/scheduler.py` | emits the boot line at the at-rest point, next to the #485 residency census. |
 | `scripts/vram_ledger/host_shmem_695.py` | **new, executable.** The metal recipe: `--save`, `--compare`, verdict with exit code. |
-| 3 new test files | 32 tests, all hermetic, all CPU. |
+| 3 new test files | 37 tests, all hermetic, all CPU. |
 
 ### The boot line
 
@@ -265,4 +309,44 @@ mappings, when fed a no-op.
    scope here; name it before anyone "discovers" it again.
 4. **`--phase-flip-spill-depth cache`** instead of `arena` removes 3 × 512 MiB
    and nothing more. Not worth the VRAM rungs it costs.
-5. **Resolve the cgroup-path inconsistency** in 1.4.
+5. **Resolve the cgroup-path inconsistency** in 1.5.
+
+---
+
+## 7. TEST RESULTS (all CPU, `PYTHONPATH=/spinning/wt-shmem-lever/python`)
+
+Every directory compared against a clean worktree of the parent commit
+`281bbfb739` at `/tmp/wt-695-baseline`, because a failure count means nothing
+without the number it is being compared to.
+
+| suite | this branch | baseline `281bbfb739` |
+|---|---|---|
+| 3 new files | **37 passed** | n/a (new) |
+| `unit/{mem_ledger,memtier,model_executor,model_loader}` | 16 failed, **1470** passed | 16 failed, **1433** passed |
+| `unit/managers` | 13 failed, **1298** passed, 1 error | 13 failed, **1298** passed, 1 error |
+| `unit/managers -k "flip or phase or arena or weights"` | **463 passed**, 0 failed | — |
+| ruff `--select=F401,F821,UP037` on every changed file | clean | — |
+
+1470 − 1433 = 37, exactly the new tests. The 16 and the 13 are identical on
+both sides: all are GPU-dependent (`retry() exceed maximum number of retries`,
+`Process group cannot be None`) and pre-existing.
+
+**Red-first**: 8 of the 9 pricer tests and 3 of the routing tests were written
+first and observed failing (`TypeError: unexpected keyword argument
+'cgroup_shmem'`; `module has no attribute '_alloc_with_host_register'`) before
+the code existed. The `--compare` gate in the recipe was exercised in both
+directions at the desk: it passes on the projected post-fix mappings and fails
+naming all six offenders when fed a no-op.
+
+**Verified live, read-only, on the running boot before it was stopped**: the
+census reconciles against the kernel. Allocating a 600 MiB anon-shared mapping
+moved the census's `host` figure 0.00 → 0.59 GiB and the cgroup's own `shmem`
+0.02 → 0.61 GiB — the Pss measurement and the cgroup charge agree.
+
+**Not verified**: that the boot line is actually *emitted* into a log file.
+The call site is proven to execute in a real scheduler init (the exit-137
+traceback in 1.2a originated at exactly that line), and the function's output
+is proven by the live smoke above — but pytest does not capture the scheduler
+subprocess's logs, so the two halves were proven separately rather than
+end-to-end. Confirm with `grep HOST-SHMEM` on the first real boot; it is step 5
+of the recipe.

@@ -191,6 +191,39 @@ class ImageAllocationRouting(unittest.TestCase):
         self.assertEqual(out.numel(), 4096)
         self.assertEqual(int(out.max()), 0)
 
+    def test_an_overwritten_image_is_not_faulted_in_up_front(self):
+        """zero=False must stay torch.empty, not torch.zeros.
+
+        REGRESSION, caught by the manager suite dying at exit 137. The first
+        version of this fix routed ``arena_image`` through a zeroing
+        allocation, where it had previously used ``torch.empty``. Every byte
+        of that image is overwritten immediately, so the zero-fill buys
+        nothing -- but it faults the whole allocation in, and over a CPU test
+        run that was the difference between finishing and being SIGKILLed.
+        Resident pages, not virtual size, is what gets a process killed.
+        """
+        import resource
+
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        big = weights_arena._alloc_host_image(256 * MIB, pin=False, zero=False)
+        after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        try:
+            self.assertEqual(big.numel(), 256 * MIB)
+            # ru_maxrss is in KiB. An untouched torch.empty must not move the
+            # high-water mark by anything like the allocation size.
+            self.assertLess(
+                (after - before) * 1024,
+                128 * MIB,
+                "zero=False faulted the image in; it must stay torch.empty",
+            )
+        finally:
+            del big
+
+    def test_zero_true_still_zeroes(self):
+        """image_from_tensors' alignment-gap contract still holds."""
+        buf = weights_arena._alloc_host_image(4096, pin=False, zero=True)
+        self.assertEqual(int(buf.max()), 0)
+
     def test_a_failing_host_register_falls_back_to_torch_pin(self):
         """A rank that cannot register must still boot, not die at the image.
 

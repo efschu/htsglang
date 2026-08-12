@@ -322,8 +322,17 @@ def _register_image_post(nbytes: int) -> None:
         logger.debug("could not register host image post: %s", exc)
 
 
-def _alloc_host_image(total: int, pin: bool) -> torch.Tensor:
-    """``total`` zeroed host bytes, page-locked when ``pin``, EXACTLY sized.
+def _alloc_host_image(total: int, pin: bool, zero: bool = True) -> torch.Tensor:
+    """``total`` host bytes, page-locked when ``pin``, EXACTLY sized.
+
+    ``zero`` is not cosmetic and the default is not free. An UNPINNED image
+    with ``zero=False`` is ``torch.empty``: pages stay untouched until written,
+    so an image whose every byte is about to be overwritten costs no resident
+    memory up front. Forcing ``torch.zeros`` there faults the whole image in,
+    and on a CPU test run over the manager suite that alone was the difference
+    between finishing and being SIGKILLed. Callers that overwrite the payload
+    immediately (``arena_image``) pass ``zero=False``; callers that rely on
+    alignment-gap bytes being zero (``image_from_tensors``) must not.
 
     #695 -- WHY THIS IS NOT ``torch.zeros(..., pin_memory=True)``.
     Every ``pin_memory=True`` allocation goes through PyTorch's pinned-host
@@ -370,7 +379,9 @@ def _alloc_host_image(total: int, pin: bool) -> torch.Tensor:
     the rounding back, never the boot.
     """
     if not pin:
-        return torch.zeros(total, dtype=torch.uint8)
+        if zero:
+            return torch.zeros(total, dtype=torch.uint8)
+        return torch.empty(total, dtype=torch.uint8)
     # #695: make the bytes VISIBLE to the one registry that sums host posts.
     # These images never registered, so `pinned_host_budget` -- which exists
     # precisely because "two independently plausible budgets can be jointly
@@ -456,11 +467,11 @@ def arena_image(
 ) -> torch.Tensor:
     """Host snapshot of the packed arena bytes + 8-byte checksum trailer."""
     used = arena[: layout.total_bytes]
-    # #695: same exact-size pinned allocation as image_from_tensors. Every
-    # byte is overwritten below, so the zero-fill is redundant here -- it is
-    # accepted because a second allocator variant that skips it would be a
-    # second thing to keep page-locked correctly, for one memset at boot.
-    host = _alloc_host_image(layout.total_bytes + _CHECKSUM_BYTES, pin)
+    # #695: same exact-size pinned allocation as image_from_tensors, but
+    # zero=False -- the payload and the checksum trailer below overwrite every
+    # byte, so this keeps the pre-#695 torch.empty behaviour on the unpinned
+    # path instead of faulting the whole image in for nothing.
+    host = _alloc_host_image(layout.total_bytes + _CHECKSUM_BYTES, pin, zero=False)
     host[: layout.total_bytes].copy_(used)
     total = uint8_checksum(used)
     host[layout.total_bytes :] = (

@@ -396,21 +396,24 @@ def log_host_shmem_census(rank: Optional[int] = None) -> Optional[HostShmemCensu
     """
     try:
         census = collect_host_shmem_census()
+        line = render_host_shmem_line(census, rank=rank)
+        if census.residual_bytes >= RESIDUAL_WARN_BYTES:
+            logger.warning(
+                "%s -- %.2f GiB of host shmem is held by no registered post. "
+                "It is page-locked and, with swap at %s, unreclaimable; it is "
+                "charged to the cgroup under `file`, so it will not appear in "
+                "any `anon` figure. If this rank is later SIGKILLed with no "
+                "traceback, this is the first line to read.",
+                line,
+                census.residual_bytes / _GIB,
+                "0" if not census.swap_free else f"{census.swap_free / _GIB:.2f}GiB",
+            )
+        else:
+            logger.info("%s", line)
+        return census
     except Exception as exc:  # noqa: BLE001
+        # EVERYTHING is inside the guard, rendering included. The first
+        # version guarded only the collection, and the boot it then broke was
+        # broken by the line AFTER it.
         logger.warning("%s census unavailable: %s", LOG_PREFIX, exc)
         return None
-    line = render_host_shmem_line(census, rank=rank)
-    if census.residual_bytes >= RESIDUAL_WARN_BYTES:
-        logger.warning(
-            "%s -- %.2f GiB of host shmem is held by no registered post. "
-            "It is page-locked and, with swap at %s, unreclaimable; it is "
-            "charged to the cgroup under `file`, so it will not appear in any "
-            "`anon` figure. If this rank is later SIGKILLed with no "
-            "traceback, this is the first line to read.",
-            line,
-            census.residual_bytes / _GIB,
-            "0" if not census.swap_free else f"{census.swap_free / _GIB:.2f}GiB",
-        )
-    else:
-        logger.info("%s", line)
-    return census

@@ -225,6 +225,43 @@ class LiveCollection(unittest.TestCase):
             self.assertGreaterEqual(value, 0, name)
         self.assertNotIn("\n", render_host_shmem_line(c))
 
+    def test_the_census_can_never_raise(self):
+        """An instrument that can kill a boot is not an instrument.
+
+        REGRESSION. The first wiring passed `self.tp_rank`, which the
+        Scheduler does not have. The AttributeError propagated out of
+        scheduler init, the launcher SIGKILLed the process group, and a
+        read-only /proc walk took a working boot down with it -- reproduced
+        as exit 137 on test_customized_info_streaming.py. Guarding the
+        COLLECTION was not enough; the render and the argument have to be
+        covered too.
+        """
+        import sglang.srt.mem_ledger.host_shmem as hs
+
+        original = hs.collect_host_shmem_census
+        hs.collect_host_shmem_census = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        try:
+            self.assertIsNone(hs.log_host_shmem_census(rank=0))
+        finally:
+            hs.collect_host_shmem_census = original
+
+        # A renderer that blows up must not escape either.
+        original_render = hs.render_host_shmem_line
+        hs.render_host_shmem_line = lambda *a, **k: (_ for _ in ()).throw(
+            ValueError("bad format")
+        )
+        try:
+            self.assertIsNone(hs.log_host_shmem_census(rank=0))
+        finally:
+            hs.render_host_shmem_line = original_render
+
+    def test_an_unusable_rank_label_is_still_rendered(self):
+        """rank=None is the getattr default at the call site."""
+        c = HostShmemCensus(pid=4242)
+        self.assertIn("pid4242", render_host_shmem_line(c, rank=None))
+
     def test_a_new_anon_shared_mapping_shows_up(self):
         """The measurement moves when the thing it measures moves."""
         import mmap

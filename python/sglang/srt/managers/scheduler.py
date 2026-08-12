@@ -1345,9 +1345,19 @@ class Scheduler(
         # kills, one of them presenting as a silent rank death. Unlike the two
         # censuses above this one is NOT env-gated: it is the line that has to
         # already be in the log when a rank dies with exit code -9.
-        from sglang.srt.mem_ledger.host_shmem import log_host_shmem_census
+        # The rank comes off the model_runner with getattr, exactly as the
+        # residency census above does, and the whole call is guarded. The
+        # first version read `self.tp_rank`, which the Scheduler does not
+        # have: the AttributeError killed the scheduler, the launcher
+        # SIGKILLed the process group, and a read-only instrument took the
+        # boot down with it. A try/except INSIDE the census was not enough,
+        # because the argument is evaluated out here.
+        try:
+            from sglang.srt.mem_ledger.host_shmem import log_host_shmem_census
 
-        log_host_shmem_census(rank=self.tp_rank)
+            log_host_shmem_census(rank=getattr(model_runner, "tp_rank", None))
+        except Exception as host_shmem_exc:  # noqa: BLE001
+            logger.warning("#695 host-shmem census skipped: %s", host_shmem_exc)
 
         # #485 transient census (env-gated, read-only): the residency census
         # above is a snapshot AT REST, and a cut gate calibrated on at-rest
