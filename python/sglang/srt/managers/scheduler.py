@@ -1972,14 +1972,22 @@ class Scheduler(
         # server_args rather than self: init_chunked_prefill() runs later in
         # __init__, and its only transform is to map <= 0 to None, which this
         # helper already treats as "chunked prefill off".
-        _align_err = truncation_align_admission_error(
+        _align_err, _align_warn = truncation_align_admission_error(
             self.server_args.chunked_prefill_size,
             self.server_args.page_size,
             self.truncation_align_size,
             sources,
+            dynamic_chunking=bool(
+                getattr(self.server_args, "enable_dynamic_chunking", False)
+            ),
         )
         if _align_err is not None:
             raise ValueError(_align_err)
+        if _align_warn is not None:
+            # ERROR level: the failure it describes is a total admission stall
+            # with no other symptom, so this line is the only warning anyone
+            # would ever get.
+            logger.error("kv/prefill admission: %s", _align_warn)
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(

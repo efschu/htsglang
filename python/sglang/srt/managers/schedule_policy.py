@@ -31,7 +31,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -497,7 +497,8 @@ def truncation_align_admission_error(
     page_size: int,
     truncation_align_size: Optional[int],
     sources: Sequence[str] = (),
-) -> Optional[str]:
+    dynamic_chunking: bool = False,
+) -> Tuple[Optional[str], Optional[str]]:
     """Reject a chunk budget that can never satisfy the truncation alignment.
 
     ``PrefillAdder.add_one_req``'s chunked branch aligns the chunk it is about
@@ -536,21 +537,49 @@ def truncation_align_admission_error(
     * ``--mamba-checkpoint-interval``, which sets the align size on its own
       when deterministic inference is OFF and is lcm-ed into it when on.
 
-    Returns the error text, or None when the configuration can admit.
+    THE CHECK IS AGAINST THE STATIC FLAG, DELIBERATELY. With
+    ``--enable-dynamic-chunking`` the per-batch width comes from
+    ``dynamic_chunked_prefill_size()``, which can deviate in BOTH directions.
+    The static value is still the right thing to refuse on, because the
+    predictor returns None until it has profiled, so the static size is what
+    is in force for the first requests of every boot -- exactly the ones that
+    would wedge. But the predictor's floor is ``base_chunk_size // 4``
+    (``scheduler_pp_mixin.predict_next_chunk_size``), so a config that passes
+    the static check can still dip below the alignment once the predictor
+    engages. That case is WARNED about rather than refused: it is conditional
+    on runtime behaviour, and refusing it would reject configurations that
+    mostly work.
+
+    Returns ``(error, warning)``. ``error`` non-None means refuse.
     """
     if truncation_align_size is None or int(truncation_align_size) <= 0:
-        return None
+        return None, None
     if chunked_prefill_size is None or int(chunked_prefill_size) <= 0:
         # Chunked prefill is off -> rem_chunk_tokens is None -> the aligned
         # branch is unreachable and nothing can be refused by it.
-        return None
+        return None, None
     chunked_prefill_size = int(chunked_prefill_size)
     page_size = max(1, int(page_size))
     truncation_align_size = int(truncation_align_size)
     budget = chunked_prefill_size // page_size * page_size
-    if budget >= truncation_align_size:
-        return None
     why = f" ({', '.join(sources)})" if sources else ""
+    if budget >= truncation_align_size:
+        dyn_floor = budget // 4
+        if dynamic_chunking and dyn_floor < truncation_align_size:
+            return None, (
+                f"--enable-dynamic-chunking can shrink the prefill chunk "
+                f"width to a quarter of --chunked-prefill-size "
+                f"({chunked_prefill_size} -> as low as {dyn_floor}), which is "
+                f"below the truncation alignment of {truncation_align_size}"
+                f"{why}. The static budget satisfies the alignment, so this "
+                "boots and serves; but if the predictor ever settles below "
+                f"{truncation_align_size} the scheduler will refuse every "
+                "request longer than the chunk and stop admitting entirely. "
+                f"Raise --chunked-prefill-size to at least "
+                f"{truncation_align_size * 4}, or disable dynamic chunking, "
+                "to remove the possibility."
+            )
+        return None, None
     return (
         f"--chunked-prefill-size={chunked_prefill_size} cannot satisfy a "
         f"prefill truncation alignment of {truncation_align_size}"
@@ -562,7 +591,7 @@ def truncation_align_admission_error(
         "at all: no batch, no crash, no hang in any collective and no log "
         f"line. Raise --chunked-prefill-size to at least "
         f"{truncation_align_size}, or lower the alignment."
-    )
+    ), None
 
 
 class PrefillAdder:

@@ -153,8 +153,14 @@ def test_truncation_align_admission_error_names_the_numbers():
     every configuration that can actually admit."""
     from sglang.srt.managers.schedule_policy import truncation_align_admission_error
 
+    def _err(*a, **k):
+        return truncation_align_admission_error(*a, **k)[0]
+
+    def _warn(*a, **k):
+        return truncation_align_admission_error(*a, **k)[1]
+
     # the configuration that wedged the instance
-    err = truncation_align_admission_error(256, 1, 4096)
+    err = _err(256, 1, 4096)
     assert err is not None, (
         "a 256-token chunk budget against a 4096-token alignment was accepted; "
         "that configuration boots, reports ready and then admits nothing"
@@ -163,28 +169,38 @@ def test_truncation_align_admission_error_names_the_numbers():
         assert needle in err, f"error does not name {needle!r}: {err}"
 
     # the same alignment with a budget that satisfies it
-    assert truncation_align_admission_error(4096, 1, 4096) is None
-    assert truncation_align_admission_error(8192, 1, 4096) is None
+    assert _err(4096, 1, 4096) is None
+    assert _err(8192, 1, 4096) is None
 
     # page alignment is part of the budget: 4100 aligns DOWN to 4096 at
     # page_size 8 -> 4096, still fine; but 4095 does not reach 4096
-    assert truncation_align_admission_error(4100, 8, 4096) is None
-    assert truncation_align_admission_error(4095, 1, 4096) is not None
+    assert _err(4100, 8, 4096) is None
+    assert _err(4095, 1, 4096) is not None
 
     # inert wherever the trap is unreachable: no alignment, or chunked
     # prefill switched off (rem_chunk_tokens is None -> the branch never runs)
-    assert truncation_align_admission_error(256, 1, None) is None
-    assert truncation_align_admission_error(256, 1, 0) is None
-    assert truncation_align_admission_error(None, 1, 4096) is None
-    assert truncation_align_admission_error(-1, 1, 4096) is None
-    assert truncation_align_admission_error(0, 1, 4096) is None
+    assert _err(256, 1, None) is None
+    assert _err(256, 1, 0) is None
+    assert _err(None, 1, 4096) is None
+    assert _err(-1, 1, 4096) is None
+    assert _err(0, 1, 4096) is None
 
     # the sources are quoted back so the operator knows which flag set the
     # alignment -- there are two and they are not interchangeable
-    err = truncation_align_admission_error(
-        256, 1, 4096, ("--mamba-checkpoint-interval=4096",)
-    )
+    err = _err(256, 1, 4096, ("--mamba-checkpoint-interval=4096",))
     assert "--mamba-checkpoint-interval=4096" in err
+
+    # DYNAMIC CHUNKING: the predictor's floor is base//4, so a static
+    # budget that satisfies the alignment can still dip below it at
+    # runtime. Warned, not refused -- it is conditional on runtime
+    # behaviour and refusing would reject configs that mostly work.
+    assert _err(8192, 1, 4096, dynamic_chunking=True) is None
+    w = _warn(8192, 1, 4096, dynamic_chunking=True)
+    assert w is not None and "2048" in w and "16384" in w
+    # a budget of 4x the alignment cannot dip below it -> silent
+    assert _warn(16384, 1, 4096, dynamic_chunking=True) is None
+    # and with dynamic chunking OFF the same budget says nothing
+    assert _warn(8192, 1, 4096) is None
 
 
 def test_the_scheduler_refuses_at_boot_for_both_alignment_sources():
