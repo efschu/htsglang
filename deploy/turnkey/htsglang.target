@@ -1,0 +1,23 @@
+# The one thing an operator enables. `systemctl enable --now htsglang.target`
+# brings the whole stack up, and a host reboot repeats that with no human in
+# the loop -- which is the entire point of #539.
+#
+# Topology: a target plus template units, deliberately NOT a supervisor
+# process. A supervisor would need its own unit anyway (so it cannot replace
+# systemd), it would duplicate restart policy, backoff, cgroup accounting and
+# journal integration that systemd already does correctly, and its own death
+# would be unsupervised. What a supervisor CAN do that systemd cannot is
+# notice a wedge -- a process that is alive and answering while generating
+# nothing -- and that single job is what htsglang-watchdog@ exists for.
+
+[Unit]
+Description=htsglang full stack (#539 turnkey autoboot)
+Documentation=file:/spinning/htsglang-gpu/docs/dev/631/HANDOFF_539_TURNKEY.md
+Wants=htsglang-preflight.service
+Wants=htsglang-planner.service
+Wants=htsglang-serving@ship.service
+Wants=htsglang-watchdog@ship.service
+After=htsglang-preflight.service
+
+[Install]
+WantedBy=multi-user.target

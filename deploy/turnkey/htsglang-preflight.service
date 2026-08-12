@@ -1,0 +1,23 @@
+# Every named check, once, before anything touches a card.
+#
+# RemainAfterExit=yes makes the successful run a LATCH: the serving units
+# Require= this, so a machine that failed preflight cannot have serving
+# started on it by a later `systemctl start`, and the failure stays visible
+# in `systemctl status` instead of scrolling past in a log.
+
+[Unit]
+Description=htsglang turnkey preflight (named refusals, #539)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PYTHONPATH=/spinning/htsglang-gpu/python
+ExecStartPre=/usr/bin/mkdir -p /var/log/htsglang
+ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.srt.turnkey --config /etc/htsglang/stack.toml preflight
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=htsglang.target
