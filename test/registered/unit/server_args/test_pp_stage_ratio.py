@@ -150,5 +150,85 @@ class TestPPStageRatioHandler(CustomTestCase):
         self.assertNotIn(PARTITION_ENV, os.environ)
 
 
+class TestPPAttnStageRatio(CustomTestCase):
+    """--pp-attn-stage-ratio: the per-family decoupling on the CLI (#485)."""
+
+    def setUp(self):
+        os.environ.pop(PARTITION_ENV, None)
+
+    def tearDown(self):
+        os.environ.pop(PARTITION_ENV, None)
+
+    def _derive(self, **kwargs):
+        # Each derivation is its own launcher process in reality; clear the
+        # export so the conflict guard is not tripped by the previous case.
+        os.environ.pop(PARTITION_ENV, None)
+        args = make_args(**kwargs)
+        with patch.object(
+            ServerArgs, "declared_num_hidden_layers", return_value=64
+        ), patch.object(
+            ServerArgs, "declared_layer_kinds", return_value=qwen_kinds()
+        ):
+            args._handle_pp_stage_ratio()
+            args._handle_pp_layer_ratio()
+        return args
+
+    def test_requires_stage_ratio(self):
+        args = make_args(pp_size=3, pp_attn_stage_ratio=[7, 5, 4])
+        with self.assertRaisesRegex(ValueError, "cannot be used on its own"):
+            args._handle_pp_stage_ratio()
+
+    def test_length_must_match_pp_size(self):
+        args = make_args(
+            pp_size=3, pp_stage_ratio=[31, 17, 16], pp_attn_stage_ratio=[7, 5]
+        )
+        with patch.object(
+            ServerArgs, "declared_num_hidden_layers", return_value=64
+        ), patch.object(
+            ServerArgs, "declared_layer_kinds", return_value=qwen_kinds()
+        ):
+            with self.assertRaisesRegex(ValueError, "one score per stage"):
+                args._handle_pp_stage_ratio()
+
+    def test_refuses_on_a_non_hybrid_model(self):
+        args = make_args(
+            pp_size=2, pp_stage_ratio=[3, 1], pp_attn_stage_ratio=[3, 1]
+        )
+        with patch.object(
+            ServerArgs, "declared_num_hidden_layers", return_value=64
+        ), patch.object(
+            ServerArgs, "declared_layer_kinds", return_value=[True] * 64
+        ):
+            with self.assertRaisesRegex(ValueError, "not a hybrid"):
+                args._handle_pp_stage_ratio()
+
+    def test_reaches_the_split_the_coupled_vector_cannot(self):
+        """31,17,16 with attention held at 7,5,4 -- three linear layers move
+        off stage 1 and the KV split does not budge. The coupled derivation
+        snaps the same request to 32,16,16 (attention 8,4,4)."""
+        coupled = self._derive(pp_size=3, pp_stage_ratio=[31, 17, 16])
+        self.assertEqual(coupled.pp_layer_ratio, [32, 16, 16])
+
+        decoupled = self._derive(
+            pp_size=3, pp_stage_ratio=[31, 17, 16], pp_attn_stage_ratio=[7, 5, 4]
+        )
+        self.assertEqual(decoupled.pp_layer_ratio, [31, 17, 16])
+        self.assertEqual(os.environ.get(PARTITION_ENV), "31,17,16")
+
+        kinds = qwen_kinds()
+        for counts, expected in ((coupled.pp_layer_ratio, 8), ([31, 17, 16], 7)):
+            self.assertEqual(sum(kinds[: counts[0]]), expected)
+
+    def test_unset_is_byte_identical(self):
+        with_flag = self._derive(
+            pp_size=3, pp_stage_ratio=[14, 10, 8], pp_attn_stage_ratio=[7, 5, 4]
+        )
+        without = self._derive(pp_size=3, pp_stage_ratio=[14, 10, 8])
+        # 14,10,8 already lands on 7,5,4, so asking for it explicitly must
+        # change nothing at all.
+        self.assertEqual(without.pp_layer_ratio, [28, 20, 16])
+        self.assertEqual(with_flag.pp_layer_ratio, [28, 20, 16])
+
+
 if __name__ == "__main__":
     unittest.main()

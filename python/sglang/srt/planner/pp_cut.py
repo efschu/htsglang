@@ -1,0 +1,862 @@
+"""Planner-solved pipeline-parallel layer cut, per layer FAMILY (#485).
+
+Why this module exists
+----------------------
+``derive_pp_layer_split`` (``srt/distributed/utils.py``) turns ONE per-stage
+score vector into per-stage layer counts. On a hybrid checkpoint it derives
+two targets from that single vector:
+
+    target_full   = round(n_full   * cum_score / total)   # KV / bandwidth mass
+    target_layers = round(n_layers * cum_score / total)   # compute / weight mass
+
+and then clamps ``target_layers`` into the layer window that yields exactly
+``target_full`` full-attention layers on the left. Both targets come from the
+same fraction, so on a period-P hybrid ``target_layers`` lands at
+``P * target_full`` -- the bottom of that window -- whenever the fraction sits
+near a multiple of ``1/n_full``. That is the whole origin of the "the stage
+boundary can only fall on a multiple of 4" observation in the 631 bench log
+(PROD_BRINGUP_BENCH.md sec. 1e): it is a property of deriving two targets from
+one number, NOT a property of the hardware, the KV pool, or the flip maps.
+
+The consequence is that the two families cannot be traded against each other.
+On a period-4 hybrid, one step of the single-score lever moves FOUR layers --
+three linear/GDN plus one full-attention -- so relieving a memory-bound stage
+by a fraction of a layer-block is unrepresentable, and buying compute relief
+always drags KV mass along with it.
+
+This module removes that coupling. Attention mass and linear mass are cut
+INDEPENDENTLY, and the cut is SOLVED against measured per-rank rates rather
+than supplied by hand as a ratio.
+
+What stays the same
+-------------------
+The cut is still CONTIGUOUS: stage ``i`` owns the half-open layer range
+``[bounds[i-1], bounds[i])``. That is deliberate and is not a shortcut.
+Non-contiguous ownership would require replacing the ``layer_id -
+self.start_layer`` offset arithmetic throughout ``mem_cache/memory_pool.py``,
+the ``PPMissingLayer`` padding in ``utils/common.py:make_layers``, and the
+contiguity assertions in ``managers/phase_flip_runtime.py:870-874`` and
+``managers/gdn_flip_mover.py:65-69``. It is also unnecessary: because a
+boundary may sit anywhere INSIDE a full-attention period, a contiguous cut
+already spans the useful decoupled space. On the 64-layer / period-4
+reference checkpoint, holding the attention split at ``[7, 5, 4]`` admits
+layer counts from ``[28, 20, 16]`` through ``[31, 17, 16]`` -- i.e. up to
+three linear layers may move off a memory-bound stage at ZERO KV cost.
+
+Objective
+---------
+Prefill runs in lockstep, so a stage's wall time is the pipeline's cost only
+through the SLOWEST stage. The solver therefore minimizes the makespan
+
+    T = max_i ( attention_core_seconds_i + dense_compute_seconds_i )
+
+subject to a hard per-rank memory feasibility constraint. Both terms are
+per-stage sums over the layers that stage owns, which is what makes the
+family decoupling meaningful: the attention term scales with the stage's
+FULL-ATTENTION layer count, while the dense term scales with ALL of its
+layers.
+
+The attention core is priced as a ROOFLINE, ``max(flops/gemm, bytes/bw)``,
+and not as a bandwidth term. That is a measured correction, not a
+refinement. At a prefill chunk of C query tokens against KV depth D, one
+attention layer does ``4 * C * D * q_heads * head_dim`` FLOPs while reading
+``D * kv_heads * head_dim * 2 * dtype_bytes`` bytes of KV, so its arithmetic
+intensity is INDEPENDENT of depth and equal to
+``2 * C * q_heads / (kv_heads * dtype_bytes)``. On the reference geometry
+that is ~24 600 FLOP/byte at C=2048, against ridge points of 151 (5090) and
+91 (3080) -- compute-bound by more than two orders of magnitude. The term
+only crosses into bandwidth-bound below a chunk of ~13 tokens, i.e. in
+decode, never in prefill. Pricing deep-prefill attention as
+bandwidth-proportional is therefore wrong, and a cut derived that way skews
+the wrong way: it apportions attention on the 2.14x memory-bandwidth spread
+when the binding spread is the 3.54x bf16 GEMM spread.
+
+The roofline is kept rather than replaced by a bare FLOP count precisely so
+this module stays honest at the other end of the chunk axis -- a decode-
+shaped stage flips to the bandwidth side automatically, and ``StageCost``
+reports which side bound it.
+
+This module is stdlib-only on purpose: it must stay importable and testable
+without torch, like ``planner/cost_model.py``. Everything that needs the
+checkpoint or the measured probe is fed in as plain numbers; the adapter that
+builds those numbers from ``PerfCostModel`` lives in ``pp_cut_adapter.py``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+from typing import Dict, List, Optional, Sequence, Tuple
+
+__all__ = [
+    "LAYER_FAMILY_ATTENTION",
+    "LAYER_FAMILY_LINEAR",
+    "MIB",
+    "RankResources",
+    "PPCutInputs",
+    "StageCost",
+    "PPCutSolution",
+    "layer_families_from_config",
+    "attention_counts",
+    "solve_pp_cut",
+    "validate_pp_cut",
+]
+
+#: Layer-family tags. These match the strings a hybrid checkpoint puts in
+#: ``layer_types`` / ``layers_block_type`` (see ``configs/qwen3_next.py:259``),
+#: so a config-derived list needs no translation.
+LAYER_FAMILY_ATTENTION = "full_attention"
+LAYER_FAMILY_LINEAR = "linear_attention"
+
+MIB = 1024.0 * 1024.0
+
+
+# ---------------------------------------------------------------------------
+# Inputs
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RankResources:
+    """One pipeline stage's host card, as MEASURED.
+
+    ``attn_bw_gbs`` is the KV-read rate for the attention term. Feed it the
+    probe's GEMV-shaped rate (``membw_gemv_gbs``) rather than the streaming
+    number when both exist -- the decode/attention roofline uses the GEMV
+    basis (``uneven_perf.PerfCostModel.decode_bw_basis``), and on a 5090 the
+    streaming figure is optimistic for this access pattern.
+
+    ``budget_mib`` is everything the stage may occupy on that card: weights,
+    its KV arena, and its transient working set. ``transient_mib`` is carved
+    out of it separately because the transient is a property of the REQUEST
+    and the geometry, not of the pool (PROD_BRINGUP_BENCH.md sec. 1f), so it
+    must not scale with the cut.
+    """
+
+    label: str
+    attn_bw_gbs: float
+    gemm_tflops: float
+    budget_mib: float
+    transient_mib: float = 0.0
+    #: Everything resident on the card that the cut does NOT move: CUDA
+    #: context, the mamba/GDN state pool, graph capture, allocator
+    #: fragmentation, the weights-arena high-water. Calibrate it from a
+    #: measured at-rest boot -- ``resident_at_rest - weights - kv``. Left at
+    #: zero the memory verdict is a LOWER BOUND on real occupancy and will
+    #: read as feasible where metal is not.
+    fixed_overhead_mib: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.attn_bw_gbs <= 0.0:
+            raise ValueError(
+                f"rank {self.label!r}: attn_bw_gbs must be > 0, got "
+                f"{self.attn_bw_gbs!r}. A missing measured rate must be "
+                f"refused, never defaulted -- see planner/cost_model.AbsentRate."
+            )
+        if self.gemm_tflops <= 0.0:
+            raise ValueError(
+                f"rank {self.label!r}: gemm_tflops must be > 0, got "
+                f"{self.gemm_tflops!r}."
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class PPCutInputs:
+    """Everything the cut is solved against.
+
+    Per-layer masses are given per FAMILY so the solver can price a stage
+    from its family census alone.
+    """
+
+    #: Per-layer family tags, index-aligned with the model's layers.
+    layer_families: Tuple[str, ...]
+
+    #: Resident weight bytes of ONE layer of each family, already at the
+    #: checkpoint's bytes-per-param (so a quantized checkpoint is priced as
+    #: it actually loads).
+    attn_layer_weight_bytes: float
+    linear_layer_weight_bytes: float
+
+    #: FLOPs per prompt token for ONE layer of each family, projections and
+    #: MLP included. The attention CORE (the depth-dependent part) is NOT
+    #: here; it is priced separately by the roofline below.
+    attn_layer_flops_per_token: float
+    linear_layer_flops_per_token: float
+
+    #: Attention-core FLOPs per (query token x KV depth token) for ONE
+    #: full-attention layer: ``4 * q_heads * head_dim`` (2 for QK^T, 2 for
+    #: A@V). Depth-independent by construction, which is what makes the
+    #: term's arithmetic intensity depth-independent too.
+    attn_core_flops_per_token_pair: float
+
+    #: KV bytes one full-attention layer stores per token, at the serving
+    #: kv-cache dtype. On the reference checkpoint: 4 kv heads x 256 head_dim
+    #: x 2 (K and V) x 1 byte (fp8_e4m3) = 2048.
+    kv_bytes_per_token_per_attn_layer: float
+
+    #: The KV depth the cut is optimized FOR -- the depth of the request the
+    #: pipeline is being timed on. This drives the attention CORE term only.
+    kv_depth_tokens: int
+
+    #: Prompt tokens per prefill chunk. Sets the compute term's scale.
+    prefill_chunk_tokens: int
+
+    ranks: Tuple[RankResources, ...]
+
+    #: Tokens the KV ARENA is sized for, i.e. ``--max-total-tokens``. This
+    #: drives the memory term only, and it is a different quantity from
+    #: ``kv_depth_tokens``: the arena is provisioned for the whole pool while
+    #: one request reads only its own depth. Conflating them either prices a
+    #: 600k-token arena as if it were one 179k request (far too optimistic on
+    #: memory) or times a request as if it swept the whole pool (far too
+    #: pessimistic on speed). Zero falls back to ``kv_depth_tokens``.
+    kv_pool_tokens: int = 0
+
+    #: Decode-phase token shares per rank, when this PP layout shares its KV
+    #: arena with a TP layout (the #631 phase flip). The arena is then sized
+    #: ``max(PP layer share, TP token share)`` per rank, because one arena
+    #: backs both layouts rather than two -- the relation the 631 bench log
+    #: validates to the byte against two boots (PROD_BRINGUP_BENCH.md sec. 2).
+    #: ``None`` for a pure-PP deployment.
+    tp_token_shares: Optional[Tuple[float, ...]] = None
+
+    #: How many times a chunk sweeps the stage's KV. 1.0 models a
+    #: well-tiled flash kernel reading K/V once per chunk. It scales the
+    #: attention term against the compute term, so it moves the balance
+    #: point; it is an explicit MODELLING ASSUMPTION and the measurement arm
+    #: is what falsifies it.
+    kv_sweeps_per_chunk: float = 1.0
+
+    #: Free VRAM that must remain on every card. The rig's standing corridor.
+    corridor_mib: float = 1024.0
+
+    def __post_init__(self) -> None:
+        n = len(self.layer_families)
+        if n == 0:
+            raise ValueError("PPCutInputs: layer_families is empty.")
+        bad = sorted(
+            set(self.layer_families) - {LAYER_FAMILY_ATTENTION, LAYER_FAMILY_LINEAR}
+        )
+        if bad:
+            raise ValueError(
+                f"PPCutInputs: unknown layer families {bad}; expected only "
+                f"{LAYER_FAMILY_ATTENTION!r} and {LAYER_FAMILY_LINEAR!r}."
+            )
+        if not self.ranks:
+            raise ValueError("PPCutInputs: no ranks.")
+        if len(self.ranks) > n:
+            raise ValueError(
+                f"PPCutInputs: {len(self.ranks)} stages cannot split {n} "
+                f"layers (every stage needs at least one)."
+            )
+        if self.kv_depth_tokens < 0 or self.prefill_chunk_tokens <= 0:
+            raise ValueError(
+                "PPCutInputs: kv_depth_tokens must be >= 0 and "
+                "prefill_chunk_tokens > 0."
+            )
+        if self.kv_pool_tokens < 0:
+            raise ValueError("PPCutInputs: kv_pool_tokens must be >= 0.")
+        if self.tp_token_shares is not None:
+            if len(self.tp_token_shares) != len(self.ranks):
+                raise ValueError(
+                    f"PPCutInputs: tp_token_shares has "
+                    f"{len(self.tp_token_shares)} entries for "
+                    f"{len(self.ranks)} ranks."
+                )
+            if any(s < 0.0 for s in self.tp_token_shares):
+                raise ValueError(
+                    f"PPCutInputs: tp_token_shares must be non-negative, got "
+                    f"{list(self.tp_token_shares)}."
+                )
+
+    @property
+    def arena_tokens(self) -> int:
+        return self.kv_pool_tokens or self.kv_depth_tokens
+
+    @property
+    def n_layers(self) -> int:
+        return len(self.layer_families)
+
+    @property
+    def pp_size(self) -> int:
+        return len(self.ranks)
+
+    @property
+    def n_full_attention(self) -> int:
+        return sum(1 for f in self.layer_families if f == LAYER_FAMILY_ATTENTION)
+
+
+# ---------------------------------------------------------------------------
+# Costs
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class StageCost:
+    """One stage's priced load. ``feasible`` is the hard memory verdict."""
+
+    rank: str
+    start_layer: int
+    end_layer: int
+    n_layers: int
+    n_attention: int
+    #: Attention core, priced by roofline: ``max(flops/gemm, bytes/bw)``.
+    attn_seconds: float
+    #: Dense projections + MLP over every layer the stage owns.
+    compute_seconds: float
+    weight_mib: float
+    kv_mib: float
+    transient_mib: float
+    budget_mib: float
+    #: Which side of the roofline bound the attention core: ``"compute"``,
+    #: ``"bandwidth"``, or ``"none"`` when the stage owns no attention layer.
+    attn_bound_by: str = "none"
+
+    @property
+    def total_seconds(self) -> float:
+        return self.attn_seconds + self.compute_seconds
+
+    @property
+    def resident_mib(self) -> float:
+        return self.weight_mib + self.kv_mib + self.transient_mib
+
+    @property
+    def headroom_mib(self) -> float:
+        """Budget left after weights, KV and the transient. The corridor
+        constraint is ``headroom_mib >= 0`` once the corridor has been
+        subtracted from the budget by the caller."""
+        return self.budget_mib - self.resident_mib
+
+    @property
+    def feasible(self) -> bool:
+        return self.headroom_mib >= 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class PPCutSolution:
+    counts: Tuple[int, ...]
+    bounds: Tuple[int, ...]
+    attention_counts: Tuple[int, ...]
+    stages: Tuple[StageCost, ...]
+    makespan_seconds: float
+    bottleneck_stage: int
+    min_headroom_mib: float
+    feasible: bool
+    refusals: Tuple[str, ...]
+    candidates_considered: int
+
+    def as_layer_ratio(self) -> List[int]:
+        """The value ``--pp-layer-ratio`` / ``SGLANG_PP_LAYER_PARTITION`` wants."""
+        return list(self.counts)
+
+    def summary(self) -> str:
+        parts = [
+            f"layers={list(self.counts)}",
+            f"attn={list(self.attention_counts)}",
+            f"makespan={self.makespan_seconds * 1e3:.1f}ms",
+            f"pacer=stage{self.bottleneck_stage}",
+            f"min_headroom={self.min_headroom_mib:.0f}MiB",
+        ]
+        return "  ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+
+def layer_families_from_config(
+    config: Dict,
+    num_hidden_layers: Optional[int] = None,
+) -> Tuple[str, ...]:
+    """Per-layer family tags from a checkpoint config dict.
+
+    Resolution order mirrors the advisory probe in ``server_args`` and the
+    model's own rule (``configs/qwen3_next.py:259-269``):
+
+      1. an explicit ``layer_types`` / ``layers_block_type`` list;
+      2. ``full_attention_interval`` -- layer ``l`` is full attention when
+         ``(l + 1) % interval == 0``;
+      3. no hybrid marker at all -> every layer is full attention.
+
+    A ``text_config`` wrapper (VL checkpoints) is unwrapped first.
+    """
+    cfg = config.get("text_config") or config
+    n = int(num_hidden_layers or cfg.get("num_hidden_layers") or 0)
+    if n <= 0:
+        raise ValueError(
+            "layer_families_from_config: num_hidden_layers is missing or "
+            "non-positive; a cut cannot be derived from an unknown depth."
+        )
+
+    explicit = cfg.get("layer_types") or cfg.get("layers_block_type")
+    if explicit:
+        if len(explicit) != n:
+            raise ValueError(
+                f"layer_families_from_config: layer_types has "
+                f"{len(explicit)} entries but num_hidden_layers is {n}."
+            )
+        return tuple(
+            LAYER_FAMILY_ATTENTION
+            if str(t) == LAYER_FAMILY_ATTENTION
+            else LAYER_FAMILY_LINEAR
+            for t in explicit
+        )
+
+    interval = cfg.get("full_attention_interval")
+    if interval:
+        interval = int(interval)
+        return tuple(
+            LAYER_FAMILY_ATTENTION
+            if (idx + 1) % interval == 0
+            else LAYER_FAMILY_LINEAR
+            for idx in range(n)
+        )
+
+    return tuple([LAYER_FAMILY_ATTENTION] * n)
+
+
+def attention_counts(
+    layer_families: Sequence[str], counts: Sequence[int]
+) -> Tuple[int, ...]:
+    """Full-attention layers per stage, for a contiguous split ``counts``."""
+    out: List[int] = []
+    start = 0
+    for c in counts:
+        out.append(
+            sum(
+                1
+                for f in layer_families[start : start + c]
+                if f == LAYER_FAMILY_ATTENTION
+            )
+        )
+        start += c
+    return tuple(out)
+
+
+def _prefix_attention(layer_families: Sequence[str]) -> List[int]:
+    """``pref[i]`` = full-attention layers in ``[0, i)``."""
+    pref = [0]
+    for f in layer_families:
+        pref.append(pref[-1] + (1 if f == LAYER_FAMILY_ATTENTION else 0))
+    return pref
+
+
+def _price_stage(
+    inputs: PPCutInputs,
+    stage: int,
+    start: int,
+    end: int,
+    pref_attn: Sequence[int],
+) -> StageCost:
+    rank = inputs.ranks[stage]
+    n_layers = end - start
+    n_attn = pref_attn[end] - pref_attn[start]
+    n_linear = n_layers - n_attn
+
+    # Attention core, as a roofline over the stage's attention layers. The
+    # compute side is the chunk x depth score-and-weight product; the
+    # bandwidth side is one sweep of the stage's KV. Whichever is slower is
+    # what the stage actually waits on. This term depends ONLY on n_attn --
+    # never on n_layers -- which is exactly the coupling the family cut
+    # breaks.
+    kv_bytes = (
+        float(n_attn)
+        * inputs.kv_bytes_per_token_per_attn_layer
+        * float(inputs.kv_depth_tokens)
+    )
+    core_flops = (
+        float(n_attn)
+        * float(inputs.prefill_chunk_tokens)
+        * float(inputs.kv_depth_tokens)
+        * inputs.attn_core_flops_per_token_pair
+    )
+    attn_compute_s = core_flops / (rank.gemm_tflops * 1e12)
+    attn_bw_s = kv_bytes * inputs.kv_sweeps_per_chunk / (rank.attn_bw_gbs * 1e9)
+    if n_attn == 0:
+        attn_seconds, attn_bound_by = 0.0, "none"
+    elif attn_compute_s >= attn_bw_s:
+        attn_seconds, attn_bound_by = attn_compute_s, "compute"
+    else:
+        attn_seconds, attn_bound_by = attn_bw_s, "bandwidth"
+
+    # Dense term: projections and MLP for the chunk over the measured rate.
+    flops = float(inputs.prefill_chunk_tokens) * (
+        n_attn * inputs.attn_layer_flops_per_token
+        + n_linear * inputs.linear_layer_flops_per_token
+    )
+    compute_seconds = flops / (rank.gemm_tflops * 1e12)
+
+    weight_mib = (
+        n_attn * inputs.attn_layer_weight_bytes
+        + n_linear * inputs.linear_layer_weight_bytes
+    ) / MIB
+
+    # KV ARENA, which is sized for the whole pool and not for one request.
+    # When a TP layout shares this arena (the phase flip), the stage pays the
+    # LARGER of its PP layer share and its TP token share -- one arena backs
+    # both layouts, so the rig pays max(), not the sum and not the PP term
+    # alone.
+    n_full_total = inputs.n_full_attention
+    arena_layers = float(n_attn)
+    if inputs.tp_token_shares is not None and n_full_total > 0:
+        arena_layers = max(
+            arena_layers, inputs.tp_token_shares[stage] * float(n_full_total)
+        )
+    kv_mib = (
+        arena_layers
+        * inputs.kv_bytes_per_token_per_attn_layer
+        * float(inputs.arena_tokens)
+    ) / MIB
+
+    return StageCost(
+        rank=rank.label,
+        start_layer=start,
+        end_layer=end,
+        n_layers=n_layers,
+        n_attention=n_attn,
+        attn_seconds=attn_seconds,
+        compute_seconds=compute_seconds,
+        weight_mib=weight_mib,
+        kv_mib=kv_mib,
+        # The transient and the cut-invariant overhead both occupy the card
+        # alongside weights and KV, so they are charged together here.
+        transient_mib=rank.transient_mib + rank.fixed_overhead_mib,
+        # The corridor is subtracted here, once, so every downstream
+        # comparison is against usable bytes.
+        budget_mib=rank.budget_mib - inputs.corridor_mib,
+        attn_bound_by=attn_bound_by,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Solver
+# ---------------------------------------------------------------------------
+
+#: Relative slack on the optimal makespan when the secondary objective
+#: (maximize the tightest stage's headroom) picks among near-optimal cuts.
+#: A cut 0.5 % slower that leaves hundreds of MiB more on the binding card is
+#: the better cut on this rig -- the corridor is a hard law, the half percent
+#: is inside the A-vs-A noise floor.
+_MAKESPAN_SLACK = 1.005
+
+
+def solve_pp_cut(
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+    makespan_slack: float = _MAKESPAN_SLACK,
+) -> PPCutSolution:
+    """Exactly minimize the lockstep makespan over contiguous cuts.
+
+    Two passes, both exact dynamic programs over stage boundaries:
+
+      1. minimize ``max_i stage_seconds_i`` over memory-FEASIBLE cuts;
+      2. among cuts within ``_MAKESPAN_SLACK`` of that optimum, maximize
+         ``min_i headroom_i``.
+
+    Splitting it this way keeps each pass a single-aggregate DP, which is
+    exactly solvable; a one-pass lexicographic DP would not be, because a
+    prefix that is worse on the primary key can still lead to the better
+    overall cut.
+
+    The search space is every contiguous split, so the answer is the true
+    optimum over the representable space -- not a rounded ratio and not a
+    local repair. ``O(pp_size * n_layers^2)`` stage prices, which is 12k
+    evaluations at the reference geometry.
+
+    ``makespan_slack`` is how much the second pass may spend on headroom;
+    pass ``1.0`` to get the strictly makespan-optimal cut and nothing else.
+
+    Infeasible input does not fall back to an even split (the #202 lesson):
+    it returns ``feasible=False`` with a named reason per rank.
+    """
+    if makespan_slack < 1.0:
+        raise ValueError(
+            f"solve_pp_cut: makespan_slack must be >= 1.0, got "
+            f"{makespan_slack!r} -- a value below 1 would exclude the "
+            f"optimum itself."
+        )
+    n = inputs.n_layers
+    k = inputs.pp_size
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < n
+
+    # Price every (stage, start, end) once.
+    cache: Dict[Tuple[int, int, int], StageCost] = {}
+
+    def price(stage: int, start: int, end: int) -> StageCost:
+        key = (stage, start, end)
+        got = cache.get(key)
+        if got is None:
+            got = _price_stage(inputs, stage, start, end, pref_attn)
+            cache[key] = got
+        return got
+
+    def admissible(cost: StageCost) -> bool:
+        if not cost.feasible:
+            return False
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            # A stage with no full-attention layer has an EMPTY KV pool.
+            # Same refusal as derive_pp_layer_split (#201 slice 2).
+            return False
+        return True
+
+    inf = math.inf
+
+    # ---- pass 1: minimize the makespan -----------------------------------
+    # best[s][b] = minimal achievable max-stage-seconds using stages
+    # 0..s-1 to cover layers [0, b).
+    best: List[List[float]] = [[inf] * (n + 1) for _ in range(k + 1)]
+    best[0][0] = 0.0
+    considered = 0
+    for s in range(1, k + 1):
+        # Stage s-1 must leave at least one layer for each remaining stage.
+        hi = n - (k - s)
+        for b in range(s, hi + 1):
+            row = best[s - 1]
+            acc = inf
+            for prev in range(s - 1, b):
+                base = row[prev]
+                if base is inf or base >= acc:
+                    continue
+                cost = price(s - 1, prev, b)
+                considered += 1
+                if not admissible(cost):
+                    continue
+                cand = cost.total_seconds
+                val = base if base > cand else cand
+                if val < acc:
+                    acc = val
+            best[s][b] = acc
+
+    if best[k][n] is inf:
+        return _infeasible(inputs, pref_attn, hybrid, considered)
+
+    optimal = best[k][n]
+    ceiling = optimal * makespan_slack
+
+    # ---- pass 2: among near-optimal cuts, maximize the tightest headroom --
+    hbest: List[List[float]] = [[-inf] * (n + 1) for _ in range(k + 1)]
+    choice: List[List[int]] = [[-1] * (n + 1) for _ in range(k + 1)]
+    hbest[0][0] = inf
+    for s in range(1, k + 1):
+        hi = n - (k - s)
+        for b in range(s, hi + 1):
+            row = hbest[s - 1]
+            acc = -inf
+            arg = -1
+            for prev in range(s - 1, b):
+                base = row[prev]
+                if base == -inf:
+                    continue
+                cost = price(s - 1, prev, b)
+                if not admissible(cost) or cost.total_seconds > ceiling:
+                    continue
+                val = base if base < cost.headroom_mib else cost.headroom_mib
+                # Deterministic tie-break: the earliest boundary wins, so the
+                # same inputs always yield the same cut.
+                if val > acc:
+                    acc = val
+                    arg = prev
+            hbest[s][b] = acc
+            choice[s][b] = arg
+
+    if hbest[k][n] == -inf:
+        # Cannot happen while ceiling >= optimal, but never silently guess.
+        return _infeasible(inputs, pref_attn, hybrid, considered)
+
+    bounds_rev: List[int] = []
+    b = n
+    for s in range(k, 0, -1):
+        bounds_rev.append(b)
+        b = choice[s][b]
+    bounds = tuple(reversed(bounds_rev))
+    starts = (0,) + bounds[:-1]
+    stages = tuple(
+        price(i, starts[i], bounds[i]) for i in range(k)
+    )
+    counts = tuple(s.n_layers for s in stages)
+    times = [s.total_seconds for s in stages]
+    makespan = max(times)
+
+    return PPCutSolution(
+        counts=counts,
+        bounds=bounds,
+        attention_counts=tuple(s.n_attention for s in stages),
+        stages=stages,
+        makespan_seconds=makespan,
+        bottleneck_stage=times.index(makespan),
+        min_headroom_mib=min(s.headroom_mib for s in stages),
+        feasible=True,
+        refusals=(),
+        candidates_considered=considered,
+    )
+
+
+def _infeasible(
+    inputs: PPCutInputs,
+    pref_attn: Sequence[int],
+    hybrid: bool,
+    considered: int,
+) -> PPCutSolution:
+    """Name WHY no cut fits, per rank, with the numbers that decide it.
+
+    Fail-fast with the physical quantities in the message; a late OOM or a
+    silent even split is what this replaces.
+    """
+    n = inputs.n_layers
+    k = inputs.pp_size
+    reasons: List[str] = []
+
+    # The cheapest possible stage is one linear layer plus its KV share of
+    # zero; if even that does not fit a rank, that rank is the reason.
+    lightest_mib = min(
+        inputs.attn_layer_weight_bytes, inputs.linear_layer_weight_bytes
+    ) / MIB
+    for r in inputs.ranks:
+        overhead = r.transient_mib + r.fixed_overhead_mib
+        usable = r.budget_mib - inputs.corridor_mib - overhead
+        if usable < lightest_mib:
+            reasons.append(
+                f"rank {r.label}: budget {r.budget_mib:.0f} MiB minus corridor "
+                f"{inputs.corridor_mib:.0f} MiB minus transient+overhead "
+                f"{overhead:.0f} MiB leaves {usable:.0f} MiB, which "
+                f"cannot hold even one layer ({lightest_mib:.0f} MiB)."
+            )
+
+    if not reasons:
+        total_weight_mib = (
+            pref_attn[n] * inputs.attn_layer_weight_bytes
+            + (n - pref_attn[n]) * inputs.linear_layer_weight_bytes
+        ) / MIB
+        total_kv_mib = (
+            inputs.n_full_attention
+            * inputs.kv_bytes_per_token_per_attn_layer
+            * inputs.arena_tokens
+        ) / MIB
+        usable = sum(
+            r.budget_mib
+            - inputs.corridor_mib
+            - r.transient_mib
+            - r.fixed_overhead_mib
+            for r in inputs.ranks
+        )
+        reasons.append(
+            f"no contiguous {k}-stage cut of {n} layers fits: the model needs "
+            f"{total_weight_mib:.0f} MiB of weights plus {total_kv_mib:.0f} MiB "
+            f"of KV for a {inputs.arena_tokens}-token arena, against "
+            f"{usable:.0f} MiB usable across {k} ranks after the "
+            f"{inputs.corridor_mib:.0f} MiB corridor and per-rank transients. "
+            f"Lower --max-total-tokens, raise the per-rank budget, or reduce "
+            f"the optimization depth."
+        )
+        if hybrid and inputs.n_full_attention < k:
+            reasons.append(
+                f"the checkpoint has only {inputs.n_full_attention} "
+                f"full-attention layers for {k} stages, so at least one stage "
+                f"would hold an empty KV pool."
+            )
+
+    return PPCutSolution(
+        counts=(),
+        bounds=(),
+        attention_counts=(),
+        stages=(),
+        makespan_seconds=math.inf,
+        bottleneck_stage=-1,
+        min_headroom_mib=-math.inf,
+        feasible=False,
+        refusals=tuple(reasons),
+        candidates_considered=considered,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Validation of a hand-supplied cut
+# ---------------------------------------------------------------------------
+
+
+def validate_pp_cut(
+    counts: Sequence[int],
+    inputs: PPCutInputs,
+    *,
+    require_attention_per_stage: bool = True,
+) -> Tuple[PPCutSolution, Tuple[str, ...]]:
+    """Price an EXPLICIT per-stage layer split and report every violation.
+
+    This is what turns ``--pp-layer-ratio`` from a planner bypass into a
+    planner-checked override: the flag still wins, but it is priced against
+    the same measured model the solver uses, and an infeasible list is
+    refused loudly at parse time instead of becoming a runtime OOM or a
+    corridor breach twenty minutes into a soak.
+
+    Returns the priced solution and the violation list. An empty violation
+    tuple means the split is admissible; the solution is still returned when
+    violations exist so the caller can print the numbers alongside them.
+    """
+    n = inputs.n_layers
+    k = inputs.pp_size
+    violations: List[str] = []
+
+    if len(counts) != k:
+        raise ValueError(
+            f"validate_pp_cut: got {len(counts)} stage counts for "
+            f"{k} ranks."
+        )
+    if any(int(c) < 1 for c in counts):
+        raise ValueError(
+            f"validate_pp_cut: every stage needs at least one layer, got "
+            f"{list(counts)}."
+        )
+    if sum(int(c) for c in counts) != n:
+        raise ValueError(
+            f"validate_pp_cut: the split {list(counts)} sums to "
+            f"{sum(int(c) for c in counts)}, but the model has {n} layers."
+        )
+
+    pref_attn = _prefix_attention(inputs.layer_families)
+    hybrid = 0 < inputs.n_full_attention < n
+
+    stages: List[StageCost] = []
+    start = 0
+    for i, c in enumerate(counts):
+        cost = _price_stage(inputs, i, start, start + int(c), pref_attn)
+        stages.append(cost)
+        start += int(c)
+
+    for cost in stages:
+        if not cost.feasible:
+            violations.append(
+                f"stage {cost.start_layer}-{cost.end_layer} on rank "
+                f"{cost.rank}: needs {cost.resident_mib:.0f} MiB "
+                f"({cost.weight_mib:.0f} weights + {cost.kv_mib:.0f} KV + "
+                f"{cost.transient_mib:.0f} transient) but only "
+                f"{cost.budget_mib:.0f} MiB is usable after the "
+                f"{inputs.corridor_mib:.0f} MiB corridor -- over by "
+                f"{-cost.headroom_mib:.0f} MiB."
+            )
+        if require_attention_per_stage and hybrid and cost.n_attention == 0:
+            violations.append(
+                f"stage {cost.start_layer}-{cost.end_layer} on rank "
+                f"{cost.rank} holds zero of the model's "
+                f"{inputs.n_full_attention} full-attention layers -- its KV "
+                f"pool would be empty. A hybrid model splits its KV after "
+                f"full-attention layers, not after layers."
+            )
+
+    times = [s.total_seconds for s in stages]
+    makespan = max(times)
+    solution = PPCutSolution(
+        counts=tuple(int(c) for c in counts),
+        bounds=tuple(s.end_layer for s in stages),
+        attention_counts=tuple(s.n_attention for s in stages),
+        stages=tuple(stages),
+        makespan_seconds=makespan,
+        bottleneck_stage=times.index(makespan),
+        min_headroom_mib=min(s.headroom_mib for s in stages),
+        feasible=not violations,
+        refusals=tuple(violations),
+        candidates_considered=k,
+    )
+    return solution, tuple(violations)
