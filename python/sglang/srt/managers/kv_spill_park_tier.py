@@ -39,14 +39,22 @@ TWO MEASUREMENT TRAPS THIS PROBE ACTIVELY AVOIDS, both found on this rig:
     the one an fsync makes honest.
 
 GROUP UNIFORMITY (standing law; register laws 8 and 14). Every rank runs this
-probe against the same filesystem and will measure slightly different numbers.
-A ladder ordered on raw per-rank floats is a rank-local decision over
-replicated state -- exactly the shape that made three ranks take turns being
-short in C20's delay budget. So every ordering-relevant number is QUANTIZED
-(:func:`quantize_bandwidth`, :func:`quantize_bytes`) before it can influence an
-order: measurement noise cannot flip a rung, and only a difference big enough
-to be real survives the rounding. The raw value is still recorded on the entry
-for the ledger; it is the quantized one that sorts.
+probe against the same filesystem and measures a DIFFERENT number -- and not
+slightly: the first live two-rank boot reported 2.41 GB/s on TP0 and 7.00 GB/s
+on TP1 for the same directory at the same instant, because the two probes
+contend with each other. A ladder ordered on raw per-rank floats is a
+rank-local decision over replicated state, exactly the shape that made three
+ranks take turns being short in C20's delay budget, and here it would surface
+as a hang in the park completion min-reduce rather than as an error.
+
+That measurement killed the first design (an absolute quantization grid: no
+fixed boundary can keep 2.41 and 7.00 in one bucket AND separate real media).
+What replaced it is a RATIO test -- :data:`PROMOTION_RATIO`, applied by
+:func:`outranks` over the operator's configured order -- because contention
+scales every tier on a rank together, so a ratio is stable across ranks where
+an absolute value is not. Capacity still sorts on a coarse byte grid
+(:func:`quantize_bytes`), where the per-rank spread is a df reading rather than
+a contended benchmark.
 
 THE BUDGET IS EXPLICIT AND df-AWARE (#558 family). A park directory shares a
 filesystem with everything else on the box, so an unbounded park tier is a
@@ -90,9 +98,9 @@ logger = logging.getLogger(__name__)
 #:
 #: i.e. the honest sustained rate here is ~3 GB/s and a 64 MiB probe overstates
 #: it by 2.8x. 256 MiB is the chosen compromise: 127 ms of boot per rank, and
-#: within ~2x of sustained. The value is used for ORDERING tiers (quantized,
-#: see :func:`quantize_bandwidth`) and for the measured/absent distinction --
-#: it is NOT a capacity plan and NOT an ETA, and nothing may quote it as one.
+#: within ~2x of sustained. The value is used for ORDERING tiers (by ratio, see
+#: :data:`PROMOTION_RATIO`) and for the measured/absent distinction -- it is NOT
+#: a capacity plan and NOT an ETA, and nothing may quote it as one.
 PARK_PROBE_BYTES = 256 * 1024 * 1024
 
 #: Payload of one latency sample: a page-sized write plus ``fdatasync``. The
@@ -100,11 +108,31 @@ PARK_PROBE_BYTES = 256 * 1024 * 1024
 PARK_LATENCY_SAMPLE_BYTES = 4096
 PARK_LATENCY_SAMPLES = 64
 
-#: Ordering grid. Bandwidth sorts in 0.25 GB/s buckets and capacity in 1 GiB
-#: buckets, so two ranks measuring the same medium cannot disagree about an
-#: order while a genuinely different medium still separates.
-BANDWIDTH_QUANTUM_GBS = 0.25
+#: Capacity ordering grid (1 GiB), so a small difference in a live df reading
+#: cannot move a verdict.
 BYTES_QUANTUM = 1024 * 1024 * 1024
+
+#: How much faster a park tier must MEASURE before it may be promoted above the
+#: order the operator configured.
+#:
+#: THIS IS A RATIO, NOT A GRID, AND THE MEASUREMENT SAYS WHY. The first live
+#: two-rank boot of this tier had both ranks probe the SAME directory at the
+#: same instant and report 2.41 GB/s (TP0) and 7.00 GB/s (TP1) -- a 2.9x spread
+#: caused by the two probes contending with each other. An absolute grid cannot
+#: survive that: any fixed bucket boundary between 2.41 and 7.00 splits one
+#: medium across two buckets and the two ranks then order a two-tier ladder
+#: differently. That is a rank-local decision over replicated state, i.e. a
+#: divergence that surfaces as a hang in the completion min-reduce rather than
+#: as an error (register laws 8 and 14).
+#:
+#: A RATIO test survives it because contention scales BOTH measurements on a
+#: rank together: two tiers on one medium measure ~1x apart on every rank (tie
+#: -> configured order, uniformly), while a genuinely different medium -- the
+#: refused 0.075 GB/s remote path against ~3 GB/s local is 40x -- clears the
+#: threshold on every rank. The remaining exposure is a pair of tiers whose
+#: true ratio sits near the threshold, which is recorded rather than pretended
+#: away.
+PROMOTION_RATIO = 4.0
 
 #: Default free-space headroom kept below any park budget. The park directory
 #: shares its volume with the model cache, the evidence tree and the logs; a
@@ -118,14 +146,18 @@ PARK_FAULT_WARN = 1
 PARK_FAULT_BLOCK = 3
 
 
-def quantize_bandwidth(value: float) -> float:
-    """Round a GB/s reading down onto the ordering grid.
+def outranks(candidate_gbs: float, incumbent_gbs: float) -> bool:
+    """Is ``candidate`` decisively faster than ``incumbent``?
 
-    DOWN, not nearest: a tier may never be ranked above what it demonstrated.
+    Decisively = by at least :data:`PROMOTION_RATIO`. Anything less is a TIE and
+    ties are broken by the configured order, which is the same on every rank.
+    See :data:`PROMOTION_RATIO` for the measurement that forced this shape.
     """
-    if value <= 0:
-        return 0.0
-    return (int(value / BANDWIDTH_QUANTUM_GBS)) * BANDWIDTH_QUANTUM_GBS
+    if candidate_gbs <= 0:
+        return False
+    if incumbent_gbs <= 0:
+        return True
+    return candidate_gbs >= PROMOTION_RATIO * incumbent_gbs
 
 
 def quantize_bytes(value: int) -> int:
@@ -398,7 +430,7 @@ def file_park_tier(
 
 def _ordering_bandwidth(tier: TierDescriptor) -> float:
     value = tier.caps.bandwidth_gbs.or_none()
-    return quantize_bandwidth(value) if value else 0.0
+    return float(value) if value else 0.0
 
 
 def choose_park_tier(
@@ -419,29 +451,43 @@ def choose_park_tier(
     only restricts the answer to the configured park tiers and translates the
     winner back into the index #224's transfer records.
 
-    ORDERING IS QUANTIZED, so the answer is group-uniform. Two ranks probing
-    the same filesystem measure different floats; if those floats sorted
-    directly, two ranks could park the same session to two different tiers and
-    the divergence would surface as a hang rather than an error (register law
-    14's shape). The quantum is coarser than the spread between ranks and
-    finer than the gap between media.
+    ORDERING IS GROUP-UNIFORM BY A RATIO TEST, not by sorting raw floats. Two
+    ranks probing the same filesystem measured 2.41 and 7.00 GB/s on the first
+    live boot of this tier; sorting those directly lets two ranks order a
+    two-tier ladder differently and park one session to two places, which the
+    completion min-reduce turns into a hang rather than an error. So the
+    CONFIGURED order stands unless a tier is faster by at least
+    :data:`PROMOTION_RATIO` -- a margin that per-rank contention cannot
+    manufacture, because contention scales every tier on a rank together.
     """
     selection = registry.select(kv_spill_query(int(bytes_needed)))
     wanted = list(park_tier_ids)
-    ranked = [
+    admitted = [
         candidate
         for candidate in selection.candidates
         if candidate.tier.id in wanted
     ]
-    ranked.sort(
-        key=lambda c: (
-            -_ordering_bandwidth(c.tier),
-            wanted.index(c.tier.id),
-        )
-    )
-    if not ranked:
+    if not admitted:
         return None, selection
-    return wanted.index(ranked[0].tier.id), selection
+    # Walk the CONFIGURED order and promote only on a decisive margin. Stable
+    # by construction: with no decisive difference this returns the operator's
+    # first surviving tier, which is what #224's hardcoded law returned.
+    by_id = {c.tier.id: c for c in admitted}
+    best_id = None
+    for tier_id in wanted:
+        candidate = by_id.get(tier_id)
+        if candidate is None:
+            continue
+        if best_id is None:
+            best_id = tier_id
+        elif outranks(
+            _ordering_bandwidth(candidate.tier),
+            _ordering_bandwidth(by_id[best_id].tier),
+        ):
+            best_id = tier_id
+    if best_id is None:
+        return None, selection
+    return wanted.index(best_id), selection
 
 
 def park_refusal_lines(
@@ -499,7 +545,7 @@ def park_fault_key(tier_name: str) -> str:
 
 
 __all__ = [
-    "BANDWIDTH_QUANTUM_GBS",
+    "PROMOTION_RATIO",
     "BYTES_QUANTUM",
     "DEFAULT_DF_HEADROOM_BYTES",
     "PARK_FAULT_BLOCK",
@@ -513,6 +559,6 @@ __all__ = [
     "park_health",
     "park_refusal_lines",
     "probe_park_filesystem",
-    "quantize_bandwidth",
+    "outranks",
     "quantize_bytes",
 ]

@@ -1033,6 +1033,39 @@ def attach_destinations(mgr) -> Optional[SpillDestinationController]:
             )
         )
     park_descriptors = _build_park_descriptors(sa, tiers)
+    # #659, register law 12: a mechanism that logs only its INTENT ships
+    # silently doing nothing. Say what was actually resolved -- which path was
+    # probed, what it measured, and what capacity that yields -- so an entry
+    # built against the wrong directory or with an absent probe is visible in
+    # the boot log rather than at the first shortfall.
+    for descriptor in park_descriptors:
+        capacity = descriptor.capacity.total
+        bandwidth = descriptor.caps.bandwidth_gbs
+        logger.info(
+            "kv-spill park tier REGISTERED: %s (%s) capacity=%s bandwidth=%s "
+            "latency=%s volatility=%s stages_through=%s",
+            descriptor.id,
+            descriptor.transport.name,
+            (
+                f"absent ({capacity.source})"
+                if capacity.is_absent
+                else f"{capacity.require('total') / 1e9:.2f} GB "
+                f"[{capacity.provenance.value}]"
+            ),
+            (
+                f"absent ({bandwidth.source})"
+                if bandwidth.is_absent
+                else f"{bandwidth.require('bandwidth_gbs'):.2f} GB/s "
+                f"[{bandwidth.provenance.value}]"
+            ),
+            (
+                "absent"
+                if descriptor.caps.latency_us.is_absent
+                else f"{descriptor.caps.latency_us.require('latency_us'):.1f} us"
+            ),
+            descriptor.volatility.value,
+            descriptor.transport.stages_through,
+        )
     ctl = SpillDestinationController(
         destinations=dests,
         tiers=tiers,

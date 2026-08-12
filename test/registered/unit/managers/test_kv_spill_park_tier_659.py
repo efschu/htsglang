@@ -32,7 +32,7 @@ from sglang.srt.managers.kv_spill_park_tier import (
     park_health,
     park_refusal_lines,
     probe_park_filesystem,
-    quantize_bandwidth,
+    outranks,
 )
 from sglang.srt.managers.kv_spill_tier_selection import (
     kv_spill_registry,
@@ -204,16 +204,29 @@ class TheSelectionPolicyAgreesWithTheHardcodedLaw(unittest.TestCase):
         self.assertIn("capacity", lines[0])
         self.assertIn(tier.id, lines[0])
 
-    def test_quantization_makes_near_identical_measurements_rank_alike(self):
-        """Group uniformity: measurement noise may not reorder a ladder.
+    def test_the_measured_per_rank_spread_cannot_reorder_a_ladder(self):
+        """Group uniformity, pinned to the numbers that falsified the design.
 
-        Two ranks probing one filesystem measure different floats. If those
-        sorted directly, two ranks could park one session to two tiers and the
-        divergence would surface as a hang (register law 14).
+        TP0 and TP1 measured 2.41 and 7.00 GB/s for the SAME directory at the
+        same instant on the first live boot. Neither may outrank the other, or
+        two ranks order a two-tier ladder differently and park one session to
+        two places -- a divergence the completion min-reduce turns into a hang
+        (register laws 8 and 14).
         """
-        self.assertEqual(quantize_bandwidth(3.01), quantize_bandwidth(3.19))
-        # ... and a genuinely different medium still separates.
-        self.assertNotEqual(quantize_bandwidth(3.01), quantize_bandwidth(9.0))
+        self.assertFalse(outranks(7.00, 2.41))
+        self.assertFalse(outranks(2.41, 7.00))
+
+    def test_a_genuinely_different_medium_still_promotes(self):
+        """The sibling arm: the ratio test must not be inert.
+
+        The refused remote path measured 0.075 GB/s against ~3 GB/s local --
+        40x, far past the threshold -- and that difference is real on every
+        rank, because contention scales a rank's measurements together.
+        """
+        self.assertTrue(outranks(3.0, 0.075))
+        self.assertFalse(outranks(0.075, 3.0))
+        # An unmeasurable incumbent is beaten by anything that measured.
+        self.assertTrue(outranks(1.0, 0.0))
 
 
 class TheParkCountersAreRead(unittest.TestCase):
