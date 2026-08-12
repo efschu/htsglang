@@ -84,6 +84,19 @@ def _write_gguf(directory: pathlib.Path) -> str:
         raw_dtype=gguf.GGMLQuantizationType.BF16,
         raw_shape=(_NUM_EXPERTS, _HIDDEN * 2),
     )
+    # BF16 shared-expert gate, exactly as a real Qwen3.5/3.6 MoE export stores
+    # it: a 1-D [hidden] vector, not a matrix. Same dense-module hazard as the
+    # router gate above, reached through a different HF suffix.
+    shexp = np.arange(_HIDDEN, dtype=np.float32)
+    shexp_bf16_bytes = (
+        shexp.view(np.uint8).reshape(_HIDDEN, 4)[:, 2:].copy().reshape(_HIDDEN * 2)
+    )
+    writer.add_tensor(
+        "blk.0.ffn_gate_inp_shexp.weight",
+        shexp_bf16_bytes,
+        raw_dtype=gguf.GGMLQuantizationType.BF16,
+        raw_shape=(_HIDDEN * 2,),
+    )
     # F32 contrast: must keep ".weight" both before and after the fix.
     writer.add_tensor("blk.0.attn_norm.weight", np.ones((_HIDDEN,), dtype=np.float32))
     writer.write_header_to_file()
@@ -95,6 +108,7 @@ def _write_gguf(directory: pathlib.Path) -> str:
 
 _NAME_MAP = {
     "blk.0.ffn_gate_inp.weight": "model.layers.0.mlp.gate.weight",
+    "blk.0.ffn_gate_inp_shexp.weight": "model.layers.0.mlp.shared_expert_gate.weight",
     "blk.0.attn_norm.weight": "model.layers.0.input_layernorm.weight",
 }
 
@@ -128,6 +142,36 @@ class HazardTest(CustomTestCase):
             src,
             "precondition: the router gate is built without a quant method, "
             "so it has no .qweight parameter",
+        )
+
+    def test_shared_expert_gate_has_no_qweight_parameter_to_land_in(self):
+        """The second dense gate in the same block, found on metal (#656).
+
+        A boot of the real Qwen3.6-35B-A3B MoE GGUF with NEXTN speculation on
+        2026-08-12 refused with the loader's own draft guard::
+
+            ValueError: Draft checkpoint ...Q3_K_XL.gguf left 1 parameter(s)
+            of Qwen3_5ForCausalLMMTP unloaded:
+            ['model.layers.0.mlp.shared_expert_gate.weight']
+
+        The checkpoint stores that gate as ``blk.40.ffn_gate_inp_shexp.weight``
+        in BF16 -- the same storage class as the router gate, in the same MTP
+        block -- and the module is built ``torch.nn.Linear(hidden, 1)`` on the
+        CUDA path (``qwen2_moe.py:467``), i.e. with no quant method and hence
+        no ``.qweight``. It is a second instance of #647 reached through a
+        suffix the fix's table did not name: ``shared_expert_gate.weight``
+        ends in ``_gate.weight``, never ``.gate.weight``.
+        """
+        import inspect
+
+        from sglang.srt.models import qwen2_moe
+
+        src = inspect.getsource(qwen2_moe.Qwen2MoeSparseMoeBlock.__init__)
+        self.assertIn(
+            "self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1",
+            src,
+            "precondition: the shared-expert gate is a plain nn.Linear on the "
+            "CUDA path, so it has no .qweight parameter either",
         )
 
     def test_unquantized_types_are_wider_than_the_dispatch_test(self):
@@ -199,6 +243,41 @@ class FixTest(CustomTestCase):
             _NUM_EXPERTS, _HIDDEN
         )
         np.testing.assert_allclose(gate.float().numpy(), expected)
+
+    def test_bf16_shared_expert_gate_keeps_the_weight_name(self):
+        """The suffix table must cover both dense gates, not only the router.
+
+        Missing this one does not degrade quietly on the draft path: the
+        loader's ``raise_on_unloaded_draft_parameters`` guard turns it into a
+        hard boot refusal for every GGUF MoE checkpoint that carries an MTP
+        block, which is how it was found (#656 metal window).
+        """
+        out = _emitted(self.path)
+        self.assertIn(
+            "model.layers.0.mlp.shared_expert_gate.weight",
+            out,
+            "a dense BF16 shared-expert gate must arrive under the name the "
+            "model actually has",
+        )
+        self.assertNotIn(
+            "model.layers.0.mlp.shared_expert_gate.qweight",
+            out,
+            "the shared-expert gate must NOT be routed onto the quantized path",
+        )
+        self.assertNotIn("model.layers.0.mlp.shared_expert_gate.qweight_type", out)
+
+    def test_bf16_shared_expert_gate_arrives_as_real_bf16_values(self):
+        """1-D storage, and the values must survive the byte reinterpretation."""
+        import numpy as np
+        import torch
+
+        out = _emitted(self.path)
+        gate = out["model.layers.0.mlp.shared_expert_gate.weight"]
+        self.assertEqual(gate.dtype, torch.bfloat16)
+        self.assertEqual(tuple(gate.shape), (_HIDDEN,))
+        np.testing.assert_allclose(
+            gate.float().numpy(), np.arange(_HIDDEN, dtype=np.float32)
+        )
 
     def test_f32_tensor_is_unaffected(self):
         """Backward compatibility: F32 never reached the rename anyway."""
