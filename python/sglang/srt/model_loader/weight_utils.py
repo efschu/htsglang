@@ -1370,6 +1370,15 @@ GGUF_DENSE_PARAM_SUFFIXES: Tuple[str, ...] = (
     # no parameter and is dropped silently, leaving the gate uninitialised and
     # the MoE routing on garbage.
     ".gate.weight",
+    # MoE shared-expert gate. Same hazard, different suffix: the HF name ends
+    # in "_gate.weight", never ".gate.weight", so the entry above does not
+    # reach it. Built torch.nn.Linear(hidden, 1) on the CUDA path
+    # (qwen2_moe.py:467) -- no quant method, hence no ".qweight" either.
+    # Found on metal (#656, 2026-08-12): a Qwen3.6-35B-A3B GGUF boot with
+    # NEXTN speculation refused outright, because the checkpoint stores
+    # blk.<mtp>.ffn_gate_inp_shexp.weight in BF16 and the renamed tensor
+    # reached no parameter, leaving the draft model's gate unloaded.
+    ".shared_expert_gate.weight",
 )
 
 
