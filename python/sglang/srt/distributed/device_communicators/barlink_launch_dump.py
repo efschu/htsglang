@@ -139,9 +139,41 @@ def _handler(signum, frame):  # noqa: ARG001
     dump(reason="SIGUSR1 pid-local")
 
 
-#: Where the sampler thread writes. One file per rank, truncated each tick, so
-#: reading it during a wedge always yields the CURRENT record without parsing.
+#: Where the sampler thread writes. One file per rank, APPENDED to on every
+#: tick -- so the file also holds the record from before a wedge, which is
+#: where the offset is introduced. It is not truncated, so it grows for the
+#: life of the process (one line per live transport per ``interval``).
+#:
+#: #251: the value below is the rig's investigation directory and was the only
+#: possible destination until this override existed. A deployment that has no
+#: such directory (a container, another host) must be able to move the record
+#: or switch it off; both are env-only because the sampler starts inside
+#: transport construction, long before any server argument is reachable here.
 SAMPLE_DIR = "/spinning/wedge-catch-603b"
+
+#: Destination override. Unset -> ``SAMPLE_DIR`` exactly, so the default path
+#: is byte-identical to the pre-#251 behaviour.
+ENV_DIR = "SGLANG_BARLINK_LAUNCH_DUMP_DIR"
+
+#: Set to ``0`` to start no sampler at all. Any other value (including unset)
+#: leaves the sampler ON, which is the pre-#251 behaviour: the #631 wedge hunt
+#: reads these files, so the default is not flipped here. A released image
+#: that does not want the writes sets this to ``0``.
+ENV_ENABLE = "SGLANG_BARLINK_LAUNCH_DUMP"
+
+
+def sample_dir() -> str:
+    """The directory the sampler writes to. ``SAMPLE_DIR`` unless overridden."""
+    import os
+
+    return os.environ.get(ENV_DIR) or SAMPLE_DIR
+
+
+def sampler_enabled() -> bool:
+    """False only for an explicit ``SGLANG_BARLINK_LAUNCH_DUMP=0``."""
+    import os
+
+    return os.environ.get(ENV_ENABLE, "1").strip() != "0"
 
 
 def start_sampler(rank: int, interval: float = 1.0) -> bool:
@@ -167,8 +199,14 @@ def start_sampler(rank: int, interval: float = 1.0) -> bool:
     try:
         import os
 
-        os.makedirs(SAMPLE_DIR, exist_ok=True)
-        path = os.path.join(SAMPLE_DIR, f"launch_rank{rank}.log")
+        if not sampler_enabled():
+            logger.info(
+                "BARLINK-LAUNCH-DUMP sampler off (%s=0).", ENV_ENABLE
+            )
+            return False
+        directory = sample_dir()
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"launch_rank{rank}.log")
 
         def _run():
             import time
