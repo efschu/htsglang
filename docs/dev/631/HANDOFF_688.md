@@ -262,8 +262,40 @@ and `live_pids.txt` (the ship config as it stood before I stopped it).
 
 * **#659 is NOT closed** and this shift did not fix C28 — it found and
   characterised it. Stating that plainly is the point of this section.
-* **#559 merge-backlog triage was not begun.** The probe, its root cause and
-  the ship restore consumed the shift. Nothing about #559 is in this
-  document, and its absence should not be read as "nothing to merge".
+* **#559 merge-backlog triage is a first pass only, in §7.** It is a listing,
+  not an analysis: no branch was diffed against `feat/route-a-631`'s state
+  for conflicts, and no merge order is proposed on evidence. Treat §7 as the
+  input to the triage, not the triage.
 * The restore-margin sizing question in §1c is raised, not settled beyond
   what §2 establishes.
+
+---
+
+## 7. #559 MERGE BACKLOG — FIRST PASS, LISTING ONLY
+
+Branches on the fork carrying commits `feat/route-a-631` does not have, by
+distance. **Nothing here has been diffed for conflicts and no merge order is
+proposed on evidence** — see §6.
+
+| ahead | branch | tip |
+|---|---|---|
+| 155 | `origin/docs/features-vs-upstream` | 2026-07-24 docs(benchmarks): remove misleading spill tokens chart |
+| 82 | `origin/bugfix/pd-mamba-conv-state-transfer` | 2026-07-19 PD mamba conv-state transfer: per-sub-block |
+| 2 | `origin/docs/pool-audit-2026-08-04` | 2026-08-04 fix 3 stale file:line citations in catalogue |
+| 2 | `origin/audit/unwired-sweep-421` | 2026-08-02 #421 audit: calibration passes on both known cases |
+| 1 | `origin/docs/433-int8-prefill-vector` | 2026-08-02 #433 desk analysis, INT8-W8A8 phase-prefill vector |
+| 1 | `origin/chore/stash-rescue-432` | 2026-08-02 #432 rescue seven legacy stash entries |
+
+Two observations a successor should not have to rediscover:
+
+* **The two large ones are large for different reasons and must not be
+  treated alike.** `docs/features-vs-upstream` at 155 commits is almost
+  certainly mostly SHARED history that simply predates this line's branch
+  point, not 155 pending changes; its distance is a measurement artefact
+  until someone computes the actual merge base. `bugfix/pd-mamba-conv-state-
+  transfer` at 82 is a real code branch touching the mamba conv-state path,
+  which #631 Route A also touches — that one is the genuine conflict
+  candidate and is where the triage should start.
+* **The four small ones are docs/audit branches** and are cheap; they are the
+  right first merges precisely because they exercise the merge process
+  without risking the integration line.
