@@ -896,6 +896,30 @@ curl -s -X POST http://127.0.0.1:<port>/vram_budget \
   The response returns immediately with per-rank budget/floor/backing
   numbers; the physical release/growth commits at the next group-idle
   consensus boundary. Watch the log for `VRAM-DIAL DONE ... released`.
+- **Measured on metal (successor 47, first `--enable-vram-dial` boot on this
+  rig; evidence `/spinning/evidence-631/s47/`).** TP=3 weighted uneven DCP,
+  vector `[30, 17, 17]`, dial-down of 4096 MiB on one rank issued **under
+  load**: HTTP returned in **2.0 ms** (arming is synchronous), the commit
+  landed at the next idle boundary as `VRAM-DIAL DONE SHRINK
+  max_total_num_tokens 327760 -> 69824 ... released 4000.0 MiB to the driver`,
+  and NVML confirmed the pages left the process out of band (target card free
+  **8132 -> 11584 MiB**). The raise restored capacity (`-> 327744`) and a real
+  generation succeeded after it. Corridor: 202 samples at 100 ms, **0
+  breaches**, min free 3485 / 7584 / 4239 MiB.
+- **Two cautions the numbers above expose, neither of them a bug.**
+  **(1) The relief ladder is asked first and returns nothing.** The dial logs
+  `the corridor relief ladder returned 0 MiB now; the residual is funded by
+  the capacity arithmetic`. Both providers register
+  (`allocator-cache[local]`, `draft-weights[rebalance]`) but `draft-weights`
+  yields 0 outside a PP phase and no `RELIEF_PARK`/`RELIEF_HOST` provider is
+  registered anywhere, so on a boot without the phase flip the full reduction
+  comes from the capacity arithmetic. Do not plan a dial-down around ladder
+  relief that will not arrive.
+  **(2) A per-card dial is a GLOBAL lever.** Global `max_total_num_tokens` is
+  a min-reduce over per-rank (capacity / ratio) units, so dialing ONE rank
+  makes it bind everyone: the 4096 MiB cut above cost **79% of the global KV
+  ceiling** and forced 128 MiB out of each undialed rank. Budget the ceiling
+  loss, not just the MiB.
 - A dial below the pinned floor (weights + graphs + GDN state + one KV
   owner block) is rejected in the HTTP response with the exact MiB numbers.
 - Dial-DOWN flushes the radix cache when the token ceiling must contract
