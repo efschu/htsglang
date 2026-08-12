@@ -70,6 +70,83 @@ landed.
 
 ## OPEN — flagged, never resolved
 
+**C28, a session that finishes ON HOST deletes its own terminal output before
+the streamer reads it, and the caller hangs forever (#659, successor 44,
+measured on metal 2026-08-12).** This is what stood behind C26. With C26
+fixed the instance survives the park, so for the first time a session got
+through the whole round trip alive — and the round trip is not the problem.
+`rid=s44-sat-3` spilled, parked to the file tier, unparked cleanly
+(`identity_miss=0`, zero failures, both ranks identical), then finished on
+host two seconds later. **The HTTP client never received a byte and blocked
+forever against a scheduler reporting `#running-req: 0`.** 40 further
+requests did not release it; `abort_request` on the rid returned 200 and was
+a no-op, because the req slot had already been freed.
+
+**THE MECHANISM IS AN ALIAS, AND IT IS EXACT.** `release_finished_spilled_req`
+runs from INSIDE the per-request loop of `process_batch_result_decode`
+(`batch_result_processor.py:932-938`, gated on `req.kv_spill_state == "host"`),
+and it calls `slot.batch.filter_batch()` (`kv_session_offload.py:5868`). For a
+spill tick, **`batch` IS `slot.batch` — one object, two names**
+(`maybe_take_tick` returns the persistent batch at `kv_session_offload.py:4930,
+4974`; the scheduler runs it as `ret = spill_tick_batch`, `scheduler.py:4865`;
+under `--disable-overlap-schedule` `event_loop_normal` passes it through
+unchanged, `scheduler.py:2232-2233`). `filter_batch` keeps only unfinished
+reqs and, when none survive, rebinds `self.reqs = []`
+(`schedule_batch.py:3273-3277`). The enclosing `for` loop already holds the
+old list so it finishes normally — and then, ~100 lines later,
+
+```python
+self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+```
+
+(`batch_result_processor.py:805`) reads the NEW, EMPTY list.
+`_stream_output_generation([])` accumulates nothing, `payload is None`,
+nothing is sent, the detokenizer never sees a finished chunk, the tokenizer
+manager's waiter never resolves. **The request deleted its own completion
+from the list that was about to carry it.**
+
+**AND THE FIX FOR THIS ALREADY EXISTS, ON THE OTHER EXIT.** The abort exit
+has `_stream_terminal` (`kv_session_spill_destination.py:1537-1546, 1562-1572`),
+added by `bcc72dd569 [#552]` with the comment *"Without it the abort frees the
+memory and the caller hangs."* That is this bug, written down, on the sibling
+path. `kv_session_offload.py` contains **zero** occurrences of
+`stream_output`, `output_streamer`, `send_to_detokenizer` or `_stream_terminal`.
+The same hole is on the pre-schedule reap (`kv_session_offload.py:4520-4524`).
+
+**WHY EVERY SPILLED SESSION ON THIS BOOT LANDED ON THAT PATH (contributing,
+not the wedge).** Restore was unreachable twice over, so finishing on host was
+forced rather than chosen:
+
+* an early return before the gate whenever ANY fast-lane request waits
+  (`kv_session_offload.py:4707-4712`) — `s44-target` waited throughout;
+* the gate itself, `fits_now = restorable >= remaining + restore_margin_tokens`
+  (`:4753-4757`): `remaining = 3372 - 3010 = 362` against
+  `restore_margin=4096`, so it demands `restorable >= 4458` **while the entire
+  pool is `max_total_tokens=4096`** — unsatisfiable by construction. The
+  default is an absolute token count (`server_args.py:1870-1877`) validated
+  only against `< 0` (`:6983-6984`) and **never sized against the pool**.
+
+A restored session would have finished in the device batch and streamed
+normally, which is why `RESTORE complete:` count 0 and the hang co-occur.
+**The park is exonerated:** `_commit_unpark` re-inserts the same slot object
+and restores every flag (`kv_session_spill_destination.py:1479-1482`), and
+`slot.batch` survives the round trip untouched. Had the session finished
+WHILE parked, `_release_parked_req` would have streamed it and the client
+would have been served.
+
+**THE DISCRIMINATING OBSERVATION, CPU-ONLY, FOR WHOEVER FIXES THIS.** What the
+metal run witnesses is that nothing was streamed and that the path has no
+emit; it does not directly witness that the finish was processed on the
+spill-tick batch rather than via `release_kv_cache` (`mem_cache/common.py:1098`,
+equally emit-less but a DIFFERENT fix site). Drive
+`process_batch_result_decode` over a one-req spill-tick batch with
+`slot.batch is batch` whose req finishes, and assert the streamer receives a
+non-empty list. It will receive `[]`. Secondary prediction that discriminates
+the alias from a generic missing emit: **the same boot WITHOUT
+`--disable-overlap-schedule` should not hang**, because `event_loop_overlap`
+snapshots `batch.copy()` (`scheduler.py:2315`, `schedule_batch.py:3474-3479`),
+so `filter_batch` cannot empty the list being streamed.
+
 **C27, the corridor law was enforced by nothing at the place it is spent
 (#656).** Successor 42's confirmation window breached: 12 samples, gpu0 at
 941 MiB for 1.5 s. Root-caused by successor 43 to a `pp_to_tp` cutover on
@@ -133,7 +210,13 @@ are byte-identical. The pool difference (512552 vs 503950) is **a warm page
 cache**, not code: weight load took 11.11 s cold and 2.35 s warm, and the
 faster load leaves ~0.1 GB more allocator high-water on every rank.
 
-**C26 — ROOT-CAUSED AND FIXED IN `bdb2c3db53`, awaiting its metal proof.**
+**C26 — ROOT-CAUSED, FIXED IN `bdb2c3db53`, AND NOW PROVEN ON METAL
+(successor 44, 2026-08-12).** The probe boot that killed the instance for
+successor 42 ran the same pressure band to completion: a session spilled,
+parked and unparked with **zero** device-side asserts, zero tracebacks, and
+the instance stayed healthy afterwards and served 40 further requests. The
+fix holds. It bought exactly what it promised and no more — the crash is
+gone, and what stood behind it is now C28.
 The mechanism is not a race and not a corner: **PS2 is admitted onto a backend
 that has no hook to divert its sentinels.** `spill_extend_alloc` returns
 `make_sentinels(...)` AS `out_cache_loc`, and exactly one thing in the tree
@@ -439,3 +522,53 @@ to the pinned host pool by `host_pool.backup_from_device_all_layer`, `:3790`).
    rank-local" but "can two ranks take different ACTIONS from it". Stated
    because the first draft of the C27 fix was nearly abandoned on a
    misreading of law 15 that would have left the breach unfixed.
+
+18. **An instrument may not NAME the subject of its claim in advance when the
+   system chooses that subject** (C28, #659, successor 44). The park-completion
+   driver picked a TARGET request, drove pressure at it, and compared that
+   request's output to a reference. On metal the server parked a DIFFERENT
+   request, because the spill victim is elected by the victim ordering and not
+   by which request a test author found interesting. The driver had already
+   computed the attribution term (`target_named_in_park_records`) **and did not
+   gate on it**, so its verdict would have read PROVEN over a run in which the
+   measured session never parked and the parked session was never measured.
+   The cure is not a better prediction: make the cohort HOMOGENEOUS (every
+   member identical to the reference in prompt and sampling) and assign the
+   arms AFTER the fact from the server's own per-rid records. **Then there is
+   nothing left to guess, because every possible choice the system makes is
+   already a valid measurement.** Sibling of the `proof_driver2` lesson (a
+   verdict whose first conjunct must be "the mechanism ran"), one level in:
+   there the instrument could pass without the mechanism running, here it could
+   pass with the mechanism running *on something else*. Both are the same
+   failure — a conjunct that was computed and not enforced.
+
+19. **A state has more than one exit, and a fix applied to one exit is not
+   applied to the state** (C28, #659). A parked/spilled session can leave
+   through an ABORT or through a normal FINISH. `#552` found that the abort
+   exit freed the session's memory without emitting its terminal chunk, fixed
+   it with `_stream_terminal`, and left a comment saying in as many words
+   *"Without it the abort frees the memory and the caller hangs."* The finish
+   exit does the same freeing, was never given the same emit, and hangs the
+   caller in exactly the way the comment describes. The bug was documented on
+   its sibling for three shifts. **When a fix restores an obligation a cleanup
+   path skipped, enumerate every path that performs that cleanup and check
+   each one** — the obligation belongs to the STATE being left, not to the
+   reason for leaving it. Sibling of law 12 (mechanisms that resolve nothing
+   and report intent): here the mechanism reported, correctly and in detail,
+   everything it released — `device head + tree lock + mamba + req slot +
+   region` — and the log line's very completeness reads as diligence, which is
+   why nobody noticed that the client's answer was not on the list.
+
+20. **A cleanup that runs INSIDE an iteration must not mutate the collection
+   the iteration's output depends on** (C28, #659). `filter_batch()` on
+   `slot.batch` rebinds `reqs` to `[]`; the enclosing loop survives because it
+   holds the old list, and the streamer 100 lines later reads the new one and
+   sends nothing. The two names (`batch`, `slot.batch`) are one object, and
+   nothing in either signature says so. **Membership of the
+   Geteilte-Puffer-Familie** (a shared object plus an ordering assumption
+   recorded only in a comment): the falsifier is cheap and should be written
+   first — assert the streamer's input is non-empty for a request that
+   finished. Note the diagnostic trap this creates: the symptom is a CLIENT
+   hang with the server idle and healthy, which points every instinct at the
+   transport, the scheduler or a deadlock, and none at a list that was
+   correctly emptied 100 lines earlier.
