@@ -46,6 +46,11 @@ def _supported(**over):
         page_size=1,
         enable_hisparse=False,
         disaggregation_transfer_backend="mooncake",
+        # The token-sharded pool exists only under an installed --rank-tp-ratio
+        # plan: uneven_dcp_kv_replicated() is `dcp_size > 1 and
+        # get_tp_partition_ratios() is not None`. Without it the pool is stock
+        # head-sharded DCP and the receive is unimplemented.
+        rank_tp_ratio=[2, 1, 1],
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -90,15 +95,55 @@ class DcpTokenShardContractTest(CustomTestCase):
         self.assertIn("--disaggregation-transfer-backend must be one of", msg)
 
     def test_inert_off_the_token_sharded_layout(self):
-        """Not this layout -> not this contract. Must not refuse other setups."""
-        for over in (
-            {"dcp_size": 1},  # no DCP at all
-            {"dcp_size": 2, "tp_size": 3},  # DCP but not the dcp==tp layout
-        ):
+        """Not this layout -> not this contract. Must not refuse other setups.
+
+        ``dcp_size == 1`` is the ONLY genuinely inert DCP shape: with no DCP
+        group there is no owner rule, no compact rows, and nothing this
+        contract governs. The case that used to sit beside it here --
+        ``dcp_size=2, tp_size=3`` -- is NOT inert and is now pinned as a
+        refusal below; see
+        ``test_head_sharded_dcp_decode_arm_is_refused_at_boot``.
+        """
+        for over in ({"dcp_size": 1},):
             with self.subTest(over=over):
                 validate_pd_dcp_token_shard_contract(
                     _supported(page_size=64, enable_hisparse=True, **over)
                 )
+
+    def test_head_sharded_dcp_decode_arm_is_refused_at_boot(self):
+        """#636 P2, the precondition the boot gate used to wave through.
+
+        ``uneven_dcp_owner_bounds()`` (``distributed/utils.py:421``) returns
+        non-None iff ``uneven_dcp_kv_replicated(dcp_size)`` -- which is
+        ``dcp_size > 1 and get_tp_partition_ratios() is not None``
+        (``utils.py:346-354``). So a DCP arm WITHOUT an installed
+        ``--rank-tp-ratio`` plan takes the ``elif get_parallel().dcp_enabled``
+        branch at ``decode.py:1153-1159`` and raises "Stock head-sharded DCP
+        receive is not supported" -- on the FIRST handover, after the weight
+        load, in production. That is verbatim the lateness this gate exists to
+        remove, and it was the one of the four preconditions the gate's own
+        applicability test skipped over.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            validate_pd_dcp_token_shard_contract(_supported(rank_tp_ratio=None))
+        msg = str(ctx.exception)
+        self.assertIn("--rank-tp-ratio", msg)
+        self.assertIn("head-sharded", msg)
+
+    def test_the_owner_rule_does_not_require_dcp_equal_tp(self):
+        """The gate's applicability must mirror the RUNTIME predicate.
+
+        The old gate applied only when ``dcp_size == tp_size``, but the owner
+        rule needs no such equality -- an installed ratio plan and
+        ``dcp_size > 1`` are the whole condition. A ``dcp_size=2, tp_size=3``
+        arm therefore DOES build compact rows, and its page_size/hisparse/
+        transport preconditions are live rather than moot.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            validate_pd_dcp_token_shard_contract(
+                _supported(dcp_size=2, tp_size=3, page_size=64)
+            )
+        self.assertIn("page_size must be 1", str(ctx.exception))
 
     def test_inert_for_a_monolithic_server(self):
         """The standing production boot is monolithic and must be untouched."""

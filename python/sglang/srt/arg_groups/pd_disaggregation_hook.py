@@ -25,11 +25,29 @@ def validate_pd_dcp_token_shard_contract(server_args: ServerArgs) -> None:
     replicated-KV DCP path) can only receive a transfer on a narrow
     combination. All four conditions were enforced, and enforced well, but
     every one of them at RUNTIME: three in ``disaggregation/decode.py``
-    (:1109-1133) on the first ``send_metadata``, and the transport one from
-    inside the sender (``nixl/conn.py:2511``, ``mori/conn.py:1699``), later
-    still. The server therefore boots healthy, reports 200, accepts traffic,
-    and dies on the FIRST handover -- after the full weight load, and in
-    production rather than at the operator's keyboard.
+    (:1135-1159) on the first ``send_metadata``, and the transport one from
+    the receiver the decode arm constructs (``NixlKVReceiver``,
+    ``nixl/conn.py:2516``; ``MoriKVReceiver``, ``mori/conn.py:1704``, reached
+    from ``decode.py:1249``), later still. The server therefore boots healthy,
+    reports 200, accepts traffic, and dies on the FIRST handover -- after the
+    full weight load, and in production rather than at the operator's
+    keyboard.
+
+    THE FOUR, and where each is decided here:
+
+    ==  =============================  ==========================
+    P1  ``page_size == 1``             below, with the owner-rule reason
+    P2  the uneven-TP replicated-KV    the ``rank_tp_ratio is None``
+        layout (``--rank-tp-ratio``)   refusal below
+    P3  the mooncake transport         below
+    P4  ``--enable-hisparse`` off      below
+    ==  =============================  ==========================
+
+    P2 was the one this gate originally did not decide: it sat in the
+    APPLICABILITY test rather than among the violations, so an arm that failed
+    it was waved through instead of refused (#636's open leg). Its runtime
+    raise is the ``elif get_parallel().dcp_enabled`` branch at
+    ``decode.py:1153``.
 
     That lateness is the defect this gate removes; four loud failures in four
     files is not the problem, four loud failures that all arrive too late is.
@@ -50,11 +68,37 @@ def validate_pd_dcp_token_shard_contract(server_args: ServerArgs) -> None:
     """
     if server_args.disaggregation_mode not in ("prefill", "decode"):
         return
-    # Not the token-sharded layout -> this contract does not apply. The
-    # decode-side runtime checks remain as the backstop for anything that
-    # reaches them by another route.
-    if not (server_args.dcp_size > 1 and server_args.dcp_size == server_args.tp_size):
+    # No DCP group -> no owner rule, no compact rows, nothing this contract
+    # governs. The ONLY genuinely inert DCP shape.
+    if server_args.dcp_size <= 1:
         return
+
+    # PRECONDITION 2, and the reason this predicate is not `dcp == tp`.
+    #
+    # The runtime decides on ``uneven_dcp_owner_bounds()``
+    # (``distributed/utils.py:421``), which is non-None iff
+    # ``uneven_dcp_kv_replicated(dcp_size)`` -- and that is
+    # ``dcp_size > 1 and get_tp_partition_ratios() is not None``
+    # (``utils.py:346-354``), with NO equality between dcp_size and tp_size in
+    # it. So the equality this gate used to test was both too narrow (it waved
+    # a dcp != tp arm through P1/P3/P4, which the runtime does enforce there)
+    # and blind to P2 itself: an arm with DCP but no installed --rank-tp-ratio
+    # plan fell out of the gate entirely and died at ``decode.py:1153-1159``
+    # on the first handover. Mirror the runtime predicate instead.
+    if server_args.rank_tp_ratio is None:
+        raise ValueError(
+            "PD disaggregation on a DCP decode server "
+            f"(dcp_size={server_args.dcp_size}) requires the uneven-TP "
+            "replicated-KV layout, i.e. an installed --rank-tp-ratio plan. "
+            "Stock head-sharded DCP receive is not supported: the sender can "
+            "only filter its source rows by the receiver's OWNED ORDINALS, "
+            "which exist only under the owner rule that --rank-tp-ratio "
+            "installs.\n\n"
+            "Pass --rank-tp-ratio (the uneven-TP replicated-KV layout), or "
+            "run this arm without DCP (--dcp-size 1). Refused at boot on "
+            "purpose: without this gate the server loads its weights, reports "
+            "200, accepts traffic and raises on the FIRST KV handover."
+        )
 
     violations = []
     if server_args.page_size != 1:
@@ -81,15 +125,16 @@ def validate_pd_dcp_token_shard_contract(server_args: ServerArgs) -> None:
 
     raise ValueError(
         "PD disaggregation on a DCP token-sharded KV pool "
-        f"(dcp_size={server_args.dcp_size} == tp_size={server_args.tp_size}) "
-        "is only supported on one combination, and this launch is outside "
-        "it:\n"
+        f"(dcp_size={server_args.dcp_size}, tp_size={server_args.tp_size}, "
+        "--rank-tp-ratio installed) is only supported on one combination, and "
+        "this launch is outside it:\n"
         + "\n".join(violations)
         + "\n\nSupported combination: page_size == 1, --enable-hisparse off, "
         "--disaggregation-transfer-backend mooncake, on the uneven-TP "
-        "replicated-KV layout (dcp_size == tp_size). Refused at boot on "
-        "purpose: each of these was previously discovered on the first KV "
-        "handover, i.e. after the weight load and in production."
+        "replicated-KV layout (--rank-tp-ratio installed, dcp_size > 1). "
+        "Refused at boot on purpose: each of these was previously discovered "
+        "on the first KV handover, i.e. after the weight load and in "
+        "production."
     )
 
 

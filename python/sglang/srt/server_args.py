@@ -5350,7 +5350,11 @@ class ServerArgs:
             "the spill unmaps PHYSICAL pages while every address the TP "
             "decode graphs baked stands still; that is what makes this rung "
             "compatible with keeping draft graphs ON, which spec item 8 "
-            "measured as worth 41% of decode throughput. 'draft' REQUIRES "
+            # `%%`: argparse expands help through `%`-formatting, and `% o`
+            # parses as the octal conversion with a space flag -- one literal
+            # percent here made `--help` raise for EVERY option, not just this
+            # one. Pinned by test_help_text_renders.
+            "measured as worth 41%% of decode throughput. 'draft' REQUIRES "
             "--phase-flip-purity strict (a PP-phase decode would touch "
             "unbacked memory) and is refused at boot otherwise. "
             "'draft+graphs' remains defined and REFUSED rather than clamped: "
