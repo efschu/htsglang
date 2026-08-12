@@ -28,22 +28,21 @@ import sys
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from sglang.srt.turnkey import config as C            # noqa: E402
 from sglang.srt.turnkey import orchestrator as O      # noqa: E402
 from sglang.srt.turnkey import preflight as PF        # noqa: E402
+from turnkey_539_export_env import PER_BOOT_KEYS      # noqa: E402
 
 #: Env keys the turnkey path is EXPECTED to diverge on, each for a stated
 #: reason. Anything diverging outside this set is a parity failure.
-EXPECTED_DIVERGENCE = {
-    "PYTHONPATH": "capture ran from the wt-631-routea worktree; the unit "
-                  "roots the stack in the canonical checkout",
-    "CUDA_VISIBLE_DEVICES": "derived from the card UUIDs at boot (same value, "
-                            "different provenance)",
-    "SGLANG_PHASE_FLIP_INSTANCE": "per-boot identity; the capture embeds the "
-                                  "dead pid 3940356",
-    "SGLANG_BOOT_COMMIT": "provenance, measured from the repo at boot",
-}
+#:
+#: DEFINED ONCE, in turnkey_539_export_env.py, and imported here. It was
+#: written out twice until 2026-08-12, and the boot gate that reads the other
+#: copy would have been free to sanction a key this proof still refuses --
+#: two lists of sanctioned divergences is the drift defect one directory over.
+EXPECTED_DIVERGENCE = PER_BOOT_KEYS
 
 
 def idle_machine_probes(cfg) -> PF.Probes:

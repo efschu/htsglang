@@ -20,7 +20,87 @@
 # sampling through boot, flip and a speculating decode). The higher
 # 16400,10750,10750 used for the acceptance ladder breached the 1024 MiB
 # corridor at the boot peak. Do not raise without re-sampling.
+#
+# THE ENVIRONMENT IS NOT MAINTAINED HERE. It comes from the captured ship
+# process (deploy/turnkey/ship_env.capture) and is verified against that
+# capture immediately before exec. This script used to keep its own copy of
+# those keys, and on 2026-08-12 that copy had drifted in seven of them --
+# five dropped, PYTORCH_CUDA_ALLOC_CONF added, and SGLANG_UNEVEN_TOKEN_VECTOR
+# at 28,26,20 where the ship process carried 14,10,8. The instance it booted
+# came up, answered /model_info with 200 and never answered /generate.
+#
+# So there is exactly one way for a value to differ from the capture: a
+# DECLARED override, named per key, printed to stderr, and passed to the gate
+# as --allow <that key>. There is deliberately no blanket bypass -- adding one
+# restores the defect in full.
 set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The capture this boot replays. Overridable so a NEW capture can be adopted
+# deliberately, never so the gate can be pointed at something convenient.
+SHIP_ENV_CAPTURE="${SHIP_ENV_CAPTURE:-$HERE/../deploy/turnkey/ship_env.capture}"
+# DRY_RUN assembles the environment and argv, runs the gate, prints both and
+# exits without launching. It exists so the env/argv this script produces can
+# be tested on the desk -- the previous version could only be inspected by
+# reading it, which is how seven drifted keys survived review.
+DRY_RUN="${DRY_RUN:-0}"
+
+# --- operator intent, snapshotted BEFORE the capture is sourced -------------
+# Every key here is a knob an operator may set in the environment. The list is
+# explicit because it is what separates "the operator meant this" from "a
+# stale variable in somebody's shell": a governed key that arrives set and is
+# NOT on this list is a stray, and the gate refuses the boot over it.
+OPERATOR_TUNABLE_KEYS=(
+    SGLANG_FLIP_SEAM_CHUNK_MIB
+    SGLANG_UNEVEN_TOKEN_VECTOR
+    SGLANG_BARLINK_BAR1_WINDOW_MIB
+    SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0
+    SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0
+    SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0
+    SGLANG_COLLECTIVE_CENSUS_INTERVAL
+    SGLANG_MAMBA_PIN_TRACE
+    SGLANG_VRAM_FLIGHT_DIR
+)
+declare -A OPERATOR_SET=()
+for _k in "${OPERATOR_TUNABLE_KEYS[@]}"; do
+    if [ -n "${!_k+set}" ]; then OPERATOR_SET["$_k"]="${!_k}"; fi
+done
+OP_PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-}"
+
+# Keys whose value was DECLARED to differ from the capture. Only these are
+# passed to the gate as --allow, one flag per key.
+ENV_OVERRIDES=()
+
+# Announce and apply a divergence from the capture. Loud on purpose: an
+# override nobody sees is a silent redefinition wearing a different hat.
+override_env() {  # key value reason
+    local k="$1" v="$2" why="$3"
+    printf 'OVERRIDE %s: capture %s -> boot %s  reason: %s\n' \
+           "$k" "${!k-<unset>}" "$v" "$why" >&2
+    export "$k=$v"
+    ENV_OVERRIDES+=("$k")
+}
+
+# Remove a captured key for this boot. Same declaration, same announcement.
+drop_env() {  # key reason
+    local k="$1" why="$2"
+    printf 'OVERRIDE %s: capture %s -> boot <unset>  reason: %s\n' \
+           "$k" "${!k-<unset>}" "$why" >&2
+    unset "$k"
+    ENV_OVERRIDES+=("$k")
+}
+
+# Set a knob whose default IS the captured value: only a value that actually
+# differs becomes a declared override. Setting a key to what the capture
+# already says is not a divergence and must not be announced as one.
+set_tunable() {  # key value reason
+    local k="$1" v="$2" why="$3"
+    if [ "${!k+set}" = "set" ] && [ "${!k}" = "$v" ]; then
+        export "$k=$v"
+        return 0
+    fi
+    override_env "$k" "$v" "$why"
+}
 
 WT="${WT:-/spinning/wt-631-routea}"
 PY="${PY:-/spinning/htsglang-gpu/.venv/bin/python}"
@@ -152,25 +232,55 @@ LOGDIR="${LOGDIR:-/tmp/route-a-631}"
 LOG="${SERVING_LOG:-/spinning/serving-30030.boot.log}"
 mkdir -p "$LOGDIR"
 
-# The production stop guard. Same contract as start-serving-30030.sh: while
-# the marker exists, production must not be restored.
-if [ -f /spinning/PRODUCTION_STOPPED ]; then
-  echo "REFUSED: production is stopped by operator order." >&2
-  cat /spinning/PRODUCTION_STOPPED >&2
-  exit 3
+# The two guards below refuse to LAUNCH. DRY_RUN launches nothing -- it
+# assembles env and argv, gates them and exits -- so it is not what either
+# guard exists to prevent, and skipping them there is what makes the
+# assembled environment testable while production is stopped.
+if [ "$DRY_RUN" != 1 ]; then
+  # The production stop guard. Same contract as start-serving-30030.sh: while
+  # the marker exists, production must not be restored.
+  if [ -f /spinning/PRODUCTION_STOPPED ]; then
+    echo "REFUSED: production is stopped by operator order." >&2
+    cat /spinning/PRODUCTION_STOPPED >&2
+    exit 3
+  fi
+
+  # Single-instance guard (the 19:44 Bar1Failed was a second boot racing a
+  # live instance for the aperture).
+  if pgrep -f "sglang.launch_server.*--port $PORT" >/dev/null 2>&1; then
+    echo "REFUSE: a serving instance for port $PORT is already running." >&2
+    echo "Read /spinning/gpu-arb/holder for the owner; stop it with" >&2
+    echo "kill -TERM -- -<pgid> before rebooting." >&2
+    exit 1
+  fi
 fi
 
-# Single-instance guard (the 19:44 Bar1Failed was a second boot racing a
-# live instance for the aperture).
-if pgrep -f "sglang.launch_server.*--port $PORT" >/dev/null 2>&1; then
-  echo "REFUSE: a serving instance for port $PORT is already running." >&2
-  echo "Read /spinning/gpu-arb/holder for the owner; stop it with" >&2
-  echo "kill -TERM -- -<pgid> before rebooting." >&2
-  exit 1
+# --- THE SHIP ENVIRONMENT, FROM THE CAPTURE ---------------------------------
+# Everything the stack owns arrives here, once, from the capture. Nothing
+# below re-states a captured value; a divergence goes through override_env /
+# set_tunable and is checked against the capture before exec.
+if [ ! -r "$SHIP_ENV_CAPTURE" ]; then
+  echo "REFUSE: the ship env capture is unreadable: $SHIP_ENV_CAPTURE" >&2
+  echo "This boot has no environment of its own to fall back on, and that is" >&2
+  echo "deliberate -- a hand-maintained fallback is the defect this removes." >&2
+  exit 4
 fi
+SHIP_ENV_EXPORTS="$("$PY" "$HERE/turnkey_539_export_env.py" \
+                    "$SHIP_ENV_CAPTURE" --governed-only)" || {
+  echo "REFUSE: could not render $SHIP_ENV_CAPTURE" >&2; exit 4; }
+eval "$SHIP_ENV_EXPORTS"
+echo "ship env: $(grep -c '^export ' <<<"$SHIP_ENV_EXPORTS") keys from" \
+     "$SHIP_ENV_CAPTURE" >&2
 
+# PYTHONPATH is a per-boot key: this boot runs from $WT, and the capture's
+# copy names the worktree the capture was taken in.
 export PYTHONPATH="$WT/python"
-export LD_LIBRARY_PATH="/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
+# DECLARED DIVERGENCE. The capture carries the cuda-12.2 runtime path from the
+# shell the ship process was started in; this boot puts the venv's cu13
+# libraries first, which is what the wheels in that venv link against.
+override_env LD_LIBRARY_PATH \
+  "/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}" \
+  "the venv's cu13 runtime must precede the system cuda-12.2 path"
 # THE CORRIDOR KNOB, and it is not --rank-gpu-memory-mib (#631, measured
 # 2026-08-09). torch's caching allocator expands into whatever the KV pool
 # does not take and, with the default segment allocator, never returns
@@ -189,14 +299,15 @@ export LD_LIBRARY_PATH="/spinning/htsglang-gpu/.venv/lib/python3.12/site-package
 # still prefills in PP at 4507 tok/s, so nothing was paid for it here.
 # Overridable because it interacts with CUDA graph capture and the VMM
 # arena, and an A/B needs the old behaviour reachable on purpose.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
-# The flip's TP phase token-shards KV under the WEIGHTED owner rule; the
-# boot builder REFUSES without this pair (phase_flip_boot).
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-# Mixed 5090+3080 group is the CONFIGURATION, not a symptom.
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+override_env PYTORCH_CUDA_ALLOC_CONF \
+  "${OP_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
+  "corridor: the 5090 goes from 1400 breaches to 0 under this allocator"
+# SGLANG_MAMBA_SSM_DTYPE, SGLANG_UNEVEN_DCP, SGLANG_UNEVEN_DCP_WEIGHTED and
+# SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK were re-declared here and all four
+# already match the capture; they now arrive with it. The reasons stay: the
+# boot builder REFUSES without the weighted uneven-DCP pair
+# (phase_flip_boot), and a mixed 5090+3080 group is the CONFIGURATION rather
+# than an imbalance symptom.
 
 # #656 SPEC ITEM 12: THE KV ARENA'S COMMIT CHUNK. A PRECONDITION, NOT A KNOB.
 #
@@ -218,7 +329,9 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 # 8 MiB it is ~15285 rows (~230 MiB/rank), the right size against a gate
 # asking a few hundred MiB. Measured on metal 2026-08-11 at exactly that:
 # 2016 / 1440 / 1152 MiB released on the three ranks in one shrink.
-export SGLANG_FLIP_SEAM_CHUNK_MIB="${SGLANG_FLIP_SEAM_CHUNK_MIB:-8}"
+set_tunable SGLANG_FLIP_SEAM_CHUNK_MIB \
+  "${OPERATOR_SET[SGLANG_FLIP_SEAM_CHUNK_MIB]:-8}" \
+  "operator-supplied KV arena commit chunk"
 
 # #631: the phase-flip presence rendezvous tag. Set ONCE here so every
 # rank of this boot inherits the SAME value, and so a LATER boot gets a
@@ -231,13 +344,23 @@ export SGLANG_PHASE_FLIP_INSTANCE="${SGLANG_PHASE_FLIP_INSTANCE:-$(date +%s)-$$}
 # #631 phase policy tuning. Exported only when set, so an unset knob keeps
 # the module default rather than exporting an empty string that the
 # parser would have to special-case.
-[ -n "$PHASE_POLICY_TP_TOK_S" ] && export SGLANG_PHASE_POLICY_TP_TOK_S="$PHASE_POLICY_TP_TOK_S"
-[ -n "$PHASE_POLICY_FLIP_TOKENS" ] && export SGLANG_PHASE_POLICY_FLIP_TOKENS="$PHASE_POLICY_FLIP_TOKENS"
-[ -n "$PHASE_POLICY_MIN_DWELL_S" ] && export SGLANG_PHASE_POLICY_MIN_DWELL_S="$PHASE_POLICY_MIN_DWELL_S"
-[ -n "$PHASE_POLICY_PP_WINDOW_S" ] && export SGLANG_PHASE_POLICY_PP_WINDOW_S="$PHASE_POLICY_PP_WINDOW_S"
-[ -n "$PHASE_POLICY_TP_DECODE_FLOOR_S" ] && export SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S="$PHASE_POLICY_TP_DECODE_FLOOR_S"
-[ -n "$PHASE_POLICY_IDLE_DWELL_S" ] && export SGLANG_PHASE_POLICY_IDLE_DWELL_S="$PHASE_POLICY_IDLE_DWELL_S"
-[ -n "$PHASE_IDLE_STATE" ] && export HTSGLANG_PHASE_IDLE_STATE="$PHASE_IDLE_STATE"
+# The three the capture already carries go through set_tunable: an unchanged
+# default is not a divergence, a changed one is announced. The other four are
+# absent from the capture, so setting them at all is a declared addition.
+[ -n "$PHASE_POLICY_MIN_DWELL_S" ] && set_tunable SGLANG_PHASE_POLICY_MIN_DWELL_S \
+    "$PHASE_POLICY_MIN_DWELL_S" "PHASE_POLICY_MIN_DWELL_S was set for this boot"
+[ -n "$PHASE_POLICY_PP_WINDOW_S" ] && set_tunable SGLANG_PHASE_POLICY_PP_WINDOW_S \
+    "$PHASE_POLICY_PP_WINDOW_S" "PHASE_POLICY_PP_WINDOW_S was set for this boot"
+[ -n "$PHASE_POLICY_TP_DECODE_FLOOR_S" ] && set_tunable SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S \
+    "$PHASE_POLICY_TP_DECODE_FLOOR_S" "PHASE_POLICY_TP_DECODE_FLOOR_S was set for this boot"
+[ -n "$PHASE_POLICY_TP_TOK_S" ] && override_env SGLANG_PHASE_POLICY_TP_TOK_S \
+    "$PHASE_POLICY_TP_TOK_S" "measured TP-phase prefill threshold, not captured"
+[ -n "$PHASE_POLICY_FLIP_TOKENS" ] && override_env SGLANG_PHASE_POLICY_FLIP_TOKENS \
+    "$PHASE_POLICY_FLIP_TOKENS" "explicit flip threshold, not captured"
+[ -n "$PHASE_POLICY_IDLE_DWELL_S" ] && override_env SGLANG_PHASE_POLICY_IDLE_DWELL_S \
+    "$PHASE_POLICY_IDLE_DWELL_S" "idle dwell was set for this boot, not captured"
+[ -n "$PHASE_IDLE_STATE" ] && override_env HTSGLANG_PHASE_IDLE_STATE \
+    "$PHASE_IDLE_STATE" "idle resting layout was set for this boot, not captured"
 
 # --- decode-phase KV token split -------------------------------------------
 # The flip's TP vector 30,17,17 drives BOTH the weight shard plan and, by
@@ -256,7 +379,19 @@ export SGLANG_PHASE_FLIP_INSTANCE="${SGLANG_PHASE_FLIP_INSTANCE:-$(date +%s)-$$}
 # a restart hint; 7,39,18 lifts the same physical memory to ~108480 tokens
 # (4.0x) with no extra VRAM, by giving each rank a share of the token
 # vector matched to what it can actually hold.
-export SGLANG_UNEVEN_TOKEN_VECTOR="${SGLANG_UNEVEN_TOKEN_VECTOR:-28,26,20}"
+#
+# THE VALUE COMES FROM THE CAPTURE, and this line is where the 2026-08-12
+# wedge lived: a hand-maintained 28,26,20 here against the ship process's
+# 14,10,8. The vector is the uneven-DCP KV token OWNERSHIP split, so it is
+# coupled to the layout the argv asks for; a value invented next to the flag
+# it must agree with is exactly how the two came apart. An operator who has
+# measured a different split sets SGLANG_UNEVEN_TOKEN_VECTOR in the
+# environment and gets it announced as an override.
+if [ -n "${OPERATOR_SET[SGLANG_UNEVEN_TOKEN_VECTOR]+set}" ]; then
+  override_env SGLANG_UNEVEN_TOKEN_VECTOR \
+    "${OPERATOR_SET[SGLANG_UNEVEN_TOKEN_VECTOR]}" \
+    "operator-supplied KV token split (must match the layout in argv)"
+fi
 
 # --- transport ---------------------------------------------------------------
 # barlink is the standing default transport: defects are fixed forward,
@@ -270,17 +405,14 @@ export SGLANG_UNEVEN_TOKEN_VECTOR="${SGLANG_UNEVEN_TOKEN_VECTOR:-28,26,20}"
 # explicitly reachable for an A/B rather than by accident.
 BARLINK="${BARLINK:-1}"
 if [ "$BARLINK" = "1" ]; then
-  if [ ! -e /dev/dmabuf_holder ]; then
+  if [ "$DRY_RUN" != 1 ] && [ ! -e /dev/dmabuf_holder ]; then
     echo "REFUSE: SGLANG_BARLINK_TRANSPORT=bar1 requested but" >&2
     echo "/dev/dmabuf_holder is missing. Run /root/smallbar_reload.sh on the" >&2
     echo "Proxmox host (never silent-degrade to the device sub-transport)." >&2
     exit 1
   fi
-  export SGLANG_BARLINK=1
-  export SGLANG_BARLINK_TRANSPORT=bar1
-  # Interim #603b mitigation: 5x collective deadline covers a full cold
-  # flashinfer sampling JIT build. The abort check stays armed.
-  export SGLANG_BARLINK_BAR1_CAP_CYCLES=300000000000
+  # SGLANG_BARLINK, SGLANG_BARLINK_TRANSPORT and the #603b cap cycles all
+  # arrive from the capture, which carries 1 / bar1 / 300000000000.
 
   # --- BAR1 aperture budget (REQUIRED with --enable-phase-flip) ------------
   # The phase flip DOUBLES the number of wire-carrying process groups: on
@@ -316,24 +448,40 @@ if [ "$BARLINK" = "1" ]; then
   # with the arithmetic in hand instead of silently clipping to a number
   # nobody chose. That is the intended contract; if a future topology adds
   # a group, this budget must be recomputed, not widened by reflex.
-  export SGLANG_BARLINK_BAR1_WINDOW_MIB="${SGLANG_BARLINK_BAR1_WINDOW_MIB:-24}"
-  export SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0="${SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0:-96}"
-  export SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0="${SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0:-48}"
-  export SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0="${SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0:-32}"
+  # The capture carries 24 / 96 / 48 / 32, i.e. the budget above. Only an
+  # operator value differing from it becomes a declared override.
+  set_tunable SGLANG_BARLINK_BAR1_WINDOW_MIB \
+    "${OPERATOR_SET[SGLANG_BARLINK_BAR1_WINDOW_MIB]:-24}" \
+    "operator-supplied world:0 aperture window"
+  set_tunable SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0 \
+    "${OPERATOR_SET[SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0]:-96}" \
+    "operator-supplied pp:0 aperture window"
+  set_tunable SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0 \
+    "${OPERATOR_SET[SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0]:-48}" \
+    "operator-supplied flip_tp:0 aperture window"
+  set_tunable SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0 \
+    "${OPERATOR_SET[SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0]:-32}" \
+    "operator-supplied flip_dcp:0 aperture window"
 else
-  export SGLANG_BARLINK=0
-  unset SGLANG_BARLINK_TRANSPORT || true
+  override_env SGLANG_BARLINK 0 "BARLINK=0: NCCL transport for this boot"
+  drop_env SGLANG_BARLINK_TRANSPORT "BARLINK=0: no bar1 sub-transport"
   echo "NOTE: barlink DISABLED for this boot (NCCL transport), BARLINK=0." >&2
 fi
 
 # Census cadence back to the near-free default (the cadence-1 diagnostic
 # window is closed, #650).
-export SGLANG_COLLECTIVE_CENSUS_INTERVAL="${SGLANG_COLLECTIVE_CENSUS_INTERVAL:-50}"
+set_tunable SGLANG_COLLECTIVE_CENSUS_INTERVAL \
+  "${OPERATOR_SET[SGLANG_COLLECTIVE_CENSUS_INTERVAL]:-50}" \
+  "operator-supplied collective census cadence"
 # #581 standing falsifier: ack_write must stay ~0 in idle.
-export SGLANG_MAMBA_PIN_TRACE="${SGLANG_MAMBA_PIN_TRACE:-50}"
+set_tunable SGLANG_MAMBA_PIN_TRACE \
+  "${OPERATOR_SET[SGLANG_MAMBA_PIN_TRACE]:-50}" \
+  "operator-supplied mamba pin trace cadence"
 # #605 VRAM flight-recorder marks are permanently armed (budgets computed,
 # not guessed).
-export SGLANG_VRAM_FLIGHT_DIR="${SGLANG_VRAM_FLIGHT_DIR:-/spinning/flight_605}"
+set_tunable SGLANG_VRAM_FLIGHT_DIR \
+  "${OPERATOR_SET[SGLANG_VRAM_FLIGHT_DIR]:-/spinning/flight_605}" \
+  "operator-supplied VRAM flight-recorder directory"
 
 # --- resolve cards by NAME -> UUID, 5090 FIRST -------------------------------
 BIG_UUID=""; SMALL_UUID=()
@@ -351,17 +499,27 @@ done < <(nvidia-smi --query-gpu=index,name,uuid,memory.total --format=csv,nohead
 # the presence/gate timeline was overwritten by the NEXT boot four minutes
 # later. Rank 2's state is now permanently unknown, so the fix for that
 # wedge had to rest on inference. Keeping the previous log costs a few MiB.
-if [ -s "$LOG" ]; then
-  PREV_STAMP="$(date -u -r "$LOG" '+%Y%m%dT%H%M%SZ' 2>/dev/null || date -u '+%Y%m%dT%H%M%SZ')"
-  mv "$LOG" "${LOG%.log}.${PREV_STAMP}.log" 2>/dev/null || true
-  # Keep the last 15 boots; that spans a full debugging session.
-  ls -1t "${LOG%.log}".*.log 2>/dev/null | tail -n +16 | xargs -r rm -f
+if [ "$DRY_RUN" != 1 ]; then
+  if [ -s "$LOG" ]; then
+    PREV_STAMP="$(date -u -r "$LOG" '+%Y%m%dT%H%M%SZ' 2>/dev/null || date -u '+%Y%m%dT%H%M%SZ')"
+    mv "$LOG" "${LOG%.log}.${PREV_STAMP}.log" 2>/dev/null || true
+    # Keep the last 15 boots; that spans a full debugging session.
+    ls -1t "${LOG%.log}".*.log 2>/dev/null | tail -n +16 | xargs -r rm -f
+  fi
+  : > "$LOG"
+else
+  # A dry run must not touch the production log at all: rotating it would
+  # destroy the boot record the log exists to keep.
+  LOG=/dev/null
 fi
-: > "$LOG"
 BOOT_COMMIT="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BOOT_BRANCH="$(git -C "$WT" branch --show-current 2>/dev/null || echo detached)"
 BOOT_DIRTY="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+# Per-boot provenance key: measured from the tree that is about to boot.
 export SGLANG_BOOT_COMMIT="$BOOT_COMMIT"
+# Per-boot device identity, exported rather than prefixed onto the launch so
+# the gate below sees the environment the server will actually get.
+export CUDA_VISIBLE_DEVICES="$BIG_UUID,${SMALL_UUID[0]},${SMALL_UUID[1]}"
 {
   printf '=== BOOT PROVENANCE %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf 'tree=%s commit=%s branch=%s dirty_files=%s\n' \
@@ -373,8 +531,10 @@ export SGLANG_BOOT_COMMIT="$BOOT_COMMIT"
 } >> "$LOG"
 
 cd "$WT"
-CUDA_VISIBLE_DEVICES="$BIG_UUID,${SMALL_UUID[0]},${SMALL_UUID[1]}" \
-setsid "$PY" -m sglang.launch_server \
+# Built as an array rather than an inline command line so the same tokens can
+# be PRINTED (DRY_RUN) and launched. The `# ...` command substitutions expand
+# to nothing and word-split away exactly as they did on the command line.
+ARGV=( "$PY" -m sglang.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --served-model-name Qwen3.6-27B \
     --tp-size 1 --pp-size 3 \
@@ -428,5 +588,37 @@ setsid "$PY" -m sglang.launch_server \
     `# 'auto' cannot map ranks to cards on a mixed-model node).` \
     ${KV_LADDER:+--kv-pressure-ladder "$KV_LADDER"} \
     --enable-metrics --host "$HOST" --port "$PORT" \
-    "$@" >> "$LOG" 2>&1 &
+    "$@" )
+
+# --- THE GATE, IMMEDIATELY BEFORE EXEC --------------------------------------
+# Last thing before the server gets this environment: prove it is the captured
+# ship environment, key for key, except where this boot DECLARED otherwise.
+# Every --allow below was registered by an override_env / set_tunable call
+# that printed itself; there is no way to reach this line with a divergence
+# nobody announced, and no flag that waves the whole comparison through.
+ALLOW_ARGS=()
+for _k in ${ENV_OVERRIDES[@]+"${ENV_OVERRIDES[@]}"}; do
+    ALLOW_ARGS+=(--allow "$_k")
+done
+if ! "$PY" "$HERE/turnkey_539_export_env.py" "$SHIP_ENV_CAPTURE" --check \
+        ${ALLOW_ARGS[@]+"${ALLOW_ARGS[@]}"}; then
+    echo "REFUSE: this boot's environment is not the captured ship" >&2
+    echo "environment, and the difference was not declared. See the keys" >&2
+    echo "above. A boot with a drifted env is what wedged on 2026-08-12:" >&2
+    echo "it came up, served /model_info and never answered /generate." >&2
+    echo "Fix the environment, or declare the key deliberately in $0." >&2
+    exit 4
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+    echo "=== DRY RUN ENV ==="
+    env | grep -E '^(SGLANG_|HTSGLANG_|PYTORCH_|PYTHONPATH=|LD_LIBRARY_PATH=|CUDA_VISIBLE_DEVICES=)' \
+        | sort || true
+    echo "=== DRY RUN ARGV ==="
+    printf '%s\n' "${ARGV[@]}"
+    echo "=== DRY RUN: nothing was launched ==="
+    exit 0
+fi
+
+setsid "${ARGV[@]}" >> "$LOG" 2>&1 &
 echo "serving pgid $!  log $LOG"
