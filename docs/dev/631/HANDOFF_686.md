@@ -280,6 +280,19 @@ attributing anything to HEAD.
 * **`quantize_bytes` is still an absolute grid** for capacity. That is
   defensible — a df reading is not a contended benchmark — but it is the same
   shape §1b falsified for bandwidth, and it has not been checked across ranks.
+* **The park tier's `reserved` is frozen at registration, so its headroom does
+  not shrink as it fills.** `_build_park_descriptors` passes `parked_bytes=0`
+  once and the descriptors are cached, which means the capacity refusal is
+  reachable in the hermetic tests (which construct a full tier directly) but
+  effectively unreachable at runtime until the tier is 20 GiB over budget in
+  reality. This is a KNOWN TENSION, not an oversight: a live `reserved` is
+  exactly the per-park-varying input that §1b/law 14 says must not enter a
+  group decision, so wiring `park_bytes_by_tier` straight into it would trade
+  a stale denominator for a divergence risk. The honest fix is the same one
+  law 15 names — reduce the occupancy through the collective the transfer
+  already enters, then feed the reduced value — and it is the first thing the
+  next shift on this rung should build, because without it the tier's byte
+  budget is advisory.
 
 ---
 
