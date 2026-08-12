@@ -206,10 +206,21 @@ def test_the_dllm_mirror_is_not_the_extend_prefix_vector():
     assert _as_list(mirror) == [s - _DLLM_BLOCK for s in _SEQ_LENS]
 
 
-def test_the_wired_sibling_still_forwards_its_mirror():
-    """Control: the eager extend site (#616h) is unchanged by this fix."""
+def test_the_full_cg_mirror_is_the_forward_batch_one():
+    """The full-prefill-CG site's mirror IS forward_batch.extend_prefix_lens_cpu.
+
+    The complement of the dLLM case above: here the two happen to coincide, and
+    pinning WHICH vector was chosen is what keeps a later "unify these two
+    callsites" refactor from quietly giving both of them the same source.
+
+    (The sixth callsite, eager extend, was already wired by #616h and is not
+    reachable through ``init_forward_metadata_out_graph``; it is pinned in
+    ``test_dcp_index_host_sum_623.py``, not here.)
+    """
     captured, fb = _drive("extend")
-    assert captured["kwargs"].get("extend_prefix_lens_cpu") is not None
+    mirror = captured["kwargs"].get("extend_prefix_lens_cpu")
+    assert mirror is not None
+    assert _as_list(mirror) == fb.extend_prefix_lens_cpu
 
 
 if __name__ == "__main__":
