@@ -1352,6 +1352,68 @@ def gguf_quantized_name(name: str, leaf: str) -> str:
     return f"{head}{sep}{leaf}"
 
 
+# #647: HF-name suffixes that are ALWAYS plain dense parameters, never
+# GGUF-quantized linears -- so an unquantized tensor destined for one of them
+# must keep its ".weight" name instead of being renamed to ".qweight".
+#
+# A table rather than a chain of endswith() in one family's adapter: the
+# defect is in the GENERIC iterator, so every family and the no-adapter path
+# hit it, and DeepSeek V4 had already grown a bespoke repair for its own gate
+# (gguf_deepseek4.py:366-375) that no other model benefited from.
+#
+# Membership alone is not sufficient to fire -- see is_dense_gguf_target. A
+# module that genuinely IS quantized keeps the quantized path even if its name
+# matches, because the type check fails.
+GGUF_DENSE_PARAM_SUFFIXES: Tuple[str, ...] = (
+    # MoE router gate. Built ReplicatedLinear(..., quant_config=None), so it
+    # owns a ".weight" and nothing else; a ".qweight" emitted for it matches
+    # no parameter and is dropped silently, leaving the gate uninitialised and
+    # the MoE routing on garbage.
+    ".gate.weight",
+)
+
+
+def is_dense_gguf_target(hf_name: str, weight_type) -> bool:
+    """Whether this tensor must bypass the ``.qweight`` rename (#647).
+
+    Two conditions, both required:
+
+    * the destination is a known dense module (``GGUF_DENSE_PARAM_SUFFIXES``);
+    * the stored GGML type is genuinely unquantized -- F32, F16 or BF16, the
+      layer's own ``UNQUANTIZED_TYPES`` set. The iterator historically tested
+      only ``!= "F32"``, which is narrower than that set by exactly F16 and
+      BF16, and that gap is the whole of #647.
+
+    Requiring the type check keeps a genuinely quantized tensor on the
+    quantized path even if its name matches the table, so the rule cannot
+    misfire on a model that really does quantize the module.
+    """
+    if not any(hf_name.endswith(suffix) for suffix in GGUF_DENSE_PARAM_SUFFIXES):
+        return False
+    return getattr(weight_type, "name", None) in ("F32", "F16", "BF16")
+
+
+def gguf_dense_payload(tensor: torch.Tensor, weight_type) -> torch.Tensor:
+    """Reinterpret the raw payload gguf-py returns for a dense F16/BF16 tensor.
+
+    gguf-py hands F16/BF16 back as ``uint8`` with the last dimension doubled;
+    a view is enough, no conversion. A tensor that already carries a float
+    dtype (F32, or a future gguf-py that decodes BF16 itself) is passed
+    through unchanged.
+
+    Generalised from ``gguf_deepseek4._bytes_to_bf16``, which did this for one
+    family's router gate only.
+    """
+    if tensor.dtype != torch.uint8:
+        return tensor
+    name = getattr(weight_type, "name", None)
+    if name == "BF16":
+        return tensor.contiguous().view(torch.bfloat16)
+    if name == "F16":
+        return tensor.contiguous().view(torch.float16)
+    return tensor
+
+
 def gguf_quant_weights_iterator(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -1445,7 +1507,12 @@ def gguf_quant_weights_iterator(
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
 
-            if weight_type.name != "F32":
+            # #647: a dense module gets no type marker either. The marker is
+            # named after the ".qweight" that is not going to exist, so
+            # emitting it would leave a second orphan alongside the first.
+            if weight_type.name != "F32" and not is_dense_gguf_target(
+                name, weight_type
+            ):
                 weight_type_name = gguf_quantized_name(name, "qweight_type")
                 yield weight_type_name, torch.tensor(weight_type)
 
@@ -1514,12 +1581,23 @@ def gguf_quant_weights_iterator(
                 # Normal weight handling
                 name = gguf_to_hf_name_map[tensor_name]
 
-                if weight_type.name != "F32":
-                    name = gguf_quantized_name(name, "qweight")
-                param = torch.tensor(
-                    repacked_gguf_bytes(source_type, weight, tensor_name)
-                )
-                yield name, param
+                # #647: an unquantized tensor bound for a dense module keeps
+                # its ".weight" name and is handed over as real values, not
+                # as the raw uint8 payload with a doubled last dimension.
+                if is_dense_gguf_target(name, weight_type):
+                    yield name, gguf_dense_payload(
+                        torch.tensor(
+                            repacked_gguf_bytes(source_type, weight, tensor_name)
+                        ),
+                        weight_type,
+                    )
+                else:
+                    if weight_type.name != "F32":
+                        name = gguf_quantized_name(name, "qweight")
+                    param = torch.tensor(
+                        repacked_gguf_bytes(source_type, weight, tensor_name)
+                    )
+                    yield name, param
 
         if previous_origin is not None:
             dropper.consume(*previous_origin)

@@ -363,11 +363,19 @@ class Deepseek4GGUFAdapter(GGUFAdapterBase):
                     "give this tensor an explicit case in transform_stream."
                 )
 
-            # (3) BF16 router gate. The iterator renames every non-F32 tensor
-            # to `.qweight` and hands over the raw little-endian bytes as
-            # uint8. The DeepSeek V4 router gate is a plain parameter, not a
-            # GGUF-quantized linear, so it must arrive as `.weight` holding
+            # (3) BF16 router gate. The iterator used to rename every non-F32
+            # tensor to `.qweight` and hand over the raw little-endian bytes
+            # as uint8. The DeepSeek V4 router gate is a plain parameter, not
+            # a GGUF-quantized linear, so it must arrive as `.weight` holding
             # real bf16 values.
+            #
+            # #647 generalised this: the iterator now keeps `.weight` for any
+            # unquantized tensor bound for a dense module
+            # (weight_utils.GGUF_DENSE_PARAM_SUFFIXES), so a BF16 gate no
+            # longer reaches the two branches below. They are retained as the
+            # family's fallback for a gate stored under some other non-F32
+            # type, which the generic rule deliberately leaves on the
+            # quantized path.
             if name.endswith(".gate.qweight_type"):
                 continue
             if name.endswith(".gate.qweight"):

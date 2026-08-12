@@ -21,6 +21,14 @@ import torch
 import triton
 import triton.language as tl
 
+# #643 lives in its own dependency-free module because the live PD handshake
+# path needs it and must not acquire a triton import to ask an integer
+# question. Re-exported here so the historical import site keeps working.
+from sglang.srt.disaggregation.common.tp_pair import (  # noqa: F401
+    HeadSplitNotRepresentable,
+    validate_tp_pair_divisible,
+)
+
 logger = logging.getLogger(__name__)
 
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
@@ -694,7 +702,16 @@ def compute_head_slice_params(
 
     Returns:
         (src_head_start, num_heads_to_send, dst_head_start, num_heads_to_send)
+
+    Raises:
+        HeadSplitNotRepresentable: if the TP pair is non-divisible (#643).
     """
+    validate_tp_pair_divisible(
+        src_attn_tp_size,
+        dst_attn_tp_size,
+        total_kv_heads,
+        where="compute_head_slice_params",
+    )
     src_heads_per_rank = max(1, total_kv_heads // src_attn_tp_size)
     dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
 
@@ -731,7 +748,18 @@ def compute_staging_layout(
     Returns:
         (num_writers, writer_bytes_list, total_bytes)
         where writer_bytes_list[i] = bytes for writer i covering all layers (K+V).
+
+    Raises:
+        HeadSplitNotRepresentable: if the TP pair is non-divisible (#643). The
+            writer count below is a floor division, so a non-divisible pair
+            sizes the region for fewer writers than actually write into it.
     """
+    validate_tp_pair_divisible(
+        src_attn_tp_size,
+        dst_attn_tp_size,
+        total_kv_heads,
+        where="compute_staging_layout",
+    )
     if src_attn_tp_size > dst_attn_tp_size:
         num_writers = src_attn_tp_size // max(1, dst_attn_tp_size)
     else:
