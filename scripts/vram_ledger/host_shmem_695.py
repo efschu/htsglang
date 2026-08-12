@@ -95,22 +95,66 @@ def _is_power_of_two(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
-def discover_scheduler_pids() -> List[int]:
-    """Every ``sglang::scheduler*`` process, by comm. No pattern matching on
-    a command line, so this cannot match itself."""
-    pids: List[int] = []
+#: What a rank's ``comm`` can actually be compared against.
+#:
+#: The ranks ask to be called ``sglang::scheduler_PP0`` and the like, but the
+#: kernel stores ``comm`` in ``TASK_COMM_LEN`` = 16 bytes, so what
+#: ``/proc/<pid>/comm`` returns is the 15-character prefix
+#: ``sglang::schedul``. Testing for ``"sglang::scheduler"`` (17 chars) is
+#: therefore False for every process that ever existed -- which is what this
+#: script did, and why it reported "no sglang::scheduler process found"
+#: against a healthy three-rank boot.
+#:
+#: 13 characters, so it survives the truncation with room to spare, and long
+#: enough not to collide with the launcher's other children (the sibling
+#: ``sglang::detoken`` does not share this prefix).
+_SCHEDULER_COMM_PREFIX = "sglang::sched"
+
+
+def is_scheduler_comm(comm: str) -> bool:
+    """Is this ``/proc/<pid>/comm`` value one of the ranks?
+
+    Compares against the TRUNCATED prefix on purpose -- see
+    ``_SCHEDULER_COMM_PREFIX``. Matching on comm rather than the command line
+    is still deliberate: it cannot match this script itself.
+    """
+    return comm.startswith(_SCHEDULER_COMM_PREFIX)
+
+
+def _all_proc_pids() -> List[int]:
+    out: List[int] = []
     for path in glob.glob("/proc/[0-9]*/comm"):
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                comm = handle.read().strip()
-        except OSError:
+            out.append(int(path.split("/")[2]))
+        except (IndexError, ValueError):
             continue
-        if comm.startswith("sglang::scheduler"):
-            try:
-                pids.append(int(path.split("/")[2]))
-            except (IndexError, ValueError):
-                continue
-    return sorted(pids)
+    return out
+
+
+def _read_comm(pid: int) -> Optional[str]:
+    try:
+        with open(f"/proc/{pid}/comm", "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def discover_scheduler_pids(read_comm=None, pids=None) -> List[int]:
+    """Every scheduler rank, by comm.
+
+    ``read_comm``/``pids`` exist so the matching can be tested without a
+    running server. The desk half of this branch was hermetic and never
+    exercised this function against a real ``comm``, which is exactly how the
+    truncation bug reached a GPU window.
+    """
+    read_comm = read_comm or _read_comm
+    pids = _all_proc_pids() if pids is None else pids
+    found: List[int] = []
+    for pid in pids:
+        comm = read_comm(pid)
+        if comm and is_scheduler_comm(comm):
+            found.append(pid)
+    return sorted(found)
 
 
 def census_for(pid: int) -> Optional[Dict]:
