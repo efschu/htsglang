@@ -7497,6 +7497,56 @@ class ServerArgs:
                     "'the policy is running'."
                 )
             return
+
+        # SERVING-PROOF CEILING ON THE DERIVED POOL (#656 flip livelock).
+        #
+        # The TP pool is sized from the PP id space, so with no
+        # --max-total-tokens the pool is whatever the VRAM backs. On this rig
+        # that reached 683150 tokens: it booted, held the 1024 MiB corridor
+        # with zero breaches, answered /health with 200 -- and produced NO
+        # TOKENS. Every /generate timed out at 120 s against 362 flip events
+        # and a repeating
+        #   "POLICY holding in tp: min dwell: 3.0s since last flip < 3s
+        #    (pending prefill 1 tok, running bs 0)".
+        # The same build serves normally at 620000. The livelock is real,
+        # undiagnosed, and it is the worst failure class we have: an instance
+        # that looks healthy from every side except the only one that matters.
+        #
+        # So the DEFAULT is the largest pool this rig has actually been proven
+        # to SERVE, not the largest it can back. A capacity number without a
+        # completed generation beside it is a sizing result, not a serving
+        # result. Opt out with SGLANG_PHASE_FLIP_UNPROVEN_POOL=1 to reproduce
+        # the livelock or to re-prove a larger pool once it is fixed.
+        #
+        # This is NOT a physics number and must not be read as one. It is a
+        # quarantine marker, and it should be deleted -- not raised -- when
+        # the livelock is fixed. Note the cost, so nobody rediscovers it the
+        # hard way: capping here also re-masks the per-rank capacity
+        # imbalance, because each non-binding rank then reports the ceiling
+        # as its own capacity (contradictions register entry 43). To measure
+        # true per-rank capacity, set the env var.
+        PHASE_FLIP_SERVING_PROVEN_TOKENS = 620000
+        if self.max_total_tokens is None:
+            if os.environ.get("SGLANG_PHASE_FLIP_UNPROVEN_POOL") == "1":
+                logger.warning(
+                    "SGLANG_PHASE_FLIP_UNPROVEN_POOL=1: letting the pool size "
+                    "itself to what the VRAM backs. Pools above %d tokens have "
+                    "wedged this rig (#656 flip livelock: health 200, zero "
+                    "tokens). VERIFY WITH A REAL GENERATION, never /health.",
+                    PHASE_FLIP_SERVING_PROVEN_TOKENS,
+                )
+            else:
+                self.max_total_tokens = PHASE_FLIP_SERVING_PROVEN_TOKENS
+                logger.warning(
+                    "phase flip: capping max_total_tokens at %d, the largest "
+                    "pool PROVEN to serve on this rig. The VRAM may back more "
+                    "(measured 683150), but that pool booted corridor-green "
+                    "and produced no tokens (#656 flip livelock, undiagnosed). "
+                    "Set SGLANG_PHASE_FLIP_UNPROVEN_POOL=1 to size to the "
+                    "hardware instead, and prove it with a real generation.",
+                    PHASE_FLIP_SERVING_PROVEN_TOKENS,
+                )
+
         # Default the spill ladder to its lowest MEASURED rung, and resolve it
         # here so a bad value is an argument error rather than an exception
         # raised inside a cutover that has already released the source pool's
