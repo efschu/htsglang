@@ -3418,7 +3418,10 @@ class KVSessionOffloadManager:
                 # park the oldest spilled session to free a region for the
                 # NEXT spill (this one still falls back to stock retraction,
                 # honestly: a network tier cannot free a region in-line).
-                self._dest.note_region_shortfall(self._iter_ct)
+                # `manager=self` lets the #659 ladder report name WHICH tier
+                # was full and by how much; without it the shortfall is only a
+                # timestamp. Read-only -- the destination chain still decides.
+                self._dest.note_region_shortfall(self._iter_ct, manager=self)
             return False
         if fast_pressure is None:
             fast_pressure = self._fast_lane_pressure(batch.reqs)

@@ -98,6 +98,23 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+#: Iterations between two #659 spill-ladder reports. A region shortfall can
+#: repeat every iteration under sustained pressure; the ladder is an
+#: accounting read, so it is reported once per episode rather than per decline.
+_LADDER_REPORT_EVERY_ITERS: int = 512
+
+
+def _local_host_name() -> str:
+    """This machine's name, as the tier ids spell it.
+
+    One spelling for the whole process: a tier id that disagrees with
+    ``TierRegistry.local_host`` would make every local tier read as remote and
+    silently invert the ladder's ``role()``.
+    """
+    import socket
+
+    return socket.gethostname()
+
 LOCAL_DESTINATION = "local"
 
 # Park tiers accepted in V1 (see module docstring for why the other
@@ -655,8 +672,60 @@ class SpillDestinationController:
 
     # -- pressure ----------------------------------------------------------
 
-    def note_region_shortfall(self, now_iter: int) -> None:
+    def note_region_shortfall(self, now_iter: int, manager=None) -> None:
         self.pressure_iter = int(now_iter)
+        if manager is not None:
+            self._report_spill_ladder(manager)
+
+    def _report_spill_ladder(self, manager) -> None:
+        """#659: say WHICH tier declined and why, once per shortfall episode.
+
+        A region shortfall is the exact moment the local host tier is full,
+        and until now it was recorded only as a pressure timestamp -- the
+        operator saw a spill decline with no statement of what was full or how
+        full. The #407 registry answers that in the vocabulary the rest of the
+        fleet already uses (headroom with a provenance, one named refusal per
+        tier), and it renders ABSENCES rather than hiding them.
+
+        Read-only: this reports the ladder, it does not pick the destination.
+        The #224 chain still decides, so the spill path is byte-identical --
+        the registry is under the rung as an observer in this cut, which is
+        what makes its verdict comparable against the hardcoded law before
+        anything is allowed to depend on it.
+
+        Rate-limited to one report per episode, and every failure is swallowed:
+        an accounting read may never turn a spill decline into a crash.
+        """
+        if self.pressure_iter - getattr(self, "_ladder_reported_iter", -(10**9)) < (
+            _LADDER_REPORT_EVERY_ITERS
+        ):
+            return
+        self._ladder_reported_iter = self.pressure_iter
+        try:
+            from sglang.srt.managers.kv_spill_tier_selection import (
+                ladder_rows,
+                live_kv_spill_ladder,
+                local_first_disagreement,
+            )
+
+            registry = live_kv_spill_ladder(manager, local_host=_local_host_name())
+            if registry is None:
+                return
+            for tier_id, role, headroom, bandwidth in ladder_rows(registry):
+                logger.info(
+                    "kv-spill ladder: %s (%s) headroom=%s bandwidth=%s",
+                    tier_id,
+                    role,
+                    headroom,
+                    bandwidth,
+                )
+            disagreement = local_first_disagreement(
+                registry, 0, local_host=_local_host_name()
+            )
+            if disagreement:
+                logger.warning("kv-spill ladder: %s", disagreement)
+        except Exception as exc:  # noqa: BLE001 - report, never escalate
+            logger.debug("kv-spill ladder report skipped: %r", exc)
 
     # -- transfer lifecycle ------------------------------------------------
 
