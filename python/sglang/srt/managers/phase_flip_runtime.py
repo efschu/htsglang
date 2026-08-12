@@ -2101,6 +2101,12 @@ class PhaseFlipRuntime:
         #: quietly widen the margin.
         self.seam_margin_delays = 0
         self.seam_margin_yields = 0
+        #: #656: seam entries whose own arithmetic, priced on the MEASURED
+        #: in-cutover draw rather than on the staging reservation, predicted a
+        #: trough below the corridor law. A counter and not only a log line
+        #: because "never fired" and "fired and was right" have to be tellable
+        #: apart in a bench row.
+        self.seam_draw_predicted_breaches = 0
         #: Consecutive ABANDONED ATTEMPTS per direction -- the currency the
         #: C20 delay budget is spent in. Booked by ``note_seam_verdict`` from
         #: the REDUCED fit verdict, which is identical on every rank, so the
@@ -2118,6 +2124,17 @@ class PhaseFlipRuntime:
         #: the wedge. One shared counter would let the safe leg spend the
         #: dangerous leg's budget.
         self._seam_abandons_in_a_row = {PP_TO_TP: 0, TP_TO_PP: 0}
+        #: #656: the largest driver-visible in-cutover draw this rank has
+        #: actually MEASURED, per direction, taken from the seam census.
+        #:
+        #: The seam entry law check priced itself on ``staging_bytes`` for
+        #: three shifts. The staging is what the seam RESERVES; the census
+        #: says the cutover DRAWS materially more, because the backing
+        #: restore walk asks the driver for RAW pages while torch sits on its
+        #: cache. Measured 2026-08-12 on PP1: staged 1625 MiB, drew 2066 MiB.
+        #: Pricing the law on the smaller of the two is what let a yield
+        #: enter a cutover whose own arithmetic predicted a breach.
+        self._seam_draw_max = {PP_TO_TP: 0, TP_TO_PP: 0}
         #: Set once the seam-entry margin has announced itself, so the
         #: liveness line is one per process rather than one per flip.
         self._seam_margin_announced = False
@@ -3924,6 +3941,10 @@ class PhaseFlipRuntime:
         if not hasattr(self, "seam_margin_delays"):
             self.seam_margin_delays = 0
             self.seam_margin_yields = 0
+        if not hasattr(self, "seam_draw_predicted_breaches"):
+            self.seam_draw_predicted_breaches = 0
+        if not hasattr(self, "_seam_draw_max"):
+            self._seam_draw_max = {PP_TO_TP: 0, TP_TO_PP: 0}
         margin_bytes = seam_entry_margin_bytes()
         ask_bytes = int(staging_bytes) + margin_bytes
         # ANNOUNCE ONCE, FROM THE PATH THAT ALWAYS RUNS. The margin appears in
@@ -4100,9 +4121,92 @@ class PhaseFlipRuntime:
         # the seam into the breach this gate exists to prevent. Arithmetic on
         # a value already in hand cannot raise and cannot spend.
         law_floor = int(getattr(guard, "law_floor_bytes", 0))
+        # PRICE THE LAW ON THE DRAW, NOT ON THE STAGING. #656, 2026-08-12.
+        #
+        # ``staging_bytes`` is what the seam RESERVES. It is not what the
+        # cutover TAKES from the driver: the backing restore walk commits raw
+        # driver pages while torch's caching allocator is still sitting on its
+        # own reserve, so the driver-visible draw runs materially above the
+        # staging figure. Both windows in the corpus yielded on a law check
+        # that was sub-law by its own numbers once the real draw is used:
+        #
+        #     s38  free_after 2190 - staged 1184 = 1006  (18 MiB under the law)
+        #     s42  free_after 3154 - staged 1625 = 1529  (looks clear)
+        #          ...but the census measured a 2066 MiB draw, and the cutover
+        #          entered at 3006 and troughed at 940.
+        #
+        # s38 survived only because its staging OVER-estimated that flip's
+        # draw by ~388 MiB. That is luck, not a margin, and it is the same
+        # shape as C20 one level up: a check that passes on an estimator's
+        # conservatism rather than on the quantity it claims to bound.
+        #
+        # So the subtrahend becomes max(staged, WORST MEASURED DRAW for this
+        # direction). Until this rank has completed one cutover in this
+        # direction the measured term is 0 and the behaviour is exactly the
+        # old one -- an unmeasured bucket is never a licence to invent a
+        # number (the ``measured_capture_mib_per_token`` rule).
+        #
+        # GROUP SAFETY: this stays a per-rank OBJECTION, not a per-rank
+        # ACTION. ``law_ok`` already rides the existing reduction -- the group
+        # abandons if ANY rank objects -- so a rank whose measured draw is
+        # larger makes the GROUP delay, which every rank then observes
+        # identically. No rank acts on its own number (register laws 14, 15).
+        measured_draw = 0
+        try:
+            book = getattr(self, "_seam_draw_max", None)
+            if isinstance(book, dict):
+                measured_draw = int(book.get(str(direction), 0) or 0)
+        except Exception:  # noqa: BLE001 -- arithmetic here may not raise
+            measured_draw = 0
+        law_want = max(int(staging_bytes), measured_draw)
+        predicted_trough = int(verdict.free_after) - law_want
+        draw_short = measured_draw > 0 and predicted_trough < law_floor
         law_ok = margin_bytes > 0 and (
             int(verdict.free_after) - int(staging_bytes) >= law_floor
         )
+        # WHY THE MEASURED DRAW DOES NOT MOVE ``law_ok``, WHICH IS THE
+        # OBVIOUS THING TO DO AND IS WRONG HERE.
+        #
+        # A False ``law_ok`` routes into the abort path below, and for
+        # pp->tp that path is the DECODE WEDGE: under strict purity decode
+        # runs only in TP, so a persistently refused pp->tp starves decode
+        # outright and nothing the PP phase holds can ever end the refusal.
+        # It is measured, not feared -- 411 abandons, 0 requests completed in
+        # 6 minutes, /health 503 with every rank alive (2026-08-10). Trading
+        # a 1.5 s corridor dip for a total outage is not a fix, and register
+        # law 13 says the same thing from the other side: relief that arrives
+        # eventually cannot fund an allocation happening now.
+        #
+        # So the measured draw does what it can legitimately do: it PREDICTS
+        # the trough and says so, and the walk itself is what keeps the law,
+        # by spending torch's cache at the moment of crossing
+        # (``kv_vmm_backing._corridor_preempt``). That resource was measurably
+        # there -- 1054 MiB of slack at the 940 MiB trough -- and needed no
+        # prediction at all to spend. Prediction that cannot act safely is a
+        # log line; the actuator belongs where the bytes are taken.
+        if draw_short:
+            self.seam_draw_predicted_breaches += 1
+            logger.warning(
+                "%s seam entry PREDICTS A SUB-LAW TROUGH (%s): %d MiB free "
+                "after the ladder minus this rank's worst MEASURED draw of "
+                "%d MiB leaves %d MiB, below the %d MiB corridor law. The "
+                "staged figure alone (%d MiB) puts it %d MiB CLEAR, which is "
+                "the gap every previous yield entered on. The seam is NOT "
+                "refused -- refusing pp->tp starves decode -- so the walk "
+                "carries the law instead: the arena spends torch's cached "
+                "blocks at the commit that would cross. If a breach is "
+                "recorded anyway, the walk had no slack to spend and the "
+                "budget is the finding.",
+                LOG_PREFIX,
+                direction,
+                int(verdict.free_after) // (1024 * 1024),
+                measured_draw // (1024 * 1024),
+                predicted_trough // (1024 * 1024),
+                law_floor // (1024 * 1024),
+                int(staging_bytes) // (1024 * 1024),
+                (int(verdict.free_after) - int(staging_bytes) - law_floor)
+                // (1024 * 1024),
+            )
         if law_ok:
             budget = seam_entry_delay_budget()
             # GROUP-UNIFORM CURRENCY. The budget is spent in consecutive
@@ -4721,4 +4825,19 @@ class PhaseFlipRuntime:
                 stats["seam_transient_bytes"] = int(peak)
                 low = census.trough()
                 stats["seam_trough_stage"] = low[0] if low else ""
+                # FEED THE MEASUREMENT BACK TO THE GATE THAT GUESSED IT.
+                # This is the only place the driver-visible in-cutover draw is
+                # ever known, and until now it was written to a stats dict and
+                # read by nobody. A running MAX, not a mean: the law check is
+                # a safety predicate and must be priced on the worst draw this
+                # rank has seen, not on a typical one. It only ever ratchets
+                # up, so an unusually cheap flip cannot re-open the gap.
+                try:
+                    book = getattr(self, "_seam_draw_max", None)
+                    if isinstance(book, dict):
+                        key = str(direction)
+                        if int(peak) > int(book.get(key, 0)):
+                            book[key] = int(peak)
+                except Exception:  # noqa: BLE001 -- bookkeeping, never fatal
+                    pass
         return stats

@@ -40,6 +40,7 @@ FAMILY=(
     test/registered/unit/managers/test_phase_flip_spill_depth_631.py
     test/registered/unit/managers/test_phase_flip_draft_carrier_631.py
     test/registered/unit/managers/test_corridor_guard_631.py
+    test/registered/unit/managers/test_corridor_law_preempt_656.py
     test/registered/unit/managers/test_kv_backing_relief_631.py
     test/registered/unit/managers/test_kv_backing_collective_631.py
     test/registered/unit/managers/test_kv_admission_floor_631.py

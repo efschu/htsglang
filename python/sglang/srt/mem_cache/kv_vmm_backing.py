@@ -36,6 +36,120 @@ def _check(result, label: str):
     return result[1] if isinstance(result, tuple) and len(result) > 1 else None
 
 
+#: Below this much torch slack the preemption is not worth its cost: spending
+#: ``empty_cache`` to recover a few MiB re-warms the allocator for nothing, and
+#: on a walk that is genuinely short it would fire on every commit step.
+_CORRIDOR_MIN_SLACK_BYTES = 64 * 1024 * 1024
+
+
+def _corridor_law_floor_bytes() -> int:
+    """The corridor law floor in bytes, or 0 when the preemption is disabled.
+
+    Read per call rather than cached at import: the arena is built long before
+    the first flip, and a value frozen at import time cannot be corrected by a
+    boot that sets the variable later. The read is a dict lookup.
+
+    This is the LAW floor (1024 MiB), deliberately NOT
+    ``SGLANG_CORRIDOR_FLOOR_MIB`` (1536), which is the admission gate's ARMING
+    floor and carries a margin on top of the law. Preempting on the arming
+    floor here would spend the allocator cache on a walk that was never going
+    to break the law.
+    """
+    try:
+        return max(0, int(os.getenv("SGLANG_CORRIDOR_LAW_FLOOR_MIB", "1024"))) * (
+            1024 * 1024
+        )
+    except (TypeError, ValueError):
+        return 1024 * (1024 * 1024)
+
+
+def _corridor_preempt(step: int, label: str, reclaim: Optional[callable]) -> None:
+    """Spend torch's cache BEFORE a commit that would cross the corridor law.
+
+    THE DEFECT THIS CLOSES, measured on metal (#656, 2026-08-12 01:18:26-29,
+    PP1 on a 3080). ``_mem_create_reclaiming`` below already knows the exact
+    remedy -- torch sits on reserved-but-unused blocks that the arena needs as
+    RAW driver pages, and ``empty_cache`` returns them. Its trigger, however,
+    is ``CUDA_ERROR_OUT_OF_MEMORY``: it fires when free memory reaches ZERO.
+    The corridor law floor is 1024 MiB ABOVE zero, so a restore walk marching
+    down in 8-24 MiB commit steps crosses the law long before anything refuses,
+    and the remedy never runs.
+
+    That is not hypothetical. A ``pp_to_tp`` cutover entered on the law with
+    3006 MiB free, drew a 2066 MiB transient through this very path, and sat at
+    **940 MiB free for 1.5 s** -- 84 MiB under the law. The seam census recorded
+    ``slack=1054`` at the trough: torch was holding 1054 MiB of cached blocks
+    throughout, more than enough to have kept the walk legal, and nothing asked
+    for them because nothing had failed yet.
+
+    So the trigger moves from "the driver refused" to "the next commit would
+    cross the law", and the remedy is unchanged. Properties that matter:
+
+    * **Rank-local.** No collective is entered and no group verdict is
+      consumed, so this cannot split a group decision (register laws 14, 15).
+      Every rank makes the same KIND of decision on its own card's numbers.
+    * **It does not shrink the pool.** The bytes come from torch's cache, which
+      by definition nothing is using; the KV pool's capacity is untouched
+      (register law 13 -- a smaller pool is never the fix).
+    * **The common path is one driver read.** ``mem_get_info`` is the same call
+      the seam census already makes at every stage boundary.
+    * **It preempts rather than recovers**, which is the whole point: a walk
+      that has already crossed the law cannot be un-crossed by a later reclaim.
+
+    Silent by design when it does nothing. When it acts it says so once per
+    commit, because a mechanism that cannot be shown to have fired is
+    indistinguishable from one that is never reached.
+    """
+    floor = _corridor_law_floor_bytes()
+    if floor <= 0:
+        return
+    try:
+        free, _total = torch.cuda.mem_get_info()
+    except Exception:  # noqa: BLE001 -- a probe must never break the walk
+        return
+    if free - int(step) >= floor:
+        return
+    try:
+        reserved = int(torch.cuda.memory_reserved())
+        allocated = int(torch.cuda.memory_allocated())
+    except Exception:  # noqa: BLE001
+        return
+    slack = reserved - allocated
+    if slack < _CORRIDOR_MIN_SLACK_BYTES:
+        # Nothing worth spending. The walk proceeds and the census records
+        # where it went: an unfundable walk is a REAL finding about the
+        # configuration, and hiding it behind pointless cache churn would
+        # remove the evidence that the budget is too tight.
+        return
+    logger.warning(
+        "%s: committing %d bytes would leave %d MiB free, below the %d MiB "
+        "corridor law floor. Releasing torch's cached blocks FIRST (%d MiB of "
+        "slack held, reserved %.2f GiB / allocated %.2f GiB). This is the "
+        "same reclaim the OUT_OF_MEMORY path takes, moved ahead of the "
+        "crossing instead of after the refusal.",
+        label,
+        int(step),
+        (free - int(step)) // (1024 * 1024),
+        floor // (1024 * 1024),
+        slack // (1024 * 1024),
+        reserved / (1 << 30),
+        allocated / (1 << 30),
+    )
+    try:
+        torch.cuda.empty_cache()
+        if reclaim is not None:
+            freed = reclaim()
+            if freed:
+                logger.warning(
+                    "%s: released %.2f GiB of parked handles as well, ahead of "
+                    "the corridor crossing.",
+                    label,
+                    freed / (1 << 30),
+                )
+    except Exception as err:  # noqa: BLE001 -- the walk owns the no-return path
+        logger.warning("%s: corridor preemption failed: %s", label, err)
+
+
 def _mem_create_reclaiming(
     step: int,
     prop,
@@ -74,6 +188,11 @@ def _mem_create_reclaiming(
     fails, the error is genuine and propagates unchanged.
     """
     drv = _driver()
+    # PREEMPT THE CORRIDOR CROSSING BEFORE THE COMMIT, not after a refusal.
+    # The OUT_OF_MEMORY branch below is the same remedy at a trigger 1024 MiB
+    # too late: it waits for the driver to refuse, and the corridor law is
+    # broken long before anything is refused. See ``_corridor_preempt``.
+    _corridor_preempt(step, label, reclaim)
     result = drv.cuMemCreate(step, prop, 0)
     err = result[0] if isinstance(result, tuple) else result
     if err == drv.CUresult.CUDA_ERROR_OUT_OF_MEMORY:
@@ -432,9 +551,7 @@ class KvVmmArena:
             torch.cuda.synchronize()
             for rel, size, handle in extents:
                 if rel >= keep:
-                    _check(
-                        drv.cuMemUnmap(self.base + offset + rel, size), "cuMemUnmap"
-                    )
+                    _check(drv.cuMemUnmap(self.base + offset + rel, size), "cuMemUnmap")
                     if self._retain_handles:
                         self._park_retained(size, handle)
                     else:
@@ -515,7 +632,8 @@ class KvVmmArena:
     def _extent_intervals(self, offset: int):
         """Mapped [start, end) intervals at ``offset``, ascending."""
         return sorted(
-            (rel, rel + size) for rel, size, _h in self._extents_by_offset.get(offset, [])
+            (rel, rel + size)
+            for rel, size, _h in self._extents_by_offset.get(offset, [])
         )
 
     def _gaps_in(self, offset: int, lo: int, hi: int):
@@ -650,9 +768,7 @@ class KvVmmArena:
             torch.cuda.synchronize()
             for rel, size, handle in extents:
                 if rel >= lo and rel + size <= hi:
-                    _check(
-                        drv.cuMemUnmap(self.base + offset + rel, size), "cuMemUnmap"
-                    )
+                    _check(drv.cuMemUnmap(self.base + offset + rel, size), "cuMemUnmap")
                     if self._retain_handles:
                         self._park_retained(size, handle)
                     else:
@@ -873,9 +989,9 @@ class KvVmmBufferOwner:
             self.ensure_prefix(self.page_size)
 
         for t in self.tensors:
-            assert (
-                t.is_cuda and t.device.index == self.device_id
-            ), f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+            assert t.is_cuda and t.device.index == self.device_id, (
+                f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
+            )
 
     # -- backing --------------------------------------------------------------
 

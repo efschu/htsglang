@@ -85,6 +85,7 @@ DISCIPLINE
 from __future__ import annotations
 
 import logging
+import os
 from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,30 @@ logger = logging.getLogger(__name__)
 LOG_PREFIX = "[#631 seam-census]"
 
 _MIB = 1024 * 1024
+
+
+def law_floor_bytes() -> int:
+    """The corridor law floor in bytes, or 0 when the check is disabled.
+
+    THE ONE-LINE HISTORY: for three shifts this module sampled the exact
+    observable the corridor law is written against, named the 1024 MiB floor in
+    its own docstring above, and never compared the two. On 2026-08-12 a
+    ``pp_to_tp`` cutover on PP1 sat at 940 MiB free for 1.5 s -- 84 MiB under
+    the law -- and the process recorded the number in a line it emitted AFTER
+    the flip had already completed, so the breach was discovered hours later
+    from an external 100 ms CSV. A recorder that holds the evidence and does
+    not read it is not neutral: it is the reason a breach looks like a clean
+    run until someone else measures it.
+
+    The LAW floor (1024 MiB), not ``SGLANG_CORRIDOR_FLOOR_MIB`` (1536), which
+    is the admission gate's ARMING floor and carries a margin on top of the
+    law. Reporting a "breach" on the arming floor would cry wolf on every
+    cutover that legally spends its margin.
+    """
+    try:
+        return max(0, int(os.getenv("SGLANG_CORRIDOR_LAW_FLOOR_MIB", "1024"))) * _MIB
+    except (TypeError, ValueError):
+        return 1024 * _MIB
 
 
 def _default_probe() -> Optional[Tuple[int, int, int]]:
@@ -132,6 +157,12 @@ class SeamCensus:
         # which is kept as a row so a gap in the record is visible rather
         # than silently closed up.
         self.stages: List[Tuple[str, int, int, int]] = []
+        #: Stages whose free reading was BELOW the corridor law floor. Kept as
+        #: a list rather than a flag so the line can say how long the walk
+        #: stayed under, which is the difference between a sampling artefact
+        #: and the 1.5 s plateau this was built for.
+        self.below_law: List[Tuple[str, int]] = []
+        self._law_announced = False
 
     def mark(self, label: str) -> None:
         """Record one stage boundary.
@@ -153,6 +184,52 @@ class SeamCensus:
             return
         free, reserved, allocated = sample
         self.stages.append((str(label), free, reserved, allocated))
+        self._check_law(str(label), free, reserved, allocated)
+
+    def _check_law(self, label: str, free: int, reserved: int, allocated: int) -> None:
+        """Compare this stage's free reading against the corridor law.
+
+        Announced ONCE per census, at the stage that first crosses, and then
+        counted silently: a cutover that spends 60 stages under the floor must
+        not emit 60 identical ERROR lines on the no-return path, but it must
+        also not be indistinguishable from one that dipped for a single sample.
+        The count goes on the summary line.
+
+        Reports the SLACK alongside, because the slack is what decides whether
+        the crossing was fundable. At the 2026-08-12 trough it read 1054 MiB --
+        i.e. the walk could have stayed legal at any moment and nothing asked.
+        Guarded like every other statement in this module: an instrument on the
+        cutover path may not be the reason a flip dies.
+        """
+        floor = law_floor_bytes()
+        if floor <= 0 or free >= floor:
+            return
+        self.below_law.append((label, free))
+        if self._law_announced:
+            return
+        self._law_announced = True
+        try:
+            logger.error(
+                "%s CORRIDOR LAW BROKEN during %s rank %d at stage '%s': free "
+                "%d MiB is below the %d MiB floor. torch is holding %d MiB of "
+                "slack (reserved %d MiB, allocated %d MiB) -- if that number is "
+                "large, the walk was fundable and the reclaim did not run; if "
+                "it is small, this configuration cannot fund this cutover and "
+                "the budget is the finding. Reported HERE, at the stage that "
+                "crossed, because the summary line is emitted only after the "
+                "flip completes.",
+                LOG_PREFIX,
+                self.direction,
+                self.rank,
+                label,
+                free // _MIB,
+                floor // _MIB,
+                (reserved - allocated) // _MIB,
+                reserved // _MIB,
+                allocated // _MIB,
+            )
+        except Exception:  # pragma: no cover - the no-return path owns this
+            pass
 
     @property
     def baseline_free(self) -> Optional[int]:
@@ -230,6 +307,17 @@ class SeamCensus:
             head += (
                 f" (baseline free {base // _MIB} MiB, trough {low[1] // _MIB} MiB "
                 f"at '{low[0]}')"
+            )
+        # The verdict belongs in the HEAD, not buried among the stage parts:
+        # every consumer of this corpus greps the head, and a breach that is
+        # only visible to whoever reads to the end of a 60-stage line is a
+        # breach that gets missed -- which is exactly what happened once.
+        if self.below_law:
+            head += (
+                f" *** CORRIDOR LAW BROKEN: {len(self.below_law)} stage(s) below "
+                f"{law_floor_bytes() // _MIB} MiB, deepest "
+                f"{min(free for _lbl, free in self.below_law) // _MIB} MiB "
+                f"at '{self.below_law[0][0]}' ***"
             )
         return head + " | " + " | ".join(parts)
 
