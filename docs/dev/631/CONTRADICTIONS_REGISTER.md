@@ -70,9 +70,9 @@ landed.
 
 ## OPEN — flagged, never resolved
 
-**C28, a session that finishes ON HOST deletes its own terminal output before
-the streamer reads it, and the caller hangs forever (#659, successor 44,
-measured on metal 2026-08-12).** This is what stood behind C26. With C26
+**C28 — ROOT-CAUSED BY SUCCESSOR 44, FIXED IN `b2f18010c2` BY SUCCESSOR 45
+(2026-08-12). A session that finishes ON HOST deletes its own terminal output
+before the streamer reads it, and the caller hangs forever (#659).** This is what stood behind C26. With C26
 fixed the instance survives the park, so for the first time a session got
 through the whole round trip alive — and the round trip is not the problem.
 `rid=s44-sat-3` spilled, parked to the file tier, unparked cleanly
@@ -146,6 +146,125 @@ the alias from a generic missing emit: **the same boot WITHOUT
 `--disable-overlap-schedule` should not hang**, because `event_loop_overlap`
 snapshots `batch.copy()` (`scheduler.py:2315`, `schedule_batch.py:3474-3479`),
 so `filter_batch` cannot empty the list being streamed.
+
+**THE FIX, AND WHY IT IS NOT THE TWIN THAT WAS PROPOSED (successor 45).** The
+CPU falsifier above was written
+(`test/registered/unit/managers/test_host_finish_stream_659.py`) and it is red
+on the pre-fix tree exactly as predicted — verified by reverse-applying the
+patch, not by assertion. The fix is NOT a `_stream_terminal` call inside
+`release_finished_spilled_req`, which is what the abort-exit twin would have
+suggested, and the reason is worth keeping: **the alias exists only when
+overlap is off.** Under the overlap loops the result processor runs on
+`batch.copy()` — a list the release cannot reach — so an emit inside the
+release would DOUBLE-stream at all three overlap dispatch sites
+(`scheduler.py:2314-2315` `event_loop_overlap`, `scheduler.py:6071-6080` the
+decoupled spill lane, and `pause_generation`'s drain). Instead
+`process_batch_result_decode` now binds `reqs` and `return_logprob` ONCE before
+its loop and streams from that binding — the same stream-then-filter ordering
+`disaggregation/decode.py:2113-2116` already uses. `return_logprob` is
+snapshotted too, because `filter_batch` recomputes it from the SURVIVING
+requests (`schedule_batch.py:3316`), so a finished request that asked for
+logprobs would otherwise be streamed without them.
+
+**CORRECTION TO THE ENTRY ABOVE, small but load-bearing:** the loss is not
+confined to the "no request survives" branch. `filter_batch()` keys on
+`not finished()`, so a finished spilled request is ALWAYS dropped, and the
+survivor branch (`schedule_batch.py:3293`) is equally a rebind. In production
+`slot.batch` is a bs=1 batch so the empty branch is the one taken, but a fix
+keyed on "the batch became empty" would have been incomplete in principle.
+
+**SIBLING SWEEP (successor 45), so the next shift does not redo it.** Every
+`filter_batch()` call site was audited. Two are of the same silent-drop class
+and emit nothing: the pre-schedule reap (`kv_session_offload.py:4520-4524`) and
+the tick-batch drain (`:4931-4934`). Both are reachable only for a request that
+is already `finished()` — hence already streamed — so they are LATENT, not
+live, and were deliberately left alone rather than patched with unvalidated
+defensive code that could double-emit. The prefill result path, `retract_decode`,
+`retract_all` and `pause_generation` are clean (retracted requests are
+re-queued; the solo-OOM aborts get a direct `AbortReq` that never reads
+`batch.reqs`). The park abort exit (`_release_parked_req` → `_stream_terminal`)
+already has the correct stream-then-filter ordering and is the reference shape.
+
+**C29, the restore-margin default is an absolute token count that is never
+sized against the KV pool (#659, successor 44 observed it, successor 45
+confirms it is independent of C28).** `--kv-session-offload-restore-margin-tokens`
+defaults to 4096 (`server_args.py:1870-1877`) and is validated only against
+`< 0` (`:6983-6984`). The restore gate is
+`fits_now = restorable >= remaining + restore_margin_tokens`
+(`kv_session_offload.py:4753-4757`). On any boot whose `max_total_tokens` is at
+or below the margin, the gate demands more than the entire pool and **can never
+open** — which is why successor 44's boot logged `RESTORE complete: rid=` zero
+times and every spilled session finished on the host floor. It is not a
+consequence of C28 and C28's fix does not touch it. Successor 45's probe works
+around it by CONFIG (`--kv-session-offload-restore-margin-tokens 64` against a
+4096-token pool), deliberately not by code, so that the sizing defect stays
+visible and gets its own commit rather than being smuggled into a streaming
+fix. **The margin should be expressed against the pool** (a fraction, or an
+absolute value clamped to a fraction of `max_total_tokens`) with a boot-time
+refusal when it exceeds the pool.
+
+**C28 IS CLOSED ON METAL (successor 45, probe v9, 2026-08-12).** The same
+pressure band that wedged successor 44's client ran again on the fixed tree
+(boot commit `b2f18010c2`). `rid=s45-cohort-3` spilled, PARKED to the file
+tier (33 blobs / 3 760 128 B on disk, peak host tier 536 903 680 B), UNPARKED
+(`identity_miss=0`, zero `UNPARK ... FAILED`, both ranks logging identically),
+finished ON HOST — and **completed, with its output delivered to the HTTP
+client** (1744 chars, `round_trip_completed: ['s45-cohort-3']`). The whole
+cohort drained with `errors=0` and nothing hung. That is the exact request
+shape that blocked forever on the pre-fix tree and could not be released by 40
+further requests or by `abort_request`.
+
+**BYTE-IDENTITY IS NOT ATTRIBUTABLE ON THIS BOOT, and the instrument says so
+rather than guessing.** Neither the parked arm nor the CONTROL arm matched the
+quiescent reference (`parked_arm_identical_to_reference: False`,
+`control_arm_identical_to_reference: False`). Per `park_complete_proof2.py`'s
+own verdict table that is the "this run separates nothing" outcome: requests
+that never parked also diverge, so the divergence is the rig's known
+batch-composition nondeterminism (HANDOFF_686's standing rule) and NOT
+evidence against the round trip. It cannot be bought with determinism either —
+see C30. **Byte-identity across a park therefore remains UNPROVEN, and it is
+unproven for a reason that is now understood and booked, not for lack of
+trying.**
+
+**C30, `--enable-deterministic-inference` and `--enable-kv-session-offload`
+cannot both be on: the instance boots, declares itself ready, and then admits
+nothing (#659, successor 45, measured 2026-08-12).** Booked because the next
+shift that needs byte-identity will reach for the same flag and lose an hour
+to it. The intersection of the two constraints is a single backend and it is
+NOT a free choice:
+
+* `--enable-kv-session-offload` REFUSES any backend but flashinfer
+  (`ValueError: --enable-kv-session-offload requires the flashinfer attention
+  backend; got --attention-backend=triton`), so HANDOFF_688 §1e's prescription
+  of triton does not boot at all. The deterministic default (fa3) is
+  Hopper-only and does not boot on these SM86 cards either.
+* flashinfer IS on `DETERMINISTIC_ATTENTION_BACKEND_CHOICES`
+  (`server_args.py:233-239`), so it is the only backend satisfying both — and
+  it is not on `RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND` (`:241`), so
+  `disable_radix_cache = True` is set silently (`:15500-15505`).
+
+**What that combination then does, measured:** the instance boots clean, prints
+"The server is fired up and ready to roll!", serves its two warmup prefills —
+and never admits another request. A trivial 8-token `/generate` hung for 55 s;
+`/health` timed out while `/get_model_info` answered instantly (so the HTTP
+loop was healthy and this is not an entrypoint stall); the collective census
+froze at 1862 all_reduce; **zero `Decode batch` lines appeared in the entire
+boot**; py-spy showed TP1 spinning inside `add_one_req`
+(`schedule_policy.py:1255`) while rank 0's metrics reported
+`num_queue_reqs 0` — a rank-asymmetric view of the same admission decision.
+
+**Attribution is clean, one variable.** The same boot with the two
+deterministic flags removed and everything else byte for byte identical
+(`probe_boot_v9.sh` vs `probe_boot_v8.sh`, diff = one line) served a
+generation in **0.36 s** and reproduced the park on its first attempt.
+Evidence: `/spinning/evidence-631/s45/v8_deterministic_wedge_pyspy.txt`,
+`v8_wedge_metrics.txt`, `probe_v8.log`, `probe_v8_triton_refused.log`.
+
+**Consequence for the byte-identity arm:** it cannot be bought with
+determinism on this rig while kv-session-offload is on. It must be earned the
+way `park_complete_proof2.py` already earns it — a homogeneous cohort whose
+CONTROL arm measures whether batch-composition nondeterminism is live in that
+boot, so a mismatch can be attributed instead of guessed.
 
 **C27, the corridor law was enforced by nothing at the place it is spent
 (#656).** Successor 42's confirmation window breached: 12 samples, gpu0 at
