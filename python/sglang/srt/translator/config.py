@@ -22,8 +22,26 @@ changing, because nothing here imports ``srt`` internals.
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Sequence
+
+#: The rig layout this deployment was developed against. Kept as the literal
+#: default so an unset environment behaves exactly as it did before #251.
+RIG_MODEL_ROOT = "/spinning/llm_stuff/translator-models"
+
+#: #251: one env var for the whole translator asset tree. Every checkpoint
+#: default in this package (config, launcher flags, in-process TTS) is derived
+#: from it, so a deployment that keeps its models elsewhere -- a container with
+#: a mounted volume, another host -- moves all of them with one setting instead
+#: of five flags. Unset -> ``RIG_MODEL_ROOT``, byte-identical to the previous
+#: hard-coded defaults.
+MODEL_ROOT_ENV = "SGLANG_TRANSLATOR_MODEL_ROOT"
+
+
+def default_model_root() -> Path:
+    """Root of the translator checkpoint tree. Env override, rig fallback."""
+    return Path(os.environ.get(MODEL_ROOT_ENV) or RIG_MODEL_ROOT)
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
     from sglang.srt.translator.idle_park import IdleParkConfig
@@ -121,8 +139,9 @@ class TranslatorConfig:
     #: overridable per session by the client, and it is the only place a
     #: language pair appears anywhere in the system.
     default_participants: Sequence[str] = ("de", "es")
-    #: Model cache root. Never inside the repository.
-    model_root: Path = Path("/spinning/llm_stuff/translator-models")
+    #: Model cache root. Never inside the repository. Resolved per instance so
+    #: the env override is read at construction, not at import (#251).
+    model_root: Path = dataclasses.field(default_factory=default_model_root)
     #: Bounded journal for reconnect replay, per session.
     journal_events: int = 512
     journal_audio_mib: int = 24

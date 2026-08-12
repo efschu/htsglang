@@ -22,6 +22,10 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from sglang.srt.video_enhance.asset_root import (
+    default_engine_cache_dir,
+    default_model_root,
+)
 from sglang.srt.video_enhance.chain import Chain, ChainRequest, StageKind, build_chain
 from sglang.srt.video_enhance.engine_cache import EngineCache
 from sglang.srt.video_enhance.frame_math import (
@@ -49,8 +53,10 @@ class TenantConfig:
     #: exactly this card via CUDA_VISIBLE_DEVICES, so inside the process
     #: ``cuda:0`` is unambiguous.
     card_uuid: str | None = None
-    engine_cache_dir: Path = Path("/spinning/llm_stuff/k3-models/engines")
-    model_dir: Path = Path("/spinning/llm_stuff/k3-models")
+    #: #251: both follow SGLANG_VIDEO_MODEL_ROOT; unset -> the previous
+    #: literals, byte-identical.
+    engine_cache_dir: Path = field(default_factory=default_engine_cache_dir)
+    model_dir: Path = field(default_factory=default_model_root)
     precision: str = "fp16"
     provider: str = "tensorrt"
     decoder_pool_depth: int = 4
