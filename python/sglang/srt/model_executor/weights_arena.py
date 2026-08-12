@@ -295,6 +295,18 @@ def _torch_pinned_zeros(total: int) -> torch.Tensor:
     return torch.zeros(total, dtype=torch.uint8, pin_memory=True)
 
 
+def _torch_pinned_empty(total: int) -> torch.Tensor:
+    """The pre-#695 allocation for the ``zero=False`` caller (``arena_image``).
+
+    Separate from ``_torch_pinned_zeros`` because the difference is not
+    cosmetic: ``torch.zeros`` faults the whole image in at allocation time,
+    which for a 13 GiB image is boot-time cost paid for bytes that are
+    overwritten immediately afterwards. The opt-out arm has to reproduce the
+    pre-#695 path it is a comparand for, including this.
+    """
+    return torch.empty(total, dtype=torch.uint8, pin_memory=True)
+
+
 #: Serial number for the host-image posts. The registry is keyed by NAME, so
 #: two images in one process must not share one, or the second would silently
 #: replace the first and the ledger would under-report by a whole image.
@@ -390,6 +402,26 @@ def _alloc_host_image(total: int, pin: bool, zero: bool = True) -> torch.Tensor:
     # could break a boot that works today, and the diagnosis this is for is
     # served by the number being present, not by a veto.
     _register_image_post(total)
+    # #695 risk 2 -- the opt-out arm. SGLANG_PHASE_FLIP_EXACT_PIN=0 restores the
+    # pre-#695 allocation so the two allocators can be compared through ONE
+    # harness on ONE binary, the arms differing by this variable and nothing
+    # else. Read per call, not at import: a value frozen at import would also
+    # survive a test override and yield a silently single-armed measurement.
+    # The post above is registered on BOTH arms on purpose -- the ledger
+    # visibility and the shmem pricing are separate defects from the same
+    # commit and are correct under either allocator.
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_PHASE_FLIP_EXACT_PIN.get():
+        logger.warning(
+            "#695 exact-size pinned host images DISABLED by "
+            "SGLANG_PHASE_FLIP_EXACT_PIN=0: allocating %d bytes through "
+            "torch's pinned caching allocator, which rounds it up to %d bytes "
+            "and holds the difference for the life of the process.",
+            total,
+            1 << (total - 1).bit_length() if total > 1 else total,
+        )
+        return _torch_pinned_zeros(total) if zero else _torch_pinned_empty(total)
     try:
         return _alloc_with_host_register((total,), torch.uint8, "cpu", True, None)
     except Exception as exc:  # noqa: BLE001 -- any refusal degrades, none kills

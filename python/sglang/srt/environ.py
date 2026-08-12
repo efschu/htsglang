@@ -242,6 +242,17 @@ class Envs:
     # a debugging escape hatch, not a supported configuration.
     SGLANG_ALLOW_UNLOADED_DRAFT_PARAMS = EnvBool(False)
 
+    # #695: allocate the permanent phase-flip host weight images at their exact
+    # size (MAP_ANONYMOUS + cudaHostRegister) instead of through torch's pinned
+    # caching allocator, which rounds every request up to a power of two and
+    # held 13.65 GiB of pure rounding for the life of the process.
+    # Set to 0 to restore the pre-#695 allocation. That is the comparand arm of
+    # the flip-latency A/B (MERGE-R5 §6) and the opt-out if the exact-size path
+    # ever has to be taken off by default without reverting the commit. It does
+    # NOT disable the host-post registration or the shmem pricing from the same
+    # commit -- those are correct under either allocator.
+    SGLANG_PHASE_FLIP_EXACT_PIN = EnvBool(True)
+
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
