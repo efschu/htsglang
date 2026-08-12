@@ -22,6 +22,7 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
     dcp_even_write_mask,
+    dcp_fresh_host_lens,
     dcp_host_even_total,
     dcp_host_total_tokens,
     dcp_token_sharded_layer,
@@ -91,6 +92,27 @@ if TYPE_CHECKING:
 _DCP_VERIFY_SPEC_INPUT_TYPES = frozenset(
     {SpecInputType.EAGLE_VERIFY, SpecInputType.DFLASH_VERIFY}
 )
+
+
+def _verify_host_mirror(
+    seq_lens_cpu: Optional[Union[Sequence[int], torch.Tensor]],
+    num_draft_tokens: int,
+) -> Optional[Union[Sequence[int], torch.Tensor]]:
+    """The target-verify PAGED length mirror, or None (#623/#629).
+
+    The mirror goes through the SAME length function as the device vector
+    rather than assuming the identity here: ``dcp_verify_paged_lens`` is where
+    the reason the verify paged length is NOT ``seq_lens + num_draft_tokens``
+    is written down, and a mirror derived by a second, independent expression
+    is exactly the drift the #616h wiring exists to prevent.
+
+    Shared by the eager verify site and its cuda-graph replay-prep twin so the
+    two cannot diverge -- they were separate inline expressions before #629,
+    and only one of them had been wired.
+    """
+    if seq_lens_cpu is None:
+        return None
+    return dcp_verify_paged_lens(seq_lens_cpu, num_draft_tokens)
 
 
 def _reject_stale_verify_window(spec_info, qo_stride: int) -> None:
@@ -1007,8 +1029,15 @@ class TritonAttnBackend(AttentionBackend):
         #
         # #618/#623: lens_cpu is the host mirror of `lens` and lens_sum its
         # independently known host sum (the staleness check). Both default to
-        # None, which keeps the blocking device read -- the cuda-graph callers
-        # have no mirror in scope and are unchanged.
+        # None, which keeps the blocking device read.
+        #
+        # #629: the cuda-graph replay-prep callers now supply the mirror too.
+        # #623 left them on the device read on the grounds that no mirror was in
+        # scope, which was true of the helpers' own signatures and false of the
+        # entry point: init_forward_metadata_out_graph holds the ForwardBatch.
+        # None still means "keep the old read", which is what a gpu_only batch
+        # (no host mirror at all) and a mirror that fails the staleness check
+        # both fall back to.
         if self.uneven_dcp_weighted:
             return self._dcp_weighted_kv_indices(
                 req_pool_indices,
@@ -1148,6 +1177,8 @@ class TritonAttnBackend(AttentionBackend):
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        seq_lens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
+        seq_lens_sum: Optional[int] = None,
     ):
         """Fill KV (and SWA) cuda-graph buffers for decode/idle mode.
 
@@ -1156,9 +1187,14 @@ class TritonAttnBackend(AttentionBackend):
         ``num_kv_splits_lens`` is the per-request length used to size kv splits
         (per-DCP-rank length clamped to >=1 when DCP is enabled, full seq_lens
         otherwise).
+
+        ``seq_lens_cpu`` / ``seq_lens_sum`` are the #629 host mirror of
+        ``seq_lens``, sliced to ``bs`` alongside it.
         """
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         if self.dcp_size > 1:
             # DCP: per-rank sharded; write into the same cuda-graph buffers
             # _build_cuda_graph_forward_metadata reads back.
@@ -1168,6 +1204,11 @@ class TritonAttnBackend(AttentionBackend):
                 self.kv_indptr,
                 self.cuda_graph_kv_indices,
                 None,
+                # #629: the eager decode twin's mirror, reaching the replay-prep
+                # fill. Without it this site sizes kv_indices from an unbounded
+                # blocking D2H inside the collective window.
+                lens_cpu=seq_lens_cpu,
+                lens_sum=seq_lens_sum,
             )
             kv_indptr = self.kv_indptr[: bs + 1]
             num_kv_splits_lens = dcp_seq_lens.clamp_min(1)
@@ -1203,8 +1244,14 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         spec_info,
+        seq_lens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
+        seq_lens_sum: Optional[int] = None,
     ):
-        """Fill all cuda-graph buffers for target_verify mode."""
+        """Fill all cuda-graph buffers for target_verify mode.
+
+        ``seq_lens_cpu`` / ``seq_lens_sum`` are the #629 host mirror of
+        ``seq_lens``.
+        """
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
@@ -1228,6 +1275,15 @@ class TritonAttnBackend(AttentionBackend):
                 self.kv_indptr,
                 self.cuda_graph_kv_indices,
                 None,
+                # #629: the same shared mirror function as the eager verify
+                # twin. dcp_verify_paged_lens returns seq_lens itself, so
+                # seq_lens_sum is that vector's sum and stays a valid
+                # staleness check.
+                lens_cpu=_verify_host_mirror(
+                    None if seq_lens_cpu is None else seq_lens_cpu[:bs],
+                    self.num_draft_tokens,
+                ),
+                lens_sum=seq_lens_sum,
             )
             kv_indptr = self.kv_indptr[: bs + 1]
         else:
@@ -1332,6 +1388,23 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
+        # #629: the host mirror of seq_lens, for the owner-rule index builders
+        # the replay-prep fills drive. #623 left these fills on the unbounded
+        # blocking D2H "because the cuda-graph callers have no mirror in scope"
+        # -- true of _update_*_buffers, false HERE, where the ForwardBatch is.
+        #
+        # seq_lens_sum is the "mirror present" signal, the same test
+        # _translate_cuda_graph_shared_pool_locs uses: it is None-preserving,
+        # while seq_lens_cpu is a non-None but STALE slice on gpu_only batches.
+        # It is forwarded as the expected_sum rather than merely consulted, so
+        # dcp_host_lens re-checks the two against each other and refuses a
+        # mirror that disagrees -- a stale vector would silently MIS-SIZE the
+        # index buffer, which is worse than the sync it replaces. When the
+        # signal is absent altogether, dcp_fresh_host_lens drops the slice, so
+        # "no sum" degrades to the old device read and never to an UNCHECKED
+        # mirror.
+        seq_lens_sum = forward_batch.seq_lens_sum
+        seq_lens_cpu = dcp_fresh_host_lens(forward_batch.seq_lens_cpu, seq_lens_sum)
 
         if in_capture:
             assert forward_batch.encoder_lens is None, "Not supported"
@@ -1362,6 +1435,8 @@ class TritonAttnBackend(AttentionBackend):
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
+                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_sum=seq_lens_sum,
             )
             out_cache_loc_full_physical = self._translate_cuda_graph_shared_pool_locs(
                 forward_batch, bs
@@ -1381,6 +1456,8 @@ class TritonAttnBackend(AttentionBackend):
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
+                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_sum=seq_lens_sum,
             )
             # Metadata view is reused from capture; just refill the buffers.
             self._translate_cuda_graph_shared_pool_locs(forward_batch, bs)
@@ -1496,7 +1573,15 @@ class TritonAttnBackend(AttentionBackend):
                         # None-preserving for gpu_only batches while
                         # seq_lens_cpu is a stale slice), and it doubles as the
                         # equality check, so a stale vector is refused.
-                        lens_cpu=forward_batch.seq_lens_cpu,
+                        #
+                        # #629: the signal has to be APPLIED, not just relied
+                        # on. dcp_host_lens accepts a mirror unchecked when no
+                        # expected_sum comes with it, so passing the pair raw
+                        # meant a gpu_only batch handed over the stale slice
+                        # with nothing to catch it -- a silent mis-size.
+                        lens_cpu=dcp_fresh_host_lens(
+                            forward_batch.seq_lens_cpu, forward_batch.seq_lens_sum
+                        ),
                         lens_sum=forward_batch.seq_lens_sum,
                     )
                 else:
@@ -1623,12 +1708,14 @@ class TritonAttnBackend(AttentionBackend):
                     # dcp_verify_paged_lens for why it is emphatically not
                     # seq_lens + num_draft_tokens), so the mirror goes through
                     # the SAME function rather than assuming the identity here.
-                    lens_cpu=(
-                        None
-                        if forward_batch.seq_lens_cpu is None
-                        else dcp_verify_paged_lens(
-                            forward_batch.seq_lens_cpu, self.num_draft_tokens
-                        )
+                    # #629: same freshness guard as the decode twin -- a
+                    # gpu_only batch's stale seq_lens_cpu must not be sized
+                    # from just because seq_lens_sum is None.
+                    lens_cpu=_verify_host_mirror(
+                        dcp_fresh_host_lens(
+                            forward_batch.seq_lens_cpu, forward_batch.seq_lens_sum
+                        ),
+                        self.num_draft_tokens,
                     ),
                     lens_sum=forward_batch.seq_lens_sum,
                 )
@@ -1994,16 +2081,26 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        seq_lens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
+        seq_lens_sum: Optional[int] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
+
+        ``seq_lens_cpu`` / ``seq_lens_sum`` are the #629 host mirror of
+        ``seq_lens``; they reach the owner-rule index builders that the
+        replay-prep fills drive, and default to None (old device read).
         """
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
             assert spec_info is None, "Multi-step cuda graph init is not done here."
             _, _, window_kv_lens, num_kv_splits_lens = self._update_decode_kv_buffers(
-                bs, seq_lens, req_pool_indices
+                bs,
+                seq_lens,
+                req_pool_indices,
+                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_sum=seq_lens_sum,
             )
             self.get_num_kv_splits(
                 self.cuda_graph_num_kv_splits[:bs], num_kv_splits_lens[:bs]
@@ -2015,7 +2112,12 @@ class TritonAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
             self._update_target_verify_buffers(
-                bs, seq_lens, req_pool_indices, spec_info
+                bs,
+                seq_lens,
+                req_pool_indices,
+                spec_info,
+                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_sum=seq_lens_sum,
             )
         elif forward_mode.is_draft_extend_v2():
             self._update_draft_extend_buffers(

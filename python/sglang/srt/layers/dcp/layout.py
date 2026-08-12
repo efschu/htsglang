@@ -102,6 +102,29 @@ def dcp_host_lens(
     return lens
 
 
+def dcp_fresh_host_lens(
+    lens_cpu: Optional[HostLens],
+    expected_sum: Optional[int],
+) -> Optional[HostLens]:
+    """The mirror, or None when its freshness signal is absent (#629).
+
+    :func:`dcp_host_lens` refuses a mirror that DISAGREES with a known sum, but
+    ACCEPTS one unchecked when ``expected_sum`` is None -- correct for a vector
+    whose sum nobody independently knows, wrong for ``seq_lens_cpu``. That one
+    is a non-None but STALE slice exactly when ``seq_lens_sum`` is None
+    (gpu_only batches; see ``have_cpu_mirror`` in triton_backend.py and the
+    same note on the eager decode site). Handing the stale slice on with no sum
+    to check it against turns the #616h fix into a silent MIS-SIZE of the index
+    buffer -- worse than the blocking read it replaces, because a mis-sized
+    buffer is wrong output rather than a stall.
+
+    Callers holding such a (vector, its-sum-or-None) pair route the vector
+    through here, so "no sum" degrades to "no mirror" -- the old device read --
+    instead of to "unchecked mirror".
+    """
+    return None if expected_sum is None else lens_cpu
+
+
 def dcp_host_total_tokens(
     lens_cpu: Optional[HostLens],
     expected_sum: Optional[int] = None,

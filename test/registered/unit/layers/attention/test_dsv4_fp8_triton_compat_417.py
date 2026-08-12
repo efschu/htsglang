@@ -203,16 +203,28 @@ class TestPagedDequantKernel(CustomTestCase):
         ) * NOPE_ROPE_BYTES
         cache = torch.randint(0, 256, (num_pages, bytes_per_page), dtype=torch.uint8)
         # The nope bytes stay fully random -- all 256 codes including both NaNs
-        # are what this exercises. The ue8m0 scale section is drawn from the
-        # range real data occupies (2**-17 .. 2**13) instead: byte 0 and byte
-        # 255 mean 2**-127 and 2**128, where the kernel and the torch reference
-        # in dequant_k_cache.py have a pre-existing disagreement (the reference
-        # flushes subnormal scales to zero, the kernel does not) that predates
-        # this change and is not what is under test here.
+        # are what this exercises.
+        #
+        # #418: the ue8m0 scale window used to be [110, 141), narrowed because
+        # "the reference flushes subnormal scales to zero, the kernel does
+        # not". That disagreement is fixed (the flush is gone; see
+        # test_dequant_k_cache_subnormal_scale_418.py), so the window is no
+        # longer bounded by a defect -- it is bounded by fp32 range, which is
+        # a property of the arithmetic rather than of either implementation.
+        #
+        # With the nope byte unrestricted, the product must stay a normal fp32
+        # for a bit-exact comparison to mean anything:
+        #   low  -- smallest non-zero e4m3fn is 2**-9, so 2**(e-127) * 2**-9
+        #           >= 2**-126 requires e >= 10;
+        #   high -- largest e4m3fn is 448 < 2**9, so 2**(e-127) * 2**9 < 2**128
+        #           requires e < 246.
+        # [10, 246) is that whole safe span: 236 of the 256 encodings, up from
+        # 31. The ends belong to the #418 suite, which controls the nope byte
+        # and can therefore reach them without leaving fp32 range.
         scale_start = page_size * NOPE_ROPE_BYTES
         cache[:, scale_start:] = torch.randint(
-            110,
-            141,
+            10,
+            246,
             (num_pages, bytes_per_page - scale_start),
             dtype=torch.uint8,
         )
