@@ -1495,6 +1495,29 @@ class ServerArgs:
             type_parser=_parse_int_list,
         ),
     ] = None
+    pp_solve_cut: A[
+        Optional[str],
+        Arg(
+            help="Ask the planner to SOLVE the pipeline layer cut instead of "
+            "spelling it out, against a residency census measured on a "
+            "previous boot (#485). The value is the directory that boot "
+            "wrote with SGLANG_RESIDENCY_CENSUS=1 and "
+            "SGLANG_RESIDENCY_CENSUS_DIR=<dir>. The solver minimizes the "
+            "lockstep prefill makespan subject to a hard per-rank memory "
+            "constraint including the corridor, and materializes the answer "
+            "as --pp-layer-ratio, so the existing validation and the hybrid "
+            "family-census gate still run on it. "
+            "EXPLICIT WINS: --pp-layer-ratio and --pp-stage-ratio are "
+            "validated overrides and refuse to be combined with this flag "
+            "rather than being silently overruled. "
+            "REFUSES, never defaults: a missing or partial census, an "
+            "unreadable model depth, or a card whose measured rates are "
+            "absent -- an unpriced term reads as free memory and would "
+            "certify a configuration that cannot run. "
+            "Unset (default): nothing is solved and the boot is "
+            "byte-identical.",
+        ),
+    ] = None
     dp_size: A[
         int,
         Arg(
@@ -14586,6 +14609,7 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
+        self._handle_pp_solve_cut()
         self._handle_pp_stage_ratio()
         self._handle_pp_layer_ratio()
 
@@ -14701,6 +14725,262 @@ class ServerArgs:
         if isinstance(interval, int) and interval > 0:
             return [(i + 1) % interval == 0 for i in range(depth)]
         return [True] * depth
+
+    def _handle_pp_solve_cut(self):
+        """--pp-solve-cut: solve the layer cut from a measured census (#485).
+
+        Materializes ``pp_layer_ratio``, so everything downstream -- the sum
+        check against the declared depth, the SGLANG_PP_LAYER_PARTITION
+        export, the conflict matrix and the hybrid family-census gate -- runs
+        on the solved cut exactly as it does on a hand-written one. The
+        solver is an input to that pipeline, not a bypass of it.
+
+        Every refusal here is deliberate. This gate spent three shifts
+        looking calibrated while being ~3000 MiB wrong on any cut it had not
+        been fitted on (C38/C39), and the single lesson is that an unpriced
+        or guessed term does not read as "unknown", it reads as "free". So a
+        missing census, an unknown depth or an absent card rate stops the
+        boot with the number it could not source.
+        """
+        census_dir = self.pp_solve_cut
+        if census_dir is None:
+            return
+
+        if self.pp_size <= 1:
+            raise ValueError(
+                "--pp-solve-cut solves a split across pipeline stages, but "
+                f"--pp-size is {self.pp_size} (no pipeline). Set --pp-size "
+                "to the number of stages, or drop the flag."
+            )
+        for name, value in (
+            ("--pp-layer-ratio", self.pp_layer_ratio),
+            ("--pp-stage-ratio", self.pp_stage_ratio),
+        ):
+            if value is not None:
+                raise ValueError(
+                    f"--pp-solve-cut and {name} both decide the layer split. "
+                    f"{name} is a VALIDATED OVERRIDE and still wins when you "
+                    f"want it -- but it wins by being the only one passed, "
+                    f"not by silently overruling a solved cut. Drop one."
+                )
+
+        depth = self.declared_num_hidden_layers()
+        if depth is None:
+            raise ValueError(
+                "--pp-solve-cut cannot solve a split: the model's hidden "
+                f"layer count is not readable from {self.model_path}. Pass "
+                "--pp-layer-ratio explicitly."
+            )
+        kinds = self.declared_layer_kinds()
+        if kinds is None:
+            raise ValueError(
+                "--pp-solve-cut cannot solve a split: the model's per-layer "
+                f"families are not readable from {self.model_path}."
+            )
+
+        from sglang.srt.planner import pp_cut
+        from sglang.srt.planner.pp_cut_calibration import (
+            load_census_calibration,
+            with_arena_split_state,
+        )
+
+        families = tuple(
+            pp_cut.LAYER_FAMILY_ATTENTION if k else pp_cut.LAYER_FAMILY_LINEAR
+            for k in kinds
+        )
+        pool_tokens = int(self.max_total_tokens or 0)
+        kv_bytes = self._pp_cut_kv_bytes_per_token_per_attn_layer()
+        token_shares = self._pp_cut_token_shares()
+
+        calibration = load_census_calibration(census_dir)
+        calibration = with_arena_split_state(
+            calibration,
+            census_dir=census_dir,
+            kv_bytes_per_token_per_attn_layer=kv_bytes,
+            pool_tokens=pool_tokens or depth,
+            tp_token_shares=token_shares,
+        )
+
+        rates = self._pp_cut_card_rates(calibration.gpu_names)
+        budgets = self._pp_cut_budgets(calibration.total_visible_mib)
+        ranks = tuple(
+            pp_cut.RankResources(
+                label=f"stage{i}-{rates[i][0]}",
+                gemm_tflops=rates[i][1],
+                attn_bw_gbs=rates[i][2],
+                budget_mib=budgets[i],
+                fixed_overhead_mib=calibration.residual_mib[i],
+            )
+            for i in range(self.pp_size)
+        )
+        flops = self._pp_cut_flops_per_token()
+        inputs = pp_cut.PPCutInputs(
+            layer_families=families,
+            attn_layer_weight_bytes=calibration.attn_layer_mib * pp_cut.MIB,
+            linear_layer_weight_bytes=calibration.linear_layer_mib * pp_cut.MIB,
+            embedding_weight_bytes=calibration.embedding_mib * pp_cut.MIB,
+            lm_head_weight_bytes=calibration.lm_head_mib * pp_cut.MIB,
+            replicated_weight_bytes=calibration.replicated_mib * pp_cut.MIB,
+            state_bytes_per_linear_layer=(
+                calibration.state_per_linear_mib * pp_cut.MIB
+            ),
+            attn_layer_flops_per_token=flops["attn"],
+            linear_layer_flops_per_token=flops["linear"],
+            attn_core_flops_per_token_pair=flops["core"],
+            kv_bytes_per_token_per_attn_layer=kv_bytes,
+            kv_depth_tokens=int(self.chunked_prefill_size or 2048) * 64,
+            prefill_chunk_tokens=int(self.chunked_prefill_size or 2048),
+            ranks=ranks,
+            kv_pool_tokens=pool_tokens,
+            tp_token_shares=token_shares,
+        )
+
+        solution = pp_cut.solve_pp_cut(inputs)
+        if not solution.feasible:
+            raise ValueError(
+                "--pp-solve-cut found no feasible layer split:\n  "
+                + "\n  ".join(solution.refusals)
+            )
+
+        # C39: the census's per-rank residual is NOT cut-invariant -- it moved
+        # ~1250 MiB between a 28-layer and a 40-layer stage 0 on the reference
+        # rig. A census taken far from the solved cut is still the best number
+        # available, but the operator must be told the verdict carries that
+        # error bar rather than discovering it as a corridor breach.
+        drift = max(
+            abs(a - b)
+            for a, b in zip(solution.counts, calibration.calibrated_on_counts)
+        )
+        if drift > 4:
+            logger.warning(
+                "--pp-solve-cut: the census was taken on cut %s and the "
+                "solved cut is %s (%d layers apart on one stage). The "
+                "per-rank residual it carries is NOT cut-invariant (C39: "
+                "~1250 MiB across the reference rig's ship/planner "
+                "boundary), so this verdict carries that error bar. Re-take "
+                "the census on the solved cut and solve again to close it.",
+                list(calibration.calibrated_on_counts),
+                list(solution.counts),
+                drift,
+            )
+
+        self.pp_layer_ratio = list(solution.counts)
+        logger.info(
+            "--pp-solve-cut %s: solved --pp-layer-ratio %s (attention per "
+            "stage %s of %d) -- %s. %s",
+            census_dir,
+            ",".join(str(c) for c in solution.counts),
+            list(solution.attention_counts),
+            sum(1 for k in kinds if k),
+            solution.summary(),
+            calibration.describe(),
+        )
+
+    def _pp_cut_card_rates(self, gpu_names):
+        """(name, gemm_tflops, attn_bw_gbs) per stage, or refuse.
+
+        The card identity comes from the CENSUS -- each rank recorded its own
+        device -- and is never re-derived from the ``--rank-gpu-id`` index.
+        On this rig ``--rank-gpu-id 0,1,2`` puts stage 0 on NVML index 1,
+        because ``CUDA_VISIBLE_DEVICES`` is set by UUID; an index-based
+        lookup silently prices stage 0 as the wrong card, which is the
+        documented torch-vs-NVML device-order trap. Caught here by executing
+        this path against a real census rather than by reading it.
+        """
+        from sglang.srt.planner.card_library import CardLibrary
+
+        library = CardLibrary()
+        out = []
+        for stage in range(self.pp_size):
+            name = gpu_names[stage] if stage < len(gpu_names) else None
+            if not name:
+                raise ValueError(
+                    f"--pp-solve-cut: the census does not record which card "
+                    f"stage {stage} ran on, so its compute cannot be priced. "
+                    f"Re-take the census on a build that records gpu_name -- "
+                    f"do NOT fall back to the --rank-gpu-id index, which is "
+                    f"not the NVML order on every rig."
+                )
+            if not library.has(name):
+                raise ValueError(
+                    f"--pp-solve-cut: no measured profile for {name!r} "
+                    f"(stage {stage}). A missing rate must be refused, never "
+                    f"defaulted -- see planner/cost_model.AbsentRate."
+                )
+            spec = library.get(name)
+            if not spec.gemm_tflops or not spec.membw_gbs:
+                raise ValueError(
+                    f"--pp-solve-cut: the profile for {name!r} carries no "
+                    f"measured gemm/bandwidth rate, so stage {stage} cannot "
+                    f"be priced."
+                )
+            out.append((name, float(spec.gemm_tflops), float(spec.membw_gbs)))
+        return out
+
+    def _pp_cut_budgets(self, census_totals):
+        """Per-stage memory budget: the explicit per-rank cap when given,
+        otherwise what the census saw the card offering."""
+        caps = self.rank_gpu_memory_mib
+        if caps:
+            return [float(c) for c in caps]
+        return [float(t) for t in census_totals]
+
+    def _pp_cut_kv_bytes_per_token_per_attn_layer(self):
+        cfg = self._read_declared_config() or {}
+        text = cfg.get("text_config") or cfg
+
+        def probe(key, default=None):
+            v = cfg.get(key)
+            return v if v is not None else text.get(key, default)
+
+        kv_heads = int(probe("num_key_value_heads") or probe("linear_num_key_heads") or 0)
+        head_dim = int(probe("head_dim") or 0)
+        if not kv_heads or not head_dim:
+            raise ValueError(
+                "--pp-solve-cut cannot size the KV arena: the model config "
+                "does not declare num_key_value_heads/head_dim."
+            )
+        dtype_bytes = 1 if "fp8" in str(self.kv_cache_dtype or "") else 2
+        return float(kv_heads * head_dim * 2 * dtype_bytes)
+
+    def _pp_cut_flops_per_token(self):
+        """Dense FLOPs per token per layer, from the config's geometry.
+
+        The WEIGHT side of this model is measured (the census) because every
+        formula-derived weight so far has been wrong. The FLOP side stays
+        config-derived: it drives the makespan ORDERING, and that ordering is
+        already known not to resolve near-neighbour cuts (successor 50 §1d).
+        """
+        cfg = self._read_declared_config() or {}
+        text = cfg.get("text_config") or cfg
+
+        def probe(key, default=0):
+            v = cfg.get(key)
+            return int((v if v is not None else text.get(key, default)) or default)
+
+        hidden = probe("hidden_size")
+        q_heads = probe("num_attention_heads")
+        kv_heads = probe("num_key_value_heads")
+        head_dim = probe("head_dim")
+        inter = probe("intermediate_size")
+        if not (hidden and q_heads and head_dim and inter):
+            raise ValueError(
+                "--pp-solve-cut cannot price compute: the model config does "
+                "not declare hidden_size/num_attention_heads/head_dim/"
+                "intermediate_size."
+            )
+        attn_proj = hidden * (q_heads * head_dim + 2 * kv_heads * head_dim) + (
+            q_heads * head_dim
+        ) * hidden
+        mlp = 3 * hidden * inter
+        k_sz = probe("linear_num_key_heads") * probe("linear_key_head_dim")
+        v_sz = probe("linear_num_value_heads") * probe("linear_value_head_dim")
+        gdn = hidden * (2 * k_sz + 2 * v_sz) + v_sz * hidden
+        return {
+            "attn": 2.0 * (attn_proj + mlp),
+            "linear": 2.0 * ((gdn or attn_proj) + mlp),
+            "core": 4.0 * q_heads * head_dim,
+        }
 
     def _handle_pp_stage_ratio(self):
         """--pp-stage-ratio: derive the uneven layer split from per-stage

@@ -98,6 +98,7 @@ __all__ = [
     "PPCutSolution",
     "layer_families_from_config",
     "attention_counts",
+    "token_shares_from_vector",
     "solve_pp_cut",
     "validate_pp_cut",
 ]
@@ -208,6 +209,13 @@ class PPCutInputs:
     #: Resident weight bytes of ONE layer of each family, already at the
     #: checkpoint's bytes-per-param (so a quantized checkpoint is priced as
     #: it actually loads).
+    #:
+    #: MEASURE THESE FROM THE CHECKPOINT, do not derive them from the config's
+    #: parameter formulas. On the reference checkpoint the formula-derived
+    #: attention layer is 325.0 MiB and the real one is 355.1 MiB, because
+    #: ``attn_output_gate`` adds a second q-sized projection that the formula
+    #: does not know about -- 482 MiB of silent error across 16 layers, and
+    #: CUT-SHAPED, so it lands on whichever stage the solver was choosing.
     attn_layer_weight_bytes: float
     linear_layer_weight_bytes: float
 
@@ -237,6 +245,47 @@ class PPCutInputs:
 
     ranks: Tuple[RankResources, ...]
 
+    #: NON-LAYER WEIGHTS, by the stage ROLE that owns them (C38).
+    #:
+    #: The three fields below exist because pricing "a per-layer census of the
+    #: transformer layers" is not the same as pricing the checkpoint. On the
+    #: reference model these payloads are ~5.7 GiB and every one of them is
+    #: bf16: a compressed-tensors quantizer only ever targets Linear modules,
+    #: so the input embeddings are never a candidate, and ``lm_head`` plus the
+    #: whole visual tower sit in the config's explicit ``ignore`` list. They
+    #: were invisible to this ledger for three shifts, and a second error of
+    #: the opposite sign (see ``tp_token_shares``) cancelled them on the
+    #: shipping cut -- which is exactly why nobody caught it: the gate was
+    #: only ever checked on the configuration where its errors cancel.
+    #:
+    #: They are ROLE-scoped, not per-rank scalars, because that is how the
+    #: pipeline places them: the input embedding is resident on the FIRST
+    #: stage, ``lm_head`` on the LAST, and anything replicated (the vision
+    #: tower, per-process loader constants) on EVERY stage. A cut that moves
+    #: the stage boundaries does not move these -- but a cut that changes
+    #: which rank IS the first or last stage does, and a per-rank scalar
+    #: could not express that.
+    #:
+    #: Measure them from the checkpoint's tensor headers, or from a boot's
+    #: residency census (``planner/residency_census.py``), which reports
+    #: exactly these groups. Left at zero they are simply unpriced, and the
+    #: verdict is optimistic by their size.
+    embedding_weight_bytes: float = 0.0
+    lm_head_weight_bytes: float = 0.0
+    replicated_weight_bytes: float = 0.0
+
+    #: Resident state bytes the runtime allocates PER LINEAR (GDN/mamba)
+    #: LAYER a stage owns -- the recurrent state pool, sized by the mamba
+    #: cache slots and not by the KV pool.
+    #:
+    #: It is here rather than inside ``RankResources.fixed_overhead_mib``
+    #: because it is CUT-SHAPED: moving eleven linear layers onto a stage
+    #: moves this term with them. Folding it into the per-rank overhead is
+    #: what made that overhead look cut-invariant when it was not (C35's
+    #: card conclusion stands; its cut-invariance conclusion does not).
+    #: Calibrate from the census; zero prices it away.
+    state_bytes_per_linear_layer: float = 0.0
+
     #: Tokens the KV ARENA is sized for, i.e. ``--max-total-tokens``. This
     #: drives the memory term only, and it is a different quantity from
     #: ``kv_depth_tokens``: the arena is provisioned for the whole pool while
@@ -246,12 +295,27 @@ class PPCutInputs:
     #: pessimistic on speed). Zero falls back to ``kv_depth_tokens``.
     kv_pool_tokens: int = 0
 
-    #: Decode-phase token shares per rank, when this PP layout shares its KV
+    #: Decode-phase TOKEN shares per rank, when this PP layout shares its KV
     #: arena with a TP layout (the #631 phase flip). The arena is then sized
     #: ``max(PP layer share, TP token share)`` per rank, because one arena
     #: backs both layouts rather than two -- the relation the 631 bench log
-    #: validates to the byte against two boots (PROD_BRINGUP_BENCH.md sec. 2).
+    #: validates to the byte against two boots (PROD_BRINGUP_BENCH.md sec. 2),
+    #: and which a boot log confirms directly: every rank allocates all 16
+    #: full-attention layers' rows for ITS OWN token slice, and the three
+    #: slices are the token vector exactly.
     #: ``None`` for a pure-PP deployment.
+    #:
+    #: FEED THIS THE TOKEN VECTOR, NEVER THE FLIP WEIGHT VECTOR (C38). The
+    #: #631 flip carries two different per-rank ratios and they are not
+    #: interchangeable: ``--phase-flip-tp-vector`` splits the WEIGHT shard by
+    #: compute, while ``SGLANG_UNEVEN_TOKEN_VECTOR`` splits the KV ARENA by
+    #: each rank's remaining memory. This field sizes the ARENA, so it takes
+    #: the second one. Feeding it the first is worth 547-664 MiB per rank on
+    #: the reference rig, in the optimistic direction on the cut the solver
+    #: prefers, and it is half of the pair of errors that cancelled on the
+    #: shipping cut. Build it with :func:`token_shares_from_vector` from
+    #: ``phase_flip_boot.parse_flip_token_vector`` -- one resolver, so the
+    #: gate cannot drift away from what the allocator actually does.
     tp_token_shares: Optional[Tuple[float, ...]] = None
 
     #: How many times a chunk sweeps the stage's KV. 1.0 models a
@@ -342,6 +406,13 @@ class StageCost:
     kv_mib: float
     transient_mib: float
     budget_mib: float
+    #: Non-layer weights this stage's ROLE owns (embedding on the first
+    #: stage, lm_head on the last, replicated payloads everywhere). Kept as
+    #: its own post rather than folded into ``weight_mib`` so a future
+    #: mismatch names the term that moved.
+    nonlayer_weight_mib: float = 0.0
+    #: Recurrent (GDN/mamba) state pool for the linear layers this stage owns.
+    state_mib: float = 0.0
     #: Which side of the roofline bound the attention core: ``"compute"``,
     #: ``"bandwidth"``, or ``"none"`` when the stage owns no attention layer.
     attn_bound_by: str = "none"
@@ -355,7 +426,13 @@ class StageCost:
 
     @property
     def resident_mib(self) -> float:
-        return self.weight_mib + self.kv_mib + self.transient_mib
+        return (
+            self.weight_mib
+            + self.nonlayer_weight_mib
+            + self.state_mib
+            + self.kv_mib
+            + self.transient_mib
+        )
 
     @property
     def headroom_mib(self) -> float:
@@ -481,6 +558,34 @@ def attention_counts(
     return tuple(out)
 
 
+def token_shares_from_vector(token_vector: Sequence[int]) -> Tuple[float, ...]:
+    """Normalize a KV TOKEN vector into per-rank shares for the gate.
+
+    The one supported way to build :attr:`PPCutInputs.tp_token_shares`. It
+    exists so the arena's ratio has a single source: pass what
+    ``phase_flip_boot.parse_flip_token_vector`` returns -- the resolved
+    ``SGLANG_UNEVEN_TOKEN_VECTOR``, or the flip vector when that env is unset
+    and the two genuinely coincide -- and never the flip WEIGHT vector read
+    straight off ``--phase-flip-tp-vector``.
+
+    Note that a gcd-reduced vector is the SAME vector: ``14,10,8`` and
+    ``7,5,4`` normalize identically, which is exactly the equivalence
+    ``resolve_cp_token_split`` applies. Two configurations that differ only
+    there are one configuration.
+    """
+    vec = [float(x) for x in token_vector]
+    if not vec:
+        raise ValueError("token_shares_from_vector: empty token vector.")
+    if any(x <= 0.0 for x in vec):
+        raise ValueError(
+            f"token_shares_from_vector: every rank needs a positive token "
+            f"ratio, got {list(token_vector)}. A rank with ratio 0 owns no KV "
+            f"rows while still holding a weight shard."
+        )
+    total = sum(vec)
+    return tuple(x / total for x in vec)
+
+
 def _prefix_attention(layer_families: Sequence[str]) -> List[int]:
     """``pref[i]`` = full-attention layers in ``[0, i)``."""
     pref = [0]
@@ -539,6 +644,21 @@ def _price_stage(
         + n_linear * inputs.linear_layer_weight_bytes
     ) / MIB
 
+    # Non-layer weights, charged to the stage ROLE that holds them: the input
+    # embedding to the first stage, lm_head to the last, replicated payloads
+    # (vision tower, loader constants) to every stage. These do not move when
+    # the cut moves, which is precisely why leaving them out was invisible on
+    # a single cut and ~3.6 GiB wrong the moment the cut changed.
+    nonlayer_bytes = inputs.replicated_weight_bytes
+    if stage == 0:
+        nonlayer_bytes += inputs.embedding_weight_bytes
+    if stage == inputs.pp_size - 1:
+        nonlayer_bytes += inputs.lm_head_weight_bytes
+    nonlayer_weight_mib = nonlayer_bytes / MIB
+
+    # Recurrent-state pool: cut-shaped, one share per linear layer owned.
+    state_mib = (n_linear * inputs.state_bytes_per_linear_layer) / MIB
+
     # KV ARENA, which is sized for the whole pool and not for one request.
     # When a TP layout shares this arena (the phase flip), the stage pays the
     # LARGER of its PP layer share and its TP token share -- one arena backs
@@ -565,6 +685,8 @@ def _price_stage(
         attn_seconds=attn_seconds,
         compute_seconds=compute_seconds,
         weight_mib=weight_mib,
+        nonlayer_weight_mib=nonlayer_weight_mib,
+        state_mib=state_mib,
         kv_mib=kv_mib,
         # The transient and the cut-invariant overhead both occupy the card
         # alongside weights and KV, so they are charged together here.
@@ -762,7 +884,15 @@ def _infeasible(
         min(inputs.attn_layer_weight_bytes, inputs.linear_layer_weight_bytes) / MIB
     )
     for r in inputs.ranks:
-        overhead = r.transient_mib + r.fixed_overhead_mib
+        # The replicated non-layer weights are on every stage whatever the
+        # cut does, so they belong in the "before a single layer lands"
+        # figure; the role-scoped ones (embedding, lm_head) are not, because
+        # this loop does not know which rank ends up holding them.
+        overhead = (
+            r.transient_mib
+            + r.fixed_overhead_mib
+            + inputs.replicated_weight_bytes / MIB
+        )
         usable = r.budget_mib - inputs.corridor_mib - overhead
         if usable < lightest_mib:
             reasons.append(
@@ -776,15 +906,29 @@ def _infeasible(
         total_weight_mib = (
             pref_attn[n] * inputs.attn_layer_weight_bytes
             + (n - pref_attn[n]) * inputs.linear_layer_weight_bytes
+            + inputs.embedding_weight_bytes
+            + inputs.lm_head_weight_bytes
+            + inputs.pp_size * inputs.replicated_weight_bytes
         ) / MIB
         total_kv_mib = (
             inputs.n_full_attention
             * inputs.kv_bytes_per_token_per_attn_layer
             * inputs.arena_tokens
         ) / MIB
-        usable = sum(
-            r.budget_mib - inputs.corridor_mib - r.transient_mib - r.fixed_overhead_mib
-            for r in inputs.ranks
+        usable = (
+            sum(
+                r.budget_mib
+                - inputs.corridor_mib
+                - r.transient_mib
+                - r.fixed_overhead_mib
+                for r in inputs.ranks
+            )
+            - (
+                inputs.pp_size * inputs.replicated_weight_bytes
+                + inputs.embedding_weight_bytes
+                + inputs.lm_head_weight_bytes
+            )
+            / MIB
         )
         reasons.append(
             f"no contiguous {k}-stage cut of {n} layers fits: the model needs "
@@ -873,7 +1017,10 @@ def validate_pp_cut(
             violations.append(
                 f"stage {cost.start_layer}-{cost.end_layer} on rank "
                 f"{cost.rank}: needs {cost.resident_mib:.0f} MiB "
-                f"({cost.weight_mib:.0f} weights + {cost.kv_mib:.0f} KV + "
+                f"({cost.weight_mib:.0f} layer weights + "
+                f"{cost.nonlayer_weight_mib:.0f} non-layer weights + "
+                f"{cost.state_mib:.0f} recurrent state + "
+                f"{cost.kv_mib:.0f} KV + "
                 f"{cost.transient_mib:.0f} transient) plus "
                 f"{cost.seam_staging_mib:.0f} MiB of peak seam staging it "
                 f"must still be able to reach, but only "

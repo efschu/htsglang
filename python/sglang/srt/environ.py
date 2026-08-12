@@ -637,6 +637,15 @@ class Envs:
     # pools to the profiled optimum. Model-type-agnostic (keys off measured
     # capacity, which is dtype-independent).
     SGLANG_UNEVEN_TOKEN_VECTOR = EnvStr(None)
+    # Log one per-rank residency census line once everything permanent is
+    # resident (planner/residency_census.py). Read-only instrument for
+    # calibrating the #485 cut gate against exclusively-owned, measured bytes
+    # instead of a fit; unset, the boot is byte-identical.
+    SGLANG_RESIDENCY_CENSUS = EnvBool(False)
+    # Directory the census also writes itself to as JSON, one file per rank.
+    # A later boot points --pp-solve-cut at it to solve the layer cut against
+    # these measured bytes. Requires SGLANG_RESIDENCY_CENSUS.
+    SGLANG_RESIDENCY_CENSUS_DIR = EnvStr(None)
     # Force a fresh stage-0 hardware micro-probe for --rank-tp-ratio
     # auto-performance, ignoring the cached profile under ~/.cache/sglang.
     SGLANG_PERF_REPROBE = EnvBool(False)

@@ -11,6 +11,7 @@ than the solved cut. Without it, "the solver produced a skewed cut" is not
 evidence that the skew is the right one.
 """
 
+import dataclasses
 import itertools
 import unittest
 
@@ -715,6 +716,207 @@ class TestSeamStagingIsFundedNotAssumed(CustomTestCase):
                 0.0,
                 f"{st.rank} was emitted with an unfundable seam",
             )
+
+
+class TestCheckpointConservation(CustomTestCase):
+    """The gate must price the CHECKPOINT, not just its transformer layers.
+
+    Every constant here is MEASURED from the shipping checkpoint's safetensors
+    headers (dtype x shape per tensor, grouped by owner) -- not derived from
+    the config's parameter formulas, because those formulas are what hid two
+    of these three errors. The reference model is a VL checkpoint quantized
+    INT8-W8A8: ``lm_head`` and the whole visual tower sit in the quantizer's
+    explicit ``ignore`` list, and the input embedding is never a candidate at
+    all (compressed-tensors only targets Linear modules), so all three load in
+    bf16 and all three were invisible to a per-layer census.
+
+    The falsifier for the WHOLE ledger is
+    ``test_priced_weights_equal_the_checkpoint``: if the sum over stages of
+    what the gate charges does not equal what the checkpoint contains, the
+    gate is wrong by the difference no matter how well any single boot was
+    calibrated. It fails by 5729 MiB on the pre-C38 model.
+    """
+
+    # Measured 2026-08-12 from
+    # Qwen3.6-27B-INT8-W8A8-yarn1.5/*.safetensors headers.
+    CKPT_ATTN_LAYER_MIB = 355.13
+    CKPT_LINEAR_LAYER_MIB = 366.15
+    CKPT_EMBED_MIB = 2425.0
+    CKPT_LM_HEAD_MIB = 2425.0
+    CKPT_VISUAL_MIB = 878.8
+    CKPT_LANGUAGE_LAYERS_MIB = 23257.5
+
+    def _measured_inputs(self, **kw):
+        """Rig inputs whose weight terms are the MEASURED checkpoint bytes."""
+        params = dict(
+            attn_layer_weight_bytes=self.CKPT_ATTN_LAYER_MIB * pp_cut.MIB,
+            linear_layer_weight_bytes=self.CKPT_LINEAR_LAYER_MIB * pp_cut.MIB,
+            embedding_weight_bytes=self.CKPT_EMBED_MIB * pp_cut.MIB,
+            lm_head_weight_bytes=self.CKPT_LM_HEAD_MIB * pp_cut.MIB,
+            replicated_weight_bytes=self.CKPT_VISUAL_MIB * pp_cut.MIB,
+        )
+        params.update(kw)
+        base = _inputs(pool=280000)
+        return dataclasses.replace(base, **params)
+
+    def test_measured_layer_bytes_are_not_the_formula_bytes(self):
+        # Pins WHY the measured constants are used: the config-derived
+        # formula omits attn_output_gate's second q-sized projection. If a
+        # future checkpoint makes these agree, this test says so out loud
+        # rather than letting the formula quietly become right by accident.
+        formula_mib = ATTN_LAYER_BYTES / pp_cut.MIB
+        self.assertAlmostEqual(formula_mib, 325.0, delta=0.5)
+        self.assertAlmostEqual(self.CKPT_ATTN_LAYER_MIB, 355.13, delta=0.05)
+        gate_mib = HIDDEN * Q_HEADS * HEAD_DIM * BYTES_PER_PARAM / pp_cut.MIB
+        self.assertAlmostEqual(
+            self.CKPT_ATTN_LAYER_MIB - formula_mib, gate_mib, delta=0.5
+        )
+
+    def test_the_checkpoint_census_is_self_consistent(self):
+        # The per-family constants must add up to the measured language-model
+        # total, or one of the four numbers above is a typo.
+        total = 16 * self.CKPT_ATTN_LAYER_MIB + 48 * self.CKPT_LINEAR_LAYER_MIB
+        self.assertAlmostEqual(total, self.CKPT_LANGUAGE_LAYERS_MIB, delta=1.0)
+
+    def test_priced_weights_equal_the_checkpoint(self):
+        # THE LEDGER LAW. Sum what the gate charges every stage; it must equal
+        # what the checkpoint puts on the rig -- the language layers once,
+        # embedding once, lm_head once, and the replicated payload once per
+        # stage. Pre-C38 this is short by 5729 MiB.
+        inputs = self._measured_inputs()
+        sol, violations = pp_cut.validate_pp_cut([28, 20, 16], inputs)
+        self.assertEqual(violations, ())
+        priced = sum(s.weight_mib + s.nonlayer_weight_mib for s in sol.stages)
+        expected = (
+            self.CKPT_LANGUAGE_LAYERS_MIB
+            + self.CKPT_EMBED_MIB
+            + self.CKPT_LM_HEAD_MIB
+            + 3 * self.CKPT_VISUAL_MIB
+        )
+        self.assertAlmostEqual(priced, expected, delta=2.0)
+
+    def test_non_layer_weights_follow_the_stage_ROLE(self):
+        # Role-scoped, not per-rank: the embedding is on the FIRST stage and
+        # lm_head on the LAST, so a three-stage cut charges them once each and
+        # the middle stage carries only the replicated payload. A per-rank
+        # scalar cannot express this, which is why the field is not one.
+        sol, _ = pp_cut.validate_pp_cut([28, 20, 16], self._measured_inputs())
+        first, middle, last = sol.stages
+        self.assertAlmostEqual(
+            first.nonlayer_weight_mib,
+            self.CKPT_EMBED_MIB + self.CKPT_VISUAL_MIB,
+            delta=1.0,
+        )
+        self.assertAlmostEqual(
+            middle.nonlayer_weight_mib, self.CKPT_VISUAL_MIB, delta=1.0
+        )
+        self.assertAlmostEqual(
+            last.nonlayer_weight_mib,
+            self.CKPT_LM_HEAD_MIB + self.CKPT_VISUAL_MIB,
+            delta=1.0,
+        )
+
+    def test_the_unpriced_payload_is_worth_3300_MiB_on_rank0(self):
+        # The size of the error this closes, on the rank it was measured on.
+        # rank0 holds the embedding and its copy of the vision tower, and the
+        # old model charged for neither.
+        priced = self._measured_inputs()
+        unpriced = dataclasses.replace(
+            priced,
+            embedding_weight_bytes=0.0,
+            lm_head_weight_bytes=0.0,
+            replicated_weight_bytes=0.0,
+        )
+        cut = [42, 11, 11]
+        a, _ = pp_cut.validate_pp_cut(cut, priced)
+        b, _ = pp_cut.validate_pp_cut(cut, unpriced)
+        gap = a.stages[0].resident_mib - b.stages[0].resident_mib
+        self.assertAlmostEqual(gap, 3303.8, delta=5.0)
+
+    def test_recurrent_state_is_cut_shaped_not_a_rank_constant(self):
+        # Moving eleven linear layers onto rank0 must move their state pool
+        # with them. Folding this into fixed_overhead_mib is what made that
+        # overhead look cut-invariant.
+        per_layer = 51.2 * pp_cut.MIB
+        inputs = self._measured_inputs(state_bytes_per_linear_layer=per_layer)
+        ship, _ = pp_cut.validate_pp_cut([28, 20, 16], inputs)
+        planner, _ = pp_cut.validate_pp_cut([42, 11, 11], inputs)
+        # ship rank0: 21 linear layers; planner rank0: 32.
+        self.assertAlmostEqual(ship.stages[0].state_mib, 21 * 51.2, delta=0.5)
+        self.assertAlmostEqual(planner.stages[0].state_mib, 32 * 51.2, delta=0.5)
+        self.assertAlmostEqual(
+            planner.stages[0].state_mib - ship.stages[0].state_mib,
+            563.2,
+            delta=1.0,
+        )
+
+
+class TestTokenShareContract(CustomTestCase):
+    """The arena follows the TOKEN vector. Half of C38 was feeding it the
+    other one -- the flip's WEIGHT vector -- which is a different ratio for a
+    different resource."""
+
+    SHIP_TOKEN_VECTOR = (14, 10, 8)
+    FLIP_WEIGHT_VECTOR = (32, 16, 16)
+
+    def test_gcd_reduced_vectors_are_the_same_vector(self):
+        # 14,10,8 and 7,5,4 are one configuration, not two:
+        # resolve_cp_token_split gcd-reduces. A shift that "fixed" one to
+        # match the other would be changing nothing and reporting a change.
+        self.assertEqual(
+            pp_cut.token_shares_from_vector((14, 10, 8)),
+            pp_cut.token_shares_from_vector((7, 5, 4)),
+        )
+
+    def test_the_two_vectors_are_not_interchangeable(self):
+        tokens = pp_cut.token_shares_from_vector(self.SHIP_TOKEN_VECTOR)
+        weights = pp_cut.token_shares_from_vector(self.FLIP_WEIGHT_VECTOR)
+        self.assertAlmostEqual(tokens[0], 0.4375, places=4)
+        self.assertAlmostEqual(weights[0], 0.5, places=4)
+        self.assertNotAlmostEqual(tokens[0], weights[0], places=3)
+
+    def test_the_wrong_vector_overcharges_rank0_KV_on_the_ship_cut(self):
+        # Both vectors normalize to 1.0, so no sum check can catch the
+        # substitution -- only using one resolver can. On the ship cut the
+        # weight vector rounds rank0's arena up from 7 layers to 8.
+        pool = 280000
+        right = _inputs(
+            pool=pool, tp_token_shares=pp_cut.token_shares_from_vector((14, 10, 8))
+        )
+        wrong = _inputs(
+            pool=pool, tp_token_shares=pp_cut.token_shares_from_vector((32, 16, 16))
+        )
+        a, _ = pp_cut.validate_pp_cut([28, 20, 16], right)
+        b, _ = pp_cut.validate_pp_cut([28, 20, 16], wrong)
+        overcharge = b.stages[0].kv_mib - a.stages[0].kv_mib
+        self.assertAlmostEqual(
+            overcharge,
+            1 * KV_BYTES_PER_TOKEN_PER_ATTN_LAYER * pool / pp_cut.MIB,
+            delta=1.0,
+        )
+        self.assertAlmostEqual(overcharge, 546.9, delta=1.0)
+
+    def test_on_the_planner_cut_the_wrong_vector_is_invisible(self):
+        # And this is why the substitution survived: where the PP layer share
+        # dominates (rank0 owns 10 attention layers, above both token shares)
+        # the max() hides it completely. An error that is invisible on the cut
+        # you are testing is still there on the cut you ship.
+        pool = 280000
+        right = _inputs(
+            pool=pool, tp_token_shares=pp_cut.token_shares_from_vector((14, 10, 8))
+        )
+        wrong = _inputs(
+            pool=pool, tp_token_shares=pp_cut.token_shares_from_vector((32, 16, 16))
+        )
+        a, _ = pp_cut.validate_pp_cut([42, 11, 11], right)
+        b, _ = pp_cut.validate_pp_cut([42, 11, 11], wrong)
+        self.assertAlmostEqual(a.stages[0].kv_mib, b.stages[0].kv_mib, delta=0.01)
+
+    def test_a_zero_share_is_refused(self):
+        with self.assertRaises(ValueError):
+            pp_cut.token_shares_from_vector((14, 0, 8))
+        with self.assertRaises(ValueError):
+            pp_cut.token_shares_from_vector(())
 
 
 if __name__ == "__main__":

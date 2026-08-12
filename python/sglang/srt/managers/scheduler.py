@@ -1326,6 +1326,14 @@ class Scheduler(
         model_runner.note_post_capture_leftover(
             draft_solo_pool_bytes=self._solo_draft_kv_pool_bytes()
         )
+        # #485 residency census (env-gated, read-only): the same point, seen
+        # from the CUT's side. note_post_capture_leftover above answers "how
+        # much is left"; this answers "what is here, and who owns it", which
+        # is what the cut gate has to price. Off by default and byte-identical
+        # when off, so it can ride along on a corridor-measuring boot.
+        from sglang.srt.planner.residency_census import log_residency_census
+
+        log_residency_census(model_runner)
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():

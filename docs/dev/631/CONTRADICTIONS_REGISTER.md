@@ -854,6 +854,90 @@ before a single token was served** — it was never a load problem.
 
 ---
 
+**C39 — C38's TWO ERRORS DO NOT CANCEL; A FITTED RESIDUAL ABSORBED THEM
+(#485, successor 50, 2026-08-12).** C38's two defects are real and are now
+fixed. Its explanation of why three shifts missed them is wrong, and the
+correct one is more dangerous.
+
+The arithmetic, on rank0, ship cut, measured this shift:
+
+| term | direction | @280000 | @620000 |
+|---|---|---:|---:|
+| unpriced non-layer weights (embed 2425 + vision 930) | under | **3358** | **3358** |
+| arena on the flip WEIGHT vector, `max(7, 0.5*16)=8` | over | 547 | 1212 |
+| net | under | **−2811** | **−2146** |
+
+The over-charge is at most a third of the under-charge, so "cancel to within
+~100 MiB" does not hold at any pool. What hid the error is that
+`fixed_overhead_mib` is **a residual fitted on the ship boot**, and a residual
+fitted on one cut absorbs every term that is constant on that cut. Measured
+four ways on one axis over three boots (`s50/ledger.py`), worst held-out
+error on rank0:
+
+```
+pre-C38 gate,  calibrated on ship boot   -> 3040.5 MiB  (both planner boots)
+pre-C38 gate,  calibrated on planner boot->  109.2 MiB  (the other planner boot)
+corrected,     calibrated on ship boot   -> 1266.4 MiB  (both planner boots)
+corrected,     calibrated on planner boot->    6.8 MiB  (the other planner boot)
+```
+
+Read rows 1 and 2 together: the old gate was already good to ~109 MiB WITHIN
+a cut family. **The failure was never "inaccurate", it was "accurate only
+where it was fitted".** Diagnostic tell is therefore not "accurate on exactly
+one config" (C38's version, which invites you to look for a cancelling pair
+that may not exist) but "the model contains a residual, and the residual was
+fitted on the config you are trusting it on".
+
+**Still open, and now quantified:** the residual is NOT cut-invariant. rank0
+measures **3174 MiB at 28 layers, 4419 at 40, 4440 at 42** — flat across
+40 vs 42, 1250 MiB apart across 28 vs 40. It sits in the census's
+graphs/workspaces post. Until that is itemized, the gate must be calibrated
+in the neighbourhood of the cut it judges, and a cross-family verdict carries
+a ~1250 MiB error bar.
+
+**Confirmed by direct measurement, not by fit** (`planner/residency_census.py`,
+two cuts, both card types): `embed_tokens` 2425.0 on stage 0 and `lm_head`
+2425.0 on the last stage exactly as C38 predicted; the vision tower
+replicated at 927.8/927.8/932.8; the PP-stage recurrent pool **51.2 MiB x
+n_linear** (C38's figure, against my own mid-shift fit of 158 MiB, which was
+wrong — see law 28); and the arena following the TOKEN vector, visible in the
+ship boot's own allocation `#tokens 271264/193760/155008` = `14,10,8`.
+
+**One more unpriced term C38 did not name:** the attention layer is 364.88 MiB
+resident against the 325.0 MiB the config formula gives, because
+`attn_output_gate` adds a second q-sized projection. 482 MiB across 16
+layers, and cut-shaped.
+
+---
+
+**C40 — A RANK DIED SILENTLY UNDER THE FLIP WITH 1926 MiB FREE IN HAND
+(#485/#622/#649, successor 50, 2026-08-12). OPEN.** During the planner-cut
+window, rank0 stopped at 11:48:41 in the middle of an ordinary decode batch:
+
+* no traceback on rank0, and its last log line is a normal `Decode batch`;
+* **no OOM anywhere** — zero `out of memory` / `cuMemCreate` /
+  `CUDA_ERROR_OUT_OF_MEMORY` lines in the whole boot;
+* no kernel OOM-killer record, host RAM at 107 GB available;
+* rank0's free VRAM over the preceding 20 s ranged **1926-7726 MiB**, i.e.
+  the corridor law was comfortably held at the moment it died;
+* ranks 1 and 2 then raised `Bar1CollectiveAborted ... group flip_tp:0`
+  via barlink's peer-liveness abort, naming `peer rank gone: rank 0 (pid
+  986533)`.
+
+**The barlink abort is the CONSEQUENCE and must not be read as the cause** —
+it is the mechanism working correctly, reporting a peer that vanished.
+Equally, this is **not** the corridor event that happened in the same window:
+that was at 11:44:06, four and a half minutes earlier, and the rank survived
+it. Two findings, one window, and conflating them would send the next shift
+hunting memory when the memory was there.
+
+This is the #622/#649 silent-wedge family seen under the phase flip on a
+planner cut. It is the reason no planner-family cut can be certified on a
+20-minute window yet: the window is the instrument that would have to catch
+it, and here the window is what it killed.
+
+---
+
 ## SINGLE-SOURCED AND LOAD-BEARING — the next contradictions
 
 Each appears in exactly one place and a decision rests on it. Confirm before
@@ -1448,3 +1532,66 @@ boot with **TP>=2 per PP stage** plus `--enable-phase-flip` plus
    subtracting two measurements, ask whether they are the same KIND of
    quantity** — at-rest and under-load are different instruments, and a
    ratio between them is not a slope.
+
+28. **A fitted residual makes any model look calibrated on the config it was
+   fitted on** (C39, #485). Not "check a model where its errors cancel" —
+   check whether the model has a free parameter absorbing them. The #485 gate
+   carried one (`fixed_overhead_mib`, defined as
+   `resident_at_rest − weights − kv`), and with it the pre-fix gate predicted
+   a held-out boot of the SAME cut family to 109 MiB while being wrong by
+   3040 MiB the moment the cut moved. **Report a model's held-out error
+   across the axis it will be USED on** — for a cut gate that axis is the
+   cut, so a residual calibrated on one cut is evidence about that cut only.
+   Corollary: name the free parameters in any ledger, and state which boot
+   each was fitted on.
+
+29. **A measurement refutes a fit even when the fit predicts** (successor
+   50's own retraction). I fitted 158 MiB/linear-layer from two boots; it
+   predicted a third to 88 MiB, and it was still the wrong mechanism — the
+   census measured 51.2 MiB/linear-layer directly, on two cuts and both card
+   types. Predictive success over a narrow range is not mechanism. **When a
+   term can be measured directly, measuring it is not optional because the
+   fit happens to work** (sibling of law 28: the fit worked because another
+   free parameter moved to accommodate it).
+
+30. **An instrument that must not perturb what it measures has to be
+   default-off AND read-only** (#485 residency census). The component balance
+   this shift needed already existed in
+   `note_post_capture_leftover`, but it is gated on
+   `SGLANG_MEASURED_KV_BUDGET`, which also PERSISTS a budget correction and
+   changes the next boot's pool. Reusing it would have made every corridor
+   window it rode along on worthless. The new census reuses the same
+   allocator checkpoints and writes nothing. **Before reusing an existing
+   probe, check what else its gate turns on.**
+
+31. **A transient is a property of the LOAD STATE, and "the load" is not one
+   state** (successor 50, law 27 repeated). Law 27 says two minima from
+   differently-loaded boots are not a derivative. Its corollary, learned the
+   expensive way one shift later: a single measured DRAW is not transferable
+   either. Measured on rank0 of the reference rig, same rank, same law:
+
+   ```
+   deep-prefill A/B load   ->  956 MiB drawn below at-rest
+   22-min mixed soak       -> 1989 MiB (planner cut) / 3148 MiB (ship config)
+   ```
+
+   I aimed two boots with the 956, and **the refuting number was already on
+   my own disk** — I had measured the 3148 myself, four hours earlier, in
+   this shift's ship window. **Before reusing a transient, name the load
+   state that produced it and check it against every load state you have
+   already measured.** The same applies to `RankResources.transient_mib`,
+   which is fed a prefill-trigger figure and is therefore optimistic by
+   ~650 MiB under the shipping soak.
+
+32. **Execute the path before believing the reading** (successor 50,
+   `--pp-solve-cut`). My first card-rate lookup used `--rank-gpu-id` as an
+   NVML index. It reads correctly and it is wrong: on this rig
+   `--rank-gpu-id 0,1,2` puts stage 0 on NVML index 1, because
+   `CUDA_VISIBLE_DEVICES` is set by UUID and torch's device order is not
+   NVML's. It priced the 5090 as a 3080 and no unit test would have caught
+   it, because the mapping is a property of the rig. Running the handler once
+   against a real census found it in seconds. **A per-card join must carry
+   its IdentityMap in the artifact** — each rank now records its own device
+   in the census — **and desk-written code gets executed before it is
+   trusted** (the desk-written-never-executed law, applied to a refusal path
+   nobody expected to reach).
