@@ -1,7 +1,9 @@
 # HANDOFF 693 — the #485 wall was two bugs, and the cut runs under the flip
 
-Successor 49. Branch `feat/route-a-631` at `10213cd58e`; `integration/r2` and
-`feat/pp-family-cut-485-rebased` pushed at the same commit. Evidence:
+Successor 49. Branch `feat/route-a-631`; the two code commits are
+`6c7e8a1411` (seam retry bound + `KvRowCap` clear-hook fix) and `10213cd58e`
+(solver transient-staging term), docs on top. `integration/r2` tracks the same
+tip; `feat/pp-family-cut-485-rebased` carries the code commits. Evidence:
 `/spinning/evidence-631/s49/` (`RESULTS.md` is the verdict, `CONFOUND.md` the
 experiment that reframed C34, `PREDICTION_confound.md` the desk call recorded
 before the boot that decided it).
