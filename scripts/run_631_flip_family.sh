@@ -78,6 +78,9 @@ FAMILY=(
     test/registered/unit/managers/test_phase_flip_mover_streaming_631.py
     test/registered/unit/managers/test_kv_arena_span_ops_631.py
     test/registered/unit/mem_cache/test_kv_pool_row_span_631.py
+    # Added by successor 45 with the C28 fix (#659). Red-first: it fails on
+    # the pre-fix tree with the host-finished session missing from the emit.
+    test/registered/unit/managers/test_host_finish_stream_659.py
 )
 
 cd "$WT/test/registered/scheduler"

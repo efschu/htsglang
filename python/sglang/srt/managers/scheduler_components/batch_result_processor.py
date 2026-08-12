@@ -740,12 +740,40 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # C28 (#659): bind the request list ONCE, here, and stream from that
+        # binding at the end of the method. A request that finishes while
+        # host-spilled is released from INSIDE the loop below
+        # (_handle_finish_state_updated_req -> release_finished_spilled_req),
+        # and that release calls slot.batch.filter_batch(). On a spill tick
+        # `batch` IS `slot.batch` -- one object under two names, because
+        # maybe_take_tick hands the scheduler the persistent batch and
+        # event_loop_normal passes it through unchanged. filter_batch REBINDS
+        # `reqs` (both branches: the empty one and the list comprehension), so
+        # the finished request is dropped from the list this method is about to
+        # emit, the terminal chunk is never sent, and the HTTP caller blocks
+        # forever against an idle scheduler. Measured on metal, successor 44,
+        # rid=s44-sat-3. Iteration itself was never at risk (enumerate captures
+        # the list object), which is why the loss was silent instead of an
+        # IndexError.
+        #
+        # The emit must NOT be moved into the release instead: under the
+        # overlap loops the result processor runs on `batch.copy()`, a list the
+        # release cannot reach, so an emit there would DOUBLE-stream on every
+        # overlap dispatch site. Streaming before the batch is filtered is also
+        # exactly the ordering the disaggregation decode path already uses.
+        #
+        # return_logprob is snapshotted for the same reason: filter_batch
+        # recomputes it from the SURVIVING requests, so a finished request that
+        # asked for logprobs would otherwise be streamed without them.
+        decode_reqs = batch.reqs
+        decode_return_logprob = batch.return_logprob
+
         # #631: what this round produced, recorded only inside a
         # post-cutover window. A round that appends nothing and a round
         # that produced nothing look identical in output_ids alone.
-        trace_round("decode", batch.reqs, next_token_ids, result)
+        trace_round("decode", decode_reqs, next_token_ids, result)
 
-        for i, req in enumerate(batch.reqs):
+        for i, req in enumerate(decode_reqs):
             req: Req
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
@@ -802,7 +830,8 @@ class SchedulerBatchResultProcessor:
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        # C28 (#659): the pre-loop binding, NOT batch.reqs -- see the note above.
+        self.output_streamer.stream_output(decode_reqs, decode_return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
