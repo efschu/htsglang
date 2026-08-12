@@ -2242,6 +2242,44 @@ class ServerArgs:
             "named error (its parked KV cannot be restored). Default 512.",
         ),
     ] = 512
+    kv_session_offload_park_dir: A[
+        Optional[str],
+        Arg(
+            help="kv-session-offload DESTINATIONS (#224/#659): directory the "
+            "'file' park tier writes its blobs into. Unset = the file "
+            "backend's own default (SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR "
+            "or /tmp/hicache). Setting it also fixes the volume whose FREE "
+            "SPACE bounds the park tier, so point it at the volume you are "
+            "willing to spend: the tier's capacity and its write bandwidth "
+            "are MEASURED from THIS path at registration (statvfs plus a "
+            "short incompressible fsync'd write), never read from a bundled "
+            "profile. Requires --kv-session-offload-destinations.",
+        ),
+    ] = None
+    kv_session_offload_park_budget_gib: A[
+        float,
+        Arg(
+            help="kv-session-offload DESTINATIONS (#224/#659): CEILING in GiB "
+            "on how much the 'file' park tier may hold. Default 0 = derive "
+            "the whole capacity from free space alone. This is a ceiling and "
+            "never a reservation: effective capacity is min(this budget, "
+            "free space - park df headroom), so the df headroom is honoured "
+            "FIRST and a generous budget on a nearly-full volume yields a "
+            "small tier rather than a disk-full outage. Requires "
+            "--kv-session-offload-destinations.",
+        ),
+    ] = 0.0
+    kv_session_offload_park_df_headroom_gib: A[
+        float,
+        Arg(
+            help="kv-session-offload DESTINATIONS (#224/#659): free space in "
+            "GiB the 'file' park tier will never consume, subtracted from "
+            "statvfs BEFORE any budget applies. Default 32. The park volume "
+            "is shared with model caches, logs and evidence, so this is what "
+            "keeps a spill tier from taking the box down with it. Requires "
+            "--kv-session-offload-destinations.",
+        ),
+    ] = 32.0
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -6823,6 +6861,34 @@ class ServerArgs:
                     "--kv-session-offload-park-timeout-iters must be >= 1; "
                     f"got {self.kv_session_offload_park_timeout_iters}."
                 )
+            # #659: a NEGATIVE budget or headroom is rejected rather than
+            # clamped. Both are ceilings on a shared volume, and silently
+            # reading a negative one as "unbounded" is how a park tier fills a
+            # disk while its operator believes it capped one.
+            if getattr(self, "kv_session_offload_park_budget_gib", 0.0) < 0:
+                raise ValueError(
+                    "--kv-session-offload-park-budget-gib must be >= 0 (0 = "
+                    "derive from free space); got "
+                    f"{self.kv_session_offload_park_budget_gib}."
+                )
+            if getattr(self, "kv_session_offload_park_df_headroom_gib", 0.0) < 0:
+                raise ValueError(
+                    "--kv-session-offload-park-df-headroom-gib must be >= 0; "
+                    f"got {self.kv_session_offload_park_df_headroom_gib}."
+                )
+        elif (
+            getattr(self, "kv_session_offload_park_dir", None)
+            or getattr(self, "kv_session_offload_park_budget_gib", 0.0)
+            or getattr(self, "kv_session_offload_park_df_headroom_gib", 32.0) != 32.0
+        ):
+            # Same rule as the extra-config flag above: a park-tier knob with
+            # no park tier configured would silently do nothing.
+            raise ValueError(
+                "--kv-session-offload-park-dir / "
+                "--kv-session-offload-park-budget-gib / "
+                "--kv-session-offload-park-df-headroom-gib require "
+                "--kv-session-offload-destinations to name a park tier."
+            )
         # #552: the env twin ORs into the flag ONCE, here, BEFORE the
         # feature-disabled return -- so that everything downstream (this
         # validation block, the boot log, the effective-args dump the operator

@@ -88,6 +88,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import queue
 import threading
 from collections import OrderedDict
@@ -586,9 +587,17 @@ class SpillDestinationController:
         fingerprint: str,
         rank: int,
         timeout_iters: int,
+        park_descriptors: Optional[List[Any]] = None,
     ):
         self.destinations = destinations
         self.tiers = tiers  # park tiers only (destinations[1:])
+        # #659: one #407 tier entry per park tier, measured at registration
+        # and positionally aligned with ``self.tiers`` so a registry verdict
+        # translates back into the tier index a _Transfer records. Empty when
+        # the descriptors could not be built -- the selection policy then
+        # degrades to #224's configured order and SAYS so, rather than
+        # pretending it consulted a ladder.
+        self.park_descriptors: List[Any] = list(park_descriptors or [])
         self.fingerprint = fingerprint
         self.fp_hash = fingerprint_hash(fingerprint)
         self.rank = int(rank)
@@ -611,6 +620,14 @@ class SpillDestinationController:
             "blobs_orphaned": 0,
             "parked_aborted": 0,
         }
+        # #659: the same tally, keyed by the tier that took it. The flat
+        # counters answer "how many parks failed"; a selection policy needs
+        # "which tier failed them", and without that a tier that eats every
+        # park it is given keeps being chosen forever.
+        from sglang.srt.managers.kv_spill_park_tier import park_fault_key
+
+        for tier in self.tiers:
+            self.counters[park_fault_key(tier.name)] = 0
         self._seq = 0
         # Park-episode generation: advances at every _start_park (a
         # rank-uniform decision), making each episode's blob keys fresh --
@@ -656,6 +673,11 @@ class SpillDestinationController:
             t.abandoned = True
             key = "parks_timeout" if t.kind == "park" else "unparks_timeout"
             self.counters[key] += 1
+            if t.kind == "park":
+                # #659: charge the timeout to the TIER that took it. The
+                # abandon decision is made on the min-reduced completion, so
+                # every rank charges the same tier on the same iteration.
+                self._charge_park_fault(t.tier_index)
             logger.error(
                 "kv-session-offload destinations: %s of rid=%s on tier "
                 "'%s' exceeded %d iterations; abandoned (will resolve as "
@@ -671,6 +693,20 @@ class SpillDestinationController:
         )
 
     # -- pressure ----------------------------------------------------------
+
+    def _charge_park_fault(self, tier_index: int) -> None:
+        """Charge one park failure to the tier that took it (#659).
+
+        Kept next to the flat counters rather than replacing them: the flat
+        tally is the traffic report, this one is the signal a selection policy
+        reads. Both are written from the same min-reduced verdict, so both stay
+        rank-uniform.
+        """
+        from sglang.srt.managers.kv_spill_park_tier import park_fault_key
+
+        if 0 <= int(tier_index) < len(self.tiers):
+            key = park_fault_key(self.tiers[int(tier_index)].name)
+            self.counters[key] = int(self.counters.get(key, 0)) + 1
 
     def note_region_shortfall(self, now_iter: int, manager=None) -> None:
         self.pressure_iter = int(now_iter)
@@ -708,7 +744,13 @@ class SpillDestinationController:
                 local_first_disagreement,
             )
 
-            registry = live_kv_spill_ladder(manager, local_host=_local_host_name())
+            from sglang.srt.managers.kv_spill_park_tier import park_counter_row
+
+            registry = live_kv_spill_ladder(
+                manager,
+                local_host=_local_host_name(),
+                park_tiers=list(getattr(self, "park_descriptors", ()) or ()),
+            )
             if registry is None:
                 return
             for tier_id, role, headroom, bandwidth in ladder_rows(registry):
@@ -719,6 +761,10 @@ class SpillDestinationController:
                     headroom,
                     bandwidth,
                 )
+            # #659 (d): the #224 park counters, READ. They were complete for
+            # three shifts and nothing consumed them, so a park that failed and
+            # a park that never happened produced the same silence.
+            logger.info("kv-spill ledger: %s", park_counter_row(self.counters))
             disagreement = local_first_disagreement(
                 registry, 0, local_host=_local_host_name()
             )
@@ -831,6 +877,94 @@ class SpillDestinationController:
 # ---------------------------------------------------------------------------
 
 
+def _park_directory_of(tier: DestinationTier) -> Optional[str]:
+    """The directory a file-backed park tier actually writes into, or None.
+
+    Asked of the CONSTRUCTED backend rather than re-derived from the flag, so
+    the probe measures the path the blobs really take. A backend that exposes
+    no directory (mooncake, a remote 'dynamic') answers None and is registered
+    without a filesystem measurement rather than with a guessed one.
+    """
+    storage = getattr(tier, "storage", None)
+    value = getattr(storage, "file_path", None)
+    return value if isinstance(value, str) and value else None
+
+
+def _build_park_descriptors(sa, tiers: List[DestinationTier]) -> List[Any]:
+    """One #407 tier entry per configured park tier, MEASURED at registration.
+
+    #659 (c). This is where the second rung stops being a plan. Every entry is
+    built from a probe of the real path -- never from ``memtier/profiles``,
+    whose remote rows describe a link this process cannot route to (register
+    C24), and which is the standing example of a number outliving its geometry.
+
+    A park tier this process cannot measure is still ENUMERATED, with an absent
+    bandwidth naming why. That is the difference between a ladder that says
+    "mooncake was not considered because nobody probed it" and one that
+    silently has one fewer rung.
+    """
+    from sglang.srt.managers.kv_spill_park_tier import file_park_tier
+    from sglang.srt.memtier.tiers import (
+        TierCapacity,
+        TierKind,
+        Volatility,
+        blob_tier_id,
+        host_tier_id,
+    )
+    from sglang.srt.managers.kv_spill_tier_selection import park_tier
+    from sglang.srt.planner.cost_model import Rate
+
+    host = _local_host_name()
+    local_id = host_tier_id(host)
+    budget_bytes = int(
+        float(getattr(sa, "kv_session_offload_park_budget_gib", 0.0) or 0.0)
+        * (1024**3)
+    )
+    df_headroom = int(
+        float(getattr(sa, "kv_session_offload_park_df_headroom_gib", 32.0) or 0.0)
+        * (1024**3)
+    )
+    descriptors: List[Any] = []
+    for tier in tiers:
+        directory = _park_directory_of(tier)
+        if directory:
+            descriptors.append(
+                file_park_tier(
+                    host=host,
+                    directory=directory,
+                    backend_name=tier.name,
+                    budget_bytes=budget_bytes,
+                    df_headroom_bytes=df_headroom,
+                    local_host_tier_id=local_id,
+                )
+            )
+            continue
+        reason = (
+            f"the {tier.name} park backend exposes no local path this process "
+            f"can probe, and no bundled profile may stand in for a measurement "
+            f"(register C24)"
+        )
+        descriptors.append(
+            park_tier(
+                tier_id=blob_tier_id(tier.name, host),
+                kind=TierKind.BLOB,
+                host=host,
+                volatility=Volatility.PERSISTENT,
+                capacity=TierCapacity(
+                    total=Rate.absent(reason, unit="bytes", label="total"),
+                    floor=Rate.absent(reason, unit="bytes", label="floor"),
+                ),
+                bandwidth_gbs=Rate.absent(reason, unit="GB/s", label="bandwidth_gbs"),
+                latency_us=Rate.absent(reason, unit="us", label="latency_us"),
+                transport_name=tier.name,
+                stages_through=local_id,
+                handle=f"make_tier({tier.name})",
+                profile_id="kv-spill-live",
+            )
+        )
+    return descriptors
+
+
 def attach_destinations(mgr) -> Optional[SpillDestinationController]:
     """Build the controller at manager init. Returns None when the flag is
     unset (the byte-identical default). Fails FAST on an invalid list or an
@@ -879,6 +1013,15 @@ def attach_destinations(mgr) -> Optional[SpillDestinationController]:
         extra_config=extra_cfg,
         dcp_owner_mode=False,  # blobs are rank-private; rank-suffixed keys
     )
+    # #659: fix the park directory BEFORE the backend is constructed. The
+    # file backend resolves its directory from this env var (or its own
+    # default) at __init__ and never re-reads it, and the same path is what
+    # the registration probe measures -- so the flag has to land here, ahead
+    # of make_tier, or the tier would be measured somewhere it does not write.
+    park_dir = getattr(sa, "kv_session_offload_park_dir", None)
+    if park_dir:
+        os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = str(park_dir)
+
     tiers = []
     for name in dests[1:]:
         tiers.append(
@@ -889,6 +1032,7 @@ def attach_destinations(mgr) -> Optional[SpillDestinationController]:
                 extra_config=extra_cfg,
             )
         )
+    park_descriptors = _build_park_descriptors(sa, tiers)
     ctl = SpillDestinationController(
         destinations=dests,
         tiers=tiers,
@@ -897,6 +1041,7 @@ def attach_destinations(mgr) -> Optional[SpillDestinationController]:
         timeout_iters=int(
             getattr(sa, "kv_session_offload_park_timeout_iters", 512)
         ),
+        park_descriptors=park_descriptors,
     )
     logger.info(
         "kv-session-offload destinations ARMED: %s (park tiers: %s; "
@@ -988,6 +1133,173 @@ def _record_sync_events(mgr) -> List[Any]:
     return events
 
 
+def _park_ask_bytes(mgr, ctl: SpillDestinationController) -> int:
+    """The size of one park, as a BOOT CONSTANT rather than a per-park number.
+
+    Group uniformity is the whole reason this is not simply the payload's
+    nbytes. ``_start_park`` runs on every rank; if the ask varied per rank, two
+    ranks could land on opposite sides of a capacity threshold and park the
+    same session to different tiers -- or one park while another declines --
+    and that divergence surfaces as a hang in the completion min-reduce, not as
+    an error (register law 14's shape, and law 8's currency rule: the quantity
+    a group decision is denominated in must be one every rank reads the same).
+
+    ``region_tokens`` is rank-uniform and ``get_size_per_token()`` is fixed at
+    boot, so this product cannot drift while the instance runs. It is rounded
+    UP onto the ordering grid, so even a per-rank difference in owned heads
+    (uneven TP) has to exceed a whole grid step before it can change a verdict.
+    """
+    from sglang.srt.managers.kv_spill_park_tier import BYTES_QUANTUM
+
+    host_pool = getattr(mgr, "host_pool", None)
+    region_tokens = int(getattr(mgr, "region_tokens", 0) or 0)
+    per_token = int(host_pool.get_size_per_token()) if host_pool is not None else 0
+    raw = max(0, region_tokens * per_token)
+    if raw <= 0:
+        return 0
+    return -(-raw // BYTES_QUANTUM) * BYTES_QUANTUM
+
+
+def _select_park_tier(mgr, ctl: SpillDestinationController, payload) -> Optional[int]:
+    """WHICH park tier takes this region -- asked of the #407 ladder (#659).
+
+    This is the cut where the registry stops being an observer on the spill
+    path. Until now the destination was ``tier_index=0``: the first entry the
+    operator listed, forever, with a failing tier only discovered by failing.
+    Now the ladder RANKS the configured park tiers by measured bandwidth and
+    refuses the ones that cannot take the ask, each by name.
+
+    What has NOT changed, deliberately: the local host tier is still the first
+    rung and is not a candidate here. That law is physical (a device D2H copy
+    has nowhere else to land) and cut 1 made it derived-and-falsifiable rather
+    than asserted; this function picks among the tiers BELOW it.
+
+    BYTE-IDENTICAL WHERE BUDGETS ALLOW. With one healthy park tier -- every
+    configuration on this rig -- the ranking is degenerate and returns 0, which
+    is exactly what the hardcoded law returned. The change is visible only when
+    a tier is refused, and then it is visible by name instead of as a failed
+    transfer.
+
+    EVERY INPUT IS RANK-UNIFORM, AND THAT IS LOAD-BEARING. The ranking is
+    computed ONCE from boot constants (:func:`_park_ranking`) -- the ask is a
+    boot constant, and each tier's capacity and bandwidth were measured at
+    registration, not re-read here, so no live disk reading can make two ranks
+    disagree. The only per-park input is the fault tally, which is written from
+    the min-reduced transfer verdict and is therefore identical on every rank.
+
+    There is deliberately NO per-park ``try/except`` around this. A rank-local
+    ``except`` here would be register law 14 exactly: a rank that fell into it
+    and parked, next to a rank that succeeded and declined, diverge into the
+    completion min-reduce and the instance wedges rather than errors. The one
+    fallible step -- building the ranking -- happens once, on inputs every rank
+    shares, so if it fails it fails identically everywhere.
+
+    Returns the index into ``ctl.tiers``, or ``None`` when every park tier is
+    blocked; both verdicts are reached from rank-uniform state.
+    """
+    if not ctl.tiers:
+        return None
+    from sglang.srt.managers.kv_spill_park_tier import park_fault_key, park_health
+
+    ranking = _park_ranking(mgr, ctl)
+    for index in ranking:
+        faults = int(ctl.counters.get(park_fault_key(ctl.tiers[index].name), 0))
+        reachable, verdict, reason = park_health(faults)
+        if reachable:
+            return index
+        if not getattr(ctl, "_park_block_logged", set()):
+            ctl._park_block_logged = set()
+        if index not in ctl._park_block_logged:
+            ctl._park_block_logged.add(index)
+            logger.warning(
+                "kv-spill selection: park tier '%s' BLOCKED: %s",
+                ctl.tiers[index].name,
+                reason,
+            )
+    logger.warning(
+        "kv-spill selection: every park tier is blocked by its own fault "
+        "tally; declining the park (no silent fallback to a tier the ladder "
+        "refused)."
+    )
+    return None
+
+
+def _park_ranking(mgr, ctl: SpillDestinationController) -> List[int]:
+    """The park-tier order, derived once from the measured ladder and cached.
+
+    Cached because it must not change under the instance: a ranking recomputed
+    per park would re-read live state, and live state is the one thing that can
+    differ between ranks at the instant they decide (register law 8's currency
+    rule). Every number in it was measured at registration.
+
+    Falls back to #224's configured order, loudly and once, if the ladder
+    cannot be built. That fallback is itself rank-uniform: it depends only on
+    the configuration, so every rank takes it together or none does.
+    """
+    cached = getattr(ctl, "_park_ranking", None)
+    if cached is not None:
+        return cached
+    identity = list(range(len(ctl.tiers)))
+    descriptors = list(getattr(ctl, "park_descriptors", ()) or ())
+    if len(descriptors) != len(ctl.tiers):
+        logger.warning(
+            "kv-spill selection: %d park tiers configured but %d measured "
+            "entries; using #224's configured order. The ladder is not being "
+            "consulted for this instance.",
+            len(ctl.tiers),
+            len(descriptors),
+        )
+        ctl._park_ranking = identity
+        return identity
+    try:
+        from sglang.srt.managers.kv_spill_park_tier import (
+            choose_park_tier,
+            park_refusal_lines,
+        )
+        from sglang.srt.managers.kv_spill_tier_selection import live_kv_spill_ladder
+
+        ask = _park_ask_bytes(mgr, ctl)
+        registry = live_kv_spill_ladder(
+            mgr, local_host=_local_host_name(), park_tiers=descriptors
+        )
+        if registry is None:
+            ctl._park_ranking = identity
+            return identity
+        ids = [d.id for d in descriptors]
+        order: List[int] = []
+        remaining = list(ids)
+        while remaining:
+            index, selection = choose_park_tier(registry, ask, park_tier_ids=remaining)
+            if index is None:
+                for line in park_refusal_lines(selection, remaining, ask):
+                    logger.warning("kv-spill selection: %s", line)
+                break
+            chosen = remaining.pop(index)
+            order.append(ids.index(chosen))
+        # Refused tiers stay in the order, LAST: #224's failover contract still
+        # owns the "everything above me failed" case, and dropping a tier here
+        # would turn a ranked ladder into a silently shorter one.
+        order.extend(i for i in identity if i not in order)
+        logger.info(
+            "kv-spill selection ARMED: park order %s for an ask of %d B "
+            "(measured ladder; local host RAM remains the first rung). "
+            "Refused at this ask: %s",
+            " > ".join(ctl.tiers[i].name for i in order),
+            ask,
+            "; ".join(park_refusal_lines(selection, ids, ask)) or "none",
+        )
+        ctl._park_ranking = order
+        return order
+    except Exception as exc:  # noqa: BLE001 - deterministic on rank-uniform input
+        logger.warning(
+            "kv-spill selection: could not build the ladder (%r); using "
+            "#224's configured order.",
+            exc,
+        )
+        ctl._park_ranking = identity
+        return identity
+
+
 def _start_park(mgr, ctl: SpillDestinationController, rpi: int) -> None:
     slot = mgr.spills.get(rpi)
     if slot is None:
@@ -1015,13 +1327,21 @@ def _start_park(mgr, ctl: SpillDestinationController, rpi: int) -> None:
     payload: List[Tuple[str, torch.Tensor]] = [(meta_key, padded_meta_blob(meta))]
     for item, view in _region_row_views(mgr, region_base, rows):
         payload.append((blob_key(ctl.fp_hash, rid, ctl.rank, gen, item), view))
+    tier_index = _select_park_tier(mgr, ctl, payload)
+    if tier_index is None:
+        # Every park tier refused, each by name in the log above. Declining
+        # here is #224's existing "after the last tier, today's behaviour"
+        # branch reached one step earlier and with a stated reason -- the one
+        # thing that may not happen is picking a tier the ladder refused.
+        slot.park_pending = False
+        return
     ctl.counters["parks_started"] += 1
     ctl.begin(
         _Transfer(
             kind="park",
             rid=rid,
             rpi=rpi,
-            tier_index=0,
+            tier_index=tier_index,
             start_iter=mgr._iter_ct,
             seq=0,
             payload=payload,
@@ -1036,7 +1356,7 @@ def _start_park(mgr, ctl: SpillDestinationController, rpi: int) -> None:
         "kv-session-offload destinations: PARK start rid=%s tier=%s L=%d "
         "boundary=%d rows(rank)=%d region=%d",
         slot.req.rid,
-        ctl.tiers[0].name,
+        ctl.tiers[tier_index].name,
         L,
         boundary,
         rows,
@@ -1277,6 +1597,9 @@ def maybe_park_flow(mgr, running_batch, last_batch):
                 if slot is not None:
                     slot.park_pending = False
                 ctl.counters["parks_failed"] += 1
+                # #659: and to the tier, so the selection policy can stop
+                # choosing a tier that keeps eating parks.
+                ctl._charge_park_fault(t.tier_index)
                 if t.tier_index + 1 < len(ctl.tiers):
                     # Failover: the next tier in the user's order takes
                     # over. Restart from the pending mark next iteration.

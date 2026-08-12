@@ -186,6 +186,40 @@ def park_bytes_by_tier(manager: Any) -> Dict[str, int]:
     return out
 
 
+def park_capacity_by_tier(manager: Any) -> Dict[str, int]:
+    """Measured CAPACITY of each #224 park tier, from its #407 entry (#659).
+
+    Until the park tier became a registered entry there was no capacity to
+    report: the dashboard drew occupancy against no denominator, so a park tier
+    at 2 GB looked the same whether its budget was 4 GB or 400. The number here
+    is the one measured at registration -- ``min(configured budget, free space
+    - df headroom)`` -- and it is reported as a total, never as a promise: a
+    shared volume can lose free space to something else entirely.
+
+    A tier whose capacity could not be measured contributes NO key, so the
+    dashboard keeps drawing "configured, denominator unknown" rather than
+    inventing a zero. Empty dict when no destinations are configured.
+    """
+    out: Dict[str, int] = {}
+    if manager is None:
+        return out
+    ctl = getattr(manager, "_dest", None)
+    if ctl is None:
+        return out
+    tiers = list(getattr(ctl, "tiers", ()) or ())
+    descriptors = list(getattr(ctl, "park_descriptors", ()) or ())
+    if len(descriptors) != len(tiers):
+        return out
+    for tier, descriptor in zip(tiers, descriptors):
+        total = descriptor.capacity.total
+        if total.is_absent:
+            continue
+        out[TIER_PARK_PREFIX + str(getattr(tier, "name", "?"))] = int(
+            total.require("total")
+        )
+    return out
+
+
 def hicache_file_bytes(tree_cache: Any) -> Optional[int]:
     """On-disk bytes held by the HiCache file backend (the L3 rung).
 
@@ -240,6 +274,11 @@ def collect_spill_tiers(scheduler: Any) -> Tuple[Dict[str, int], Dict[str, int]]
         used.update(park_bytes_by_tier(kvso))
     except Exception as e:  # pragma: no cover - defensive
         _warn_once(TIER_PARK_PREFIX, e)
+
+    try:
+        total.update(park_capacity_by_tier(kvso))
+    except Exception as e:  # pragma: no cover - defensive
+        _warn_once(TIER_PARK_PREFIX + "capacity", e)
 
     try:
         disk = hicache_file_bytes(getattr(scheduler, "tree_cache", None))
