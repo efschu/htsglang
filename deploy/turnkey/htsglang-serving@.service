@@ -1,0 +1,67 @@
+# One serving lane. %i is the lane name in /etc/htsglang/stack.toml
+# (`htsglang-serving@ship.service` serves the [serving.ship] lane).
+#
+# ExecStart BECOMES the server: the orchestrator runs preflight, resolves the
+# pinned plan, then os.execve()s launch_server in the same pid. systemd's
+# main pid is therefore the serving process itself -- no wrapper shell that
+# knows nothing, no intermediate that can outlive or orphan its child, and
+# Restart= applies to the process that actually failed.
+#
+# No setsid anywhere. setsid exists to escape an interactive session that is
+# about to end; a unit already runs outside every session, and detaching from
+# systemd's supervision would be the defect rather than the feature.
+
+[Unit]
+Description=htsglang serving lane %i (#539 turnkey)
+Requires=htsglang-preflight.service
+After=htsglang-preflight.service
+PartOf=htsglang.target
+
+# StartLimit* belong in [Unit], NOT [Service]. They lived in [Service] until
+# systemd 229 and are silently IGNORED there by anything newer -- caught by
+# `systemd-analyze verify` in the installer's dry run ("Unknown key name
+# 'StartLimitIntervalSec' in section 'Service', ignoring"). Placed wrongly,
+# the restart rate limit simply does not exist, and a crash-looping lane
+# restarts forever with nothing to stop it.
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+Environment=PYTHONPATH=/spinning/htsglang-gpu/python
+ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.srt.turnkey --config /etc/htsglang/stack.toml boot %i
+
+# A cold JIT cache legitimately makes the first boot minutes long (#172/#615).
+# TimeoutStartSec must not be shorter than the lane's ready_timeout_s, or
+# systemd kills the boot just before it finishes.
+TimeoutStartSec=1800
+TimeoutStopSec=120
+
+# Crash restarts belong to systemd; WEDGE restarts belong to the watchdog.
+# Each mechanism handles the failure it can actually observe.
+Restart=on-failure
+RestartSec=30
+
+# control-group is CORRECT here and is the #638 lesson applied rather than
+# worked around. The historical incident was that serving spawned BY the
+# watchdog landed in the WATCHDOG's cgroup, so a control-group kill of the
+# watchdog killed production too; the workaround was KillMode=process on the
+# watchdog. Here serving is started by systemd into its OWN cgroup and the
+# watchdog spawns nothing, so a control-group kill reaches exactly this
+# lane's ranks -- which is what makes rank cleanup reliable instead of a
+# pgid-chasing exercise.
+KillMode=control-group
+KillSignal=SIGTERM
+
+# Serving is the workload this machine exists for; the OOM killer should
+# reach for anything else first.
+OOMScoreAdjust=-500
+
+# Boot output goes to the lane's OWN log (#375 defect 3: two lanes on one
+# boot-log path interleave, and the resulting file proves nothing about
+# either). The orchestrator opens it; the journal keeps unit-level events.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=htsglang.target

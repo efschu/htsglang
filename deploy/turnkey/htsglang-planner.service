@@ -1,0 +1,43 @@
+# The planner API (#584 names it the authority for VRAM/compute decisions).
+#
+# This unit exists because of a defect observed on this rig 2026-08-12: the
+# planner was serving :8780 as a bare manual process (pid 2291562, ppid 1,
+# up 3.5 days) whose working directory was /spinning/wt-631-routea -- a GIT
+# WORKTREE, i.e. a directory an unrelated agent can delete. It would not have
+# survived a host reboot, and nothing would have reported its absence. That
+# is precisely the "manual reconstruction" #539 classifies as a defect.
+#
+# WorkingDirectory is the canonical checkout, never a worktree.
+
+[Unit]
+Description=htsglang planner API (#584 resource authority)
+After=network-online.target
+Wants=network-online.target
+PartOf=htsglang.target
+
+[Service]
+Type=simple
+WorkingDirectory=/spinning/htsglang-gpu
+Environment=PYTHONPATH=/spinning/htsglang-gpu/python
+ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.planner --serve --port 8780
+
+# DELIBERATELY NOT CUDA_VISIBLE_DEVICES=-1, unlike the router's no-cuda
+# drop-in. That was the first draft here and it is wrong: the planner loads
+# no weights, but it DOES initialise CUDA to resolve card identity (cuda
+# ordinals are what --rank-gpu-id speaks, AUDIT_331). Measured on the live
+# planner, pid 2291562, 2026-08-12: 27 open /dev/nvidia* fds and 144 CUDA
+# mappings. Blinding it would break the resource authority it exists to be.
+#
+# The consequence is real and belongs here rather than in a surprise: those
+# fds PIN THE DRIVER, so a driver reload (smallbar, #601) must stop this unit
+# first. That is now a one-liner -- `systemctl stop htsglang-planner` --
+# where previously it meant identifying an anonymous manual pid by hand.
+
+Restart=always
+RestartSec=5
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=htsglang.target
