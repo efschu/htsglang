@@ -203,6 +203,29 @@ fix. **The margin should be expressed against the pool** (a fraction, or an
 absolute value clamped to a fraction of `max_total_tokens`) with a boot-time
 refusal when it exceeds the pool.
 
+**C29 IS RESOLVED (successor 46, 2026-08-12, commit `948c53e6da`).**
+`resolve_restore_margin_tokens()` sizes the margin against the pool at manager
+init — deliberately AFTER the draft-scratch carve-out, which permanently
+shrinks `allocator.size`, so the judgement is made against the pool the gate
+will actually see rather than the one the boot started with. Who chose the
+value decides the outcome, which is the part worth remembering: an EXPLICIT
+unsatisfiable margin is REFUSED at startup naming the margin, the pool and
+what the gate would have done (the same treatment
+`mtp_resident_reservation_error` already gives an unsatisfiable scratch
+reservation, for the same reason — both wedge silently); a margin left at the
+SHIPPED DEFAULT is clamped to half the pool and logged at ERROR, because the
+operator did not choose the default and refusing would turn a shipped constant
+into a boot failure on every small-pool instance. `SGLANG_KVSO_RESTORE_MARGIN_
+FORCE=1` honours the configured value verbatim, still reporting. The default
+is READ from the `ServerArgs` dataclass rather than restated (the C18 rule): a
+drifted copy would silently move a boot from the clamp branch to the refusal
+branch. Inert on the ship config — `(512552, 4096)` resolves to 4096 with no
+log. Red-first was EXECUTED by reverse-applying the patch, and the red is
+behavioural rather than an import error: "the manager would run this
+4096-token pool with margin 4096, at which no spilled session can EVER be
+restored". The test's first half pins the MECHANISM and passes on both trees,
+so it survives the fix as a regression guard.
+
 **C28 IS CLOSED ON METAL (successor 45, probe v9, 2026-08-12).** The same
 pressure band that wedged successor 44's client ran again on the fixed tree
 (boot commit `b2f18010c2`). `rid=s45-cohort-3` spilled, PARKED to the file
@@ -265,6 +288,77 @@ determinism on this rig while kv-session-offload is on. It must be earned the
 way `park_complete_proof2.py` already earns it — a homogeneous cohort whose
 CONTROL arm measures whether batch-composition nondeterminism is live in that
 boot, so a mismatch can be attributed instead of guessed.
+
+**C30 IS RESOLVED, AND THE DIAGNOSIS ABOVE IS WRONG ON EVERY LOAD-BEARING
+DETAIL (successor 46, 2026-08-12, commit `6a751b0adb`). Read this before
+quoting anything from the C30 paragraphs above.** It is not an exclusion
+between those two flags, and the boot-time refusal the entry called for —
+one naming both flags — would have REJECTED A WORKING CONFIGURATION while
+leaving the real trap armed everywhere else.
+
+**The actual mechanism.** `PrefillAdder.add_one_req`'s chunked branch aligns
+the chunk it is about to take and refuses outright when the whole chunk budget
+is below one alignment unit:
+
+    trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+    if truncation_align_size is not None:
+        if trunc_len < truncation_align_size:
+            return AddReqResult.OTHER
+
+`rem_chunk_tokens` is bounded above by `--chunked-prefill-size`, so a budget
+below the alignment refuses EVERY request longer than the budget, forever. The
+admission loop `break`s on any non-CONTINUE verdict, so one such request at
+the head of the FCFS queue blocks the queue behind it, `can_run_list` stays
+empty and no batch is ever built. The wedged boot had `--chunked-prefill-size
+256` against an alignment of 4096. **kv-session-offload's only role is that it
+forces the flashinfer backend**; the refusing predicate is a THIRD variable,
+and the same two flags at `--chunked-prefill-size 4096` serve normally.
+
+**Two claims in the entry above do not survive re-reading its own evidence:**
+
+* **there is NO rank divergence.** `probe_v8.log` prints the #583 collective
+  census from both ranks throughout the wedge and the two are IDENTICAL
+  (`all_reduce 1862x` on each). It froze because no forward ran, not because a
+  rank was stuck in a collective. `num_queue_reqs 0` is a 30 s-cadence idle
+  gauge sampled after the client had already disconnected. The py-spy dump
+  does not show `schedule_policy.py:1255` at all.
+* **the silently disabled radix cache is a red herring.** `ChunkCache`
+  inherits `evictable_size() -> 0` (never None, never raising) and
+  `_tree_evictable_size()` already tolerates it. Losing the radix cache costs
+  restore headroom; it does not gate admission.
+
+**THE ALIGNMENT HAS TWO INDEPENDENT SOURCES and either alone arms the trap**,
+which is why the refusal cannot sit behind a deterministic-inference
+condition: `--enable-deterministic-inference` on flashinfer/triton (align 4096
+by default), and `--mamba-checkpoint-interval`, which sets the alignment on
+its own with NO deterministic inference anywhere and is lcm-ed into it when
+both are present. `truncation_align_admission_error()` is therefore called
+from `init_deterministic_inference_config` AFTER the lcm — the only point
+where the final alignment exists.
+
+**Side-finding:** `--mamba-checkpoint-interval`'s own help recommended
+"2048", which silently wedges any boot whose `--chunked-prefill-size` is below
+2048 — including this rig's ship config at 512. Help corrected, guard
+enforces it.
+
+**Inert on the ship config, verified against the live process rather than
+assumed** (`/proc/<pid>/cmdline`: `--chunked-prefill-size 512`, no
+`--mamba-checkpoint-interval`, no `--enable-deterministic-inference`), and
+then proven ON METAL: the ship config booted on commit `c78cc71442` with the
+guard executing at every rank's scheduler init and did not refuse.
+
+**Consequence for the byte-identity arm, corrected:** the door is NOT closed.
+Deterministic inference and kv-session-offload CAN coexist — what the earlier
+attempt lacked was a chunk budget of at least the alignment size. What would
+prove byte-identity across a park, for whoever picks this up: boot the probe
+with `--enable-deterministic-inference --attention-backend flashinfer
+--enable-kv-session-offload` AND `--chunked-prefill-size 4096` (>= the 4096
+alignment), then re-run `park_complete_proof2.py`'s cohort. With determinism
+live, the CONTROL arm should stop diverging from the quiescent reference — and
+once the control holds, a parked-arm mismatch becomes attributable instead of
+"NOT ATTRIBUTABLE". Note the cost that made the earlier boot unattractive is
+still real: flashinfer under deterministic mode disables the radix cache, so
+restore headroom shrinks and C29's margin sizing matters more, not less.
 
 **C27, the corridor law was enforced by nothing at the place it is spent
 (#656).** Successor 42's confirmation window breached: 12 samples, gpu0 at
