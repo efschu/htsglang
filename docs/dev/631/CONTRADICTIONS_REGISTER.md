@@ -70,6 +70,24 @@ landed.
 
 ## OPEN — flagged, never resolved
 
+**C25, kv-session-offload cannot run on the Route-A ship recipe at all
+(#659).** Five briefs have asked for kvso to be proven "on the Route-A recipe
+plus `--enable-kv-session-offload`". That boot does not exist, and the refusal
+is at arg-parse, not a runtime surprise: `--enable-kv-session-offload (S1)
+supports single-node pure TP/DCP only (pp_size=3, dp_size=1)`. Route A **is**
+PP=3 prefill -> flip -> TP=3 decode, so the ship recipe and the feature are
+mutually exclusive by construction. Successor 42 ran the metal probe on the
+DECODE layout instead (pure TP), which means **no shift has ever exercised the
+phase-flip x kvso crossing, and none can until S1 changes.** Any plan that
+assumes the two compose is planning against a gate that says otherwise.
+Close/reopen trigger: S1 admitting PP, or an explicit decision that kvso is
+tested only on the decode layout. Corollary worth carrying separately: the
+byte-identity of a kvso restore may NOT be argued from two model generations on
+this rig — reference and under-load continuations differ with ZERO parks
+(GDN prefill nondeterminism), so the claim has to be made about the transported
+BYTES. HANDOFF_686 §1a/§1c.
+
+
 **C24, the bundled profile's remote rows describe a path this process cannot
 route to (#659).** `memtier/profiles/rig1.json` carries `host:rig-2` with
 transport `roce-40g` and bandwidth **2.83 GB/s MEASURED**, and
@@ -240,4 +258,24 @@ to the pinned host pool by `host_pool.backup_from_device_all_layer`, `:3790`).
    bug presenting as a hang, and both are cured by making the mechanism
    report a resolved, group-visible verdict rather than acting on a private
    one.
+15. **A per-rank benchmark is not a rank-uniform quantity, and rounding does
+   not make it one** (#659, HANDOFF_686 §1b). The #659 park tier shipped with
+   bandwidth quantized onto a 0.25 GB/s grid and a docstring asserting "the
+   quantum is coarser than the spread between ranks". The first live two-rank
+   boot printed **2.41 GB/s on TP0 and 7.00 GB/s on TP1 for the same directory
+   at the same instant** — a 2.9x spread, because the two probes contend with
+   each other. No absolute grid survives that: any boundary between the two
+   splits ONE medium across two buckets, after which two ranks order a
+   two-tier ladder differently and park one session to two places, which the
+   completion min-reduce turns into a hang rather than an error. **If a group
+   decision must consume a measured value, consume a RATIO of two values
+   measured on the SAME rank** (contention scales them together, so the ratio
+   is stable where the absolute value is not), **or reduce it through a
+   collective every rank enters.** Sibling of law 8 (the currency of a group
+   decision must read identically on every rank) and law 14; distinct from
+   both in that the offending quantity here is not an identity or a branch but
+   a *number nobody doubted*. Note the shape of the near-miss: the falsified
+   premise was stated confidently in the code's own docstring, and only the
+   boot log — which existed because law 12 demanded the mechanism report what
+   it RESOLVED — contradicted it.
 
