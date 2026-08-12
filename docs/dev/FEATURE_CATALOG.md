@@ -3462,6 +3462,35 @@ taxonomy and the global importance ladder.
   GATE: `LivenessConfig` (`:378`) — a null global config means the
   watchdog is inert; set it through `:449`.
 
+- **Turnkey stack boot + serving watchdog (#539/#604)** — the stack
+  description a boot reads, the named refusals it may decline with, the
+  pinned-plan staleness guard, and the wedge detector that supervises a lane
+  once it is up. One systemd target plus template units; the watchdog is a
+  DETECTOR that asks systemd to restart and never spawns serving itself.
+  ENTRY config `turnkey/config.py:215` (`StackConfig`), `:306` (`load`);
+  refusals `turnkey/refusal.py:111` (`Refusal`), `:146` (`RefusalError`);
+  preflight `turnkey/preflight.py:322` (`run_all`), `:66` (`Probes`, the
+  injection seam every check is reachable through); plan pin
+  `turnkey/plan.py:115` (`fingerprint_of`), `:190` (`check_staleness`);
+  boot `turnkey/orchestrator.py:179` (`boot`), `:120` (`assemble`);
+  watchdog policy `turnkey/watchdog.py:202` (`step`, pure), `:83` (`Policy`),
+  `:149` (`initial`); runner `turnkey/runner.py:95` (`WatchdogRunner`),
+  `:188` (`orphan_pids`), `:226` (`reap_orphans`);
+  probes `turnkey/probe.py:99` (`generation_ok`), `:75` (`LIVENESS_PATH`).
+  Units in `deploy/turnkey/`, installer `scripts/turnkey_539_install.sh`.
+  GATE: `/etc/htsglang/stack.toml` must exist and name cards by UUID; the
+  units ship DISABLED (enabling them reverses the standing "do not restore
+  production" order, `/spinning/GPU_WINDOWS.md:71`). `plan.mode="pinned"`
+  additionally requires a plan file written by `turnkey plan-pin`.
+  REACH NOTE, and it is why this is a separate entry from the one below:
+  `liveness/watchdog.py` (`ConsumerWatchdog`) is IN-PROCESS liveness of an
+  attached consumer holding resource claims. This is process-level
+  supervision of a serving lane from outside it. Neither can do the other's
+  job, and `planner/server_state.py:194` (`classify`) is the piece all three
+  share — this module extends its four states with the fifth one a
+  four-state classifier structurally cannot express, WEDGED: the API answers
+  and generation does not, which only a real generation probe can see.
+
 ### 18.5 Collectives and transport
 
 - **CollectiveClock** — per-rank compute vs wait split from paired CUDA

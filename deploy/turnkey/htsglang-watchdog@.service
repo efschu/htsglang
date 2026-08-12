@@ -1,0 +1,41 @@
+# #604: notice that lane %i died -- including the death systemd cannot see.
+#
+# systemd restarts a process that EXITS. It has no opinion about a process
+# that is alive, holds its port, answers HTTP 200 and generates nothing
+# (#622/#649). That gap is this unit's entire remit, and the only way to
+# observe it is to ask the model for tokens and insist on receiving them.
+#
+# This unit NEVER starts serving. Its one restart action is
+# `systemctl restart htsglang-serving@%i.service`, so the replacement is
+# started by pid 1 into the serving unit's own cgroup. That is #638's lesson
+# made structural: a detector that spawns nothing cannot leak its cgroup into
+# production, and consequently this unit does NOT need KillMode=process --
+# control-group is safe precisely because nothing but the detector is in it.
+
+[Unit]
+Description=htsglang serving watchdog for lane %i (#604)
+# Wants, not Requires: the watchdog must keep running while serving is down.
+# It is the component whose job is to notice that, and a dependency that
+# stopped it alongside serving would blind it exactly when it is needed.
+Wants=htsglang-serving@%i.service
+After=htsglang-serving@%i.service
+PartOf=htsglang.target
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=/spinning/htsglang-gpu/python
+ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.srt.turnkey --config /etc/htsglang/stack.toml watch %i --unit htsglang-serving@%i.service
+
+Restart=always
+RestartSec=10
+KillMode=control-group
+
+# The watchdog must outlive memory pressure that serving creates; if the OOM
+# killer takes the detector first, the outage becomes invisible.
+OOMScoreAdjust=-600
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=htsglang.target
