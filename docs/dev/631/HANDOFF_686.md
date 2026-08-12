@@ -100,6 +100,25 @@ records the LEDGER, and the ledger said `used:park:file = 0`.
 > TRIP** (bytes in vs bytes out of the tier, or the #224 meta/fingerprint
 > identity check), never two model generations.
 
+**The instrument was rebuilt so that it cannot pass vacuously, and the rebuild
+was itself proven able to fail.** `proof_driver2.py`'s verdict is a conjunction
+whose FIRST term is `parked_count > 0`, carrying its own exit code (3), so "the
+mechanism did not run" and "the mechanism ran correctly" can no longer produce
+the same verdict. Exercised offline against synthetic ledgers
+(`evidence-631/s42/INSTRUMENT_CANFAIL.txt`):
+
+| case | exit |
+|---|---|
+| **v1's exact failure: identical text, nothing parked** | **3 (hard fail)** |
+| nothing parked and text differs | 3 |
+| parked via disk files, text identical | 0 |
+| parked via metrics bytes, text identical | 0 |
+| parked via counters, text differs | 1 |
+| counters report zero parks | 3 |
+
+The text comparison survives only as a recorded OBSERVATION about model
+determinism; it is no longer the pass criterion.
+
 ### 1d. NO LOAD SHAPE REACHED A SPILL, SO PARK/UNPARK ON METAL IS UNPROVEN
 
 Three attempts against the probe, all with `max_total_tokens=16384` and a host
@@ -113,11 +132,39 @@ tier deliberately capped to exactly ONE region (`effective max_spills reduced
 | `s33_occupancy_leg.py --sessions 4 --tokens 12000` | **peak 47951 concurrent prompt tokens, 2.9x the pool** | no spill |
 
 `kv_session_host_ram` used stayed **0.0** throughout and the park directory
-stayed **empty**. The likely reason, stated as a hypothesis for the next shift
-rather than a finding: kvso spills sessions that are SUSPENDED between turns,
-and every load I drove was single-turn completions that free their KV on
-finish. The next attempt should hold sessions open across turns with a gap
-(the occupancy leg with `--rounds` > 1 and a dwell), not push more tokens.
+stayed **empty**.
+
+**The cause is now READ OUT OF THE CODE, not guessed.** The spill trigger is in
+the DECODE path, `scheduler.py:5578`:
+
+```python
+num_tokens_next = batch.new_tokens_required_next_decode()
+evict_from_tree_cache(self.tree_cache, num_tokens_next)
+kv_full_retract_flag = self.kv_session_offload.dcp_min_avail() < num_tokens_next
+if kv_full_retract_flag and self.kv_session_offload.try_spill(batch):
+```
+
+So a spill fires when the pool cannot fund **the next decode step** — not when a
+prefill is large. **Every load I drove was prefill-heavy with short
+generations**, which frees on finish and never reaches that predicate. Pushing
+*more prompt tokens* was the wrong axis, and 2.9x oversubscription on the wrong
+axis is still zero.
+
+Two further eligibility rules that shape any forcing attempt
+(`kv_session_offload.py:950-985`, `spill_victim_candidates`):
+
+* **the oldest normal session is TABU** under plain decode-OOM pressure, so a
+  single running request yields an EMPTY candidate set — at least two
+  concurrent decoders are required before a spill is even possible;
+* **under EAGLE/MTP a request may only leave the batch from the BACK**
+  (`spec_back_only_victim`), so speculation narrows the victim set further.
+
+The forcing recipe that follows: a small `--max-total-tokens`, several
+CONCURRENT requests with LONG `max_new_tokens`, and modest prompts — decode
+pressure, not prefill pressure. Prepared as
+`evidence-631/s42/probe_boot_v4.sh` (ctx 8192 / MTT 4096, so a 1 GiB host
+budget holds exactly one region and the second spill demand must park) plus
+`proof_driver2.py` retargeted to decode-dominated load.
 
 ### 1e. TWO PROBE MEASUREMENT TRAPS, BOTH HIT BEFORE THEY WERE AVOIDED
 
