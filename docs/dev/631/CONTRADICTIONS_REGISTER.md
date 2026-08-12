@@ -1801,3 +1801,66 @@ wrong. Closed by MERGE-R5, commit `1798cbfb6b`.
    min 30827 -> 44635 MiB, against a defect whose observed consequence was
    nine cumulative cgroup OOM kills. The at-rest number is the mechanism; the
    under-load number is the claim.
+
+---
+
+## RES-R5 ADDITIONS (2026-08-12)
+
+### C25 — the #695 exact-size pin does not cost flip latency; it saves it
+
+| | |
+|---|---|
+| **Superseded claim** | HANDOFF_MERGE_R5 §6: flip p50 `2036 -> 2153 ms (+5.7 %)`, "not called a regression, not called clean", with the settling A/B specified. |
+| **Standing claim** | Same-harness, one md5-frozen tree, arms differing by `SGLANG_PHASE_FLIP_EXACT_PIN` alone: **fix p50 2200.1 ms (n=540) vs revert p50 2257.5 ms (n=534)** — the exact-size pin is **57.4 ms FASTER at p50, 314.6 ms (18.5 %) faster at the minimum**, and faster at p90, p95 and the mean. |
+| **Closed by** | RES-R5, `evidence-631/res-r5/AB_FLIP_LATENCY.json`. |
+
+MERGE-R5's number was never a measurement of the allocator: n=18 against
+n=546, two load profiles, and a baseline log holding 18 `FLIP DONE` lines
+while its own window text claimed 186. MERGE-R5 said so and declined to quote
+it. The replacement holds the tree, the argv, the load and the box constant.
+
+The arms are provably the two allocators rather than two labels: the revert
+arm reproduced merge-r4's host profile (shmem peak 76919 vs 76872 MiB) and the
+fix arm reproduced merge-r5's to the megabyte (62367 vs 62367 MiB).
+
+### C26 — #644's residual ~16 GB is untrimmed allocator arena, not retention
+
+| | |
+|---|---|
+| **Open question** | HANDOFF_VAL_R4 §2: ~16 GB of host `RssAnon` survives load on BOTH sides of the #644 fix; RSS cannot say whether it is referenced or merely untrimmed, and gdb is not installed. |
+| **Standing claim** | **ALLOCATOR.** In-process at end of load: live CPU tensor storage **20.1 MiB**, both named holders empty, and `malloc_trim(0)` returns **14714.2 MiB — 91.6 % of the residue**. The outside sampler sees the same release at constant process count (17.713 → 3.339 GB). |
+| **Closed by** | RES-R5, `evidence-631/res-r5/GGUF_644_VERDICT.txt`. |
+
+There is no holder to fix. #644's own fix is confirmed at the object level —
+`data_container` and `expert_data_map` are empty on every parameter, which is
+exactly what VAL-R4's RSS instrument could not see.
+
+Not closed: whether to trim automatically at end of load. The residue is real
+`MemAvailable` on a swapless box with nine recorded OOM kills, but a trim
+costs the next allocations a fault-in and deserves its own measurement.
+
+---
+
+## LAWS, continued
+
+40. **`pkill -f` will eventually kill the process that runs it.** RES-R5 used
+   it on its own sampler and the pattern matched its own shell, which died
+   mid-statement (exit 144). The prohibition is not about style: `-f` matches
+   full command lines, so the killer, the router, and any agent's shell that
+   merely *mentions* the pattern are all candidates. Stop processes by PID
+   after a `py-spy` dump, and confirm death by PID.
+
+41. **A budget with no slack turns any co-tenant into a boot blocker, and the
+   preflight threshold will not catch it.** The ship config asks for 31800 MiB
+   of a 32607 MiB card; after the 518 MiB NVML carve-out that leaves **under
+   300 MiB**. `s33_boot_from_capture.sh` waits only while a card holds more
+   than **2000 MiB**, so a foreign 500 MiB pytest passes the gate and the boot
+   dies three minutes later at the memory-pool profile. A preflight threshold
+   must be derived from the per-rank budgets, not from a constant.
+
+42. **A drop in a resource trace is only a release if the process count held
+   still.** The largest single drop in RES-R5's GGUF trace was 37 loader
+   workers exiting at once (19.09 → 4.99 GB), not the `malloc_trim` it was
+   looking for (17.71 → 3.34 GB at constant `nproc`). Memory leaving with its
+   processes says nothing about whether memory was reclaimable. Constant
+   `nproc` is part of the instrument, not a sanity print beside it.
