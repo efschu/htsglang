@@ -359,3 +359,21 @@ and is not a new symptom.
 3. **Close branches 5 and 6** of the #559 backlog on the §1c measurement, or
    overrule it with a counter-measurement. Do not merge them.
 4. The `used:park:file` gauge reading 0 against 33 blobs on disk.
+
+## 8. ONE THING LEFT QUEUED ON PURPOSE, WITH ITS STATUS MEASURED
+
+My brief said "`feat/route-a-631` itself merges LAST if the triage says it's
+ready, or stays queued with the blocker named". **HANDOFF_689 §8's triage does
+not discuss it at all**, so by the brief's own conditional it stays queued —
+but "queued" is useless without the number, so here it is:
+
+    integration/r2: HEAD is 2368 ahead, 0 BEHIND (merge-base aac55475)
+    integration/r1: HEAD is 2633 ahead, 47 behind
+
+`integration/r2` is a **strict ancestor** of this line. There is no merge to
+perform and no conflict to resolve — a fast-forward of `integration/r2` to
+`feat/route-a-631` is available whenever the branch-policy owner wants it, and
+nothing blocks it. I did not do it: it is a repo-topology move that no triage
+asked for and no successor authorized, and it is not the kind of thing to
+perform silently at the end of a shift. `integration/r1` is 47 commits behind
+and would be a real merge; nobody has asked for that either.
