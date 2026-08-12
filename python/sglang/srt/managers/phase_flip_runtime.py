@@ -4720,6 +4720,21 @@ class PhaseFlipRuntime:
             # shipped C20 behaviour. This whole block is therefore inert on a
             # configuration whose only objection is the entry margin.
             if not delayed_for_margin:
+                # #656: PUBLISH THE ABANDON so the phase policy can see it.
+                #
+                # The policy learns an arm's fate from ``arm``'s return, and
+                # an abandon happens long after arm returned True -- so for
+                # the first ``seam_abandon_cap()`` rounds the policy is told
+                # the flip was accepted while every one of them dies at the
+                # seam. That is the window in which boot E burnt its arms.
+                # A sequence number rather than a flag: the reader is the
+                # scheduler's round loop and it must be able to tell a NEW
+                # abandon from the same one seen twice.
+                self.seam_abandon_seq = getattr(self, "seam_abandon_seq", 0) + 1
+                self.last_seam_abandon = (
+                    direction,
+                    "; ".join(too_small) if too_small else "a peer refused",
+                )
                 spent = self._seam_abandons_in_a_row.get(direction, 0)
                 cap = seam_abandon_cap()
                 if cap and spent >= cap:

@@ -201,13 +201,37 @@ the only one still untried.
    exceeds its token share (0.378) and is therefore the binding term. **The
    5090 cannot be both the compute-heavy PP stage and the capacity-efficient
    one.**
-2. **The layer split also moves the weight arena, and that partly cancels the
+2. ~~**The layer split also moves the weight arena, and that partly cancels the
    gain.** Moving rank0 32→24 layers frees ~1.77 GiB of arena there but adds
    ~1.31 GiB on rank1, and the 3080s are the cards with no slack. I costed
    `[24,23,17]` and it *breaks* both 3080s while giving the 5090 3.5 GiB it
-   does not need. **Any candidate split must be costed on weights AND KV
+   does not need.~~ **Any candidate split must be costed on weights AND KV
    together, per card** — the KV-only arithmetic looks like a free win and
    is not.
+
+   > **ERRATUM (2026-08-12, #656 — the struck arithmetic above is WRONG).**
+   > The weight arena is a **max over layouts**, not a sum:
+   > `phase_flip_boot.py` sizes it `arena_total = max(layout_pp.total_bytes,
+   > layout_tp.total_bytes)`, so a rank whose TP weight share already exceeds
+   > its new PP layer share pays **nothing** for received layers. Measured on
+   > the ship boot: PP weights 13482.18 / 8144.00 / 9114.95 MiB against TP
+   > weights 13692.29 / 7659.52 / 7659.52 — ranks 1 and 2 sit at their PP
+   > term, rank 0 at its TP term. The "adds ~1.31 GiB on rank1" figure models
+   > a cost that does not exist, and any `[24,23,17]`-class candidate costed
+   > from it was rejected on arithmetic that does not hold.
+   >
+   > The *conclusion* "do not move layers onto the 5090" survives, but for a
+   > different reason, established on metal and not at a desk: rank0's budget
+   > is already 31800 MiB of a 32607 MiB card, leaving 807 MiB — **below the
+   > 1024 MiB corridor floor**. `--pp-stage-ratio 18,7,7` OOMed PP0 with
+   > 421.75 MiB free. The 5090 has no room to *receive* layers at all.
+   > See HANDOFF_KV_UNIVERSE.md §E2/§E3 and CONTRADICTIONS_REGISTER entry 46.
+   >
+   > Audited 2026-08-12 across `python/sglang/**`, `test/**` and the planner:
+   > **no code or test ever implemented the additive model.** `pp_cut.py`,
+   > `weights_arena.py`, `refill_high_water_bytes()` and
+   > `test_pp_family_cut_485.py` all use max(). The error was confined to
+   > this paragraph.
 
 ## 5b. THE WEDGE: a self-reinforcing deadlock, and it is the real blocker
 
