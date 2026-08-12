@@ -27,6 +27,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -1428,36 +1429,86 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "the native/Triton fallback paths."
             )
 
-    # Signal handlers can only be registered from the main thread.
-    if threading.current_thread() is threading.main_thread():
-        if server_args.custom_sigquit_handler is None:
-            # Register the signal handler.
-            # The child processes will send SIGQUIT to this process when any error happens
-            # This process then clean up the whole process tree
-            # Note: This sigquit handler is used in the launch phase, and may be replaced by
-            # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
-            def launch_phase_sigquit_handler(signum, frame):
-                logger.error(
-                    "Received sigquit from a child process. It usually means the child failed."
-                )
-                kill_process_tree(os.getpid())
-
-            signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
-        else:
-            # Allow users to register a custom SIGQUIT handler for things like crash dump
-            logger.error(
-                f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
-            )
-            signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
-    else:
-        logger.warning(
-            "Signal handler is not added because the engine is not in the "
-            "main thread. This disables the SIGQUIT handler for cleaning up "
-            "the process tree when a child process fails."
-        )
+    _install_launch_phase_signal_handlers(server_args)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+def _install_launch_phase_signal_handlers(server_args: ServerArgs):
+    """Install the launch-phase dispositions for SIGQUIT and SIGTERM.
+
+    SIGQUIT is the child-failure path: a rank that dies sends SIGQUIT to this
+    process, which then reaps the whole tree. That has always been here.
+
+    SIGTERM is #656. Until it was added, SIGTERM kept Python's DEFAULT
+    disposition for the entire launch phase -- ``_launch_subprocesses`` ->
+    weight load -> warmup, several minutes on a large checkpoint. Default
+    disposition terminates the parent immediately: no ``finally`` (so
+    ``launch_server.py``'s ``kill_process_tree`` never ran), no ``atexit`` (so
+    ``Engine.shutdown`` never ran), and the ranks are non-daemonic
+    ``mp.Process`` children in this process's own group, so nothing else
+    reaped them either. Observed consequence, VAL-R4 2026-08-12: SIGTERM to
+    the launcher left three orphaned ranks holding ~55 GB of VRAM with the
+    parent already gone, and the replacement boot would have OOM'd.
+
+    The running-phase SIGTERM handler in ``tokenizer_manager`` does not close
+    this: it is installed by ``auto_create_handle_loop()``, which runs on the
+    first REQUEST. It covers a serving instance and specifically not a
+    booting one. This handler is deliberately replaced by that one later --
+    same layering as the SIGQUIT pair.
+
+    Under systemd the gap is masked, because ``htsglang-serving@.service``
+    sets ``KillMode=control-group`` and the cgroup kill reaches the ranks
+    regardless. The shell path has no such cover, and that is the path the
+    orphaning was observed on.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "Signal handler is not added because the engine is not in the "
+            "main thread. This disables the SIGQUIT handler for cleaning up "
+            "the process tree when a child process fails, and the SIGTERM "
+            "handler that stops a terminated launch from orphaning ranks."
+        )
+        return
+
+    if server_args.custom_sigquit_handler is None:
+        # The child processes will send SIGQUIT to this process when any error
+        # happens; this process then cleans up the whole process tree.
+        # Note: this handler is used in the launch phase, and may be replaced
+        # by the running_phase_sigquit_handler in the tokenizer manager after
+        # the grpc server is launched.
+        def launch_phase_sigquit_handler(signum, frame):
+            logger.error(
+                "Received sigquit from a child process. It usually means the child failed."
+            )
+            kill_process_tree(os.getpid())
+
+        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+    else:
+        # Allow users to register a custom SIGQUIT handler for things like crash dump
+        logger.error(
+            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+        )
+        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
+
+    def launch_phase_sigterm_handler(signum, frame):
+        # Reap FIRST, then leave. The ranks hold the VRAM; a parent that
+        # exits before them is exactly the orphan case. include_parent is
+        # left at its default so this process goes too -- returning from the
+        # handler would resume a boot that has been asked to stop, which
+        # orphans the same ranks a few seconds later.
+        logger.error(
+            "Received SIGTERM during the launch phase. Terminating the rank "
+            "processes before exiting, so they do not survive this process "
+            "holding device memory."
+        )
+        try:
+            kill_process_tree(os.getpid(), include_parent=False)
+        finally:
+            sys.exit(128 + signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, launch_phase_sigterm_handler)
 
 
 def _set_gc(server_args: ServerArgs):
