@@ -118,10 +118,35 @@ python`), so the window doubles as the merge's acceptance test — the #485
 commits must be inert when the new flags are absent, and this is that claim on
 metal rather than in a unit test. Numbers in `WINDOW.txt`.
 
-**On the watch item.** N47 reported two of three NVML minima and the deepest
-seam trough below N46's and booked the trend as unexplained. My window is
-measured against both. See `WINDOW.txt` for the three-way comparison; the
-honest reading is recorded there rather than summarised into a claim here.
+21 minutes, 9515 NVML samples, 426 seam-census troughs, **0 breaches on both
+instruments**, 142 flips with 0 abandoned, 0 tracebacks, soak ok=118 err=0.
+The restored boot runs the MERGED tree with no new flags and behaves exactly
+like the ship boot did — which is the "byte-identical when absent" claim on
+metal, not in a unit test.
+
+**The watch item: the trend does not continue.**
+
+| axis | N46 | N47 | **N48** |
+|---|---:|---:|---:|
+| gpu0_free MIN | 1435 | 1397 | **1477** |
+| gpu1_free MIN | 2388 | 2061 | **2416** |
+| gpu2_free MIN | 1713 | 1727 | **1725** |
+| deepest seam trough | 1434 | 1396 | **1476** |
+| soak ok / err | — | 72 / 0 | **118 / 0** |
+| soak prefill tokens | — | 355993 | **554151** |
+
+Above BOTH predecessors on gpu0, gpu1 and the deepest trough; above N46 on
+gpu2 and 2 MiB under N47's there, i.e. equal within one sample. It did that
+under **1.56x N47's prefill load**, the direction that would have DEEPENED a
+real drift. The axis that fell furthest under N47 (gpu1, 2061) came back as
+the highest of the three.
+
+This supports N47's own hypothesis — load state, not degradation — but does
+not prove it, because my soak shape is not identical to N47's either. The
+defensible statement is the negative: **three consecutive windows do not form
+a monotone decline.** C7 applies; these minima read a state. Not carried
+forward as a drift; carried forward as a method fix — **compare on
+load-matched windows or not at all.**
 
 ---
 
