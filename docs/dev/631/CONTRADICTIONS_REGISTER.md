@@ -671,8 +671,16 @@ control look contaminated. The verdict table is therefore wrong in both
 directions at once. This is **law 19's shape applied to attribution**: the
 state is "this session's KV left the device and came back", and that state has
 at least two exits (host tier, file tier) while the instrument was written for
-one. Fix before reuse: assign arms from the union of the spill/park record
-families, and report the tier.
+one.
+
+**FIXED this shift** as `park_complete_proof3.py`: arms are assigned from the
+UNION of both exits and the tier is reported per rid. Validated by replay
+against the recorded `probe_v10.log` rather than by inspection -- on run A's
+own digests the corrected logic returns **EXIT 1 DEFECT** ("the parked arm
+differs from the reference while the control arm, under the same pressure,
+matches it") where v2 returned exit 3 ("nothing parked, no claim can be
+made"). The driver reaches C31's conclusion on its own once the arms are
+right. The live path is still unexecuted.
 
 **Not yet known, and not to be guessed:** whether the divergence is the fp8
 KV round trip through host, the partial wave-back boundary, the born-spilled

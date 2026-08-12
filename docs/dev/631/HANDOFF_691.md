@@ -82,13 +82,34 @@ instrument.** The check that broke it open cost 55 s: three quiescent repeats
 of the reference prompt, required to match, BEFORE asking the driver to judge
 anything.
 
-**A second instrument defect, still unfixed.** `park_complete_proof2.py` exited
-**3 ("NOTHING PARKED")** on every run that contains the finding. Its arm
-assignment keys only on file-tier `PARK commit rid=` (`PARK_RE`, `:166`), so a
-host-tier spiller is filed into the **CONTROL** arm, where it sets
-`control_arm_identical_to_reference = False` and makes a clean control look
-contaminated. Wrong in both directions at once. **Fix before reuse:** assign
-arms from the union of the spill/park record families and report the tier.
+**A second instrument defect — FOUND AND FIXED THIS SHIFT.**
+`park_complete_proof2.py` exited **3 ("NOTHING PARKED")** on every run that
+contains the finding. Its arm assignment keys only on file-tier
+`PARK commit rid=` (`PARK_RE`, `:166`), so a host-tier spiller is filed into
+the **CONTROL** arm, where it sets `control_arm_identical_to_reference = False`
+and makes a clean control look contaminated. Wrong in both directions at once:
+the round-trip arm is empty AND the control arm is poisoned by the very session
+that belongs in the other arm.
+
+`park_complete_proof3.py` (in `/spinning/evidence-631/s47/`) assigns arms from
+the **union of both exits** — `SPILL(partial)` / `first spill tick` /
+`WAVE-BACK` / `spilled session ... finished on host` alongside the file-tier
+park family — and reports the tier per rid.
+
+**Validated by replay against the recorded log, not by inspection.** Run
+through the real `probe_v10.log`, v3 puts `cohort-0` in the round-trip arm and
+leaves a clean three-member control, and its verdict logic on run A's recorded
+digests returns:
+
+    round-trip arm : ['s47-cohort-0']              identical = False
+    control arm    : [cohort-1, cohort-2, cohort-3] identical = True
+    -> EXIT 1 DEFECT: parked arm differs while the control arm MATCHES
+
+**Same recorded run: v2 said exit 3 "no claim can be made", v3 says exit 1
+"the round trip is corrupting the session".** The driver's own verdict logic,
+once the arms are assigned correctly, reaches the C31 conclusion independently.
+v3 has NOT yet been run live against a server — only its scanner and verdict
+paths are executed, which are exactly the parts that changed.
 
 **Not closed:** the FILE-tier park arm. The host tier is sized to hold **one**
 full-context region — proved by the refusal at
@@ -191,8 +212,9 @@ two-actuator race needs **TP>=2 per PP stage** + `--enable-phase-flip` +
    the born-spilled path?); then a bf16 KV cache instead of fp8 (is it the
    quantised round trip?); then compare a session that waved back FULLY against
    one that finished on host (is it the partial boundary?).
-2. **Fix `park_complete_proof2.py`'s arm assignment** (§1b) before anyone reuses
-   it. It currently reports the run that contains the finding as a null.
+2. **Run `park_complete_proof3.py` live** (§1b). Its scanner and verdict paths
+   are validated by replay against the recorded log, but it has not driven a
+   live server yet, so the live path is the one thing still unexecuted.
 3. **The FILE-tier park arm**, with `--max-total-tokens` raised so chunk 4096
    still admits several concurrent sessions.
 4. **C32's min-reduce risk**: check whether admission can run against the stale
