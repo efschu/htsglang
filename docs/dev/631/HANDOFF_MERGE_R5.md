@@ -219,16 +219,114 @@ See §6 for the numbers.
 
 ---
 
-## 6. CONFIRMATION WINDOW
+## 6. CONFIRMATION WINDOW — clean on both instruments, and the saving holds under load
 
-*(filled in at window close — see `WINDOW_SHIP_R5.txt`)*
+21 minutes of real mixed load (`soak_631_mixed_load.py`, decode streams plus
+periodic 12k-token prefills) on the ship config out of the merged tree, against
+the merge-r4 window as the comparison arm. Full page:
+`evidence-631/merge-r5/WINDOW_SHIP_R5.txt`.
+
+| | merge-r4 (comparison) | merge-r5 (this window) |
+|---|---|---|
+| corridor samples | 10383 | 9512 |
+| `gpu0_free` MIN / breaches | 1523 / **0** | **1527 / 0** |
+| `gpu1_free` MIN / breaches | 2610 / **0** | **2620 / 0** |
+| `gpu2_free` MIN / breaches | 1945 / **0** | **1965 / 0** |
+| seam census `CORRIDOR LAW BROKEN` | 0 | **0** |
+| seam `PREDICTS A SUB-LAW TROUGH` | 0 | **0** |
+| soak | ok 261, err 0 | **ok 261, err 0** |
+| flips | — | **546 DONE: 273 `pp_to_tp` + 273 `tp_to_pp`** |
+| `FLIP ABANDONED` | 0 | **0** |
+| tracebacks / CUDA errors | 0 | **0 / 0** |
+
+**Zero breaches on both instruments, and the flip ran in both directions in
+exactly equal numbers** — 273 each way, which is what a window that actually
+exercised the seam looks like rather than one parked in a regime.
+
+### The #695 saving under load, which is the number that matters
+
+| host instrument | merge-r4 | merge-r5 |
+|---|---|---|
+| cgroup `shmem` peak | 76872 MiB | **62367 MiB** (−14505 MiB, −14.2 GiB) |
+| `MemAvailable` min | 30827 MiB | **44635 MiB** (+13.8 GiB) |
+| cgroup `oom_kill` delta | 0 | **0** |
+| rank processes | 3/3 survived | **3/3 survived** |
+
+The at-rest 14.16 GiB is the mechanism; **this** is the claim. Against a defect
+whose recorded consequence was nine cumulative cgroup OOM kills, host headroom
+under load went up by 13.8 GiB.
+
+### Risk 2, flip restore latency: a number, and an honest confound
+
+| arm | n | min | p50 | p90 | max | mean |
+|---|---|---|---|---|---|---|
+| merge-r4 (rounded images) | **18** | 1372.1 | 2036.4 | 2542.1 | 2543.3 | 1961.8 |
+| merge-r5 (exact-size, `cudaHostRegister`) | **546** | 1360.6 | 2152.8 | 2652.1 | 2808.5 | 2227.7 |
+
+p50 +116 ms (+5.7 %), mean +266 ms (+13.6 %).
+
+**I am not calling this a regression, and I am not calling it clean.** The
+comparison is confounded three ways and every one of them favours caution:
+
+1. **n=18 against n=546.** Eighteen flips is not a distribution.
+2. The two windows ran **different load profiles**, and flip cost tracks live
+   slot count and seam traffic, both of which the soak drives.
+3. That n=18 is itself suspect: merge-r4's `WINDOW_SHIP.txt` reports **186**
+   flips for its window while its `ship_boot_merge_r4.log` contains only 18
+   `FLIP DONE` lines, so the baseline may be a partial log. **Do not quote 18
+   as merge-r4's flip count.**
+
+The minima are effectively identical (1372.1 vs 1360.6), which is what you
+would expect if the page-locked DMA property is unchanged and the difference
+lives in load-dependent tail behaviour rather than in the registration.
+
+**Settling experiment, cheap and specified:** boot the parent commit and the
+merged tip through the *same* harness (`window_merge_r5.sh`, same soak
+arguments) and compare p50 over comparable n. Until then the fix ships **on
+by default** — the memory result is large, proven under load, and addresses a
+mechanism with nine recorded OOM kills, while the latency delta is small,
+unattributed and measured against a baseline that may be a partial log.
+Recorded here so nobody has to rediscover the question.
 
 ---
 
 ## 7. STATE AT HANDOVER
 
-*(filled in at close)*
+- **Serving: UP on 30030, from the MERGED tree** `/spinning/wt-merge-r5`,
+  booted from the pristine s485 capture and verified with **real generations**
+  (3.4 s and 6.3 s after the load window, speculation live at accept length
+  3.0) — not a health 200. Corridor free **1741 / 3426 / 3183 MiB**, all above
+  the 1024 law. **Nobody owes a restore.**
+- The instance that was running at shift start was the parent commit, and it
+  served as the #695 BEFORE arm before being stopped. Its argv was verified
+  **identical 60/60** to the s485 capture, and its env diverged from the
+  capture in **exactly the three sanctioned per-boot keys** and nothing else —
+  so the capture is proven faithful, which is what made the replay safe.
+- **Router 30099: untouched.**
+- Turnkey units: **not installed, not enabled, not started by this shift.**
+  Nothing under `/etc` was modified. The unit *rendering* change is tested
+  against temp dirs only.
+- Branch `merge/r5-batch`; both `feat/route-a-631` and `integration/r2` carry
+  the same tip, `ls-remote` verified after every push.
 
 ## 8. NEXT, IN ORDER
 
-*(filled in at close)*
+0. **Label the #695 census lines with a rank identity that is unique under
+   PP** (§4). One line, and until it is done the instrument's own acceptance
+   step cannot be checked.
+1. **Settle the flip-latency question** with the same-harness A/B in §6. It is
+   the only open number attached to a shipped change.
+2. **Retire `route_a_631_prod_boot.sh` in favour of the turnkey unit path.**
+   The env drift class is now closed by a refusal gate, but the script's
+   **argv still diverges from the ship capture in seven flags** (`--model-path`
+   by the `yarn1.5` suffix, `--pp-stage-ratio` 14,10,8 vs 2,1,1,
+   `--context-length` 393216 vs 262144, `--rank-gpu-memory-mib`,
+   `--phase-flip-tp-vector`, `--max-total-tokens`, `--max-mamba-cache-size`).
+   One capture must govern env **and** argv as a unit; the #539 orchestrator
+   already does exactly that.
+3. **#644's residual ~16 GB is still unsettled** (VAL-R4 §2). It needs the GGUF
+   MoE checkpoint, not this ship config, so it could not ride this window's
+   boot — that is why it is untouched, not an oversight.
+4. VAL-R4's ticket 4 (`--pp-solve-cut` recommendable arm) remains unrun.
+5. The `--deterministic-hetero` / `--chunked-prefill-size` ergonomics refusal
+   (VAL-R4 §3) is still booked and still unfixed.

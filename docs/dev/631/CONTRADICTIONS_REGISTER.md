@@ -1740,3 +1740,64 @@ law, because the law was already correct.
    unobserved, and the two are indistinguishable from the outside. When a
    number has been stable across many shifts (1116 here), that stability is
    evidence about the list, not about the code around it.
+
+---
+
+## MERGE-R5 ADDITIONS (2026-08-12)
+
+### C23 — `SGLANG_UNEVEN_TOKEN_VECTOR` is NOT the PP stage ratio
+
+| | |
+|---|---|
+| **Superseded claim** | HANDOFF_VAL_R4 §4b: "`14,10,8` matches `--pp-stage-ratio 14,10,8`, while the script's `28,26,20` does not, and a per-stage token split inconsistent with the stage ratio is exactly the shape that would stall a PP chain." |
+| **Standing claim** | It is the **uneven-DCP KV-token ownership vector** (`planner/placement.py:117`, `planner/feasibility.py:699`), coupled to each rank's remaining memory via `--rank-gpu-memory-mib`. Its agreement with the stage ratio on this rig is a **numeric coincidence**, not a mechanism. |
+| **Closed by** | MERGE-R5, by reading the consumers. |
+
+VAL-R4 was explicit that it had *not* bisected the six divergent keys and
+named this one as "the first thing to test" — so this corrects a stated
+hypothesis, not a stated finding. The wedge itself remains **unattributed**:
+six env keys AND, as MERGE-R5 also found, **seven argv flags** differed at
+once (`--model-path` differs by the `yarn1.5` suffix, `--pp-stage-ratio`
+14,10,8 vs 2,1,1, `--context-length` 393216 vs 262144, and four more).
+
+The operational lesson survives the correction intact, and is stronger than
+the hypothesis was: **the drift, not any one key, was the defect.**
+
+### C24 — the #695 recipe's rank discovery could never match
+
+`host_shmem_695.py` tested `comm.startswith("sglang::scheduler")` (17 chars)
+against a `comm` the kernel truncates to 15 (`TASK_COMM_LEN`), so it returned
+an empty list on a healthy three-rank boot. `scripts/hostmem_sample.sh`
+already used the truncated form `sglang::schedul`. **Two sibling instruments
+in this tree disagreed about the same kernel fact**, and the newer one was
+wrong. Closed by MERGE-R5, commit `1798cbfb6b`.
+
+---
+
+## LAWS, continued
+
+37. **A hermetic test suite cannot see the shape of the world it abstracts.**
+   The #695 branch's desk work was hermetic and correct, and it still shipped a
+   discovery function that could not match a real `/proc/<pid>/comm`, because
+   no hermetic test ever passed it one. Where a function's entire job is to
+   recognise something the kernel produces, at least one test must be fed the
+   **literal bytes the kernel produces**, copied from a live system, not the
+   string the code was written against. "Hermetic" is a property of the test
+   environment, never a warrant about the interface.
+
+38. **Extract a suite's verdict from the whole file, not its tail.** MERGE-R5
+   twice concluded that a `model_executor` run had been killed mid-flight,
+   and twice attributed it to the known "this box kills long pytest runs"
+   behaviour. Both runs had completed normally: the summary line was simply
+   followed by a flood of trailing stderr, and a `tail -c 300` window never
+   reached it. A missing summary is evidence about your extraction before it
+   is evidence about the run — and a known flaky failure mode is exactly the
+   explanation that will be accepted too readily.
+
+39. **A saving measured at rest must be re-measured under load, and the
+   instrument that matters is the one that was binding.** #695's 14.16 GiB was
+   first shown on two at-rest snapshots. What makes it a *result* is the
+   21-minute soak: cgroup `shmem` peak 76872 -> 62367 MiB and `MemAvailable`
+   min 30827 -> 44635 MiB, against a defect whose observed consequence was
+   nine cumulative cgroup OOM kills. The at-rest number is the mechanism; the
+   under-load number is the claim.
