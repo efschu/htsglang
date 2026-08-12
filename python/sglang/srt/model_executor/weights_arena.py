@@ -36,12 +36,15 @@ than half-supported.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
 
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+
+logger = logging.getLogger(__name__)
 
 ARENA_ALIGN = 256
 _CHECKSUM_BYTES = 8
@@ -271,6 +274,126 @@ def pack_into_arena(
     return views
 
 
+def _alloc_with_host_register(dims, dtype, device, pin_memory, allocator):
+    """Indirection so the routing is spyable from a CPU unit test.
+
+    Imported lazily: ``pool_host.common`` pulls in the mem_cache stack, and
+    this module is imported by CPU-only tests that must not need it.
+    """
+    from sglang.srt.mem_cache.pool_host.common import (
+        HostTensorAllocator,
+        alloc_with_host_register,
+    )
+
+    if allocator is None:
+        allocator = HostTensorAllocator()
+    return alloc_with_host_register(dims, dtype, device, pin_memory, allocator)
+
+
+def _torch_pinned_zeros(total: int) -> torch.Tensor:
+    """The pre-#695 allocation, kept as the fallback. See below."""
+    return torch.zeros(total, dtype=torch.uint8, pin_memory=True)
+
+
+#: Serial number for the host-image posts. The registry is keyed by NAME, so
+#: two images in one process must not share one, or the second would silently
+#: replace the first and the ledger would under-report by a whole image.
+_image_post_seq = 0
+
+
+def _register_image_post(nbytes: int) -> None:
+    """Record a pinned host image in the shared post registry. Never raises."""
+    global _image_post_seq
+    try:
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            PinnedHostPost,
+            register_pinned_post,
+        )
+
+        _image_post_seq += 1
+        register_pinned_post(
+            PinnedHostPost(
+                name=f"phase-flip host weight image #{_image_post_seq}",
+                flag="--enable-phase-flip",
+                nbytes=int(nbytes),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- bookkeeping never kills a boot
+        logger.debug("could not register host image post: %s", exc)
+
+
+def _alloc_host_image(total: int, pin: bool) -> torch.Tensor:
+    """``total`` zeroed host bytes, page-locked when ``pin``, EXACTLY sized.
+
+    #695 -- WHY THIS IS NOT ``torch.zeros(..., pin_memory=True)``.
+    Every ``pin_memory=True`` allocation goes through PyTorch's pinned-host
+    caching allocator, which rounds the request up to the next POWER OF TWO
+    before it ever reaches ``cudaHostAlloc``::
+
+        ATen/core/CachingHostAllocator.h:302  roundSize = PowerOf2Ceil(size);
+        ATen/core/CachingHostAllocator.h:334  allocate_host_memory(roundSize, &ptr);
+
+    For a transient buffer that is a bounded overshoot. For these images it is
+    permanent: the flip holds two of them per rank for the life of the process
+    (``image_pp``, ``image_tp``) plus a draft image, and ``PhaseFlipStacks
+    .refill`` re-reads them on every flip, so nothing may free them.
+
+    Measured on the live PP=3 boot of 2026-08-12, ``/proc/<pid>/smaps`` of the
+    three scheduler ranks, against the payload figures this repo already
+    records at ``phase_flip_spill.py:851-854``::
+
+        PP0  13482.18 -> 16384 MiB   13163.45 -> 16384 MiB
+        PP1   8144.00 ->  8192 MiB    7923.95 ->  8192 MiB
+        PP2   9114.95 -> 16384 MiB    7923.95 ->  8192 MiB
+
+    58.35 GiB of payload held in 72 GiB of mappings: 13.65 GiB of pure
+    rounding, on a swapless box with a ~120 GiB ceiling that had by then taken
+    nine cgroup OOM kills. Host shmem is not a free axis -- see
+    ``memtier/profile.py:honest_host_memory_bytes``, which until #695 counted
+    every one of those bytes as reclaimable page cache.
+
+    ``alloc_with_host_register`` is the in-tree path the host KV pool already
+    uses: an exact-size ``MAP_SHARED|MAP_ANONYMOUS|MAP_POPULATE`` mapping plus
+    ``cudaHostRegister``. The pages are locked exactly as ``cudaHostAlloc``
+    locks them, so the restore's H2D copy stays a DMA -- the size is decided in
+    PAGES instead of in powers of two, and nothing else about the image
+    changes.
+
+    ZEROING is the mapping's own guarantee, not a memset: MAP_ANONYMOUS pages
+    arrive zero-filled, which is what the caller's "alignment-gap bytes are
+    zeroed, so the checksum is deterministic" contract needs. Memsetting 13 GiB
+    per image to restate a kernel guarantee would cost boot time for nothing.
+
+    FALLBACK. ``cudaHostRegister`` can refuse -- no CUDA context yet, or a
+    driver unwilling to lock that many pages. A rank that cannot register must
+    still boot, so the pre-#695 allocation is kept and used: the failure costs
+    the rounding back, never the boot.
+    """
+    if not pin:
+        return torch.zeros(total, dtype=torch.uint8)
+    # #695: make the bytes VISIBLE to the one registry that sums host posts.
+    # These images never registered, so `pinned_host_budget` -- which exists
+    # precisely because "two independently plausible budgets can be jointly
+    # impossible" -- was summing hicache and kvso while 72 GiB of pinned flip
+    # images sat outside it. Registered, not CHECKED: a new refusal path here
+    # could break a boot that works today, and the diagnosis this is for is
+    # served by the number being present, not by a veto.
+    _register_image_post(total)
+    try:
+        return _alloc_with_host_register((total,), torch.uint8, "cpu", True, None)
+    except Exception as exc:  # noqa: BLE001 -- any refusal degrades, none kills
+        logger.warning(
+            "#695 exact-size pinned host image unavailable (%s); falling back "
+            "to torch pin_memory for %d bytes, which the caching host "
+            "allocator rounds up to %d bytes. The boot proceeds; the "
+            "difference is resident host RAM for the life of the process.",
+            exc,
+            total,
+            1 << (total - 1).bit_length() if total > 1 else total,
+        )
+        return _torch_pinned_zeros(total)
+
+
 def image_from_tensors(
     named: Dict[str, torch.Tensor], layout: ArenaLayout, pin: bool = False
 ) -> torch.Tensor:
@@ -286,7 +409,9 @@ def image_from_tensors(
     (14.7 + 12.4 + 14.7 GB > 31.8). Alignment-gap bytes are zeroed, so
     the checksum is deterministic."""
     total = layout.total_bytes + _CHECKSUM_BYTES
-    host = torch.zeros(total, dtype=torch.uint8, pin_memory=pin)
+    # #695: exact-size, page-locked. See _alloc_host_image for why this must
+    # not be torch's pin_memory (power-of-two rounding, held for process life).
+    host = _alloc_host_image(total, pin)
     for slot in layout.slots:
         t = named[slot.name]
         seg = host[slot.offset : slot.offset + slot.nbytes]
@@ -331,11 +456,11 @@ def arena_image(
 ) -> torch.Tensor:
     """Host snapshot of the packed arena bytes + 8-byte checksum trailer."""
     used = arena[: layout.total_bytes]
-    host = torch.empty(
-        layout.total_bytes + _CHECKSUM_BYTES,
-        dtype=torch.uint8,
-        pin_memory=pin,
-    )
+    # #695: same exact-size pinned allocation as image_from_tensors. Every
+    # byte is overwritten below, so the zero-fill is redundant here -- it is
+    # accepted because a second allocator variant that skips it would be a
+    # second thing to keep page-locked correctly, for one memset at boot.
+    host = _alloc_host_image(layout.total_bytes + _CHECKSUM_BYTES, pin)
     host[: layout.total_bytes].copy_(used)
     total = uint8_checksum(used)
     host[layout.total_bytes :] = (

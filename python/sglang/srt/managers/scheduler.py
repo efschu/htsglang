@@ -1336,6 +1336,19 @@ class Scheduler(
 
         log_residency_census(model_runner)
 
+        # #695 host-shmem census. The residency census above answers "what is
+        # on this CARD"; this answers the question that actually killed the
+        # 2026-08-12 boot, which no ledger asked: what is this rank holding in
+        # PAGE-LOCKED HOST memory. cgroup v2 files that memory under `file`,
+        # so it never appears in an `anon` figure, and with no swap it cannot
+        # be reclaimed -- 75 GiB of it across three ranks, nine cgroup OOM
+        # kills, one of them presenting as a silent rank death. Unlike the two
+        # censuses above this one is NOT env-gated: it is the line that has to
+        # already be in the log when a rank dies with exit code -9.
+        from sglang.srt.mem_ledger.host_shmem import log_host_shmem_census
+
+        log_host_shmem_census(rank=self.tp_rank)
+
         # #485 transient census (env-gated, read-only): the residency census
         # above is a snapshot AT REST, and a cut gate calibrated on at-rest
         # bytes alone certifies configurations that cannot serve. This arms
