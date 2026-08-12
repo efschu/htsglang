@@ -14870,6 +14870,38 @@ class ServerArgs:
             else:
                 raise ValueError(message)
 
+        # #485: an explicitly spelled-out split used to reach get_pp_indices
+        # without ever meeting the hybrid check that --pp-stage-ratio's
+        # derivation applies, so a list that leaves a stage with no
+        # full-attention layer -- an EMPTY KV pool -- was accepted silently
+        # and only misbehaved much later. The census below needs no probe and
+        # no measured rates: it is pure geometry, read off the checkpoint's
+        # declared layer kinds. It refuses exactly what derive_pp_layer_split
+        # already refuses, and nothing else -- deliberately NOT a memory or
+        # performance verdict, both of which need calibration this does not
+        # have (HANDOFF_485_PPCUT.md sec. 1e).
+        kinds = self.declared_layer_kinds()
+        if kinds is not None and declared is not None and sum(ratio) == declared:
+            n_full = sum(kinds)
+            if 0 < n_full < declared:
+                start = 0
+                for stage, count in enumerate(ratio):
+                    in_stage = sum(1 for k in kinds[start : start + count] if k)
+                    if in_stage == 0:
+                        raise ValueError(
+                            f"--pp-layer-ratio "
+                            f"{','.join(str(n) for n in ratio)}: stage "
+                            f"{stage} (layers {start}-{start + count}) holds "
+                            f"zero of the model's {n_full} full-attention "
+                            f"layers, so its KV pool would be empty. A hybrid "
+                            f"model splits its KV after FULL-ATTENTION "
+                            f"layers, not after layers (#201 slice 2). Move a "
+                            f"boundary so every stage owns at least one, or "
+                            f"use --pp-stage-ratio and let the split be "
+                            f"derived."
+                        )
+                    start += count
+
         prefill_split = getattr(self, "disaggregation_prefill_layer_split", None)
         if prefill_split is not None:
             raise ValueError(

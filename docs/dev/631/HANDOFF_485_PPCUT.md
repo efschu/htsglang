@@ -98,15 +98,15 @@ mechanism is tested (`test_fixed_overhead_binds_the_constraint`,
 
 ## 2. What is PROVEN — hermetic only, no metal
 
-61 tests, all green, all CPU-only, all runnable in 0.4 s:
+68 tests, all green, all CPU-only, all runnable in 0.4 s:
 
 ```
 cd /spinning/wt-485-ppcut && PYTHONPATH=/spinning/wt-485-ppcut/python \
   /spinning/htsglang-gpu/.venv/bin/python \
-  test/registered/unit/planner/test_pp_family_cut_485.py        # 40
+  test/registered/unit/planner/test_pp_family_cut_485.py        # 42
 cd /spinning/wt-485-ppcut && PYTHONPATH=/spinning/wt-485-ppcut/python \
   /spinning/htsglang-gpu/.venv/bin/python \
-  test/registered/unit/server_args/test_pp_stage_ratio.py       # 21 (16 pre-existing)
+  test/registered/unit/server_args/test_pp_stage_ratio.py       # 26 (16 pre-existing)
 ```
 
 `PYTHONPATH` is mandatory — without it the tests silently run against
@@ -223,9 +223,9 @@ boot snapshot). B is accepted on the corridor axis alone.
 |---|---|
 | `python/sglang/srt/planner/pp_cut.py` | **new**, stdlib-only. Roofline stage cost, exact two-pass DP over contiguous cuts (minimize makespan, then maximize the tightest headroom), loud per-rank refusals, and `validate_pp_cut` for priced override checking. |
 | `python/sglang/srt/distributed/utils.py` | `derive_pp_layer_split` gains optional `attn_scores`. Absent ⇒ byte-identical to before (pinned by three legacy rows). |
-| `python/sglang/srt/server_args.py` | new `--pp-attn-stage-ratio`; refuses without `--pp-stage-ratio`, refuses on a non-hybrid, logs what the coupled derivation *would* have produced. |
-| `test/registered/unit/planner/test_pp_family_cut_485.py` | **new**, 40 tests. |
-| `test/registered/unit/server_args/test_pp_stage_ratio.py` | +5 tests for the new flag. |
+| `python/sglang/srt/server_args.py` | new `--pp-attn-stage-ratio`; refuses without `--pp-stage-ratio`, refuses on a non-hybrid, logs what the coupled derivation *would* have produced. Plus the family-census gate on the explicit `--pp-layer-ratio` path (§4c). |
+| `test/registered/unit/planner/test_pp_family_cut_485.py` | **new**, 42 tests. |
+| `test/registered/unit/server_args/test_pp_stage_ratio.py` | +10 tests (5 for the new flag, 5 for the gate). |
 
 `ruff` clean on every file I touched; `server_args.py` has the same 356
 pre-existing findings as the base commit, i.e. I added none. `codespell`
@@ -250,18 +250,39 @@ non-contiguous ownership. Reasons, in order:
    (`layers/dcp/phase_flip_plan.py:48-83`), so nothing downstream is blocked
    by this choice if it is ever revisited.
 
+### 4c. The explicit `--pp-layer-ratio` path is no longer unexamined
+
+An explicitly spelled-out ratio reached `get_pp_indices` without ever
+meeting the hybrid check that the derived path applies, so a list leaving a
+stage with **no full-attention layer — an empty KV pool** — was accepted
+silently. `--pp-layer-ratio 3,45,16` on the reference checkpoint is exactly
+that, and at base commit `03b6fb990d` it boots.
+
+The gate now applied is pure geometry read off the declared layer kinds: no
+probe, no measured rates, no calibration. It refuses precisely what
+`derive_pp_layer_split` already refuses and nothing more, and it stands down
+entirely when the checkpoint is not a hybrid or its layer kinds are
+unreadable — it never invents a census. Proven new: the test file run
+against the base commit fails `test_zero_full_attention_stage_is_refused`
+with "ValueError not raised".
+
+Deliberately **not** included in that gate: any memory or performance
+verdict. Both need §1e's calibration; a gate is only worth having if it is
+right.
+
 ### 4b. Not done
 
 * **The planner does not yet solve the cut at boot.** `solve_pp_cut` is a
   library function with no call site in `server_args`; wiring it needs the
   probe artifact plumbed into PP parse time, and it should not be wired
-  before §1e is calibrated (an uncalibrated gate would refuse good configs
-  or pass bad ones). `--pp-attn-stage-ratio` is the manual surface that makes
-  the solver's output usable today.
-* **`--pp-layer-ratio` still bypasses validation.** `validate_pp_cut` exists
-  and is tested, but is not called from the flag handler, for the same
-  reason. This is the "booked generality gap" and it is **still open** — I
-  built the checker, not the gate.
+  before §1e is calibrated. `--pp-attn-stage-ratio` is the manual surface
+  that makes the solver's output usable today.
+* **`validate_pp_cut`'s memory verdict is not wired.** The structural half
+  of the generality gap is closed (§4c); the memory half is built and tested
+  but uncalled, because with `fixed_overhead_mib = 0` it can only ever
+  under-report occupancy. It would not produce false refusals — a lower
+  bound refuses only the genuinely impossible — so it is safe to wire the
+  moment §1e lands, and that is the recommended first use of the calibration.
 
 ---
 
