@@ -115,6 +115,35 @@ def _verify_host_mirror(
     return dcp_verify_paged_lens(seq_lens_cpu, num_draft_tokens)
 
 
+def _swa_window_host_sum(
+    seq_lens_cpu: Optional[Union[Sequence[int], torch.Tensor]],
+    sliding_window_size: Optional[int],
+) -> Optional[int]:
+    """Total SWA window length ``sum(min(seq_len, W))`` from the host mirror.
+
+    The window index buffer holds ``min(seq_len, W)`` entries per request, so
+    its filled prefix length is this sum -- the same number the device carries
+    in ``window_kv_indptr[bs]``. Taking it from the mirror is what removes the
+    unbounded blocking device-to-host read that bounding the slice with
+    ``window_kv_indptr[-1]`` forces (#616h class, #3287).
+
+    Shared by the cuda-graph window FILLS and by
+    ``_translate_cuda_graph_shared_pool_locs``, which need the identical bound
+    over the identical buffer. They were two independent inline expressions,
+    which is precisely the drift ``_verify_host_mirror`` exists to prevent:
+    if the fill and the later translate disagreed on the prefix length, the
+    tail would be left half-translated -- silently, since neither the shape nor
+    the dtype would change.
+
+    Returns None when no mirror is available, which restores the device read.
+    """
+    if seq_lens_cpu is None or not sliding_window_size or sliding_window_size <= 0:
+        return None
+    if not isinstance(seq_lens_cpu, torch.Tensor):
+        return int(sum(min(int(x), sliding_window_size) for x in seq_lens_cpu))
+    return int(seq_lens_cpu.clamp(max=sliding_window_size).sum())
+
+
 def _reject_stale_verify_window(spec_info, qo_stride: int) -> None:
     """Enforce the M4 split's disjointness invariant at a verify metadata build.
 
@@ -1235,6 +1264,11 @@ class TritonAttnBackend(AttentionBackend):
                 token_to_kv_pool=self.token_to_kv_pool,
                 window_kv_indices=self.cuda_graph_window_kv_indices,
                 skip_full_to_swa_translation=(self._translate_kv_loc is not None),
+                # #3287: baseline SWA still translates in place here, and bounded
+                # the slice with a 0-dim device tensor. The mirror is in scope.
+                window_lens_sum=_swa_window_host_sum(
+                    seq_lens_cpu, self.sliding_window_size
+                ),
             )
         return kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens
 
@@ -1308,6 +1342,17 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     token_to_kv_pool=self.token_to_kv_pool,
                     window_kv_indices=window_kv_indices,
+                    # #3287: MUST match the decode sibling above. Under the
+                    # unified pool the window translate is deferred to
+                    # _translate_cuda_graph_shared_pool_locs, which rewrites
+                    # THIS buffer; translating here as well made the verify
+                    # window v2p[v2p[x]] -- silently wrong indices on the very
+                    # path that decides which drafted tokens are accepted.
+                    skip_full_to_swa_translation=(self._translate_kv_loc is not None),
+                    window_lens_sum=_swa_window_host_sum(
+                        None if seq_lens_cpu is None else seq_lens_cpu[:bs],
+                        self.sliding_window_size,
+                    ),
                 )
             )
         if self.dcp_size > 1:
@@ -1515,13 +1560,16 @@ class TritonAttnBackend(AttentionBackend):
             )
         # SWA window read path. window_kv_indptr[bs] == sum(min(seq_len, window)).
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            if have_cpu_mirror:
-                n_win = int(
-                    forward_batch.seq_lens_cpu[:bs]
-                    .clamp(max=self.sliding_window_size)
-                    .sum()
+            # Same bound, same buffer, as the fill that wrote it: one shared
+            # expression so the two cannot drift apart (#3287).
+            n_win = (
+                _swa_window_host_sum(
+                    forward_batch.seq_lens_cpu[:bs], self.sliding_window_size
                 )
-            else:
+                if have_cpu_mirror
+                else None
+            )
+            if n_win is None:
                 n_win = int(self.window_kv_indptr[bs].item())
             if n_win > 0:
                 self.cuda_graph_window_kv_indices[:n_win] = (
@@ -3246,6 +3294,7 @@ def update_sliding_window_buffer(
     token_to_kv_pool=None,
     window_kv_indices=None,
     skip_full_to_swa_translation=False,
+    window_lens_sum=None,
 ):
     """Fill window KV buffers for sliding-window attention.
 
@@ -3260,6 +3309,11 @@ def update_sliding_window_buffer(
     ``init_forward_metadata_out_graph``, BEFORE ``graph.replay()``), which reads
     the live v2p and rewrites the static window buffer to swa-physical in place;
     baseline SWA leaves it False (eager).
+
+    ``window_lens_sum`` is the host mirror of ``window_kv_indptr[-1]``, i.e.
+    ``sum(min(seq_len, W))``, from ``_swa_window_host_sum``. Supplying it keeps
+    the filled-prefix bound on the host; omitting it (the default) reads the
+    bound back off the device, which is a blocking sync.
     """
     window_kv_lens = torch.minimum(
         seq_lens,
@@ -3269,7 +3323,9 @@ def update_sliding_window_buffer(
     window_kv_indptr = window_kv_indptr[: bs + 1]
     if window_kv_indices is None:
         window_kv_indices = torch.empty(
-            window_kv_indptr[-1], dtype=torch.int64, device=device
+            window_kv_indptr[-1] if window_lens_sum is None else window_lens_sum,
+            dtype=torch.int64,
+            device=device,
         )
     window_kv_start_idx = seq_lens - window_kv_lens
     create_flashinfer_kv_indices_triton[(bs,)](
@@ -3284,7 +3340,11 @@ def update_sliding_window_buffer(
     if not skip_full_to_swa_translation and hasattr(
         token_to_kv_pool, "translate_loc_from_full_to_swa"
     ):
-        kv_last_index = window_kv_indptr[-1]
+        # Host mirror when supplied; else the 0-dim device tensor, whose
+        # __index__ is an unbounded blocking D2H (#3287).
+        kv_last_index = (
+            window_kv_indptr[-1] if window_lens_sum is None else window_lens_sum
+        )
         window_kv_indices[:kv_last_index] = (
             token_to_kv_pool.translate_loc_from_full_to_swa(
                 window_kv_indices[:kv_last_index]
