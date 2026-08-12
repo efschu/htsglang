@@ -790,9 +790,19 @@ fixed in passing.
 
 **Disposition.** Docstring corrected to state that the seam is unbound, what
 binding requires, and that the runtime note is the honest report until then.
-`test_regime_act.py::TestPlannerFeed::test_the_seam_is_unbound_in_production`
-is a RATCHET over both the call site and the docstring: it goes red when the
-seam is bound, which forces the wiring and the prose to move together.
+The ratchet sat in `test_regime_act.py::TestPlannerFeed`, over both the call
+site and the docstring: it goes red when the seam is bound, which forces the
+wiring and the prose to move together.
+
+**Resolution (task #578).** The ratchet fired and the seam is now BOUND.
+`regime_runtime.build_regime_stage_table` calls
+`planner_candidates(server_args, solve_fn=_planner_solve_fn(scheduler))`
+(`managers/regime_runtime.py`), and `planner_candidates`
+(`managers/regime_stages.py`) records the binding in its own docstring. Per
+this document's rule the absence ratchet was INVERTED rather than deleted:
+`test/registered/unit/managers/test_regime_act.py::TestPlannerFeed::test_the_seam_is_bound_and_refuses_without_measurement`
+pins that the call site still passes `solve_fn` and that planner-produced
+stages stay `unmeasured` and are refused by name.
 
 **The general lesson, for the next sweep.** A docstring that describes its own
 production wiring is an assertion about a call site somewhere else, and nothing

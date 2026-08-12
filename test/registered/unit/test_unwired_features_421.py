@@ -182,7 +182,7 @@ class TestRuntimeDraftLifecycleIsUnreachable(CustomTestCase):
 # streaming door (``fused_moe_triton/layer.py``) and from the launcher
 # (``entrypoints/engine.py``). Per this file's own rule the pin is deleted
 # rather than widened, and replaced by
-# ``test/registered/unit/moe/test_cold_tier_wiring_394.py``, which asserts the
+# ``test/registered/unit/layers/moe/test_cold_tier_wiring_394.py``, which asserts the
 # POSITIVE fact and pins the CALL SITES -- so a refactor cannot quietly drop
 # the fetch route and leave the module importable but unreached again.
 #
