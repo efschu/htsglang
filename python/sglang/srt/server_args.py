@@ -1873,7 +1873,15 @@ class ServerArgs:
             help="kv-session-offload: restore the spilled session only when "
             "the allocator has (session tokens + this margin) free slots "
             "(anti-flutter headroom so the restored session does not "
-            "immediately re-trigger a spill).",
+            "immediately re-trigger a spill). This is an ABSOLUTE token "
+            "count and it is spent from the KV pool, so it is SIZED AGAINST "
+            "THE POOL at startup: a margin at or above the pool makes the "
+            "restore gate unopenable for every session (spilled sessions "
+            "then finish on the host floor, silently, with the device idle). "
+            "An explicit value that large is REFUSED at startup; the default "
+            "is clamped to half the pool and logged at ERROR. Set "
+            "SGLANG_KVSO_RESTORE_MARGIN_FORCE=1 to be taken literally "
+            "anyway.",
         ),
     ] = 4096
     kv_session_offload_restore_hysteresis_steps: A[

@@ -1238,6 +1238,153 @@ def draft_scratch_carveout_error(
     )
 
 
+#: Set to 1 to honour ``--kv-session-offload-restore-margin-tokens`` verbatim
+#: even when it is unsatisfiable against the pool. The operator keeps the last
+#: word; the resolution still logs, at ERROR, what it was told to ignore.
+RESTORE_MARGIN_FORCE_ENV = "SGLANG_KVSO_RESTORE_MARGIN_FORCE"
+
+
+def restore_margin_force_enabled() -> bool:
+    return os.environ.get(RESTORE_MARGIN_FORCE_ENV, "0") == "1"
+
+
+def restore_margin_shipped_default() -> Optional[int]:
+    """The margin's dataclass default, READ from ``ServerArgs``.
+
+    Restating ``4096`` here would create a second copy of a constant whose
+    whole role is to answer "did the operator choose this value, or did we?".
+    A copy that drifted would silently move a boot from the clamp branch to
+    the refusal branch. Imported lazily: ``server_args`` imports this module's
+    package, so a module-level import would close a cycle.
+
+    Returns None when the field cannot be found. ``resolve_restore_margin_
+    tokens`` then treats every value as operator-chosen and REFUSES rather
+    than clamping -- the loud side, which is the right side to fail to.
+    """
+    import dataclasses
+
+    try:
+        from sglang.srt.server_args import ServerArgs
+
+        for f in dataclasses.fields(ServerArgs):
+            if f.name == "kv_session_offload_restore_margin_tokens":
+                return int(f.default)
+    except Exception:  # pragma: no cover - import shape change
+        return None
+    return None
+
+
+def resolve_restore_margin_tokens(
+    pool_tokens: int,
+    configured: int,
+    shipped_default: Optional[int],
+    forced: bool = False,
+) -> Tuple[int, Optional[str], Optional[str]]:
+    """Size the restore margin against the KV pool it is spent from.
+
+    ``--kv-session-offload-restore-margin-tokens`` is an ABSOLUTE token count
+    and was validated only against ``< 0``. The restore gate is
+
+        restorable >= remaining + restore_margin_tokens
+
+    where ``restorable`` is bounded above by the whole pool. A margin at or
+    above the pool therefore demands more slots than exist, for every session,
+    forever: **the gate cannot open even once**. It does not crash, does not
+    warn, and does not log -- every spilled session simply finishes on the host
+    floor while the device sits idle, which reads exactly like "restore is not
+    implemented". Measured: successor 44 saw restores=0 across an entire boot
+    on a 4096-token pool against the shipped default margin of 4096; successor
+    45 got the first ``RESTORE complete`` of this whole line of shifts out of
+    the same tree purely by passing ``--kv-session-offload-restore-margin-
+    tokens 64``. Nothing in the code said which of those two boots was the
+    broken one. That silence is the defect being fixed here.
+
+    Returns ``(effective_margin, error, warning)``.
+
+    * ``error`` is non-None only when the operator EXPLICITLY chose an
+      unsatisfiable margin -- the caller raises. An explicit unsatisfiable
+      request is an operator error and gets the same treatment as an
+      unsatisfiable ``--kv-session-offload-mtp-resident-slices``.
+    * A margin left at the SHIPPED DEFAULT is clamped instead, and the clamp
+      is reported through ``warning`` for the caller to log at ERROR. The
+      operator did not choose the default, so refusing to boot on it would
+      turn a shipped constant into a hard failure on every small-pool
+      instance -- but it must never go quietly inert, which is the whole
+      point. An operator who explicitly passes exactly the default value on a
+      too-small pool lands in the clamp branch rather than the refusal
+      branch; the two are indistinguishable from the parsed args and the
+      clamp is the safe side of that ambiguity.
+    * ``forced`` (``SGLANG_KVSO_RESTORE_MARGIN_FORCE=1``) suppresses both the
+      refusal and the clamp and honours ``configured`` verbatim, still
+      reporting through ``warning``. The operator keeps the last word.
+
+    The clamp target is HALF the pool. Half is where the margin stops being
+    the binding term: the largest session that can coexist with its own
+    margin occupies at most ``pool - margin`` slots, so at ``margin > pool/2``
+    the margin excludes sessions SMALLER than itself from ever restoring,
+    while at ``margin <= pool/2`` every session the pool can hold alongside
+    the margin can still reach the gate. It is a bound, not a tuning: a margin
+    that has to be clamped is already misconfigured and the log says so.
+    """
+    pool_tokens = int(pool_tokens)
+    configured = int(configured)
+    shipped_default = None if shipped_default is None else int(shipped_default)
+    if pool_tokens <= 0 or configured <= 0:
+        # No pool figure to judge against (or no margin at all -> the gate
+        # reduces to `restorable >= remaining`, which is satisfiable).
+        return configured, None, None
+
+    if configured < pool_tokens:
+        if configured * 2 > pool_tokens:
+            return (
+                configured,
+                None,
+                f"--kv-session-offload-restore-margin-tokens={configured} is "
+                f"more than half of this rank's {pool_tokens}-token KV pool, "
+                f"so any spilled session with a host tail longer than "
+                f"{pool_tokens - configured} tokens can never satisfy the "
+                "restore gate and will finish on the host floor. The margin "
+                "is anti-flutter headroom, not a reserve; lower it or raise "
+                "--max-total-tokens.",
+            )
+        return configured, None, None
+
+    clamped = max(1, pool_tokens // 2)
+    detail = (
+        f"--kv-session-offload-restore-margin-tokens={configured} is at or "
+        f"above this rank's ENTIRE KV pool of {pool_tokens} tokens. The "
+        f"restore gate asks for (session tail + {configured}) free slots, so "
+        "it cannot open for any session, ever: every spilled session finishes "
+        "on the host floor with the device idle, silently, with no restore "
+        "and no error."
+    )
+    if forced:
+        return (
+            configured,
+            None,
+            detail + f" Honoured verbatim because {RESTORE_MARGIN_FORCE_ENV}=1.",
+        )
+    if configured == shipped_default:
+        return (
+            clamped,
+            None,
+            detail
+            + f" This is the SHIPPED DEFAULT ({shipped_default}), not an "
+            f"operator choice, so it is clamped to {clamped} (half the pool) "
+            "rather than refused. Set --kv-session-offload-restore-margin-"
+            "tokens explicitly to choose your own value.",
+        )
+    return (
+        configured,
+        detail
+        + f" Lower it below {pool_tokens} (half the pool, {clamped}, is the "
+        "largest value that leaves every session the pool can hold able to "
+        f"restore), raise --max-total-tokens, or set "
+        f"{RESTORE_MARGIN_FORCE_ENV}=1 to run with the gate shut anyway.",
+        None,
+    )
+
+
 def spill_tick_seq_len(n_origin_input_ids: int, n_output_ids: int) -> Optional[int]:
     """Committed sequence length for a spill-tick decode batch, or None when
     the session has no token to decode yet.
@@ -2491,6 +2638,42 @@ class KVSessionOffloadManager:
         # byte-identical to the pre-feature path).
         if self.spec_in_tick_ready and self._draft_read_scratch is None:
             self.spec_in_tick_ready = False
+
+        # C29: size the restore margin against the pool it is spent from.
+        # Deliberately placed HERE, after the draft-scratch carve-out, because
+        # that carve permanently shrinks `allocator.size` -- the margin has to
+        # be judged against the pool the gate will actually see, not the one
+        # the boot started with. The margin is an ABSOLUTE token count, so the
+        # shipped default is simultaneously fine on a 512552-token pool and
+        # unsatisfiable on a 4096-token one; nothing checked which.
+        _pool_tokens = int(getattr(self.allocator, "size", 0) or 0)
+        _margin, _margin_err, _margin_warn = resolve_restore_margin_tokens(
+            _pool_tokens,
+            self.restore_margin_tokens,
+            restore_margin_shipped_default(),
+            forced=restore_margin_force_enabled(),
+        )
+        if _margin_err is not None:
+            raise ValueError("kv-session-offload: " + _margin_err)
+        if _margin_warn is not None:
+            # ERROR, not warning: the failure this describes is invisible at
+            # every other level (no crash, no hang, no restore) so the log line
+            # is the ONLY place it can be seen. Never let it go quiet.
+            logger.error(
+                "kv-session-offload restore margin: %s (rank %d)",
+                _margin_warn,
+                self.dcp_rank,
+            )
+        if _margin != self.restore_margin_tokens:
+            logger.error(
+                "kv-session-offload restore margin: %d -> %d against a "
+                "%d-token pool (rank %d).",
+                self.restore_margin_tokens,
+                _margin,
+                _pool_tokens,
+                self.dcp_rank,
+            )
+            self.restore_margin_tokens = _margin
 
         # S4 multi-spill: the host pool is partitioned into `max_spills` equal
         # regions of `region_tokens` rows each; region r owns host rows

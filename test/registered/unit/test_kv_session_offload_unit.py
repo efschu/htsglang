@@ -2685,3 +2685,162 @@ def test_restore_readiness_counts_radix_evictable_not_just_the_free_list():
     assert not _run(avail=0, evictable=0)
     # Not enough even when combined -> wave-back, not a doomed restore.
     assert not _run(avail=700, evictable=700)
+
+
+def _restore_gate_opens(pool_tokens: int, margin: int) -> bool:
+    """Drive the REAL restore gate on a pool of `pool_tokens` with `margin`.
+
+    Same fixture shape as the radix-evictable test above: the real
+    `_maybe_restore_flow` over a real `RestoreHysteresis`, with the wave-back
+    branch fenced off so taking it is observable as "the gate stayed shut".
+    The whole pool is offered as restorable (avail + evictable == pool), which
+    is the most generous state the gate can ever see -- so a False here means
+    the gate cannot open at this margin under ANY memory condition.
+    """
+    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+
+    class _WaveBackReached(Exception):
+        pass
+
+    class _NoBackend:
+        def __getattr__(self, name):
+            raise _WaveBackReached(name)
+
+    L, boundary = 2000, 1500  # a 500-token host tail
+
+    m = object.__new__(KVSessionOffloadManager)
+    m.scheduler = types.SimpleNamespace(spec_algorithm=None, tp_rank=0)
+    m._fast_lane_enabled = False
+    m.host_base = 100000
+    row = torch.arange(L, dtype=torch.int64)
+    row[boundary:] += m.host_base
+    m.req_to_token_pool = types.SimpleNamespace(req_to_token=row.unsqueeze(0))
+    m.allocator = types.SimpleNamespace(
+        available_size=lambda: pool_tokens, size=pool_tokens
+    )
+    m.tree_cache = types.SimpleNamespace(evictable_size=lambda: 0)
+    m.restore_margin_tokens = margin
+    m._iter_ct = 100
+    m.backend = _NoBackend()
+
+    req = types.SimpleNamespace(req_pool_idx=0, rid="victim")
+    batch = types.SimpleNamespace(seq_lens_cpu=torch.tensor([L]))
+    slot = types.SimpleNamespace(
+        req=req, batch=batch, spill_iter=0, suppress_tick=False,
+        hysteresis=RestoreHysteresis(4),
+    )
+    try:
+        m._maybe_restore_flow(slot, None, slot.batch)
+    except _WaveBackReached:
+        return False
+    return slot.suppress_tick
+
+
+def test_the_restore_margin_is_sized_against_the_pool_it_is_spent_from():
+    """C29: an absolute margin at or above the pool shuts the gate forever.
+
+    The gate is `restorable >= remaining + restore_margin_tokens` and
+    `restorable` is bounded above by the pool. So a margin >= the pool asks
+    for more slots than exist, for every session, on every iteration -- and
+    says nothing while doing it. Successor 44 measured restores=0 across an
+    entire boot on a 4096-token pool at the shipped default margin of 4096;
+    successor 45 got the first `RESTORE complete` in this line of shifts out
+    of the same tree by passing the margin as 64. Neither boot logged which
+    one of them was misconfigured.
+
+    RED-FIRST, in two halves. The first half pins the MECHANISM and is true
+    on both trees (a permanent regression guard). The second half is the FIX
+    and fails on the pre-C29 tree, where the manager spends the configured
+    4096 verbatim against a 4096-token pool.
+    """
+    pool_tokens = 4096
+
+    # --- the mechanism: at the raw default this gate cannot open at all,
+    # even when the ENTIRE pool is offered as restorable.
+    assert not _restore_gate_opens(pool_tokens, 4096), (
+        "the restore gate opened at a margin equal to the whole pool; this "
+        "test no longer pins the defect it was written for"
+    )
+    # ...and it is the margin doing it, not the fixture: a small margin opens
+    # the very same gate on the very same pool.
+    assert _restore_gate_opens(pool_tokens, 64), (
+        "the fixture cannot open the gate at ANY margin -- it is not "
+        "measuring the margin"
+    )
+
+    # --- the fix: the margin the MANAGER resolves for this pool must be one
+    # the gate can actually open at. Falls back to the configured value on a
+    # tree without the resolver, which is exactly the pre-C29 behaviour and
+    # exactly what must fail here.
+    try:
+        from sglang.srt.managers.kv_session_offload import (
+            resolve_restore_margin_tokens,
+        )
+
+        effective = resolve_restore_margin_tokens(pool_tokens, 4096, 4096)[0]
+    except ImportError:  # pre-C29 tree: the raw flag value, never sized
+        effective = 4096
+    assert _restore_gate_opens(pool_tokens, effective), (
+        f"the manager would run this {pool_tokens}-token pool with margin "
+        f"{effective}, at which no spilled session can EVER be restored: "
+        "every one of them finishes on the host floor with the device idle, "
+        "silently. The margin must be sized against the pool at boot."
+    )
+
+
+def test_restore_margin_resolution_refuses_explicit_and_clamps_the_default():
+    """C29: who chose the value decides whether it is refused or clamped.
+
+    An operator who explicitly asks for an unsatisfiable margin gets the
+    `mtp_resident_reservation_error` treatment -- a refusal naming the
+    numbers. A margin left at the SHIPPED DEFAULT was not chosen by anybody,
+    so refusing would turn a shipped constant into a boot failure on every
+    small-pool instance; it is clamped instead. Both paths are LOUD. The one
+    outcome that is forbidden is the pre-C29 one: silently inert.
+    """
+    from sglang.srt.managers.kv_session_offload import (
+        resolve_restore_margin_tokens,
+        restore_margin_shipped_default,
+    )
+
+    # the default on a pool that cannot afford it -> clamped, loudly, no raise
+    margin, err, warn = resolve_restore_margin_tokens(4096, 4096, 4096)
+    assert err is None, "the shipped default must not fail a boot"
+    assert margin == 2048, f"expected a clamp to half the pool, got {margin}"
+    assert warn is not None, "a clamp that logs nothing is the C29 defect"
+    for needle in ("4096", "2048", "host floor"):
+        assert needle in warn, f"clamp message does not name {needle!r}: {warn}"
+
+    # the SAME number, explicitly chosen against a pool that is not the
+    # default's -> refused by name
+    margin, err, warn = resolve_restore_margin_tokens(4096, 8192, 4096)
+    assert err is not None, "an explicit unsatisfiable margin was accepted"
+    for needle in ("8192", "4096", "cannot open"):
+        assert needle in err, f"refusal does not name {needle!r}: {err}"
+    assert margin == 8192 and warn is None
+
+    # forced -> honoured verbatim, still reported
+    margin, err, warn = resolve_restore_margin_tokens(4096, 8192, 4096, forced=True)
+    assert err is None and margin == 8192
+    assert warn is not None and "FORCE" in warn
+
+    # unknown shipped default (server_args refactored) -> refuse, never clamp
+    margin, err, warn = resolve_restore_margin_tokens(4096, 4096, None)
+    assert err is not None, "with no default to compare against, refuse"
+
+    # a satisfiable-but-dominant margin warns without changing the value
+    margin, err, warn = resolve_restore_margin_tokens(4096, 3000, 4096)
+    assert margin == 3000 and err is None
+    assert warn is not None and "half" in warn
+
+    # the ordinary case is silent and untouched: the shipped default against
+    # the pool this rig actually ships (512552 rows)
+    assert resolve_restore_margin_tokens(512552, 4096, 4096) == (4096, None, None)
+
+    # inert when there is nothing to judge
+    assert resolve_restore_margin_tokens(0, 4096, 4096) == (4096, None, None)
+    assert resolve_restore_margin_tokens(4096, 0, 4096) == (0, None, None)
+
+    # the default is READ from ServerArgs, not restated -- a drift here would
+    # silently move a boot from the clamp branch to the refusal branch
+    assert restore_margin_shipped_default() == 4096
