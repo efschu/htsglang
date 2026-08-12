@@ -348,5 +348,97 @@ class TestPlanStaleness(CustomTestCase):
             self.assertEqual(got.launch_flags, ("--a", "1"))
 
 
+class TestCardBusyIsForeignUsageNotCarveOut(CustomTestCase):
+    """#656: preflight refused an IDLE machine.
+
+    VAL-R4 hit ``REFUSE_CARD_BUSY subject=RTX 5090 observed=521 MiB in use
+    (no compute pids) expected=<= 512 MiB`` on a rig with nothing running.
+    521 MiB is the 5090's NVML driver carve-out; the shipped
+    ``card_busy_mib = 512`` sat just under it. The remedy -- "stop the named
+    pids BY PID" -- was unactionable, because the message itself said there
+    were none.
+
+    The carve-out is not foreign occupancy. It is measured, named and
+    budgeted everywhere else in this tree (``registry/nvml.py`` reports it as
+    ``reserved_bytes``; ``mem_ledger`` books it as
+    ``TERM_NVML_CARVE_OUT``; ``uneven_perf.py`` records the measured
+    magnitudes, 425 MiB on a 3080 and 518 on a 5090). Only preflight folded
+    it into ``used`` and compared the sum against a flat constant -- which is
+    why the threshold had to be hand-raised to 600 to let the machine boot.
+
+    The fix derives the quantity under test from the measured carve-out
+    instead of guessing a constant above it: what must stay small is
+    ``total - free - reserved``, the FOREIGN part.
+    """
+
+    #: The measured values from the VAL-R4 refusal, in bytes.
+    _5090_TOTAL = 32 << 30
+    _5090_CARVE = 518 * (1 << 20)
+    _5090_FREE_IDLE = _5090_TOTAL - 521 * (1 << 20)
+
+    def _idle_cards(self):
+        """Both cards idle: nothing but each driver's own carve-out."""
+        return [
+            PF.CardObs(U1, "RTX 3080", 20 << 30,
+                       (20 << 30) - 425 * (1 << 20),
+                       reserved_bytes=425 * (1 << 20)),
+            PF.CardObs(U2, "RTX 5090", self._5090_TOTAL,
+                       self._5090_FREE_IDLE,
+                       reserved_bytes=self._5090_CARVE),
+        ]
+
+    def test_an_idle_machine_is_not_a_busy_card(self):
+        """THE fix test. Fails before the fix with REFUSE_CARD_BUSY on the
+        5090, at the shipped threshold of 512 -- exactly VAL-R4's refusal."""
+        c = cfg()  # card_busy_mib defaults to 512
+        names = [r.name for r in
+                 PF.run_all(c, probes(cards=self._idle_cards,
+                                      procs_on=lambda u: {}))]
+        # The whole list, not just the absence of CARD_BUSY: asserting only
+        # the absence would pass for the WRONG reason before the fix, because
+        # the unknown ``reserved_bytes`` argument raises inside the card
+        # probe and the census guard converts it into REFUSE_CARD_CENSUS --
+        # at which point "not busy" is trivially true. An idle machine must
+        # produce no refusal at all.
+        self.assertEqual(names, [])
+
+    def test_a_genuinely_occupied_card_still_refuses(self):
+        """The check must not be defanged: a real tenant is still foreign
+        occupancy even after its card's carve-out is discounted."""
+        c = cfg()
+        cards = self._idle_cards()
+        cards[1] = PF.CardObs(U2, "RTX 5090", self._5090_TOTAL,
+                              1 << 30, reserved_bytes=self._5090_CARVE)
+        r = [x for x in PF.run_all(c, probes(cards=lambda: cards,
+                                             procs_on=lambda u: {4242: 30 << 30}))
+             if x.name == RF.REFUSE_CARD_BUSY]
+        self.assertTrue(r, "a 30 GiB tenant must still refuse")
+        self.assertIn("4242", r[0].observed)
+
+    def test_the_refusal_separates_foreign_bytes_from_the_carve_out(self):
+        """A reader must be able to tell the two apart in the message. The
+        old text reported one number that silently contained both."""
+        c = cfg()
+        cards = self._idle_cards()
+        cards[1] = PF.CardObs(U2, "RTX 5090", self._5090_TOTAL,
+                              1 << 30, reserved_bytes=self._5090_CARVE)
+        r = [x for x in PF.run_all(c, probes(cards=lambda: cards,
+                                             procs_on=lambda u: {4242: 30 << 30}))
+             if x.name == RF.REFUSE_CARD_BUSY][0]
+        self.assertIn("carve-out", r.observed)
+        self.assertIn("518", r.observed)
+
+    def test_a_card_reporting_no_carve_out_behaves_as_before(self):
+        """``reserved_bytes`` defaults to 0, and NVML's own fallback path
+        returns 0 when it cannot read the v2 struct. An unknown carve-out
+        must not silently widen the threshold -- it degrades to the old,
+        conservative answer."""
+        c = cfg()
+        cards = [PF.CardObs(U1, "RTX 3080", 20 << 30, 20 << 30),
+                 PF.CardObs(U2, "RTX 5090", 32 << 30, (32 << 30) - (1 << 30))]
+        names = [r.name for r in PF.run_all(c, probes(cards=lambda: cards))]
+        self.assertIn(RF.REFUSE_CARD_BUSY, names)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -60,6 +60,25 @@ class CardObs:
     name: str
     total_bytes: int
     free_bytes: int
+    #: The NVML driver carve-out, as ``MemoryInfo.reserved_bytes``. It is
+    #: excluded from ``free`` and included in ``used``, so it must be
+    #: discounted before ``total - free`` can be read as FOREIGN occupancy.
+    #: Defaults to 0, which is also what ``registry/nvml.py`` returns when it
+    #: cannot read the v2 struct -- an unknown carve-out degrades to the old,
+    #: conservative answer rather than silently widening the threshold.
+    reserved_bytes: int = 0
+
+    def foreign_bytes(self) -> int:
+        """Occupancy that belongs to somebody else.
+
+        ``total - free`` is not that number: NVML keeps the driver's own
+        carve-out out of ``free`` and inside ``used``, so the subtraction
+        charges the driver's reservation to whatever tenant is being looked
+        for. On this rig that is ~425 MiB on a 3080 and ~518 on a 5090
+        (measured; see ``uneven_perf.py`` and ``TERM_NVML_CARVE_OUT``), which
+        is enough on its own to trip a 512 MiB threshold on an EMPTY card.
+        """
+        return max(0, self.total_bytes - self.free_bytes - self.reserved_bytes)
 
 
 @dataclasses.dataclass
@@ -104,7 +123,13 @@ def _real_cards() -> Sequence[CardObs]:
                            # driver carve-out is excluded from free and
                            # included in used, so the subtraction reads ~0
                            # and hides the shortfall.
-                           free_bytes=mem.free_bytes))
+                           free_bytes=mem.free_bytes,
+                           # ...and carry the carve-out itself, so the
+                           # occupancy check can subtract the term instead of
+                           # comparing against a constant guessed above it.
+                           # NVML already measures this; preflight used to be
+                           # the one consumer in the tree that dropped it.
+                           reserved_bytes=mem.reserved_bytes))
     return out
 
 
@@ -254,8 +279,16 @@ def check_cards(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
             used_uuids.add(cfg.cards[i].uuid)
     for uuid in sorted(used_uuids):
         card = by_uuid[uuid]
-        used_mib = (card.total_bytes - card.free_bytes) // MIB
-        if used_mib > cfg.preflight.card_busy_mib:
+        # FOREIGN occupancy, i.e. with the driver's own carve-out discounted.
+        # Reading `total - free` here charged the carve-out to the tenant
+        # being hunted, and refused an IDLE machine: the 5090 reports 521 MiB
+        # in use with zero compute pids, against a shipped threshold of 512,
+        # and the refusal's remedy ("stop the named pids") named none because
+        # there were none. `card_busy_mib` is an allowance for genuine
+        # foreign bytes; it was never meant to have to clear a hardware
+        # constant that differs per card.
+        foreign_mib = card.foreign_bytes() // MIB
+        if foreign_mib > cfg.preflight.card_busy_mib:
             try:
                 procs = p.procs_on(uuid)
             except Exception:
@@ -263,10 +296,12 @@ def check_cards(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
             who = ", ".join(f"pid {pid}={b // MIB}MiB"
                             for pid, b in sorted(procs.items())) or "no compute pids"
             spec = cfg.card_by_uuid(uuid)
+            carve_mib = card.reserved_bytes // MIB
             return refuse(
                 REFUSE_CARD_BUSY, (spec.label if spec else "") or uuid,
-                f"{used_mib} MiB in use ({who})",
-                f"<= {cfg.preflight.card_busy_mib} MiB",
+                f"{foreign_mib} MiB foreign ({who}); "
+                f"NVML driver carve-out {carve_mib} MiB already discounted",
+                f"<= {cfg.preflight.card_busy_mib} MiB foreign",
                 remedy="stop the named pids BY PID; never pkill -f, which "
                        "also matches the router")
     return None
