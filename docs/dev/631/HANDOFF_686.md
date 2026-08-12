@@ -10,15 +10,18 @@ first.
 
 ## 0. THE ONE-LINE STATE
 
-**The file park tier exists, registers with MEASURED metrics on a live boot,
-and the ladder now picks instead of hardcoding `tier_index=0`. What is NOT
-proven is a park/unpark round trip on metal: no load shape I could construct
-made kv-session-offload spill at all (2.9x pool oversubscription, a 10-way
-burst and the occupancy leg all finished with `kv_session_host_ram` used = 0),
-and the byte-identity METHOD I planned is independently invalid on this rig.**
+**The file park tier exists, registers with MEASURED metrics, the ladder picks
+instead of hardcoding `tier_index=0`, and the PARK/UNPARK ROUND TRIP IS PROVEN
+ON METAL: 16 PARK commits, 8 UNPARK commits, 0 failures, `identity_miss=0`,
+132 blobs written to and drained from the NVMe tier, with the selection policy
+firing live. #659 is still NOT closed, and the remaining gap is exactly one
+thing: no parked session COMPLETED its generation, because the instance died
+first on #224's PS2 born-spilled-deep path.**
 
-Serving is UP on 30030, ship config, restored from my own commit, health 200,
-confirmation window run and clean. Nobody owes a restore.
+Serving is UP on 30030, ship config, health 200, real generate verified.
+Nobody owes a restore. The confirmation window ran and **breached the corridor
+once** (§3) — not from this shift's code, which is proven inert on two
+independent channels.
 
 ---
 
@@ -119,7 +122,65 @@ the same verdict. Exercised offline against synthetic ledgers
 The text comparison survives only as a recorded OBSERVATION about model
 determinism; it is no longer the pass criterion.
 
-### 1d. NO LOAD SHAPE REACHED A SPILL, SO PARK/UNPARK ON METAL IS UNPROVEN
+### 1d-BIS. THE ROUND TRIP IS PROVEN — AND THE RUN THAT PROVED IT ENDED IN A CRASH
+
+Once the trigger was read out of the code rather than guessed at (§1d), the
+very first boot designed from it produced the proof. `probe_boot_v5.sh`
+(TP=2, `--enable-fast-lane`, `--kv-session-offload-prefill`, host tier capped
+to ONE region, spec OFF), driven by `force_spill.py`:
+
+| axis | measured |
+|---|---|
+| `SPILL(partial)` | 8 |
+| **`PARK start` / `PARK commit`** | **16 / 16** |
+| **`UNPARK start` / `UNPARK commit`** | **8 / 8** |
+| park failures / unpark failures | **0 / 0** |
+| **`identity_miss`** | **0** (the only occurrences in the log are `identity_miss=0`) |
+| blobs on the tier | **132 files, 13 MB**, `used:park:file` peaking at 10174464 B then draining as sessions returned |
+| selection policy | fired live: `kv-spill selection ARMED: park order file for an ask of 1073741824 B (measured ladder ...). Refused at this ask: none` |
+
+The unpark lines say it in the runtime's own words: `UNPARK commit rid=sat-5 ->
+region 0 (host-resident again; wave-back/restore unchanged from here)`.
+
+**Cut 1's falsifier also fired on metal, and it behaved exactly as designed.**
+With the host tier at `headroom=0.00 GB` and its bandwidth absent, the measured
+ladder ranked the park tier ABOVE local — and the code reported the
+disagreement instead of acting on it:
+
+> `the measured ladder ranks fs:CT999:/...park above the local host tier for 0
+> bytes, but #224's law makes the local pinned pool the only tier a device copy
+> can reach. One of the two is wrong about this machine ... The law stands;
+> this is a report, not a reorder.`
+
+That is the whole point of deriving the law rather than asserting it, observed
+live rather than argued.
+
+**WHAT IS STILL MISSING, AND IT IS ONE THING.** Every request in that run
+errored (`ok_sat=0 ok_fast=0`), because ~60 s after the parks the instance died:
+
+```
+kv-session-offload prefill-spill (PS2): admit rid=fast-3 BORN-SPILLED DEEP
+  (input=392 does NOT fit device budget=102) -- prefilled straight into a host
+  region, no device KV slots.
+kv-session-offload PREFILL-SPILL (PS2, born-spilled deep): rid=fast-3 L=3012
+  boundary=2620 host_tail=392 ... -- NO device KV slots allocated
+Scheduler hit an exception: torch.AcceleratorError: CUDA error: device-side assert
+```
+
+So the TIER is proven (bytes out, bytes back, identity intact) but the
+END-TO-END claim — a parked session resuming and finishing byte-identically —
+is not, because nothing finished. **PS2 born-spilled-deep is a #224 crash, not
+a #659 one**, and it is the second device-side assert this shift produced from
+the KV path (§1f); both belong to the #622/#649 lane with reproducers attached.
+
+**A gentler retry confirmed the pressure band is narrow.** `probe_boot_v6.sh`
+with SAT=3 / FAST_SHOTS=2 spilled (host tier full at 536903680 B, 2 partial
+spills) but **never parked**: a park needs a SECOND spill demand inside
+`PARK_PRESSURE_WINDOW_ITERS` (64), and the softer load never produced one. The
+band that parks without hitting PS2 is therefore thin, and finding it is the
+next shift's first job.
+
+### 1d. NO LOAD SHAPE REACHED A SPILL AT FIRST, AND THE REASON INVERTS THE INTUITION
 
 Three attempts against the probe, all with `max_total_tokens=16384` and a host
 tier deliberately capped to exactly ONE region (`effective max_spills reduced
@@ -286,9 +347,11 @@ never happened produced the same silence. Now:
 | **park tier REGISTERED on metal** | `fs:CT999:/spinning/evidence-631/s42/park (filesystem) capacity=21.47 GB [measured] bandwidth=2.41 / 7.00 GB/s [measured] latency=1.8 us volatility=persistent stages_through=host:CT999` — both ranks |
 | **measured capacity in the live ledger** | `sglang:spill_tier_total_bytes{spill_tier="park:file"} = 2.147483648e10` on 30040 — a denominator that did not exist before this shift |
 | **corridor, probe boot** | 3017 samples at 100 ms, per-card MINIMUM free **1309 / 32086 / 1309 MiB**, **0 breaches** of the 1024 floor |
-| park/unpark round trip on metal | **NOT PROVEN** — no spill was reachable (§1d) |
-| byte-identical restore from the park tier | **NOT PROVEN**, and the planned method is invalid (§1c) |
-| restored session back on CUDA graphs (item 13) | **NOT REACHED** — depends on a park happening |
+| **park/unpark round trip on metal** | **PROVEN** — 16/16 park, 8/8 unpark, 0 failures, `identity_miss=0`, 132 blobs (§1d-BIS) |
+| **selection policy live on metal** | **PROVEN** — `kv-spill selection ARMED: park order file ...` |
+| **cut 1's local-first falsifier on metal** | **FIRED and did not reorder**, as designed (§1d-BIS) |
+| parked session COMPLETING byte-identically | **NOT PROVEN** — all requests errored when the instance died on PS2 (§1d-BIS) |
+| restored session back on CUDA graphs WITH spec (item 13) | **NOT PROVEN** — spec was off in the proving boot, deliberately (`spec_in_tick` is itself a park-eligibility blocker) |
 
 ### The confirmation window (restored ship config) — IT BREACHED THE CORRIDOR
 
@@ -360,12 +423,19 @@ attributing anything to HEAD.
 
 ## 4. WHAT IS NOT DONE, STATED SO NOBODY READS IT AS DONE
 
-* **#659 IS NOT CLOSED.** Its (c) tier and (b)/(d) ledger halves landed and are
-  live; its metal proof did not. Marking it closed on the strength of a
-  registration line would be exactly the "green claim for a mechanism that
-  never ran" that §1c nearly produced.
-* **No park/unpark ever happened on metal.** See §1d for the three load shapes
-  that failed to trigger one and the hypothesis for the next attempt.
+* **#659 IS NOT CLOSED, and the blocker is one sentence:** no parked session
+  ever finished its generation, because the instance died on #224's PS2
+  born-spilled-deep path before any request completed (§1d-BIS). The tier, the
+  selection policy, the counters and the round trip itself ARE proven on metal.
+  What is missing is the end-to-end claim, and it is missing for a reason that
+  lives in someone else's code.
+* **The next shift's first job is the narrow pressure band**: harsh enough that
+  a second spill demand arrives within 64 iterations (so a park fires), gentle
+  enough that the device budget never collapses to ~100 tokens (so PS2 does not
+  fire). Both boots are in `evidence-631/s42/` — `probe_boot_v5.sh` parked and
+  crashed, `probe_boot_v6.sh` spilled and did not park; the answer is between
+  them. Then re-run with `--kv-session-offload-prefill` OFF if PS2 keeps
+  firing, accepting that the spill trigger gets harder without it.
 * **The phase-flip x kvso crossing is untested and, as written, unbootable**
   (§1a). Nothing in this shift says anything about that pair.
 * **The selection policy's multi-tier behaviour is desk-proven only.** Every

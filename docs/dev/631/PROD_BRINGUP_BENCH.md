@@ -4608,3 +4608,49 @@ clock is not a group-uniform mutation of replicated state.
 
 Serving was restored on the ship config at 22:59:08Z (health 200, steering
 unset, 0 steer lines) and left running.
+
+---
+
+## Successor 42 (2026-08-12): #659 second spill tier, and a corridor breach
+
+Two GPU windows. Between them the ship config was restored twice; serving was
+up on 30030 with health 200 and a verified generate at 01:52:33Z.
+
+### Window A — confirmation window on the restored ship config (30.9 min)
+
+| axis | N38 (reference) | s42 |
+|---|---|---|
+| requests | — | **103 ok / 0 err** |
+| occupancy legs | — | 2 legs, 3/3 ok each, peak **389324** concurrent prompt tokens (**62.8%** of the 620k pool) |
+| per-card MINIMUM free MiB | 1083 / 1580 / 1581 | **941** / 1870 / 1243 |
+| **corridor breaches vs 1024** | 0 / 0 / 0 | **12** / 0 / 0 |
+| phase flips | — | 5360 |
+| tracebacks / CUDA errors | — | 0 |
+
+The breach is a single 1.5 s excursion (t+982.1s..t+983.7s, gpu0 pinned at
+exactly 941 MiB, 0.089% of 13437 samples) under plain soak, NOT at the
+occupancy peak. It is not attributable to #659: every new code path is absent
+from the window's log while present in the control, and the ship config carries
+no destinations flag. Flagged for its own investigation.
+
+### Window B — #659 park round trip (probe port 30040, NOT the ship config)
+
+kv-session-offload refuses `pp_size>1`, so this ran on the Route-A DECODE
+layout (pure TP=2 on the matched 3080s), not on the flip recipe. See C25.
+
+| axis | measured |
+|---|---|
+| park tier registration | `capacity=21.47 GB [measured] bandwidth=3.43 / 4.84 GB/s [measured] latency=1.8 us volatility=persistent` |
+| SPILL(partial) | 8 |
+| **PARK start / commit** | **16 / 16** |
+| **UNPARK start / commit** | **8 / 8** |
+| park / unpark failures | 0 / 0 |
+| `identity_miss` | **0** |
+| blobs on tier | 132 files, 13 MB; `used:park:file` peak 10174464 B, then drained |
+| corridor (probe boot) | 3017 samples, min free 1309 / 32086 / 1309 MiB, **0 breaches** |
+| outcome | round trip PROVEN; instance then died on #224's PS2 born-spilled-deep path, so no request completed |
+
+Probe bandwidth is a SHORT-write upper bound (256 MiB probe; sustained on this
+volume is ~3.1 GB/s at 8 GiB). Two ranks probing the same directory at the same
+instant measured 2.41 vs 7.00 GB/s on an earlier boot — the measurement that
+forced ratio-based ordering (register law 15).
