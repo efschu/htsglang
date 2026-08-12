@@ -291,15 +291,72 @@ demonstrably reachable, demonstrably decisive, and the number it prevented
 (1016 MiB) is in the record next to the number it achieved (1024 MiB).
 `CORRIDOR LAW BROKEN` appears **0** times, which is the recogniser agreeing.
 
+**THE WINDOW, JUDGED AGAINST N38 (the brief's reference):**
+
+| axis | N38 (GREEN) | N42 (BREACH) | **N43 (this, fixed)** |
+|---|---|---|---|
+| corridor samples | 15235 | 14352 | **15671** |
+| per-card MIN free MiB | 1083 / 1580 / 1581 | **941** / 1870 / 1243 | **1141 / 1624 / 1241** |
+| **breaches vs 1024** | 0 / 0 / 0 | **12** / 0 / 0 | **0 / 0 / 0** |
+| gpu0 quiescent p50 | 2369 | **2313** | **2313** |
+| requests | — | 103 ok, 0 err | **104 ok, 0 err** |
+| occupancy legs | — | 2 legs 3/3, peak 389324 | 3/3, peak **389324** |
+| YaRN prompt tokens | 271237 | 271237 | **271237** (>262144) |
+| phase flips | — | 86 | **90** |
+| **seam entry YIELDS** | 1 | **3** | **3** |
+| tracebacks / CUDA errors | 0 | 0 | **0** |
+| deepest seam-census trough | — | **940** | **1024** |
+
+**Read the last three rows together, because that is the whole argument.**
+This window ran at the SAME quiescent baseline as the breaching one (p50 2313
+on gpu0, against N38's 2369 — the warm-cache level, §1a) and took the SAME
+number of seam-entry yields (3, against N38's 1). By the pre-fix mechanics
+those are the conditions that produced −84 MiB. It held at exactly the floor
+instead, and the log says which line did it.
+
+**THE PATCH LEVEL THE WINDOW RAN, STATED EXACTLY** (Patchstand vor Last). The
+serving instance reports `SGLANG_BOOT_COMMIT=18ff17ec6e`. That hash no longer
+exists: the first push was rejected by GitHub's email-privacy rule because
+three commits carried the wrong author address, and rewriting them to
+`efschu@users.noreply.github.com` renumbered them. **The content is
+byte-identical** — only the author header changed — and `18ff17ec6e` is now
+`7964f3c525`, whose tree is `c80521c6ef`. So the window ran exactly the code
+that is on the fork; the hash in the process environment is simply the
+pre-rewrite name for it. A successor comparing the two will find no diff, and
+should not spend a boot looking for one.
+
 ---
 
 ## 4. WHAT IS NOT DONE, STATED SO NOBODY READS IT AS DONE
 
-* **#659 IS NOT CLOSED.** The blocker is unchanged from HANDOFF_686: no parked
-  session has completed its generation, because the instance dies on #224's
-  PS2 born-spilled-deep path (C26). This shift prioritised the corridor breach
-  as the brief directed, and the window occupies all three cards, so the C26
-  probe boot could not run beside it.
+* **#659 IS NOT CLOSED. The blocker has MOVED but not gone.** C26's crash is
+  root-caused and fixed (§2b) with 9 pins and a can-fail proof, so the thing
+  that killed the instance will not kill it again. What is still missing is
+  the same single claim HANDOFF_686 named: **one parked session COMPLETING**,
+  byte-identically, with `parked_count > 0` on the rebuilt instrument.
+  That needs a probe boot, and a probe boot needs the two 3080s, which the
+  confirmation window held for its whole duration.
+
+  **This was a deliberate decision, not an overrun.** Running it would have
+  meant stopping the ship config with limited context left, and the failure
+  mode of running out mid-probe is serving DOWN — which is strictly worse than
+  an unclosed issue. The brief ranks the corridor first and says to protect
+  the ship config; both point the same way. The next shift inherits a fixed
+  crash, a known pressure band, and a ~20-minute job:
+
+  1. stop the ship config (capture `/proc/<pid>/cmdline`+`environ` first —
+     `/spinning/evidence-631/s43/boot_ship_30030.sh` is that capture, current);
+  2. boot `evidence-631/s42/probe_boot_v5.sh` **plus
+     `--chunked-prefill-size 256`** — that single knob makes the 392-token
+     tail chunk, which fails `prefill_spill_deep_ok`'s one-chunk condition, so
+     PS2 cannot be admitted while PS1, the fast-lane spill and the whole park
+     path are untouched (§2b);
+  3. drive `force_spill.py` with `SAT=4 FAST_SHOTS=3`, keep `HOSTGIB=1.5
+     MAXSPILLS=3` exactly as they are;
+  4. let the load subside so `unpark_decision` fires, and assert the round
+     trip through `proof_driver2.py` — whose verdict already hard-fails on
+     `parked_count == 0` (exit 3), so it cannot pass vacuously;
+  5. reboot the ship config and confirm health 200.
 * **The C27 fix is proven in the pins and on ONE window.** The close trigger
   written into the register is deliberately two-part: 0 breaches **and** the
   preemption demonstrably reachable. A green window in which the mechanism

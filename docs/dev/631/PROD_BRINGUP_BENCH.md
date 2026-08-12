@@ -4698,6 +4698,26 @@ asked for, because the only mechanism that could have asked was waiting for
 | CUDA graph capture | IDENTICAL — 3 sets, `bs=[1,2,3,4]`, 0.56/0.30/0.28 vs 0.57/0.32/0.32 GB |
 | pool 512552 vs 503950 | a WARM PAGE CACHE — weight load 11.11 s cold vs 2.35 s warm, ~0.1 GB more allocator high-water per rank; final decode pools identical |
 
+### The window, judged against N38
+
+| axis | N38 (GREEN) | N42 (BREACH) | N43 (fixed) |
+|---|---|---|---|
+| corridor samples | 15235 | 14352 | **15671** |
+| per-card MIN free MiB | 1083 / 1580 / 1581 | **941** / 1870 / 1243 | **1141 / 1624 / 1241** |
+| breaches vs 1024 | 0 / 0 / 0 | **12** / 0 / 0 | **0 / 0 / 0** |
+| gpu0 quiescent p50 | 2369 | 2313 | **2313** |
+| requests | - | 103 ok, 0 err | **104 ok, 0 err** |
+| occupancy peak prompt tokens | - | 389324 | **389324** (3/3 ok) |
+| YaRN prompt tokens | 271237 | 271237 | **271237** |
+| phase flips | - | 86 | **90** |
+| seam entry YIELDS | 1 | **3** | **3** |
+| tracebacks / CUDA errors | 0 | 0 | **0** |
+| deepest seam-census trough | - | **940** | **1024** |
+
+The last three rows are the argument: this window ran at the SAME quiescent
+baseline as the breaching one and took the SAME number of seam-entry yields,
+i.e. the exact conditions that produced -84 MiB, and held at the floor.
+
 ### Instrument note, worth carrying
 
 The 100 ms external sampler **understates depth**: it read PP0's floor as 2578
