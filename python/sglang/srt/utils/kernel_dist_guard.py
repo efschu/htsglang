@@ -120,9 +120,7 @@ INT8_ARM_SYMBOL = b"int8_scaled_mm"
 #: default so a caller can verify the *installed* dist against the documented
 #: wheel without re-typing the hash; ``--expect-sha256`` overrides it, and
 #: passing ``expect_sha256=None`` skips the comparison entirely.
-PINNED_WHEEL_SHA256 = (
-    "67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664"
-)
+PINNED_WHEEL_SHA256 = "67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664"
 
 #: Repair recipe, quoted in every loud failure so the reader never has to go
 #: looking for it. Mirrors "Making it durable" in runbook section 2.1.
@@ -585,8 +583,7 @@ def inspect_sgl_kernel(
             )
         elif expect_sha256 not in observed:
             report.sha256_mismatch = (
-                f"installed from sha256 {sorted(observed)}, pin expects "
-                f"{expect_sha256}"
+                f"installed from sha256 {sorted(observed)}, pin expects {expect_sha256}"
             )
 
     return report

@@ -52,6 +52,30 @@
 #
 # CUDA 13 dropped Maxwell/Pascal/Volta. sm_70 and below need a cu12 base image;
 # that is out of scope for this Dockerfile.
+#
+# ---------------------------------------------------------------------------
+# Two optional native paths this image deliberately does NOT carry
+# ---------------------------------------------------------------------------
+# Both are AUDIT-251 section 3.2 flags, closed here as decisions rather than
+# left to be discovered at boot. Neither is a defect: each is a build input
+# that cannot be vendored, and each refuses by name when its input is absent.
+#
+#   barlink BAR1 (peer-VRAM transport). Compiles against the open-kernel-module
+#   headers at barlink_bar1_ext.py NV_SOURCE_DEFAULT=/spinning/nvidia-open-595,
+#   overridable via SGLANG_BARLINK_BAR1_NV_SOURCE. It additionally needs a
+#   patched out-of-tree driver and /dev/dmabuf_holder on the host, so vendoring
+#   the headers alone would not make it work. DECISION: the image ships without
+#   it. Expected behaviour is the named refusal at barlink_bar1_ext.py:2098-2103
+#   ("... cannot be called. Set the path via SGLANG_BARLINK_BAR1_NV_SOURCE"),
+#   logged at INFO, and a fall back to the other barlink transports -- never a
+#   silent switch to NCCL. To enable it, mount the headers and set the env.
+#
+#   GDR crossover probe. planner/comm_suite.py _GDR_CROSSOVER_DEFAULT_BIN
+#   points at /spinning/gdr-uebergabe/gpurdma_04_bench, overridable via
+#   SGLANG_GDR_CROSSOVER_BIN. The binary is MIT but version-locked to the
+#   installed driver's ioctl layout, which is why it is never vendored.
+#   DECISION: the arm is expected ABSENT in the image. The suite must report it
+#   as absent; an absent probe reported as a zero would be a false measurement.
 # ---------------------------------------------------------------------------
 
 ARG CUDA_VERSION=13.0.1
@@ -292,7 +316,16 @@ RUN mkdir -p \
 # CHAT_TEMPLATE is deliberately NOT set here: the froggeric v21.3 template is
 # Qwen-specific, and a baked-in default would silently apply it to every model.
 # The compose files set it explicitly.
+# SGLANG_BARLINK_LAUNCH_DUMP=0 closes AUDIT-251 section 3.2's first flag. The
+# #603b launch sampler is ON by default and writes one line per live transport
+# per second, forever, to /spinning/wedge-catch-603b -- a rig directory that
+# does not exist in this image. The default stays ON in the tree deliberately
+# (the #631 wedge hunt is reading those files, and an audit branch is not where
+# another strand's instrument gets switched off), so the image is the correct
+# place to turn it off. Flip this to 1 only to debug a wedge INSIDE a
+# container, and give it a writable SGLANG_BARLINK_LAUNCH_DUMP_DIR if you do.
 ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}" \
+    SGLANG_BARLINK_LAUNCH_DUMP=0 \
     HICACHE_STORAGE_DIR=/var/lib/htsglang/hicache \
     TRITON_CACHE_DIR=/root/.triton \
     TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \

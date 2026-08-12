@@ -65,9 +65,7 @@ def _run(env_over):
     """Run the entrypoint with a stub python3; return the argv it would exec."""
     with tempfile.TemporaryDirectory() as tmp:
         stub = pathlib.Path(tmp) / "python3"
-        stub.write_text(
-            '#!/bin/bash\nprintf "ARGV:%s\\n" "$*"\nexit 0\n'
-        )
+        stub.write_text('#!/bin/bash\nprintf "ARGV:%s\\n" "$*"\nexit 0\n')
         stub.chmod(0o755)
         env = {
             "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
