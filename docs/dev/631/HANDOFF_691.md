@@ -120,11 +120,35 @@ costs the concurrency that reached the file tier at chunk 256. **The way
 through is a bigger pool** (raise `--max-total-tokens` well above 4096 so chunk
 4096 still admits several sessions), not a smaller host tier.
 
-**Also not closed:** the mechanism. Candidates, none tested: the fp8 KV round
-trip through host, the partial wave-back boundary, the born-spilled prefill
-path (`--kv-session-offload-prefill` was on), the radix cache being disabled
-under deterministic flashinfer. **Do not guess this one — it is now cheap to
-bisect, because the instrument works.**
+**THE MECHANISM IS NO LONGER UNKNOWN — localized from source the same shift and
+verified line by line (full detail in C31).** It is not the round trip:
+
+* **`kv_session_offload.py` has ZERO references to
+  `enable_deterministic_inference` / `fixed_split_size` / `split_tile`**
+  (`grep -c` = 0). The feature was never wired for determinism.
+* The resident path pins `fixed_split_size=self.decode_split_tile_size`
+  (`flashinfer_backend.py:1668`); the spill path's `w.plan(...)` calls
+  (`:3731`, `:3762`) pass it **not at all**, falling back to heuristic split-k.
+* A spilled session's attention is a **chain of partial decodes folded by
+  `_safe_merge_state` (`:3873`), a sequential non-associative LSE merge** — a
+  different reduction tree from the resident decode, on byte-identical KV.
+* **The fold's shape is chosen by a timing query**, which is why the three
+  spilled runs differ from EACH OTHER:
+  `copy_inflight = not self.backend._sess_wave_done.query()`
+  (`kv_session_offload.py:4983`), a CUDA event progress probe, plus the live
+  allocator free list (`:4918`). Neither depends on the token sequence.
+* The path never claimed bit-exactness: its own self-test passes at
+  `rel < 5e-2` (`:4282`).
+
+Ruled out from source: fp8 round trip (host pool inherits `store_dtype`=uint8,
+indexed byte memcpy), recompute (target never re-forwarded; draft backfill
+gated off at `spec=False`), mamba/GDN (never spilled).
+
+**So the honest framing is not "a bug in the spill path".** kv-session-offload
+and deterministic inference are **semantically incompatible as currently
+built** — the spill path's design IS a runtime-adaptive decomposition. Making
+them compose means pinning the boundary and the split-k, at an unpriced
+performance cost. That is a product decision, not a bug fix.
 
 ### 1c. THE #330 DIAL BRIEF CONTAINED TWO FALSE PREMISES
 
@@ -207,11 +231,18 @@ two-actuator race needs **TP>=2 per PP stage** + `--enable-phase-flip` +
 
 ## 4. WHAT THE NEXT SHIFT SHOULD DO, IN ORDER
 
-1. **Bisect C31's mechanism.** The instrument works now and the reproduction is
-   3-for-3. Cheapest cuts, in order: `--kv-session-offload-prefill` off (is it
-   the born-spilled path?); then a bf16 KV cache instead of fp8 (is it the
-   quantised round trip?); then compare a session that waved back FULLY against
-   one that finished on host (is it the partial boundary?).
+1. **CONFIRM C31's mechanism on metal — it is already localized, so this is a
+   confirmation, not a hunt.** No code changes needed, two existing knobs:
+   set `--kv-session-offload-wave-back-min-free-tokens` above the pool size to
+   freeze the boundary at 0 for the whole episode. If the spilled outputs
+   become identical **to each other** while still differing from the reference,
+   the timing-gated boundary is confirmed as the run-to-run variable; if they
+   still all differ, the unpinned split-k is also live. Then raise
+   `--kv-session-offload-block-size` above the context so the merge chain
+   collapses to a single partial. Free extra signal with no generation at all:
+   boot once with `KVSO_ATTN_SELFTEST=1` — `_sess_attn_selftest`
+   (`flashinfer_backend.py:4123`) already prints per-block-count twin-vs-
+   monolithic deltas on byte-identical KV.
 2. **Run `park_complete_proof3.py` live** (§1b). Its scanner and verdict paths
    are validated by replay against the recorded log, but it has not driven a
    live server yet, so the live path is the one thing still unexecuted.
@@ -219,5 +250,10 @@ two-actuator race needs **TP>=2 per PP stage** + `--enable-phase-flip` +
    still admits several concurrent sessions.
 4. **C32's min-reduce risk**: check whether admission can run against the stale
    ceiling during the shrink gap.
-5. `used:park:file` gauge reading 0 against files on disk — still open, still
-   untouched, now three shifts old.
+5. `used:park:file` gauge reading 0 against files on disk — still open, but
+   with one new data point from this shift that narrows it: my runs produced
+   **0 park files AND gauge 0, i.e. they AGREED**. The gauge is therefore not
+   unconditionally broken; the disagreement s45 saw (33 files, gauge 0) needs
+   the file tier to actually engage. Whoever picks this up should reproduce
+   with a run that reaches the file tier (see the pool-size note in 1b) rather
+   than re-deriving it from s45's log.

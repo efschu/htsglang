@@ -682,10 +682,71 @@ matches it") where v2 returned exit 3 ("nothing parked, no claim can be
 made"). The driver reaches C31's conclusion on its own once the arms are
 right. The live path is still unexecuted.
 
-**Not yet known, and not to be guessed:** whether the divergence is the fp8
-KV round trip through host, the partial wave-back boundary, the born-spilled
-prefill path (`--kv-session-offload-prefill` was on), or the loss of the radix
-cache under deterministic flashinfer. The FILE-tier park arm is separately
+**THE MECHANISM, localized from source and verified line by line (successor 47,
+same shift).** It is not the round trip. It is that **`--enable-deterministic-
+inference` never reaches the spill path at all**, and that a spilled session
+does not run the same attention as a resident one.
+
+* **`kv_session_offload.py` contains ZERO references to
+  `enable_deterministic_inference`, `fixed_split_size` or `split_tile`**
+  (verified: `grep -c` returns 0). Its five "deterministic" mentions are about
+  cross-rank agreement, an unrelated property. **The feature was never wired
+  for determinism.**
+* **The resident path pins the split tile and the spill path drops it.**
+  Resident decode passes `fixed_split_size=self.decode_split_tile_size`
+  (`flashinfer_backend.py:1668`); the spill path's `w.plan(...)` calls
+  (`_sess_plan_block:3731`, `_sess_plan_dev_head:3762`) pass neither
+  `fixed_split_size` nor `disable_split_kv` — 0 occurrences in `:3720-3790` —
+  so each partial falls back to flashinfer's occupancy heuristic split-k,
+  which is exactly what the determinism flag exists to pin.
+* **A spilled session's attention is a CHAIN of partial decodes merged in
+  software.** `_sess_blockwise_decode_return_lse` (`:3776`) runs one partial
+  over the device head plus one per streamed host block and folds them with
+  `o_acc, lse_acc = _safe_merge_state(o_acc, lse_acc, o_b, lse_b)` (`:3873`) —
+  a **sequential left-fold LSE merge, non-associative in floating point**. A
+  different reduction tree from the resident monolithic decode, on
+  byte-identical KV.
+* **The fold's shape is chosen by a TIMING QUERY, which is what makes the
+  three spilled runs differ from EACH OTHER.** The wave-back boundary sets
+  both the device-head size and the block count
+  (`flashinfer_backend.py:3505,3529`), and it advances only when
+  `WaveBackController.plan` allows, whose input is
+  `copy_inflight = not self.backend._sess_wave_done.query()`
+  (`kv_session_offload.py:4983`) — a **CUDA event progress probe** — plus the
+  live allocator free list (`:4918`). Neither is a function of the token
+  sequence. PCIe contention and host jitter therefore change the partition,
+  the fold order, and the rounding, run to run.
+* **The path was never claimed to be bit-exact.** Its own self-test passes at
+  `ok = (not nan) and rel < 5e-2` (`:4282`), and the source says so directly
+  (`:4140-4142`): *"the ONLY gap T-vs-R is bounded blockwise fp
+  reassociation (decode-class)"*. Bounded reassociation is precisely what
+  byte-identity forbids.
+
+**Ruled out from source, so nobody re-treads them:** the fp8 round trip (the
+host pool inherits `store_dtype`, `uint8` for fp8, and the movers are indexed
+byte memcpy — `pool_host/base.py:136`, `memory_pool.py:2012`); recompute (the
+target is never re-forwarded, and the draft backfill is gated off at
+`spec=False`); and mamba/GDN state (never spilled — the "+ mamba" in the
+release line is the finish path freeing a slot).
+
+**Cheapest confirming experiment, no code changes**, both existing CLI knobs:
+set `--kv-session-offload-wave-back-min-free-tokens` above the pool size to
+freeze the boundary at 0 for the whole episode. If the spilled outputs become
+identical **to each other** while still differing from the reference, the
+timing-gated boundary is confirmed as the run-to-run variable and the residual
+delta is the blockwise decomposition. If they still all differ, the unpinned
+split-k is also live. Then additionally raise
+`--kv-session-offload-block-size` above the context so the chain collapses to
+one partial with no merge.
+
+**What this means for the feature, stated plainly:** kv-session-offload and
+deterministic inference are not merely unwired — they are **semantically
+incompatible as currently built**, because the spill path's whole design is a
+runtime-adaptive decomposition. Making them compose is not a flag fix; it
+requires pinning the boundary and the split-k, at a performance cost nobody
+has priced. Whether that is worth doing is a product decision, not a bug fix.
+
+The FILE-tier park arm is separately
 unproven — the host tier is sized to hold **one** full-context region (proved
 by the refusal at `--kv-session-offload-host-ram-gib 0.12`: *"cannot hold even
 ONE full-context session ... 3933 tokens < 32770"*), so a single spill fills
