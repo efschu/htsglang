@@ -16,6 +16,13 @@
 # So: this script leaves the machine able to run the stack, and unchanged in
 # what it is currently running.
 #
+# THE UNITS ARE RENDERED, NOT COPIED. Until 2026-08-12 this script copied
+# them byte for byte, so five units carried a literal /spinning/htsglang-gpu
+# for PYTHONPATH and for the interpreter no matter what [stack].repo said. On
+# this rig that checkout predated the turnkey merge and every unit died with
+# "No module named sglang.srt.turnkey". [stack].repo now decides, which is
+# what it always claimed to do.
+#
 # Usage:
 #   scripts/turnkey_539_install.sh                 # dry-run, prints a diff
 #   scripts/turnkey_539_install.sh --apply         # write unit files
@@ -23,11 +30,10 @@
 #
 set -uo pipefail
 
-REPO="${REPO:-/spinning/htsglang-gpu}"
-SRC="${SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy/turnkey}"
+CHECKOUT="${CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SRC="${SRC:-$CHECKOUT/deploy/turnkey}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 CONF_DIR="${CONF_DIR:-/etc/htsglang}"
-LOG_DIR="${LOG_DIR:-/var/log/htsglang}"
 
 APPLY=0
 CONFIG_TOO=0
@@ -52,13 +58,52 @@ say() { printf '%s\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
 
 [ "$APPLY" = 1 ] || say "== DRY RUN == (pass --apply to write; nothing is enabled either way)"
-say "source:  $SRC"
+
+# --- render the units from the config that will run them --------------------
+# WHICH CONFIG: the installed one if it exists, because that is what the units
+# will read at runtime; otherwise the shipped template, because a first
+# install has nothing else. Printed either way -- this file decides every path
+# in every unit, and picking it silently is the defect one level up.
+dstconf="$CONF_DIR/stack.toml"
+seed="$SRC/stack.rig3.toml"
+if [ -n "${CONFIG:-}" ]; then
+    RENDER_FROM="$CONFIG"
+elif [ -f "$dstconf" ]; then
+    RENDER_FROM="$dstconf"
+else
+    RENDER_FROM="$seed"
+fi
+PY="${PY:-$CHECKOUT/.venv/bin/python}"
+[ -x "$PY" ] || PY="$(command -v python3)"
+RENDERED="$(mktemp -d)"
+trap 'rm -rf "$RENDERED"' EXIT
+say "render from: $RENDER_FROM"
+if ! PYTHONPATH="$CHECKOUT/python:${PYTHONPATH:-}" "$PY" \
+        "$CHECKOUT/scripts/turnkey_539_render_units.py" \
+        --config "$RENDER_FROM" --src "$SRC" --dst "$RENDERED" \
+        --config-path "$dstconf"; then
+    say "REFUSED: could not render the units from $RENDER_FROM"
+    say "  Nothing was written. Fix [stack].repo/.venv/.log_dir and re-run."
+    exit 1
+fi
+# LOG_DIR follows the config too, so the directory this script creates is the
+# one the rendered units write into.
+LOG_DIR="${LOG_DIR:-$(PYTHONPATH="$CHECKOUT/python:${PYTHONPATH:-}" "$PY" -c '
+import sys
+from sglang.srt.turnkey import config as C
+print(C.load(sys.argv[1]).log_dir)' "$RENDER_FROM")}"
+REPO="${REPO:-$(PYTHONPATH="$CHECKOUT/python:${PYTHONPATH:-}" "$PY" -c '
+import sys
+from sglang.srt.turnkey import config as C
+print(C.load(sys.argv[1]).repo)' "$RENDER_FROM")}"
+
+say "source:  $SRC (rendered)"
 say "target:  $UNIT_DIR"
 say ""
 
 rc=0
 for f in "${UNITS[@]}"; do
-    src="$SRC/$f"
+    src="$RENDERED/$f"
     dst="$UNIT_DIR/$f"
     if [ ! -f "$src" ]; then
         say "MISSING SOURCE $src"; rc=1; continue
@@ -93,9 +138,8 @@ done
 # The stack config is DATA, not a unit, and it encodes the ship parity. It is
 # seeded once and never overwritten: silently replacing an operator's tuned
 # config during a routine unit update is exactly the class of surprise this
-# feature exists to remove.
-seed="$SRC/stack.rig3.toml"
-dstconf="$CONF_DIR/stack.toml"
+# feature exists to remove. ($seed and $dstconf are set above, where they also
+# decide which config the units are rendered from.)
 say ""
 if [ -f "$dstconf" ]; then
     say "config exists, NOT overwritten: $dstconf"
@@ -113,16 +157,26 @@ fi
 
 if [ "$APPLY" = 1 ]; then
     say ""
-    say "systemctl daemon-reload"
-    systemctl daemon-reload || rc=1
+    if [ "$UNIT_DIR" = "/etc/systemd/system" ]; then
+        say "systemctl daemon-reload"
+        systemctl daemon-reload || rc=1
+    else
+        # Reloading systemd after writing units somewhere systemd does not
+        # read is a no-op that touches the live manager for nothing. This is
+        # also what lets the rendering be exercised end to end in a test.
+        say "UNIT_DIR is $UNIT_DIR, not /etc/systemd/system: no daemon-reload"
+    fi
 fi
 
 # Verify the unit files parse. systemd-analyze verify resolves the units by
 # name once installed; before that it can still check the source files.
+# It runs on the RENDERED units: a template full of @@REPO@@ would be checked
+# for a syntax nobody installs, and would report an absolute-path error for
+# every ExecStart.
 say ""
 say "== systemd-analyze verify =="
 for f in "${UNITS[@]}"; do
-    out=$(systemd-analyze verify "$SRC/$f" 2>&1)
+    out=$(systemd-analyze verify "$RENDERED/$f" 2>&1)
     if [ -n "$out" ]; then
         # Missing-dependency notes are expected for a template's %i instances
         # and for units not yet installed; print them rather than judging.

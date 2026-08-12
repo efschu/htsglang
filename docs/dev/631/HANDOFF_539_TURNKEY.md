@@ -202,9 +202,30 @@ lane); neither can do the other's job.
 | `python/sglang/srt/turnkey/__main__.py` | CLI: preflight/boot/watch/probe/plan-pin/orphans |
 | `deploy/turnkey/*.service`, `.target` | 5 units |
 | `deploy/turnkey/stack.rig3.toml` | GENERATED from the ship capture |
-| `scripts/turnkey_539_install.sh` | idempotent installer, dry-run default |
+| `scripts/turnkey_539_install.sh` | idempotent installer, dry-run default; RENDERS the units |
+| `scripts/turnkey_539_render_units.py` | `@@REPO@@`/`@@VENV@@`/`@@LOG_DIR@@`/`@@CONFIG@@` ← `[stack]` |
 | `scripts/turnkey_539_config_from_capture.py` | config generator |
 | `scripts/turnkey_539_parity_proof.py` | the parity acceptance test |
+| `scripts/turnkey_539_export_env.py` | capture → sourceable shell, and the `--check` gate |
+| `deploy/turnkey/ship_env.capture` | the captured ship env, source of truth for the boot |
+
+### 4b. The units are RENDERED, not copied (2026-08-12)
+
+Until 2026-08-12 all five units carried a literal `/spinning/htsglang-gpu` for
+PYTHONPATH and for the interpreter, and the installer copied them byte for
+byte. On this rig that checkout predated the turnkey merge, so every unit died
+with `No module named sglang.srt.turnkey` and the serving unit died on the
+dependency — while `[stack].repo` read as the single source of truth for
+exactly that path.
+
+The units now carry placeholders and the installer renders them from
+`[stack]`. Two consequences worth knowing:
+
+* the installer renders from `/etc/htsglang/stack.toml` when it exists and
+  from the shipped template otherwise, and prints which one it used;
+* **changing `[stack].repo`, `.venv` or `.log_dir` means re-running the
+  installer.** The rendered units under `/etc` are a snapshot; editing them
+  in place is overwritten by the next install.
 
 ---
 

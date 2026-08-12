@@ -1,3 +1,12 @@
+# PATHS HERE ARE RENDERED, NOT LITERAL. @@REPO@@, @@VENV@@,
+# @@LOG_DIR@@ and @@CONFIG@@ are substituted from [stack] by
+# scripts/turnkey_539_render_units.py when the installer writes this
+# unit. They were literal /spinning/htsglang-gpu paths until
+# 2026-08-12, when every unit died with 'No module named
+# sglang.srt.turnkey' because that checkout was not the one
+# [stack].repo named. Change stack.toml, or this template -- never
+# the rendered copy under /etc, which the next install overwrites.
+
 # One serving lane. %i is the lane name in /etc/htsglang/stack.toml
 # (`htsglang-serving@ship.service` serves the [serving.ship] lane).
 #
@@ -28,8 +37,8 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
-Environment=PYTHONPATH=/spinning/htsglang-gpu/python
-ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.srt.turnkey --config /etc/htsglang/stack.toml boot %i
+Environment=PYTHONPATH=@@REPO@@/python
+ExecStart=@@VENV@@/bin/python -m sglang.srt.turnkey --config @@CONFIG@@ boot %i
 
 # A cold JIT cache legitimately makes the first boot minutes long (#172/#615).
 # TimeoutStartSec must not be shorter than the lane's ready_timeout_s, or

@@ -1,3 +1,12 @@
+# PATHS HERE ARE RENDERED, NOT LITERAL. @@REPO@@, @@VENV@@,
+# @@LOG_DIR@@ and @@CONFIG@@ are substituted from [stack] by
+# scripts/turnkey_539_render_units.py when the installer writes this
+# unit. They were literal /spinning/htsglang-gpu paths until
+# 2026-08-12, when every unit died with 'No module named
+# sglang.srt.turnkey' because that checkout was not the one
+# [stack].repo named. Change stack.toml, or this template -- never
+# the rendered copy under /etc, which the next install overwrites.
+
 # Every named check, once, before anything touches a card.
 #
 # RemainAfterExit=yes makes the successful run a LATCH: the serving units
@@ -13,9 +22,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-Environment=PYTHONPATH=/spinning/htsglang-gpu/python
-ExecStartPre=/usr/bin/mkdir -p /var/log/htsglang
-ExecStart=/spinning/htsglang-gpu/.venv/bin/python -m sglang.srt.turnkey --config /etc/htsglang/stack.toml preflight
+Environment=PYTHONPATH=@@REPO@@/python
+ExecStartPre=/usr/bin/mkdir -p @@LOG_DIR@@
+ExecStart=@@VENV@@/bin/python -m sglang.srt.turnkey --config @@CONFIG@@ preflight
 StandardOutput=journal
 StandardError=journal
 

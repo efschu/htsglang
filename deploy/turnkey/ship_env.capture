@@ -1,0 +1,45 @@
+# THE SHIP ENVIRONMENT, CAPTURED FROM THE LIVE PROCESS. SOURCE OF TRUTH.
+#
+# Taken byte-for-byte from /spinning/evidence-631/val-r4/ship_env_captured.txt
+# (captured 2026-08-12 15:07 from the running ship process on port 30030).
+# It lives in the repo so a boot does not depend on an evidence directory an
+# agent may clean up, and so a change to what production carries arrives as a
+# reviewable diff instead of an edit to somebody's shell script.
+#
+# Read with scripts/turnkey_539_export_env.py. Do NOT hand-edit to make a boot
+# pass: the whole point of this file is that the boot follows it, not the
+# other way round. A new recipe means a NEW CAPTURE from a process that was
+# observed to serve.
+#
+# The four per-boot keys (PYTHONPATH, CUDA_VISIBLE_DEVICES,
+# SGLANG_PHASE_FLIP_INSTANCE, SGLANG_BOOT_COMMIT) are kept here as captured
+# but are never exported or compared; see PER_BOOT_KEYS in the tool.
+CUDA_VISIBLE_DEVICES=GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d,GPU-5c648f96-be1d-42d5-0221-34d11ab137f7,GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4
+LD_LIBRARY_PATH=:/usr/local/cuda-12.2/lib64
+PYTHONPATH=/spinning/wt-merge-r4/python
+SGLANG_BARLINK=1
+SGLANG_BARLINK_BAR1_CAP_CYCLES=300000000000
+SGLANG_BARLINK_BAR1_WINDOW_MIB=24
+SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0=32
+SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0=48
+SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0=96
+SGLANG_BARLINK_TRANSPORT=bar1
+SGLANG_BOOT_COMMIT=75c86bf255
+SGLANG_COLLECTIVE_CENSUS_INTERVAL=50
+SGLANG_CORRIDOR_FLOOR_MIB=1536
+SGLANG_CORRIDOR_REBALANCE=0
+SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+SGLANG_FLIP_SEAM_CHUNK_MIB=8
+SGLANG_KV_BACKING_RELIEF=1
+SGLANG_MAMBA_PIN_TRACE=50
+SGLANG_MAMBA_SSM_DTYPE=bfloat16
+SGLANG_PHASE_FLIP_INSTANCE=1786515732-3940356
+SGLANG_PHASE_POLICY_MIN_DWELL_S=3
+SGLANG_PHASE_POLICY_PP_WINDOW_S=15
+SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S=10
+SGLANG_SEAM_ENTRY_DELAY_BUDGET=2
+SGLANG_SEAM_ENTRY_MARGIN_MIB=512
+SGLANG_UNEVEN_DCP=1
+SGLANG_UNEVEN_DCP_WEIGHTED=1
+SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8
+SGLANG_VRAM_FLIGHT_DIR=/spinning/flight_605

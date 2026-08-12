@@ -1,3 +1,12 @@
+# PATHS HERE ARE RENDERED, NOT LITERAL. @@REPO@@, @@VENV@@,
+# @@LOG_DIR@@ and @@CONFIG@@ are substituted from [stack] by
+# scripts/turnkey_539_render_units.py when the installer writes this
+# unit. They were literal /spinning/htsglang-gpu paths until
+# 2026-08-12, when every unit died with 'No module named
+# sglang.srt.turnkey' because that checkout was not the one
+# [stack].repo named. Change stack.toml, or this template -- never
+# the rendered copy under /etc, which the next install overwrites.
+
 # The one thing an operator enables. `systemctl enable --now htsglang.target`
 # brings the whole stack up, and a host reboot repeats that with no human in
 # the loop -- which is the entire point of #539.
@@ -12,7 +21,7 @@
 
 [Unit]
 Description=htsglang full stack (#539 turnkey autoboot)
-Documentation=file:/spinning/htsglang-gpu/docs/dev/631/HANDOFF_539_TURNKEY.md
+Documentation=file:@@REPO@@/docs/dev/631/HANDOFF_539_TURNKEY.md
 Wants=htsglang-preflight.service
 Wants=htsglang-planner.service
 Wants=htsglang-serving@ship.service
