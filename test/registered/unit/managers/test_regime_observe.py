@@ -1007,9 +1007,24 @@ class TestSchedulerHookContract(CustomTestCase):
 
     def test_the_hook_passes_only_replicated_state_plus_the_named_rank_local(self):
         """Every keyword the scheduler hands the observer is tier-R except
-        ``rank_forward_ms``, which is the one input the observer is allowed to
-        treat as rank-local. A new keyword here needs a tier decision, and
-        this test is where that decision gets made deliberately."""
+        the named rank-local ones. A new keyword here needs a tier decision,
+        and this test is where that decision gets made deliberately.
+
+        UPDATED DELIBERATELY (#363 intra-phase axis). Two keywords joined the
+        list: ``rank_compute_ms`` and ``rank_wait_ms``. The tier decision is
+        that both are TIER-L, exactly like ``rank_forward_ms`` -- they are the
+        same retired forward's device time, split into the two terms, and they
+        are subject to the same discipline: accumulated rank-locally, never
+        branched on locally, and released only through a MIN reduction
+        (``regime_ms_clock.pack_ms_sample``). The ms clock that consumes them
+        is fed the GROUP statistic, never this rank's own, which is why adding
+        a rank-local input here does not add a rank-local decision.
+
+        Why a split rather than reusing the existing total: the stage axes the
+        intra-phase controller moves (#297 KV vector, #330 budget) change how
+        work is DIVIDED, not how fast a GEMM runs, so the wait term is the
+        only part of the round they can be credited against. A total would
+        hide it."""
         import ast
         import pathlib
 
@@ -1038,6 +1053,9 @@ class TestSchedulerHookContract(CustomTestCase):
                 "queued_prompt_tokens",
                 "max_queued_prompt_tokens",
                 "rank_forward_ms",
+                # Tier-L, #363 intra-phase. See the docstring above.
+                "rank_compute_ms",
+                "rank_wait_ms",
             },
         )
         self.assertEqual(calls[0].args, [], "the hook must be keyword-only")

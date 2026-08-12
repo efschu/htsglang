@@ -5310,6 +5310,34 @@ class ServerArgs:
             "--regime-controller act.",
         ),
     ] = None
+    regime_stage_clock: A[
+        bool,
+        Arg(
+            help="INTRA-PHASE axis of the #363 controller: let measured "
+            "ms/round decide WHICH planner-solved stage to hold, and route "
+            "every stage flip through the corridor guard's admission. Off "
+            "(default) leaves the controller deciding from the regime LABEL "
+            "alone, exactly as today -- byte-identical, one 'is None' compare "
+            "per consensus boundary. On, two things change. (1) The decision: "
+            "the group-reduced compute/wait split (slowest rank sets the "
+            "round, least-waiting rank sets the addressable term -- both "
+            "conservative) is compared against the stage table's measured "
+            "gains, and a flip needs the challenger over its enter watermark "
+            "AND over the combined A-vs-A band of the two stages, sustained, "
+            "while the incumbent fails to hold across a deliberately longer "
+            "window. An UNMEASURED (planner-solved) stage is never proposed "
+            "on this axis: its placeholder zeros are not a measured gain of "
+            "zero. (2) The admission: a stage flip is priced as residency "
+            "delta plus the TARGET stage's transient UNDER THE CURRENT LOAD "
+            "STATE and put to the corridor guard, group-unanimous or nothing "
+            "moves. Without a transient census for the target stage the flip "
+            "is REFUSED rather than priced at zero -- an unpriced term reads "
+            "as free memory, and the #330 dial's grow path checks only its "
+            "own floor and the VA ceiling, so this is the only thing standing "
+            "between an autonomous budget growth and the corridor law. "
+            "Requires --regime-controller act to have any effect.",
+        ),
+    ] = False
     kv_reshard_vectors: A[
         Optional[str],
         Arg(

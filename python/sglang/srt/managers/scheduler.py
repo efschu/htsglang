@@ -4749,6 +4749,7 @@ class Scheduler(
                 from sglang.srt.managers.regime_runtime import (
                     phase_of_last_batch,
                     rank_forward_ms_from,
+                    rank_split_ms_from,
                 )
 
                 # THREE-way (prefill / decode / idle), read off LAST_BATCH --
@@ -4772,6 +4773,9 @@ class Scheduler(
                 # timing on one record describe one event. The attribution
                 # rules, including why one boundary of lag does not move a
                 # share, are in phase_of_last_batch.
+                # One read, two terms: calling the accessor twice would ask
+                # the same retired forward for its split twice.
+                rank_split = rank_split_ms_from(self)
                 self.regime_observer.on_round(
                     phase=phase_of_last_batch(last_batch),
                     held_tokens=sum(req.seqlen for req in running_batch.reqs),
@@ -4786,6 +4790,17 @@ class Scheduler(
                         default=0,
                     ),
                     rank_forward_ms=rank_forward_ms_from(self),
+                    # #363 intra-phase axis. The SAME retired forward, split
+                    # into its two terms: the stage axes move the wait term
+                    # and not the compute term, so a total would hide the only
+                    # part of the round they can be credited against. Both are
+                    # None on a graph-covered forward, and the observer's
+                    # packed sentinel carries that absence through the group
+                    # reduction rather than letting a blind rank read as fast.
+                    # Accumulated unconditionally and read only by the
+                    # flag-gated clock, so an off boot pays two float adds.
+                    rank_compute_ms=rank_split[0],
+                    rank_wait_ms=rank_split[1],
                 )
 
         # #631 PARKING: an ARMED flip withholds all new work -- no prefill

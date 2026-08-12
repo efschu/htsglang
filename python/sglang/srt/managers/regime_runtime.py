@@ -180,6 +180,8 @@ class RegimeObserver:
         table_plan=None,
         commit_fn: Optional[Callable] = None,
         dwell: Optional[DwellGate] = None,
+        stage_clock=None,
+        admission=None,
     ):
         if consensus_interval < 1:
             raise ValueError(
@@ -231,6 +233,17 @@ class RegimeObserver:
         self._table_plan = table_plan
         self._commit_fn = commit_fn
         self._dwell = dwell
+        # #363 INTRA-PHASE AXIS. Both are None on every boot that did not pass
+        # --regime-stage-clock, and every line below that touches them is
+        # guarded by that None, so the default path is byte-identical.
+        #
+        # The clock is fed the GROUP-REDUCED split, never this rank's own (see
+        # regime_ms_clock.pack_ms_sample): its inputs are then replicated, so
+        # its verdict is uniform by construction and does not need a second
+        # agreement check bolted onto the existing one.
+        self._stage_clock = stage_clock
+        self._admission = admission
+        self.stage_clock_proposals = 0
         self.actuations = 0
         self.vetoes: Dict[str, int] = {}
 
@@ -245,6 +258,11 @@ class RegimeObserver:
         # object only inside the packed payload.
         self._rank_ms_sum = 0.0
         self._rank_ms_n = 0
+        # #363 intra-phase: the same discipline for the SPLIT. Accumulated
+        # rank-locally, released only through the ms reduction.
+        self._ms_compute_sum = 0.0
+        self._ms_wait_sum = 0.0
+        self._ms_split_n = 0
         # Carried forward from the previous boundary's reduction (see the
         # one-boundary lag in the module docstring).
         self._last_spread_pct: Optional[float] = None
@@ -306,6 +324,8 @@ class RegimeObserver:
         queued_prompt_tokens: int = 0,
         max_queued_prompt_tokens: int = 0,
         rank_forward_ms: Optional[float] = None,
+        rank_compute_ms: Optional[float] = None,
+        rank_wait_ms: Optional[float] = None,
     ) -> Optional[Dict]:
         """One between-tick boundary.
 
@@ -340,6 +360,10 @@ class RegimeObserver:
         if rank_forward_ms is not None:
             self._rank_ms_sum += float(rank_forward_ms)
             self._rank_ms_n += 1
+        if rank_compute_ms is not None and rank_wait_ms is not None:
+            self._ms_compute_sum += float(rank_compute_ms)
+            self._ms_wait_sum += float(rank_wait_ms)
+            self._ms_split_n += 1
 
         # Rule 2: the cadence gate is the REPLICATED round counter. Every rank
         # passes or skips this line in the same round, so the collective below
@@ -371,6 +395,28 @@ class RegimeObserver:
 
         mean_ms = (self._rank_ms_sum / self._rank_ms_n) if self._rank_ms_n else None
         reduced = self._consensus(regime, stage_index, mean_ms)
+
+        # #363 INTRA-PHASE AXIS. Runs only when --regime-stage-clock wired a
+        # clock; on every other boot this block is one `is None` compare and
+        # the collective below is never entered. It runs AFTER the existing
+        # consensus so the order of collectives at a boundary is fixed.
+        ms_decision = None
+        if self._stage_clock is not None:
+            ms_decision = self._intra_phase_decide(target)
+            if ms_decision is not None and ms_decision.wants_flip:
+                self.stage_clock_proposals += 1
+                # The clock only ever names a stage it was handed, so a miss
+                # here is a bug rather than a state -- but it must not take
+                # the scheduler loop down with it.
+                proposed = (
+                    self._table[ms_decision.target]
+                    if ms_decision.target in self._table_names()
+                    else None
+                )
+                if proposed is not None:
+                    target = proposed
+                    stage_index = self._stage_index(target)
+                    why = ms_decision.reason
 
         self._verdicts += 1
         if target is not None:
@@ -406,6 +452,9 @@ class RegimeObserver:
                 reduced.get("rank_ms_spread_pct") if reduced else None
             ),
             "agreed": bool(reduced["agreed"]) if reduced else None,
+            # #363 intra-phase: None on every boot without --regime-stage-clock,
+            # so a trace from the default path is byte-identical in shape.
+            "ms_decision": ms_decision.as_dict() if ms_decision is not None else None,
             "actuated": False,
             "action": None,
         }
@@ -426,6 +475,10 @@ class RegimeObserver:
                     self._current_stage = target.name
                     if self._dwell is not None:
                         self._dwell.record_flip(self._round)
+                    if self._stage_clock is not None:
+                        # Samples taken under the OLD stage must not judge the
+                        # new one.
+                        self._stage_clock.note_flip()
                 else:
                     self._count_veto("actuator refused")
         self._last_record = record
@@ -437,8 +490,69 @@ class RegimeObserver:
         self._idle_rounds = 0
         self._rank_ms_sum = 0.0
         self._rank_ms_n = 0
+        self._ms_compute_sum = 0.0
+        self._ms_wait_sum = 0.0
+        self._ms_split_n = 0
         self._epoch += 1
         return record
+
+    # -- #363 intra-phase axis ------------------------------------------------
+    def _table_names(self) -> frozenset:
+        if self._table is None:
+            return frozenset()
+        return frozenset(s.name for s in self._table.stages)
+
+    def _intra_phase_decide(self, label_target):
+        """The ms/round verdict for this boundary, or ``None``.
+
+        THE ORDER OF THE TWO AXES. The regime label chooses the FAMILY of
+        stage; the clock chooses WITHIN what the table judged reachable and
+        may decline a move the label wanted. The clock never invents a stage
+        the table does not carry -- it ranks the table's own entries by what
+        the rig measured.
+        """
+        from sglang.srt.managers.regime_ms_clock import (
+            pack_ms_sample,
+            unpack_ms_sample,
+        )
+
+        if self._table is None or self._current_stage is None:
+            return None
+        current = self._table[self._current_stage]
+        if current is None:
+            return None
+
+        # The one collective this axis adds. A blind rank packs the sentinel,
+        # so the group answers "no split" rather than a partial mean.
+        mean_compute = (
+            (self._ms_compute_sum / self._ms_split_n) if self._ms_split_n else None
+        )
+        mean_wait = (
+            (self._ms_wait_sum / self._ms_split_n) if self._ms_split_n else None
+        )
+        payload = pack_ms_sample(mean_compute, mean_wait)
+        if self._tp_size > 1:
+            if self._collective_min is None:
+                # No channel: the split cannot be made group-uniform, and a
+                # rank-local clock on replicated state is the thing this
+                # design forbids. Abstain.
+                return None
+            payload = self._collective_min(payload)
+        group_split = unpack_ms_sample(payload)
+        if group_split is None:
+            return None
+
+        self._stage_clock.observe_round(self._round, group_split[0], group_split[1])
+        # `.stages`, not iteration: StageTable is keyed BY NAME, so iterating
+        # it falls back to the sequence protocol and asks for index 0.
+        candidates = [s for s in self._table.stages if s.name != current.name]
+        if label_target is not None:
+            # Keep the label's own choice in the running even if the table
+            # would not otherwise offer it this boundary.
+            if all(c.name != label_target.name for c in candidates):
+                if label_target.name != current.name:
+                    candidates.append(label_target)
+        return self._stage_clock.decide(current, candidates)
 
     # -- act-mode interlocks --------------------------------------------------
     def _act_interlocks(self, target, sample, reduced) -> tuple:
@@ -497,6 +611,23 @@ class RegimeObserver:
                 "has not been checked against this rig and a flip would be "
                 "unvalidated"
             )
+
+        # 5. CORRIDOR ADMISSION (#363 intra-phase). The move grows a VRAM
+        #    budget and/or reshards KV; the #330 dial's GROW path checks only
+        #    its own floor and the VA ceiling and spends the corridor ladder
+        #    only on a SHRINK, so without this the one direction that consumes
+        #    free VRAM was never priced against the corridor law. Priced from
+        #    the residency delta plus the TARGET stage's transient under the
+        #    CURRENT load state, and refused rather than priced at zero when
+        #    any of that is unmeasured.
+        #
+        #    Last of the five deliberately: it is the only interlock that
+        #    touches the driver, so the four cheap replicated checks get to
+        #    refuse first.
+        if self._admission is not None:
+            verdict = self._admission.admit(self._table[self._current_stage], target)
+            if not verdict.ok:
+                return False, verdict.reason
         return True, ""
 
     def _count_veto(self, reason: str) -> None:
@@ -656,6 +787,15 @@ class RegimeObserver:
             "mode": self._mode,
             "actuations": self.actuations,
             "vetoes": dict(self.vetoes),
+            # #363 intra-phase. Absent on a boot without --regime-stage-clock,
+            # so a summary from the default path is unchanged in shape.
+            "stage_clock": (
+                self._stage_clock.summary() if self._stage_clock is not None else None
+            ),
+            "stage_clock_proposals": self.stage_clock_proposals,
+            "admission": (
+                self._admission.summary() if self._admission is not None else None
+            ),
         }
 
 
@@ -727,6 +867,28 @@ def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
         commit_fn = build_regime_actuator(scheduler, table_plan).apply
         dwell = _dwell_for(table_plan)
 
+    # #363 INTRA-PHASE AXIS, off unless --regime-stage-clock. Built only in
+    # act mode: in observe there is nothing for an admission gate to admit,
+    # and a clock whose verdict cannot move anything would be an expensive
+    # observe under a misleading name.
+    stage_clock = None
+    admission = None
+    if mode == MODE_ACT and bool(getattr(server_args, "regime_stage_clock", False)):
+        from sglang.srt.managers.regime_admission import build_corridor_admission
+        from sglang.srt.managers.regime_ms_clock import MsStageDecider
+
+        stage_clock = MsStageDecider()
+        admission = build_corridor_admission(
+            scheduler,
+            stage_transients=getattr(scheduler, "regime_stage_transients", None),
+        )
+        logger.warning(
+            "%s INTRA-PHASE AXIS ARMED (#363): ms/round selects the stage and "
+            "every flip is priced against the corridor. A stage with no "
+            "transient census is REFUSED, not priced at zero.",
+            LOG_PREFIX,
+        )
+
     observer = RegimeObserver(
         consensus_interval=interval,
         tp_size=tp_size,
@@ -737,6 +899,8 @@ def build_regime_observer(scheduler) -> Optional[RegimeObserver]:
         current_stage=current,
         commit_fn=commit_fn,
         dwell=dwell,
+        stage_clock=stage_clock,
+        admission=admission,
         trace_path=_rank_trace_path(
             getattr(server_args, "regime_trace", None), scheduler
         ),
@@ -1187,6 +1351,27 @@ def rank_forward_ms_from(scheduler) -> Optional[float]:
     return getattr(log, "last_gpu_ms", None)
 
 
+def rank_split_ms_from(scheduler):
+    """This rank's last (compute_ms, wait_ms), or ``(None, None)``.
+
+    The #363 intra-phase axis needs the two terms separately -- the stage
+    axes move the WAIT term and not the compute term, so a total would hide
+    the only part of the round they can be credited against. Same honesty
+    rule as ``rank_forward_ms_from``: a graph-covered forward reports NOTHING
+    rather than a fast zero, and the absence travels into the packed payload
+    as a sentinel.
+    """
+    reporter = getattr(scheduler, "metrics_reporter", None)
+    log = getattr(reporter, "rank_prefill_log", None) if reporter else None
+    if log is None or not getattr(log, "last_split_known", False):
+        return (None, None)
+    gpu_ms = getattr(log, "last_gpu_ms", None)
+    wait_ms = getattr(log, "last_wait_ms", None)
+    if gpu_ms is None or wait_ms is None:
+        return (None, None)
+    return (max(0.0, float(gpu_ms) - float(wait_ms)), float(wait_ms))
+
+
 __all__ = [
     "ENV_MODE",
     "LOG_PREFIX",
@@ -1207,5 +1392,6 @@ __all__ = [
     "observe_mode",
     "phase_of_last_batch",
     "rank_forward_ms_from",
+    "rank_split_ms_from",
     "resolve_mode",
 ]
