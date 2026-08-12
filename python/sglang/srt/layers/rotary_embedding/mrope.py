@@ -557,6 +557,14 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         )
         return inv_freq
 
+    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
+        # Must match _compute_cos_sin_cache below: scaling_factor, not base.
+        return self._compute_inv_freq(self.scaling_factor)
+
+    def _cos_sin_cache_row_scale(self) -> float:
+        # Must match _compute_cos_sin_cache below, which applies mscale.
+        return self.mscale
+
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(

@@ -207,6 +207,30 @@ class RotaryEmbedding(MultiPlatformOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
+        """Frequencies for rows APPENDED by _ensure_cos_sin_cache_length.
+
+        This exists because the rows a subclass builds in
+        _compute_cos_sin_cache and the rows the growth path appends must come
+        from the SAME frequencies. The base cache is built with
+        _compute_inv_freq(self.base), so that is the default -- but every
+        scaled variant (YaRN, Deepseek, YaRN-MRoPE) builds its cache with
+        _compute_inv_freq(self.scaling_factor) instead. Those classes MUST
+        override this, or the appended positions silently carry different
+        frequencies from the ones before them: no exception, just wrong
+        attention past the boot-time cache length.
+        """
+        return self._compute_inv_freq(self.base)
+
+    def _cos_sin_cache_row_scale(self) -> float:
+        """Amplitude applied to appended cos/sin rows (YaRN's mscale).
+
+        Same contract as _cos_sin_cache_inv_freq: the scaled variants
+        multiply their cache by self.mscale, so a growth path that omits it
+        produces rows of the wrong magnitude.
+        """
+        return 1.0
+
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""
         cur_len = int(self.cos_sin_cache.shape[0])
@@ -219,8 +243,9 @@ class RotaryEmbedding(MultiPlatformOp):
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
 
-        # Compute inv_freq on same device
-        inv_freq = self._compute_inv_freq(self.base).to(device=device)
+        # Compute inv_freq on same device, through the hook so scaled
+        # variants extend with the frequencies they were built with.
+        inv_freq = self._cos_sin_cache_inv_freq().to(device=device)
 
         # Incremental computation for new positions only
         start = cur_len
@@ -229,8 +254,9 @@ class RotaryEmbedding(MultiPlatformOp):
             return
 
         freqs_new = torch.einsum("i,j->ij", t_new, inv_freq)
-        cos_new = freqs_new.cos()
-        sin_new = freqs_new.sin()
+        row_scale = self._cos_sin_cache_row_scale()
+        cos_new = freqs_new.cos() * row_scale
+        sin_new = freqs_new.sin() * row_scale
         new_rows = torch.cat((cos_new, sin_new), dim=-1).to(dtype=dtype)
 
         # Update cache with new rows
