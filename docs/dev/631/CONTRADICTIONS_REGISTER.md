@@ -1915,3 +1915,35 @@ costs the next allocations a fault-in and deserves its own measurement.
    context ceiling is precisely the change that makes the corrupt rows
    reachable.** Fixed via an overridable hook pair; guarded by
    `test/srt/test_yarn_rope_cache_growth.py`.
+
+48. **A pool that boots, holds corridor and answers /health is not a pool that
+   serves.** Boot E sized to 683150 with no cap flag, 0 tracebacks, corridor
+   minimum 1469/2912/2975 and 0 breaches of the 1024 floor -- and every
+   `/generate` timed out at 120 s. The log repeated `POLICY holding in tp:
+   min dwell: 3.0s since last flip < 3s (pending prefill 1 tok, running bs 0)`
+   against 362 flip events. Corridor-green is a MEMORY verdict; it says
+   nothing about whether tokens come out. Every capacity number must carry a
+   real generation beside it or it is a sizing result, not a serving result.
+
+49. **Raising one rank's budget charges every rank, because the pool is a
+   min-reduction.** Each rank's usage is `fixed + share_r x 32 KiB x pool`,
+   and the pool is `min_r(capacity_r)`, so a budget raise on a non-binding
+   rank lifts the global pool and spends VRAM on the binding one. Boot D
+   raised rank1 and rank2 together, the pool went to 793844, and rank1 -- the
+   rank whose own budget rose only 831 MiB -- died at 21 MiB free. Solve for
+   the POOL that leaves every card at the floor, then derive budgets from it;
+   do not tune budgets card by card.
+
+50. **CUDA-graph capture peaks above the idle steady state, so budgets solved
+   from idle free overshoot.** Boot C's idle free (1855/3468/3229) was
+   measured after capture and read as available headroom. Budgets derived
+   from it put boot D 867 MiB past rank1's floor and it died inside the full
+   cuda-graph capture warmup, not at steady state. The corridor law is a
+   continuous minimum; the capture transient is part of the series.
+
+51. **A /proc scan matches the shell that runs it.** Scanning
+   `/proc/*/cmdline` for `sglang.launch_server` returned the scanning
+   `bash -c` process, whose command line contains the pattern, and killing the
+   result took the shell down mid-statement (exit 144). Law 40 is usually
+   filed under `pkill -f`; the actual hazard is any full-command-line match,
+   including one built by hand. Exclude shells and the caller's own PID.

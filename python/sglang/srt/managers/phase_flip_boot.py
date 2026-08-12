@@ -157,7 +157,7 @@ TP_STACK_OVERRIDDEN_FIELDS: Tuple[str, ...] = (
 )
 
 
-def derive_tp_stack_server_args(server_args):
+def derive_tp_stack_server_args(server_args, pp_id_space: int | None = None):
     """The TP decode phase's ServerArgs: a deepcopy of the boot args with
     the geometry rotated from (tp=1, pp=N) to (tp=N, dcp=N, pp=1).
 
@@ -178,6 +178,31 @@ def derive_tp_stack_server_args(server_args):
     tp_args.pp_stage_ratio = None
     tp_args.enable_phase_flip = False
     tp_args.phase_flip_tp_vector = None
+
+    # THE TP POOL IS SIZED TO THE ID SPACE, NOT TO AN OPERATOR NUMBER.
+    #
+    # The scheduler's allocator is the PP stack's, so the TP layout can only
+    # ever be handed slot ids below the PP capacity. A TP pool LARGER than
+    # that addresses nothing extra -- the surplus rows are unreachable by
+    # construction -- while still costing the VRAM the PP pool needs. Left to
+    # size itself against its own budget it does exactly that: measured 788026
+    # rows against an id space of 367704, and an uncapped boot dies in
+    # cuMemCreate with the corridor guard counting free down to -4 MiB.
+    #
+    # The historical workaround was to have the operator pass a
+    # --max-total-tokens that happened to be small enough. That is a guess
+    # about physics wearing the shape of a policy: too low and it silently
+    # caps a pool the VRAM would have backed (it also MASKS the per-rank
+    # imbalance, because every non-binding rank then reports the cap as its
+    # capacity); too high and the boot OOMs.
+    #
+    # Deriving it removes the guess. The pool becomes exactly what the
+    # hardware backs, bounded only by what the allocator can address, and it
+    # tracks the id space automatically whenever the PP side grows. The
+    # >= check after the TP worker is built stays as the real invariant --
+    # this only stops the TP side from overshooting it.
+    if pp_id_space is not None:
+        tp_args.max_total_tokens = int(pp_id_space)
     return tp_args
 
 
@@ -570,7 +595,15 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     # 3. Build the TP-shaped worker under the flip scope. The server-args
     # copy is PUBLISHED for the whole build (the #470 lesson: context
     # readers must see the stack's own geometry, not the target's).
-    tp_args = derive_tp_stack_server_args(server_args)
+    tp_args = derive_tp_stack_server_args(
+        server_args, pp_id_space=int(primary_runner.max_total_num_tokens)
+    )
+    logger.info(
+        "%s TP pool sized to the PP id space: %d tokens (no --max-total-tokens "
+        "needed; the surplus a self-sized TP pool would take is unaddressable)",
+        LOG_PREFIX,
+        int(primary_runner.max_total_num_tokens),
+    )
     ctx = get_context()
     saved_args = get_server_args()
     ctx.set_server_args(tp_args)
