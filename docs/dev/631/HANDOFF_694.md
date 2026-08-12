@@ -1,6 +1,9 @@
 # HANDOFF 694 — the gate is honest now, and it still says no
 
-Successor 50. Branch `feat/route-a-631`. Evidence `/spinning/evidence-631/s50/`
+Successor 50. Branch `feat/route-a-631`, code + docs in `7362073945`;
+`integration/r2` fast-forwarded to the same tip. Everything below was
+measured from `c2ceac7f31` plus that commit's contents.
+Evidence `/spinning/evidence-631/s50/`
 (`README.txt` indexes it, `RESULTS.md` is the verdict, `gate_check.py` and
 `ledger.py` are runnable and reproduce every number below).
 
