@@ -107,6 +107,11 @@ class TransientCensus:
         #: draw is measured against THIS, not against the card's total, so it
         #: is a property of the load and not of the cut.
         self.baseline_free_bytes = int(baseline_free_bytes)
+        #: Highest free level seen while serving, RECORDED BUT NOT USED AS
+        #: THE REFERENCE -- see the note on ``draw_mib``. Kept because on a
+        #: phase-flip boot it is several GiB above the post-capture reading
+        #: and a reader needs to know that before calling anything "at rest".
+        self.max_free_bytes = int(baseline_free_bytes)
         self.min_free_bytes: Dict[str, int] = {}
         self.samples: Dict[str, int] = {}
         self._seen = 0
@@ -115,17 +120,47 @@ class TransientCensus:
 
     def note(self, load_state: str, free_bytes: int) -> None:
         with self._lock:
+            if free_bytes > self.max_free_bytes:
+                self.max_free_bytes = int(free_bytes)
             self.samples[load_state] = self.samples.get(load_state, 0) + 1
             prev = self.min_free_bytes.get(load_state)
             if prev is None or free_bytes < prev:
                 self.min_free_bytes[load_state] = int(free_bytes)
 
     def draw_mib(self) -> Dict[str, float]:
-        """Per load state: how far below at-rest that state pulled the card."""
+        """Per load state: the draw BELOW THE POST-CAPTURE LEVEL.
+
+        WHY THE POST-CAPTURE LEVEL AND NOT THE HIGHEST FREE OBSERVED. I tried
+        the latter mid-shift, on the reasoning that the boot-time backing swap
+        releases the non-resident layout after capture so free at rest ends up
+        GiB higher. That reasoning is right about the memory and wrong about
+        the reference: the gate's OTHER terms -- in particular
+        ``fixed_overhead_mib``, calibrated as ``nvml_used - params - pools``
+        -- are all measured AT THE POST-CAPTURE POINT, so the residual already
+        counts the layout that is later released. Referencing the transient to
+        the later, higher level would charge that same layout twice, on the
+        rank where the constraint binds. A transient is a difference, and a
+        difference is only meaningful against the baseline the rest of the
+        model uses.
+
+        The consequence, stated plainly: under a running phase flip there is
+        no single "at rest" -- free on rank0 of the reference rig oscillates
+        by ~6.5 GiB between flip phases. That is why the corridor law is
+        judged on the observed MINIMUM by a separate instrument, and why the
+        raw minima are written into the payload here: a reader who wants a
+        different reference can compute it, and does not have to trust this
+        one.
+        """
+        at_rest = self.baseline_free_bytes
         return {
-            state: max(0.0, (self.baseline_free_bytes - low) / _MIB)
+            state: max(0.0, (at_rest - low) / _MIB)
             for state, low in self.min_free_bytes.items()
         }
+
+    def min_free_mib(self) -> Dict[str, float]:
+        """Per load state, the raw minimum. Recorded so a reader can
+        re-reference the draws to a baseline measured some other way."""
+        return {s: low / _MIB for s, low in self.min_free_bytes.items()}
 
     def worst(self) -> Optional[str]:
         draws = self.draw_mib()
@@ -140,6 +175,8 @@ class TransientCensus:
             "pp_rank": self.pp_rank,
             "gpu_name": self.gpu_name,
             "baseline_free_mib": self.baseline_free_bytes / _MIB,
+            "max_free_observed_mib": self.max_free_bytes / _MIB,
+            "min_free_mib_by_load_state": self.min_free_mib(),
             "transient_mib_by_load_state": draws,
             "samples_by_load_state": dict(self.samples),
             "worst_load_state": worst,

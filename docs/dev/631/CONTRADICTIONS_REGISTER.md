@@ -911,7 +911,9 @@ layers, and cut-shaped.
 ---
 
 **C40 — A RANK DIED SILENTLY UNDER THE FLIP WITH 1926 MiB FREE IN HAND
-(#485/#622/#649, successor 50, 2026-08-12). OPEN.** During the planner-cut
+(#485/#622/#649, successor 50, 2026-08-12). CLOSED by C41 — IT WAS NOT
+SILENT AND IT WAS NOT A GPU EVENT. Read C41 first; the account below is
+preserved because the way it went wrong is the lesson.** During the planner-cut
 window, rank0 stopped at 11:48:41 in the middle of an ordinary decode batch:
 
 * no traceback on rank0, and its last log line is a normal `Decode batch`;
@@ -935,6 +937,56 @@ This is the #622/#649 silent-wedge family seen under the phase flip on a
 planner cut. It is the reason no planner-family cut can be certified on a
 20-minute window yet: the window is the instrument that would have to catch
 it, and here the window is what it killed.
+
+---
+
+**C41 — C40's "SILENT DEATH" WAS A SIGKILL THE LAUNCHER HAD ALREADY LOGGED,
+AND THE LEDGER WAS THE HOST'S (#485/#622/#649, successor 51, 2026-08-12).
+RESOLVED.** Line 49494 of the same boot log C40 was written from:
+
+```
+[2026-08-12 11:48:55] Subprocess scheduler_0 (pid=986533) crashed with exit
+code -9. Triggering SIGQUIT for cleanup...
+```
+
+`-9` is `-SIGKILL`. Every clause of C40's evidence list survives except the
+one it turned on: there was no traceback (a SIGKILLed process cannot write
+one), there was no OOM line (this codebase does not emit one for a kill it
+did not perform), the GPU corridor was held (irrelevant -- the kill came from
+the host), and the barlink abort was indeed the consequence. What was NOT
+true is that nothing recorded how the process ended.
+
+Two reasons it read as absent, and both are now fixed in code:
+
+1. **It was a bare integer.** Nothing decoded `-9` to `SIGKILL`, so the line
+   reads as noise. `utils/watchdog.py` now names the signal.
+2. **Nothing named a mechanism.** SIGKILL is never sent to a healthy rank by
+   this tree. On this rig the sender is the kernel's cgroup OOM killer, whose
+   report goes to a ring buffer **a container cannot read**: in CT999 `dmesg`
+   is `Operation not permitted`, `/dev/kmsg` does not exist, `journalctl -k`
+   is empty. The only in-container trace is `memory.events`'s cumulative
+   `oom_kill` counter, which carries neither timestamp nor victim and is
+   therefore evidence ONLY against a baseline taken earlier. The watchdog now
+   samples one at construction and reports the delta at any SIGKILL --
+   including when it is zero, so the instrument can exonerate the OOM killer
+   as well as convict it.
+
+**The host ledger, measured this shift.** The container ceiling is ~120 GiB.
+With serving up on the ship config the three schedulers hold **75.1 GiB of
+unreclaimable shmem** -- their unlinked `/dev/shm/sglang_loads_*.shm` weight
+mappings, 33.1 + 17.2 + 25.1 GiB, summing to the cgroup's shmem post exactly
+-- and swap is zero. So the real working margin is ~45 GiB, not 120, and the
+cgroup carries 9 cumulative OOM kills. It is not a cross-boot leak: stopping
+serving returned shmem 75.1 -> 0.0 GiB and MemAvailable 31 -> 118.9 GiB. The
+planner cut costs more of this budget than the ship config does: measured on
+identical soaks, MemAvailable bottomed at 23.5 GiB on the ship config and at
+15.9 GiB on the 40,12,12 arm.
+
+**The general lesson (law 33).** C40 rested on three searches coming back
+empty. Two of them could never have come back full. A negative search result
+is evidence only once the instrument has been shown able to produce a
+positive one.
+
 
 ---
 
@@ -1595,3 +1647,54 @@ boot with **TP>=2 per PP stage** plus `--enable-phase-flip` plus
    in the census — **and desk-written code gets executed before it is
    trusted** (the desk-written-never-executed law, applied to a refusal path
    nobody expected to reach).
+
+
+33. **A search that comes back empty is evidence only if it could have come
+   back full** (successor 51, C41). C40 concluded "silent death" from three
+   absent strings: no traceback, no OOM line, no kernel record. A SIGKILLed
+   process cannot write a traceback; this tree does not log an OOM it did not
+   perform; and the kernel's OOM report goes to a ring buffer that an LXC
+   container cannot read at all (`dmesg` denied, no `/dev/kmsg`, empty
+   `journalctl -k`). Two of the three searches were incapable of a positive
+   result on this rig, and the one line that WAS present -- `crashed with
+   exit code -9` -- was passed over because nothing decoded it. **Before
+   reporting an absence, name the instrument that would have shown the
+   presence, and show it works here.** Sibling of the can-fail proof required
+   of a gate, applied to forensics.
+
+34. **Price the term on the path that BOOTS, not the path you reason with**
+   (successor 51, #485). The published cut-gate verdicts came from a desk
+   script that hand-fed a per-rank transient. The wired `--pp-solve-cut`
+   handler never set the field at all, so it took its `0.0` default and
+   priced a demand measured between 1346 and 3148 MiB as free memory --
+   admitting the very cut metal had measured breaching the corridor. A
+   default of zero on an unmeasured term is not a conservative
+   simplification; it is the most optimistic answer available, applied to the
+   term most likely to bind. **When a model has a desk harness and a wired
+   path, report which one produced the number, and make the wired path refuse
+   what the desk one merely guesses at.**
+
+35. **A difference is only meaningful against the baseline the rest of the
+   model uses** (successor 51, a claim I made and refuted inside one shift).
+   I armed the transient census at the residency census's post-capture point,
+   then noticed that a phase-flip boot's boot-time backing swap releases the
+   non-resident layout AFTER that point -- 3776 MiB on rank0 -- so free at
+   rest sits GiB higher than the value I had baselined against. I "fixed" it
+   to a running maximum of the free column and wrote that up as a law.
+
+   It was wrong, and the arm boot's own data showed it: rank0's free
+   oscillates between 1355 and 7820 MiB with the flip phase, so the maximum
+   is not a resting state, it is the moment a layout is released. Worse, the
+   gate's `fixed_overhead_mib` is calibrated as `nvml_used - params - pools`
+   AT THE POST-CAPTURE POINT, so the residual already counts the layout that
+   is later released. Referencing the transient to the higher level charges
+   the same bytes twice, on the one rank where the constraint binds.
+
+   Reverted to the post-capture reference, with the maximum recorded
+   alongside and the raw per-state minima written into the artifact so any
+   reader can re-reference without trusting mine. **Two consequences worth
+   keeping: (a) before changing a baseline, ask which other terms were
+   calibrated against the old one; (b) under a running phase flip there is no
+   single "at rest" -- which is exactly why the corridor law is judged on an
+   observed MINIMUM by an independent instrument rather than on a modelled
+   at-rest level.**

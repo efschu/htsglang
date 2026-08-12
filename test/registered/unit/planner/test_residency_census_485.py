@@ -108,5 +108,74 @@ class TestOwnerGrouping(CustomTestCase):
         self.assertFalse(residency_census.census_enabled())
 
 
+
+class TestTheTransientCensus(CustomTestCase):
+    """#485/law 31: the per-load-state transient instrument."""
+
+    def _census(self, baseline_mib=2038.0):
+        from sglang.srt.planner.transient_census import TransientCensus
+
+        return TransientCensus(0, "RTX 5090", int(baseline_mib * 1024 * 1024))
+
+    @staticmethod
+    def _mib(n):
+        return int(n * 1024 * 1024)
+
+    def test_it_is_off_by_default(self):
+        from sglang.srt.planner import transient_census
+
+        self.assertFalse(transient_census.census_enabled())
+        self.assertFalse(transient_census.ARMED)
+        # And the scheduler's per-batch call must be a no-op in that state.
+        self.assertIsNone(transient_census.note("DECODE"))
+
+    def test_the_worst_state_is_the_one_reported(self):
+        c = self._census()
+        c.note("DECODE", self._mib(1800))
+        c.note("EXTEND", self._mib(900))
+        self.assertEqual(c.worst(), "EXTEND")
+        self.assertAlmostEqual(c.draw_mib()["EXTEND"], 1138.0, delta=0.01)
+
+    def test_the_draw_is_referenced_to_the_post_capture_level(self):
+        # A CORRECTION I MADE TO MYSELF MID-SHIFT. On a phase-flip boot the
+        # boot-time backing swap releases the non-resident layout AFTER
+        # capture, so free at rest ends up GiB above the armed baseline, and
+        # referencing draws to the highest observed free is tempting. It is
+        # wrong: fixed_overhead_mib is calibrated at the post-capture point
+        # and already counts the layout that is later released, so the higher
+        # reference charges it twice on the rank where the constraint binds.
+        c = self._census(baseline_mib=2038.0)
+        c.note("DECODE", self._mib(7000))  # a flip phase released memory
+        c.note("EXTEND", self._mib(1355))
+        self.assertAlmostEqual(c.draw_mib()["EXTEND"], 683.0, delta=0.01)
+        self.assertEqual(c.draw_mib()["DECODE"], 0.0)
+        # The higher level is still RECORDED, because a reader must know that
+        # "at rest" is not one number under a running flip.
+        self.assertAlmostEqual(
+            c.payload()["max_free_observed_mib"], 7000.0, delta=0.01
+        )
+
+    def test_the_raw_minima_are_kept_so_a_reader_can_re_reference(self):
+        c = self._census()
+        c.note("EXTEND", self._mib(1400))
+        payload = c.payload()
+        self.assertAlmostEqual(
+            payload["min_free_mib_by_load_state"]["EXTEND"], 1400.0, delta=0.01
+        )
+        self.assertIn("max_free_observed_mib", payload)
+        self.assertIn("baseline_free_mib", payload)
+
+    def test_a_state_never_seen_is_absent_rather_than_zero(self):
+        c = self._census()
+        c.note("DECODE", self._mib(1800))
+        self.assertNotIn("EXTEND", c.draw_mib())
+
+    def test_nothing_is_written_when_nothing_was_measured(self):
+        import tempfile
+
+        c = self._census()
+        self.assertIsNone(c.write(tempfile.mkdtemp()))
+
+
 if __name__ == "__main__":
     unittest.main()
