@@ -70,6 +70,69 @@ landed.
 
 ## OPEN — flagged, never resolved
 
+**C27, the corridor law was enforced by nothing at the place it is spent
+(#656).** Successor 42's confirmation window breached: 12 samples, gpu0 at
+941 MiB for 1.5 s. Root-caused by successor 43 to a `pp_to_tp` cutover on
+**rank 1 (= nvidia-smi 0, a 3080)** — not a prefill, not a graph capture; the
+instance was quiescent by design and the descent is the arena's
+`backing_restore_span` walk. **It is a LATENT DEFECT, not a regression, and
+that is shown rather than argued:** s38's GREEN window contains the SAME
+event — one excursion per window, 12 samples, 1.54 s vs 1.53 s, at the same
+point of the acceptance script (the completion of the 271k YaRN leg) — and
+was green by 59 MiB. s34's was green by 19 MiB. The three windows are three
+draws from one distribution whose left tail straddles the floor:
+
+| window | entry free | draw | trough | vs law |
+|---|---|---|---|---|
+| s38 | 3469 | 2386 | 1083 | **+59** |
+| s34 | — | — | 1043 | **+19** |
+| s42 | 3006 | 2066 | **940** | **−84** |
+
+Three things were wrong at once, and each alone was survivable:
+
+1. **The remedy's trigger was a hardware failure, not the policy floor.**
+   `_mem_create_reclaiming` already knew that torch sits on
+   reserved-but-unused blocks and that `empty_cache` returns them — but it
+   fired on `CUDA_ERROR_OUT_OF_MEMORY`, i.e. free reaching ZERO, which is
+   1024 MiB below the law. The census recorded `slack=1054` at the 940 MiB
+   trough: **the bytes to stay legal were held throughout and nothing asked
+   for them, because nothing had failed yet.** (Now law 16.)
+2. **The recogniser held the evidence and never read it.**
+   `phase_flip_seam_census` samples the exact NVML observable at every stage,
+   names the 1024 MiB floor in its own docstring, and contained no comparison
+   — and emits its line only AFTER the flip completes. The process measured
+   940 and said nothing; the breach was found hours later in an external CSV.
+   Note also that **the 100 ms external sampler UNDERSTATES depth** (it read
+   PP0's floor as 2578 where PP0's own census recorded 2375), so the census
+   is the tighter instrument and should be the one judged against.
+3. **The seam-entry law check was priced on the wrong term.** It subtracts
+   `staging_bytes` — what the seam RESERVES — from `verdict.free_after`. The
+   census measures the DRAW at 2066 MiB against 1625 MiB staged, and
+   `free_after` itself overstates the 3006 the cutover actually entered with.
+   s38's own yield was **18 MiB sub-law by that same arithmetic** (free 2190,
+   staged 1184) and survived only because its estimate overshot the real draw
+   by ~388 MiB. Passing on an estimator's conservatism is not a margin.
+
+**Fixed red-first in `18ff17ec6e`**: the trigger moves to "the next commit
+would cross the law" (`kv_vmm_backing._corridor_preempt`), the census compares
+and announces at the stage that crosses, and the gate prices a PREDICTION on
+the measured draw. **The yield is deliberately left able to yield**: refusing
+`pp_to_tp` starves decode outright (411 abandons, 0 completions in 6 minutes,
+/health 503, measured 2026-08-10), so the actuator was put where the bytes are
+taken rather than in a predicate that can only refuse. Close/reopen trigger: a
+>=30 min ship-config window with 0 breaches **and** at least one
+`corridor law floor` preemption line proving the mechanism was reachable — a
+green window with the mechanism never armed proves nothing.
+
+FALSIFIED ALONG THE WAY, so nobody re-runs them: N41's merged changes are
+**inert** (the #657 allocation steering ships OFF and has zero fingerprints in
+either log; the registry observer and P2 gate fix are observation/refusal
+paths that allocate nothing); graph capture is identical in both windows
+(bs=[1,2,3,4], 0.56/0.30/0.28 vs 0.57/0.32/0.32 GB); the environment blocks
+are byte-identical. The pool difference (512552 vs 503950) is **a warm page
+cache**, not code: weight load took 11.11 s cold and 2.35 s warm, and the
+faster load leaves ~0.1 GB more allocator high-water on every rank.
+
 **C26, #224's PS2 born-spilled-deep path kills the instance (#659 window).**
 Reproduced twice in one shift, both times a device-side assert out of the KV
 path, both times with ZERO #659 code involved. The clean signature is PS2:
@@ -297,3 +360,34 @@ to the pinned host pool by `host_pool.backup_from_device_all_layer`, `:3790`).
    boot log — which existed because law 12 demanded the mechanism report what
    it RESOLVED — contradicted it.
 
+
+16. **A relief mechanism triggered by a hardware failure cannot enforce a
+   policy floor above that failure** (C27, #656). `_mem_create_reclaiming`
+   held exactly the right remedy for exactly the right resource and was
+   useless for the corridor, because its trigger was
+   `CUDA_ERROR_OUT_OF_MEMORY` — free memory reaching ZERO — while the law it
+   needed to protect sits 1024 MiB higher. The gap between the two triggers
+   is not a tuning question; it is the entire region in which the policy
+   exists. Measured: a cutover marched down in 24 MiB commit steps straight
+   through the floor while torch held **1054 MiB of slack** the remedy would
+   have released, and nothing asked for it because nothing had failed. **When
+   a policy floor is declared, find every mechanism that could fund it and
+   check what each one WAITS FOR.** A remedy that waits for the failure the
+   policy exists to prevent is not a safety net, and it will pass every
+   review because the code is correct — only its trigger is in the wrong
+   place. Sibling of law 6 (hang relief on a clock that ticks inside the
+   trough): both are mechanisms that are perfectly good except that they
+   cannot arrive in time, and both were invisible until someone asked what
+   the mechanism was waiting on rather than what it did.
+
+17. **Clarification to law 15, from the fix for C27.** Law 15 forbids a
+   per-rank measured number from producing DIVERGENT GROUP ACTION. It does
+   not forbid a per-rank number from producing a per-rank OBJECTION that is
+   then reduced: the seam entry check already computes `law_ok` from this
+   rank's own `verdict.free_after` and rides a reduction where the group
+   abandons if ANY rank objects, so feeding a per-rank measured draw into the
+   same predicate adds no new divergence — every rank still observes one
+   reduced verdict and acts on that. The test is not "is the input
+   rank-local" but "can two ranks take different ACTIONS from it". Stated
+   because the first draft of the C27 fix was nearly abandoned on a
+   misreading of law 15 that would have left the breach unfixed.

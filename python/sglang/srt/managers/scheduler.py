@@ -2612,9 +2612,7 @@ class Scheduler(
             # quiescent boundary at all, and the rank whose starvation
             # defined corpse G.
             phase_flip_armed_hook=(
-                self.phase_flip_is_armed
-                if self.server_args.enable_phase_flip
-                else None
+                self.phase_flip_is_armed if self.server_args.enable_phase_flip else None
             ),
             # #631 G: one service turn -- consume every inbound message
             # the upstream's counter accounts for, then reap this rank's
@@ -4230,8 +4228,7 @@ class Scheduler(
             # would turn one warning into a per-tick stream.
             cc.compared = True
             logger.warning(
-                "barlink capture census: one-shot comparison unavailable "
-                "(%s: %s)",
+                "barlink capture census: one-shot comparison unavailable (%s: %s)",
                 type(exc).__name__,
                 exc,
             )
@@ -4948,9 +4945,7 @@ class Scheduler(
         if not self.enable_dynamic_chunking:
             return self.chunked_prefill_size
         history_len = (
-            len(self.chunked_req.prefix_indices)
-            if self.chunked_req is not None
-            else 0
+            len(self.chunked_req.prefix_indices) if self.chunked_req is not None else 0
         )
         dynamic_size = self.predict_next_chunk_size(history_len)
         if dynamic_size is None:
@@ -5243,16 +5238,32 @@ class Scheduler(
                 getattr(self.kv_session_offload, "spec_in_tick_ready", False)
             )
             _resume_spec = resume_under_spec_enabled()
+            # C26: PS2's sentinel out_cache_loc is only diverted on the DCP
+            # lane. Admitting it on plain TP sends host row ids into
+            # store_kvcache and asserts device-side. Replicated boot config,
+            # so every rank computes the same verdict without a collective.
+            _backend_hook = bool(
+                getattr(
+                    self.kv_session_offload,
+                    "prefill_spill_deep_backend_ok",
+                    False,
+                )
+            )
             prefill_spill_deep = prefill_spill_deep_gate(
                 self.kv_session_offload.prefill_spill,
                 _spec_active,
                 spec_in_tick_ready=_spec_in_tick,
                 resume_under_spec=_resume_spec,
                 dflash_prefill_append=_dflash_prefill,
+                backend_write_hook=_backend_hook,
             )
             if self.kv_session_offload.prefill_spill and not prefill_spill_deep:
                 _reason = prefill_spill_deep_reject_reason(
-                    _spec_active, _spec_in_tick, _resume_spec, _dflash_prefill
+                    _spec_active,
+                    _spec_in_tick,
+                    _resume_spec,
+                    _dflash_prefill,
+                    _backend_hook,
                 )
                 if _reason is not None and _reason != getattr(
                     self, "_ps2_spec_declined_reason", None
@@ -7909,8 +7920,7 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
             return
         except PhaseFlipLoopExit as e:
             logger.warning(
-                "PHASE-FLIP event loop re-dispatch after %s (active stack "
-                "now %s)",
+                "PHASE-FLIP event loop re-dispatch after %s (active stack now %s)",
                 e.direction,
                 scheduler.phase_flip_active_stack,
             )

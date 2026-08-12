@@ -259,8 +259,44 @@ def prefill_spill_deep_reject_reason(
     spec_in_tick_ready: bool,
     resume_under_spec: bool,
     dflash_prefill_append: bool,
+    backend_write_hook: bool = True,
 ) -> Optional[str]:
-    """The condition that blocks PS2 under speculative decoding, or ``None``.
+    """The condition that blocks PS2, or ``None``.
+
+    THE FIRST CONDITION IS NOT ABOUT SPECULATION AND IT IS THE ONE THAT KILLED
+    AN INSTANCE (register C26). PS2 hands the extend a ``out_cache_loc`` full
+    of HOST SENTINELS -- see ``spill_extend_alloc``, which returns
+    ``make_sentinels(...)`` -- and exactly one thing in the tree diverts that
+    tensor away from the KV write: ``_dcp_write_scatter``'s
+    ``_sess_prefill_owner_write`` branch. That branch is reachable ONLY from
+    the token-sharded DCP lane (``forward_extend`` enters it under
+    ``if self.uneven_dcp``). On plain TP the backend still BUILDS the
+    prefill-spill state and nothing complains, but ``forward_extend`` falls
+    through to the stock ``set_kv_buffer``, and the sentinels go straight into
+    ``store_kvcache``:
+
+        jit_kernel/csrc/elementwise/kvcache.cuh:112
+          Assertion `index >= 0 && index < size_limit` failed
+
+    Measured, not inferred: with ``host_base=4097`` and a 4096-row allocator,
+    a request with ``boundary=2620 L=3012`` writes indices 6717..7108 against
+    a ``size_limit`` of ~4097 -- every one of the 392 rows out of bounds, on
+    layer 0, on both ranks. The admission gate had no way to know, because it
+    was never told which backend it was admitting onto.
+
+    So PS2 declines when the backend has no born-spilled EXTEND write hook.
+    The decline is the pre-PS2 behaviour exactly -- the request stays queued
+    and the fast lane retries it -- and it is RANK-UNIFORM by construction:
+    ``_sess_mode`` is derived purely from ``dcp_size``, which is replicated
+    boot configuration, fixed before the first forward and identical on every
+    rank. No collective, and the refusal is a NON-ADMISSION rather than a
+    rank-local skip around a collective, so register law 14 is satisfied.
+
+    The default is ``True`` because the pure-function pins below exercise the
+    speculation conditions and predate this one; the single production caller
+    passes it explicitly and must keep doing so.
+
+    THE REST OF THIS DOCSTRING IS ABOUT SPECULATION.
 
     The mechanical problem: the target prefill is followed by a DRAFT extend
     that reuses the SAME ScheduleBatch and hence the same ``out_cache_loc``
@@ -297,6 +333,17 @@ def prefill_spill_deep_reject_reason(
 
     Rank-uniform: every input is replicated config or a rank-0-broadcast rung
     id (``_effective_spec_algorithm``)."""
+    if not backend_write_hook:
+        return (
+            "the attention backend runs in plain-TP mode and has no "
+            "born-spilled EXTEND write hook (_sess_prefill_owner_write is "
+            "reachable only from _dcp_write_scatter, i.e. only on the "
+            "token-sharded DCP lane). Admitting PS2 here sends host sentinel "
+            "rows into store_kvcache and asserts device-side, killing the "
+            "instance (register C26). Run kv-session-offload on a DCP lane to "
+            "use PS2, or write the plain-TP extend twin of "
+            "_sess_forward_decode_plain."
+        )
     if not spec_active:
         return None
     if spec_in_tick_ready:
@@ -330,6 +377,7 @@ def prefill_spill_deep_gate(
     spec_in_tick_ready: bool = False,
     resume_under_spec: bool = False,
     dflash_prefill_append: bool = False,
+    backend_write_hook: bool = True,
 ) -> bool:
     """PS2 MASTER GATE. ``--kv-session-offload-prefill`` AND no blocking spec
     condition (``prefill_spill_deep_reject_reason`` carries the reasoning and
@@ -348,6 +396,7 @@ def prefill_spill_deep_gate(
             spec_in_tick_ready,
             resume_under_spec,
             dflash_prefill_append,
+            backend_write_hook,
         )
         is None
     )
@@ -2265,6 +2314,15 @@ class KVSessionOffloadManager:
         # it from the installed DCP vector at init).
         self.backend = backend
         self.mode = backend._sess_mode  # "weighted" | "even" | "plain"
+        #: Whether this backend has a born-spilled EXTEND write hook, i.e.
+        #: whether PS2's sentinel ``out_cache_loc`` gets diverted before it
+        #: reaches ``store_kvcache``. Only the DCP lane does
+        #: (``_dcp_write_scatter`` -> ``_sess_prefill_owner_write``); the plain
+        #: lane has the DECODE twin (``_sess_forward_decode_plain``) but the
+        #: EXTEND twin was never written. C26: admitting PS2 without it is a
+        #: device-side assert. Read from replicated boot config, so this is
+        #: identical on every rank and fixed before the first forward.
+        self.prefill_spill_deep_backend_ok = self.mode != "plain"
         self.S = backend._sess_S
         self.cp_prefix = list(backend._sess_prefix)
         self.dcp_size = backend.dcp_size if self.mode != "plain" else 1
@@ -4201,6 +4259,28 @@ class KVSessionOffloadManager:
             f"{batch.extend_num_tokens} != seq_len-prefix {n_new}; the prompt "
             "is chunked, which needs PS3 (host-prefix extend read)."
         )
+        # C26 BELT AND BRACES. Everything below builds a sentinel
+        # ``out_cache_loc``, and only the DCP lane's ``_dcp_write_scatter``
+        # diverts it before ``store_kvcache``. Reaching here on a plain-TP
+        # backend means the admission gate was bypassed, and the failure mode
+        # is a device-side assert that kills the instance -- so fail HERE,
+        # legibly, in Python, where the message names the cause.
+        #
+        # Raising is correct rather than returning a soft refusal: the caller
+        # has already committed to the PS2 path, and the alternative
+        # (falling through to ``alloc_for_extend``) would ask for device slots
+        # this request was admitted precisely because it cannot have. Every
+        # rank raises on the same replicated boot config, so this is not a
+        # rank-local branch around a collective (law 14).
+        if self.mode == "plain":
+            raise RuntimeError(
+                "kv-session-offload prefill-spill (PS2): born-spilled prompt "
+                f"rid={req.rid} reached spill_extend_alloc on a plain-TP "
+                "backend, which has no EXTEND write hook to divert the host "
+                "sentinels away from store_kvcache. The admission gate "
+                "(prefill_spill_deep_gate backend_write_hook) should have "
+                "declined this request. Register C26."
+            )
         device = self.req_to_token_pool.req_to_token.device
         positions = torch.arange(boundary, L, dtype=torch.int64, device=device)
         own_idx = prefill_spill_owner_split(positions, self.S, self.lo, self.hi)
