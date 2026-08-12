@@ -41,6 +41,7 @@ from sglang.srt.layers.dcp import (
     create_triton_kv_indices_for_dcp_triton,
     dcp_even_write_mask,
     dcp_host_even_total,
+    dcp_fresh_host_lens,
     dcp_host_lens,
     dcp_host_total_tokens,
     get_dcp_lens,
@@ -6270,6 +6271,48 @@ def _dcp_host_total_tokens(
     return dcp_host_total_tokens(extend_prefix_lens_cpu, expected_sum)
 
 
+def _host_clamp_max(
+    lens_cpu: Optional[Union[List[int], torch.Tensor]],
+    cap: int,
+) -> Optional[torch.Tensor]:
+    """``min(lens, cap)`` on the host, or None when no mirror is usable (#629).
+
+    The sliding-window paged length under use_ragged is written on the device
+    as ``prefix_lens - clamp(prefix_lens - W, min=0)``. That is ``min(prefix,
+    W)`` by identity for non-negative lengths, so this is the same integer
+    vector, not a re-derivation that could drift from it.
+    """
+    lens = dcp_host_lens(lens_cpu)
+    return None if lens is None else torch.clamp(lens, max=cap)
+
+
+def _host_swa_paged_lens(
+    seq_lens_cpu: Optional[Union[List[int], torch.Tensor]],
+    prefix_lens_cpu: Optional[Union[List[int], torch.Tensor]],
+    window: int,
+) -> Optional[torch.Tensor]:
+    """``min(seq, W + seq - prefix)`` on the host, or None (#629).
+
+    The non-ragged window branch needs BOTH host vectors; with either missing
+    there is no mirror to claim and the caller keeps its device read.
+    """
+    seq = dcp_host_lens(seq_lens_cpu)
+    prefix = dcp_host_lens(prefix_lens_cpu)
+    if seq is None or prefix is None or seq.shape != prefix.shape:
+        return None
+    return torch.minimum(seq, window + seq - prefix)
+
+
+def _host_sum_or_device(
+    lens_cpu: Optional[torch.Tensor],
+    lens: torch.Tensor,
+) -> int:
+    """The length sum from the host mirror, else the old blocking read (#629)."""
+    if lens_cpu is None:
+        return lens.sum().item()
+    return int(lens_cpu.sum())
+
+
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
@@ -6812,6 +6855,19 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
     ):
+        # #629: extend_prefix_lens_cpu mirrors the prefix_lens the CALLER
+        # passed. When prefix_lens arrives None it is derived below from
+        # seq_lens (and possibly a device-only num_accept_tokens), and the
+        # incoming mirror no longer describes it -- so the mirror is dropped
+        # rather than paired with a vector it does not match.
+        prefix_lens_cpu = extend_prefix_lens_cpu if prefix_lens is not None else None
+        # #629: the mirror used for SIZING is freshness-guarded -- seq_lens_cpu
+        # is a non-None but STALE slice exactly when seq_lens_sum is None, and
+        # sizing an index buffer from it is a silent mis-size. The mirror
+        # FORWARDED to call_begin_forward stays raw, matching
+        # update_single_wrapper: fast_prefill_plan asserts it is not None, and
+        # dropping it there would convert a slow path into a hard failure.
+        fresh_seq_lens_cpu = dcp_fresh_host_lens(seq_lens_cpu, seq_lens_sum)
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
             prefix_lens = (
@@ -6835,7 +6891,14 @@ class FlashInferIndicesUpdaterPrefill:
                         prefix_lens - sliding_window_size, min=0
                     )
                     paged_kernel_lens = prefix_lens - effective_start
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    # #629: prefix - max(prefix - W, 0) == min(prefix, W), the
+                    # same integers by identity rather than by re-derivation.
+                    paged_kernel_lens_cpu = _host_clamp_max(
+                        prefix_lens_cpu, sliding_window_size
+                    )
+                    paged_kernel_lens_sum = _host_sum_or_device(
+                        paged_kernel_lens_cpu, paged_kernel_lens
+                    )
                     kv_start_idx = effective_start
                     swa_paged_custom_mask = self._build_swa_prefix_custom_mask(
                         prefix_lens, seq_lens, effective_start
@@ -6846,12 +6909,21 @@ class FlashInferIndicesUpdaterPrefill:
                         seq_lens,
                         sliding_window_size + seq_lens - prefix_lens,
                     )
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    # #629: min(seq, W + seq - prefix) needs BOTH host vectors;
+                    # without either, no mirror is claimed.
+                    paged_kernel_lens_cpu = _host_swa_paged_lens(
+                        fresh_seq_lens_cpu, prefix_lens_cpu, sliding_window_size
+                    )
+                    paged_kernel_lens_sum = _host_sum_or_device(
+                        paged_kernel_lens_cpu, paged_kernel_lens
+                    )
                     kv_start_idx = seq_lens - paged_kernel_lens
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
                 paged_kernel_lens_sum = seq_lens_sum
+                # #629: exact mirror, checked by seq_lens_sum downstream.
+                paged_kernel_lens_cpu = fresh_seq_lens_cpu
                 kv_start_idx = seq_lens - paged_kernel_lens
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
@@ -6874,6 +6946,14 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                # #629: the second of the two PrefillWrapper paths left off the
+                # #616h/#623 channel. Same two consequences as the cross-attn
+                # twin: the weighted-DCP branch falls back to the unbounded
+                # int(full_indptr[bs].item()), and fast_prefill_plan's
+                # seq_lens_cpu assert has nothing to satisfy it.
+                seq_lens_cpu=seq_lens_cpu,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                paged_kernel_lens_cpu=paged_kernel_lens_cpu,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -6939,11 +7019,22 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens = seq_lens
                 kv_start_idx = encoder_lens
                 paged_kernel_lens_sum = seq_lens_sum
+                # #629: paged_kernel_lens IS seq_lens here, so seq_lens_cpu is
+                # its exact mirror and seq_lens_sum the check on it -- via the
+                # freshness guard, since a gpu_only batch's seq_lens_cpu is
+                # stale rather than absent and would mis-size the buffer.
+                paged_kernel_lens_cpu = dcp_fresh_host_lens(
+                    seq_lens_cpu, seq_lens_sum
+                )
             else:
                 # cross attention
                 paged_kernel_lens = encoder_lens
                 kv_start_idx = torch.zeros_like(encoder_lens)
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                # #629: encoder_lens has no host mirror on the ForwardBatch, so
+                # none is claimed -- None keeps the existing device read rather
+                # than substituting a vector that mirrors something else.
+                paged_kernel_lens_cpu = None
 
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
@@ -6963,6 +7054,15 @@ class FlashInferIndicesUpdaterPrefill:
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
+                # #629: this updater was one of the two PrefillWrapper paths
+                # left off the #616h/#623 host-mirror channel. Beyond the
+                # unbounded D2H in the weighted-DCP branch, call_begin_forward
+                # ASSERTS seq_lens_cpu is not None once fast_prefill_plan is
+                # installed, so an unforwarded mirror is a hard failure under a
+                # captured prefill graph, not merely a slow path.
+                seq_lens_cpu=seq_lens_cpu,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                paged_kernel_lens_cpu=paged_kernel_lens_cpu,
             )
 
     def call_begin_forward(
