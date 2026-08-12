@@ -31,7 +31,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Union
 
 import torch
 
@@ -490,6 +490,79 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+
+
+def truncation_align_admission_error(
+    chunked_prefill_size: Optional[int],
+    page_size: int,
+    truncation_align_size: Optional[int],
+    sources: Sequence[str] = (),
+) -> Optional[str]:
+    """Reject a chunk budget that can never satisfy the truncation alignment.
+
+    ``PrefillAdder.add_one_req``'s chunked branch aligns the chunk it is about
+    to take and REFUSES outright when the whole chunk budget is smaller than
+    one alignment unit::
+
+        trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+        if truncation_align_size is not None:
+            if trunc_len < truncation_align_size:
+                return AddReqResult.OTHER
+
+    ``rem_chunk_tokens`` is bounded above by ``chunked_prefill_size``, so when
+    the aligned chunk budget is below the alignment size that branch returns
+    ``OTHER`` for **every** request longer than the budget, on every
+    iteration, forever. The scheduler's admission loop ``break``s on any
+    non-CONTINUE verdict, so one such request at the head of the FCFS waiting
+    queue blocks the queue behind it, ``can_run_list`` stays empty, and no
+    batch is ever built.
+
+    The resulting instance is the worst failure shape this tree knows: it
+    boots, prints "fired up and ready to roll", serves its warmup prefills
+    (which are short enough to take the non-chunked branch) and then admits
+    NOTHING. Measured (booked as C30): zero ``Decode batch`` lines across an
+    entire boot, an 8-token ``/generate`` hung for 55 s, ``/health`` timing
+    out while ``/get_model_info`` answered instantly, and the collective
+    census FROZEN on both ranks at an identical count -- no crash, no
+    collective hang, no rank divergence and no log line. It looks exactly
+    like a deadlock and it is a refused predicate.
+
+    ``truncation_align_size`` has TWO independent sources and this guard
+    covers both, because either alone is sufficient to arm the trap:
+
+    * ``--enable-deterministic-inference`` on the flashinfer or triton
+      backend (align = ``SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE`` /
+      ``SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE``, both default 4096);
+    * ``--mamba-checkpoint-interval``, which sets the align size on its own
+      when deterministic inference is OFF and is lcm-ed into it when on.
+
+    Returns the error text, or None when the configuration can admit.
+    """
+    if truncation_align_size is None or int(truncation_align_size) <= 0:
+        return None
+    if chunked_prefill_size is None or int(chunked_prefill_size) <= 0:
+        # Chunked prefill is off -> rem_chunk_tokens is None -> the aligned
+        # branch is unreachable and nothing can be refused by it.
+        return None
+    chunked_prefill_size = int(chunked_prefill_size)
+    page_size = max(1, int(page_size))
+    truncation_align_size = int(truncation_align_size)
+    budget = chunked_prefill_size // page_size * page_size
+    if budget >= truncation_align_size:
+        return None
+    why = f" ({', '.join(sources)})" if sources else ""
+    return (
+        f"--chunked-prefill-size={chunked_prefill_size} cannot satisfy a "
+        f"prefill truncation alignment of {truncation_align_size}"
+        f"{why}. The chunk budget aligns down to {budget} tokens "
+        f"(page_size={page_size}), which is below one alignment unit, so the "
+        "scheduler's chunked-prefill branch refuses EVERY request longer than "
+        f"{budget} tokens and breaks the waiting-queue loop on it. The server "
+        "would boot, report ready, serve its warmups and then admit nothing "
+        "at all: no batch, no crash, no hang in any collective and no log "
+        f"line. Raise --chunked-prefill-size to at least "
+        f"{truncation_align_size}, or lower the alignment."
+    )
 
 
 class PrefillAdder:

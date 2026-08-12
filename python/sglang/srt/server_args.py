@@ -4048,8 +4048,13 @@ class ServerArgs:
         "pool churns under mixed traffic. Setting a fixed interval makes the "
         "checkpoint grid a pure function of the token history. Must be a "
         "multiple of the page size and of the model's mamba/FLA chunk size; "
-        "overrides --mamba-track-interval to the same value. Recommended: "
-        "2048, or the chunked prefill size.",
+        "overrides --mamba-track-interval to the same value. MUST NOT exceed "
+        "--chunked-prefill-size: the interval becomes the prefill truncation "
+        "alignment, and a chunk budget below one alignment unit makes the "
+        "scheduler refuse every request longer than the budget, so the server "
+        "boots, reports ready and then admits nothing (refused at startup). "
+        "Recommended: the chunked prefill size, or 2048 when the chunk budget "
+        "is at least that large.",
     ] = None
     enable_int8_mamba_checkpoint: A[
         bool,

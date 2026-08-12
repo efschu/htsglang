@@ -211,6 +211,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    truncation_align_admission_error,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -1948,13 +1949,37 @@ class Scheduler(
         # snapshot — on absolute interval positions, independent of the
         # traffic-dependent token budget of each round.
         ckpt_interval = self.server_args.mamba_checkpoint_interval
+        sources = []
+        if self.truncation_align_size is not None:
+            sources.append(
+                f"--enable-deterministic-inference on the "
+                f"{self.server_args.attention_backend} backend"
+            )
         if ckpt_interval is not None:
+            sources.append(f"--mamba-checkpoint-interval={ckpt_interval}")
             if self.truncation_align_size is None:
                 self.truncation_align_size = ckpt_interval
             else:
                 self.truncation_align_size = math.lcm(
                     self.truncation_align_size, ckpt_interval
                 )
+
+        # C30: refuse a chunk budget that can never satisfy the alignment just
+        # derived. Checked HERE because this is the only point where BOTH
+        # contributors (deterministic inference and the mamba checkpoint grid)
+        # have been folded into the final align size -- server_args cannot see
+        # the lcm without restating it. Reading chunked_prefill_size off
+        # server_args rather than self: init_chunked_prefill() runs later in
+        # __init__, and its only transform is to map <= 0 to None, which this
+        # helper already treats as "chunked prefill off".
+        _align_err = truncation_align_admission_error(
+            self.server_args.chunked_prefill_size,
+            self.server_args.page_size,
+            self.truncation_align_size,
+            sources,
+        )
+        if _align_err is not None:
+            raise ValueError(_align_err)
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(

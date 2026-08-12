@@ -37,6 +37,7 @@ FAMILY=(
     test/registered/unit/managers/test_spec_verify_width_631.py
     test/registered/unit/managers/test_kv_arena_reclaim_631.py
     test/registered/unit/managers/test_phase_flip_seam_census_631.py
+    test/registered/unit/managers/test_truncation_align_admission_656.py
     test/registered/unit/managers/test_phase_flip_spill_depth_631.py
     test/registered/unit/managers/test_phase_flip_draft_carrier_631.py
     test/registered/unit/managers/test_corridor_guard_631.py
