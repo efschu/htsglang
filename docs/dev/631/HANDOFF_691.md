@@ -232,6 +232,54 @@ two-actuator race needs **TP>=2 per PP stage** + `--enable-phase-flip` +
 
 ---
 
+## 2b. THE CONFIRMATION WINDOW — 0 BREACHES ON BOTH INSTRUMENTS, AND TWO AXES BELOW N46
+
+21 min of the canonical mixed load (`scripts/s24_green_run.sh`, the same recipe
+N43/N46 used, so the rows are comparable), ship config, boot commit
+`0fbbf9bfdc` running, extract at
+`/spinning/evidence-631/s47/WINDOW_EXTRACT.txt`.
+
+| axis | N46 | N47 |
+|---|---|---|
+| corridor breaches (NVML) | 0 | **0** (11307 samples) |
+| gpu0_free MIN | 1435 | **1397** |
+| gpu1_free MIN | 2388 | **2061** |
+| gpu2_free MIN | 1713 | **1727** |
+| deepest seam-census trough | 1434 | **1396** (306 troughs) |
+| seam-census breaches | 0 | **0** |
+| census CORRIDOR LAW BROKEN | 0 | **0** |
+| seam PREDICTS A SUB-LAW TROUGH | 0 | **0** |
+| FLIP ABANDONED | 0 | **0** (102 flips) |
+| tracebacks / CUDA errors | 0 | **0** |
+| soak | ok=54 err=0 | **ok=72 err=0** |
+| max context | 111405 | **111405** |
+| C29/C30 lines on metal | 0 | **0** |
+
+**Stated plainly because it would be easy to quote only the good half: two of
+the three NVML minima and the deepest seam trough are BELOW N46's.** N46 could
+claim every axis above N43; I cannot claim that against N46. What holds is the
+acceptance criterion — **0 breaches on both instruments** — with the deepest
+seam trough clearing the 1024 law by 372 MiB. The soak did more work in a
+shorter window (ok=72 vs 54), which is the most likely reason the minima sit
+lower; I did not isolate that, so treat it as unexplained rather than
+explained.
+
+Judged on the seam census as well as NVML, per the standing law.
+
+**Two harness notes for whoever runs this next.**
+* `scripts/s24_green_run.sh` does NOT wait for its legs — it `setsid`s them and
+  exits immediately. **`pgrep -f "s24_green_run.sh"` therefore matches only
+  YOUR OWN shell** (the pattern is in your command line), which reads as "still
+  running" forever. I lost several minutes to exactly the trap HANDOFF_690 §6
+  documents. Poll the real legs instead: `soak_631_mixed_load`,
+  `corridor_sample`, `route_a_631_prefill_ladder`, `s22_decode_probe`.
+* The ladder leg's output filename is single-quoted in the harness, so every
+  pass writes to a file literally named `ladder_$i.json` and overwrites the
+  previous one. Only the last pass survives. Harmless for the max-context axis,
+  wrong if anyone ever wants per-pass ladder data.
+
+---
+
 ## 3. THE RIG AS I LEAVE IT
 
 * **Serving is UP on 30030, ship config**, restored by me with `setsid` from
