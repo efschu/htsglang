@@ -1,0 +1,4 @@
+# Locally built wheels are build inputs, never repository content.
+*
+!.gitignore
+!README.md

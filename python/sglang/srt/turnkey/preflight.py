@@ -39,13 +39,21 @@ from sglang.srt.turnkey.refusal import (
     REFUSE_HOST_HEADROOM,
     REFUSE_PATH_MISSING,
     REFUSE_PORT_BUSY,
+    REFUSE_WHEEL_DIST_SHADOW,
     REFUSE_WHEEL_SHADOW,
     Refusal,
     RefusalError,
     refuse,
 )
 
-__all__ = ["Probes", "CardObs", "Probes", "run_all", "default_probes"]
+__all__ = [
+    "Probes",
+    "CardObs",
+    "DistObs",
+    "ImportObs",
+    "run_all",
+    "default_probes",
+]
 
 MIB = 1024 * 1024
 GIB = 1024 * 1024 * 1024
@@ -98,6 +106,13 @@ class Probes:
     #: ImportError. Kept as one probe because the two facts come from the
     #: same import and splitting them would allow a half-checked state.
     probe_import: Callable[[str, str], "ImportObs"]
+    #: Every installed distribution that ships files under ``<package>/``.
+    #: Deliberately NOT folded into ``probe_import``: that probe answers "what
+    #: does importing give me", which is a fact about the winner, and this one
+    #: answers "how many candidates were there", which is a fact about the
+    #: installation. The #384 state this catches is one where the import
+    #: answers correctly and the installation is still wrong.
+    dist_providers: Callable[[str], Sequence["DistObs"]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -105,6 +120,15 @@ class ImportObs:
     module_file: str
     version: str
     has_arm: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class DistObs:
+    """One installed distribution providing an import package."""
+
+    dist_name: str
+    version: str
+    recorded_files: int
 
 
 # --- real probes ----------------------------------------------------------
@@ -174,6 +198,25 @@ def _real_probe_import(module: str, attr: str) -> ImportObs:
     )
 
 
+def _real_dist_providers(package: str) -> Sequence[DistObs]:
+    """Enumerate providing distributions WITHOUT importing the package.
+
+    Importing is both impossible in some callers and hazardous in others (see
+    ``sglang.srt.utils.kernel_dist_guard``), and it would answer the wrong
+    question anyway: the import tells you who won, not how many were running.
+    """
+    from sglang.srt.utils.kernel_dist_guard import list_providers
+
+    return [
+        DistObs(
+            dist_name=p.dist_name,
+            version=p.version,
+            recorded_files=p.recorded_files,
+        )
+        for p in list_providers(package)
+    ]
+
+
 def default_probes() -> Probes:
     return Probes(
         cards=_real_cards,
@@ -183,6 +226,7 @@ def default_probes() -> Probes:
         port_busy=_real_port_busy,
         path_exists=os.path.exists,
         probe_import=_real_probe_import,
+        dist_providers=_real_dist_providers,
     )
 
 
@@ -242,6 +286,55 @@ def check_wheel(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
         if w.expect_prefix and not obs.module_file.startswith(w.expect_prefix):
             return refuse(REFUSE_WHEEL_SHADOW, f"{module}.__file__",
                           obs.module_file, f"a path under {w.expect_prefix}")
+    return None
+
+
+def check_wheel_dist_shadow(cfg: StackConfig, p: Probes) -> Optional[Refusal]:
+    """#384 standing reinstall block: is the shadow STRUCTURALLY possible?
+
+    :func:`check_wheel` asks whether the shadow has already chosen wrongly.
+    This asks the earlier question -- whether there is a choice to make at all
+    -- and refuses while everything still looks fine. That is the point.
+
+    Two distributions with different names providing the same import package
+    are not a conflict to pip, so no install fails, no warning is printed, and
+    which one owns the files is decided by whichever ran last. A venv in that
+    state serves correctly right up until an unrelated ``pip install -U``
+    touches the other dist, and then it serves an armless kernel with no event
+    marking the change. The rig has been through that twice (#357's
+    roll-forward/roll-back pair flipped the same files both ways).
+
+    So the refusal is deliberately raised on a HEALTHY-looking machine. An
+    operator reading it will object that the arm is present and the server
+    works; both are true, and neither is stable. The remedy is to uninstall
+    the loser, which removes the choice rather than winning it again.
+    """
+    w = cfg.wheel
+    if not w.enabled:
+        return None
+    for module in w.must_import:
+        providers = list(p.dist_providers(module))
+        if len(providers) <= 1:
+            continue
+        names = ", ".join(
+            f"{d.dist_name} {d.version} ({d.recorded_files} files)"
+            for d in sorted(providers, key=lambda d: d.dist_name)
+        )
+        keep = w.dist or "the fork distribution"
+        losers = [d.dist_name for d in providers if d.dist_name != w.dist]
+        return refuse(
+            REFUSE_WHEEL_DIST_SHADOW,
+            f"distributions providing {module}",
+            names,
+            f"exactly one ({keep})",
+            remedy=(
+                f"pip uninstall -y {' '.join(losers) or '<the other dist>'} "
+                f"and reinstall the pinned wheel, so the import name has one "
+                f"owner; see docs/rig-runbook.md 2.1. Do this only while the "
+                f"venv is QUIET -- removing the files under a running server "
+                f"breaks it mid-flight."
+            ),
+        )
     return None
 
 
@@ -368,8 +461,8 @@ def run_all(cfg: StackConfig, p: Optional[Probes] = None) -> List[Refusal]:
         r = fn(cfg)
         if r:
             out.append(r)
-    for fn in (check_paths, check_wheel, check_cards, check_host_headroom,
-               check_disk, check_ports):
+    for fn in (check_paths, check_wheel, check_wheel_dist_shadow, check_cards,
+               check_host_headroom, check_disk, check_ports):
         try:
             r = fn(cfg, p)
         except RefusalError as e:

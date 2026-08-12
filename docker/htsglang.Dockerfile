@@ -52,6 +52,30 @@
 #
 # CUDA 13 dropped Maxwell/Pascal/Volta. sm_70 and below need a cu12 base image;
 # that is out of scope for this Dockerfile.
+#
+# ---------------------------------------------------------------------------
+# Two optional native paths this image deliberately does NOT carry
+# ---------------------------------------------------------------------------
+# Both are AUDIT-251 section 3.2 flags, closed here as decisions rather than
+# left to be discovered at boot. Neither is a defect: each is a build input
+# that cannot be vendored, and each refuses by name when its input is absent.
+#
+#   barlink BAR1 (peer-VRAM transport). Compiles against the open-kernel-module
+#   headers at barlink_bar1_ext.py NV_SOURCE_DEFAULT=/spinning/nvidia-open-595,
+#   overridable via SGLANG_BARLINK_BAR1_NV_SOURCE. It additionally needs a
+#   patched out-of-tree driver and /dev/dmabuf_holder on the host, so vendoring
+#   the headers alone would not make it work. DECISION: the image ships without
+#   it. Expected behaviour is the named refusal at barlink_bar1_ext.py:2098-2103
+#   ("... cannot be called. Set the path via SGLANG_BARLINK_BAR1_NV_SOURCE"),
+#   logged at INFO, and a fall back to the other barlink transports -- never a
+#   silent switch to NCCL. To enable it, mount the headers and set the env.
+#
+#   GDR crossover probe. planner/comm_suite.py _GDR_CROSSOVER_DEFAULT_BIN
+#   points at /spinning/gdr-uebergabe/gpurdma_04_bench, overridable via
+#   SGLANG_GDR_CROSSOVER_BIN. The binary is MIT but version-locked to the
+#   installed driver's ioctl layout, which is why it is never vendored.
+#   DECISION: the arm is expected ABSENT in the image. The suite must report it
+#   as absent; an absent probe reported as a zero would be a false measurement.
 # ---------------------------------------------------------------------------
 
 ARG CUDA_VERSION=13.0.1
@@ -187,6 +211,58 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
     && python3 -m pip install --no-deps --force-reinstall \
        "${NCCL_PACKAGE}==${NCCL_VERSION}"
 
+# 3a) sgl-kernel provenance gate (#384). The image must not be able to ship a
+#     silently armless kernel, and it must not be able to ship TWO
+#     distributions of it.
+#
+#     THE DEFECT. `sgl-kernel` (pypi, installed in step 2) and `sglang-kernel`
+#     (the fork's build) provide the SAME `sgl_kernel` import package under
+#     DIFFERENT distribution names. pip does not see a conflict, so whichever
+#     was installed last owns the files and nothing is logged. The pypi one
+#     has no `int8_scaled_mm`, so an INT8-W8A8 boot then dies during layer
+#     construction, far from the install that caused it. Full provenance,
+#     hazard and repair: docs/rig-runbook.md section 2.1.
+#
+#     WHY THE CHECK IS FILE INSPECTION AND NOT AN IMPORT. The recipe in the
+#     runbook ends with `python -c "import sgl_kernel; assert ..."`, which
+#     cannot run here: as step 4 below records, a real import needs
+#     libcuda.so.1 from the host driver, which `docker build` does not have.
+#     An import-based assert would fail on a CORRECT image. The guard is
+#     therefore stdlib-only and reads dist-info RECORDs plus the ELF objects
+#     directly -- the same file-inspection route the runbook itself uses to
+#     verify an installed wheel without importing it. It is invoked by PATH
+#     with `python3 -I`, so it neither imports nor needs the `sglang` package.
+#
+#     DEFAULTS PRESERVE TODAY'S IMAGE. With no build args, nothing is
+#     installed and nothing is required beyond "exactly one distribution
+#     provides sgl_kernel" -- which the stock image already satisfies. Set
+#     SGL_KERNEL_WHEEL (a bare filename in docker/kernel-wheel/, see its README) to
+#     install the fork wheel, and REQUIRE_INT8_ARM=1 to make an armless result
+#     a failed build instead of a runtime surprise months later.
+ARG SGL_KERNEL_WHEEL=
+ARG SGL_KERNEL_WHEEL_SHA256=67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664
+ARG REQUIRE_INT8_ARM=0
+COPY docker/kernel-wheel /tmp/htsglang-wheels
+RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
+    set -eu; \
+    GUARD=/sgl-workspace/sglang/python/sglang/srt/utils/kernel_dist_guard.py; \
+    test -f "${GUARD}" || { echo "FATAL: kernel guard missing from the fork source"; exit 1; }; \
+    if [ "${INSTALL_SGL_KERNEL}" != "1" ]; then \
+      echo "INSTALL_SGL_KERNEL=0 -> no sgl_kernel in this image; provenance gate skipped"; \
+    else \
+      if [ -n "${SGL_KERNEL_WHEEL}" ]; then \
+        W="/tmp/htsglang-wheels/${SGL_KERNEL_WHEEL}"; \
+        test -f "${W}" || { echo "FATAL: SGL_KERNEL_WHEEL=${SGL_KERNEL_WHEEL} not found in docker/kernel-wheel/ (see its README)"; exit 1; }; \
+        python3 -I "${GUARD}" --wheel "${W}" --expect-sha256 "${SGL_KERNEL_WHEEL_SHA256}"; \
+        python3 -m pip uninstall -y sgl-kernel || true; \
+        python3 -m pip install --no-deps "${W}"; \
+      fi; \
+      ARM=""; \
+      if [ "${REQUIRE_INT8_ARM}" = "1" ]; then ARM="--require-arm"; fi; \
+      python3 -I "${GUARD}" ${ARM}; \
+    fi; \
+    rm -rf /tmp/htsglang-wheels
+
 # 3b) Planner extra: chess + cairosvg + defusedxml (pyproject's `planner`
 #     extra). Only the quality-benchmark tab imports them, and it imports them
 #     lazily, so the UI boots without them — but the tab then hard-fails.
@@ -240,7 +316,16 @@ RUN mkdir -p \
 # CHAT_TEMPLATE is deliberately NOT set here: the froggeric v21.3 template is
 # Qwen-specific, and a baked-in default would silently apply it to every model.
 # The compose files set it explicitly.
+# SGLANG_BARLINK_LAUNCH_DUMP=0 closes AUDIT-251 section 3.2's first flag. The
+# #603b launch sampler is ON by default and writes one line per live transport
+# per second, forever, to /spinning/wedge-catch-603b -- a rig directory that
+# does not exist in this image. The default stays ON in the tree deliberately
+# (the #631 wedge hunt is reading those files, and an audit branch is not where
+# another strand's instrument gets switched off), so the image is the correct
+# place to turn it off. Flip this to 1 only to debug a wedge INSIDE a
+# container, and give it a writable SGLANG_BARLINK_LAUNCH_DUMP_DIR if you do.
 ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}" \
+    SGLANG_BARLINK_LAUNCH_DUMP=0 \
     HICACHE_STORAGE_DIR=/var/lib/htsglang/hicache \
     TRITON_CACHE_DIR=/root/.triton \
     TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \

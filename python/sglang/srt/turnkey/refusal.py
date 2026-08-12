@@ -38,6 +38,7 @@ __all__ = [
     "REFUSE_REPO_IS_WORKTREE",
     "REFUSE_PATH_MISSING",
     "REFUSE_WHEEL_SHADOW",
+    "REFUSE_WHEEL_DIST_SHADOW",
     "REFUSE_CARD_CENSUS",
     "REFUSE_CARD_UNKNOWN_UUID",
     "REFUSE_CARD_BUSY",
@@ -67,6 +68,16 @@ REFUSE_PATH_MISSING = "REFUSE_PATH_MISSING"
 #: plain ``pip install`` silently drops the INT8 arm. Verified BEFORE boot,
 #: because the symptom otherwise appears as a quality regression hours later.
 REFUSE_WHEEL_SHADOW = "REFUSE_WHEEL_SHADOW"
+#: #384 standing reinstall block: MORE THAN ONE installed distribution ships
+#: the same import package. Distinct from REFUSE_WHEEL_SHADOW, which reports
+#: that the shadow has ALREADY chosen wrongly (wrong version, wrong tree,
+#: missing arm). This one fires while the fork's files are still winning --
+#: the venv is correct today and one unrelated ``pip install`` away from
+#: silently losing the INT8 arm, because pip sees no conflict between two
+#: dists with different names and the same import name. Detected by file
+#: inspection (RECORD contents), never by importing, so it also holds where
+#: an import is impossible.
+REFUSE_WHEEL_DIST_SHADOW = "REFUSE_WHEEL_DIST_SHADOW"
 #: The set of cards NVML reports does not match the set the config names.
 REFUSE_CARD_CENSUS = "REFUSE_CARD_CENSUS"
 REFUSE_CARD_UNKNOWN_UUID = "REFUSE_CARD_UNKNOWN_UUID"
@@ -94,6 +105,7 @@ NAMES = (
     REFUSE_REPO_IS_WORKTREE,
     REFUSE_PATH_MISSING,
     REFUSE_WHEEL_SHADOW,
+    REFUSE_WHEEL_DIST_SHADOW,
     REFUSE_CARD_CENSUS,
     REFUSE_CARD_UNKNOWN_UUID,
     REFUSE_CARD_BUSY,

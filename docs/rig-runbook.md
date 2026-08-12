@@ -117,15 +117,38 @@ the operator with its own type and message.
 
 ### What is installed on CT999, measured
 
-Two distributions both provide the `sgl_kernel` import package:
+Two distributions CAN both provide the `sgl_kernel` import package, and that
+is the whole hazard:
 
 | dist-info | dist name | provides `sgl_kernel/` | has INT8 arm |
 |---|---|---|---|
 | `sgl_kernel-0.3.21.dist-info` | `sgl-kernel` (pypi) | 69 files | no |
 | `sglang_kernel-0.4.4.dist-info` | `sglang-kernel` (fork) | 74 files | **yes** |
 
-`import sgl_kernel` currently reports `0.4.4` and `int8_scaled_mm` is present,
-i.e. the fork's files are the ones on disk.
+**Current state, re-measured 2026-08-12 by file inspection (no import): the
+venv is SINGLE-DIST.** Only `sglang_kernel-0.4.4.dist-info` is present — the
+shadowing pypi dist-info is gone, `direct_url.json` carries the pinned
+`67f03cfa…4664`, the objects link `libcudart.so.13`, and `int8_scaled_mm` is
+in `sm100/common_ops.abi3.so`. That is the intended state, and it is what the
+"durable reinstall" below produces. The table above describes the state to
+avoid returning to, not the state of this box today.
+
+Do not verify this by hand any more. There is now one command, and it checks
+all four facts at once without importing anything:
+
+```bash
+V=/spinning/htsglang-gpu/.venv
+$V/bin/python python/sglang/srt/utils/kernel_dist_guard.py \
+    --site-packages $V/lib/python3.12/site-packages \
+    --require-arm --expect-pinned-sha256      # expect: verdict=ARMED, exit 0
+```
+
+It refuses a second providing distribution even while the fork's files are
+still winning — the state every import-based check passes and which is one
+`pip install` away from silently losing the arm. The same detector runs as a
+turnkey preflight refusal (`REFUSE_WHEEL_DIST_SHADOW`), so a shadowed venv
+blocks serving activation, and as a Docker build-layer gate, so an image
+cannot be built into that state (`docker/htsglang.Dockerfile` step 3a).
 
 Fork wheel provenance (from the fork dist's `direct_url.json`) — this is the
 single authority for what is installed; every ticket that builds a wheel points
@@ -337,7 +360,17 @@ forgets the stream will see that error and it is not #436.
 
 The image must not pull `sgl-kernel` from an index either. In the build:
 
+**This recipe is now IMPLEMENTED in the Dockerfile (step 3a), with one
+correction — do not copy the sketch below into a build.** The sketch's trailing
+assert cannot run: `import sgl_kernel` needs `libcuda.so.1` from the host
+driver, which `docker build` does not have, so the assert would fail on a
+*correct* image. The shipped gate does the same job by file inspection
+instead, and additionally verifies the wheel's sha256 *before* installing it
+and refuses a two-dist result. Kept here as the historical statement of intent:
+
 ```dockerfile
+# SUPERSEDED by docker/htsglang.Dockerfile step 3a -- the import cannot run at
+# build time. See docker/kernel-wheel/README.md for the current build args.
 COPY sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl /tmp/
 RUN pip uninstall -y sgl-kernel || true && \
     pip install --no-deps /tmp/sglang_kernel-0.4.4-cp310-abi3-linux_x86_64.whl && \
@@ -345,7 +378,8 @@ RUN pip uninstall -y sgl-kernel || true && \
 ```
 
 The trailing assert is the point: it turns a silently-armless image into a
-failed build instead of a runtime `ColdBuildWindowError` months later.
+failed build instead of a runtime `ColdBuildWindowError` months later. The
+shipped gate keeps that property and adds the sha256 and single-dist checks.
 
 **The recipe above has NOT been applied to `htsglang:cu130-nccl2307` yet
 (#384, open).** Measured inside the running container: `/usr/local/lib/
