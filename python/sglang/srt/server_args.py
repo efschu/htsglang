@@ -7508,9 +7508,32 @@ class ServerArgs:
         # and a repeating
         #   "POLICY holding in tp: min dwell: 3.0s since last flip < 3s
         #    (pending prefill 1 tok, running bs 0)".
-        # The same build serves normally at 620000. The livelock is real,
-        # undiagnosed, and it is the worst failure class we have: an instance
-        # that looks healthy from every side except the only one that matters.
+        # The same build serves normally at 620000. It is the worst failure
+        # class we have: an instance that looks healthy from every side except
+        # the only one that matters.
+        #
+        # ROOT CAUSE, confirmed from the wedged boot's own log:
+        #   121x "staging 464 MiB needed but only 444 MiB is spendable"
+        #   336x "phase flip refused (guards): seam unfundable: tp_to_pp
+        #         abandoned 8 times consecutively"
+        #   179x "PHASE-POLICY arming" at the 3 s dwell cadence
+        # The pool sizer fills to the 1024 MiB corridor floor and leaves
+        # NOTHING for the flip seam, which must stage live KV rows across the
+        # layout change. At 683150 the seam needs 464 MiB and can spend 444 --
+        # short by 20 MiB. Every cutover is abandoned, the guards latch
+        # "seam unfundable", and under strict purity a prefill cannot be built
+        # in the TP phase at all, so the queued token waits forever.
+        # Compounding it, the policy commits its dwell clock in
+        # note_flip_armed BEFORE knowing whether the arm succeeded, and
+        # handle_phase_flip drops the outcome for internal requests, so the
+        # refusal never reaches the policy state: an unfundable seam becomes
+        # an unbounded silent retry instead of a bounded stand-down.
+        #
+        # THE REAL FIX is therefore not this ceiling but a sizer that reserves
+        # the seam's staging bytes on top of the user corridor -- the pool
+        # should be VRAM minus corridor minus staging, which lands above
+        # 620000 and still serves. This constant is a stand-in until that
+        # lands.
         #
         # So the DEFAULT is the largest pool this rig has actually been proven
         # to SERVE, not the largest it can back. A capacity number without a

@@ -1947,3 +1947,25 @@ costs the next allocations a fault-in and deserves its own measurement.
    result took the shell down mid-statement (exit 144). Law 40 is usually
    filed under `pkill -f`; the actual hazard is any full-command-line match,
    including one built by hand. Exclude shells and the caller's own PID.
+
+52. **The KV sizer fills to the corridor floor and leaves nothing for the
+   phase-flip seam, which needs ~464 MiB to stage live rows across the layout
+   change.** At pool 683150 the wedged boot logged 121x
+   `staging 464 MiB needed but only 444 MiB is spendable` -- short by 20 MiB --
+   then 336x `phase flip refused (guards): seam unfundable: tp_to_pp abandoned
+   8 times consecutively`. Under strict purity a prefill cannot be built in
+   the TP phase, so the queued token waited forever: health 200, zero tokens.
+   A pool sized to "VRAM minus corridor" is NOT a pool the flip can operate;
+   the seam's staging cost is a fixed post like any other and must be
+   subtracted before the pool is sized.
+
+53. **The flip policy commits its dwell clock before knowing whether the arm
+   succeeded, so a refusable seam becomes an unbounded silent retry.**
+   `note_flip_armed(state, decision, inp.now)` resets `last_flip_at` and
+   increments `flips_armed` the instant `decide()` wants a flip, and
+   `handle_phase_flip` drops the outcome for internally generated requests
+   (`if internal: return None`). The runtime's own backoff -- seam_backoff and
+   SEAM_ABANDON_CAP, built exactly for this -- is defeated by a policy layer
+   that re-arms every `min_dwell_s` regardless. 179 arms, 0 completed
+   cutovers. "362 flip events" in a log means arms attempted, NOT phases
+   changed; counting them as flips is how this hid.
