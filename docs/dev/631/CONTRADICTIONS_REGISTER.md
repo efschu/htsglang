@@ -727,6 +727,85 @@ constant is written down.**
 
 ---
 
+**C36 — C34's "WALL" WAS TWO BUGS WEARING ONE ARM, AND THE CUT RUNS UNDER THE
+FLIP AFTER ALL (#485/#631, successor 49, 2026-08-12).** C34 recorded that
+"every cut that moves the attention split off `[7,5,4]` starves the flip's
+seam staging". That is too strong, and the reason it was believable is a
+design fault in the arm set, not a fault in the measurement.
+
+N48 set `SGLANG_UNEVEN_TOKEN_VECTOR` per arm to that arm's attention split —
+good physics, because the KV arena should follow the attention layers — which
+means the cut and the arena moved TOGETHER in every arm. One boot separates
+them: arm C's cut at pool 340000, flip on, everything identical except the
+vector held at the ship `7,5,4`.
+
+| | vector 10,3,3 (N48) | vector 7,5,4 (this shift) |
+|---|---:|---:|
+| flips completed | 3 | **6** |
+| flips abandoned | 185 (555 lines) | **0** |
+| reached /health 200 | never | **yes** |
+
+**The seam wedge follows the ARENA, not the cut.** A desk derivation from
+`_staging_bytes` predicted the opposite and was recorded before the boot; it
+correctly predicts WHICH RANK refuses in both of N48's wedges (rank0 for arm
+C, rank2 for arm D) and still names the wrong variable, because the row counts
+in that formula are set by the arena. **A model can get the right answer for
+the right mechanism and still be attributing the wrong cause, when the causes
+were never separated.**
+
+**The second bug, and it is a correctness bug.** `KvRowCap._apply` accumulates
+its withheld ids and was wired as the allocator's on-CLEAR hook as well as its
+on-free hook. `clear()` rebuilds `free_pages = arange(1, size+1)`, so the ids
+above the cap are taken a SECOND time. Measured twice:
+
+| boot | pool | vector | total−available | withheld | ratio |
+|---|---:|---|---:|---:|---:|
+| N48 arm C | 280000 | 10,3,3 | 12783 | 25566 | **2.000** |
+| successor 49 | 340000 | 7,5,4 | 81640 | 163280 | **2.000** |
+
+`withheld == 2 x (total − available)` exactly, across two pools and two token
+vectors. **An exact integer ratio that survives both axes is a duplicate
+booking, and that arithmetic is what found the defect** — the share and
+rounding hypotheses were refuted by it before any code was read. The free list
+stays correct, so only the published counter lies and the idle invariant
+reports a leak on an intact pool. Worse half: `release()` cats the doubled
+tensor back into `free_pages`, handing one KV row to two requests silently.
+Only a configuration that ENGAGES the cap can reach it, which needs a corridor
+deficit — so the ship cut never does, and doubling zero is invisible.
+
+**The result.** With both fixed, the planner cut at pool 280000, flip ON:
+**66.072 s at depth 179200 against the 98.276 s flip-on control, +48.7 %**,
+42 flips, 0 abandoned, five deep prefills survived. Flip-off was +50.9 %, so
+**the gain survives the flip world and the honest number is the smaller one.**
+
+**Still GATED, and now for named numbers rather than a category.** The cut
+does not hold the corridor: rank0 (the 5090, 10 of 16 attention layers)
+bottoms at **976 MiB, 6 samples of 3568 under the 1024 law** at pool 280000,
+and at pool 340000 it is 606 MiB and a `cuMemCreate` OOM. And the residency
+model itself mispredicts that rank — it called arm C feasible with 2617 MiB
+spare. Two calibration gaps, both quantified, neither a mystery.
+
+---
+
+**C37 — A BELT THAT HIDES THE DEFECT FROM ITS OWN TEST IS NOT A BELT
+(#485, successor 49, 2026-08-12).** The `KvRowCap` fix above was written as
+two changes: the semantic one (give `clear` its own hook that drops the stale
+set) and a `torch.unique` "belt" in `_apply` to make a duplicate
+unrepresentable. With the belt in place the three new regression tests passed
+**whether or not the semantic fix existed** — the can-fail probe is what
+revealed it, by reverting the hook and watching the suite stay green.
+
+The belt was REMOVED, not kept. Two reasons, and the second is the general
+one: it would have certified the wrong change as the fix, and it would have
+silently absorbed the next path that books an id twice instead of failing on
+it. **Run the can-fail probe against each candidate fix separately, not
+against the patch as a whole** — a patch that contains a masking change and a
+real change passes as a unit and teaches nothing about which half worked.
+Sibling of the instrument-floor law: an instrument that cannot fail is not
+evidence, and that applies to a fix's own tests as much as to a benchmark.
+
+---
+
 ## SINGLE-SOURCED AND LOAD-BEARING — the next contradictions
 
 Each appears in exactly one place and a decision rests on it. Confirm before
@@ -1270,3 +1349,29 @@ boot with **TP>=2 per PP stage** plus `--enable-phase-flip` plus
    demand does not appear in any at-rest measurement. Sibling of law 13 (name
    the LATENCY class of a relief mechanism): same error one axis over — there
    the missing dimension was time, here it is transience.
+
+24. **A setting that is DERIVED from the variable under test is a second
+   variable** (C36, #485). The four-arm cut A/B set
+   `SGLANG_UNEVEN_TOKEN_VECTOR` per arm to that arm's attention split,
+   because the KV arena should follow the attention layers. The physics is
+   right and the experiment had two variables in it, so one shift attributed
+   two independent failures to a single "wall" and wrote it into the register
+   as a property of the cut. One boot holding the derived setting at its ship
+   value separated them, and the answer was the opposite of the desk
+   prediction on the failure the prediction was aimed at. **Before an arm
+   set runs, list every setting that MOVES WITH the variable and ask what a
+   result would mean if the rider carried it.** Diagnostic tell: an arm
+   differs from the control in "one thing" that is described in two clauses
+   joined by "and therefore".
+
+25. **Consumed law 23's other half: the transient term is in the model now,
+   and an uncalibrated term is still a zero** (C36, #485). `RankResources`
+   gained `seam_staging_mib` and the solver maximizes the tightest RUNNABLE
+   headroom, so "fits at rest" and "can run" are finally different
+   predicates in code. The field defaults to 0, which means the gate is
+   unchanged until someone measures the value — and a gate modelling
+   transient demand as zero is exactly the gate that certified the cut that
+   wedged. **Adding the TERM is not the same as closing the hole; the hole
+   closes when the number is measured.** Two measured demands exist and do
+   not separate the term's shape, and no formula was fitted to them,
+   because the mechanism a formula would encode was refuted the same week.
