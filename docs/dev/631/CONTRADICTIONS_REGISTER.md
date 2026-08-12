@@ -602,6 +602,89 @@ to the pinned host pool by `host_pool.backup_from_device_all_layer`, `:3790`).
 
 ---
 
+### C31 — the KV spill round trip breaks byte-identity, and it took a working instrument three shifts to say so (#659, successor 47)
+
+**OPEN. Measured, reproduced, attributed; mechanism NOT yet identified.**
+
+The headline is not the defect. It is that **three shifts in a row concluded
+"not obtainable" / "separates nothing" from an instrument that could not have
+detected the defect if it were there**, and the defect was there the whole
+time.
+
+**What was measured**, probe `v10` on port 30042 (`--enable-deterministic-inference
+--attention-backend flashinfer --enable-kv-session-offload
+--chunked-prefill-size 4096`, boot commit `03b6fb990d`, evidence
+`/spinning/evidence-631/s47/`):
+
+| run | pressure | spilled | result |
+|---|---|---|---|
+| floor x3 | quiescent, sequential | none | all 3 identical, `89f0c7e305c1ceab` |
+| `s47c` | 4 concurrent, NO fill | **none** | **all 4 identical**, cohort-0 included |
+| `s47` (A) | 4 concurrent + 3 fill | `cohort-0` only | 1/2/3 identical; **cohort-0 `b25a8fc15649a2dc`, 1673 ch** |
+| `s47b` (B) | 4 concurrent + 3 fill | `cohort-0` only | 1/2/3 identical; **cohort-0 `81e02f5e659d47d8`, 1706 ch** |
+| `s47f` (F) | 8 concurrent + 5 fill | `cohort-0` only | **7 of 8 identical**; **cohort-0 `eb0c3615126dfce2`, 1639 ch** |
+
+Seventeen never-spilled generations of one prompt are byte-identical across
+five independent runs, including a run at double the cohort size. The three
+generations that spilled are **each** divergent from the reference **and from
+each other** (1673 / 1706 / 1639 chars, three distinct digests) — so the spill
+path does not shift the output by some fixed amount, it **reintroduces
+nondeterminism into a boot whose entire purpose was to remove it**.
+
+**The attribution is closed by the `s47c` falsifier, and that run is the point
+of the entry.** `cohort-0` is also the first-submitted request, so "position 0
+is special" was a live alternative explanation for A and B. Removing only the
+fill pressure — same cohort, same concurrency, same prompt, same sampling —
+made `cohort-0` spill-free and byte-identical. Position, concurrency and batch
+composition are excluded **by measurement, not by argument**.
+
+The spilled session's own records (`probe_v10.log:380-459`) name what it went
+through: `SPILL(partial) rid=s47-cohort-0 L=3073 device_head=0 host_tail=3073`
+(the entire context left the device), `first spill tick`, `WAVE-BACK boundary
+0->1083 tail_left=2028`, then `finished on host`. It decoded **from host RAM**,
+which the boot warned about in advance at `probe_v10.log:166`: *"no
+token-sharded DCP active -- the spilled session streams its WHOLE context over
+a single PCIe link every decode step"*.
+
+**Why every earlier shift missed it, which is the transferable part.** The
+defect needs TWO conditions to be visible and no previous run had both:
+determinism live (or every session differs and nothing is attributable — s45
+measured exactly that, all four cohort digests distinct, verdict "this run
+separates nothing"), AND a spill actually occurring. HANDOFF_689 then
+concluded byte-identity was "not obtainable on this rig until deterministic
+inference and kv-session-offload can coexist" and told the next shift not to
+spend time on flag variations. They coexist (C30). **A null result from an
+instrument with no demonstrated floor is not evidence of absence, and this
+register now has three shifts of it.** The cheap thing that would have caught
+it at any point is the one this shift ran first: three quiescent repeats of
+the reference prompt, to show the instrument can register "identical" at all
+before asking it to judge "different".
+
+**A SECOND instrument defect, found by the same run and still unfixed.**
+`park_complete_proof2.py` exited **3 ("NOTHING PARKED")** on both A and B —
+i.e. the run that contains the finding is reported by the driver as a null.
+Its arm assignment keys exclusively on file-tier `PARK commit rid=` records
+(`PARK_RE`, `:166`), so a session that spilled to the **host** tier and waved
+back is not merely missed — it is filed into the **control** arm, where it
+sets `control_arm_identical_to_reference = False` and makes a genuinely clean
+control look contaminated. The verdict table is therefore wrong in both
+directions at once. This is **law 19's shape applied to attribution**: the
+state is "this session's KV left the device and came back", and that state has
+at least two exits (host tier, file tier) while the instrument was written for
+one. Fix before reuse: assign arms from the union of the spill/park record
+families, and report the tier.
+
+**Not yet known, and not to be guessed:** whether the divergence is the fp8
+KV round trip through host, the partial wave-back boundary, the born-spilled
+prefill path (`--kv-session-offload-prefill` was on), or the loss of the radix
+cache under deterministic flashinfer. The FILE-tier park arm is separately
+unproven — the host tier is sized to hold **one** full-context region (proved
+by the refusal at `--kv-session-offload-host-ram-gib 0.12`: *"cannot hold even
+ONE full-context session ... 3933 tokens < 32770"*), so a single spill fills
+it and a second concurrent spiller is required to reach the file tier at all.
+
+---
+
 ## THE LAWS THIS REGISTER PRODUCES
 
 1. **A number is valid for its geometry, its pool, and its residency state.**
@@ -785,3 +868,116 @@ to the pinned host pool by `host_pool.backup_from_device_all_layer`, `:3790`).
    hang with the server idle and healthy, which points every instinct at the
    transport, the scheduler or a deadlock, and none at a list that was
    correctly emptied 100 lines earlier.
+
+21. **An instrument that has never been shown to register "identical" cannot
+   be believed when it reports "different" — and its NULL results are worth
+   nothing at all** (C31, #659, successor 47). Three consecutive shifts drew a
+   conclusion from the byte-identity cohort driver while it had no
+   demonstrated floor: s45 measured four distinct digests and booked "this run
+   separates nothing"; HANDOFF_689 escalated that to "byte-identity is not
+   obtainable on this rig" and told the next shift to stop trying flag
+   variations. The defect was present in every one of those runs. The check
+   that broke it open cost 55 seconds: **run the reference prompt three times
+   quiescent and require the digests to match BEFORE running the comparison
+   the instrument exists for.** Once the floor held, the same driver on the
+   same rig separated a real defect on the first attempt. Sibling of law 18
+   (an instrument may not name the subject of its claim in advance) and of the
+   `proof_driver2` lesson (a verdict whose first conjunct must be "the
+   mechanism ran"), and the same shape as both: a conjunct nobody enforced.
+   The distinguishing feature here is the DIRECTION of the error — 18 and the
+   proof_driver2 case are instruments that could pass wrongly, this is an
+   instrument that FAILED wrongly, three times, and each failure was recorded
+   as a fact about the SYSTEM rather than a fact about the instrument. A
+   "cannot be done" that rests on a null is a claim about your measurement
+   until the measurement has a floor.
+
+---
+
+### C32 — the #330 dial's first metal boot: the join is real, the ladder is empty, and one card's budget moves the WHOLE ceiling (#330/#656, successor 47)
+
+**Two sub-findings RESOLVED (they were false premises), one NEW risk OPEN.**
+
+This was the **first `--enable-vram-dial` boot in this project's history** — no
+file under `/spinning/evidence-631/` had ever contained the string `VRAM-DIAL`
+before this shift. Boot script `/spinning/evidence-631/s47/boot_dial_tp3.sh`,
+evidence `dial_metal_result.json`, `dial_metal_proof.log`.
+
+**What was proven on metal** (TP=3, weighted uneven DCP, vector `[30, 17, 17]`):
+
+| axis | measurement |
+|---|---|
+| dial-down under load, HTTP latency | **2.0 ms** — arming is synchronous |
+| ladder asked before capacity arithmetic | **YES**, one line, at the reduction |
+| capacity committed | `VRAM-DIAL DONE SHRINK ... 327760 -> 69824` |
+| pages returned to the DRIVER | rank 0 `released 4000.0 MiB`, ranks 1/2 `128.0 MiB` each |
+| NVML cross-check (out of band) | target card free **8132 -> 11584 MiB** |
+| raise restores capacity | C `69824 -> 327744`, real generation OK after it |
+| corridor | **202 samples, 0 breaches**; min free 3485 / 7584 / 4239 vs law 1024 |
+
+**FALSE PREMISE 1, corrected: "the dial refuses PP=3 boots."** There is no
+`pp_size` check anywhere in `vram_dial.py`. The refusal is
+`if not uneven_dcp_active(dcp_size)` (`vram_dial.py:1291`), and DCP
+auto-engages only as `dcp_size = tp_size` (`server_args.py:10702`). The ship
+config is PP=3 with **TP=1 per stage**, so `tp_size=1 -> dcp_size=1 ->
+uneven_dcp_active(1) is False`. **The dial refuses the ship config because
+TP=1 leaves no DCP axis, not because PP is PP.** The distinction matters for
+the composition question: a PP boot with TP>=2 per stage would pass this
+check, and nothing else in the dial refuses PP.
+
+**FALSE PREMISE 2, corrected: "prove sessions return to CUDA graphs after a
+budget raise."** They never leave. The dial commits physical pages behind a
+**stable VA reservation** — *"No tensor moves, no CUDA-graph re-capture"*
+(`vram_dial.py:23-25`, `rig-runbook.md:882-883`). No such log line exists and
+none can. Any future acceptance criterion phrased that way is unmeasurable and
+should be rewritten to the converse actually checked here: decode keeps
+reporting `cuda graph: True` across the dial and the post-raise generation
+succeeds.
+
+**Also corrected: the C18 join runs the other way.** The brief for this shift
+said "the guard calls the dial". Source and metal both say the **dial calls
+the guard**: `apply_budget_request` -> `_relieve_for_reduction`
+(`vram_dial.py:598-599`) -> `_corridor_relief._relief` (`:1106-1108`) ->
+`CorridorGuard.ensure_headroom`. `HANDOFF_684:4-5` already said so: *"the dial
+cannot be the guard's actuator, so the guard became the dial's."*
+
+**THE LADDER IS ORDERED CORRECTLY AND YIELDS NOTHING.** The one line it
+emitted is the whole story:
+
+    VRAM-DIAL budget reduction of 4096 MiB on rank 0: the corridor relief
+    ladder returned 0 MiB now; the residual is funded by the capacity
+    arithmetic at the next group-idle boundary.
+
+Both providers registered (`CORRIDOR-GUARD registered provider
+'allocator-cache' in tier local at cost 10`, then `'draft-weights' in tier
+rebalance at cost 20`), so the guard was built and the spend order was right —
+and **the entire 4096 MiB still came from the capacity arithmetic.**
+`draft-weights` returns 0 unless `phase_flip_active_stack == PHASE_PP`
+(`phase_flip_spill.py:1344-1346`), and `allocator-cache` found nothing to
+give under load. **No `RELIEF_PARK` or `RELIEF_HOST` provider is registered
+anywhere in the tree.** So "the ladder spends before the capacity arithmetic"
+is proven as an ORDERING and unproven as an EFFECT; on any boot without the
+phase flip in a PP phase the ladder is decorative. Do not quote the dial's own
+docstring here (`vram_dial.py:626-631`) — it claims the ladder runs
+"local -> park -> host", and two of those three tiers have no provider at all.
+
+**NEW RISK, OPEN — the min-reduce makes a per-card dial a GLOBAL lever.**
+Cutting **one** rank's budget by 4096 MiB collapsed the global token ceiling
+from **327760 to 69824 — 79% of the KV capacity for 12% of one card's
+budget.** The cause is the uneven-DCP sizing path the dial requires: global
+`max_total_num_tokens` is a **min-reduce** over per-rank (capacity / ratio)
+units, so the dialed rank becomes the binding constraint for every rank.
+Rank 0 gave up 4000 MiB; ranks 1 and 2 were forced to release 128 MiB each and
+lost the same 79% of ceiling **without being dialed at all**. Nothing is
+broken — the arithmetic is correct and the raise restored it — but any
+operator model of "dial one card to lend a co-tenant some VRAM" is wrong by a
+factor of six here, and a scheduler admitting against the old ceiling during
+the gap is the obvious next thing to check. **This is the composition question
+for #330 x uneven-DCP and it is not in DESIGN_330.**
+
+**Still unproven, with its exact precondition:** the dial x phase-flip
+composition. The ship config cannot host the dial (TP=1 per stage, above), so
+the C23 two-actuator race (`KvBackingRelief` MAX-reduction at the flip seam vs
+`KvCapacityRuntime` MIN-reduction at the idle boundary, both driving
+`pool.runtime_set_backing_rows`) remains unobserved. Its precondition is a
+boot with **TP>=2 per PP stage** plus `--enable-phase-flip` plus
+`--enable-vram-dial`, which this rig's three cards can host only as PP=1.
