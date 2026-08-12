@@ -110,6 +110,14 @@ category:
 **What IS shippable today:** the cut as a MANUAL, validated configuration.
 `--pp-stage-ratio 42,11,11 --pp-attn-stage-ratio 10,3,3` at
 `--max-total-tokens 280000` with the ship token vector delivers +48.7 % deep
-prefill under the flip. It needs a little more corridor room than it has;
-rank0 KV costs 0.0195 MiB/token here, so ~2500 tokens off the pool buys the
-48 MiB. That is the next boot, not a redesign.
+prefill under the flip. It needs a little more corridor room than it has.
+
+**Size the reduction from the measurement, not the layer count.** rank0 holds
+10 of 16 attention layers, so KV there "should" cost 0.0195 MiB/token, which
+says 48 MiB costs ~2500 tokens. The two boots measured 608 MiB free at pool
+340000 and 976 MiB at 280000 -- **0.0061 MiB/token, 3.2x shallower**, the same
+direction of error as the residency misprediction above and probably the same
+cause. On the measured slope, ~1100 MiB of margin needs roughly 20000 tokens
+off, i.e. **pool ~260000**. Two points across two boots, and minima read a
+load state (C7), so this aims the next boot rather than calibrating anything
+-- but the theoretical slope would have under-shot by 8x.

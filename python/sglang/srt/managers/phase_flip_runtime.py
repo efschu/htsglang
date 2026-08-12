@@ -2366,8 +2366,9 @@ class PhaseFlipRuntime:
             self.seam_backoff_skips[direction] = (
                 self.seam_backoff_skips.get(direction, 0) + 1
             )
+            book = getattr(self, "_seam_abandons_in_a_row", None) or {}
             msg = (
-                f"flip {direction} backing off: {self._seam_abandons_in_a_row.get(direction, 0)} "
+                f"flip {direction} backing off: {book.get(direction, 0)} "
                 f"consecutive group abandons, next entry at arm "
                 f"{retry_at} (this is arm {self._arm_seq})"
             )

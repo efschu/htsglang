@@ -52,7 +52,18 @@ can-fail probe against the semantic half alone. The belt is REMOVED (C37).
 **Probe each candidate fix separately; a patch containing a masking change and
 a real change passes as a unit and teaches nothing.**
 
-### 1e. What I did not do
+### 1e. A near-miss worth pinning: `7,5,4` and `14,10,8` are the same vector
+
+The captured ship env sets `SGLANG_UNEVEN_TOKEN_VECTOR=14,10,8`, while N48's
+arm scripts and this shift's confound boot both pass `7,5,4` and call it "the
+ship vector". They are the SAME ratio: `resolve_cp_token_split`
+(`distributed/utils.py`) gcd-reduces the vector, and `gcd(14,10,8) = 2`, so
+`14,10,8 -> 7,5,4` exactly. I checked this against the live process's
+`/proc/<pid>/environ` rather than assuming it, because if they had differed
+the confound boot would have had two variables in it and §2's conclusion would
+be void. They do not differ. Do not "fix" one to match the other.
+
+### 1f. What I did not do
 
 * **No same-boot control.** The headline compares my arm-C boot against N48's
   arm-A boot. Admissible only because N48 measured that control's cross-boot
@@ -137,17 +148,39 @@ RESIDENCY model itself mispredicts rank0 — it called arm C feasible with
 
 **What is shippable today** is the cut as a MANUAL configuration:
 `--pp-stage-ratio 42,11,11 --pp-attn-stage-ratio 10,3,3` at
-`--max-total-tokens 280000`, ship token vector. rank0 KV costs
-0.0195 MiB/token, so ~2500 tokens off the pool buys the 48 MiB.
+`--max-total-tokens 280000`, ship token vector — once it holds the corridor.
+
+**How much pool to give back, and do NOT use the theoretical slope.** rank0
+holds 10 of 16 attention layers, so KV there "should" cost
+`10 x 2048 B/token = 0.0195 MiB/token`, which says 48 MiB is bought by ~2500
+tokens. The two measured boots say otherwise:
+
+| pool | rank0 min free |
+|---:|---:|
+| 340000 | 608 MiB |
+| 280000 | 976 MiB |
+
+That is **0.0061 MiB/token**, 3.2x SHALLOWER than the layer-count model — the
+same direction of error as the residency misprediction in §3, and probably the
+same cause. Taking the measured slope, reaching ~1100 MiB of margin needs
+about **20000 tokens off, i.e. pool ~260000**, not 2500.
+
+Two points, two separate boots, and minima read a load state (C7), so treat
+this as a RANKER that aims the next boot rather than a calibration. But aim it
+at the measurement: the theoretical slope would have under-shot by 8x and cost
+a boot.
 
 ---
 
 ## 4. NEXT SHIFT, IN ORDER
 
-1. **One boot at pool ~277000 to close the corridor gap**, then re-measure
-   179200. If it holds the law with the gain intact, the manual configuration
-   is shippable and the wire-or-gate question becomes only about the solver.
-   This is the cheapest remaining item by a wide margin.
+1. **One boot at pool ~260000 to close the corridor gap** (see §3 for why
+   260000 and not 277000 — use the MEASURED slope, not the layer-count one),
+   then re-measure 179200. If it holds the law with the gain intact, the
+   manual configuration is shippable and the wire-or-gate question becomes
+   only about the solver. Cheapest remaining item by a wide margin. Fold the
+   §3 slope check into it: a third (pool, min-free) point turns a two-point
+   ranker into a usable line.
 2. **The same-boot control** (§1e): arm A, flip on, pool 280000, in one boot
    with arm C. Removes the only caveat on the +48.7 %.
 3. **Calibrate `seam_staging_mib`.** Two demands are measured (4881 MiB at
