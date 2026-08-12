@@ -27,8 +27,18 @@ obligation:** consult §18 before building new infrastructure, and a PR that
 adds a reusable module adds its §18 entry in the SAME PR. §1-§17 answer "does
 this fork do X"; §18 answers "is there already a module I should be calling".
 Fourteen incidents came from rebuilding what §18 lists.
-Last full refresh: 2026-08-02 (tip 33148dbe0f); reach-audited 2026-08-03 (#500,
-tip 3b7569f664 — see `docs/dev/AUDIT_500_mechanism_reach.md`).
+Last full refresh: 2026-08-02 (`fbdf12a293`, "docs: add agent-facing feature
+catalog"); reach-audited 2026-08-03 (#500, merged as `d653405223`, "Merge
+docs/reach-audit-500" — see `docs/dev/AUDIT_500_mechanism_reach.md`).
+(Corrected 2026-08-04, pool audit: the two commits previously cited here as
+"tip 33148dbe0f" / "tip 3b7569f664" are each real commits on this branch, but
+neither is the commit its label implies. `33148dbe0f`'s own diff is an
+unrelated bench-posting-artefact correction, not a catalog refresh; this file
+was actually added ~35 min later by `fbdf12a293`. `3b7569f664` is an unrelated
+video-enhance lint fix (`lint(#484)`) that landed chronologically BEFORE
+`d653405223` — the actual #500 audit merge — so it cannot be the state that
+"carries" the audit; it was most likely the integration-line commit the audit
+branch was based on before its own merge, but the wording did not say so.)
 
 ## 1. Uneven parallelism (core differentiator)
 - **Uneven TP** `--rank-tp-ratio` (+ `--rank-gpu-id` for placement): per-card
@@ -1172,7 +1182,10 @@ TRANSPORT-NAME-keyed, not property-keyed:
 `SGLANG_BARLINK_GRAPH_ENABLE` (default on) (`parallel_state.py:298`, `:303`,
 `:352-362`); ucx/shm/gloo are refused at startup unless `--disable-cuda-graph`
 (`:365-383`), and under an active capture there is no silent gloo fallback —
-barlink aborts with the reason (`barlink.py:635-676`).
+barlink aborts with the reason (`_no_fallback`, `barlink.py:330-345`, checked
+uncaught in `_build_transport`'s no-fallback branch, `:508-511` — corrected
+2026-08-04, the previous `barlink.py:635-676` pointed at
+`BarlinkCommunicator.__init__`/path-dispatcher setup, not the abort path).
 Op coverage per transport, from `BARLINK_OPS` at source: device
 `{all_reduce, all_gather, reduce_scatter, broadcast}`
 (`barlink_device.py:1152`); host the same plus send/recv
@@ -1184,32 +1197,44 @@ reduce_scatter (`barlink_bar1.py:1450`); matrix only
 (#500-B17). The communicator refuses four collectives outright:
 `reduce_scatter(list)`, `reduce_scatterv`, `all_gather(output_tensor_list=)`,
 `all_gatherv` (`parallel_state.py:1348-1371`); bar1 additionally caps the group
-at 8 ranks (`MAX_RANGE`, `barlink_bar1.py:811`, `:1518`). **Smallbar BAR1 direct path**:
+at 8 ranks (`MAX_RANGE`, `barlink_bar1.py:810` — corrected 2026-08-04, was
+cited as `:811` (a blank line) plus `:1518` (unrelated `_ctl_event` abort-read
+state, no connection to `MAX_RANGE`)). **Smallbar BAR1 direct path**:
 peer VRAM over the card's own BAR aperture — PROBED, not assumed (NVML
 `bar1Free`, sysfs gross fallback, `barlink_matrix_transport.py:280-302`).
 Requested window `SGLANG_BARLINK_BAR1_WINDOW_MIB` (default 96) with a per-group
 override `..._MIB_<GROUP>` (`:113-120`); the group-wide MINIMUM governs
 (`barlink_bar1.py:1953-1985`). Payload eligibility is checked against the
 CONTIGUOUSLY mapped length, never the sysfs gross size
-(`barlink_bar1.py:2385-2405`) — a larger BAR raises reachability directly.
+(`check_window_requirement`, `barlink_bar1.py:2409-2427` — corrected
+2026-08-04, was cited as `:2385-2405`, which is the CAP_SYS_ADMIN /
+PeerMappingOverride error-message text a few lines above the real check) —
+a larger BAR raises reachability directly.
 Measured 1.13-1.34x over NCCL in serving (measurement, not a gate).
 Undocumented sizing knobs on the same plane: `SGLANG_BARLINK_SLOT_MIB` (64,
 `barlink.py:70`), `_HOST_SLOT_MIB` (`barlink_host.py:120`), `_CHUNK_MIB` (8,
 `barlink.py:52`), `_PIPE_CHUNK_MIB` (4, `barlink_device.py:989`).
 `--collective-net-small/-bulk` pin the NIC (not the transport) per message
 class; typo hard-reject against sysfs, not a name list
-(`server_args.py:14089-14098`, accepted set = dirs under
-`/sys/class/infiniband` + `/sys/class/net`, plus `all`, optional `:port`). SMALL
-reaches only the barlink UCX plane and pins BOTH small and large TP collectives
-(one UCX context, `server_args.py:14176-14185`); BULK reaches PD-KV/HiCache via
-`--disaggregation-ib-device`. BAR1 is not selectable here.
+(`_validate_net_device`, `server_args.py:14341-14372`, accepted set = dirs
+under `/sys/class/infiniband` + `/sys/class/net`, plus `all`, optional
+`:port`). SMALL reaches only the barlink UCX plane and pins BOTH small and
+large TP collectives (one UCX context, `server_args.py:14386-14390`); BULK
+reaches PD-KV/HiCache via `--disaggregation-ib-device`. BAR1 is not
+selectable here. (Corrected 2026-08-04: both citations previously pointed at
+`:14089-14098` and `:14176-14185`, which are diffusion-LLM/ASR validation and
+workbench-arb-heartbeat validation respectively — unrelated code, ~250-280
+lines off.)
 dma-buf EXPORT works on consumer cards with the stock driver — probed
 (`cuMemGetHandleForAddressRange` first, `NV_ESC_EXPORT_TO_DMABUF_FD` ext as
 fallback, `barlink_bar1.py:517-537`). The BAR1 PEER MAPPING on top of it is NOT
 stock: it needs the widened driver guard (regkey
 `BarlinkPeerBar1`/`RMSmallBarP2PPeerBar1`, `barlink_bar1.py:597`, `:2337-2342`),
 the `dmabuf_holder` module (`:589`, `:644-653`) and a passing byte proof
-(`:4644-4656`); `CAP_SYS_ADMIN` or `PeerMappingOverride=1` is the second hurdle
+(`byte_proof_all`, `:2485`, gated on the `z.byte_proof` flag at `:2648` —
+corrected 2026-08-04, was cited as `:4644-4656`, which is the unrelated
+`_no_collective` stub for `reduce_scatter` and its F811 method-shadowing
+comment); `CAP_SYS_ADMIN` or `PeerMappingOverride=1` is the second hurdle
 in a container (`:2352-2374`). Rig facts: NO
 P2P/NVLink here, negotiated PCIe x4/x8/x8 (NVML max-width reports x16
 NAMEPLATE — always read negotiated width), NCCL-verbs broken on our RoCE.
@@ -1297,8 +1322,10 @@ iteration, outside any cuda graph"). They reach barlink because a barlink boot
 does not CONSTRUCT pynccl (`parallel_state.py:440`, `:778-781`), so
 `capture_safe_tp_broadcast`'s pynccl branch is dead and `spec_utils.py:138`
 takes `tp_group.broadcast`; a BAR1 broadcast is issued as an `all_to_all`
-(`barlink_bar1.py:3648-3651`), which is what the #476 §3 crash line
-("all_to_all (8 bytes, 0 rounds)") names.
+(`barlink_broadcast` calls `barlink_all_to_all_single`, `barlink_bar1.py:3678`
+— corrected 2026-08-04, was cited as `:3648-3651`, the guard/src-validation
+lines at the top of the same function, ~27 lines before the actual dispatch),
+which is what the #476 §3 crash line ("all_to_all (8 bytes, 0 rounds)") names.
 **Staged abort read** (#517): the status word is read asynchronously — a
 non-blocking D2H onto the current stream plus a `cudaEventQuery`, returning
 the value an earlier check staged — so a check costs no stream
@@ -1323,7 +1350,9 @@ Generalized loader (registry + family mapping tables), unsloth-UD, mixed-dtype
 fused GDN qkvz, MoE tensor mapping, vision/mmproj, sibling-config validation,
 DeepSeek-V2/3/4 class GGUF-safe (`.qweight` accessors, quantization_config
 drop, tokenizer route). Perf: batched MMVQ (default follows the WHEEL probe `_dequant_supports_out`,
-`gguf.py:342-345`), Q8 lm_head, K-quant MMVQ tuned to Q8_0 efficiency (TP=2
+`gguf.py:349` — corrected 2026-08-04, was cited as `:342-345`, which is only
+the env-var read and two blank lines above the actual call), Q8 lm_head,
+K-quant MMVQ tuned to Q8_0 efficiency (TP=2
 beats llama.cpp; wheel probe `ggml_mmvq_kq_tuned` + `SGLANG_GGUF_KQ_KERNEL` kill
 switch, `gguf.py:355-371` — when present it fully disables the #72 reroute,
 `:442`), graph-replay numeric safety for ALL quants — literally type-agnostic
@@ -1345,19 +1374,35 @@ loaders. The scale helper `ggml_cuda_e8m0_to_fp32_half` returns 2^(e-128) —
 already halved against the doubled lattice — and is bit-identical to the host
 reference, so dequant is compared EXACTLY, not within a tolerance. Kernel
 presence is a wheel property, probed via the `ggml_mxfp4_native` marker op (the
-#73 pattern, `gguf.py:272`) and evaluated ONCE at import (`:277`).
+#73 pattern, `gguf.py:272`) and evaluated ONCE at import (`:281`,
+`MXFP4_NATIVE = _mxfp4_kernels_present()` — corrected 2026-08-04, was cited as
+`:277`, which is `except Exception:` inside the probe function, not the
+module-level assignment).
 `SGLANG_GGUF_MXFP4_NATIVE=0` hands the checkpoint back to the repack —
 first-character test (`:265`), so `false`/`no`/`off` do NOT disable it. The
 "no-op on a native wheel" is a short-circuit, not a cheap pass: `_type_map()`
 returns `{}` before any tensor is read (`gguf_mxfp4_repack.py:113-115`). Second,
-undocumented lever: `SGLANG_GGUF_MXFP4_REPACK=0` (default 1, `environ.py:1776`)
-empties the same map (`:122-124`); combined with `NATIVE=0` or an old wheel it
-turns the checkpoint into a loud load-time refusal by tensor name (`:127-135`) —
-never a silent fallback. Native also widens MoE expert-offload coverage, since
-`MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES` (`gguf.py:292`). **Merged AND
-installed** in the serving venv since 2026-08-03 12:37 (`direct_url.json`
-names the pinned wheel, sha `67f03cfa`; the `ggml_mxfp4_native` hasattr probe
-returns `True` live) — GPU gates still PENDING under window #537:
+undocumented lever: `SGLANG_GGUF_MXFP4_REPACK=0` (default 1,
+`environ.py:1897`) empties the same map (`repack_source_types()`,
+`gguf_mxfp4_repack.py:118-124` — the file is named explicitly because the
+previous bare `:122-124` shorthand sat right after an `environ.py:NNNN`
+citation and could be misread as belonging to that file, when the sentence's
+subject is still `gguf_mxfp4_repack.py`); combined with `NATIVE=0` or an old
+wheel it turns the checkpoint into a loud load-time refusal by tensor name
+(`_refuse()`, `gguf_mxfp4_repack.py:127-135`, spelled out for the same
+reason) — never a silent fallback. Native also widens MoE expert-offload
+coverage, since `MOE_OFFLOAD_SUPPORTED_TYPES = MMVQ_QUANT_TYPES`
+(`gguf.py:292`). **Merged AND installed** in the serving venv since 2026-08-03
+12:37 (`direct_url.json` names the pinned wheel, sha `67f03cfa`; the
+`ggml_mxfp4_native` hasattr probe returns `True` live) — GPU gates still
+PENDING under window #537:
+(Line-number history, kept because BOTH prior citations were wrong by the
+time this merge ran: the integration line cited `environ.py:1776` and the
+pool-audit branch "corrected" it to `:1803`. Re-derived at merge time,
+2026-08-12, the symbol is at `environ.py:1897`; `:1776` is now
+`SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS` and `:1803` is past
+nothing useful. Verify a line number against the tree before quoting it —
+this one has drifted twice.)
 `TICKET_398_mxfp4_validation.md`.
 **#479 traced the served checkpoint and found no untraced fallback.** The
 active UD-IQ3_XXS driver carries exactly two type-39 tensors,
