@@ -26,17 +26,18 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
     StateType,
 )
+from sglang.srt.disaggregation.common.tp_pair import validate_tp_pair_divisible
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
+from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
@@ -499,6 +500,33 @@ class CommonKVManager(BaseKVManager):
                 "it: differing TP/PP/DCP between the arms is supported and "
                 "is not what this refusal is about."
             )
+
+        # #643 guard: the TP pair must be one this transfer path can express.
+        #
+        # Differing TP between the arms is supported and deliberately NOT part
+        # of the identity hash above -- but "differing" is only handled for
+        # pairs where one attn_tp_size is an integer multiple of the other.
+        # Every head split below this line is a bare floor division
+        # (_resolve_rank_mapping:522-550, then compute_head_slice_params and
+        # its three inline copies in the mooncake/nixl/mori transports), and
+        # floor division is a partition only under that multiple relation.
+        # For a non-divisible pair -- prefill TP=3 against decode TP=2 is the
+        # smallest -- source ranks alias onto the same destination offset, the
+        # writer count truncates so the receiver declares a chunk complete
+        # after too few arrivals, and a prefill rank can go uncontacted with
+        # its heads never transferred. All silent, all producing fluent wrong
+        # output, which is the #212 shape the guard above exists to prevent.
+        #
+        # This is checked HERE and not at parse time because a PD arm's
+        # ServerArgs never names the peer's TP size: the pair first meets at
+        # this handshake. The prefill arm applies the mirror-image check when
+        # a decode rank registers its KV args.
+        validate_tp_pair_divisible(
+            src_attn_tp_size=info.attn_tp_size,
+            dst_attn_tp_size=self.attn_tp_size,
+            total_kv_heads=getattr(self.kv_args, "total_kv_head_num", 0),
+            where=f"PD handshake with prefill arm at {bootstrap_addr}",
+        )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info

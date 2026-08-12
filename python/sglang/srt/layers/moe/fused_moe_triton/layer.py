@@ -2756,10 +2756,46 @@ class FusedMoE(torch.nn.Module):
                     )
 
                     if plan is None:
-                        # Default path: one [E, ...] stack, unchanged.
-                        stacked = torch.stack([get(i) for i in range(count)], dim=0)
-                        param.materialize(stacked.shape, dtype=stacked.dtype)
-                        param.data.copy_(stacked)
+                        # Default path: the same [E, ...] parameter as ever,
+                        # filled one expert at a time.
+                        #
+                        # #644, host-RAM double residency. The old form built
+                        # ``torch.stack([get(i) ...])`` first -- a second full
+                        # host copy of the expert set, on top of the loaded one
+                        # -- and then ``continue``d with both loader holders
+                        # still populated, so the set stayed in host ANON
+                        # memory (which the loader's page-cache dropper cannot
+                        # touch) for the process's lifetime, after it was
+                        # already resident in the parameter.
+                        #
+                        # Both holders are dead the moment the parameter is
+                        # materialized; every other branch that ends the
+                        # parameter's uninitialized life already says so --
+                        # the streaming drain above and the offload branch
+                        # below release them exactly like this. Clearing
+                        # ``data_container`` BEFORE the fill is what lets
+                        # ``drop`` return each expert's bytes as it lands,
+                        # since the two holders alias the same tensors and
+                        # releasing one alone frees nothing.
+                        param.data_container = []
+                        param.materialize((count,) + row_shape, dtype=dtype)
+                        for i in range(count):
+                            expert = get(i)
+                            if expert.shape != row_shape or expert.dtype != dtype:
+                                # torch.stack used to reject a ragged expert
+                                # set outright; copy_ would broadcast or cast
+                                # it into place instead. Keep the rejection.
+                                raise ValueError(
+                                    f"GGUF MoE parameter {name}: expert {i} has "
+                                    f"shape {tuple(expert.shape)} dtype "
+                                    f"{expert.dtype}, expected {row_shape} "
+                                    f"dtype {dtype}"
+                                )
+                            param.data[i].copy_(expert)
+                            del expert
+                            drop(i)
+                        param.expert_data_map = {}
+                        expert_weights.clear()
                         continue
 
                     # The loader's flat list is only read for the truthiness

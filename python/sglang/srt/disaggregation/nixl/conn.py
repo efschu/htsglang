@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
     KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
+from sglang.srt.disaggregation.common.tp_pair import validate_tp_pair_divisible
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
@@ -745,6 +746,19 @@ class NixlKVManager(CommonKVManager):
                 "(prefill.py:201-202).  The previous fallback of kv_head_num * "
                 "attn_tp_size was incorrect under uneven TP (#641)."
             )
+
+        # #643: the floor divisions below partition heads only when one TP
+        # size is an integer multiple of the other. The decode arm refuses a
+        # non-divisible pair at its own handshake; this is the prefill-side
+        # mirror, so a mis-paired decoder cannot be served from this end
+        # either. Raised here rather than at registration because the
+        # registration listener is a background thread.
+        validate_tp_pair_divisible(
+            src_attn_tp_size=prefill_tp_size,
+            dst_attn_tp_size=decode_tp_size,
+            total_kv_heads=total_kv_heads,
+            where=f"nixl _init_hetero_tp_prep_handle for peer {peer_name}",
+        )
 
         src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
