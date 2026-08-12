@@ -1698,3 +1698,45 @@ boot with **TP>=2 per PP stage** plus `--enable-phase-flip` plus
    single "at rest" -- which is exactly why the corridor law is judged on an
    observed MINIMUM by an independent instrument rather than on a modelled
    at-rest level.**
+
+### C42 — a curated suite reported health while a neighbouring directory was a third red (#656, merge-r4 shift)
+
+Every shift on this line runs `scripts/run_631_flip_family.sh`. It has read
+1116 passed since N49, it read 1116 passed after each of the seven merges in
+the r4 batch, and it is the number each handoff quotes as the line's health.
+
+`test/registered/unit/planner/` is not in that family. At `0ae49fafb4` — the
+tip N51 handed over, with a clean 22-minute window behind it — that directory
+read **109 failed, 2230 passed, 3 errors**. The briefing for this merge named
+exactly two known-red tests in it. The real number was fifty times that, and
+it had been there across at least four shifts without appearing in any
+handoff.
+
+It was not caused by any of the seven merges: the identical suite, re-run in a
+separate worktree checked out at `0ae49fafb4`, produced the same 109 and a
+`diff` of the two failure sets is empty. Step 7 (`feat/rig-advisor-413`) then
+repaired 107 of them, because its two "wizard-blocking planner fixes"
+(`runtime_reserve_mib` binding, `library=` passthrough) were also the root of
+a hundred failures that did not look related to the wizard at all.
+
+**The contradiction is not the red count, it is that the line believed a
+number that was never about the thing being claimed.** "The suite is green"
+meant "the curated list is green", and the curated list was assembled to cover
+the phase-flip family. Its header already warns about three separate
+under-collections *within* its own scope (successors 25 and 45 both had to
+extend it); this is the same failure one level up, where the missing tests are
+not absent from the list but absent from the concept of the list.
+
+Related and deliberately not duplicated: law 33 already says an empty search
+is evidence only if it could have come back full. This shift violated it
+again, in the cheapest possible way — searching file *contents* for
+`test_rejected_evidence_pins` and reporting the test absent, when the string
+lives in the *filename*. Recorded here as a repeat offence rather than a new
+law, because the law was already correct.
+
+36. **A green suite bounds its own list, not the tree.** Before quoting a
+   suite as evidence of health, ask what it was assembled to cover and what
+   sits immediately outside it. A directory nobody runs is not passing; it is
+   unobserved, and the two are indistinguishable from the outside. When a
+   number has been stable across many shifts (1116 here), that stability is
+   evidence about the list, not about the code around it.
