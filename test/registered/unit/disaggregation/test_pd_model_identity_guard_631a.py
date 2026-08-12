@@ -160,8 +160,15 @@ class HandshakeIdentityGuardTest(CustomTestCase):
         """A stub carrying only what try_ensure_parallel_info touches."""
         mgr = SimpleNamespace(
             prefill_info_table={},
-            kv_args=SimpleNamespace(page_size=1),
+            # total_kv_head_num is read by #643's TP-pair guard, which runs
+            # after the identity guard and before _resolve_rank_mapping.
+            kv_args=SimpleNamespace(page_size=1, total_kv_head_num=8),
             server_args=server_args,
+            # attn_tp_size is likewise touched directly by the #643 guard.
+            # The real CommonKVManager has always carried it (it is what
+            # _resolve_rank_mapping divides by); the stub could omit it only
+            # while that method was the sole reader and was itself stubbed.
+            attn_tp_size=1,
             _resolve_rank_mapping=lambda info: None,
         )
         return mgr
