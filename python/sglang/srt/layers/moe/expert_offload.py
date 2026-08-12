@@ -28,10 +28,24 @@ output buffer.
 Byte-identity: a token's MoE output depends only on its own hidden state and
 its own routed experts' weights -- it is independent of which other tokens
 share the batch. Because every token is computed EXACTLY ONCE, with ALL of its
-experts resident, and its top-k reduction runs in the original slot order, the
-per-token result is bit-identical to the no-offload (fraction == 1.0) path.
-There is no cross-wave accumulation of a single token's partial sums, so no
-floating-point re-association is introduced.
+experts resident, and its top-k reduction runs in the original slot order,
+the wave decomposition introduces no cross-wave accumulation of a single
+token's partial sums, and so no floating-point re-association of its own.
+
+SCOPE OF THAT CLAIM (corrected, #412). It is a statement about the WAVE
+mechanism, not about the offloaded path as a whole, and the unqualified form
+this paragraph used to carry ("bit-identical to the no-offload path") is
+false: shrinking the resident expert buffer from the full expert count to
+R+C slots changes ``layer.num_local_experts`` (see the marlin apply at
+``:2898-2902``), which changes ``moe_align_block_size``'s ``global_num_experts``,
+which changes the GEMM tiling and therefore reassociates the accumulation --
+measured at ~1e-2 logit delta on marlin int4, and sub-ULP but still non-zero
+on fp8 (the author's own "FP8 byte-identical" claim was retracted after a
+256-token re-run agreed on 118/256). The correctly scoped statements are the
+ones further down this module: self-determinism at temp 0 (``:437-442``) and
+bit-identity against the static [0,R) layout AT THE SAME FRACTION
+(``:3615-3622``). A determinism certificate must cite those, never this
+paragraph's former wording.
 
 Expert-major waves (SGLANG_MOE_OFFLOAD_WAVE_ORDER=expert, #254)
 ---------------------------------------------------------------
