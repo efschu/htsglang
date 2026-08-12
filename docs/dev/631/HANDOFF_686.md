@@ -246,6 +246,22 @@ every new path must be absent:
 The control matters: a grep that finds nothing proves nothing until you show it
 finds the thing where the thing exists.
 
+Inertness holds on a SECOND, independent axis: the ship's `/metrics` carries
+**zero** `spill_tier` series and **zero** `park:` keys, while the probe's
+carried `park:file` with both a used and a (new) total. Two different
+observation channels, same verdict — which is what separates "inert" from
+"the one place I looked was quiet".
+
+**The patch level the window actually ran, stated exactly** (Patchstand vor
+Last). The restored instance reports `SGLANG_BOOT_COMMIT=08585169fe` and was
+booted from that commit **plus the then-uncommitted registration-log line**,
+which is now part of `4bc9e0093a`. So the running instance does NOT equal HEAD
+(`00a5bb23a4`): the ratio fix of §1b landed after the boot and is not loaded in
+it. This costs the window nothing — both are inert on the ship config, which
+the table above proves rather than assumes — but the next shift should know
+that the serving process is two commits behind the tree and re-boot before
+attributing anything to HEAD.
+
 ---
 
 ## 4. WHAT IS NOT DONE, STATED SO NOBODY READS IT AS DONE
