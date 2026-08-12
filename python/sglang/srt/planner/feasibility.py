@@ -284,6 +284,7 @@ def plan(
     regime_decode_layout: str = "decode",
     regime_workload: Optional[object] = None,
     regime_pre_captured: bool = True,
+    card_library=None,
 ) -> PlanResult:
     """Plan ``model_path`` on ``hardware``.
 
@@ -291,6 +292,16 @@ def plan(
     manual edit of design §2.6 and goes through the same validation.
     Raises :class:`PlanRejected` for structurally invalid inputs; returns
     ``fits=False`` with fail-loud reasons for valid-but-infeasible plans.
+
+    ``card_library`` is the :class:`~sglang.srt.planner.card_library.CardLibrary`
+    the roofline and energy estimates look nameplate peaks up in; ``None``
+    keeps their own ``SEED_CARDS`` default, so every existing caller is
+    unchanged. It exists for callers that plan a rig containing a card the
+    seed set does not know -- the #413 buying advisor prices candidate cards
+    the operator types in by hand. Without the passthrough those estimates
+    returned None (``_rank_peaks`` finds no peaks -> ``estimate_roofline``
+    returns None), and the bare ``except`` below turned that into a silently
+    empty roofline rather than a visible absence.
     """
     if not hardware.gpus:
         raise PlanRejected(["The hardware spec declares zero GPUs."])
@@ -448,6 +459,7 @@ def plan(
                 hardware,
                 capacity,
                 offload,
+                library=card_library,
                 measured_scores=measured_scores,
                 context_tokens=roofline_context_tokens,
             )
@@ -461,7 +473,12 @@ def plan(
         try:
             from sglang.srt.planner.roofline import roofline_energy
 
-            energy = roofline_energy(getattr(result, "roofline", None), inputs, hardware)
+            energy = roofline_energy(
+                getattr(result, "roofline", None),
+                inputs,
+                hardware,
+                library=card_library,
+            )
             result = dataclasses.replace(result, roofline_energy=energy)
         except Exception:
             result = dataclasses.replace(result, roofline_energy=None)
