@@ -576,7 +576,14 @@ def test_triton_even_site_sizes_kv_indices_from_the_host_mirror(monkeypatch):
 
 
 def test_triton_default_path_is_unchanged_without_a_mirror(monkeypatch):
-    """The cuda-graph callers pass no mirror and must keep the old read."""
+    """A caller that supplies no mirror keeps the old read.
+
+    #629 note: this used to say "the cuda-graph callers pass no mirror", which
+    is no longer the invariant -- they now do (see
+    test_dcp_replay_prep_mirror_629.py). What is pinned here is the DEFAULT
+    itself: absent a mirror, the device read stands. That is still what a
+    gpu_only batch and a mirror failing the staleness check both fall back to.
+    """
     captured = {}
     monkeypatch.setattr(
         f"{_TRITON}.build_dcp_weighted_kv_indices", _capturing_builder(captured)

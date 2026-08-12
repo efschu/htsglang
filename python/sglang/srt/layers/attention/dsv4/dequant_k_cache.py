@@ -189,10 +189,23 @@ def dequantize_k_cache_paged_ref(
         + torch.arange(NUM_SCALE_TILES, device=device)[None, :]
     )
     scale_u8 = flat_u8[scale_byte].to(torch.int32)
+    # #418: the same expression the kernel uses, and nothing on top of it.
+    # This used to be followed by a torch.where that replaced any result below
+    # the fp32 smallest-normal with zero. Exactly one encoding decodes below
+    # that threshold -- the byte 0x00, exp2(-127) -- so the clause fired there
+    # and nowhere else, and the kernel has no counterpart to it. That made the
+    # two disagree on every 0x00-scale input and left this function unusable as
+    # the kernel's oracle in that regime.
+    #
+    # The flush was also wrong on the merits, not merely unmatched. ue8m0 is
+    # the OCP MX v1.0 (section 5.4.1) E8M0 scale format: unsigned exponent
+    # only, no zero, no subnormals, 0..254 finite as 2**(e-127) and 255 alone
+    # NaN. So 0x00 is an ordinary legal code for 2**-127; only the fp32 value
+    # it decodes to is subnormal, which is what the clause confused it with.
+    # torch's own decoder special-cases it for that exact reason -- see
+    # Float8_e8m0fnu.h: "if exponent is zero, need to special case to return
+    # 2^-127 instead of zero".
     scale_pow2 = torch.exp2((scale_u8 - 127).to(torch.float32))
-    scale_pow2 = torch.where(
-        scale_pow2 < (2.0**-126), torch.zeros_like(scale_pow2), scale_pow2
-    )
     scale_full = scale_pow2.repeat_interleave(TILE_SIZE, dim=1)
     nope = nope_fp8 * scale_full
 
