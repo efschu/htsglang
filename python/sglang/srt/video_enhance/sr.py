@@ -26,6 +26,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from sglang.srt.video_enhance.asset_root import default_sr_model_dir
 from sglang.srt.video_enhance.backends import BackendUnavailable, OnnxRuntimeBackend
 from sglang.srt.video_enhance.engine_cache import (
     EngineCache,
@@ -151,7 +152,8 @@ def model_for_scale(scale: int) -> SrModel:
     )
 
 
-DEFAULT_MODEL_DIR = Path("/spinning/llm_stuff/k3-models/sr")
+#: #251: follows SGLANG_VIDEO_MODEL_ROOT; unset -> the previous literal.
+DEFAULT_MODEL_DIR = default_sr_model_dir()
 
 
 class ArtifactError(RuntimeError):

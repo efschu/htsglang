@@ -47,6 +47,7 @@ from sglang.srt.translator.backends import (
     AudioChunk,
     BackendError,
 )
+from sglang.srt.translator.config import default_model_root
 from sglang.srt.translator.ledger import AudioAssetLedger
 from sglang.srt.translator.talker_config import TalkerGeometry, read_talker_geometry
 from sglang.srt.translator.tts_backends import (
@@ -63,7 +64,12 @@ __all__ = ["InProcessQwen3Tts", "InProcessTtsConfig"]
 class InProcessTtsConfig:
     """Where the checkpoint is and how the talker is driven."""
 
-    model_dir: Path = Path("/spinning/llm_stuff/translator-models/qwen3-tts-0.6b-base")
+    #: #251: derived from the translator asset root so a relocated model tree
+    #: needs one env var, not one flag per checkpoint. Unset environment ->
+    #: the previous literal.
+    model_dir: Path = dataclasses.field(
+        default_factory=lambda: default_model_root() / "qwen3-tts-0.6b-base"
+    )
     device: str = "cuda:0"
     dtype: str = "bfloat16"
     sample_rate: int = 24000

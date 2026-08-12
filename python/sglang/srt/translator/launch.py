@@ -25,6 +25,10 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
+# Desk-safe: config.py imports no srt internals and no torch (#251 relies on
+# that, and the module says so in its own header).
+from sglang.srt.translator.config import default_model_root
+
 logger = logging.getLogger("translator.launch")
 
 
@@ -49,13 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--asr-cache",
         type=Path,
-        default=Path("/spinning/llm_stuff/translator-models/asr-models"),
-        help="shared with the gate script; a second root re-downloads 1.5 GB",
+        default=default_model_root() / "asr-models",
+        help=(
+            "shared with the gate script; a second root re-downloads 1.5 GB. "
+            "Default follows SGLANG_TRANSLATOR_MODEL_ROOT (#251)"
+        ),
     )
     parser.add_argument(
         "--asr-lib",
         type=Path,
-        default=Path("/spinning/llm_stuff/translator-models/asr-lib"),
+        default=default_model_root() / "asr-lib",
         help=(
             "tree holding faster-whisper. APPENDED to sys.path, never "
             "prepended: the shared serving venv must keep priority for every "
@@ -74,8 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tts-model-dir", type=Path,
-        default=Path("/spinning/llm_stuff/translator-models/qwen3-tts-0.6b-base"),
-        help="checkpoint for --tts inprocess",
+        default=default_model_root() / "qwen3-tts-0.6b-base",
+        help=(
+            "checkpoint for --tts inprocess. Default follows "
+            "SGLANG_TRANSLATOR_MODEL_ROOT (#251)"
+        ),
     )
     parser.add_argument(
         "--tts-device", default="cuda:0",

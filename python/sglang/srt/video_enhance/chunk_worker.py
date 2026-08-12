@@ -33,6 +33,7 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
+from sglang.srt.video_enhance.asset_root import default_model_root
 from sglang.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
 from sglang.srt.video_enhance.frame_math import Resolution
 from sglang.srt.video_enhance.multicard import REPORT_PREFIX, ChunkSpec
@@ -104,7 +105,9 @@ def build_chunk_stages(
         streams_in_flight=request.get("streams_in_flight", 1),
     )
     chain = build_chain(chain_request)
-    model_dir = Path(request.get("model_dir", "/spinning/llm_stuff/k3-models"))
+    # #251: the request still wins; only the fallback moved behind
+    # SGLANG_VIDEO_MODEL_ROOT (unset -> the previous literal).
+    model_dir = Path(request.get("model_dir") or default_model_root())
     out_fps = retimed_rate(Fraction(request["source_frame_rate"]), chunk.multiplier)
 
     decode = codec.DecodeStage(
