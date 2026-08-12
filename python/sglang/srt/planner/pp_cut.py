@@ -86,7 +86,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "LAYER_FAMILY_ATTENTION",
@@ -132,6 +132,22 @@ class RankResources:
     out of it separately because the transient is a property of the REQUEST
     and the geometry, not of the pool (PROD_BRINGUP_BENCH.md sec. 1f), so it
     must not scale with the cut.
+
+    THE TRANSIENT IS PER LOAD STATE (law 31). The paragraph above is right
+    that the transient is a property of the request rather than the pool, and
+    it was read for three shifts as if that made it ONE number. It does not:
+    "the load" is not one state, and the same rank on the same rig drew
+
+        deep-prefill A/B     ->   956 MiB below at-rest
+        22-minute mixed soak ->  1989 MiB (planner cut) / 3148 MiB (ship)
+
+    A gate fed the 956 admitted cuts that metal then broke the corridor on,
+    twice. So supply ``transient_by_load_state`` -- a measured mapping from
+    load-state name to drawn MiB, as ``planner/transient_census.py`` writes
+    it -- and the gate funds the WORST state, because every state in that
+    table is one the deployment will serve. The scalar ``transient_mib``
+    remains for callers with a single measured state; supplying both is
+    refused rather than silently reconciled.
     """
 
     label: str
@@ -139,6 +155,11 @@ class RankResources:
     gemm_tflops: float
     budget_mib: float
     transient_mib: float = 0.0
+    #: Measured transient draw per load state, e.g.
+    #: ``{"DECODE": 1204.0, "EXTEND": 1989.0}``. The gate charges the worst
+    #: entry and names it in any refusal, so the operator learns WHICH state
+    #: could not be funded rather than only that something could not.
+    transient_by_load_state: Optional[Mapping[str, float]] = None
     #: Everything resident on the card that the cut does NOT move: CUDA
     #: context, the mamba/GDN state pool, graph capture, allocator
     #: fragmentation, the weights-arena high-water. Calibrate it from a
@@ -193,6 +214,51 @@ class RankResources:
                 f"rank {self.label!r}: gemm_tflops must be > 0, got "
                 f"{self.gemm_tflops!r}."
             )
+        table = self.transient_by_load_state
+        if table is not None:
+            if not table:
+                raise ValueError(
+                    f"rank {self.label!r}: transient_by_load_state is empty. "
+                    f"An empty table is not 'no transient' -- it is an "
+                    f"unmeasured one, and an unpriced term reads as free "
+                    f"memory. Pass None to mean 'use the scalar', or measure "
+                    f"a state."
+                )
+            for state, value in table.items():
+                if value < 0.0:
+                    raise ValueError(
+                        f"rank {self.label!r}: transient for load state "
+                        f"{state!r} is negative ({value!r})."
+                    )
+            if self.transient_mib:
+                raise ValueError(
+                    f"rank {self.label!r}: both transient_mib "
+                    f"({self.transient_mib!r}) and transient_by_load_state "
+                    f"({dict(table)!r}) were supplied. Two sources for one "
+                    f"term is how a load state gets silently swapped for "
+                    f"another (law 31); pass exactly one."
+                )
+
+    @property
+    def governing_load_state(self) -> Optional[str]:
+        """The load state whose transient binds, when a table was measured."""
+        table = self.transient_by_load_state
+        if not table:
+            return None
+        return max(table, key=lambda k: table[k])
+
+    @property
+    def worst_transient_mib(self) -> float:
+        """The transient the gate charges: the worst state that will be served.
+
+        Not the mean and not the most recent -- a cut is admitted only if the
+        WORST load state it will serve is funded, because that state arrives
+        whether or not the gate priced it.
+        """
+        table = self.transient_by_load_state
+        if not table:
+            return self.transient_mib
+        return max(table.values())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -419,6 +485,11 @@ class StageCost:
     #: Peak transient this stage must be able to reach on top of residency.
     #: See ``RankResources.seam_staging_mib``.
     seam_staging_mib: float = 0.0
+    #: Which measured load state's transient was charged, when the rank
+    #: carried a per-load-state table. ``None`` means a single scalar was
+    #: supplied and the gate cannot say which state it describes -- which is
+    #: exactly the ambiguity law 31 was written about.
+    transient_load_state: Optional[str] = None
 
     @property
     def total_seconds(self) -> float:
@@ -689,8 +760,11 @@ def _price_stage(
         state_mib=state_mib,
         kv_mib=kv_mib,
         # The transient and the cut-invariant overhead both occupy the card
-        # alongside weights and KV, so they are charged together here.
-        transient_mib=rank.transient_mib + rank.fixed_overhead_mib,
+        # alongside weights and KV, so they are charged together here. The
+        # transient charged is the WORST measured load state (law 31): a cut
+        # that only fits in the gentlest state it will serve does not fit.
+        transient_mib=rank.worst_transient_mib + rank.fixed_overhead_mib,
+        transient_load_state=rank.governing_load_state,
         seam_staging_mib=rank.seam_staging_mib,
         # The corridor is subtracted here, once, so every downstream
         # comparison is against usable bytes.
@@ -889,7 +963,7 @@ def _infeasible(
         # figure; the role-scoped ones (embedding, lm_head) are not, because
         # this loop does not know which rank ends up holding them.
         overhead = (
-            r.transient_mib
+            r.worst_transient_mib
             + r.fixed_overhead_mib
             + inputs.replicated_weight_bytes / MIB
         )
@@ -919,7 +993,7 @@ def _infeasible(
             sum(
                 r.budget_mib
                 - inputs.corridor_mib
-                - r.transient_mib
+                - r.worst_transient_mib
                 - r.fixed_overhead_mib
                 for r in inputs.ranks
             )
@@ -1021,7 +1095,13 @@ def validate_pp_cut(
                 f"{cost.nonlayer_weight_mib:.0f} non-layer weights + "
                 f"{cost.state_mib:.0f} recurrent state + "
                 f"{cost.kv_mib:.0f} KV + "
-                f"{cost.transient_mib:.0f} transient) plus "
+                f"{cost.transient_mib:.0f} transient"
+                + (
+                    f", worst load state {cost.transient_load_state!r}"
+                    if cost.transient_load_state
+                    else ""
+                )
+                + f") plus "
                 f"{cost.seam_staging_mib:.0f} MiB of peak seam staging it "
                 f"must still be able to reach, but only "
                 f"{cost.budget_mib:.0f} MiB is usable after the "

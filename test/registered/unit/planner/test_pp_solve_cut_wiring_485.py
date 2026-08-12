@@ -164,5 +164,91 @@ class TestDefaultPathUnchanged(CustomTestCase):
         self.assertIn("no pipeline", str(cm.exception))
 
 
+
+def _transient(dirpath, pp_rank, table):
+    payload = {
+        "pp_rank": pp_rank,
+        "gpu_name": "NVIDIA GeForce RTX 5090",
+        "baseline_free_mib": 3000.0,
+        "transient_mib_by_load_state": table,
+        "samples_by_load_state": {k: 10 for k in table},
+        "worst_load_state": max(table, key=lambda k: table[k]) if table else None,
+        "worst_transient_mib": max(table.values()) if table else None,
+    }
+    with open(os.path.join(dirpath, f"transient_pp{pp_rank}.json"), "w") as fh:
+        json.dump(payload, fh)
+
+
+class TestTheTransientTravelsInTheCensus(CustomTestCase):
+    """law 31: the gate must read a MEASURED per-load-state transient, and
+    must refuse rather than price an unmeasured one at zero."""
+
+    def _dir(self):
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        blobs = [_census(0, 10, 32), _census(1, 3, 9), _census(2, 3, 9)]
+        blobs[-1]["params_mib"]["lm_head"] = 2425.0
+        _write(d, blobs)
+        return d
+
+    def test_a_census_without_transients_loads_with_empty_tables(self):
+        # Loading is not the refusal point -- the CONSUMER refuses, because
+        # only it knows the deployment. But nothing may be invented here.
+        c = cal.load_census_calibration(self._dir())
+        self.assertEqual(len(c.transient_by_load_state), 3)
+        self.assertTrue(all(t == {} for t in c.transient_by_load_state))
+        self.assertEqual(c.worst_transient_mib, (0.0, 0.0, 0.0))
+
+    def test_measured_transients_are_read_per_rank(self):
+        d = self._dir()
+        _transient(d, 0, {"EXTEND": 1989.0, "DECODE": 1204.0})
+        _transient(d, 1, {"EXTEND": 1120.0})
+        _transient(d, 2, {"EXTEND": 982.0})
+        c = cal.load_census_calibration(d)
+        self.assertEqual(c.worst_transient_mib, (1989.0, 1120.0, 982.0))
+        self.assertEqual(c.transient_by_load_state[0]["DECODE"], 1204.0)
+
+    def test_a_partial_transient_census_is_refused(self):
+        # Funding the worst state on two cards and zero on the third looks
+        # calibrated and is not.
+        d = self._dir()
+        _transient(d, 0, {"EXTEND": 1989.0})
+        _transient(d, 1, {"EXTEND": 1120.0})
+        with self.assertRaises(cal.PPCutCalibrationError) as cm:
+            cal.load_census_calibration(d)
+        self.assertIn("[2]", str(cm.exception))
+
+    def test_the_wiring_refuses_a_census_with_no_transient_at_all(self):
+        # THE REGRESSION THAT MOTIVATED THIS: the wired --pp-solve-cut path
+        # built RankResources without a transient, so the field took its 0.0
+        # default and a demand measured at 1346-3148 MiB was priced as free
+        # memory. The wired path admitted the cut metal breached.
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs.__new__(ServerArgs)
+        args.pp_size = 3
+        calibration = cal.load_census_calibration(self._dir())
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs._pp_cut_transients(args, calibration, "/tmp/census")
+        message = str(cm.exception)
+        self.assertIn("SGLANG_TRANSIENT_CENSUS=1", message)
+        self.assertIn("worst", message.lower())
+
+    def test_the_wiring_accepts_a_complete_transient_census(self):
+        from sglang.srt.server_args import ServerArgs
+
+        d = self._dir()
+        _transient(d, 0, {"EXTEND": 1989.0})
+        _transient(d, 1, {"EXTEND": 1120.0})
+        _transient(d, 2, {"EXTEND": 982.0})
+        args = ServerArgs.__new__(ServerArgs)
+        args.pp_size = 3
+        tables = ServerArgs._pp_cut_transients(
+            args, cal.load_census_calibration(d), d
+        )
+        self.assertEqual(tables[0]["EXTEND"], 1989.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,17 @@ class CensusCalibration:
     #: NVML's. The IdentityMap travels in the artifact.
     gpu_names: Tuple[Optional[str], ...] = ()
     calibrated_on_pool: Optional[int] = None
+    #: Per rank, the MEASURED transient draw for every load state that rank
+    #: actually served, as ``planner/transient_census.py`` wrote it. Empty
+    #: when the census boot did not run the transient instrument -- and the
+    #: gate REFUSES on empty rather than charging zero, because a transient
+    #: priced at zero reads to the solver as free memory. See law 31.
+    transient_by_load_state: Tuple[Dict[str, float], ...] = ()
+
+    @property
+    def worst_transient_mib(self) -> Tuple[float, ...]:
+        return tuple(max(t.values()) if t else 0.0
+                     for t in self.transient_by_load_state)
 
     def describe(self) -> str:
         return (
@@ -198,7 +209,48 @@ def load_census_calibration(census_dir: str) -> CensusCalibration:
         total_visible_mib=tuple(totals),
         calibrated_on_counts=tuple(counts),
         gpu_names=tuple(names),
+        transient_by_load_state=_load_transients(census_dir, expected),
     )
+
+
+def _load_transients(
+    census_dir: str, expected: List[int]
+) -> Tuple[Dict[str, float], ...]:
+    """Read the per-load-state transient tables written beside the census.
+
+    Absent files are returned as empty dicts rather than refused HERE: the
+    refusal belongs to the consumer, which knows whether this deployment is
+    one the transient has to be funded for. A partial set IS refused, because
+    a table for some ranks and silence for others would let the gate fund the
+    worst state on two cards and zero on the third.
+    """
+    tables: List[Dict[str, float]] = []
+    found = 0
+    for pp_rank in expected:
+        path = os.path.join(census_dir, f"transient_pp{pp_rank}.json")
+        if not os.path.exists(path):
+            tables.append({})
+            continue
+        with open(path) as fh:
+            blob = json.load(fh)
+        table = {
+            str(k): float(v)
+            for k, v in (blob.get("transient_mib_by_load_state") or {}).items()
+        }
+        if table:
+            found += 1
+        tables.append(table)
+
+    if found and found != len(expected):
+        missing = [i for i, t in enumerate(tables) if not t]
+        raise PPCutCalibrationError(
+            f"{census_dir!r} holds transient censuses for some ranks but not "
+            f"{missing}. A gate that funds the worst load state on some cards "
+            f"and zero on others is worse than one that funds none, because "
+            f"it looks calibrated. Re-take the census with "
+            f"SGLANG_TRANSIENT_CENSUS=1 on every rank."
+        )
+    return tuple(tables)
 
 
 def with_arena_split_state(

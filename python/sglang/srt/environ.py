@@ -646,6 +646,16 @@ class Envs:
     # A later boot points --pp-solve-cut at it to solve the layer cut against
     # these measured bytes. Requires SGLANG_RESIDENCY_CENSUS.
     SGLANG_RESIDENCY_CENSUS_DIR = EnvStr(None)
+    # Record, per rank, the driver-visible free-memory MINIMUM reached in each
+    # load state the rank actually serves (planner/transient_census.py), and
+    # write it beside the residency census. The #485 cut gate funds the WORST
+    # measured state, because a transient measured under one load state does
+    # not transfer to another -- a scalar measured at a prefill trigger
+    # admitted cuts that broke the corridor under a mixed soak, twice. Uses
+    # SGLANG_RESIDENCY_CENSUS_DIR for its output. Unset: byte-identical.
+    SGLANG_TRANSIENT_CENSUS = EnvBool(False)
+    # Sample one batch in this many for the transient census above.
+    SGLANG_TRANSIENT_CENSUS_STRIDE = EnvInt(8)
     # Force a fresh stage-0 hardware micro-probe for --rank-tp-ratio
     # auto-performance, ignoring the cached profile under ~/.cache/sglang.
     SGLANG_PERF_REPROBE = EnvBool(False)

@@ -14803,6 +14803,7 @@ class ServerArgs:
 
         rates = self._pp_cut_card_rates(calibration.gpu_names)
         budgets = self._pp_cut_budgets(calibration.total_visible_mib)
+        transients = self._pp_cut_transients(calibration, census_dir)
         ranks = tuple(
             pp_cut.RankResources(
                 label=f"stage{i}-{rates[i][0]}",
@@ -14810,6 +14811,7 @@ class ServerArgs:
                 attn_bw_gbs=rates[i][2],
                 budget_mib=budgets[i],
                 fixed_overhead_mib=calibration.residual_mib[i],
+                transient_by_load_state=transients[i],
             )
             for i in range(self.pp_size)
         )
@@ -14875,6 +14877,36 @@ class ServerArgs:
             solution.summary(),
             calibration.describe(),
         )
+
+    def _pp_cut_transients(self, calibration, census_dir: str):
+        """Per-rank measured transient tables, or a refusal naming the fix.
+
+        WHY THIS REFUSES INSTEAD OF DEFAULTING TO ZERO. Until this shift the
+        wired path built RankResources without a transient at all, so the
+        field took its 0.0 default and the solver priced a demand measured
+        between 1346 and 3148 MiB as nothing. That is not a conservative
+        simplification: it is the most optimistic possible answer, on the term
+        most likely to bind, and it admitted the cut that metal then broke the
+        corridor on. The flag's own help text promises "REFUSES, never
+        defaults"; this makes that true for the transient too.
+        """
+        tables = getattr(calibration, "transient_by_load_state", ()) or ()
+        if len(tables) != self.pp_size or not all(tables):
+            raise ValueError(
+                f"--pp-solve-cut {census_dir!r} carries no measured transient "
+                f"for every rank, and the cut gate will not price one at "
+                f"zero. A transient measured at a prefill trigger does not "
+                f"transfer to a mixed soak -- on the reference rig the same "
+                f"rank drew 956 MiB in one load state and 3148 MiB in "
+                f"another -- so the gate funds the WORST state each rank "
+                f"actually served, and it needs that table to exist. Re-take "
+                f"the census with SGLANG_RESIDENCY_CENSUS=1, "
+                f"SGLANG_TRANSIENT_CENSUS=1 and "
+                f"SGLANG_RESIDENCY_CENSUS_DIR={census_dir}, and serve real "
+                f"traffic on that boot -- an idle boot measures an idle "
+                f"transient."
+            )
+        return tables
 
     def _pp_cut_card_rates(self, gpu_names):
         """(name, gemm_tflops, attn_bw_gbs) per stage, or refuse.

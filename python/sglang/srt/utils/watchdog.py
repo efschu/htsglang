@@ -163,6 +163,80 @@ class WatchdogRaw:
             self.parent_process.send_signal(signal.SIGQUIT)
 
 
+def _cgroup_memory_dir() -> Optional[str]:
+    """The cgroup whose memory limit this process actually runs under.
+
+    Inside an LXC container the namespaced root IS the container, so
+    /sys/fs/cgroup/.lxc is where the serving processes are accounted even
+    though the limit itself is set on the host side and reads as "max" here.
+    """
+    for path in ("/sys/fs/cgroup/.lxc", "/sys/fs/cgroup"):
+        if os.path.exists(os.path.join(path, "memory.events")):
+            return path
+    return None
+
+
+def _oom_kill_count() -> Optional[int]:
+    """Cumulative cgroup OOM kills, or None where cgroup v2 is not readable.
+
+    This counter is the ONLY in-container trace of a kernel OOM kill: the
+    kernel's own report goes to the ring buffer, and a container has neither
+    /dev/kmsg nor permission for dmesg. The counter carries no timestamp and
+    no victim, so it is only evidence when a BEFORE value was taken -- which
+    is why the watchdog samples one at construction.
+    """
+    path = _cgroup_memory_dir()
+    if path is None:
+        return None
+    try:
+        with open(os.path.join(path, "memory.events")) as fh:
+            for line in fh:
+                if line.startswith("oom_kill "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _host_memory_state() -> str:
+    """One line of host-side memory state, for the report at a death."""
+    parts = []
+    path = _cgroup_memory_dir()
+    if path is not None:
+        try:
+            with open(os.path.join(path, "memory.current")) as fh:
+                parts.append(f"cgroup memory.current={int(fh.read()) // 1048576} MiB")
+        except (OSError, ValueError):
+            pass
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    parts.append(f"MemAvailable={int(line.split()[1]) // 1024} MiB")
+                    break
+    except (OSError, ValueError):
+        pass
+    return ", ".join(parts) if parts else "host memory state unavailable"
+
+
+def describe_exit(exitcode: Optional[int]) -> str:
+    """Render a multiprocessing exitcode as something a human can act on.
+
+    A negative exitcode is `-signum`, which in a log reads as an arbitrary
+    small negative number. Naming the signal is the difference between "the
+    rank died silently" and "the kernel killed the rank".
+    """
+    if exitcode is None:
+        return "still running (exit code None)"
+    if exitcode < 0:
+        try:
+            name = signal.Signals(-exitcode).name
+        except ValueError:
+            name = f"signal {-exitcode}"
+        return f"killed by {name} (exit code {exitcode})"
+    return f"exit code {exitcode}"
+
+
 class SubprocessWatchdog:
     """Monitors subprocess liveness and triggers SIGQUIT when a crash is detected.
 
@@ -172,6 +246,16 @@ class SubprocessWatchdog:
     sends SIGQUIT to trigger proper cleanup.
 
     See: https://github.com/sgl-project/sglang/issues/18421
+
+    #485/C40 -- WHAT THE WATCHDOG OWES THE OPERATOR. This class is the only
+    continuously-running observer of rank liveness in the launcher, so it is
+    the one place that can answer "how did the child die". It previously
+    answered with a bare integer, skipped `exitcode == 0` without a word, and
+    returned at the first dead process. A rank that was SIGKILLed mid-decode
+    was consequently written up as a SILENT DEATH for a full shift, while the
+    line `crashed with exit code -9` sat in the log. The reporting below is
+    therefore deliberately verbose; the SIGQUIT policy is deliberately
+    unchanged.
     """
 
     def __init__(
@@ -185,6 +269,10 @@ class SubprocessWatchdog:
         self._interval = interval
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Sampled BEFORE anything can die, so a later reading is a difference
+        # rather than an absolute nobody can interpret.
+        self._oom_kills_at_start = _oom_kill_count()
+        self._reported: set = set()
 
     def processes_with_names(self) -> List[Tuple[Process, str]]:
         """Tracked (process, name) pairs, for external liveness checks."""
@@ -212,16 +300,69 @@ class SubprocessWatchdog:
         except Exception as e:
             logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
 
-    def _check_processes(self) -> bool:
-        for proc, name in zip(self._processes, self._names):
-            if proc.is_alive() or proc.exitcode == 0:
-                continue
+    def _oom_attribution(self) -> str:
+        """Whether the kernel OOM-killed anything in this cgroup since start.
 
-            logger.error(
-                f"Subprocess {name} (pid={proc.pid}) crashed "
-                f"with exit code {proc.exitcode}. "
-                f"Triggering SIGQUIT for cleanup..."
+        A SIGKILL is never sent to a healthy rank by this codebase, so when one
+        appears the question is only who sent it. On this rig the answer is
+        almost always the kernel's cgroup OOM killer, and the report it writes
+        is unreadable from inside a container -- so the counter delta is the
+        evidence, and it is worth stating even when it is zero.
+        """
+        now = _oom_kill_count()
+        before = self._oom_kills_at_start
+        if now is None or before is None:
+            return (
+                "cgroup OOM counter unavailable, so an OOM kill can be neither "
+                "confirmed nor excluded from inside this container"
             )
+        if now > before:
+            return (
+                f"THE KERNEL OOM-KILLED A PROCESS IN THIS CGROUP: "
+                f"{_cgroup_memory_dir()}/memory.events oom_kill went "
+                f"{before} -> {now} since this server started. This is a HOST "
+                f"memory event; GPU free memory is irrelevant to it"
+            )
+        return (
+            f"no cgroup OOM kill recorded ({_cgroup_memory_dir()}/memory.events "
+            f"oom_kill still {now}), so the SIGKILL came from outside the "
+            f"kernel's OOM killer"
+        )
+
+    def _report_death(self, proc: Process, name: str) -> None:
+        """Say how this child ended, once, in terms someone can act on."""
+        if proc.pid in self._reported:
+            return
+        self._reported.add(proc.pid)
+
+        detail = describe_exit(proc.exitcode)
+        lines = [f"Subprocess {name} (pid={proc.pid}) is gone: {detail}."]
+        if proc.exitcode is not None and proc.exitcode < 0:
+            lines.append(f"  host memory at detection: {_host_memory_state()}")
+            if proc.exitcode == -int(signal.SIGKILL):
+                lines.append(f"  {self._oom_attribution()}")
+        elif proc.exitcode == 0:
+            lines.append(
+                "  A long-running rank that returns cleanly has still stopped "
+                "serving. Not signalling on it (unchanged policy), but it is "
+                "recorded here rather than passed over in silence."
+            )
+        logger.error("\n".join(lines))
+
+    def _check_processes(self) -> bool:
+        # Report EVERY dead child before acting on any of them: when one rank
+        # dies its peers follow within seconds, and a record naming only the
+        # first invites the consequence to be mistaken for the cause.
+        crashed = False
+        for proc, name in zip(self._processes, self._names):
+            if proc.is_alive():
+                continue
+            self._report_death(proc, name)
+            if proc.exitcode != 0:
+                crashed = True
+
+        if crashed:
+            logger.error("Triggering SIGQUIT for cleanup...")
             os.kill(os.getpid(), signal.SIGQUIT)
             return True
         return False

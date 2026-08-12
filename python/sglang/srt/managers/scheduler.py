@@ -264,6 +264,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     maybe_cache_unfinished_req,
@@ -1334,6 +1335,27 @@ class Scheduler(
         from sglang.srt.planner.residency_census import log_residency_census
 
         log_residency_census(model_runner)
+
+        # #485 transient census (env-gated, read-only): the residency census
+        # above is a snapshot AT REST, and a cut gate calibrated on at-rest
+        # bytes alone certifies configurations that cannot serve. This arms
+        # the per-load-state measurement of how far below at-rest each load
+        # state actually pulls this rank. Armed HERE because this point is
+        # the at-rest baseline: capture is done, no request has run.
+        from sglang.srt.planner import transient_census
+
+        if transient_census.census_enabled():
+            try:
+                import torch
+
+                _free_at_rest, _ = torch.cuda.mem_get_info()
+                transient_census.begin(
+                    pp_rank=int(getattr(model_runner, "pp_rank", -1)),
+                    gpu_name=torch.cuda.get_device_name(),
+                    baseline_free_bytes=int(_free_at_rest),
+                )
+            except Exception as exc:  # pragma: no cover - instrument only
+                logger.warning("transient census could not be armed: %s", exc)
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -6185,6 +6207,12 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+
+        # #485 transient census: one strided, read-only driver query, labelled
+        # with the load state that produced it. On every default boot this is
+        # a module-global boolean test and nothing more.
+        if _transient_census.ARMED:
+            _transient_census.note(batch.forward_mode.name)
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)

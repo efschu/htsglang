@@ -859,6 +859,41 @@ async def validate_json_request(raw_request: Request):
 ##### Native API endpoints #####
 
 
+def _dead_subprocess_response() -> Optional[Response]:
+    """503 naming the dead component, or None when every subprocess is alive.
+
+    #604 established that a dead scheduler must not read as healthy. #485/C40
+    established WHEN that has to be checked: always. This helper is therefore
+    mode-independent, and the two /health modes both consult it before doing
+    anything else -- see ``health_generate``.
+    """
+    watchdog = getattr(
+        _global_state.tokenizer_manager, "_subprocess_watchdog", None
+    )
+    if watchdog is None:
+        return None
+    for proc, name in watchdog.processes_with_names():
+        # is_alive() calls os.waitpid(pid, WNOHANG) internally which
+        # reaps zombies. After the call, proc.exitcode is set if the
+        # process has exited. A long-running scheduler/detokenizer that
+        # is not alive is always a failure, regardless of exit code.
+        if not proc.is_alive():
+            from sglang.srt.utils.watchdog import describe_exit
+
+            logger.error(
+                "Health check failed: subprocess %s (pid=%d) is dead: %s",
+                name,
+                proc.pid,
+                describe_exit(proc.exitcode),
+            )
+            return Response(
+                status_code=503,
+                content=_make_health_error_json(name, proc.pid, proc.exitcode),
+                media_type="application/json",
+            )
+    return None
+
+
 def _health_fast_path() -> Response:
     """Fast-path liveness check when generation-based health is disabled.
 
@@ -867,29 +902,7 @@ def _health_fast_path() -> Response:
     where the fast path returned 200 unconditionally while scheduler
     subprocesses could be dead/zombie.
     """
-    watchdog = getattr(
-        _global_state.tokenizer_manager, "_subprocess_watchdog", None
-    )
-    if watchdog is not None:
-        for proc, name in watchdog.processes_with_names():
-            # is_alive() calls os.waitpid(pid, WNOHANG) internally which
-            # reaps zombies. After the call, proc.exitcode is set if the
-            # process has exited. A long-running scheduler/detokenizer that
-            # is not alive is always a failure, regardless of exit code.
-            if not proc.is_alive():
-                logger.error(
-                    "Health check failed: subprocess %s (pid=%d) is dead "
-                    "with exit code %s",
-                    name,
-                    proc.pid,
-                    proc.exitcode,
-                )
-                return Response(
-                    status_code=503,
-                    content=_make_health_error_json(name, proc.pid, proc.exitcode),
-                    media_type="application/json",
-                )
-    return Response(status_code=200)
+    return _dead_subprocess_response() or Response(status_code=200)
 
 
 def _make_health_error_json(name: str, pid: int, exitcode: int | None) -> str:
@@ -919,6 +932,19 @@ async def health_generate(request: Request) -> Response:
 
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
+
+    # #485/C40: LIVENESS IS A PRECONDITION OF HEALTH, IN EVERY MODE.
+    # A dead rank used to be invisible here on a default boot: the check below
+    # lived behind the fast path, and the fast path is only taken when
+    # SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION is off, which it is not by
+    # default. The generation path then answered 200 as soon as
+    # last_receive_tstamp moved, and a still-draining output stream moves it,
+    # so an instance printed healthy with a rank gone -- the #622 wedge
+    # signature. The subprocess check is cheap (a waitpid(WNOHANG) per handle)
+    # and now runs before the mode is consulted.
+    dead = _dead_subprocess_response()
+    if dead is not None:
+        return dead
 
     if (
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()

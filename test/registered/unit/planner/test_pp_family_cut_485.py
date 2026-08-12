@@ -919,5 +919,127 @@ class TestTokenShareContract(CustomTestCase):
             pp_cut.token_shares_from_vector(())
 
 
+
+class TestTheTransientIsPerLoadState(CustomTestCase):
+    """#485/law 31: a transient measured in one load state is not the transient.
+
+    The gate charged one scalar per rank for three shifts. The scalar was
+    measured at a prefill trigger (956 MiB drawn on rank0); the shipping mixed
+    soak drew 1989 MiB on the same rank on one cut and 3148 on another. Every
+    verdict the gate issued was optimistic by that gap, and two cuts it
+    admitted broke the corridor on metal. A cut is admitted only when the
+    WORST load state it will serve is funded.
+    """
+
+    def _rank(self, **kw):
+        base = dict(
+            label="rank0-5090",
+            attn_bw_gbs=1533.8,
+            gemm_tflops=231.97,
+            budget_mib=31800.0,
+        )
+        base.update(kw)
+        return pp_cut.RankResources(**base)
+
+    def test_the_worst_state_is_charged_not_the_mean_or_the_last(self):
+        rank = self._rank(
+            transient_by_load_state={
+                "EXTEND": 1989.0,
+                "DECODE": 1204.0,
+                "IDLE": 12.0,
+            }
+        )
+        self.assertEqual(rank.worst_transient_mib, 1989.0)
+        self.assertEqual(rank.governing_load_state, "EXTEND")
+
+    def test_a_scalar_still_works_and_names_no_state(self):
+        rank = self._rank(transient_mib=1346.0)
+        self.assertEqual(rank.worst_transient_mib, 1346.0)
+        self.assertIsNone(rank.governing_load_state)
+
+    def test_two_sources_for_one_term_are_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            self._rank(
+                transient_mib=1346.0,
+                transient_by_load_state={"EXTEND": 1989.0},
+            )
+        self.assertIn("exactly one", str(cm.exception))
+
+    def test_an_empty_table_is_refused_not_read_as_zero(self):
+        with self.assertRaises(ValueError) as cm:
+            self._rank(transient_by_load_state={})
+        self.assertIn("unmeasured", str(cm.exception))
+
+    def test_a_negative_transient_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._rank(transient_by_load_state={"DECODE": -1.0})
+
+    @staticmethod
+    def _with_transients(inputs, tables):
+        return dataclasses.replace(
+            inputs,
+            ranks=tuple(
+                dataclasses.replace(r, transient_mib=0.0,
+                                    transient_by_load_state=t)
+                for r, t in zip(inputs.ranks, tables)
+            ),
+        )
+
+    def _budget_that_binds(self, cut, gentle_mib, spare=200.0):
+        """A rank0 budget where the GENTLE transient fits with `spare` left.
+
+        Derived from the model's own pricing rather than hard-coded, so this
+        test keeps testing the load-state axis and not a stale constant.
+        """
+        probe = _inputs(transients=(0.0, 0.0, 0.0), pool=280000)
+        sol, _ = pp_cut.validate_pp_cut(cut, probe)
+        stage0 = sol.stages[0]
+        # budget_mib on the stage is already net of the corridor.
+        return stage0.resident_mib + gentle_mib + spare + 1024.0
+
+    def test_the_gate_refuses_a_cut_the_gentle_state_would_admit(self):
+        # THE AXIS THAT MATTERS, isolated: identical inputs, identical cut,
+        # and the ONLY difference is which load state's transient is charged.
+        cut = [40, 12, 12]
+        gentle, worst = 1346.0, 1989.0
+        budget0 = self._budget_that_binds(cut, gentle)
+        budgets = (budget0, 20054.9, 20054.9)
+
+        gentle_inputs = self._with_transients(
+            _inputs(transients=(0.0, 0.0, 0.0), budgets=budgets, pool=280000),
+            ({"PREFILL_TRIGGER": gentle}, {"PREFILL_TRIGGER": 1120.0},
+             {"PREFILL_TRIGGER": 982.0}),
+        )
+        worst_inputs = self._with_transients(
+            _inputs(transients=(0.0, 0.0, 0.0), budgets=budgets, pool=280000),
+            ({"PREFILL_TRIGGER": gentle, "MIXED_SOAK": worst},
+             {"PREFILL_TRIGGER": 1120.0}, {"PREFILL_TRIGGER": 982.0}),
+        )
+
+        _s1, gentle_violations = pp_cut.validate_pp_cut(cut, gentle_inputs)
+        _s2, worst_violations = pp_cut.validate_pp_cut(cut, worst_inputs)
+
+        self.assertEqual(list(gentle_violations), [])
+        self.assertTrue(
+            worst_violations,
+            "adding a WORSE measured load state to the same rank must be "
+            "able to refuse a cut the gentler state admitted",
+        )
+
+    def test_the_refusal_names_the_load_state_that_binds(self):
+        cut = [40, 12, 12]
+        budget0 = self._budget_that_binds(cut, 1346.0)
+        inputs = self._with_transients(
+            _inputs(transients=(0.0, 0.0, 0.0),
+                    budgets=(budget0, 20054.9, 20054.9), pool=280000),
+            ({"MIXED_SOAK": 1989.0, "IDLE": 1.0},
+             {"MIXED_SOAK": 1120.0}, {"MIXED_SOAK": 982.0}),
+        )
+        _sol, violations = pp_cut.validate_pp_cut(cut, inputs)
+        self.assertTrue(violations)
+        self.assertIn("MIXED_SOAK", violations[0])
+        self.assertNotIn("IDLE", violations[0])
+
+
 if __name__ == "__main__":
     unittest.main()

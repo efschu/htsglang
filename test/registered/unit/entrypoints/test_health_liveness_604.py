@@ -282,5 +282,69 @@ class TestHealthFastPathLogging(unittest.TestCase):
         self.assertIn("139", msg)
 
 
+# ---------------------------------------------------------------------------
+# #485/C40: the liveness check must not depend on which health MODE is on
+# ---------------------------------------------------------------------------
+
+
+class TestADeadRankIsUnhealthyOnTheDefaultPath(unittest.TestCase):
+    """#604's liveness check was real but only reachable with
+    SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0, which is NOT the default.
+
+    On a default boot /health goes to the generation path instead, and that
+    path returns 200 as soon as ``last_receive_tstamp`` moves -- which any
+    still-draining scheduler output does. So an instance could print healthy
+    while a rank was gone, which is the #622 wedge signature. Liveness is a
+    precondition of health in every mode, so it is checked before the mode is
+    consulted at all.
+    """
+
+    def setUp(self):
+        procs = [
+            _FakeProcess(pid=7001, alive=False, exitcode=-9),
+            _FakeProcess(pid=7002, alive=True),
+        ]
+        _make_global_state(
+            watchdog=_FakeWatchdog(
+                processes=procs, names=["scheduler_0", "detokenizer_0"]
+            )
+        )
+        self.tm = _global_state_tokenizer_manager()
+        self.tm.gracefully_exit = False
+        self.tm.server_status = "Running"
+
+    def _call(self, path: str):
+        import asyncio
+
+        from sglang.srt.entrypoints.http_server import health_generate
+
+        request = types.SimpleNamespace(url=types.SimpleNamespace(path=path))
+        return asyncio.run(health_generate(request))
+
+    def test_health_is_503_when_a_rank_is_gone(self):
+        # The fake tokenizer manager has no generate machinery at all, so if
+        # the handler reaches the generation path this raises instead of
+        # returning -- which is the second half of the assertion.
+        resp = self._call("/health")
+        self.assertEqual(resp.status_code, 503)
+
+    def test_health_generate_is_503_when_a_rank_is_gone(self):
+        resp = self._call("/health_generate")
+        self.assertEqual(resp.status_code, 503)
+
+    def test_the_body_still_names_the_dead_component(self):
+        resp = self._call("/health")
+        body = json.loads(resp.body)
+        self.assertEqual(body["component"], "scheduler_0")
+        self.assertEqual(body["pid"], 7001)
+        self.assertEqual(body["exit_code"], -9)
+
+
+def _global_state_tokenizer_manager():
+    from sglang.srt.entrypoints.http_server import _global_state
+
+    return _global_state.tokenizer_manager
+
+
 if __name__ == "__main__":
     unittest.main()
