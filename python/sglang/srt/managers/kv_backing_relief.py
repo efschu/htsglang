@@ -225,7 +225,19 @@ class KvRowCap:
             # a kernel writing into unmapped memory.
             register = getattr(self._alloc, "register_free_listener", None)
             if register is not None:
-                register(lambda _idx: self._apply(), self._apply)
+                # THE TWO HOOKS ARE NOT THE SAME FUNCTION (#485). On a FREE,
+                # ids above the cap re-enter the list one batch at a time and
+                # must be ADDED to what is already withheld. On a CLEAR the
+                # allocator rebuilds ``free_pages`` as ``arange(1, size+1)``,
+                # so nothing is outstanding any more and the withheld set has
+                # to be recomputed from scratch. Wiring the accumulating
+                # ``_apply`` to both made a clear double-book its own ids:
+                # measured 2026-08-12, ``available=267217 withheld=25566``
+                # against ``total=280000`` -- withheld exactly 2x the true
+                # count -- which the idle invariant reports as a pool memory
+                # leak and which puts DUPLICATE ids into the free list on the
+                # next ``release()``.
+                register(lambda _idx: self._apply(), self._on_clear)
                 self._subscribed = True
             else:
                 logger.warning(
@@ -260,8 +272,31 @@ class KvRowCap:
         self._publish()
         return n
 
+    def _on_clear(self) -> None:
+        """Re-apply the cap after the allocator rebuilt its free list.
+
+        ``clear()`` replaces ``free_pages`` with ``arange(1, size + 1)``, so
+        every id the cap was holding is back in the list and NONE of them is
+        outstanding. The withheld set is therefore stale in full, not stale in
+        part: it is dropped and recomputed. Adding to it instead is what
+        published twice the true count and put duplicate ids into the free
+        list on the following ``release()``.
+        """
+        self._withheld = None
+        self._apply()
+        # A cap that was engaged stays published even when the rebuilt list
+        # happens to hold nothing above it, so the counter never keeps a value
+        # the free list no longer supports.
+        self._publish()
+
     def _apply(self) -> None:
-        """Move ids above the cap out of every free list, idempotently."""
+        """Move ids above the cap out of every free list.
+
+        Accumulates: on a free, ids above the cap re-enter one batch at a
+        time and each batch adds to what is held. That is correct for the
+        free path and WRONG for a clear, which is why the clear has its own
+        hook (``_on_clear``) rather than sharing this one.
+        """
         import torch
 
         if self._cap is None:
@@ -278,6 +313,13 @@ class KvRowCap:
             self._withheld = (
                 taken if self._withheld is None else torch.cat((self._withheld, taken))
             )
+            # A ``torch.unique`` belt here was written and REMOVED on purpose.
+            # It also makes the symptom disappear -- and that is the problem:
+            # with it in place the regression tests below pass whether or not
+            # ``_on_clear`` exists, so the instrument could no longer fail and
+            # would have certified the wrong fix. Duplicates are prevented by
+            # having the clear rebuild its set, which is the actual invariant;
+            # a dedupe would have hidden the next path that books twice.
             self._publish()
 
 
@@ -724,11 +766,7 @@ class KvBackingRelief:
             t["free_now"] / _MIB,
             t["cheap_relief_bytes"] / _MIB,
             deficit_mib,
-            (
-                f"SHRINK to {t['desire']}"
-                if t["desire"] < t["current"]
-                else "no change"
-            )
+            (f"SHRINK to {t['desire']}" if t["desire"] < t["current"] else "no change")
             + self._describe_live_split(t["max_live"]),
             (
                 t["skipped"]
@@ -737,8 +775,7 @@ class KvBackingRelief:
                     "the cheaper tier covers the whole gap, so KV capacity is "
                     "not spent -- this is the tier law, not a broken rung"
                     if t["deficit"] <= 0
-                    else "the cheap tier cannot cover it; KV capacity is the "
-                    "funder"
+                    else "the cheap tier cannot cover it; KV capacity is the funder"
                 )
             ),
         )
@@ -1052,7 +1089,12 @@ def kv_backing_provider(
     # then 94017 on all three, health 200 throughout, flips continuing in both
     # directions. So the switch turns OFF a rung that works rather than ON one
     # that might not, which is the direction an escape hatch should face.
-    if os.environ.get("SGLANG_KV_BACKING_RELIEF", "1") not in ("1", "true", "yes", "on"):
+    if os.environ.get("SGLANG_KV_BACKING_RELIEF", "1") not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
         logger.warning(
             "%s relief is DISABLED by SGLANG_KV_BACKING_RELIEF. Spec item 12's "
             "device half is off: the KV pool keeps its full backing in both "
@@ -1139,7 +1181,10 @@ def _admission_reserve_rows(scheduler: Any) -> int:
                 raw,
             )
     args = getattr(scheduler, "server_args", None)
-    for holder, name in ((scheduler, "chunked_prefill_size"), (args, "chunked_prefill_size")):
+    for holder, name in (
+        (scheduler, "chunked_prefill_size"),
+        (args, "chunked_prefill_size"),
+    ):
         size = getattr(holder, name, None) if holder is not None else None
         try:
             size = int(size)

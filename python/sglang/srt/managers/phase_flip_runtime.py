@@ -220,6 +220,39 @@ ENV_SEAM_ENTRY_DELAY_BUDGET = "SGLANG_SEAM_ENTRY_DELAY_BUDGET"
 #: counted there is indistinguishable from the 411-abandon decode wedge.
 SEAM_MARGIN_DELAY_TAG = "seam entry margin short"
 
+# How many CONSECUTIVE group abandons in one direction may be spent before the
+# seam stands down for good and says why.
+#
+# WHY A CAP EXISTS AT ALL (#485, C34). A seam that is short by a fixed,
+# configuration-determined amount is short on every retry: the staging ask is
+# a property of the LAYER MAP and the live set, and an abandon moves neither.
+# Measured 2026-08-12 on the #485 planner cut: rank0 wanted 4881 MiB of
+# staging against 4314 MiB spendable and the group re-armed every
+# SGLANG_PHASE_POLICY_MIN_DWELL_S (3 s on the ship config) for nine minutes --
+# 185 group abandons, 555 log lines. Each retry is not free: it runs the whole
+# spill ladder and a torch ``empty_cache``, and the armed window withholds
+# admissions, so nothing drained to the detokenizer. Its heartbeat expired,
+# the instance kept the "fired up and ready to roll" it had already printed,
+# and /health stopped answering inside its timeout. Nothing was deadlocked --
+# every stack sat IDLE in a normal wait. An unbounded retry of a refusal that
+# cannot change is what turned an unfundable CONFIG into a dead INSTANCE.
+#
+# The cap converts that into a diagnosis: serving continues in whichever phase
+# the instance is already in, the reason is logged once with the numbers, and
+# the operator gets a configuration verdict instead of a silent corpse.
+DEFAULT_SEAM_ABANDON_CAP = 8
+ENV_SEAM_ABANDON_CAP = "SGLANG_SEAM_ABANDON_CAP"
+
+# Upper bound on the arm attempts a single backoff step may skip, so the
+# damping cannot grow without limit before the cap is reached.
+DEFAULT_SEAM_ABANDON_BACKOFF_MAX = 16
+ENV_SEAM_ABANDON_BACKOFF_MAX = "SGLANG_SEAM_ABANDON_BACKOFF_MAX"
+
+#: The guard a capped seam installs. ``arm`` already refuses on
+#: ``blocking_guards``, so appending here is what makes "stay in the current
+#: phase" a STATE rather than a hope -- and it surfaces in the status string.
+SEAM_ABANDON_CAP_GUARD = "seam unfundable"
+
 
 def seam_entry_margin_bytes() -> int:
     """The designed headroom a seam must have ON TOP OF its staging ask.
@@ -243,6 +276,52 @@ def seam_entry_delay_budget() -> int:
     except ValueError:
         n = DEFAULT_SEAM_ENTRY_DELAY_BUDGET
     return max(0, n)
+
+
+def seam_abandon_cap() -> int:
+    """Consecutive group abandons a direction may spend before standing down.
+
+    Zero disables the cap and restores the pre-#485 unbounded retry exactly,
+    as a VALUE of the same term rather than a second code path.
+    """
+    try:
+        n = int(os.environ.get(ENV_SEAM_ABANDON_CAP, DEFAULT_SEAM_ABANDON_CAP))
+    except ValueError:
+        n = DEFAULT_SEAM_ABANDON_CAP
+    return max(0, n)
+
+
+def seam_abandon_backoff_max() -> int:
+    try:
+        n = int(
+            os.environ.get(
+                ENV_SEAM_ABANDON_BACKOFF_MAX, DEFAULT_SEAM_ABANDON_BACKOFF_MAX
+            )
+        )
+    except ValueError:
+        n = DEFAULT_SEAM_ABANDON_BACKOFF_MAX
+    return max(0, n)
+
+
+def seam_backoff_skips(consecutive_abandons: int, backoff_max: int) -> int:
+    """Arm requests to decline cheaply after ``k`` consecutive group abandons.
+
+    ``0, 1, 3, 7, 15, ...`` clamped at ``backoff_max``. The FIRST abandon
+    costs nothing: a seam that was short because a request happened to be
+    resident deserves an immediate second look, and that is the case the
+    existing C20 delay budget is built around. Growth starts only once the
+    refusal has repeated, which is the signature of a demand the retry cannot
+    change.
+
+    A pure function of a group-uniform input, so every rank computes the same
+    number without a collective.
+    """
+    k = int(consecutive_abandons)
+    if k <= 0:
+        return 0
+    if k >= 32:  # 2**31 is already far past any sane clamp; do not overflow it
+        return max(0, int(backoff_max))
+    return min((1 << (k - 1)) - 1, max(0, int(backoff_max)))
 
 
 def park_deadline_s() -> float:
@@ -2124,6 +2203,20 @@ class PhaseFlipRuntime:
         #: the wedge. One shared counter would let the safe leg spend the
         #: dangerous leg's budget.
         self._seam_abandons_in_a_row = {PP_TO_TP: 0, TP_TO_PP: 0}
+        #: #485: monotonic count of ARM REQUESTS this rank has seen, and the
+        #: arm number at which each direction may next spend a full seam
+        #: entry. Both are the backoff's clock, and the clock is ARMS rather
+        #: than seconds or rounds ON PURPOSE: an arm reaches every rank as one
+        #: broadcast ``PhaseFlipReqInput``, so all three ranks count the same
+        #: sequence, while a wall clock is rank-local and a round count is not
+        #: uniform across ranks within one arm. Group-uniform inputs, group-
+        #: uniform decision, no collective added.
+        self._arm_seq = 0
+        self._seam_retry_at_arm = {PP_TO_TP: 0, TP_TO_PP: 0}
+        #: How many arm requests this rank declined cheaply for the backoff,
+        #: per direction. Reported so a damped retry is visible as damping
+        #: rather than as silence.
+        self.seam_backoff_skips = {PP_TO_TP: 0, TP_TO_PP: 0}
         #: #656: the largest driver-visible in-cutover draw this rank has
         #: actually MEASURED, per direction, taken from the seam census.
         #:
@@ -2247,12 +2340,42 @@ class PhaseFlipRuntime:
     def arm(self, direction: str, source: str) -> Tuple[bool, str]:
         """Arm a flip. Replicated call; the consensus round commits it once
         every rank is armed AND ready. Returns (ok, msg)."""
+        # THE BACKOFF CLOCK TICKS ON EVERY ARM REQUEST, including the ones
+        # this function goes on to refuse. It has to: the sequence is only
+        # group-uniform if every rank advances it for the same events, and a
+        # refusal is an event every rank sees.
+        self._arm_seq = getattr(self, "_arm_seq", 0) + 1
         if self.blocking_guards:
             msg = f"phase flip refused (guards): {', '.join(self.blocking_guards)}"
             logger.warning("%s %s", LOG_PREFIX, msg)
             return False, msg
         if direction not in _DIR_ID:
             return False, f"unknown flip direction {direction!r}"
+        # #485: DAMP A REFUSAL THAT CANNOT CHANGE. Declining here rather than
+        # in ``_execute`` is deliberate -- nothing is armed, so no rank enters
+        # the seam, no collective is reached, and the ranks cannot disagree
+        # about whether this attempt happened. The alternative (an early
+        # return inside ``_execute``) would have to be taken identically by
+        # every rank on a path that already carries collectives, which is a
+        # divergence waiting to be written.
+        if not hasattr(self, "_seam_retry_at_arm"):
+            self._seam_retry_at_arm = {PP_TO_TP: 0, TP_TO_PP: 0}
+            self.seam_backoff_skips = {PP_TO_TP: 0, TP_TO_PP: 0}
+        retry_at = self._seam_retry_at_arm.get(direction, 0)
+        if self._arm_seq < retry_at:
+            self.seam_backoff_skips[direction] = (
+                self.seam_backoff_skips.get(direction, 0) + 1
+            )
+            msg = (
+                f"flip {direction} backing off: {self._seam_abandons_in_a_row.get(direction, 0)} "
+                f"consecutive group abandons, next entry at arm "
+                f"{retry_at} (this is arm {self._arm_seq})"
+            )
+            # DEBUG, not WARNING. The whole purpose of this branch is to stop
+            # a hot loop from producing work -- including log work. The state
+            # it represents is announced once, by the abandon that set it.
+            logger.debug("%s %s", LOG_PREFIX, msg)
+            return False, msg
         want = _DIR_OF_PHASE[self._phase]
         if direction != want:
             return False, (
@@ -3308,6 +3431,65 @@ class PhaseFlipRuntime:
     def _seam_backing_is_swappable(self) -> bool:
         swap = self._seam_swap()
         return bool(swap is not None and swap.is_swappable)
+
+    # -- the seam's terminal verdict ------------------------------------------
+    def _install_seam_cap_guard(
+        self, direction: str, spent: int, too_small: Sequence[str]
+    ) -> None:
+        """Stand the flip down for good and say why, once.
+
+        WHY THIS IS A VERDICT AND NOT A LOUDER RETRY. The seam's staging ask
+        is set by the layer map and the live set; an abandon moves neither, so
+        a refusal that has repeated ``cap`` times is a statement about the
+        CONFIGURATION and no amount of patience answers it. Before this, the
+        group re-armed every ``min_dwell`` forever: measured 185 group
+        abandons in nine minutes on the #485 planner cut, each one running the
+        full spill ladder while the armed window withheld admissions, until
+        the detokenizer heartbeat expired and /health stopped answering inside
+        its timeout -- with every stack IDLE in a normal wait and the instance
+        still claiming the readiness it printed at boot.
+
+        The verdict is installed as a BLOCKING GUARD because that is the one
+        piece of state ``arm`` already honours, so "stay in the current phase"
+        becomes a fact the next arm reads rather than a hope. ``_phase`` is
+        deliberately untouched -- every abandon path already leaves it alone,
+        and serving continues on whichever stack the instance is on.
+
+        The headline is NOT "FLIP ABANDONED": every acceptance harness in this
+        corpus counts that string, and a terminal verdict must not be
+        summed into the same total as the retries it replaces.
+        """
+        detail = "; ".join(too_small) if too_small else "fits (a peer did not)"
+        guard = (
+            f"{SEAM_ABANDON_CAP_GUARD}: {direction} abandoned {spent} times "
+            f"consecutively ({detail})"
+        )
+        # Idempotent: the group reaches this branch on every rank, and a
+        # re-entry must not stack duplicate guards.
+        if any(g.startswith(SEAM_ABANDON_CAP_GUARD) for g in self.blocking_guards):
+            return
+        self.blocking_guards = tuple(self.blocking_guards) + (guard,)
+        self.seam_cap_verdicts = getattr(self, "seam_cap_verdicts", 0) + 1
+        logger.error(
+            "%s SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (%s). %d consecutive "
+            "group abandons reached the cap; this rank: %s. The staging ask is "
+            "a property of the layer map and the live set, so retrying cannot "
+            "change it and retrying is what kills the instance: each attempt "
+            "runs the spill ladder while the armed window withholds "
+            "admissions, and an unbounded loop starves the detokenizer "
+            "heartbeat until the server stops answering /health while every "
+            "stack sits IDLE. THE INSTANCE STAYS IN THE %s PHASE AND KEEPS "
+            "SERVING -- degraded, because the other phase is now unreachable, "
+            "but alive and saying so. To make the seam fundable, lower "
+            "--max-total-tokens, raise this rank's --rank-gpu-memory-mib, or "
+            "choose a layer cut whose seam fits; see SGLANG_SEAM_ABANDON_CAP "
+            "to change or disable this bound.",
+            LOG_PREFIX,
+            direction,
+            spent,
+            detail,
+            self._phase,
+        )
 
     # -- staging affordability ------------------------------------------------
     def _staging_bytes(self, tr, direction: str, src, dst, waves=None) -> int:
@@ -4527,6 +4709,45 @@ class PhaseFlipRuntime:
                     "; ".join(too_small) if too_small else "fits (a peer did not)",
                     self._phase,
                 )
+            # #485: BOUND THE RETRY, AND END IT IF IT CANNOT WIN.
+            #
+            # Only real abandons are bounded. A margin DELAY is a by-design
+            # wait whose own budget already ends it -- after
+            # ``seam_entry_delay_budget()`` rounds the gate yields to the law
+            # and the flip goes through -- so damping it here would slow a
+            # path that is already self-terminating, and would change the
+            # shipped C20 behaviour. This whole block is therefore inert on a
+            # configuration whose only objection is the entry margin.
+            if not delayed_for_margin:
+                spent = self._seam_abandons_in_a_row.get(direction, 0)
+                cap = seam_abandon_cap()
+                if cap and spent >= cap:
+                    self._install_seam_cap_guard(direction, spent, too_small)
+                else:
+                    skips = seam_backoff_skips(spent, seam_abandon_backoff_max())
+                    if not hasattr(self, "_seam_retry_at_arm"):
+                        self._seam_retry_at_arm = {PP_TO_TP: 0, TP_TO_PP: 0}
+                        self.seam_backoff_skips = {PP_TO_TP: 0, TP_TO_PP: 0}
+                    self._seam_retry_at_arm[direction] = (
+                        getattr(self, "_arm_seq", 0) + 1 + skips
+                    )
+                    if skips:
+                        logger.warning(
+                            "%s seam BACKING OFF (%s): %d consecutive group "
+                            "abandons, so the next %d arm request(s) are "
+                            "declined before the seam is priced again, and the "
+                            "flip stands down for good at %d. Each entry runs "
+                            "the spill ladder and an empty_cache while the "
+                            "armed window withholds admissions, so retrying a "
+                            "refusal that cannot change is what starves the "
+                            "detokenizer -- the damping is the point, not a "
+                            "delay tactic.",
+                            LOG_PREFIX,
+                            direction,
+                            spent,
+                            skips,
+                            cap,
+                        )
             # Abandoned before any byte moved: there is no seam to attribute.
             seam_census.reset()
             return None
@@ -4538,6 +4759,13 @@ class PhaseFlipRuntime:
         if not hasattr(self, "_seam_abandons_in_a_row"):
             self._seam_abandons_in_a_row = {}
         self._seam_abandons_in_a_row[direction] = 0
+        # #485: and so is the backoff. A seam that went through has proved the
+        # demand fundable, so the next refusal starts its damping from zero
+        # rather than inheriting a streak the group has already broken.
+        if not hasattr(self, "_seam_retry_at_arm"):
+            self._seam_retry_at_arm = {PP_TO_TP: 0, TP_TO_PP: 0}
+            self.seam_backoff_skips = {PP_TO_TP: 0, TP_TO_PP: 0}
+        self._seam_retry_at_arm[direction] = 0
 
         # THE MOVE, ONE LAYER WAVE AT A TIME (#631).
         #

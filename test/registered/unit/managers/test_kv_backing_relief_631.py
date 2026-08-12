@@ -175,6 +175,44 @@ class AllocatorCapTest(unittest.TestCase):
         cap.engage(400)
         a.clear()
         self.assertEqual(int(a.free_pages.max()), 400)
+        # THE HALF THIS TEST USED TO MISS (#485). Re-applying the cap was
+        # already correct; BOOKING the re-apply was not. The clear hook was
+        # the accumulating _apply, so the 600 ids above the cap were taken a
+        # second time and concatenated onto the 600 already held.
+        self.assertEqual(cap.withheld, 600)
+        self.assertEqual(a.residency_withheld_slots, 600)
+
+    def test_a_clear_does_not_double_book_the_idle_pool_invariant(self):
+        # The measured crash, in one assertion. on_idle checks
+        # available + ... + withheld == total; a doubled withheld reports a
+        # pool memory leak on a pool that is perfectly intact. Metal
+        # 2026-08-12: total=280000 available=267217 withheld=25566, i.e.
+        # withheld exactly 2x the true 12783, raised inside on_idle right
+        # after a /flush_cache.
+        a = _FakeAllocator(1000)
+        cap = kbr.KvRowCap(a)
+        cap.engage(400)
+        for _ in range(3):
+            a.clear()
+            self.assertEqual(
+                a.available_size() + cap.withheld,
+                1000,
+                "available + withheld must equal the pool, on every clear",
+            )
+
+    def test_a_release_after_a_clear_leaves_no_duplicate_ids(self):
+        # The worse half of the same bug: release() cats the withheld tensor
+        # straight back into free_pages, so a double-booked id is handed out
+        # TWICE -- two requests writing the same KV row, with no error.
+        import torch
+
+        a = _FakeAllocator(1000)
+        cap = kbr.KvRowCap(a)
+        cap.engage(400)
+        a.clear()
+        cap.release()
+        self.assertEqual(a.free_pages.numel(), 1000)
+        self.assertEqual(int(torch.unique(a.free_pages).numel()), 1000)
 
     def test_releasing_the_cap_returns_every_withheld_id(self):
         a = _FakeAllocator(1000)
@@ -455,9 +493,7 @@ class ChunklessArenaIsDisqualifiedTest(unittest.TestCase):
         # ENABLED explicitly: the rung is opt-in until its shrink target is a
         # collective minimum, and without this the assertion would pass on the
         # opt-in gate rather than on the chunk check it names.
-        with unittest.mock.patch.dict(
-            os.environ, {"SGLANG_KV_BACKING_RELIEF": "1"}
-        ):
+        with unittest.mock.patch.dict(os.environ, {"SGLANG_KV_BACKING_RELIEF": "1"}):
             self.assertIsNone(
                 kbr.kv_backing_provider(self._Sched(False), device_index=0)
             )

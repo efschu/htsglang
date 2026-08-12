@@ -52,6 +52,7 @@ FAMILY=(
     test/registered/unit/managers/test_arena_high_water_631.py
     test/registered/unit/managers/test_phase_flip_corridor_gate_631.py
     test/registered/unit/managers/test_seam_entry_margin_631.py
+    test/registered/unit/managers/test_seam_abandon_cap_631.py
     test/registered/unit/managers/test_phase_flip_arena_tail_631.py
     test/registered/unit/managers/test_kv_arena_handle_retention_631.py
     test/registered/unit/managers/test_spec_counter_wire_631.py
