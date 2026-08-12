@@ -2442,6 +2442,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
+        # #644: end-of-load host-anon discriminator. Off unless
+        # SGLANG_644_DISCRIMINATOR is set; the answer it produces (references
+        # genuinely persist vs glibc arenas holding freed pages) cannot be read
+        # off an RSS sampler, and gdb is not installed on this rig. Placed here
+        # because "after load" is exactly the point the ~16 GB residue was
+        # measured at, and because a failure inside a diagnostic must never
+        # cost a boot.
+        try:
+            from sglang.srt.mem_ledger.host_anon_644 import run_discriminator
+
+            run_discriminator(
+                self.model,
+                tag=f"pp{self.pp_rank}tp{self.tp_rank}"
+                + ("-draft" if self.is_draft_worker else ""),
+            )
+        except Exception as exc:  # noqa: BLE001 -- diagnosis never kills a boot
+            logger.debug("#644 discriminator skipped: %s", exc)
+
         # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
         # TODO: Move this online-quantization reporting out of ModelRunner.
         quantized_layers = getattr(
