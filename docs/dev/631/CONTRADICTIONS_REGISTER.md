@@ -133,7 +133,55 @@ are byte-identical. The pool difference (512552 vs 503950) is **a warm page
 cache**, not code: weight load took 11.11 s cold and 2.35 s warm, and the
 faster load leaves ~0.1 GB more allocator high-water on every rank.
 
-**C26, #224's PS2 born-spilled-deep path kills the instance (#659 window).**
+**C26 — ROOT-CAUSED AND FIXED IN `bdb2c3db53`, awaiting its metal proof.**
+The mechanism is not a race and not a corner: **PS2 is admitted onto a backend
+that has no hook to divert its sentinels.** `spill_extend_alloc` returns
+`make_sentinels(...)` AS `out_cache_loc`, and exactly one thing in the tree
+diverts that tensor away from the KV write — `_dcp_write_scatter`'s
+`_sess_prefill_owner_write` branch, reachable ONLY from the token-sharded DCP
+lane (`forward_extend` enters it under `if self.uneven_dcp`). On plain TP the
+backend still BUILDS the prefill-spill state and nothing complains;
+`forward_extend` falls through to the stock `set_kv_buffer` and the sentinels
+reach `store_kvcache`. The arithmetic closes exactly: `host_base=4097` against
+a 4096-row allocator, `boundary=2620 L=3012`, so the 392 written indices are
+**6717..7108 against a `size_limit` of ~4097** — every row out of bounds,
+layer 0, both ranks.
+
+Two premises from HANDOFF_686 are corrected. **The crash is NOT delayed** —
+the ~60 s gap is a coincidence of the log; the parks at 01:37:28 completed
+cleanly and are unrelated, `fast-3` was admitted at 01:38:26 and the next line
+is the exception, so the assert comes from that same extend forward and
+`adopt_born_spilled_prefills` is never reached. **The #501 flag-after-last-
+decline hypothesis is refuted for this crash** — `req.born_spilled_deep =
+False` at the end of `spill_extend_alloc` has no later reader.
+
+Fixed at the admission gate, where the information was missing rather than
+wrong: `prefill_spill_deep_gate(backend_write_hook=...)` from
+`_sess_mode != "plain"` — replicated boot config, identical on every rank, no
+collective, and a decline is a NON-ADMISSION rather than a rank-local skip
+around one (law 14). Plus a Python `RuntimeError` in `spill_extend_alloc` as
+belt and braces. Close/reopen trigger UNCHANGED and still open: a boot that
+drives >=2 concurrent spills to a park and back **with a request COMPLETING
+afterwards**. The band is now known — `--chunked-prefill-size 256` removes PS2
+entirely (the 392-token tail then chunks and fails `prefill_spill_deep_ok`'s
+one-chunk condition) while leaving PS1, the fast-lane spill and the park path
+untouched. HANDOFF_687 §2b.
+
+**A SEPARATE, REAL BUG FOUND IN THE SAME TRACE AND DELIBERATELY NOT FIXED
+HERE (open):** `_admit_born_spilled_deep` sets `req.born_spilled_deep`,
+`prefill_spill_deep_taken` and decrements `prefill_spill_regions`
+(`schedule_policy.py:908-910`), and `add_one_req` can still bail out
+afterwards (hybrid-SWA `:1290`/`:1322`, dllm `:1352`, truncation
+`:1384`/`:1391`/`:1402`) without clearing any of it. The request is never
+appended to `can_run_list`, that iteration's region accounting is lost, and a
+later adder with `deep_taken=False` can admit the stale-flagged request
+WITHOUT re-entering the deep branch — after which it reaches
+`prepare_for_extend` and either takes an unintended PS2 allocation or trips
+the mixed-batch raise. This IS the #501 flag family, just on the decline side
+rather than where HANDOFF_686 looked. It wants its own change with its own
+reproducer.
+
+**C26 (ORIGINAL ENTRY, kept for the record), #224's PS2 born-spilled-deep path kills the instance (#659 window).**
 Reproduced twice in one shift, both times a device-side assert out of the KV
 path, both times with ZERO #659 code involved. The clean signature is PS2:
 `admit rid=... BORN-SPILLED DEEP (input=392 does NOT fit device budget=102) --

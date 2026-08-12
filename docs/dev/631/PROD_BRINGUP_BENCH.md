@@ -4654,3 +4654,63 @@ Probe bandwidth is a SHORT-write upper bound (256 MiB probe; sustained on this
 volume is ~3.1 GB/s at 8 GiB). Two ranks probing the same directory at the same
 instant measured 2.41 vs 7.00 GB/s on an earlier boot — the measurement that
 forced ratio-based ordering (register law 15).
+
+## SUCCESSOR 43 — the corridor breach root-caused and fixed (#656 C27), C26 fixed (#659)
+
+Ship config rebooted from `18ff17ec6e`, healthy 02:26:38Z, real generate
+verified. `s34_acceptance_run.sh 31`. Evidence `/spinning/evidence-631/s43/`.
+
+### The breach was never a regression — three draws from one distribution
+
+| window | code | entry free | in-cutover draw | trough | vs the 1024 law |
+|---|---|---|---|---|---|
+| s34 | pre-fix | — | — | 1043 | +19 |
+| s38 | pre-fix | 3469 | 2386 | 1083 | +59 |
+| **s42** | pre-fix | 3006 | 2066 | **940** | **−84 BREACH** |
+| **s43** | **fixed** | 2946 | 1922 | **1024** | **+0 HELD** |
+
+Every window in this corpus contains exactly ONE deep excursion, 12 samples,
+1.53-1.54 s, at the completion of the 271k YaRN leg, on rank 1 (nvidia-smi 0,
+a 3080). s38 and s34 were green by 59 and 19 MiB. The floor sits inside the
+left tail of that distribution, so "green" was a coin flip.
+
+### The fix fired in the identical event and named its own counterfactual
+
+```
+[02:43:27 PP1] cuMemCreate: committing 8388608 bytes would leave 1016 MiB free,
+  below the 1024 MiB corridor law floor. Releasing torch's cached blocks FIRST
+  (1032 MiB of slack held, reserved 22.88 GiB / allocated 21.88 GiB).
+```
+
+One firing (self-limiting: after the release, slack falls under the 64 MiB
+threshold and the rest of the walk returns at the slack check). The 1032 MiB
+it spent is the same resource s42's trough recorded as `slack=1054` and never
+asked for, because the only mechanism that could have asked was waiting for
+`CUDA_ERROR_OUT_OF_MEMORY` — 1024 MiB too late (register law 16).
+
+### Falsified candidates, each with a can-find control
+
+| candidate | verdict |
+|---|---|
+| N41's merged changes (P2 gate, registry observer, help string) | INERT — observation/refusal paths, allocate nothing; `registry`/`observer` logged 0 times in both windows |
+| #657 allocation steering (4 commits on `allocator/base.py`) | INERT — ships OFF, var absent from the byte-identical env, 0 `steer` fingerprints in either log |
+| environment drift | NONE — env blocks byte-identical |
+| CUDA graph capture | IDENTICAL — 3 sets, `bs=[1,2,3,4]`, 0.56/0.30/0.28 vs 0.57/0.32/0.32 GB |
+| pool 512552 vs 503950 | a WARM PAGE CACHE — weight load 11.11 s cold vs 2.35 s warm, ~0.1 GB more allocator high-water per rank; final decode pools identical |
+
+### Instrument note, worth carrying
+
+The 100 ms external sampler **understates depth**: it read PP0's floor as 2578
+where PP0's own census recorded 2375, and in this window it read gpu0's min as
+1145 where the census recorded 1024. **Judge the corridor on the seam census**,
+which samples the same NVML observable at every stage of the cutover.
+
+### C26 (#659 blocker) — root-caused and fixed, metal proof still owed
+
+PS2 is admitted onto a backend with no hook to divert its sentinel
+`out_cache_loc`; only the DCP lane has one. `host_base=4097` against a
+4096-row allocator with `boundary=2620 L=3012` writes indices 6717..7108
+against a `size_limit` of ~4097. Gated at admission on `_sess_mode != "plain"`
+(replicated boot config, no collective). Tests 167 passed. The band for the
+completion proof: `--chunked-prefill-size 256` removes PS2 while leaving PS1,
+the fast-lane spill and the park path untouched.

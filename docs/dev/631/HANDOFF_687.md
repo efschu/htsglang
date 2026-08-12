@@ -173,6 +173,73 @@ and read by nobody; it now feeds a running per-direction MAX which the seam
 entry consults to predict a sub-law trough and say so. It does not move
 `law_ok` — see §1d.
 
+## 2b. C26 IS ROOT-CAUSED AND FIXED — `bdb2c3db53`
+
+**The mechanism, and it is not a race or a corner case: PS2 is admitted onto
+a backend that has no hook to divert its sentinels.**
+
+`spill_extend_alloc` returns `make_sentinels(...)` *as* `out_cache_loc`, and
+exactly one thing in the tree diverts that tensor away from the KV write:
+`_dcp_write_scatter`'s `_sess_prefill_owner_write` branch — which is reachable
+**only** from the token-sharded DCP lane, because `forward_extend` enters that
+lane under `if self.uneven_dcp`. On plain TP the backend still BUILDS the
+prefill-spill state (`_sess_mode="plain"`, `_sess_prefill_spill` computed, the
+staging carve reserved) and nothing complains; `forward_extend` then falls
+through to the stock `set_kv_buffer` and the sentinels go into `store_kvcache`.
+
+The arithmetic closes exactly, which is why this is a mechanism and not a
+theory: `host_base=4097` against a 4096-row allocator, request
+`boundary=2620 L=3012`, so the 392 written indices are **6717..7108 against a
+`size_limit` of ~4097** — every row out of bounds, layer 0, both ranks.
+
+Two premises from HANDOFF_686 are corrected by this:
+
+* **The crash is NOT delayed.** The ~60 s gap between the parks and the assert
+  is a coincidence of the log. The parks at 01:37:28 completed cleanly and are
+  unrelated; `fast-3` was admitted at 01:38:26 and the very next line is the
+  exception. **The assert is raised by that same extend forward**, so there is
+  no stale-sentinel decode path to hunt and `adopt_born_spilled_prefills` is
+  never reached.
+* **The `#501` flag-after-last-decline hypothesis is refuted for this crash.**
+  `req.born_spilled_deep = False` at the end of `spill_extend_alloc` has no
+  later reader. (The flag family does have a real instance, but on the
+  DECLINE side — see §4.)
+
+**The fix is at the admission gate**, where the information was missing rather
+than wrong: `prefill_spill_deep_gate` now takes `backend_write_hook`, derived
+from `_sess_mode != "plain"`. That is replicated boot config, fixed before the
+first forward and identical on every rank, so the verdict needs no collective,
+and a decline is a NON-ADMISSION rather than a rank-local skip around one
+(law 14). Declining is bit-for-bit the pre-PS2 behaviour: the request stays
+queued and the fast lane retries it, which is exactly what the log shows it
+already doing one line earlier.
+
+Belt and braces: `spill_extend_alloc` raises in Python if it is ever reached
+on a plain backend. The two failures are not equivalent — a `RuntimeError`
+names the cause and unwinds; the device-side assert it replaces poisons the
+CUDA context and points the traceback at an `all_reduce` three frames from the
+mistake.
+
+**The pressure band for the next shift is now known, and one knob removes the
+crash without perturbing the pressure.** `probe_boot_v5.sh` and
+`probe_boot_v6.sh` are byte-identical except the park directory; all the
+difference lives in the driver env (`SAT=6 FAST_SHOTS=4` vs `SAT=3
+FAST_SHOTS=2`). Recommended order:
+
+1. **`--chunked-prefill-size 256`.** The uncached tail is 392 tokens, so
+   392 > 256 forces chunking and `prefill_spill_deep_ok` returns False on its
+   "ONE CHUNK ONLY" condition — PS2 cannot be admitted at all, while PS1, the
+   fast-lane spill and the entire park path are untouched. This is the knob
+   for the first park/unpark completion proof.
+2. `FAST_NEW=1200` (driver, default 600) — raises `need` so both spill demands
+   fire at LOWER occupancy, reaching the park before the budget drains.
+3. `SAT=4`, `FAST_SHOTS=3` — the intermediate between the two known boots.
+4. `MTT=5120` — keeps `rem_total_tokens` around 1500 instead of 102, so every
+   prompt lands in PS1's window and PS2 never applies.
+
+Keep `HOSTGIB=1.5` / `MAXSPILLS=3` exactly as they are: a larger host budget
+yields more free regions and makes the park HARDER.
+
 ---
 
 ## 3. THE EVIDENCE
@@ -183,8 +250,46 @@ entry consults to predict a sub-law trough and say so. It does not move
 | can-fail proof | with the floor disabled, the 4 "it acts" arms go RED and the sibling arms stay green |
 | ruff / codespell | clean on the changed files |
 | root cause | in-process seam census, matching the external sampler to 1 MiB |
+| C26 pins (new) | 9 passed, both arms; kvso + tier-selection + park-tier suites unmoved (167 total) |
 
-### The confirmation window — SEE §3a
+### 3a. THE CONFIRMATION WINDOW — GREEN, AND THE FIX IS WHAT MADE IT GREEN
+
+Ship config, rebooted from `18ff17ec6e` (the fix), healthy 02:26:38Z, real
+generate verified. `s34_acceptance_run.sh 31`.
+
+**The fix fired in the identical event, and its own log line states the
+counterfactual:**
+
+```
+[2026-08-12 02:43:27 PP1] cuMemCreate: committing 8388608 bytes would leave
+  1016 MiB free, below the 1024 MiB corridor law floor. Releasing torch's
+  cached blocks FIRST (1032 MiB of slack held, reserved 22.88 GiB /
+  allocated 21.88 GiB). This is the same reclaim the OUT_OF_MEMORY path
+  takes, moved ahead of the crossing instead of after the refusal.
+```
+
+Same rank (PP1), same direction (`pp_to_tp`), same trigger (the completion of
+the 271k YaRN leg). It fired **once** — after the release, torch's slack drops
+below the 64 MiB threshold and the remaining commits of that walk return at
+the slack check, so the expensive path is self-limiting to about one call per
+walk. The 1032 MiB of slack it spent is the same resource s42's trough
+recorded as `slack=1054` and never asked for.
+
+| window | entry free | draw | trough | vs the law |
+|---|---|---|---|---|
+| s38 (no fix) | 3469 | 2386 | 1083 | +59, by luck |
+| **s42 (no fix)** | 3006 | 2066 | **940** | **−84, BREACH** |
+| **s43 (fix)** | 2946 | 1922 | **1024** | **+0, HELD BY THE MECHANISM** |
+
+The seam census for that flip:
+`pp_to_tp rank 1: transient 1922 MiB (baseline free 2946 MiB, trough 1024 MiB
+at 'backing_restore_span')`.
+
+**This is why the close trigger was written in two parts.** A green window
+alone would have been indistinguishable from s38's luck. Here the mechanism is
+demonstrably reachable, demonstrably decisive, and the number it prevented
+(1016 MiB) is in the record next to the number it achieved (1024 MiB).
+`CORRIDOR LAW BROKEN` appears **0** times, which is the recogniser agreeing.
 
 ---
 
