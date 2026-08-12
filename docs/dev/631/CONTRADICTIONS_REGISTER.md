@@ -70,6 +70,24 @@ landed.
 
 ## OPEN — flagged, never resolved
 
+**C26, #224's PS2 born-spilled-deep path kills the instance (#659 window).**
+Reproduced twice in one shift, both times a device-side assert out of the KV
+path, both times with ZERO #659 code involved. The clean signature is PS2:
+`admit rid=... BORN-SPILLED DEEP (input=392 does NOT fit device budget=102) --
+prefilled straight into a host region, no device KV slots`, immediately
+followed by `PREFILL-SPILL (PS2, born-spilled deep) ... NO device KV slots
+allocated` and then `torch.AcceleratorError: CUDA error: device-side assert`.
+The earlier one (uneven TP=3, --max-total-tokens 8192) asserted inside
+`kvcache.cuh:112 store_kvcache: index >= 0 && index < size_limit`. Both look
+like a KV row index computed against a device allocation that is not there.
+This is what stopped #659's end-to-end proof: the park round trip completed,
+then the instance died before any parked session could finish. Reproducers:
+`evidence-631/s42/probe_boot_v5.sh` (parks, then PS2-crashes) and
+`probe_boot_30040.sh` (the uneven-TP variant). Belongs to the #622/#649 lane.
+Close/reopen trigger: a boot that drives >=2 concurrent spills to a park and
+back with a request COMPLETING afterwards. HANDOFF_686 §1d-BIS, §1f.
+
+
 **C25, kv-session-offload cannot run on the Route-A ship recipe at all
 (#659).** Five briefs have asked for kvso to be proven "on the Route-A recipe
 plus `--enable-kv-session-offload`". That boot does not exist, and the refusal
