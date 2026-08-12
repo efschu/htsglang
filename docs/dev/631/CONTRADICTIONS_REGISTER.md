@@ -70,6 +70,26 @@ landed.
 
 ## OPEN — flagged, never resolved
 
+**C24, the bundled profile's remote rows describe a path this process cannot
+route to (#659).** `memtier/profiles/rig1.json` carries `host:rig-2` with
+transport `roce-40g` and bandwidth **2.83 GB/s MEASURED**, and
+`kv_session_spill_destination.py:29`/`:153` quote **3.43 GB/s RDMA write,
+1.47 us** in prose. Measured from inside the serving container by successor 41
+(`evidence-631/s41/TIER2_LINK_MEASUREMENTS.md`), the second rig is reachable
+only over its 1 GbE `enp7s0`: its 100G/40G NICs sit on `10.10.10.2/30` and
+`192.168.40.10/24`, **both unreachable from here**, and `169.254.17.33`
+answers ICMP but measures identically to the 1 GbE address. Bulk throughput
+**75 MB/s on both paths** (dd 1500 MiB through nc), RTT 0.265 ms avg. The box
+also has only **8629 MiB available RAM plus a 64 GiB swapfile**, against a
+~12.9 GB full-context kvso region (C13) — so remote "RAM" there is
+swap-backed and cannot honour a pinned-residency contract either. Neither
+number is wrong about the machine it was taken on; both are numbers carried
+across a change in REACHABILITY, which is law 1 in its network form. **Nothing
+may size a remote tier against rig1.json without re-measuring the path from
+inside the container.** Close/reopen trigger: a boot in which `10.10.10.2` or
+`192.168.40.10` is routable from the serving container.
+
+
 **C23, two independent drivers of one VMM release primitive (#658).**
 `pool.runtime_set_backing_rows` -- the only call that hands KV pages back to
 the driver -- has TWO callers that do not know about each other.
