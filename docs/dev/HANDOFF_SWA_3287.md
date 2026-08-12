@@ -314,10 +314,23 @@ Every delta is accounted for by the new files and nothing else:
 * attention dir: +7 tests, +6 subtests = the two new files in that dir.
 * distributed set: +6 passed = the new census file, which lives in
   `test/srt/distributed`. Failed and error counts are unchanged at 23 / 52, and
-  the FAILED/ERROR **name lists** are identical between base and branch — so the
-  equal counts are not an equal-sized swap. Those 23+52 are pre-existing on base
-  (missing `sglang` binary, UCX device warnings, process-table-sensitive bar1
-  tests) and none of them touch anything in this diff.
+  the FAILED/ERROR **name lists** are identical between base and branch (72
+  captured names each, `diff` empty) — so the equal counts are not an equal-sized
+  swap. They are pre-existing on base and concentrated in GPU/multi-node harness
+  files that cannot run here at all: `test_dsv31_dcp8_gsm8k.py` (26),
+  `test_deepseek_v4_flash_fp4_b200_cp.py` (18),
+  `test_collective_census_broadcast_families_583.py` (9),
+  `test_uneven_dcp_pool_geometry.py` (8), the rest in ones and twos; the
+  representative error is `FileNotFoundError: 'sglang'`, i.e. a missing server
+  binary. None of them touch anything in this diff.
+
+  METHOD NOTE, recorded because it produced a false green first: capturing those
+  names with `grep -E "^(FAILED|ERROR)"` matched **nothing**, because pytest
+  writes ANSI colour codes before the word, and `diff` on two empty files
+  reported "identical". The counts above (0 and 0) are what exposed it. Pass
+  `--color=no` when grepping pytest summary lines, and assert the captured line
+  count is non-zero before trusting a clean diff — an empty capture and a real
+  match look the same downstream.
 * flip family: byte-for-byte the same 1116, before and after.
 
 ruff `check`: `flashinfer_backend.py` 30 / 30 (all pre-existing at base),
