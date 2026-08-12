@@ -112,12 +112,54 @@ category:
 `--max-total-tokens 280000` with the ship token vector delivers +48.7 % deep
 prefill under the flip. It needs a little more corridor room than it has.
 
-**Size the reduction from the measurement, not the layer count.** rank0 holds
-10 of 16 attention layers, so KV there "should" cost 0.0195 MiB/token, which
-says 48 MiB costs ~2500 tokens. The two boots measured 608 MiB free at pool
-340000 and 976 MiB at 280000 -- **0.0061 MiB/token, 3.2x shallower**, the same
-direction of error as the residency misprediction above and probably the same
-cause. On the measured slope, ~1100 MiB of margin needs roughly 20000 tokens
-off, i.e. **pool ~260000**. Two points across two boots, and minima read a
-load state (C7), so this aims the next boot rather than calibrating anything
--- but the theoretical slope would have under-shot by 8x.
+**RETRACTED, and replaced.** I first divided rank0's LOAD MINIMUM at pool
+340000 (608 MiB) by its LOAD MINIMUM at 280000 (976 MiB), got 0.0061
+MiB/token, declared the layer-count slope 3.2x too steep, and aimed the next
+boot at pool 260000. That is a C7 error: two minima from two differently
+loaded boots are not a pool derivative. The at-rest ledger gives
+
+| pool | rank0 free AT REST | rank0 min under load |
+|---:|---:|---:|
+| 280000 | 1932 | 976 |
+| 340000 | 672 | 608 |
+
+i.e. **0.021 MiB/token at rest**, which IS the layer-count figure
+(10 x 2048 B = 0.0195). The theory was right; my "measurement" subtracted two
+different instruments. Load draws rank0 ~956 MiB below at-rest, so landing the
+minimum near 1100 MiB wants ~124 MiB more at rest -- about **6400 tokens off,
+pool ~273500**.
+
+And the deeper reading (C38): the planner cut at pool 340000 sat at **672 MiB
+free AT REST**, already under the corridor before a single token was served.
+That was never a load problem.
+
+
+## 5. Why the gate mispredicted rank0 -- solved (C38)
+
+The residency model is off by **~3900 MiB** on rank0, and the account needs no
+new measurement:
+
+1. **~3760 MiB of unpriced non-layer weights.** `_price_stage` prices a
+   per-layer census of transformer layers only; the checkpoint is a VL model
+   quantized INT8-W8A8 with `lm_head`, the visual tower and the embeddings in
+   the quantizer's `ignore` list, so they load in bf16 and are invisible to
+   the model. `embed_tokens` = 248320 x 5120 x 2 B = **2425 MiB** on stage 0
+   (untied), `lm_head` the same on the last stage, ~1096 MiB replicated vision
+   tower and loader constant per rank.
+2. **`tp_token_shares` was fed the wrong vector** -- the flip WEIGHT vector
+   `32,16,16` (0.5/0.25/0.25) instead of `SGLANG_UNEVEN_TOKEN_VECTOR`
+   `14,10,8` (0.4375/0.3125/0.25), worth 547-664 MiB of KV.
+3. **On the ship cut, (1) and (2) cancel** to within ~100 MiB -- `max(7, 8)=8`
+   overcharges KV by almost exactly what the weights undercharge -- which is
+   why the gate looked calibrated for three shifts. On the planner cut
+   `n_attn = 10 > 8` and the cancellation disappears.
+4. **The PP-stage mamba pool is cut-shaped** (`51.2 MiB x n_linear`, +563 MiB
+   ship -> planner on rank0) and sat unitemized inside `fixed_overhead`, which
+   is what made the residual look cut-invariant. This partly refutes C35 --
+   its CARD conclusion stands, its cut-invariance conclusion does not.
+
+The corrected ledger reproduces NVML free to within **64 MiB on all three
+boots** and returns the right verdict on each: planner @340k infeasible by
+~900 MiB (metal: OOM), planner @280k 321 MiB headroom (metal: 6 samples 48 MiB
+under), ship @280k 7633 MiB (metal: 7212). This is the wiring blocker's fix
+and it is desk work.
