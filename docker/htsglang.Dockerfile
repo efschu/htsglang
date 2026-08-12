@@ -187,6 +187,58 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
     && python3 -m pip install --no-deps --force-reinstall \
        "${NCCL_PACKAGE}==${NCCL_VERSION}"
 
+# 3a) sgl-kernel provenance gate (#384). The image must not be able to ship a
+#     silently armless kernel, and it must not be able to ship TWO
+#     distributions of it.
+#
+#     THE DEFECT. `sgl-kernel` (pypi, installed in step 2) and `sglang-kernel`
+#     (the fork's build) provide the SAME `sgl_kernel` import package under
+#     DIFFERENT distribution names. pip does not see a conflict, so whichever
+#     was installed last owns the files and nothing is logged. The pypi one
+#     has no `int8_scaled_mm`, so an INT8-W8A8 boot then dies during layer
+#     construction, far from the install that caused it. Full provenance,
+#     hazard and repair: docs/rig-runbook.md section 2.1.
+#
+#     WHY THE CHECK IS FILE INSPECTION AND NOT AN IMPORT. The recipe in the
+#     runbook ends with `python -c "import sgl_kernel; assert ..."`, which
+#     cannot run here: as step 4 below records, a real import needs
+#     libcuda.so.1 from the host driver, which `docker build` does not have.
+#     An import-based assert would fail on a CORRECT image. The guard is
+#     therefore stdlib-only and reads dist-info RECORDs plus the ELF objects
+#     directly -- the same file-inspection route the runbook itself uses to
+#     verify an installed wheel without importing it. It is invoked by PATH
+#     with `python3 -I`, so it neither imports nor needs the `sglang` package.
+#
+#     DEFAULTS PRESERVE TODAY'S IMAGE. With no build args, nothing is
+#     installed and nothing is required beyond "exactly one distribution
+#     provides sgl_kernel" -- which the stock image already satisfies. Set
+#     SGL_KERNEL_WHEEL (a bare filename in docker/kernel-wheel/, see its README) to
+#     install the fork wheel, and REQUIRE_INT8_ARM=1 to make an armless result
+#     a failed build instead of a runtime surprise months later.
+ARG SGL_KERNEL_WHEEL=
+ARG SGL_KERNEL_WHEEL_SHA256=67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664
+ARG REQUIRE_INT8_ARM=0
+COPY docker/kernel-wheel /tmp/htsglang-wheels
+RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
+    set -eu; \
+    GUARD=/sgl-workspace/sglang/python/sglang/srt/utils/kernel_dist_guard.py; \
+    test -f "${GUARD}" || { echo "FATAL: kernel guard missing from the fork source"; exit 1; }; \
+    if [ "${INSTALL_SGL_KERNEL}" != "1" ]; then \
+      echo "INSTALL_SGL_KERNEL=0 -> no sgl_kernel in this image; provenance gate skipped"; \
+    else \
+      if [ -n "${SGL_KERNEL_WHEEL}" ]; then \
+        W="/tmp/htsglang-wheels/${SGL_KERNEL_WHEEL}"; \
+        test -f "${W}" || { echo "FATAL: SGL_KERNEL_WHEEL=${SGL_KERNEL_WHEEL} not found in docker/kernel-wheel/ (see its README)"; exit 1; }; \
+        python3 -I "${GUARD}" --wheel "${W}" --expect-sha256 "${SGL_KERNEL_WHEEL_SHA256}"; \
+        python3 -m pip uninstall -y sgl-kernel || true; \
+        python3 -m pip install --no-deps "${W}"; \
+      fi; \
+      ARM=""; \
+      if [ "${REQUIRE_INT8_ARM}" = "1" ]; then ARM="--require-arm"; fi; \
+      python3 -I "${GUARD}" ${ARM}; \
+    fi; \
+    rm -rf /tmp/htsglang-wheels
+
 # 3b) Planner extra: chess + cairosvg + defusedxml (pyproject's `planner`
 #     extra). Only the quality-benchmark tab imports them, and it imports them
 #     lazily, so the UI boots without them — but the tab then hard-fails.

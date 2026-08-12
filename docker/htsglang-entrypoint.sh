@@ -9,6 +9,27 @@
 # generated arg list, so they win for single-value argparse flags and can add
 # flags this script does not know about.
 #
+# SCOPE OF THAT RULE, because it used to be stated more broadly than it holds
+# (#416, #384). It covers the FLAG variables: each is declared `: "${VAR:=}"`
+# with an EMPTY default, and `add`/`add_flag` skip an empty value, so setting
+# one to "" really does remove the flag. It does NOT cover the seven scalars
+# that carry a real default -- MODE, TP_SIZE, HOST, PORT, HICACHE_STORAGE_DIR,
+# PLANNER_HOST, PLANNER_PORT. Those use `:=` with a non-empty value, and `:=`
+# treats set-but-empty as unset, so e.g. PORT="" yields 30000, not "no port".
+# They are scalars the server always needs, so a default is right for them --
+# the bug was ever describing them under the same rule as the flags.
+#
+# The history is worth knowing, because the failure was live. RANK_GPU_ID,
+# SPECULATIVE_ALGORITHM, CHAT_TEMPLATE and ENABLE_HIERARCHICAL_CACHE ONCE had
+# non-empty defaults here (`: "${RANK_GPU_ID:=0,1,2}"`). Clearing them in the
+# env file therefore re-applied the fork's rig profile instead of disabling
+# it, and #416 hit exactly that: an image asked for stock even TP=2 booted
+# with --rank-gpu-id 0,1,2 and died on a ValueError naming GPU 2 with two
+# devices visible. Commit 25d3a5ded2 emptied those four defaults. Anyone
+# adding a flag variable here must give it an EMPTY default; the pin is
+# test/registered/unit/docker/test_entrypoint_empty_env_384.py, which fails if
+# a flag variable regains a non-empty one.
+#
 # Defaults here are deliberately NEUTRAL — a bare `docker run` behaves like a
 # stock sglang image (TP=1, no speculation, no HiCache, no rank mapping). The
 # rig-specific production profile lives in docker/htsglang.yml and

@@ -91,6 +91,10 @@ def probes(**over):
         port_busy=lambda p: False,
         path_exists=lambda p: True,
         probe_import=lambda m, a: PF.ImportObs("/repo/x.py", "0.4.4", True),
+        # One provider = no #384 shadow. The clean machine has exactly one
+        # distribution owning the import name; two is the refusal, even when
+        # the import itself still answers correctly.
+        dist_providers=lambda pkg: [PF.DistObs("sglang-kernel", "0.4.4", 74)],
     )
     base.update(over)
     return PF.Probes(**base)
@@ -206,6 +210,14 @@ class TestPreflight(CustomTestCase):
              dict(probe_import=lambda m, a: PF.ImportObs("/x", "0.4.4", False))),
             (RF.REFUSE_WHEEL_SHADOW,
              dict(probe_import=lambda m, a: PF.ImportObs("/x", "0.3.21", True))),
+            # The #384 standing-reinstall block. Note what the probes say:
+            # the import still resolves to the fork version WITH the arm, so
+            # every other wheel check passes. The installation is one pip
+            # invocation from silently losing it, and that is the refusal.
+            (RF.REFUSE_WHEEL_DIST_SHADOW,
+             dict(dist_providers=lambda pkg: [
+                 PF.DistObs("sglang-kernel", "0.4.4", 74),
+                 PF.DistObs("sgl-kernel", "0.3.21", 69)])),
             (RF.REFUSE_CARD_UNKNOWN_UUID,
              dict(cards=lambda: [PF.CardObs(U1, "RTX 3080", 1, 1)])),
             (RF.REFUSE_CARD_CENSUS, dict(cards=lambda: (_ for _ in ()).throw(
