@@ -602,6 +602,8 @@ def honest_host_memory_bytes(
     cgroup_max: Optional[int],
     cgroup_anon: Optional[int],
     cgroup_kernel: Optional[int],
+    cgroup_shmem: Optional[int] = None,
+    swap_free: Optional[int] = None,
 ) -> Tuple[Optional[int], Optional[int]]:
     """``(total, available)`` a PINNED allocation may believe, or ``(None, None)``.
 
@@ -619,6 +621,27 @@ def honest_host_memory_bytes(
     this process group will be killed at, and ``memory.stat``'s ``anon`` is what
     is genuinely resident and unreclaimable, as opposed to ``file`` (page cache),
     which a pinning allocation can reclaim.
+
+    SHMEM IS THE EXCEPTION TO THAT LAST CLAUSE, and it is why this function
+    grew two more inputs (#695). In cgroup v2 tmpfs/shmem pages are accounted
+    under ``file``, not under ``anon`` -- so a process holding a large
+    ``MAP_SHARED`` region was priced here as holding reclaimable page cache.
+    Measured on the PP=3 boot of 2026-08-12: ``anon`` 13.6 GiB, ``file``
+    84.9 GiB, of which ``shmem`` 75.07 GiB, and ``SwapTotal: 0``. Shmem with
+    no swap has nowhere to be reclaimed TO -- the pages are pinned for the
+    lifetime of the mapping -- yet all 75.07 GiB counted as free. Nine
+    cumulative cgroup OOM kills followed, one of them presenting as a silent
+    rank death.
+
+    The correction is deliberately NOT "subtract ``file``": the paragraph above
+    is right that page cache is reclaimable and that subtracting it would
+    refuse boots that would have succeeded. It is to subtract the
+    UNRECLAIMABLE SUBSET of ``file``, which the cgroup already reports under
+    its own key. Reclaimability of shmem is a function of swap rather than a
+    constant, so the rule is stated against swap: only the part of ``shmem``
+    that exceeds FREE SWAP is unreclaimable. On a swapless box that reduces to
+    all of it, which is this rig; on a box with swap the term shrinks by
+    itself and no boot is refused that would have fitted.
 
     The rules, in order:
 
@@ -656,6 +679,18 @@ def honest_host_memory_bytes(
             resident += int(part)
             have_resident = True
 
+    # #695: the UNRECLAIMABLE part of `file`. shmem can only be reclaimed to
+    # swap, so free swap is exactly how much of it is not pinned; whatever
+    # exceeds that is as unavailable as `anon` and is charged next to it. No
+    # double count -- shmem is inside `file`, and `file` is never charged.
+    # Unknown shmem stays UNCHARGED rather than guessed, per rule 3: a caller
+    # that cannot establish the term must degrade to the old answer, not to an
+    # invented one.
+    if cgroup_shmem is not None and cgroup_shmem >= 0:
+        swappable = int(swap_free) if swap_free is not None and swap_free > 0 else 0
+        resident += max(0, int(cgroup_shmem) - swappable)
+        have_resident = True
+
     if cgroup_max is not None and cgroup_max > 0:
         if not have_resident:
             # A ceiling with no usage accounting tells us nothing about how much
@@ -684,13 +719,27 @@ def _read_meminfo() -> Tuple[Optional[int], Optional[int]]:
     return values.get("MemTotal"), values.get("MemAvailable")
 
 
-def _read_cgroup_memory() -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """``(memory.max, anon, kernel)`` from cgroup v2, any of them ``None``.
+def _read_cgroup_memory() -> (
+    Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]
+):
+    """``(memory.max, anon, kernel, shmem, swap_free)``, any of them ``None``.
 
     ``memory.max`` reads ``"max"`` when unlimited, which becomes ``None`` here:
     "no ceiling I can name" rather than a number. cgroup v1 and a missing
     cgroupfs both fall out as all-``None``, so the caller degrades to
     ``/proc/meminfo`` on those.
+
+    ``shmem`` (#695) is read from the same ``memory.stat`` as ``anon``. It is a
+    SUBSET of that file's ``file`` key, not of ``anon``, which is the whole
+    reason it needed its own term: see :func:`honest_host_memory_bytes`.
+
+    ``swap_free`` is how much of that shmem could still be pushed out, and the
+    honest source depends on the cgroup. A finite ``memory.swap.max`` bounds
+    this process group regardless of what the machine has left, so the headroom
+    is ``memory.swap.max - memory.swap.current``. With swap unlimited the bound
+    is the machine's, so ``/proc/meminfo``'s ``SwapFree`` is read instead --
+    the one figure in that file that lxcfs does not synthesise into an
+    impossible reading, since a container has no swap of its own to report.
     """
     root = "/sys/fs/cgroup"
     limit: Optional[int] = None
@@ -702,6 +751,7 @@ def _read_cgroup_memory() -> Tuple[Optional[int], Optional[int], Optional[int]]:
         limit = None
     anon: Optional[int] = None
     kernel: Optional[int] = None
+    shmem: Optional[int] = None
     try:
         with open(f"{root}/memory.stat", "r", encoding="utf-8") as handle:
             for line in handle:
@@ -710,9 +760,38 @@ def _read_cgroup_memory() -> Tuple[Optional[int], Optional[int], Optional[int]]:
                     anon = int(rest.strip())
                 elif key == "kernel":
                     kernel = int(rest.strip())
+                elif key == "shmem":
+                    shmem = int(rest.strip())
     except (OSError, ValueError):
         pass
-    return limit, anon, kernel
+    return limit, anon, kernel, shmem, _swap_headroom_bytes(root)
+
+
+def _swap_headroom_bytes(root: str) -> Optional[int]:
+    """Bytes of swap this cgroup could still push shmem into, or ``None``."""
+    swap_max: Optional[int] = None
+    try:
+        with open(f"{root}/memory.swap.max", "r", encoding="utf-8") as handle:
+            raw = handle.read().strip()
+        swap_max = None if raw == "max" else int(raw)
+    except (OSError, ValueError):
+        swap_max = None
+    if swap_max is not None:
+        try:
+            with open(f"{root}/memory.swap.current", "r", encoding="utf-8") as handle:
+                used = int(handle.read().strip())
+        except (OSError, ValueError):
+            used = 0
+        return max(0, swap_max - used)
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                if key == "SwapFree":
+                    return int(rest.strip().split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 def host_memory_bytes_for_pinning() -> Tuple[Optional[int], Optional[int]]:
@@ -737,13 +816,21 @@ def _host_memory_bytes() -> Tuple[Optional[int], Optional[int]]:
     why the cgroup has to be consulted at all.
     """
     meminfo_total, meminfo_available = _read_meminfo()
-    cgroup_max, cgroup_anon, cgroup_kernel = _read_cgroup_memory()
+    (
+        cgroup_max,
+        cgroup_anon,
+        cgroup_kernel,
+        cgroup_shmem,
+        swap_free,
+    ) = _read_cgroup_memory()
     return honest_host_memory_bytes(
         meminfo_total,
         meminfo_available,
         cgroup_max,
         cgroup_anon,
         cgroup_kernel,
+        cgroup_shmem,
+        swap_free,
     )
 
 
