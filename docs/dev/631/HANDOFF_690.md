@@ -275,15 +275,68 @@ clean.
 
 ---
 
+## 5b. THE CONFIRMATION WINDOW — 0 BREACHES ON BOTH INSTRUMENTS
+
+22 min on the ship config at boot commit `c78cc71442`, canonical harness
+(`scripts/s24_green_run.sh`, the same recipe N43 used, so the two are
+comparable axis by axis) plus real agent traffic reading this tree's own
+source through the router. Full extract:
+`/spinning/evidence-631/s46/WINDOW_EXTRACT.txt`.
+
+| axis | N43 (baseline) | N46 |
+|---|---|---|
+| corridor breaches | 0 | **0** (10214 samples) |
+| gpu0_free MIN | 1141 | **1435** |
+| gpu1_free MIN | 1624 | **2388** |
+| gpu2_free MIN | 1241 | **1713** |
+| deepest seam-census trough | 1024 | **1434** (306 troughs) |
+| seam-census breaches | 0 | **0** |
+| census CORRIDOR LAW BROKEN | 0 | **0** |
+| seam PREDICTS A SUB-LAW TROUGH | 0 | **0** |
+| FLIP ABANDONED | — | **0** (306 flips) |
+| tracebacks / CUDA errors | 0 | **0** |
+| soak | ok=104 err=0 | **ok=54 err=0** (22 min vs 31) |
+
+**Judged on the seam census, not only on NVML**, per the standing law. Every
+minimum is ABOVE N43's, and the deepest seam trough clears the 1024 law by
+410 MiB where N43's touched it exactly. No axis regressed. Long-context
+ladder reached 111405 input tokens.
+
+**C29 and C30 were confirmed INERT here on metal, not by argument:**
+`restore-margin clamp/refusal lines: 0` and `truncation-align refusals: 0`
+across the whole boot. The C30 guard executes at every rank's scheduler init
+on every boot, so a wrong predicate would have refused the boot outright —
+that it served 306 flips and 393 decode batches is the proof it is correct
+for this config. Note the inverse relationship to C30's own signature: the
+wedged boot had **zero** `Decode batch` lines; this one has hundreds.
+
+Two caveats stated so nobody over-reads the table. The window is 22 min
+against N43's 31, so the soak totals are not directly comparable (the rates
+are). And `gpu0`'s 1435 MiB minimum is below this boot's OWN configured
+`SGLANG_CORRIDOR_FLOOR_MIB=1536` by 101 MiB — the same undershoot N43 (1141)
+and N45's probe (1381) both had. The USER LAW at 1024 is what holds; the
+boot's self-configured floor has been undershot on every window in this chain
+and is not a new symptom.
+
 ## 6. THE RIG AS I LEAVE IT
 
-* **Serving is UP on 30030, ship config, boot commit `c78cc71442`**, booted by
-  me with `setsid` from `/spinning/evidence-631/s43/boot_ship_30030.sh` after I
-  verified that script's flag set against the LIVE `/proc/<pid>/cmdline`
-  before stopping anything. I stopped it; I brought it back. Nobody owes a
+* **Serving is UP on 30030, ship config, boot commit `0fbbf9bfdc` = HEAD**,
+  booted by me with `setsid` from
+  `/spinning/evidence-631/s43/boot_ship_30030.sh` after I verified that
+  script's flag set against the LIVE `/proc/<pid>/cmdline` before stopping
+  anything. I stopped it twice; I brought it back both times. Nobody owes a
   restore.
-* Verified with a **real generation** (17+25 -> "42"), not health alone. Pool
-  **503950**, matching N43's window.
+* **The rig runs exactly HEAD, deliberately.** The confirmation window ran on
+  `c78cc71442`; the dynamic-chunking follow-up (`0fbbf9bfdc`) landed after it
+  and touches python, so I rebooted rather than leave the running instance a
+  commit behind what is pushed (Patchstand-vor-Last). The follow-up is
+  therefore covered by the suite and by a clean boot + real generation, but
+  NOT by the 22-min window — it is inert for this config (no dynamic
+  chunking, no alignment source) and the boot proves the guard path executes
+  without refusing.
+* Verified with a **real generation** on both boots ("42", then "shipped"),
+  not health alone. Pool **503950**, matching N43's window. Corridor after the
+  final restore: free **1853 / 3458 / 3213 MiB**, all above 1024.
 * **The ship config now runs with C29 and C30 in the tree, and the C30 guard
   executes at every rank's scheduler init on every boot.** That it booted at
   all is the on-metal proof the guard is correctly inert here — a wrong
