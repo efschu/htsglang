@@ -3838,6 +3838,9 @@ class TestConsolidatedNavigation(CustomTestCase):
         "quality",
         "data",
         "pair",
+        # #413 buying advisor: appended to the Rig group after "pair", so the
+        # three pre-existing Rig tabs keep their relative order.
+        "advisor",
         "history",
         "training",
         "video",
@@ -3954,6 +3957,7 @@ class TestFrontendIAv2NavMapping(CustomTestCase):
         "models",
         "training",
         "video",
+        "advisor",
     ]
     GROUPS = ["models", "playground", "training", "video", "rig", "bench", "settings"]
 

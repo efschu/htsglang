@@ -4794,6 +4794,119 @@ def wizard_rejected_payload(payload: Optional[dict] = None) -> dict:
 
 
 # ===========================================================================
+# #413 -- rig buying advisor: "what would card X buy me?"
+# ===========================================================================
+
+
+def rig_advisor_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/rig_advisor/plan -> before/after for a candidate card.
+
+    Body:
+      ``candidate``        library card name, or an object with at least
+                           ``{name, total_mib}`` for a card typed by hand.
+      ``mode``             "add" (default) | "replace".
+      ``replace_index``    which card goes, for mode="replace".
+      ``free_slot``        ``{pcie_gen, pcie_width}`` -- the slot a bought
+                           card would physically occupy. Omit it and the
+                           answer says the width is undeclared rather than
+                           assuming x16.
+      ``models``           ``[[label, path], ...]``; defaults to the model
+                           named in the payload's ``model`` field.
+      ``hardware``         the usual card list / manual spec (shared resolver).
+      ``prompt_tokens``    prompt length for the TTFT floor (default 4096).
+
+    A request with no ``candidate`` is legal and returns the library listing
+    alone, so the tab can populate its picker from the same endpoint it plans
+    with (#342: the UI composes the same API a script would, never a private
+    shortcut).
+
+    Boots nothing, measures nothing, applies nothing, and takes no card.
+    """
+    from sglang.srt.planner import rig_advisor as advmod
+    from sglang.srt.planner.card_library import CardLibrary, CardSpec
+
+    payload = payload or {}
+    library = CardLibrary()
+    listing = [
+        {
+            "name": n,
+            "total_mib": library.get(n).total_mib,
+            "tdp_w": library.get(n).tdp_w,
+            "sm_arch": library.get(n).sm_arch,
+        }
+        for n in library.names()
+    ]
+
+    candidate = payload.get("candidate")
+    if not candidate:
+        return {"ok": True, "cards": listing, "rows": [], "truths": []}
+
+    try:
+        if isinstance(candidate, dict):
+            # A hand-typed card. Unknown fields are left None on purpose: the
+            # roofline reports what it cannot price instead of guessing.
+            spec = CardSpec(
+                name=str(candidate.get("name") or "custom card"),
+                total_mib=int(candidate["total_mib"]),
+                sm_arch=candidate.get("sm_arch"),
+                pcie_gen=candidate.get("pcie_gen"),
+                pcie_width=candidate.get("pcie_width"),
+                nvlink=bool(candidate.get("nvlink", False)),
+                tdp_w=candidate.get("tdp_w"),
+                peak_membw_gbs=candidate.get("peak_membw_gbs"),
+                peak_gemm_tflops_fp16=candidate.get("peak_gemm_tflops_fp16"),
+                peak_gemm_tflops_fp8=candidate.get("peak_gemm_tflops_fp8"),
+            )
+        else:
+            spec = library.get(str(candidate))
+    except (KeyError, TypeError, ValueError) as e:
+        return {"ok": False, "error": str(e), "cards": listing}
+
+    slot_in = payload.get("free_slot") or {}
+    free_slot = advmod.FreeSlot(
+        pcie_gen=slot_in.get("pcie_gen"),
+        pcie_width=slot_in.get("pcie_width"),
+        provenance="declared" if slot_in.get("pcie_width") else advmod.ABSENT,
+    )
+
+    models = payload.get("models")
+    if not models:
+        model = str(payload.get("model") or "").strip()
+        if not model:
+            return {
+                "ok": False,
+                "error": "pick a model first: the advisor answers per model, "
+                "because a card that unlocks one checkpoint can be useless "
+                "for another.",
+                "cards": listing,
+            }
+        models = [[model.rstrip("/").rsplit("/", 1)[-1], model]]
+
+    try:
+        hardware, reserve = _hardware_and_reserve(payload)
+        plan_kwargs = {}
+        if reserve is not None:
+            plan_kwargs["user_free_reserve_mib"] = reserve
+        result = advmod.advise(
+            hardware,
+            spec,
+            [(str(a), str(b)) for a, b in models],
+            mode=str(payload.get("mode") or "add"),
+            replace_index=payload.get("replace_index"),
+            free_slot=free_slot,
+            library=library,
+            prompt_tokens=int(payload.get("prompt_tokens") or 4096),
+            plan_kwargs=plan_kwargs,
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e), "cards": listing}
+
+    out = result.to_dict()
+    out["cards"] = listing
+    return out
+
+
+# ===========================================================================
 # #152 -- GitHub results sharing (thin adapters over github_share.py).
 # Preview-first + explicit confirm; the PAT is per-use, never persisted,
 # never logged, never echoed, and redacted from every error message.
@@ -5762,6 +5875,12 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/wizard/tipping"):
                 self._json(200, wizard_tipping_payload(payload))
                 return
+            # #413 buying advisor. Deliberately NOT under /api/rig/, which
+            # would prefix-collide with /api/rig_pair and /api/rig_coupling
+            # in this startswith chain.
+            if self.path.startswith("/api/rig_advisor/plan"):
+                self._json(200, rig_advisor_payload(payload))
+                return
             if self.path.startswith("/api/share_preview"):
                 self._json(200, share_preview_payload(payload))
                 return
@@ -6620,11 +6739,17 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   /* #270: the same three provenance pills, used unscoped by the guide's
      family table. One definition, so a label cannot look like measurement on
      one page and like a guess on another. */
-  #view_wizard .p { border: 1px solid var(--bd-weak); border-radius: 2px;
+  /* #413 shares this selector rather than copying it: the buying advisor
+     renders the same three labels, and a second copy is a second thing to
+     drift. */
+  #view_wizard .p, #view_advisor .p {
+                    border: 1px solid var(--bd-weak); border-radius: 2px;
                     padding: 0 4px; font-size: var(--t-xs); white-space: nowrap; }
-  #view_wizard .p.measured { color: var(--ok); border-color: var(--ok-dim); }
-  #view_wizard .p.estimate { color: var(--warn); border-color: var(--warn-dim); }
-  #view_wizard .p.absent   { color: var(--fg-muted); }
+  #view_wizard .p.measured, #view_advisor .p.measured {
+                    color: var(--ok); border-color: var(--ok-dim); }
+  #view_wizard .p.estimate, #view_advisor .p.estimate {
+                    color: var(--warn); border-color: var(--warn-dim); }
+  #view_wizard .p.absent, #view_advisor .p.absent { color: var(--fg-muted); }
   #view_wizard pre { background: var(--bg-input); border: 1px solid var(--bd-weak);
                      border-radius: var(--radius); padding: var(--s2);
                      font-size: var(--t-sm); margin: var(--s2) 0; }
@@ -6739,6 +6864,8 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     title="per-card power calibration and energy per token; run the short comm benchmark and share an anonymized rig profile to improve the project">Data</button>
   <button id="tab_pair" class="tab" data-group="rig" onclick="showTab('pair')"
     title="couple a second rig">Pair rig</button>
+  <button id="tab_advisor" class="tab" data-group="rig" onclick="showTab('advisor')"
+    title="what would a candidate GPU buy you, added to or instead of a card you already have">Buy</button>
   <button id="tab_history" class="tab" data-group="bench" onclick="showTab('history')"
     title="your own recorded benchmark runs: browse, filter, open, delete">History</button>
   <button id="tab_training" class="tab" data-group="training" onclick="showTab('training')"
@@ -7561,6 +7688,52 @@ _INDEX_TEMPLATE = r"""<!doctype html>
         placeholder='{"schema":"htsglang-rig-artifact/v1", ...}'></textarea>
     </details>
     <div id="coup_out"></div>
+  </fieldset>
+</div>
+
+<div id="view_advisor" style="display:none">
+  <div class="sub">What would a card buy you? Pick a candidate, say whether it
+    is ADDED to the rig or REPLACES a card, and this prices the rig as it
+    would be against the rig as it is &mdash; per model, because a card that
+    unlocks one checkpoint can be useless for another. Every number carries
+    its provenance: nothing about a card that is not in this machine can be
+    <span class="p measured">measured</span>, and where the model has no basis
+    the answer is <span class="p absent">absent</span> rather than a plausible
+    figure.</div>
+  <fieldset>
+    <legend>Candidate</legend>
+    <div class="setrow"><span class="lbl">Card</span>
+      <select id="adv_card"></select>
+    </div>
+    <div class="setrow"><span class="lbl">Change</span>
+      <select id="adv_mode" onchange="advSyncMode()">
+        <option value="add">add to the rig</option>
+        <option value="replace">replace a card</option>
+      </select>
+      <select id="adv_replace" style="display:none"></select>
+    </div>
+    <div class="setrow"><span class="lbl">Free slot</span>
+      <select id="adv_slot">
+        <option value="">undeclared (say so, assume nothing)</option>
+        <option value="4x4">gen4 x4</option>
+        <option value="4x8">gen4 x8</option>
+        <option value="4x16">gen4 x16</option>
+        <option value="5x8">gen5 x8</option>
+        <option value="5x16">gen5 x16</option>
+      </select>
+    </div>
+    <div class="sub muted">The slot a bought card would physically occupy. An
+      x16 card in an x4 slot negotiates x4, and NVML cannot read an empty slot
+      &mdash; so this is declared, or it stays unknown and the answer says
+      so.</div>
+    <div class="actions">
+      <button onclick="advRun()">Price it</button>
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend>Before / after</legend>
+    <div id="adv_out"><span class="muted">pick a model above, then a candidate
+      card.</span></div>
   </fieldset>
 </div>
 
@@ -9293,7 +9466,7 @@ async function csForgetToken(){
 // section (loadProfiles() below moved with it, guarded the same way).
 function showTab(t) {
   const TABS = ['landing','wizard','bench','quality','data','pair','history','about',
-                'models','training','video'];
+                'models','training','video','advisor'];
   window._tab = t;
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
@@ -9317,6 +9490,7 @@ function showTab(t) {
   } else csStopPoll();
   if (t==='quality') { autofillQuality(); if(!window._qualityInit){window._qualityInit=true; loadShots();} }
   if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
+  if (t==='advisor' && !window._advisorInit) { window._advisorInit=true; advInit(); }
   // The guide OWNS the planner form now (model picker in step 1, card set in
   // step 2, the whole flag surface in the expert step), so entering it warms
   // exactly what the Planner tab used to warm on its own first visit.
@@ -9370,7 +9544,7 @@ const NAV_GROUPS = {
   playground: {tabs: ['wizard']},
   training:   {tabs: ['training']},
   video:      {tabs: ['video']},
-  rig:        {tabs: ['landing','data','pair']},
+  rig:        {tabs: ['landing','data','pair','advisor']},
   bench:      {tabs: ['bench','quality','history']},
   settings:   {tabs: ['about']},
 };
@@ -12346,6 +12520,118 @@ function wzCell(c){
   const v=c.value;
   const s=(Math.abs(v)>=1000)?Math.round(v).toLocaleString():v.toFixed(2);
   return '<b>'+s+'</b> '+esc(c.unit||'')+' '+p;
+}
+// ---------------------------------------------------------------------
+// #413 buying advisor. Reuses wzCell's pill vocabulary verbatim: a label
+// must not read as measurement on one tab and as a guess on another.
+// ---------------------------------------------------------------------
+function advSlot(){
+  const v=($('adv_slot')&&$('adv_slot').value)||'';
+  if(!v) return null;
+  const p=v.split('x');
+  return {pcie_gen:parseInt(p[0],10), pcie_width:parseInt(p[1],10)};
+}
+function advSyncMode(){
+  const r=$('adv_replace'); if(!r) return;
+  r.style.display = ($('adv_mode').value==='replace') ? '' : 'none';
+}
+function advRigCards(){
+  const hw=(payload()||{}).hardware||{};
+  if(Array.isArray(hw.cards)) return hw.cards.filter(c=>c.include!==false)
+    .map((c,i)=>({i:i, name:c.name||('gpu'+i)}));
+  if(Array.isArray(hw.gpus)) return hw.gpus.map((g,i)=>(
+    {i:i, name:(''+g).split(':')[0]}));
+  return [];
+}
+function advSyncReplace(){
+  const sel=$('adv_replace'); if(!sel) return;
+  sel.innerHTML=advRigCards().map(c=>
+    '<option value="'+c.i+'">'+esc(c.name)+'</option>').join('');
+}
+async function advInit(){
+  let d;
+  try{ d=await api('/api/rig_advisor/plan',{key:'adv_cards',body:{}}); }
+  catch(e){ if(!apiAborted(e)) setHTML($('adv_out'),
+    '<div class="rev-error">'+esc(apiError(e))+'</div>'); return; }
+  const sel=$('adv_card');
+  if(sel) sel.innerHTML=(d.cards||[]).map(c=>'<option value="'+esc(c.name)+'">'
+    +esc(c.name)+' &mdash; '+Math.round(c.total_mib/1024)+' GiB</option>').join('');
+  advSyncReplace(); advSyncMode();
+}
+function advNum(v){
+  if(v===null||v===undefined) return '&mdash;';
+  const a=Math.abs(v);
+  if(a>=1000) return Math.round(v).toLocaleString();
+  if(a>=1) return v.toFixed(2);
+  return v.toPrecision(3);
+}
+function advCell(c){
+  if(!c) return '<span class="muted">&mdash;</span>';
+  const p='<span class="p '+esc(c.provenance)+'" title="'+esc(c.basis||'')
+    +'">'+esc(c.provenance)+'</span>';
+  if(!c.available) return p;
+  return '<b>'+advNum(c.value)+'</b> '+p;
+}
+async function advRun(){
+  const box=$('adv_out'); if(!box) return;
+  const model=($('model')&&$('model').value.trim())||'';
+  if(!model){ setHTML(box,'<span class="muted">pick a model first (Guide tab, '
+    +'step 1) &mdash; the answer is per model.</span>'); return; }
+  const b=Object.assign({}, payload());
+  b.candidate=$('adv_card').value;
+  b.mode=$('adv_mode').value;
+  if(b.mode==='replace') b.replace_index=parseInt($('adv_replace').value,10);
+  const slot=advSlot(); if(slot) b.free_slot=slot;
+  stale(box,true);
+  let d;
+  try{ d=await api('/api/rig_advisor/plan',{key:'adv_plan',body:b,timeout:60000}); }
+  catch(e){
+    if(apiAborted(e)) return;
+    setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>'); return;
+  } finally { stale(box,false); }
+  if(!d.ok){ setHTML(box,'<div class="rev-error">'+esc(d.error||'failed')
+    +'</div>'); return; }
+  renderAdvisor(d);
+}
+function renderAdvisor(d){
+  const box=$('adv_out'); if(!box) return;
+  let h='<div class="sub">'+esc(d.before_rig)+' <b>&rarr;</b> '+esc(d.after_rig)
+    +' <span class="p '+esc(d.after_provenance==='live'?'measured':'estimate')
+    +'">'+esc(d.after_provenance)+'</span></div>';
+  h+='<div class="sub muted">'+esc(d.free_slot)+'</div>';
+  for(const r of (d.rows||[])){
+    h+='<h4>'+esc(r.label)+'</h4>';
+    if(!r.after_fits && (r.after_refusal||[]).length){
+      h+='<div class="rev-error"><b>Refused after the change:</b><ul>'
+        +r.after_refusal.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul></div>';
+    }
+    if(!r.before_fits && (r.before_refusal||[]).length){
+      h+='<div class="muted">Does not fit today either: '
+        +esc(r.before_refusal[0])+'</div>';
+    }
+    h+='<table class="sc"><tr><th>Metric</th><th>Now</th><th>After</th>'
+      +'<th>Change</th></tr>';
+    for(const m of (r.metrics||[])){
+      const cls=(m.verdict==='better')?'d-gain':((m.verdict==='worse')?'d-cost':'d-same');
+      let dl='&mdash;';
+      if(m.delta_pct!==null&&m.delta_pct!==undefined&&m.verdict!=='absent'){
+        dl=(m.delta_pct>=0?'+':'')+m.delta_pct.toFixed(1)+'%';
+      } else if(m.verdict==='absent'){ dl='absent'; }
+      h+='<tr><td>'+esc(m.label)+' <span class="muted">'+esc(m.unit)+'</span></td>'
+        +'<td>'+advCell(m.before)+'</td><td>'+advCell(m.after)+'</td>'
+        +'<td class="'+cls+'">'+dl+'</td></tr>';
+    }
+    h+='</table>';
+    if(r.before_bottleneck||r.after_bottleneck){
+      h+='<div class="muted">Clocked by '+esc(r.before_bottleneck||'?')
+        +' &rarr; '+esc(r.after_bottleneck||'?')+'</div>';
+    }
+  }
+  if((d.truths||[]).length){
+    h+='<fieldset><legend>What the product page does not say</legend><ul>'
+      +d.truths.map(t=>'<li>'+esc(t)+'</li>').join('')+'</ul></fieldset>';
+  }
+  setHTML(box,h);
 }
 function renderWizardFamilies(){
   const d=window._wizard, box=$('wz_families'); if(!box) return;

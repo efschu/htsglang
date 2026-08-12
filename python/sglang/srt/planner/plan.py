@@ -107,6 +107,14 @@ def _make_view(plan_inputs) -> _ServerArgsView:
     view.speculative_capture_tokens = ServerArgs.speculative_capture_tokens.__get__(
         view
     )
+    # #590 added a ``runtime_reserve_mib`` hop inside
+    # ``derived_rank_auto_reserve_mib``; without this binding the view raises
+    # AttributeError, which is the loud failure this class promises but which
+    # nothing had yet answered. The planner calls it with no card UUID, and
+    # that branch returns ``mamba_pre_capture_reserve_mb`` (bound above), so
+    # binding it keeps the planner's numbers byte-identical to the formula's
+    # documented "heuristic:not-asked" path rather than re-deriving anything.
+    view.runtime_reserve_mib = ServerArgs.runtime_reserve_mib.__get__(view)
     view.derived_rank_auto_reserve_mib = (
         ServerArgs.derived_rank_auto_reserve_mib.__get__(view)
     )
