@@ -5696,6 +5696,21 @@ class ServerArgs:
         bool,
         "Enable deterministic inference mode with batch invariant ops.",
     ] = False
+    deterministic_hetero: A[
+        bool,
+        (
+            "Determinism CERTIFICATE mode (#412). A bundle, not a replacement: "
+            "it turns on --enable-deterministic-inference, resolves ONE "
+            "attention backend that every rank's architecture can actually run "
+            "(the base mode asks a single device and applies the answer "
+            "group-wide), pairs the fp8 Marlin switch-off on sm80..88 ranks, "
+            "and prints a GUARANTEE STATEMENT at boot naming exactly what is "
+            "and is not covered. Every flag it sets stays independently usable. "
+            "It refuses only impossibilities -- a pinned backend some rank "
+            "cannot run -- and narrows-and-names everything else rather than "
+            "downgrading silently."
+        ),
+    ] = False
     rl_on_policy_target: A[
         Optional[str],
         Arg(
@@ -6235,6 +6250,9 @@ class ServerArgs:
 
         # Set kernel backends.
         self._handle_sampling_backend()
+        # Must run before _handle_deterministic_inference so the base mode sees
+        # a group-valid attention backend instead of guessing from one device.
+        self._handle_deterministic_hetero()
         # Must run before _handle_attention_backend_compatibility so the
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
@@ -15853,6 +15871,39 @@ class ServerArgs:
                     "(--chunked-prefill-size > 0) so in-flight prefill KV is "
                     "bounded."
                 )
+
+    def _handle_deterministic_hetero(self):
+        """Resolve the #412 certificate and apply its bundle.
+
+        Runs BEFORE ``_handle_deterministic_inference`` so that the base mode
+        sees an attention backend already pinned to a group-valid choice: its
+        own fallback resolves a single device's capability and applies that
+        answer to every rank (``arg_groups/overrides.py:1682-1700`` via
+        ``utils/common.py:493-520``), which is the defect this mode exists to
+        close. Pinning the backend here means the base pass takes the
+        explicit-backend branch and validates rather than guesses.
+        """
+        if not self.deterministic_hetero:
+            return
+
+        from sglang.srt.determinism_certificate import (
+            facts_from_server_args,
+            probe_visible_rank_archs,
+            resolve_certificate,
+        )
+
+        archs = probe_visible_rank_archs(limit=self.tp_size)
+        certificate = resolve_certificate(facts_from_server_args(self, archs))
+
+        for name, value in certificate.forced_args.items():
+            setattr(self, name, value)
+        for key, value in certificate.forced_env.items():
+            os.environ[key] = value
+
+        # Kept on the instance so the entrypoint can echo it and tests can read
+        # it back without re-resolving.
+        self._determinism_certificate = certificate
+        logger.info("\n%s", certificate.render())
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
