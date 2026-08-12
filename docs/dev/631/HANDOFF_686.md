@@ -290,11 +290,40 @@ never happened produced the same silence. Now:
 | byte-identical restore from the park tier | **NOT PROVEN**, and the planned method is invalid (§1c) |
 | restored session back on CUDA graphs (item 13) | **NOT REACHED** — depends on a park happening |
 
-### The confirmation window (restored ship config)
+### The confirmation window (restored ship config) — IT BREACHED THE CORRIDOR
 
 Ship config restored from my own commit and healthy at **01:01:49Z**;
-`s34_acceptance_run.sh 30` ran on it. Numbers in
-`/spinning/evidence-631/s42/window/`.
+`s34_acceptance_run.sh 30` ran on it (30.9 min, 13437 corridor samples at
+100 ms). Numbers in `/spinning/evidence-631/s42/window/`.
+
+**The window is NOT clean, and this is the first thing the next shift should
+look at.** Against N38's reference of 0 breaches:
+
+| axis | N38 (reference) | this window |
+|---|---|---|
+| per-card MINIMUM free MiB | 1083 / 1580 / 1581 | **941** / 1870 / 1243 |
+| breaches of the 1024 floor | 0 / 0 / 0 | **12** / 0 / 0 |
+| requests | — | 103 ok, **0 err** |
+| occupancy legs | — | 2 legs, 3/3 ok each, peak **389324** concurrent prompt tokens (**62.8%** of the 620k pool) |
+| phase flips | — | 5360 |
+| tracebacks / CUDA errors | — | 0 |
+
+The breach is **one 1.5-second excursion**, not a drift: all 12 samples sit at
+t+982.1s .. t+983.7s, gpu0 pinned at **exactly 941 MiB** (83 below the floor)
+for the whole excursion and recovered immediately. 0.089% of samples. It falls
+BETWEEN the two occupancy legs, i.e. under plain soak rather than at the
+occupancy peak — which is the interesting part, because the peak is where the
+corridor was expected to bind.
+
+**It is not attributable to this shift's code**, and that is shown rather than
+asserted: every #659 path is absent from the window's log while present in the
+control (table below), and the ship config carries no destinations flag at all,
+so nothing in the new code executed. What it does mean is that the ship
+config's corridor margin on gpu0 is thinner than N38's window suggested, and
+the corridor law (1024 MiB free per card, CONTINUOUSLY, on the NVML free
+column) was broken for 1.5 s under ordinary load. Flagged, not fixed: the cause
+is upstream of #659 and deserves its own investigation with the flight
+recorder, not a guess from me at the end of a shift.
 
 **Inertness of the new code on the ship config, proven with a can-find
 control** — the ship config carries no `--kv-session-offload-destinations`
