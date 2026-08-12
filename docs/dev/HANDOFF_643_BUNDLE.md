@@ -11,8 +11,8 @@ Errors first. Each bug is reported as **fixed**, **refused**, or
 established at a desk is named rather than implied.
 
 **On the line numbers in this document:** every `file:line` citation refers to
-the tree **as it was at base `aca5037531`**, i.e. before the three commits on
-this branch. That is deliberate — the citations exist to let a reader verify
+the tree **as it was at base `aca5037531`**, i.e. before the three code
+commits on this branch (a fourth carries this document). That is deliberate — the citations exist to let a reader verify
 the DEFECT, and the defect only exists in the pre-fix tree. Lines in the files
 this branch touched have shifted; use `git show aca5037531:<path>` to read
 them at the quoted coordinates.
@@ -296,7 +296,7 @@ exclusion. This needs the checkpoints on disk but no GPU.
 
 ## 3. #644 — GGUF LOADER HOST-RAM DOUBLE-RESIDENCY
 
-Reported in §3a-§3c below.
+Reported in §3a-§3d below.
 
 ### 3a. What the trace established
 
@@ -439,19 +439,22 @@ must not move it.
 
 ### A pre-existing red that is NOT this branch
 
-`test/registered/unit/distributed/` carries failures at base. Measured both
-sides on the same two files:
+`test/registered/unit/distributed/` carries failures at base. Measured on both
+trees, whole directories, same interpreter and same `CUDA_VISIBLE_DEVICES=99`:
 
-| tree | result |
+| `unit/server_args/` + `unit/distributed/` | result |
 |---|---|
-| pristine base `aca5037531` (scratch worktree) | 8 failed, 40 passed |
-| this branch | 8 failed, 40 passed |
+| pristine base `aca5037531` (scratch worktree) | 22 failed, 3303 passed, 12 skipped, 1048 subtests |
+| this branch | 22 failed, 3303 passed, 12 skipped, 1048 subtests |
 
-Identical, so `test_uneven_dcp_pool_geometry.py` and `test_uneven_tp_memory.py`
-are red **before** any change here. Do not attribute them to this bundle, and
-do not let them mask a real regression later — they belong to whoever owns the
-uneven-DCP pool geometry, and they should be filed rather than left to rot in
-a directory people run.
+Identical in every column. Narrowed to the two owning files, again on both
+trees: `test_uneven_dcp_pool_geometry.py` and `test_uneven_tp_memory.py` give
+8 failed / 40 passed on base and 8 failed / 40 passed here.
+
+So these are red **before** any change in this bundle. Do not attribute them
+to it — and do not let them sit, either: they are in a directory people run,
+which means they are actively training readers to ignore a red result. They
+belong to whoever owns the uneven-DCP pool geometry and should be filed.
 
 Per-bug numbers are also in the commit messages, each against the same
 baselines.
