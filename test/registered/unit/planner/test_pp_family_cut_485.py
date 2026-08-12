@@ -44,9 +44,10 @@ KV_BYTES_PER_TOKEN_PER_ATTN_LAYER = KV_HEADS * HEAD_DIM * 2 * 1
 
 #: Weight params of one layer of each family, from the same formulas the
 #: cost model uses (uneven_perf.PerfCostModel._build_families:4011-4044).
-_ATTN_PROJ = HIDDEN * (Q_HEADS * HEAD_DIM + 2 * KV_HEADS * HEAD_DIM) + (
-    Q_HEADS * HEAD_DIM
-) * HIDDEN
+_ATTN_PROJ = (
+    HIDDEN * (Q_HEADS * HEAD_DIM + 2 * KV_HEADS * HEAD_DIM)
+    + (Q_HEADS * HEAD_DIM) * HIDDEN
+)
 _MLP = 3 * HIDDEN * INTERMEDIATE
 _K_SZ = GDN_K_HEADS * GDN_K_DIM
 _V_SZ = GDN_V_HEADS * GDN_V_DIM
@@ -110,6 +111,7 @@ def _inputs(
     pool=0,
     tp_token_shares=None,
     overheads=(0.0, 0.0, 0.0),
+    seam_staging=(0.0, 0.0, 0.0),
 ):
     cards = (RANK0_5090, RANK1_3080, RANK2_3080)
     bw = bw or tuple(c["attn_bw_gbs"] for c in cards)
@@ -122,6 +124,7 @@ def _inputs(
             budget_mib=budgets[i],
             transient_mib=transients[i],
             fixed_overhead_mib=overheads[i],
+            seam_staging_mib=seam_staging[i],
         )
         for i, label in enumerate(("rank0-5090", "rank1-3080", "rank2-3080"))
     )
@@ -168,9 +171,7 @@ class TestReferenceGeometry(CustomTestCase):
     def test_family_map_matches_checkpoint_rule(self):
         fams = _families()
         self.assertEqual(len(fams), N_LAYERS)
-        attn_idx = [
-            i for i, f in enumerate(fams) if f == pp_cut.LAYER_FAMILY_ATTENTION
-        ]
+        attn_idx = [i for i, f in enumerate(fams) if f == pp_cut.LAYER_FAMILY_ATTENTION]
         self.assertEqual(len(attn_idx), 16)
         self.assertEqual(attn_idx[:3], [3, 7, 11])
         self.assertEqual(attn_idx[-1], 63)
@@ -182,12 +183,8 @@ class TestReferenceGeometry(CustomTestCase):
     def test_ship_split_attention_census(self):
         """[28,20,16] holds 7/5/4 full-attention layers, as the flip plan
         records (layers/dcp/phase_flip_plan.py:93-97)."""
-        self.assertEqual(
-            pp_cut.attention_counts(_families(), [28, 20, 16]), (7, 5, 4)
-        )
-        self.assertEqual(
-            pp_cut.attention_counts(_families(), [32, 16, 16]), (8, 4, 4)
-        )
+        self.assertEqual(pp_cut.attention_counts(_families(), [28, 20, 16]), (7, 5, 4))
+        self.assertEqual(pp_cut.attention_counts(_families(), [32, 16, 16]), (8, 4, 4))
 
     def test_explicit_layer_types_are_honoured(self):
         types = ["linear_attention"] * 3 + ["full_attention"]
@@ -257,9 +254,7 @@ class TestSolver(CustomTestCase):
             default.makespan_seconds,
             exact.makespan_seconds * pp_cut._MAKESPAN_SLACK + 1e-12,
         )
-        self.assertGreaterEqual(
-            default.min_headroom_mib, exact.min_headroom_mib - 1e-9
-        )
+        self.assertGreaterEqual(default.min_headroom_mib, exact.min_headroom_mib - 1e-9)
 
     def test_slack_below_one_is_refused(self):
         with self.assertRaises(ValueError):
@@ -305,8 +300,7 @@ class TestSolver(CustomTestCase):
         self.assertGreater(
             anti.makespan_seconds,
             sol.makespan_seconds,
-            "the anti-proportional cut must be strictly slower than the "
-            "solved cut",
+            "the anti-proportional cut must be strictly slower than the solved cut",
         )
 
     def test_every_alternative_cut_is_at_least_as_slow(self):
@@ -367,9 +361,7 @@ class TestRefusals(CustomTestCase):
         self.assertIn("MiB", joined)
 
     def test_more_stages_than_attention_layers_refuses(self):
-        fams = tuple(
-            [pp_cut.LAYER_FAMILY_LINEAR] * 7 + [pp_cut.LAYER_FAMILY_ATTENTION]
-        )
+        fams = tuple([pp_cut.LAYER_FAMILY_LINEAR] * 7 + [pp_cut.LAYER_FAMILY_ATTENTION])
         ranks = tuple(
             pp_cut.RankResources(
                 label=f"r{i}",
@@ -420,9 +412,9 @@ class TestMemoryModel(CustomTestCase):
     def test_pool_tokens_drive_memory_not_depth(self):
         """A 600k-token arena must not be priced as a 179k request."""
         small = pp_cut.validate_pp_cut([28, 20, 16], _inputs(depth=179000))[0]
-        big = pp_cut.validate_pp_cut(
-            [28, 20, 16], _inputs(depth=179000, pool=600000)
-        )[0]
+        big = pp_cut.validate_pp_cut([28, 20, 16], _inputs(depth=179000, pool=600000))[
+            0
+        ]
         self.assertGreater(big.stages[0].kv_mib, small.stages[0].kv_mib)
         # ... while the timing term is untouched, because depth is the same.
         self.assertAlmostEqual(
@@ -435,9 +427,9 @@ class TestMemoryModel(CustomTestCase):
         on the ship config ``[32,16,16]`` = attention ``8,4,4`` (sec. 3), and
         they report the K arena alone, which is half of the K+V arena this
         model prices."""
-        sol = pp_cut.validate_pp_cut(
-            [32, 16, 16], _inputs(depth=179000, pool=540000)
-        )[0]
+        sol = pp_cut.validate_pp_cut([32, 16, 16], _inputs(depth=179000, pool=540000))[
+            0
+        ]
         self.assertEqual(sol.attention_counts, (8, 4, 4))
         expected_rank0_gib = 540000 * 32 * 1024 * (8 / 16) / (1024**3)
         self.assertAlmostEqual(
@@ -570,8 +562,7 @@ class TestDecoupling(CustomTestCase):
             (b1, b2 - b1, N_LAYERS - b2)
             for b1 in range(1, N_LAYERS)
             for b2 in range(b1 + 1, N_LAYERS)
-            if pp_cut.attention_counts(fams, [b1, b2 - b1, N_LAYERS - b2])
-            == (7, 5, 4)
+            if pp_cut.attention_counts(fams, [b1, b2 - b1, N_LAYERS - b2]) == (7, 5, 4)
         ]
         self.assertEqual(len(holding), 16)
         self.assertIn((28, 20, 16), holding)
@@ -660,6 +651,70 @@ class TestDerivePPLayerSplitDecoupling(CustomTestCase):
             attn_scores=list(sol.attention_counts),
         )
         self.assertEqual(counts, list(sol.counts))
+
+
+class TestSeamStagingIsFundedNotAssumed(CustomTestCase):
+    """Law 23 / C34: a residency gate cannot certify runnability.
+
+    The measured failure this pins: the model priced weights + KV + a
+    calibrated fixed overhead, called the #485 planner cut feasible with
+    2617 MiB to spare, and was RIGHT about residency -- the configuration
+    does fit at rest. It wedged anyway, because the phase flip needed
+    4881 MiB of TRANSIENT staging on that rank at a cutover and nothing in
+    this module had a term for peak demand at all.
+    """
+
+    def test_a_stage_that_fits_at_rest_can_still_be_refused(self):
+        base = _inputs(pool=280000)
+        counts = [28, 20, 16]
+        rest, _ = pp_cut.validate_pp_cut(counts, base)
+        self.assertTrue(rest.feasible, rest.refusals)
+        spare = min(s.headroom_mib for s in rest.stages)
+
+        # Ask for more transient than the tightest stage has spare.
+        staged = _inputs(
+            pool=280000, seam_staging=(spare + 256.0, spare + 256.0, spare + 256.0)
+        )
+        sol, violations = pp_cut.validate_pp_cut(counts, staged)
+        self.assertFalse(sol.feasible)
+        self.assertTrue(violations)
+        # The refusal must SAY that it fits at rest, or the reader will go
+        # looking for a residency problem that does not exist.
+        self.assertIn("FITS AT REST", " ".join(violations))
+        self.assertIn("seam staging", " ".join(violations))
+
+    def test_zero_staging_reproduces_the_old_verdict_exactly(self):
+        # The off switch is a VALUE of the same term, not a second path.
+        a = pp_cut.solve_pp_cut(_inputs(pool=280000))
+        b = pp_cut.solve_pp_cut(_inputs(pool=280000, seam_staging=(0.0, 0.0, 0.0)))
+        self.assertEqual(a.counts, b.counts)
+        self.assertEqual(a.min_headroom_mib, b.min_headroom_mib)
+
+    def test_the_reported_headroom_is_the_spendable_one(self):
+        # min_headroom_mib is what a caller gates on, so it must be the
+        # headroom left AFTER the peak is funded -- reporting residency
+        # headroom is exactly how the planner cut got certified.
+        staging = 700.0
+        plain = pp_cut.solve_pp_cut(_inputs(pool=280000))
+        with_staging = pp_cut.solve_pp_cut(
+            _inputs(pool=280000, seam_staging=(staging, staging, staging))
+        )
+        self.assertLess(with_staging.min_headroom_mib, plain.min_headroom_mib)
+
+    def test_the_solver_prefers_a_cut_whose_peak_is_fundable(self):
+        # The second pass must rank on runnable headroom. A cut is only
+        # better for leaving room the rank can actually spend.
+        staging = 400.0
+        sol = pp_cut.solve_pp_cut(
+            _inputs(pool=280000, seam_staging=(staging, staging, staging))
+        )
+        self.assertTrue(sol.feasible, sol.refusals)
+        for st in sol.stages:
+            self.assertGreaterEqual(
+                st.runnable_headroom_mib,
+                0.0,
+                f"{st.rank} was emitted with an unfundable seam",
+            )
 
 
 if __name__ == "__main__":

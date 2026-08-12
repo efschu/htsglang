@@ -146,6 +146,40 @@ class RankResources:
     #: read as feasible where metal is not.
     fixed_overhead_mib: float = 0.0
 
+    #: TRANSIENT headroom this rank must still have FREE once everything
+    #: above is resident, because some mechanism needs peak memory that no
+    #: at-rest measurement contains. On this rig that mechanism is the #631
+    #: phase flip's seam staging: at a cutover the rank holds packed send
+    #: buffers, pre-allocated receive buffers and the retained local leg at
+    #: once (``phase_flip_runtime._staging_bytes``).
+    #:
+    #: WHY THIS FIELD EXISTS AT ALL (law 23, C34). Without it this model
+    #: priced weights + KV + a measured fixed overhead, declared the #485
+    #: planner cut feasible with 2617 MiB to spare, and was RIGHT -- the
+    #: configuration does fit at rest. It wedged anyway, because the flip
+    #: wanted 4881 MiB of staging on that same rank and nothing here had a
+    #: term for it. A gate that certifies a cut which then cannot run is
+    #: worse than no gate: it launders an unrunnable configuration through a
+    #: calibrated-looking number. "Fits at rest" and "can run" are different
+    #: predicates and this field is the difference.
+    #:
+    #: A PER-RANK SCALAR, AND THE SHAPE IS THE OPEN QUESTION. Two demands
+    #: have been measured, both at a cutover that refused:
+    #:
+    #:     4881 MiB   rank0, attention 10/16, pool 340000
+    #:     4343 MiB   rank2, attention  6/16, pool 280000
+    #:
+    #: which is not enough to separate "scales with the stage's attention
+    #: count" from "scales with the arena's row count" -- and successor 49's
+    #: confound boot showed the demand follows the ARENA (the token vector),
+    #: not the attention split, which is the opposite of what the layer-count
+    #: reading predicted. So NO formula is applied here on purpose: a derived
+    #: term whose mechanism was wrong last week is exactly the kind of
+    #: calibrated-looking number this field exists to prevent. Supply the
+    #: measured value; left at zero the verdict is a residency verdict again
+    #: and says nothing about runnability.
+    seam_staging_mib: float = 0.0
+
     def __post_init__(self) -> None:
         if self.attn_bw_gbs <= 0.0:
             raise ValueError(
@@ -311,6 +345,9 @@ class StageCost:
     #: Which side of the roofline bound the attention core: ``"compute"``,
     #: ``"bandwidth"``, or ``"none"`` when the stage owns no attention layer.
     attn_bound_by: str = "none"
+    #: Peak transient this stage must be able to reach on top of residency.
+    #: See ``RankResources.seam_staging_mib``.
+    seam_staging_mib: float = 0.0
 
     @property
     def total_seconds(self) -> float:
@@ -322,14 +359,26 @@ class StageCost:
 
     @property
     def headroom_mib(self) -> float:
-        """Budget left after weights, KV and the transient. The corridor
-        constraint is ``headroom_mib >= 0`` once the corridor has been
-        subtracted from the budget by the caller."""
+        """Budget left after weights, KV and the transient.
+
+        RESIDENCY ONLY. This is what the stage does not occupy at rest; it is
+        NOT what the stage can spend at a cutover. Use
+        :attr:`runnable_headroom_mib` for the feasibility question.
+        """
         return self.budget_mib - self.resident_mib
 
     @property
+    def runnable_headroom_mib(self) -> float:
+        """Headroom left once the peak transient is also funded.
+
+        The quantity the verdict is actually about: a stage that fits at rest
+        and cannot reach its seam is a stage that boots and then wedges.
+        """
+        return self.headroom_mib - self.seam_staging_mib
+
+    @property
     def feasible(self) -> bool:
-        return self.headroom_mib >= 0.0
+        return self.runnable_headroom_mib >= 0.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -407,9 +456,7 @@ def layer_families_from_config(
     if interval:
         interval = int(interval)
         return tuple(
-            LAYER_FAMILY_ATTENTION
-            if (idx + 1) % interval == 0
-            else LAYER_FAMILY_LINEAR
+            LAYER_FAMILY_ATTENTION if (idx + 1) % interval == 0 else LAYER_FAMILY_LINEAR
             for idx in range(n)
         )
 
@@ -522,6 +569,7 @@ def _price_stage(
         # The transient and the cut-invariant overhead both occupy the card
         # alongside weights and KV, so they are charged together here.
         transient_mib=rank.transient_mib + rank.fixed_overhead_mib,
+        seam_staging_mib=rank.seam_staging_mib,
         # The corridor is subtracted here, once, so every downstream
         # comparison is against usable bytes.
         budget_mib=rank.budget_mib - inputs.corridor_mib,
@@ -653,7 +701,8 @@ def solve_pp_cut(
                 cost = price(s - 1, prev, b)
                 if not admissible(cost) or cost.total_seconds > ceiling:
                     continue
-                val = base if base < cost.headroom_mib else cost.headroom_mib
+                cand_h = cost.runnable_headroom_mib
+                val = base if base < cand_h else cand_h
                 # Deterministic tie-break: the earliest boundary wins, so the
                 # same inputs always yield the same cut.
                 if val > acc:
@@ -673,9 +722,7 @@ def solve_pp_cut(
         b = choice[s][b]
     bounds = tuple(reversed(bounds_rev))
     starts = (0,) + bounds[:-1]
-    stages = tuple(
-        price(i, starts[i], bounds[i]) for i in range(k)
-    )
+    stages = tuple(price(i, starts[i], bounds[i]) for i in range(k))
     counts = tuple(s.n_layers for s in stages)
     times = [s.total_seconds for s in stages]
     makespan = max(times)
@@ -687,7 +734,7 @@ def solve_pp_cut(
         stages=stages,
         makespan_seconds=makespan,
         bottleneck_stage=times.index(makespan),
-        min_headroom_mib=min(s.headroom_mib for s in stages),
+        min_headroom_mib=min(s.runnable_headroom_mib for s in stages),
         feasible=True,
         refusals=(),
         candidates_considered=considered,
@@ -711,9 +758,9 @@ def _infeasible(
 
     # The cheapest possible stage is one linear layer plus its KV share of
     # zero; if even that does not fit a rank, that rank is the reason.
-    lightest_mib = min(
-        inputs.attn_layer_weight_bytes, inputs.linear_layer_weight_bytes
-    ) / MIB
+    lightest_mib = (
+        min(inputs.attn_layer_weight_bytes, inputs.linear_layer_weight_bytes) / MIB
+    )
     for r in inputs.ranks:
         overhead = r.transient_mib + r.fixed_overhead_mib
         usable = r.budget_mib - inputs.corridor_mib - overhead
@@ -736,10 +783,7 @@ def _infeasible(
             * inputs.arena_tokens
         ) / MIB
         usable = sum(
-            r.budget_mib
-            - inputs.corridor_mib
-            - r.transient_mib
-            - r.fixed_overhead_mib
+            r.budget_mib - inputs.corridor_mib - r.transient_mib - r.fixed_overhead_mib
             for r in inputs.ranks
         )
         reasons.append(
@@ -801,8 +845,7 @@ def validate_pp_cut(
 
     if len(counts) != k:
         raise ValueError(
-            f"validate_pp_cut: got {len(counts)} stage counts for "
-            f"{k} ranks."
+            f"validate_pp_cut: got {len(counts)} stage counts for {k} ranks."
         )
     if any(int(c) < 1 for c in counts):
         raise ValueError(
@@ -831,10 +874,19 @@ def validate_pp_cut(
                 f"stage {cost.start_layer}-{cost.end_layer} on rank "
                 f"{cost.rank}: needs {cost.resident_mib:.0f} MiB "
                 f"({cost.weight_mib:.0f} weights + {cost.kv_mib:.0f} KV + "
-                f"{cost.transient_mib:.0f} transient) but only "
+                f"{cost.transient_mib:.0f} transient) plus "
+                f"{cost.seam_staging_mib:.0f} MiB of peak seam staging it "
+                f"must still be able to reach, but only "
                 f"{cost.budget_mib:.0f} MiB is usable after the "
                 f"{inputs.corridor_mib:.0f} MiB corridor -- over by "
-                f"{-cost.headroom_mib:.0f} MiB."
+                f"{-cost.runnable_headroom_mib:.0f} MiB."
+                + (
+                    ""
+                    if cost.headroom_mib < 0
+                    else f" It FITS AT REST ({cost.headroom_mib:.0f} MiB spare) "
+                    f"and still cannot run: the staging is transient and no "
+                    f"at-rest measurement contains it."
+                )
             )
         if require_attention_per_stage and hybrid and cost.n_attention == 0:
             violations.append(
@@ -854,7 +906,7 @@ def validate_pp_cut(
         stages=tuple(stages),
         makespan_seconds=makespan,
         bottleneck_stage=times.index(makespan),
-        min_headroom_mib=min(s.headroom_mib for s in stages),
+        min_headroom_mib=min(s.runnable_headroom_mib for s in stages),
         feasible=not violations,
         refusals=tuple(violations),
         candidates_considered=k,
