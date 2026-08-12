@@ -4371,6 +4371,17 @@ class Scheduler(
             )
 
             self.phase_flip_runtime = build_phase_flip_runtime(self)
+            # #656: the first round is the earliest point at which both
+            # layouts, the arena carrier and the drafter all exist, so it is
+            # the earliest point at which the seam's at-rest cost is a
+            # measurement rather than a prediction. Measure it once, leave
+            # the record for the next boot's sizer, and say out loud whether
+            # THIS boot can fund its own flip.
+            from sglang.srt.managers.phase_flip_seam_reserve import (
+                measure_and_record,
+            )
+
+            measure_and_record(self, self.phase_flip_runtime)
         # #631: the per-rank output_ids clock, once per pass. Both loop
         # families reach this line exactly once per pass, which is what
         # makes the three ranks' lines comparable; the site name records
@@ -4399,7 +4410,7 @@ class Scheduler(
         flip_stats = self.phase_flip_runtime.on_round(
             require_armed_and_parked=require_armed_and_parked
         )
-        self._drain_seam_abandons_into_policy()
+        _drain_seam_abandons_into_policy(self)
         if flip_stats is not None:
             from sglang.srt.managers.phase_flip_runtime import (
                 PhaseFlipLoopExit,
@@ -6823,74 +6834,14 @@ class Scheduler(
             # Arming performs no collective and moves no byte; every rank
             # computes the same verdict from the same replicated input.
             logger.warning("PHASE-FLIP arm failed: %s", e)
-            self._note_policy_arm_outcome(recv_req.direction, False, str(e))
+            _note_policy_arm_outcome(self, recv_req.direction, False, str(e))
             if internal:
                 return None
             return PhaseFlipReqOutput(success=False, message=str(e))
-        self._note_policy_arm_outcome(recv_req.direction, ok, msg)
+        _note_policy_arm_outcome(self, recv_req.direction, ok, msg)
         if internal:
             return None
         return PhaseFlipReqOutput(success=ok, message=msg)
-
-    def _drain_seam_abandons_into_policy(self) -> None:
-        """Report a seam ABANDON to the policy as a refused arm (#656).
-
-        An arm that returns True and then dies at the seam is, from the
-        policy's point of view, indistinguishable from an arm that was
-        refused outright: no layout changed, and the work the other layout
-        owes is still undone. Reporting only the second kind means the first
-        ``seam_abandon_cap()`` attempts of every unfundable configuration are
-        invisible to the policy -- which is exactly the window boot E spent
-        re-arming at the dwell interval.
-
-        Edge-triggered on the runtime's own sequence number so a rank that
-        reads it twice in one round counts one abandon.
-        """
-        rt = getattr(self, "phase_flip_runtime", None)
-        if rt is None or getattr(self, "phase_policy_state", None) is None:
-            return
-        seq = getattr(rt, "seam_abandon_seq", 0)
-        if seq == getattr(self, "_last_seam_abandon_seq", 0):
-            return
-        self._last_seam_abandon_seq = seq
-        last = getattr(rt, "last_seam_abandon", None)
-        if not last:
-            return
-        direction, detail = last
-        self._note_policy_arm_outcome(direction, False, f"seam abandoned: {detail}")
-
-    def _note_policy_arm_outcome(self, direction: str, ok: bool, msg: str) -> None:
-        """Close the policy's control loop with the arm verdict (#656).
-
-        REPORTED FOR EVERY SOURCE, not just the policy's own arms. A manual
-        POST /phase_flip that the runtime refuses proves the same thing about
-        the seam as a refused internal arm does, and a manual one that
-        SUCCEEDS really did reset the dwell -- so the policy has to see both
-        or its clock drifts from the layout it is steering.
-
-        Never raises. This runs on the request-handling path of a replicated
-        broadcast; an exception here would take down a scheduler over
-        bookkeeping.
-        """
-        state = getattr(self, "phase_policy_state", None)
-        if state is None:
-            return
-        try:
-            from sglang.srt.managers.phase_policy import note_flip_outcome
-
-            note_flip_outcome(
-                self.phase_policy_cfg,
-                state,
-                direction,
-                bool(ok),
-                msg or "",
-                # THE SAME CLOCK the policy inputs are stamped with. A
-                # perf_counter hold compared against a monotonic stamp is
-                # not a shorter or longer hold, it is an arbitrary one.
-                time.perf_counter(),
-            )
-        except Exception as e:  # pragma: no cover - bookkeeping must not kill
-            logger.warning("PHASE-POLICY arm outcome not recorded: %s", e)
 
     def handle_vram_budget(self, recv_req: VramBudgetReqInput) -> VramBudgetReqOutput:
         """#330 control plane: dial a card's VRAM budget or query the state.
@@ -8490,3 +8441,75 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+
+
+# ---------------------------------------------------------------------------
+# #656: the phase policy's control loop, at MODULE level and not on the class.
+#
+# Both are reached from handle_phase_flip and the round hook, and both of
+# those are exercised by stub schedulers (SimpleNamespace and _StubScheduler
+# in test_phase_flip_protocol) that bind the real method and carry none of the
+# scheduler's fields. As methods these turned "this stub has no policy" into
+# an AttributeError inside the RPC handler -- a wiring hole reported as a
+# protocol failure. As functions taking the scheduler, every field access is
+# already a guarded getattr and a stub simply has no policy to inform.
+# ---------------------------------------------------------------------------
+def _drain_seam_abandons_into_policy(scheduler) -> None:
+    """Report a seam ABANDON to the policy as a refused arm (#656).
+
+    An arm that returns True and then dies at the seam is, from the
+    policy's point of view, indistinguishable from an arm that was
+    refused outright: no layout changed, and the work the other layout
+    owes is still undone. Reporting only the second kind means the first
+    ``seam_abandon_cap()`` attempts of every unfundable configuration are
+    invisible to the policy -- which is exactly the window boot E spent
+    re-arming at the dwell interval.
+
+    Edge-triggered on the runtime's own sequence number so a rank that
+    reads it twice in one round counts one abandon.
+    """
+    rt = getattr(scheduler, "phase_flip_runtime", None)
+    if rt is None or getattr(scheduler, "phase_policy_state", None) is None:
+        return
+    seq = getattr(rt, "seam_abandon_seq", 0)
+    if seq == getattr(scheduler, "_last_seam_abandon_seq", 0):
+        return
+    scheduler._last_seam_abandon_seq = seq
+    last = getattr(rt, "last_seam_abandon", None)
+    if not last:
+        return
+    direction, detail = last
+    _note_policy_arm_outcome(scheduler, direction, False, f"seam abandoned: {detail}")
+
+def _note_policy_arm_outcome(scheduler, direction: str, ok: bool, msg: str) -> None:
+    """Close the policy's control loop with the arm verdict (#656).
+
+    REPORTED FOR EVERY SOURCE, not just the policy's own arms. A manual
+    POST /phase_flip that the runtime refuses proves the same thing about
+    the seam as a refused internal arm does, and a manual one that
+    SUCCEEDS really did reset the dwell -- so the policy has to see both
+    or its clock drifts from the layout it is steering.
+
+    Never raises. This runs on the request-handling path of a replicated
+    broadcast; an exception here would take down a scheduler over
+    bookkeeping.
+    """
+    state = getattr(scheduler, "phase_policy_state", None)
+    if state is None:
+        return
+    try:
+        from sglang.srt.managers.phase_policy import note_flip_outcome
+
+        note_flip_outcome(
+            scheduler.phase_policy_cfg,
+            state,
+            direction,
+            bool(ok),
+            msg or "",
+            # THE SAME CLOCK the policy inputs are stamped with. A
+            # perf_counter hold compared against a monotonic stamp is
+            # not a shorter or longer hold, it is an arbitrary one.
+            time.perf_counter(),
+        )
+    except Exception as e:  # pragma: no cover - bookkeeping must not kill
+        logger.warning("PHASE-POLICY arm outcome not recorded: %s", e)

@@ -2382,6 +2382,14 @@ class ModelRunnerKVCacheMixin:
             int(max(0.0, free_gb - headroom_gb) * (1 << 30))
             + pool.post_capture_backed_bytes
         )
+        # #656: THE FLIP SEAM IS A SIZING POST, and this is the only measuring
+        # point honest enough to charge it -- free VRAM here is the
+        # post-capture resting state, which is what the seam will actually
+        # find. Unchanged on every non-flip boot and on every flip rank whose
+        # existing headroom already covers the corridor law plus the seam.
+        budget_bytes = self._seam_adjusted_budget(
+            budget_bytes, int(headroom_gb * (1 << 30))
+        )
         # Uneven-TP self-calibration: this post-capture budget is the
         # most accurate per-rank measurement (weights + graphs resident),
         # matching the restart the hint asks for.
@@ -5592,6 +5600,96 @@ class ModelRunnerKVCacheMixin:
             )
 
         self._init_pools()
+
+    # ------------------------------------------------------------------
+    # #656: the flip seam as a sizing post. See
+    # sglang/srt/managers/phase_flip_seam_reserve.py for the law, the fixed
+    # point and why the terms are measured rather than derived.
+    # ------------------------------------------------------------------
+    def _seam_world_rank(self: ModelRunner) -> int:
+        """The rank the seam record is keyed by.
+
+        The flip's primary topology is (tp=1, pp=N), so the flat world rank
+        IS pp_rank there -- and the arena tail, the biggest term in the
+        record, differs by ~1 GiB between ranks on this rig. Keying by
+        tp_rank under a pipeline would give every stage rank 0's record.
+        """
+        if int(getattr(self, "pp_size", 1) or 1) > 1:
+            return int(getattr(self, "pp_rank", 0) or 0)
+        return int(getattr(self, "tp_rank", 0) or 0)
+
+    def _seam_reserve(self: ModelRunner):
+        """This rank's seam reserve, read once and announced once."""
+        cached = getattr(self, "_seam_reserve_cached", None)
+        if cached is not None:
+            return cached
+        from sglang.srt.managers import phase_flip_seam_reserve as seam
+
+        if not getattr(self.server_args, "enable_phase_flip", False):
+            cached = seam.SeamReserve(provenance=seam.PROVENANCE_DISABLED)
+        else:
+            rank = self._seam_world_rank()
+            cached = seam.read_seam_reserve(self.server_args, rank)
+            # Announced on EVERY flip boot, cold included: a capacity that
+            # depends on an on-disk record from a previous boot is a harness
+            # trap when it is silent (#188).
+            logger.info(
+                "%s (rank %d): %s",
+                seam.LOG_PREFIX,
+                rank,
+                seam.describe(cached, seam.record_path(self.server_args, rank)),
+            )
+        self._seam_reserve_cached = cached
+        return cached
+
+    def _seam_cell_bytes(self: ModelRunner) -> int:
+        """Per-token KV bytes on this rank, or 0 if the configurator has no
+        single cell (hybrid SWA, MiniMax sparse). Abstaining is correct there:
+        the seam term is bounded by one layer's rows, and inventing a cell to
+        charge it against would be a worse number than not charging it."""
+        try:
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            return int(getattr(create_memory_pool_configurator(self), "_cell_size", 0))
+        except Exception:
+            return 0
+
+    def _seam_adjusted_budget(
+        self: ModelRunner, budget_bytes: int, headroom_bytes: int
+    ) -> int:
+        """Charge the flip seam against the KV budget. See
+        managers/phase_flip_seam_reserve.py for the law and the solve."""
+        reserve = self._seam_reserve()
+        if not reserve.active:
+            return int(budget_bytes)
+        from sglang.srt.managers import phase_flip_seam_reserve as seam
+        from sglang.srt.managers.vram_dial import corridor_law_floor_bytes
+
+        cell = self._seam_cell_bytes()
+        corridor = corridor_law_floor_bytes()
+        new_bytes, tokens = seam.seam_adjusted_budget_bytes(
+            budget_bytes, headroom_bytes, corridor, cell, reserve
+        )
+        logger.info(
+            "%s (rank %d): seam floor %d MiB + %.1f B/row against a %d MiB "
+            "budget with %d MiB headroom and a %d MiB corridor law -> %d MiB "
+            "(%d tokens), giving up %d MiB of KV so the flip can still be "
+            "paid for. Sizing without this is what produced a boot that held "
+            "the corridor and served nothing (#656 boot E).",
+            seam.LOG_PREFIX,
+            self._seam_world_rank(),
+            reserve.fixed_bytes >> 20,
+            reserve.per_row_bytes,
+            int(budget_bytes) >> 20,
+            int(headroom_bytes) >> 20,
+            corridor >> 20,
+            new_bytes >> 20,
+            tokens,
+            (int(budget_bytes) - new_bytes) >> 20,
+        )
+        return new_bytes
 
     def _config_from_budget(
         self: ModelRunner, budget_bytes: int, *, cap_tokens: Optional[int] = None
