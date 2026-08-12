@@ -143,44 +143,104 @@ samples**. Close is not held.
 
 `solve_pp_cut` stays unwired for two now-quantified reasons: `seam_staging_mib`
 has no calibrated value (default 0 = the gate that certified arm C), and the
-RESIDENCY model itself mispredicts rank0 — it called arm C feasible with
-2617 MiB spare against a measured 606.
+RESIDENCY model itself mispredicts rank0 — **and that second one is now fully
+diagnosed, see §3a.**
+
+### 3a. The residency misprediction is SOLVED, from logs already on disk
+
+The model over-predicts rank0's free VRAM by **~3900 MiB** (not the ~2000 I
+first estimated; N48's "2617 MiB spare" is the optimistic end). Four terms,
+ranked, all reconstructed to within 8 MiB:
+
+1. **Missing non-layer weights on rank0, ~3760 MiB, CONSTANT — the answer.**
+   `_price_stage` prices a per-layer census of the transformer layers only.
+   The checkpoint is `Qwen3_5ForConditionalGeneration`, a VL model quantized
+   INT8-W8A8 with `lm_head`, the whole visual tower and the embeddings in the
+   quantizer's `ignore` list — i.e. **bf16 and completely unpriced**.
+   `embed_tokens` = vocab 248320 x hidden 5120 x 2 B = **2425 MiB** exactly
+   (untied: `tie_word_embeddings: false`), on rank0 only; `lm_head` the same
+   2425 MiB on rank2 only; plus ~1096 MiB of replicated bf16 vision tower and
+   loader constant on every rank. Fitting the six measured `Load weight end`
+   values across two cuts x three ranks closes to the megabyte.
+2. **`tp_token_shares` is fed the WRONG VECTOR.** `pp_cut` was given
+   `--phase-flip-tp-vector 32,16,16` = 0.5/0.25/0.25, but the arena is sized
+   by `parse_flip_token_vector` reading `SGLANG_UNEVEN_TOKEN_VECTOR` =
+   `14,10,8` = 0.4375/0.3125/0.25. Worth ∓547-664 MiB, and the sign is what
+   makes this vicious: on the SHIP cut `max(7, 8)=8` overcharges KV by exactly
+   as much as the weights undercharge, so **the two errors cancel and the ship
+   cut looks fine**. On the planner cut `n_attn=10 > 8`, the cancellation
+   disappears and the full shortfall shows naked. That is the whole reason
+   this went unnoticed.
+3. **The PP-stage mamba/GDN pool is inside `fixed_overhead` and IS
+   cut-shaped** — `51.2 MiB x n_linear`, so +563 MiB going ship -> planner on
+   rank0. **This partly refutes C35.** CALIBRATION.md's "mamba/GDN pool
+   1229/614/614 = exactly the TP vector" was the **TP-stack pool only**; there
+   are TWO pools, and the PP-stage one was never itemized, so it vanished into
+   the residual and made the residual look cut-invariant. C35's conclusion
+   about the CARD (the two 3080s are interchangeable) stands; its conclusion
+   that `fixed_overhead_mib` is cut-invariant does not.
+4. **Draft KV scales with pool** inside `fixed_overhead` (266 MiB @280k ->
+   328 @340k), so that term is not pool-invariant either.
+
+The ledger reproduces NVML free to **within 64 MiB on all three boots** with a
+single 577 MiB CUDA-context constant. That matters for §3's headline: the
+planner cut at pool 340000 was **already 672 MiB free AT REST, below the
+corridor before a single token was served** — it was never a load problem.
+
+**A corrected model gets all three verdicts right**, from terms that are
+already measured: planner @340k infeasible by ~900 MiB (metal: OOM); planner
+@280k 321 MiB headroom, refuse or shave (metal: 6 samples 48 MiB under); ship
+@280k 7633 MiB headroom (metal: 7212 min free). **This is the wiring
+blocker's fix and it needs no new measurement.**
 
 **What is shippable today** is the cut as a MANUAL configuration:
 `--pp-stage-ratio 42,11,11 --pp-attn-stage-ratio 10,3,3` at
 `--max-total-tokens 280000`, ship token vector — once it holds the corridor.
 
-**How much pool to give back, and do NOT use the theoretical slope.** rank0
-holds 10 of 16 attention layers, so KV there "should" cost
-`10 x 2048 B/token = 0.0195 MiB/token`, which says 48 MiB is bought by ~2500
-tokens. The two measured boots say otherwise:
+**How much pool to give back. I got this wrong once mid-shift; read the
+retraction.** I first compared rank0's LOAD MINIMUM at pool 340000 (608 MiB)
+against its LOAD MINIMUM at 280000 (976 MiB), got 0.0061 MiB/token, called the
+layer-count slope "3.2x too steep" and told the next shift to aim at pool
+260000. **That is wrong and it is a textbook C7 error**: those two minima read
+two different load states, so their difference is not a pool derivative at
+all. Corrected against the at-rest ledger (§3a):
 
-| pool | rank0 min free |
-|---:|---:|
-| 340000 | 608 MiB |
-| 280000 | 976 MiB |
+| pool | rank0 free AT REST | rank0 min under load |
+|---:|---:|---:|
+| 280000 | 1932 | 976 |
+| 340000 | 672 | 608 |
 
-That is **0.0061 MiB/token**, 3.2x SHALLOWER than the layer-count model — the
-same direction of error as the residency misprediction in §3, and probably the
-same cause. Taking the measured slope, reaching ~1100 MiB of margin needs
-about **20000 tokens off, i.e. pool ~260000**, not 2500.
+At rest the slope is `1260 MiB / 60000 tok = 0.021 MiB/token`, which is the
+layer-count figure `10 x 2048 B = 0.0195` to within the ledger's own noise.
+**The theoretical slope was right and my "measurement" was two states
+subtracted from each other.**
 
-Two points, two separate boots, and minima read a load state (C7), so treat
-this as a RANKER that aims the next boot rather than a calibration. But aim it
-at the measurement: the theoretical slope would have under-shot by 8x and cost
-a boot.
+So: the load draws rank0 about **956 MiB below its at-rest level** at pool
+280000 (1932 -> 976). To land the minimum near 1100 MiB the at-rest level
+needs ~124 MiB more, i.e. **~6400 tokens off: pool ~273500**. Not 260000, and
+not the 277000 I first guessed either.
 
 ---
 
 ## 4. NEXT SHIFT, IN ORDER
 
-1. **One boot at pool ~260000 to close the corridor gap** (see §3 for why
-   260000 and not 277000 — use the MEASURED slope, not the layer-count one),
-   then re-measure 179200. If it holds the law with the gain intact, the
-   manual configuration is shippable and the wire-or-gate question becomes
-   only about the solver. Cheapest remaining item by a wide margin. Fold the
-   §3 slope check into it: a third (pool, min-free) point turns a two-point
-   ranker into a usable line.
+1. **Fix the residency model from §3a — no GPU needed, all four terms are
+   already measured.** Price the non-layer weights (embed on stage 0, lm_head
+   on the last stage, the replicated bf16 vision tower), feed
+   `tp_token_shares` from `SGLANG_UNEVEN_TOKEN_VECTOR` and not from the flip
+   WEIGHT vector, and move the PP-stage mamba pool out of `fixed_overhead`
+   into a `51.2 MiB x n_linear` term. The corrected model already gets all
+   three measured boots right. This is the highest-value item on the ticket
+   and it is desk work.
+2. **One boot at pool ~273500 to close the corridor gap** (§3: at-rest slope
+   0.021 MiB/token, load draws ~956 MiB below at-rest; do NOT use the
+   load-minimum slope I first published — see the retraction). Then
+   re-measure 179200. If it holds the law with the gain intact, the manual
+   configuration is shippable. Fold in the §3a confirming probe: one
+   `named_parameters()` walk on rank0 after `Load weight end`, grouped by
+   top-level owner, costs microseconds and separates "per-rank vision
+   constant" from "stage-0 embedding" — which decides whether the fix is one
+   rank0 constant or three role-scoped ones.
 2. **The same-boot control** (§1e): arm A, flip on, pool 280000, in one boot
    with arm C. Removes the only caveat on the +48.7 %.
 3. **Calibrate `seam_staging_mib`.** Two demands are measured (4881 MiB at

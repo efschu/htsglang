@@ -806,6 +806,54 @@ evidence, and that applies to a fix's own tests as much as to a benchmark.
 
 ---
 
+**C38 — THE RESIDENCY GATE MISPREDICTS rank0 BY ~3900 MiB, AND TWO OF ITS
+ERRORS CANCEL ON THE SHIP CUT (#485, successor 49, 2026-08-12).** C36 left
+"the residency model mispredicts rank0" as unexplained. It is now fully
+accounted, from logs already on disk, and the account amends C35.
+
+`_price_stage` prices a per-layer census of the TRANSFORMER LAYERS ONLY. The
+checkpoint is `Qwen3_5ForConditionalGeneration` — a VL model, INT8-W8A8, with
+`lm_head`, the entire visual tower and the embeddings in the quantizer's
+`ignore` list, i.e. **bf16 and unpriced**. Fitting the six measured
+`Load weight end` values (2 cuts x 3 ranks) closes to the megabyte:
+
+```
+embed_tokens = 2425 MiB   stage 0 only   (248320 vocab x 5120 x 2 B, untied)
+lm_head      = 2425 MiB   last stage only
+vision+loader ~ 1096 MiB  every rank, replicated bf16
+```
+
+~3760 MiB missing on rank0, essentially CONSTANT in the cut.
+
+**Why nobody saw it: two errors cancel on the ship cut.** `tp_token_shares`
+was fed the flip WEIGHT vector `32,16,16` (0.5/0.25/0.25) while the arena is
+actually sized by `SGLANG_UNEVEN_TOKEN_VECTOR` `14,10,8` (0.4375/0.3125/0.25).
+On the ship cut the arena term `max(7, 0.5*16)=8` OVERCHARGES KV by 547-664
+MiB — almost exactly what the weight term undercharges — so the model looks
+calibrated. On the planner cut `n_attn=10 > 8`, the cancellation vanishes and
+the full shortfall appears. **A model validated only on the configuration
+whose errors cancel is not validated.** Diagnostic tell: a gate that is
+accurate on exactly one cut and wrong on every other.
+
+**This partly refutes C35.** C35 concluded `fixed_overhead_mib` is
+cut-invariant because "the mamba/GDN pool 1229/614/614 is exactly the TP
+vector 0.5/0.25/0.25". There are TWO mamba pools. That figure is the TP-STACK
+pool; the PP-STAGE pool is `51.2 MiB x n_linear(stage)` — genuinely PP-cut-
+shaped, +563 MiB going ship -> planner on rank0 — and it was never itemized,
+so it disappeared into the residual and made the residual LOOK invariant.
+C35's card conclusion (the two 3080s are interchangeable, the residual follows
+the stage ROLE) STANDS; its cut-invariance conclusion does not. Draft KV also
+scales with the pool inside the same bucket (266 -> 328 MiB, 280k -> 340k).
+
+The corrected ledger reproduces NVML free to **within 64 MiB on all three
+boots** with a single 577 MiB CUDA-context constant, and gets every verdict
+right: planner @340k infeasible by ~900 MiB (metal: OOM), planner @280k 321
+MiB headroom (metal: 6 samples 48 MiB under the law), ship @280k 7633 MiB
+(metal: 7212). **The planner cut at 340000 was below the corridor AT REST,
+before a single token was served** — it was never a load problem.
+
+---
+
 ## SINGLE-SOURCED AND LOAD-BEARING — the next contradictions
 
 Each appears in exactly one place and a decision rests on it. Confirm before
@@ -1375,3 +1423,28 @@ boot with **TP>=2 per PP stage** plus `--enable-phase-flip` plus
    closes when the number is measured.** Two measured demands exist and do
    not separate the term's shape, and no formula was fitted to them,
    because the mechanism a formula would encode was refuted the same week.
+
+26. **A model validated only where its errors cancel is not validated**
+   (C38, #485). The residency gate under-priced rank0's weights by ~3760 MiB
+   (unquantized embeddings, lm_head and vision tower, all outside the
+   per-layer census) and over-priced its KV arena by 547-664 MiB (fed the
+   flip WEIGHT vector where the arena uses the TOKEN vector). On the ship
+   cut those two cancel to within ~100 MiB and the gate reads calibrated.
+   On any cut where the attention count exceeds the token share the
+   cancellation disappears and the gate is wrong by ~3900 MiB. **Check a
+   model on a configuration it was NOT tuned on before trusting it, and
+   when a model is accurate on exactly one config, suspect cancellation
+   rather than calibration.** Sibling of law 23: there the gate modelled the
+   wrong PREDICATE, here it models the right one with two compensating
+   errors.
+
+27. **Two minima from two differently-loaded boots do not make a derivative**
+   (successor 49's own retraction, C7). I took rank0's load MINIMUM at two
+   pools, divided, got a slope 3.2x shallower than the layer-count model,
+   published it as "the measurement beats the theory" and aimed the next
+   shift's boot at the wrong pool. The at-rest ledger gives 0.021 MiB/token,
+   i.e. the layer-count figure was right all along; the load minima differ
+   by load state, which is exactly what C7 says they read. **Before
+   subtracting two measurements, ask whether they are the same KIND of
+   quantity** — at-rest and under-load are different instruments, and a
+   ratio between them is not a slope.
