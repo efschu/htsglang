@@ -67,6 +67,15 @@ FAMILY=(
     test/registered/unit/managers/test_kv_arena_handle_retention_631.py
     test/registered/unit/managers/test_spec_counter_wire_631.py
     test/registered/unit/managers/test_corridor_steering_657.py
+    # FIFTH under-collection, avoided rather than caught: the #656
+    # remediation shift added these two and extended the list in the same
+    # commit. The first is register C22's root cause (the flip's wire frame
+    # is never agreed) and carries the red arm that reproduces the metal
+    # signature on a CPU desk; the second pins the corridor law and the
+    # gate's arming floor as ONE declared pair, and stops a private 1024
+    # literal creeping back into an instrument that audits the gate.
+    test/registered/scheduler/test_flip_frame_agreement_656.py
+    test/registered/unit/managers/test_corridor_threshold_pair_656.py
     # Third under-collection, caught 2026-08-10: six tests were added to
     # this file and the family total did not move, because the list is
     # explicit and nobody extended it. The file guards spec item 8's flag
