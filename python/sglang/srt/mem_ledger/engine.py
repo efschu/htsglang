@@ -805,6 +805,22 @@ def _attention_tp_uses_pynccl(server_args) -> bool:
         return True
 
 
+def _history_band(history, uuid: str, post: str):
+    """One band off a :class:`BootHistory`, or None, never raising.
+
+    Guarded whole and typed loosely on purpose: the history is an OBSERVATION
+    fed in from outside, and an instrument that can refuse a launch is worse
+    than no instrument. A malformed or absent history leaves every term on the
+    behaviour it had before this parameter existed.
+    """
+    if history is None:
+        return None
+    try:
+        return history.band(uuid, post)
+    except Exception:  # pragma: no cover - an observation must not raise
+        return None
+
+
 def build_card_ledgers(
     inputs: DemandInputs,
     *,
@@ -813,6 +829,7 @@ def build_card_ledgers(
     user_reserve_mib: Mapping[int, int],
     calibration=None,
     tenant_terms: Optional[Mapping[int, Sequence[LedgerTerm]]] = None,
+    history=None,
 ) -> List[CardVramLedger]:
     """One :class:`CardVramLedger` per card, itemized and provenance-tagged.
 
@@ -822,6 +839,25 @@ def build_card_ledgers(
     becomes UNBOUNDED and the boot refuses with the probe command, because a
     residual that the rig has never measured is exactly the number the old
     ``_PREDICT_OVERHEAD_MIB = 1280`` guessed.
+
+    ``history`` is a
+    :class:`~sglang.srt.mem_ledger.boot_history.BootHistory` or None, and
+    ``None`` is the default precisely so every existing caller is byte-
+    identical. When present it takes PRECEDENCE over the inherited constants
+    for the two terms it can speak to, because it is a measurement of THIS rig
+    in THIS window and they are not:
+
+    * the hardware residual, where the window-2026-08-06 calibration measured
+      25-34% low against 472 recorded boots;
+    * the load transient, whose flat ``LOAD_TRANSIENT_REFERENCE_MIB`` the same
+      history falsifies outright.
+
+    A band the history REFUSES (too wide to summarise) does not silently fall
+    through to the constant it was meant to replace. For the transient, which
+    has no probe behind it, the term becomes UNBOUNDED and names the
+    distribution. For the residual, which does have a probe, the measured
+    calibration stands -- a wide history is a reason to distrust a summary of
+    the history, not a reason to discard a direct measurement.
     """
     if len(rank_gpu_id) != inputs.rank_count():
         raise LedgerError(
@@ -873,8 +909,41 @@ def build_card_ledgers(
         # peak. The 2026-08-06 window that produced the inherited number ran one
         # rank per card, so it cannot distinguish per-card from per-rank; per
         # rank is the reading that cannot under-charge a co-located card.
+        transient_band = _history_band(history, card.uuid, "load_transient")
         measured_transient = inputs.load_transient_mib_per_rank
-        if measured_transient and len(measured_transient) > max(ranks):
+        if transient_band is not None and transient_band.refused:
+            # The post is not a constant on this rig, so no constant is honest.
+            # UNBOUNDED rather than the inherited 70 MiB: a falsified figure
+            # that still prints is the failure mode this ledger exists to end.
+            unbounded.append(
+                f"{TERM_LOAD_TRANSIENT} on {card.name}: the boot history "
+                f"refuses to summarise this post -- {transient_band.reason}. "
+                "The inherited "
+                f"{LOAD_TRANSIENT_REFERENCE_MIB} MiB constant is NOT used as a "
+                "fallback: this rig's own boots falsify it, and a term that "
+                "cannot be bounded has to say so"
+            )
+        elif transient_band is not None:
+            terms.append(
+                LedgerTerm(
+                    name=TERM_LOAD_TRANSIENT,
+                    mib=int(transient_band.charge_mib) * n_co,
+                    provenance=Provenance.CALIBRATED,
+                    derivation=(
+                        f"boot-history band {transient_band.low_mib}-"
+                        f"{transient_band.high_mib} MiB over "
+                        f"{transient_band.n_boots} recorded boots of this "
+                        f"card, charged at the band's HIGH x {n_co} rank "
+                        "process(es) on this card"
+                    ),
+                    fingerprint=f"boot-history:{transient_band.n_boots}",
+                    bounded_by=(
+                        "the caching allocator: the peak is reservation above "
+                        "the resident set within one phase, not a growing pool"
+                    ),
+                )
+            )
+        elif measured_transient and len(measured_transient) > max(ranks):
             transient = sum(float(measured_transient[r]) for r in ranks)
             terms.append(
                 LedgerTerm(
@@ -1341,8 +1410,49 @@ def build_card_ledgers(
             )
 
         residual = residual_by_uuid.get(card.uuid)
+        residual_band = _history_band(history, card.uuid, "hardware_residual")
         processes = n_co + (1 if inputs.parent_binds_cuda_context else 0)
-        if residual is None:
+        if residual_band is not None and not residual_band.refused:
+            # MEASURED beats CALIBRATED. The probe measures the residual of a
+            # process that has just bound a context; the history measures the
+            # residual of the processes this rig actually boots, on the wheel
+            # and driver it actually runs. Where they disagree the boots win.
+            terms.append(
+                LedgerTerm(
+                    name=TERM_HARDWARE_RESIDUAL,
+                    mib=int(residual_band.charge_mib) * n_co,
+                    provenance=Provenance.CALIBRATED,
+                    derivation=(
+                        f"boot-history band {residual_band.low_mib}-"
+                        f"{residual_band.high_mib} MiB over "
+                        f"{residual_band.n_boots} recorded boots of "
+                        f"{card.name}, charged at the band's HIGH x {n_co} "
+                        "rank process(es) on this card. Supersedes the probe "
+                        "calibration"
+                        + (
+                            f" ({residual.total_mib} MiB, fingerprint "
+                            f"{getattr(calibration, 'fingerprint', '')})"
+                            if residual is not None
+                            else ""
+                        )
+                    ),
+                    fingerprint=f"boot-history:{residual_band.n_boots}",
+                )
+            )
+            if inputs.parent_binds_cuda_context and residual is not None:
+                terms.append(
+                    LedgerTerm(
+                        name=TERM_PARENT_CONTEXT,
+                        mib=residual.cuda_context_bytes // (1 << 20),
+                        provenance=Provenance.CALIBRATED,
+                        derivation=(
+                            "the parent/tokenizer process binds its own CUDA "
+                            "primary context on this card (#237/#403)"
+                        ),
+                        fingerprint=getattr(calibration, "fingerprint", ""),
+                    )
+                )
+        elif residual is None:
             unbounded.append(
                 f"{TERM_HARDWARE_RESIDUAL} on {card.name}: no VRAM calibration "
                 "matches this rig's fingerprint (card set / driver / wheel). "

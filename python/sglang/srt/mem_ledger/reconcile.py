@@ -59,9 +59,74 @@ __all__ = [
     "TERM_TO_POST",
     "TermComparison",
     "CardReconciliation",
+    "LedgerIncomplete",
+    "completeness_failures",
+    "require_complete",
     "reconcile_card",
     "reconcile",
 ]
+
+
+class LedgerIncomplete(RuntimeError):
+    """A ledger prices a structural post at zero."""
+
+
+#: Terms whose zero is never a price. A card that holds a model shard holds a
+#: nonzero number of bytes of it, so a 0 in this term is always the model
+#: failing to compute rather than the boot failing to allocate. Kept as data so
+#: the check reads as a claim a reader can dispute.
+_NEVER_LEGITIMATELY_ZERO: Tuple[str, ...] = (TERM_WEIGHTS,)
+
+
+def completeness_failures(ledger_payload: Mapping[str, Any]) -> List[str]:
+    """Every structural post this ledger left unpriced, named per card.
+
+    WHAT THIS CATCHES, AND WHY IT IS WORTH A CHECK OF ITS OWN. The ledger
+    dumped on ship boot 1464299 carried ``model weights (shards) = 0 MiB`` on
+    all three cards while the boot loaded 13674 / 8325 / 9293 MiB of them. The
+    cause is structural: the shipped configuration pins
+    ``--rank-gpu-memory-mib``, which is the PIN PATH, and the pin path skips
+    the planner that computes the shard vector. So the term was constructed,
+    formatted, dumped and read as a priced zero -- indistinguishable in the
+    JSON from a model that genuinely needs no weights.
+
+    A REFUSAL IS NOT A FAILURE HERE. A term listed in the ledger's
+    ``unbounded`` entries has said out loud that it could not be priced, which
+    is the honest outcome and the one this whole module prefers. Only a
+    silent zero, or a term missing altogether, is a failure.
+    """
+    failures: List[str] = []
+    for card in ledger_payload.get("cards", []) or ():
+        label = str(card.get("card", f"GPU {card.get('gpu_id', '?')}"))
+        priced = {str(t.get("name", "")): t for t in card.get("terms", []) or ()}
+        refused_text = " ".join(str(x) for x in (card.get("unbounded") or ()))
+        for term in _NEVER_LEGITIMATELY_ZERO:
+            if term in refused_text:
+                continue
+            entry = priced.get(term)
+            if entry is None:
+                failures.append(
+                    f"{term} on {label}: the ledger carries no such term at "
+                    "all, and no refusal naming it. A card that holds a shard "
+                    "holds a nonzero number of its bytes"
+                )
+            elif int(entry.get("mib", 0)) <= 0:
+                failures.append(
+                    f"{term} on {label}: priced at {int(entry.get('mib', 0))} "
+                    "MiB. This is the PIN PATH signature -- pinning "
+                    "--rank-gpu-memory-mib skips the planner that computes the "
+                    "shard vector, so the term is built and dumped as a zero "
+                    "rather than refused. It is the ledger's dominant post and "
+                    "a zero here silently removes it from every total"
+                )
+    return failures
+
+
+def require_complete(ledger_payload: Mapping[str, Any]) -> None:
+    """Raise :class:`LedgerIncomplete` if any structural post is unpriced."""
+    failures = completeness_failures(ledger_payload)
+    if failures:
+        raise LedgerIncomplete("; ".join(failures))
 
 
 #: ``term name -> (measurement key, basis)``.
