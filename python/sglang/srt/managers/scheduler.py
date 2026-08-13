@@ -4287,24 +4287,34 @@ class Scheduler(
         # log mentions it -- the breach was found afterwards, by an external
         # sampler, in a CSV. A law the runtime cannot see is a law it cannot
         # be held to.
-        trace = self._corridor_trace
+        trace = getattr(self, "_corridor_trace", None)
         if trace is None:
             return
+        # getattr WITH DEFAULTS, not attribute access. The class carries these
+        # as class attributes, but this method is called on whatever object
+        # holds it, and `test_it_is_armed_ONCE_however_many_ticks_run` drives
+        # it against a minimal stub -- correctly, because an instrument that
+        # needs its host to have grown particular attributes is an instrument
+        # that raises on the scheduler's hot path the first time someone
+        # refactors around it. Same reason the sampler itself never raises.
         now = time.monotonic()
-        if now < self._corridor_trace_next_check:
+        if now < getattr(self, "_corridor_trace_next_check", 0.0):
             return
-        self._corridor_trace_next_check = now + self._CORRIDOR_BREACH_CHECK_S
+        self._corridor_trace_next_check = now + getattr(
+            self, "_CORRIDOR_BREACH_CHECK_S", 10.0
+        )
         try:
             summary = trace.summary()
+            floor_raw = summary.get("free_min_mib")
+            if not summary.get("breach") or floor_raw is None:
+                return
+            floor = int(floor_raw)
         except Exception:  # noqa: BLE001 - instrument must not raise
             return
-        if not summary.get("breach"):
-            return
-        floor = int(summary.get("free_min_mib", 0))
         # The ring holds the whole window, so once a breach is in it the
         # verdict stays true forever. Report only when it gets WORSE, which
         # makes each line a new deepest instant rather than a repeat.
-        prior = self._corridor_trace_reported_floor
+        prior = getattr(self, "_corridor_trace_reported_floor", None)
         if prior is not None and floor >= prior:
             return
         self._corridor_trace_reported_floor = floor
