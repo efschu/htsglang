@@ -306,6 +306,41 @@ acceptance ran its probes at the shipped eager default and saw the same
 signature, so MERGE-R7 follow-up 1's attribution came from an uncontrolled
 lazy-only pair.
 
+### Every COLD deep probe on record, across both boots
+
+| tokens | boot | filler | result |
+|---|---|---|---|
+| 250026 | acceptance | repeated | EXACT |
+| **280026** | acceptance run 1 | repeated | **EMPTY** |
+| **280026** | acceptance bracket (127.2 s) | repeated | EXACT |
+| 300026 | acceptance | repeated | EXACT |
+| **280026** | remediation, load phase 2 (193.1 s) | repeated | **EMPTY** |
+| 300026 | remediation, load phase 2 (226.9 s) | repeated | EXACT |
+| 338916 | remediation, probe attempt 1 (244.0 s) | **unique** | EXACT |
+
+**280026 has failed 2 of 3 cold attempts. Every other depth is 4 of 4
+exact, including one 58890 tokens deeper.** That is a sharper shape than the
+acceptance's "intermittent, not depth-determined", and it is not a ceiling
+either — a ceiling cannot be passed by going deeper.
+
+**Two confounds are live and the probe run separates only one of them.** All
+the failures used the REPEATED filler (`"The quick brown fox jumps over the
+lazy dog. " * n`); the one unique-filler probe passed. So "280026 is a bad
+depth" and "highly repetitive content at depth is fragile" both fit the
+table. The run below uses unique filler at **280012** — 14 tokens off the
+failing depth and different content — so a failure there implicates depth
+and a clean sweep implicates content, but neither is isolated by this run
+alone. Said plainly rather than presented as a rate for a single cause.
+
+### The mis-calibration, recorded because it cost a probe
+
+The first attempt reused the acceptance's sentence COUNTS. The unique tag
+makes each sentence longer, so 17016 sentences came to 414320 tokens and the
+server refused with a clean 400 naming the 393216 limit — the same incidental
+confirmation the acceptance got. The counts are now computed exactly with the
+checkpoint's own tokenizer (11196 → 280012, 9644 → 240016) instead of scaled
+from someone else's probe.
+
 ---
 
 ## 5. METAL — one boot, and what it is honestly worth
