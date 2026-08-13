@@ -42,10 +42,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from sglang.srt.mem_ledger.engine import (
     TERM_ACTIVATION,
     TERM_ATTN_WORKSPACE,
+    TERM_GDN_SCRATCH,
     TERM_GRAPH_CAPTURE,
     TERM_HARDWARE_RESIDUAL,
     TERM_LOAD_TRANSIENT,
     TERM_MAMBA_POOL,
+    TERM_NCCL_BUFFERS,
     TERM_NVML_CARVE_OUT,
     TERM_PARENT_CONTEXT,
     TERM_WEIGHTS,
@@ -69,8 +71,11 @@ __all__ = [
 #: quantity read directly off one mark.
 TERM_TO_POST: Dict[str, Tuple[Tuple, str]] = {
     TERM_WEIGHTS: (
-        ("delta", "pre_weight_load", "weights_loaded"),
-        "the shard is allocated by load_model and nothing else runs in that gap",
+        ("episodes",),
+        "each (pre_weight_load -> weights_loaded) pair is ONE weight-load "
+        "episode, measured on allocated bytes OUTSIDE the KV arena; the term "
+        "is the LARGEST episode, never their sum, because every episode is "
+        "freed before the next one loads",
     ),
     TERM_MAMBA_POOL: (
         ("delta", "weights_loaded", "kv_pool_sized"),
@@ -94,11 +99,12 @@ TERM_TO_POST: Dict[str, Tuple[Tuple, str]] = {
         "the bytes NVML charges this pid that torch does not account for",
     ),
     TERM_LOAD_TRANSIENT: (
-        ("field", "allocator_transient_bytes", "weights_loaded"),
-        "the allocator's reserved PEAK minus what is still reserved once the "
-        "weights are in, i.e. the transient the load phase raised and gave "
-        "back. A LOWER BOUND on the term: the serving phase can raise a "
-        "larger one, and the ledger charges the term for the whole boot",
+        ("peak", "allocator_transient_bytes"),
+        "the allocator's reserved PEAK above what is still reserved, taken as "
+        "the MAXIMUM over every mark of the boot. Reading it at one phase is "
+        "what the first reconciliation did and it measured 0 on a boot whose "
+        "true peak was 13392 MiB, three marks further on: the term is a "
+        "property of the whole boot, so its measurement has to be too",
     ),
     TERM_ACTIVATION: (
         ("delta", "boot_complete", "first_forward"),
@@ -109,6 +115,19 @@ TERM_TO_POST: Dict[str, Tuple[Tuple, str]] = {
         ("field", "nvml_carve_out_bytes", "boot_complete"),
         "REPORTED by the driver, so the measurement should equal the model "
         "exactly; a difference here means the ledger read a different card",
+    ),
+    TERM_GDN_SCRATCH: (
+        ("delta", "gdn_scratch_begin", "gdn_scratch_end"),
+        "the GDN/Mamba prefill scratch is allocated between these two marks "
+        "and released after; #595 left the term with no boundary at all, so "
+        "it read UNMEASURED on every boot ever recorded",
+    ),
+    TERM_NCCL_BUFFERS: (
+        ("delta", "nccl_init_begin", "nccl_init_end"),
+        "NCCL allocates its communicator buffers at init and does not grow "
+        "them with message size, so the gap around init is the whole term. "
+        "This was #595's gap: the taxonomy carried the term and the recorder "
+        "had nowhere to see it",
     ),
     TERM_PARENT_CONTEXT: (
         ("processes", "parent_on_card", "boot_complete"),
@@ -124,11 +143,16 @@ class TermComparison:
     """One modeled term beside its measurement."""
 
     term: str
-    modeled_mib: int
+    #: ``None`` when the MODEL refused to price the term (an UNBOUNDED entry
+    #: on the ledger). Distinct from 0, which is a priced zero, and distinct
+    #: from the term being absent, which is how a refusal used to look.
+    modeled_mib: Optional[int]
     measured_mib: Optional[int]
     basis: str
     provenance: str = ""
     note: str = ""
+    #: True when the ledger REFUSED this term rather than modelling it.
+    refused: bool = False
 
     @property
     def measured(self) -> bool:
@@ -137,18 +161,24 @@ class TermComparison:
     @property
     def error_mib(self) -> Optional[int]:
         """Model minus measurement. Positive = the term overpredicts."""
-        if self.measured_mib is None:
+        if self.measured_mib is None or self.modeled_mib is None:
             return None
         return self.modeled_mib - self.measured_mib
 
     def row(self) -> str:
+        modeled = "REFUSED" if self.modeled_mib is None else f"{self.modeled_mib} MiB"
         if self.measured_mib is None:
             return (
-                f"  {self.term:<38} {self.modeled_mib:>7} MiB  "
+                f"  {self.term:<38} {modeled:>11}  "
                 f"{'UNMEASURED':>12}  {'':>9}  {self.note or self.basis}"
             )
+        if self.modeled_mib is None:
+            return (
+                f"  {self.term:<38} {modeled:>11}  "
+                f"{self.measured_mib:>8} MiB  {'':>9}  {self.note or self.basis}"
+            )
         return (
-            f"  {self.term:<38} {self.modeled_mib:>7} MiB  "
+            f"  {self.term:<38} {modeled:>11}  "
             f"{self.measured_mib:>8} MiB  {self.error_mib:>+8} MiB  {self.basis}"
         )
 
@@ -212,8 +242,7 @@ class CardReconciliation:
                 "per-runner phases; these terms were computed with a global "
                 "delta (first -> last) rather than per-runner sum -- the "
                 "measurement is still valid but runner attribution is "
-                "unavailable: "
-                + ", ".join(self.ambiguous_runner_terms)
+                "unavailable: " + ", ".join(self.ambiguous_runner_terms)
             )
         return "\n".join(lines)
 
@@ -318,6 +347,84 @@ def _dedup_first(
     return result
 
 
+def _peak_field(marks: Sequence[Mapping[str, Any]], field: str) -> Optional[int]:
+    """The LARGEST value *field* takes anywhere in this rank's record.
+
+    For a term the ledger charges over the whole boot, the honest measurement
+    is the boot's maximum and not the value at one chosen phase. The first
+    reconciliation read ``allocator_transient_bytes`` at the target runner's
+    ``weights_loaded`` -- a mark at which the allocator has, by definition,
+    just finished handing its peak back -- and reported 0 for a term whose
+    real peak on that same card, three marks later, was 13392 MiB.
+    """
+    values = [int(m[field]) for m in marks if field in m]
+    return max(values) if values else None
+
+
+def _weight_episodes(
+    marks: Sequence[Mapping[str, Any]],
+) -> List[Tuple[str, int]]:
+    """Every weight-load episode, in order, as ``(label, bytes)``.
+
+    An EPISODE is one ``pre_weight_load -> weights_loaded`` pair. A boot can
+    run several: this rig's phase-flip configuration loads the PP-prefill
+    layout, frees it, loads the TP-decode layout, frees that, and then loads
+    the NEXTN draft -- three episodes in one process.
+
+    TWO CORRECTIONS OVER THE FIRST RUN, both of which inflated the answer:
+
+    1. Episodes are not summed. Each is released before the next loads, so the
+       card's weight demand is the LARGEST episode. Summing the first two gave
+       27800 MiB on a card whose entire process footprint was 28436 MiB.
+    2. The measurement runs on allocated bytes OUTSIDE the KV arena
+       (``allocated_bytes - kv_arena_backed_bytes``) rather than on
+       ``reserved_bytes``. Between episodes the arena takes over the pages the
+       weights gave back -- that is what ``--phase-flip-spill-depth arena``
+       does -- so a reserved-bytes delta charges the arena's growth to the
+       weights.
+
+    DEGRADED BASIS FOR OLD BOOTS. A mark written before ``allocated_bytes``
+    existed carries only ``reserved_bytes``. Such a boot is still reconciled,
+    on the reserved basis, rather than reading UNMEASURED -- it has no KV
+    arena fields either, so on those boots the two bases agree. The degradation
+    is recorded in the episode label so a reader can see which basis produced
+    the number instead of having to date the boot.
+    """
+    episodes: List[Tuple[str, int]] = []
+    pending: Optional[int] = None
+    index = 0
+    for m in marks:
+        phase = m.get("phase")
+        if phase not in ("pre_weight_load", "weights_loaded"):
+            continue
+        if "allocated_bytes" in m:
+            outside = int(m.get("allocated_bytes", 0)) - int(
+                m.get("kv_arena_backed_bytes", 0) or 0
+            )
+        elif "reserved_bytes" in m:
+            outside = int(m["reserved_bytes"])
+        else:
+            continue
+        if phase == "pre_weight_load":
+            pending = outside
+        elif pending is not None:
+            index += 1
+            tag = (m.get("extra") or {}).get("draft_worker")
+            basis = "" if "allocated_bytes" in m else " [reserved basis]"
+            label = (
+                f"episode {index}"
+                + (
+                    " (target runner)"
+                    if tag is False
+                    else " (draft/second runner)" if tag is True else ""
+                )
+                + basis
+            )
+            episodes.append((label, outside - pending))
+            pending = None
+    return episodes
+
+
 def _field_bytes(
     marks: Sequence[Mapping[str, Any]], field: str, phase: str
 ) -> Optional[int]:
@@ -392,12 +499,47 @@ def reconcile_card(
             continue
         (kind, *args), basis = mapping
         measured: Optional[int]
-        if kind == "delta":
-            measured, ambiguous = _delta_bytes(
-                marks, args[0], args[1], "reserved_bytes"
-            )
-            if ambiguous and measured is not None:
-                ambiguous_runner_terms.append(name)
+        note = ""
+        if kind == "peak":
+            measured = _peak_field(marks, args[0])
+            if measured is None:
+                note = (
+                    f"no mark in this boot's record carries {args[0]!r}; the "
+                    "recorder predates the field"
+                )
+        elif kind == "episodes":
+            episodes = _weight_episodes(marks)
+            if not episodes:
+                measured = None
+                note = (
+                    "no (pre_weight_load -> weights_loaded) pair carrying "
+                    "allocated_bytes in this boot's record"
+                )
+            else:
+                measured = max(b for _label, b in episodes)
+                note = (
+                    "largest of "
+                    + ", ".join(f"{label} {b // MIB} MiB" for label, b in episodes)
+                    + "; NOT their sum -- each is freed before the next loads"
+                )
+        elif kind == "delta":
+            absent = [p for p in (args[0], args[1]) if p not in phases]
+            if absent:
+                measured = None
+                note = (
+                    "the boot recorded no "
+                    + " and no ".join(repr(p) for p in absent)
+                    + f" mark, so the gap {args[0]!r} -> {args[1]!r} that "
+                    "brackets this term does not exist in the record. The "
+                    "boundary is named so the gap is a to-do with an address "
+                    "rather than a permanent blank"
+                )
+            else:
+                measured, ambiguous = _delta_bytes(
+                    marks, args[0], args[1], "reserved_bytes"
+                )
+                if ambiguous and measured is not None:
+                    ambiguous_runner_terms.append(name)
             if measured is not None and name == TERM_MAMBA_POOL:
                 # The KV pool is allocated in the same gap and is the ledger's
                 # residual, not a term. Subtract it so what remains is the
@@ -438,6 +580,47 @@ def reconcile_card(
                 measured_mib=None if measured is None else measured // MIB,
                 basis=basis,
                 provenance=str(term.get("provenance", "")),
+                note=note,
+            )
+        )
+
+    # Terms the MODEL refused to price. Without these rows a refusal and a
+    # term that does not exist in the taxonomy look identical in the table,
+    # which is precisely the ambiguity the ledger's UNBOUNDED list exists to
+    # remove. They carry no modeled number by construction, so they are shown
+    # against their measurement where one exists -- a refused term with a
+    # measured post is the strongest possible argument for calibrating it.
+    for refusal in ledger.get("unbounded", ()) or ():
+        text = str(refusal)
+        refused_term = next(
+            (t for t in TERM_TO_POST if text.startswith(t)),
+            text.split(" on ")[0],
+        )
+        mapping = TERM_TO_POST.get(refused_term)
+        measured_refused: Optional[int] = None
+        if mapping is not None:
+            (kind, *args), _basis = mapping
+            if kind == "peak":
+                measured_refused = _peak_field(marks, args[0])
+            elif kind == "delta" and not [
+                p for p in (args[0], args[1]) if p not in phases
+            ]:
+                measured_refused, _amb = _delta_bytes(
+                    marks, args[0], args[1], "reserved_bytes"
+                )
+            elif kind == "field":
+                measured_refused = _field_bytes(marks, args[0], args[1])
+        comparisons.append(
+            TermComparison(
+                term=refused_term,
+                modeled_mib=None,
+                measured_mib=(
+                    None if measured_refused is None else measured_refused // MIB
+                ),
+                basis="",
+                provenance="unbounded",
+                note="REFUSED BY THE MODEL: " + text,
+                refused=True,
             )
         )
 
