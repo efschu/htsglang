@@ -124,6 +124,7 @@ a refactor.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -163,6 +164,36 @@ DEFAULT_FLOOR_MIB = CORRIDOR_LAW_MIB
 #: which would let the gate bless an allocation the law forbids -- is
 #: refused instead of silently accepted.
 DEFAULT_SEAM_ENTRY_RESERVE_MIB = 512
+
+
+#: Overrides the law. Read HERE and nowhere else: three modules used to read
+#: it with their own ``"1024"`` fallback (``kv_vmm_backing``,
+#: ``phase_flip_seam_census``, and ``corridor_trace``'s default argument), so
+#: the law could be moved for one of them and not the others -- a divergence
+#: with no symptom until a breach is judged twice and answered differently.
+LAW_ENV = "SGLANG_CORRIDOR_LAW_FLOOR_MIB"
+
+
+def corridor_law_mib() -> int:
+    """The law in force, in MiB. THE reader of :data:`LAW_ENV`.
+
+    Read per call, not frozen at import: a rank can be told the law late
+    (the ``kv_vmm_backing`` preempt path is reached long after import), and
+    a value captured at import cannot be corrected by a boot that sets the
+    variable afterwards.
+    """
+    raw = os.environ.get(LAW_ENV)
+    if raw is None:
+        return CORRIDOR_LAW_MIB
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return CORRIDOR_LAW_MIB
+
+
+def corridor_law_bytes() -> int:
+    """The law in force, in bytes."""
+    return corridor_law_mib() * _MIB
 
 
 def arming_floor_mib(

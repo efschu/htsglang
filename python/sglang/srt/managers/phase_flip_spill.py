@@ -1404,11 +1404,17 @@ def get_corridor_guard(scheduler: Any):
     # that 512 MiB was supposed to be the seam's whole draw -- and the
     # measured draw was 1814-1852 MiB, so the gap between the two numbers was
     # exactly where five corridor breaches lived, unseen.
+    # NOTE the getattr is a no-op today: there is no
+    # `--phase-flip-corridor-floor-mib` server arg, so this attribute never
+    # exists and the fallback is always taken. Kept because it is the hook a
+    # flag would land on, and NOT advertised in the log line below -- naming
+    # a flag that does not exist sends an operator looking for it.
     configured = os.environ.get(CORRIDOR_FLOOR_ENV) or getattr(
         server_args, "phase_flip_corridor_floor_mib", None
     )
-    floor_mib = int(configured) if configured else cg.arming_floor_mib()
-    cg.check_threshold_pair(floor_mib, cg.CORRIDOR_LAW_MIB)
+    law_mib = cg.corridor_law_mib()
+    floor_mib = int(configured) if configured else cg.arming_floor_mib(law_mib=law_mib)
+    cg.check_threshold_pair(floor_mib, law_mib)
     logger.warning(
         "%s THRESHOLD PAIR on device %d: corridor LAW %d MiB (the verdict, "
         "and the only thing a refusal may be justified by), gate ARMS at %d "
@@ -1420,12 +1426,10 @@ def get_corridor_guard(scheduler: Any):
         "on the binding card.",
         LOG_PREFIX,
         int(device_index),
-        cg.CORRIDOR_LAW_MIB,
+        law_mib,
         floor_mib,
-        floor_mib - cg.CORRIDOR_LAW_MIB,
-        f" (set by {CORRIDOR_FLOOR_ENV} or --phase-flip-corridor-floor-mib)"
-        if configured
-        else " (derived)",
+        floor_mib - law_mib,
+        f" (set by {CORRIDOR_FLOOR_ENV})" if configured else " (derived)",
     )
     guard = cg.CorridorGuard(
         int(device_index),
@@ -1433,7 +1437,7 @@ def get_corridor_guard(scheduler: Any):
         # The LAW never moves with the proof setting: a raised arming floor
         # must make the gate work EARLIER, never make it refuse allocations
         # the corridor permits. See CorridorGuard.__init__.
-        law_floor_mib=cg.CORRIDOR_LAW_MIB,
+        law_floor_mib=law_mib,
         fleet_probe=cg.nvml_fleet_probe(),
     )
 

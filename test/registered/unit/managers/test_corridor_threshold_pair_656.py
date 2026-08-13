@@ -123,3 +123,49 @@ class TestOneDeclaration(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheLawHasOneReader(CustomTestCase):
+    """`SGLANG_CORRIDOR_LAW_FLOOR_MIB` was read in three places, each with
+    its own `"1024"` fallback. The law could then be moved for one module
+    and not the others -- a divergence with no symptom until a breach is
+    judged twice and answered differently."""
+
+    def setUp(self):
+        import os
+
+        self._saved = os.environ.pop(cg.LAW_ENV, None)
+
+    def tearDown(self):
+        import os
+
+        os.environ.pop(cg.LAW_ENV, None)
+        if self._saved is not None:
+            os.environ[cg.LAW_ENV] = self._saved
+
+    def test_unset_is_the_declared_constant(self):
+        self.assertEqual(cg.corridor_law_mib(), cg.CORRIDOR_LAW_MIB)
+        self.assertEqual(cg.corridor_law_bytes(), cg.CORRIDOR_LAW_MIB << 20)
+
+    def test_every_consumer_moves_together(self):
+        import os
+
+        from sglang.srt.managers import phase_flip_seam_census as census
+        from sglang.srt.mem_cache import kv_vmm_backing
+
+        os.environ[cg.LAW_ENV] = "1500"
+        self.assertEqual(cg.corridor_law_mib(), 1500)
+        self.assertEqual(corridor_trace.corridor_law_mib(), 1500)
+        self.assertEqual(census.law_floor_bytes(), 1500 << 20)
+        self.assertEqual(kv_vmm_backing._corridor_law_floor_bytes(), 1500 << 20)
+        # ... and the arming floor follows the law rather than staying put.
+        self.assertEqual(
+            cg.arming_floor_mib(law_mib=cg.corridor_law_mib()),
+            1500 + cg.DEFAULT_SEAM_ENTRY_RESERVE_MIB,
+        )
+
+    def test_a_malformed_override_falls_back_to_the_constant(self):
+        import os
+
+        os.environ[cg.LAW_ENV] = "not-a-number"
+        self.assertEqual(cg.corridor_law_mib(), cg.CORRIDOR_LAW_MIB)

@@ -87,9 +87,11 @@ def corridor_law_mib() -> int:
     tie an instrument's import graph to the scheduler's.
     """
     try:
-        from sglang.srt.managers.corridor_guard import CORRIDOR_LAW_MIB
+        from sglang.srt.managers.corridor_guard import (
+            corridor_law_mib as _law,
+        )
 
-        return int(CORRIDOR_LAW_MIB)
+        return int(_law())
     except Exception:  # pragma: no cover - defensive; see _LAW_MIB_FALLBACK
         return _LAW_MIB_FALLBACK
 
