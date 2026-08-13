@@ -1969,3 +1969,57 @@ costs the next allocations a fault-in and deserves its own measurement.
    that re-arms every `min_dwell_s` regardless. 179 arms, 0 completed
    cutovers. "362 flip events" in a log means arms attempted, NOT phases
    changed; counting them as flips is how this hid.
+
+## 52. A requirement measured in the phase that does not pay it reads zero.
+
+`pending_tail_bytes` is `want - committed` and `pending_restore_bytes` returns
+0 unless the drafter is CURRENTLY spilled. Both are STATE, not requirement.
+Sampled at the first round -- PP, arena committed, nothing spilled -- the
+flip seam's fixed cost measured 0 MiB on all three ranks, against a runtime
+refusal on the same rig naming 464 MiB (boot F, 2026-08-13). Price the commit
+the seam faces FROM THE OTHER PHASE, which is a static layout quantity and
+therefore readable in any phase.
+
+## 53. `num_rows` is the rank's share, not the id space.
+
+`KvPoolView.num_rows` is physical rows, and under the TP layout that is the
+rank's TOKEN SHARE. Dividing a per-pool quantity by it gives a coefficient
+inflated by 1/share: the same 1396 MiB of wave slack read 2360.7 B/row on
+pp_to_tp and 5393.8 on tp_to_pp (boot F). Anything the sizer multiplies by
+`T` must be normalised by the GLOBAL id space.
+
+## 54. There are three KV sizing paths, and the ship config takes the one
+without a headroom term.
+
+A seam correction hooked at the post-capture measuring point applied nothing
+at all on the production configuration -- the pool came back unchanged and
+nothing logged (boot H). `_config_from_budget` is the single funnel. And the
+pre-capture path has no headroom quantity to subtract a reserve from, so a
+correction shaped as "headroom minus X" cannot be expressed there. Anchor on
+a MEASURED position instead (bytes spendable above the law at a known id
+space): everything unnamed -- activation reserve, capture peak, arena, TP
+stack, carve-out -- is already inside a number that was measured with all of
+it resident.
+
+## 55. Unit tests that cover the arithmetic do not cover the module's
+existence.
+
+An edit spliced a file between two function names and removed four functions
+including the one the scheduler calls; a follow-up edit to one of them
+matched nothing and silently did nothing; every unit test still passed; the
+next boot died at the first round on ImportError (boot I). Tests exercised
+the maths, which survived. Pin the IMPORT SURFACE by the names the callers
+use, one assertion per call site.
+
+## 56. Corridor-green plus completed flips is still not a capacity claim
+about a NUMBER.
+
+The staging-aware sizer produced a boot that serves, completes 24 cutovers,
+holds 1634/2845/1804 MiB continuous minimum free with 0 breaches, and
+prefills 64001 tokens -- at a pool of 563974, which is BELOW the 620000 that
+was already serving-proven. The mechanism being right does not make the
+derived number bigger; it makes it honest. Boot E's extra 119176 tokens were
+being paid for with a wedge. When a physics-derived pool comes out smaller
+than an operator number, the budget vector is what to re-solve -- it was
+solved against the corridor law alone and must be solved against
+`corridor + seam floor` (measured per rank: 455 / 484 / 1455 MiB).

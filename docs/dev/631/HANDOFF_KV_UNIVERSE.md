@@ -244,3 +244,102 @@ failure class to hunt.
    three generations, NOT as a continuous 100 ms minimum under load. The
    corridor law is a continuous-minimum law; boot C is not yet a corridor
    acceptance.
+
+---
+
+# R3 (2026-08-13): the seam is a sizing post, and the policy can now hear "no"
+
+Branch `feat/kv-universe-656`. Evidence
+`/spinning/evidence-631/kvuniverse-r2/` (RESULTS.md, boot_f/g/h/i/i2/j logs,
+corridor CSVs, load transcripts). Window 23:45Z-06:15Z; serving stopped and
+restored by this session, verified with three real generations + health 200.
+
+## 6. ERRORS FIRST -- four premises this shift falsified, three of them mine
+
+**E6. The seam measurement read ZERO in the phase it was taken in.** Boot F:
+`floor 0 MiB` on every rank, against boot E's refusal naming 464 MiB. Both of
+the runtime's accessors are STATE readings -- `pending_tail_bytes` is
+`want - committed`, `pending_restore_bytes` is 0 unless CURRENTLY spilled --
+and at the first round the instance sits in PP with the arena committed and
+nothing spilled. The 464 MiB is what rung 3 releases on ENTERING TP. **A
+requirement measured in the phase that does not pay it reads zero.**
+
+**E7. `src.num_rows` is not the id space.** Same rank, same 1396 MiB of slack:
+2360.7 B/row on `pp_to_tp`, 5393.8 on `tp_to_pp`, because under the TP layout
+`num_rows` is the rank's token SHARE (rank2: 170793 against 683151). Any
+per-token coefficient must be normalised by the GLOBAL id space, which is what
+the sizer's `T` means.
+
+**E8. A sizing correction keyed to the post-capture path never fires on this
+config.** Boot H applied nothing and logged nothing: the pool came back at
+683150 unchanged. The ship pool is decided PRE-capture. The fix is not just
+the hook location (`_config_from_budget`, the one funnel all three paths
+reach) but the SHAPE of the term: the pre-capture path has no "headroom"
+quantity to subtract from, so the correction is now anchored on a MEASURED
+position -- bytes actually spendable above the corridor law at a known id
+space -- and needs no model of the activation reserve, capture peak, arena, TP
+stack or carve-out, because all of them were already resident when it was
+measured.
+
+**E9. An edit deleted the measurement half and every unit test still passed.**
+Boot I died on `ImportError: cannot import name 'measure_and_record'`. The
+tests covered the arithmetic, which survived; nothing imported the deleted
+names the way the CALLERS import them. Pinned now by
+`test_every_symbol_the_callers_import_exists`, one assertion per real call
+site.
+
+## 7. T1 -- the sizer works, and the honest pool is SMALLER than 620000
+
+The measurement now reproduces the runtime's refusal from the other side of
+the code. Boot G at 683150:
+
+| rank | seam needs at rest | spendable above the law | verdict |
+|---|---|---|---|
+| 0 | 455 MiB | 2002 MiB | fundable |
+| 1 | 484 MiB | **8 MiB** | cannot fund its own flip |
+| 2 | **1455 MiB** | 524 MiB | cannot fund its own flip |
+
+rank2's 1455 MiB is the tail boot E logged as `rung 3 released 1436.0 MiB`.
+The ERROR line naming this fires BEFORE the instance wedges -- boot G then did
+wedge (empty `/generate` at 85 s), which is the self-diagnosis boot E lacked.
+
+**Boot J (acceptance, commit `5a4ff94208`, no `--max-total-tokens`):** pool
+**563974**, **24 completed cutovers, 0 abandons, 0 refusals, 0 tracebacks**,
+real generations with speculation (accept 2.46-3.56), a **64001-token
+prefill**, and a continuous 100 ms corridor minimum under load of
+**1634 / 2845 / 1804 MiB with 0 breaches**.
+
+Per-rank allowed id space: 712159 / 634396 / **563974** -- rank2 binds.
+
+**563974 is BELOW the 620000 serving-proven default, so the quarantine STAYS
+and the task's "land above 620000" is NOT met.** This is not the sizer being
+conservative: it is the sizer pricing a cost boot E was paying with a wedge.
+At budgets `31583,15750,18205` rank2 is handed 18205 MiB and keeps only 524
+MiB spendable, while its arena tail alone needs 1455.
+
+**THE NEXT STEP IS A BUDGET RE-SOLVE, NOT A CAP CHANGE.** The budget vector
+was solved (r2) against the corridor law ALONE. It must be re-solved against
+`corridor + seam floor` per rank, where the seam floor is now a measured
+number on disk: 455 / 484 / 1455 MiB. rank2 is over-budgeted for a card that
+has to carry a 1455 MiB arena tail; moving budget from rank2 to rank0 (which
+has 2002 MiB spare above its own seam) is the obvious first candidate, and
+unlike every previous vector guess it can be checked against a recorded
+per-rank requirement before a boot is spent on it.
+
+## 8. T2 -- the control layer, proven on metal
+
+Boot G held the exact boot-E condition and produced **5 arms, 17 arm refusals,
+9 abandons, 3 completed cutovers** against boot E's **179 arms, 0 cutovers**.
+Three events are now distinct in the policy: ARMED is provisional, ACCEPTED is
+not COMPLETED (`arm()` returns True for the first `SEAM_ABANDON_CAP` attempts
+of an unfundable configuration), and only a cutover retires the attempt.
+
+## 9. Carry forward
+
+* The 620000 quarantine stays. Removing it needs a budget vector whose seam
+  floors fit, not a code change.
+* `flips_completed` is the metric. Arm counts read boot E as healthy.
+* T3 (YaRN 1M) and T4 (PP-after-spill) carry no metal from this shift. T3's
+  RoPE cache-growth fix is still on the branch, can-fail proven, unbooted.
+* T5 is closed: the additive weight-arena model was never implemented in code
+  or tests -- prose only, corrected in place in HANDOFF_662.md.
