@@ -5,7 +5,11 @@ based on `origin/feat/route-a-631` at `cd71ec34ce` (the MERGE-R7 tip both lines
 carried). Frozen pre-merge baseline: `/spinning/wt-merge-r8-base`, detached at
 `cd71ec34ce`, clean tree. Evidence and logs: `/spinning/evidence-631/merge-r8/`.
 
-Final tip on both lines: **`FINAL_SHA`**, `ls-remote` verified after every push.
+Content tip on both lines: **`1c92b12abe`** (merge steps 1-3). This handoff
+cannot name the commit that contains it, so the actual branch tip is the single
+docs-only commit sitting directly on top of `1c92b12abe` — same convention
+MERGE-R7 used. `ls-remote` verified against `git rev-parse HEAD` after every
+push.
 
 ERRORS FIRST.
 
@@ -149,7 +153,7 @@ trusting a clean merge (§8).
 |---|---|---|---|---|
 | 1 | `feat/ledger-reconcile-605` | `20e2e3714e` | `1e060038c1` (`--no-ff`) | **0** |
 | 2 | `fix/mamba-floor-resident-cap-656` | `81e9e3c071` | `974015fe77` (`--no-ff`) | **0** |
-| 3 | flip-family test-list patch + proof-gate skipif (§9) | — | **`FINAL_SHA`** | — |
+| 3 | flip-family test-list patch + proof-gate skipif (§9) | — | **`1c92b12abe`** | — |
 
 Each step's suite was green and pushed to **both lines** before the next was
 started; nothing was batched. Author on every commit `efschu
@@ -359,7 +363,8 @@ the `schedul` hit in `CONTRADICTIONS_REGISTER.md` is the deliberate 15-character
 
 ## 11. STATE AT HANDOVER
 
-- **Both lines at the same SHA** — `FINAL_SHA`, `ls-remote`-verified against
+- **Both lines at the same SHA** — content `1c92b12abe` plus this handoff
+  commit on top, `ls-remote`-verified against
   local `HEAD` after every push. Pushed to **`origin` = the efschu fork only**;
   `upstream` was never a push target.
 - Working branch `merge/r8-batch` in `/spinning/wt-merge-r8` — same SHA, kept.
