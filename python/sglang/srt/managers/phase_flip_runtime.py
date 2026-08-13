@@ -3390,25 +3390,124 @@ class PhaseFlipRuntime:
         int64 and nothing wraps) and POSITIVE, which is what makes it safe
         to negate for the max half of the pair.
         """
+        return self._frame_digest_parts(slots, direction, waves)["frame"]
+
+    #: The three things a frame is made of, reported apart so a divergence can
+    #: be ATTRIBUTED. See _frame_digest_parts.
+    FRAME_PARTS = ("slots", "waves", "geometry")
+
+    def _frame_digest_parts(
+        self,
+        slots: torch.Tensor,
+        direction: str,
+        waves: Sequence[Sequence[int]],
+    ) -> dict:
+        """The frame digest, and the three parts it is made of.
+
+        WHY THE PARTS EXIST. The combined digest detects a divergence and
+        cannot attribute one, so its message has to hedge -- "the live slot
+        set, the wave partition or the vector" -- and then names the pool
+        census as the instrument, which only helps when the POOL is what
+        differs. On boot_v2, 2026-08-13 16:00:42Z, it wasn't: the KV cap
+        agreement had just levelled the group, all three POOL CENSUS lines
+        were identical in every field (``size=579870 free=278572
+        cached=300034 unaccounted=1264``), and the frames diverged anyway
+        (PP1 250257408 against 1658515222). Six rounds of it followed with
+        nothing in the log to say which term carried it.
+
+        So each part rides the reduction as its own ``[x, -x]`` MIN pair.
+        Six more integers in a payload the round already reduces: no new
+        collective, and the collective COUNT invariant is untouched.
+
+        ``frame`` is bit-for-bit what the ballot voted on before this
+        change -- the parts ATTRIBUTE, they do not decide.
+
+        All four values are modular (Mersenne 2**31-1, so every product fits
+        an int64 and nothing wraps) and POSITIVE, which is what makes them
+        safe to negate for the max half of each pair.
+        """
         mod = _FRAME_DIGEST_MOD
         s = slots.detach().to("cpu", torch.int64)
         n = int(s.numel())
         if n:
             # Position-weighted so a permutation is not a collision; both
             # ends sort, so any difference here is a real set difference.
-            weights = torch.arange(1, n + 1, dtype=torch.int64)
-            acc = int((((s % mod) * weights) % mod).sum().item() % mod)
+            acc = int(
+                (((s % mod) * torch.arange(1, n + 1, dtype=torch.int64)) % mod)
+                .sum()
+                .item()
+                % mod
+            )
         else:
             acc = 0
+        slots_part = (acc * 1000003 + n) % mod
+
+        wave_terms: List[int] = [len(waves)]
+        for wave in waves:
+            wave_terms.append(len(wave))
+            wave_terms.extend(int(o) for o in wave)
+        waves_part = 0
+        for term in wave_terms:
+            waves_part = (waves_part * 1000003 + int(term)) % mod
+
+        geometry_terms: List[int] = [
+            1 if direction == PP_TO_TP else 2,
+            int(self._n_layers),
+        ]
+        geometry_terms.extend(int(v) for v in self._vec)
+        geometry_part = 0
+        for term in geometry_terms:
+            geometry_part = (geometry_part * 1000003 + int(term)) % mod
+
+        # THE COMBINED VALUE IS THE ORIGINAL ONE, TERM FOR TERM AND IN ORDER.
+        # Recomputed here rather than folded from the parts, because a fold
+        # would quietly change the number the ballot votes on and every
+        # digest in the corpus's logs would stop being comparable.
         terms: List[int] = [n, 1 if direction == PP_TO_TP else 2, len(waves)]
         terms.append(int(self._n_layers))
         terms.extend(int(v) for v in self._vec)
         for wave in waves:
             terms.append(len(wave))
             terms.extend(int(o) for o in wave)
+        frame = acc
         for term in terms:
-            acc = (acc * 1000003 + int(term)) % mod
-        return acc
+            frame = (frame * 1000003 + int(term)) % mod
+        return {
+            "slots": slots_part,
+            "waves": waves_part,
+            "geometry": geometry_part,
+            "frame": frame,
+        }
+
+    @staticmethod
+    def _name_frame_divergence(mine: dict, group_lo: dict, group_hi: dict) -> str:
+        """Which framing term the group disagrees on, in words.
+
+        ``group_lo``/``group_hi`` are the MIN and MAX of each part across the
+        group. A part whose two ends differ is a part the ranks disagree on.
+        """
+        named = []
+        for part, label in (
+            ("slots", "the live slot set"),
+            ("waves", "the wave partition"),
+            ("geometry", "the layer geometry (vector, layer count or direction)"),
+        ):
+            lo, hi = group_lo.get(part), group_hi.get(part)
+            if lo is None or hi is None or lo == hi:
+                continue
+            named.append(f"{label} (this rank {mine.get(part)}, group [{lo}, {hi}])")
+        if not named:
+            # NEVER SILENT. An unattributable divergence has to READ as
+            # unattributable, or a successor takes the absence of a named
+            # term as evidence about the terms rather than about the
+            # granularity of the parts.
+            return (
+                "no single term explains it: every part agreed across the "
+                "group while the combined digest did not, which means the "
+                "parts are not fine-grained enough to carry this one -- split "
+                "them further rather than concluding anything about the terms"
+            )
+        return "; ".join(named)
 
     # -- seam waves -----------------------------------------------------------
     def _flip_waves(self, direction: str) -> Tuple[Tuple[int, ...], ...]:
@@ -4813,9 +4912,27 @@ class PhaseFlipRuntime:
         # for why the premise needs verifying and what it cost when it was
         # only asserted. The [x, -x] pair makes MIN answer "are they all
         # equal", which is the only question here.
+        # THE PARTS RIDE THE SAME PAYLOAD (#656 R2). Six more integers, three
+        # more [x, -x] pairs, so a divergence can be ATTRIBUTED instead of
+        # only detected -- see _frame_digest_parts for the metal round that
+        # made that necessary. No new collective.
+        # ``frame`` still comes from ``_frame_digest`` and nowhere else: it is
+        # the value the ballot VOTES on, and the can-fail arm that reproduces
+        # the metal signature works by stubbing exactly that method. Routing
+        # the vote through the parts instead would have quietly disarmed the
+        # one test that proves this ballot can fail.
+        parts = self._frame_digest_parts(slots, direction, waves)
         frame = self._frame_digest(slots, direction, waves)
-        reduced_fit = self._collective_min([fits, -fits, margin_only, frame, -frame])
+        payload = [fits, -fits, margin_only, frame, -frame]
+        for name in self.FRAME_PARTS:
+            payload.extend((parts[name], -parts[name]))
+        reduced_fit = self._collective_min(payload)
         frames_agree = len(reduced_fit) < 5 or reduced_fit[3] == -reduced_fit[4]
+        part_lo, part_hi = {}, {}
+        if len(reduced_fit) >= 5 + 2 * len(self.FRAME_PARTS):
+            for i, name in enumerate(self.FRAME_PARTS):
+                part_lo[name] = reduced_fit[5 + 2 * i]
+                part_hi[name] = -reduced_fit[6 + 2 * i]
         if not frames_agree:
             # NOT a capacity verdict, so it does not join `too_small` before
             # the reduction -- it cannot be known before it. It joins after,
@@ -4824,9 +4941,10 @@ class PhaseFlipRuntime:
             self.frame_aborts += 1
             too_small.append(
                 f"wire frame divergence: this rank framed digest {frame}, the "
-                f"group spans [{-reduced_fit[4]}, {reduced_fit[3]}] -- the "
-                f"ranks do not agree on the live slot set, the wave partition "
-                f"or the vector, so the per-peer payload LENGTHS would not "
+                f"group spans [{-reduced_fit[4]}, {reduced_fit[3]}]. THE "
+                f"DIVERGING TERM IS: "
+                f"{self._name_frame_divergence(parts, part_lo, part_hi)}. The "
+                f"per-peer payload LENGTHS would therefore not "
                 f"match. Sending them anyway is register C22: the peer's "
                 f"receive buffer keeps an unwritten tail, the checksum "
                 f"trailer read out of it is not a checksum, and the guard "

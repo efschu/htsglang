@@ -332,6 +332,11 @@ def _relaxed(scheduler, work: str) -> bool:
     prohibition is back, without anything having to remember to restore it.
     """
     reason = flip_unavailable_reason(scheduler, work)
+    # EDGE-TRIGGER ON THE CAUSE, NOT ON ITS WORDING. The reason string carries
+    # the streak COUNT, which grows every round, so keying the "log once" on
+    # the whole string re-announced the same stand-down on every arm refusal
+    # -- measured on boot_v2, once a minute for the life of the degrade.
+    key = (work, reason.split(" ", 1)[0] if reason else None)
     if reason is None:
         # Edge-triggered: re-arm the log so the NEXT stand-down is announced.
         if getattr(scheduler, "_phase_purity_stood_down", None) is not None:
@@ -343,8 +348,8 @@ def _relaxed(scheduler, work: str) -> bool:
                 work,
             )
         return False
-    if getattr(scheduler, "_phase_purity_stood_down", None) != (work, reason):
-        scheduler._phase_purity_stood_down = (work, reason)
+    if getattr(scheduler, "_phase_purity_stood_down", None) != key:
+        scheduler._phase_purity_stood_down = key
         logger.warning(
             "%s PHASE FLIP STOOD DOWN -- RELAXING PURITY FOR %s: %s. This "
             "instance would otherwise hold %s for ever and answer /health "

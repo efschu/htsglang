@@ -280,6 +280,76 @@ class TheMetalDivergenceIsReproducedAndClosedTest(unittest.TestCase):
             )
 
 
+class TheFreeListORDERMustBeLevelledTooTest(unittest.TestCase):
+    """Metal, boot_v2 2026-08-13 16:00:30-16:04Z. The second divergence.
+
+    The levelling worked -- three ranks at 579870 / 579722 / 578606 exposed
+    rows converged to 578606 in one round, and every POOL CENSUS field was
+    identical from the next round on. And the FRAME diverged anyway, six
+    rounds running: PP1 framed 250257408 against 1658515222.
+
+    The pool was level; the ORDER was not. ``KvRowCap.release`` restores the
+    withheld ids with ``torch.sort``, deliberately -- "the allocator takes
+    from the FRONT" -- while ``_apply`` is a mask filter that PRESERVES the
+    eviction order. So a rank that had to change its cap ended with a SORTED
+    free list and a rank that did not kept its eviction order. Same
+    membership, different order, therefore different row ids handed to the
+    next request, therefore different live slot sets, therefore different
+    frames.
+
+    A group decision has to be applied group-symmetrically or it is not a
+    group decision. When the group is not level, EVERY rank runs the same
+    normalisation -- including the ranks already at the target, whose only
+    job is to end in the same order as the ones that moved.
+    """
+
+    def _fleet(self, levels):
+        fleet = []
+        for lvl in levels:
+            relief, pool, card = _rank(free_mib=1024 + 90_000, backed=BOOT_ROWS)
+            if lvl < BOOT_ROWS:
+                relief._rows_at_boot = BOOT_ROWS
+                relief._cap.engage(lvl)
+            # Scramble the free list the way eviction does, so "sorted" is a
+            # property this test can actually observe rather than assume.
+            alloc = relief._alloc
+            alloc.free_pages = torch.flip(alloc.free_pages, dims=(0,))
+            fleet.append((relief, pool, card))
+        return fleet
+
+    def test_every_rank_ends_with_the_same_free_list_order(self):
+        fleet = self._fleet([BOOT_ROWS, 577_722, 576_606])
+        _reconcile([r for r, _, _ in fleet])
+        firsts = [tuple(r._alloc.free_pages[:64].tolist()) for r, _, _ in fleet]
+        self.assertEqual(
+            len(set(firsts)),
+            1,
+            "the ranks hand out different row ids next, so their live slot "
+            "sets and therefore their wire frames must diverge",
+        )
+
+    def test_a_rank_already_at_the_target_still_normalises(self):
+        """The rank that does not move is the one that breaks the tie.
+
+        It is also the one an early return is most tempting for, which is
+        exactly how this defect got in.
+        """
+        fleet = self._fleet([BOOT_ROWS, 576_606, 576_606])
+        _reconcile([r for r, _, _ in fleet])
+        for relief, _pool, _card in fleet:
+            pages = relief._alloc.free_pages.tolist()
+            self.assertEqual(pages, sorted(pages))
+
+    def test_a_group_already_level_is_not_churned(self):
+        """Normalisation is for the unlevel case only -- it is not free."""
+        fleet = self._fleet([BOOT_ROWS, BOOT_ROWS, BOOT_ROWS])
+        before = [tuple(r._alloc.free_pages[:8].tolist()) for r, _, _ in fleet]
+        target = _agree([r for r, _, _ in fleet])
+        self.assertIsNone(target, "a level group has nothing to agree")
+        after = [tuple(r._alloc.free_pages[:8].tolist()) for r, _, _ in fleet]
+        self.assertEqual(before, after)
+
+
 class TheAgreementNeverCommitsAPageTest(unittest.TestCase):
     """Metal, 2026-08-13 15:40:23Z, on the first boot of this mechanism.
 
@@ -393,13 +463,18 @@ class ARankThatCannotJoinVetoesTest(unittest.TestCase):
 class AnAgreedGroupIsLeftAloneTest(unittest.TestCase):
     """The common case must cost nothing: no cap churn on a healthy group."""
 
-    def test_a_group_already_at_one_level_does_not_touch_its_allocators(self):
+    def test_a_group_already_at_one_level_has_nothing_to_agree(self):
+        """The no-op is decided from the REDUCED view, never per rank.
+
+        It used to be decided per rank, by an early return in
+        ``reconcile_to``, and that is precisely what let one rank normalise
+        its free list while another did not -- see
+        TheFreeListORDERMustBeLevelledTooTest.
+        """
         fleet = [_rank(free_mib=8000, backed=BOOT_ROWS) for _ in range(3)]
-        target = _agree([r for r, _, _ in fleet])
-        self.assertEqual(target, BOOT_ROWS)
+        self.assertIsNone(_agree([r for r, _, _ in fleet]))
         for relief, pool, _card in fleet:
             calls = len(pool.calls)
-            self.assertEqual(relief.reconcile_to(target), 0)
             self.assertEqual(len(pool.calls), calls, "no backing call")
             self.assertFalse(relief._cap.engaged)
 

@@ -218,6 +218,20 @@ def collective_cap_target(reduced):
         return None
     if max_floor > capable:
         return None
+    min_exposed = int(reduced[2])
+    max_exposed = -int(reduced[3])
+    if min_exposed == max_exposed == capable:
+        # ALREADY LEVEL, AND THAT IS NOT THE SAME AS "NOTHING TO DO ON THIS
+        # RANK". When the group is NOT level, every rank -- including the ones
+        # already at the target -- has to run the same normalisation, because
+        # the cap's release path SORTS the free list while its apply path
+        # preserves eviction order. A rank that skipped would hand out
+        # different row ids from the ones that moved, which is a divergent
+        # live slot set and therefore a divergent wire frame. Measured on
+        # metal: boot_v2, six abandoned rounds, pool census identical on all
+        # three ranks. So the "nothing to do" decision is taken HERE, from
+        # the reduced view of the whole group, and never per rank.
+        return None
     return int(capable)
 
 
@@ -325,6 +339,22 @@ class KvRowCap:
         self._withheld = None
         self._publish()
         return n
+
+    def sort_free_lists(self) -> None:
+        """Put every free list in ascending id order on THIS rank.
+
+        Called by the group cap agreement so that the order is a function of
+        MEMBERSHIP and nothing else. Two ranks with the same free ids must
+        hand the next request the same row id, or their live slot sets -- and
+        therefore the lengths of the payloads they frame -- part company.
+        """
+        import torch
+
+        for name in ("free_pages", "release_pages"):
+            pages = getattr(self._alloc, name, None)
+            if pages is None or pages.numel() < 2:
+                continue
+            setattr(self._alloc, name, torch.sort(pages).values)
 
     def _on_clear(self) -> None:
         """Re-apply the cap after the allocator rebuilt its free list.
@@ -1152,23 +1182,35 @@ class KvBackingRelief:
         target = int(target)
         before = self.exposed_rows()
         backed = self._current_rows()
-        if before == target and target <= backed:
-            # Already at the group's level with the backing to support it.
-            # Returning here keeps the common case free of allocator work:
-            # re-engaging a cap walks every free list, and this runs on the
-            # unconditional path of every seam round.
-            return 0
+        # NO EARLY RETURN FOR "I AM ALREADY THERE". The caller only reaches
+        # this when the GROUP is not level (``collective_cap_target`` decides
+        # that from the reduced view), and every rank must then run the same
+        # release-and-re-engage so that every rank's free list ends in the
+        # same ORDER. Skipping here is what left one rank sorted and another
+        # in eviction order on boot_v2, and a different order hands the next
+        # request different row ids -- a divergent live slot set, and a
+        # divergent wire frame, with the pool census identical on every rank.
         level = min(target, backed)
         ceiling = (
             int(self._rows_at_boot)
             if self._rows_at_boot is not None
             else self._reservation_rows()
         )
-        if level >= self._reservation_rows():
-            self._cap.release()
-        else:
-            self._cap.release()
+        self._cap.release()
+        if level < self._reservation_rows():
             self._cap.engage(level)
+        # AND MAKE THE ORDER A FUNCTION OF MEMBERSHIP ALONE.
+        #
+        # ``release`` sorts only when it actually had ids withheld, and
+        # ``engage``'s filter preserves whatever order it found, so after the
+        # pair above a rank that HAD a cap is sorted and a rank that did not
+        # is still in eviction order -- with identical membership. The
+        # allocator takes from the FRONT, so those two ranks hand the next
+        # request different row ids, and the live slot sets part company with
+        # nothing in the pool census to show for it. That is boot_v2's second
+        # divergence, and it is why the sort is explicit and unconditional
+        # here rather than a side effect of one branch.
+        self._cap.sort_free_lists()
         if self._rows_at_boot is not None and level >= ceiling:
             self._rows_at_boot = None
             self._exhausted = False

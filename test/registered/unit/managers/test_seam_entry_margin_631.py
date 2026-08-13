@@ -483,7 +483,12 @@ class TestTheDecisionIsGroupUniform(unittest.TestCase):
         )
         exec_src = inspect.getsource(PhaseFlipRuntime._execute)
         gate_at = exec_src.index("_corridor_gate")
-        reduce_at = exec_src.index("_collective_min([fits, -fits")
+        # The payload is BUILT from ``fits`` and then reduced -- #656 R2 added
+        # the frame parts to it, so the literal call no longer carries the
+        # list inline. The property under test is unchanged and is asserted
+        # on both halves: the gate's verdict is computed before the payload
+        # that carries it, and there is still exactly ONE reduction.
+        reduce_at = exec_src.index("payload = [fits, -fits")
         self.assertLess(
             gate_at, reduce_at, "the gate's verdict must reach the reduction"
         )
