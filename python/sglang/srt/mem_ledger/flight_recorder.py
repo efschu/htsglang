@@ -134,6 +134,17 @@ DIR_ENV = "SGLANG_VRAM_FLIGHT_DIR"
 #: lacked the field they all built by hand.
 BOOT_PHASES: Tuple[Tuple[str, str], ...] = (
     ("process_start", "before any CUDA allocation; the context is not yet bound"),
+    (
+        "nccl_init_begin",
+        "before any process group is built; the communicator buffers this "
+        "gap allocates are TERM_NCCL_BUFFERS, which #595 added to the ledger "
+        "taxonomy and left with nowhere to be seen",
+    ),
+    (
+        "nccl_init_end",
+        "every process group of this launch now exists, the phase-flip "
+        "secondary groups included",
+    ),
     ("pre_weight_load", "CUDA context, comm init, allocator warm-up"),
     ("weights_loaded", "the model shard this rank holds"),
     ("kv_pool_sized", "the KV pool and the mamba/GDN state pool"),

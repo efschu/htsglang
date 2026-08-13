@@ -6504,9 +6504,66 @@ class ServerArgs:
         if not os.environ.get(DIR_ENV):
             return
         try:
-            self._build_card_ledgers()
+            from sglang.srt.mem_ledger.boot_history import load_boot_history
+
+            self._build_card_ledgers(
+                weight_mib_per_rank=self._observation_weight_mib_per_rank(),
+                history=load_boot_history(),
+            )
         except Exception as e:  # pragma: no cover - observation only
             logger.debug("observation ledger unavailable (%s)", e)
+
+    def _observation_weight_mib_per_rank(self) -> Optional[List[int]]:
+        """Per-rank resident weight footprint for the observation ledger.
+
+        WHY THIS EXISTS AT ALL. The pin path skips the planner, and the planner
+        is where the shard vector was computed, so the ledger's largest post
+        shipped as 0 MiB on every card of every pinned boot. The PARTITION,
+        however, does not depend on the planner having run: by the time this is
+        reached the launch has already resolved how many layers each rank
+        holds and how wide each rank's shard is, and this reads that decision
+        rather than re-deciding it.
+
+        Returns ``None`` -- never zeros -- when the split cannot be derived.
+        A None reaches the ledger as no weight term at all, which the
+        completeness check in ``mem_ledger.reconcile`` then names; a zero would
+        pass every check by looking like a price.
+
+        PIPELINE PARALLELISM IS NOT MODELLED HERE and returns None on purpose.
+        Under ``--pp-size > 1`` the weight split is a LAYER split (this rig's
+        ship configuration runs ``--pp-layer-ratio 28,20,16``), and the
+        per-layer byte cost is not uniform on a hybrid checkpoint: Qwen3.5/3.6
+        interleaves GDN and full-attention layers, so a stage's share is not
+        its layer count over the total. Modelling it as if it were would return
+        a number that is wrong by an unknown amount and looks exactly like one
+        that is right. Named as an open item instead -- see
+        HANDOFF_LEDGER_RECONCILE.md section 4.
+        """
+        try:
+            if int(getattr(self, "pp_size", 1) or 1) > 1:
+                return None
+            from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+
+            rank_gpu_id = list(self.rank_gpu_id or [])
+            if not rank_gpu_id:
+                return None
+            ratio = self.rank_tp_ratio
+            base_plan = list(ratio) if isinstance(ratio, list) else [1] * self.tp_size
+            budgets = self.rank_gpu_memory_mib
+            if isinstance(budgets, int):
+                budgets = [budgets] * self.tp_size
+            model = PerfCostModel(
+                PlanInputs.from_server_args(self),
+                base_plan,
+                list(budgets or [1024] * self.tp_size),
+            )
+            per_rank = model.per_rank_weight_bytes(base_plan)
+        except Exception as e:
+            logger.debug("observation weight vector unavailable (%s)", e)
+            return None
+        if not per_rank or any(b <= 0 for b in per_rank):
+            return None
+        return [int(b / 2**20) for b in per_rank]
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -11800,12 +11857,22 @@ class ServerArgs:
                 self.rank_auto_reserve_mib,
             )
 
-    def _build_card_ledgers(self):
+    def _build_card_ledgers(self, *, weight_mib_per_rank=None, history=None):
         """The per-card VRAM ledgers for this launch, labelled and ready.
 
         Shared so the gated ledger path and the #593 full-demand reserve read
         the SAME ledger. Two constructions would be two answers, and the whole
         point of the ledger is that there is one.
+
+        ``weight_mib_per_rank`` and ``history`` both default to None, and None
+        reproduces the previous behaviour exactly -- zero weight terms and the
+        inherited constants. Only the OBSERVATION ledger (#605,
+        :meth:`_dump_observation_ledger`) passes them, so the sizing paths that
+        consume ``demand_outside_budget_mib`` are byte-identical. That
+        separation is deliberate: the observation ledger is discarded and can
+        afford to be as complete as the tree can make it, while a sizing path
+        must not change what a boot reserves as a side effect of an instrument
+        being armed.
         """
         import dataclasses as _dc
 
@@ -11866,7 +11933,11 @@ class ServerArgs:
             self,
             rank_gpu_id=rank_gpu_id,
             gpu_total_mib=gpu_total_mib,
-            weight_mib_per_rank=[0] * len(rank_gpu_id),
+            weight_mib_per_rank=(
+                list(weight_mib_per_rank)
+                if weight_mib_per_rank is not None
+                else [0] * len(rank_gpu_id)
+            ),
             card_uuid_by_gpu={c.gpu_id: c.uuid for c in cards},
         )
         ledgers = build_card_ledgers(
@@ -11875,7 +11946,26 @@ class ServerArgs:
             rank_gpu_id=rank_gpu_id,
             user_reserve_mib=user_reserve,
             calibration=load_calibration(),
+            history=history,
         )
+        if weight_mib_per_rank is not None:
+            # The weights are a TERM now, so the residual is the KV pool alone.
+            # Leaving the old label would have the same ledger claim in one
+            # place that the shards are unpriced and in another that they are
+            # 13850 MiB, which is exactly the kind of two-answers-one-document
+            # defect this ledger exists to prevent.
+            return [
+                _dc.replace(
+                    x,
+                    residual_label="KV pool (residual)",
+                    residual_note=(
+                        "total - user reserve - demand. The weight shards are "
+                        "a priced term above, so what remains here is the KV "
+                        "pool alone"
+                    ),
+                )
+                for x in ledgers
+            ]
         return [
             _dc.replace(
                 x,

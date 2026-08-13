@@ -27,7 +27,12 @@ from sglang.srt.mem_ledger.engine import (
     TERM_PARENT_CONTEXT,
     TERM_WEIGHTS,
 )
-from sglang.srt.mem_ledger.reconcile import TERM_TO_POST, reconcile, reconcile_card
+from sglang.srt.mem_ledger.reconcile import (
+    TERM_TO_POST,
+    ReconcileRefusal,
+    reconcile,
+    reconcile_card,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -36,9 +41,17 @@ MIB = 1 << 20
 
 
 def _mark(
-    phase, *, reserved=0, self_bytes=0, non_torch=0, carve=0, procs=None, pid=100
+    phase,
+    *,
+    reserved=0,
+    self_bytes=0,
+    non_torch=0,
+    carve=0,
+    procs=None,
+    pid=100,
+    arena=None,
 ):
-    return {
+    mark = {
         "phase": phase,
         "rank": 0,
         "pid": pid,
@@ -50,6 +63,14 @@ def _mark(
         "nvml_processes": procs or {},
         "monotonic": 0.0,
     }
+    if arena is not None:
+        # The MEASURED KV pool. Added when reconcile stopped subtracting the
+        # ledger's BUDGETED pool from a measured footprint -- a formula that
+        # went negative on live boots whose profiler clamped the pool below
+        # budget. This fixture's 12000 MiB pool was previously supplied by the
+        # ledger; it is now supplied by the boot, which is the whole point.
+        mark["kv_arena_backed_bytes"] = arena * MIB
+    return mark
 
 
 def _boot_marks():
@@ -71,6 +92,7 @@ def _boot_marks():
             non_torch=500,
             carve=425,
             procs={"100": 21300 * MIB},
+            arena=12000,
         ),
         _mark("first_forward", reserved=21200, self_bytes=21700, non_torch=500),
     ]
@@ -244,11 +266,22 @@ class TestWholeBoot(unittest.TestCase):
         results = reconcile(payload, marks)
         self.assertEqual([(r.gpu_id, r.rank) for r in results], [(2, 1), (0, 0)])
 
-    def test_a_rank_that_left_no_marks_is_skipped_not_invented(self):
+    def test_a_rank_that_left_no_marks_REFUSES_rather_than_being_skipped(self):
+        """FALSIFIED PREMISE, corrected here.
+
+        This test previously asserted that a rank with no marks is silently
+        skipped. That contract is what hid a caller-side defect for an entire
+        release: ``attribute_flight.py`` passed ``read_marks``'s PID-keyed
+        dict into a rank-keyed lookup, EVERY card matched nothing, the skip
+        fired for all of them, and the tool printed "The ledger names no card
+        whose rank left marks" -- a sentence about the boot that was really
+        about the keying. Skipping is indistinguishable from a total mismatch,
+        so it refuses and names the ranks.
+        """
         payload = {"cards": [_ledger([(TERM_WEIGHTS, 7000)]) | {"ranks": [0, 1]}]}
-        results = reconcile(payload, {0: _boot_marks()})
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].rank, 0)
+        with self.assertRaises(ReconcileRefusal) as ctx:
+            reconcile(payload, {0: _boot_marks()})
+        self.assertIn("rank 1", str(ctx.exception))
 
 
 if __name__ == "__main__":

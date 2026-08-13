@@ -43,7 +43,10 @@ from sglang.srt.mem_ledger.flight_recorder import (  # noqa: E402
     read_marks,
     resident_attribution,
 )
-from sglang.srt.mem_ledger.reconcile import reconcile  # noqa: E402
+from sglang.srt.mem_ledger.reconcile import (  # noqa: E402
+    ReconcileRefusal,
+    reconcile,
+)
 
 
 def _reconcile(args) -> int:
@@ -72,7 +75,17 @@ def _reconcile(args) -> int:
         return 1
     with open(path) as f:
         payload = json.load(f)
-    results = reconcile(payload, by_rank)
+    # `by_rank` is a misnomer inherited from before read_marks was fixed to
+    # PID keying (R1 defect 1a): it is `{pid: marks}`. reconcile() re-keys it
+    # onto the ledger's ranks and REFUSES on anything it cannot match, which
+    # is what this call site needs -- passing the pid dict into a rank-keyed
+    # lookup used to match nothing, return [], and print the message below as
+    # though it were a finding about the boot.
+    try:
+        results = reconcile(payload, by_rank)
+    except ReconcileRefusal as refusal:
+        print(f"Cannot reconcile boot {boot}: {refusal}")
+        return 1
     if not results:
         print("The ledger names no card whose rank left marks.")
         return 1
@@ -81,7 +94,16 @@ def _reconcile(args) -> int:
         print(result.render())
     print("\nOVERPREDICTION BY CARD (modeled - measured):")
     for result in results:
-        print(f"  rank {result.rank} {result.card}: {result.overprediction_mib:+d} MiB")
+        if result.overprediction_mib is None:
+            # No measured demand to compare against. Printed as a refusal
+            # rather than skipped: a card missing from this list would look
+            # like a card that reconciled perfectly.
+            print(f"  rank {result.rank} {result.card}: UNAVAILABLE")
+        else:
+            print(
+                f"  rank {result.rank} {result.card}: "
+                f"{result.overprediction_mib:+d} MiB"
+            )
     return 0
 
 

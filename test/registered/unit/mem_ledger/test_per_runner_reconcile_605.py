@@ -110,8 +110,13 @@ def _dual_runner_marks():
         _mark("capture_begin", reserved=28000, self_bytes=28000, draft_worker=True),
         _mark("capture_end", reserved=31000, self_bytes=31000, draft_worker=False),
         _mark("capture_end", reserved=31000, self_bytes=31000, draft_worker=True),
-        _mark("boot_complete", reserved=31000, self_bytes=31000, carve=425,
-              procs={"100": 31000 * MIB}),
+        _mark(
+            "boot_complete",
+            reserved=31000,
+            self_bytes=31000,
+            carve=425,
+            procs={"100": 31000 * MIB},
+        ),
         _mark("first_forward", reserved=31400, self_bytes=31400),
         _mark("first_forward", reserved=31400, self_bytes=31400),
     ]
@@ -141,8 +146,14 @@ def _old_boot_marks():
         _mark("kv_pool_sized", reserved=22000, self_bytes=22500, non_torch=500),
         _mark("capture_begin", reserved=22300, self_bytes=22800, non_torch=500),
         _mark("capture_end", reserved=23200, self_bytes=23700, non_torch=500),
-        _mark("boot_complete", reserved=23200, self_bytes=23700, non_torch=500, carve=425,
-              procs={"100": 23700 * MIB}),
+        _mark(
+            "boot_complete",
+            reserved=23200,
+            self_bytes=23700,
+            non_torch=500,
+            carve=425,
+            procs={"100": 23700 * MIB},
+        ),
         _mark("first_forward", reserved=23600, self_bytes=24100, non_torch=500),
     ]
 
@@ -244,17 +255,35 @@ class TestReconcileCardPerRunner(unittest.TestCase):
         self.assertEqual(by_term[TERM_MAMBA_POOL].measured_mib, 5000)
         self.assertEqual(by_term[TERM_MAMBA_POOL].error_mib, 0)
 
-    def test_weights_term_sums_both_runners(self):
-        """Weights term measures the SUM of target + draft weight loads."""
+    def test_weights_term_takes_the_LARGEST_episode_never_the_sum(self):
+        """FALSIFIED PREMISE, corrected here (#605 second reconcile run).
+
+        This test previously asserted that the weights term measures the SUM
+        of the target and draft weight loads, and it was wrong for a reason
+        the marks state plainly: between the two loads the process FREES the
+        first. On the ship boot 1464299 the 5090's reserved bytes fell from
+        21724 to 8758 MiB between the target's ``kv_pool_sized`` and the next
+        runner's ``pre_weight_load``. Summing across that free produced a
+        weights row of 27800 MiB on a card whose entire process footprint at
+        ``boot_complete`` was 26364 MiB -- an impossible post that nonetheless
+        looked like a measurement.
+
+        The card must fund the LARGEST episode, because that is the most
+        weight it holds at any one instant. Here that is the target's 10000
+        MiB, not 10000 + 9500.
+        """
         ledger = _ledger(
-            [(TERM_WEIGHTS, 19500)],  # modeled: 10000 + 9500
+            [(TERM_WEIGHTS, 10000)],
             kv_pool=12000,
         )
         marks = _dual_runner_marks()
         result = reconcile_card(ledger, marks, rank=0, rank_pids=[100])
         by_term = {c.term: c for c in result.comparisons}
-        self.assertEqual(by_term[TERM_WEIGHTS].measured_mib, 19500)
+        self.assertEqual(by_term[TERM_WEIGHTS].measured_mib, 10000)
         self.assertEqual(by_term[TERM_WEIGHTS].error_mib, 0)
+        self.assertNotEqual(by_term[TERM_WEIGHTS].measured_mib, 19500)
+        # Every episode is still named, so nothing is absorbed silently.
+        self.assertIn("9500", by_term[TERM_WEIGHTS].note)
 
     def test_capture_term_sums_both_runners(self):
         """Graph capture costs from both runners add."""
@@ -282,7 +311,13 @@ class TestReconcileCardPerRunner(unittest.TestCase):
         result = reconcile_card(ledger, marks, rank=0, rank_pids=[100])
         by_term = {c.term: c for c in result.comparisons}
         self.assertEqual(by_term[TERM_WEIGHTS].measured_mib, 10000)
-        self.assertIn(TERM_WEIGHTS, result.ambiguous_runner_terms)
+        # The weights term no longer needs runner tags at all: episodes are
+        # delimited by the marks' own ORDER, so a boot without tags is
+        # measured exactly, not ambiguously. The ambiguity flag survives for
+        # the terms that are still computed with a runner-partitioned delta
+        # (the state pool below), which is what it was built for.
+        self.assertNotIn(TERM_WEIGHTS, result.ambiguous_runner_terms)
+        self.assertIn(TERM_MAMBA_POOL, result.ambiguous_runner_terms)
         self.assertIn("AMBIGUOUS RUNNER", result.render())
 
 
@@ -305,8 +340,8 @@ class TestCanFailRevertProof(unittest.TestCase):
         last_kp = list(
             reversed([m for m in marks if m.get("phase") == "kv_pool_sized"])
         )[0]
-        old_global_raw = (
-            int(last_kp["reserved_bytes"]) - int(first_ww["reserved_bytes"])
+        old_global_raw = int(last_kp["reserved_bytes"]) - int(
+            first_ww["reserved_bytes"]
         )
         old_state_pool_mib = old_global_raw // MIB - 12000
 

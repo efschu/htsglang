@@ -1919,6 +1919,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                     )
 
+            # #605 NCCL boundary. Everything between this mark and
+            # nccl_init_end builds process groups, and communicator buffers
+            # are what that costs. The ledger has carried TERM_NCCL_BUFFERS
+            # since #595 with no boundary to measure it against, so the term
+            # read UNMEASURED on every boot ever recorded. No-op unless
+            # SGLANG_VRAM_FLIGHT_DIR is set.
+            from sglang.srt.mem_ledger import flight_recorder as _flight_recorder
+
+            _flight_recorder.mark(
+                "nccl_init_begin",
+                rank=self.tp_rank,
+                extra={"draft_worker": bool(self.is_draft_worker)},
+            )
+
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
@@ -1968,6 +1982,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         pp_size=1,
                         dcp_size=len(flip_vec),
                     )
+            # #605: placed AFTER the phase-flip secondary groups, not after
+            # initialize_model_parallel. Those groups are communicators too,
+            # and a boundary drawn before them would price a launch's NCCL
+            # buffers at the fraction the primary topology happens to build.
+            _flight_recorder.mark(
+                "nccl_init_end",
+                rank=self.tp_rank,
+                extra={"draft_worker": bool(self.is_draft_worker)},
+            )
+
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 

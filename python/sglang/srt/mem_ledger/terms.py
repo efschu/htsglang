@@ -300,6 +300,11 @@ class CardVramLedger:
     #: The label is a field rather than a constant because a ledger that
     #: printed "KV pool" for a number that also has to hold the weights would
     #: be lying in exactly the direction that OOMs a boot.
+    #: The card's NVML UUID. Carried into the dump so a reader can join marks
+    #: to cards EXACTLY. Without it the join falls back to recovering the rank
+    #: from the marks, which works but is inference; the uuid is identity.
+    #: Defaults to "" so every existing constructor is unchanged.
+    uuid: str = ""
     residual_label: str = "KV pool (residual)"
     residual_note: str = (
         "total - user reserve - demand; surplus flows here rather than sitting idle"
@@ -438,6 +443,7 @@ class CardVramLedger:
         return {
             "gpu_id": self.gpu_id,
             "card": self.card,
+            "uuid": self.uuid,
             "total_mib": self.total_mib,
             "user_reserve_mib": self.user_reserve_mib,
             "demand_mib": self.demand_mib,

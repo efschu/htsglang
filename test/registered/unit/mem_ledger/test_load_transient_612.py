@@ -166,11 +166,24 @@ class TestAMeasurementReplacesTheConstant(unittest.TestCase):
     def test_the_term_has_a_measured_counterpart_in_the_reconciliation(self):
         """The path off the inherited constant. Without an entry here the term
         would be reported UNMEASURED forever and the constant could never be
-        falsified by a boot."""
+        falsified by a boot.
+
+        FALSIFIED PREMISE, corrected here (#605 second reconcile run). The
+        mapping used to read the field at ONE phase -- the target runner's
+        ``weights_loaded`` -- which is the mark at which the allocator has by
+        definition just handed its peak back. On ship boot 1464299 it read 0
+        MiB on all three cards while the boot's real peaks were 13392 / 8058 /
+        9030 MiB, recorded three marks later on the second runner's
+        ``pre_weight_load``. A term the ledger charges for the WHOLE boot has
+        to be measured over the whole boot.
+        """
         self.assertIn(TERM_LOAD_TRANSIENT, TERM_TO_POST)
         key, basis = TERM_TO_POST[TERM_LOAD_TRANSIENT]
-        self.assertEqual(key, ("field", "allocator_transient_bytes", "weights_loaded"))
-        self.assertIn("LOWER BOUND", basis)
+        self.assertEqual(key, ("peak", "allocator_transient_bytes"))
+        self.assertNotEqual(
+            key, ("field", "allocator_transient_bytes", "weights_loaded")
+        )
+        self.assertIn("MAXIMUM over every mark", basis)
 
 
 class TestTheRecorderMeasuresWhatTheTermClaims(unittest.TestCase):
