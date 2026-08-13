@@ -2382,14 +2382,8 @@ class ModelRunnerKVCacheMixin:
             int(max(0.0, free_gb - headroom_gb) * (1 << 30))
             + pool.post_capture_backed_bytes
         )
-        # #656: THE FLIP SEAM IS A SIZING POST, and this is the only measuring
-        # point honest enough to charge it -- free VRAM here is the
-        # post-capture resting state, which is what the seam will actually
-        # find. Unchanged on every non-flip boot and on every flip rank whose
-        # existing headroom already covers the corridor law plus the seam.
-        budget_bytes = self._seam_adjusted_budget(
-            budget_bytes, int(headroom_gb * (1 << 30))
-        )
+        # #656: the flip seam is charged inside _config_from_budget, which
+        # every sizing path funnels through -- including this one.
         # Uneven-TP self-calibration: this post-capture budget is the
         # most accurate per-rank measurement (weights + graphs resident),
         # matching the restart the hint asks for.
@@ -5642,22 +5636,8 @@ class ModelRunnerKVCacheMixin:
         self._seam_reserve_cached = cached
         return cached
 
-    def _seam_cell_bytes(self: ModelRunner) -> int:
-        """Per-token KV bytes on this rank, or 0 if the configurator has no
-        single cell (hybrid SWA, MiniMax sparse). Abstaining is correct there:
-        the seam term is bounded by one layer's rows, and inventing a cell to
-        charge it against would be a worse number than not charging it."""
-        try:
-            from sglang.srt.model_executor.pool_configurator import (
-                create_memory_pool_configurator,
-            )
-
-            return int(getattr(create_memory_pool_configurator(self), "_cell_size", 0))
-        except Exception:
-            return 0
-
     def _seam_adjusted_budget(
-        self: ModelRunner, budget_bytes: int, headroom_bytes: int
+        self: ModelRunner, budget_bytes: int, configurator
     ) -> int:
         """Charge the flip seam against the KV budget. See
         managers/phase_flip_seam_reserve.py for the law and the solve."""
@@ -5665,29 +5645,30 @@ class ModelRunnerKVCacheMixin:
         if not reserve.active:
             return int(budget_bytes)
         from sglang.srt.managers import phase_flip_seam_reserve as seam
-        from sglang.srt.managers.vram_dial import corridor_law_floor_bytes
 
-        cell = self._seam_cell_bytes()
-        corridor = corridor_law_floor_bytes()
-        new_bytes, tokens = seam.seam_adjusted_budget_bytes(
-            budget_bytes, headroom_bytes, corridor, cell, reserve
+        # Per-RANK per-token bytes, which is what the record's slope means.
+        # A configurator with no single cell (hybrid SWA, MiniMax sparse)
+        # gets no invented one: abstaining is a smaller error than charging
+        # a slope against a cell that does not exist.
+        cell = int(getattr(configurator, "_cell_size", 0) or 0)
+        new_bytes, allowed = seam.seam_adjusted_budget_bytes(
+            budget_bytes, cell, reserve
         )
         logger.info(
-            "%s (rank %d): seam floor %d MiB + %.1f B/row against a %d MiB "
-            "budget with %d MiB headroom and a %d MiB corridor law -> %d MiB "
-            "(%d tokens), giving up %d MiB of KV so the flip can still be "
-            "paid for. Sizing without this is what produced a boot that held "
-            "the corridor and served nothing (#656 boot E).",
+            "%s (rank %d): seam floor %d MiB + %.1f B/token, measured with "
+            "%d MiB spendable at an id space of %d -> this rank can fund up "
+            "to %d tokens, so the %d MiB budget becomes %d MiB. Sizing "
+            "without this is what produced a boot that held the corridor and "
+            "served nothing (#656 boot E/G).",
             seam.LOG_PREFIX,
             self._seam_world_rank(),
             reserve.fixed_bytes >> 20,
             reserve.per_row_bytes,
+            reserve.have_bytes >> 20,
+            reserve.id_space,
+            allowed,
             int(budget_bytes) >> 20,
-            int(headroom_bytes) >> 20,
-            corridor >> 20,
             new_bytes >> 20,
-            tokens,
-            (int(budget_bytes) - new_bytes) >> 20,
         )
         return new_bytes
 
@@ -5703,6 +5684,10 @@ class ModelRunnerKVCacheMixin:
         )
 
         configurator = create_memory_pool_configurator(self)
+        # #656: charge the flip seam HERE, the one funnel every sizing path
+        # reaches. Keyed to the post-capture path instead, it never fired at
+        # all on the ship config, whose pool is decided pre-capture (boot H).
+        budget_bytes = self._seam_adjusted_budget(budget_bytes, configurator)
         config = configurator.calculate_pool_sizes(budget_bytes, self.page_size)
         max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
         if cap_tokens is not None:

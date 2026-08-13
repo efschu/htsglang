@@ -31,117 +31,77 @@ BOOT_E_STAGING = 464 * MIB
 
 
 # ---------------------------------------------------------------------------
-# The reservation is the binding term, and only the binding term.
+# The solve is anchored on a MEASUREMENT, not on a model of the sizer.
 # ---------------------------------------------------------------------------
 
+CELL = 32 * 1024  # per-RANK per-token KV bytes
+BOOT_G_HAVE = 8 * MIB  # rank1 measured 8 MiB spendable above the law
+BOOT_G_T = 683150
 
-def test_the_boot_e_shortfall_is_exactly_recovered():
-    need = sr.required_free_bytes(BOOT_E_HEADROOM, BOOT_E_CORRIDOR, BOOT_E_STAGING)
-    assert need == BOOT_E_CORRIDOR + BOOT_E_STAGING
-    assert (need - BOOT_E_HEADROOM) == 20 * MIB, (
-        "the fix must reserve the 20 MiB that were missing and not a byte "
-        "more -- over-reserving here is paid for in permanent pool"
+
+def _reserve(fixed, per_row=0.0, have=BOOT_G_HAVE, t=BOOT_G_T):
+    return sr.SeamReserve(
+        fixed_bytes=fixed,
+        per_row_bytes=per_row,
+        have_bytes=have,
+        id_space=t,
+        provenance=sr.PROVENANCE_STORED,
     )
 
 
-def test_the_corridor_is_not_reserved_twice():
-    """A headroom that already covers corridor+seam must not shrink the pool."""
-    roomy = 4096 * MIB
-    assert sr.required_free_bytes(roomy, BOOT_E_CORRIDOR, BOOT_E_STAGING) == roomy
+def test_the_boot_g_shortfall_becomes_a_pool_reduction():
+    """rank1 measured: needs 484 MiB, had 8 MiB spendable, at T=683150.
+
+    Every row given back returns one cell to the spendable pool, so the pool
+    must shrink by (484-8) MiB / cell tokens -- and no further.
+    """
+    need = 484 * MIB
+    allowed = sr.seam_allowed_tokens(CELL, _reserve(need))
+    assert allowed == BOOT_G_T + (BOOT_G_HAVE - need) // CELL
+    assert allowed < BOOT_G_T
+    # ... and at that id space the seam is exactly funded.
+    have_at = BOOT_G_HAVE + (BOOT_G_T - allowed) * CELL
+    assert have_at >= need
+    assert have_at - need < CELL, "and not a token more conservative"
 
 
-def test_no_seam_means_no_change():
-    assert sr.required_free_bytes(BOOT_E_HEADROOM, BOOT_E_CORRIDOR, 0) == BOOT_E_HEADROOM
+def test_a_rank_with_room_to_spare_is_not_cut():
+    """rank0 measured 2000 MiB spendable against a 455 MiB floor."""
+    allowed = sr.seam_allowed_tokens(CELL, _reserve(455 * MIB, have=2000 * MIB))
+    assert allowed > BOOT_G_T, "a funded rank must not lower the pool"
 
 
-# ---------------------------------------------------------------------------
-# The fixed point.
-# ---------------------------------------------------------------------------
-
-CELL = 32 * 1024  # 32 KiB per token per rank, the rig's measured cell
-PER_ROW = 512.0  # wave-boundary slack per pool row
-
-
-def test_the_floor_branch_is_exact():
-    """While a*T <= F the floor binds and the pool loses exactly F bytes."""
-    R = 20 * (1 << 30)
-    T = sr.solve_pool_tokens(R, CELL, fixed_bytes=8 * (1 << 30), per_row_bytes=1.0)
-    assert T == (R - 8 * (1 << 30)) // CELL
-    assert T * 1.0 <= 8 * (1 << 30)
+def test_the_budget_is_never_grown():
+    budget = 15 * (1 << 30)
+    new_bytes, allowed = sr.seam_adjusted_budget_bytes(
+        budget, CELL, _reserve(455 * MIB, have=2000 * MIB)
+    )
+    assert new_bytes == budget and allowed > BOOT_G_T
 
 
 def test_the_slack_branch_is_self_consistent():
-    """When the row term binds, T must satisfy the equation it came from."""
-    R = 20 * (1 << 30)
-    T = sr.solve_pool_tokens(R, CELL, fixed_bytes=0, per_row_bytes=PER_ROW)
-    assert T * CELL + T * PER_ROW <= R
-    assert (T + 1) * CELL + (T + 1) * PER_ROW > R
+    """When the row term binds, have(T) must still cover need(T) = a*T."""
+    a = 2360.4  # rank0's measured B/token
+    allowed = sr.seam_allowed_tokens(CELL, _reserve(0, per_row=a, have=2000 * MIB))
+    have_at = BOOT_G_HAVE * 0 + 2000 * MIB + (BOOT_G_T - allowed) * CELL
+    assert have_at >= a * allowed
+    assert have_at < a * (allowed + 1) + CELL
 
 
-def test_the_branch_that_binds_is_the_one_chosen():
-    """max(F, a*T), not F + a*T: reserving the sum costs pool for a peak that
-    does not occur (the runtime's own _staging_bytes takes the max)."""
-    R = 20 * (1 << 30)
-    F, a = 464 * MIB, 368.0
-    T = sr.solve_pool_tokens(R, CELL, F, a)
-    summed = int((R - F) / (CELL + a))
-    assert T > summed, "summing the two terms gives away pool the seam never uses"
-    assert T * CELL + max(F, T * a) <= R
-
-
-def test_one_iteration_lands_on_the_wrong_side():
-    """Why this is solved rather than iterated once.
-
-    A single iteration charges the per-row term at the NAIVE pool size -- a
-    pool that will not exist once the term is charged -- so it over-subtracts
-    and settles BELOW the fixed point. The direction is the safe one, which
-    is exactly why it would never be noticed: it silently gives away pool on
-    a ticket whose whole subject is pool that was silently given away.
-    """
-    R = 20 * (1 << 30)
-    naive = R // CELL
-    one_step = int((R - naive * PER_ROW) // CELL)
-    solved = sr.solve_pool_tokens(R, CELL, 0, PER_ROW)
-    assert one_step < solved < naive
-
-
-def test_the_boot_e_budget_gives_up_exactly_the_missing_bytes():
-    """End to end on boot E's rank1 numbers, with no row term.
-
-    budget + headroom - corridor - F is the KV that may remain, and that is
-    20 MiB less than the budget the boot actually took.
-    """
+def test_a_cold_or_incomplete_record_changes_nothing():
     budget = 15 * (1 << 30)
-    reserve = sr.SeamReserve(
-        fixed_bytes=BOOT_E_STAGING,
-        per_row_bytes=0.0,
-        provenance=sr.PROVENANCE_STORED,
-    )
-    new_bytes, tokens = sr.seam_adjusted_budget_bytes(
-        budget, BOOT_E_HEADROOM, BOOT_E_CORRIDOR, CELL, reserve
-    )
-    assert budget - new_bytes >= 20 * MIB
-    assert budget - new_bytes < 20 * MIB + CELL, "and not a page more"
-    assert tokens == new_bytes // CELL
+    for rv in (
+        sr.SeamReserve(provenance=sr.PROVENANCE_COLD),
+        # A record from before the measured position existed: no id space,
+        # so the slope has no anchor and the correction must abstain.
+        sr.SeamReserve(fixed_bytes=484 * MIB, provenance=sr.PROVENANCE_STORED),
+    ):
+        assert sr.seam_adjusted_budget_bytes(budget, CELL, rv) == (budget, 0)
 
 
-def test_a_roomy_headroom_leaves_the_budget_untouched():
-    """The seam must never GROW a budget, whatever the headroom is."""
+def test_no_cell_means_abstain():
     budget = 15 * (1 << 30)
-    reserve = sr.SeamReserve(fixed_bytes=64 * MIB, provenance=sr.PROVENANCE_STORED)
-    new_bytes, _ = sr.seam_adjusted_budget_bytes(
-        budget, 8 * (1 << 30), BOOT_E_CORRIDOR, CELL, reserve
-    )
-    assert new_bytes == budget
-
-
-def test_no_cell_means_abstain(tmp_path):
-    """A configurator with no single per-token cell gets no invented one."""
-    budget = 15 * (1 << 30)
-    reserve = sr.SeamReserve(fixed_bytes=BOOT_E_STAGING, provenance=sr.PROVENANCE_STORED)
-    assert sr.seam_adjusted_budget_bytes(
-        budget, BOOT_E_HEADROOM, BOOT_E_CORRIDOR, 0, reserve
-    ) == (budget, 0)
+    assert sr.seam_adjusted_budget_bytes(budget, 0, _reserve(484 * MIB)) == (budget, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -171,20 +131,26 @@ def test_a_cold_record_corrects_nothing(tmp_path):
     assert rv.provenance == sr.PROVENANCE_COLD
     assert rv.fixed_bytes == 0 and rv.per_row_bytes == 0.0 and not rv.active
     budget = 15 * (1 << 30)
-    assert sr.seam_adjusted_budget_bytes(
-        budget, BOOT_E_HEADROOM, BOOT_E_CORRIDOR, CELL, rv
-    ) == (budget, 0), "a first boot must size exactly as it does today"
+    assert sr.seam_adjusted_budget_bytes(budget, CELL, rv) == (
+        budget,
+        0,
+    ), "a first boot must size exactly as it does today"
     assert "COLD" in sr.describe(rv, "p") and "boot E" in sr.describe(rv, "p")
 
 
 def test_the_record_round_trips_and_is_per_rank(tmp_path):
     args = _Args(str(tmp_path / "kv_budget-abc.json"))
-    sr.write_seam_reserve(args, 1, BOOT_E_STAGING, 512.0, "arena tail 466 MiB")
-    sr.write_seam_reserve(args, 2, 1436 * MIB, 512.0, "arena tail 1436 MiB")
+    sr.write_seam_reserve(
+        args, 1, BOOT_E_STAGING, 512.0, "arena tail 466 MiB", 8 * MIB, BOOT_G_T
+    )
+    sr.write_seam_reserve(
+        args, 2, 1436 * MIB, 512.0, "arena tail 1436 MiB", 524 * MIB, BOOT_G_T
+    )
 
     r1, r2 = sr.read_seam_reserve(args, 1), sr.read_seam_reserve(args, 2)
     assert r1.provenance == sr.PROVENANCE_STORED
     assert r1.fixed_bytes == BOOT_E_STAGING and r1.per_row_bytes == 512.0
+    assert r1.have_bytes == 8 * MIB and r1.id_space == BOOT_G_T
     assert r2.fixed_bytes == 1436 * MIB, (
         "the arena tail differs per rank by ~1 GiB on this rig; one shared "
         "record would size every rank from one rank's seam"
@@ -205,7 +171,7 @@ def test_a_malformed_record_sizes_cold_rather_than_raising(tmp_path):
 def test_a_partial_write_cannot_be_read(tmp_path):
     """The write is atomic, so a boot that dies mid-write leaves the old record."""
     args = _Args(str(tmp_path / "kv_budget-abc.json"))
-    sr.write_seam_reserve(args, 1, BOOT_E_STAGING, 512.0, "first")
+    sr.write_seam_reserve(args, 1, BOOT_E_STAGING, 512.0, "first", 8 * MIB, BOOT_G_T)
     path = sr.record_path(args, 1)
     with open(path) as fh:
         assert json.load(fh)["fixed_bytes"] == BOOT_E_STAGING
@@ -215,7 +181,7 @@ def test_a_partial_write_cannot_be_read(tmp_path):
 
 def test_the_term_can_be_switched_off_as_a_value(tmp_path):
     args = _Args(str(tmp_path / "kv_budget-abc.json"))
-    sr.write_seam_reserve(args, 1, BOOT_E_STAGING, 512.0, "measured")
+    sr.write_seam_reserve(args, 1, BOOT_E_STAGING, 512.0, "measured", 8 * MIB, BOOT_G_T)
     os.environ[sr.ENV_ENABLE] = "0"
     rv = sr.read_seam_reserve(args, 1)
     assert rv.provenance == sr.PROVENANCE_DISABLED and rv.fixed_bytes == 0
@@ -223,7 +189,7 @@ def test_the_term_can_be_switched_off_as_a_value(tmp_path):
 
 def test_an_operator_override_wins_over_the_record(tmp_path):
     args = _Args(str(tmp_path / "kv_budget-abc.json"))
-    sr.write_seam_reserve(args, 1, BOOT_E_STAGING, 512.0, "measured")
+    sr.write_seam_reserve(args, 1, BOOT_E_STAGING, 512.0, "measured", 8 * MIB, BOOT_G_T)
     os.environ[sr.ENV_FIXED_MIB] = "900"
     rv = sr.read_seam_reserve(args, 1)
     assert rv.provenance == sr.PROVENANCE_OVERRIDE and rv.fixed_bytes == 900 * MIB
