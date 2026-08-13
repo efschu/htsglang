@@ -774,3 +774,43 @@ that on this rig the term would cancel the entire saving (section 26), so the
 first question for the next shift is whether the feature is worth having HERE
 at all -- as opposed to on a rig where the allocator is not already sitting on
 the bytes.
+
+## 28. T2 CLOSED and T3 CLOSED
+
+**T2, the control R4 left open: R4's differing pair is NOT reproducible.** At
+393216, on the ship, a matched 2x2 (short prompt below the ~109-token GDN
+threshold, long prompt above it) x 5 repeats returned **10/10 byte-identical**
+replies, every one of them served across a phase flip (two cutover lines per
+rank inside each request's own log span). At 1048576, two valid observations
+were byte-identical as well; the third died with the instance. So "YaRN 4.0
+broke determinism" is refuted for this shape rather than merely unsupported --
+and register 72's pair, which crossed a phase boundary AND a 7-second latency
+gap, stays unexplained but unreproduced.
+
+**T3: no shortfall, so the margin term is untouched.** 16 minutes, 20 cycles
+of bs=4 concurrent decode + 64001-token prefill + 32k prefill + bs=4 on 4k +
+a short pair, on the restored ship: 240 completions, 0 errors, 0 tracebacks,
+168 completed cutovers, health 200 throughout, corridor continuous minimum
+**1516 / 2701 / 1820 MiB and 0 breaches**. The qualification that matters: this
+is the SHIP configuration (32,16,16 at 393216, pool pinned 620000), not L3's
+(30,16,18, derived 648388) whose 1128 MiB minimum raised the question. The
+production instance holds 492 MiB above the law under sustained load; L3's
+tighter figure would need an L3 boot to re-measure, and that boot is the one
+piece of T3 this shift did not buy.
+
+## 29. WHAT THE NEXT SHIFT SHOULD DO FIRST
+
+1. **Do not turn on `SGLANG_ROPE_LAZY_CACHE`.** It is wrong at depth (register
+   77) and its guard cannot see the failure. The reproducer is bounded and
+   cheap: 1M ceiling, planted-answer probe at 250026 (passes) and 390026
+   (fails, one empty token).
+2. **Write the guard that WOULD have caught it**: read a filled row back off
+   the device and compare it against `_build_cos_sin_rows` for the same index.
+   Content, not indices. Run it at 390k, not at 4k.
+3. **Then decide whether the feature is worth having on THIS rig at all**
+   (section 26): the eager cache costs the sizer nothing here, so laziness has
+   nothing to win back, and it has a corridor breach to lose.
+4. **The open question the ceiling actually poses** is unanswered: 648388 at
+   393216 against 593264 at 1048576, and it is NOT the cos/sin cache. Change
+   one variable at a time -- the budget vector differs between those two boots
+   as well.
