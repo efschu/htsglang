@@ -2169,7 +2169,11 @@ class ModelRunnerKVCacheMixin:
                     "GDN resident-slot cap: state slots %d -> %d "
                     "(--gdn-resident-state-slots %d); %.2f GB stays out of "
                     "the state pool and is spent on KV instead. Sessions "
-                    "beyond the cap run with a vacated (host-blob) state.",
+                    "beyond the cap run with a vacated (host-blob) state "
+                    "where an idle slot holder can exist -- under pp_size>1 "
+                    "the vacate's population (kv-session-offload) is refused, "
+                    "so there they WAIT for a slot instead (throughput cost, "
+                    "not an OOM).",
                     _profiled,
                     _capped,
                     int(_resident_cap),

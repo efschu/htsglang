@@ -2144,3 +2144,85 @@ wedge. Meanwhile changing the budget vector DOES orphan the record and costs a
 cold boot. So the fingerprint is simultaneously too coarse for the flags that
 matter to the seam and fine enough to be expensive for the one that does not.
 Any layout experiment must pin or invalidate the record deliberately.
+
+## 63. The phase-flip seam floor is a WEIGHTS term, not a KV term, and the
+cheap knob is the TP vector.
+
+Two shifts described rank2's 1455 MiB floor as "the arena tail" without
+naming what fills it, and the natural reading -- a KV arena, so reshape the
+KV budget -- is wrong. It is `max(0, PP_weights - TP_weights)` on that rank's
+two layouts. The runtime prints it (boot L3): `rung 3 released 924.0 MiB of
+weights-arena tail to the driver (TP layout needs 8188.4 of 9115.0 MiB)`, and
+it reproduces register 46's measured PP/TP weight vectors
+(13482.18/8144.00/9114.95 against 13692.29/7659.52/7659.52) to the MiB on all
+three ranks.
+
+The consequence is a lever nobody had used: **`--phase-flip-tp-vector` moves
+the floor for free, `--pp-stage-ratio` does not.** Raising the binding rank's
+TP share shrinks the subtraction without touching `have`, because `have` is
+measured at rest in the PP phase, where rung 3 has already released the TP
+arena. Moving PP layers instead charges the receiving rank ~1304.9 MiB of
+`have` per stage unit -- its PP weights and its KV both grow -- which is why
+every layer-shifting candidate modelled WORSE than the status quo while the
+TP-vector change modelled better and then measured better:
+`32,16,16 -> 30,16,18` dropped rank2's floor 1455 -> 927 MiB.
+
+## 64. The quarantine constant is deleted, and the thing that replaced it is
+a mechanism, not a bigger number.
+
+`PHASE_FLIP_SERVING_PROVEN_TOKENS = 620000` carried its own deletion
+instruction ("deleted, not raised, when the livelock is fixed"). Boot L3, with
+the seam reserve, the margin term and the fixed policy loop, derived **648388
+tokens** -- +28388 above the constant -- and served it: 24 completed cutovers
+in both directions, 0 abandons, 0 refusals, 0 tracebacks, 64001-token prefill,
+real generations, corridor 1128/2567/1664 MiB with 0 breaches over 5991
+samples. The net that stays is `seam_reserve_enabled()` defaulting True, so a
+pool sized as "VRAM minus corridor" with nothing left to stage the seam cannot
+be built by accident; the gate test asserts THAT instead of a token count.
+
+The trap to avoid on the way: **boot L2 derived a seam ceiling of 651498 and
+still ran at 620000**, because the constant was still clamping it. A seam
+"allowed" number in a log is not the pool. Check for the capping warning, or
+read the id space the seam re-measure reports, before believing a capacity.
+
+## 65. A solver that targets equality needs a margin, and the margin belongs
+on the measured position, not on the floor.
+
+Adding it to `F` looks equivalent and is not: in the slack-bound regime `F`
+appears ONLY in the regime test, so a floor-side margin leaves that whole
+branch unmargined. Subtracting from `have_m` is identical in the floor-bound
+regime and correct in both. Default 192 MiB, and deliberately NOT the flip
+gate's 512 MiB C20 entry margin -- the gate satisfies that at flip time from
+transient reclaim (`CORRIDOR-GUARD cleared ... reclaimed 136 MiB from
+[allocator-cache]`), so reserving it in the sizer would charge one requirement
+twice, about 65k tokens on the binding rank. Result: every rank re-measured
+ABOVE its floor at the derived pool (+2873/+224/+173 MiB) against boot K3's
+-25 MiB and its `CANNOT FUND ITS OWN FLIP`.
+
+## 66. #364's admission optimism is real but BENIGN: the scheduler's own slot
+check gates admission before the allocator is asked.
+
+`session_admission_slots(..., vacate_available=_resident_cap is not None)`
+keys "the overflow has a backer" on the FLAG, and on a PP flip boot the
+backer cannot exist (entry 58). Falsified directly: four concurrent sessions
+against a 4-slot pool (two requests' worth) **all completed correctly**, 200
+tokens each, accept 2.857-3.571. The pressure surfaced as max `#running-req`
+3 against 4 requested, max `#queue-req` 1, mamba usage 1.00, and 6x `mamba
+slot pool exhausted and nothing evictable ... skipping this cache insert` --
+with **0 OOM, 0 crashes, 0 wrong answers**. So the hazard is throughput and
+lost state caching, not the admit-into-OOM the code guards against, and the
+correction is documentation: the flag's help text claims sessions beyond the
+cap "run with a vacated (host-blob) state", which on this path is false --
+they run by WAITING for a slot.
+
+## 67. "kvso is refused under PP" does NOT mean the bs1 spill requirement is
+unmet, and the two must not be conflated.
+
+The spec's "bs2-4 reserves incl. unused Mamba states spilled in bs1 time" is
+carried on flip boots by the PHASE-FLIP SPILL LADDER, which fires 18 times per
+direction on boot L3: `rung 1 (cache) at pp_to_tp / tp_to_pp`, `rung 2
+SPILLED / RESTORED the draft weights`, `rung 3 released ... weights-arena
+tail`. Those rungs are what make the seam affordable at all. What is refused
+under `pp_size>1` is only kvso's SESSION KV tail on the host, and with it
+#549's GDN-vacate-x-kvso fixes. Reading the parse-time refusal as "spilling
+does not happen here" would retire a mechanism that is live and load-bearing.

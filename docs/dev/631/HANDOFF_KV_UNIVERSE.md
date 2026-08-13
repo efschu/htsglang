@@ -486,3 +486,75 @@ flip path and are exercised only under pure TP/DCP.
 * The seam record fingerprint omits `gdn_resident_state_slots`,
   `enable_kv_session_offload`, `pp_stage_ratio`, `phase_flip_tp_vector` and
   `max_total_tokens`. Any layout experiment MUST account for that.
+
+# R4 continuation: the quarantine is deleted, and the tail was a weights term
+
+## 16. THE ARENA TAIL IS `PP_weights - TP_weights`, confirmed three ways
+
+R4's first half named rank2's 1455 MiB seam floor as "the layout" without
+saying which knob. It is this, and the runtime says so itself on boot L3:
+
+    rung 3 released 924.0 MiB of weights-arena tail (TP layout needs 8188.4 of 9115.0 MiB)  <- rank2
+    rung 3 released 466.0 MiB (TP needs 7659.5 of 8144.0)                                   <- rank1
+    rung 3 released 300.0 MiB (TP needs 13163.5 of 13482.2)                                 <- rank0
+
+which reproduces register 46's measured PP/TP weight vectors exactly, and
+reproduces the measured floors 0/484/1455 under the old vector.
+
+**The cheap knob is `--phase-flip-tp-vector`, not `--pp-stage-ratio`.** Raising
+the binding rank's TP share shrinks `max(0, PP - TP)` without moving `have`,
+because `have` is measured at rest in the PP phase, where rung 3 has already
+released the TP arena. Moving PP layers instead costs the receiving rank
+~1304.9 MiB of `have` per stage unit (its PP weights AND its KV both grow),
+and modelling that is what made the (16,10,6) and (14,9,7) candidates come
+out WORSE than the status quo.
+
+## 17. T2 CLOSED -- quarantine deleted, 648388 derived and served
+
+`--phase-flip-tp-vector 30,16,18` drops rank2's tail 1455 -> 927 MiB.
+Boot L3 (commit `9fc98e8649`, constant removed): derived pool **648388**,
+**+28388 above the 620000 it replaced**, no capping warning, **24 completed
+cutovers (12/12), 0 abandons, 0 refusals, 0 tracebacks, 0 CANNOT FUND**,
+64001-token prefill, accept 2.46-2.67, corridor **1128/2567/1664, 0 breaches**
+over 5991 samples.
+
+Every rank re-measured ABOVE its floor at the derived pool -- +2873 / +224 /
++173 MiB -- against boot K3's -25 MiB. That is the margin term working.
+
+**The arithmetic now predicts the sizer**: L2 predicted 651398 vs derived
+651498, L3 predicted 648288 vs derived **648388**. 100 tokens both times.
+Future layout work should predict first and spend the boot on confirmation.
+
+**What replaced the constant** is the mechanism, not another number:
+seam_reserve_enabled() defaults True, so a pool sized as "VRAM minus corridor"
+with nothing left for the seam cannot be built by accident; the solver holds
+a margin; the policy counts refusals. The gate test asserts those, not 620000.
+
+**Careful with boot L2**: it ran CLAMPED at 620000 (pre-removal commit), so
+its numbers prove the LAYOUT, not the removal. L3 proves the removal.
+
+## 18. Open, and honest
+
+* **The bs=4 falsifier came back BENIGN.** Four concurrent sessions on a
+  4-slot pool all completed correctly; concurrency degraded to 3 with 1
+  queued, mamba usage 1.00, 6x "mamba slot pool exhausted ... skipping this
+  cache insert", 0 OOM. `vacate_available` is optimistic but the scheduler's
+  own slot check gates admission first, so the cost is throughput and state
+  caching, not correctness. Fix is documentation: "sessions beyond the cap run
+  with a vacated (host-blob) state" is FALSE on a PP flip boot -- they WAIT.
+* **T4's refusal must not be read as the spill requirement being unmet.** The
+  phase-flip spill ladder fires 18x per direction on flip boots (rung 1 cache,
+  rung 2 draft weights, rung 3 arena tail) and is what makes the seam
+  affordable. Only the kvso SESSION KV tail on the host is unavailable under
+  PP, and with it #549's fixes.
+* **Corridor is now genuinely tight**: 1128 MiB minimum on GPU0, 104 above the
+  law, 0 breaches. That is the user law's "frei nahe 1024" rather than slack
+  to spend. A further pool raise needs freed bytes, not a bigger number.
+* **The ship env sets `SGLANG_CORRIDOR_FLOOR_MIB=1536`**, so the flip GATE
+  arms against 1536 while the corridor VERDICT is read against 1024. Both
+  statements are true at once and the runtime logs the distinction; do not
+  "fix" one into the other.
+* **T3 (YaRN 1M) still carries no metal.** Note it now costs a cold seam
+  record: `context_length` is in the fingerprint, so a 1048576 boot orphans
+  the 393216 record and its first boot sizes uncorrected. Pin
+  `--max-total-tokens` on that first boot exactly as L1 did.
