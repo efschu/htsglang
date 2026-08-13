@@ -343,3 +343,35 @@ of an unfundable configuration), and only a cutover retires the attempt.
   RoPE cache-growth fix is still on the branch, can-fail proven, unbooted.
 * T5 is closed: the additive weight-arena model was never implemented in code
   or tests -- prose only, corrected in place in HANDOFF_662.md.
+
+## 10. #364 idle-vacate: BUILT, NOT ENGAGED (found 2026-08-13, not fixed)
+
+Ordered mid-shift: verify that idle GDN/Mamba state (~147 MiB per slot,
+~440 MiB for three idle slots) vacates into the KV pool, and that the sizer
+counts it as reclaimable mass.
+
+**(a) It does not fire.** Zero occurrences of `vacat` and zero of
+`resident state slots` across boot_f, boot_g and boot_j. The gate is
+`if self.server_args.gdn_resident_state_slots is not None:` in the
+scheduler's between-tick block, and `--gdn-resident-state-slots` is in
+NEITHER the ship argv capture nor the uncapped flip argv. Unset flag ->
+`gdn_slot_executor` stays None -> the ladder never runs. The machinery is
+built and correct-looking; it is simply not switched on for this path.
+
+**(b) The sizer does not count it, and currently must not.** The mamba
+reservation is its own budget post (`MAMBA_BUDGET_POST`) subtracted before
+KV, and the seam reserve's measured anchor (`have_bytes`) is read with every
+slot reserved. So vacatable bytes are subtracted as a fixed post AND absent
+from the spendable measurement -- counted as unavailable twice, reclaimable
+never. Making the sizer bank them while the vacate is off would size a pool
+against memory nothing releases.
+
+**(c) The bs1 leg is NOT proven.** No boot with the flag, no vacated-byte
+count, no wake-on-slot-2 determined-answer probe. Nothing is claimed.
+
+**The order of work is (a) then (b), and it is not optional.** ~440 MiB is
+the same order as the seam shortfalls that bind this rig (rank1 short 476
+MiB, rank2 short 931 MiB at boot G), so this is a live candidate for the
+budget re-solve in section 7 -- but only once the vacate is engaged and its
+freed bytes are COUNTED in a log. Until then the seam floors 455/484/1455
+MiB stand as measured, against slots that stay reserved.

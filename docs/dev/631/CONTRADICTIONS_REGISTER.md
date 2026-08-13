@@ -2023,3 +2023,36 @@ being paid for with a wedge. When a physics-derived pool comes out smaller
 than an operator number, the budget vector is what to re-solve -- it was
 solved against the corridor law alone and must be solved against
 `corridor + seam floor` (measured per rank: 455 / 484 / 1455 MiB).
+
+## 57. #364 idle-vacate is BUILT AND NOT ENGAGED on the phase-flip path.
+
+Checked 2026-08-13 against three flip boots of this shift (boot_f, boot_g,
+boot_j in /spinning/evidence-631/kvuniverse-r2): **zero occurrences of
+"vacat" and zero of "resident state slots" in any of them.** The machinery
+is real -- `managers/gdn_slot_runtime.py`, `mem_cache/gdn_slot_ladder.py`,
+`gdn_slot_executor.py` -- and the scheduler calls it at the between-tick
+boundary, but behind
+
+    if self.server_args.gdn_resident_state_slots is not None:
+
+and `--gdn-resident-state-slots` appears in NEITHER the ship argv capture
+(`/spinning/evidence-631/s485/ship_argv.txt`) nor the uncapped flip argv.
+Flag unset -> `gdn_slot_executor` stays None -> the ladder never runs. So
+every claim of the form "unused Mamba states are spilled during bs1 time"
+is, on this configuration, unbacked: the states sit as dead reservation.
+
+WHY IT MATTERS TO THE SIZER, with numbers of the same order as the defect it
+would relieve: idle GDN state is ~147 MiB per request slot (48 GDN layers,
+fp32 SSM), so with bs1 running and slots 2-4 idle that is ~440 MiB parked --
+against a seam that starved 20 MiB short on rank1 and 931 MiB short on rank2
+(boot G). The mamba reservation is charged to the KV budget as its own post
+(`MAMBA_BUDGET_POST`, model_runner_kv_cache_mixin) BEFORE KV is sized, and
+the seam reserve's measured anchor is taken with every slot reserved -- so
+vacatable bytes are counted as unavailable twice over and as reclaimable
+never.
+
+The rule this establishes: **a reservation that a built mechanism can
+release is not a fixed post, but only if the mechanism is switched on.**
+Neither the sizer nor the flip spec may assume the vacate; the flag has to
+be in the boot argv and the vacate has to be COUNTED in the log before any
+byte of it is spent in an arithmetic.
