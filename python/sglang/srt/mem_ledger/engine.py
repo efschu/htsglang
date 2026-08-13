@@ -1528,6 +1528,7 @@ def build_card_ledgers(
             CardVramLedger(
                 gpu_id=card.gpu_id,
                 card=card.describe(),
+                uuid=card.uuid,
                 total_mib=card.total_mib,
                 user_reserve_mib=int(user_reserve_mib.get(card.gpu_id, 0)),
                 terms=tuple(terms),

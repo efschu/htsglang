@@ -190,3 +190,88 @@ PYTHONPATH=/spinning/wt-ledger-605/python CUDA_VISIBLE_DEVICES=99 \
 
 Artifacts in `/spinning/evidence-631/ledger-r1/`:
 `rerun_reconcile.py`, `reconcile_second_run.txt`, `boot_history_bands.txt`.
+
+---
+
+## 7. Follow-up: four defects found by running against LIVE acceptance boots
+
+A delegate ran `reconcile` against the merged tree (without this branch) on
+five live acceptance boots in `/spinning/evidence-631/acceptance-656/flight/`
+and exposed four defects. All four are fixed here and verified against boot
+`1917721-1786622304`. **Two of them my branch already covered; two it did
+not, and one of those was the worst of the set.**
+
+### 7a. The tool had not reconciled anything for an entire release
+
+`attribute_flight.py reconcile` printed **"The ledger names no card whose rank
+left marks"** and exited 1. Two shifts read that as a fact about the boot. It
+was a fact about the caller: `read_marks` was correctly changed to PID keying
+(the ship config runs `--tp-size 1 --pp-size 3`, so all three processes file
+under TP rank 0), and `_reconcile()` was never updated — it handed the pid
+dict straight into `marks_by_rank.get(int(rank))`. Pids `1918126..8` cannot
+equal ranks `0..2`, so every card matched nothing and the skip fired for all
+of them.
+
+The skip itself was the accomplice, and it was a PINNED contract
+(`test_a_rank_that_left_no_marks_is_skipped_not_invented`). A silent skip is
+indistinguishable from a total mismatch. It now **refuses and names the
+unmatched ranks**.
+
+The join is by card uuid where available (`CardVramLedger.to_json` now emits
+it), else the caller's own key when already rank-keyed, else the **maximum
+rank the process's marks carry** — the process-level phases all report 0
+because they are written before the runner knows its pipeline rank, so only
+the runner-tagged marks know it. Verified on two boots: pids 1918126/7/8 give
+0/1/2, as do 1464746/7/8. Every route is cross-checked against the card's
+`total_mib`.
+
+### 7b. Measured demand went negative on live boots
+
+Exactly as §1c predicted, and now with live numbers: subtracting the
+**modelled** pool gave **−2023 MiB** on the 5090 and **−180 MiB** on a 3080.
+My branch already subtracted the measured pool, but it **fell back to the
+modelled budget** when the arena census was absent — which is the same defect
+wearing a condition. The fallback is removed: absent an arena census the
+demand **refuses loudly** and prints why.
+
+The obvious second source was rejected by measurement: the target runner's
+`weights_loaded -> kv_pool_sized` growth contains the KV pool **and** the
+mamba/GDN state pool (7720 vs 6916 MiB on boot 1464299), so it over-subtracts
+by exactly the term the ledger books separately.
+
+### 7c. Field-style terms always read the target runner
+
+My `peak` fix covered the load transient but **not** the other field terms.
+`_field_bytes` took the first matching mark, i.e. always the target runner. On
+live boot 1917721 the hardware residual reads **886 MiB on the target and 896
+on the draft** — under-read on every card of every speculative boot. A field
+term is a LEVEL, so it is now the **maximum across runner partitions**;
+summing would be wrong, and process-level phases appear once and are
+unchanged. The falsifier (target 0 / draft nonzero) is pinned.
+
+### 7d. `not_applicable` is not `UNMEASURED`
+
+`NCCL communicator buffers = 0` carries `not_applicable: true` because barlink
+carries the collectives and no PyNccl communicator is built. Reporting that as
+UNMEASURED invites a successor to hunt for the boundary, find the one this
+branch just added, measure 0, and conclude the recorder is broken. It renders
+`N/A -- not applicable to this launch (barlink ...)` and is excluded from the
+UNMEASURED summary line.
+
+### 7e. Live-boot acceptance
+
+`attribute_flight.py reconcile /spinning/evidence-631/acceptance-656/flight`
+now completes on all three cards. Full output:
+`/spinning/evidence-631/ledger-r1/reconcile_live_boot_1917721.txt`.
+
+| card | demand before | demand after | residual before | residual after | NCCL before | NCCL after |
+|---|---:|---:|---:|---:|---|---|
+| 5090 | **−2023** | **5740** | 886 (target) | **896** (draft) | UNMEASURED | **N/A (barlink)** |
+| 3080-5c64 | 158 | **4075** | 480 | **496** | UNMEASURED | **N/A (barlink)** |
+| 3080-62db | **−180** | **3919** | 480 | **496** | UNMEASURED | **N/A (barlink)** |
+
+Weights measure 13674 / 8325 / 9293 MiB (largest episode) and the load
+transient 13392 / 8058 / 9030 MiB, matching boot 1464299 — as they should,
+since these boots are the same configuration.
+
+Register: `C605-13` … `C605-17`.

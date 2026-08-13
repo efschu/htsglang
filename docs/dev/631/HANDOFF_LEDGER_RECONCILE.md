@@ -141,6 +141,32 @@ MiB without a boot.
    pieces that need a boot to produce data; neither changes behaviour when
    unarmed.
 
+## 5a. FOLLOW-UP: four more defects, found by running against LIVE boots
+
+A delegate ran reconcile on five live acceptance boots against the MERGED tree
+and exposed four defects. Two this branch already covered; two it did not, and
+one of those means **the tool had reconciled nothing at all for an entire
+release**: `attribute_flight.py` passed `read_marks`'s PID-keyed dict into a
+rank-keyed lookup, every card matched nothing, and the resulting empty list
+printed as "The ledger names no card whose rank left marks" -- read by two
+shifts as a fact about the boot.
+
+The general lesson compounds §1: **the silent skip was a PINNED CONTRACT.** A
+test asserted that an unmatched rank is skipped rather than invented, which
+sounds like conservatism and is actually the thing that made a total keying
+mismatch look like a quiet edge case. An instrument's "nothing to report"
+path deserves the same suspicion as its numbers.
+
+Also fixed: my own measured-demand fix still fell back to the modelled budget
+when the arena census was absent -- the same defect wearing a condition, now a
+loud refusal; `_field_bytes` still read the target runner on every non-peak
+field term (886 vs the draft's 896 MiB on live boots); and `not_applicable`
+NCCL zeros rendered as UNMEASURED. Full detail and the before/after table are
+in `RECONCILE_SECOND_RUN.md` §7. Register `C605-13`..`C605-17`.
+
+The ledger dump now carries the card `uuid` so future joins are identity
+rather than inference.
+
 ## 6. corridor_trace has a caller (R2 open item 1 closed)
 
 `Scheduler._corridor_trace_tick()`, called beside `_census_tick()`. Arms once,
@@ -163,8 +189,12 @@ pytest test/registered/unit/mem_ledger/ --color=no -q`
 | point | passed | failed |
 |---|---:|---:|
 | base `cd71ec34ce` (detached worktree) | 379 | 1 |
-| this branch | 424 | 1 |
+| this branch | 437 | 1 |
 
-Same single inherited failure at both points (§5.2). 45 new tests, every one
-of them red before its change. `black` 26.1.0 clean on all touched files;
+Same single inherited failure at both points (§5.2). 58 new tests, every one
+of them red before its change. With `test/registered/unit/turnkey/` included:
+553 passed, 1 failed. `managers` + `observability` were run on both the branch
+and a detached base worktree and produced BYTE-IDENTICAL failure sets (8
+inherited failures each), so the scheduler and model_runner call sites
+introduce no regression. `black` 26.1.0 clean on all touched files;
 `ruff` 0 on every touched file, identical to base.
