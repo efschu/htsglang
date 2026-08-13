@@ -77,6 +77,17 @@ FAMILY=(
     test/registered/scheduler/test_flip_frame_agreement_656.py
     test/registered/unit/managers/test_corridor_threshold_pair_656.py
     test/registered/unit/managers/test_seam_margin_selfcal_656.py
+    # SIXTH: the R2 shift, added with the list extended in the same commit.
+    # The first is C22's actual root cause -- the shrink was collective and
+    # the recovery was not, so the rank nearest the corridor law came back
+    # from a phase with 40404 fewer rows than its peers and framed a
+    # different payload. The second closes the wedge that discovery exposed:
+    # a controller that cannot flip must degrade to a working static phase,
+    # never to 503. The third stops the one path that deliberately enters at
+    # the law from entering a trough this rank has already measured.
+    test/registered/unit/managers/test_kv_backing_cap_agreement_656.py
+    test/registered/unit/managers/test_purity_stand_down_656.py
+    test/registered/unit/managers/test_seam_yield_draw_656.py
     # Third under-collection, caught 2026-08-10: six tests were added to
     # this file and the family total did not move, because the list is
     # explicit and nobody extended it. The file guards spec item 8's flag

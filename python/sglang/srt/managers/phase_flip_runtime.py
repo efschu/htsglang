@@ -2160,6 +2160,10 @@ class PhaseFlipRuntime:
         #: frame divergence is a broken replication premise, not a capacity
         #: verdict, and the two want opposite responses from an operator.
         self.frame_aborts = 0
+        #: Rounds in which the KV cap agreement had to move THIS rank. Counted
+        #: apart from the aborts: a levelling is the fix working, an abort is
+        #: the ballot catching what the levelling could not reach.
+        self.corridor_cap_levelled = 0
         #: Flips abandoned by the corridor gate (#656 item 15a) because no
         #: provider could fund the staging without breaking the floor.
         #: Distinct from staging_aborts: that one says "there is not enough
@@ -2194,6 +2198,10 @@ class PhaseFlipRuntime:
         #: quietly widen the margin.
         self.seam_margin_delays = 0
         self.seam_margin_yields = 0
+        #: Yields WITHHELD because this rank's measured draw predicted a
+        #: sub-law trough. Counted apart from the yields it replaces: one is
+        #: the gate giving up its margin, the other is the gate refusing to.
+        self.seam_yields_withheld = 0
         #: #656: seam entries whose own arithmetic, priced on the MEASURED
         #: in-cutover draw rather than on the staging reservation, predicted a
         #: trough below the corridor law. A counter and not only a log line
@@ -4204,6 +4212,7 @@ class PhaseFlipRuntime:
         if not hasattr(self, "seam_margin_delays"):
             self.seam_margin_delays = 0
             self.seam_margin_yields = 0
+            self.seam_yields_withheld = 0
         if not hasattr(self, "seam_draw_predicted_breaches"):
             self.seam_draw_predicted_breaches = 0
         if not hasattr(self, "_seam_draw_max"):
@@ -4296,6 +4305,16 @@ class PhaseFlipRuntime:
                 LOG_PREFIX,
                 e,
             )
+        # #656 C22 NOTE: the KV cap AGREEMENT rides the very same reduction as
+        # the shrink above (its payload is 8 fields, not 4). ``recover`` on the
+        # tp->pp leg is bounded by each rank's own distance from the corridor
+        # law, so the rank nearest the law comes back from a phase with fewer
+        # rows than its peers, its live-slot enumeration differs by exactly
+        # that many, and the frame ballot below refuses every subsequent flip
+        # -- measured as a 40404-row divergence on rank 1 that wedged decode's
+        # leg. Closing it HERE, before ``_frame_digest`` runs in this same
+        # round, is what stops the frame tripping over it. No second
+        # collective: the count is diffed across ranks by the census.
         # #657 item 16, the REBALANCE tier: agree on where the NEXT phase's
         # new KV rows should be placed. It runs here and not on the round
         # clock because the decision needs a REDUCTION -- its input is NVML,
@@ -4501,6 +4520,61 @@ class PhaseFlipRuntime:
                 return (
                     f"{SEAM_MARGIN_DELAY_TAG}: {verdict.detail} "
                     f"(attempt {spent + 1}, budget {budget}, {direction})"
+                )
+            # #656 AXIS 3: THE YIELD MAY NOT ENTER A TROUGH THIS RANK HAS
+            # ALREADY MEASURED.
+            #
+            # The yield is the one path that deliberately enters at the law,
+            # and it is where every corridor breach in this corpus was made --
+            # the acceptance's five, and the remediation boot's one remaining
+            # 12 MiB dip, which the 100 ms trace puts at 14:42:25 inside a
+            # tp_to_pp cutover at stage 'weights_refill', three seconds after
+            # this rank yielded. Not a prefill transient: the same mechanism.
+            #
+            # WHY THIS IS NOW SAFE, WHEN THE PREDICTION ABOVE STILL REFUSES TO
+            # ACT. That comment's premise was "refusing pp->tp starves decode
+            # outright", and it was true: under strict purity decode runs only
+            # in TP. It is no longer true. The purity stand-down valve
+            # (phase_purity._relaxed) lets decode run in the PP layout once
+            # pp_to_tp has been abandoned a few rounds running, so a withheld
+            # flip now costs THROUGHPUT rather than the instance. The corridor
+            # law is a hard user limit; the decode layout is a performance
+            # choice; this trade goes the other way from the one that comment
+            # refused.
+            #
+            # AND IT STAYS A DELAY. The objection carries the margin-delay
+            # tag, which is exempt from the seam-abandon cap, so the flip is
+            # not stood down for good over a condition that clears itself:
+            # once decode drains in the degraded layout the memory comes back
+            # and the very next round enters with room.
+            if draw_short:
+                self.seam_yields_withheld = (
+                    getattr(self, "seam_yields_withheld", 0) + 1
+                )
+                logger.warning(
+                    "%s seam entry margin YIELD WITHHELD (%s): the budget of "
+                    "%d attempts is spent, but this rank's own worst MEASURED "
+                    "draw of %d MiB against %d MiB free predicts a %d MiB "
+                    "trough, below the %d MiB corridor law. Entering on the "
+                    "law alone is what made every breach in this corpus, so "
+                    "the seam waits instead. This objection is a DELAY, not "
+                    "an abandon: it does not spend the stand-down cap, and "
+                    "the purity valve lets the starved work class run in the "
+                    "current layout meanwhile, so the instance keeps serving "
+                    "while the memory comes back.",
+                    LOG_PREFIX,
+                    direction,
+                    budget,
+                    measured_draw // (1024 * 1024),
+                    int(verdict.free_after) // (1024 * 1024),
+                    predicted_trough // (1024 * 1024),
+                    law_floor // (1024 * 1024),
+                )
+                return (
+                    f"{SEAM_MARGIN_DELAY_TAG}: measured draw "
+                    f"{measured_draw // (1024 * 1024)} MiB predicts a "
+                    f"{predicted_trough // (1024 * 1024)} MiB trough under "
+                    f"the {law_floor // (1024 * 1024)} MiB law ({direction})"
                 )
             self.seam_margin_yields += 1
             logger.warning(
