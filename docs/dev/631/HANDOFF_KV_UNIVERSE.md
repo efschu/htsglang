@@ -375,3 +375,114 @@ MiB, rank2 short 931 MiB at boot G), so this is a live candidate for the
 budget re-solve in section 7 -- but only once the vacate is engaged and its
 freed bytes are COUNTED in a log. Until then the seam floors 455/484/1455
 MiB stand as measured, against slots that stay reserved.
+
+# R4 (2026-08-13): the vacate is engaged, and the wall is the layout, not the budget
+
+Branch `feat/kv-universe-656`. Evidence `/spinning/evidence-631/kvuniverse-r3/`
+(RESULTS.md, boot_k1/k2/k3 logs, corridor CSVs, load transcripts). Window
+06:22Z-08:0xZ; serving stopped and restored by this session (res-r5 script,
+only SELF and LOG changed), verified health 200 + three real generations.
+
+## 11. ERRORS FIRST -- four premises this shift falsified, two of them R3's
+
+**E10. The idle-vacate credit is ~4x smaller than R3 priced it, and correctly
+so.** `--gdn-resident-state-slots 4` against a profiled 12 banks
+0.26/0.18/0.15 GB per stack, not ~440 MiB per rank. The cap shrinks
+`ssm_state`+`conv_state`; it does NOT shrink
+`intermediate_ssm_state_cache` (0.62/0.44/0.35 GB, the largest component),
+which is sized from `max_running_requests x draft_tokens` -- from ADMISSION,
+which slice 3 deliberately decouples from the cap.
+
+**E11. kvso is refused on the flip path at parse time**: `--enable-kv-session-
+offload (S1) supports single-node pure TP/DCP only (pp_size=3)`, with no
+opt-in env beside the `KVSO_ALLOW_SPEC`/`KVSO_ALLOW_HICACHE` pair. kvso is the
+ladder's named standing population (`live_offload_reqs`), so on a PP=3 flip
+instance the runtime vacate has nothing to act on. R3's entry 57 read this as
+"the flag is not in the argv"; the flag is necessary but NOT sufficient.
+
+**E12. The budget vector is inert for the binding rank.** `have_bytes` is
+`torch.cuda.mem_get_info()[0] - law` -- PHYSICAL free VRAM. rank2's pool is
+capped by its seam, not its budget (4406 MiB used of an 8438 MiB KV budget),
+so raising `--rank-gpu-memory-mib` allocates nothing and frees nothing.
+**R3's carry-forward "the next step is a BUDGET re-solve" is wrong**, and the
+task's own fallback clause applies: the why is arithmetic, in section 13.
+
+**E13. The seam solver targets equality with the floor, so it sizes a boot
+with zero margin.** K3 derived 610942, then re-measured rank2 at 1430 MiB
+against its 1455 MiB floor and logged `CANNOT FUND ITS OWN FLIP`. All 30
+flips completed anyway -- the line is conservative -- but the sizer books no
+margin, and the flip gate separately wants 512 MiB of C20 entry margin that
+the sizer never reserves.
+
+## 12. T1 -- ENGAGED, MEASURED, BANKED; wake-correctness NOT proven
+
+Engaging is argv-only; the banking route is boot-time and automatic (capped
+`max_mamba_cache_size` -> smaller `MAMBA_BUDGET_POST` -> the physical-free
+`have` anchor rises by the same bytes). No sizer change was written or needed.
+
+* The cap fires on all three ranks with a byte-naming log line, and
+  `GDN-SLOT-LADDER armed: 4 resident state slots` on all three.
+* Credit MEASURED at an identical pinned pool (563974) against boot J:
+  have_m **3744->4306 / 1224->1574 / 1514->1822 MiB** (+562/+350/+308).
+* Boot K1 serves under the cap: 30 cutovers (15/15), 0 abandons, 0 refusals,
+  0 tracebacks, 64001-token prefill, corridor min 2082/3341/2128, 0 breaches.
+* The runtime vacate NEVER fired and structurally cannot here (E11), so
+  **wake-correctness is not claimed**. The banked bytes do not depend on it
+  (slice 1 is boot-time); slice 3's admission decoupling DOES -- see risk.
+
+**RISK, single-sourced, not proven.** `session_admission_slots(...,
+vacate_available=_resident_cap is not None)` keys "the overflow has a backer"
+on THE FLAG, not on the ladder's reachable inventory. Cap 4 + ratio 2 admits
+4 requests against 2 requests' worth of slots, and actives are never vacate
+victims. Falsifier: a genuine bs=4 concurrent load on a capped flip boot.
+Expect a stall, not an OOM -- untested. Fix: derive `vacate_available` from
+inventory reachability.
+
+## 13. T2 -- the honest optimum at this layout is 610942, and the lever is the layout
+
+Boot K3, derived with no operator number: **pool 610942** (up from 563974,
++8.3%), per-rank allowed 754642/675579/610942, **30 completed cutovers, 0
+abandons, 0 refusals, 0 tracebacks**, 64001-token prefill, corridor
+**1510/2715/1994, 0 breaches**. **610942 < 620000: the quarantine STAYS and
+was not removed.**
+
+The pool is bounded by rank2's physical free memory:
+
+    free at rest 2846  -  seam floor 1455  -  corridor law 1024  =  367 MiB
+    367 MiB / 8192 B per token  =  46976 tokens   ->  563974 + 46976 = 610950
+
+against the sizer's derived 610942. No budget term appears. rank2 holds
+4032 MiB of unusable KV-budget slack.
+
+Reaching 620000 needs **438 MiB more free memory on rank2**. Levers, by size:
+
+1. **rank2's arena tail, 1455 MiB** (rank0 455, rank1 484) --
+   `max(0, pp_bytes - tp_bytes)` over rank2's two layouts, i.e. a function of
+   `--pp-stage-ratio 14,10,8` vs `--phase-flip-tp-vector 32,16,16`. THIS IS
+   THE LEVER. It also lowers rank2's 8192 B/token cell. This is the user law
+   "PP layout/budgets follow the KV target" taken literally.
+2. cap 4->2 buys ~77 MiB on rank2; 4->1 ~115 MiB. Both cost concurrency.
+3. `--max-running-requests 4->2` halves `intermediate_ssm_state_cache`
+   (~179 MiB on rank2), changes the fingerprint and the serving contract.
+
+2+3 together still fall short of 438 MiB. Next shift should re-solve the
+STAGE RATIO against the measured per-rank arena tails, and must re-measure
+the seam per layout -- `pp_stage_ratio` is NOT in the record fingerprint.
+
+## 14. T4 -- answered without a boot: REFUSAL at parse time
+
+The composition "spilled kvso session across a PP-prefill flip" cannot be
+constructed on this configuration: kvso refuses `pp_size>1` before the server
+starts (E11). Verdict is refusal -- not crash, not silent corruption -- and it
+needs no new regression test; the existing validation is explicit and has no
+override. Consequence: the #549 GDN-vacate-x-kvso fixes are unreachable on the
+flip path and are exercised only under pure TP/DCP.
+
+## 15. Carry forward
+
+* The 620000 quarantine stays. It is now bounded by a MEASURED physical
+  quantity (rank2's free memory vs its 1455 MiB arena tail), not by a guess.
+* T3 (YaRN 1M) still carries no metal. RoPE cache-growth fix still unbooted.
+* The seam record fingerprint omits `gdn_resident_state_slots`,
+  `enable_kv_session_offload`, `pp_stage_ratio`, `phase_flip_tp_vector` and
+  `max_total_tokens`. Any layout experiment MUST account for that.

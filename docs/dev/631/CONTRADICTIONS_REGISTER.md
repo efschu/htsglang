@@ -2056,3 +2056,91 @@ release is not a fixed post, but only if the mechanism is switched on.**
 Neither the sizer nor the flip spec may assume the vacate; the flag has to
 be in the boot argv and the vacate has to be COUNTED in the log before any
 byte of it is spent in an arithmetic.
+
+## KVUNIVERSE-R4 ADDITIONS (2026-08-13)
+
+## 58. Engaging #364 is necessary but NOT sufficient: the ladder's standing
+population is refused on the very path that needs it.
+
+R3 (entry 57) found `--gdn-resident-state-slots` absent from every flip argv
+and concluded the fix was to add it. Adding it works -- the cap fires, one
+line per rank, and the bytes are real -- but the RUNTIME vacate still never
+fires, for a reason no argv can fix: `build_gdn_slot_executor` sources idle
+holders from `scheduler.kv_session_offload.live_offload_reqs()`, and
+`--enable-kv-session-offload` raises at parse time with "(S1) supports
+single-node pure TP/DCP only (pp_size=3, dp_size=1)". There is no opt-in env,
+though `KVSO_ALLOW_SPEC` and `KVSO_ALLOW_HICACHE` sit within 30 lines of it.
+A phase-flip instance is PP=3 by construction. So on the flip path the ladder
+can be ARMED and can never have a victim.
+
+The decomposition this forces, and it is the useful part: **slice 1 (boot-time
+pool cap) delivers the bytes and needs no runtime vacate at all; slice 3
+(admission decoupled above the cap) is the part that depends on the vacate,
+and it is the part that is unbacked here.** Banking the bytes is therefore
+legitimate; admitting past the cap is not.
+
+## 59. The mamba cap does not touch the largest mamba component, and should
+not.
+
+Measured on this rig at `--gdn-resident-state-slots 4` against a profiled 12:
+banked 0.26/0.18/0.15 GB per stack, roughly a quarter of R3's ~440 MiB
+estimate. `ssm_state` and `conv_state` scale with resident slots and shrink;
+`intermediate_ssm_state_cache` (0.62/0.44/0.35 GB -- larger than both) is
+`per_req x capped_reqs x max_speculative_num_draft_tokens`, i.e. sized from
+ADMISSION, which #364 slice 3 deliberately holds at the pre-cap profiled
+count. A cap that shrank it would be capping the thing slice 3 exists to
+preserve. **The vacatable mass is the resident state only, and it is about a
+quarter of "the mamba memory".** Credit measured at an identical pinned pool
+(563974): have_m 3744->4306 / 1224->1574 / 1514->1822 MiB, i.e. ~2x the
+per-stack cap line because both the PP and the TP stack are capped.
+
+## 60. `have_bytes` is PHYSICAL free VRAM, so the budget vector is inert for
+any rank whose pool is seam-capped.
+
+`measure_and_record` takes `have = torch.cuda.mem_get_info()[0] - law`. It is
+not budget-relative and it does not care what `--rank-gpu-memory-mib` says.
+On boot K3 rank2 spent 4406 MiB of an 8438 MiB KV budget -- its pool was
+stopped by its seam floor, not by its ceiling -- so raising that ceiling
+allocates nothing, frees nothing, and moves `have` by exactly zero. The pool
+falls straight out of physical arithmetic on the binding rank:
+
+    free at rest 2846 - seam floor 1455 - corridor law 1024 = 367 MiB
+    367 MiB / 8192 B per token = 46976 tokens ; 563974 + 46976 = 610950
+
+and the sizer derived **610942**. R3's carry-forward ("the next step is a
+BUDGET re-solve, not a cap change") is therefore wrong in its noun: the vector
+was never the constraint. **The lever is rank2's 1455 MiB arena tail --
+`max(0, pp_bytes - tp_bytes)` over its two layouts, i.e. `--pp-stage-ratio`
+against `--phase-flip-tp-vector`.** Reaching 620000 needs 438 MiB more free
+memory on rank2; the mamba cap at its most aggressive plus halving
+`max_running_requests` does not get there. **The honest optimum at this layout
+is 610942, and the quarantine stays.**
+
+## 61. A solver that targets equality ships a boot with zero margin, and its
+own gate then reads red.
+
+`seam_allowed_tokens` returns the largest T with `have(T) >= need(T)`, so the
+boot it sizes lands, by construction, exactly ON the floor. Boot K3 derived
+610942 and re-measured rank2 at **1430 MiB against a 1455 MiB floor** -- 25
+MiB the wrong side, logging `THIS BOOT CANNOT FUND ITS OWN FLIP` -- while
+completing all 30 cutovers with 0 refusals and 0 abandons. Two things follow.
+The 25 MiB is second-order error in the slope (allocator granularity, arena)
+against a term with no margin to absorb it. And the flip gate separately
+demands a 512 MiB C20 entry margin that the SIZER never books, so "fundable
+at rest" and "fundable at the gate" are different questions sized by different
+code. A margin term belongs in the solver, and the honest one is the entry
+margin the gate will actually apply.
+
+## 62. The seam record fingerprint omits the flags that move the memory
+balance by hundreds of MiB.
+
+`measured_kv_budget_fingerprint_fields` carries `rank_gpu_memory_mib`,
+`context_length` and `max_running_requests`, but NOT
+`gdn_resident_state_slots`, NOT `enable_kv_session_offload`, NOT
+`pp_stage_ratio`, NOT `phase_flip_tp_vector`, NOT `max_total_tokens`. Boot K1
+consumed boot J's UNCAPPED record while running capped, which under-sizes and
+is harmless; the reverse direction over-sizes and is precisely the boot-E
+wedge. Meanwhile changing the budget vector DOES orphan the record and costs a
+cold boot. So the fingerprint is simultaneously too coarse for the flags that
+matter to the seam and fine enough to be expensive for the one that does not.
+Any layout experiment must pin or invalidate the record deliberately.
