@@ -558,3 +558,73 @@ its numbers prove the LAYOUT, not the removal. L3 proves the removal.
   record: `context_length` is in the fingerprint, so a 1048576 boot orphans
   the 393216 record and its first boot sizes uncorrected. Pin
   `--max-total-tokens` on that first boot exactly as L1 did.
+
+# R4 T3: the 1M ceiling reached, priced, and proven correct past 393216
+
+## 19. Reaching 1048576 -- the route, and two dead ends worth not repeating
+
+The checkpoint carries `rope_parameters {rope_type: yarn, factor: 1.5}` over
+`max_position_embeddings 262144`, and the convention is derived = max_pos x
+factor. So:
+
+* `--context-length 1048576` alone is refused. Its suggested
+  `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` is register 47's hazard --
+  positions past the cache -- and was deliberately NOT used.
+* `--json-model-override-args` merges SHALLOWLY at the top level: a nested
+  `{"text_config": {"rope_parameters": ...}}` replaces the whole text_config
+  and the boot dies on a missing `max_position_embeddings`.
+* Adding `original_max_position_embeddings` (demanded by the transformers
+  YaRN validator on that path) collapses the derived ceiling to 262144,
+  because it marks max_pos as ALREADY scaled.
+
+Route that works: a symlink checkpoint with one edited config.json carrying
+`factor: 4.0` and nothing else. 262144 x 4.0 = 1048576, derived legitimately.
+`/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn4.0`,
+7.5 K of symlinks.
+
+## 20. "Zero upfront cost" is FALSE: ~440 MiB per rank, and it is eager
+
+At an identical pinned pool with nothing using the context, `have` fell by
+**exactly 440 MiB on every rank** (3312->2872, 708->268, 1100->660). Equal
+across ranks = a replicated per-position structure. `head_dim 256 x
+partial_rotary 0.25` -> 64 rotary dims, cos+sin 128 values/row, fp32 512
+B/row, x 655360 new rows = **320 MiB**, the predicted figure; the remaining
+~120 MiB is other per-position state and is not separately attributed.
+
+It is already PRICED, though, because `have` is a physical-free reading: the
+sizer sees it and lowers the pool without being told. **The 1M ceiling costs
+58652 tokens of pool** -- derived 589736 at 1048576 against 648388 at 393216,
+-9.0%. Making the reserve LAZY is the remaining work if that 9% is wanted
+back; nothing is broken without it.
+
+## 21. Positions past 393216 decode CORRECTLY -- the RoPE fix, on metal
+
+Determined-answer probe: 400030 prompt tokens, a planted secret at the end,
+answered **BANANA47**, finish=stop, 330 s. Register 47 says raising the
+ceiling is exactly what makes the corrupt appended rows reachable. Raised,
+reached, correct.
+
+## 22. M1's wedge is the thesis, restated by the runtime
+
+M1 pinned the 393216-era pool (648388) at 1048576 ctx. Both small ranks
+logged `CANNOT FUND ITS OWN FLIP` AT BOOT, and the instance later held in TP:
+`tp_to_pp refused 14 times and treated as unfundable ... re-probing in 13.8s`,
+with 0 tracebacks and every process alive.
+
+Read it as a result, not an accident: **pinning a pool the seam cannot fund
+is the failure mode; letting the sizer derive is the fix.** The same
+configuration, unpinned (M2), gave 589736 with 132 completed cutovers
+(66/66), 0 abandons, 0 refusals, 0 tracebacks, corridor 1256/3099/1360, 0
+breaches. And unlike boot E, the wedge announced itself twice at startup and
+then backed off on a clock instead of storming.
+
+## 23. OPEN and unattributed: A-vs-A is not byte-identical at 1M
+
+Two identical temperature-0 requests on M2 returned different text, and took
+2.79 s and 9.66 s -- served in DIFFERENT PHASES. The rig also carries a
+documented upstream GDN prefill nondeterminism beyond ~109 tokens.
+
+**No causal claim either way.** The attributing control -- the same A-vs-A on
+the 393216 config -- was not run. Next shift: A-vs-A on L3's config FIRST,
+then M2, then compare. Do not record "YaRN 4.0 broke determinism" until that
+control exists; this evidence does not support it, nor its denial.

@@ -2226,3 +2226,72 @@ tail`. Those rungs are what make the seam affordable at all. What is refused
 under `pp_size>1` is only kvso's SESSION KV tail on the host, and with it
 #549's GDN-vacate-x-kvso fixes. Reading the parse-time refusal as "spilling
 does not happen here" would retire a mechanism that is live and load-bearing.
+
+## 68. `--json-model-override-args` is a SHALLOW merge, so a nested override
+silently deletes its siblings.
+
+Passing `{"text_config": {"rope_parameters": {...}}}` to raise the YaRN factor
+replaced the ENTIRE `text_config` -- 25 keys -- and the boot died on
+`'PreTrainedConfig' object has no attribute 'max_position_embeddings'`, an
+error that reads like a broken checkpoint rather than a lost sibling key. The
+follow-on trap: adding `original_max_position_embeddings`, which the
+transformers YaRN validator demands on that path, made the derived ceiling
+COLLAPSE from 393216 to 262144, because that key marks `max_position_
+embeddings` as already-scaled and the runtime's convention here is
+`derived = max_pos x factor`. Two opposite failures from one flag. For a
+nested model-config change, edit a config.json in a symlink checkpoint
+(7.5 K, weights not copied) instead of overriding through argv.
+
+## 69. The 1M context ceiling is NOT free: ~440 MiB per rank, eager, and
+worth 9% of the pool.
+
+Measured at an identical pinned pool with nothing using the context, `have`
+fell by exactly 440 MiB on EVERY rank (3312->2872 / 708->268 / 1100->660)
+when the ceiling went 393216 -> 1048576. Equal across ranks is the signature
+of a replicated per-position structure: `head_dim 256 x partial_rotary 0.25`
+-> 64 rotary dims, cos+sin 128 values/row, fp32 512 B/row x 655360 new rows =
+320 MiB, with ~120 MiB more not separately attributed. The user law's "every
+session grantable ~1M ctx with zero upfront cost" therefore does not hold
+today -- the reserve is eager. It IS priced, because `have` is a physical
+free reading and the sizer lowers the pool on its own: derived 589736 at
+1048576 against 648388 at 393216, **-58652 tokens, -9.0%**. Nothing is broken
+without a lazy reserve; 9% of the pool is simply the standing price.
+
+## 70. Positions beyond the old ceiling decode CORRECTLY -- register 47's fix,
+proven on metal instead of in a unit test.
+
+Entry 47 established that the YaRN family grew its cos/sin cache with
+`_compute_inv_freq(self.base)` and no mscale, so appended rows carried wrong
+frequencies, and that **raising the context ceiling is precisely the change
+that makes those rows reachable**. Raised to 1048576 and reached: a
+determined-answer probe with **400030 prompt tokens** -- 6814 past the old
+393216 -- returned the planted `BANANA47`, finish=stop, in 330 s. The guard
+test `test_yarn_rope_cache_growth.py` now has a metal counterpart.
+
+## 71. A pinned pool that the seam cannot fund reproduces the wedge exactly,
+which is why the pin -- not the pool -- is the defect.
+
+Boot M1 carried the 393216-era pool (648388) into a 1048576 context, where
+the eager RoPE reserve had taken 440 MiB per rank. Both small ranks logged
+`CANNOT FUND ITS OWN FLIP` AT BOOT (268 vs 484, 660 vs 927); the instance
+served short prompts and the 400030-token probe, then held in TP with
+`tp_to_pp refused 14 times and treated as unfundable (seam abandoned: a peer
+refused); re-probing in 13.8s`, 0 tracebacks, all processes alive. The same
+configuration UNPINNED derived 589736 and ran 132 completed cutovers (66/66)
+with 0 abandons and 0 refusals. Two lessons: an operator pool number is a
+liability whenever anything else about the memory balance moves, and the R3
+control loop has converted this failure from a silent livelock into a bounded
+one that announces itself twice before it happens.
+
+## 72. A-vs-A is not byte-identical at 1M, and this is recorded WITHOUT an
+attribution on purpose.
+
+Two identical temperature-0 requests on boot M2 returned different text and
+took 2.79 s and 9.66 s -- i.e. they were served in DIFFERENT PHASES, and the
+rig separately carries a documented upstream GDN prefill nondeterminism
+beyond ~109 tokens. The control that would attribute it -- the same A-vs-A on
+the 393216 configuration -- was NOT run this shift. So "YaRN 4.0 broke
+determinism" is unsupported by this evidence, and so is its denial. Recorded
+as an open observation with its missing control named, rather than as a
+finding; law: a difference measured under two uncontrolled variables is a
+question, not a result.
