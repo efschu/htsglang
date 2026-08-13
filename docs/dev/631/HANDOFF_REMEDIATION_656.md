@@ -96,6 +96,75 @@ widens an existing `_collective_min` payload from 3 to 5 elements on a group
 the round already reduces on, so nothing new lands inside the `nccl_init`
 boundary.
 
+### THE BALLOT FIRED ON METAL, AND IT NAMED THE DIVERGENCE
+
+**2026-08-13 14:46:39Z**, during a cold 280012-token deep prefill on the
+remediation boot. Evidence: `BALLOT_FIRED_ON_METAL.txt`.
+
+```
+PP0  framed digest 1545804850
+PP2  framed digest 1545804850
+PP1  framed digest 1237458399     <- the group spans [1545804850, 1237458399]
+```
+
+All three ranks abandoned the flip unanimously. **No KvReshardError. No
+SIGQUIT. The process lived.** Under the code this replaces, that same round
+would have been the acceptance's crash.
+
+**PP1 is the same rank both peers blamed in the acceptance** ("from peer 1").
+
+And the pool census at that instant says exactly what diverged:
+
+| rank | free rows | unaccounted |
+|---|---|---|
+| PP0 | 309574 | 0 |
+| PP2 | 309574 | 0 |
+| **PP1** | **269170** | **40404** |
+
+`309574 − 269170 = 40404`, exactly. All three agree on the resident request
+(`rid fa034de4…`, seqlen 268817, `kv_allocated_len` 268816) and on
+`cached=268816`, so **the difference is not the request**: rank 1's allocator
+holds 40404 rows that neither the radix tree nor any resident request
+accounts for, and its live-slot enumeration therefore differs from its peers'
+by that many rows. **40404 rows × row_bytes IS the payload-length mismatch**
+that, before the ballot, produced the garbage trailer.
+
+So the open question §7 of the first draft listed — *which* rank-local term
+diverged — is closed within the same window the ballot shipped: it is the
+live slot set, the divergence is an allocator-owned residue on one rank, it
+is persistent rather than a race, and it appears under a deep resident
+prefill. The acceptance's fatal cutover had a 312221-token resident request;
+this one had 268816. Same regime.
+
+### AND IT IS NOT BENIGN: a PERSISTENT divergence is a WEDGE
+
+The honest other half, measured in the same window. The divergence did not
+clear. The ballot refused the flip eight times, the seam cap guard declared
+`pp_to_tp` unfundable, and the policy held the instance in PP — which is the
+leg **decode** needs. The result:
+
+* process alive on all three ranks, still logging;
+* every request's KV intact, nothing scattered;
+* `/health` **503**, "couldn't get a response from detokenizer";
+* **no tokens**.
+
+That is the 411-abandon deadlock class the corridor guard's arming/law
+separation was introduced to prevent, reached by a different route. **The
+ballot converts an instance-fatal crash into an instance wedge.** That is
+strictly better — recoverable instead of dead, diagnosed instead of
+mysterious, with the two digests and the 40404-row delta printed — but the
+first draft of the log line said "serving continues", and on the pp→tp leg
+that is false. The message now says so, and names the census comparison that
+identifies the odd rank.
+
+**The real fix is AGREEMENT, not detection.** The ballot proves the
+replicated-live-set premise is false on this rig; a successor should replace
+the premise rather than keep testing it — broadcast the live slot set from a
+designated rank, or reduce it to the intersection, so the ranks cannot frame
+different payloads in the first place. Detection was the right first move
+because it is cheap, unanimous and non-fatal, and because it is what produced
+the 40404 number that a fix can be built against.
+
 ### Two pre-existing tests changed, and they got STRONGER
 
 `test_can_fail_abort_applied_on_one_rank_mid_flip` and
@@ -383,13 +452,31 @@ covering the whole branch.
 
 Continuous 100 ms sampling across the whole load window:
 
-| card | continuous minimum | vs the 1024 MiB law | acceptance |
-|---|---|---|---|
-| gpu0 (rank 1, binding) | **1050 MiB** | **+26** | 886 (**breach**) |
-| gpu1 (rank 0, the 5090) | 2097 MiB | +1073 | 1941 |
-| gpu2 (rank 2) | 1370 MiB | +346 | 1304 |
+**Segment it by regime, because the two halves give different verdicts.**
+63.5 minutes, 38020 samples per card:
 
-**0 samples below the law on any card.** And the causal chain is visible in
+| regime | window | gpu0 min | gpu1 min | gpu2 min | below the law |
+|---|---|---|---|---|---|
+| **mixed flip soak** | 46.1 min | **1050** | 2097 | 1370 | **0 / 0 / 0** |
+| **deep-prefill probes (bs=1)** | 17.3 min | **1012** | 2057 | 1376 | **2 / 0 / 0** |
+| full window | 63.5 min | 1012 | 2057 | 1370 | 2 / 0 / 0 |
+
+vs the acceptance's 886 / 1941 / 1304 with 25 samples in 5 episodes.
+
+**So the corridor holds under the flip soak and BREACHES — 12 MiB, 2 samples,
+one episode at 14:42:25Z — under a maximal-depth single-session prefill**
+(the 338916-token probe). This is a different regime from the acceptance's
+five breaches, which were all at seam entries after a yield; there is no
+yield here and no flip involved.
+
+It has to be reported as a breach, not rounded away: the law is a continuous
+minimum and the spec puts bs=1 YaRN past `max_position_embeddings` squarely
+in scope, so a deep-prefill trough is inside the acceptance's own axis-3
+window. What changed is the magnitude and the cause: **138 MiB at a flip seam
+became 12 MiB at a deep prefill.** The seam mechanism is closed; a prefill-
+side trough is a different, much smaller, and so far uncharacterised item.
+
+And the causal chain for the seam half is visible in
 the log rather than inferred:
 
 | | acceptance | remediation |
@@ -427,9 +514,19 @@ changed is the resting level, not the model. See
 
 ### The C22 result, and its power
 
-**0 KvReshardError, 0 "NOT A CHECKSUM", 0 wire-frame divergences, 0
-tracebacks, 0 scheduler exceptions, 0 SIGQUIT, 0 CANNOT FUND, 0 abandons**
-across the run.
+Across the 218-cutover soak: **0 KvReshardError, 0 "NOT A CHECKSUM", 0
+tracebacks, 0 scheduler exceptions, 0 SIGQUIT, 0 CANNOT FUND, 0 abandons.**
+
+**And then, in the deep-prefill phase, the ballot FIRED** — 12 frame-
+divergence abandons, still 0 KvReshardError and 0 SIGQUIT (§1). That is the
+result this shift actually bought: not an absence, an **occurrence** that was
+caught. The defect reproduced on metal, on the same rank the acceptance
+blamed, and the instance did not die.
+
+It also means the power argument below applies only to the soak half. **The
+ballot's positive metal proof does not depend on it at all**: a divergence
+happened, the digests differed by a measurable amount, and the guard did what
+the desk arm said it would.
 
 **What the soak DOES prove, and it is not nothing: the ballot does not
 false-positive on metal.** Every completed cutover is a round in which the
@@ -463,14 +560,32 @@ rather than treating 320 as a standard.
 
 ## 6. IS THE ACCEPTANCE RE-RUN UNBLOCKED?
 
-**Yes for axes 3 and 7, no for axis 4, and axis 4 is now a spec question
-rather than a defect.**
+**No — and the reason is a better one than the shift started with.** Every
+failure is smaller, named and mechanised, but a clean pass is not yet
+available on any of the three failing axes.
 
 | axis | acceptance | after this shift |
 |---|---|---|
-| 3 MAX-KV + corridor >= 1024 continuous | FAIL (886 MiB, 5 episodes) | **unblocked** — 0 samples below the law on all three cards over the load window, pool still derived and uncapped at 578390 |
-| 7 zero tolerance | FAIL (2 tracebacks, 1 SIGQUIT, 1 breach) | **unblocked** — 0 of each on this boot; C22's guard now abandons instead of raising |
-| 4 idle-vacate | FAIL (0 vacate lines) | **still fails, and cannot be fixed by a recipe** — `--enable-kv-session-offload` is refused outright under `pp_size>1` (`server_args.py:7405`), so no argv produces vacate lines on a flip boot. Needs either a PP-safe idle-session source or a spec amendment |
+| 3 MAX-KV + corridor >= 1024 continuous | FAIL — 886 MiB, 25 samples, 5 episodes, at flip seams | **improved, still FAIL** — the seam mechanism is closed (0 breaches in 46 min of mixed flip soak), but a bs=1 maximal-depth prefill still dips to **1012 MiB, 2 samples, one episode**. 138 MiB at a seam became 12 MiB at a prefill |
+| 7 zero tolerance | FAIL — 2 tracebacks, 1 SIGQUIT, 1 breach | **improved, still FAIL** — no traceback, no SIGQUIT, and C22 no longer kills the instance; but a PERSISTENT frame divergence holds the instance in PP and it **wedges** (`/health` 503, no tokens). Zero tolerance forbids a wedge as much as a crash |
+| 4 idle-vacate | FAIL — 0 vacate lines | **still fails, and cannot be fixed by a recipe** — `--enable-kv-session-offload` is refused outright under `pp_size>1` (`server_args.py:7405`), so no argv produces vacate lines on a flip boot. Needs a PP-safe idle-session source or a spec amendment |
+
+**What the shift did buy**, stated without inflation:
+
+* C22 went from **kills the instance** to **wedges it, loudly, with the two
+  digests and a 40404-row delta printed**. Recoverable instead of dead,
+  diagnosed instead of mysterious.
+* The root cause moved from a wrong attribution (#657 steering) to a measured
+  one (rank 1's allocator holds 40404 rows its peers do not enumerate).
+* The corridor's seam breach is closed by a derived, measured term rather
+  than a guessed one, and the residual is an order of magnitude smaller and
+  in a different mechanism.
+* Idle-vacate stopped being an open question at all.
+
+**The one change that would unblock axis 7 is not detection, it is
+agreement** — broadcast or intersect the live slot set so the ranks cannot
+frame different payloads. That is a bounded piece of work and it is now
+specified by a number rather than a hypothesis.
 
 **Two things the re-run must carry, or it will draw a wrong conclusion:**
 
@@ -501,11 +616,16 @@ rather than a defect.**
   Boot A must breach for boot B to consume the record, and boot A did not
   breach — which is the desired outcome and also why the loop is unproven
   end-to-end.
-* **C22's remaining unknown is WHICH rank-local term diverged.** The ballot
-  makes any divergence loud, unanimous and non-fatal, and its first trip on
-  metal will name the digest spread. Until then the live slot set is the
-  suspect (it is the only term that varies at runtime) and the wave partition
-  is the documented alternative.
+* **CLOSED IN THIS WINDOW: the diverging term is the live slot set**, and it
+  is an allocator-owned residue of 40404 rows on rank 1 that no tree entry
+  and no resident request accounts for (section 1). What is NOT known is
+  why rank 1 accumulates it and the other two do not. That is the next
+  question, and `unaccounted` in the POOL CENSUS line is the instrument
+  for it.
+* **The wedge is the top open item.** A persistent divergence starves the
+  pp->tp leg and the instance stops emitting tokens. The fix is agreement
+  (broadcast or intersect the live slot set), not a longer backoff: a
+  backoff only decides how quickly a wedge is reached.
 * **The wire still carries no length.** The receiver's size check remains
   vacuous by construction; the ballot prevents a divergence from reaching the
   wire, and the representability check names it if one ever does. A 16-byte

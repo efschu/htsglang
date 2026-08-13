@@ -4757,7 +4757,18 @@ class PhaseFlipRuntime:
                 f"receive buffer keeps an unwritten tail, the checksum "
                 f"trailer read out of it is not a checksum, and the guard "
                 f"kills the instance reporting a corruption that never "
-                f"happened. Nothing has been moved; serving continues"
+                f"happened. NOTHING HAS BEEN MOVED. But read the next "
+                f"sentence before calling this benign: a divergence that "
+                f"PERSISTS starves the pp_to_tp leg, and that leg is the one "
+                f"decode needs, so a repeated refusal here ends as a WEDGE "
+                f"-- alive, every request's KV intact, /health 503, no "
+                f"tokens. Measured on metal 2026-08-13 14:46:39Z. That is "
+                f"still strictly better than the SIGQUIT this replaces "
+                f"(recoverable, and diagnosed rather than mysterious), but "
+                f"it is not 'serving continues'. Compare the ranks' POOL "
+                f"CENSUS lines: the one whose 'unaccounted' count differs is "
+                f"the rank whose allocator holds rows the others do not "
+                f"enumerate, and that count IS the payload-length mismatch"
             )
         if reduced_fit[0] == 0 or not frames_agree:
             # THE BUDGET'S CURRENCY, BOOKED WHERE EVERY RANK AGREES. This is
