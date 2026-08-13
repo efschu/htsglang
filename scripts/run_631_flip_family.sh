@@ -16,6 +16,16 @@ FAMILY=(
     test/registered/scheduler/test_phase_flip_protocol.py
     test/registered/scheduler/test_phase_flip_round_cadence_631.py
     test/registered/scheduler/test_phase_flip_resident_carry.py
+    # Fourth under-collection, caught by MERGE-R7 §7 and fixed here. The
+    # kv-universe branch (#656) added six test files and did not extend this
+    # list, so the family total sat at 1116 looking green while the seam
+    # sizer that REPLACED the 620000-token quarantine constant -- the whole
+    # point of that branch -- was collected by nothing. MERGE-R7 ran them as
+    # a private arm; a private arm is not a canonical list, and the next
+    # shift would not have known to run it.
+    test/registered/scheduler/test_phase_flip_seam_reserve.py
+    test/registered/scheduler/test_phase_policy_arm_outcome.py
+    test/registered/scheduler/test_seam_fingerprint_and_margin_656.py
     test/registered/scheduler/test_gdn_flip_plan.py
     test/registered/scheduler/test_gdn_flip_mover.py
     test/registered/scheduler/test_weights_arena.py
@@ -83,6 +93,20 @@ FAMILY=(
     # Added by successor 45 with the C28 fix (#659). Red-first: it fails on
     # the pre-fix tree with the host-finished session missing from the emit.
     test/registered/unit/managers/test_host_finish_stream_659.py
+    # The other half of the MERGE-R7 §7 under-collection: three #656 files
+    # under test/srt/. They are reached by the same test/conftest.py as
+    # everything above, so the runner's cd does not change how they collect.
+    #
+    # test_phase_flip_serving_proof_gate.py needs a VISIBLE DEVICE and carries
+    # its own module-level skipif for that reason (measured: 7/7 with a
+    # device, 4 failed / 3 passed without). It is listed here so the family
+    # names it, and skips itself under this runner's CUDA_VISIBLE_DEVICES=99
+    # rather than reporting red -- the runner's CPU-only contract is that a
+    # green run means something, and a permanently-red entry destroys that.
+    # Running it FOR REAL requires a device arm inside a GPU window.
+    test/srt/test_phase_flip_serving_proof_gate.py
+    test/srt/test_rope_lazy_cache.py
+    test/srt/test_yarn_rope_cache_growth.py
 )
 
 cd "$WT/test/registered/scheduler"

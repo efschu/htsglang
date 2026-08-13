@@ -30,9 +30,46 @@ number safe, which is the thing that must never regress.
 import os
 
 import pytest
+import torch
 
 from sglang.srt.managers import phase_flip_seam_reserve as sr
 from sglang.srt.server_args import ServerArgs
+
+#: THIS FILE NEEDS A VISIBLE DEVICE, and says so instead of failing.
+#:
+#: Every case here builds a real ``ServerArgs``, whose ``__post_init__``
+#: resolves a device; without one it raises ``RuntimeError: No accelerator
+#: (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available`` before
+#: any assertion in this file is reached. Measured under the canonical
+#: CPU-only desk protocol (``CUDA_VISIBLE_DEVICES=99``): 4 failed, 3 passed;
+#: with a device visible: 7 passed. MERGE-R7 §2 proved the four reds are the
+#: file's own device requirement rather than a merge regression, by running
+#: the identical arm against the untouched source worktree.
+#:
+#: WHY SKIP RATHER THAN LEAVE IT RED. This file is named by
+#: ``scripts/run_631_flip_family.sh``, whose contract is that a CPU-only run
+#: is green -- that is what makes a NEW red in it mean something. A permanent
+#: red entry trains the reader to discount the runner, which is the failure
+#: mode the explicit family list exists to prevent.
+#:
+#: WHAT THIS COSTS, stated plainly: three cases that DID pass without a device
+#: now skip too. A module-level marker makes the device requirement one
+#: declared fact about the file instead of four scattered ones, and the file's
+#: subject -- that the quarantine constant is gone and the mechanism replaced
+#: it -- is not meaningfully gated by three cases in isolation. The three are
+#: recoverable by converting this to per-test markers if a shift wants them.
+#:
+#: THE GATE IS THEREFORE NOT DISCHARGED BY A CPU RUN. Closing it needs a
+#: device-visible arm in a GPU window; a skip is an honest "not measured",
+#: never a pass.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason=(
+        "needs a visible device: every case builds a real ServerArgs, whose "
+        "__post_init__ resolves one. 7/7 pass with a device; without one, 4 "
+        "of 7 fail in device resolution before reaching an assertion."
+    ),
+)
 
 MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5"
 OLD_QUARANTINE = 620000
