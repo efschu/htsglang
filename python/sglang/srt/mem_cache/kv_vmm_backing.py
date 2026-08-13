@@ -56,12 +56,14 @@ def _corridor_law_floor_bytes() -> int:
     floor here would spend the allocator cache on a walk that was never going
     to break the law.
     """
-    try:
-        return max(0, int(os.getenv("SGLANG_CORRIDOR_LAW_FLOOR_MIB", "1024"))) * (
-            1024 * 1024
-        )
-    except (TypeError, ValueError):
-        return 1024 * (1024 * 1024)
+    #656: read through the ONE declaration rather than re-implementing the
+    # env read with a private "1024" fallback here. Three modules had their
+    # own copy, so the law could be moved for one and not the others -- a
+    # divergence with no symptom until a breach is judged twice and answered
+    # differently. Still read per call, for the reason above.
+    from sglang.srt.managers.corridor_guard import corridor_law_bytes
+
+    return corridor_law_bytes()
 
 
 def _corridor_preempt(step: int, label: str, reclaim: Optional[callable]) -> None:

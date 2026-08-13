@@ -238,6 +238,135 @@ def _active_phase(scheduler) -> Optional[str]:
     return getattr(scheduler, "phase_flip_active_stack", None)
 
 
+#: Consecutive GROUP abandons of one direction after which the purity
+#: prohibition on the work class that direction serves is lifted. Small on
+#: purpose: ``/health`` times out at 20 s and a refused round costs about 3 s
+#: on this rig, so a larger bound would open the valve after the instance has
+#: already stopped answering -- which is the state this exists to prevent.
+ENV_STAND_DOWN_AFTER = "SGLANG_PHASE_PURITY_STAND_DOWN_AFTER"
+DEFAULT_STAND_DOWN_AFTER = 4
+
+#: The direction whose failure starves each work class. Decode runs in TP, so
+#: decode waiting in PP is starved by a ``pp_to_tp`` that will not commit.
+_STARVED_BY = {"decode": "pp_to_tp", "prefill": "tp_to_pp"}
+
+
+def stand_down_after() -> int:
+    try:
+        n = int(os.environ.get(ENV_STAND_DOWN_AFTER, DEFAULT_STAND_DOWN_AFTER))
+    except ValueError:
+        return DEFAULT_STAND_DOWN_AFTER
+    return max(1, n)
+
+
+def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
+    """Why the flip cannot serve ``work`` right now, or None.
+
+    #656 C22. Two causes, and BOTH inputs are already group-reduced, which is
+    what lets this be read from a gate that must stay rank-uniform:
+
+    * a BLOCKING GUARD -- the seam-abandon cap's terminal verdict, installed
+      on every rank from the same unanimous abandon. The flip can never arm
+      again on this boot, so the other layout is unreachable, for ever.
+    * a streak of consecutive GROUP abandons of the direction this work class
+      needs. ``_seam_abandons_in_a_row`` is booked from the reduced verdict --
+      "all three ranks increment together" -- and reset to 0 by a committed
+      cutover, so the streak means the same thing on every rank and clears on
+      every rank at the same moment.
+
+    Deliberately keyed on the DIRECTION rather than on any abandon: a stuck
+    ``tp_to_pp`` starves prefill and says nothing about decode. Relaxing on
+    the wrong one is how a safety valve becomes the normal path.
+    """
+    rt = getattr(scheduler, "phase_flip_runtime", None)
+    if rt is None:
+        return None
+    guards = tuple(getattr(rt, "blocking_guards", ()) or ())
+    if guards:
+        return "; ".join(str(g) for g in guards)
+    direction = _STARVED_BY.get(work)
+    if direction is None:
+        return None
+    bound = stand_down_after()
+    book = getattr(rt, "_seam_abandons_in_a_row", None) or {}
+    spent = int(book.get(direction, 0) or 0)
+    if spent >= bound:
+        return (
+            f"{direction} abandoned {spent} times consecutively (bound "
+            f"{bound}); the layout {work} needs is not reachable"
+        )
+    # AND THE POLICY'S OWN REFUSAL STREAK, because the seam streak alone
+    # CANNOT REACH THE BOUND once the backoff engages. Measured on metal
+    # 2026-08-13 15:40-15:44Z: three group abandons of tp_to_pp armed the
+    # seam backoff, which then DECLINED the next arms without entering the
+    # seam at all, so the abandon counter froze at 3 while the policy logged
+    # "tp_to_pp arm refused (7 in a row)" and a 9-token prefill sat unrunnable
+    # for four minutes. A valve keyed only on the inner counter is a valve
+    # the damping layer holds shut.
+    #
+    # Group-uniform in the same way: every rank runs the same policy over the
+    # same reduced verdicts, and the three ranks printed identical refusal
+    # counts on every line of that window.
+    state = getattr(scheduler, "phase_policy_state", None)
+    refused = int((getattr(state, "arm_refusals", None) or {}).get(direction, 0) or 0)
+    if refused >= bound:
+        return (
+            f"{direction} arm refused {refused} times consecutively (bound "
+            f"{bound}); the layout {work} needs is not reachable"
+        )
+    return None
+
+
+def _relaxed(scheduler, work: str) -> bool:
+    """True when purity must yield for ``work``, logged once per stand-down.
+
+    A SERVING INSTANCE BEATS A CORRECT-LOOKING SILENT ONE. Purity is a
+    throughput rule -- its own modes ``threshold:<n>`` and ``off`` run decode
+    in the PP layout as supported configurations, and the documented cost is
+    latency and throughput, never a wrong answer. So when the layout a work
+    class needs is unreachable, running that work in the layout the instance
+    is actually in is strictly better than emitting nothing until ``/health``
+    times out with every stack idle.
+
+    Not a mode change: the moment a flip commits, the streak resets and the
+    prohibition is back, without anything having to remember to restore it.
+    """
+    reason = flip_unavailable_reason(scheduler, work)
+    # EDGE-TRIGGER ON THE CAUSE, NOT ON ITS WORDING. The reason string carries
+    # the streak COUNT, which grows every round, so keying the "log once" on
+    # the whole string re-announced the same stand-down on every arm refusal
+    # -- measured on boot_v2, once a minute for the life of the degrade.
+    key = (work, reason.split(" ", 1)[0] if reason else None)
+    if reason is None:
+        # Edge-triggered: re-arm the log so the NEXT stand-down is announced.
+        if getattr(scheduler, "_phase_purity_stood_down", None) is not None:
+            scheduler._phase_purity_stood_down = None
+            logger.warning(
+                "%s the flip is working again; the purity rule is back in "
+                "force for %s",
+                LOG_PREFIX,
+                work,
+            )
+        return False
+    if getattr(scheduler, "_phase_purity_stood_down", None) != key:
+        scheduler._phase_purity_stood_down = key
+        logger.warning(
+            "%s PHASE FLIP STOOD DOWN -- RELAXING PURITY FOR %s: %s. This "
+            "instance would otherwise hold %s for ever and answer /health "
+            "with 503 while every rank is alive and idle. %s now runs in the "
+            "layout the instance is IN, which is slower and correct; the "
+            "prohibition returns by itself the moment a flip commits. Set "
+            "%s to change the bound.",
+            LOG_PREFIX,
+            work.upper(),
+            reason,
+            work,
+            work.capitalize(),
+            ENV_STAND_DOWN_AFTER,
+        )
+    return True
+
+
 def prefill_blocked_here(scheduler) -> bool:
     """True when a prefill batch must NOT be built this iteration.
 
@@ -251,7 +380,9 @@ def prefill_blocked_here(scheduler) -> bool:
 
     if _active_phase(scheduler) != PHASE_TP:
         return False
-    return not purity_of(scheduler).prefill_allowed_in_tp()
+    if purity_of(scheduler).prefill_allowed_in_tp():
+        return False
+    return not _relaxed(scheduler, "prefill")
 
 
 def decode_blocked_here(scheduler, running_bs: int) -> bool:
@@ -260,7 +391,9 @@ def decode_blocked_here(scheduler, running_bs: int) -> bool:
 
     if _active_phase(scheduler) != PHASE_PP:
         return False
-    return not purity_of(scheduler).decode_allowed_in_pp(running_bs)
+    if purity_of(scheduler).decode_allowed_in_pp(running_bs):
+        return False
+    return not _relaxed(scheduler, "decode")
 
 
 def purity_of(scheduler) -> PhasePurity:

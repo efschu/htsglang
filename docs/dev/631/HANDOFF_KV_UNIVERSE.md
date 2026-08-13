@@ -814,3 +814,66 @@ piece of T3 this shift did not buy.
    393216 against 593264 at 1048576, and it is NOT the cos/sin cache. Change
    one variable at a time -- the budget vector differs between those two boots
    as well.
+
+---
+
+## SUPERSEDED IN PART BY THE #656 REMEDIATION SHIFT (2026-08-13)
+
+See `HANDOFF_REMEDIATION_656.md`. Three items above are now moved on:
+
+* **The solver margin is no longer one constant.** Section "Solver margin,
+  192 MiB" still describes the MEASUREMENT ERROR BAR, and that term is
+  unchanged. A second, per-rank term joins it: the deepest CORRIDOR SHORTFALL
+  the runtime has actually observed on that rank, written into the seam record
+  and read by the next boot of the same configuration. It is ZERO until a
+  breach is measured, so a rig that has never breached sizes exactly as
+  before. `seam_margin_bytes(reserve)`, `record_corridor_shortfall()`.
+
+* **L3's corridor figure did not survive an hour, and the reason is not
+  sizing.** The acceptance measured 886 MiB on the binding card, 138 below the
+  law, in five episodes — and all five begin 2-4 s after a C20 seam-entry
+  margin YIELD on the rank that owns that card. The remedy is 138 MiB, not the
+  200-300 MiB the acceptance guessed, and the rank is NOT rank0: by register
+  C21's card rule rank0 is the 5090, which never came near the law.
+
+* **The empty-token probe at 390026 quoted in item 1 above is CONFOUNDED the
+  same way the acceptance's bracket was.** Cold and cached deep prefills were
+  compared without separating them. The full cold-probe table is in
+  `HANDOFF_REMEDIATION_656.md` section 4: 280026 has failed 2 of 3 cold
+  attempts while 250026, 300026 and 338916 are 4 of 4 exact. Do not read the
+  390026 point as a lazy-RoPE property — the same signature appears with the
+  lazy cache OFF.
+
+---
+
+## AND CORRECTED AGAIN BY THE R2 SHIFT (2026-08-13)
+
+See `HANDOFF_REMEDIATION_656_R2.md`. Two of the three notes above need
+amending, and one item this document does not cover is now load-bearing for
+anyone sizing a pool here.
+
+* **The corridor shortfall term is real but it was never the binding
+  mechanism, and the R1 note above reads as if it were.** The acceptance's five
+  breaches and the remediation boot's one residual breach are the SAME thing --
+  a seam entered on the corridor law alone after a C20 yield, then the
+  in-cutover draw -- and the closer is not a sizing term at all. It is the gate
+  WITHHOLDING the yield when this rank's own measured draw predicts a sub-law
+  trough. Sizing raises the resting level; only the gate can decline the
+  entry. Keep the per-rank shortfall term (it is measured and it is free), but
+  do not size against it expecting the corridor to hold.
+
+* **The pool's row count is a GROUP quantity, and this document treats it as a
+  per-rank one throughout.** `KvBackingRelief`'s shrink was already collective;
+  its RECOVERY was not, and a rank whose recovery is corridor-bounded comes
+  back with fewer rows than its peers -- 40404 of them on the metal boot, which
+  is exactly the divergence that had been killing the instance at the seam.
+  Under pure PP every rank holds the same token rows, so **the group can never
+  use more rows than its poorest rank has backed**; any sizing reasoning that
+  quotes a per-rank number without taking the group MIN is quoting a capacity
+  that does not exist.
+
+* **The allocator's free-list ORDER belongs in the same sentence as its size.**
+  Two ranks with identical membership in different order hand the next request
+  different row ids, which is a divergent live slot set with nothing in the
+  pool census to show for it. Anything that adds or removes ids from a free
+  list here has to do so identically on every rank, or normalise afterwards.

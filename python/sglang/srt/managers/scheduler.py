@@ -4232,9 +4232,20 @@ class Scheduler(
     #: reading of "byte-identical when off".
     _corridor_trace = None
     _corridor_trace_armed = False
+    #: Monotonic deadline for the next breach read, and the deepest floor
+    #: already reported. See _corridor_trace_tick.
+    _corridor_trace_next_check = 0.0
+    _corridor_trace_reported_floor = None
+
+    #: How often the armed trace is asked whether the law still holds. The
+    #: SAMPLING is 100 ms and unchanged; this is only how often the verdict
+    #: is read, and it is deliberately coarse -- the report is for an
+    #: operator, and a breach that has happened cannot be un-happened by
+    #: reading it sooner.
+    _CORRIDOR_BREACH_CHECK_S = 10.0
 
     def _corridor_trace_tick(self) -> None:
-        """Arm the continuous corridor sampler, ONCE, on the first tick.
+        """Arm the continuous corridor sampler, then AUDIT it on a cadence.
 
         #605 R2 open item 1: ``mem_ledger.corridor_trace`` was tested, ready
         and callerless. The boot marks are snapshots and the corridor law is a
@@ -4259,15 +4270,98 @@ class Scheduler(
         not take serving down with it, and a failure that re-fires every
         iteration is the 2661-line boot log the census already learned from.
         """
-        if self._corridor_trace_armed:
-            return
-        self._corridor_trace_armed = True
-        try:
-            from sglang.srt.mem_ledger import corridor_trace
+        if not self._corridor_trace_armed:
+            self._corridor_trace_armed = True
+            try:
+                from sglang.srt.mem_ledger import corridor_trace
 
-            self._corridor_trace = corridor_trace.start()
-        except Exception as exc:  # noqa: BLE001 - instrument must not raise
-            logger.warning("corridor trace could not be armed: %s", exc)
+                self._corridor_trace = corridor_trace.start()
+            except Exception as exc:  # noqa: BLE001 - instrument must not raise
+                logger.warning("corridor trace could not be armed: %s", exc)
+            return
+
+        # #656: AND THEN READ IT. Arming alone made the process able to
+        # measure its own corridor and still unable to SAY anything about
+        # it. The acceptance run sampled 63 minutes at 100 ms, went 138 MiB
+        # under the law on GPU0 in five episodes, and no line in the serving
+        # log mentions it -- the breach was found afterwards, by an external
+        # sampler, in a CSV. A law the runtime cannot see is a law it cannot
+        # be held to.
+        trace = getattr(self, "_corridor_trace", None)
+        if trace is None:
+            return
+        # getattr WITH DEFAULTS, not attribute access. The class carries these
+        # as class attributes, but this method is called on whatever object
+        # holds it, and `test_it_is_armed_ONCE_however_many_ticks_run` drives
+        # it against a minimal stub -- correctly, because an instrument that
+        # needs its host to have grown particular attributes is an instrument
+        # that raises on the scheduler's hot path the first time someone
+        # refactors around it. Same reason the sampler itself never raises.
+        now = time.monotonic()
+        if now < getattr(self, "_corridor_trace_next_check", 0.0):
+            return
+        self._corridor_trace_next_check = now + getattr(
+            self, "_CORRIDOR_BREACH_CHECK_S", 10.0
+        )
+        try:
+            summary = trace.summary()
+            floor_raw = summary.get("free_min_mib")
+            if not summary.get("breach") or floor_raw is None:
+                return
+            floor = int(floor_raw)
+        except Exception:  # noqa: BLE001 - instrument must not raise
+            return
+        # The ring holds the whole window, so once a breach is in it the
+        # verdict stays true forever. Report only when it gets WORSE, which
+        # makes each line a new deepest instant rather than a repeat.
+        prior = getattr(self, "_corridor_trace_reported_floor", None)
+        if prior is not None and floor >= prior:
+            return
+        self._corridor_trace_reported_floor = floor
+        logger.error(
+            "CORRIDOR LAW BREACHED on this rank's card: the continuous "
+            "minimum over the last %s samples (%.0f s at %s ms) is %d MiB, "
+            "%d MiB BELOW the %d MiB law. This is the time-series minimum, "
+            "not a snapshot -- the binding instant is a transient, typically "
+            "inside a flip cutover, and it is already over by the time this "
+            "line is written. It is reported because the alternative is what "
+            "the #656 acceptance did: breach for 63 minutes and find out "
+            "from a CSV afterwards. If this fires on a flip boot, the seam's "
+            "measured DRAW exceeds the gate's seam-entry reserve and the "
+            "arming floor is the number to re-derive (corridor_guard."
+            "arming_floor_mib).",
+            summary.get("n"),
+            float(summary.get("span_s") or 0.0),
+            summary.get("period_ms"),
+            floor,
+            int(summary.get("corridor_mib", 0)) - floor,
+            summary.get("corridor_mib"),
+        )
+        # AND WRITE IT DOWN, so the next boot of this configuration sizes
+        # itself against a measured shortfall instead of an assumed one.
+        # Guarded and never raises: an instrument must not take serving down,
+        # and a rank with no seam record (a cold boot) simply has nothing to
+        # append to.
+        try:
+            from sglang.srt.managers.phase_flip_seam_reserve import (
+                record_corridor_shortfall,
+            )
+
+            # THE FLIP RUNTIME'S RANK, not self.ps.tp_rank. The seam record
+            # is keyed on the rank write_seam_reserve used (runtime._rank),
+            # and under --tp-size 1 --pp-size 3 the TP rank is 0 in ALL
+            # THREE processes -- register C605-3, where exactly that
+            # substitution filed three cards under one rank. No runtime, no
+            # record to append to, so nothing is written.
+            runtime = getattr(self, "phase_flip_runtime", None)
+            rank = getattr(runtime, "_rank", None)
+            if rank is not None:
+                depth_mib = int(summary.get("corridor_mib", 0)) - floor
+                record_corridor_shortfall(
+                    self.server_args, int(rank), depth_mib << 20
+                )
+        except Exception:  # noqa: BLE001 - instrument must not raise
+            pass
 
     def _census_tick(self) -> None:
         """Advance the census round and, on cadence, diff counts across ranks.

@@ -124,6 +124,7 @@ a refactor.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -133,8 +134,98 @@ LOG_PREFIX = "CORRIDOR-GUARD"
 
 _MIB = 1024 * 1024
 
-#: The user's corridor law, in the unit the law is stated in.
-DEFAULT_FLOOR_MIB = 1024
+#: The user's corridor law, in the unit the law is stated in. THE ONE
+#: DECLARATION. Every other module that needs the law imports it from here
+#: rather than repeating the literal -- ``corridor_trace.summary`` used to
+#: default to its own ``1024`` and ``phase_flip_seam_census`` to another, so
+#: three modules each held a private copy of a number the operator states
+#: once.
+CORRIDOR_LAW_MIB = 1024
+#: Historical name, kept because it is the ``floor_mib`` default of the guard
+#: and callers pass it positionally. It IS the law.
+DEFAULT_FLOOR_MIB = CORRIDOR_LAW_MIB
+
+#: How far above the LAW the gate starts working. The arming floor is not a
+#: second policy number: it is the law plus what a seam is expected to draw
+#: while it runs, and it must be DECLARED WITH the law or the two drift.
+#:
+#: #656 acceptance (2026-08-13) is what that drift costs. The gate armed at
+#: 1536 MiB while the verdict was read against 1024, so a 512 MiB entry
+#: allowance was being asked to cover a draw that the corridor sampler
+#: measured at 1814-1852 MiB on GPU0 -- 3.6x. Five cutovers entered cleanly
+#: through a gate that had no objection and took the card to 886 MiB, 138
+#: below the law, and NOTHING IN THE PROCESS NOTICED: the runtime's own
+#: verdict is read at 1024 and its own gate arms at 1536, so the breach fell
+#: in the gap between the two numbers.
+#:
+#: The default keeps the shipped 512 MiB allowance, so a boot that does not
+#: measure its draw behaves exactly as before. What changes is that the pair
+#: is now derived and logged together, and an arming floor BELOW the law --
+#: which would let the gate bless an allocation the law forbids -- is
+#: refused instead of silently accepted.
+DEFAULT_SEAM_ENTRY_RESERVE_MIB = 512
+
+
+#: Overrides the law. Read HERE and nowhere else: three modules used to read
+#: it with their own ``"1024"`` fallback (``kv_vmm_backing``,
+#: ``phase_flip_seam_census``, and ``corridor_trace``'s default argument), so
+#: the law could be moved for one of them and not the others -- a divergence
+#: with no symptom until a breach is judged twice and answered differently.
+LAW_ENV = "SGLANG_CORRIDOR_LAW_FLOOR_MIB"
+
+
+def corridor_law_mib() -> int:
+    """The law in force, in MiB. THE reader of :data:`LAW_ENV`.
+
+    Read per call, not frozen at import: a rank can be told the law late
+    (the ``kv_vmm_backing`` preempt path is reached long after import), and
+    a value captured at import cannot be corrected by a boot that sets the
+    variable afterwards.
+    """
+    raw = os.environ.get(LAW_ENV)
+    if raw is None:
+        return CORRIDOR_LAW_MIB
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return CORRIDOR_LAW_MIB
+
+
+def corridor_law_bytes() -> int:
+    """The law in force, in bytes."""
+    return corridor_law_mib() * _MIB
+
+
+def arming_floor_mib(
+    seam_entry_reserve_mib: int = DEFAULT_SEAM_ENTRY_RESERVE_MIB,
+    law_mib: int = CORRIDOR_LAW_MIB,
+) -> int:
+    """The gate's watermark, derived from the law it protects.
+
+    ``seam_entry_reserve_mib`` is the MEASURED draw a seam makes while it
+    runs, where a measurement exists; the default is the shipped allowance.
+    Deriving it means an operator cannot raise one number and leave the
+    other behind, which is the failure this function exists to make
+    impossible.
+    """
+    return int(law_mib) + max(0, int(seam_entry_reserve_mib))
+
+
+def check_threshold_pair(arming_mib: int, law_mib: int = CORRIDOR_LAW_MIB) -> None:
+    """Refuse a pair that cannot mean what it says.
+
+    An arming floor below the law lets the gate return "no reclaim needed"
+    for an allocation that ends under the corridor -- the guard would be
+    laundering a breach as a passed check, which is the one thing its own
+    refusal message says it must never do.
+    """
+    if int(arming_mib) < int(law_mib):
+        raise ValueError(
+            f"corridor arming floor {arming_mib} MiB is BELOW the corridor "
+            f"law {law_mib} MiB. The gate would clear allocations the law "
+            f"forbids and no refusal would ever fire. The arming floor is "
+            f"the law PLUS the seam's expected draw, never less than it."
+        )
 
 #: How far ABOVE the floor a reclaim frees, so the next few allocations do not
 #: each pay a spill. 256 MiB is one seam's worth of slack on this rig's

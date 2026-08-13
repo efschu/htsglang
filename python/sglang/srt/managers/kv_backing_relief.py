@@ -167,6 +167,74 @@ def collective_kv_target(reduced):
     return int(target)
 
 
+#: The proposal of a rank that cannot take part in the CAP AGREEMENT below.
+#: Its first field (``capable``) is 0, and :func:`collective_cap_target`
+#: declines whenever the group's minimum is not positive, so one abstention
+#: cancels the levelling for everyone -- the same direction as :data:`ABSTAIN`,
+#: and for the same reason.
+CAP_ABSTAIN = (0, 0, 0, 0)
+
+
+def collective_cap_target(reduced):
+    """The ONE row level every rank's allocator exposes, from a MIN reduction.
+
+    #656 C22, and it is the recovery half of the law
+    :func:`collective_kv_target` states for the shrink: *a refusal may be
+    decided locally, a CAPACITY may not*.
+
+    ``reduced`` is what a MIN all-reduce returns over the four-field proposals
+    :meth:`KvBackingRelief.cap_proposal` produces::
+
+        [ capable, -floor, exposed, -exposed ]
+            |         |       |        |
+            |         |       |        `-- MAX exposed level (is the group level?)
+            |         |       `-- MIN exposed level right now
+            |         `-- negated, so MIN yields the MAX floor across the group
+            `-- MIN capable: the poorest rank sets the level the group lives at
+
+    **The poorest rank sets the level, and the most-loaded rank sets the
+    limit.** ``capable`` is how far a rank could expose rows *without breaching
+    its own corridor law*, so the MIN is a level every rank can honour with
+    memory it has actually mapped. ``floor`` is the highest live row plus the
+    admission reserve, so a target below it would withhold ids a request is
+    using -- the limit therefore wins, exactly as it does for the shrink.
+
+    Returns the level unconditionally when one exists -- INCLUDING when the
+    group is already at it, because "no change needed" is a property of each
+    rank's own state and :meth:`KvBackingRelief.reconcile_to` is a no-op in
+    that case. A None here means there is no honest level at all: a rank
+    abstained, or -- the one asymmetry against the shrink -- the MAX floor is
+    ABOVE the MIN capable. That last case cannot be answered: the poorest rank
+    cannot expose the rows a peer's live set requires, and forcing it would
+    hand out unmapped memory. Declining leaves the divergence for the flip's
+    frame ballot to refuse, which costs a flip and never a rank.
+    """
+    if len(reduced) < 4:
+        return None
+    capable = int(reduced[0])
+    max_floor = -int(reduced[1])
+    if capable <= 0:
+        # An abstention, or a rank with nothing to expose.
+        return None
+    if max_floor > capable:
+        return None
+    min_exposed = int(reduced[2])
+    max_exposed = -int(reduced[3])
+    if min_exposed == max_exposed == capable:
+        # ALREADY LEVEL, AND THAT IS NOT THE SAME AS "NOTHING TO DO ON THIS
+        # RANK". When the group is NOT level, every rank -- including the ones
+        # already at the target -- has to run the same normalisation, because
+        # the cap's release path SORTS the free list while its apply path
+        # preserves eviction order. A rank that skipped would hand out
+        # different row ids from the ones that moved, which is a divergent
+        # live slot set and therefore a divergent wire frame. Measured on
+        # metal: boot_v2, six abandoned rounds, pool census identical on all
+        # three ranks. So the "nothing to do" decision is taken HERE, from
+        # the reduced view of the whole group, and never per rank.
+        return None
+    return int(capable)
+
+
 class KvRowCap:
     """Withhold slot ids above ``cap`` from the allocator's free list.
 
@@ -271,6 +339,22 @@ class KvRowCap:
         self._withheld = None
         self._publish()
         return n
+
+    def sort_free_lists(self) -> None:
+        """Put every free list in ascending id order on THIS rank.
+
+        Called by the group cap agreement so that the order is a function of
+        MEMBERSHIP and nothing else. Two ranks with the same free ids must
+        hand the next request the same row id, or their live slot sets -- and
+        therefore the lengths of the payloads they frame -- part company.
+        """
+        import torch
+
+        for name in ("free_pages", "release_pages"):
+            pages = getattr(self._alloc, name, None)
+            if pages is None or pages.numel() < 2:
+                continue
+            setattr(self._alloc, name, torch.sort(pages).values)
 
     def _on_clear(self) -> None:
         """Re-apply the cap after the allocator rebuilt its free list.
@@ -1009,6 +1093,140 @@ class KvBackingRelief:
             self._exhausted = False
         self.recover_count += 1
         return max(0, now - was)
+
+    # -- the cap agreement (#656 C22) -------------------------------------
+
+    def _reservation_rows(self) -> int:
+        """Rows the allocator's id space spans -- the reservation, not the
+        backing. This is what an UNCAPPED allocator will hand out."""
+        return int(getattr(self._pool, "size", 0) or self._current_rows())
+
+    def exposed_rows(self) -> int:
+        """The highest row id this rank's allocator may hand out.
+
+        The cap when one is engaged, the whole reservation otherwise. This is
+        the quantity that has to be identical across the group: it decides
+        ``available_size()``, which feeds ADMISSION, and it decides which ids
+        the flip's live-slot enumeration can encounter, which decides the
+        length of the payload each rank frames.
+        """
+        if self._cap.engaged and self._cap.cap is not None:
+            return int(self._cap.cap)
+        return self._reservation_rows()
+
+    def cap_proposal(self):
+        """This rank's four-field proposal for the group's exposed row level.
+
+        PURE: reads free memory, the backing and the live set, and computes.
+        It is on the seam round's unconditional path, so it must not change
+        residency and must not raise -- an unreadable live set abstains, which
+        makes the whole group decline.
+        """
+        max_live = self._max_live_row()
+        if max_live < 0:
+            return CAP_ABSTAIN
+        backed = self._current_rows()
+        if backed <= 0:
+            return CAP_ABSTAIN
+        # WHAT THIS RANK CAN EXPOSE IS WHAT IS ALREADY BACKED. NOT ONE ROW
+        # MORE, and the missing term is the one that had to be measured to be
+        # believed. The first metal boot of this agreement proposed
+        # ``backed + (free - law) / bytes_per_row`` -- what ``recover`` would
+        # be allowed to commit -- and the levelling then tried to GROW on the
+        # pp->tp leg, i.e. to hand back the very rows the collective shrink
+        # had just taken to fund the seam. Measured 2026-08-13 15:40:23Z:
+        # ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` on all three ranks,
+        # rank 0 driven to 3 MiB free (1021 MiB below the law), the seam then
+        # unfundable, and the instance parked in TP with a 9-token prefill it
+        # could not run.
+        #
+        # So the agreement is STRICTLY NON-ALLOCATING. Growing has exactly one
+        # owner -- ``recover``, on the leg the pool becomes active again, with
+        # its own corridor bound -- and this decides only which of the backed
+        # rows the group agrees to hand out. The two never fight, and the
+        # level still rises: a rank that recovers raises its own proposal, and
+        # its peers follow by RELEASING a cap over pages they never gave up.
+        capable = backed
+        page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
+        capable = int(capable // page * page)
+        if capable <= 0:
+            return CAP_ABSTAIN
+        exposed = self.exposed_rows()
+        floor = self._floor_rows(max_live)
+        return (int(capable), -int(floor), int(exposed), -int(exposed))
+
+    def reconcile_to(self, target: int) -> int:
+        """Bring this rank's exposed row level to exactly ``target``.
+
+        IT COMMITS NOTHING, EVER, and it releases nothing either. This is an
+        ID decision: the pages stay exactly as they are and only the
+        allocator's free list moves. Growing the backing has ONE owner --
+        :meth:`recover`, on the leg the pool becomes active again, with its
+        own corridor bound -- and an agreement that also grew would hand back
+        the rows the collective shrink had just taken to fund the seam. That
+        is not hypothetical; it OOM'd all three ranks on the first metal boot
+        of this mechanism (see :meth:`cap_proposal`).
+
+        ``target`` is the group MIN of what every rank has BACKED, so it is
+        never above this rank's own backing; the ``min`` below is a
+        belt-and-braces reading rather than a clamp that does work.
+
+        Levelling a rank DOWN costs it no real capacity: under pure PP every
+        rank holds the same token rows, so rows above the group minimum could
+        never have been admitted against anyway. What it buys is that the
+        ranks cannot disagree about ``available_size()`` or about which ids a
+        live-slot enumeration may encounter.
+
+        Returns the change in this rank's exposed level (signed).
+        """
+        target = int(target)
+        before = self.exposed_rows()
+        backed = self._current_rows()
+        # NO EARLY RETURN FOR "I AM ALREADY THERE". The caller only reaches
+        # this when the GROUP is not level (``collective_cap_target`` decides
+        # that from the reduced view), and every rank must then run the same
+        # release-and-re-engage so that every rank's free list ends in the
+        # same ORDER. Skipping here is what left one rank sorted and another
+        # in eviction order on boot_v2, and a different order hands the next
+        # request different row ids -- a divergent live slot set, and a
+        # divergent wire frame, with the pool census identical on every rank.
+        level = min(target, backed)
+        ceiling = (
+            int(self._rows_at_boot)
+            if self._rows_at_boot is not None
+            else self._reservation_rows()
+        )
+        self._cap.release()
+        if level < self._reservation_rows():
+            self._cap.engage(level)
+        # AND MAKE THE ORDER A FUNCTION OF MEMBERSHIP ALONE.
+        #
+        # ``release`` sorts only when it actually had ids withheld, and
+        # ``engage``'s filter preserves whatever order it found, so after the
+        # pair above a rank that HAD a cap is sorted and a rank that did not
+        # is still in eviction order -- with identical membership. The
+        # allocator takes from the FRONT, so those two ranks hand the next
+        # request different row ids, and the live slot sets part company with
+        # nothing in the pool census to show for it. That is boot_v2's second
+        # divergence, and it is why the sort is explicit and unconditional
+        # here rather than a side effect of one branch.
+        self._cap.sort_free_lists()
+        if self._rows_at_boot is not None and level >= ceiling:
+            self._rows_at_boot = None
+            self._exhausted = False
+        after = self.exposed_rows()
+        if after != before:
+            logger.info(
+                "%s cap agreement: exposed rows %d -> %d (group level %d, "
+                "backed %d). The group's ranks hold the same token rows, so "
+                "the level every rank can fund is the level the group has",
+                LOG_PREFIX,
+                before,
+                after,
+                target,
+                backed,
+            )
+        return int(after - before)
 
 
 def row_geometry(pool: Any):

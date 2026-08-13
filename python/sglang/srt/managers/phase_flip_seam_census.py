@@ -85,7 +85,6 @@ DISCIPLINE
 from __future__ import annotations
 
 import logging
-import os
 from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -113,10 +112,11 @@ def law_floor_bytes() -> int:
     law. Reporting a "breach" on the arming floor would cry wolf on every
     cutover that legally spends its margin.
     """
-    try:
-        return max(0, int(os.getenv("SGLANG_CORRIDOR_LAW_FLOOR_MIB", "1024"))) * _MIB
-    except (TypeError, ValueError):
-        return 1024 * _MIB
+    #656: through the ONE declaration, not a private env read with its own
+    # "1024" fallback. See corridor_guard.LAW_ENV.
+    from sglang.srt.managers.corridor_guard import corridor_law_bytes
+
+    return corridor_law_bytes()
 
 
 def _default_probe() -> Optional[Tuple[int, int, int]]:

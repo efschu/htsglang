@@ -1116,6 +1116,66 @@ def recover_kv_backing(scheduler: Any) -> int:
         )
         return 0
 
+def apply_cap_agreement(scheduler: Any, reduced_cap_fields) -> int:
+    """#656 C22: ONE exposed row level for the whole group, every seam round.
+
+    THE SHRINK WAS COLLECTIVE AND THE RECOVERY WAS NOT, and that asymmetry is
+    the divergence the frame ballot caught on metal (boot ``boot_m1``,
+    2026-08-13). ``KvBackingRelief.recover`` is bounded by each rank's own
+    distance from the corridor law -- correctly, since recovery is an
+    allocation on the card that needed relieving -- so the rank nearest the
+    law recovers less than its peers and stays capped where they do not::
+
+        14:42:25 PP1  KV-BACKING recovered to 537986 of 578390 rows (corridor-bounded)
+        14:42:25 PP1  POOL CENSUS post-cutover: free=197527 unaccounted=40404
+        14:42:25 PP0  POOL CENSUS post-cutover: free=237931 unaccounted=0
+        14:42:25 PP2  POOL CENSUS post-cutover: free=237931 unaccounted=0
+
+    ``578390 - 537986 = 40404``, which is the census delta to the row. From
+    that moment the ranks enumerated different live slot sets, framed payloads
+    of different lengths, and every subsequent ``pp_to_tp`` round was refused
+    by the ballot -- decode's leg, so the instance wedged.
+
+    Levelling costs the healthy ranks nothing real: under pure PP every rank
+    holds the SAME token rows, so rows above the group minimum could never
+    have been admitted against. It is also not a ratchet -- the level rises
+    again as soon as the poorest rank can fund it.
+
+    WHERE THIS RUNS AND WHY. It rides the KV rung's EXISTING reduction, whose
+    payload is widened from 4 fields to 8 -- no second collective, because the
+    collective COUNT is itself a load-bearing invariant here (``on_round``'s
+    census diffs it across ranks to catch desyncs, and the gate's own tests
+    pin one reduction per gate call). That site is the one place every rank
+    reaches unconditionally, and it runs BEFORE ``_frame_digest`` in the same
+    round -- so a divergence that opened during the previous phase is closed
+    before the frame that would have tripped over it is computed. Both legs,
+    unlike the shrink: the level has to be uniform whichever way the flip is
+    going.
+
+    ``reduced_cap_fields`` is the second half of that reduced payload.
+
+    Returns this rank's signed change in exposed rows.
+    """
+    from sglang.srt.managers import kv_backing_relief as kbr
+
+    relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None) if scheduler else None
+    target = kbr.collective_cap_target(reduced_cap_fields)
+    if target is None or relief is None:
+        return 0
+    try:
+        return int(relief.reconcile_to(target))
+    except Exception as e:
+        logger.error(
+            "%s could not level this rank to the agreed %d rows: %s. The rank "
+            "stays where it is and the seam's frame ballot refuses the flip "
+            "until it agrees -- a lost flip, never a half-flipped group",
+            LOG_PREFIX,
+            target,
+            e,
+        )
+        return 0
+
+
 def _cached_relief_estimate(device_index: int) -> int:
     """Bytes the tiers BELOW the KV rung could still return, on this rank.
 
@@ -1203,6 +1263,14 @@ def collective_kv_backing_relief(
     from sglang.srt.managers import kv_backing_relief as kbr
 
     relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None) if scheduler else None
+    # #656 C22: the CAP AGREEMENT rides this same reduction, and it is NOT
+    # subject to the exclusions below. The shrink happens on one leg and needs
+    # a guard to propose against; the levelling has to happen on both legs and
+    # needs neither, because it changes no bytes -- it only decides which ids
+    # the allocators may hand out. Held in its own name so the exclusions
+    # cannot silently disable it, which is exactly how the recovery came to be
+    # rank-local in the first place.
+    cap_relief = relief
     if str(direction) != KV_RELIEF_DIRECTION:
         # ONE LEG ONLY, and the asymmetry is structural rather than cautious.
         #
@@ -1280,21 +1348,52 @@ def collective_kv_backing_relief(
                 e,
             )
             proposal = kbr.ABSTAIN
-    target = kbr.collective_kv_target(reduce_fn(list(proposal)))
-    if target is None or relief is None:
-        return 0
-    try:
-        return int(relief.apply_target(target))
-    except Exception as e:
-        logger.error(
-            "%s KV relief failed to apply the agreed target %d: %s. This rank "
-            "is now capped differently from its peers -- recovery on the "
-            "tp->pp leg lifts it.",
+    # THE SECOND HALF OF THE SAME PAYLOAD (#656 C22). Built unconditionally,
+    # including when this rank abstains from the shrink, because the payload
+    # LENGTH must be identical on every rank or the reduction is malformed.
+    cap_proposal = kbr.CAP_ABSTAIN
+    if cap_relief is not None:
+        try:
+            cap_proposal = cap_relief.cap_proposal()
+        except Exception as e:
+            logger.warning(
+                "%s KV cap proposal failed (%s); abstaining, which makes the "
+                "whole group decline the levelling",
+                LOG_PREFIX,
+                e,
+            )
+            cap_proposal = kbr.CAP_ABSTAIN
+    reduced = list(reduce_fn(list(proposal) + list(cap_proposal)))
+    target = kbr.collective_kv_target(reduced[:4])
+    if target is not None and relief is not None:
+        # A SHRINK MAKES THE GROUP LEVEL BY CONSTRUCTION -- every rank caps to
+        # the same absolute row target -- so the levelling has nothing to do
+        # this round, and applying it from proposals made BEFORE the shrink
+        # would act on a state that no longer exists.
+        try:
+            return int(relief.apply_target(target))
+        except Exception as e:
+            logger.error(
+                "%s KV relief failed to apply the agreed target %d: %s. This "
+                "rank is now capped differently from its peers -- the cap "
+                "agreement on a later round levels it.",
+                LOG_PREFIX,
+                target,
+                e,
+            )
+            return 0
+    levelled = apply_cap_agreement(scheduler, reduced[4:8])
+    if levelled:
+        logger.warning(
+            "%s KV cap agreement moved this rank %+d exposed rows (%s). A "
+            "rank that came back from a phase with fewer backed rows than its "
+            "peers frames a different seam payload; the group now lives at "
+            "the level its poorest rank can fund",
             LOG_PREFIX,
-            target,
-            e,
+            int(levelled),
+            direction,
         )
-        return 0
+    return 0
 
 
 #: Proof/soak override for the gate's arming floor. See get_corridor_guard.
@@ -1396,30 +1495,48 @@ def get_corridor_guard(scheduler: Any):
     # real payload. The corridor law itself is unchanged: the sampler still
     # judges against 1024, so a proof run at a raised floor can demonstrate
     # spill-before-alloc without being able to launder a breach.
-    floor_mib = int(
-        os.environ.get(CORRIDOR_FLOOR_ENV)
-        or getattr(server_args, "phase_flip_corridor_floor_mib", None)
-        or cg.DEFAULT_FLOOR_MIB
+    # #656 remediation: THE PAIR IS DERIVED AND DECLARED TOGETHER. The default
+    # arming floor is the law plus the seam's expected draw (cg.arming_floor_
+    # mib) rather than an unrelated number, and whichever way it is set, both
+    # halves are logged in ONE line naming the reserve BETWEEN them. The
+    # acceptance run armed at 1536 and judged at 1024 with nothing stating
+    # that 512 MiB was supposed to be the seam's whole draw -- and the
+    # measured draw was 1814-1852 MiB, so the gap between the two numbers was
+    # exactly where five corridor breaches lived, unseen.
+    # NOTE the getattr is a no-op today: there is no
+    # `--phase-flip-corridor-floor-mib` server arg, so this attribute never
+    # exists and the fallback is always taken. Kept because it is the hook a
+    # flag would land on, and NOT advertised in the log line below -- naming
+    # a flag that does not exist sends an operator looking for it.
+    configured = os.environ.get(CORRIDOR_FLOOR_ENV) or getattr(
+        server_args, "phase_flip_corridor_floor_mib", None
     )
-    if floor_mib != cg.DEFAULT_FLOOR_MIB:
-        logger.warning(
-            "%s corridor guard floor is %d MiB, NOT the %d MiB corridor law "
-            "(%s is set). This makes the gate arm earlier than the law "
-            "requires; it is a proof/soak setting, and the corridor verdict "
-            "must still be read against %d MiB.",
-            LOG_PREFIX,
-            floor_mib,
-            cg.DEFAULT_FLOOR_MIB,
-            CORRIDOR_FLOOR_ENV,
-            cg.DEFAULT_FLOOR_MIB,
-        )
+    law_mib = cg.corridor_law_mib()
+    floor_mib = int(configured) if configured else cg.arming_floor_mib(law_mib=law_mib)
+    cg.check_threshold_pair(floor_mib, law_mib)
+    logger.warning(
+        "%s THRESHOLD PAIR on device %d: corridor LAW %d MiB (the verdict, "
+        "and the only thing a refusal may be justified by), gate ARMS at %d "
+        "MiB, i.e. the law plus a %d MiB seam-entry reserve%s. The reserve is "
+        "what the gate assumes a seam DRAWS while it runs: if the measured "
+        "draw exceeds it, entries clear this gate and still breach the law, "
+        "and the breach lands in the gap between these two numbers where "
+        "nothing looks. Measured on this rig (#656 acceptance): 1814-1852 MiB "
+        "on the binding card.",
+        LOG_PREFIX,
+        int(device_index),
+        law_mib,
+        floor_mib,
+        floor_mib - law_mib,
+        f" (set by {CORRIDOR_FLOOR_ENV})" if configured else " (derived)",
+    )
     guard = cg.CorridorGuard(
         int(device_index),
         floor_mib=floor_mib,
         # The LAW never moves with the proof setting: a raised arming floor
         # must make the gate work EARLIER, never make it refuse allocations
         # the corridor permits. See CorridorGuard.__init__.
-        law_floor_mib=cg.DEFAULT_FLOOR_MIB,
+        law_floor_mib=law_mib,
         fleet_probe=cg.nvml_fleet_probe(),
     )
 
