@@ -109,7 +109,28 @@ open("/tmp/s33_argv.txt", "w").write("\n".join(argv))
 print(f"[boot] argv prepared, {len(argv)} entries")
 PYEOF
 
-REPLAY_EXTRA_ENV="$EXTRA_ENV" ENV_SRC="$ENV_SRC" setsid "$PY" - "$LOG" <<'PYEOF' &
+# #638 CGROUP TRAP, new edge: setsid detaches the SESSION, not the CGROUP.
+#
+# An agent session's shell runs in /system.slice/claude.service, so a server
+# booted from it joins that cgroup and every claude.service restart SIGTERMs
+# it as collateral -- the serving instance on 2026-08-13 09:04:59 drained and
+# died that way, mid-probe, with nothing wrong with the instance. The router
+# survives the same restarts only because it has its own unit.
+#
+# A transient scope moves the launched process into
+# /system.slice/<unit>.scope, which no claude.service restart touches. The
+# serving argv and env are UNCHANGED: this is supervision, not configuration.
+SCOPE_UNIT=""
+LAUNCH_PREFIX=()
+if command -v systemd-run >/dev/null 2>&1; then
+  SCOPE_UNIT="htsglang-serving-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  LAUNCH_PREFIX=(systemd-run --scope --quiet --unit="$SCOPE_UNIT" --slice=system.slice)
+else
+  echo "[boot] WARNING: no systemd-run. Serving inherits this shell's cgroup" >&2
+  echo "[boot]          and dies with it (#638 cgroup trap)." >&2
+fi
+
+REPLAY_EXTRA_ENV="$EXTRA_ENV" ENV_SRC="$ENV_SRC" "${LAUNCH_PREFIX[@]}" setsid "$PY" - "$LOG" <<'PYEOF' &
 import os, sys
 
 log = sys.argv[1]
@@ -132,3 +153,34 @@ os.setsid() if os.getpgrp() != os.getpid() else None
 os.execve(argv[0], argv, env)
 PYEOF
 echo "[boot] launched; log -> $LOG"
+
+# The membership check IS the acceptance for the escape above. Never test it
+# by restarting claude.service: that kills the operator session and every
+# other shift on this box.
+if [ -n "$SCOPE_UNIT" ]; then
+  procs="/sys/fs/cgroup/system.slice/${SCOPE_UNIT}.scope/cgroup.procs"
+  # The scope exists before its payload does: systemd-run returns as soon as
+  # the transient unit is up, and the execve chain behind it takes a moment to
+  # appear. 10 s was not enough on a cold boot and reported an empty scope for
+  # a process that was there 20 s later.
+  # NOT [ -s ]: cgroup.procs is a kernfs file and always stats as size 0, so
+  # -s reported "empty scope" for a scope with a live server in it. Read it.
+  for _ in $(seq 1 150); do
+    [ -n "$(cat "$procs" 2>/dev/null)" ] && break
+    sleep 0.2
+  done
+  if [ -n "$(cat "$procs" 2>/dev/null)" ]; then
+    trapped=0
+    while read -r p; do
+      [ -e "/proc/$p/cgroup" ] || continue
+      if grep -q "claude.service" "/proc/$p/cgroup"; then trapped=$((trapped + 1)); fi
+    done < "$procs"
+    if [ "$trapped" -eq 0 ]; then
+      echo "[boot] cgroup escape OK: scope ${SCOPE_UNIT}.scope, $(cat "$procs" | wc -l) pid(s), none in claude.service"
+    else
+      echo "[boot] WARNING: $trapped launched pid(s) are STILL in claude.service" >&2
+    fi
+  else
+    echo "[boot] WARNING: scope ${SCOPE_UNIT}.scope has no pids; escape unproven" >&2
+  fi
+fi

@@ -408,7 +408,33 @@ class RotaryEmbedding(MultiPlatformOp):
         """
         state = getattr(self, "_lazy_cos_sin", None)
         if state is None:
-            self._ensure_cos_sin_cache_length(rows - 1)
+            # A cache can be born too small to be worth a reservation and then
+            # be asked to cover the whole ceiling right here -- which is how a
+            # 1048960x36 cache that started under the threshold ended up
+            # EAGERLY holding 144 MiB of a 1M ceiling. The reserve is the
+            # moment the ceiling becomes known, so it is also the moment to
+            # reconsider. Eligibility is re-asked in full (install, not
+            # reserve): this layer has never been lazy.
+            written = int(self.cos_sin_cache.shape[0])
+            cache = lazy_cos_sin_cache.install(
+                self,
+                capacity_rows=rows,
+                cols=self.rotary_dim,
+                device=self.cos_sin_cache.device,
+                dtype=self.cos_sin_cache.dtype,
+            )
+            if cache is None:
+                self._ensure_cos_sin_cache_length(rows - 1)
+                return
+            # Carry over the rows that were already computed, so becoming lazy
+            # never un-writes a row somebody may already have read.
+            if written > self._lazy_cos_sin.filled:
+                cache[:written] = self.cos_sin_cache[:written].to(
+                    device=cache.device, dtype=cache.dtype
+                )
+                self._lazy_cos_sin.filled = written
+                lazy_cos_sin_cache.note_growth(self)
+            self.cos_sin_cache = cache
             return
         if rows <= state.capacity:
             return

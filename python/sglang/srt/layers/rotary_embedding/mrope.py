@@ -7,7 +7,10 @@ from typing import List, Optional, Tuple
 
 import torch
 
+import math
+
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.lazy_cos_sin_cache import register_lazy_safe
 from sglang.srt.layers.rotary_embedding.triton_kernels import (
     triton_ernie45_rope_fused_inplace,
     triton_mrope_fused,
@@ -494,6 +497,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
 
 
+@register_lazy_safe
 class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
     """MRoPE-enabled rotary embedding with YaRN context scaling."""
 
@@ -556,6 +560,11 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
             + inv_freq_extrapolation * inv_freq_mask
         )
         return inv_freq
+
+    def _cos_sin_cache_rows(self) -> int:
+        # Must match _compute_cos_sin_cache below, whose arange runs to
+        # max_position_embeddings * scaling_factor.
+        return int(math.ceil(self.max_position_embeddings * self.scaling_factor))
 
     def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
         # Must match _compute_cos_sin_cache below: scaling_factor, not base.

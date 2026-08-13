@@ -265,3 +265,34 @@ def test_written_rows_reports_the_fill_not_the_reservation():
     assert lazy_cos_sin_cache.written_rows(rope) >= 701
     eager = _build(lazy=False)
     assert lazy_cos_sin_cache.written_rows(eager) == EAGER_ROWS
+
+
+def test_a_cache_born_small_becomes_lazy_when_the_ceiling_arrives():
+    """The reserve is when the ceiling becomes known.
+
+    A layer whose constructor builds fewer rows than the threshold is not
+    worth a reservation at construction -- but the pre-capture reserve then
+    asks it to cover the whole context ceiling, and doing THAT eagerly is the
+    cost this path exists to remove. Measured on metal before this was fixed:
+    a 1048960x36 cache holding 144.1 MiB of a 1M ceiling, fully written.
+    """
+    rope = _build(lazy=True, min_rows=EAGER_ROWS + 1)  # too small at birth
+    assert rope._lazy_cos_sin is None
+    born_with = int(rope.cos_sin_cache.shape[0])
+
+    with (
+        envs.SGLANG_ROPE_LAZY_CACHE.override(True),
+        envs.SGLANG_ROPE_LAZY_MIN_ROWS.override(EAGER_ROWS),
+    ):
+        rope.ensure_cos_sin_cache_capacity(EAGER_ROWS * 4)
+
+    state = rope._lazy_cos_sin
+    assert state is not None, "the reserve did not reconsider"
+    assert state.capacity == EAGER_ROWS * 4
+    assert state.filled == born_with, "rows already computed must be carried over"
+    torch.testing.assert_close(
+        rope.cos_sin_cache[:born_with],
+        _reference_rows(rope, 0, born_with),
+        rtol=1e-5,
+        atol=1e-5,
+    )

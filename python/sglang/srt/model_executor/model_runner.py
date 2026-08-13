@@ -4051,10 +4051,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not lazy_cos_sin_cache.any_installed():
             return
+
+        # CAPTURE IS NOT A BATCH. The eagle draft worker enters this same
+        # forward() from inside torch.cuda.graph capture
+        # (eagle_draft_cuda_graph_runner.run_once -> draft_runner.forward), and
+        # while a stream is capturing, ANY device read is
+        # cudaErrorStreamCaptureUnsupported -- which is how the first lazy boot
+        # died, in capture_end rather than at the read. Capture runs dummy
+        # positions inside the initial chunk, and every real batch enters
+        # forward() again outside capture, so there is nothing to grow here.
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return
         needed = int(seq_lens_cpu.max()) + self._rope_lazy_batch_margin
+
+        # MULTIMODAL BATCHES BREAK THE seq_lens BOUND. Text positions are
+        # bounded by the sequence length, but an M-RoPE batch carries its own
+        # position ids (temporal/height/width sections), which are NOT that
+        # bound -- a video's temporal ids run past the token count. The
+        # allowlisted lazy class on this rig IS the M-RoPE YaRN variant, so
+        # this is not hypothetical. Only these batches pay the device read.
+        mrope_positions = getattr(forward_batch, "mrope_positions", None)
+        if mrope_positions is not None and mrope_positions.numel():
+            needed = max(
+                needed, int(mrope_positions.max()) + self._rope_lazy_batch_margin
+            )
+
         lazy_cos_sin_cache.ensure_capacity_for_position(needed)
 
         if envs.SGLANG_ROPE_LAZY_VERIFY.get():

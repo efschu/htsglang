@@ -5091,6 +5091,53 @@ def reserve_rope_cache_for_long_sequences(
 
     reserve_rope_cache_recursive(model)
 
+    # Say what the ceiling actually costs, in bytes, on this rank. Register 69
+    # priced it by DIFFERENCE between two boots, which is a measurement that
+    # carries every other difference between those boots with it. This is the
+    # quantity itself.
+    if logger is not None:
+        from sglang.srt.layers.rotary_embedding.lazy_cos_sin_cache import written_rows
+
+        seen, reserved_b, written_b, lazy_n = set(), 0, 0, 0
+        detail = []
+
+        def account(module):
+            nonlocal reserved_b, written_b, lazy_n
+            for child in module.children():
+                cache = getattr(child, "cos_sin_cache", None)
+                if cache is not None and hasattr(child, "_ensure_cos_sin_cache_length"):
+                    if id(cache) in seen:
+                        continue  # one instance shared by many layers (_ROPE_DICT)
+                    seen.add(id(cache))
+                    row_b = cache.element_size() * cache.shape[-1]
+                    reserved_b += int(cache.shape[0]) * row_b
+                    written_b += written_rows(child) * row_b
+                    is_lazy = getattr(child, "_lazy_cos_sin", None) is not None
+                    lazy_n += is_lazy
+                    detail.append(
+                        f"{type(child).__name__} {int(cache.shape[0])}x{cache.shape[-1]} "
+                        f"{str(cache.dtype).replace('torch.', '')} "
+                        f"{int(cache.shape[0]) * row_b / 2**20:.1f} MiB reserved / "
+                        f"{written_rows(child) * row_b / 2**20:.1f} MiB written"
+                        f"{' LAZY' if is_lazy else ' EAGER'}"
+                    )
+                else:
+                    account(child)
+
+        account(model)
+        if seen:
+            logger.info(
+                "RoPE cos/sin cache: %d distinct cache(s), %.1f MiB reserved, "
+                "%.1f MiB written at boot (%d lazy). Reserve target was %d rows. "
+                "Each: %s",
+                len(seen),
+                reserved_b / 2**20,
+                written_b / 2**20,
+                lazy_n,
+                reserve,
+                "; ".join(detail),
+            )
+
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
 def calc_diff(x, y):
