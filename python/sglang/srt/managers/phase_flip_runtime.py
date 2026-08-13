@@ -63,7 +63,10 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
-from sglang.srt.model_executor.weights_arena import uint8_checksum
+from sglang.srt.model_executor.weights_arena import (
+    checksum_is_representable,
+    uint8_checksum,
+)
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
@@ -219,6 +222,12 @@ ENV_SEAM_ENTRY_DELAY_BUDGET = "SGLANG_SEAM_ENTRY_DELAY_BUDGET"
 #: in this corpus greps "FLIP ABANDONED", and a healthy by-design wait
 #: counted there is indistinguishable from the 411-abandon decode wedge.
 SEAM_MARGIN_DELAY_TAG = "seam entry margin short"
+
+#: Modulus for the wire-frame digest (register C22). A Mersenne prime just
+#: under 2**31 so that a product of two residues fits an int64 with room for
+#: the sum, and the digest stays POSITIVE -- it is reduced as a ``[x, -x]``
+#: MIN pair, and a value that could reach INT64_MIN could not be negated.
+_FRAME_DIGEST_MOD = (1 << 31) - 1
 
 # How many CONSECUTIVE group abandons in one direction may be spent before the
 # seam stands down for good and says why.
@@ -2146,6 +2155,11 @@ class PhaseFlipRuntime:
         #: Flips abandoned because the live set did not fit the target
         #: pool. Same reason for counting it.
         self.fit_aborts = 0
+        #: Flips abandoned because the ranks did not agree on the WIRE FRAME
+        #: (register C22). Counted separately from every other abandon: a
+        #: frame divergence is a broken replication premise, not a capacity
+        #: verdict, and the two want opposite responses from an operator.
+        self.frame_aborts = 0
         #: Flips abandoned by the corridor gate (#656 item 15a) because no
         #: provider could fund the staging without breaking the floor.
         #: Distinct from staging_aborts: that one says "there is not enough
@@ -3321,6 +3335,72 @@ class PhaseFlipRuntime:
                 path,
             )
         self._seam_row_blocks = blocks
+
+    # -- wire frame agreement (register C22) ----------------------------------
+    def _frame_digest(
+        self,
+        slots: torch.Tensor,
+        direction: str,
+        waves: Sequence[Sequence[int]],
+    ) -> int:
+        """Fingerprint of everything that FRAMES the wire, so the ranks can
+        check they agree on it BEFORE a byte moves.
+
+        WHAT THIS IS FOR. The per-peer payload length is
+        ``rows x row_bytes`` summed over a wave's ordinals, and every term
+        of that product is derived RANK-LOCALLY: the rows come from
+        ``_live_slots_fn`` (documented "replicated", never verified), the
+        wave partition from ``_flip_waves`` (pure, but see its own two
+        documented gaps -- ``_pools_alias`` and ``SGLANG_FLIP_SEAM_WAVES``
+        are both rank-local and both change the wave COUNT). Nothing on the
+        wire carries a length, and the receiver's size check compares the
+        buffer it allocated itself against the size it computed itself, so
+        it is vacuous by construction and cannot see a divergence.
+
+        WHAT A DIVERGENCE LOOKED LIKE BEFORE THIS (2026-08-13 13:03:16Z,
+        the #656 acceptance run, after 320 clean cutovers): NCCL matched a
+        send of one length against a recv of another, delivered the shorter
+        one and completed, and the tail of the receiver's ``torch.empty``
+        buffer -- which is where the checksum trailer lives -- was never
+        written. The guard then reported a CHECKSUM MISMATCH naming a
+        "sender" value of 4626949667419791296 on one rank and
+        -4450328002521349435 on another. Neither is a possible uint8 sum
+        (the second is negative; the first would need an 18-petabyte
+        payload), so the failure was never about the data at all -- but it
+        raised, and raising at the seam takes the INSTANCE down. One in 320
+        cutovers, i.e. an unattended auto-flip instance's mean time to
+        failure was about an hour.
+
+        So the premise gets a BALLOT, exactly as #639 gave one to the
+        prefix-length vector after the same class of bug. Reduced with the
+        ``[x, -x]`` MIN pair the fit verdict already uses, on the collective
+        that round already runs -- no extra round trip, and the answer is
+        identical on every rank, so the abandon is unanimous and no rank can
+        half-flip.
+
+        The digest is modular (Mersenne 2**31-1, so every product fits an
+        int64 and nothing wraps) and POSITIVE, which is what makes it safe
+        to negate for the max half of the pair.
+        """
+        mod = _FRAME_DIGEST_MOD
+        s = slots.detach().to("cpu", torch.int64)
+        n = int(s.numel())
+        if n:
+            # Position-weighted so a permutation is not a collision; both
+            # ends sort, so any difference here is a real set difference.
+            weights = torch.arange(1, n + 1, dtype=torch.int64)
+            acc = int((((s % mod) * weights) % mod).sum().item() % mod)
+        else:
+            acc = 0
+        terms: List[int] = [n, 1 if direction == PP_TO_TP else 2, len(waves)]
+        terms.append(int(self._n_layers))
+        terms.extend(int(v) for v in self._vec)
+        for wave in waves:
+            terms.append(len(wave))
+            terms.extend(int(o) for o in wave)
+        for term in terms:
+            acc = (acc * 1000003 + int(term)) % mod
+        return acc
 
     # -- seam waves -----------------------------------------------------------
     def _flip_waves(self, direction: str) -> Tuple[Tuple[int, ...], ...]:
@@ -4655,8 +4735,31 @@ class PhaseFlipRuntime:
         # the string every acceptance harness in this corpus counts and the
         # one the 411-abandon decode wedge was measured with.
         margin_only = 0 if any(SEAM_MARGIN_DELAY_TAG not in d for d in too_small) else 1
-        reduced_fit = self._collective_min([fits, -fits, margin_only])
-        if reduced_fit[0] == 0:
+        # #656 C22: THE WIRE FRAME RIDES THE SAME BALLOT. See _frame_digest
+        # for why the premise needs verifying and what it cost when it was
+        # only asserted. The [x, -x] pair makes MIN answer "are they all
+        # equal", which is the only question here.
+        frame = self._frame_digest(slots, direction, waves)
+        reduced_fit = self._collective_min([fits, -fits, margin_only, frame, -frame])
+        frames_agree = len(reduced_fit) < 5 or reduced_fit[3] == -reduced_fit[4]
+        if not frames_agree:
+            # NOT a capacity verdict, so it does not join `too_small` before
+            # the reduction -- it cannot be known before it. It joins after,
+            # so the abandon below reports it, and it forces the abandon
+            # regardless of how the fit voted.
+            self.frame_aborts += 1
+            too_small.append(
+                f"wire frame divergence: this rank framed digest {frame}, the "
+                f"group spans [{-reduced_fit[4]}, {reduced_fit[3]}] -- the "
+                f"ranks do not agree on the live slot set, the wave partition "
+                f"or the vector, so the per-peer payload LENGTHS would not "
+                f"match. Sending them anyway is register C22: the peer's "
+                f"receive buffer keeps an unwritten tail, the checksum "
+                f"trailer read out of it is not a checksum, and the guard "
+                f"kills the instance reporting a corruption that never "
+                f"happened. Nothing has been moved; serving continues"
+            )
+        if reduced_fit[0] == 0 or not frames_agree:
             # THE BUDGET'S CURRENCY, BOOKED WHERE EVERY RANK AGREES. This is
             # the reduced verdict, so all three ranks increment together and
             # a delay budget means the same thing on each of them.
@@ -4664,13 +4767,22 @@ class PhaseFlipRuntime:
             if book is None:
                 book = self._seam_abandons_in_a_row = {}
             book[direction] = book.get(direction, 0) + 1
-            delayed_for_margin = len(reduced_fit) > 2 and bool(reduced_fit[2])
+            # A frame divergence is never a by-design margin wait, however
+            # the margin half of the ballot voted.
+            delayed_for_margin = (
+                frames_agree and len(reduced_fit) > 2 and bool(reduced_fit[2])
+            )
             self._pending = None
             self._armed_at = None
             self._last_hold_reason = None
             # Which of the two conditions THIS rank hit, so a boot that is
             # short of staging room is not read as a pool-sizing problem.
-            if corridor_detail:
+            if not frames_agree:
+                # Counted as frame_aborts above. Kept ahead of the capacity
+                # arms so a broken replication premise is never booked as a
+                # pool that is too small -- they want opposite responses.
+                pass
+            elif corridor_detail:
                 # Already counted by the gate itself, and counted there
                 # rather than here so that a PEER's corridor refusal (which
                 # reaches this rank only as a reduced verdict) is not
@@ -4693,6 +4805,23 @@ class PhaseFlipRuntime:
                     direction,
                     "; ".join(too_small) if too_small else "clear (a peer was not)",
                     self._seam_abandons_in_a_row.get(direction, 0),
+                    self._phase,
+                )
+            elif not frames_agree:
+                logger.error(
+                    "%s FLIP ABANDONED (wire frame divergence, %s): %s. This "
+                    "is NOT a capacity verdict -- every rank may have room. "
+                    "The ranks disagree about what the payload IS, so the "
+                    "per-peer lengths would not have matched, and the group "
+                    "refuses before a byte moves. Serving continues on the %s "
+                    "stack with every request intact. The replication premise "
+                    "that broke is named in the digest above; the live slot "
+                    "set is the term that varies at runtime, and #639 had to "
+                    "give the prefix-length vector the same ballot for the "
+                    "same reason.",
+                    LOG_PREFIX,
+                    direction,
+                    "; ".join(too_small),
                     self._phase,
                 )
             else:
@@ -4875,10 +5004,35 @@ class PhaseFlipRuntime:
                 data = payload[:-_CHECKSUM_BYTES]
                 want = int(payload[-_CHECKSUM_BYTES:].clone().view(torch.int64).item())
                 have = uint8_checksum(data)
+                # #656 C22: SAY WHICH OF THE TWO FAILURES THIS IS. A uint8
+                # sum over N bytes can only land in [0, 255N]. A field
+                # outside that range is not a checksum the sender computed
+                # and this rank disagrees with -- it is not a checksum at
+                # all, so the payload was never framed the way this rank
+                # expected and the DATA is not the thing that is wrong. The
+                # acceptance run reported one of these as a corruption and
+                # killed a healthy instance for it; the two diagnoses send
+                # an operator to opposite ends of the system.
+                if not checksum_is_representable(want, int(data.numel())):
+                    raise KvReshardError(
+                        f"{LOG_PREFIX} payload TRAILER from peer {peer} is "
+                        f"NOT A CHECKSUM: the field reads {want}, outside "
+                        f"[0, {255 * int(data.numel())}], the only values a "
+                        f"uint8 sum over {int(data.numel())} bytes can take. "
+                        f"This is a FRAMING failure, not payload corruption: "
+                        f"the peer sent a different number of bytes than this "
+                        f"rank allocated for it, so the tail of the receive "
+                        f"buffer -- where the trailer lives -- was never "
+                        f"written. The pre-move frame ballot agreed this "
+                        f"round, so the divergence is in the TRANSPORT, not "
+                        f"in the plan (register C22)."
+                    )
                 if want != have:
                     raise KvReshardError(
                         f"{LOG_PREFIX} payload checksum mismatch from peer "
-                        f"{peer}: sender {want}, receiver {have} -- refusing to "
+                        f"{peer}: sender {want}, receiver {have} -- both are "
+                        f"possible sums over these {int(data.numel())} bytes, "
+                        f"so the frame held and the DATA differs. Refusing to "
                         f"scatter."
                     )
                 incoming_data[peer] = data

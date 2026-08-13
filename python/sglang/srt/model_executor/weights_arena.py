@@ -127,6 +127,32 @@ def uint8_checksum(payload: torch.Tensor) -> int:
     return int(torch.stack(parts).sum().item())
 
 
+def checksum_is_representable(value: int, nbytes: int) -> bool:
+    """Can ``value`` be :func:`uint8_checksum` of SOME payload of ``nbytes``?
+
+    An exact int64 sum of ``nbytes`` unsigned bytes lies in ``[0, 255 *
+    nbytes]`` and nowhere else. That makes the range a free, exact
+    discriminator between the two failures a checksum comparison can
+    report, which otherwise look identical in a log line:
+
+    * BOTH values in range -> the two ends framed the payload the same way
+      and computed different sums over it. The DATA differs. This is what
+      the guard is for.
+    * A value OUT of range -> that field was never a checksum. The bytes
+      read as one are something else (an unwritten buffer tail, payload
+      bytes at the wrong offset), so the payload was not framed the way
+      the reader expected and the data is not the thing that is wrong.
+
+    #656 register C22 is the second case misreported as the first: the
+    acceptance run's two events named "sender" checksums of
+    4626949667419791296 (which would need an 18-petabyte payload) and
+    -4450328002521349435 (negative, which no sum of unsigned bytes can
+    be), and the instance was killed for a data corruption that had not
+    happened.
+    """
+    return 0 <= int(value) <= 255 * int(nbytes)
+
+
 class WeightsArenaError(KvReshardError):
     """Loud failure of the weights-arena family (#631)."""
 

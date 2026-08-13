@@ -764,13 +764,25 @@ class TestAbortDeferral(CustomTestCase):
             )
         return runtimes
 
-    def test_can_fail_abort_applied_on_one_rank_mid_flip_is_loud(self):
+    def test_can_fail_abort_applied_on_one_rank_mid_flip_is_refused(self):
         # WITHOUT deferral: rank 0 has already applied a disconnect (its
         # live set lost a slot owned by rank 1) while the peers still see
-        # the old set. The flip must die LOUDLY (size mismatch on the
-        # shrunken pair payload), never scatter silently -- proves the
-        # hazard deferral exists for is real, and that the runtime's
-        # failure mode for it is the loud one.
+        # the old set. The flip must REFUSE, never scatter silently --
+        # proves the hazard deferral exists for is real.
+        #
+        # #656 C22: this used to assert a loud RAISE, because a size or
+        # checksum error on the shrunken pair payload was the only thing
+        # that noticed. Raising at the seam is what killed the acceptance
+        # instance, and on the real transport the divergence does not
+        # even reach a size error -- NCCL delivers the short count into a
+        # receiver-allocated buffer and the trailer read from its
+        # unwritten tail is not a checksum at all. The pre-move frame
+        # ballot now catches the SAME divergence one collective earlier,
+        # so the assertions here get strictly stronger: not merely "some
+        # rank died before the mixed layout served", but "no byte moved
+        # on any rank". The can-fail arm proving this can still go red
+        # lives in test_flip_frame_agreement_656.py, which stubs the
+        # digest out and recovers the metal signature.
         ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 140, seed=31
         )
@@ -780,29 +792,32 @@ class TestAbortDeferral(CustomTestCase):
         dropped = int(rank1_slots[0].item())
         live_rank0 = live[live != dropped]
         live_per_rank = [live_rank0, live, live]
+        tp_before = _clone_pools(tp_pools)
         runtimes = self._runtimes_with_per_rank_live(
             live_per_rank, pp_views, tp_views
         )
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
-        louds = [e for e in exceptions if isinstance(e, KvReshardError)]
-        self.assertTrue(louds, f"divergent live set went undetected: {exceptions}")
+        self.assertEqual([e for e in exceptions if e is not None], [])
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.frame_aborts, 1, f"rank {r}")
+            self.assertEqual(rt.completed, 0, f"rank {r}")
         self.assertTrue(
-            any(
-                "size mismatch" in str(e) or "checksum" in str(e)
-                for e in louds
-            ),
-            louds,
+            _pools_equal(tp_pools, tp_before),
+            "a divergent live set scattered bytes into the TP layout",
         )
 
-    def test_can_fail_batch_membership_disagreement_is_refused_loudly(self):
+    def test_can_fail_batch_membership_disagreement_is_refused(self):
         # Cross-strand hazard (#622 root cause, first-token no-sync): on a
         # mixed-arch rig ranks can read DIFFERENT first tokens and so
         # DISAGREE whether a request hit EOS -- one rank believes the
         # request FINISHED (freed its rows), peers still hold it parked.
         # The flip's replicated-live-set assumption is then false. This
-        # test pins the required behavior: the flip REFUSES loudly (the
-        # shrunken pair payloads mismatch the peers' expectations), it
-        # never commits a mixed-membership layout silently.
+        # test pins the required behavior: the flip REFUSES, and never
+        # commits a mixed-membership layout silently.
+        #
+        # #656 C22: the refusal is now the pre-move frame ballot rather
+        # than a payload error at the seam -- see the sibling test above
+        # for why that is a strengthening and not a relaxation.
         ref, live, pp_pools, pp_views, tp_pools, tp_views = _make_layout_pools(
             MAP_625, VEC, 140, seed=37
         )
@@ -816,25 +831,27 @@ class TestAbortDeferral(CustomTestCase):
         live_rank2 = live[mask]
         self.assertLess(int(live_rank2.numel()), int(live.numel()))
         live_per_rank = [live, live, live_rank2]
+        tp_before = _clone_pools(tp_pools)
         runtimes = self._runtimes_with_per_rank_live(
             live_per_rank, pp_views, tp_views
         )
         exceptions = _run_ranks(3, runtimes=runtimes, directions=[PP_TO_TP] * 3)
-        louds = [e for e in exceptions if isinstance(e, KvReshardError)]
-        self.assertTrue(
-            louds,
-            f"membership disagreement went undetected: {exceptions}",
+        self.assertEqual(
+            [e for e in exceptions if e is not None],
+            [],
+            "a membership disagreement must be refused, not raised: raising "
+            "at the seam takes the instance down",
         )
-        # Nobody may have cut over to the new layout on a divergent set...
-        # except ranks whose pair payloads happened to be consistent; the
-        # LOUD failure on at least one rank is what kills the group before
-        # the mixed layout serves. The binding assertion: no hang, loud.
+        # THE BINDING ASSERTIONS: detected on EVERY rank (the verdict is
+        # the reduced one, so the refusal cannot be partial), no hang, and
+        # -- stronger than the version this replaces -- not one byte of the
+        # mixed-membership layout was committed anywhere.
+        for r, rt in enumerate(runtimes):
+            self.assertEqual(rt.frame_aborts, 1, f"rank {r}")
+            self.assertEqual(rt.completed, 0, f"rank {r}")
         self.assertTrue(
-            any(
-                "size mismatch" in str(e) or "checksum" in str(e)
-                for e in louds
-            ),
-            louds,
+            _pools_equal(tp_pools, tp_before),
+            "a mixed-membership layout was scattered into the TP pools",
         )
 
     def test_deferral_keeps_flip_clean_then_applies_abort(self):
