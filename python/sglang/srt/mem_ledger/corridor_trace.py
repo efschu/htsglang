@@ -72,6 +72,27 @@ DEFAULT_PERIOD_MS = 100
 #: ones it does not.
 DEFAULT_CAPACITY = 18000
 
+#: Fallback only. The law lives in ``managers.corridor_guard`` and is read
+#: from there; this value exists so that an instrument can still report a
+#: verdict if that import is ever unavailable, and it is deliberately the
+#: same number so a fallback cannot change a verdict silently.
+_LAW_MIB_FALLBACK = 1024
+
+
+def corridor_law_mib() -> int:
+    """The ONE declaration of the corridor law, read at call time.
+
+    Imported lazily: this module sits under ``mem_ledger`` and the law is
+    declared in ``managers.corridor_guard``, so a module-level import would
+    tie an instrument's import graph to the scheduler's.
+    """
+    try:
+        from sglang.srt.managers.corridor_guard import CORRIDOR_LAW_MIB
+
+        return int(CORRIDOR_LAW_MIB)
+    except Exception:  # pragma: no cover - defensive; see _LAW_MIB_FALLBACK
+        return _LAW_MIB_FALLBACK
+
 
 @dataclasses.dataclass
 class Sample:
@@ -183,8 +204,16 @@ class CorridorTrace:
 
     # -- reading ----------------------------------------------------------
 
-    def summary(self, corridor_mib: int = 1024) -> Dict[str, Any]:
-        """The minimum, not the mean, plus what the instrument itself cost."""
+    def summary(self, corridor_mib: Optional[int] = None) -> Dict[str, Any]:
+        """The minimum, not the mean, plus what the instrument itself cost.
+
+        ``corridor_mib`` defaults to the ONE declaration of the law
+        (:data:`corridor_guard.CORRIDOR_LAW_MIB`) rather than to a literal
+        of this module's own. A private copy of a threshold is how an
+        instrument ends up reporting a different verdict from the gate it
+        is meant to audit (#656).
+        """
+        corridor_mib = corridor_law_mib() if corridor_mib is None else int(corridor_mib)
         samples = list(self.samples)
         if not samples:
             return {"n": 0, "card_uuid": self.card_uuid}
@@ -218,7 +247,7 @@ class CorridorTrace:
             "overruns": self.overruns,
         }
 
-    def dump(self, path: str, corridor_mib: int = 1024) -> str:
+    def dump(self, path: str, corridor_mib: Optional[int] = None) -> str:
         payload = {
             "summary": self.summary(corridor_mib=corridor_mib),
             "samples": [dataclasses.asdict(s) for s in self.samples],

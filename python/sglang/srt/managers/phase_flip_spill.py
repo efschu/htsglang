@@ -1396,30 +1396,44 @@ def get_corridor_guard(scheduler: Any):
     # real payload. The corridor law itself is unchanged: the sampler still
     # judges against 1024, so a proof run at a raised floor can demonstrate
     # spill-before-alloc without being able to launder a breach.
-    floor_mib = int(
-        os.environ.get(CORRIDOR_FLOOR_ENV)
-        or getattr(server_args, "phase_flip_corridor_floor_mib", None)
-        or cg.DEFAULT_FLOOR_MIB
+    # #656 remediation: THE PAIR IS DERIVED AND DECLARED TOGETHER. The default
+    # arming floor is the law plus the seam's expected draw (cg.arming_floor_
+    # mib) rather than an unrelated number, and whichever way it is set, both
+    # halves are logged in ONE line naming the reserve BETWEEN them. The
+    # acceptance run armed at 1536 and judged at 1024 with nothing stating
+    # that 512 MiB was supposed to be the seam's whole draw -- and the
+    # measured draw was 1814-1852 MiB, so the gap between the two numbers was
+    # exactly where five corridor breaches lived, unseen.
+    configured = os.environ.get(CORRIDOR_FLOOR_ENV) or getattr(
+        server_args, "phase_flip_corridor_floor_mib", None
     )
-    if floor_mib != cg.DEFAULT_FLOOR_MIB:
-        logger.warning(
-            "%s corridor guard floor is %d MiB, NOT the %d MiB corridor law "
-            "(%s is set). This makes the gate arm earlier than the law "
-            "requires; it is a proof/soak setting, and the corridor verdict "
-            "must still be read against %d MiB.",
-            LOG_PREFIX,
-            floor_mib,
-            cg.DEFAULT_FLOOR_MIB,
-            CORRIDOR_FLOOR_ENV,
-            cg.DEFAULT_FLOOR_MIB,
-        )
+    floor_mib = int(configured) if configured else cg.arming_floor_mib()
+    cg.check_threshold_pair(floor_mib, cg.CORRIDOR_LAW_MIB)
+    logger.warning(
+        "%s THRESHOLD PAIR on device %d: corridor LAW %d MiB (the verdict, "
+        "and the only thing a refusal may be justified by), gate ARMS at %d "
+        "MiB, i.e. the law plus a %d MiB seam-entry reserve%s. The reserve is "
+        "what the gate assumes a seam DRAWS while it runs: if the measured "
+        "draw exceeds it, entries clear this gate and still breach the law, "
+        "and the breach lands in the gap between these two numbers where "
+        "nothing looks. Measured on this rig (#656 acceptance): 1814-1852 MiB "
+        "on the binding card.",
+        LOG_PREFIX,
+        int(device_index),
+        cg.CORRIDOR_LAW_MIB,
+        floor_mib,
+        floor_mib - cg.CORRIDOR_LAW_MIB,
+        f" (set by {CORRIDOR_FLOOR_ENV} or --phase-flip-corridor-floor-mib)"
+        if configured
+        else " (derived)",
+    )
     guard = cg.CorridorGuard(
         int(device_index),
         floor_mib=floor_mib,
         # The LAW never moves with the proof setting: a raised arming floor
         # must make the gate work EARLIER, never make it refuse allocations
         # the corridor permits. See CorridorGuard.__init__.
-        law_floor_mib=cg.DEFAULT_FLOOR_MIB,
+        law_floor_mib=cg.CORRIDOR_LAW_MIB,
         fleet_probe=cg.nvml_fleet_probe(),
     )
 
