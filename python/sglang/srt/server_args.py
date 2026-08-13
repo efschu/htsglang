@@ -7529,46 +7529,39 @@ class ServerArgs:
         # refusal never reaches the policy state: an unfundable seam becomes
         # an unbounded silent retry instead of a bounded stand-down.
         #
-        # THE REAL FIX is therefore not this ceiling but a sizer that reserves
-        # the seam's staging bytes on top of the user corridor -- the pool
-        # should be VRAM minus corridor minus staging, which lands above
-        # 620000 and still serves. This constant is a stand-in until that
-        # lands.
+        # THE REAL FIX was never this ceiling but a sizer that reserves the
+        # seam's staging bytes on top of the user corridor -- the pool should
+        # be VRAM minus corridor minus staging. THAT HAS LANDED, so the
+        # constant is DELETED rather than raised, exactly as this comment
+        # used to instruct.
         #
-        # So the DEFAULT is the largest pool this rig has actually been proven
-        # to SERVE, not the largest it can back. A capacity number without a
-        # completed generation beside it is a sizing result, not a serving
-        # result. Opt out with SGLANG_PHASE_FLIP_UNPROVEN_POOL=1 to reproduce
-        # the livelock or to re-prove a larger pool once it is fixed.
+        # What replaced it, and why a number is no longer the right shape:
+        #   * phase_flip_seam_reserve sizes the pool so EVERY rank can fund
+        #     its own seam, from a position measured on the previous boot
+        #     with every unnamed post already resident.
+        #   * That solver targets equality, so it also carries a margin
+        #     (ENV_MARGIN_MIB, default 192 MiB): boot K3 derived 610942 and
+        #     re-measured 25 MiB the wrong side of its own floor. With the
+        #     margin, boot L2 re-measured every rank ABOVE its floor
+        #     (3716/439, 1004/484, 1340/927 MiB).
+        #   * The flip policy counts refusals and backs off instead of
+        #     re-arming at the dwell interval, which is what turned the
+        #     unfundable seam into a silent livelock in the first place.
         #
-        # This is NOT a physics number and must not be read as one. It is a
-        # quarantine marker, and it should be deleted -- not raised -- when
-        # the livelock is fixed. Note the cost, so nobody rediscovers it the
-        # hard way: capping here also re-masks the per-rank capacity
-        # imbalance, because each non-binding rank then reports the ceiling
-        # as its own capacity (contradictions register entry 43). To measure
-        # true per-rank capacity, set the env var.
-        PHASE_FLIP_SERVING_PROVEN_TOKENS = 620000
-        if self.max_total_tokens is None:
-            if os.environ.get("SGLANG_PHASE_FLIP_UNPROVEN_POOL") == "1":
-                logger.warning(
-                    "SGLANG_PHASE_FLIP_UNPROVEN_POOL=1: letting the pool size "
-                    "itself to what the VRAM backs. Pools above %d tokens have "
-                    "wedged this rig (#656 flip livelock: health 200, zero "
-                    "tokens). VERIFY WITH A REAL GENERATION, never /health.",
-                    PHASE_FLIP_SERVING_PROVEN_TOKENS,
-                )
-            else:
-                self.max_total_tokens = PHASE_FLIP_SERVING_PROVEN_TOKENS
-                logger.warning(
-                    "phase flip: capping max_total_tokens at %d, the largest "
-                    "pool PROVEN to serve on this rig. The VRAM may back more "
-                    "(measured 683150), but that pool booted corridor-green "
-                    "and produced no tokens (#656 flip livelock, undiagnosed). "
-                    "Set SGLANG_PHASE_FLIP_UNPROVEN_POOL=1 to size to the "
-                    "hardware instead, and prove it with a real generation.",
-                    PHASE_FLIP_SERVING_PROVEN_TOKENS,
-                )
+        # Measured on this rig (#656 kvuniverse-r4, 2026-08-13): with
+        # --phase-flip-tp-vector 30,16,18 the derived pool is 651498 tokens --
+        # ABOVE the 620000 this constant used to pin -- with 24 completed
+        # cutovers in both directions, 0 abandons, 0 refusals, 0 tracebacks,
+        # a 64001-token prefill, real generations, and a continuous 100 ms
+        # corridor minimum under load of 1426/3305/1902 MiB, 0 breaches.
+        #
+        # THE NET THAT STAYS is the seam reserve itself, not a token count: a
+        # pool sized as "VRAM minus corridor" with nothing left for the seam
+        # is the failure this family is about, and seam_reserve_enabled()
+        # defaults to True so that pool cannot be built by accident. A
+        # capacity number still means nothing without a completed generation
+        # beside it -- that discipline is unchanged and belongs to whoever
+        # reads the number, which is why nothing here silently clamps.
 
         # Default the spill ladder to its lowest MEASURED rung, and resolve it
         # here so a bad value is an argument error rather than an exception

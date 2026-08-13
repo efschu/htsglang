@@ -116,7 +116,21 @@ class _Args:
 
 @pytest.fixture(autouse=True)
 def _clean_env():
-    saved = {k: os.environ.pop(k, None) for k in (sr.ENV_ENABLE, sr.ENV_FIXED_MIB)}
+    saved = {
+        k: os.environ.pop(k, None)
+        for k in (sr.ENV_ENABLE, sr.ENV_FIXED_MIB, sr.ENV_MARGIN_MIB)
+    }
+    # THE MARGIN IS PINNED TO ZERO FOR THIS FILE, deliberately. Every solver
+    # test here asserts the EXACT equality point -- "and not a token more
+    # conservative", and the slack branch's self-consistency to within one
+    # cell. Those are statements about the arithmetic identity, which the
+    # #656 R4 margin (a deliberate stand-back from the measured position) is
+    # designed to shift. Leaving the default in place would make them assert
+    # the identity plus a constant and read as if the identity had changed.
+    # The margin's own behaviour is covered in
+    # test_seam_fingerprint_and_margin_656.py, including the can-fail proof
+    # that it moves BOTH regimes.
+    os.environ[sr.ENV_MARGIN_MIB] = "0"
     yield
     for k, v in saved.items():
         if v is not None:

@@ -105,6 +105,27 @@ ENV_ENABLE = "SGLANG_PHASE_FLIP_SEAM_RESERVE"
 #: it -- and for pinning a reproducible capacity when a byte gate needs one.
 ENV_FIXED_MIB = "SGLANG_PHASE_FLIP_SEAM_RESERVE_MIB"
 
+#: Margin, in MiB, the solver keeps between the measured position and the seam
+#: floor. WHY A MARGIN AT ALL (#656 R4, boot K3): ``seam_allowed_tokens``
+#: returns the largest T with ``have(T) >= need(T)``, i.e. it targets EQUALITY,
+#: so the boot it sizes lands exactly ON its own floor and has nothing to
+#: absorb second-order error. Boot K3 derived 610942 and then re-measured
+#: rank2 at 1430 MiB against a 1455 MiB floor -- 25 MiB the wrong side of its
+#: own gate, logging ``CANNOT FUND ITS OWN FLIP`` while completing all 30
+#: cutovers. The error is allocator granularity and arena drift along the pool
+#: axis, and it is one-sided in the dangerous direction.
+#:
+#: THIS IS NOT THE GATE'S C20 ENTRY MARGIN. The flip gate wants 512 MiB of
+#: entry headroom on top of the staging, but it satisfies that at flip time
+#: from transient reclaim (measured: ``CORRIDOR-GUARD cleared on device 0:
+#: ... reclaimed 136 MiB from [allocator-cache]``), so reserving the gate's
+#: number here would charge the pool twice for one requirement -- roughly
+#: 65k tokens on this rig's binding rank. What the SIZER owes is only the
+#: measurement's own error bar, and 192 MiB is ~8x the largest observed
+#: deviation.
+ENV_MARGIN_MIB = "SGLANG_PHASE_FLIP_SEAM_MARGIN_MIB"
+DEFAULT_MARGIN_MIB = 192
+
 PROVENANCE_COLD = "cold"
 PROVENANCE_STORED = "stored"
 PROVENANCE_OVERRIDE = "override"
@@ -143,6 +164,28 @@ def seam_reserve_enabled() -> bool:
     if raw is None or raw == "":
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def seam_margin_bytes() -> int:
+    """Bytes the solver stands back from the measured position.
+
+    Read from the environment every call rather than cached: the same
+    discipline as ``seam_reserve_enabled``, so a boot can be re-run with a
+    different margin without a code change, and a test can set it per case.
+    A malformed or negative value falls back to the default rather than
+    disabling the margin -- the failure mode this exists to prevent is a
+    zero-margin pool, so an unparseable override must not produce one.
+    """
+    raw = os.environ.get(ENV_MARGIN_MIB)
+    if raw is None:
+        return DEFAULT_MARGIN_MIB << 20
+    try:
+        mib = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MARGIN_MIB << 20
+    if mib < 0:
+        return DEFAULT_MARGIN_MIB << 20
+    return mib << 20
 
 
 def record_path(server_args, world_rank: int) -> str:
@@ -350,7 +393,12 @@ def seam_allowed_tokens(cell_bytes: int, reserve: "SeamReserve") -> int:
     cell = int(cell_bytes)
     if cell <= 0 or not reserve.active:
         return 0
-    have_m = int(reserve.have_bytes)
+    # The margin comes off the MEASURED POSITION, not off the floor. In the
+    # floor-bound regime the two are algebraically identical; in the
+    # slack-bound regime only this one has any effect, because ``F`` appears
+    # there solely in the regime test. Taking it here therefore means the same
+    # thing on both branches: "stand this far back from where we measured".
+    have_m = max(0, int(reserve.have_bytes) - seam_margin_bytes())
     t_m = int(reserve.id_space)
     F = max(0, int(reserve.fixed_bytes))
     a = max(0.0, float(reserve.per_row_bytes))
