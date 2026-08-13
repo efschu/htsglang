@@ -814,3 +814,32 @@ piece of T3 this shift did not buy.
    393216 against 593264 at 1048576, and it is NOT the cos/sin cache. Change
    one variable at a time -- the budget vector differs between those two boots
    as well.
+
+---
+
+## SUPERSEDED IN PART BY THE #656 REMEDIATION SHIFT (2026-08-13)
+
+See `HANDOFF_REMEDIATION_656.md`. Three items above are now moved on:
+
+* **The solver margin is no longer one constant.** Section "Solver margin,
+  192 MiB" still describes the MEASUREMENT ERROR BAR, and that term is
+  unchanged. A second, per-rank term joins it: the deepest CORRIDOR SHORTFALL
+  the runtime has actually observed on that rank, written into the seam record
+  and read by the next boot of the same configuration. It is ZERO until a
+  breach is measured, so a rig that has never breached sizes exactly as
+  before. `seam_margin_bytes(reserve)`, `record_corridor_shortfall()`.
+
+* **L3's corridor figure did not survive an hour, and the reason is not
+  sizing.** The acceptance measured 886 MiB on the binding card, 138 below the
+  law, in five episodes — and all five begin 2-4 s after a C20 seam-entry
+  margin YIELD on the rank that owns that card. The remedy is 138 MiB, not the
+  200-300 MiB the acceptance guessed, and the rank is NOT rank0: by register
+  C21's card rule rank0 is the 5090, which never came near the law.
+
+* **The empty-token probe at 390026 quoted in item 1 above is CONFOUNDED the
+  same way the acceptance's bracket was.** Cold and cached deep prefills were
+  compared without separating them. The full cold-probe table is in
+  `HANDOFF_REMEDIATION_656.md` section 4: 280026 has failed 2 of 3 cold
+  attempts while 250026, 300026 and 338916 are 4 of 4 exact. Do not read the
+  390026 point as a lazy-RoPE property — the same signature appears with the
+  lazy cache OFF.

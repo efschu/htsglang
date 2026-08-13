@@ -198,3 +198,28 @@ and a detached base worktree and produced BYTE-IDENTICAL failure sets (8
 inherited failures each), so the scheduler and model_runner call sites
 introduce no regression. `black` 26.1.0 clean on all touched files;
 `ruff` 0 on every touched file, identical to base.
+
+---
+
+## NOTE FROM THE #656 REMEDIATION SHIFT (2026-08-13)
+
+See `HANDOFF_REMEDIATION_656.md`. Two things this ledger's readers should
+know:
+
+* **The corridor law now has exactly ONE reader.** It was declared as a `1024`
+  literal in `corridor_guard`, in `corridor_trace.summary`'s default argument,
+  and parsed from `SGLANG_CORRIDOR_LAW_FLOOR_MIB` independently in
+  `kv_vmm_backing` and `phase_flip_seam_census`. Anything here that needs the
+  law must call `corridor_guard.corridor_law_mib()` /
+  `corridor_law_bytes()`; a private copy is how an instrument ends up
+  reporting a different verdict from the gate it audits.
+
+* **`contract-612`'s group-declaration test is RED on the line**, not from
+  this branch: `test_communicator_group_contract_612.py::
+  test_no_runtime_group_is_missing_from_the_declaration` fails identically on
+  `/spinning/wt-merge-r8 @ 6d169c04ab`. Named here because the R8 merge shift
+  flagged that contract as load-bearing for the NCCL ledger term, and a
+  successor should know the gate is already failing rather than discover it
+  under a change of their own. The #656 frame ballot does NOT add a
+  communicator — it widens an existing `_collective_min` payload from 3 to 5
+  elements on a group the round already reduces on.
