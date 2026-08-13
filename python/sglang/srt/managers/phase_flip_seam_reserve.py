@@ -378,6 +378,210 @@ def seam_adjusted_budget_bytes(
     return min(int(budget_bytes), allowed * int(cell_bytes)), allowed
 
 
+def _worst_case_fixed_bytes(runtime, direction: str) -> Tuple[int, int]:
+    """(arena_tail, draft_restore) the seam WILL have to commit, not the
+    amount pending right now.
+
+    MEASURED IN THE WRONG PHASE IS MEASURED WRONG (boot F, 2026-08-12). Both
+    of the runtime's live accessors are state readings:
+    ``pending_tail_bytes`` is ``want - committed``, and
+    ``pending_restore_bytes`` returns 0 unless the drafter is CURRENTLY
+    spilled. At the first round the instance sits in its boot phase (PP) with
+    the arena fully committed and nothing spilled, so both read ZERO -- and a
+    reserve of zero is exactly the sizing that wedged boot E, whose refusal
+    named 464 MiB. That 464 MiB is the tail rung 3 releases on ENTERING TP,
+    which is a state this measuring point never sees.
+
+    So the sizing term is the commit the seam would face from the OTHER
+    phase: the arena span above the TP layout (what rung 3 releases and the
+    tp->pp leg must take back) and the drafter's whole payload (what rung 2
+    releases and the pp->tp leg must take back). Both are static layout
+    quantities, which is what makes them safe to read at any time.
+    """
+    scheduler = getattr(runtime, "_census_scheduler", None)
+    stacks = getattr(scheduler, "phase_flip_stacks", None) if scheduler else None
+    if stacks is None:
+        return 0, 0
+
+    arena_tail = 0
+    if direction == "tp_to_pp":
+        try:
+            # What rung 3 releases in TP = the arena span the PP layout needs
+            # above what the TP layout does. Zero on a rank whose TP layout is
+            # the larger one, which is where the "PP is always bigger"
+            # assumption killed three ranks at the first flip.
+            high_water = int(stacks.refill_high_water_bytes())
+            arena_tail = max(0, high_water - int(stacks.layout_tp.total_bytes))
+        except Exception:
+            arena_tail = 0
+
+    draft_restore = 0
+    if direction == "pp_to_tp":
+        try:
+            from sglang.srt.managers.phase_flip_spill import carrier_of
+
+            carrier = carrier_of(getattr(stacks, "draft_worker", None))
+            if carrier is not None:
+                draft_restore = int(carrier.payload_bytes)
+        except Exception:
+            draft_restore = 0
+    return arena_tail, draft_restore
+
+
+def measure_at_rest(runtime) -> Tuple[int, float, str]:
+    """(fixed_bytes, per_row_bytes, detail) for THIS boot's two layouts.
+
+    Computed from the runtime's OWN methods against an EMPTY live set, so the
+    number recorded here is the number the gate will check -- not a parallel
+    model of it that can drift. ``build_phase_flip_transition`` already
+    handles a zero-row slot tensor (every send/recv guard evaluates false),
+    which is what makes "at rest" expressible rather than approximated.
+
+    ``_arena_tail_bytes`` and ``_draft_restore_bytes`` read static layout and
+    carrier counters; ``_flip_waves`` is a pure function of the layer map and
+    the vector; ``src.num_rows`` is the pool's physical row CAPACITY, not the
+    live count. So none of this needs a round to have run, allocates
+    anything, or performs a collective.
+    """
+    import torch
+
+    from sglang.srt.layers.dcp.phase_flip_plan import build_phase_flip_transition
+
+    empty = torch.empty(0, dtype=torch.int64)
+    # The id space the sizer solves for: the PP allocator's capacity, which is
+    # what every "T tokens" in this module means.
+    scheduler = getattr(runtime, "_census_scheduler", None)
+    id_space = max(1, int(getattr(scheduler, "max_total_num_tokens", 0) or 0))
+    fixed = 0
+    per_row = 0.0
+    parts = []
+    for direction in ("pp_to_tp", "tp_to_pp"):
+        src, dst = runtime._src_dst(direction)
+        waves = runtime._flip_waves(direction)
+        tr = build_phase_flip_transition(
+            empty,
+            runtime._map,
+            runtime._n_layers,
+            runtime._vec,
+            runtime._rank,
+            direction,
+        )
+        total = int(runtime._staging_bytes(tr, direction, src, dst, waves))
+        slack = int(runtime._backing_slack_bytes(direction, src, dst, waves))
+        arena, draft = _worst_case_fixed_bytes(runtime, direction)
+        d_fixed = max(arena, draft)
+        # NORMALISED BY THE ID SPACE, NOT BY src.num_rows (boot F).
+        #
+        # The sizer's T is the GLOBAL pool -- the id space every rank shares.
+        # ``src.num_rows`` is this rank's PHYSICAL row count, and under the TP
+        # layout that is its token SHARE of the id space, so tp_to_pp divided
+        # by roughly T/3 and reported a coefficient ~3x too large (measured on
+        # boot F: 5393.8 B/row against a pp_to_tp reading of 2360.7 for the
+        # same 1396 MiB of slack). Dividing both directions by the id space
+        # makes the two comparable and makes the number mean what the sizer
+        # multiplies it by.
+        d_per_row = float(slack) / float(id_space)
+        fixed = max(fixed, d_fixed)
+        per_row = max(per_row, d_per_row)
+        mib = 1 << 20
+        parts.append(
+            f"{direction}: staging {total / mib:.0f} MiB now, seam commit "
+            f"{d_fixed / mib:.0f} MiB (arena tail {arena / mib:.0f}, draft "
+            f"restore {draft / mib:.0f}), wave slack {slack / mib:.0f} MiB "
+            f"over an id space of {id_space} = {d_per_row:.1f} B/token "
+            f"[this rank holds {int(src.num_rows)} rows]"
+        )
+    return fixed, per_row, "; ".join(parts)
+
+
+def measure_and_record(scheduler, runtime) -> None:
+    """Measure this boot's seam and leave the record for the next one.
+
+    Never raises: a bookkeeping write must not be able to take down an
+    instance that is otherwise serving.
+    """
+    if not seam_reserve_enabled():
+        return
+    try:
+        fixed, per_row, detail = measure_at_rest(runtime)
+    except Exception as e:
+        logger.warning("%s could not measure the seam at rest: %s", LOG_PREFIX, e)
+        return
+
+    mib = 1 << 20
+    try:
+        import torch
+
+        free_bytes = int(torch.cuda.mem_get_info()[0])
+    except Exception:
+        free_bytes = 0
+    law = _corridor_law_bytes()
+    # THE MEASURED POSITION. Taken with every unnamed post already resident
+    # -- activation reserve, capture peak, arena, TP stack, carve-out -- so
+    # the next boot's correction needs no model of any of them.
+    have = max(0, free_bytes - law)
+    id_space = max(0, int(getattr(scheduler, "max_total_num_tokens", 0) or 0))
+    path = write_seam_reserve(
+        scheduler.server_args,
+        int(runtime._rank),
+        fixed,
+        per_row,
+        detail,
+        have_bytes=have,
+        id_space=id_space,
+    )
+    logger.info(
+        "%s MEASURED (rank %d): floor %.0f MiB, %.1f B/row. %s. Recorded in "
+        "%s for the next boot with this configuration.",
+        LOG_PREFIX,
+        int(runtime._rank),
+        fixed / mib,
+        per_row,
+        detail,
+        path,
+    )
+
+    # LIVE VERDICT for the boot that is running right now. The record helps
+    # the NEXT boot; an operator watching this one needs to know today
+    # whether its flips can be funded, because the failure mode is an
+    # instance that answers /health and serves nothing (#656 boot E).
+    try:
+        spendable = have
+        if spendable < fixed:
+            logger.error(
+                "%s (rank %d): THIS BOOT CANNOT FUND ITS OWN FLIP. The seam "
+                "needs %.0f MiB at rest and only %.0f MiB is spendable above "
+                "the %.0f MiB corridor law (driver free %.0f MiB). Under "
+                "strict phase purity the layout that cannot be reached will "
+                "not run its work at all. Re-boot to pick up the record just "
+                "written, or set %s.",
+                LOG_PREFIX,
+                int(runtime._rank),
+                fixed / mib,
+                spendable / mib,
+                law / mib,
+                int(free_bytes) / mib,
+                ENV_FIXED_MIB,
+            )
+        else:
+            logger.info(
+                "%s (rank %d): seam fundable at rest -- needs %.0f MiB, has "
+                "%.0f MiB above the corridor law.",
+                LOG_PREFIX,
+                int(runtime._rank),
+                fixed / mib,
+                spendable / mib,
+            )
+    except Exception as e:  # pragma: no cover - diagnosis only
+        logger.warning("%s live verdict unavailable: %s", LOG_PREFIX, e)
+
+
+def _corridor_law_bytes() -> int:
+    from sglang.srt.managers.vram_dial import corridor_law_floor_bytes
+
+    return int(corridor_law_floor_bytes())
+
+
 def describe(reserve: SeamReserve, path: str) -> str:
     """The boot line. Emitted on EVERY flip boot, cold included (#188)."""
     mib = 1 << 20

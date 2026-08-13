@@ -193,3 +193,26 @@ def test_an_operator_override_wins_over_the_record(tmp_path):
     os.environ[sr.ENV_FIXED_MIB] = "900"
     rv = sr.read_seam_reserve(args, 1)
     assert rv.provenance == sr.PROVENANCE_OVERRIDE and rv.fixed_bytes == 900 * MIB
+
+
+def test_every_symbol_the_callers_import_exists():
+    """A boot died on ImportError because an edit removed measure_and_record
+    while every unit test still passed -- the deleted function had no test
+    that imported it BY THE NAME THE CALLER USES. These are those names, one
+    per call site, so a refactor that drops one fails here instead of on
+    metal."""
+    import importlib
+
+    m = importlib.import_module("sglang.srt.managers.phase_flip_seam_reserve")
+    # scheduler._phase_flip_on_round
+    assert callable(m.measure_and_record)
+    # model_runner_kv_cache_mixin._seam_reserve / _seam_adjusted_budget
+    assert callable(m.read_seam_reserve)
+    assert callable(m.record_path)
+    assert callable(m.describe)
+    assert callable(m.seam_adjusted_budget_bytes)
+    assert isinstance(m.LOG_PREFIX, str)
+    # internals the measurement path needs
+    assert callable(m.measure_at_rest)
+    assert callable(m.write_seam_reserve)
+    assert callable(m.seam_allowed_tokens)
