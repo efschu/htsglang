@@ -2295,3 +2295,55 @@ determinism" is unsupported by this evidence, and so is its denial. Recorded
 as an open observation with its missing control named, rather than as a
 finding; law: a difference measured under two uncontrolled variables is a
 question, not a result.
+
+## KVUNIVERSE-R6 ADDITIONS (2026-08-13)
+
+## 73. Serving was never crashing on this edge: it was a cgroup member of the
+agent session that started it.
+
+`setsid` detaches the SESSION, not the CGROUP. Every agent shell runs in
+`/system.slice/claude.service`, so a server booted from one joins that unit
+and every restart of it SIGTERMs the server as collateral. The instance that
+drained at 2026-08-13 09:04:59 mid-measurement died exactly that way:
+`claude.service` came up at **09:05:07**, eight seconds later, restart counter
+11. Checked directly rather than inferred -- the peer shift's fresh restore
+and all three of its schedulers read `0::/system.slice/claude.service`; the
+router at 30099 survives the same restarts only because it has its own unit.
+Fix: capture-replay boots launch inside a transient `systemd-run --scope`, and
+the boot prints the membership check that proves it. The law: a process
+outlives the session only if it leaves the session's CGROUP, and the proof of
+that is `/proc/<pid>/cgroup`, never an absence of crashes.
+
+## 74. An acceptance check that cannot pass is worse than no check: `[ -s ]`
+on a cgroup file is always false.
+
+`cgroup.procs` is kernfs and stats as size 0 even when it lists pids, so the
+boot's own escape check reported "scope has no pids" for a scope with a live
+server in it. The mechanism had worked from the first boot; only its acceptance
+print was wrong. A check with a false negative invites exactly the wrong
+repair -- undoing a working fix -- so a new check has to be proven able to
+PASS as well as to fail.
+
+## 75. A per-batch hook in ModelRunner.forward runs inside CUDA graph capture.
+
+The eagle draft worker enters `ModelRunner.forward` from within
+`torch.cuda.graph` capture (`eagle_draft_cuda_graph_runner.run_once ->
+draft_runner.forward`). Any device read there raises
+`cudaErrorStreamCaptureUnsupported`, and the boot dies later and elsewhere, in
+`capture_end`, which points at the graph runner instead of at the read. So a
+capture guard belongs at the TOP of any such hook, not inside the function it
+calls -- and "the graph runner bypasses ModelRunner.forward on replay" (true)
+does not imply it bypasses it on CAPTURE (false).
+
+## 76. The class a rig actually builds is not the class the code reads like.
+
+The lazy RoPE allowlist was written for `YaRNScalingRotaryEmbedding` after a
+code survey. The rig builds `YaRNScalingMRotaryEmbedding`, the M-RoPE variant,
+and the first lazy boot ran fully EAGER with one log line per rank saying so.
+That is the allowlist doing its job -- register 47's failure mode is silent
+wrong attention, so an unverified growth hook must not be trusted -- but it
+cost a boot, and the lesson is that a class-identity assumption is worth one
+`grep` of a real boot log before it is worth a design. It also carried a real
+consequence: M-RoPE position ids are NOT bounded by the sequence length, so a
+host-side `seq_lens` bound is wrong for a multimodal batch and needs its own
+branch.

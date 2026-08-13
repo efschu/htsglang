@@ -1070,6 +1070,43 @@ on later. Both are live for non-hybrid models on `HiRadixCache`.
 `--enable-kv-session-offload` and `--weightless-kv-host-spill-tokens` — each
 is its own host tier. Making them composable is task #547.
 
+**A SERVER BOOTED FROM AN AGENT SHELL DIES WITH THAT SHELL'S SERVICE.**
+Verified 2026-08-13: every agent session runs in `/system.slice/claude.service`,
+and `setsid` detaches the *session*, not the *cgroup*, so a serving instance
+started from one is a member of that unit. Every `claude.service` restart —
+which the usage-limit exits cause routinely; the restart counter was at 11 —
+SIGTERMs it as collateral. The instance at 09:04:59 drained and died exactly
+that way, mid-measurement, with nothing wrong with it: `claude.service` came
+up at 09:05:07, eight seconds later. The router at 30099 survives the same
+restarts only because it has its own unit (`claude-local-router.service`).
+
+Any boot that is meant to outlive the session must therefore launch inside its
+own transient scope:
+
+```bash
+systemd-run --scope --unit=htsglang-serving-$(date -u +%Y%m%dT%H%M%SZ) \
+  --slice=system.slice  <the launch command>
+```
+
+`scripts/s33_boot_from_capture.sh` does this for every capture-replay boot,
+including the sanctioned restore, and prints its own acceptance:
+
+```
+[boot] cgroup escape OK: scope htsglang-serving-<ts>.scope, N pid(s), none in claude.service
+```
+
+**The membership check IS the acceptance**, on the serving pid itself:
+
+```bash
+cat /proc/$(pgrep -o -f 'sglang.launch_server')/cgroup   # must NOT say claude.service
+```
+
+Do **not** verify by restarting `claude.service`: that kills the operator
+session and every other shift on the box. Two traps when writing such a check:
+`cgroup.procs` is a kernfs file and always stats as size 0, so `[ -s ]` reports
+an empty scope for a live one; and the scope exists before its payload does, so
+poll for the pids rather than reading once.
+
 **Production boot additions to the 4.1 recipe** (`start-serving-30030.sh`,
 outside the repo). The live serving instance carries these flags beyond the
 standard 4.1 + 4.1.3 recipe:

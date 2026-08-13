@@ -628,3 +628,149 @@ documented upstream GDN prefill nondeterminism beyond ~109 tokens.
 the 393216 config -- was not run. Next shift: A-vs-A on L3's config FIRST,
 then M2, then compare. Do not record "YaRN 4.0 broke determinism" until that
 control exists; this evidence does not support it, nor its denial.
+
+# R6: the lazy RoPE reserve, and the cgroup that was killing serving
+
+## 24. ERRORS FIRST -- four premises falsified, two of them mine
+
+**E18. Serving was not crashing. It was being SIGTERMed by its own cgroup.**
+Agent sessions run in `/system.slice/claude.service`; `setsid` detaches the
+SESSION, not the CGROUP; so a server booted from an agent shell is a member of
+that unit and dies with every restart of it. The 09:04:59 instance drained
+mid-probe and `claude.service` came up at 09:05:07 -- eight seconds later. The
+peer's fresh restore and all three of its schedulers read
+`0::/system.slice/claude.service` when checked directly. Fixed for every
+capture-replay boot in `scripts/s33_boot_from_capture.sh` (transient
+`systemd-run --scope`), acceptance printed by the boot itself and re-checkable
+with `cat /proc/<serving-pid>/cgroup`. Runbook section 4.1 carries it.
+
+**E19. The class this rig builds is `YaRNScalingMRotaryEmbedding`, not
+`YaRNScalingRotaryEmbedding`.** A desk-read said the latter; the boot said
+otherwise, and the lazy allowlist DECLINED it and ran fully eager. That is the
+allowlist working: register 47's failure mode is silent, so an unverified
+growth hook must not be trusted. Consequence beyond the class name: M-RoPE
+position ids are NOT bounded by the sequence length, so the host-side
+`seq_lens` bound the batch hook uses needed an explicit multimodal branch.
+
+**E20. The per-batch hook runs inside CUDA graph capture.** The eagle draft
+worker enters `ModelRunner.forward` from within `torch.cuda.graph`, where any
+device read is `cudaErrorStreamCaptureUnsupported`; the boot then dies in
+`capture_end`, nowhere near the read. The capture guard must be the hook's
+first statement.
+
+**E21. `have` does not move when the RoPE cache does.** Same tree, same argv,
+warm records both: eager 1M measured 3536/708/1106 MiB and lazy 1M measured
+3535/708/1106 MiB, with 240 MiB per rank fewer bytes written. The eager cache
+comes out of the torch caching allocator's existing arena, which `have` --
+a driver-free reading -- already counted. **So register 69's "440 MiB per
+rank" does not reproduce**: see section 26.
+
+## 25. MERGE READINESS -- what the R7 merge shift must know
+
+`origin/integration/r2` has NOT moved: it is exactly `481411ac6b`, and this
+branch is 0 commits behind it, so **no rebase is required**. The frozen
+baseline `/spinning/wt-merge-r6-base` is `598f570ba4`, which is the merge base.
+
+Suite, run in both trees on the six phase-flip files they share (boot, plan,
+protocol, resident carry, round cadence, runtime): **189 passed in each**, so
+the branch adds no red to the shared suite. Branch total over the flip family
+plus the seam, gate and RoPE suites: **239 passed** before this shift's lazy
+work, plus 16 new lazy cases.
+
+What changed that a merger must carry:
+
+* **`seam_reserve_enabled()` defaults True** (from R4). A pool sized as "VRAM
+  minus corridor" with nothing left for the seam can no longer be built by
+  accident, and the gate test asserts the MECHANISM, not the number 620000.
+* **Seam fingerprint fields**: `gdn_resident_state_slots`,
+  `enable_kv_session_offload`, `pp_stage_ratio`, `phase_flip_tp_vector`, keyed
+  only when non-default so digests on a defaults rig stay valid. A record
+  written before this widening is not comparable across those flags.
+* **Solver margin, 192 MiB**, taken off the MEASURED position so it binds in
+  both regimes. Every rank now re-measures above its floor.
+* **`SGLANG_ROPE_LAZY_CACHE` defaults OFF** and is the only switch that
+  changes when RoPE memory is spent. Nothing in the default path changes: with
+  it unset, `install()` returns None on its first line and every call site
+  lands on the code it landed on before.
+* **`scripts/s33_boot_from_capture.sh` now launches inside a transient systemd
+  scope.** This affects EVERY capture-replay boot including the sanctioned
+  restore. If a deployment has no systemd (a container without it), the script
+  warns and behaves exactly as before.
+* **`_build_cos_sin_rows` is now the single row builder** for both the growth
+  path and the lazy fill. Any new scaled RoPE subclass must override
+  `_cos_sin_cache_inv_freq`, `_cos_sin_cache_row_scale` and (if its cache is
+  longer than `max_position_embeddings`) `_cos_sin_cache_rows` -- and must be
+  added to the lazy allowlist explicitly, or it silently stays eager, which is
+  the safe direction.
+
+## 26. THE 1M CEILING'S PRICE IS NOT THE ROPE CACHE (register 69 reversed)
+
+R4 priced the ceiling at 440 MiB per rank by comparing `have` on a 393216 boot
+against a 1048576 boot. R6 built the lazy reserve that was supposed to buy
+those bytes back, engaged it on metal, and measured that **it buys nothing**:
+
+| boot (all 1048576 ctx, same tree, same argv) | RoPE written per rank | have per rank |
+|---|---|---|
+| N0 eager  | 400.1 MiB | 3536 / 708 / 1106 |
+| N2 lazy   | 160.1 MiB | 3535 / 708 / 1106 |
+
+240 MiB per rank fewer bytes written, and `have` is unchanged. The mechanism
+works -- the boot prints `256.1 MiB reserved / 16.0 MiB written LAZY` and the
+managed reservation itself commits 0 MiB until touched -- but the eager cache
+was coming out of the torch caching allocator's ALREADY-RESERVED arena, which
+a driver-free reading cannot see. `have` is a driver-free reading. So the
+sizer never paid for the eager cache, and freeing it gives the sizer nothing.
+
+Two further consequences, both of which the next shift should treat as open:
+
+* **Register 69's 440 MiB is not attributable to the ceiling.** R4's pair also
+  crossed a COLD/WARM seam-record boundary (M1's log says `seam reserve is
+  COLD`) and a different `--rank-gpu-memory-mib` vector, and this shift's
+  warm-vs-warm 1M eager boot measures the same `have` as R4's warm 393216 boot
+  to within 6 MiB on two ranks. A difference measured under three uncontrolled
+  variables is a question, not a result -- the same law entry 72 was written
+  for.
+* **The ceiling still costs pool** (593264 at 1048576 against 648388 at
+  393216), so SOMETHING scales with `context_length`. It is not the cos/sin
+  cache. Candidates not yet separated: per-request structures sized by
+  `context_len` (`req_to_token`), attention-backend workspaces, and the fact
+  that the two boots also differ in their budget vector. Whoever takes this
+  next should change ONE of those at a time.
+
+**The lazy reserve stays, at default OFF.** It is correct, it is proven on
+metal past the old ceiling (section 27), and it is the only mechanism that
+makes a ceiling cheap when the allocator is NOT already holding the bytes --
+but on this rig, today, it is not worth turning on for pool reasons.
+
+## 27. WHAT THE LAZY RESERVE STILL NEEDS BEFORE IT MAY BE TURNED ON
+
+The mechanism is built, unit-proven and engaged on metal, and it is DEFAULT
+OFF for a reason this shift measured rather than guessed: on the lazy boot the
+corridor was breached under a deep prefill -- continuous 100 ms minimum
+**692 / 1785 / 1174 MiB** over 3958 samples, **19 samples under the 1024 MiB
+law**, where the eager boots of this shift stayed above it.
+
+The mechanism of that breach is inherent to the design, not a bug in it:
+
+* An EAGER cache is allocated at boot, so the sizer sees the bytes gone (via
+  `have`) and sizes the pool around them.
+* A LAZY cache commits its pages when a sequence walks into new rows, i.e.
+  during serving, in 128 MiB blocks -- and nothing prices that.
+
+So a lazy reserve is only sound if the SOLVER charges for the rows a session
+can still reach. The honest term is bounded and cheap to compute:
+
+    reachable_rope_bytes = min(context_length, pool_tokens) * row_bytes
+                           - already_filled_bytes
+
+subtracted from `have` before sizing, exactly where the seam's own terms are
+subtracted. `row_bytes` is `rotary_dim * 4` per lazy cache and the boot
+already prints it. With that term in place the pool is smaller by the amount
+the corridor was losing, which is the correct trade and the one the user law
+asks for; without it, laziness is a corridor risk dressed as a saving.
+
+**Do not turn `SGLANG_ROPE_LAZY_CACHE` on before that term exists**, and note
+that on this rig the term would cancel the entire saving (section 26), so the
+first question for the next shift is whether the feature is worth having HERE
+at all -- as opposed to on a rig where the allocator is not already sitting on
+the bytes.
