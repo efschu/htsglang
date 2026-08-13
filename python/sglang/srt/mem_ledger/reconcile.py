@@ -695,7 +695,18 @@ def reconcile_card(
     # so the CUDA context and the driver windows are inside the number.
     self_bytes = _field_bytes(marks, "nvml_self_bytes", "boot_complete") or 0
     carve_out = _field_bytes(marks, "nvml_carve_out_bytes", "boot_complete") or 0
-    measured_demand = self_bytes + carve_out - kv_pool_bytes
+    # The KV pool subtracted here is the one the boot ACTUALLY got, read from
+    # the arena census, and only falls back to the ledger's budget when the
+    # marks cannot say. The budget is the wrong number to subtract from a
+    # measurement: on boot 1464299 the ledger budgeted 29927 MiB on the 5090
+    # and the arena ended up backing 21130, so subtracting the budget removed
+    # 8797 MiB that the process never held and drove the measured demand
+    # NEGATIVE. A demand of -3045 MiB is not a small error; it is a totals row
+    # that cannot be read at all, and the first reconciliation had to patch
+    # around it by hand in prose.
+    measured_kv_pool = _field_bytes(marks, "kv_arena_backed_bytes", "boot_complete")
+    kv_pool_used = kv_pool_bytes if measured_kv_pool is None else measured_kv_pool
+    measured_demand = self_bytes + carve_out - kv_pool_used
 
     residuum = measured_demand - claimed_bytes
     return CardReconciliation(
