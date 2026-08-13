@@ -4226,6 +4226,49 @@ class Scheduler(
         """
         return int(getattr(self, "_uniform_budget_deficit", 0))
 
+    #: #605 corridor sampler state. Class-level defaults rather than two more
+    #: lines in ``__init__``: a scheduler that never arms the sampler then
+    #: carries no per-instance attribute for it at all, which is the strictest
+    #: reading of "byte-identical when off".
+    _corridor_trace = None
+    _corridor_trace_armed = False
+
+    def _corridor_trace_tick(self) -> None:
+        """Arm the continuous corridor sampler, ONCE, on the first tick.
+
+        #605 R2 open item 1: ``mem_ledger.corridor_trace`` was tested, ready
+        and callerless. The boot marks are snapshots and the corridor law is a
+        continuous minimum, so the sampler is the only instrument in this tree
+        that can answer the law's own question -- but a module nothing calls
+        measures nothing.
+
+        WHY THE TICK, AND WHY ONCE. The sampler is a background thread with
+        its own cadence; it does not need a per-iteration call and must not
+        get one, because arming per iteration would be one NVML thread per
+        scheduler round. The tick is used only as the first moment at which
+        serving is definitely up, which is what makes this the natural home
+        rather than a boot hook that fires before the cards are loaded.
+
+        OFF BY DEFAULT, in two independent ways: ``corridor_trace.start()``
+        returns None unless :data:`corridor_trace.TRACE_ENV` is set, and the
+        attempt is made exactly once either way. A serving process that does
+        not opt in starts no thread, touches no NVML on a timer, and is
+        byte-identical.
+
+        Never raises, and never retries: an instrument that cannot arm must
+        not take serving down with it, and a failure that re-fires every
+        iteration is the 2661-line boot log the census already learned from.
+        """
+        if self._corridor_trace_armed:
+            return
+        self._corridor_trace_armed = True
+        try:
+            from sglang.srt.mem_ledger import corridor_trace
+
+            self._corridor_trace = corridor_trace.start()
+        except Exception as exc:  # noqa: BLE001 - instrument must not raise
+            logger.warning("corridor trace could not be armed: %s", exc)
+
     def _census_tick(self) -> None:
         """Advance the census round and, on cadence, diff counts across ranks.
 
@@ -4638,6 +4681,11 @@ class Scheduler(
         # device group cannot silence the instrument meant to explain it.
         # Warn-never-raise lives inside compare_across_ranks.
         self._census_tick()
+
+        # #605: the corridor sampler's production call site. Arms once and
+        # returns immediately on every later iteration; no-op unless
+        # SGLANG_CORRIDOR_TRACE_MS is set.
+        self._corridor_trace_tick()
 
         # #297 phase-boundary KV resharding: same lazy-build and cadence
         # discipline as the #287 block below. Built FIRST so the pressure
@@ -5469,8 +5517,9 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
@@ -8038,9 +8087,9 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
         PhaseFlipLoopExit,
     )
 
-    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
-        "phase flip x PD disaggregation is refused at argument time"
-    )
+    assert (
+        scheduler.disaggregation_mode == DisaggregationMode.NULL
+    ), "phase flip x PD disaggregation is refused at argument time"
     assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
     while True:
         try:
@@ -8480,6 +8529,7 @@ def _drain_seam_abandons_into_policy(scheduler) -> None:
         return
     direction, detail = last
     _note_policy_arm_outcome(scheduler, direction, False, f"seam abandoned: {detail}")
+
 
 def _note_policy_arm_outcome(scheduler, direction: str, ok: bool, msg: str) -> None:
     """Close the policy's control loop with the arm verdict (#656).
