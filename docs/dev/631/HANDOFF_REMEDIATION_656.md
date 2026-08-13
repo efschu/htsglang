@@ -222,6 +222,21 @@ what matters.
    flags**. `scheduler.kv_session_offload` is `None` on every phase-flip
    instance, by construction.
 
+   **Proved by execution, not by reading**, because a lane sent to check this
+   reported the opposite — it searched `kv_session_offload.py` (which indeed
+   contains no `pp_size`) and concluded no refusal existed. The refusal is in
+   `server_args.py`. Against the real class:
+
+   ```
+   ServerArgs._handle_kv_session_offload   called from __post_init__ (:6255)
+     early return "if not self.enable_kv_session_offload"   at char  9326
+     the pp_size > 1 raise                                  at char 25487
+   ```
+
+   The raise sits AFTER the early return, so it is reachable exactly when the
+   flag is on. An agent report is not evidence; the source of the real class,
+   read at runtime, is.
+
 ### Therefore the recipe cannot be fixed
 
 There is no argv that produces vacate lines on a phase-flip boot. Adding
@@ -309,6 +324,26 @@ two-boot protocol was satisfied. One deliberate difference:
 * cgroup `/system.slice/htsglang-serving-20260813T134830Z-2227367.scope` —
   not `claude.service`.
 
+### EXACTLY WHAT CODE THIS BOOT RAN, because it is not the whole branch
+
+The boot started 13:48:30Z, when HEAD was `522eae8c9d` (R8 + the C22 frame
+ballot). The corridor commits landed afterwards. So:
+
+| change | in the booted tree? |
+|---|---|
+| C22 frame ballot + representability check | **YES** — running, 152+ cutovers |
+| `corridor_trace` armed at 100 ms (R8's call site) | **YES** — armed on all 3 ranks |
+| the seam margin at 384 MiB | **YES**, via the env, which is version-independent |
+| the declared THRESHOLD PAIR + `check_threshold_pair` | **NO** — desk only |
+| the corridor AUDIT (report + record on worsening) | **NO** — desk only |
+| the per-rank self-calibrating margin | **NO** — desk only |
+
+The corridor RESULT is therefore attributable to the pool re-derivation, which
+is the mechanism §2 claims and the one the env exercises. The declaration and
+audit work is desk-proven and **has not run on metal**; the acceptance re-run
+will be its first. Stating this rather than letting one green boot be read as
+covering the whole branch.
+
 ### The corridor result
 
 Continuous 100 ms sampling across the whole load window:
@@ -319,10 +354,28 @@ Continuous 100 ms sampling across the whole load window:
 | gpu1 (rank 0, the 5090) | 2097 MiB | +1073 | 1941 |
 | gpu2 (rank 2) | 1370 MiB | +346 | 1304 |
 
-**0 samples below the law on any card**, and **0 C20 seam-entry-margin
-YIELDS** — which is the mechanism, not a coincidence: with the margin funded,
-the rank never has to enter on the law alone, and every breach in the
-acceptance followed a yield.
+**0 samples below the law on any card.** And the causal chain is visible in
+the log rather than inferred:
+
+| | acceptance | remediation |
+|---|---|---|
+| `CORRIDOR-GUARD REFUSED` | 24 (21 of them on rank 1) | **0** |
+| `FLIP DELAYED` (entry margin short) | many | **0** |
+| `seam entry margin YIELDED` | 8 | **0** |
+| corridor breach episodes | 5 | **0** |
+
+The gate never fired at all. A pool 18716 tokens smaller leaves the C20 entry
+margin affordable on every attempt, so the rank never has to enter on the law
+alone — and every breach in the acceptance followed an entry that did.
+
+**One caveat stated rather than buried: the flip rate is 18% lower.** 4.25
+cutovers/min here against the acceptance's 5.20, on the same load script.
+Some of the improvement could therefore be a slightly gentler flip cadence
+rather than the pool change alone. What the rate cannot explain is the gate
+counters going from 24 refusals and 8 yields to exactly zero — a lower
+cadence thins the sample, it does not make a margin affordable — but the
+corridor minimum should be re-read on the acceptance re-run at a matched
+cadence before the +26 MiB figure is treated as the settled headroom.
 
 **Fill quality, honestly.** gpu0 at +26 MiB is exactly the user's *frei nahe
 1024, nicht mehr*. gpu1 is **under-filled by about a gibibyte**. That is the
