@@ -222,8 +222,15 @@ R6's frozen bases is unbroken.
 |---|---|---|---|
 | `managers` | 9 | 9 | **identical** |
 | `model_executor` | 15 | 15 | **identical** |
-| `utils` | 44 `FAILED` lines (46 counting subtests) | 44 | **identical** |
+| `utils` | 46 (44 `FAILED` + 2 `SUBFAILED`) | 46 | **identical** |
 | `mem_ledger` | 1 | 1 | **identical** |
+
+`utils` needed a second pass: a `^FAILED ` grep finds only **44** of its 46,
+because two are emitted as `SUBFAILED(module=...)` lines by
+`test_capability_vendor_gates.py::test_cutedsl_blackwell_gates` (the
+`gdn_cutedsl` and `kda_cutedsl` subtests). A name diff that matched the count
+would have silently skipped them; the diff above matches all three prefixes and
+covers **46 of 46**.
 
 Inherited failure sets carried unchanged: 46 `unit/utils`, 15
 `unit/model_executor`, 9 `unit/managers`, 1 `unit/mem_ledger` — **none grew**.
