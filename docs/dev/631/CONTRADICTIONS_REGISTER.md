@@ -2347,3 +2347,38 @@ cost a boot, and the lesson is that a class-identity assumption is worth one
 consequence: M-RoPE position ids are NOT bounded by the sequence length, so a
 host-side `seq_lens` bound is wrong for a multimodal batch and needs its own
 branch.
+
+## 77. The lazy RoPE reserve is CORRECT UNDER TEST AND WRONG ON METAL past a
+depth its own guard does not see.
+
+Unit suite: 22 green, including a can-fail proof that reintroducing register
+47's bug turns 10 of them red. Metal, same tree, same argv, same prompt, one
+variable (`SGLANG_ROPE_LAZY_CACHE`):
+
+| depth | lazy | eager |
+|---|---|---|
+| 100026 tok | EXACT | -- |
+| 250026 tok | EXACT | -- |
+| 390026 tok | **1 token, empty** | -- |
+| 400026 tok | **1 token, empty** | **EXACT `BANANA47`, 12 tok** |
+
+and the corridor under the 400k probe: lazy 692/1785/1174 MiB with **19
+samples under the 1024 MiB law**, eager 1494/3401/1766 with **0**.
+
+`SGLANG_ROPE_LAZY_VERIFY=1` -- which asserts `positions.max() < filled` on
+every batch -- stayed SILENT through the failing probe. So the rows the
+runtime asked for were inside the region the bookkeeping believed written, and
+the defect is in the bytes or their visibility, not in the accounting. Two
+candidates, neither eliminated: a fill/read ordering gap across this runtime's
+streams and captured graphs, and UVM eviction under the device-memory pressure
+this same feature creates by moving its cost from boot time to run time.
+
+Three laws restated by this:
+* A host-side bookkeeping assertion cannot witness a device-side visibility
+  bug. The guard that would have caught this compares CONTENT (a row read back
+  against the formula), not indices.
+* Register 55 again, on my own work: unit tests that cover the arithmetic do
+  not cover the module's integration.
+* A feature that moves a cost from a priced moment (boot, where the sizer
+  reads `have`) to an unpriced one (serving) has not saved the cost; it has
+  moved it somewhere with no accounting, and the corridor is where that shows.
