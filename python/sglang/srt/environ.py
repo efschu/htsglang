@@ -1524,6 +1524,16 @@ class Envs:
     SGLANG_ROPE_CACHE_FP32 = EnvBool(False)
     SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
+    # #656 T1: reserve the context ceiling's cos/sin rows instead of
+    # materializing them. Default OFF -- the eager cache is the shipped
+    # behaviour and this changes when memory is spent, which the KV sizer
+    # reads. See layers/rotary_embedding/lazy_cos_sin_cache.py.
+    SGLANG_ROPE_LAZY_CACHE = EnvBool(False)
+    SGLANG_ROPE_LAZY_CHUNK_ROWS = EnvInt(65536)
+    SGLANG_ROPE_LAZY_MIN_ROWS = EnvInt(262144)
+    # Costs a device sync per batch. For proving the fill actually precedes
+    # every position that is read, never for serving.
+    SGLANG_ROPE_LAZY_VERIFY = EnvBool(False)
 
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)

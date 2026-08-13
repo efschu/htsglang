@@ -148,6 +148,8 @@ ENV_IDLE_DWELL = "SGLANG_PHASE_POLICY_IDLE_DWELL_S"
 ENV_REST_STATE = "HTSGLANG_PHASE_IDLE_STATE"
 ENV_PP_WINDOW = "SGLANG_PHASE_POLICY_PP_WINDOW_S"
 ENV_TP_FLOOR = "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S"
+ENV_REFUSAL_BACKOFF_CAP = "SGLANG_PHASE_POLICY_REFUSAL_BACKOFF_CAP_S"
+ENV_REFUSAL_DEGRADE_AFTER = "SGLANG_PHASE_POLICY_REFUSAL_DEGRADE_AFTER"
 
 # -- THE FAIRNESS BOUND (starvation fix, metal-observed 2026-08-09) ----------
 # Both thresholds above are LOAD-TRIGGERED, and that is not enough. Under
@@ -211,6 +213,17 @@ ENV_TP_FLOOR = "SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S"
 # PP phase specifically.
 DEFAULT_PP_WINDOW_S = 0.0
 DEFAULT_TP_DECODE_FLOOR_S = 0.0
+
+# -- THE REFUSED-ARM CLOCK (#656, boot E) -----------------------------------
+# A minute is long against a flip (1.0-1.7 s/rank) and short against an
+# operator noticing, which is the window a hold that MIGHT heal should sit
+# in: long enough that the retry costs nothing measurable, short enough that
+# a transient -- an occupancy trough, a spill that lands, a peer's cache
+# returned to the driver -- is picked up on its own.
+DEFAULT_REFUSAL_BACKOFF_CAP_S = 60.0
+# 8, the same number as the runtime's DEFAULT_SEAM_ABANDON_CAP, and for the
+# same reason: past it, the evidence says the ask is structural.
+DEFAULT_REFUSAL_DEGRADE_AFTER = 8
 
 # Defaults for the two timers. The minimum dwell is deliberately larger than
 # one round trip: a server that flips, and is allowed to flip straight back,
@@ -281,6 +294,24 @@ class PhasePolicyConfig:
     #: comment at DEFAULT_PP_WINDOW_S.
     pp_window_s: float = DEFAULT_PP_WINDOW_S
     tp_decode_floor_s: float = DEFAULT_TP_DECODE_FLOOR_S
+    #: How long a REFUSED arm holds the policy off that direction, doubling
+    #: per consecutive refusal from ``min_dwell_s`` and clamped here.
+    #:
+    #: WHY A REFUSAL NEEDS ITS OWN CLOCK AT ALL. ``min_dwell_s`` bounds
+    #: THRASH -- how soon after a flip the next one may happen -- and a
+    #: refused arm is not a flip, so it must not reset that clock (a refusal
+    #: moved no request and changed no layout). But without a clock of its
+    #: own the policy would then re-arm on the very next round, which is
+    #: worse than the defect this replaces. So the refusal gets a clock
+    #: whose growth matches what a repeating refusal means: the seam is
+    #: short by a CONFIGURATION-determined amount, and retrying an
+    #: unfundable configuration cannot fund it.
+    refusal_backoff_cap_s: float = DEFAULT_REFUSAL_BACKOFF_CAP_S
+    #: Consecutive refusals in one direction before the hold is announced as
+    #: a degradation. Mirrors the runtime's ``SEAM_ABANDON_CAP`` on purpose:
+    #: that cap is the point at which the SEAM has decided the ask cannot be
+    #: met, and this is the point at which the POLICY says so out loud.
+    refusal_degrade_after: int = DEFAULT_REFUSAL_DEGRADE_AFTER
     #: False when STRICT PHASE PURITY forbids prefill in the TP layout.
     #:
     #: THIS COLLAPSES N TO ZERO, and it must. N is a BREAK-EVEN: it
@@ -342,6 +373,27 @@ class PhasePolicyState:
     #: and the two readings must not be confusable.
     phase_since: Optional[float] = None
     last_phase: Optional[str] = None
+    #: Consecutive REFUSED arms per direction, reset by the first success.
+    arm_refusals: dict = field(default_factory=dict)
+    #: Clock, per direction, before which no further arm may be issued.
+    arm_hold_until: dict = field(default_factory=dict)
+    #: The runtime's own words for a direction that has been refused past
+    #: ``refusal_degrade_after``. Truthy = degraded; cleared by a success.
+    arm_degraded: dict = field(default_factory=dict)
+    #: What ``note_flip_armed`` overwrote, so a refusal can put it back.
+    #: A tuple (direction, previous_last_flip_at, previous_idle_since); None
+    #: when no arm is outstanding.
+    pending_arm: Optional[tuple] = None
+    #: Metrics. ``arm_refusals_total`` counts every refused arm ever;
+    #: ``arm_degrade_events`` counts DEGRADATIONS, not refusals, so it stays
+    #: readable as "how many times did this instance stop being able to
+    #: flip" rather than as a retry tally.
+    arm_refusals_total: int = 0
+    arm_degrade_events: int = 0
+    #: Cutovers that actually MOVED BYTES. Distinct from ``flips_armed`` on
+    #: purpose: boot E armed 179 flips and completed none, and every summary
+    #: that read the arm count called that instance healthy.
+    flips_completed: int = 0
 
 
 @dataclass(frozen=True)
@@ -370,6 +422,40 @@ def _no(reason: str) -> PhasePolicyDecision:
 
 
 def decide(
+    cfg: PhasePolicyConfig,
+    state: PhasePolicyState,
+    inp: PhasePolicyInputs,
+) -> PhasePolicyDecision:
+    """The load rules, then the refused-arm hold. Pure, mutates nothing.
+
+    THE HOLD IS APPLIED LAST, not folded into the rules, because the two
+    answer different questions. The rules answer "which layout does this
+    load want"; the hold answers "did the last attempt to get there work".
+    Keeping them apart is what lets the hold be per-DIRECTION: a tp_to_pp
+    seam that cannot be funded says nothing about pp_to_tp, which is
+    staged from the other leg's buffers entirely (#656 boot E refused only
+    tp_to_pp, and gagging both would have been a second bug).
+    """
+    d = _decide_from_load(cfg, state, inp)
+    if not d.wants_flip:
+        return d
+    hold_until = state.arm_hold_until.get(d.direction)
+    if hold_until is not None and inp.now < hold_until:
+        k = state.arm_refusals.get(d.direction, 0)
+        degraded = state.arm_degraded.get(d.direction)
+        if degraded:
+            return _no(
+                f"{d.direction} refused {k} times and treated as unfundable "
+                f"({degraded}); re-probing in {hold_until - inp.now:.1f}s"
+            )
+        return _no(
+            f"{d.direction} arm refused {k} in a row, backoff holds for "
+            f"{hold_until - inp.now:.1f}s more"
+        )
+    return d
+
+
+def _decide_from_load(
     cfg: PhasePolicyConfig,
     state: PhasePolicyState,
     inp: PhasePolicyInputs,
@@ -545,11 +631,141 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
 def note_flip_armed(
     state: PhasePolicyState, decision: PhasePolicyDecision, now: float
 ) -> None:
-    """Commit the dwell clock, once a decision was actually armed."""
+    """Commit the dwell clock, once a decision was actually armed.
+
+    PROVISIONAL, and the word is load-bearing. The arm travels the broadcast
+    pipe and its verdict comes back later, so between dispatch and verdict
+    the policy must already be holding -- otherwise every round in that gap
+    arms again. So the dwell is committed here and the displaced value is
+    remembered in ``pending_arm``; ``note_flip_outcome`` either keeps it (the
+    flip happened) or puts it back (it did not).
+    """
+    state.pending_arm = (decision.direction, state.last_flip_at, state.idle_since)
     state.last_flip_at = now
     state.idle_since = None
     state.flips_armed += 1
     state.last_reason = decision.reason
+
+
+def note_flip_outcome(
+    cfg: PhasePolicyConfig,
+    state: PhasePolicyState,
+    direction: Optional[str],
+    ok: bool,
+    message: str,
+    now: float,
+) -> None:
+    """Feed the ARM VERDICT back into the policy. The missing return path.
+
+    WHAT WAS BROKEN (#656 boot E, 2026-08-12). ``decide`` is pure and
+    documents that "a decision which is refused downstream (guards, a losing
+    consensus) does not leave the policy believing it flipped" -- but nothing
+    ever told it about the refusal. ``handle_phase_flip`` has ``(ok, msg)``
+    in hand and, for an INTERNAL request (the policy's own), returned None
+    without recording either. The policy therefore saw only its own dispatch,
+    held for ``min_dwell_s``, and armed again -- 179 times, against a seam the
+    runtime had already declared unfundable and installed a blocking guard
+    for. Under strict phase purity the pending prefill could not run in TP, so
+    the instance answered /health and produced no tokens.
+
+    A refusal is therefore recorded three ways, each covering a different
+    failure of the old code:
+
+    * the dwell rollback, so a refused arm is not mistaken for a flip;
+    * a growing hold, so the retry rate is not the dwell rate;
+    * a degradation, so a refusal that keeps repeating is NAMED with the
+      runtime's own numbers instead of accumulating as log noise.
+
+    NOT A LATCH. The degraded direction is still re-probed at the capped
+    interval: staging is a function of the live set as well as of the layer
+    map, and an occupancy trough or a landed spill can fund a seam that was
+    short a moment ago. What must never happen again is the SILENT spin, not
+    the retry.
+    """
+    if direction is None:
+        return
+    if ok:
+        # ACCEPTED IS NOT COMPLETED, and conflating the two is the half of
+        # this defect that survives the obvious fix. ``arm`` returning True
+        # only means no guard blocked the request; the seam is priced rounds
+        # later and may abandon, which is how boot E burnt its first eight
+        # attempts per episode with the policy believing all was well. So the
+        # arm stays OUTSTANDING here -- ``note_flip_completed`` retires it,
+        # and an abandon reported through this same function retires it as a
+        # refusal, with the dwell rolled back.
+        return
+    pending = state.pending_arm
+    state.pending_arm = None
+
+    # Refused: put back what the provisional commit displaced. Only if the
+    # verdict belongs to the arm still outstanding -- an out-of-order or
+    # duplicated verdict must not rewind a dwell some LATER flip earned.
+    if pending is not None and pending[0] == direction:
+        state.last_flip_at = pending[1]
+        state.idle_since = pending[2]
+        state.flips_armed = max(0, state.flips_armed - 1)
+
+    k = state.arm_refusals.get(direction, 0) + 1
+    state.arm_refusals[direction] = k
+    state.arm_refusals_total += 1
+    hold = min(cfg.min_dwell_s * (2**k), cfg.refusal_backoff_cap_s)
+    state.arm_hold_until[direction] = now + hold
+    detail = (message or "no reason given").strip()
+
+    if k >= cfg.refusal_degrade_after and not state.arm_degraded.get(direction):
+        state.arm_degraded[direction] = detail
+        state.arm_degrade_events += 1
+        logger.error(
+            "%s %s REFUSED %d times consecutively and is being treated as "
+            "unfundable: %s. Serving continues in the current layout; under "
+            "strict phase purity that means the work only the other layout "
+            "can do will NOT drain. Re-probing every %gs in case the live "
+            "set changes.",
+            LOG_PREFIX,
+            direction,
+            k,
+            detail,
+            cfg.refusal_backoff_cap_s,
+        )
+    else:
+        logger.warning(
+            "%s %s arm refused (%d in a row), holding %.1fs: %s",
+            LOG_PREFIX,
+            direction,
+            k,
+            hold,
+            detail,
+        )
+
+
+def note_flip_completed(
+    cfg: PhasePolicyConfig,
+    state: PhasePolicyState,
+    direction: Optional[str],
+    now: float,
+) -> None:
+    """A CUTOVER actually happened. The only event that clears a refusal.
+
+    The distinction this enforces is the one #656 was measured against:
+    boot E logged 179 arms and 0 completed cutovers, and every summary that
+    counted arms as flips read that boot as healthy. A flip is completed
+    bytes, not an accepted request.
+    """
+    if direction is None:
+        return
+    state.pending_arm = None
+    state.last_flip_at = now
+    state.idle_since = None
+    state.flips_completed += 1
+    state.arm_refusals.pop(direction, None)
+    state.arm_hold_until.pop(direction, None)
+    if state.arm_degraded.pop(direction, None):
+        logger.warning(
+            "%s %s completed a cutover and is fundable again after being "
+            "declared unfundable; the flip has resumed",
+            LOG_PREFIX,
+            direction,
+        )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -618,6 +834,12 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
         rest_state=rest_state,
         pp_window_s=_env_float(ENV_PP_WINDOW, DEFAULT_PP_WINDOW_S),
         tp_decode_floor_s=_env_float(ENV_TP_FLOOR, DEFAULT_TP_DECODE_FLOOR_S),
+        refusal_backoff_cap_s=_env_float(
+            ENV_REFUSAL_BACKOFF_CAP, DEFAULT_REFUSAL_BACKOFF_CAP_S
+        ),
+        refusal_degrade_after=_env_int(
+            ENV_REFUSAL_DEGRADE_AFTER, DEFAULT_REFUSAL_DEGRADE_AFTER
+        ),
     )
     if enabled:
         logger.warning(
@@ -653,5 +875,7 @@ __all__ = [
     "config_from_env",
     "decide",
     "note_flip_armed",
+    "note_flip_completed",
+    "note_flip_outcome",
     "observe_idle",
 ]

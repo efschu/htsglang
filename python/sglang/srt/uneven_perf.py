@@ -2603,6 +2603,36 @@ def measured_kv_budget_fingerprint_fields(server_args) -> dict:
         value = getattr(sa, name, default)
         if value != default:
             fields[name] = value
+    # #656 R4: four settings that move the SEAM record's measured position by
+    # hundreds of MiB and were not keyed, so a record taken under one was
+    # replayed under another. The seam record (phase_flip_seam_reserve) hangs
+    # off this digest, and its `have_bytes` is a physical-free reading -- so
+    # anything that changes what is resident changes the record's meaning:
+    #   gdn_resident_state_slots  -- caps the mamba pool at boot; measured
+    #                                +562/+350/+308 MiB of `have` on this rig
+    #                                (boot K1 against boot J, identical pool).
+    #   enable_kv_session_offload -- adds host-pinned and device-side spill
+    #                                bookkeeping to the balance.
+    #   pp_stage_ratio            -- the PP weight split, hence PP_bytes, hence
+    #                                the arena tail max(0, PP - TP) that IS the
+    #                                seam floor on the binding rank.
+    #   phase_flip_tp_vector      -- the TP weight/token split, i.e. the other
+    #                                half of that same subtraction.
+    # Boot K1 consumed an UNCAPPED record while running capped: harmless, it
+    # under-sizes. The reverse over-sizes and is exactly the boot-E wedge, so
+    # the omission was a latent one-directional hazard, not a cosmetic gap.
+    # Included ONLY when set to a non-default, for the same reason as
+    # spec_drafter_policy and pp_size above: every pre-existing registry digest
+    # on a rig that runs the defaults stays valid.
+    for name, default in (
+        ("gdn_resident_state_slots", None),
+        ("enable_kv_session_offload", False),
+        ("pp_stage_ratio", None),
+        ("phase_flip_tp_vector", None),
+    ):
+        value = getattr(sa, name, default)
+        if value != default:
+            fields[name] = value
     return fields
 
 

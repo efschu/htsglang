@@ -1864,3 +1864,521 @@ costs the next allocations a fault-in and deserves its own measurement.
    looking for (17.71 → 3.34 GB at constant `nproc`). Memory leaving with its
    processes says nothing about whether memory was reclaimable. Constant
    `nproc` is part of the instrument, not a sanity print beside it.
+
+43. **A cap that never binds still does damage: it masks the imbalance that
+   would tell you where the capacity went.** `--max-total-tokens 620000` did
+   not lower the ship pool -- the min across ranks was 503950, well under it.
+   But it made the two non-binding ranks each report their capacity as exactly
+   `620000`, so the sizing log read as "three ranks near the cap" when the
+   truth was PP0 1252026 / PP1 503950 / PP2 727592 with **971718 token-slots
+   stranded**. Lifting a cap is a MEASUREMENT before it is an optimisation:
+   read the uncapped per-rank capacities before reasoning about the layout.
+
+44. **Removing the pool cap OOMs the boot, so "the cap is soft" and "the cap
+   can be deleted" are different claims.** The number lives in no source file
+   (`--max-total-tokens`, `server_args.py:1151`, pass-through to
+   `memory_pool.py:2481`) and `req_to_token` is `int32`, so nothing structural
+   bounds it -- and yet `--max-total-tokens 100000000` died with
+   `cuMemCreate ... CUDA_ERROR_OUT_OF_MEMORY` after the corridor guard counted
+   free from 116 to -4 MiB. The TP layout can only address ids the PP
+   allocator issues; uncapped, the TP pool allocates VRAM it can never address
+   and starves the PP pool. A cap is removable only once the TP pool is sized
+   to the PP id space.
+
+45. **torch's device 0 is not NVML's device 0, and a per-rank MiB budget is
+   read against the physical card.** torch orders FASTEST_FIRST, so gpu0 is
+   the 5090 while `nvidia-smi` index 1 is. `--pp-stage-ratio 18,7,7` was
+   costed as "give the big card more layers" and OOMed on it:
+   `GPU 0 has a total capacity of 31.34 GiB of which 421.75 MiB is free`.
+   rank0's budget was already 31800 of 32607 MiB -- 807 MiB, **below the 1024
+   corridor floor**. Resolve the mapping from the boot's own OOM/geometry
+   lines before attributing a per-rank number to a card.
+
+46. **The phase-flip weight arena is a max over layouts, not a sum, so a moved
+   layer can be free.** `phase_flip_boot.py`: `arena_total = max(
+   layout_pp.total_bytes, layout_tp.total_bytes)`. HANDOFF_662 §5 costed
+   `[24,23,17]` additively ("frees ~1.77 GiB on rank0 but adds ~1.31 GiB on
+   rank1") and rejected it. A rank whose TP weight share already exceeds its
+   new PP layer share pays nothing for received layers -- measured PP
+   13482.18/8144.00/9114.95 MiB against TP 13692.29/7659.52/7659.52. 662's
+   verdict survives for rank0 but on the ceiling argument of entry 45, not on
+   its own arithmetic.
+
+47. **A scaled RoPE cache that GROWS is not the cache it was built with.**
+   The YaRN family builds from `_compute_inv_freq(self.scaling_factor)` and
+   `* self.mscale`, but inherited a `_ensure_cos_sin_cache_length` that used
+   `_compute_inv_freq(self.base)` -- the RoPE theta passed where a scaling
+   factor belongs -- and no mscale. Appended rows carried different
+   frequencies and the wrong amplitude, silently. It already fires at every
+   boot (cache 393216 rows, reserve asks 393600) and is invisible only because
+   `context_len` caps positions below the appended region. **Raising the
+   context ceiling is precisely the change that makes the corrupt rows
+   reachable.** Fixed via an overridable hook pair; guarded by
+   `test/srt/test_yarn_rope_cache_growth.py`.
+
+48. **A pool that boots, holds corridor and answers /health is not a pool that
+   serves.** Boot E sized to 683150 with no cap flag, 0 tracebacks, corridor
+   minimum 1469/2912/2975 and 0 breaches of the 1024 floor -- and every
+   `/generate` timed out at 120 s. The log repeated `POLICY holding in tp:
+   min dwell: 3.0s since last flip < 3s (pending prefill 1 tok, running bs 0)`
+   against 362 flip events. Corridor-green is a MEMORY verdict; it says
+   nothing about whether tokens come out. Every capacity number must carry a
+   real generation beside it or it is a sizing result, not a serving result.
+
+49. **Raising one rank's budget charges every rank, because the pool is a
+   min-reduction.** Each rank's usage is `fixed + share_r x 32 KiB x pool`,
+   and the pool is `min_r(capacity_r)`, so a budget raise on a non-binding
+   rank lifts the global pool and spends VRAM on the binding one. Boot D
+   raised rank1 and rank2 together, the pool went to 793844, and rank1 -- the
+   rank whose own budget rose only 831 MiB -- died at 21 MiB free. Solve for
+   the POOL that leaves every card at the floor, then derive budgets from it;
+   do not tune budgets card by card.
+
+50. **CUDA-graph capture peaks above the idle steady state, so budgets solved
+   from idle free overshoot.** Boot C's idle free (1855/3468/3229) was
+   measured after capture and read as available headroom. Budgets derived
+   from it put boot D 867 MiB past rank1's floor and it died inside the full
+   cuda-graph capture warmup, not at steady state. The corridor law is a
+   continuous minimum; the capture transient is part of the series.
+
+51. **A /proc scan matches the shell that runs it.** Scanning
+   `/proc/*/cmdline` for `sglang.launch_server` returned the scanning
+   `bash -c` process, whose command line contains the pattern, and killing the
+   result took the shell down mid-statement (exit 144). Law 40 is usually
+   filed under `pkill -f`; the actual hazard is any full-command-line match,
+   including one built by hand. Exclude shells and the caller's own PID.
+
+52. **The KV sizer fills to the corridor floor and leaves nothing for the
+   phase-flip seam, which needs ~464 MiB to stage live rows across the layout
+   change.** At pool 683150 the wedged boot logged 121x
+   `staging 464 MiB needed but only 444 MiB is spendable` -- short by 20 MiB --
+   then 336x `phase flip refused (guards): seam unfundable: tp_to_pp abandoned
+   8 times consecutively`. Under strict purity a prefill cannot be built in
+   the TP phase, so the queued token waited forever: health 200, zero tokens.
+   A pool sized to "VRAM minus corridor" is NOT a pool the flip can operate;
+   the seam's staging cost is a fixed post like any other and must be
+   subtracted before the pool is sized.
+
+53. **The flip policy commits its dwell clock before knowing whether the arm
+   succeeded, so a refusable seam becomes an unbounded silent retry.**
+   `note_flip_armed(state, decision, inp.now)` resets `last_flip_at` and
+   increments `flips_armed` the instant `decide()` wants a flip, and
+   `handle_phase_flip` drops the outcome for internally generated requests
+   (`if internal: return None`). The runtime's own backoff -- seam_backoff and
+   SEAM_ABANDON_CAP, built exactly for this -- is defeated by a policy layer
+   that re-arms every `min_dwell_s` regardless. 179 arms, 0 completed
+   cutovers. "362 flip events" in a log means arms attempted, NOT phases
+   changed; counting them as flips is how this hid.
+
+## 52. A requirement measured in the phase that does not pay it reads zero.
+
+`pending_tail_bytes` is `want - committed` and `pending_restore_bytes` returns
+0 unless the drafter is CURRENTLY spilled. Both are STATE, not requirement.
+Sampled at the first round -- PP, arena committed, nothing spilled -- the
+flip seam's fixed cost measured 0 MiB on all three ranks, against a runtime
+refusal on the same rig naming 464 MiB (boot F, 2026-08-13). Price the commit
+the seam faces FROM THE OTHER PHASE, which is a static layout quantity and
+therefore readable in any phase.
+
+## 53. `num_rows` is the rank's share, not the id space.
+
+`KvPoolView.num_rows` is physical rows, and under the TP layout that is the
+rank's TOKEN SHARE. Dividing a per-pool quantity by it gives a coefficient
+inflated by 1/share: the same 1396 MiB of wave slack read 2360.7 B/row on
+pp_to_tp and 5393.8 on tp_to_pp (boot F). Anything the sizer multiplies by
+`T` must be normalised by the GLOBAL id space.
+
+## 54. There are three KV sizing paths, and the ship config takes the one
+without a headroom term.
+
+A seam correction hooked at the post-capture measuring point applied nothing
+at all on the production configuration -- the pool came back unchanged and
+nothing logged (boot H). `_config_from_budget` is the single funnel. And the
+pre-capture path has no headroom quantity to subtract a reserve from, so a
+correction shaped as "headroom minus X" cannot be expressed there. Anchor on
+a MEASURED position instead (bytes spendable above the law at a known id
+space): everything unnamed -- activation reserve, capture peak, arena, TP
+stack, carve-out -- is already inside a number that was measured with all of
+it resident.
+
+## 55. Unit tests that cover the arithmetic do not cover the module's
+existence.
+
+An edit spliced a file between two function names and removed four functions
+including the one the scheduler calls; a follow-up edit to one of them
+matched nothing and silently did nothing; every unit test still passed; the
+next boot died at the first round on ImportError (boot I). Tests exercised
+the maths, which survived. Pin the IMPORT SURFACE by the names the callers
+use, one assertion per call site.
+
+## 56. Corridor-green plus completed flips is still not a capacity claim
+about a NUMBER.
+
+The staging-aware sizer produced a boot that serves, completes 24 cutovers,
+holds 1634/2845/1804 MiB continuous minimum free with 0 breaches, and
+prefills 64001 tokens -- at a pool of 563974, which is BELOW the 620000 that
+was already serving-proven. The mechanism being right does not make the
+derived number bigger; it makes it honest. Boot E's extra 119176 tokens were
+being paid for with a wedge. When a physics-derived pool comes out smaller
+than an operator number, the budget vector is what to re-solve -- it was
+solved against the corridor law alone and must be solved against
+`corridor + seam floor` (measured per rank: 455 / 484 / 1455 MiB).
+
+## 57. #364 idle-vacate is BUILT AND NOT ENGAGED on the phase-flip path.
+
+Checked 2026-08-13 against three flip boots of this shift (boot_f, boot_g,
+boot_j in /spinning/evidence-631/kvuniverse-r2): **zero occurrences of
+"vacat" and zero of "resident state slots" in any of them.** The machinery
+is real -- `managers/gdn_slot_runtime.py`, `mem_cache/gdn_slot_ladder.py`,
+`gdn_slot_executor.py` -- and the scheduler calls it at the between-tick
+boundary, but behind
+
+    if self.server_args.gdn_resident_state_slots is not None:
+
+and `--gdn-resident-state-slots` appears in NEITHER the ship argv capture
+(`/spinning/evidence-631/s485/ship_argv.txt`) nor the uncapped flip argv.
+Flag unset -> `gdn_slot_executor` stays None -> the ladder never runs. So
+every claim of the form "unused Mamba states are spilled during bs1 time"
+is, on this configuration, unbacked: the states sit as dead reservation.
+
+WHY IT MATTERS TO THE SIZER, with numbers of the same order as the defect it
+would relieve: idle GDN state is ~147 MiB per request slot (48 GDN layers,
+fp32 SSM), so with bs1 running and slots 2-4 idle that is ~440 MiB parked --
+against a seam that starved 20 MiB short on rank1 and 931 MiB short on rank2
+(boot G). The mamba reservation is charged to the KV budget as its own post
+(`MAMBA_BUDGET_POST`, model_runner_kv_cache_mixin) BEFORE KV is sized, and
+the seam reserve's measured anchor is taken with every slot reserved -- so
+vacatable bytes are counted as unavailable twice over and as reclaimable
+never.
+
+The rule this establishes: **a reservation that a built mechanism can
+release is not a fixed post, but only if the mechanism is switched on.**
+Neither the sizer nor the flip spec may assume the vacate; the flag has to
+be in the boot argv and the vacate has to be COUNTED in the log before any
+byte of it is spent in an arithmetic.
+
+## KVUNIVERSE-R4 ADDITIONS (2026-08-13)
+
+## 58. Engaging #364 is necessary but NOT sufficient: the ladder's standing
+population is refused on the very path that needs it.
+
+R3 (entry 57) found `--gdn-resident-state-slots` absent from every flip argv
+and concluded the fix was to add it. Adding it works -- the cap fires, one
+line per rank, and the bytes are real -- but the RUNTIME vacate still never
+fires, for a reason no argv can fix: `build_gdn_slot_executor` sources idle
+holders from `scheduler.kv_session_offload.live_offload_reqs()`, and
+`--enable-kv-session-offload` raises at parse time with "(S1) supports
+single-node pure TP/DCP only (pp_size=3, dp_size=1)". There is no opt-in env,
+though `KVSO_ALLOW_SPEC` and `KVSO_ALLOW_HICACHE` sit within 30 lines of it.
+A phase-flip instance is PP=3 by construction. So on the flip path the ladder
+can be ARMED and can never have a victim.
+
+The decomposition this forces, and it is the useful part: **slice 1 (boot-time
+pool cap) delivers the bytes and needs no runtime vacate at all; slice 3
+(admission decoupled above the cap) is the part that depends on the vacate,
+and it is the part that is unbacked here.** Banking the bytes is therefore
+legitimate; admitting past the cap is not.
+
+## 59. The mamba cap does not touch the largest mamba component, and should
+not.
+
+Measured on this rig at `--gdn-resident-state-slots 4` against a profiled 12:
+banked 0.26/0.18/0.15 GB per stack, roughly a quarter of R3's ~440 MiB
+estimate. `ssm_state` and `conv_state` scale with resident slots and shrink;
+`intermediate_ssm_state_cache` (0.62/0.44/0.35 GB -- larger than both) is
+`per_req x capped_reqs x max_speculative_num_draft_tokens`, i.e. sized from
+ADMISSION, which #364 slice 3 deliberately holds at the pre-cap profiled
+count. A cap that shrank it would be capping the thing slice 3 exists to
+preserve. **The vacatable mass is the resident state only, and it is about a
+quarter of "the mamba memory".** Credit measured at an identical pinned pool
+(563974): have_m 3744->4306 / 1224->1574 / 1514->1822 MiB, i.e. ~2x the
+per-stack cap line because both the PP and the TP stack are capped.
+
+## 60. `have_bytes` is PHYSICAL free VRAM, so the budget vector is inert for
+any rank whose pool is seam-capped.
+
+`measure_and_record` takes `have = torch.cuda.mem_get_info()[0] - law`. It is
+not budget-relative and it does not care what `--rank-gpu-memory-mib` says.
+On boot K3 rank2 spent 4406 MiB of an 8438 MiB KV budget -- its pool was
+stopped by its seam floor, not by its ceiling -- so raising that ceiling
+allocates nothing, frees nothing, and moves `have` by exactly zero. The pool
+falls straight out of physical arithmetic on the binding rank:
+
+    free at rest 2846 - seam floor 1455 - corridor law 1024 = 367 MiB
+    367 MiB / 8192 B per token = 46976 tokens ; 563974 + 46976 = 610950
+
+and the sizer derived **610942**. R3's carry-forward ("the next step is a
+BUDGET re-solve, not a cap change") is therefore wrong in its noun: the vector
+was never the constraint. **The lever is rank2's 1455 MiB arena tail --
+`max(0, pp_bytes - tp_bytes)` over its two layouts, i.e. `--pp-stage-ratio`
+against `--phase-flip-tp-vector`.** Reaching 620000 needs 438 MiB more free
+memory on rank2; the mamba cap at its most aggressive plus halving
+`max_running_requests` does not get there. **The honest optimum at this layout
+is 610942, and the quarantine stays.**
+
+## 61. A solver that targets equality ships a boot with zero margin, and its
+own gate then reads red.
+
+`seam_allowed_tokens` returns the largest T with `have(T) >= need(T)`, so the
+boot it sizes lands, by construction, exactly ON the floor. Boot K3 derived
+610942 and re-measured rank2 at **1430 MiB against a 1455 MiB floor** -- 25
+MiB the wrong side, logging `THIS BOOT CANNOT FUND ITS OWN FLIP` -- while
+completing all 30 cutovers with 0 refusals and 0 abandons. Two things follow.
+The 25 MiB is second-order error in the slope (allocator granularity, arena)
+against a term with no margin to absorb it. And the flip gate separately
+demands a 512 MiB C20 entry margin that the SIZER never books, so "fundable
+at rest" and "fundable at the gate" are different questions sized by different
+code. A margin term belongs in the solver, and the honest one is the entry
+margin the gate will actually apply.
+
+## 62. The seam record fingerprint omits the flags that move the memory
+balance by hundreds of MiB.
+
+`measured_kv_budget_fingerprint_fields` carries `rank_gpu_memory_mib`,
+`context_length` and `max_running_requests`, but NOT
+`gdn_resident_state_slots`, NOT `enable_kv_session_offload`, NOT
+`pp_stage_ratio`, NOT `phase_flip_tp_vector`, NOT `max_total_tokens`. Boot K1
+consumed boot J's UNCAPPED record while running capped, which under-sizes and
+is harmless; the reverse direction over-sizes and is precisely the boot-E
+wedge. Meanwhile changing the budget vector DOES orphan the record and costs a
+cold boot. So the fingerprint is simultaneously too coarse for the flags that
+matter to the seam and fine enough to be expensive for the one that does not.
+Any layout experiment must pin or invalidate the record deliberately.
+
+## 63. The phase-flip seam floor is a WEIGHTS term, not a KV term, and the
+cheap knob is the TP vector.
+
+Two shifts described rank2's 1455 MiB floor as "the arena tail" without
+naming what fills it, and the natural reading -- a KV arena, so reshape the
+KV budget -- is wrong. It is `max(0, PP_weights - TP_weights)` on that rank's
+two layouts. The runtime prints it (boot L3): `rung 3 released 924.0 MiB of
+weights-arena tail to the driver (TP layout needs 8188.4 of 9115.0 MiB)`, and
+it reproduces register 46's measured PP/TP weight vectors
+(13482.18/8144.00/9114.95 against 13692.29/7659.52/7659.52) to the MiB on all
+three ranks.
+
+The consequence is a lever nobody had used: **`--phase-flip-tp-vector` moves
+the floor for free, `--pp-stage-ratio` does not.** Raising the binding rank's
+TP share shrinks the subtraction without touching `have`, because `have` is
+measured at rest in the PP phase, where rung 3 has already released the TP
+arena. Moving PP layers instead charges the receiving rank ~1304.9 MiB of
+`have` per stage unit -- its PP weights and its KV both grow -- which is why
+every layer-shifting candidate modelled WORSE than the status quo while the
+TP-vector change modelled better and then measured better:
+`32,16,16 -> 30,16,18` dropped rank2's floor 1455 -> 927 MiB.
+
+## 64. The quarantine constant is deleted, and the thing that replaced it is
+a mechanism, not a bigger number.
+
+`PHASE_FLIP_SERVING_PROVEN_TOKENS = 620000` carried its own deletion
+instruction ("deleted, not raised, when the livelock is fixed"). Boot L3, with
+the seam reserve, the margin term and the fixed policy loop, derived **648388
+tokens** -- +28388 above the constant -- and served it: 24 completed cutovers
+in both directions, 0 abandons, 0 refusals, 0 tracebacks, 64001-token prefill,
+real generations, corridor 1128/2567/1664 MiB with 0 breaches over 5991
+samples. The net that stays is `seam_reserve_enabled()` defaulting True, so a
+pool sized as "VRAM minus corridor" with nothing left to stage the seam cannot
+be built by accident; the gate test asserts THAT instead of a token count.
+
+The trap to avoid on the way: **boot L2 derived a seam ceiling of 651498 and
+still ran at 620000**, because the constant was still clamping it. A seam
+"allowed" number in a log is not the pool. Check for the capping warning, or
+read the id space the seam re-measure reports, before believing a capacity.
+
+## 65. A solver that targets equality needs a margin, and the margin belongs
+on the measured position, not on the floor.
+
+Adding it to `F` looks equivalent and is not: in the slack-bound regime `F`
+appears ONLY in the regime test, so a floor-side margin leaves that whole
+branch unmargined. Subtracting from `have_m` is identical in the floor-bound
+regime and correct in both. Default 192 MiB, and deliberately NOT the flip
+gate's 512 MiB C20 entry margin -- the gate satisfies that at flip time from
+transient reclaim (`CORRIDOR-GUARD cleared ... reclaimed 136 MiB from
+[allocator-cache]`), so reserving it in the sizer would charge one requirement
+twice, about 65k tokens on the binding rank. Result: every rank re-measured
+ABOVE its floor at the derived pool (+2873/+224/+173 MiB) against boot K3's
+-25 MiB and its `CANNOT FUND ITS OWN FLIP`.
+
+## 66. #364's admission optimism is real but BENIGN: the scheduler's own slot
+check gates admission before the allocator is asked.
+
+`session_admission_slots(..., vacate_available=_resident_cap is not None)`
+keys "the overflow has a backer" on the FLAG, and on a PP flip boot the
+backer cannot exist (entry 58). Falsified directly: four concurrent sessions
+against a 4-slot pool (two requests' worth) **all completed correctly**, 200
+tokens each, accept 2.857-3.571. The pressure surfaced as max `#running-req`
+3 against 4 requested, max `#queue-req` 1, mamba usage 1.00, and 6x `mamba
+slot pool exhausted and nothing evictable ... skipping this cache insert` --
+with **0 OOM, 0 crashes, 0 wrong answers**. So the hazard is throughput and
+lost state caching, not the admit-into-OOM the code guards against, and the
+correction is documentation: the flag's help text claims sessions beyond the
+cap "run with a vacated (host-blob) state", which on this path is false --
+they run by WAITING for a slot.
+
+## 67. "kvso is refused under PP" does NOT mean the bs1 spill requirement is
+unmet, and the two must not be conflated.
+
+The spec's "bs2-4 reserves incl. unused Mamba states spilled in bs1 time" is
+carried on flip boots by the PHASE-FLIP SPILL LADDER, which fires 18 times per
+direction on boot L3: `rung 1 (cache) at pp_to_tp / tp_to_pp`, `rung 2
+SPILLED / RESTORED the draft weights`, `rung 3 released ... weights-arena
+tail`. Those rungs are what make the seam affordable at all. What is refused
+under `pp_size>1` is only kvso's SESSION KV tail on the host, and with it
+#549's GDN-vacate-x-kvso fixes. Reading the parse-time refusal as "spilling
+does not happen here" would retire a mechanism that is live and load-bearing.
+
+## 68. `--json-model-override-args` is a SHALLOW merge, so a nested override
+silently deletes its siblings.
+
+Passing `{"text_config": {"rope_parameters": {...}}}` to raise the YaRN factor
+replaced the ENTIRE `text_config` -- 25 keys -- and the boot died on
+`'PreTrainedConfig' object has no attribute 'max_position_embeddings'`, an
+error that reads like a broken checkpoint rather than a lost sibling key. The
+follow-on trap: adding `original_max_position_embeddings`, which the
+transformers YaRN validator demands on that path, made the derived ceiling
+COLLAPSE from 393216 to 262144, because that key marks `max_position_
+embeddings` as already-scaled and the runtime's convention here is
+`derived = max_pos x factor`. Two opposite failures from one flag. For a
+nested model-config change, edit a config.json in a symlink checkpoint
+(7.5 K, weights not copied) instead of overriding through argv.
+
+## 69. The 1M context ceiling is NOT free: ~440 MiB per rank, eager, and
+worth 9% of the pool.
+
+Measured at an identical pinned pool with nothing using the context, `have`
+fell by exactly 440 MiB on EVERY rank (3312->2872 / 708->268 / 1100->660)
+when the ceiling went 393216 -> 1048576. Equal across ranks is the signature
+of a replicated per-position structure: `head_dim 256 x partial_rotary 0.25`
+-> 64 rotary dims, cos+sin 128 values/row, fp32 512 B/row x 655360 new rows =
+320 MiB, with ~120 MiB more not separately attributed. The user law's "every
+session grantable ~1M ctx with zero upfront cost" therefore does not hold
+today -- the reserve is eager. It IS priced, because `have` is a physical
+free reading and the sizer lowers the pool on its own: derived 589736 at
+1048576 against 648388 at 393216, **-58652 tokens, -9.0%**. Nothing is broken
+without a lazy reserve; 9% of the pool is simply the standing price.
+
+## 70. Positions beyond the old ceiling decode CORRECTLY -- register 47's fix,
+proven on metal instead of in a unit test.
+
+Entry 47 established that the YaRN family grew its cos/sin cache with
+`_compute_inv_freq(self.base)` and no mscale, so appended rows carried wrong
+frequencies, and that **raising the context ceiling is precisely the change
+that makes those rows reachable**. Raised to 1048576 and reached: a
+determined-answer probe with **400030 prompt tokens** -- 6814 past the old
+393216 -- returned the planted `BANANA47`, finish=stop, in 330 s. The guard
+test `test_yarn_rope_cache_growth.py` now has a metal counterpart.
+
+## 71. A pinned pool that the seam cannot fund reproduces the wedge exactly,
+which is why the pin -- not the pool -- is the defect.
+
+Boot M1 carried the 393216-era pool (648388) into a 1048576 context, where
+the eager RoPE reserve had taken 440 MiB per rank. Both small ranks logged
+`CANNOT FUND ITS OWN FLIP` AT BOOT (268 vs 484, 660 vs 927); the instance
+served short prompts and the 400030-token probe, then held in TP with
+`tp_to_pp refused 14 times and treated as unfundable (seam abandoned: a peer
+refused); re-probing in 13.8s`, 0 tracebacks, all processes alive. The same
+configuration UNPINNED derived 589736 and ran 132 completed cutovers (66/66)
+with 0 abandons and 0 refusals. Two lessons: an operator pool number is a
+liability whenever anything else about the memory balance moves, and the R3
+control loop has converted this failure from a silent livelock into a bounded
+one that announces itself twice before it happens.
+
+## 72. A-vs-A is not byte-identical at 1M, and this is recorded WITHOUT an
+attribution on purpose.
+
+Two identical temperature-0 requests on boot M2 returned different text and
+took 2.79 s and 9.66 s -- i.e. they were served in DIFFERENT PHASES, and the
+rig separately carries a documented upstream GDN prefill nondeterminism
+beyond ~109 tokens. The control that would attribute it -- the same A-vs-A on
+the 393216 configuration -- was NOT run this shift. So "YaRN 4.0 broke
+determinism" is unsupported by this evidence, and so is its denial. Recorded
+as an open observation with its missing control named, rather than as a
+finding; law: a difference measured under two uncontrolled variables is a
+question, not a result.
+
+## KVUNIVERSE-R6 ADDITIONS (2026-08-13)
+
+## 73. Serving was never crashing on this edge: it was a cgroup member of the
+agent session that started it.
+
+`setsid` detaches the SESSION, not the CGROUP. Every agent shell runs in
+`/system.slice/claude.service`, so a server booted from one joins that unit
+and every restart of it SIGTERMs the server as collateral. The instance that
+drained at 2026-08-13 09:04:59 mid-measurement died exactly that way:
+`claude.service` came up at **09:05:07**, eight seconds later, restart counter
+11. Checked directly rather than inferred -- the peer shift's fresh restore
+and all three of its schedulers read `0::/system.slice/claude.service`; the
+router at 30099 survives the same restarts only because it has its own unit.
+Fix: capture-replay boots launch inside a transient `systemd-run --scope`, and
+the boot prints the membership check that proves it. The law: a process
+outlives the session only if it leaves the session's CGROUP, and the proof of
+that is `/proc/<pid>/cgroup`, never an absence of crashes.
+
+## 74. An acceptance check that cannot pass is worse than no check: `[ -s ]`
+on a cgroup file is always false.
+
+`cgroup.procs` is kernfs and stats as size 0 even when it lists pids, so the
+boot's own escape check reported "scope has no pids" for a scope with a live
+server in it. The mechanism had worked from the first boot; only its acceptance
+print was wrong. A check with a false negative invites exactly the wrong
+repair -- undoing a working fix -- so a new check has to be proven able to
+PASS as well as to fail.
+
+## 75. A per-batch hook in ModelRunner.forward runs inside CUDA graph capture.
+
+The eagle draft worker enters `ModelRunner.forward` from within
+`torch.cuda.graph` capture (`eagle_draft_cuda_graph_runner.run_once ->
+draft_runner.forward`). Any device read there raises
+`cudaErrorStreamCaptureUnsupported`, and the boot dies later and elsewhere, in
+`capture_end`, which points at the graph runner instead of at the read. So a
+capture guard belongs at the TOP of any such hook, not inside the function it
+calls -- and "the graph runner bypasses ModelRunner.forward on replay" (true)
+does not imply it bypasses it on CAPTURE (false).
+
+## 76. The class a rig actually builds is not the class the code reads like.
+
+The lazy RoPE allowlist was written for `YaRNScalingRotaryEmbedding` after a
+code survey. The rig builds `YaRNScalingMRotaryEmbedding`, the M-RoPE variant,
+and the first lazy boot ran fully EAGER with one log line per rank saying so.
+That is the allowlist doing its job -- register 47's failure mode is silent
+wrong attention, so an unverified growth hook must not be trusted -- but it
+cost a boot, and the lesson is that a class-identity assumption is worth one
+`grep` of a real boot log before it is worth a design. It also carried a real
+consequence: M-RoPE position ids are NOT bounded by the sequence length, so a
+host-side `seq_lens` bound is wrong for a multimodal batch and needs its own
+branch.
+
+## 77. The lazy RoPE reserve is CORRECT UNDER TEST AND WRONG ON METAL past a
+depth its own guard does not see.
+
+Unit suite: 22 green, including a can-fail proof that reintroducing register
+47's bug turns 10 of them red. Metal, same tree, same argv, same prompt, one
+variable (`SGLANG_ROPE_LAZY_CACHE`):
+
+| depth | lazy | eager |
+|---|---|---|
+| 100026 tok | EXACT | -- |
+| 250026 tok | EXACT | -- |
+| 390026 tok | **1 token, empty** | -- |
+| 400026 tok | **1 token, empty** | **EXACT `BANANA47`, 12 tok** |
+
+and the corridor under the 400k probe: lazy 692/1785/1174 MiB with **19
+samples under the 1024 MiB law**, eager 1494/3401/1766 with **0**.
+
+`SGLANG_ROPE_LAZY_VERIFY=1` -- which asserts `positions.max() < filled` on
+every batch -- stayed SILENT through the failing probe. So the rows the
+runtime asked for were inside the region the bookkeeping believed written, and
+the defect is in the bytes or their visibility, not in the accounting. Two
+candidates, neither eliminated: a fill/read ordering gap across this runtime's
+streams and captured graphs, and UVM eviction under the device-memory pressure
+this same feature creates by moving its cost from boot time to run time.
+
+Three laws restated by this:
+* A host-side bookkeeping assertion cannot witness a device-side visibility
+  bug. The guard that would have caught this compares CONTENT (a row read back
+  against the formula), not indices.
+* Register 55 again, on my own work: unit tests that cover the arithmetic do
+  not cover the module's integration.
+* A feature that moves a cost from a priced moment (boot, where the sizer
+  reads `have`) to an unpriced one (serving) has not saved the cost; it has
+  moved it somewhere with no accounting, and the corridor is where that shows.

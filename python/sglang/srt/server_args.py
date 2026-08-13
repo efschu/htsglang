@@ -5090,7 +5090,19 @@ class ServerArgs:
             "second ledger). Sessions beyond the cap are NOT refused: an IDLE "
             "session's state leaves VRAM as an opaque blob and is restored "
             "into a free slot before that session's next decode tick; an "
-            "ACTIVE session never loses its state. A cap above what the "
+            "ACTIVE session never loses its state. THAT VACATE NEEDS AN IDLE "
+            "SLOT HOLDER TO EXIST, and its standing population is "
+            "kv-session-offload's spilled set -- which is refused under "
+            "pp_size>1, so on a PHASE-FLIP (PP) boot the ladder arms and "
+            "never fires. There the overflow does not run vacated, it WAITS "
+            "for a slot: measured with 4 concurrent sessions against a "
+            "4-slot pool, all four completed correctly but concurrency "
+            "degraded to 3 with one queued and the mamba radix insert was "
+            "skipped. That is a throughput cost and not an OOM -- the "
+            "scheduler's own slot check gates admission before the allocator "
+            "is asked -- but outside pure TP/DCP, size the cap for the "
+            "concurrency you need rather than relying on the vacate. "
+            "A cap above what the "
             "memory budget profiled is a ceiling, not a demand, and is "
             "ignored. Default: unset = today's behaviour, every profiled slot "
             "stays resident. Note this makes 'GDN stays resident' a default "
@@ -7497,6 +7509,72 @@ class ServerArgs:
                     "'the policy is running'."
                 )
             return
+
+        # SERVING-PROOF CEILING ON THE DERIVED POOL (#656 flip livelock).
+        #
+        # The TP pool is sized from the PP id space, so with no
+        # --max-total-tokens the pool is whatever the VRAM backs. On this rig
+        # that reached 683150 tokens: it booted, held the 1024 MiB corridor
+        # with zero breaches, answered /health with 200 -- and produced NO
+        # TOKENS. Every /generate timed out at 120 s against 362 flip events
+        # and a repeating
+        #   "POLICY holding in tp: min dwell: 3.0s since last flip < 3s
+        #    (pending prefill 1 tok, running bs 0)".
+        # The same build serves normally at 620000. It is the worst failure
+        # class we have: an instance that looks healthy from every side except
+        # the only one that matters.
+        #
+        # ROOT CAUSE, confirmed from the wedged boot's own log:
+        #   121x "staging 464 MiB needed but only 444 MiB is spendable"
+        #   336x "phase flip refused (guards): seam unfundable: tp_to_pp
+        #         abandoned 8 times consecutively"
+        #   179x "PHASE-POLICY arming" at the 3 s dwell cadence
+        # The pool sizer fills to the 1024 MiB corridor floor and leaves
+        # NOTHING for the flip seam, which must stage live KV rows across the
+        # layout change. At 683150 the seam needs 464 MiB and can spend 444 --
+        # short by 20 MiB. Every cutover is abandoned, the guards latch
+        # "seam unfundable", and under strict purity a prefill cannot be built
+        # in the TP phase at all, so the queued token waits forever.
+        # Compounding it, the policy commits its dwell clock in
+        # note_flip_armed BEFORE knowing whether the arm succeeded, and
+        # handle_phase_flip drops the outcome for internal requests, so the
+        # refusal never reaches the policy state: an unfundable seam becomes
+        # an unbounded silent retry instead of a bounded stand-down.
+        #
+        # THE REAL FIX was never this ceiling but a sizer that reserves the
+        # seam's staging bytes on top of the user corridor -- the pool should
+        # be VRAM minus corridor minus staging. THAT HAS LANDED, so the
+        # constant is DELETED rather than raised, exactly as this comment
+        # used to instruct.
+        #
+        # What replaced it, and why a number is no longer the right shape:
+        #   * phase_flip_seam_reserve sizes the pool so EVERY rank can fund
+        #     its own seam, from a position measured on the previous boot
+        #     with every unnamed post already resident.
+        #   * That solver targets equality, so it also carries a margin
+        #     (ENV_MARGIN_MIB, default 192 MiB): boot K3 derived 610942 and
+        #     re-measured 25 MiB the wrong side of its own floor. With the
+        #     margin, boot L2 re-measured every rank ABOVE its floor
+        #     (3716/439, 1004/484, 1340/927 MiB).
+        #   * The flip policy counts refusals and backs off instead of
+        #     re-arming at the dwell interval, which is what turned the
+        #     unfundable seam into a silent livelock in the first place.
+        #
+        # Measured on this rig (#656 kvuniverse-r4, 2026-08-13): with
+        # --phase-flip-tp-vector 30,16,18 the derived pool is 651498 tokens --
+        # ABOVE the 620000 this constant used to pin -- with 24 completed
+        # cutovers in both directions, 0 abandons, 0 refusals, 0 tracebacks,
+        # a 64001-token prefill, real generations, and a continuous 100 ms
+        # corridor minimum under load of 1426/3305/1902 MiB, 0 breaches.
+        #
+        # THE NET THAT STAYS is the seam reserve itself, not a token count: a
+        # pool sized as "VRAM minus corridor" with nothing left for the seam
+        # is the failure this family is about, and seam_reserve_enabled()
+        # defaults to True so that pool cannot be built by accident. A
+        # capacity number still means nothing without a completed generation
+        # beside it -- that discipline is unchanged and belongs to whoever
+        # reads the number, which is why nothing here silently clamps.
+
         # Default the spill ladder to its lowest MEASURED rung, and resolve it
         # here so a bad value is an argument error rather than an exception
         # raised inside a cutover that has already released the source pool's
