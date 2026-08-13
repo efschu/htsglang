@@ -13616,6 +13616,7 @@ class ServerArgs:
 
         self._handle_mamba_checkpoint_interval(view)
         self._validate_max_mamba_cache_size(view)
+        self._validate_gdn_resident_state_slots(view)
 
         if mamba_extra_buffer_of(view):
             self._validate_mamba_extra_buffer(view, model_arch)
@@ -13659,6 +13660,74 @@ class ServerArgs:
             "starve at runtime instead of failing here. Either raise "
             f"--max-mamba-cache-size to at least {floor}, or lower "
             "--max-running-requests."
+        )
+
+    def _validate_gdn_resident_state_slots(self, view) -> None:
+        """Apply the SAME hard demand floor to `--gdn-resident-state-slots`.
+
+        WHY THIS EXISTS, measured. `_validate_max_mamba_cache_size` above
+        refuses a state pool below the running set's structural demand, and
+        its docstring names the exact failure it prevents: "will starve at
+        runtime instead of failing here". `--gdn-resident-state-slots` then
+        boot-sizes the state pool to ITS OWN value instead of to
+        `--max-mamba-cache-size` -- so it overrides the very quantity that was
+        validated, and nothing re-checked the number that actually wins.
+
+        The #656 formal acceptance run on 2026-08-13 died on that gap. Config
+        was `--max-mamba-cache-size 12 --max-running-requests 4
+        --gdn-resident-state-slots 4`: 12 passes the floor of 12 exactly, the
+        cap then sizes the pool to 4, and 4 is the floor for ONE running
+        request, not four. After ~4 minutes of mixed load (a deep prefill
+        holding slots while further sessions arrived) admission over-committed
+        and the fail-loud `alloc_req_slots` RuntimeError took the whole
+        instance down with SIGQUIT:
+
+            alloc_req_slots runs out of memory ...
+            available_size()=2 (request slots), num_reqs=1,
+            mamba_available=0, mamba_schedulable=0
+
+        The admission gate in `PrefillAdder` budgets
+        `available_size() + mamba_evictable_size()`, so it admits against
+        slots it believes are evictable; when they are pinned it is already
+        too late. That is a runtime race. The floor is arithmetic and is
+        knowable at parse time, which is where this belongs.
+
+        NOT clamped, refused: silently lowering `--max-running-requests` would
+        change the serving shape the operator asked for, and silently raising
+        the cap would give back the KV bytes the cap exists to take. Both
+        choices belong to the operator, and both are named in the message.
+        """
+        if self.gdn_resident_state_slots is None:
+            return
+        if self.max_running_requests is None:
+            # Concurrency not pinned yet; the auto path floors itself. Same
+            # guard, same reason, as the sibling validator above.
+            return
+
+        from sglang.srt.mem_cache.mamba_pool_floor import (
+            describe_mamba_floor,
+            mamba_hard_floor,
+        )
+
+        floor = mamba_hard_floor(self, self.max_running_requests)
+        if self.gdn_resident_state_slots >= floor:
+            return
+        servable = max(1, self.gdn_resident_state_slots // mamba_hard_floor(self, 1))
+        raise ValueError(
+            f"--gdn-resident-state-slots {self.gdn_resident_state_slots} is "
+            f"below the hard demand floor of {floor} slots for this "
+            "configuration.\n"
+            f"  {describe_mamba_floor(self, self.max_running_requests)}\n"
+            "This flag boot-sizes the GDN/Mamba state pool to its own value, "
+            "overriding --max-mamba-cache-size "
+            f"({self.max_mamba_cache_size}), so it is the number that has to "
+            "clear the floor. At this cap the pool can serve about "
+            f"{servable} concurrent request(s), not "
+            f"{self.max_running_requests}; the shortfall does not degrade "
+            "gracefully, it kills the instance from alloc_req_slots once a "
+            "held slot outlives an admission. Either raise "
+            f"--gdn-resident-state-slots to at least {floor}, or lower "
+            f"--max-running-requests to at most {servable}."
         )
 
     def _handle_mamba_checkpoint_interval(self, view) -> None:
