@@ -242,7 +242,41 @@ time on an instance where nothing was fixed. ~957 would be a 95% claim.
 
 ---
 
-## 7. OPEN, AND HONEST
+## 7. DEFECT B — the rate, and the confound resolved
+
+12 probes on boot_v3, FILLER x DEPTH, 2 each, every one planting a secret and
+asking for it. **Read it by CACHE, not by filler**: the run's own guard fired
+(`probes served a CACHED prefix: 4`) because repeated filler is the same text
+in every probe, so the radix cache answers most of it after the first. That arm
+was designed as a CONTENT control and is a CACHE control — R1's confound, one
+layer down.
+
+The 8 COLD probes (`cached=0`) are the ones that speak:
+
+| depth | cold probes | empty |
+|---|---|---|
+| 240016 | 4 | 0 |
+| **280016** | **2** | **1** |
+| 300016 | 2 | 0 |
+
+**`p02` is UNIQUE filler, `cached=0`, 280016 tokens, `completion=1`.** Every
+previous empty on record used the repeated filler, which left "bad depth" and
+"repetitive content is fragile" both alive. A unique-filler failure at the same
+depth kills the second.
+
+Pooled with every cold deep probe on record across four boots: **~5 of 7 empty
+at ~280k, 0 of 12 at 240016 / 250026 / 300016 / 300026 / 332532 / 338916.** A
+narrow failing BAND above `max_position_embeddings` (262144) — not a ceiling,
+since 300k, 332k and 338k all pass — and intermittent within it, so a RATE and
+not a threshold. Cached prefills in the band are clean (4 of 4). The
+mamba-floor fix is on the line in all of it and changed nothing.
+
+Next step, cheap and specified: bisect the band (260k / 270k / 280k / 290k,
+unique filler, cold) — about 5 probes and 20 minutes.
+
+---
+
+## 8. OPEN, AND HONEST
 
 * **The arena tail is priced with `max()`, and the measurement says `+`.**
   `_staging_bytes` returns `max(wave_peak, draft_restore, arena_tail)` on the
