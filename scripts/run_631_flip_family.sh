@@ -88,6 +88,18 @@ FAMILY=(
     test/registered/unit/managers/test_kv_backing_cap_agreement_656.py
     test/registered/unit/managers/test_purity_stand_down_656.py
     test/registered/unit/managers/test_seam_yield_draw_656.py
+    # SEVENTH under-collection, caught by MERGE-R9. The R2 shift added seven
+    # test files and extended this list by six: the component ballot was the
+    # one left out. It is not invisible -- the unit/managers arm collects it,
+    # which is why nothing was red -- but the CANONICAL family sweep did not
+    # run it, and it is the file that pins C22-d: the pool census can be
+    # IDENTICAL in every field on all three ranks and the frames diverge
+    # anyway, because the free-list ORDER is part of the agreement and the
+    # census cannot see it. A single digest detects that and cannot attribute
+    # it; this file pins the three-part (slots/waves/geometry) digest that
+    # names the diverging TERM. Folded in here rather than left to a private
+    # arm, for the same reason MERGE-R8 folded in the previous six.
+    test/registered/unit/managers/test_frame_component_ballot_656.py
     # Third under-collection, caught 2026-08-10: six tests were added to
     # this file and the family total did not move, because the list is
     # explicit and nobody extended it. The file guards spec item 8's flag
