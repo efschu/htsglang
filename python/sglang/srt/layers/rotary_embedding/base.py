@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.rotary_embedding import lazy_cos_sin_cache
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.platforms import current_platform
@@ -80,6 +81,7 @@ if _is_xpu:
     from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
 
+@lazy_cos_sin_cache.register_lazy_safe
 class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
 
@@ -100,10 +102,26 @@ class RotaryEmbedding(MultiPlatformOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-        cache = self._compute_cos_sin_cache()
-        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
-        if not (_is_cuda or envs.SGLANG_ROPE_CACHE_FP32.get()):
-            cache = cache.to(dtype)
+        # #656 T1: reserve the ceiling instead of materializing it, when the
+        # lazy cache is enabled and this class's growth hooks are verified.
+        # Declining (None) lands on the eager path below, unchanged.
+        self._lazy_cos_sin = None
+        cache = lazy_cos_sin_cache.install(
+            self,
+            capacity_rows=self._cos_sin_cache_rows(),
+            cols=self.rotary_dim,
+            device=torch.empty(0).device,
+            dtype=(
+                torch.float32
+                if (_is_cuda or envs.SGLANG_ROPE_CACHE_FP32.get())
+                else dtype
+            ),
+        )
+        if cache is None:
+            cache = self._compute_cos_sin_cache()
+            # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
+            if not (_is_cuda or envs.SGLANG_ROPE_CACHE_FP32.get()):
+                cache = cache.to(dtype)
 
         if (
             (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
@@ -172,6 +190,14 @@ class RotaryEmbedding(MultiPlatformOp):
             self.cos_sin_cache.device != query.device
             or self.cos_sin_cache.dtype != query.dtype
         ):
+            # A conversion copies the buffer, and a lazy buffer's tail is
+            # uninitialized reservation -- copying it would turn deferred rows
+            # into garbage rows with no error anywhere. Materialize first.
+            if getattr(self, "_lazy_cos_sin", None) is not None:
+                self._relinquish_lazy_cos_sin_cache(
+                    f"cache {self.cos_sin_cache.dtype}@{self.cos_sin_cache.device} "
+                    f"converted to {query.dtype}@{query.device}"
+                )
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
@@ -231,8 +257,125 @@ class RotaryEmbedding(MultiPlatformOp):
         """
         return 1.0
 
+    def _cos_sin_cache_rows(self) -> int:
+        """How many rows _compute_cos_sin_cache would build, without building.
+
+        The lazy cache reserves this many rows. A subclass whose cache is
+        longer than max_position_embeddings (every scaled variant) MUST
+        override this, or its reservation is short and the growth path pays
+        for the difference at runtime.
+        """
+        return int(self.max_position_embeddings)
+
+    def _build_cos_sin_rows(
+        self,
+        start: int,
+        end: int,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """Rows [start, end) from the SAME parameters the cache was built with.
+
+        The single place rows are computed outside the constructor: both the
+        growth path and the lazy fill go through here, so register 47's bug
+        (appending rows from _compute_inv_freq(self.base) with no mscale) has
+        one place left to be wrong in, and one place to be tested.
+        """
+        inv_freq = self._cos_sin_cache_inv_freq()
+        if device is not None:
+            inv_freq = inv_freq.to(device=device)
+        t = torch.arange(start, end, dtype=inv_freq.dtype, device=inv_freq.device)
+        if t.numel() == 0:
+            return torch.empty(
+                (0, self.rotary_dim),
+                dtype=dtype or inv_freq.dtype,
+                device=inv_freq.device,
+            )
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        row_scale = self._cos_sin_cache_row_scale()
+        rows = torch.cat((freqs.cos() * row_scale, freqs.sin() * row_scale), dim=-1)
+        return rows if dtype is None else rows.to(dtype=dtype)
+
+    def _relinquish_lazy_cos_sin_cache(self, why: str) -> None:
+        """Stop being lazy, and materialize what laziness was deferring.
+
+        Called when something takes the buffer out from under the state --
+        a dtype conversion, a device move. The rows past `filled` are
+        uninitialized reservation, so they MUST be written before the buffer
+        can be treated as an ordinary cache; skipping that is silent garbage
+        attention rather than an error.
+        """
+        state = getattr(self, "_lazy_cos_sin", None)
+        if state is None:
+            return
+        logger.warning(
+            "RoPE lazy cos/sin cache relinquished (%s): materializing rows %d..%d",
+            why,
+            state.filled,
+            state.capacity,
+        )
+        self._lazy_cos_sin = None
+        lazy_cos_sin_cache.drop(self)
+        if state.filled < state.capacity:
+            tail = self._build_cos_sin_rows(
+                state.filled,
+                state.capacity,
+                device=self.cos_sin_cache.device,
+                dtype=self.cos_sin_cache.dtype,
+            )
+            if int(self.cos_sin_cache.shape[0]) >= state.capacity:
+                self.cos_sin_cache[state.filled : state.capacity] = tail
+            else:
+                self.cos_sin_cache = torch.cat(
+                    (self.cos_sin_cache[: state.filled], tail), dim=0
+                )
+
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""
+        state = getattr(self, "_lazy_cos_sin", None)
+        if state is not None:
+            if self.cos_sin_cache.data_ptr() != state.ptr:
+                # Somebody replaced the buffer (a .to(), an _apply). The
+                # reservation is no longer what the layer reads from, so the
+                # unfilled tail has to be written before it is read.
+                self._relinquish_lazy_cos_sin_cache("buffer was replaced")
+            elif needed_max_pos < state.filled:
+                return
+            elif needed_max_pos < state.capacity:
+                # THE LAZY PATH: fill in place, so the address the CUDA graphs
+                # captured stays valid. Growth is chunked to keep the number
+                # of fill launches small, and is monotone.
+                chunk = lazy_cos_sin_cache.lazy_chunk_rows()
+                new_filled = min(
+                    state.capacity,
+                    max(needed_max_pos + 1, state.filled + chunk),
+                )
+                self.cos_sin_cache[state.filled : new_filled] = (
+                    self._build_cos_sin_rows(
+                        state.filled,
+                        new_filled,
+                        device=self.cos_sin_cache.device,
+                        dtype=self.cos_sin_cache.dtype,
+                    )
+                )
+                logger.debug(
+                    "RoPE lazy cos/sin cache grew %d -> %d rows (position %d reached)",
+                    state.filled,
+                    new_filled,
+                    needed_max_pos,
+                )
+                state.filled = new_filled
+                lazy_cos_sin_cache.note_growth(self)
+                return
+            else:
+                # Past the reservation. Reallocation is the only way out and
+                # it moves the address, so say so: if a CUDA graph has been
+                # captured against this buffer, this is the moment it broke.
+                self._relinquish_lazy_cos_sin_cache(
+                    f"position {needed_max_pos} is past the reserved {state.capacity} rows"
+                )
+
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
@@ -243,26 +386,63 @@ class RotaryEmbedding(MultiPlatformOp):
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
 
-        # Compute inv_freq on same device, through the hook so scaled
-        # variants extend with the frequencies they were built with.
-        inv_freq = self._cos_sin_cache_inv_freq().to(device=device)
-
-        # Incremental computation for new positions only
-        start = cur_len
-        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
-        if t_new.numel() == 0:
+        # Incremental computation for new positions only, through the hooks so
+        # scaled variants extend with the frequencies they were built with.
+        new_rows = self._build_cos_sin_rows(
+            cur_len, new_len, device=device, dtype=dtype
+        )
+        if new_rows.shape[0] == 0:
             return
-
-        freqs_new = torch.einsum("i,j->ij", t_new, inv_freq)
-        row_scale = self._cos_sin_cache_row_scale()
-        cos_new = freqs_new.cos() * row_scale
-        sin_new = freqs_new.sin() * row_scale
-        new_rows = torch.cat((cos_new, sin_new), dim=-1).to(dtype=dtype)
 
         # Update cache with new rows
         self.cos_sin_cache = torch.cat((self.cos_sin_cache, new_rows), dim=0).to(
             device=device, dtype=dtype
         )
+
+    def ensure_cos_sin_cache_capacity(self, rows: int) -> None:
+        """Make the reservation cover `rows`, without filling it.
+
+        This is what a lazy cache does with a pre-capture reserve request: the
+        reserve is a CEILING statement, and prepaying it is the cost this
+        whole path exists to remove.
+        """
+        state = getattr(self, "_lazy_cos_sin", None)
+        if state is None:
+            self._ensure_cos_sin_cache_length(rows - 1)
+            return
+        if rows <= state.capacity:
+            return
+        # Enlarging the reservation moves the address. Safe here only because
+        # the reserve runs before CUDA graph capture; that ordering is the
+        # caller's contract (model_runner calls it before capture).
+        logger.info(
+            "RoPE lazy cos/sin cache: enlarging reservation %d -> %d rows",
+            state.capacity,
+            rows,
+        )
+        filled = state.filled
+        self._lazy_cos_sin = None
+        lazy_cos_sin_cache.drop(self)
+        cache = lazy_cos_sin_cache.reserve(
+            self,
+            capacity_rows=rows,
+            cols=self.rotary_dim,
+            device=self.cos_sin_cache.device,
+            dtype=self.cos_sin_cache.dtype,
+        )
+        if cache is None:
+            self._ensure_cos_sin_cache_length(rows - 1)
+            return
+        if filled > self._lazy_cos_sin.filled:
+            cache[self._lazy_cos_sin.filled : filled] = self._build_cos_sin_rows(
+                self._lazy_cos_sin.filled,
+                filled,
+                device=cache.device,
+                dtype=cache.dtype,
+            )
+            self._lazy_cos_sin.filled = filled
+            lazy_cos_sin_cache.note_growth(self)
+        self.cos_sin_cache = cache
 
     def get_cos_sin_with_position(self, positions):
         assert positions.ndim == 1, (
@@ -496,9 +676,7 @@ class RotaryEmbedding(MultiPlatformOp):
                 assert (
                     fused_set_kv_buffer_arg is None
                 ), "save kv cache is not supported for fallback_rotary_embedding."
-                self.cos_sin_cache = self.cos_sin_cache.to(
-                    query.device, dtype=query.dtype
-                )
+                self._match_cos_sin_cache_dtype(query)
                 self.fallback_rotary_embedding(
                     positions,
                     query,

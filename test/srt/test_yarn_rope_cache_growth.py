@@ -14,8 +14,12 @@ Nothing raises when that happens. The failure is silent wrong attention past
 the boot cache length, which is exactly the region a raised context ceiling
 makes reachable.
 """
+
+import pytest
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.rotary_embedding import lazy_cos_sin_cache
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
@@ -29,6 +33,29 @@ ROTARY_DIM = 64
 MAX_POS = 512
 BASE = 10000
 SCALING_FACTOR = 4.0
+
+
+# #656 T1: every test here runs twice. The lazy reserve writes its rows
+# through the SAME growth path this file was written to guard, so if the two
+# ever diverge, the lazy arm is the one that says so. In the lazy arm the
+# cache TENSOR is the full reservation and only `filled` rows are written, so
+# the tests measure the seam at `filled`, not at shape[0].
+@pytest.fixture(params=["eager", "lazy"], autouse=True)
+def rope_mode(request):
+    with (
+        envs.SGLANG_ROPE_LAZY_CACHE.override(request.param == "lazy"),
+        envs.SGLANG_ROPE_LAZY_CHUNK_ROWS.override(128),
+        envs.SGLANG_ROPE_LAZY_MIN_ROWS.override(64),
+    ):
+        yield request.param
+    for module in list(lazy_cos_sin_cache._LAZY_MODULES):
+        lazy_cos_sin_cache.drop(module)
+
+
+def _written_rows(rope) -> int:
+    """Rows that carry values: the reservation is longer than the fill."""
+    state = getattr(rope, "_lazy_cos_sin", None)
+    return state.filled if state is not None else int(rope.cos_sin_cache.shape[0])
 
 
 def _build():
@@ -51,19 +78,20 @@ def test_appended_rows_match_the_constructed_rows():
     a wide margin rather than by a rounding tolerance.
     """
     rope = _build()
-    grown_from = int(rope.cos_sin_cache.shape[0])
+    grown_from = _written_rows(rope)
 
     rope._ensure_cos_sin_cache_length(grown_from + 128)
-    cache = rope.cos_sin_cache
-    assert cache.shape[0] > grown_from, "growth path did not extend the cache"
+    grown_to = _written_rows(rope)
+    cache = rope.cos_sin_cache[:grown_to]
+    assert grown_to > grown_from, "growth path did not extend the cache"
 
     # Reference: the identity _compute_cos_sin_cache itself uses.
     inv_freq = rope._compute_inv_freq(SCALING_FACTOR)
     t = torch.arange(grown_from, cache.shape[0], dtype=torch.float32)
     freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    want = torch.cat(
-        (freqs.cos() * rope.mscale, freqs.sin() * rope.mscale), dim=-1
-    ).to(dtype=cache.dtype)
+    want = torch.cat((freqs.cos() * rope.mscale, freqs.sin() * rope.mscale), dim=-1).to(
+        dtype=cache.dtype
+    )
 
     got = cache[grown_from:]
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
@@ -78,9 +106,9 @@ def test_growth_is_continuous_across_the_seam():
     smooth, so this catches the bug without restating the formula.
     """
     rope = _build()
-    seam = int(rope.cos_sin_cache.shape[0])
+    seam = _written_rows(rope)
     rope._ensure_cos_sin_cache_length(seam + 128)
-    cache = rope.cos_sin_cache
+    cache = rope.cos_sin_cache[: _written_rows(rope)]
 
     # Slowest-rotating component: adjacent positions must barely differ.
     slowest = cache[:, ROTARY_DIM // 2 - 1]
@@ -100,11 +128,11 @@ def test_mscale_is_actually_applied():
     multiply even if the frequencies happened to match.
     """
     rope = _build()
-    seam = int(rope.cos_sin_cache.shape[0])
+    seam = _written_rows(rope)
     assert rope.mscale > 1.0, "test needs a scaling factor whose mscale != 1"
 
     rope._ensure_cos_sin_cache_length(seam + 128)
-    appended = rope.cos_sin_cache[seam:]
+    appended = rope.cos_sin_cache[seam : _written_rows(rope)]
     assert appended.abs().max() > 1.0 + 1e-3, (
         "appended rows never exceed 1.0, so mscale was not applied "
         f"(mscale={rope.mscale})"

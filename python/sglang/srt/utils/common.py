@@ -5079,7 +5079,13 @@ def reserve_rope_cache_for_long_sequences(
             if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
                 child, "cos_sin_cache"
             ):
-                child._ensure_cos_sin_cache_length(reserve - 1)
+                # #656 T1: a reserve is a statement about the CEILING. With a
+                # lazy cache this makes the reservation cover it and fills
+                # nothing; without one it is the same pre-expansion as before.
+                if hasattr(child, "ensure_cos_sin_cache_capacity"):
+                    child.ensure_cos_sin_cache_capacity(reserve)
+                else:
+                    child._ensure_cos_sin_cache_length(reserve - 1)
             else:
                 reserve_rope_cache_recursive(child)
 

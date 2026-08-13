@@ -600,6 +600,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
+        # #656 T1: how far past the batch's deepest sequence length the lazy
+        # RoPE fill has to reach. Same terms as
+        # reserve_rope_cache_for_long_sequences, so the two agree on what a
+        # speculative step can ask for.
+        self._rope_lazy_batch_margin = int(
+            getattr(server_args, "speculative_num_steps", 0) or 0
+        ) * int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0) * int(
+            envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+        ) + int(
+            envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+        )
         # #421 F2: build the #286 offload register from the operator's
         # --lane-offload-* flags. Must run BEFORE the first adapter read: the
         # pools, input buffers and lane workspaces created further down all go
@@ -1507,9 +1518,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             should_capture_draft_graphs,
         )
 
-        if self.is_draft_worker and not should_capture_draft_graphs(
-            self.server_args
-        ):
+        if self.is_draft_worker and not should_capture_draft_graphs(self.server_args):
             self._install_eager_only_runners(
                 "Draft CUDA graphs DISABLED by --disable-draft-cuda-graph; "
                 "this draft runner is eager. Target-model graphs unaffected."
@@ -1952,8 +1961,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 if not phase_flip_groups_initialized():
                     flip_vec = [
-                        int(x)
-                        for x in self.server_args.phase_flip_tp_vector.split(",")
+                        int(x) for x in self.server_args.phase_flip_tp_vector.split(",")
                     ]
                     initialize_phase_flip_secondary_groups(
                         tp_size=len(flip_vec),
@@ -4029,6 +4037,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.split_index = next_split_index
         return ret
 
+    def _ensure_rope_cache_for_batch(self, forward_batch: ForwardBatch) -> None:
+        """Fill the lazy RoPE reserve up to this batch's deepest position.
+
+        The whole point of the lazy reserve is that a 1M ceiling costs nothing
+        until it is used, so the cost of using it has to be paid HERE, before
+        the forward that reads those rows -- including before a captured decode
+        graph is replayed, which is why this sits in forward() and not in the
+        model. The fill writes in place, so the address the graph captured does
+        not move.
+        """
+        from sglang.srt.layers.rotary_embedding import lazy_cos_sin_cache
+
+        if not lazy_cos_sin_cache.any_installed():
+            return
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+            return
+        needed = int(seq_lens_cpu.max()) + self._rope_lazy_batch_margin
+        lazy_cos_sin_cache.ensure_capacity_for_position(needed)
+
+        if envs.SGLANG_ROPE_LAZY_VERIFY.get():
+            # Can-fail proof that the fill really precedes every position that
+            # gets read. Costs a device sync, so it is never on in serving.
+            positions = getattr(forward_batch, "positions", None)
+            if positions is not None and positions.numel():
+                lazy_cos_sin_cache.verify_positions_are_filled(
+                    int(positions.max()), where="ModelRunner.forward"
+                )
+
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -4106,6 +4143,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if not self.is_draft_worker and ((c := self.canary_manager) is not None)
             else contextlib.nullcontext()
         )
+
+        # #656 T1: a lazy RoPE reserve has written only the rows positions have
+        # actually reached, so the rows THIS batch needs may still be
+        # unwritten reservation. Host-side only: seq_lens_cpu is already a CPU
+        # tensor, and the speculative path has bumped it by its draft tokens
+        # before this point, so no synchronisation is added on any path. With
+        # no lazy cache installed -- the shipped default -- this is one bool.
+        self._ensure_rope_cache_for_batch(forward_batch)
 
         with (
             canary_ctx,

@@ -8,6 +8,7 @@ from typing import Tuple
 import torch
 
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.lazy_cos_sin_cache import register_lazy_safe
 
 
 # Inverse dim formula to find dim based on number of rotations
@@ -62,6 +63,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+@register_lazy_safe
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
     """RotaryEmbedding extended with YaRN method.
 
@@ -121,6 +123,11 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             + inv_freq_extrapolation * inv_freq_mask
         )
         return inv_freq
+
+    def _cos_sin_cache_rows(self) -> int:
+        # Must match _compute_cos_sin_cache below, whose arange runs to
+        # max_position_embeddings * scaling_factor.
+        return int(math.ceil(self.max_position_embeddings * self.scaling_factor))
 
     def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
         # Must match _compute_cos_sin_cache below: scaling_factor, not base.
