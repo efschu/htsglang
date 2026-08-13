@@ -468,6 +468,51 @@ def _nvml_view() -> Dict[str, Any]:
     }
 
 
+def _kv_arena_view() -> Dict[str, Any]:
+    """The KV VMM arena's own committed total, for the mark that is being taken.
+
+    SOURCE 4, and the one that turns an argument into a chain. Sources 1-3
+    could see that torch's ``reserved`` exceeded NVML's resident bytes by
+    4.6-8.3 GiB per rank on the ship config, and could say WHY in prose -- the
+    KV pool is a virtual-memory arena whose address space is reserved up front
+    and whose physical pages are mapped incrementally -- but could not measure
+    the split, because neither torch nor NVML knows where the arena's
+    watermark sits. The arena does. Reading it here makes
+
+        commit watermark -> resident bytes -> free VRAM -> corridor
+
+    a measured chain instead of a plausible story.
+
+    ``retained`` is reported separately from ``backed`` on purpose: parked
+    physical handles are memory the arena still owns but has unmapped, so NVML
+    charges the process for them while the backed total does not. Folding them
+    together would recreate, one level down, exactly the false-zero this
+    instrument was fixed for.
+
+    Import is local and the whole body is guarded: a boot must not acquire a
+    new way to fail by being measured, and a rank with no arena at all (the
+    common case before the pool exists) simply contributes nothing.
+    """
+    try:
+        from sglang.srt.mem_cache.kv_vmm_backing import arena_census
+
+        census = arena_census()
+    except Exception:  # pragma: no cover - the instrument never breaks a boot
+        return {}
+    if not census:
+        return {}
+    totals = {"reserved": 0, "backed": 0, "retained": 0, "arenas": 0}
+    for row in census.values():
+        for key in totals:
+            totals[key] += int(row.get(key, 0) or 0)
+    return {
+        "kv_arena_reserved_bytes": totals["reserved"],
+        "kv_arena_backed_bytes": totals["backed"],
+        "kv_arena_retained_bytes": totals["retained"],
+        "kv_arena_count": totals["arenas"],
+    }
+
+
 def mark(
     phase: str,
     *,
@@ -508,9 +553,26 @@ def mark(
         # one line does not have to know the subtraction. Floored at 0: NVML
         # rounds to MiB granularity and torch does not, so a sub-MiB negative
         # here is quantisation, not a discovery.
-        record["non_torch_bytes"] = max(
-            0, int(record["nvml_self_bytes"]) - int(record["reserved_bytes"])
-        )
+        #
+        # A LARGE negative is a different animal and may not be floored away.
+        # On the ship config torch reports up to 7162 MiB MORE reserved than
+        # NVML says this process holds -- reservation that carries no physical
+        # backing. Flooring that to 0 published "this rank has no CUDA context,
+        # no NCCL buffer and no JIT workspace on this card" for a rank whose
+        # context alone measured 886 MiB. The floor was built for quantisation
+        # and was swallowing gigabytes, so the two cases are now separated and
+        # each is named:
+        #
+        #   non_torch_measurable  -- False when torch's books exceed the card's,
+        #                            in which case non_torch_bytes is NOT a
+        #                            measurement of the residue and a reader
+        #                            must not treat its 0 as an observation.
+        #   unbacked_reservation  -- how far reserved exceeds resident. This is
+        #                            the measurement that replaces the lost one.
+        residue = int(record["nvml_self_bytes"]) - int(record["reserved_bytes"])
+        record["non_torch_bytes"] = max(0, residue)
+        record["unbacked_reservation_bytes"] = max(0, -residue)
+        record["non_torch_measurable"] = residue >= 0
     if "reserved_peak_bytes" in record and "reserved_bytes" in record:
         # #612. The allocator peak ABOVE what is still resident at this mark:
         # the transient the ledger's TERM_LOAD_TRANSIENT stands for. Computed
@@ -523,6 +585,7 @@ def mark(
         record["allocator_transient_bytes"] = max(
             0, int(record["reserved_peak_bytes"]) - int(record["reserved_bytes"])
         )
+    record.update(_kv_arena_view())
     if extra:
         record["extra"] = dict(extra)
     try:
@@ -537,7 +600,7 @@ def mark(
 
 
 def read_marks(directory: str, *, boot: Optional[str] = None) -> Dict[int, List[dict]]:
-    """``{rank: [mark, ...]}`` for ONE boot, latest by default.
+    """``{pid: [mark, ...]}`` for ONE boot, latest by default.
 
     THE FILE HOLDS MORE THAN ONE BOOT and that is the point of the format: a
     rank appends, so a crashed boot keeps the boundaries it did reach and the
@@ -549,17 +612,32 @@ def read_marks(directory: str, *, boot: Optional[str] = None) -> Dict[int, List[
     post. Selecting a boot is therefore not a convenience, it is the thing that
     keeps the output honest once the recorder is armed on every boot.
 
+    GROUPED BY PID, NOT BY RANK, and not by the file the marks were found in.
+    Marks are FILED under the TP rank, and the ship config runs ``--tp-size 1
+    --pp-size 3``: the TP rank is 0 in all three processes, so all three append
+    to ``flight_marks_rank0.jsonl``. Keying the result on the rank field
+    therefore merged three processes on three different cards into a single
+    timeline, and differencing it produced posts that no card ever paid --
+    a 20480 MiB card's CUDA context billed to the 32607 MiB card. The pid is
+    stamped by the process that took the mark and cannot collide while that
+    process lives, so the pid is the grouping key. Callers that want the rank
+    read it off any mark in the group.
+
+    THE BOOT IS RESOLVED ACROSS ALL FILES, not per file. Ranks do not stop
+    writing at the same instant, so "the last boot_id in this file" can name a
+    different boot for each rank, which silently returns a mixture.
+
     Pass ``boot="all"`` to get every record, for a reader that means to handle
     the seams itself.
     """
     out: Dict[int, List[dict]] = {}
     if not os.path.isdir(directory):
         return out
+    records: List[dict] = []
     for name in sorted(os.listdir(directory)):
         if not (name.startswith("flight_marks_rank") and name.endswith(".jsonl")):
             continue
         path = os.path.join(directory, name)
-        records: List[dict] = []
         with open(path) as f:
             for line in f:
                 line = line.strip()
@@ -572,24 +650,30 @@ def read_marks(directory: str, *, boot: Optional[str] = None) -> Dict[int, List[
                     # Keep the boundaries that did land rather than dropping
                     # the rank's whole history over its last byte.
                     logger.warning("flight recorder: dropping a torn line in %s", path)
-        if not records:
-            continue
-        if boot != "all":
-            wanted = boot if boot is not None else records[-1].get("boot_id")
-            selected = [r for r in records if r.get("boot_id") == wanted]
-            # Records written before boot_id existed carry none; keeping them
-            # out of a boot-scoped read is right, but silently returning
-            # nothing would look like "the boot wrote no marks".
-            if not selected and wanted is None:
-                logger.warning(
-                    "flight recorder: %s carries no boot_id; it predates "
-                    "boot-scoped reads and is being returned whole",
-                    path,
-                )
-                selected = records
-            records = selected
-        if records:
-            out[int(records[0].get("rank", 0))] = records
+    if not records:
+        return out
+    if boot != "all":
+        if boot is not None:
+            wanted = boot
+        else:
+            latest = max(records, key=lambda r: r.get("wall") or 0.0)
+            wanted = latest.get("boot_id")
+        selected = [r for r in records if r.get("boot_id") == wanted]
+        # Records written before boot_id existed carry none; keeping them out
+        # of a boot-scoped read is right, but silently returning nothing would
+        # look like "the boot wrote no marks".
+        if not selected and wanted is None:
+            logger.warning(
+                "flight recorder: %s carries marks with no boot_id; they "
+                "predate boot-scoped reads and are being returned whole",
+                directory,
+            )
+            selected = records
+        records = selected
+    for record in records:
+        out.setdefault(int(record.get("pid", 0)), []).append(record)
+    for group in out.values():
+        group.sort(key=lambda r: r.get("monotonic") or 0.0)
     return out
 
 

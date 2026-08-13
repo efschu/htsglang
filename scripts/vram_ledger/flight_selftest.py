@@ -129,7 +129,7 @@ def main() -> int:
         "workspaces, driver windows)",
     )
 
-    deltas = fr.phase_deltas(fr.read_marks(directory)[0])
+    deltas = fr.phase_deltas(fr.read_marks(directory)[os.getpid()])
     check("phase deltas produced", len(deltas) == 1)
     if deltas:
         print(f"       {deltas[0].row()}")

@@ -51,8 +51,38 @@ def main(argv=None) -> int:
         action="store_true",
         help="Print the cached calibration and exit without measuring.",
     )
+    parser.add_argument(
+        "--from-flight-recorder",
+        metavar="DIR",
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "Read the flight recorder's boot history instead of touching the "
+            "GPU, and report which residuals it can calibrate. Only posts that "
+            "are stable across several boots are offered; a post whose spread "
+            "is wide is listed as DECLINED, because a median of a wide "
+            "distribution is variance wearing a constant's clothes. Defaults "
+            "to $SGLANG_VRAM_FLIGHT_DIR."
+        ),
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    if args.from_flight_recorder is not None:
+        from sglang.srt.mem_ledger.measured import describe, residual_overrides
+
+        directory = args.from_flight_recorder or None
+        print(describe(directory))
+        overrides = residual_overrides(directory, force=True)
+        if not overrides:
+            print("No residual is stable enough to calibrate from this history.")
+            return 1
+        print("residuals this history supports:")
+        for uuid in sorted(overrides):
+            for field, value in sorted(overrides[uuid].items()):
+                print(f"  {uuid}  {field} = {value // (1 << 20)} MiB")
+        return 0
 
     existing = load_calibration()
     if args.show:
