@@ -4,8 +4,9 @@ import ctypes
 import logging
 import os
 import tempfile
+import weakref
 from math import prod
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.utils.cpp_extension
@@ -282,6 +283,56 @@ void kvarena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{}}
 
 _DEFAULT_RESERVE_BYTES = 256 * (1024**3)  # 256 GiB virtual; free until committed
 
+#: Every live arena, for READ-ONLY census by the VRAM flight recorder (#605).
+#:
+#: WHY THIS EXISTS. torch's ``reserved`` counts what this allocator handed out
+#: -- the pool's LOGICAL size -- while NVML counts the pages actually mapped.
+#: On the ship config the two differ by 4.6-8.3 GiB per rank, and with no way
+#: to read the arena's own committed total that difference could only be
+#: ARGUED. The census makes "commit watermark -> free VRAM -> corridor" a
+#: measured chain.
+#:
+#: A ``WeakValueDictionary`` and not a ``WeakSet``: an arena must not be kept
+#: alive by being observed, and the WeakSet form of this pattern was already
+#: fixed once in the attention workspace registry for exactly that reason.
+#: Keyed by instance counter, which is unique per process.
+_LIVE_ARENAS: "weakref.WeakValueDictionary[int, KvVmmArena]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def arena_census() -> Dict[int, Dict[str, int]]:
+    """``{device_id: {reserved, backed, retained, arenas}}`` over live arenas.
+
+    Read-only and allocation-free: it reads counters the arena already keeps.
+    Never raises -- a census that can fail a boot is not an instrument.
+
+    ``backed`` is mapped physical memory. ``retained`` is physical memory this
+    arena still OWNS but has unmapped (parked handles); NVML charges the
+    process for it while ``backed`` does not, so reporting only ``backed``
+    would leave a real, resident post invisible.
+    """
+    out: Dict[int, Dict[str, int]] = {}
+    try:
+        arenas = list(_LIVE_ARENAS.values())
+    except Exception:  # pragma: no cover - registry races are not worth a boot
+        return out
+    for arena in arenas:
+        try:
+            if getattr(arena, "_closed", True):
+                continue
+            row = out.setdefault(
+                int(arena.device_id),
+                {"reserved": 0, "backed": 0, "retained": 0, "arenas": 0},
+            )
+            row["reserved"] += int(getattr(arena, "reserved", 0) or 0)
+            row["backed"] += int(getattr(arena, "_range_backed", 0) or 0)
+            row["retained"] += int(getattr(arena, "_retained_bytes", 0) or 0)
+            row["arenas"] += 1
+        except Exception:  # pragma: no cover
+            continue
+    return out
+
 
 class KvVmmArena:
     """One device's CUDA virtual-memory reservation exposed as a ``torch.cuda.MemPool``."""
@@ -301,6 +352,9 @@ class KvVmmArena:
         # tempdir, so co-located engine processes must not build the same-named .so
         # (they race and one loads a half-relinked copy -> undefined symbol crash).
         self._sfx = f"{os.getpid()}_{KvVmmArena._instance_count}"
+        # Read-only census hook (#605). Registered before any mapping happens so
+        # a crash during construction still leaves a countable arena.
+        _LIVE_ARENAS[KvVmmArena._instance_count] = self
         KvVmmArena._instance_count += 1
         drv = _driver()
         with torch.cuda.device(self.device_id):
@@ -989,9 +1043,9 @@ class KvVmmBufferOwner:
             self.ensure_prefix(self.page_size)
 
         for t in self.tensors:
-            assert t.is_cuda and t.device.index == self.device_id, (
-                f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
-            )
+            assert (
+                t.is_cuda and t.device.index == self.device_id
+            ), f"post-capture KV buffer landed on {t.device}, expected cuda:{self.device_id}"
 
     # -- backing --------------------------------------------------------------
 

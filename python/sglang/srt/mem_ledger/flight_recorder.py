@@ -468,6 +468,51 @@ def _nvml_view() -> Dict[str, Any]:
     }
 
 
+def _kv_arena_view() -> Dict[str, Any]:
+    """The KV VMM arena's own committed total, for the mark that is being taken.
+
+    SOURCE 4, and the one that turns an argument into a chain. Sources 1-3
+    could see that torch's ``reserved`` exceeded NVML's resident bytes by
+    4.6-8.3 GiB per rank on the ship config, and could say WHY in prose -- the
+    KV pool is a virtual-memory arena whose address space is reserved up front
+    and whose physical pages are mapped incrementally -- but could not measure
+    the split, because neither torch nor NVML knows where the arena's
+    watermark sits. The arena does. Reading it here makes
+
+        commit watermark -> resident bytes -> free VRAM -> corridor
+
+    a measured chain instead of a plausible story.
+
+    ``retained`` is reported separately from ``backed`` on purpose: parked
+    physical handles are memory the arena still owns but has unmapped, so NVML
+    charges the process for them while the backed total does not. Folding them
+    together would recreate, one level down, exactly the false-zero this
+    instrument was fixed for.
+
+    Import is local and the whole body is guarded: a boot must not acquire a
+    new way to fail by being measured, and a rank with no arena at all (the
+    common case before the pool exists) simply contributes nothing.
+    """
+    try:
+        from sglang.srt.mem_cache.kv_vmm_backing import arena_census
+
+        census = arena_census()
+    except Exception:  # pragma: no cover - the instrument never breaks a boot
+        return {}
+    if not census:
+        return {}
+    totals = {"reserved": 0, "backed": 0, "retained": 0, "arenas": 0}
+    for row in census.values():
+        for key in totals:
+            totals[key] += int(row.get(key, 0) or 0)
+    return {
+        "kv_arena_reserved_bytes": totals["reserved"],
+        "kv_arena_backed_bytes": totals["backed"],
+        "kv_arena_retained_bytes": totals["retained"],
+        "kv_arena_count": totals["arenas"],
+    }
+
+
 def mark(
     phase: str,
     *,
@@ -540,6 +585,7 @@ def mark(
         record["allocator_transient_bytes"] = max(
             0, int(record["reserved_peak_bytes"]) - int(record["reserved_bytes"])
         )
+    record.update(_kv_arena_view())
     if extra:
         record["extra"] = dict(extra)
     try:
