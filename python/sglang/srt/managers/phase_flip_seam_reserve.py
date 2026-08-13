@@ -150,6 +150,14 @@ class SeamReserve:
     #: measured position plus the slope along which moving the pool moves it.
     have_bytes: int = 0
     id_space: int = 0
+    #: The deepest CORRIDOR SHORTFALL this rank has been observed to make,
+    #: in bytes: how far below the law its card went at the worst instant,
+    #: recorded by the runtime's own corridor audit. ZERO until a boot
+    #: actually measures one, so a rig that has never breached is sized
+    #: exactly as before -- this term can only ever appear as a consequence
+    #: of a measurement, which is what keeps it from becoming another
+    #: constant carried between rigs (#656).
+    corridor_shortfall_bytes: int = 0
     provenance: str = PROVENANCE_COLD
     written_at: Optional[str] = None
     detail: str = ""
@@ -166,8 +174,30 @@ def seam_reserve_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
-def seam_margin_bytes() -> int:
+def seam_margin_bytes(reserve: Optional["SeamReserve"] = None) -> int:
     """Bytes the solver stands back from the measured position.
+
+    TWO TERMS, and only the first is a constant:
+
+    * the MEASUREMENT ERROR BAR (``DEFAULT_MARGIN_MIB``), which is what the
+      sizer owes because ``seam_allowed_tokens`` targets equality;
+    * the MEASURED CORRIDOR SHORTFALL for this rank, if any boot has ever
+      recorded one. This is zero on a rig that has never breached, so it
+      cannot travel between configurations as a number somebody picked.
+
+    WHY THE SECOND TERM EXISTS (#656 acceptance, 2026-08-13). The sizer
+    guarantees the seam is fundable AT REST. It says nothing about the
+    level the card actually reaches while the seam RUNS, and on this rig
+    that drawdown measured 1814-1852 MiB against a gate that assumes 512.
+    Five cutovers entered through a gate with no objection and took the
+    card to 886 MiB, 138 below the law. The shortfall is knowable only by
+    measurement -- it is a property of the geometry, the load and the
+    card -- so the honest term is the one the runtime writes down after it
+    has seen it, and the two-boot protocol this file already documents is
+    exactly the vehicle for carrying it to the next boot.
+
+    ``SGLANG_PHASE_FLIP_SEAM_MARGIN_MIB`` still overrides BOTH terms, so a
+    bring-up can pin the whole margin to one number.
 
     Read from the environment every call rather than cached: the same
     discipline as ``seam_reserve_enabled``, so a boot can be re-run with a
@@ -177,15 +207,18 @@ def seam_margin_bytes() -> int:
     zero-margin pool, so an unparseable override must not produce one.
     """
     raw = os.environ.get(ENV_MARGIN_MIB)
-    if raw is None:
-        return DEFAULT_MARGIN_MIB << 20
-    try:
-        mib = int(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_MARGIN_MIB << 20
-    if mib < 0:
-        return DEFAULT_MARGIN_MIB << 20
-    return mib << 20
+    if raw is not None:
+        try:
+            mib = int(raw)
+        except (TypeError, ValueError):
+            mib = -1
+        if mib >= 0:
+            return mib << 20
+        # Malformed or negative: fall through to the derived margin rather
+        # than to zero. The failure mode this exists to prevent is a
+        # zero-margin pool, so an unparseable override must not produce one.
+    measured = 0 if reserve is None else max(0, int(reserve.corridor_shortfall_bytes))
+    return (DEFAULT_MARGIN_MIB << 20) + measured
 
 
 def record_path(server_args, world_rank: int) -> str:
@@ -239,6 +272,9 @@ def read_seam_reserve(server_args, world_rank: int) -> SeamReserve:
             per_row_bytes=float(rec["per_row_bytes"]),
             have_bytes=int(rec.get("have_bytes", 0)),
             id_space=int(rec.get("id_space", 0)),
+            # Absent in records written before #656; absent means "never
+            # measured", which is exactly the zero the term defaults to.
+            corridor_shortfall_bytes=int(rec.get("corridor_shortfall_bytes", 0)),
             provenance=PROVENANCE_STORED,
             written_at=rec.get("written_at"),
             detail=rec.get("detail", ""),
@@ -264,11 +300,22 @@ def write_seam_reserve(
     predicted.
     """
     path = record_path(server_args, world_rank)
+    # PRESERVED, NOT OVERWRITTEN. The shortfall is written by a different
+    # event (the runtime's corridor audit, mid-run) than this measurement
+    # (end of the flip boot), so a boot that re-measures its seam must not
+    # silently discard a breach an earlier boot paid to learn about.
+    prior_shortfall = 0
+    try:
+        with open(path) as fh:
+            prior_shortfall = int(json.load(fh).get("corridor_shortfall_bytes", 0))
+    except Exception:
+        prior_shortfall = 0
     payload = {
         "fixed_bytes": int(fixed_bytes),
         "per_row_bytes": float(per_row_bytes),
         "have_bytes": int(have_bytes),
         "id_space": int(id_space),
+        "corridor_shortfall_bytes": max(0, prior_shortfall),
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "detail": detail,
     }
@@ -284,6 +331,62 @@ def write_seam_reserve(
     except Exception as e:
         logger.warning("%s could not write %s: %s", LOG_PREFIX, path, e)
         return None
+
+
+def record_corridor_shortfall(
+    server_args, world_rank: int, shortfall_bytes: int
+) -> Optional[int]:
+    """Persist a MEASURED corridor shortfall for this rank. Never raises.
+
+    Called by the runtime's corridor audit when the continuous minimum on
+    this rank's card has gone below the law. The next boot of the same
+    configuration reads it back through :func:`read_seam_reserve` and the
+    solver stands that much further back -- the two-boot protocol this file
+    already documents, carrying one more measured quantity.
+
+    A MONOTONIC MAXIMUM, deliberately. A shallower breach later does not
+    mean the deeper one cannot recur; the pool must be sized for the worst
+    instant that has ever been seen, which is the same rule the corridor law
+    itself is stated with. Returns the value now on record, or None if it
+    could not be written.
+    """
+    want = max(0, int(shortfall_bytes))
+    if want <= 0:
+        return None
+    path = record_path(server_args, world_rank)
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+    except Exception:
+        # No record yet: a cold boot has nothing to append to, and inventing
+        # one here would hand the next boot a seam floor nobody measured.
+        return None
+    prior = int(rec.get("corridor_shortfall_bytes", 0))
+    if want <= prior:
+        return prior
+    rec["corridor_shortfall_bytes"] = want
+    rec["corridor_shortfall_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w") as fh:
+            json.dump(rec, fh, indent=1)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("%s could not record the shortfall in %s: %s", LOG_PREFIX, path, e)
+        return None
+    logger.warning(
+        "%s recorded a MEASURED corridor shortfall of %d MiB for rank %d "
+        "(was %d MiB). The next boot of this configuration will stand that "
+        "much further back when it sizes the pool, which is the two-boot "
+        "protocol carrying one more measured quantity. This term is zero "
+        "until a breach is actually observed, so it can never travel to "
+        "another rig as a number somebody picked.",
+        LOG_PREFIX,
+        want >> 20,
+        int(world_rank),
+        prior >> 20,
+    )
+    return want
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +501,7 @@ def seam_allowed_tokens(cell_bytes: int, reserve: "SeamReserve") -> int:
     # slack-bound regime only this one has any effect, because ``F`` appears
     # there solely in the regime test. Taking it here therefore means the same
     # thing on both branches: "stand this far back from where we measured".
-    have_m = max(0, int(reserve.have_bytes) - seam_margin_bytes())
+    have_m = max(0, int(reserve.have_bytes) - seam_margin_bytes(reserve))
     t_m = int(reserve.id_space)
     F = max(0, int(reserve.fixed_bytes))
     a = max(0.0, float(reserve.per_row_bytes))

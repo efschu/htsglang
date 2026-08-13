@@ -76,6 +76,7 @@ FAMILY=(
     # literal creeping back into an instrument that audits the gate.
     test/registered/scheduler/test_flip_frame_agreement_656.py
     test/registered/unit/managers/test_corridor_threshold_pair_656.py
+    test/registered/unit/managers/test_seam_margin_selfcal_656.py
     # Third under-collection, caught 2026-08-10: six tests were added to
     # this file and the family total did not move, because the list is
     # explicit and nobody extended it. The file guards spec item 8's flag

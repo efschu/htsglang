@@ -4327,6 +4327,31 @@ class Scheduler(
             int(summary.get("corridor_mib", 0)) - floor,
             summary.get("corridor_mib"),
         )
+        # AND WRITE IT DOWN, so the next boot of this configuration sizes
+        # itself against a measured shortfall instead of an assumed one.
+        # Guarded and never raises: an instrument must not take serving down,
+        # and a rank with no seam record (a cold boot) simply has nothing to
+        # append to.
+        try:
+            from sglang.srt.managers.phase_flip_seam_reserve import (
+                record_corridor_shortfall,
+            )
+
+            # THE FLIP RUNTIME'S RANK, not self.ps.tp_rank. The seam record
+            # is keyed on the rank write_seam_reserve used (runtime._rank),
+            # and under --tp-size 1 --pp-size 3 the TP rank is 0 in ALL
+            # THREE processes -- register C605-3, where exactly that
+            # substitution filed three cards under one rank. No runtime, no
+            # record to append to, so nothing is written.
+            runtime = getattr(self, "phase_flip_runtime", None)
+            rank = getattr(runtime, "_rank", None)
+            if rank is not None:
+                depth_mib = int(summary.get("corridor_mib", 0)) - floor
+                record_corridor_shortfall(
+                    self.server_args, int(rank), depth_mib << 20
+                )
+        except Exception:  # noqa: BLE001 - instrument must not raise
+            pass
 
     def _census_tick(self) -> None:
         """Advance the census round and, on cadence, diff counts across ranks.
