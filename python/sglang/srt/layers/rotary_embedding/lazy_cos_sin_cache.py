@@ -196,6 +196,13 @@ def install(
         return None
     if capacity_rows < lazy_min_rows():
         return None
+    if device.type not in ("cuda", "cpu"):
+        # meta above all: the weightless worker and the draft-solo shadow build
+        # their layers on meta, where a reservation is neither needed nor
+        # meaningful, and a meta buffer that claims to be filled would be a lie
+        # with a shape.
+        logger.info("RoPE lazy cache declined: device %s", device)
+        return None
     if dtype != torch.float32:
         # The managed view is typed through __cuda_array_interface__, which has
         # no bf16 typestr, and a non-fp32 cache is the CPU/npu path anyway.
