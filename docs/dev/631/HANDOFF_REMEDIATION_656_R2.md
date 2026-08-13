@@ -190,8 +190,55 @@ control removes the noise around it; it does not remove it.
 
 ## 6. METAL
 
-*(Filled in from boot_v2 — see §6 of the evidence directory's
-`ACCEPTANCE_656_R2.md`.)*
+Three boots this shift, and two of them are results.
+
+**boot_v1 (15:37Z) — the agreement tried to grow.** Killed after 4 minutes.
+Evidence `boot_v1_capfail.log`; diagnosis in §4(a).
+
+**boot_v2 (15:49Z) — the two positive proofs.** Both mechanisms fired:
+
+* 16:00:30Z, the levelling: three ranks at 579870 / 579722 / 578606 exposed
+  rows converged to 578606 in ONE round, and every field of every POOL CENSUS
+  line was identical from the next round on;
+* 16:01:24Z, the valve: a persistent divergence blocked `tp_to_pp`, all three
+  ranks relaxed purity for PREFILL simultaneously and identically, and the
+  instance kept serving — `/health` 200, tokens flowing, the load driver
+  advancing — where R1's boot answered 503 with none.
+
+It also produced this shift's second defect (the free-list order, §4(b)).
+
+**boot_v3 (16:12Z) — the acceptance re-run.** One boot, one continuous log,
+argv identical to the acceptance and to R1's boot, 55.4 minutes of load plus
+the deep-probe run in the same log, corridor sampled at 100 ms throughout.
+
+| | acceptance | R1 | **R2** |
+|---|---|---|---|
+| cutovers | 320, then died | 218 + 12 frame abandons | **364, 0 abandons** |
+| terminal state | SIGQUIT | wedge, 503, no tokens | **serving** |
+| corridor minima | 886 / 1941 / 1304 | 1012 / 2057 / 1370 | **1070 / 2139 / 1466** |
+| samples below the law | 25 (5 episodes) | 2 (1 episode) | **0 of 33648** |
+| tracebacks / SIGQUIT | 2 / 1 | 0 / 0 | **0 / 0** |
+
+**7 of 7 axes.** Full table and caveats in
+`evidence-631/remediation-656-r2/ACCEPTANCE_656_R2.md`.
+
+### WHAT boot_v3 DOES NOT PROVE, and it matters
+
+Neither mechanism this shift built fired on it: 0 levelling events, 0 purity
+stand-downs, 0 yields withheld, 0 yields taken. One corridor-bounded recovery
+DID occur (PP1, 16:25:13Z, 558489 of 585730 rows) and opened no divergence,
+because the next `pp_to_tp` shrink caps every rank to one agreed absolute row
+target and therefore **levels the group by construction**. That is why the
+divergence window is narrow, why R1 saw only two episodes in 33 minutes, and
+why a clean boot is cheap to get.
+
+So boot_v3 is a NO-REGRESSION result on C22, not a positive proof; the positive
+proofs are boot_v2's two events and the desk red arms. The corridor result is
+likewise attributable to the pool sizing and to the gate never having to yield
+— not to the yield-withholding, which has still never fired on metal.
+
+At the acceptance's 1-in-320 rate, 364 clean cutovers happen about 32% of the
+time on an instance where nothing was fixed. ~957 would be a 95% claim.
 
 ---
 
