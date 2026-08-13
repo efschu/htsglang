@@ -280,6 +280,59 @@ class TheMetalDivergenceIsReproducedAndClosedTest(unittest.TestCase):
             )
 
 
+class TheAgreementNeverCommitsAPageTest(unittest.TestCase):
+    """Metal, 2026-08-13 15:40:23Z, on the first boot of this mechanism.
+
+    The proposal was ``backed + (free - law) / bytes_per_row`` -- what
+    ``recover`` would be ALLOWED to commit -- so on the pp->tp leg the
+    levelling tried to grow the pool straight back to the boot rows, handing
+    back the very rows the collective shrink had just taken to fund the seam::
+
+        KV-BACKING cap agreement could not commit to the agreed level 579130
+          (reached 558837): cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY   x3
+        [#631 seam-census] CORRIDOR LAW BROKEN during tp_to_pp rank 0 at
+          stage 'entry': free 3 MiB is below the 1024 MiB floor
+        CORRIDOR-GUARD REFUSED ... free 4 -> 4 MiB, reclaimed 0 MiB
+        PHASE-FLIP FLIP ABANDONED (pool too small for the live set)
+
+    Three minutes into the boot the instance was parked in TP with a 9-token
+    prefill it could not run. Growing has exactly ONE owner and this is not
+    it.
+    """
+
+    def test_reconcile_never_touches_the_backing(self):
+        relief, pool, _card = _rank(free_mib=1024 + 90_000, backed=400_000)
+        relief._rows_at_boot = BOOT_ROWS
+        relief._cap.engage(400_000)
+        calls = len(pool.calls)
+        relief.reconcile_to(BOOT_ROWS)  # a target above what is backed
+        self.assertEqual(len(pool.calls), calls, "the agreement committed pages")
+        self.assertEqual(pool.full_pool_backed_rows, 400_000)
+        self.assertLessEqual(relief.exposed_rows(), 400_000)
+
+    def test_a_rank_proposes_what_it_has_backed_not_what_it_could_commit(self):
+        """The card has room for the whole pool; the proposal must ignore it."""
+        relief, _pool, _card = _rank(free_mib=1024 + 500_000, backed=400_000)
+        relief._rows_at_boot = BOOT_ROWS
+        relief._cap.engage(400_000)
+        self.assertEqual(relief.cap_proposal()[0], 400_000)
+
+    def test_levelling_up_is_a_cap_release_over_pages_already_held(self):
+        """The level rises without an allocation, which is why it is safe.
+
+        A rank levelled DOWN kept its pages, so when the poorest rank recovers
+        and the group target rises, its peers follow by releasing a cap -- no
+        commit anywhere on the path.
+        """
+        relief, pool, _card = _rank(free_mib=1024 + 90_000, backed=BOOT_ROWS)
+        relief.reconcile_to(500_000)
+        self.assertEqual(relief.exposed_rows(), 500_000)
+        calls = len(pool.calls)
+        relief.reconcile_to(BOOT_ROWS)
+        self.assertEqual(relief.exposed_rows(), BOOT_ROWS)
+        self.assertEqual(len(pool.calls), calls, "levelling up committed pages")
+
+
 class TheLimitStillWinsOverTheAmbitionTest(unittest.TestCase):
     """A levelled-down rank may never be capped below its own live set."""
 
@@ -288,9 +341,9 @@ class TheLimitStillWinsOverTheAmbitionTest(unittest.TestCase):
         # A rank whose resident set reaches far up the pool, and a poorer rank
         # that sets the level -- but may not set it below that live row.
         b, _p, _c = _rank(free_mib=1024 + 90_000, backed=BOOT_ROWS, live=(400_000,))
-        poor, _p, _c = _rank(free_mib=1024 + 150_000, backed=300_000, live=(80,))
+        poor, _p, _c = _rank(free_mib=1024, backed=450_000, live=(80,))
         poor._rows_at_boot = BOOT_ROWS
-        poor._cap.engage(300_000)
+        poor._cap.engage(450_000)
         target = _agree([a, b, poor])
         self.assertIsNotNone(target)
         self.assertEqual(target, 450_000, "the poorest rank sets the level")

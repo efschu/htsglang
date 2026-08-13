@@ -1084,19 +1084,6 @@ class KvBackingRelief:
             return int(self._cap.cap)
         return self._reservation_rows()
 
-    def _affordable_growth_rows(self) -> int:
-        """Rows this rank could COMMIT without crossing the corridor law.
-
-        The same bound :meth:`recover` applies, factored out so the proposal
-        and the application price the grow identically.
-        """
-        if not self._supported() or self._bytes_per_row <= 0:
-            return 0
-        headroom = self._free_bytes() - self._law_floor_bytes
-        if headroom <= 0:
-            return 0
-        return int(headroom // self._bytes_per_row)
-
     def cap_proposal(self):
         """This rank's four-field proposal for the group's exposed row level.
 
@@ -1111,12 +1098,25 @@ class KvBackingRelief:
         backed = self._current_rows()
         if backed <= 0:
             return CAP_ABSTAIN
-        ceiling = (
-            int(self._rows_at_boot)
-            if self._rows_at_boot is not None
-            else self._reservation_rows()
-        )
-        capable = min(ceiling, backed + max(0, self._affordable_growth_rows()))
+        # WHAT THIS RANK CAN EXPOSE IS WHAT IS ALREADY BACKED. NOT ONE ROW
+        # MORE, and the missing term is the one that had to be measured to be
+        # believed. The first metal boot of this agreement proposed
+        # ``backed + (free - law) / bytes_per_row`` -- what ``recover`` would
+        # be allowed to commit -- and the levelling then tried to GROW on the
+        # pp->tp leg, i.e. to hand back the very rows the collective shrink
+        # had just taken to fund the seam. Measured 2026-08-13 15:40:23Z:
+        # ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` on all three ranks,
+        # rank 0 driven to 3 MiB free (1021 MiB below the law), the seam then
+        # unfundable, and the instance parked in TP with a 9-token prefill it
+        # could not run.
+        #
+        # So the agreement is STRICTLY NON-ALLOCATING. Growing has exactly one
+        # owner -- ``recover``, on the leg the pool becomes active again, with
+        # its own corridor bound -- and this decides only which of the backed
+        # rows the group agrees to hand out. The two never fight, and the
+        # level still rises: a rank that recovers raises its own proposal, and
+        # its peers follow by RELEASING a cap over pages they never gave up.
+        capable = backed
         page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
         capable = int(capable // page * page)
         if capable <= 0:
@@ -1128,16 +1128,18 @@ class KvBackingRelief:
     def reconcile_to(self, target: int) -> int:
         """Bring this rank's exposed row level to exactly ``target``.
 
-        THE TWO DIRECTIONS ARE NOT SYMMETRIC AND MUST NOT BE.
+        IT COMMITS NOTHING, EVER, and it releases nothing either. This is an
+        ID decision: the pages stay exactly as they are and only the
+        allocator's free list moves. Growing the backing has ONE owner --
+        :meth:`recover`, on the leg the pool becomes active again, with its
+        own corridor bound -- and an agreement that also grew would hand back
+        the rows the collective shrink had just taken to fund the seam. That
+        is not hypothetical; it OOM'd all three ranks on the first metal boot
+        of this mechanism (see :meth:`cap_proposal`).
 
-        * Upwards is an ALLOCATION -- ``cuMemCreate`` on a card the rung was
-          relieving -- so it is bounded by the corridor law here exactly as it
-          is in :meth:`recover`, re-measured at the moment of the call rather
-          than trusted from the proposal. Free memory moves between the two.
-        * Downwards is an ID DECISION and nothing else. The pages stay
-          committed. Releasing them would be a second, unpriced shrink at a
-          point the corridor gate has already reasoned about, and the undo is
-          the ``cuMemCreate`` this chain has paid 2.5 GiB to learn to avoid.
+        ``target`` is the group MIN of what every rank has BACKED, so it is
+        never above this rank's own backing; the ``min`` below is a
+        belt-and-braces reading rather than a clamp that does work.
 
         Levelling a rank DOWN costs it no real capacity: under pure PP every
         rank holds the same token rows, so rows above the group minimum could
@@ -1156,41 +1158,6 @@ class KvBackingRelief:
             # re-engaging a cap walks every free list, and this runs on the
             # unconditional path of every seam round.
             return 0
-        if target > backed and self._supported():
-            affordable = self._affordable_growth_rows()
-            reach = min(target, backed + max(0, affordable))
-            page = max(1, int(getattr(self._pool, "page_size", 1) or 1))
-            reach = int(reach // page * page)
-            if reach > backed:
-                try:
-                    self._pool.runtime_set_backing_rows(reach)
-                except Exception as e:
-                    # A failed grow leaves the watermark where it was, and the
-                    # cap below is set from the backing that EXISTS. The group
-                    # stays divergent and the frame ballot refuses the flip --
-                    # a lost flip, never an unmapped row handed out.
-                    logger.error(
-                        "%s cap agreement could not commit to the agreed "
-                        "level %d (reached %d): %s. This rank stays below the "
-                        "group and the seam's frame ballot will refuse the "
-                        "flip until it catches up -- a capacity loss and a "
-                        "delayed flip, never a row handed out unbacked",
-                        LOG_PREFIX,
-                        target,
-                        backed,
-                        e,
-                    )
-            backed = self._current_rows()
-            if backed < target:
-                logger.warning(
-                    "%s cap agreement fell short of the agreed level %d: this "
-                    "card can back %d rows without crossing the %d MiB "
-                    "corridor law. Exposing what is backed",
-                    LOG_PREFIX,
-                    target,
-                    backed,
-                    self._law_floor_bytes // (1024 * 1024),
-                )
         level = min(target, backed)
         ceiling = (
             int(self._rows_at_boot)

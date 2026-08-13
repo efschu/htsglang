@@ -287,12 +287,31 @@ def flip_unavailable_reason(scheduler, work: str) -> Optional[str]:
     direction = _STARVED_BY.get(work)
     if direction is None:
         return None
+    bound = stand_down_after()
     book = getattr(rt, "_seam_abandons_in_a_row", None) or {}
     spent = int(book.get(direction, 0) or 0)
-    bound = stand_down_after()
     if spent >= bound:
         return (
             f"{direction} abandoned {spent} times consecutively (bound "
+            f"{bound}); the layout {work} needs is not reachable"
+        )
+    # AND THE POLICY'S OWN REFUSAL STREAK, because the seam streak alone
+    # CANNOT REACH THE BOUND once the backoff engages. Measured on metal
+    # 2026-08-13 15:40-15:44Z: three group abandons of tp_to_pp armed the
+    # seam backoff, which then DECLINED the next arms without entering the
+    # seam at all, so the abandon counter froze at 3 while the policy logged
+    # "tp_to_pp arm refused (7 in a row)" and a 9-token prefill sat unrunnable
+    # for four minutes. A valve keyed only on the inner counter is a valve
+    # the damping layer holds shut.
+    #
+    # Group-uniform in the same way: every rank runs the same policy over the
+    # same reduced verdicts, and the three ranks printed identical refusal
+    # counts on every line of that window.
+    state = getattr(scheduler, "phase_policy_state", None)
+    refused = int((getattr(state, "arm_refusals", None) or {}).get(direction, 0) or 0)
+    if refused >= bound:
+        return (
+            f"{direction} arm refused {refused} times consecutively (bound "
             f"{bound}); the layout {work} needs is not reachable"
         )
     return None

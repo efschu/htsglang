@@ -75,11 +75,19 @@ class _Runtime:
         self._seam_abandons_in_a_row = dict(abandons or {})
 
 
+class _PolicyState:
+    def __init__(self, refusals=None):
+        self.arm_refusals = dict(refusals or {})
+
+
 class _Sched:
-    def __init__(self, phase, *, purity="strict", guards=(), abandons=None):
+    def __init__(
+        self, phase, *, purity="strict", guards=(), abandons=None, refusals=None
+    ):
         self.server_args = _Args(purity)
         self.phase_flip_active_stack = phase
         self.phase_flip_runtime = _Runtime(guards, abandons)
+        self.phase_policy_state = _PolicyState(refusals)
 
 
 class ThePurityRuleStandsWhileTheFlipWorksTest(unittest.TestCase):
@@ -115,6 +123,25 @@ class AStoodDownFlipMustNotStarveTheWorkClassTest(unittest.TestCase):
         """The metal case: the ballot refuses pp_to_tp round after round."""
         sched = _Sched(PHASE_PP, abandons={PP_TO_TP: 8})
         self.assertFalse(phase_purity.decode_blocked_here(sched, 1))
+
+    def test_the_backoff_cannot_hold_the_valve_shut(self):
+        """Metal, 2026-08-13 15:40-15:44Z, and it is why one counter is not enough.
+
+        Three group abandons of tp_to_pp armed the seam BACKOFF, which then
+        declined the next arm requests without entering the seam at all. The
+        abandon counter froze at 3 -- below any bound -- while the policy
+        logged "tp_to_pp arm refused (7 in a row)" on all three ranks and a
+        9-token prefill sat unrunnable in the TP layout for four minutes.
+        """
+        sched = _Sched(PHASE_TP, abandons={TP_TO_PP: 3}, refusals={TP_TO_PP: 7})
+        self.assertFalse(
+            phase_purity.prefill_blocked_here(sched),
+            "the damping layer must not be able to hold the valve shut",
+        )
+
+    def test_the_policy_streak_is_keyed_on_the_direction_too(self):
+        sched = _Sched(PHASE_PP, refusals={TP_TO_PP: 99})
+        self.assertTrue(phase_purity.decode_blocked_here(sched, 1))
 
     def test_the_relaxation_is_keyed_on_the_direction_that_is_stuck(self):
         """A stuck tp_to_pp says nothing about decode's leg.
