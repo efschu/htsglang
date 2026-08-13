@@ -153,6 +153,25 @@ string `sigquit` inside the `server_args=` config dump. The filter was widened
 for coverage and caught a field name; tightened to
 `Received sigquit|Traceback \(most recent|CUDA_ERROR_OUT_OF_MEMORY|KvReshardError`.
 
+## 6a. Serving handover, errors first
+
+This shift restored the ship (res-r5, commit `21f07330b2`), reached health 200
+at 09:31:00Z and verified it with a **real generation** (120 tokens, http 200)
+— never a health 200 alone, because the #622 wedge signature is precisely an
+instance that answers health and emits no tokens.
+
+**At 09:32:32Z that instance was taken down by an external SIGKILL** to the
+detokenizer, coinciding with the #656 shift opening a new window
+(`heartbeat.656-kvuniverse-r6`). The instance's own log rules out the kernel:
+`no cgroup OOM kill recorded (oom_kill still 9), so the SIGKILL came from
+outside the kernel's OOM killer`, with `MemAvailable=57872 MiB`.
+
+Recorded because a successor reading only the commit message would conclude
+this shift left serving up and then find it down. It was left up, verified, and
+then stopped by the next window's owner — who therefore owns the restore. No
+attempt was made to boot into their live window: two instances on one set of
+cards is an OOM, which is exactly what the capture-replay script refuses.
+
 ## 7. Open, in order
 
 1. **`corridor_trace.py` has no production call site.** The in-process sampler
