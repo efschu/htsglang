@@ -223,3 +223,22 @@ know:
   under a change of their own. The #656 frame ballot does NOT add a
   communicator — it widens an existing `_collective_min` payload from 3 to 5
   elements on a group the round already reduces on.
+
+---
+
+## R2 ADDENDUM (2026-08-13)
+
+See `HANDOFF_REMEDIATION_656_R2.md`.
+
+* **A ledger that books the KV pool at its boot reservation over-books it on
+  any boot where the corridor bounds a recovery.** The backing is shrunk to
+  fund each seam and re-grown afterwards only as far as that rank's distance
+  from the corridor law allows, so the resident row count moves within a boot
+  and can settle BELOW the reservation for the rest of it. The arena census
+  (`kv_arena_backed_bytes`) remains the only accepted source, and it is now
+  also the only honest one for a mid-boot reading.
+
+* **The exposed row count is now group-levelled**, so a reconciliation that
+  finds three ranks at the same row count should not read that as three
+  independent measurements agreeing. It is one measurement, applied three
+  times.

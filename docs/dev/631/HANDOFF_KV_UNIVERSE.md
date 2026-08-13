@@ -843,3 +843,37 @@ See `HANDOFF_REMEDIATION_656.md`. Three items above are now moved on:
   attempts while 250026, 300026 and 338916 are 4 of 4 exact. Do not read the
   390026 point as a lazy-RoPE property — the same signature appears with the
   lazy cache OFF.
+
+---
+
+## AND CORRECTED AGAIN BY THE R2 SHIFT (2026-08-13)
+
+See `HANDOFF_REMEDIATION_656_R2.md`. Two of the three notes above need
+amending, and one item this document does not cover is now load-bearing for
+anyone sizing a pool here.
+
+* **The corridor shortfall term is real but it was never the binding
+  mechanism, and the R1 note above reads as if it were.** The acceptance's five
+  breaches and the remediation boot's one residual breach are the SAME thing --
+  a seam entered on the corridor law alone after a C20 yield, then the
+  in-cutover draw -- and the closer is not a sizing term at all. It is the gate
+  WITHHOLDING the yield when this rank's own measured draw predicts a sub-law
+  trough. Sizing raises the resting level; only the gate can decline the
+  entry. Keep the per-rank shortfall term (it is measured and it is free), but
+  do not size against it expecting the corridor to hold.
+
+* **The pool's row count is a GROUP quantity, and this document treats it as a
+  per-rank one throughout.** `KvBackingRelief`'s shrink was already collective;
+  its RECOVERY was not, and a rank whose recovery is corridor-bounded comes
+  back with fewer rows than its peers -- 40404 of them on the metal boot, which
+  is exactly the divergence that had been killing the instance at the seam.
+  Under pure PP every rank holds the same token rows, so **the group can never
+  use more rows than its poorest rank has backed**; any sizing reasoning that
+  quotes a per-rank number without taking the group MIN is quoting a capacity
+  that does not exist.
+
+* **The allocator's free-list ORDER belongs in the same sentence as its size.**
+  Two ranks with identical membership in different order hand the next request
+  different row ids, which is a divergent live slot set with nothing in the
+  pool census to show for it. Anything that adds or removes ids from a free
+  list here has to do so identically on every rank, or normalise afterwards.
