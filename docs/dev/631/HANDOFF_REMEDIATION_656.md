@@ -401,6 +401,35 @@ failing depth and different content — so a failure there implicates depth
 and a clean sweep implicates content, but neither is isolated by this run
 alone. Said plainly rather than presented as a rate for a single cause.
 
+### THE RATE IS STILL NOT CHARACTERISED, and here is exactly why
+
+**The probe run did not finish.** It was aborted by the instance wedging
+(§1) during its first recalibrated probe. What exists is:
+
+| probe | tokens | filler | result |
+|---|---|---|---|
+| attempt 1, probe 2 | 338916 | unique | **EXACT**, 244.0 s, `cached=0` |
+| attempt 1, probes 1 and 3 | 414320 | unique | refused, clean 400 naming the 393216 limit |
+| attempt 2 | 280012 | unique | **never returned** — the instance wedged mid-prefill |
+
+So the deliverable this shift owed on defect B is **not delivered**: there is
+no rate. Saying so plainly rather than presenting `1 of 1 exact` as a
+characterisation.
+
+**But the abort is itself a result.** The wedge fired *during a cold
+280012-token prefill*, and the divergence it caught (§1) had a 268816-token
+request resident. The acceptance's fatal cutover had 312221. **Deep resident
+prefill is the regime in which the live-set divergence appears**, which
+makes the deep-prefill probe and the C22 hunt the same experiment rather
+than two. A successor running the rate probes should expect to trip the
+ballot, and should run them with the flip policy pinned (no auto-flip) if
+the intent is to measure the completion and not the seam.
+
+**What to run, unchanged:** `yarn_cold20.sh` with `N=6`, depths 11196 →
+280012 and 9644 → 240016, both unique-filler, `cached` asserted 0 in the
+summary. It is written, calibrated against the checkpoint's own tokenizer,
+and unrun.
+
 ### The mis-calibration, recorded because it cost a probe
 
 The first attempt reused the acceptance's sentence COUNTS. The unique tag
