@@ -338,6 +338,56 @@ def seam_adjusted_budget_bytes(
     return min(int(budget_bytes), tokens * int(cell_bytes)), tokens
 
 
+def _worst_case_fixed_bytes(runtime, direction: str) -> Tuple[int, int]:
+    """(arena_tail, draft_restore) the seam WILL have to commit, not the
+    amount pending right now.
+
+    MEASURED IN THE WRONG PHASE IS MEASURED WRONG (boot F, 2026-08-12). Both
+    of the runtime's live accessors are state readings:
+    ``pending_tail_bytes`` is ``want - committed``, and
+    ``pending_restore_bytes`` returns 0 unless the drafter is CURRENTLY
+    spilled. At the first round the instance sits in its boot phase (PP) with
+    the arena fully committed and nothing spilled, so both read ZERO -- and a
+    reserve of zero is exactly the sizing that wedged boot E, whose refusal
+    named 464 MiB. That 464 MiB is the tail rung 3 releases on ENTERING TP,
+    which is a state this measuring point never sees.
+
+    So the sizing term is the commit the seam would face from the OTHER
+    phase: the arena span above the TP layout (what rung 3 releases and the
+    tp->pp leg must take back) and the drafter's whole payload (what rung 2
+    releases and the pp->tp leg must take back). Both are static layout
+    quantities, which is what makes them safe to read at any time.
+    """
+    scheduler = getattr(runtime, "_census_scheduler", None)
+    stacks = getattr(scheduler, "phase_flip_stacks", None) if scheduler else None
+    if stacks is None:
+        return 0, 0
+
+    arena_tail = 0
+    if direction == "tp_to_pp":
+        try:
+            # What rung 3 releases in TP = the arena span the PP layout needs
+            # above what the TP layout does. Zero on a rank whose TP layout is
+            # the larger one, which is where the "PP is always bigger"
+            # assumption killed three ranks at the first flip.
+            high_water = int(stacks.refill_high_water_bytes())
+            arena_tail = max(0, high_water - int(stacks.layout_tp.total_bytes))
+        except Exception:
+            arena_tail = 0
+
+    draft_restore = 0
+    if direction == "pp_to_tp":
+        try:
+            from sglang.srt.managers.phase_flip_spill import carrier_of
+
+            carrier = carrier_of(getattr(stacks, "draft_worker", None))
+            if carrier is not None:
+                draft_restore = int(carrier.payload_bytes)
+        except Exception:
+            draft_restore = 0
+    return arena_tail, draft_restore
+
+
 def measure_at_rest(runtime) -> Tuple[int, float, str]:
     """(fixed_bytes, per_row_bytes, detail) for THIS boot's two layouts.
 
@@ -358,6 +408,10 @@ def measure_at_rest(runtime) -> Tuple[int, float, str]:
     from sglang.srt.layers.dcp.phase_flip_plan import build_phase_flip_transition
 
     empty = torch.empty(0, dtype=torch.int64)
+    # The id space the sizer solves for: the PP allocator's capacity, which is
+    # what every "T tokens" in this module means.
+    scheduler = getattr(runtime, "_census_scheduler", None)
+    id_space = max(1, int(getattr(scheduler, "max_total_num_tokens", 0) or 0))
     fixed = 0
     per_row = 0.0
     parts = []
@@ -374,19 +428,28 @@ def measure_at_rest(runtime) -> Tuple[int, float, str]:
         )
         total = int(runtime._staging_bytes(tr, direction, src, dst, waves))
         slack = int(runtime._backing_slack_bytes(direction, src, dst, waves))
-        arena = int(runtime._arena_tail_bytes(direction))
-        draft = int(runtime._draft_restore_bytes(direction))
-        rows = max(1, int(src.num_rows))
+        arena, draft = _worst_case_fixed_bytes(runtime, direction)
         d_fixed = max(arena, draft)
-        d_per_row = float(slack) / float(rows)
+        # NORMALISED BY THE ID SPACE, NOT BY src.num_rows (boot F).
+        #
+        # The sizer's T is the GLOBAL pool -- the id space every rank shares.
+        # ``src.num_rows`` is this rank's PHYSICAL row count, and under the TP
+        # layout that is its token SHARE of the id space, so tp_to_pp divided
+        # by roughly T/3 and reported a coefficient ~3x too large (measured on
+        # boot F: 5393.8 B/row against a pp_to_tp reading of 2360.7 for the
+        # same 1396 MiB of slack). Dividing both directions by the id space
+        # makes the two comparable and makes the number mean what the sizer
+        # multiplies it by.
+        d_per_row = float(slack) / float(id_space)
         fixed = max(fixed, d_fixed)
         per_row = max(per_row, d_per_row)
         mib = 1 << 20
         parts.append(
-            f"{direction}: staging {total / mib:.0f} MiB at rest "
-            f"(arena tail {arena / mib:.0f}, draft restore {draft / mib:.0f}, "
-            f"wave slack {slack / mib:.0f} over {rows} rows = "
-            f"{d_per_row:.1f} B/row)"
+            f"{direction}: staging {total / mib:.0f} MiB now, seam commit "
+            f"{d_fixed / mib:.0f} MiB (arena tail {arena / mib:.0f}, draft "
+            f"restore {draft / mib:.0f}), wave slack {slack / mib:.0f} MiB "
+            f"over an id space of {id_space} = {d_per_row:.1f} B/token "
+            f"[this rank holds {int(src.num_rows)} rows]"
         )
     return fixed, per_row, "; ".join(parts)
 
