@@ -106,11 +106,13 @@ def _phases(args) -> int:
         print(f"No flight marks under {args.directory}.")
         print("Boot with SGLANG_VRAM_FLIGHT_DIR=<dir> to produce them.")
         return 1
-    for rank in sorted(by_rank):
-        marks = by_rank[rank]
+    # Keyed by pid: under PP the TP rank collides across processes, so the
+    # rank is read off the marks rather than used as the grouping key.
+    for pid in sorted(by_rank):
+        marks = by_rank[pid]
         first = marks[0]
         print(
-            f"\n=== rank {rank} (pid {first.get('pid')}, "
+            f"\n=== rank {first.get('rank')} (pid {pid}, "
             f"boot {first.get('boot_id')}) ==="
         )
         card = first.get("card_uuid") or marks[-1].get("card_uuid") or "unresolved"

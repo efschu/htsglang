@@ -179,7 +179,9 @@ class TestLauncherAndRanksAgree(unittest.TestCase):
             marks = fr.read_marks(d)
             ledgers = [f for f in os.listdir(d) if f.startswith("ledger_")]
             self.assertEqual(len(ledgers), 1)
-            self.assertEqual(ledgers[0], f"ledger_{marks[0][0]['boot_id']}.json")
+            self.assertEqual(
+                ledgers[0], f"ledger_{marks[os.getpid()][0]['boot_id']}.json"
+            )
 
 
 class TestNoFlagGate(unittest.TestCase):

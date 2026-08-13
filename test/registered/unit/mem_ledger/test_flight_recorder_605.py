@@ -256,9 +256,9 @@ class TestPhaseMarks(unittest.TestCase):
             for phase in ("process_start", "weights_loaded", "capture_end"):
                 mark(phase, rank=2, directory=d)
             by_rank = read_marks(d)
-            self.assertEqual(list(by_rank), [2])
+            self.assertEqual(list(by_rank), [os.getpid()])
             self.assertEqual(
-                [m["phase"] for m in by_rank[2]],
+                [m["phase"] for m in by_rank[os.getpid()]],
                 ["process_start", "weights_loaded", "capture_end"],
             )
 
@@ -269,7 +269,7 @@ class TestPhaseMarks(unittest.TestCase):
             with open(os.path.join(d, "flight_marks_rank0.jsonl"), "a") as f:
                 f.write('{"phase": "weights_load')
             by_rank = read_marks(d)
-            self.assertEqual([m["phase"] for m in by_rank[0]], ["process_start"])
+            self.assertEqual([m["phase"] for m in by_rank[os.getpid()]], ["process_start"])
 
     def test_non_torch_is_this_pid_minus_torch_not_a_card_level_leftover(self):
         """Card-level ``used`` would charge this rank for its co-tenants.
@@ -520,14 +520,14 @@ class TestBootScoping(unittest.TestCase):
     def test_the_latest_boot_is_returned_by_default(self):
         with tempfile.TemporaryDirectory() as d:
             self._two_boots(d)
-            marks = read_marks(d)[0]
+            marks = read_marks(d)[os.getpid()]
             self.assertEqual(len(marks), 3)
             self.assertTrue(all(m["boot_id"] == "bootB" for m in marks))
 
     def test_an_older_boot_can_be_named(self):
         with tempfile.TemporaryDirectory() as d:
             self._two_boots(d)
-            marks = read_marks(d, boot="bootA")[0]
+            marks = read_marks(d, boot="bootA")[os.getpid()]
             self.assertEqual(
                 [m["phase"] for m in marks], ["process_start", "boot_complete"]
             )
@@ -544,7 +544,7 @@ class TestBootScoping(unittest.TestCase):
         would yield four deltas, one of them meaningless."""
         with tempfile.TemporaryDirectory() as d:
             self._two_boots(d)
-            everything = read_marks(d, boot="all")[0]
+            everything = read_marks(d, boot="all")[os.getpid()]
             self.assertEqual(len(everything), 5)
             deltas = phase_deltas(everything)
             self.assertEqual(len(deltas), 3)
