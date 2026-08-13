@@ -338,18 +338,22 @@ class FusedKVMaterializeHelper:
             self._ensure_rope_cache(self.max_position_hint)
 
     def _ensure_rope_cache(self, max_position: int) -> torch.Tensor:
+        from sglang.srt.layers.rotary_embedding.lazy_cos_sin_cache import written_rows
+
         if max_position + 1 > self._reserved_rope_cache_len:
             ensure_cos_sin_cache_length = getattr(
                 self.rotary_emb, "_ensure_cos_sin_cache_length", None
             )
             if callable(ensure_cos_sin_cache_length):
                 ensure_cos_sin_cache_length(max_position)
-                self._reserved_rope_cache_len = int(
-                    self.rotary_emb.cos_sin_cache.shape[0]
-                )
+                # WRITTEN rows, not the tensor length: under a lazy reserve
+                # (#656 T1) the tensor is the whole reservation, and caching
+                # that here would make this branch believe it never needs to
+                # grow again.
+                self._reserved_rope_cache_len = written_rows(self.rotary_emb)
 
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        if max_position >= int(cos_sin_cache.shape[0]):
+        if max_position >= written_rows(self.rotary_emb):
             raise RuntimeError(
                 "RoPE cos/sin cache is too short for fused KV materialization: "
                 f"max_position={max_position}, cache_len={int(cos_sin_cache.shape[0])}."

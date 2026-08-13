@@ -269,6 +269,21 @@ def drop(module: "RotaryEmbedding") -> None:
     _refresh_min_filled()
 
 
+def written_rows(module) -> int:
+    """Rows of ``module.cos_sin_cache`` that carry values.
+
+    With a lazy reserve the TENSOR is the whole reservation, so shape[0] is a
+    ceiling, not a fill. Any caller that caches "how long is the cache" to
+    decide whether it needs to grow must ask this instead, or it will cache
+    the reservation and never grow again.
+    """
+    state = getattr(module, "_lazy_cos_sin", None)
+    if state is not None:
+        return int(state.filled)
+    cache = getattr(module, "cos_sin_cache", None)
+    return int(cache.shape[0]) if cache is not None else 0
+
+
 def any_installed() -> bool:
     """True only when some layer actually took the lazy path."""
     return bool(_LAZY_MODULES)

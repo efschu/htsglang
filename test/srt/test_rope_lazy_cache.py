@@ -248,3 +248,20 @@ def test_the_batch_hook_grows_every_installed_cache():
     lazy_cos_sin_cache.ensure_capacity_for_position(900)
     assert a._lazy_cos_sin.filled >= 901
     assert b._lazy_cos_sin.filled >= 901
+
+
+def test_written_rows_reports_the_fill_not_the_reservation():
+    """The distinction every caller that caches a length has to respect.
+
+    Under a lazy reserve the TENSOR is the whole reservation, so a caller that
+    remembers cos_sin_cache.shape[0] as "how much do I have" concludes it
+    never needs to grow again -- which is how the fused KV materialization
+    path would have stopped growing after its first call.
+    """
+    rope = _build(lazy=True)
+    assert int(rope.cos_sin_cache.shape[0]) == EAGER_ROWS
+    assert lazy_cos_sin_cache.written_rows(rope) == CHUNK
+    rope._ensure_cos_sin_cache_length(700)
+    assert lazy_cos_sin_cache.written_rows(rope) >= 701
+    eager = _build(lazy=False)
+    assert lazy_cos_sin_cache.written_rows(eager) == EAGER_ROWS
