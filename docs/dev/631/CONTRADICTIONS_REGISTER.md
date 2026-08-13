@@ -2422,3 +2422,82 @@ Three laws restated by this:
 * A feature that moves a cost from a priced moment (boot, where the sizer
   reads `have`) to an unpriced one (serving) has not saved the cost; it has
   moved it somewhere with no accounting, and the corridor is where that shows.
+
+## SOAK-656 ADDITIONS (2026-08-13)
+
+## 78. The C22 ballot is PROVEN on metal — and proven insufficient in the same
+window: agreeing the row COUNT does not agree the row SET.
+
+Boot 1 of the #656 long soak (evidence-631/soak-656) is the first run on which
+both R2 mechanisms fired. The cap agreement levelled the group (19:04:26Z, PP0
+and PP2 each `-15455 exposed rows` after PP1 came back corridor-bounded), and
+the ballot then caught a real `wire frame divergence` (19:16:48Z) and abandoned
+the flip instead of sending mismatched frames — the exact failure that killed
+the acceptance with a "checksum mismatch" that was never a checksum. The purity
+valve stood down on all three ranks and **serving never stopped**: `/health` 200,
+real generations, a 128k prefill and a 280k probe both completed afterwards.
+
+Then it never flipped again. **PP1 was the outlier in 4 of 4 divergence
+episodes** and was the only rank taking corridor-bounded recoveries (7 of 7).
+The diverging term the code names is the LIVE SLOT SET, and
+`phase_flip_runtime.py:4407-4416` already documents this class — a
+corridor-bounded rank's "live-slot enumeration differs by exactly that many, and
+the frame ballot below refuses every subsequent flip". The fix made the row
+COUNT agree before framing. **It is not enough:** the agreement fired twice and
+the SET still diverged, because levelling how many rows a rank exposes does not
+make the ranks hold the same rows. The digest is order-insensitive
+(`torch.unique` sorts, `:3399-3480`), so ordering is excluded as the cause.
+
+Law: **a quantity that must match on the wire has to be AGREED, not merely
+equal in cardinality.** Red test: `feat/soak-fixes-656` @ `56f79459fc`.
+
+## 79. The livelock is bounded now, but it has a hard floor 8 abandons away.
+
+`blocking_guards` is only ever appended to (`:261, 864, 1660, 2138, 2342-2343,
+2370-2371, 3657, 3659`), never cleared, and `_install_seam_cap_guard`
+(`:3624-3664`) refuses the direction for the rest of the boot at
+`DEFAULT_SEAM_ABANDON_CAP = 8` group abandons. Boot 1 reached 4 and was still in
+the recoverable region; its retries simply re-sampled the same unsynchronized
+state. Draining to zero requests did not clear the divergence, and neither did
+`/flush_cache`. So the current behaviour is safe-but-stuck, and the stuck state
+has a one-way door behind it.
+
+## 80. 1134 clean cutovers: the MTTF claim the acceptance could not make.
+
+Boot 2, recipe-faithful (no concurrent deep probes), 154.9 minutes: **1134
+completed cutovers, 0 abandons, 0 wire frame divergences, 0 KvReshardError, 0
+tracebacks, 0 SIGQUIT, 0 CANNOT FUND**, corridor 92752 samples/card with minima
+1264 / 2640 / 1390 MiB and **0 samples below the 1024 law**. An instance with the
+acceptance's 1-in-320 rate produces a run this clean 2.87 % of the time, so this
+**rejects that rate at 97.1 % confidence**; the assumption-free rule-of-three
+bound is < 1 in 378 at 95 %. HANDOFF_MERGE_R9 §12.1's 957 bar is cleared.
+
+Carried honestly: **on boot 2 neither mechanism fired** (0 agreements, 0
+recoveries, 0 stand-downs, 0 yields). Boot 2 is a no-failure result; the positive
+proofs are boot 1's two events. And the two boots differ in LOAD MIX, not code —
+the deep probes drove the pressure that reached the divergence, so "the recipe
+stalls after 194 cutovers" is not supported by this evidence.
+
+## 81. The ~280k empty-completion band DID NOT REPRODUCE, and two readings of the
+old data are now dead.
+
+14 of 14 cold probes exact, `cached=0` on every one: 2 each at 260016 / 270016 /
+280016 / 290016, plus **6 at the exact historical construction** (reps 14555 →
+`prompt_tokens=280016` measured, byte-identical to R2's `deep_probe_2factor`
+p02/p08). Every one returned the planted `BANANA47`, `finish=stop`.
+
+Dead: *"the first request past `max_position_embeddings` fails"* — the 270016
+probe WAS this boot's first request past 262144 and was exact. Dead: *"~280k is a
+band on this line"* — 8 cold probes at ~280k, all exact.
+
+Rate: the historical ~5 of 7 (0.71) is excluded at p = 5e-5. The honest bound is
+weaker than it looks — 0 failures in 8 puts the true rate below **37.5 %** at
+95 %, and a 5 % rate would need ~60 probes to exclude. Mechanism work excluded by
+CODE evidence: no position clamp/wrap/modulo at `max_position_embeddings`,
+text-only mrope ids are a plain `arange`, everything position- or
+frequency-carrying is float32, the YaRN ramp is a pure function of position (so
+it cannot be intermittent at fixed depth), and the lazy cache is off AND proven
+off on this boot (`393600x64 ... written EAGER ... (0 lazy)` on every rank).
+**Still open and never examined by any shift:** the GDN/mamba chunked-scan
+boundary, and attention-backend / CUDA-graph / page-table bucket sizing at these
+depths.
