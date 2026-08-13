@@ -240,7 +240,32 @@ python3 scripts/vram_ledger/fill_side_report.py /spinning/flight_605
 
 # the per-post distribution over the last N boots
 python3 scripts/vram_ledger/fill_side_report.py /spinning/flight_605 --across-boots 14
+
+# which ledger residuals the boot history can calibrate, and which it refuses
+python3 -m sglang.srt.mem_ledger.probe --from-flight-recorder /spinning/flight_605
 ```
+
+### The measured calibration source (stage 4)
+
+`mem_ledger/measured.py` turns the boot history into per-card residuals, and is
+**off unless `SGLANG_VRAM_LEDGER_MEASURED` is set**. Its precedence rule is not
+"prefer any measurement" but "prefer a measurement that is stable across at
+least 5 boots"; a post whose spread exceeds the tolerance is logged as DECLINED
+and the modelled term stands. Installing the median of a post that ranges over
+2408 MiB would be variance wearing a constant's clothes, which is the guessing
+game this task exists to end.
+
+Measured on this rig over 20 boots, `--from-flight-recorder` reports:
+
+```
+GPU-31d7ef41 (5090)  cuda_context_and_comm  n=20 min=888 max=888 spread=0  stable
+GPU-5c648f96 (3080)  cuda_context_and_comm  n=20 min=482 max=482 spread=0  stable
+GPU-62dbbae1 (3080)  cuda_context_and_comm  n=20 min=482 max=482 spread=0  stable
+```
+
+i.e. `cuda_context_bytes` = 888 / 482 / 482 MiB, derived from boot history
+without touching the GPU at all. That is the concrete answer to "why is this
+not computed exactly beforehand" for this term: it now is.
 
 Exit code is non-zero when the per-card identity does not close, so this is
 usable as a gate and not only as a report.
