@@ -192,6 +192,9 @@ reservation."** Plausible, quantitatively the right size, and **false** on the
 CUDA path: `get_available_gpu_memory` (`python/sglang/srt/utils/common.py:810`)
 reads `torch.cuda.mem_get_info(gpu_id)` — the driver's free — after an
 `empty_device_cache`. It never consults `reserved`. Recorded as C23.
+(MERGE-R7: that row ships as **C605-1** -- `C23`-`C30` were already taken
+in the register by unrelated entries, so the eight #605 rows were renamed
+`C605-1`..`C605-8` in arrival order. Text unchanged.)
 
 The unbacked reservation is real and measured; it is not, by this route, the
 cause of the underfill.

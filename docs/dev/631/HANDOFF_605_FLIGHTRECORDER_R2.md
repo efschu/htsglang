@@ -189,6 +189,9 @@ cards is an OOM, which is exactly what the capture-replay script refuses.
 
 ## 8. Register
 
-C27–C30 appended to `CONTRADICTIONS_REGISTER.md`: the R1 spread retraction, the
+C27–C30 appended to `CONTRADICTIONS_REGISTER.md` (MERGE-R7 ships these as
+**C605-5**–**C605-8**: `C23`–`C30` were already taken in that file by
+unrelated entries, so all eight #605 rows were renamed `C605-1`..`C605-8`
+in arrival order, text unchanged): the R1 spread retraction, the
 weights-layout falsification, the pin-path reason the ledger never dumped, and
 the residual's excluded candidates.
