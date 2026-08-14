@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -203,6 +204,114 @@ def check_actuator(kv_vectors: str | None, vram_dial: bool) -> None:
 # ---------------------------------------------------------------------------
 # C4 -- a stage table with at least one MEASURED non-reference stage.
 # ---------------------------------------------------------------------------
+#
+# WHY THIS CHECK GREW A SECOND INPUT (window shift 2026-08-14).
+#
+# ``--stage-table`` asks for "a JSON dump of the boot's stage table". NOTHING
+# IN THE TREE PRODUCES THAT FILE: the only occurrence of the string outside
+# this module is this module's own argparse, and ``server_args`` has no
+# stage-table dump flag. So C4 -- the check that implements the runsheet's P4,
+# the one STOP condition that would have ended this window before the cards
+# were claimed -- could only ever SKIP.
+#
+# It duly skipped, the window was claimed, and the blocker was found on metal
+# instead: the boot prints
+#
+#   REGIME-OBSERVE stage table: 1 stage(s), 1 reachable at runtime,
+#                               0 flip target(s), booted on 'booted'
+#
+# and every round after it prints "would flip to nothing -- already on stage
+# 'booted'". The runtime had been saying it in plain text all along; no
+# desk-side check could read it.
+#
+# So C4 now also accepts the artefact that DOES exist -- the boot log -- and
+# is red against the real one. A check whose only input cannot be produced is
+# indistinguishable from no check at all, which is the same lesson as an
+# instrument that cannot fail.
+_STAGE_TABLE_RE = re.compile(
+    r"stage table: (\d+) stage\(s\), (\d+) reachable at runtime, "
+    r"(\d+) flip target\(s\)"
+)
+#: NOT anchored at line start: the runtime prefixes every line with
+#: "[<ts> TP<n>] REGIME-OBSERVE   ". An anchored version matched nothing on
+#: either a real log or the smoke fixture, and because the zero-flip-target
+#: branch fires first it still LOOKED right -- the row parse was dead code
+#: certifying nothing. Requiring "gain=" keeps it off the "stage table:" line.
+_STAGE_ROW_RE = re.compile(
+    r"stage (\S+) \[(\w+)\].*?gain=([+-][\d.]+)%/band=([\d.]+)%\s+flip=([\d.]+)s",
+    re.MULTILINE,
+)
+_FEED_NOTE_RE = re.compile(r"stage feed: (.+)$", re.MULTILINE)
+_NO_TABLE_RE = re.compile(r"could not build the boot stage table")
+
+
+def check_stage_table_from_boot_log(path: str) -> None:
+    """Answer C4 from a boot log, which is an artefact that actually exists."""
+    name = "stage-table"
+    p = Path(os.path.expanduser(path))
+    if not p.is_file():
+        bad(name, f"{p} does not exist")
+        return
+    text = p.read_text(errors="replace")
+
+    if _NO_TABLE_RE.search(text):
+        bad(
+            name,
+            f"{p} says the boot could NOT build a stage table at all "
+            "('running without one ... nothing could be selected even in act "
+            "mode'). The axis has nothing to propose",
+        )
+        return
+
+    tables = _STAGE_TABLE_RE.findall(text)
+    if not tables:
+        bad(
+            name,
+            f"{p} carries no 'REGIME-OBSERVE stage table:' line. Either the "
+            "controller was off, or this is not a boot log",
+        )
+        return
+
+    # Every rank prints the same table; take the first and report the spread
+    # only if the ranks disagree, which would itself be a finding.
+    stages, reachable, targets = (int(x) for x in tables[0])
+    if len({t for t in tables}) != 1:
+        bad(name, f"{p}: ranks printed DIFFERENT stage tables: {sorted(set(tables))}")
+        return
+
+    notes = sorted({m.group(1).strip() for m in _FEED_NOTE_RE.finditer(text)})
+    rows = _STAGE_ROW_RE.findall(text)
+    measured = [
+        r
+        for r in rows
+        if r[0] != "booted" and (float(r[2]) != 0.0 or float(r[4]) != 0.0)
+    ]
+
+    if targets > 0 and measured:
+        ok(
+            name,
+            f"{stages} stage(s), {targets} flip target(s), "
+            f"{len(measured)} carrying a measured gain; the axis has "
+            "something it is allowed to propose",
+        )
+        return
+
+    why = (
+        f"{p}: the boot's OWN stage table reports {stages} stage(s), "
+        f"{reachable} reachable, {targets} flip target(s). "
+    )
+    if targets == 0:
+        why += (
+            "With zero flip targets the stage clock can never propose a move, "
+            "so 'proposals > 0 and actuations > 0' (window criterion A1) is "
+            "unreachable BY CONSTRUCTION and an act arm is an expensive "
+            "observe. "
+        )
+    if notes:
+        why += "The boot named the cause: " + "; ".join(notes[:3])
+    bad(name, why)
+
+
 def check_stage_table(path: str | None) -> None:
     name = "stage-table"
     if not path:
@@ -296,12 +405,7 @@ def smoke() -> int:
         total += 1
         ev = tmpd / "three.json"
         ev.write_text(
-            json.dumps(
-                {
-                    k: {"passed": True, "source": "smoke"}
-                    for k in GATE_KEYS[:3]
-                }
-            )
+            json.dumps({k: {"passed": True, "source": "smoke"} for k in GATE_KEYS[:3]})
         )
         FAILURES = 0
         check_entry_gate(str(ev))
@@ -314,9 +418,7 @@ def smoke() -> int:
         # 2. passed:true with no source -> malformed, refused
         total += 1
         ev2 = tmpd / "nosource.json"
-        ev2.write_text(
-            json.dumps({k: {"passed": True} for k in GATE_KEYS})
-        )
+        ev2.write_text(json.dumps({k: {"passed": True} for k in GATE_KEYS}))
         FAILURES = 0
         check_entry_gate(str(ev2))
         if FAILURES:
@@ -340,8 +442,12 @@ def smoke() -> int:
         st = tmpd / "stages.json"
         st.write_text(
             json.dumps(
-                {"stages": [{"name": "a", "unmeasured": True},
-                            {"name": "ref", "reference": True}]}
+                {
+                    "stages": [
+                        {"name": "a", "unmeasured": True},
+                        {"name": "ref", "reference": True},
+                    ]
+                }
             )
         )
         FAILURES = 0
@@ -351,6 +457,47 @@ def smoke() -> int:
             red += 1
         else:
             print("   GREEN -- check is broken")
+
+        # 4b. the SAME question asked of a boot log, which is the artefact
+        #     that exists. Fixture is the real shape the runtime prints.
+        total += 1
+        bl = tmpd / "boot0.log"
+        bl.write_text(
+            "[TP0] REGIME-OBSERVE stage feed: prefill_heavy: the planner could "
+            "not solve 'enc' (PlannerFeedUnavailable('no card probe on disk'))\n"
+            "[TP0] REGIME-OBSERVE stage table: 1 stage(s), 1 reachable at "
+            "runtime, 0 flip target(s), booted on 'booted'\n"
+            "[TP0] REGIME-OBSERVE   stage booted [mixed] weights=auto "
+            "kv=[30, 17, 17] pool=320640 gain=+0.0%/band=0.0% flip=0.00s -- "
+            "the booted configuration\n"
+        )
+        FAILURES = 0
+        check_stage_table_from_boot_log(str(bl))
+        if FAILURES:
+            print("   red as required (boot log with 0 flip targets)")
+            red += 1
+        else:
+            print("   GREEN -- check is broken")
+
+        # 4c. and it must go GREEN on a table that DOES carry a measured
+        #     non-reference stage, or it is a wall rather than a check.
+        total += 1
+        bl2 = tmpd / "boot1.log"
+        bl2.write_text(
+            "[TP0] REGIME-OBSERVE stage table: 2 stage(s), 2 reachable at "
+            "runtime, 1 flip target(s), booted on 'booted'\n"
+            "[TP0] REGIME-OBSERVE   stage booted [mixed] gain=+0.0%/band=0.0% "
+            "flip=0.00s -- the booted configuration\n"
+            "[TP0] REGIME-OBSERVE   stage enc-heavy [prefill_heavy] "
+            "gain=+6.4%/band=1.1% flip=1.80s -- measured\n"
+        )
+        FAILURES = 0
+        check_stage_table_from_boot_log(str(bl2))
+        if FAILURES == 0:
+            print("   green as required (a measured flip target opens it)")
+            red += 1
+        else:
+            print("   RED -- a usable stage table was refused")
 
         # 5. census dir empty
         total += 1
@@ -390,9 +537,21 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="CPU-only preflight for the #363 stage-clock window."
     )
-    ap.add_argument("--evidence", help="path the boot will pass to --regime-gate-evidence")
+    ap.add_argument(
+        "--evidence", help="path the boot will pass to --regime-gate-evidence"
+    )
     ap.add_argument("--stage-table", help="JSON dump of the boot's stage table")
-    ap.add_argument("--census-dir", help="SGLANG_RESIDENCY_CENSUS_DIR of the census run")
+    ap.add_argument(
+        "--boot-log",
+        help=(
+            "boot log of a previous boot, read for its own "
+            "'REGIME-OBSERVE stage table:' line. Use this when there is no "
+            "--stage-table JSON -- nothing in the tree writes one"
+        ),
+    )
+    ap.add_argument(
+        "--census-dir", help="SGLANG_RESIDENCY_CENSUS_DIR of the census run"
+    )
     ap.add_argument(
         "--stage",
         action="append",
@@ -411,14 +570,19 @@ def main(argv=None) -> int:
     check_flags_parse()
     check_entry_gate(args.evidence)
     check_actuator(args.kv_reshard_vectors, args.enable_vram_dial)
-    check_stage_table(args.stage_table)
+    if args.boot_log:
+        check_stage_table_from_boot_log(args.boot_log)
+    else:
+        check_stage_table(args.stage_table)
     check_transient_census(args.census_dir, args.stage)
 
     if FAILURES:
         print(f"-- {FAILURES} check(s) FAILED; do not claim the window yet")
         return 1
     if args.strict and SKIPS:
-        print(f"-- {SKIPS} check(s) SKIPPED under --strict; an unrunnable check is not a pass")
+        print(
+            f"-- {SKIPS} check(s) SKIPPED under --strict; an unrunnable check is not a pass"
+        )
         return 1
     print(f"-- preflight clear{f' ({SKIPS} skipped)' if SKIPS else ''}")
     return 0
