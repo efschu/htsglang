@@ -28,7 +28,7 @@ Ordered as the release actually runs, from the user's go to a shipped image.
 | 2 | Decide the kernel arm | **USER** | **BLOCKED ON USER** — and the question changed: see the correction box in §1.5, which the first real build falsified |
 | 3 | Apply the NCCL package (#599) | desk | **READY, and self-verifying** — `deploy/release/apply-nccl-tuning.sh`. Emits no env vars by design; the requirement is `--ipc=host --shm-size=4g` plus the 2.30 floor. 11 tests, selftest 7/7 red-on-demand |
 | 4 | Final test suite | shift | **PARTIAL** — release-scoped suites green (see §3.1). A full-suite run needs a window |
-| 5 | Build the release image | **USER** | **PROVEN, with a defect found and fixed** — see §4.0. The recipe as it stood could not build; it now can |
+| 5 | Build the release image | **USER** | **PROVEN END-TO-END** — three builds, §4.0.2. The recipe as inherited could not build; it now builds with the gate running in-build and the image verifying ARMED. One command, no build args |
 | 6 | Transfer to the Proxmox host and run | **USER** | **READY** — recipe in §5; the apparmor trap is confirmed live, see §4.0 |
 | 7 | Acceptance smoke (#416 shape) | **USER** | **READY** — §6 |
 | 8 | Push to ghcr with PAT2 | **USER** | **BLOCKED ON USER** — credential is read from file, never printed; §7 |
@@ -47,8 +47,9 @@ first live run, which is the strongest thing that can be said for it.
 
 An `htsglang:cu130-nccl2307` image: the uneven-TP sglang fork on CUDA 13.0.1
 with torch 2.11.0, NCCL force-pinned to 2.30.7 (torch's own 2.28.9 rejects
-co-located communicators), sgl-kernel from pypi unless a fork wheel is
-supplied, HiCache with the file backend, UCX for barlink's cross-rig
+co-located communicators), the fork's own `sglang-kernel 0.4.4` supplying
+`sgl_kernel` (armed — see 1.5's correction box; the pypi dist is no longer
+installed alongside it), HiCache with the file backend, UCX for barlink's cross-rig
 transport, and the planner UI. It is built in the GPU VM, transferred to the
 Proxmox host, run there, smoke-tested, and only then pushed to ghcr.
 
@@ -441,6 +442,57 @@ document, now with reproductions:
    default — declared early — invalidated every layer after it and forced a
    full re-download of torch, cuDNN and the 615 MB kernel wheel. The trap is
    real and it is cheap to trip: the edit was one character of intent.
+
+### 4.0.1 The fix, verified in the built image
+
+`htsglang:r2-99a4b0a4` built from `chore/release-chain-prep-r3`, then probed
+with the same guard that refused the first attempt:
+
+```
+sgl_kernel dist guard (#384): verdict=ARMED
+  provider: sglang-kernel 0.4.4 (67 recorded sgl_kernel/ files)   <-- one, not two
+  INT8 arm (int8_scaled_mm): present in {'sm100/...': 49, 'sm90/...': 49}
+  CUDA majors: sgl_kernel={libnvrtc:13, libcudart:13, ...} torch=libcudart.so.13
+```
+
+exit 0. One provider, arm present, no CUDA-major split. Build-time asserts also
+printed `NCCL 2.30.7 confirmed` and `fork source present`.
+
+So the recipe now builds, and the resulting image verifies clean — and the
+`ARMED` verdict is the direct evidence that §1.5's "cannot serve INT8-W8A8"
+premise was false.
+
+### 4.0.2 The gate proved in-build — three builds, and what each one showed
+
+| Build | Recipe state | Result |
+|---|---|---|
+| 1 | as inherited | **REFUSED at step 3a**, `verdict=SHADOWED`. A real defect, already present in the published image. |
+| 2 | `INSTALL_SGL_KERNEL=0` | Built — but step 3a took the skip branch and **ran no guard**. Green for the wrong reason. |
+| 3 | gate unconditional | Built, **gate ran in-build**: `#17 sgl_kernel dist guard (#384): verdict=ARMED`. Image re-probed after build: `ARMED`, exit 0. |
+
+Build 3 reused layers 7-16 from cache and completed in seconds, because the
+edit touched only step 3a's RUN body. That is the cheap direction of trap 3:
+editing a late layer costs nothing, editing an early ARG costs a full
+re-download. Both were demonstrated in one shift.
+
+**One command builds the release image from the current merged line:**
+
+```bash
+cd /spinning/wt-release3        # chore/release-chain-prep-r3
+docker build -f docker/htsglang.Dockerfile -t htsglang:<tag> .
+```
+
+No build args needed. The provenance gate runs inside it and fails the build on
+a shadow, an off-pin wheel, or (with `REQUIRE_INT8_ARM=1`) an armless result.
+
+**One more defect was found while fixing the first.** Flipping
+`INSTALL_SGL_KERNEL` to 0 made step 3a take the branch that prints
+*"no sgl_kernel in this image; provenance gate skipped"* — so the second build
+passed with **no guard run at all**. The message is false (pyproject pins the
+kernel into every image), meaning the skip did not skip a check for something
+absent; it shipped an unverified kernel. The gate is now unconditional. Worth
+recording as a pattern: **the fix for a fail-open created a second fail-open**,
+and only re-reading the build log caught it — the build was green either way.
 
 **Not done here:** the image was not run as a server, not smoke-tested against
 a model, and not pushed anywhere. Those remain §§5-7, USER-gated.
