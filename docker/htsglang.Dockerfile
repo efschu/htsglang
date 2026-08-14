@@ -267,6 +267,17 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
 #     SGL_KERNEL_WHEEL (a bare filename in docker/kernel-wheel/, see its README) to
 #     install the fork wheel, and REQUIRE_INT8_ARM=1 to make an armless result
 #     a failed build instead of a runtime surprise months later.
+#     THE GATE RUNS UNCONDITIONALLY, and that is a correction (2026-08-14).
+#     It used to be skipped whenever INSTALL_SGL_KERNEL was not 1, printing
+#     "no sgl_kernel in this image; provenance gate skipped". That message is
+#     false: pyproject.toml:68 hard-pins sglang-kernel==0.4.4, so step 3 puts a
+#     distribution providing sgl_kernel into EVERY image regardless of this
+#     flag. Skipping the gate therefore did not skip a check for something
+#     absent -- it shipped an unverified kernel. Flipping the flag's default to
+#     0 would have silently disabled the whole provenance gate, which is how a
+#     fix for one fail-open becomes another. INSTALL_SGL_KERNEL now controls
+#     only whether the redundant pypi dist is added; it never controls whether
+#     the result is checked.
 ARG SGL_KERNEL_WHEEL=
 ARG SGL_KERNEL_WHEEL_SHA256=67f03cfa755efa01498c7732bd6ae015ec5673feffe9a51452fefdbe0dcd4664
 ARG REQUIRE_INT8_ARM=0
@@ -275,20 +286,16 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=htsglang-pip \
     set -eu; \
     GUARD=/sgl-workspace/sglang/python/sglang/srt/utils/kernel_dist_guard.py; \
     test -f "${GUARD}" || { echo "FATAL: kernel guard missing from the fork source"; exit 1; }; \
-    if [ "${INSTALL_SGL_KERNEL}" != "1" ]; then \
-      echo "INSTALL_SGL_KERNEL=0 -> no sgl_kernel in this image; provenance gate skipped"; \
-    else \
-      if [ -n "${SGL_KERNEL_WHEEL}" ]; then \
-        W="/tmp/htsglang-wheels/${SGL_KERNEL_WHEEL}"; \
-        test -f "${W}" || { echo "FATAL: SGL_KERNEL_WHEEL=${SGL_KERNEL_WHEEL} not found in docker/kernel-wheel/ (see its README)"; exit 1; }; \
-        python3 -I "${GUARD}" --wheel "${W}" --expect-sha256 "${SGL_KERNEL_WHEEL_SHA256}"; \
-        python3 -m pip uninstall -y sgl-kernel || true; \
-        python3 -m pip install --no-deps "${W}"; \
-      fi; \
-      ARM=""; \
-      if [ "${REQUIRE_INT8_ARM}" = "1" ]; then ARM="--require-arm"; fi; \
-      python3 -I "${GUARD}" ${ARM}; \
+    if [ -n "${SGL_KERNEL_WHEEL}" ]; then \
+      W="/tmp/htsglang-wheels/${SGL_KERNEL_WHEEL}"; \
+      test -f "${W}" || { echo "FATAL: SGL_KERNEL_WHEEL=${SGL_KERNEL_WHEEL} not found in docker/kernel-wheel/ (see its README)"; exit 1; }; \
+      python3 -I "${GUARD}" --wheel "${W}" --expect-sha256 "${SGL_KERNEL_WHEEL_SHA256}"; \
+      python3 -m pip uninstall -y sgl-kernel || true; \
+      python3 -m pip install --no-deps "${W}"; \
     fi; \
+    ARM=""; \
+    if [ "${REQUIRE_INT8_ARM}" = "1" ]; then ARM="--require-arm"; fi; \
+    python3 -I "${GUARD}" ${ARM}; \
     rm -rf /tmp/htsglang-wheels
 
 # 3b) Planner extra: chess + cairosvg + defusedxml (pyproject's `planner`
