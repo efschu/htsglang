@@ -57,7 +57,16 @@ _HDR = re.compile(
 )
 
 #: One stage mark inside the same line.
-_STEP = re.compile(r"\| (\w+) free=(-?\d+) step([+-]\d+) slack=(-?\d+)")
+#:
+#: ``alloc=``/``res=`` are OPTIONAL on purpose. They were added to the census
+#: by #485 (they are the column that separates a VMM commit outside torch from
+#: a torch allocation), but every artifact already on disk predates them, and
+#: a tool that could not read the two windows the whole analysis rests on
+#: would be useless on the day it shipped.
+_STEP = re.compile(
+    r"\| (\w+) free=(-?\d+) step([+-]\d+) slack=(-?\d+)"
+    r"(?: alloc=(-?\d+) res=(-?\d+))?"
+)
 
 
 class Flip(NamedTuple):
@@ -69,6 +78,9 @@ class Flip(NamedTuple):
     trough: int
     stage: str
     steps: Tuple[Tuple[str, int, int, int], ...]
+    #: (stage, allocated MiB or None) -- None on artifacts written before the
+    #: census printed the column. See _STEP.
+    allocs: Tuple[Tuple[str, Optional[int]], ...] = ()
 
     def step_of(self, stage: str) -> Optional[int]:
         """The free-delta charged to ``stage``, or None if it never ran."""
@@ -94,7 +106,11 @@ def parse_log(path: str) -> List[Flip]:
                 continue
             steps = tuple(
                 (name, int(free), int(step), int(slack))
-                for name, free, step, slack in _STEP.findall(line)
+                for name, free, step, slack, _alloc, _res in _STEP.findall(line)
+            )
+            allocs = tuple(
+                (name, None if not alloc else int(alloc))
+                for name, _f, _s, _sl, alloc, _r in _STEP.findall(line)
             )
             out.append(
                 Flip(
@@ -106,6 +122,7 @@ def parse_log(path: str) -> List[Flip]:
                     trough=int(m.group("trough")),
                     stage=m.group("stage"),
                     steps=steps,
+                    allocs=allocs,
                 )
             )
     return out
@@ -381,6 +398,27 @@ def cmd_smoke(args: argparse.Namespace) -> int:
               len(marked) == 1)
         check("and it is weights_refill",
               bool(marked) and "weights_refill" in marked[0])
+
+    # 5. the new census format (alloc=/res=) parses, and the old one still does
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "n.log")
+        line = (
+            "[2026-08-12 11:44:06 PP0] [#631 seam-census] tp_to_pp rank 0: "
+            "transient 7055 MiB (baseline free 7723 MiB, trough 668 MiB at "
+            "'weights_refill') | gdn_state free=6203 step+0 slack=524 "
+            "alloc=31634 res=32158 | weights_refill free=668 step-5535 "
+            "slack=652 alloc=31634 res=32286\n"
+        )
+        with open(p, "w") as fh:
+            fh.write(line)
+        f = parse_log(p)[0]
+        check("new-format line parses", len(f.steps) == 2)
+        check("step still recovered from the new format",
+              f.step_of("weights_refill") == -5535)
+        allocs = dict(f.allocs)
+        check("allocated is captured", allocs["weights_refill"] == 31634)
+        check("FLAT allocated across the stage is visible (the S3 signature)",
+              allocs["gdn_state"] == allocs["weights_refill"])
 
     ok = sum(1 for _n, o in checks if o)
     print()

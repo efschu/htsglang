@@ -5916,6 +5916,33 @@ class PhaseFlipRuntime:
                 stats["seam_transient_bytes"] = int(peak)
                 low = census.trough()
                 stats["seam_trough_stage"] = low[0] if low else ""
+                # #485 T3: AND FEED THE #485 TRANSIENT CENSUS, which is a
+                # DIFFERENT consumer from the gate below and had a hole the
+                # gate did not.
+                #
+                # transient_census.note() is called from exactly one site --
+                # Scheduler.process_batch_result -- and labels its sample
+                # with batch.forward_mode.name. A cutover is not a batch, so
+                # the census that the planner cut gate funds "the WORST load
+                # state" from could not take a single sample inside the
+                # largest transient in the system. Measured over 196 flips of
+                # the two certification windows: 5800 MiB modal, 7055 MiB
+                # worst on rank 0, against a census reporting 1989 MiB.
+                #
+                # The TROUGH's free level, not the peak DRAW: the census
+                # stores per-state minima of the free column and computes the
+                # draw itself against its own at-rest baseline. Handing it a
+                # draw here would be measuring against a different reference
+                # than every other state in the same table.
+                if low is not None:
+                    try:
+                        from sglang.srt.planner import transient_census
+
+                        transient_census.note_free(
+                            transient_census.seam_load_state(direction), low[1]
+                        )
+                    except Exception:  # noqa: BLE001 -- never kill a cutover
+                        pass
                 # FEED THE MEASUREMENT BACK TO THE GATE THAT GUESSED IT.
                 # This is the only place the driver-visible in-cutover draw is
                 # ever known, and until now it was written to a stats dict and

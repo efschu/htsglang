@@ -315,12 +315,46 @@ measured draw of 5800.
 
 | | MiB |
 |---|---:|
-| runtime seam-entry estimate (`staging reserved`) | 4148 |
+| runtime seam-entry estimate on the s50/s51 code (`staging reserved`) | 4148 |
 | measured modal draw | **5800** |
-| estimator short by | **1652** |
+| estimator short by, on that code | **1652** |
 | measured worst draw | **7055** |
-| estimator short by | **2907** |
+| estimator short by, on that code | **2907** |
 | planner `seam_staging_mib` (pp_cut.py:203, default) | **0.0** |
+
+### UPDATE 2026-08-14 — the runtime half is already fixed on the line (R11)
+
+`dadd05b2c2` *"The seam's arena tail is ADDITIVE, in the gate and in the
+sizer"*, merged through R11, changed `_staging_bytes` to
+
+```python
+self._arena_tail_bytes(direction) + max(wave_peak, self._draft_restore_bytes(direction))
+```
+
+which is exactly the composition this section argued for, reached independently
+from the same boot. **The runtime gate defect is CLOSED**; what follows is the
+arithmetic of how far it goes, because it does not close the certification.
+
+Measured wave peak on the s50 modal flip, from the census: free runs
+`8081 -> 6187` inside the wave, so the wave's own peak draw is **1894 MiB**
+(its persistent residual is the 1522 above). With the additive form the gate
+now asks for `4148 + 1894 = 6042` against a measured modal draw of **5800** —
+about **242 MiB conservative**, and R11's own comment reports the same
+direction from the same boot (`max()` at 1.11x UNDER, additive at 0.80x OVER).
+
+**Two things that does not do.**
+
+1. Against the **worst** observed draw of 7055 MiB it is still **~1013 MiB
+   short**, so C2′ (§7) is unaffected and both windows still fail.
+2. R11's comment names its worst single event as **+246 MiB**, so it was not
+   looking at the 11:44:06 outlier. The additive fix and this analysis are
+   complementary: it corrects the *composition*, this corrects the *reference
+   class*.
+
+`dadd05b2c2` touches `phase_flip_runtime.py` and
+`phase_flip_seam_reserve.py` — the runtime gate and the runtime sizer. It does
+**not** touch `planner/pp_cut.py`, so the planner-side term below was untouched
+by it and is the remaining half.
 
 **Two gates, two distinct defects.**
 
@@ -447,7 +481,9 @@ Not "no breach". A boot that does not breach has only shown it did not draw the
 outlier — s51 is the worked example, and it had the *thinner* margin. One boot
 must produce **three specific readings**:
 
-1. **`allocated` per stage mark**, not just `slack`. `allocated` flat across
+1. **`allocated` per stage mark**, not just `slack`. **LANDED on this
+   branch** — the census now prints `alloc=` and `res=` alongside `slack`, so
+   the GPU shift executes rather than patches. `allocated` flat across
    `weights_refill` while `free` drops says S3 (a VMM commit outside torch);
    `allocated` rising with `free` says S1 or S2. That is the one clean split,
    and it is a one-line change to a log format on a path that already samples
@@ -474,13 +510,12 @@ binding rank's at-rest free on HEAD.
 
 **Not a certification window.** Do not book this as window 2 or 3.
 
-**Precondition (desk, ~10 min, may be done by the GPU shift or handed back):**
-one-line change in `python/sglang/srt/managers/phase_flip_seam_census.py`
-around line 277 — the formatter already holds `free`, `reserved` and
-`allocated` and prints `free`, `step` and `slack = reserved - allocated`. Print
-`reserved` and `allocated` as their own fields. No behaviour change, no new
-probe, no new cost. Without it, boot 1 below answers nothing that the two
-existing windows have not already answered.
+**Precondition: DONE on this branch, nothing to patch before booting.**
+`phase_flip_seam_census.format_line` now prints `alloc=` and `res=` as their own
+fields next to `slack`. No behaviour change, no new probe, no new cost — the
+formatter already held all three values and printed only their difference.
+`scripts/cert_485/excursion_485.py` reads both the old and the new format, so
+the new window pools directly with the existing 196 flips.
 
 **Boots, in order:**
 
@@ -520,18 +555,38 @@ or treat a clean corridor as certification.
 heartbeat before releasing `/spinning/gpu-arb/holder`. Whoever stopped serving
 owns bringing it back.
 
-**Follow-on tickets this analysis creates (desk, no metal):**
+**Follow-on tickets this analysis created — all three now resolved:**
 
-* **T1** — supply `seam_staging_mib` from the seam census and re-run the planner
-  gate on `40,12,12`. Expected: the gate refuses its own prior admit. That is a
-  CPU-only falsification of the admit, and it does not need a window.
-* **T2** — `_staging_bytes` composes the tp→pp leg with `max()`; the wave
-  residual and the arena tail coexist on that leg. Red-first test: a runtime
-  whose wave residual is non-zero and whose arena tail is the max must estimate
-  their **sum**, not the max. Fix behind the existing estimator, no new gate.
-* **T3** — `transient_census` takes no sample inside the cutover
-  (`scheduler.py:6423` is the only `note()` site). Add a seam load state so the
-  #485 census and the seam census stop disagreeing by a factor of three.
+* **T1 — DONE on this branch.** `ServerArgs._pp_cut_seam_staging` reads the
+  measured seam demand from the census and **refuses** rather than defaulting,
+  matching `_pp_cut_transients`. The pin is
+  `test/registered/unit/planner/test_seam_staging_producer_485.py`: with the
+  fixture calibrated to the real admit's **374.9 MiB** of reported headroom,
+  the gate ADMITS `40,12,12` at `seam_staging_mib=0.0` and **REFUSES** it at
+  the measured 5800, short by **5425.1 MiB**, naming *"FITS AT REST"* and
+  *"seam staging"*. The admit was arithmetically unreachable, not unlucky.
+* **T2 — ALREADY DONE UPSTREAM OF THIS BRANCH**, by `dadd05b2c2` in R11. See
+  the update in §5: the composition is now additive, which leaves the gate
+  ~242 MiB conservative on the modal seam and ~1013 MiB short of the worst.
+  No change was needed here.
+* **T3 — DONE on this branch.** The cutover now feeds
+  `transient_census.note_free()` under a per-direction seam load state, taking
+  the seam census's own trough rather than re-probing — the two instruments
+  agreed to 1 MiB on window 1 and must keep describing the same instant. The
+  feed is deliberately **unstrided**: a flip's trough is one event, and s50
+  breached on 1 flip in 86.
+
+**And one documentation defect this analysis falsified.**
+`phase_flip_seam_census`'s own module docstring excluded `arena_refill` from
+the candidate set *"by construction"*, reasoning that it copies into "an arena
+that ALREADY EXISTS". That is false on the tp→pp leg: `refill` calls
+`_commit_refill_high_water()` first, which grows the arena back to the
+high-water through a real `cuMemCreate` of ~4150 MiB. The census settled the
+question it was built for and the answer was the excluded candidate — trough at
+`weights_refill` in **86 of 86** flips, while `gdn_state` stepped +0 every time
+and the backing spans netted out identically. The docstring now records the
+falsified deduction *and* where it went wrong, rather than being quietly
+rewritten.
 
 ---
 
@@ -544,6 +599,11 @@ owns bringing it back.
 | `excursion_485.py decompose` on real s50 @ 11:44:06 | reproduces §3 verbatim; one stage differs |
 | `excursion_485.py judge` on real s50 + s51 | `NOT CERTIFIED (C2')`, s50 −354 MiB, s51 −765 MiB |
 | Threat-commit path check | §6, by grepping each diff for the named symbols and by `git log -p` over the whole merge window |
+| `excursion_485.py census` on the NEW census format | parses `alloc=`/`res=`, and still parses every artifact written before them |
+| T1 producer + T3 seam state + census format | `test_seam_staging_producer_485.py` **20 passed**; CAN-FAIL PROOF: with the three source edits reverted to the line, **14 failed / 6 passed** |
+| Regression, managers | `-k "flip or phase or arena or weights or seam or purity"` **590 passed, 0 failed** |
+| Regression, planner | **2380 passed, 6 failed** — all 6 identical with and without this branch's `server_args.py`, i.e. pre-existing (2 GPU-dependent `retry() exceed maximum number of retries`, 4 source-text pins unrelated to this change) |
 | `ruff check scripts/cert_485/` | clean |
+| `ruff --select=F401,F821,E741,F541,F841` on every changed source file | clean |
 
 No GPU, no serving process, no model touched.
