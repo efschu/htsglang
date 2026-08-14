@@ -343,6 +343,26 @@ It also means the act leg carries a live hazard: if B4's rule proposes a flip
 while the pool is occupied, the actuator that executes it is the one that
 crashed here.
 
+### 5.4 The measurement pass was RUN, and its refusal is the record
+
+The STOP was not assumed from the crash. `stage_measure_pass` was invoked on
+B3b's traces afterwards and refused on its own terms:
+
+```
+refused: B3b/trace.rank0.jsonl: no summary line. The summary is written last by
+construction, so its absence means the server was killed and the trace supports
+'so far', not a measurement.
+```
+
+and the canon is unchanged:
+
+```
+stage measurement store: stage_measurements.json (0 record(s))
+```
+
+So the window's durable output on this axis is **zero records**, stated by the
+store rather than inferred, and the refusal names the crash as the cause.
+
 ---
 
 ## 6. THE SECOND BLOCKER: NO RANK CAN FIND THE CARD PROBE
