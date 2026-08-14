@@ -31,18 +31,29 @@ permission to move its KV placement and VRAM budget as a side effect of
 wanting a layout change. So this policy actuates ONE axis and nothing else,
 behind its own flag. #363 remains the general answer.
 
-THE RESTING STATE IS THE PREFILL LAYOUT (PP), by design
--------------------------------------------------------
-Idle flips are free -- no request is waiting on them -- and the first thing
-any request does is prefill. Resting in PP therefore means a long prompt
-arriving at a quiet server gets PP-class prefill with ZERO flip cost inside
-its TTFT. Resting in TP would put a ~3.2 s round trip in the latency path of
-exactly the requests that are most latency-sensitive to it. The trade is
-real but one-sided for this deployment: TP-resting only wins for
-short-prompt / short-output traffic, where the prefill is too small to repay
-a flip anyway (and such traffic simply runs in whatever layout is current --
-see the threshold below). ``rest_state`` makes it configurable rather than
-assumed.
+THE RESTING STATE IS THE DECODE LAYOUT (TP) -- CHANGED 2026-08-14 (user)
+------------------------------------------------------------------------
+EVERY request decodes; only a large-prefill request benefits from PP. Since
+decode in the PP layout is forbidden, resting in PP means every request pays
+at least one ``pp_to_tp`` cutover to decode, and the server then idles back
+to PP and pays it again on the next one. That is not a corner case, it is a
+thrash cycle, and it was measured on this rig 2026-08-14: 882 flips in a
+single boot, arming at 184 pending prefill tokens, ~4.8 s of seam per
+request, TTFT ~2.9 s on a 65-CHARACTER prompt.
+
+Resting in TP costs the opposite case: a long prompt arriving at a QUIET
+server now pays ~2.7 s of ``tp_to_pp`` inside its TTFT that it previously got
+free. That cost is bounded and, above the threshold N, repaid by the prefill
+saving by construction -- N is precisely the point where it is. Below N the
+prompt never wanted PP anyway and now prefills in TP without any flip at all.
+
+The previous argument for PP-resting ("a long prompt gets PP-class prefill
+with ZERO flip cost") was written when prefill could not run in TP AT ALL, so
+every request had to reach PP regardless of size. With that prohibition
+withdrawn the argument only covers prompts above N, which are the ones that
+can afford the flip. ``rest_state`` remains configurable
+(``HTSGLANG_PHASE_IDLE_STATE``) for a deployment whose traffic is dominated
+by large prompts arriving at an idle server.
 
 THE THRESHOLD N, AND WHY IT IS A BREAK-EVEN AND NOT A GUESS
 -----------------------------------------------------------
@@ -143,6 +154,8 @@ DEFAULT_TP_PREFILL_TOK_S = float(os.environ.get(ENV_TP_TOK_S, "1681.0") or 1681.
 
 ENV_ENABLE = "SGLANG_PHASE_POLICY"
 ENV_FLIP_TOKENS = "SGLANG_PHASE_POLICY_FLIP_TOKENS"
+ENV_FLIP_COST_S = "SGLANG_PHASE_POLICY_FLIP_COST_S"
+ENV_DECODE_STRAND_WEIGHT = "SGLANG_PHASE_POLICY_DECODE_STRAND_WEIGHT"
 ENV_MIN_DWELL = "SGLANG_PHASE_POLICY_MIN_DWELL_S"
 ENV_IDLE_DWELL = "SGLANG_PHASE_POLICY_IDLE_DWELL_S"
 ENV_REST_STATE = "HTSGLANG_PHASE_IDLE_STATE"
@@ -280,6 +293,41 @@ def break_even_tokens(
     return int(round(flip_cost_s / (1.0 / tp_tok_s - 1.0 / pp_tok_s)))
 
 
+def effective_flip_threshold(cfg: "PhasePolicyConfig", running_bs: int) -> int:
+    """Pending-prefill tokens required to justify `tp_to_pp` RIGHT NOW.
+
+    ``break_even_tokens`` prices the seam and nothing else. A cutover also
+    PAUSES every request that is decoding: it is carried into the PP layout,
+    where decode is forbidden, and waits out the PP window before emitting
+    another token. Stranding is therefore a real cost of the flip, it scales
+    with how many requests are in flight, and it belongs in the same
+    comparison rather than in a separate ad-hoc guard.
+
+    The seconds go into the same C that produced N, so the threshold simply
+    scales:
+
+        C_eff = flip_cost_s + weight x running_bs x pp_window_s
+        N_eff = flip_tokens x C_eff / flip_cost_s
+
+    Degenerate cases return the unchanged threshold, so a deployment that has
+    not measured its seam behaves exactly as before:
+      * ``flip_cost_s <= 0``  -- seam not measured here;
+      * ``running_bs <= 0``   -- nothing to strand;
+      * ``weight == 0``       -- surcharge explicitly disabled.
+
+    Under ``strict`` purity (``prefill_runs_in_tp`` False) the threshold is 0
+    by construction -- a sub-N prompt could not run in TP at all -- and the
+    surcharge must not resurrect one, or short prompts would never run.
+    """
+    if not cfg.prefill_runs_in_tp:
+        return 0
+    base = int(cfg.flip_tokens)
+    if cfg.flip_cost_s <= 0 or running_bs <= 0 or cfg.decode_strand_weight <= 0:
+        return base
+    stranded_s = cfg.decode_strand_weight * float(running_bs) * cfg.pp_window_s
+    return int(round(base * (cfg.flip_cost_s + stranded_s) / cfg.flip_cost_s))
+
+
 @dataclass(frozen=True)
 class PhasePolicyConfig:
     """Static configuration. Built once at boot, never mutated."""
@@ -288,12 +336,22 @@ class PhasePolicyConfig:
     flip_tokens: int = 0
     min_dwell_s: float = DEFAULT_MIN_DWELL_S
     idle_dwell_s: float = DEFAULT_IDLE_DWELL_S
-    rest_state: str = REST_PREFILL
+    rest_state: str = REST_DECODE
     #: Fairness bound; 0 disables it and restores the pure load-triggered
     #: behaviour that starves under a sustained backlog. See the block
     #: comment at DEFAULT_PP_WINDOW_S.
     pp_window_s: float = DEFAULT_PP_WINDOW_S
     tp_decode_floor_s: float = DEFAULT_TP_DECODE_FLOOR_S
+    #: The MEASURED seam round trip (s) that ``flip_tokens`` was derived from.
+    #: 0.0 means "not measured here", which disables the stranded-decode
+    #: surcharge below and reproduces the previous policy exactly. The
+    #: surcharge is gated on a MEASUREMENT rather than a flag on purpose: its
+    #: entire justification is that the seam and the window were measured.
+    flip_cost_s: float = 0.0
+    #: How much of a PP window a stranded decode is charged. 1.0 = the full
+    #: window (a paused generation really does wait it out); 0.0 disables the
+    #: surcharge while keeping ``flip_cost_s`` available for reporting.
+    decode_strand_weight: float = 1.0
     #: How long a REFUSED arm holds the policy off that direction, doubling
     #: per consecutive refusal from ``min_dwell_s`` and clamped here.
     #:
@@ -488,7 +546,21 @@ def _decide_from_load(
         # the correct answer for short prompts by construction of N.
         # Under purity the break-even is meaningless (see
         # prefill_runs_in_tp): the only threshold that terminates is zero.
-        tp_threshold = cfg.flip_tokens if cfg.prefill_runs_in_tp else 0
+        tp_threshold = effective_flip_threshold(cfg, inp.running_bs)
+        if (
+            cfg.prefill_runs_in_tp
+            and inp.running_bs > 0
+            and cfg.flip_tokens < inp.pending_prefill_tokens <= tp_threshold
+        ):
+            # Repays the seam, but not the seam PLUS the generations this
+            # cutover would pause for a whole PP window. Named explicitly so
+            # the log says which term refused, not just "below threshold".
+            return _no(
+                f"pending prefill {inp.pending_prefill_tokens} tok > N="
+                f"{cfg.flip_tokens} but <= {tp_threshold} with "
+                f"{inp.running_bs} req decoding: flipping would strand them "
+                f"in pp for a {cfg.pp_window_s:g}s window"
+            )
         if inp.pending_prefill_tokens > tp_threshold:
             # THE DECODE FLOOR. Under purity every token of prefill has to
             # wait for a PP window, so the backlog is essentially always
@@ -796,7 +868,7 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
     change, and so the acceptance run can exercise a short dwell without
     shipping a short dwell as the default.
     """
-    rest_state = os.environ.get(ENV_REST_STATE) or REST_PREFILL
+    rest_state = os.environ.get(ENV_REST_STATE) or REST_DECODE
     min_dwell = _env_float(ENV_MIN_DWELL, DEFAULT_MIN_DWELL_S)
     idle_dwell = _env_float(ENV_IDLE_DWELL, DEFAULT_IDLE_DWELL_S)
 
@@ -834,6 +906,11 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
         rest_state=rest_state,
         pp_window_s=_env_float(ENV_PP_WINDOW, DEFAULT_PP_WINDOW_S),
         tp_decode_floor_s=_env_float(ENV_TP_FLOOR, DEFAULT_TP_DECODE_FLOOR_S),
+        # The seam cost the threshold was derived from, carried so the
+        # stranded-decode surcharge can price a cutover against the
+        # generations it would pause. Without this the surcharge is inert.
+        flip_cost_s=_env_float(ENV_FLIP_COST_S, DEFAULT_FLIP_COST_S),
+        decode_strand_weight=_env_float(ENV_DECODE_STRAND_WEIGHT, 1.0),
         refusal_backoff_cap_s=_env_float(
             ENV_REFUSAL_BACKOFF_CAP, DEFAULT_REFUSAL_BACKOFF_CAP_S
         ),
@@ -844,7 +921,8 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
     if enabled:
         logger.warning(
             "%s armed: N=%d tok (%s), min dwell %gs, idle dwell %gs, "
-            "pp window %gs, tp decode floor %gs, resting layout %s (%s)",
+            "pp window %gs, tp decode floor %gs, seam %gs, strand weight %g "
+            "(N with 1 req decoding: %d), resting layout %s (%s)",
             LOG_PREFIX,
             cfg.flip_tokens,
             source,
@@ -852,6 +930,9 @@ def config_from_env(enabled: bool) -> PhasePolicyConfig:
             cfg.idle_dwell_s,
             cfg.pp_window_s,
             cfg.tp_decode_floor_s,
+            cfg.flip_cost_s,
+            cfg.decode_strand_weight,
+            effective_flip_threshold(cfg, 1),
             cfg.rest_phase,
             cfg.rest_state,
         )
