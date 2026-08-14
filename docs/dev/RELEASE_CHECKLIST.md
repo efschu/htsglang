@@ -284,6 +284,42 @@ and assert no `cu12` path precedes the cu13 directory. Owner: #539.
 
 ---
 
+## 2.7 Environment-workaround sweep against the recipe (#251) — 2026-08-14
+
+AUDIT-251's flags (2.1-2.6) ask whether the *audit's* concerns are closed. This
+sweep asks the narrower release question: **is any workaround baked into the
+shipped recipe that exists only because of this rig's conditions, or only
+because someone could not start the environment cleanly?** Such a setting is
+invisible to the user who inherits it and wrong on their machine.
+
+Every environment default in `docker/htsglang.Dockerfile`, `docker/htsglang.yml`
+and `docker/htsglang-entrypoint.sh` was examined. Verdicts:
+
+| # | Suspect | Where | Verdict |
+|---|---|---|---|
+| 1 | `SGLANG_BARLINK_LAUNCH_DUMP=0` | Dockerfile ENV | **CLEAN.** A rig sampler writing forever to `/spinning/wedge-catch-603b`, a directory absent from the image. Turning it off in the image while leaving the in-tree default ON is the correct split, and the reasoning is recorded at the line. |
+| 2 | `PIP_BREAK_SYSTEM_PACKAGES=1`, `PIP_ROOT_USER_ACTION=ignore` | Dockerfile ENV | **CLEAN.** Normal for a root-owned container interpreter; no rig conditioning, no runtime effect. |
+| 3 | `HF_HUB_ENABLE_HF_TRANSFER=0` | Dockerfile ENV | **CLEAN, but undocumented.** Disabling the accelerated downloader is defensible (it is a hard failure mode on flaky links) but carries no comment, unlike every other line in that block. A reader cannot tell whether it is a decision or a leftover. Add one line of rationale. Not release-blocking. |
+| 4 | `TORCH_CUDA_ARCH_LIST` | Dockerfile ARG/ENV | **CLEAN.** Consumed only by runtime JIT, and neither `MAX_JOBS` nor `SGL_KERNEL_LIMIT_CUDA_ARCHS` is an ARG here, so an exported rig shell variable cannot narrow the release build. Docker does not forward host env into a build. Confirmed structurally in 2.4. |
+| 5 | `CHAT_TEMPLATE=${CHAT_TEMPLATE:-/etc/htsglang/chat_template.jinja}` | `htsglang.yml:104` | **DEFECT — recipe-level, and it defeats a deliberate decision.** The Dockerfile refuses to bake this in and states why: *"the froggeric v21.3 template is Qwen-specific, and a baked-in default would silently apply it to every model."* Compose then applies it to every model by default. The Dockerfile's comment even says "the compose files set it explicitly" — but a `:-` fallback is not explicit, it is a default. Same family as the entrypoint `:=` defect one layer up. **Fix: make it `${CHAT_TEMPLATE:-}`.** |
+| 6 | `CONTEXT_LENGTH=${CONTEXT_LENGTH:-32768}` | `htsglang.yml:103` | **DEFECT, same family.** Silently caps every model at 32768 regardless of what the checkpoint supports, and a user who never sets the variable will not know a cap was applied. **Fix: `${CONTEXT_LENGTH:-}`** and let the model decide. |
+| 7 | Entrypoint flag defaults | `htsglang-entrypoint.sh` | **CLEAN, and pinned.** The four flag variables are `: "${VAR:=}"` after `25d3a5ded2`; clearing one removes the flag. Regression-pinned by `test_entrypoint_empty_env_384.py`. Verified again in this sweep. |
+| 8 | Non-flag entrypoint defaults (`MODE`, `HICACHE_STORAGE_DIR`, `PLANNER_HOST`, `PLANNER_PORT`) | `htsglang-entrypoint.sh` | **CLEAN.** These name container-internal locations and a run mode, not model behaviour. A non-empty default is correct for them. |
+| 9 | `find / -path '*libnccl.so.2'` | Dockerfile step 4 | **FRAGILE, not a workaround.** An unqualified `find /` inside the build. It works, but the identical pattern was written into `apply-nccl-tuning.sh` during this shift and had to be removed: on a multi-terabyte volume it walks the whole pool and reads as a hang. Bound it to the interpreter's `purelib` plus the usual system paths. Not release-blocking. |
+| 10 | README `${VAR:=default}` workaround | `README.md` | **STALE — must be deleted.** It instructs readers to bypass env vars to dodge a bug fixed by `25d3a5ded2`. Booked as item 4 of the #135 draft. This is precisely the sweep's target class: a workaround outliving its defect. |
+
+**Two release-blocking items, both one-character fixes** (5 and 6), both in
+compose rather than the image, and both of the same shape: a `:-` fallback that
+reads as a convenience and behaves as a silent override. Neither is fixed here
+— compose is not this branch's subject and the fix wants its own commit and a
+boot to confirm nothing depended on the defaults.
+
+**Sweep conclusion:** no rig-conditioned workaround is baked into the *image*.
+The two defects and the stale README workaround live one layer out, in compose
+and in the docs.
+
+---
+
 ## 3. NCCL package (#599) — PREPARED, flipped deliberately
 
 Package: `deploy/release/nccl-tuning.env`. It is documentation plus one
@@ -528,6 +564,48 @@ docker push ghcr.io/efschu/htsglang:cu130-nccl2307
 * Making the package **public is done by the user in the GitHub UI**, not from
   here.
 * Nothing about this release is posted publicly before the operator's go.
+
+### 7.1 Public-image verify (the #416 shape) — do this BEFORE announcing
+
+#416 is the precedent: an image that built fine, pushed fine, and was wrong for
+the person who pulled it. The only check that would have caught it is pulling
+the published artifact **as a stranger does** — fresh, by tag, with no local
+layers and no build context — and inspecting what it actually contains.
+
+```bash
+docker rmi ghcr.io/efschu/htsglang:<tag> 2>/dev/null || true   # no local cache
+docker pull ghcr.io/efschu/htsglang:<tag>
+
+# (a) provenance: exactly one distribution provides sgl_kernel, arm as intended
+docker run --rm --security-opt apparmor=unconfined \
+  -v "$PWD/python/sglang/srt/utils/kernel_dist_guard.py:/g.py:ro" \
+  ghcr.io/efschu/htsglang:<tag> python3 -I /g.py            # expect exit 0
+
+# (b) the #416 defect itself: an empty flag var must REMOVE the flag
+docker run --rm --security-opt apparmor=unconfined \
+  -e RANK_GPU_ID= ghcr.io/efschu/htsglang:<tag> \
+  --print-argv-only                                          # no --rank-gpu-id
+
+# (c) NCCL floor, from NCCL's own banner rather than a filename
+deploy/release/apply-nccl-tuning.sh verify-log <boot.log> --strict
+```
+
+**Every `docker run` in this LXC needs `--security-opt apparmor=unconfined`**,
+including trivial ones — without it the daemon refuses with
+`Could not check if docker-default AppArmor profile was loaded`. Confirmed
+2026-08-14, see §4.0.
+
+> **Check (a) fails today on the already-published
+> `htsglang:cu130-nccl2307`** — `verdict=SHADOWED`. That image predates the
+> guard. Whatever is published next must pass (a) before it is announced, and
+> the existing tag should be rebuilt or superseded rather than left as the
+> thing a stranger pulls.
+
+**Orphan-container VRAM trap.** A container that failed or was replaced can
+keep its VRAM reservation while showing nothing useful in `docker ps`. Check
+`docker ps -a` and `nvidia-smi` together before concluding a card is free, and
+remove stopped containers rather than leaving them; a rebooted rig that looks
+short of VRAM is usually holding an orphan.
 
 ---
 
