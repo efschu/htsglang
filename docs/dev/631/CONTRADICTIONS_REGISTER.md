@@ -2543,3 +2543,55 @@ levelling and normalisation still running underneath so those rows drain.
 Costs nothing when the ranks agree — soak boot 2's 1134 consecutive cutovers
 return at the first branch, and the agreeing path is pinned to enter no
 collective at all.
+## 83. C22-e: the recovery creates the divergence, and it is the only place it
+can be prevented.
+
+C22-d (row 82) made the live-slot divergence safe and NAMED. Metal, 2026-08-14,
+showed it is not sufficient, and the reason is one rung below. `recover()` is
+bounded by each rank's own distance from the corridor law -- correctly, the
+grow being an allocation on the card that needed relieving -- so the
+corridor-bounded rank comes back lower than its peers and **the group is left
+with two different ID SPACES**:
+
+```
+05:40 PP2  proposal: current=585390 floor=585903 (max_live=585390)
+05:40 PP1  proposal: current=546236 floor=546749 (max_live=546236)
+05:44 all  FLIP ABANDONED ... the group's union reaches row 585390 and the
+           poorest rank has only 546236 rows BACKED
+```
+
+The peers hand out ids the poorest rank cannot map, and from there BOTH repairs
+refuse -- **and both refusals are right**. `collective_cap_target` declines
+because `max_floor > capable`: it may not withhold ids a peer's request is
+using. C22-d's union declines because framing row 585390 on a rank backed to
+546236 is a read of unmapped memory, which is `cudaErrorIllegalAddress` and
+kills every rank rather than raising. Two correct refusals and a flip that
+never happens again: the instance ran to the announced 9-refusal livelock with
+`/health` 200 and every request intact.
+
+So the divergence is prevented where it is created. `recover_kv_backing` now
+reduces `[backed, -backed]` on the tp->pp post-cutover hook -- a point every
+rank reaches exactly once per unanimous cutover -- and every rank caps its
+allocator to the group's MINIMUM backing. No pages released, no memory
+committed: an id decision, resting on the cap agreement's own argument that
+under pure PP rows above the group minimum could never have been admitted
+against.
+
+`level_recovery_to` differs from `reconcile_to` in the one way that matters: it
+REMEMBERS the reservation before capping below it. `reconcile_to` clears
+`_rows_at_boot` when the level reaches the ceiling it knows about, a fully
+recovered rank has already cleared it, and `recover()` returns 0 immediately on
+a None -- so levelling with `reconcile_to` alone would make the group level a
+ratchet, the one outcome the standing rule forbids.
+
+Metal, same rig, same argv, code as the only difference:
+
+```
+05:57:18 PP1  backs 581333, group's poorest backs 581333, capped at 581333 (+0)
+05:57:18 PP0  backs 586642, group's poorest backs 581333, capped at 581333 (-5309)
+05:57:18 PP2  backs 586642, group's poorest backs 581333, capped at 581333 (-5309)
+```
+
+Four such levellings against four corridor-bounded recoveries, and **0 wire
+frame divergences, 0 abandons, 0 union refusals** where the previous boot
+wedged permanently on the same shape.

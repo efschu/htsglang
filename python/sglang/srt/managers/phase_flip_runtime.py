@@ -997,7 +997,7 @@ def build_gdn_flip_guard(scheduler) -> Callable[[str], None]:
     return _guard
 
 
-def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
+def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], None]:
     """The cutover leg (DESIGN_631 3.6 step 5): everything the scheduler
     snapshotted from the boot topology is rebuilt for the target phase.
     Runs inside PhaseFlipRuntime._execute after KV/GDN/arena moves; the
@@ -1326,7 +1326,9 @@ def build_production_flip_cutover(scheduler) -> Callable[[str], None]:
             # forbids; recovering here bounds the reduction to one phase.
             from sglang.srt.managers.phase_flip_spill import recover_kv_backing
 
-            recover_kv_backing(scheduler)
+            # #656 C22-e: the grow is rank-local by necessity, the ID SPACE it
+            # produces may not be. See recover_kv_backing.
+            recover_kv_backing(scheduler, reduce_fn=reduce_fn)
 
             # THE SEAM MUST LEAVE NO TP DRAFT STATE REACHABLE. Runs before
             # the relay re-seed, so that nothing between the stack swap and
@@ -1587,6 +1589,14 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         int(server_args.pp_size),
     )
 
+    # #656 C22-e: ONE channel, named once, so the post-cutover recovery
+    # levelling and the seam's own ballots provably run over the SAME group.
+    # Built here rather than inside the cutover closure because the closure is
+    # constructed as an argument to the runtime that would otherwise own it.
+    flip_collective_min = default_collective_min(
+        flip_tp.cpu_group, label="phase_flip.consensus"
+    )
+
     runtime = PhaseFlipRuntime(
         n_ranks=world.world_size,
         rank=world.rank_in_group,
@@ -1612,9 +1622,7 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         * 1024,
         # Label it as OURS: a shared helper reporting under its own
         # module's name sent a live wedge into the wrong subsystem.
-        collective_min=default_collective_min(
-            flip_tp.cpu_group, label="phase_flip.consensus"
-        ),
+        collective_min=flip_collective_min,
         # #631 option 2(b): the pollable entry gate, and the non-blocking
         # pump that delivers this rank's arm forward while it waits.
         presence=PhaseFlipPresence(
@@ -1645,7 +1653,9 @@ def build_phase_flip_runtime(scheduler) -> "PhaseFlipRuntime":
         tp_pool_view=tp_view,
         live_slots_fn=build_flip_live_slots_fn(scheduler),
         ready_fn=build_flip_quiescence_fn(scheduler),
-        cutover_fn=build_production_flip_cutover(scheduler),
+        cutover_fn=build_production_flip_cutover(
+            scheduler, reduce_fn=flip_collective_min
+        ),
         # DESIGN_631 3.6 order inside the no-return region: GDN state move
         # (5.3b mover -- its preconditions re-validate on every flip and
         # refuse loudly, the reachable-refusal contract), then the arena

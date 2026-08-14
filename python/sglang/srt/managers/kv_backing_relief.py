@@ -1184,6 +1184,28 @@ class KvBackingRelief:
         """
         return int(self._current_rows())
 
+    def level_recovery_to(self, target: int) -> int:
+        """#656 C22-e: cap this rank's ID SPACE to the group's, after a grow.
+
+        :meth:`reconcile_to` with one addition that matters: it REMEMBERS the
+        reservation. ``reconcile_to`` clears ``_rows_at_boot`` whenever the
+        level it lands on reaches the ceiling it knows about, and a rank that
+        recovered fully has already cleared it -- so levelling such a rank down
+        with ``reconcile_to`` alone would cap its allocator AND destroy the
+        only record that it owes itself a recovery. :meth:`recover` returns 0
+        immediately when ``_rows_at_boot`` is None, so that rank would never
+        climb back and the level would be a ratchet. It is explicitly not one:
+        the level rises again as soon as the poorest rank can fund it.
+
+        Returns the change in this rank's exposed level (signed).
+        """
+        target = int(target)
+        if self._rows_at_boot is None and target < self._reservation_rows():
+            # Remember what this rank is entitled to before capping below it.
+            self._rows_at_boot = self._reservation_rows()
+            self._exhausted = False
+        return int(self.reconcile_to(target))
+
     def normalize_free_lists(self) -> None:
         """Put this rank's free lists in ascending id order, unconditionally.
 
