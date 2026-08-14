@@ -190,10 +190,17 @@ shared staging path is the mechanism.
    carries `measured_gain_pct`, `measured_band_pct` and `flip_cost_s`, the
    stage table cannot hold a second stage and #363 has nothing to measure. No
    amount of window time substitutes for it.
-2. **Decide what `spread_veto_pct = 25` is for** (§3). Either wire it to the
-   interlock it is named after, or take it out of gate 3's blocking set. As it
-   stands gate 3 can never pass on a balanced rig, which makes the act mode
-   permanently unreachable for a reason unrelated to the controller.
+2. ~~**Decide what `spread_veto_pct = 25` is for** (§3).~~ **DECIDED AND DONE
+   (R13, operator mandate): RETIRED from gate 3's blocking set.** The second of
+   the two options above. `bands.py`'s `Constant` now names the runtime symbol
+   it was read from, and a bad verdict blocks only if that symbol exists;
+   `spread_veto_pct` names none, so it is judged and reported but never
+   blocking. `PRESTAGE_SINGLE_PROMPT_TOKENS` was found to be a second orphan by
+   the same test and retired with it. Pinned by
+   `test/registered/unit/managers/test_gate3_runtime_orphans_363.py`; written up
+   in `RUNSHEET_363_card_gates.md` §6a. Gate 3 now blocks on what the runtime
+   actually enforces — `kv_ascend_mark`'s `UNREACHED` still blocks, and is
+   still a #287 question, not a #363 one.
 3. `kv_ascend_mark` is a **#287** question, per `bands.py`'s own note. If it is
    to be reachable here at all, it needs an admission cap above 16 or a smaller
    pool — both of which change the configuration the bands describe.

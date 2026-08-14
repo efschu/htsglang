@@ -373,9 +373,16 @@ these again:
   disagreement 0.103 = 0.206. It clears by 1.29x, which is a pass and a thin
   one — a busier workload is the way to widen it, not a new number.
 * `enter_decode = 0.90` -> **CLEARS**: rate 0.565 against 2x 0.155 = 0.310.
-* `spread_veto_pct = 25` -> **UNREACHED**: the measured spread peaked at
-  **0.68 %** here, 0.61 % and 12.5 % in the two earlier windows. Recorded, not
-  re-tuned — calibration is a separate decision with its own evidence.
+* `spread_veto_pct = 25` -> **UNREACHED**, and **RETIRED from the blocking set**
+  (R13, operator mandate). The measured spread peaked at **0.68 %** here,
+  0.61 % and 12.5 % in the two earlier windows, and **0.407 %** in the window
+  verdict — 61x below the constant. Retired not because it kept failing but
+  because it was never wired: `grep -rn 'spread_veto_pct' python/` returns
+  nothing, and the only act-mode interlock on that signal
+  (`regime_runtime.py`) vetoes on `rank_ms_spread_pct is None` — the
+  one-boundary-stale veto — and never compares a magnitude to 25. A verdict
+  that cannot move with the workload is a finding about the gate, not the rig.
+  See §6a below.
 * `kv_ascend_mark = 0.85` -> **UNREACHED** at 16.5 % peak occupancy, unless
   the workload is heavier than section 2's. This one is INHERITED from #287
   and is reported for information only: a failure here is a finding for #287,
@@ -386,6 +393,43 @@ these again:
 So the window's job for gate 3 is the two `UNREACHED` reachability findings,
 not the statistic. None of these are reasons to change a number by hand. They
 are the gate-3 output.
+
+### 6a. The blocking set now holds only what the runtime enforces (R13)
+
+`TICKET_363_WINDOW_VERDICT.md` §3 put two options in front of the next shift:
+wire `spread_veto_pct` to the interlock it is named after, or take it out of
+gate 3's blocking set. The operator mandate is the second, and it is executed
+here.
+
+**What changed.** A `Constant` in `scripts/regime_gates/bands.py` now names the
+runtime symbol it was read from (`runtime_site`, of the form
+`"module:SYMBOL"`). A bad verdict blocks the gate **only** if that site exists.
+Constants with `runtime_site=None` are still judged, still reported, and are
+listed in the report's new `retired` / `retired_verdicts` keys and in the
+evidence `source` string — the reachability history keeps accumulating, so a
+shift that later WIRES the veto inherits the evidence needed to set the number.
+It simply cannot hold the gate shut in the meantime.
+
+**Structural, not a list of retired names.** Retiring one name by hand leaves
+the next orphan for the next shift. The rule is a property of the constant, and
+`test/registered/unit/managers/test_gate3_runtime_orphans_363.py` pins it:
+every blocking-eligible constant must resolve its runtime symbol **and** still
+agree with the runtime's value. Both detectors are proven able to fail (a
+bogus symbol, a drifted value), and one test asserts the retirement did not
+become a retirement of the gate — a wired constant inside its own band still
+blocks.
+
+**A second orphan, found by that test rather than asserted.**
+`PRESTAGE_SINGLE_PROMPT_TOKENS = 8192` has no `python/sglang` site either. It
+has been CLEARING, so it was not blocking anything today — but on a quieter
+workload it would have gone `UNREACHED` and blocked the gate for the same
+non-reason. Retired on the same ground, before it costs a window.
+
+**What still blocks.** `enter_prefill`, `enter_decode` and `kv_ascend_mark`,
+all three of which `bands.py` imports from
+`sglang.srt.managers.regime_classifier` — the gate's copy and the runtime's are
+now checked to be the same number. `kv_ascend_mark`'s `UNREACHED` is unchanged
+and still blocks: it is wired, and per its own note it is a **#287** question.
 
 ## 7. Gate 4, for the window after
 

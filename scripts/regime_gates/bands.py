@@ -228,7 +228,17 @@ STATISTIC = {
 class Constant:
     """One section-3.4 constant, and how to judge it against the data."""
 
-    def __init__(self, name, value, signal, *, exit_value=None, partner=None, note=""):
+    def __init__(
+        self,
+        name,
+        value,
+        signal,
+        *,
+        exit_value=None,
+        partner=None,
+        note="",
+        runtime_site=None,
+    ):
         self.name = name
         self.value = value
         self.signal = signal
@@ -236,6 +246,26 @@ class Constant:
         self.exit_value = exit_value
         self.partner = partner
         self.note = note
+        #: ``"module:SYMBOL"`` -- where the RUNTIME reads this constant, or
+        #: ``None`` for a constant no runtime code enforces. Only a constant
+        #: with a site may block the gate; see :attr:`blocking_eligible`.
+        self.runtime_site = runtime_site
+
+    @property
+    def blocking_eligible(self):
+        """Whether a bad verdict on this constant may BLOCK gate 3.
+
+        A gate reports on the rig. A constant nothing in ``python/sglang``
+        reads reports on the gate instead: its verdict cannot change with the
+        workload, because no runtime decision is taken at it. Such a constant
+        is still judged and still reported -- the reachability evidence has to
+        keep accumulating -- but it is not allowed to hold the gate shut.
+
+        The property is deliberately structural rather than a list of retired
+        names, so the NEXT orphan is caught by
+        ``test_gate3_runtime_orphans_363.py`` instead of by a shift.
+        """
+        return self.runtime_site is not None
 
     @property
     def gap(self):
@@ -263,6 +293,7 @@ CONSTANTS = [
         "prefill_share",
         exit_value=DEFAULT_EXIT_PREFILL,
         partner="exit_prefill",
+        runtime_site="sglang.srt.managers.regime_classifier:DEFAULT_ENTER_PREFILL",
     ),
     Constant(
         "enter_decode",
@@ -270,6 +301,7 @@ CONSTANTS = [
         "decode_share",
         exit_value=DEFAULT_EXIT_DECODE,
         partner="exit_decode",
+        runtime_site="sglang.srt.managers.regime_classifier:DEFAULT_ENTER_DECODE",
     ),
     Constant(
         "kv_ascend_mark",
@@ -277,6 +309,7 @@ CONSTANTS = [
         "occupancy",
         exit_value=KV_DESCEND_MARK,
         partner="kv_descend_mark",
+        runtime_site="sglang.srt.managers.regime_classifier:KV_ASCEND_MARK",
         note=(
             "INHERITED from #287 and deliberately not re-derived here: two "
             "independently-chosen thresholds on one physical quantity is how "
@@ -289,13 +322,45 @@ CONSTANTS = [
         "spread_veto_pct",
         25.0,
         "rank_ms_spread_pct",
-        note="a bare veto threshold: judged on reachability and band only",
+        # RETIRED FROM THE BLOCKING SET (#363, this shift). `runtime_site`
+        # is None on purpose and is what does the retiring.
+        #
+        # The measurement: `grep -rn 'spread_veto_pct' python/` returns
+        # nothing. The interlock this constant was standing in for vetoes on a
+        # MISSING spread -- `rank_ms_spread_pct is None` -- and never on its
+        # magnitude, so no value of the signal can trip it and the verdict
+        # cannot move with the workload. It came back UNREACHED four
+        # recordings running (peak 0.68 %, then 0.407 % -- 61x below 25),
+        # which read as a finding about the rig and was a finding about the
+        # gate. See docs/dev/363/TICKET_363_WINDOW_VERDICT.md section 3.
+        #
+        # Still judged, still reported, so the evidence keeps accumulating and
+        # a future shift that WIRES the veto gets the reachability history it
+        # needs to set the number. It just cannot hold the gate shut meanwhile.
+        runtime_site=None,
+        note=(
+            "a bare veto threshold: judged on reachability and band only. "
+            "RETIRED from the blocking set -- no runtime code reads it; the "
+            "live interlock vetoes on a MISSING spread, not on its magnitude "
+            "(TICKET_363_WINDOW_VERDICT section 3)"
+        ),
     ),
     Constant(
         "PRESTAGE_SINGLE_PROMPT_TOKENS",
         8192,
         "queued_prompt_tokens",
-        note="queue mass, not a share; the trace records the total queued",
+        # Also runtime-orphaned, found by the test written for the one
+        # above rather than asserted: no `python/sglang` code compares queued
+        # prompt tokens against 8192. It has been CLEARING, so it was not in
+        # the blocking set today -- but on a quieter workload it would have
+        # gone UNREACHED and blocked the gate for the same non-reason. Retired
+        # on the same structural ground, before it costs a shift.
+        runtime_site=None,
+        note=(
+            "queue mass, not a share; the trace records the total queued. "
+            "RETIRED from the blocking set -- no runtime decision is taken at "
+            "this value (no `python/sglang` site reads it)"
+        ),
     ),
 ]
 
@@ -605,6 +670,10 @@ def judge_constant(c: Constant, bands: Dict[str, Dict]) -> Dict:
         "band": b.get("band"),
         "observed_max": b.get("observed_max"),
         "note": c.note,
+        # Carried into every verdict so a reader of the JSON can see WHY a bad
+        # verdict did not block, without having to know the constant list.
+        "runtime_site": c.runtime_site,
+        "blocking_eligible": c.blocking_eligible,
     }
     if b.get("status") in (None, "NO_DATA"):
         out.update(verdict="NO_DATA", why=b.get("why", "no band"))
@@ -683,12 +752,15 @@ def report(path_a: str, path_b: str) -> Dict:
     # list for the same reason as the rest: a band from under
     # MIN_PAIRED_SAMPLES samples is a number, not a measurement, so a
     # threshold judged against it has not been checked.
-    blocking = [
-        v
-        for v in verdicts
-        if v["verdict"]
-        in ("INSIDE_BAND", "UNREACHED", "NO_DATA", "ARMS_DISSIMILAR", "UNDERPOWERED")
-    ]
+    bad = ("INSIDE_BAND", "UNREACHED", "NO_DATA", "ARMS_DISSIMILAR", "UNDERPOWERED")
+    # A bad verdict blocks only if the RUNTIME enforces the constant. A
+    # constant no `python/sglang` code reads cannot produce a verdict that
+    # moves with the workload, so blocking on it reports a gap in the gate as
+    # though it were a finding about the rig -- which is exactly what
+    # `spread_veto_pct = 25` did for four recordings running. See
+    # `Constant.blocking_eligible`.
+    blocking = [v for v in verdicts if v["verdict"] in bad and v["blocking_eligible"]]
+    retired = [v["constant"] for v in verdicts if not v["blocking_eligible"]]
     return {
         "arm_a": {
             "path": path_a,
@@ -705,6 +777,13 @@ def report(path_a: str, path_b: str) -> Dict:
         "constants": verdicts,
         "passed": not blocking,
         "blocking": [f"{v['constant']}: {v['verdict']}" for v in blocking],
+        #: Judged and reported, but never blocking: no runtime site.
+        "retired": retired,
+        "retired_verdicts": [
+            f"{v['constant']}: {v['verdict']}"
+            for v in verdicts
+            if not v["blocking_eligible"]
+        ],
     }
 
 
@@ -725,6 +804,11 @@ def evidence_entry(rep: Dict, *, note: str = "") -> Dict:
         f"[{os.path.basename(rep['arm_a']['path'])}; "
         f"{os.path.basename(rep['arm_b']['path'])}]"
     )
+    if rep.get("retired"):
+        source += (
+            "; retired from the blocking set (no runtime site, judged and "
+            "reported only): " + ", ".join(rep["retired_verdicts"])
+        )
     if note:
         source += f" -- {note}"
     return {"f3_bands_measured": {"passed": bool(rep["passed"]), "source": source}}
