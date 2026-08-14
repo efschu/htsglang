@@ -15,8 +15,27 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
-from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.test.test_utils import CustomTestCase
+
+# GUARDED, BECAUSE A COLLECTION ERROR IS NOT ONE RED MODULE (#656, MERGE-R9
+# 12.7). NIXL is an optional backend; ``hicache_nixl`` raises ImportError at
+# module scope when it is absent. Importing it unguarded here made pytest
+# report "2331 tests collected, 1 error" and then INTERRUPT the whole of
+# test/registered/unit/mem_cache/ -- so a missing optional backend hid every
+# test in the directory, including the only gate on an instance-killing GDN
+# fix. The dependency is real for two of the classes below and they skip on
+# it; it must not decide whether the directory can be COLLECTED.
+try:
+    from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+
+    NIXL_IMPORT_ERROR = None
+except ImportError as _e:  # pragma: no cover -- depends on the host
+    HiCacheNixl = None
+    NIXL_IMPORT_ERROR = str(_e)
+
+requires_nixl = unittest.skipIf(
+    HiCacheNixl is None, f"NIXL backend unavailable: {NIXL_IMPORT_ERROR}"
+)
 
 # Stress tests are opt-in: CI never sets this; set locally to exercise them.
 STRESS_ENABLED = bool(os.environ.get("SGLANG_RUN_NIXL_STRESS"))
@@ -205,6 +224,7 @@ class MinioFixture:
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
 
+@requires_nixl
 class TestNixlUnified(CustomTestCase):
     """Unified test suite for all NIXL components."""
 
@@ -512,6 +532,7 @@ class TestNixlUnified(CustomTestCase):
         self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
 
 
+@requires_nixl
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
 class TestNixlDirectIO(CustomTestCase):
     """Tests for the O_DIRECT file I/O path in NixlFileManager and HiCacheNixl."""
