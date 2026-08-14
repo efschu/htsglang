@@ -166,6 +166,27 @@ one directory per invocation. Runner `/spinning/evidence-631/merge-r13/arms.sh`.
 
 **+99 tests, 0 new failures, 0 reds found.**
 
+### 5a. TIP2 — the in-window fixes, measured separately
+
+The R13 column above is the MERGE. The act window then found a defect on metal
+(§4) whose fix landed after that run, so the arms were run a third time at
+`2fe6ae0ac2` rather than folded silently into the merge column.
+
+| suite | TIP `7b950dde7f` | TIP2 `2fe6ae0ac2` | delta |
+|---|---|---|---|
+| `unit/planner` | 2F 2467P 123S | 2F **2478P** 123S | **+11** |
+| every other arm | — | — | unchanged |
+
++11 is exactly `test_rate_env_variant_lookup_584.py`'s own collected count.
+**All ten failure sets identical by name again**, so the chain base -> tip ->
+tip2 carries zero new failures end to end.
+
+One honesty note on the instrument: the tip2 run recorded `dirty=1`. The dirty
+file is `docs/dev/363/TICKET_363_ACT_VERDICT.md`, untracked and documentation
+only — it cannot change a test result, and it is recorded rather than quietly
+tidied because the SUMMARY's `dirty` field only means something if a non-zero
+value is explained.
+
 **Failure SETS diffed by name: all eleven identical.**
 
 | arm | names at base | at tip | diff |
