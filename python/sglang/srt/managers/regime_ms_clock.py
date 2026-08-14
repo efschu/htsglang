@@ -77,6 +77,49 @@ measurements and is strictly larger than either. A candidate whose predicted
 improvement does not clear that combined band is refused however long it
 sustains: sustaining noise produces a long run of noise, not a signal.
 
+THE DECISION RULE, VERBATIM (#584 measurement half / #363 act)
+--------------------------------------------------------------
+A flip to candidate C, from the stage in force I, is PROPOSED at a boundary
+only when every one of these holds:
+
+    (1) the ms window is ready (>= min_samples rounds) and I is MEASURED;
+    (2) signal(C) > threshold(C), where
+
+            signal(C)    = 100 * (mean_total_ms - predicted_ms(C))
+                                 / mean_total_ms
+            threshold(C) = max( enter_margin_pct,
+                                band(C) + flip_cost_pct(C) )
+            band(C)      = sqrt( band(I)^2 + band(C)^2 )       [quadrature]
+            flip_cost_pct(C) = 100 * flip_cost_s(C) / flip_payback_s
+
+    (3) C is the SAME best candidate for ``enter_window`` consecutive
+        boundaries; and
+    (4) some candidate has cleared ``exit_margin_pct`` for ``exit_window``
+        consecutive boundaries (``exit_window > enter_window``).
+
+Everything in (2) is a MEASURED number except the two policy terms
+``enter_margin_pct`` and ``flip_payback_s``, which are named as policy here
+and nowhere else.
+
+WHY THE FLIP COST ENTERS AS A PERCENTAGE OF A HORIZON, AND NOT OF A ROUND.
+``flip_cost_s`` is wall-clock seconds spent moving bytes; ``signal`` is a
+percentage of each round given back. They only become comparable over a
+duration: across a horizon H the flip returns ``signal/100 * H`` seconds and
+costs ``flip_cost_s``, so it pays for itself when ``signal > 100 *
+flip_cost_s / H``. That is the term added to the band, and H --
+``flip_payback_s`` -- is the one judgement in it: how long the new regime is
+expected to last before something changes again.
+
+THE HORIZON IS NOT THE DWELL, DELIBERATELY. ``DwellGate`` already refuses a
+flip that would not be HELD long enough (``min_dwell_rounds = ceil(
+amortization * flip_cost_s / mean_round_s)``). Feeding that same dwell back in
+here as the horizon would make ``flip_cost_pct`` collapse to the constant
+``100 / amortization`` -- the measured flip cost would cancel out of its own
+price, which is the identical algebraic trap this module's docstring already
+records for the whole-round formulation. The two mechanisms stay separate and
+ask different questions: dwell asks "will it be held long enough to amortize",
+the term here asks "is the predicted gain bigger than the cost of getting it".
+
 REFUSING TO PRICE AN UNMEASURED STAGE
 -------------------------------------
 A planner-solved stage carries ``unmeasured=True`` and placeholder zeros in
@@ -113,6 +156,7 @@ __all__ = [
     "DEFAULT_ENTER_WINDOW",
     "DEFAULT_EXIT_MARGIN_PCT",
     "DEFAULT_EXIT_WINDOW",
+    "DEFAULT_FLIP_PAYBACK_S",
     "DEFAULT_MIN_SAMPLES",
     "DEFAULT_WINDOW_SAMPLES",
     "MS_ABSENT",
@@ -123,6 +167,8 @@ __all__ = [
     "MsRoundWindow",
     "MsStageDecider",
     "combined_band_pct",
+    "decision_threshold_pct",
+    "flip_cost_pct",
     "improvement_pct",
     "pack_ms_sample",
     "predicted_round_ms",
@@ -232,6 +278,20 @@ DEFAULT_WINDOW_SAMPLES = 64
 #: Below this many samples the window answers "not ready" rather than a mean
 #: of two rounds. A flip decided on two samples is decided on the two.
 DEFAULT_MIN_SAMPLES = 8
+
+#: The horizon a flip has to pay for itself within, seconds. POLICY, named as
+#: such: it is the only judgement in the flip-cost term, and it is a statement
+#: about how long a regime is expected to last on this deployment, not a
+#: measurement of anything.
+#:
+#: 60 s is chosen against the two mechanisms that bracket it. Below it sits the
+#: #363 workload's own phase length (the runsheet's SHIFT phase is 300 s), so a
+#: flip that cannot repay inside a minute cannot repay inside a phase either.
+#: Above it the term becomes negligible and the cost stops entering the
+#: decision at all, which is the state this slice exists to end. At 60 s a
+#: one-second flip is priced at 1.67 % of a round -- comparable with, and
+#: deliberately of the same order as, the A-vs-A bands this rig measures.
+DEFAULT_FLIP_PAYBACK_S = 60.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -439,6 +499,61 @@ def combined_band_pct(current, candidate) -> float:
     return math.sqrt(a * a + b * b)
 
 
+def flip_cost_pct(candidate, *, payback_s: float = DEFAULT_FLIP_PAYBACK_S) -> float:
+    """The candidate's INSTRUMENTED flip cost, as percent of a round.
+
+    ``100 * flip_cost_s / payback_s``: the share of every round the flip has to
+    give back for the move to have paid for itself within ``payback_s`` of
+    serving. See the module docstring for why the conversion goes through a
+    horizon and not through the round length, and why that horizon is not the
+    dwell.
+
+    An UNMEASURED candidate is refused here exactly as it is by
+    ``combined_band_pct``: its ``flip_cost_s`` is a placeholder zero, and a
+    zero-cost flip is the single most dangerous number this module could
+    return.
+    """
+    _require_measured(candidate, "candidate")
+    if payback_s <= 0.0:
+        raise MsClockError(
+            f"payback_s must be > 0, got {payback_s}: a zero horizon prices "
+            f"every flip at infinity and a negative one pays for the flip "
+            f"before it is made."
+        )
+    cost = float(candidate.flip_cost_s)
+    if cost < 0.0:
+        raise MsClockError(
+            f"flip_cost_s must be >= 0, got {cost} for {candidate.name!r}"
+        )
+    return 100.0 * cost / float(payback_s)
+
+
+def decision_threshold_pct(
+    current,
+    candidate,
+    *,
+    enter_margin_pct: float = DEFAULT_ENTER_MARGIN_PCT,
+    payback_s: float = DEFAULT_FLIP_PAYBACK_S,
+) -> float:
+    """What a candidate's predicted improvement must EXCEED to be adopted.
+
+    ``max(enter_margin_pct, combined_band_pct + flip_cost_pct)``.
+
+    MAX, not a sum of all three. The enter margin is a policy FLOOR under the
+    whole decision -- "do not move for less than this, whatever the
+    arithmetic says" -- while the band and the flip cost are the two measured
+    reasons a given move might not be worth making. Adding the floor on top of
+    the measured terms would charge the same caution twice and make the
+    threshold depend on a policy constant even where the measurement already
+    dominates it.
+    """
+    return max(
+        float(enter_margin_pct),
+        combined_band_pct(current, candidate)
+        + flip_cost_pct(candidate, payback_s=payback_s),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class MsDecision:
     """One boundary's verdict from the ms axis.
@@ -453,6 +568,13 @@ class MsDecision:
     signal_pct: Optional[float] = None
     #: The band that signal had to clear, percent.
     band_pct: Optional[float] = None
+    #: The candidate's instrumented flip cost, priced as percent of a round
+    #: over ``flip_payback_s``.
+    flip_cost_pct: Optional[float] = None
+    #: ``max(enter_margin_pct, band_pct + flip_cost_pct)`` -- the number the
+    #: signal actually had to beat. On the record so a trace reader never has
+    #: to re-derive the rule from three constants.
+    threshold_pct: Optional[float] = None
     #: Name of the best candidate considered, adopted or not.
     candidate: Optional[str] = None
     #: Window means at the moment of the verdict.
@@ -472,6 +594,8 @@ class MsDecision:
             "reason": self.reason,
             "signal_pct": self.signal_pct,
             "band_pct": self.band_pct,
+            "flip_cost_pct": self.flip_cost_pct,
+            "threshold_pct": self.threshold_pct,
             "candidate": self.candidate,
             "mean_total_ms": self.mean_total_ms,
             "mean_wait_share": self.mean_wait_share,
@@ -511,6 +635,7 @@ class MsStageDecider:
         enter_window: int = DEFAULT_ENTER_WINDOW,
         exit_window: int = DEFAULT_EXIT_WINDOW,
         window: Optional[MsRoundWindow] = None,
+        flip_payback_s: float = DEFAULT_FLIP_PAYBACK_S,
     ):
         if enter_margin_pct <= 0.0:
             raise MsClockError(
@@ -538,10 +663,18 @@ class MsStageDecider:
                 f"configuration the actuators may already be moving toward. "
                 f"The asymmetry is the contract."
             )
+        if flip_payback_s <= 0.0:
+            raise MsClockError(
+                f"flip_payback_s must be > 0, got {flip_payback_s}: a "
+                f"non-positive horizon removes the instrumented flip cost "
+                f"from the decision, which is the state this axis exists to "
+                f"end."
+            )
         self.enter_margin_pct = float(enter_margin_pct)
         self.exit_margin_pct = float(exit_margin_pct)
         self.enter_window = int(enter_window)
         self.exit_window = int(exit_window)
+        self.flip_payback_s = float(flip_payback_s)
         self.window = window if window is not None else MsRoundWindow()
 
         self._candidate: Optional[str] = None
@@ -660,7 +793,7 @@ class MsStageDecider:
                 )
             )
 
-        best_name, best_signal, best_band = scored[0]
+        best_name, best_signal, best_band, best_flip_pct, best_threshold = scored[0]
 
         # Half 2 first: has the incumbent stopped holding? Any candidate over
         # the EXIT mark counts, not only the leader -- the question is whether
@@ -671,8 +804,10 @@ class MsStageDecider:
         else:
             self._leave_streak = 0
 
-        # Half 1: is the SAME challenger leading, over its own band?
-        clears = best_signal > self.enter_margin_pct and best_signal > best_band
+        # Half 1: is the SAME challenger leading, over the threshold the rule
+        # defines -- its own combined band PLUS its instrumented flip cost,
+        # floored by the policy enter margin?
+        clears = best_signal > best_threshold
         if clears and best_name == self._candidate:
             self._candidate_streak += 1
         elif clears:
@@ -685,6 +820,8 @@ class MsStageDecider:
         common = dict(
             signal_pct=best_signal,
             band_pct=best_band,
+            flip_cost_pct=best_flip_pct,
+            threshold_pct=best_threshold,
             candidate=best_name,
             mean_total_ms=mean_total,
             mean_wait_share=mean_wait_share,
@@ -702,6 +839,28 @@ class MsStageDecider:
                         f"combined A-vs-A band of {best_band:.2f} %; a gain "
                         f"inside the band is not a gain however long it "
                         f"sustains"
+                    ),
+                    **common,
+                )
+            )
+        if best_signal <= best_threshold:
+            # Clears the band and fails the rule: either the flip costs more
+            # than the move gives back over the payback horizon, or the policy
+            # enter margin is above both. Named separately from the band case
+            # because the remedies differ -- a cheaper flip, a longer horizon,
+            # or a bigger measured gain.
+            return self._record(
+                MsDecision(
+                    target=None,
+                    reason=(
+                        f"best candidate {best_name!r} predicts "
+                        f"{best_signal:.2f} %, clearing its {best_band:.2f} % "
+                        f"band but not the {best_threshold:.2f} % threshold "
+                        f"(band {best_band:.2f} % + instrumented flip cost "
+                        f"{best_flip_pct:.2f} % over a {self.flip_payback_s:.0f} s "
+                        f"payback horizon, floored at the {self.enter_margin_pct:.2f} % "
+                        f"enter margin). The move would not repay what it costs "
+                        f"to make it."
                     ),
                     **common,
                 )
@@ -739,7 +898,9 @@ class MsStageDecider:
                 reason=(
                     f"ms axis proposes {best_name!r}: predicted "
                     f"{best_signal:.2f} % of a {mean_total:.1f} ms round, "
-                    f"clearing a {best_band:.2f} % band, sustained "
+                    f"clearing a {best_threshold:.2f} % threshold "
+                    f"({best_band:.2f} % band + {best_flip_pct:.2f} % flip "
+                    f"cost), sustained "
                     f"{self._candidate_streak}/{self.enter_window} boundaries "
                     f"while {current.name!r} failed to hold for "
                     f"{self._leave_streak}/{self.exit_window}"
@@ -755,15 +916,24 @@ class MsStageDecider:
         mean_wait_ms: float,
         current,
         candidates: Iterable,
-    ) -> List[Tuple[str, float, float]]:
-        """(name, improvement_pct, band_pct) for every comparable candidate.
+    ) -> List[Tuple[str, float, float, float, float]]:
+        """``(name, improvement_pct, band_pct, flip_cost_pct, threshold_pct)``
+        for every comparable candidate.
 
-        Sorted best first. Ties break on the name so that two stages with an
-        identical predicted improvement produce the SAME leader on every rank
-        -- a tie broken by dict order is a rank-local decision wearing a
-        deterministic-looking hat.
+        Sorted best first BY IMPROVEMENT, not by margin over the threshold.
+        The two orderings differ when a cheap small win competes with an
+        expensive large one, and improvement is the right key: the ranking
+        answers "which stage is fastest", and affordability is a separate
+        question the threshold then asks of the leader. Ranking by margin
+        would let a candidate win the comparison by being cheap to flip into
+        rather than by being faster.
+
+        Ties break on the name so that two stages with an identical predicted
+        improvement produce the SAME leader on every rank -- a tie broken by
+        dict order is a rank-local decision wearing a deterministic-looking
+        hat.
         """
-        scored: List[Tuple[str, float, float]] = []
+        scored: List[Tuple[str, float, float, float, float]] = []
         for cand in candidates:
             if cand is None or cand.name == current.name:
                 continue
@@ -774,6 +944,13 @@ class MsStageDecider:
                     cand.name,
                     improvement_pct(mean_compute_ms, mean_wait_ms, current, cand),
                     combined_band_pct(current, cand),
+                    flip_cost_pct(cand, payback_s=self.flip_payback_s),
+                    decision_threshold_pct(
+                        current,
+                        cand,
+                        enter_margin_pct=self.enter_margin_pct,
+                        payback_s=self.flip_payback_s,
+                    ),
                 )
             )
         scored.sort(key=lambda row: (-row[1], row[0]))
@@ -790,6 +967,7 @@ class MsStageDecider:
             "exit_margin_pct": self.exit_margin_pct,
             "enter_window": self.enter_window,
             "exit_window": self.exit_window,
+            "flip_payback_s": self.flip_payback_s,
             "window": self.window.snapshot(),
             "candidate": self._candidate,
             "candidate_streak": self._candidate_streak,

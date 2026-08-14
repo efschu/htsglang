@@ -3580,6 +3580,31 @@ taxonomy and the global importance ladder.
   GATE: none. Read `EffectiveConfig` before trusting an arm's declared
   configuration — #340 published a wrong verdict from a harness environment
   that silently carried `SGLANG_UNEVEN_DCP=1`.
+- **stage measurement canon (#584 second half)** — the persisted per-stage
+  measurement the #363 stage table promotes a SOLVED candidate from: measured
+  gain over the reference stage, the band that gain was taken against, and the
+  INSTRUMENTED flip cost. Keyed by the sorted card-UUID set plus the
+  checkpoint, beside the card library, so a record from another rig or another
+  model is refused by name rather than borrowed — the same identity discipline
+  `card_rate_pass` uses, for the same reason (#584 measured borrowed rates
+  being 12–22 % wrong after a power-target change on the same cards).
+  ENTRY `planner/stage_measure_store.py:339` (`StageMeasurementLibrary`),
+  lookup `:369` (returns `(record, reason)`; the reason is filled on all four
+  misses), path `:95`, rig key `:153`, record `:177`, save `:416`, load `:446`.
+  The pass that fills it: `planner/stage_measure_pass.py:353`
+  (`build_measurement`), trace reader `:164`, band rule `:327`, flip-cost
+  parser `:339`, CLI `:466`.
+  GATE: the FILE. `managers/regime_runtime.py:1106` (`_stage_measurements`)
+  consults the canon only when it exists at the resolved path
+  (`SGLANG_STAGE_MEASUREMENTS`, else beside `card_library.json`); with no file
+  the boot takes the pre-#584 path and `StageTable` refuses an unmeasured
+  candidate with its own #578 message.
+  CONSUMERS `managers/regime_stages.py:285` (`apply_measurements`, the
+  promotion seam) via `:335` (`build_stage_table(measurements=...)`).
+  Before adding a second measurement store, read this one: an unmeasured term
+  must refuse, never default — `managers/regime_ms_clock.py:502`
+  (`flip_cost_pct`) and `:531` (`decision_threshold_pct`) are where the three
+  numbers become a flip decision.
 - **kv_canary** — installable KV-correctness canary: patches the model
   forward, holds expected inputs and a token oracle, and reports
   perturbation-driven divergence.

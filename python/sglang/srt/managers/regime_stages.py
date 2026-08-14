@@ -79,6 +79,7 @@ __all__ = [
     "GateItem",
     "StagePlan",
     "StageTablePlan",
+    "apply_measurements",
     "build_stage_table",
     "load_gate_evidence",
     "reachability",
@@ -200,6 +201,7 @@ class StageTablePlan:
         booted: str,
         table: StageTable,
         notes: Sequence[str] = (),
+        measurement_refusals: Sequence[str] = (),
     ):
         if not plans:
             raise RegimeError("a stage table plan needs at least one stage")
@@ -217,6 +219,12 @@ class StageTablePlan:
         self.booted = booted
         self.table = table
         self.notes = tuple(notes)
+        #: Candidates the planner SOLVED and the measurement canon could not
+        #: price, one line each, naming the stage and the remedy. Kept on the
+        #: plan rather than logged and dropped: a stage that is missing from
+        #: the table for want of a measurement must be visible to whoever asks
+        #: the table why it has nowhere to go.
+        self.measurement_refusals = tuple(measurement_refusals)
 
     def __len__(self) -> int:
         return len(self._plans)
@@ -256,6 +264,7 @@ class StageTablePlan:
                 p.stage.name: p.reach for p in self._plans if not p.reachable
             },
             "notes": list(self.notes),
+            "measurement_refusals": list(self.measurement_refusals),
         }
 
 
@@ -273,12 +282,65 @@ REGIME_GOALS = {
 }
 
 
+def apply_measurements(
+    candidates: Sequence[Stage],
+    *,
+    measurements,
+    rig_key: str,
+    model_key: str,
+) -> Tuple[List[Stage], List[str]]:
+    """Promote solved candidates to MEASURED ones. ``(kept, refusals)``.
+
+    THE SEAM #584's SECOND HALF PLUGS INTO. A planner candidate arrives
+    ``unmeasured=True`` with placeholder zeros in all three measurement fields,
+    and :class:`StageTable` refuses it by name. This function is where a
+    measurement taken by ``planner.stage_measure_pass`` and stored in the
+    UUID-keyed canon (``planner.stage_measure_store``) becomes those three
+    fields, so a SOLVED candidate becomes a MEASURED flip target.
+
+    THE REFUSAL PATH IS THE POINT, NOT THE FALLBACK. A candidate with no
+    usable record is DROPPED and a line naming it -- and naming which of the
+    four misses applied: never measured, measured on another card set,
+    measured for another checkpoint, or measured and self-refused -- is
+    returned with it. It is never admitted with zeros, never admitted with the
+    incumbent's numbers, and never silently absent: an operator who asks why
+    the table has one stage gets the reason per candidate.
+
+    A candidate that already carries a measurement is passed through
+    untouched. The library is not consulted for it, because a stage measured
+    in this process outranks a record on disk from a previous boot.
+    """
+    kept: List[Stage] = []
+    refusals: List[str] = []
+    for cand in candidates:
+        if not getattr(cand, "unmeasured", False):
+            kept.append(cand)
+            continue
+        record, why = measurements.lookup(cand.name, rig=rig_key, model=model_key)
+        if record is None:
+            refusals.append(f"{cand.name}: NOT SELECTABLE -- {why}")
+            continue
+        kept.append(
+            dataclasses.replace(
+                cand,
+                measured_gain_pct=float(record.gain_pct),
+                measured_band_pct=float(record.band_pct),
+                flip_cost_s=float(record.flip_cost_s),
+                unmeasured=False,
+            )
+        )
+    return kept, refusals
+
+
 def build_stage_table(
     *,
     booted: Stage,
     candidates: Sequence[Stage] = (),
     declared_vectors: Sequence[Sequence[int]] = (),
     ascend_mark: float = KV_ASCEND_MARK,
+    measurements=None,
+    rig_key: str = "",
+    model_key: str = "",
 ) -> StageTablePlan:
     """Assemble the boot table from the booted stage plus planner candidates.
 
@@ -287,18 +349,35 @@ def build_stage_table(
     function does is validation and reachability -- it never derives a plan,
     which is DESIGN_363 section 1's whole rule.
 
+    ``measurements`` is a
+    :class:`planner.stage_measure_store.StageMeasurementLibrary` or ``None``.
+    ``None`` is the pre-#584 behaviour EXACTLY: unmeasured candidates reach
+    :class:`StageTable` and the whole table is refused with the #578 message.
+    With a library, :func:`apply_measurements` promotes what the canon can
+    price and drops what it cannot, so the refusal moves from "no table at
+    all" to "this stage, for this named reason" -- which is the same refusal,
+    made per candidate and survivable.
+
     Raises :class:`RegimeError` on a table that cannot be coherent: a
     duplicate regime, a stage whose measured gain does not clear its own band
     (the #360 rule, enforced by :class:`StageTable`), or a booted stage that
     is not in the set.
     """
+    measurement_refusals: List[str] = []
+    if measurements is not None:
+        candidates, measurement_refusals = apply_measurements(
+            candidates,
+            measurements=measurements,
+            rig_key=rig_key,
+            model_key=model_key,
+        )
     seen_regimes: Dict[str, str] = {}
     stages: List[Stage] = [booted]
     plans: List[StagePlan] = [
         StagePlan(booted, REACH_BOOTED, _REACH_REASONS[REACH_BOOTED])
     ]
     seen_regimes[booted.regime] = booted.name
-    notes: List[str] = []
+    notes: List[str] = list(measurement_refusals)
 
     for cand in candidates:
         if cand.name == booted.name:
@@ -344,7 +423,13 @@ def build_stage_table(
             f"{plan.stage.name}: selectable up to {ceiling} held tokens "
             f"({ascend_mark:.2f} x {plan.stage.max_total_num_tokens})"
         )
-    return StageTablePlan(plans, booted=booted.name, table=table, notes=notes)
+    return StageTablePlan(
+        plans,
+        booted=booted.name,
+        table=table,
+        notes=notes,
+        measurement_refusals=measurement_refusals,
+    )
 
 
 def planner_candidates(

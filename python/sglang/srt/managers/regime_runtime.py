@@ -1075,11 +1075,22 @@ def build_regime_stage_table(scheduler):
         candidates, notes = planner_candidates(
             server_args, solve_fn=_planner_solve_fn(scheduler)
         )
+        library, rig, model = _stage_measurements(server_args)
         plan = build_stage_table(
-            booted=booted, candidates=candidates, declared_vectors=declared
+            booted=booted,
+            candidates=candidates,
+            declared_vectors=declared,
+            measurements=library,
+            rig_key=rig,
+            model_key=model,
         )
         for note in notes:
             logger.info("%s stage feed: %s", LOG_PREFIX, note)
+        # WARNING, not info: a solved candidate that could not be priced is
+        # the reason the controller has nowhere to go, and it is the single
+        # most useful line in the boot log when act mode does nothing.
+        for refusal in plan.measurement_refusals:
+            logger.warning("%s stage measurement: %s", LOG_PREFIX, refusal)
         return plan
     except Exception as exc:  # noqa: BLE001 -- a table is not worth a server
         logger.warning(
@@ -1090,6 +1101,57 @@ def build_regime_stage_table(scheduler):
             exc,
         )
         return None
+
+
+def _stage_measurements(server_args):
+    """``(library, rig_key, model_key)`` for this boot, or ``(None, "", "")``.
+
+    THE GATE IS THE FILE, and that is deliberate. The measurement canon binds
+    when it EXISTS at the resolved path (``SGLANG_STAGE_MEASUREMENTS``, else
+    beside the card library). With no file the boot takes the pre-#584 path
+    statement for statement: candidates arrive unmeasured, ``StageTable``
+    refuses the table with its #578 message, and this function has cost one
+    ``os.path.exists``.
+
+    Why a file rather than a flag: the store is the artifact a measurement
+    window produces, so "the measurement has been taken" and "the measurement
+    is in force" are the same fact, and an operator cannot have one without
+    the other. A flag would let a boot claim measurements it does not have.
+
+    Never raises. A canon that cannot be read is logged and skipped -- the
+    boot then refuses the candidates for want of measurement, which is the
+    same honest state a missing file produces, reached by a louder route.
+    """
+    try:
+        from sglang.srt.planner.stage_measure_store import (
+            StageMeasurementLibrary,
+            rig_key,
+            stage_measure_path,
+        )
+
+        path = stage_measure_path()
+        if not os.path.exists(path):
+            return None, "", ""
+        library = StageMeasurementLibrary.load(path)
+        rig = rig_key()
+        model = str(getattr(server_args, "model_path", "") or "")
+        logger.info(
+            "%s stage measurement canon: %d record(s) from %s, rig %s",
+            LOG_PREFIX,
+            len(library),
+            path,
+            rig,
+        )
+        return library, rig, model
+    except Exception as exc:  # noqa: BLE001 -- a canon is not worth a server
+        logger.warning(
+            "%s stage measurement canon unavailable (%r); every planner-solved "
+            "candidate will be refused for want of a measurement, which is the "
+            "same state as an unmeasured rig -- not a silent admission.",
+            LOG_PREFIX,
+            exc,
+        )
+        return None, "", ""
 
 
 class PlannerFeedUnavailable(Exception):
